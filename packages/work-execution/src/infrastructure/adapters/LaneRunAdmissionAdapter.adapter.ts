@@ -80,12 +80,21 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
     if (candidateHosts.length === 0) {
       return { outcome: 'refused', reason: 'no-host' };
     }
+    // KF-14b: a host whose remote review route cannot be built (an ssh host
+    // declaring no `runner.authFile`) is never offered to the reserve — a run
+    // must never get far enough to park `review-seat-unavailable` at
+    // brief-check. The original list was non-empty, so this refusal is
+    // distinguishable from `no-host`.
+    const routableHosts = candidateHosts.filter((host) => host.reviewRoute !== 'no-auth-file');
+    if (routableHosts.length === 0) {
+      return { outcome: 'refused', reason: 'no-review-route' };
+    }
     const reserved = await this.options.reserve.reserveExecutionCapacity({
       reservationId: this.options.newReservationId(),
       attemptId: request.attemptId,
       workOrderId: request.workOrderId,
       seatTool: request.seatTool,
-      candidateHosts,
+      candidateHosts: routableHosts,
       nowIso: request.nowIso,
     });
     if (reserved.outcome === 'reserved') {
@@ -196,11 +205,18 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
         );
         return { outcome: 'refused', reason: 'reservation-incomplete' };
       }
+      const sshAlias = reservation.sshAlias?.trim() || null;
       return {
         outcome: 'reserved',
         hostName: reservation.hostName,
         hostKind: reservation.hostKind,
         worktreePath: reservation.worktreePath,
+        // Records persisted before these fields existed read with `null`; a
+        // legacy record derives its transport from the trimmed alias it
+        // carries (a blank alias is no alias).
+        transport: reservation.transport ?? (sshAlias ? 'ssh' : 'local'),
+        sshAlias,
+        port: reservation.port ?? null,
       };
     }
     if (

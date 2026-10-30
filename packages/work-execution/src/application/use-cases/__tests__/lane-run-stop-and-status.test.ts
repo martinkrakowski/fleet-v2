@@ -79,6 +79,7 @@ function conductEntry(entryId: string, runId: string, state: 'stopped'): LaneRun
     mintedId: null,
     outcome: null,
     reasonCode: null,
+    detail: null,
     grantId: null,
     state,
   };

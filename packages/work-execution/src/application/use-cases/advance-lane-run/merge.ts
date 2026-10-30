@@ -5,6 +5,7 @@ import type { ExecuteAuthorizedForgeActionResult, ExecuteAuthorizedForgeActionRe
 import type { CiStatePort } from '../../ports/out/CiStatePort.out-port.js';
 import type { ConductorForgeGrantResult } from '../../ports/out/ConductorForgeGrantPort.out-port.js';
 import type { ForgeReadPort, PullRequestMergeState, PullRequestRef, ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
+import type { ForgeAncestryPort } from '../../ports/out/ForgeAncestryPort.out-port.js';
 import type { ReviewRequestPort } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { laneRunJournalState } from '../../../domain/lane-run-journal.js';
@@ -17,7 +18,7 @@ import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendRunIntent, appendRunResult, saveOrRefuse } from './step-context.js';
+import { appendRunIntent, appendRunResult, performPark, saveOrRefuse } from './step-context.js';
 import { readFrozenManifest } from './frozen-manifest.js';
 
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
@@ -42,7 +43,7 @@ export interface AcceptanceFacts {
   readonly acceptedHead12: string | null;
   readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
   readonly ci: 'pending' | 'passed' | 'failed' | 'unknown';
-  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string } | null;
+  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
   readonly merge: MergeFacts;
 }
 
@@ -63,6 +64,25 @@ function finalResultOfKey(
     }
   }
   return null;
+}
+
+/**
+ * A spent one-way key never loops: the decider re-acting on it parks
+ * `step-refused <step>` for the owner. An unread intent would have been routed
+ * to the reconcile by the decider's G3a, so an intent here has a final result.
+ */
+export async function parkSpentOneWayKey(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: ActDecision,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult | null> {
+  const entries = await ctx.deps.runJournal.listForKey(decision.key);
+  if (!entries.some((entry) => entry.kind === 'intent')) {
+    return null;
+  }
+  return performPark(ctx, record, 'step-refused', decision.step, gathered.facts.state, request);
 }
 
 /**
@@ -130,14 +150,17 @@ function acceptedHead12Of(
 }
 
 /**
- * No branch name is recorded on the run, so the PR is read by number when
- * `record.prNumber` is set, else by branch — the branch name being the last
- * path segment of the latest attempt's worktreePath (the same decision K5-5
- * takes).
+ * The PR is read by number when `record.prNumber` is set, else by the run's
+ * recorded branch (`record.branchName`, KF-5b); old records without the field
+ * fall back to the last path segment of the latest attempt's worktreePath
+ * (the same decision K5-5 takes).
  */
 function pullRequestRefOf(record: LaneRunRecord, latest: AttemptRecord): PullRequestRef {
   if (record.prNumber !== null) {
     return { kind: 'number', number: record.prNumber };
+  }
+  if (record.branchName !== undefined) {
+    return { kind: 'branch', branchName: record.branchName };
   }
   const segments = latest.worktreePath.split('/');
   return { kind: 'branch', branchName: segments[segments.length - 1] };
@@ -173,11 +196,28 @@ async function ciFactOf(
   }
 }
 
+/**
+ * The ancestry answer as a boolean (CT-2b): only an `answered` true is true;
+ * unavailable or a throwing port is false, and the PR snapshot is kept so the
+ * decider parks `ambiguous merge` rather than waiting on inconsistent facts.
+ */
+async function containsLaneHeadOf(ancestry: ForgeAncestryPort, ancestorSha: string, descendantSha: string): Promise<boolean> {
+  try {
+    const answer = await ancestry.containsCommit({ ancestorSha, descendantSha });
+    return answer.outcome === 'answered' && answer.contains;
+  } catch {
+    return false;
+  }
+}
+
 /** The PR read: the snapshot's state and head plus its merge state; anything but a found snapshot reads null. */
 async function prFactOf(
   port: ForgeReadPort,
   record: LaneRunRecord,
   latest: AttemptRecord,
+  laneHead12: string | null,
+  laneHeadSha: string | null,
+  ancestry: ForgeAncestryPort | undefined,
 ): Promise<PrReadResult> {
   try {
     const read = await port.readPullRequest({ ref: pullRequestRefOf(record, latest) });
@@ -188,8 +228,16 @@ async function prFactOf(
     if (head12 === null) {
       return { pr: null, mergeState: null };
     }
+    let containsLaneHead = head12 === laneHead12;
+    if (!containsLaneHead && read.pullRequest.state === 'merged' && ancestry !== undefined && laneHeadSha !== null) {
+      // CT-2b: a merged PR's head is rarely the lane's collected head (the
+      // merge train adds a merge commit), so ancestry answers it from the
+      // forge. No answer is false: the run parks ambiguous merge or stays
+      // parked for the owner; it never enters merged on a guess.
+      containsLaneHead = await containsLaneHeadOf(ancestry, laneHeadSha, read.pullRequest.headSha);
+    }
     return {
-      pr: { state: read.pullRequest.state, head12 },
+      pr: { state: read.pullRequest.state, head12, containsLaneHead },
       mergeState: read.pullRequest.mergeState,
     };
   } catch {
@@ -229,11 +277,19 @@ export async function acceptanceFactsOf(
     if (ctx.deps.ciState !== undefined) {
       ci = await ciFactOf(ctx.deps.ciState, headSha);
     }
-    if (ctx.deps.forgeRead !== undefined) {
-      const prRead = await prFactOf(ctx.deps.forgeRead, record, latest);
-      pr = prRead.pr;
-      mergeState = prRead.mergeState;
-    }
+  }
+  // CT-2a: an owner-merge park reads the PR so G5 can leave once the PR merges
+  // with the lane head; every other park keeps reading nothing.
+  const canReadPr =
+    !halted &&
+    latest !== null &&
+    latest.artifacts !== null &&
+    (FACT_READ_STATES.includes(state) ||
+      (state === 'parked' && record.parked?.reason === 'owner-merge'));
+  if (canReadPr && ctx.deps.forgeRead !== undefined) {
+    const prRead = await prFactOf(ctx.deps.forgeRead, record, latest, head12, latest.artifacts.headCommit, ctx.deps.forgeAncestry);
+    pr = prRead.pr;
+    mergeState = prRead.mergeState;
   }
   const merge = await mergeFactsOf(ctx, record, state, halted, acceptance, mergeState);
   return { acceptance, acceptedHead12, preMerge, ci, pr, merge };
@@ -317,13 +373,15 @@ async function runAcceptBody(
   let result: 'completed' | 'ambiguous';
   let reasonCode: LaneRunResultReasonCode;
   try {
-    const outcome = await assessment.assessHeadAcceptance({
+    // The conductor's pre-PR accept uses the receipts-only assessment: no
+    // acceptance is stored, but a `passed` answer at the exact head accepts.
+    const outcome = await assessment.assessHeadReceipts({
       attemptId: latest.id,
       workOrderId: record.workOrderId,
       candidateHeadSha: headSha,
       policyRevision: record.runPolicyRevision,
     });
-    if (outcome.outcome === 'accepted') {
+    if (outcome.outcome === 'passed') {
       if (outcome.assessedHeadSha === headSha) {
         result = 'completed';
         reasonCode = 'accepted';
@@ -339,8 +397,11 @@ async function runAcceptBody(
       reasonCode = 'acceptance-unknown';
     }
   } catch {
-    result = 'ambiguous';
-    reasonCode = 'acceptance-unknown';
+    // A thrown assessment leaves the intent unread (mirror performReview's
+    // pendingReview shape): append no result; the next advance's G3a routes the
+    // key to reconcileAccept, which re-runs the assessment. An `unknown`
+    // OUTCOME from the port (not a throw) keeps the ambiguous result below.
+    return { outcome: 'acted', step: decision.step, key, result: 'ambiguous', reasonCode: 'acceptance-unknown' };
   }
   const resultRefusal = await appendRunResult(ctx, request, key, result, reasonCode);
   if (resultRefusal !== null) {
@@ -354,7 +415,8 @@ async function runAcceptBody(
  * `AcceptanceAssessmentPort` under the keyed intent. Only reason codes are
  * journalled — the receipt id is not (acceptance is idempotent per head; the
  * merge reads it again through AM4a), never a reason or blocker text. A
- * thrown or `unknown` assessment stays ambiguous for the reconcile.
+ * thrown assessment stays `ambiguous` with no result for the reconcile; an
+ * `unknown` outcome journals ambiguous.
  */
 export async function performAccept(
   ctx: AdvanceStepContext,
@@ -471,11 +533,12 @@ type ForgePushKind = 'push-and-open-pr' | 'push-to-pr';
 /**
  * The shared open-pr/push body (K6-6): the frozen D7 notes and `renderPrBody`
  * (open-pr only) before any intent, the acceptance receipt id read again at
- * the exact head, the conductor push grant, then the keyed intent minting the
- * forge action id and the authorized forge action. A missing or invalid note,
- * a missing receipt, a refused or thrown grant all refuse with a null
- * minted id and no forge call; an ambiguous or thrown forge outcome leaves the
- * intent pending for the reconcile. Reason strings are never journalled.
+ * the exact head, then the keyed intent minting the forge action id, the
+ * conductor push grant, and the authorized forge action. A missing or invalid
+ * note or a missing receipt refuses before the intent (no minted id, no forge
+ * call); a refused or thrown grant refuses under the keyed intent's minted id
+ * with no forge call; an ambiguous or thrown forge outcome leaves the intent
+ * pending for the reconcile. Reason strings are never journalled.
  */
 async function runPrPushBody(
   ctx: AdvanceStepContext,
@@ -537,18 +600,19 @@ async function runPrPushBody(
     }
   }
 
-  // The acceptance receipt id is read again at the exact head (K6-5): never
-  // journalled, idempotent per head; anything else refuses the grant.
+  // The grant's acceptance receipt id is the receipts-only pass read again at
+  // the exact head (K6-5): never journalled, idempotent per head; anything
+  // else refuses the grant.
   let receiptId: string | null = null;
   try {
-    const assessment = await acceptanceAssessment.assessHeadAcceptance({
+    const assessment = await acceptanceAssessment.assessHeadReceipts({
       attemptId: latest.id,
       workOrderId: record.workOrderId,
       candidateHeadSha: headSha,
       policyRevision: record.runPolicyRevision,
     });
-    if (assessment.outcome === 'accepted' && assessment.assessedHeadSha === headSha) {
-      receiptId = assessment.receiptId;
+    if (assessment.outcome === 'passed' && assessment.assessedHeadSha === headSha) {
+      receiptId = assessment.receiptsId;
     }
   } catch {
     // fall through: no receipt.
@@ -557,8 +621,26 @@ async function runPrPushBody(
     return refuseKeyed(ctx, request, decision, 'grant-refused');
   }
 
+  // Mint the forge action id under the keyed intent BEFORE any grant is issued:
+  // a crash or a journal refusal between them must never leave an issued,
+  // unconsumed conductor grant with no journal trace. A grant refusal or throw
+  // then appends `refused` / `grant-refused` under the same key — one result,
+  // no second intent.
+  const actionId = 'forge-' + ctx.deps.newUlid();
+  const intentRefusal = await appendRunIntent(ctx, request, decision.key, actionId);
+  if (intentRefusal !== null) {
+    return { outcome: 'refused', reason: intentRefusal };
+  }
+  const refuseGrant = async (): Promise<AdvanceLaneRunResult> => {
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'grant-refused');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'grant-refused' };
+  };
+
   // The conductor's own push grant under `policy:conductor@<revision>`; a
-  // refusal or a throw refuses before the forge call.
+  // refusal or a throw refuses under the keyed intent before the forge call.
   let grant: ConductorForgeGrantResult;
   try {
     grant = await conductorForgeGrant.issueConductorForgeGrant({
@@ -571,19 +653,13 @@ async function runPrPushBody(
       acceptanceReceiptId: receiptId,
     });
   } catch {
-    return refuseKeyed(ctx, request, decision, 'grant-refused');
+    return refuseGrant();
   }
   if (grant.outcome !== 'issued') {
-    return refuseKeyed(ctx, request, decision, 'grant-refused');
-  }
-
-  // Only now mint the forge action id under the keyed intent and call the forge.
-  const actionId = 'forge-' + ctx.deps.newUlid();
-  const intentRefusal = await appendRunIntent(ctx, request, decision.key, actionId);
-  if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refuseGrant();
   }
   let forgeRequest: ExecuteAuthorizedForgeActionRequest;
+  const recordedBranch = record.branchName === undefined ? {} : { branchName: record.branchName };
   if (kind === 'push-and-open-pr' && rendered !== null) {
     forgeRequest = {
       actionId,
@@ -595,6 +671,7 @@ async function runPrPushBody(
       authorizedBy: grant.decisionRevision,
       title: rendered.title,
       body: rendered.body,
+      ...recordedBranch,
     };
   } else {
     forgeRequest = {
@@ -605,6 +682,7 @@ async function runPrPushBody(
       expectedHeadSha: headSha,
       authorizationGrantId: grant.grantId,
       authorizedBy: grant.decisionRevision,
+      ...recordedBranch,
     };
   }
   let forged: ExecuteAuthorizedForgeActionResult;
@@ -658,6 +736,10 @@ export async function performOpenPr(
   if (preCheck !== null) {
     return preCheck;
   }
+  const spent = await parkSpentOneWayKey(ctx, record, gathered, decision, request);
+  if (spent !== null) {
+    return spent;
+  }
   return runPrPushBody(ctx, record, gathered, decision, request, 'push-and-open-pr');
 }
 
@@ -676,6 +758,10 @@ export async function performPush(
   const preCheck = prPushPreCheck(ctx, gathered, decision);
   if (preCheck !== null) {
     return preCheck;
+  }
+  const spent = await parkSpentOneWayKey(ctx, record, gathered, decision, request);
+  if (spent !== null) {
+    return spent;
   }
   return runPrPushBody(ctx, record, gathered, decision, request, 'push-to-pr');
 }
@@ -751,9 +837,10 @@ export async function reconcilePrPush(
  * The `act merge` step (K6-7): one keyed intent, then `AutoMergeAttemptPort`
  * under the attempt id. Only reason codes are journalled — the port's `detail`
  * text is never. A merged head that matches the run's head completes; a merge
- * at any other head stays ambiguous for the reconcile; `waiting` is completed
- * (`merge-waiting`, the next pass re-reads the PR); `off` and `not-merged` are
- * refused; a throw is ambiguous. `merge` is one-way: the key is never re-sent.
+ * at any other head stays ambiguous for the reconcile; `waiting` is refused
+ * (`merge-waiting`: a one-way key cannot wait); `off` and `not-merged` are
+ * refused; a throw is ambiguous. `merge` is one-way: the key is never re-sent,
+ * and a spent key (an intent with a final result) parks `step-refused merge`.
  */
 export async function performMerge(
   ctx: AdvanceStepContext,
@@ -770,6 +857,10 @@ export async function performMerge(
   if (latest === null || latest.artifacts === null) {
     return { outcome: 'waiting', reason: 'facts-inconsistent' };
   }
+  const spent = await parkSpentOneWayKey(ctx, record, gathered, decision, request);
+  if (spent !== null) {
+    return spent;
+  }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
   if (intentRefusal !== null) {
     return { outcome: 'refused', reason: intentRefusal };
@@ -777,7 +868,11 @@ export async function performMerge(
   let result: 'completed' | 'refused' | 'ambiguous';
   let reasonCode: LaneRunResultReasonCode;
   try {
-    const outcome = await autoMergeAttempt.autoMergeAttempt({ attemptId: latest.id });
+    const outcome = await autoMergeAttempt.autoMergeAttempt(
+      record.branchName === undefined
+        ? { attemptId: latest.id }
+        : { attemptId: latest.id, branchName: record.branchName },
+    );
     if (outcome.outcome === 'merged') {
       if (head12Of(outcome.headSha) === gathered.facts.head12) {
         result = 'completed';
@@ -787,7 +882,7 @@ export async function performMerge(
         reasonCode = 'forge-ambiguous';
       }
     } else if (outcome.outcome === 'waiting') {
-      result = 'completed';
+      result = 'refused';
       reasonCode = 'merge-waiting';
     } else if (outcome.outcome === 'off') {
       result = 'refused';

@@ -33,6 +33,7 @@ import type {
   AssessHeadAcceptancePort,
   AssessHeadAcceptanceRequest,
   AssessHeadAcceptanceResult,
+  AssessHeadReceiptsResult,
 } from '../ports/in/AssessHeadAcceptancePort.in-port.js';
 
 export interface AssessHeadAcceptanceDependencies {
@@ -57,6 +58,13 @@ export interface AssessHeadAcceptanceDependencies {
 }
 
 const NOT_IMPLEMENTED = 'Not implemented: AssessHeadAcceptanceUseCase';
+
+/**
+ * The assessment scope. `full` is always the complete assessment, including
+ * the forge read; `receipts` is the receipts-only pass for the conductor's
+ * pre-PR step, which skips only the forge branch and never stores acceptance.
+ */
+type AssessScope = 'full' | 'receipts';
 
 const PASSING_RESULTS: readonly string[] = ['pass', 'not-applicable'];
 
@@ -214,14 +222,26 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
 
   /** Generic entry point kept for callers that hold an untyped use case. */
   async execute(input: unknown): Promise<AssessHeadAcceptanceResult> {
-    return this.run(input as AssessHeadAcceptanceRequest | undefined);
+    return this.run(input as AssessHeadAcceptanceRequest | undefined, 'full') as Promise<AssessHeadAcceptanceResult>;
   }
 
   async assessHeadAcceptance(request: AssessHeadAcceptanceRequest): Promise<AssessHeadAcceptanceResult> {
-    return this.run(request);
+    return this.run(request, 'full') as Promise<AssessHeadAcceptanceResult>;
   }
 
-  private async run(request?: AssessHeadAcceptanceRequest): Promise<AssessHeadAcceptanceResult> {
+  /**
+   * Receipts-only head assessment (checks, reviews, findings, doors), for the
+   * conductor's pre-PR step. It never stores `accepted`; every merge decision
+   * uses `assessHeadAcceptance`.
+   */
+  async assessHeadReceipts(request: AssessHeadAcceptanceRequest): Promise<AssessHeadReceiptsResult> {
+    return this.run(request, 'receipts') as Promise<AssessHeadReceiptsResult>;
+  }
+
+  private async run(
+    request?: AssessHeadAcceptanceRequest,
+    scope: AssessScope = 'full',
+  ): Promise<AssessHeadAcceptanceResult | AssessHeadReceiptsResult> {
     // Unconfigured is 501 and is checked before any request validation.
     if (!this.deps) {
       throw new Error(NOT_IMPLEMENTED);
@@ -318,6 +338,29 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
       if (doorBlockers.length > 0) {
         return await this.block(deps, assessment, doorBlockers, nowIso);
       }
+      if (scope === 'receipts') {
+        // D6 holds here too: with forge mode 'none' a stored acceptance never
+        // satisfies a brief that names a CI-state requirement.
+        if (deps.forgeMode === 'none' && namesCiRequirement(assessment.requiredChecks)) {
+          return await this.block(
+            deps,
+            assessment,
+            [
+              acceptanceBlocker(
+                'other',
+                "forge mode is 'none': the brief requires CI state, and forge evidence is 'not-configured'",
+              ),
+            ],
+            nowIso,
+          );
+        }
+        return {
+          outcome: 'receipts-passed',
+          receiptsId: `rcp-${assessment.id}-${assessment.candidateHeadSha.slice(0, 8)}`,
+          candidateHeadSha: assessment.candidateHeadSha,
+          reviewTally: reviewTallyFor(assessment),
+        };
+      }
       return {
         outcome: 'accepted',
         receiptId: assessment.acceptanceReceiptId ?? '',
@@ -345,7 +388,7 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
           ),
         );
       }
-    } else if (deps.forgeEvidence !== undefined) {
+    } else if (scope === 'full' && deps.forgeEvidence !== undefined) {
       const status = await deps.forgeEvidence.readForgeCheckStatus({
         candidateHeadSha: assessment.candidateHeadSha,
       });
@@ -388,6 +431,18 @@ export class AssessHeadAcceptanceUseCase implements AssessHeadAcceptancePort {
 
     if (blockers.length > 0) {
       return await this.block(deps, assessment, blockers, nowIso);
+    }
+
+    // The receipts-only pass never writes acceptance: no `accept`, no save.
+    // It is pre-PR evidence for the conductor; every merge decision uses the
+    // full assessment.
+    if (scope === 'receipts') {
+      return {
+        outcome: 'receipts-passed',
+        receiptsId: `rcp-${assessment.id}-${assessment.candidateHeadSha.slice(0, 8)}`,
+        candidateHeadSha: assessment.candidateHeadSha,
+        reviewTally: reviewTallyFor(assessment),
+      };
     }
 
     const receiptId = `acc-${assessment.id}-${assessment.candidateHeadSha.slice(0, 8)}`;

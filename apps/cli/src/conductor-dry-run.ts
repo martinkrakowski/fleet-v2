@@ -24,6 +24,7 @@ import type {
   ForgeReadPort,
   LaneRunAdmissionPort,
   LaneRunParkNoticePort,
+  PrepareBriefPackagePort,
   ReconcileAttemptPort,
   ReviewAssessmentPort,
   ReviewRequestPort,
@@ -36,6 +37,7 @@ export interface DryRunRecorder {
   readonly calls: readonly {
     readonly port: string;
     readonly attemptId: string | null;
+    readonly recordedHostName?: string | null;
     /** The minted request id a review act journalled, for the review ports. */
     readonly requestId?: string;
   }[];
@@ -57,7 +59,7 @@ export interface DryRunFakes {
   readonly artifactPort: Pick<
     AttemptArtifactPort,
     'readBriefManifest' | 'verifyArtifactManifest' | 'readBriefFile'
-  >; // { stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['dry-run-check'] }; 'sealed'; the brief text reads null
+  >; // { stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['dry-run-check'] }; 'sealed'; the brief file reads the example prose for `.lane/brief.md` and null otherwise
   readonly acceptanceAssessment: AcceptanceAssessmentPort;        // 'accepted' at the asked head; 'ar-dry-run-' + n
   readonly ciState: CiStatePort;                                  // 'passed' at the exact head, reason 'read'
   readonly forgeRead: ForgeReadPort;                              // 'not-found' until the push ran; then the PR at the pushed head: 'open' (clean, number 1) and, after the merge, 'merged'
@@ -65,14 +67,41 @@ export interface DryRunFakes {
   readonly executeForgeAction: ExecuteAuthorizedForgeActionPort;  // 'executed' at the expected head; PR number 1
   readonly autoMergeAttempt: AutoMergeAttemptPort;                // 'merged' at the PR head; 'policy:autoMerge@dry-run'
   readonly parkNotice: LaneRunParkNoticePort;                     // 'recorded'; the question id is 'question-dry-run-' + n
+  readonly prepareBrief: PrepareBriefPackagePort;                  // 'prepared' with a fixed digest; prosePath '.lane/brief.md'; records the call
 }
 
-/** The frozen manifest the dry-run fakes read: the limits, the frozen PR notes and the checks the seeds carry. */
+/** The fixed digest the dry-run's `prepareBrief` fake answers (KF-6). */
+export const DRY_RUN_BRIEF_DIGEST = 'f'.repeat(64);
+
+/**
+ * The frozen prose the dry-run's brief file reads: the fix round's prepare
+ * refuses an unreadable prior prose (KF-21b), so the dry-run fake reads the
+ * same prose for every attempt's `.lane/brief.md` and its recorded brief
+ * digest matches it.
+ */
+export const DRY_RUN_BRIEF_PROSE = '# Task\n\nFix the acceptance problem in the dry run.\n';
+
+/** The frozen manifest the dry-run fakes read: every field a fix-round brief rebuild needs, the limits, the frozen PR notes and the checks the seeds carry. */
 export const DRY_RUN_MANIFEST_JSON = JSON.stringify({
+  workOrderId: 'wo-example-1',
+  projectId: 'project-example-1',
+  taskId: 'task-example-1',
+  laneId: 'lane-example-1',
+  repository: 'example/repo',
+  baseCommit: 'a'.repeat(40),
+  policyRevision: 'policy:conductor@dry-run',
+  modelAssignment: { model: 'model-example-1', variant: 'default', fallbackModel: 'fallback-model', seatTool: 'opencode' },
+  independentReviewer: 'example/dry-run-reviewer',
+  ownedPaths: ['packages/example/src'],
+  allowedPathPrefixes: ['packages/example/src'],
+  permissions: ['filesystem:worktree'],
+  acceptanceChecks: ['dry-run-check'],
+  acceptanceSpec: { commitRequired: true, diffCheck: true, commands: [{ argv: ['corepack', 'yarn', 'build'] }] },
   stepLimit: 100,
   timeLimitSeconds: 2700,
+  resourceBounds: { cpu: '2' },
   expectedArtifacts: [],
-  acceptanceChecks: ['dry-run-check'],
+  ownerDecisionReferences: [],
   prNotes: { hardToUndo: 'dry run', assumptions: 'dry run', challengeThis: 'dry run' },
 });
 
@@ -128,7 +157,7 @@ export function createDryRunFakes(
   },
   nowIso: () => string,
 ): DryRunFakes {
-  const calls: { readonly port: string; readonly attemptId: string | null; readonly requestId?: string }[] = [];
+  const calls: { readonly port: string; readonly attemptId: string | null; readonly requestId?: string; readonly recordedHostName?: string | null }[] = [];
   const recordCall = (port: string, request?: object): void => {
     const field = (name: string): string | undefined => {
       if (request === undefined || !(name in request)) {
@@ -139,10 +168,14 @@ export function createDryRunFakes(
     };
     const attemptId = field('attemptId');
     const requestId = field('requestId');
+    // KF-9: a brief-package request records the host it was addressed to, so a
+    // dry run can prove the fix brief was placed on the reserved host.
+    const recordedHost = (request as { recordedHost?: { readonly host?: string | null; readonly hostName?: string | null } | null } | undefined)?.recordedHost;
     calls.push({
       port,
       attemptId: attemptId ?? null,
       ...(requestId !== undefined ? { requestId } : {}),
+      ...(recordedHost !== undefined ? { recordedHostName: recordedHost?.hostName ?? recordedHost?.host ?? null } : {}),
     });
   };
   let sessionSequence = 0;
@@ -370,7 +403,8 @@ export function createDryRunFakes(
         total: { files: 0, bytes: 0 },
       },
     }),
-    readBriefFile: async () => null,
+    readBriefFile: async (_worktreePath: string, relativePath: string) =>
+      relativePath === '.lane/brief.md' ? DRY_RUN_BRIEF_PROSE : null,
   };
 
   // K6-8: the acting fakes for the conductor's acceptance, PR, push, merge
@@ -385,6 +419,18 @@ export function createDryRunFakes(
         receiptId: 'ar-dry-run-' + String(acceptanceSequence),
         assessedHeadSha: request.candidateHeadSha,
       };
+    },
+    // The conductor's pre-PR accept and push grant use the receipts-only
+    // assessment; the dry-run answers passed so the simulated lane still
+    // accepts and opens/pushes.
+    assessHeadReceipts: (request) => {
+      recordCall('acceptanceAssessment', request);
+      acceptanceSequence += 1;
+      return Promise.resolve({
+        outcome: 'passed' as const,
+        receiptsId: 'rcp-dry-run-' + String(acceptanceSequence),
+        assessedHeadSha: request.candidateHeadSha,
+      });
     },
   };
 
@@ -471,6 +517,37 @@ export function createDryRunFakes(
     findParkQuestion: async () => ({ outcome: 'not-found' }),
   };
 
+  // KF-6: the dry-run's `prepareBrief` fake answers a fixed digest and the
+  // brief package path, writing no file. It records the call so a test can
+  // prove a fix round placed its brief package.
+  const prepareBrief: PrepareBriefPackagePort = {
+    prepareBriefPackage: async (request) => {
+      recordCall('prepareBrief', request);
+      return {
+        outcome: 'prepared',
+        prepared: {
+          attemptId: (request as { readonly attemptId?: string }).attemptId ?? '',
+          briefDigest: DRY_RUN_BRIEF_DIGEST,
+          prosePath: '.lane/brief.md',
+          manifestPath: '.lane/brief-manifest.json',
+          selectedKnowledgeVersions: [],
+        },
+      };
+    },
+    previewBriefPackage: async () => ({
+      outcome: 'previewed',
+      preview: {
+        attemptId: '',
+        briefDigest: DRY_RUN_BRIEF_DIGEST,
+        modelAssignment: { model: 'model-example-1', variant: 'default', seatTool: 'opencode' },
+        seatPlan: null,
+        acceptance: { commitRequired: true, diffCheck: true, commandCount: 1, commandDigests: [] },
+        prNotesPresent: false,
+        selectedKnowledgeVersions: [],
+      },
+    }),
+  };
+
   return {
     recorder: { calls },
     admission,
@@ -491,5 +568,6 @@ export function createDryRunFakes(
     executeForgeAction,
     autoMergeAttempt,
     parkNotice,
+    prepareBrief,
   };
 }

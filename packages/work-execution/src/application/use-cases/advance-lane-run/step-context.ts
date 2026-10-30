@@ -61,11 +61,11 @@ export async function performEnter(ctx: AdvanceStepContext,
 
 /** The park reasons that also ask one keyed owner question (K6 header). */
 const OWNER_QUESTION_REASONS: readonly LaneRunParkReason[] = [
-  'one-way-door', 'owner-merge', 'blocker-after-round-2', 'seat-plan-exhausted',
+  'one-way-door', 'owner-merge', 'blocker-after-round-2', 'seat-plan-exhausted', 'fix-no-progress',
 ];
 
 /**
- * Raise the park's attention item and, for the four owner reasons, the keyed
+ * Raise the park's attention item and, for the owner reasons, the keyed
  * owner question (K6-7). Everything is failure-tolerant: missing wiring, a
  * missing work order, a refusal or a throw never blocks or changes the park,
  * and the park outcome is returned unchanged. No journal entry is written for
@@ -73,7 +73,17 @@ const OWNER_QUESTION_REASONS: readonly LaneRunParkReason[] = [
  * `questionId` null for the next park (or the reaper) to re-raise under the
  * same key.
  */
-async function raiseParkNotice(
+/** The park notice key for one park ordinal: `<runId>/park@<n>`. */
+export function parkNoticeKey(runId: string, parkOrdinal: number): string {
+  return runId + '/park@' + String(parkOrdinal);
+}
+
+/**
+ * Re-raise (or raise) the notice of an ALREADY parked record under its saved
+ * park ordinal. Failure-tolerant and idempotent like the save path: the ports
+ * dedupe by key, so a repeat answers `exists` and costs one call per advance.
+ */
+export async function raiseParkNotice(
   ctx: AdvanceStepContext,
   record: LaneRunRecord,
   reason: LaneRunParkReason,
@@ -85,7 +95,7 @@ async function raiseParkNotice(
   if (parkNotice === undefined || workOrderRepo === undefined) {
     return;
   }
-  const key = record.runId + '/park@' + String(record.parkCount + 1);
+  const key = parkNoticeKey(record.runId, record.parkCount);
   try {
     const workOrder = await workOrderRepo.findWorkOrderById(record.workOrderId);
     if (workOrder === null) {
@@ -129,15 +139,13 @@ export async function performPark(ctx: AdvanceStepContext,
   parkedFrom: LaneRunStateValue,
   request: AdvanceLaneRunRequest,
 ): Promise<AdvanceLaneRunResult> {
-  const saved = await saveOrRefuse(ctx,
-    {
-      ...record,
-      parked: { reason, qualifier, parkedFrom, questionId: null },
-      parkCount: record.parkCount + 1,
-      revision: record.revision + 1,
-    },
-    request,
-  );
+  const parkedRecord: LaneRunRecord = {
+    ...record,
+    parked: { reason, qualifier, parkedFrom, questionId: null },
+    parkCount: record.parkCount + 1,
+    revision: record.revision + 1,
+  };
+  const saved = await saveOrRefuse(ctx, parkedRecord, request);
   if (!saved.ok) {
     return { outcome: 'refused', reason: saved.reason };
   }
@@ -145,7 +153,7 @@ export async function performPark(ctx: AdvanceStepContext,
   if (!appended.ok) {
     return { outcome: 'refused', reason: appended.reason };
   }
-  await raiseParkNotice(ctx, record, reason, qualifier, request);
+  await raiseParkNotice(ctx, saved.record ?? parkedRecord, reason, qualifier, request);
   return { outcome: 'parked', reason, qualifier };
 }
 
@@ -177,9 +185,10 @@ export async function appendRunResult(ctx: AdvanceStepContext,
   key: string,
   outcome: LaneRunJournalOutcome,
   reasonCode: LaneRunResultReasonCode | null,
+  detail: string | null = null,
 ): Promise<AdvanceLaneRunRefusal | null> {
   const appended = await ctx.deps.runJournal.append(
-    laneRunResultEntry(ctx.deps.newUlid(), request.runId, key, outcome, reasonCode, request.nowIso),
+    laneRunResultEntry(ctx.deps.newUlid(), request.runId, key, outcome, reasonCode, request.nowIso, detail),
   );
   return appended.outcome === 'appended' ? null : 'journal-refused';
 }

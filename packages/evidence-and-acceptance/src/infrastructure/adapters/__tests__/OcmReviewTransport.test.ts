@@ -10,10 +10,16 @@ import {
   createOcmReviewTransport,
   DEFAULT_REVIEW_TIMEOUT_MS,
   extractTextPart,
+  isReadOnlyReviewCommand,
+  KIND_PROMPT_DIFF_COMPLETE,
+  KIND_PROMPT_TOOLS_ONLY,
+  MAX_OCM_EMBEDDED_DIFF_BYTES,
   type OcmReviewTransportSpawn,
   parseReviewReplyStrict,
+  READ_ONLY_REVIEW_SHELL_COMMANDS,
   REVIEW_CHECKLIST,
   REVIEW_REPLY_CONTRACT,
+  ReviewTransportError,
 } from '../OcmReviewTransport.adapter.js';
 
 function extractPromptNonce(prompt: string): string {
@@ -54,6 +60,44 @@ describe('OcmReviewTransport', () => {
       /reviewer model mismatch: request specified "openai\/gpt-4o" but transport configured for "google\/gemini-1.5-pro"/,
     );
     expect(spawnCalled).toBe(false);
+  });
+
+  it('a route of kind none throws ReviewTransportError with the route code before any work', async () => {
+    let spawnCalled = false;
+    const fakeSpawn: OcmReviewTransportSpawn = async () => {
+      spawnCalled = true;
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      route: { kind: 'none', reason: 'attempt ran on an agy host', code: 'route-not-opencode' },
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    await expect(transport(baseRequest)).rejects.toBeInstanceOf(ReviewTransportError);
+    await expect(transport(baseRequest)).rejects.toMatchObject({ code: 'route-not-opencode' });
+    expect(spawnCalled).toBe(false);
+  });
+
+  it('a route of kind none without a code is route-unresolved', async () => {
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      route: { kind: 'none', reason: 'attempt ran on an agy host' },
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+    });
+
+    await expect(transport(baseRequest)).rejects.toMatchObject({ code: 'route-unresolved' });
   });
 
   it('null dir throws and does not spawn', async () => {
@@ -1426,6 +1470,420 @@ describe('OcmReviewTransport', () => {
       // Conductor request: strict — a major finding turns the PASS into a fail.
       const conductor = await makeTransport()({ ...baseRequest, kind: 'code-review' });
       expect(conductor.result).toBe('fail');
+    });
+  });
+
+  describe('isReadOnlyReviewCommand (KF-14e)', () => {
+    it('exports the allowed first words', () => {
+      expect([...READ_ONLY_REVIEW_SHELL_COMMANDS].sort()).toEqual(['cat', 'git', 'grep', 'ls', 'rg', 'sed', 'wc']);
+    });
+
+    it('accepts every allowed form', () => {
+      const allowed = [
+        'git diff --stat HEAD~1..HEAD',
+        'git log --oneline -5',
+        'git show --name-only HEAD',
+        'git status',
+        'rg -n foo src',
+        'grep -rn foo packages/x',
+        "sed -n '1,40p' src/a.ts",
+        "sed -n '12p' f",
+        'wc -l f',
+        'cat f',
+        'ls -la d',
+        'grep -nF foo src',
+        'git diff HEAD~1..HEAD',
+        'git show HEAD',
+        'git log --oneline -5 HEAD~3..HEAD',
+        'git diff -- packages/x/a.ts',
+        'grep -r -e needle src',
+        'rg -g src/a.ts needle src',
+      ];
+      for (const command of allowed) {
+        expect(isReadOnlyReviewCommand(command), command).toBe(true);
+      }
+    });
+
+    it('refuses each non-read-only shape, one case per refusal', () => {
+      const refused = [
+        'git diff; rm -rf x',
+        'cat f > g',
+        'rg x | tee y',
+        'sed -i s/a/b/ f',
+        "sed -n '1,3p;w out' f",
+        "sed -e '1e id' f",
+        'sed -n -f script f',
+        'git -c core.pager=x diff',
+        'git diff --ext-diff',
+        'git show --textconv HEAD',
+        'git diff --no-index a b',
+        'git show --output=f HEAD',
+        'git push',
+        'rg --pre cat x',
+        'rg -z x',
+        'rg --search-zip x',
+        'FOO=bar git status',
+        'env git status',
+        'xargs rm',
+        'find . -exec rm {} ;',
+        'cat /etc/passwd',
+        'cat ../../x',
+        'cat .git/config',
+        'ls ~',
+        'cat $HOME/x',
+        'cat f*',
+        'yarn vitest run',
+        'sh -c x',
+        'a'.repeat(2001),
+        'cat f\n',
+        '',
+        42,
+        'grep -nf /etc/passwd src',
+        'grep -nf ../../.ssh/id_rsa src',
+        'rg -fr /etc/passwd src',
+        'grep --file patterns.txt src',
+        'git diff ../../.ssh/id_rsa',
+        'git diff /etc/passwd',
+        'git show .git/config',
+        'git log foo/.git/config',
+        'grep -e needle /etc/passwd',
+        'grep -e needle ../../.ssh/id_rsa',
+        'rg -e needle /etc/passwd',
+        'grep -e needle .git/config',
+        'grep -r -e needle ..',
+        'grep -r -e needle ~',
+        'grep -e needle -r src',
+      ];
+      for (const command of refused) {
+        expect(isReadOnlyReviewCommand(command), String(command).slice(0, 40)).toBe(false);
+      }
+    });
+  });
+
+  describe('read-only shell proof and embedded diff (KF-14e)', () => {
+    const nonce = '0123456789abcdef';
+    const kindRequest = { ...baseRequest, kind: 'brief-check' as const, briefText: 'Do the thing.' };
+
+    const makeTransport = (stdout: string) => {
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => '/tmp/review-dir',
+        readHead: async () => baseRequest.candidateHeadSha,
+        spawn: async () => ({ exitCode: 0, stdout, stderr: '' }),
+        makeNonce: () => nonce,
+      });
+      return { transport };
+    };
+
+    it('a bash event carrying a strictly read-only command keeps readOnlyVerified true', async () => {
+      const stdout =
+        '{"type":"step_start","part":{"type":"step-start"}}\n' +
+        '{"type":"tool","part":{"tool":"read"}}\n' +
+        '{"type":"tool","part":{"tool":"bash","input":{"command":"git diff --stat HEAD~1..HEAD"}}}\n' +
+        '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}';
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(true);
+      expect(result.result).toBe('pass');
+    });
+
+    it('accepts the state.input placement and the shell tool name', async () => {
+      const stdout =
+        '{"type":"step_start","part":{"type":"step-start"}}\n' +
+        '{"type":"tool","part":{"tool":"read"}}\n' +
+        '{"type":"tool","part":{"tool":"shell","state":{"input":{"command":"git status"}}}}\n' +
+        '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}';
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
+    it('a bash event carrying rm -rf voids readOnlyVerified', async () => {
+      const stdout =
+        '{"type":"step_start","part":{"type":"step-start"}}\n' +
+        '{"type":"tool","part":{"tool":"read"}}\n' +
+        '{"type":"tool","part":{"tool":"bash","input":{"command":"rm -rf x"}}}\n' +
+        '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}';
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(false);
+    });
+
+    it('a bash event with no readable command voids readOnlyVerified', async () => {
+      const stdout =
+        '{"type":"step_start","part":{"type":"step-start"}}\n' +
+        '{"type":"tool","part":{"tool":"read"}}\n' +
+        '{"type":"tool","part":{"tool":"bash"}}\n' +
+        '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}';
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(false);
+    });
+
+    it('the recorded tool names stay the tools own names', async () => {
+      const stdout =
+        '{"type":"step_start","part":{"type":"step-start"}}\n' +
+        '{"type":"tool","part":{"tool":"bash","input":{"command":"git status"}}}\n' +
+        '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}';
+      let prompt = '';
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => '/tmp/review-dir',
+        readHead: async () => baseRequest.candidateHeadSha,
+        spawn: async (_file, args) => {
+          prompt = args[args.length - 1];
+          return { exitCode: 0, stdout, stderr: '' };
+        },
+        makeNonce: () => nonce,
+      });
+      await transport(kindRequest);
+      expect(prompt).toContain('read-only tools (read, grep, glob, list)');
+    });
+
+    it('a kind prompt embeds the base..head diff read through readDiff(baseCommit, head)', async () => {
+      const prompts: string[] = [];
+      const diffCalls: Array<readonly [string, string]> = [];
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => '/tmp/review-dir',
+        readHead: async () => baseRequest.candidateHeadSha,
+        spawn: async (_file, args) => {
+          prompts.push(args[args.length - 1]);
+          return {
+            exitCode: 0,
+            stdout:
+              '{"type":"step_start","part":{"type":"step-start"}}\n' +
+              '{"type":"tool","part":{"tool":"read"}}\n' +
+              '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+            stderr: '',
+          };
+        },
+        baseCommit: 'base-sha-1',
+        readDiff: async (fromSha, toSha) => {
+          diffCalls.push([fromSha, toSha] as const);
+          return 'diff --git a/f b/f\n+added line\n';
+        },
+        makeNonce: () => nonce,
+      });
+
+      const result = await transport(kindRequest);
+
+      expect(diffCalls).toEqual([['base-sha-1', baseRequest.candidateHeadSha]]);
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]).toContain('<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>');
+      expect(prompts[0]).toContain('+added line');
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
+    it('the kind prompt carries the diff wrapped untrusted and the new tools sentence', () => {
+      const prompt = buildReviewPrompt(kindRequest, nonce, 'diff --git a/f b/f\n+added line\n');
+      expect(prompt).toContain('<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>');
+      expect(prompt).toContain('+added line');
+      expect(prompt).toContain(KIND_PROMPT_DIFF_COMPLETE + ' ' + KIND_PROMPT_TOOLS_ONLY);
+      expect(prompt).not.toContain('if you must run a shell command');
+      expect(prompt).not.toContain('use only git diff');
+      expect(prompt).not.toContain(
+        'Inspect the code changes and candidate head using read-only tools (read, grep, glob, list).',
+      );
+    });
+
+    it('the kind prompt forbids every shell command and names only the four read-only tools (KF-14f)', () => {
+      const prompt = buildReviewPrompt(kindRequest, nonce, 'diff --git a/f b/f\n+added line\n');
+      expect(KIND_PROMPT_TOOLS_ONLY).toContain('Do not run any shell command');
+      expect(prompt).toContain('Do not run any shell command: a bash or shell call voids this review whatever the command.');
+      expect(prompt).not.toMatch(/\b(rg|sed -n|wc|cat|ls)\b.*never a command that writes/);
+    });
+
+    it('an over-cap diff becomes a one-line note and the tools remain', () => {
+      const prompt = buildReviewPrompt(kindRequest, nonce, 'x'.repeat(MAX_OCM_EMBEDDED_DIFF_BYTES + 1));
+      expect(prompt).toContain('The diff was too large to embed');
+      expect(prompt).not.toContain('<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>');
+      expect(prompt).toContain(KIND_PROMPT_TOOLS_ONLY);
+      expect(prompt).not.toContain(KIND_PROMPT_DIFF_COMPLETE);
+    });
+
+    it('the manual prompt stays byte-identical even when a diff is offered', () => {
+      const withDiff = buildReviewPrompt(baseRequest, nonce, 'diff --git a/f b/f\n');
+      const withoutDiff = buildReviewPrompt(baseRequest, nonce);
+      expect(withDiff).toBe(withoutDiff);
+      expect(withoutDiff).toContain(
+        'Inspect the code changes and candidate head using read-only tools (read, grep, glob, list).',
+      );
+      expect(withoutDiff).not.toContain('label="diff">>>');
+    });
+  });
+
+  describe('event reader and diff-read failures (KF-14e fix1)', () => {
+    const nonce = '0123456789abcdef';
+    const kindRequest = { ...baseRequest, kind: 'brief-check' as const, briefText: 'Do the thing.' };
+    const passingStdout =
+      '{"type":"step_start","part":{"type":"step-start"}}\n' +
+      '{"type":"tool","part":{"tool":"read"}}\n' +
+      '%PART%\n' +
+      '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}';
+
+    const makeTransport = (stdout: string, extra: Record<string, unknown> = {}) => {
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => '/tmp/review-dir',
+        readHead: async () => baseRequest.candidateHeadSha,
+        spawn: async () => ({ exitCode: 0, stdout, stderr: '' }),
+        makeNonce: () => nonce,
+        ...extra,
+      });
+      return { transport };
+    };
+
+    it('disagreeing part placements void the proof (a passing input.command hides nothing)', async () => {
+      const stdout = passingStdout.replace(
+        '%PART%',
+        '{"type":"tool","part":{"tool":"bash","input":{"command":"git status"},"state":{"input":{"command":"rm -rf x"}}}}',
+      );
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(false);
+    });
+
+    it('disagreeing tool-name placements void the proof (a read in part.tool hides no bash in record.tool)', async () => {
+      const stdout = passingStdout.replace(
+        '%PART%',
+        '{"type":"tool","tool":"bash","part":{"tool":"read","input":{"command":"rm -rf x"}}}',
+      );
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(false);
+    });
+
+    it('agreeing tool-name placements on a read-only command pass the proof', async () => {
+      const stdout = passingStdout.replace(
+        '%PART%',
+        '{"type":"tool","tool":"bash","part":{"tool":"bash","name":"bash","input":{"command":"git status"}}}',
+      );
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
+    it('two identical passing placements pass the proof', async () => {
+      const stdout = passingStdout.replace(
+        '%PART%',
+        '{"type":"tool","part":{"tool":"bash","input":{"command":"git status"},"state":{"input":{"command":"git status"}}}}',
+      );
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
+    it('one placement only passes the proof', async () => {
+      const stdout = passingStdout.replace(
+        '%PART%',
+        '{"type":"tool","part":{"tool":"bash","state":{"input":{"command":"git status"}}}}',
+      );
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
+    it('a bash part with no command placement voids the proof', async () => {
+      const stdout = passingStdout.replace(
+        '%PART%',
+        '{"type":"tool","part":{"tool":"bash"}}',
+      );
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(false);
+    });
+
+    it('an event-level command with a command-less part voids the proof', async () => {
+      const stdout =
+        '{"type":"step_start","part":{"type":"step-start"}}\n' +
+        '{"type":"tool","part":{"tool":"read"}}\n' +
+        '{"type":"tool","input":{"command":"git status"},"part":{"tool":"bash"}}\n' +
+        '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}';
+      const { transport } = makeTransport(stdout);
+      const result = await transport(kindRequest);
+      expect(result.readOnlyVerified).toBe(false);
+    });
+
+    it('a throwing readDiff leaves the diff unset and the review continues', async () => {
+      let prompt = '';
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => '/tmp/review-dir',
+        readHead: async () => baseRequest.candidateHeadSha,
+        spawn: async (_file, args) => {
+          prompt = args[args.length - 1];
+          return {
+            exitCode: 0,
+            stdout:
+              '{"type":"step_start","part":{"type":"step-start"}}\n' +
+              '{"type":"tool","part":{"tool":"read"}}\n' +
+              '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+            stderr: '',
+          };
+        },
+        baseCommit: 'base-sha-1',
+        readDiff: async () => {
+          throw new Error('diff read failed');
+        },
+        makeNonce: () => nonce,
+      });
+
+      const result = await transport(kindRequest);
+
+      expect(prompt).toContain('The diff was not available');
+      expect(prompt).not.toContain('label="diff">>>');
+      expect(result.result).toBe('pass');
+      expect(result.readOnlyVerified).toBe(true);
+    });
+
+    it('a null or blank readDiff is treated the same and the review continues', async () => {
+      for (const unreadable of [null, '   ']) {
+        let prompt = '';
+        const transport = createOcmReviewTransport({
+          ocmRunBin: '/test/ocm-run',
+          remotePort: 4096,
+          agent: 'reviewer',
+          model: baseRequest.reviewerModel,
+          resolveReviewDir: async () => '/tmp/review-dir',
+          readHead: async () => baseRequest.candidateHeadSha,
+          spawn: async (_file, args) => {
+            prompt = args[args.length - 1];
+            return {
+              exitCode: 0,
+              stdout:
+                '{"type":"step_start","part":{"type":"step-start"}}\n' +
+                '{"type":"tool","part":{"tool":"read"}}\n' +
+                '{"type":"text","part":{"text":"VERDICT: PASS\\n"}}',
+              stderr: '',
+            };
+          },
+          baseCommit: 'base-sha-1',
+          readDiff: async () => unreadable,
+          makeNonce: () => nonce,
+        });
+
+        const result = await transport(kindRequest);
+
+        expect(prompt).toContain('The diff was not available');
+        expect(result.result).toBe('pass');
+        expect(result.readOnlyVerified).toBe(true);
+      }
     });
   });
 });

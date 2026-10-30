@@ -60,13 +60,16 @@ import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out
 import type { ConductorForgeGrantPort } from '../ports/out/ConductorForgeGrantPort.out-port.js';
 import type { ReviewRequestPort } from '../ports/out/ReviewRequestPort.out-port.js';
 import type { PrepareFixAttemptPort } from '../ports/in/PrepareFixAttemptPort.in-port.js';
+import type { PrepareBriefPackagePort } from '../ports/in/PrepareBriefPackagePort.in-port.js';
 import type { ReviewAssessmentPort } from '../ports/out/ReviewAssessmentPort.out-port.js';
 import type { AcceptanceAssessmentPort } from '../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type { CiStatePort } from '../ports/out/CiStatePort.out-port.js';
 import type { ForgeReadPort } from '../ports/out/ForgeReadPort.out-port.js';
+import type { ForgeAncestryPort } from '../ports/out/ForgeAncestryPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { AutoMergeAttemptPort } from '../ports/in/AutoMergeAttemptPort.in-port.js';
 import type { LaneRunParkNoticePort } from '../ports/out/LaneRunParkNoticePort.out-port.js';
+import type { GateReceiptPort } from '../ports/out/GateReceiptPort.out-port.js';
 import type { SameModelFamily } from '../../domain/seat-selection.js';
 import { checkLeaseHeld } from '../../domain/lane-run-lease.js';
 import type { LeaseRefusal } from '../../domain/lane-run-lease.js';
@@ -81,6 +84,7 @@ import {
   appendConduct,
   performEnter,
   performPark,
+  raiseParkNotice,
   saveOrRefuse,
 } from './advance-lane-run/step-context.js';
 import {
@@ -93,6 +97,7 @@ import { performReconcile } from './advance-lane-run/reconcile.js';
 import { performReview } from './advance-lane-run/review-fix.js';
 import { performAccept, performMerge, performOpenPr, performPush } from './advance-lane-run/merge.js';
 import { gatherFacts, performAdmissionWait } from './advance-lane-run/facts.js';
+import { conductedRunnerOf } from './advance-lane-run/conducted-host.js';
 
 export interface AdvanceLaneRunDependencies {
   readonly runRepo: LaneRunRepositoryPort;
@@ -100,6 +105,12 @@ export interface AdvanceLaneRunDependencies {
   readonly attemptRepo: AttemptRepositoryPort;
   readonly executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJournalEntriesForAttempt'>;
   readonly artifactPort: Pick<AttemptArtifactPort, 'readBriefManifest' | 'verifyArtifactManifest' | 'readBriefFile'>;
+  /**
+   * Digest used to verify a prior attempt's frozen brief prose against its
+   * manifest when filling a fix handover (KF-21b); default
+   * `simpleDeterministicHexDigest` so existing callers keep working.
+   */
+  readonly computeDigest?: (content: string) => string;
   readonly reconcileAttempt: ReconcileAttemptPort;
   readonly admission: LaneRunAdmissionPort;
   /** A fresh ULID per call (journal entry ids, attempt ids). */
@@ -130,6 +141,8 @@ export interface AdvanceLaneRunDependencies {
   readonly workOrderRepo?: Pick<WorkOrderRepositoryPort, 'findWorkOrderById'>;
   /** K5-5: prepares a fix-round attempt from numbered findings (plan §3.3 Fix row). */
   readonly prepareFixAttempt?: PrepareFixAttemptPort;
+  /** KF-6: places the fix round's brief package from the prior attempt's frozen manifest before dispatch. */
+  readonly prepareBrief?: PrepareBriefPackagePort;
   /**
    * Resolve the runner that addresses a host for the dispatch reconcile's
    * worktree read (K4-7); absent → a dispatch reconcile that needs the
@@ -154,6 +167,10 @@ export interface AdvanceLaneRunDependencies {
   readonly parkNotice?: LaneRunParkNoticePort;
   /** Whether `policy.autoMerge` is enabled (K6-7); absent → the merge fact `policyGrant` is false. */
   readonly autoMergeEnabled?: boolean;
+  /** Answer whether a merged PR head contains the lane head (CT-2b); absent → `containsLaneHead` stays head equality. */
+  readonly forgeAncestry?: ForgeAncestryPort;
+  /** Record the conducted gate's verification receipts (KF-13a); absent → the gate records nothing. */
+  readonly gateReceipts?: GateReceiptPort;
 }
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */
@@ -230,6 +247,14 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
         if (!appended.ok) {
           return { outcome: 'refused', reason: appended.reason };
         }
+        // A crash before the notice landed is repaired here too: re-raise the
+        // saved park's notice under its key before returning `repaired`.
+        await raiseParkNotice(this.ctx,
+          record,
+          record.parked.reason,
+          record.parked.qualifier,
+          request,
+        );
         return { outcome: 'repaired', state: 'parked' };
       }
       if (parkedConducts === record.parkCount) {
@@ -248,8 +273,37 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
     }
 
     const gathered = await gatherFacts(this.ctx, record, entries, request, journalState);
-    const decision = nextLaneRunAction(record, gathered.facts, request.nowIso);
-    return this.performDecision(record, gathered, decision, request);
+    let decisionRecord: LaneRunRecord = record;
+    // A parked run whose notice did not land re-raises it under its saved park
+    // key on every advance until it lands. For an owner-question reason the
+    // question id is saved once it lands, which turns this condition off; for
+    // an attention-only reason the idempotent re-raise answers `exists` and
+    // costs one call per advance — acceptable.
+    if (
+      record.parked !== null &&
+      journalState === 'parked' &&
+      record.parked.questionId === null &&
+      this.deps.parkNotice !== undefined
+    ) {
+      await raiseParkNotice(this.ctx,
+        record,
+        record.parked.reason,
+        record.parked.qualifier,
+        request,
+      );
+      // KF-9: the re-raise may have saved the question id at revision + 1; the
+      // decision below must not save with the already-loaded record at the
+      // stale revision or its write is refused once as `save-refused`. One
+      // read, no other behaviour change; the same refusal as a vanished run
+      // above.
+      const fresh = await this.deps.runRepo.get(request.runId);
+      if (fresh === null) {
+        return { outcome: 'refused', reason: 'run-not-found' };
+      }
+      decisionRecord = fresh;
+    }
+    const decision = nextLaneRunAction(decisionRecord, gathered.facts, request.nowIso);
+    return this.performDecision(decisionRecord, gathered, decision, request);
   }
 
   private async performDecision(
@@ -272,6 +326,19 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return { outcome: 'waiting', reason: decision.reason };
     }
     if (decision.kind === 'act') {
+      // Q2a-2 act guard: an act on an attempt without a recorded host parks
+      // `step-refused` with the step as qualifier — a missing host is never
+      // read through the local executor. `prepare` creates the next attempt and
+      // `stop` must always be possible, so neither is parked.
+      const latestAttempt = gathered.latestAttempt;
+      if (
+        latestAttempt !== null &&
+        decision.step !== 'prepare' &&
+        decision.step !== 'stop' &&
+        conductedRunnerOf(latestAttempt) === null
+      ) {
+        return performPark(this.ctx, record, 'step-refused', decision.step, facts.state, request);
+      }
       if (decision.step === 'prepare') {
         return performPrepare(this.ctx, record, gathered, decision, request);
       }

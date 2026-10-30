@@ -15,7 +15,7 @@ import {
   ExecutionRunnerAdapter,
   ExecutorForHost,
   ForgeActionAdapter,
-  OpencodeDbUsageAdapter,
+  OpencodeApiUsageAdapter,
   RunnerForAttemptAdapter,
   RunnerSelectorAdapter,
   WorkOrderRepositoryAdapter,
@@ -218,19 +218,34 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     executor: roleExecutors.worktree,
     executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
   });
-  // S3: the usage read runs on the attempt's recorded runner host through the
-  // same recorded-host executor the artifact read uses; a recorded host that
-  // changed or was removed refuses (throws), which the adapter reports as
-  // `unavailable`.
-  const opencodeDbUsage = new OpencodeDbUsageAdapter({
-    executorForRecordedHost: (attempt) => {
-      const resolved = executorForHost.executorForRecordedHost(attempt.runner ?? null);
-      if (!resolved.ok) {
-        throw new Error(resolved.reason);
+  // KF-15b: the usage read asks the opencode server that ran the session
+  // (`ocm-run --usage`) over the route a review of the same attempt dials: the
+  // installation host's alias, port and auth file, or the legacy environment
+  // route. A route that cannot be built refuses, which the adapter reports as
+  // `unavailable` without running anything.
+  const opencodeUsage = new OpencodeApiUsageAdapter({
+    ocmRunBin,
+    routeForAttempt: (attempt) => {
+      const locator = reviewLocatorRef.locator;
+      if (locator === undefined) {
+        return { ok: false, reason: 'no review locator composed' };
       }
-      return resolved.executor;
+      const route = locator.routeFor(attempt.runner ?? null);
+      if (route.kind === 'none') {
+        return { ok: false, reason: route.reason };
+      }
+      if (route.remotePort === undefined) {
+        return { ok: false, reason: 'no runner port recorded or configured' };
+      }
+      const sshHost = route.remoteHost !== undefined && route.remoteHost !== '' ? route.remoteHost : null;
+      return {
+        ok: true,
+        remotePort: route.remotePort,
+        sshHost,
+        authFile: route.kind === 'installation' && route.authFile !== undefined ? route.authFile : null,
+        transport: sshHost === null ? 'local' : 'ssh',
+      };
     },
-    nodeBin: process.env.FLEET_USAGE_NODE_BIN?.trim() || undefined,
   });
   // Hand-written brief files arrive per request; no default prose is assumed.
   const briefAuthoring = new BriefAuthoringAdapter();
@@ -359,7 +374,7 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     agyRunner,
     runnerSelector,
     attemptArtifact,
-    opencodeDbUsage,
+    opencodeUsage,
     briefAuthoring,
     forgeAction,
   };

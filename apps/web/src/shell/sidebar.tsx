@@ -45,7 +45,12 @@ export function Sidebar({
           Brief and Knowledge show sample data · Lanes, Projects, Attempt and Questions read the API when configured
         </div>
       </aside>
-      <div className="sidebar-backdrop" onClick={closeDrawer} />
+      <div
+        className="sidebar-backdrop"
+        role="presentation"
+        onClick={closeDrawer}
+        onKeyDown={(event) => { if (event.key === "Escape") closeDrawer(); }}
+      />
     </>
   );
 }

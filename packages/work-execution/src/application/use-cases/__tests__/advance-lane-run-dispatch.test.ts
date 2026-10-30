@@ -10,7 +10,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import type { AttemptRecord } from '../../../domain/execution-records.js';
+import type { AttemptRecord, AttemptRunnerRecord } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
@@ -74,6 +74,13 @@ const SEAT_PLAN = {
   review: [],
 };
 
+const SEAT_PLAN_ONE = {
+  version: 1 as const,
+  'first-pass': [{ id: 'fp-1', model: 'model-example-1', tool: 'opencode' }],
+  fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'opencode' }],
+  review: [],
+};
+
 const SEAT_PLAN_AGY_PIVOT = {
   version: 1 as const,
   'first-pass': [
@@ -104,6 +111,17 @@ const SEAT_SELECTION_FP2 = {
   agent: null,
 };
 
+/** The recorded host of a conducted attempt (KF-10/Q2a-2 invariant). */
+const CONDUCTED_RUNNER: AttemptRunnerRecord = {
+  kind: 'opencode',
+  remotePort: 4166,
+  host: 'lane-alias-example',
+  hostName: 'lane-host-example',
+  agent: null,
+  model: null,
+  variant: null,
+};
+
 function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     id: 'attempt-example-1',
@@ -120,6 +138,7 @@ function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     sessionId: null,
     completionReceipt: null,
     artifacts: null,
+    runner: CONDUCTED_RUNNER,
     seatPlan: SEAT_PLAN,
     seatSelection: SEAT_SELECTION,
     stopReason: 'none',
@@ -203,6 +222,7 @@ interface Harness {
   readonly attemptRepo: AttemptRepositoryAdapter;
   readonly executionJournal: ExecutionJournalAdapter;
   readonly dispatchRequests: readonly DispatchAttemptRequest[];
+  readonly manifestReads: readonly (AttemptRunnerRecord | null)[];
   readonly cancelRequests: readonly CancelPreparedAttemptRequest[];
   readonly deps: AdvanceLaneRunDependencies;
   setManifest(json: string | null): void;
@@ -247,6 +267,7 @@ async function makeHarness(
           releaseLease: (runId, request) => runRepo.releaseLease(runId, request),
         };
   const dispatchRequests: DispatchAttemptRequest[] = [];
+  const manifestReads: (AttemptRunnerRecord | null)[] = [];
   let dispatchAnswer: (request: DispatchAttemptRequest) => Promise<DispatchAttemptResult> = async (request) => ({
     outcome: 'started',
     attempt: attemptFixture({ id: request.attemptId }),
@@ -273,7 +294,10 @@ async function makeHarness(
     attemptRepo,
     executionJournal,
     artifactPort: {
-      readBriefManifest: async () => manifestJson,
+      readBriefManifest: async (_worktreePath, _manifestPath, recordedHost) => {
+        manifestReads.push(recordedHost ?? null);
+        return manifestJson;
+      },
       verifyArtifactManifest: async () => ({ outcome: 'missing' }),
     },
     reconcileAttempt: {
@@ -321,6 +345,7 @@ async function makeHarness(
     attemptRepo,
     executionJournal,
     dispatchRequests,
+    manifestReads,
     cancelRequests,
     deps,
     setManifest: (json) => {
@@ -487,6 +512,16 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(pivot?.seatSelection?.seatIndex).toBe(1);
     expect(pivot?.briefDigest).toBe(SHA);
     expect(pivot?.worktreePath).toBe(WORKTREE);
+    // The pivot keeps the run's host identity, so the Q2a-2 act guard lets it dispatch.
+    expect(pivot?.runner).toEqual({
+      kind: CONDUCTED_RUNNER.kind,
+      remotePort: CONDUCTED_RUNNER.remotePort,
+      host: CONDUCTED_RUNNER.host,
+      hostName: CONDUCTED_RUNNER.hostName,
+      agent: null,
+      model: null,
+      variant: null,
+    });
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const prepareIntent = entries.find(
       (entry) => entry.kind === 'intent' && entry.key === prepareKey(0, 1, 2),
@@ -515,6 +550,16 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(prepared).toMatchObject({ outcome: 'acted', reasonCode: 'prepared' });
     const after = await harness.runRepo.get(RUN_ID);
     const pivotId = after?.attemptIds[1] as string;
+    // Q2a-2: a pivot attempt carries the recorded host when it dispatches (the
+    // invariant the conductor enforces); stamp it as the reservation would.
+    const pivotRecord = await harness.attemptRepo.findAttemptById(pivotId);
+    if (pivotRecord !== null) {
+      await harness.attemptRepo.saveAttempt({
+        ...pivotRecord,
+        runner: CONDUCTED_RUNNER,
+        revision: (pivotRecord.revision ?? 0) + 1,
+      });
+    }
     await admit(harness, pivotId);
     const dispatched = await advance(harness);
     expect(dispatched).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
@@ -577,6 +622,139 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
         reasonCode: 'dispatch-inputs-unreadable',
       }),
     );
+  });
+
+  it('test 7b (KF-10): a spent dispatch key parks step-refused dispatch without re-sending it or writing a second intent', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    // A crash after the dispatch result but before the dispatching conduct: the
+    // key has a final `dispatch-started` result and the attempt is still
+    // prepared, so the decider re-acts the same key. The spent-key guard parks
+    // instead of the journal's duplicate-key refusal.
+    const key = dispatchKey(0, 0, 1);
+    await appendIntent(harness, key, 'attempt-example-1', NOW);
+    await appendResult(harness, key, 'completed', 'dispatch-started', NOW);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    expect(harness.dispatchRequests).toEqual([]);
+    expect(harness.cancelRequests).toEqual([]);
+    const entries = await harness.runJournal.listForKey(key);
+    expect(entries.filter((entry) => entry.kind === 'intent')).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result')).toHaveLength(1);
+  });
+
+  it('test 7c (KF-10): after a refused first dispatch parks, a resume pivots to the next first-pass seat under a new key', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    harness.setManifest(null);
+    await admit(harness, 'attempt-example-1');
+    const key = dispatchKey(0, 0, 1);
+    const first = await advance(harness);
+    expect(first).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    expect(harness.dispatchRequests).toEqual([]);
+    expect((await harness.runJournal.listForKey(key)).filter((e) => e.kind === 'intent')).toHaveLength(1);
+
+    // Resume: applyPendingResume's exit — the park cleared, the parked-from conduct journaled.
+    const parked = await harness.runRepo.get(RUN_ID);
+    if (parked === null || parked.parked === null) {
+      throw new Error('fixture must end parked');
+    }
+    expect(parked.parked).toMatchObject({ reason: 'step-refused', qualifier: 'dispatch' });
+    const saved = await harness.deps.runRepo.save(
+      { ...parked, parked: null, revision: parked.revision + 1 },
+      { holderId: HOLDER, fence: 1, nowIso: LATER },
+    );
+    expect(saved.outcome).toBe('saved');
+    await conduct(harness, 'ready', LATER);
+
+    // The next advance owns the pivot: G8 does not re-park a dispatch refusal
+    // (dispatch is no state's keyed step), so the not-started dispatch cancels
+    // the never-contacted attempt instead of re-sending the spent key.
+    const afterResume = await advance(harness);
+    expect(afterResume).toEqual({ outcome: 'waiting', reason: 'dispatch-pending' });
+    expect(harness.dispatchRequests).toEqual([]);
+    expect((await harness.runJournal.listForKey(key)).filter((e) => e.kind === 'intent')).toHaveLength(1);
+    expect((await harness.attemptRepo.findAttemptById('attempt-example-1'))?.state).toBe('cancelled');
+
+    // The following advance prepares a NEW attempt on the next first-pass seat
+    // under a new key; the spent dispatch key is never re-sent.
+    const pivotPrepare = await advance(harness);
+    expect(pivotPrepare).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(0, 1, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    const afterRecord = await harness.runRepo.get(RUN_ID);
+    const pivotId = afterRecord?.attemptIds[1];
+    const pivot = await harness.attemptRepo.findAttemptById(pivotId as string);
+    expect(pivot?.seatSelection?.seatId).toBe('fp-2');
+    expect(pivot?.seatSelection?.seatIndex).toBe(1);
+    expect((await harness.runJournal.listForKey(key)).filter((e) => e.kind === 'intent')).toHaveLength(1);
+  });
+
+  it('test 7d (KF-10): with one first-pass seat a resumed refused dispatch re-prepares the same seat under a NEW key, never re-sending the spent key', async () => {
+    const harness = await makeHarness(runRecord(), [
+      attemptFixture({ seatPlan: SEAT_PLAN_ONE }),
+    ]);
+    harness.setManifest(null);
+    await admit(harness, 'attempt-example-1');
+    const key = dispatchKey(0, 0, 1);
+    const first = await advance(harness);
+    expect(first).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    expect(harness.dispatchRequests).toEqual([]);
+
+    // The park was taken from `ready` (pass 1), so a resume re-enters `ready`: the real path of the live run.
+    const parked = await harness.runRepo.get(RUN_ID);
+    if (parked === null || parked.parked === null) {
+      throw new Error('fixture must end parked');
+    }
+    expect(parked.parked).toMatchObject({ reason: 'step-refused', qualifier: 'dispatch', parkedFrom: 'ready' });
+    const saved = await harness.deps.runRepo.save(
+      { ...parked, parked: null, revision: parked.revision + 1 },
+      { holderId: HOLDER, fence: 1, nowIso: LATER },
+    );
+    expect(saved.outcome).toBe('saved');
+    await conduct(harness, 'ready', LATER);
+
+    const afterResume = await advance(harness);
+    expect(afterResume).toEqual({ outcome: 'waiting', reason: 'dispatch-pending' });
+    expect(harness.dispatchRequests).toEqual([]);
+    expect((await harness.runJournal.listForKey(key)).filter((e) => e.kind === 'intent')).toHaveLength(1);
+    expect((await harness.attemptRepo.findAttemptById('attempt-example-1'))?.state).toBe('cancelled');
+
+    // One seat: the next prepare lands on seat 0 again, under a new attempt ordinal and key — the spent
+    // dispatch key is never re-sent and the advance never returns journal-refused.
+    const next = await advance(harness);
+    expect(next).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(0, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect((await harness.runJournal.listForKey(key)).filter((e) => e.kind === 'intent')).toHaveLength(1);
+  });
+
+  it('test 7e (KF-10): the pre-dispatch manifest read goes through the attempt\'s stamped runner host', async () => {
+    const stamped: AttemptRunnerRecord = {
+      kind: 'opencode',
+      hostName: 'lane-example',
+      host: 'lane-alias-example',
+      remotePort: 4166,
+      agent: null,
+      model: null,
+      variant: null,
+    };
+    const harness = await makeHarness(runRecord(), [attemptFixture({ runner: stamped })]);
+    await admit(harness, 'attempt-example-1');
+    const dispatched = await advance(harness);
+    expect(dispatched).toMatchObject({ outcome: 'acted', step: 'dispatch', key: dispatchKey(0, 0, 1) });
+    expect(harness.manifestReads.length).toBeGreaterThan(0);
+    for (const read of harness.manifestReads) {
+      expect(read).toEqual(stamped);
+    }
+    expect(harness.dispatchRequests).toHaveLength(1);
   });
 
   it('test 8: a pivot seat whose tool differs is refused seat-tool-differs and then parks step-refused prepare', async () => {
@@ -860,5 +1038,37 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(
       entries.filter((entry) => entry.kind === 'result' && entry.key !== null && entry.key.includes('/stop/')),
     ).toEqual([]);
+  });
+
+  it('test 18 (KF-17): a refused dispatch whose reservation is gone, after resume, cancels the attempt instead of waiting on admission', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: 'refused by the example runner' }));
+    await admit(harness, 'attempt-example-1');
+    const key = dispatchKey(0, 0, 1);
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+
+    // Resume: clear the park and re-conduct `ready` (the park's parkedFrom).
+    const parked = await harness.runRepo.get(RUN_ID);
+    if (parked === null || parked.parked === null) {
+      throw new Error('fixture must end parked');
+    }
+    const saved = await harness.deps.runRepo.save(
+      { ...parked, parked: null, revision: parked.revision + 1 },
+      { holderId: HOLDER, fence: 1, nowIso: LATER },
+    );
+    expect(saved.outcome).toBe('saved');
+    await conduct(harness, 'ready', LATER);
+
+    // The reservation is gone: without the KF-17 admission bypass the
+    // prepared attempt would wait `admission` forever, because a refusal of
+    // `no-reservation` never admits. The not-started dispatch cancels the
+    // attempt instead, without contacting the runner.
+    expect(await harness.executionJournal.releaseCapacityReservation('attempt-example-1', LATER)).toBe(true);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'dispatch-pending' });
+    // Only the original refused call: the cancel never re-sends the key.
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect(harness.cancelRequests).toEqual([{ attemptId: 'attempt-example-1', nowIso: LATER }]);
+    expect((await harness.attemptRepo.findAttemptById('attempt-example-1'))?.state).toBe('cancelled');
+    expect((await harness.runJournal.listForKey(key)).filter((entry) => entry.kind === 'intent')).toHaveLength(1);
   });
 });

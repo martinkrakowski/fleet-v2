@@ -19,7 +19,7 @@ import {
   type EvidenceAssessmentRepositoryPort,
 } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { EvidenceArchivePort } from '../ports/out/EvidenceArchivePort.out-port.js';
-import type { IndependentReviewPort } from '../ports/out/IndependentReviewPort.out-port.js';
+import type { IndependentReviewPort, ReviewUnavailableCode } from '../ports/out/IndependentReviewPort.out-port.js';
 import type { EvidenceSeatPolicyPort } from '../ports/out/EvidenceSeatPolicyPort.out-port.js';
 import type {
   RequestIndependentReviewPort,
@@ -57,9 +57,10 @@ function rejectedFor(
   request: RequestIndependentReviewRequest,
   rejection: ReviewRejection,
   reason: string,
+  code?: ReviewUnavailableCode | 'not-read-only' | 'invalid-receipt',
 ): RequestIndependentReviewResult {
   return request.requestId !== undefined
-    ? { outcome: 'rejected', reason, rejection }
+    ? { outcome: 'rejected', reason, rejection, ...(code !== undefined ? { code } : {}) }
     : { outcome: 'rejected', reason };
 }
 
@@ -253,17 +254,18 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
         });
       } catch (error) {
         if (error instanceof EvidenceAssessmentRevisionConflictError) {
-          return rejectedFor(request, 'review-unavailable', run.reason);
+          return rejectedFor(request, 'review-unavailable', run.reason, run.code);
         }
         throw error;
       }
-      return rejectedFor(request, 'review-unavailable', run.reason);
+      return rejectedFor(request, 'review-unavailable', run.reason, run.code);
     }
     if (!run.readOnlyVerified) {
       return rejectedFor(
         request,
         'not-read-only',
         'Independent review was not verified read-only, so it is not evidence',
+        'not-read-only',
       );
     }
 
@@ -312,6 +314,7 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
         request,
         'invalid-receipt',
         placeholderEvidenceRefusal('Independent review receipt', placeholderField),
+        'invalid-receipt',
       );
     }
     const validated = ReviewReceipt.create(candidate);
@@ -320,6 +323,7 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
         request,
         'invalid-receipt',
         validated.error?.message ?? 'Independent review produced an invalid receipt',
+        'invalid-receipt',
       );
     }
     const receipt = validated.value.toRecord();

@@ -26,6 +26,11 @@ export interface ExecuteAuthorizedForgeActionRequest {
    */
   readonly title?: string;
   readonly body?: string;
+  /**
+   * The run's recorded branch (KF-5b): a safe branch name validated like the
+   * forge read's rule; absent keeps the use case's `feat/<laneId>` default.
+   */
+  readonly branchName?: string;
 }
 
 export type ExecuteAuthorizedForgeActionResult =

@@ -63,7 +63,11 @@ export interface LaneRunAttemptFact {
    */
   readonly dispatchResult: 'none' | 'not-started' | 'started';
   /** After collection: commits since base and the C1 manifest verdict; null before collection. */
-  readonly collection: { readonly commits: number; readonly manifest: 'sealed' | 'missing' | 'mismatch' } | null;
+  readonly collection: {
+    readonly commits: number;
+    readonly manifest: 'sealed' | 'missing' | 'mismatch';
+    readonly headUnchanged: boolean;
+  } | null;
 }
 
 /** A review of one kind at the current head (§3.4). */
@@ -120,8 +124,8 @@ export interface LaneRunFacts {
   readonly acceptance: 'none' | 'accepted' | 'rejected' | 'unknown';
   /** `CiStatePort` at `head12` (PC/K6). */
   readonly ci: 'pending' | 'passed' | 'failed' | 'unknown';
-  /** The run's PR as the forge reports it (K6, AM4b). */
-  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string } | null;
+  /** The run's PR as the forge reports it (K6, AM4b); `containsLaneHead` is true when the PR head is, or contains as an ancestor, the collected lane head (CT-2a). */
+  readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
   /** The step whose latest result in this round at this head was a refusal (K1b). */
   readonly refusedStep: LaneRunKeyStep | null;
   /** Unreadable door or behind-ness reads true; `trainFree` and `policyGrant` per §3.6/AM4a (K6). */
@@ -175,6 +179,14 @@ const WAIT_FACTS_INCONSISTENT: LaneRunDecision = { kind: 'wait', reason: 'facts-
  * never a pass; a seat switch only where no review receipt was recorded. Always returns a decision,
  * never throws.
  */
+/**
+ * A merged PR counts for the lane when its head is the collected lane head or
+ * contains it as an ancestor (CT-2a); every merged-PR rule (M3, G3d, G5) reads it here.
+ */
+function mergedPrCarriesLaneHead(pr: NonNullable<LaneRunFacts['pr']>, laneHead12: string | null): boolean {
+  return pr.head12 === laneHead12 || pr.containsLaneHead;
+}
+
 export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, nowIso: string): LaneRunDecision {
   try {
     const now = Date.parse(nowIso);
@@ -264,6 +276,13 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         return enter('dispatching');
       }
       if (attempt !== null && attempt.phase === 'prepared' && attempt.round === round) {
+        // A prepared attempt whose dispatch was refused (or whose intent was
+        // reconciled as never started) goes straight to the dispatch act: that
+        // act only cancels the attempt, and waiting on admission would never
+        // let a refusal of `no-reservation` recover.
+        if (attempt.dispatchResult === 'not-started') {
+          return dispatchAct(attempt);
+        }
         if (facts.admission !== 'admitted') {
           return wait('admission');
         }
@@ -431,6 +450,9 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (attempt.collection.commits === 0) {
         return enter('seat-failed');
       }
+      if (attempt.collection.headUnchanged) {
+        return park('fix-no-progress', null);
+      }
       if (attempt.collection.manifest === 'missing' || attempt.collection.manifest === 'mismatch') {
         return park('artifacts-unsealed', null);
       }
@@ -465,20 +487,31 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
     };
 
     const fixingRules = (): LaneRunDecision => {
-      if (record.round >= 2) {
+      const attempt = facts.attempt;
+      // The round is raised before dispatch (performDispatch), so an attempt placed at record.round that never ran
+      // (prepared, cancelled, or started with its conduct lost) is still this round's attempt. A cancelled attempt
+      // counts only with a journalled dispatch intent (`not-started`): a burned attempt ordinal with no record at
+      // all also reads `cancelled` at record.round, and that run must still park (KF-17).
+      const raisedUnrun =
+        attempt !== null &&
+        record.round >= 1 &&
+        attempt.round === record.round &&
+        (attempt.phase === 'prepared' ||
+          (attempt.phase === 'cancelled' && attempt.dispatchResult !== 'none') ||
+          lostDispatchConduct(attempt, record.round));
+      const fixRound = raisedUnrun ? record.round : record.round + 1;
+      if (fixRound > 2) {
         return park('blocker-after-round-2', null);
       }
       if (facts.costCeilingReached) {
         return park('cost-ceiling', null);
       }
-      const nextRound = record.round + 1;
-      const attempt = facts.attempt;
       if (
         attempt !== null &&
-        attempt.round === nextRound &&
-        (attempt.phase === 'prepared' || lostDispatchConduct(attempt, nextRound))
+        attempt.round === fixRound &&
+        (attempt.phase === 'prepared' || lostDispatchConduct(attempt, fixRound))
       ) {
-        return dispatchOrPrepare(nextRound, attempt, facts.implementerSeat);
+        return dispatchOrPrepare(fixRound, attempt, facts.implementerSeat);
       }
       if (attempt === null) {
         return WAIT_FACTS_INCONSISTENT;
@@ -486,7 +519,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (attempt.phase !== 'collected' && attempt.phase !== 'cancelled') {
         return wait('prior-not-ended');
       }
-      return dispatchOrPrepare(nextRound, attempt, facts.implementerSeat);
+      return dispatchOrPrepare(fixRound, attempt, facts.implementerSeat);
     };
 
     const acceptingRules = (): LaneRunDecision => {
@@ -582,7 +615,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (facts.pr === null) {
         return WAIT_FACTS_INCONSISTENT;
       }
-      if (facts.pr.state === 'merged' && facts.pr.head12 === facts.head12) {
+      if (facts.pr.state === 'merged' && mergedPrCarriesLaneHead(facts.pr, facts.head12)) {
         return enter('merged');
       }
       if (facts.pr.state === 'merged' || facts.pr.state === 'closed') {
@@ -649,10 +682,26 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
 
     // G3d: a merge that landed ends `merged`, never `stopped` (§3.9.1).
     if (facts.stopMode !== null && facts.state === 'merging' && facts.pr !== null && facts.pr.state === 'merged') {
-      if (facts.pr.head12 === facts.head12) {
+      if (mergedPrCarriesLaneHead(facts.pr, facts.head12)) {
         return enter('merged');
       }
       return park('ambiguous', 'merge');
+    }
+
+    // G3e: the owner-merge park leaves by itself once its PR merges with the
+    // lane head (CT-2a). It sits here, ahead of the stop rules G4a and GD1, so
+    // a landed merge ends `merged` and never `stopped` even with a stop
+    // recorded on the park (§3.9.1). A merged PR that neither equals nor
+    // contains the lane head keeps the park for the owner (no park → park).
+    if (
+      facts.state === 'parked' &&
+      record.parked !== null &&
+      record.parked.reason === 'owner-merge' &&
+      facts.pr !== null &&
+      facts.pr.state === 'merged' &&
+      mergedPrCarriesLaneHead(facts.pr, facts.head12)
+    ) {
+      return enter('merged');
     }
 
     // G4a: a force stop with nothing to stop ends the run.
@@ -807,7 +856,8 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return decision;
     }
 
-    // G5: parked waits for a resume or the owner's answer.
+    // G5: parked waits for a resume or the owner's answer (the owner-merge
+    // park's own exit is G3e above).
     if (facts.state === 'parked') {
       return wait('parked');
     }

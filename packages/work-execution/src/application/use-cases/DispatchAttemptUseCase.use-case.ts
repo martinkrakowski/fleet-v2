@@ -29,6 +29,7 @@ import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
 import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
 import { checkFixPriorSettled } from './PrepareFixAttemptUseCase.use-case.js';
+import { terminateAttemptProcessTree } from './StopAttemptUseCase.use-case.js';
 import type { DispatchAttemptPort, DispatchAttemptRequest, DispatchAttemptResult } from '../ports/in/DispatchAttemptPort.in-port.js';
 import type { RunnerIsolationCapabilities } from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
@@ -41,6 +42,7 @@ import {
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { ExecutionObservationPort } from '../ports/out/ExecutionObservationPort.out-port.js';
 import type { ExecutionRunnerPort } from '../ports/out/ExecutionRunnerPort.out-port.js';
+import type { ProcessTreeTerminationPort } from '../ports/out/ProcessTreeTerminationPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
 import type { RunnerSelectorPort } from '../ports/out/RunnerSelectorPort.out-port.js';
@@ -72,6 +74,13 @@ export interface DispatchAttemptDependencies {
   readonly runnerSelector?: RunnerSelectorPort;
   /** Free-seat check (plan F3): refuses a free or unknown seat when wired. */
   readonly allowedSeats?: AllowedSeatPort;
+  /**
+   * Optional (PK-1b). When wired, a started session that must be stopped
+   * after a second save conflict also terminates the worktree process tree
+   * before the ambiguous entry is journalled. Without it the behaviour is
+   * unchanged.
+   */
+  readonly processTreeTermination?: ProcessTreeTerminationPort;
 }
 
 /** Boolean capabilities a dispatch may require the runner to enforce. */
@@ -241,6 +250,13 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     // Refused before any reservation read, workspace inspection, journal entry,
     // save or runner call.
     const recordedAttempt = await this.deps.attemptRepo.findAttemptById(request.attemptId);
+    // KF-16: a fix attempt shares the lane's worktree with its prior attempt,
+    // so the worktree's HEAD is the prior attempt's sealed head commit, not
+    // the lane's base commit. The inspection below compares against what the
+    // worktree actually holds; `request.baseCommit` still names the lane's
+    // base everywhere else (the brief manifest check, the record, the journal).
+    let expectedCheckout = request.baseCommit;
+    let dispatchedOnPriorHead = false;
     if (recordedAttempt?.kind === 'fix') {
       const priorCheck = await checkFixPriorSettled(this.deps.attemptRepo, {
         fixAttemptId: recordedAttempt.id,
@@ -249,6 +265,24 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       });
       if (priorCheck.refusal !== null) {
         return { outcome: 'refused', reason: priorCheck.refusal };
+      }
+      const prior = priorCheck.prior;
+      // Stored records are not schema-validated on read: anything but a
+      // non-empty string is no sealed head.
+      const rawHead: unknown = prior?.artifacts?.headCommit ?? null;
+      const priorHead = typeof rawHead === 'string' && rawHead.trim() !== '' ? rawHead.trim() : null;
+      if (prior?.state === 'collected') {
+        if (priorHead === null) {
+          return {
+            outcome: 'refused',
+            reason: `Prior attempt ${prior.id} is collected but has no sealed head commit`,
+          };
+        }
+        expectedCheckout = priorHead;
+        dispatchedOnPriorHead = true;
+      } else if (prior?.state === 'cancelled' && priorHead !== null) {
+        expectedCheckout = priorHead;
+        dispatchedOnPriorHead = true;
       }
     }
 
@@ -308,7 +342,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
 
     const inspection = await this.deps.workspace.inspectWorktree({
       worktreePath: request.worktreePath,
-      baseCommit: request.baseCommit,
+      baseCommit: expectedCheckout,
       expectedArtifactPaths: request.expectedArtifacts ?? [],
       // H9b2: the inspection runs where the dispatching runner's host lives;
       // a legacy runner describes no host and keeps the configured executor.
@@ -317,7 +351,9 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     if (!inspection.matchesBaseCommit) {
       return {
         outcome: 'refused',
-        reason: `Worktree ${request.worktreePath} does not match the base commit (checked out ${inspection.checkedOutCommit})`,
+        reason: dispatchedOnPriorHead
+          ? `Worktree ${request.worktreePath} does not match the prior attempt's head (checked out ${inspection.checkedOutCommit})`
+          : `Worktree ${request.worktreePath} does not match the base commit (checked out ${inspection.checkedOutCommit})`,
       };
     }
     if (inspection.uncommittedPaths.length > 0) {
@@ -1047,6 +1083,18 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         worktreePath: runningAttempt.worktreePath,
         runner: runnerValue,
       });
+      // The worktree's process tree is killed only when the winning record
+      // holds no other live session: a foreign session there is not ours.
+      if (winner === null || winner.sessionId === null) {
+        await terminateAttemptProcessTree(
+          deps.processTreeTermination,
+          deps.journal,
+          runningAttempt,
+          'dispatch',
+          10,
+          nowIso,
+        );
+      }
       const reason = `second revision conflict; started session ${sessionId} stopped (${stopResult.outcome})`;
       await appendJournalEntry(deps.journal, {
         attemptId: runningAttempt.id,
@@ -1129,6 +1177,18 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           worktreePath: runningAttempt.worktreePath,
           runner: runnerValue,
         });
+        // Same guard: with another session recorded on the fresh record, the
+        // worktree's processes belong to it and stay.
+        if (fresh.sessionId === null) {
+          await terminateAttemptProcessTree(
+            deps.processTreeTermination,
+            deps.journal,
+            runningAttempt,
+            'dispatch',
+            10,
+            nowIso,
+          );
+        }
         const reason =
           `Attempt ${runningAttempt.id} is in state ${fresh.state}` +
           (fresh.sessionId !== null ? ` with session ${fresh.sessionId}` : '') +

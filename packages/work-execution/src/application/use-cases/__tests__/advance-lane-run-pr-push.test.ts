@@ -16,6 +16,7 @@ import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import type {
   AcceptanceAssessmentResult,
+  AcceptanceReceiptsResult,
 } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type {
   ConductorForgeGrantRequest,
@@ -47,7 +48,7 @@ const PROJECT_ID = 'project-example';
 const WORK_ORDER_ID = 'wo-example-1';
 const GRANT_ID = 'grant-conductor-example-1';
 const DECISION_REVISION = 'policy:conductor@0123456789ab';
-const RECEIPT_ID = 'receipt-example-1';
+const RECEIPT_ID = 'rcp-example-1';
 const FORGE_REASON = 'forge smoke example 1';
 const HARD_TO_UNDO = 'hard-to-undo text example 1';
 const ASSUMPTIONS = 'assumptions text example 1';
@@ -144,6 +145,15 @@ function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     sessionId: null,
     completionReceipt: null,
     artifacts: null,
+    runner: {
+      kind: 'opencode',
+      remotePort: 4166,
+      host: 'lane-alias-example',
+      hostName: 'lane-host-example',
+      agent: null,
+      model: null,
+      variant: null,
+    },
     seatPlan: SEAT_PLAN,
     seatSelection: SEAT_SELECTION,
     stopReason: 'none',
@@ -222,6 +232,7 @@ interface Harness {
   readonly deps: AdvanceLaneRunDependencies;
   setManifest(json: string | null): void;
   setAcceptanceAnswer(answer: AcceptanceAssessmentResult | 'throw'): void;
+  setReceiptsAnswer(answer: AcceptanceReceiptsResult | 'throw'): void;
   setGrantAnswer(answer: ConductorForgeGrantResult | 'throw'): void;
   setForgeAnswer(answer: ExecuteAuthorizedForgeActionResult | 'throw'): void;
   setForgeReadAnswer(answer: ReadPullRequestResult | 'throw'): void;
@@ -270,6 +281,11 @@ async function makeHarness(
   let acceptanceAnswer: AcceptanceAssessmentResult | 'throw' = {
     outcome: 'accepted',
     receiptId: RECEIPT_ID,
+    assessedHeadSha: COMMIT,
+  };
+  let receiptsAnswer: AcceptanceReceiptsResult | 'throw' = {
+    outcome: 'passed',
+    receiptsId: RECEIPT_ID,
     assessedHeadSha: COMMIT,
   };
   let grantAnswer: ConductorForgeGrantResult | 'throw' = {
@@ -333,6 +349,13 @@ async function makeHarness(
                 throw new Error('assessment unavailable');
               }
               return acceptanceAnswer;
+            },
+            assessHeadReceipts: async (_request) => {
+              portCalls.push('receipts');
+              if (receiptsAnswer === 'throw') {
+                throw new Error('receipts assessment unavailable');
+              }
+              return receiptsAnswer;
             },
           },
         }),
@@ -408,6 +431,9 @@ async function makeHarness(
     setAcceptanceAnswer: (answer) => {
       acceptanceAnswer = answer;
     },
+    setReceiptsAnswer: (answer) => {
+      receiptsAnswer = answer;
+    },
     setGrantAnswer: (answer) => {
       grantAnswer = answer;
     },
@@ -464,8 +490,8 @@ async function appendResult(
 }
 
 /** A collected attempt in `opening-pr`, accepted at the collected head. */
-async function openingPrHarness(options: HarnessOptions = {}): Promise<Harness> {
-  const harness = await makeHarness(runRecord(), [collectedAttempt()], options);
+async function openingPrHarness(options: HarnessOptions = {}, record: LaneRunRecord = runRecord()): Promise<Harness> {
+  const harness = await makeHarness(record, [collectedAttempt()], options);
   await conduct(harness, 'opening-pr', NOW);
   await appendIntent(harness, acceptKey(), null, NOW);
   await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
@@ -473,8 +499,8 @@ async function openingPrHarness(options: HarnessOptions = {}): Promise<Harness> 
 }
 
 /** A collected attempt in `pushing`, accepted at the collected head. */
-async function pushingHarness(options: HarnessOptions = {}): Promise<Harness> {
-  const harness = await makeHarness(runRecord(), [collectedAttempt()], options);
+async function pushingHarness(options: HarnessOptions = {}, record: LaneRunRecord = runRecord()): Promise<Harness> {
+  const harness = await makeHarness(record, [collectedAttempt()], options);
   await conduct(harness, 'pushing', NOW);
   await appendIntent(harness, acceptKey(), null, NOW);
   await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
@@ -530,6 +556,22 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'watching-ci' });
   });
 
+  it('test 1c: the push grant carries the receipts-only rcp id and assessHeadAcceptance is never called (KF-22b)', async () => {
+    const harness = await openingPrHarness();
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'completed',
+      reasonCode: 'pr-opened',
+    });
+    expect(harness.grantRequests).toHaveLength(1);
+    expect(harness.grantRequests[0]).toMatchObject({ acceptanceReceiptId: RECEIPT_ID });
+    expect(RECEIPT_ID.startsWith('rcp-')).toBe(true);
+    expect(harness.portCalls).toContain('receipts');
+    expect(harness.portCalls).not.toContain('acceptance');
+  });
+
   it('test 2: missing frozen prNotes refuses forge-refused with no grant and no forge call, then the next advance parks step-refused open-pr', async () => {
     const harness = await openingPrHarness();
     harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] }));
@@ -553,7 +595,7 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
     });
   });
 
-  it('test 3: a refused grant journals grant-refused with a null minted id and no forge call', async () => {
+  it('test 3: a refused grant journals grant-refused with the keyed intent minted to the action id and no forge call', async () => {
     const harness = await openingPrHarness();
     harness.setGrantAnswer({ outcome: 'refused', reason: FORGE_REASON });
     expect(await advance(harness)).toEqual({
@@ -567,7 +609,37 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === openPrKey());
     expect(intents).toHaveLength(1);
-    expect(intents[0]!.mintedId).toBeNull();
+    // The intent is minted to the action id before the grant, so it is never null.
+    // The deterministic ulid minter consumed one id each for the conduct, the accept
+    // intent and the accept result, so the action id is the minter's fourth value.
+    expect(intents[0]!.mintedId).toBe('forge-01JB0000000000000000000003');
+    const results = entries.filter((entry) => entry.kind === 'result' && entry.key === openPrKey());
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ outcome: 'refused', reasonCode: 'grant-refused' });
+  });
+
+  it('test 3b: a thrown grant journals exactly one refused/grant-refused result under the already-journalled intent and no forge call', async () => {
+    const harness = await openingPrHarness();
+    harness.setGrantAnswer('throw');
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'refused',
+      reasonCode: 'grant-refused',
+    });
+    expect(harness.grantRequests).toHaveLength(1);
+    expect(harness.forgeRequests).toEqual([]);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === openPrKey());
+    expect(intents).toHaveLength(1);
+    expect(intents[0]!.mintedId).toBe('forge-01JB0000000000000000000003');
+    const results = entries.filter((entry) => entry.kind === 'result' && entry.key === openPrKey());
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ outcome: 'refused', reasonCode: 'grant-refused' });
+    // The spent one-way key parks on the next advance; no second grant is issued.
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'open-pr' });
+    expect(harness.grantRequests).toHaveLength(1);
   });
 
   it('test 4: an ambiguous forge outcome leaves the intent pending; the reconcile that finds the PR at the head reconciles and fills the PR number, calling the forge action exactly once', async () => {
@@ -799,5 +871,158 @@ describe('AdvanceLaneRunUseCase push act (K6-6)', () => {
     // The one-way key is spent: the next advance parks for the owner instead of pushing again.
     expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'push' });
     expect(harness.forgeRequests).toHaveLength(1);
+  });
+
+  it('test 12: a spent open-pr key parks step-refused open-pr without a new intent or grant/forge calls', async () => {
+    const harness = await openingPrHarness();
+    await appendIntent(harness, openPrKey(), null, NOW);
+    await appendResult(harness, openPrKey(), 'completed', 'pr-opened', NOW);
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'open-pr' });
+    expect(harness.grantRequests).toEqual([]);
+    expect(harness.forgeRequests).toEqual([]);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === openPrKey())).toHaveLength(1);
+  });
+
+  it('test 13: a spent push key parks step-refused push without a new intent or grant/forge calls', async () => {
+    const harness = await pushingHarness();
+    harness.setForgeReadAnswer({
+      outcome: 'found',
+      pullRequest: {
+        number: 7,
+        state: 'open',
+        mergeState: 'clean',
+        headSha: MOVED_COMMIT,
+        headRef: 'wt-example-1',
+        baseRef: 'main',
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    });
+    await appendIntent(harness, pushKey(), null, NOW);
+    await appendResult(harness, pushKey(), 'completed', 'pushed', NOW);
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'push' });
+    expect(harness.grantRequests).toEqual([]);
+    expect(harness.forgeRequests).toEqual([]);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === pushKey())).toHaveLength(1);
+  });
+
+  it('test 14: a crash between the intent and the grant reconciles by the forge read, never a second grant', async () => {
+    const harness = await openingPrHarness();
+    await appendIntent(harness, openPrKey(), 'forge-01JB00000000000000000000', NOW);
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'reconciled',
+      reasonCode: 'pr-opened',
+    });
+    expect(harness.grantRequests).toEqual([]);
+    expect(harness.forgeRequests).toEqual([]);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBe(7);
+  });
+});
+
+describe('AdvanceLaneRunUseCase recorded branch (KF-5b)', () => {
+  const BRANCH = 'fleet/' + RUN_ID;
+
+  it("the open-pr forge request carries the run's recorded branch", async () => {
+    const harness = await openingPrHarness({}, runRecord({ branchName: BRANCH }));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'completed',
+      reasonCode: 'pr-opened',
+    });
+    expect(harness.forgeRequests).toHaveLength(1);
+    expect(harness.forgeRequests[0]).toMatchObject({ kind: 'push-and-open-pr', branchName: BRANCH });
+  });
+
+  it("the open-pr reconcile reads the PR by the recorded branch", async () => {
+    const harness = await openingPrHarness({}, runRecord({ branchName: BRANCH }));
+    harness.setForgeAnswer({ outcome: 'refused', reason: FORGE_REASON, forgeAmbiguous: true });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'ambiguous',
+      reasonCode: 'forge-ambiguous',
+    });
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'reconciled',
+      reasonCode: 'pr-opened',
+    });
+    // The facts read (gc) and the reconcile read all name the recorded branch.
+    expect(harness.forgeReadRequests).toHaveLength(3);
+    expect(
+      harness.forgeReadRequests.every(
+        (request) => request.ref.kind === 'branch' && request.ref.branchName === BRANCH,
+      ),
+    ).toBe(true);
+  });
+
+  it("the push forge request carries the run's recorded branch", async () => {
+    const harness = await pushingHarness({}, runRecord({ branchName: BRANCH }));
+    harness.setForgeReadAnswer({
+      outcome: 'found',
+      pullRequest: {
+        number: 7,
+        state: 'open',
+        mergeState: 'clean',
+        headSha: MOVED_COMMIT,
+        headRef: 'wt-example-1',
+        baseRef: 'main',
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'push',
+      key: pushKey(),
+      result: 'completed',
+      reasonCode: 'pushed',
+    });
+    expect(harness.forgeRequests).toHaveLength(1);
+    expect(harness.forgeRequests[0]).toMatchObject({ kind: 'push-to-pr', branchName: BRANCH });
+  });
+
+  it('old records without the field keep the worktree-path fallback and forward no branchName', async () => {
+    const harness = await openingPrHarness();
+    harness.setForgeAnswer({ outcome: 'refused', reason: FORGE_REASON, forgeAmbiguous: true });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'ambiguous',
+      reasonCode: 'forge-ambiguous',
+    });
+    expect(harness.forgeRequests[0]).not.toHaveProperty('branchName');
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'reconciled',
+      reasonCode: 'pr-opened',
+    });
+    // The facts read (twice) and the reconcile read all fall back to the
+    // worktree path's last segment for old records.
+    expect(harness.forgeReadRequests).toHaveLength(3);
+    expect(
+      harness.forgeReadRequests.every(
+        (request) => request.ref.kind === 'branch' && request.ref.branchName === 'wt-example-1',
+      ),
+    ).toBe(true);
   });
 });

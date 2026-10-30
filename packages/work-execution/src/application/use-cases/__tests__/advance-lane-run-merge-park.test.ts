@@ -25,6 +25,10 @@ import type {
   LaneRunParkRequest,
 } from '../../ports/out/LaneRunParkNoticePort.out-port.js';
 import type {
+  ContainsCommitRequest,
+  ContainsCommitResult,
+} from '../../ports/out/ForgeAncestryPort.out-port.js';
+import type {
   PullRequestMergeState,
   ReadPullRequestRequest,
   ReadPullRequestResult,
@@ -135,6 +139,15 @@ function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     sessionId: null,
     completionReceipt: null,
     artifacts: null,
+    runner: {
+      kind: 'opencode',
+      remotePort: 4166,
+      host: 'lane-alias-example',
+      hostName: 'lane-host-example',
+      agent: null,
+      model: null,
+      variant: null,
+    },
     seatPlan: SEAT_PLAN,
     seatSelection: SEAT_SELECTION,
     stopReason: 'none',
@@ -207,12 +220,14 @@ interface Harness {
   readonly recordParkAttentionCalls: readonly LaneRunParkRequest[];
   readonly askParkQuestionCalls: readonly LaneRunParkRequest[];
   readonly forgeReadRequests: readonly ReadPullRequestRequest[];
+  readonly ancestryRequests: readonly ContainsCommitRequest[];
   readonly portCalls: readonly string[];
   readonly deps: AdvanceLaneRunDependencies;
   setAutoMergeAnswer(answer: AutoMergeAttemptResult | 'throw'): void;
   setAttentionAnswer(answer: LaneRunParkNoticeResult | 'throw'): void;
   setQuestionAnswer(answer: LaneRunParkNoticeResult | 'throw'): void;
   setForgeReadAnswer(answer: ReadPullRequestResult | 'throw'): void;
+  setAncestryAnswer(answer: ContainsCommitResult | 'throw'): void;
   updateAttempt(attempt: AttemptRecord): Promise<void>;
   addWorkOrder(workOrder: WorkOrderRecord): void;
   addOtherRun(options: {
@@ -227,6 +242,7 @@ interface HarnessOptions {
   readonly wireAutoMerge?: boolean;
   readonly wireParkNotice?: boolean;
   readonly wireForgeRead?: boolean;
+  readonly wireForgeAncestry?: boolean;
   readonly wireWorkOrder?: boolean;
   readonly autoMergeEnabled?: boolean;
 }
@@ -265,6 +281,24 @@ function mergedPullRequestAtHead(number: number): ReadPullRequestResult {
   };
 }
 
+/** A merged PR whose head is ANOTHER head (the merge train's merge commit): head12 differs. */
+function mergedPullRequestAtOtherHead(number: number): ReadPullRequestResult {
+  return {
+    outcome: 'found',
+    pullRequest: {
+      number,
+      state: 'merged',
+      mergeState: 'clean',
+      headSha: MOVED_COMMIT,
+      headRef: 'wt-example-1',
+      baseRef: 'main',
+      mergedAtIso: LATER,
+      closedAtIso: null,
+      mergeCommitSha: MOVED_COMMIT,
+    },
+  };
+}
+
 async function makeHarness(
   record: LaneRunRecord,
   attempts: readonly AttemptRecord[],
@@ -278,6 +312,7 @@ async function makeHarness(
   const recordParkAttentionCalls: LaneRunParkRequest[] = [];
   const askParkQuestionCalls: LaneRunParkRequest[] = [];
   const forgeReadRequests: ReadPullRequestRequest[] = [];
+  const ancestryRequests: ContainsCommitRequest[] = [];
   const portCalls: string[] = [];
   const workOrders = new Map<string, WorkOrderRecord>([[WORK_ORDER_ID, makeWorkOrder()]]);
   let autoMergeAnswer: AutoMergeAttemptResult | 'throw' = {
@@ -290,6 +325,7 @@ async function makeHarness(
   let attentionAnswer: LaneRunParkNoticeResult | 'throw' | undefined;
   let questionAnswer: LaneRunParkNoticeResult | 'throw' | undefined;
   let forgeReadAnswer: ReadPullRequestResult | 'throw' = openPullRequestAtHead(7);
+  let ancestryAnswer: ContainsCommitResult | 'throw' = { outcome: 'answered', contains: false };
   const attentionStore = new Map<string, LaneRunParkNoticeResult>();
   const questionStore = new Map<string, LaneRunParkNoticeResult>();
 
@@ -329,6 +365,18 @@ async function makeHarness(
     },
     admission: {
       admit: async () => ({ outcome: 'admitted' }),
+    },
+    // KF-22b: the merge act never touches the acceptance port (the merge facts
+    // come from journal rows and the full assessment path). A fake that throws
+    // on either method pins that: if the merge ever called it, every merge
+    // test here would fail loudly.
+    acceptanceAssessment: {
+      assessHeadAcceptance: async () => {
+        throw new Error('assessHeadAcceptance must not be called during merge');
+      },
+      assessHeadReceipts: async () => {
+        throw new Error('assessHeadReceipts must not be called during merge');
+      },
     },
     newUlid: makeUlidMinter(),
     autoMergeEnabled,
@@ -397,6 +445,20 @@ async function makeHarness(
             },
             isConfigured: () => true,
           },
+          ...(options.wireForgeAncestry === false
+            ? {}
+            : {
+                forgeAncestry: {
+                  containsCommit: async (request) => {
+                    ancestryRequests.push(request);
+                    portCalls.push('forge-ancestry');
+                    if (ancestryAnswer === 'throw') {
+                      throw new Error('ancestry unavailable');
+                    }
+                    return ancestryAnswer;
+                  },
+                },
+              }),
         }),
     ...(options.wireWorkOrder === false
       ? {}
@@ -417,6 +479,7 @@ async function makeHarness(
     recordParkAttentionCalls,
     askParkQuestionCalls,
     forgeReadRequests,
+    ancestryRequests,
     portCalls,
     deps,
     setAutoMergeAnswer: (answer) => {
@@ -430,6 +493,9 @@ async function makeHarness(
     },
     setForgeReadAnswer: (answer) => {
       forgeReadAnswer = answer;
+    },
+    setAncestryAnswer: (answer) => {
+      ancestryAnswer = answer;
     },
     updateAttempt: async (attempt) => {
       await attemptRepo.saveAttempt(attempt);
@@ -489,8 +555,8 @@ async function appendResult(
 }
 
 /** A collected attempt in `merging`, accepted at the collected head, PR open at the head. */
-async function mergingHarness(options: HarnessOptions = {}): Promise<Harness> {
-  const harness = await makeHarness(runRecord(), [collectedAttempt()], {
+async function mergingHarness(options: HarnessOptions = {}, record: LaneRunRecord = runRecord()): Promise<Harness> {
+  const harness = await makeHarness(record, [collectedAttempt()], {
     wireForgeRead: true,
     wireWorkOrder: true,
     wireAutoMerge: true,
@@ -520,20 +586,34 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'done' });
   });
 
-  it('test 2: waiting journals merge-waiting; while the PR read still shows open the next advance acts merge again at a new head', async () => {
+  it('passes the recorded branch to the merge port (KF-5b)', async () => {
+    const harness = await mergingHarness({}, runRecord({ branchName: 'fleet/' + RUN_ID }));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'merge',
+      key: mergeKey(),
+      result: 'completed',
+      reasonCode: 'merged',
+    });
+    expect(harness.autoMergeRequests).toEqual([
+      { attemptId: 'attempt-example-1', branchName: 'fleet/' + RUN_ID },
+    ]);
+  });
+
+  it('test 2: waiting refuses merge-waiting; after the head moves and acceptance re-establishes, the next merge acts at the new head', async () => {
     const harness = await mergingHarness();
     harness.setAutoMergeAnswer({ outcome: 'waiting', reason: 'ci-pending-first-look', headSha: COMMIT, firstLookAtIso: NOW });
     expect(await advance(harness)).toEqual({
       outcome: 'acted',
       step: 'merge',
       key: mergeKey(),
-      result: 'completed',
+      result: 'refused',
       reasonCode: 'merge-waiting',
     });
     expect(harness.autoMergeRequests).toHaveLength(1);
-    // The PR read still shows open: the merge is one-way, so the next act needs a
-    // fresh head. The branch moves, acceptance is re-established at the new head,
-    // and the PR read still shows open there.
+    // `waiting` is refused: a one-way key cannot wait. The PR read still shows open,
+    // so the next merge needs a fresh head. The branch moves, acceptance is
+    // re-established at the new head, and the PR read still shows open there.
     await harness.updateAttempt(collectedAttempt({
       revision: 1,
       artifacts: { ...COLLECTED_ARTIFACTS, headCommit: MOVED_COMMIT },
@@ -603,6 +683,54 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
     expect(record?.parked).toMatchObject({ reason: 'owner-merge', questionId: QUESTION_ID });
     const entries = await harness.runJournal.listForRun(RUN_ID);
     expect(entries.some((entry) => entry.reasonCode === 'notice-recorded' || entry.reasonCode === 'notice-refused')).toBe(false);
+  });
+
+  it('test CT-2a: an owner-merge-parked run reads the PR while parked and enters merged once its PR merges at the lane head', async () => {
+    const parkedRecord = runRecord({
+      parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null },
+      parkCount: 1,
+    });
+    const harness = await makeHarness(parkedRecord, [collectedAttempt()], {
+      wireForgeRead: true,
+      wireWorkOrder: true,
+      wireAutoMerge: false,
+    });
+    await conduct(harness, 'merging', NOW);
+    await appendIntent(harness, acceptKey(), null, NOW);
+    await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
+    await conduct(harness, 'parked', NOW);
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked).toBeNull();
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'conduct' && entry.state === 'merged')).toBe(true);
+    expect(harness.forgeReadRequests).toHaveLength(1);
+  });
+
+  it('test CT-2a-b: an owner-merge park whose PR read throws stays parked, and a halted pass reads nothing', async () => {
+    const parkedRecord = runRecord({
+      parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null },
+      parkCount: 1,
+    });
+    const harness = await makeHarness(parkedRecord, [collectedAttempt()], {
+      wireForgeRead: true,
+      wireWorkOrder: true,
+      wireAutoMerge: false,
+    });
+    await conduct(harness, 'merging', NOW);
+    await appendIntent(harness, acceptKey(), null, NOW);
+    await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
+    await conduct(harness, 'parked', NOW);
+    harness.setForgeReadAnswer('throw');
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.forgeReadRequests).toHaveLength(1);
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked).toMatchObject({ reason: 'owner-merge' });
+
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness, { halted: true })).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.forgeReadRequests).toHaveLength(1);
   });
 
   it('test 4: oneWayDoor (acceptance not accepted) parks one-way-door with a question; accepted does not park it', async () => {
@@ -749,5 +877,280 @@ describe('AdvanceLaneRunUseCase park notices (K6-7)', () => {
     expect(harness.recordParkAttentionCalls).toEqual([]);
     expect(harness.askParkQuestionCalls).toEqual([]);
     expect((await harness.runRepo.get(RUN_ID))?.parked?.reason).toBe('owner-merge');
+  });
+
+  it('test 13: merge waiting refuses merge-waiting; the next advance parks step-refused merge without a second merge call', async () => {
+    const harness = await mergingHarness();
+    harness.setAutoMergeAnswer({ outcome: 'waiting', reason: 'ci-pending-first-look', headSha: COMMIT, firstLookAtIso: NOW });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'merge',
+      key: mergeKey(),
+      result: 'refused',
+      reasonCode: 'merge-waiting',
+    });
+    expect(harness.autoMergeRequests).toHaveLength(1);
+    // The merge key is spent: the next advance parks for the owner, never a second merge call.
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge' });
+    expect(harness.autoMergeRequests).toHaveLength(1);
+  });
+
+  it('test 14: a spent merge key parks step-refused merge without a new intent or a second merge call', async () => {
+    // A completed (non-refused) final result: the decider would re-act the same key; the guard parks.
+    const completed = await mergingHarness();
+    await appendIntent(completed, mergeKey(), null, NOW);
+    await appendResult(completed, mergeKey(), 'completed', 'merge-waiting', NOW);
+    expect(await advance(completed)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge' });
+    expect(completed.autoMergeRequests).toHaveLength(0);
+    const completedEntries = await completed.runJournal.listForRun(RUN_ID);
+    expect(completedEntries.filter((entry) => entry.kind === 'intent' && entry.key === mergeKey())).toHaveLength(1);
+
+    // A refused final result with the PR still open: same park, still no new intent or merge call.
+    const refused = await mergingHarness();
+    await appendIntent(refused, mergeKey(), null, NOW);
+    await appendResult(refused, mergeKey(), 'refused', 'merge-not-merged', NOW);
+    expect(await advance(refused)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge' });
+    expect(refused.autoMergeRequests).toHaveLength(0);
+    const refusedEntries = await refused.runJournal.listForRun(RUN_ID);
+    expect(refusedEntries.filter((entry) => entry.kind === 'intent' && entry.key === mergeKey())).toHaveLength(1);
+  });
+});
+
+/**
+ * CT-2b: the merge train's `update-branch` adds a merge commit, so a merged
+ * PR's head is rarely the lane's collected head. `forgeAncestry` answers
+ * whether the PR head contains the lane head; no answer is false, never a
+ * guess: the run parks `ambiguous merge` or stays parked for the owner.
+ */
+async function ownerMergeParkedHarness(options: HarnessOptions = {}): Promise<Harness> {
+  const parkedRecord = runRecord({
+    parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null },
+    parkCount: 1,
+  });
+  // A base commit distinct from the collected head pins the ancestry request's
+  // ancestor to the COLLECTED head, never the attempt's base.
+  const harness = await makeHarness(parkedRecord, [collectedAttempt({ baseCommit: 'd'.repeat(40) })], {
+    wireForgeRead: true,
+    wireWorkOrder: true,
+    wireAutoMerge: false,
+    ...options,
+  });
+  await conduct(harness, 'merging', NOW);
+  await appendIntent(harness, acceptKey(), null, NOW);
+  await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
+  await conduct(harness, 'parked', NOW);
+  return harness;
+}
+
+describe('AdvanceLaneRunUseCase forge ancestry of a merged PR head (CT-2b)', () => {
+  it('test (a): a merged PR at ANOTHER head whose ancestry answers contains: true enters merged with one ancestry request', async () => {
+    const harness = await ownerMergeParkedHarness();
+    harness.setForgeReadAnswer(mergedPullRequestAtOtherHead(7));
+    harness.setAncestryAnswer({ outcome: 'answered', contains: true });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked).toBeNull();
+    expect(harness.ancestryRequests).toEqual([
+      { ancestorSha: COMMIT, descendantSha: MOVED_COMMIT },
+    ]);
+  });
+
+  it('test (a2): in merging, a merged PR at another head enters merged on contains: true and parks ambiguous merge on false or a throw (CT-2b Fable)', async () => {
+    const contained = await mergingHarness();
+    contained.setForgeReadAnswer(mergedPullRequestAtOtherHead(7));
+    contained.setAncestryAnswer({ outcome: 'answered', contains: true });
+    expect(await advance(contained)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(contained.ancestryRequests).toEqual([{ ancestorSha: COMMIT, descendantSha: MOVED_COMMIT }]);
+
+    for (const answer of [{ outcome: 'answered', contains: false } as const, 'throw' as const]) {
+      const harness = await mergingHarness();
+      harness.setForgeReadAnswer(mergedPullRequestAtOtherHead(7));
+      harness.setAncestryAnswer(answer);
+      expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'merge' });
+      expect(harness.ancestryRequests).toHaveLength(1);
+    }
+  });
+
+  it('test (b): ancestry answers contains: false and the run stays waiting parked', async () => {
+    const harness = await ownerMergeParkedHarness();
+    harness.setForgeReadAnswer(mergedPullRequestAtOtherHead(7));
+    harness.setAncestryAnswer({ outcome: 'answered', contains: false });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked).toMatchObject({ reason: 'owner-merge' });
+    expect(harness.ancestryRequests).toEqual([
+      { ancestorSha: COMMIT, descendantSha: MOVED_COMMIT },
+    ]);
+  });
+
+  it('test (c): an unavailable answer or a throw stays waiting parked', async () => {
+    const unavailable = await ownerMergeParkedHarness();
+    unavailable.setForgeReadAnswer(mergedPullRequestAtOtherHead(7));
+    unavailable.setAncestryAnswer({ outcome: 'unavailable', reason: 'gh api compare failed (exit 1)' });
+    expect(await advance(unavailable)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect((await unavailable.runRepo.get(RUN_ID))?.parked).toMatchObject({ reason: 'owner-merge' });
+    expect(unavailable.ancestryRequests).toEqual([
+      { ancestorSha: COMMIT, descendantSha: MOVED_COMMIT },
+    ]);
+
+    const thrown = await ownerMergeParkedHarness();
+    thrown.setForgeReadAnswer(mergedPullRequestAtOtherHead(7));
+    thrown.setAncestryAnswer('throw');
+    expect(await advance(thrown)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect((await thrown.runRepo.get(RUN_ID))?.parked).toMatchObject({ reason: 'owner-merge' });
+    expect(thrown.ancestryRequests).toEqual([
+      { ancestorSha: COMMIT, descendantSha: MOVED_COMMIT },
+    ]);
+  });
+
+  it('test (d): a merged PR at the lane head makes NO ancestry request', async () => {
+    const harness = await ownerMergeParkedHarness();
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(harness.ancestryRequests).toEqual([]);
+  });
+
+  it('test (e): an open PR at another head makes NO ancestry request', async () => {
+    const harness = await ownerMergeParkedHarness();
+    harness.setForgeReadAnswer({
+      outcome: 'found',
+      pullRequest: {
+        number: 7,
+        state: 'open',
+        mergeState: 'clean',
+        headSha: MOVED_COMMIT,
+        headRef: 'wt-example-1',
+        baseRef: 'main',
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.ancestryRequests).toEqual([]);
+  });
+
+  it('test (f): no forgeAncestry dep keeps the CT-2a head-equality behaviour unchanged', async () => {
+    const harness = await ownerMergeParkedHarness({ wireForgeAncestry: false });
+    harness.setForgeReadAnswer(mergedPullRequestAtOtherHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.ancestryRequests).toEqual([]);
+    expect((await harness.runRepo.get(RUN_ID))?.parked).toMatchObject({ reason: 'owner-merge' });
+  });
+});
+
+describe('AdvanceLaneRunUseCase park notice re-raise (KF-4)', () => {
+  it('test 13: a park whose notice threw the first time gets its attention item and question on the next advance', async () => {
+    const harness = await mergingHarness({ wireParkNotice: true, autoMergeEnabled: false });
+    harness.setAttentionAnswer('throw');
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'owner-merge', qualifier: null });
+    expect(harness.recordParkAttentionCalls).toHaveLength(1);
+    expect(harness.askParkQuestionCalls).toHaveLength(0);
+    expect((await harness.runRepo.get(RUN_ID))?.parked?.questionId).toBeNull();
+
+    // The next advance re-raises under the saved park key: the fake succeeds,
+    // the question lands and its id is saved on the record.
+    harness.setAttentionAnswer(undefined as unknown as LaneRunParkNoticeResult);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.recordParkAttentionCalls).toHaveLength(2);
+    expect(harness.recordParkAttentionCalls[1]).toMatchObject({
+      key: RUN_ID + '/park@1',
+      reason: 'owner-merge',
+      runId: RUN_ID,
+    });
+    expect(harness.askParkQuestionCalls).toHaveLength(1);
+    expect((await harness.runRepo.get(RUN_ID))?.parked?.questionId).toBe(QUESTION_ID);
+  });
+
+  it('test 14: once the question id is saved, further advances raise nothing', async () => {
+    const harness = await mergingHarness({ wireParkNotice: true, autoMergeEnabled: false });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'owner-merge', qualifier: null });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    const attentionCalls = harness.recordParkAttentionCalls.length;
+    const questionCalls = harness.askParkQuestionCalls.length;
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.recordParkAttentionCalls).toHaveLength(attentionCalls);
+    expect(harness.askParkQuestionCalls).toHaveLength(questionCalls);
+  });
+
+  it('test 15: the park-repair path (record parked, conduct missing) raises on repair', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()], {
+      wireParkNotice: true,
+      wireWorkOrder: true,
+      wireForgeRead: true,
+      autoMergeEnabled: false,
+    });
+    // A crash between the park save and the conduct append: the record is
+    // parked but the journal has no `parked` conduct yet.
+    const current = await harness.runRepo.get(RUN_ID);
+    expect(current).not.toBeNull();
+    const saved = await harness.runRepo.save({
+      ...current!,
+      parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null },
+      parkCount: current!.parkCount + 1,
+      revision: current!.revision + 1,
+    }, { holderId: HOLDER, fence: 1, nowIso: LATER });
+    expect(saved.outcome).toBe('saved');
+    expect(await advance(harness)).toEqual({ outcome: 'repaired', state: 'parked' });
+    expect(harness.recordParkAttentionCalls).toHaveLength(1);
+    expect(harness.recordParkAttentionCalls[0]).toMatchObject({
+      key: RUN_ID + '/park@1',
+      reason: 'owner-merge',
+    });
+    expect(harness.askParkQuestionCalls).toHaveLength(1);
+    expect((await harness.runRepo.get(RUN_ID))?.parked?.questionId).toBe(QUESTION_ID);
+  });
+
+  it('test 16: an attention-only reason re-raises idempotently and never asks a question', async () => {
+    const harness = await mergingHarness({ wireParkNotice: true });
+    harness.setForgeReadAnswer(openPullRequestAtHead(7, 'behind'));
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'branch-behind', qualifier: null });
+    expect(harness.recordParkAttentionCalls).toHaveLength(1);
+    expect(harness.askParkQuestionCalls).toHaveLength(0);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    // The repeat answers `exists` under the same key; one call per advance.
+    expect(harness.recordParkAttentionCalls).toHaveLength(2);
+    expect(harness.recordParkAttentionCalls[1].key).toBe(RUN_ID + '/park@1');
+    expect(harness.askParkQuestionCalls).toHaveLength(0);
+    // A park other than owner-merge reads no PR while parked (CT-2a).
+    expect(harness.forgeReadRequests).toHaveLength(1);
+  });
+
+  it('test 17: no parkNotice wired means no raise and the parked wait is unchanged', async () => {
+    const harness = await mergingHarness({ wireParkNotice: false, autoMergeEnabled: false });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'owner-merge', qualifier: null });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(harness.recordParkAttentionCalls).toEqual([]);
+    expect(harness.askParkQuestionCalls).toEqual([]);
+    expect(harness.portCalls.filter((call) => call.startsWith('park'))).toHaveLength(0);
+  });
+
+  it('test 18: the reconcile after a landed notice re-raise saves at the fresh revision (KF-9)', async () => {
+    // A parked run whose owner question lands on THIS advance saves the
+    // question id at revision + 1; the unread prepare intent's reconcile (G3a)
+    // must then append its attempt id at the FRESH revision, never refusing
+    // once as `save-refused` on the stale one.
+    const harness = await makeHarness(
+      runRecord({
+        parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null },
+        parkCount: 1,
+      }),
+      [attemptFixture({ id: 'attempt-fix-1', kind: 'fix', fixNumber: 1, priorAttemptId: 'attempt-example-1' })],
+      { wireParkNotice: true, wireWorkOrder: true },
+    );
+    await conduct(harness, 'parked', NOW);
+    const prepareKey = stepKey({ round: 1, step: 'prepare', seatIndex: 0, attemptOrdinal: 2, head12: null });
+    await appendIntent(harness, prepareKey, 'attempt-fix-1', NOW);
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey,
+      result: 'reconciled',
+      reasonCode: 'prepared',
+    });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.attemptIds).toContain('attempt-fix-1');
+    expect(record?.parked?.questionId).toBe(QUESTION_ID);
   });
 });

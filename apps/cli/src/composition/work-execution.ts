@@ -23,6 +23,7 @@ import {
   ExecuteAuthorizedForgeActionUseCase,
   ExecutionObservationAdapter,
   GatePredicateAdapter,
+  ProcessTreeTerminationAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
@@ -55,7 +56,7 @@ import {
   type ExecutorForRecordedHostResult,
   type ForgeActionAdapter,
   type ForgeReadAdapter,
-  type OpencodeDbUsageAdapter,
+  type OpencodeApiUsageAdapter,
   type ProjectProfileReadPort,
   type ProjectProbeRecordAdapter,
   type RunnerForAttemptAdapter,
@@ -119,7 +120,7 @@ export interface ComposeExecutionInput {
   readonly agyRunner?: AgyRunnerAdapter;
   readonly runnerSelector: RunnerSelectorAdapter;
   readonly attemptArtifact: AttemptArtifactAdapter;
-  readonly opencodeDbUsage: OpencodeDbUsageAdapter;
+  readonly opencodeUsage: OpencodeApiUsageAdapter;
   readonly briefAuthoring: BriefAuthoringAdapter;
   readonly forgeAction: ForgeActionAdapter;
   readonly editOnlyModeOf: (
@@ -160,7 +161,7 @@ export function composeExecution(input: ComposeExecutionInput) {
     agyRunner,
     runnerSelector,
     attemptArtifact,
-    opencodeDbUsage,
+    opencodeUsage,
     briefAuthoring,
     forgeAction,
     editOnlyModeOf,
@@ -190,6 +191,32 @@ export function composeExecution(input: ComposeExecutionInput) {
           },
         });
 
+  // One mapping of a non-passing assessment (full or receipts-only) to the
+  // work-execution `rejected` answer: `blocked` keeps its blocker kinds,
+  // `stale` and `rejected` leave the action without a pass and say which.
+  const rejectedAcceptanceOf = (
+    result: Extract<
+      Awaited<ReturnType<typeof evidence.assessHeadAcceptance.assessHeadReceipts>>,
+      { outcome: 'blocked' | 'stale' | 'rejected' }
+    >,
+  ) => {
+    if (result.outcome === 'blocked') {
+      return {
+        outcome: 'rejected' as const,
+        reason: `Acceptance blocked: ${result.blockers.join('; ')}`,
+        blockerDetails: result.blockerDetails.map((blocker) => ({
+          kind: blocker.kind,
+          text: blocker.text,
+        })),
+      };
+    }
+    return {
+      outcome: 'rejected' as const,
+      reason: result.reason,
+      blockerDetails: [{ kind: result.outcome === 'stale' ? ('stale' as const) : ('other' as const), text: result.reason }],
+    };
+  };
+
   const acceptanceAssessment = new AcceptanceAssessmentAdapter({
     assess: async (request) => {
       const assessmentId = assessmentIdForAttempt(request.attemptId);
@@ -216,29 +243,26 @@ export function composeExecution(input: ComposeExecutionInput) {
           assessedHeadSha: result.candidateHeadSha,
         };
       }
-      if (result.outcome === 'blocked') {
+      return rejectedAcceptanceOf(result);
+    },
+    // The receipts-only head assessment for the conductor's pre-PR steps. It
+    // never stores acceptance: no `acceptedReceiptByHead` entry, no
+    // `accepted-receipts.json` write. Every merge decision keeps `assess`.
+    assessReceipts: async (request) => {
+      const assessmentId = assessmentIdForAttempt(request.attemptId);
+      const result = await evidence.assessHeadAcceptance.assessHeadReceipts({
+        assessmentId,
+        candidateHeadSha: request.candidateHeadSha,
+        policyRevision: request.policyRevision,
+      });
+      if (result.outcome === 'receipts-passed') {
         return {
-          outcome: 'rejected',
-          reason: `Acceptance blocked: ${result.blockers.join('; ')}`,
-          blockerDetails: result.blockerDetails.map((blocker) => ({
-            kind: blocker.kind,
-            text: blocker.text,
-          })),
+          outcome: 'passed',
+          receiptsId: result.receiptsId,
+          assessedHeadSha: result.candidateHeadSha,
         };
       }
-      if (result.outcome === 'stale') {
-        return {
-          outcome: 'rejected',
-          reason: result.reason,
-          blockerDetails: [{ kind: 'stale', text: result.reason }],
-        };
-      }
-      // `rejected` and `stale` both leave the action without a pass; the kind says which.
-      return {
-        outcome: 'rejected',
-        reason: result.reason,
-        blockerDetails: [{ kind: 'other', text: result.reason }],
-      };
+      return rejectedAcceptanceOf(result);
     },
   });
 
@@ -470,6 +494,9 @@ export function composeExecution(input: ComposeExecutionInput) {
     computeDigest: sha256HexDigest,
   });
   const attemptGate = options?.attemptGate ?? composedAttemptGate;
+  // PK-1: stop, the dispatch conflict stops and collect kill the attempt's
+  // process tree on its recorded host (a legacy record is refused by the adapter).
+  const processTreeTermination = new ProcessTreeTerminationAdapter({ executorForHost });
 
   const execution = {
     workOrderRepository,
@@ -483,7 +510,7 @@ export function composeExecution(input: ComposeExecutionInput) {
     // declared lane-runner entry, in which case the request default applies.
     runnerMaxLanes: runnerProfile?.maxLanes,
     attemptArtifact,
-    opencodeDbUsage,
+    opencodeUsage,
     briefAuthoring,
     acceptanceAssessment,
     acceptanceEvidence,
@@ -543,6 +570,7 @@ export function composeExecution(input: ComposeExecutionInput) {
       artifactPort: attemptArtifact,
       computeDigest: sha256HexDigest,
       allowedSeats,
+      processTreeTermination,
     }),
     commitEditOnlyAttempt: new CommitEditOnlyAttemptUseCase({
       attemptRepo: attemptRepository,
@@ -567,6 +595,7 @@ export function composeExecution(input: ComposeExecutionInput) {
       journal: executionJournal,
       runner,
       runnerForAttempt,
+      processTreeTermination,
     }),
     collectAttemptArtifacts: new CollectAttemptArtifactsUseCase({
       attemptRepo: attemptRepository,
@@ -574,7 +603,8 @@ export function composeExecution(input: ComposeExecutionInput) {
       artifactPort: attemptArtifact,
       briefKnowledge,
       runnerForAttempt,
-      usage: opencodeDbUsage,
+      usage: opencodeUsage,
+      processTreeTermination,
     }),
     prepareFixAttempt: new PrepareFixAttemptUseCase({ attemptRepo: attemptRepository }),
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({

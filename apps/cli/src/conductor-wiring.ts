@@ -55,17 +55,24 @@ export function laneRunnerCandidateHosts(
   for (const name of Object.keys(installation.hosts)) {
     const host = installation.hosts[name];
     if (!host.roles?.includes('lane-runner') || host.runner === undefined) continue;
+    // KF-14b: a remote review route needs `runner.authFile` over ssh (a
+    // deliberate rule of `AttemptReviewLocator.routeFor`); an ssh host
+    // without one is marked so the start refuses it before any run.
+    const transport = host.transport === 'ssh' ? 'ssh' : 'local';
+    const authFile = host.runner.authFile?.trim() ?? '';
+    const reviewRoute = transport === 'ssh' && authFile === '' ? 'no-auth-file' : 'available';
     candidates.push({
       name,
       kind: host.runner.kind,
-      transport: host.transport === 'ssh' ? 'ssh' : 'local',
+      transport,
       sshAlias:
-        host.transport === 'ssh' && host.sshAlias !== undefined && host.sshAlias.trim() !== ''
+        transport === 'ssh' && host.sshAlias !== undefined && host.sshAlias.trim() !== ''
           ? host.sshAlias
           : null,
       port: typeof host.runner.port === 'number' ? host.runner.port : null,
       maxLanes: host.runner.maxLanes,
       worktreeRoot: host.worktreeRoot,
+      reviewRoute,
     });
   }
   return candidates;
@@ -117,6 +124,16 @@ function buildConductorDriver(parts: {
  * The live driver over the runtime's real ports. Builds objects only; calling
  * `pass.runPass` acts on lane hosts.
  */
+/**
+ * The gate the live conductor evaluates after collect (KF-12): the composed,
+ * predicate-backed instance (`execution.attemptGate`, GP-wire), never the
+ * `attempt accept` instance, which has no predicates and answers `unknown`
+ * ('Gate predicates are not wired') for every attempt, parking each run.
+ */
+export function conductorGateOf(runtime: FleetCliRuntime): FleetCliRuntime['execution']['attemptGate'] {
+  return runtime.execution.attemptGate;
+}
+
 export function buildLiveConductorDriver(
   runtime: FleetCliRuntime,
   options: { readonly maxActiveRuns: number },
@@ -151,6 +168,7 @@ export function buildLiveConductorDriver(
     attemptRepo: execution.attemptRepository,
     executionJournal: execution.executionJournal,
     artifactPort: execution.attemptArtifact,
+    computeDigest: sha256HexDigest,
     reconcileAttempt: execution.reconcileAttempt,
     admission,
     newUlid: conductor.newUlid,
@@ -162,18 +180,22 @@ export function buildLiveConductorDriver(
     stopAttempt: execution.stopAttempt,
     collectAttemptArtifacts: execution.collectAttemptArtifacts,
     commitEditOnlyAttempt: execution.commitEditOnlyAttempt,
-    evaluateAttemptGate: execution.requestAttemptAcceptance,
+    evaluateAttemptGate: conductorGateOf(runtime),
     runnerForAttempt: execution.runnerForAttempt,
     reviewRequest: conductor.reviewRequest,
     reviewAssessment: conductor.reviewAssessment,
+    gateReceipts: conductor.gateReceipts,
     sameModelFamily: (left, right) =>
       isSameModelFamily(underlyingModelFamily(left), underlyingModelFamily(right)),
     workOrderRepo: execution.workOrderRepository,
     prepareFixAttempt: execution.prepareFixAttempt,
+    prepareBrief: execution.prepareBriefPackage,
     // K6-8: the conductor's acceptance, PR, push, merge and park ports.
     acceptanceAssessment: execution.acceptanceAssessment,
     ciState: conductor.ciState,
     forgeRead: execution.forgeRead,
+    // CT-2b: the same adapter answers whether a merged PR head contains the lane head.
+    forgeAncestry: execution.forgeRead,
     conductorForgeGrant: conductor.conductorForgeGrant,
     executeForgeAction: execution.executeAuthorizedForgeAction,
     autoMergeAttempt: execution.autoMergeAttempt,
@@ -247,6 +269,7 @@ export function buildDryRunConductorDriver(
     attemptRepo: stores.attemptRepo,
     executionJournal: stores.executionJournal,
     artifactPort: fakes.artifactPort,
+    computeDigest: sha256HexDigest,
     reconcileAttempt: fakes.reconcileAttempt,
     admission: fakes.admission,
     newUlid,
@@ -263,6 +286,7 @@ export function buildDryRunConductorDriver(
     sameModelFamily: () => false,
     workOrderRepo: stores.workOrderRepo,
     prepareFixAttempt: new PrepareFixAttemptUseCase({ attemptRepo: stores.attemptRepo }),
+    prepareBrief: fakes.prepareBrief,
     // K6-8: the dry-run's recording fakes for the conductor's acting ports.
     acceptanceAssessment: fakes.acceptanceAssessment,
     ciState: fakes.ciState,

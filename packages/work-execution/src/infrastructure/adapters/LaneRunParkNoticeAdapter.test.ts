@@ -44,6 +44,16 @@ describe('LaneRunParkNoticeAdapter', () => {
       );
     });
 
+    it('records an attention item for a non-owner park reason such as step-refused (Q1c)', async () => {
+      const recordAttentionItem = attentionDelegate();
+      const adapter = new LaneRunParkNoticeAdapter({ recordAttentionItem });
+      for (const reason of ['step-refused', 'ambiguous', 'review-seat-unavailable'] as const) {
+        expect(await adapter.recordParkAttention({ ...REQUEST, reason })).toEqual({ outcome: 'recorded' });
+      }
+      expect(recordAttentionItem).toHaveBeenCalledTimes(3);
+      expect(recordAttentionItem.mock.calls[0]?.[0]).toMatchObject({ summary: 'The conductor parked run-42 with reason step-refused.' });
+    });
+
     it('names the qualifier code in the summary when one is given', async () => {
       const recordAttentionItem = attentionDelegate();
       const adapter = new LaneRunParkNoticeAdapter({ recordAttentionItem });
@@ -124,7 +134,7 @@ describe('LaneRunParkNoticeAdapter', () => {
       expect(askOwnerQuestion).not.toHaveBeenCalled();
     });
 
-    it.each(['one-way-door', 'owner-merge', 'blocker-after-round-2', 'seat-plan-exhausted'] as const)(
+    it.each(['one-way-door', 'owner-merge', 'blocker-after-round-2', 'seat-plan-exhausted', 'fix-no-progress'] as const)(
       'asks the fixed question for %s with the keyed idempotency key',
       async (reason) => {
         const askOwnerQuestion = vi.fn(async (_request: unknown) => ({ outcome: 'asked', question: { questionId: 'q-1' } }));
@@ -139,18 +149,29 @@ describe('LaneRunParkNoticeAdapter', () => {
         expect(ask.questionId).toBe(`park-question:${REQUEST.key}`);
         expect(ask.linkedRequestId).toBeNull();
         expect(ask.doorKind).toBe(reason === 'one-way-door' ? 'one-way' : 'two-way');
-        expect(ask.options).toEqual([
-          {
-            id: 'resume',
-            label: 'Resume the run',
-            consequence: 'The lane run continues from its parked state.',
-          },
-          { id: 'stop', label: 'Stop the run', consequence: 'The lane run stops and stays parked.' },
-        ]);
-        expect(ask.recommendation).toEqual({
-          optionId: 'resume',
-          because: 'The parked run should continue once the owner has seen the notice.',
-        });
+        if (reason === 'fix-no-progress') {
+          // A resume would re-collect the same head and park again: stop is the only option.
+          expect(ask.options).toEqual([
+            { id: 'stop', label: 'Stop the run', consequence: 'The lane run stops; start a new run for the work order.' },
+          ]);
+          expect(ask.recommendation).toEqual({
+            optionId: 'stop',
+            because: 'A resume re-collects the same unchanged head and parks again.',
+          });
+        } else {
+          expect(ask.options).toEqual([
+            {
+              id: 'resume',
+              label: 'Resume the run',
+              consequence: 'The lane run continues from its parked state.',
+            },
+            { id: 'stop', label: 'Stop the run', consequence: 'The lane run stops and stays parked.' },
+          ]);
+          expect(ask.recommendation).toEqual({
+            optionId: 'resume',
+            because: 'The parked run should continue once the owner has seen the notice.',
+          });
+        }
         const expectedTexts: Record<string, { title: string; body: string }> = {
           'one-way-door': {
             title: 'Lane run parked: one-way door (one-way-door)',
@@ -171,6 +192,11 @@ describe('LaneRunParkNoticeAdapter', () => {
             title: 'Lane run parked: seat plan exhausted (seat-plan-exhausted)',
             body:
               'The conductor parked run run-42 of work order wo-7 in project proj-1 with reason seat-plan-exhausted. The seat plan has no remaining seat for the run. Choose resume or stop.',
+          },
+          'fix-no-progress': {
+            title: 'Lane run parked: fix made no progress (fix-no-progress)',
+            body:
+              "The conductor parked run run-42 of work order wo-7 in project proj-1 with reason fix-no-progress. A fix attempt was collected at its prior attempt's head, so it changed nothing to gate or review. A resume would park again: stop the run and start a new one.",
           },
         };
         expect(ask.title).toBe(expectedTexts[reason].title);

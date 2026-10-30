@@ -56,9 +56,6 @@ runner environment allowlist to smuggle a setting through.
 - `FLEET_OCM_RUN_BIN` — override for the runner binary path. The repository
   bundles `bin/ocm-run` and `ExecutionRunnerAdapter` resolves it automatically;
   the override exists only for unusual installations.
-- `FLEET_USAGE_NODE_BIN` — override for the node binary used on the runner host
-  to read opencode's database (the S3 usage read); default `node`; never added
-  to the runner environment allow-list.
 - `FLEET_API_URL` — the server-side base URL for `@fleet/api`. The web client
   prefers it, falls back to `NEXT_PUBLIC_FLEET_API_URL`, and falls back again to
   the fixture set when neither is configured.
@@ -72,6 +69,11 @@ runner environment allowlist to smuggle a setting through.
 - `AGY_ROUND_SSH`, `AGY_ROUND_ROOT`, `AGY_ROUND_GUARD_SSH`, `AGY_ROUND_GUARD_CMD` and
   `AGY_ROUND_SETTLE` are the environment (all but the last required) of `bin/agy-round`, the
   orchestrator's one-command-per-step driver for an agy fix round.
+
+- `bin/gate-slot <command> [args...]` runs one acceptance command inside a host-wide check
+  slot (`FLEET_V2_GATE_SLOTS`, default 8; the same lock files as the orchestrator's gate), so
+  conducted runs share the host's gate budget. Worker caps stay in the command's own flags;
+  `FLEET_V2_GATE_TMPDIR` sets the command's `TMPDIR`. It needs `flock`.
 
 Before committing what any lane produced, run `scripts/lane-diff-check.sh <worktree>`
 (protected paths including ignored ones — github workflows, agent/editor instruction and tool files,

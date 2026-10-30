@@ -12,6 +12,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { AttemptRecord } from '../../../domain/execution-records.js';
+import type { ArtifactManifest } from '../../../domain/artifact-manifest.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
@@ -23,6 +24,7 @@ import {
   type LaneRunResultReasonCode,
 } from '../../../domain/lane-run-step-facts.js';
 import type { ReconcileAttemptResult } from '../../ports/in/ReconcileAttemptPort.in-port.js';
+import { collectionFactOf } from '../advance-lane-run/facts.js';
 import type { LaneRunAdmissionResult } from '../../ports/out/LaneRunAdmissionPort.out-port.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
@@ -87,6 +89,17 @@ const SEAT_SELECTION_FP2 = {
   agent: null,
 };
 
+/** The recorded host of a conducted attempt (KF-10/Q2a-2 invariant). */
+const CONDUCTED_RUNNER = {
+  kind: 'opencode' as const,
+  remotePort: 4166,
+  host: 'lane-alias-example',
+  hostName: 'lane-host-example',
+  agent: null,
+  model: null,
+  variant: null,
+};
+
 function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     id: 'attempt-example-1',
@@ -103,6 +116,7 @@ function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     sessionId: null,
     completionReceipt: null,
     artifacts: null,
+    runner: CONDUCTED_RUNNER,
     seatPlan: SEAT_PLAN,
     seatSelection: SEAT_SELECTION,
     stopReason: 'none',
@@ -580,5 +594,71 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
     const after = await harness.runRepo.get(RUN_ID);
     expect(after?.parked).toBeNull();
     expect(after?.parkCount).toBe(0);
+  });
+});
+
+describe('collectionFactOf headUnchanged (KF-21c)', () => {
+  const artifactPort = {
+    verifyArtifactManifest: async () => ({ outcome: 'sealed' as const, manifest: {} as ArtifactManifest }),
+  };
+  const collected = (overrides: Partial<AttemptRecord> = {}): AttemptRecord =>
+    attemptFixture({
+      state: 'collected',
+      artifacts: {
+        headCommit: COMMIT,
+        commitsSinceBase: [COMMIT],
+        collectedArtifactPaths: [],
+        notes: 'present',
+      },
+      ...overrides,
+    });
+
+  it('a fix attempt collected at its prior head is headUnchanged', async () => {
+    const prior = collected({ id: 'attempt-example-1', kind: 'initial', priorAttemptId: null });
+    const latest = collected({ id: 'attempt-example-2', kind: 'fix', priorAttemptId: 'attempt-example-1' });
+    expect(await collectionFactOf(latest, prior, artifactPort)).toEqual({
+      commits: 1,
+      manifest: 'sealed',
+      headUnchanged: true,
+    });
+  });
+
+  it('a fix attempt at a new head is not headUnchanged', async () => {
+    const prior = collected({ id: 'attempt-example-1', kind: 'initial', priorAttemptId: null });
+    const latest = collected({
+      id: 'attempt-example-2',
+      kind: 'fix',
+      priorAttemptId: 'attempt-example-1',
+      artifacts: {
+        headCommit: 'b'.repeat(40),
+        commitsSinceBase: [COMMIT, 'b'.repeat(40)],
+        collectedArtifactPaths: [],
+        notes: 'present',
+      },
+    });
+    expect(await collectionFactOf(latest, prior, artifactPort)).toEqual({
+      commits: 2,
+      manifest: 'sealed',
+      headUnchanged: false,
+    });
+  });
+
+  it('a first-pass attempt is never headUnchanged', async () => {
+    const prior = collected({ id: 'attempt-example-0', kind: 'initial', priorAttemptId: null });
+    const latest = collected({ id: 'attempt-example-1', kind: 'initial', priorAttemptId: null });
+    expect(await collectionFactOf(latest, prior, artifactPort)).toEqual({
+      commits: 1,
+      manifest: 'sealed',
+      headUnchanged: false,
+    });
+  });
+
+  it('a missing prior is never headUnchanged', async () => {
+    const latest = collected({ id: 'attempt-example-2', kind: 'fix', priorAttemptId: 'attempt-example-1' });
+    expect(await collectionFactOf(latest, null, artifactPort)).toEqual({
+      commits: 1,
+      manifest: 'sealed',
+      headUnchanged: false,
+    });
   });
 });

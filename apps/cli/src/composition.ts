@@ -26,6 +26,7 @@ import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
 import { composeExecution } from './composition/work-execution.js';
 import { composeConductor } from './composition/conductor.js';
+import { composeTelemetry, type TelemetryConfiguredState, type TelemetryPolicyView } from './composition/telemetry.js';
 
 import {
   AcceptanceAssessmentAdapter,
@@ -37,6 +38,7 @@ import {
   BriefAuthoringAdapter,
   BriefKnowledgeAdapter,
   CiStateAdapter,
+  GateReceiptAdapter,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
   ConductorForgeGrantAdapter,
@@ -51,7 +53,7 @@ import {
   InspectWorkOrderUseCase,
   LaneRunParkNoticeAdapter,
   ListUnregisteredProjectsUseCase,
-  OpencodeDbUsageAdapter,
+  OpencodeApiUsageAdapter,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
   ProbeProjectUseCase,
@@ -89,6 +91,10 @@ import {
   type GhInvocationResult,
   type SubprocessRunner,
   type CommandExecutorPort,
+  type AcceptanceReceiptReadAdapter,
+  type ExportRunTelemetryUseCase,
+  type TelemetryDispositionAdapter,
+  type TelemetryResourceInput,
 } from '@fleet/work-execution';
 
 import {
@@ -167,6 +173,7 @@ import {
 import {
   loadInstallation,
   requireValidInstallationModel,
+  resolveTelemetryPolicy,
   type FleetInstallation,
   type FleetInstallationModel,
   type LoadResult,
@@ -606,8 +613,8 @@ export interface FleetCliRuntime {
     /** The runner entry's declared lane budget; undefined without one. */
     readonly runnerMaxLanes?: number;
     readonly attemptArtifact: AttemptArtifactAdapter;
-    /** S3: reads an attempt's opencode session usage on its recorded host. */
-    readonly opencodeDbUsage: OpencodeDbUsageAdapter;
+    /** KF-15b: reads an attempt's opencode session usage from the server that ran it. */
+    readonly opencodeUsage: OpencodeApiUsageAdapter;
     readonly briefAuthoring: BriefAuthoringAdapter;
     readonly acceptanceAssessment: AcceptanceAssessmentAdapter;
     readonly acceptanceEvidence: AcceptanceEvidenceAdapter;
@@ -652,6 +659,8 @@ export interface FleetCliRuntime {
     readonly reviewRequest: ReviewRequestAdapter;
     /** Opens the evidence assessment before a conductor review (K5-3); K5-6 composes it into the advance. */
     readonly reviewAssessment: ReviewAssessmentAdapter;
+    /** The conducted gate's verification receipts, one per acceptance check (KF-13). */
+    readonly gateReceipts: GateReceiptAdapter;
     /** CI per exact head (PC); K6 composes it. */
     readonly ciState: CiStateAdapter;
     /** The conductor's own push grant issuer (K6-2); K6-8 composes it into the advance. */
@@ -660,6 +669,24 @@ export interface FleetCliRuntime {
     readonly parkNotice: LaneRunParkNoticeAdapter;
     /** The auto-merge setting read once at composition; a toggle takes a restart (K6-8). */
     readonly autoMergeEnabled: boolean;
+  };
+  readonly telemetry: {
+    /** Telemetry's own read-only receipt read (OT2b); OT2c/OT4b consume it. */
+    readonly acceptanceReceiptRead: AcceptanceReceiptReadAdapter;
+    /** The telemetry disposition store (OT4b); the export writes only here. */
+    readonly dispositions: TelemetryDispositionAdapter;
+    /** The export use case; null without an installation salt (dry runs need no endpoint). */
+    readonly exportTelemetry: ExportRunTelemetryUseCase | null;
+    /** Whether telemetry is configured; a fixed code, never the endpoint/token/salt. */
+    readonly configured: TelemetryConfiguredState;
+    /** Fingerprint of the installation salt (first 8 hex), or null without one. */
+    readonly saltFingerprint: string | null;
+    /** The resolved telemetry policy without its salt (the salt never leaves the composer). */
+    readonly policy: TelemetryPolicyView;
+    /** The OTLP resource input for dry-run encoding (plan §3.2); frozen. */
+    readonly resource: TelemetryResourceInput;
+    /** The redaction canary values of the real state directory's records (OT4b-3). */
+    readonly canaryValues: () => Promise<readonly string[]>;
   };
 }
 
@@ -783,7 +810,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     agyRunner,
     runnerSelector,
     attemptArtifact,
-    opencodeDbUsage,
+    opencodeUsage,
     briefAuthoring,
     forgeAction,
   } = composeExecutionHosts({
@@ -842,7 +869,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     agyRunner,
     runnerSelector,
     attemptArtifact,
-    opencodeDbUsage,
+    opencodeUsage,
     briefAuthoring,
     forgeAction,
     editOnlyModeOf,
@@ -859,6 +886,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     installation: options?.installation,
   });
 
+  const { telemetry } = composeTelemetry({
+    stateDir,
+    policy: resolveTelemetryPolicy(options?.installation?.policy),
+    env: process.env,
+  });
+
   return {
     installation: options?.installation,
     coordination,
@@ -866,5 +899,6 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     evidence,
     execution,
     conductor,
+    telemetry,
   };
 }

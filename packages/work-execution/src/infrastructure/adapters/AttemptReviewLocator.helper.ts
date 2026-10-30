@@ -15,6 +15,7 @@
  */
 
 import type { AttemptRecord, AttemptRunnerRecord } from '../../domain/execution-records.js';
+import { ReviewTransportError } from '@fleet/evidence-and-acceptance';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import { ExecutorForHost } from './ExecutorForHost.helper.js';
 import {
@@ -33,7 +34,10 @@ export const REVIEW_GIT_HARDENING: readonly string[] = ['-c', 'core.fsmonitor=fa
 export type AttemptReviewRoute =
   | { readonly kind: 'installation'; readonly remotePort: number; readonly remoteHost: string; readonly authFile?: string }
   | { readonly kind: 'legacy'; readonly remotePort?: number; readonly remoteHost?: string }
-  | { readonly kind: 'none'; readonly reason: string };
+  | { readonly kind: 'none'; readonly reason: string; readonly code: RouteNoneCode };
+
+/** The fixed code of each `none` review route refusal (KF-14a). */
+export type RouteNoneCode = 'route-host-changed' | 'route-not-opencode' | 'route-no-port' | 'route-no-auth-file';
 
 export interface AttemptReviewLocation {
   readonly worktreePath: string;
@@ -71,7 +75,9 @@ export class AttemptReviewLocator {
     }
     const resolved = this.options.executorForHost.executorForRecordedHost(attempt.runner ?? null);
     if (!resolved.ok) {
-      throw new Error(resolved.reason);
+      // A recorded host that changed or was removed never falls back (H9b);
+      // the refusal travels as the typed route code so the journal names it.
+      throw new ReviewTransportError(resolved.reason, 'route-host-changed');
     }
     const executor = resolved.executor;
     const worktreePath = attempt.worktreePath;
@@ -87,21 +93,23 @@ export class AttemptReviewLocator {
     };
   }
 
-  private routeFor(runner: AttemptRunnerRecord | null | undefined): AttemptReviewRoute {
+  /** The ocm-run route for a recorded runner: a review and the usage read (KF-15b) dial the same one. */
+  routeFor(runner: AttemptRunnerRecord | null | undefined): AttemptReviewRoute {
     if (runner !== null && runner !== undefined && hasRecordedHostName(runner)) {
       const confirmed = confirmRecordedHost(runner, this.options.hosts);
       if (!confirmed.ok) {
-        return { kind: 'none', reason: confirmed.reason };
+        return { kind: 'none', reason: confirmed.reason, code: 'route-host-changed' };
       }
       if ((confirmed.spec.runner?.kind ?? 'opencode') !== 'opencode') {
         return {
           kind: 'none',
           reason: `Attempt ran on host ${confirmed.name}, whose runner is not opencode; an opencode reviewer cannot see its worktree`,
+          code: 'route-not-opencode',
         };
       }
       const port = confirmed.spec.runner?.port;
       if (typeof port !== 'number') {
-        return { kind: 'none', reason: `Host ${confirmed.name} declares no runner port` };
+        return { kind: 'none', reason: `Host ${confirmed.name} declares no runner port`, code: 'route-no-port' };
       }
       let remoteHost = '';
       if (confirmed.transport === 'ssh') {
@@ -113,6 +121,7 @@ export class AttemptReviewLocator {
         return {
           kind: 'none',
           reason: 'Host ' + confirmed.name + ' declares no runner authFile for a remote review route',
+          code: 'route-no-auth-file',
         };
       }
       let route: AttemptReviewRoute = { kind: 'installation', remotePort: port, remoteHost };

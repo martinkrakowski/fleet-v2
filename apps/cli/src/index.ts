@@ -45,6 +45,7 @@ import { initCommand, type InitCliOptions } from './init.js';
 import { projectsCommand, type ProjectsCliOptions } from './projects.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
 import { conductorCommand, type ConductorCliOptions } from './conductor.js';
+import { telemetryCommand, type TelemetryCliOptions } from './telemetry.js';
 import {
   CliUsageError,
   NON_ZERO_OUTCOMES,
@@ -640,6 +641,10 @@ health is unhealthy; attempt next-seat --role fix|review shows the next one.
 The conductor group shows lane runs and records a halt, a run stop or a
 resume; the driver obeys the records. Run 'fleet-v2 conductor --help'.
 
+The telemetry group exports run telemetry spans (a run, a work order or a
+time window) to the collector route, or prints them with a dry run, and shows
+the configuration status. Run 'fleet-v2 telemetry --help'.
+
 Commands:
   work-order register|inspect
   doctor [--probe-seats] [--host <name>] [--json]
@@ -650,6 +655,7 @@ Commands:
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
   state check|restore
   conductor status|halt|stop|resume|start|run
+  telemetry export|status
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge
@@ -663,8 +669,13 @@ Commands:
 
 Exit codes: 0 completed, 1 refused/rejected/blocked/unknown result, 2 usage error.`;
 
+/** UTF-16 code-unit order: identical to the default sort(), stated explicitly (Sonar S2871). */
+function compareCodeUnits(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function groupHelp(group: string): string {
-  const subcommands = Object.keys(COMMANDS[group] ?? {}).sort();
+  const subcommands = Object.keys(COMMANDS[group] ?? {}).sort(compareCodeUnits);
   return `Usage: fleet-v2 ${group} <subcommand> [--json '<payload>'] [--flag value ...]\nSubcommands: ${subcommands.join(', ')}\nSee: fleet-v2 --help`;
 }
 
@@ -684,6 +695,7 @@ export async function runCli(
   stateOptions?: StateCliOptions,
   conductorOptions?: ConductorCliOptions,
   policyOptions?: PolicyCliOptions,
+  telemetryOptions?: TelemetryCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -762,6 +774,9 @@ export async function runCli(
         ...conductorOptions,
         stateDir: conductorOptions?.stateDir ?? stateDir,
       });
+    }
+    if (group === 'telemetry') {
+      return await telemetryCommand(restArgv.slice(1), io, activeRuntime, telemetryOptions ?? {});
     }
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);

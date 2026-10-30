@@ -7,6 +7,7 @@ import type {
 } from '../../../domain/evidence-records.js';
 import type { EvidenceAssessmentRepositoryPort } from '../../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { AttemptOwnerDecisionPort } from '../../ports/out/AttemptOwnerDecisionPort.out-port.js';
+import type { ForgeEvidencePort } from '../../ports/out/ForgeEvidencePort.out-port.js';
 import { AssessHeadAcceptanceUseCase } from '../AssessHeadAcceptanceUseCase.use-case.js';
 import { RecordFindingDispositionUseCase } from '../RecordFindingDispositionUseCase.use-case.js';
 
@@ -476,5 +477,172 @@ describe('review kind pass gate (PC-1)', () => {
       policyRevision: 'pol-1',
     });
     expect(result.outcome).toBe('accepted');
+  });
+});
+
+describe('receipts-only head assessment (KF-22a)', () => {
+  /** A forge mode `github` fake whose read would block: no PR, CI unknown, threads unreadable. */
+  function blockingForge(): ForgeEvidencePort & { calls: number } {
+    return {
+      calls: 0,
+      async readForgeCheckStatus() {
+        this.calls += 1;
+        return { candidateHeadSha: HEAD, ciState: 'unknown', unresolvedThreadCount: null, observedHeadSha: null };
+      },
+    };
+  }
+
+  it('passes on receipts alone before the PR exists, reads no forge and saves nothing', async () => {
+    const record = sampleRecord();
+    const repo = new InMemoryAssessmentRepo([record]);
+    const forge = blockingForge();
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      attemptOwnerDecisionPort: NO_OWNER_DECISIONS,
+      forgeMode: 'github',
+      forgeEvidence: forge,
+    });
+
+    const result = await useCase.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+
+    expect(result.outcome).toBe('receipts-passed');
+    if (result.outcome === 'receipts-passed') {
+      expect(result.receiptsId).toBe(`rcp-asm-1-${HEAD.slice(0, 8)}`);
+      expect('assessment' in result).toBe(false);
+      expect(result.candidateHeadSha).toBe(HEAD);
+    }
+    expect(forge.calls).toBe(0);
+
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored).toEqual(record);
+
+    // A following full assessment on the same head still blocks on the forge.
+    const full = await useCase.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(full.outcome).toBe('blocked');
+    if (full.outcome === 'blocked') {
+      expect(full.blockers.join('\n')).toContain("forge reports CI state 'unknown'");
+      expect(full.blockers.join('\n')).toContain('could not read review threads');
+    }
+  });
+
+  it('still blocks in receipts scope on a failing check, a missing review, an open finding and an undecided door', async () => {
+    const record = sampleRecord({
+      requiredChecks: ['ci'],
+      // The receipt shares the implementer's model family, so no independent
+      // review counts for this head while its finding stays unresolved.
+      implementerModel: 'nvidia/abc/model-x',
+      reviewReceipts: [independentReviewReceiptWithFindings([finding('f-1')])],
+    });
+    const repo = new InMemoryAssessmentRepo([record]);
+    // No attempt owner decision port: the door is undecided.
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      forgeMode: 'github',
+      forgeEvidence: blockingForge(),
+    });
+
+    const result = await useCase.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      const joined = result.blockers.join('\n');
+      expect(joined).toContain("required check 'ci' has no completed verification receipt");
+      expect(joined).toContain('not independent');
+      expect(joined).toContain("finding 'f-1' is unresolved");
+      expect(joined).toContain('owner decision');
+      expect(result.blockerDetails.map((detail) => detail.kind)).toContain('review-missing');
+    }
+  });
+
+  it('execute() behaves as the full assessment and reads the forge', async () => {
+    const record = sampleRecord();
+    const repo = new InMemoryAssessmentRepo([record]);
+    const forge = blockingForge();
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      attemptOwnerDecisionPort: NO_OWNER_DECISIONS,
+      forgeMode: 'github',
+      forgeEvidence: forge,
+    });
+
+    const result = await useCase.execute({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+
+    expect(forge.calls).toBe(1);
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockers.join('\n')).toContain("forge reports CI state 'unknown'");
+    }
+  });
+
+  it('blocks a stored accepted assessment in receipts scope when forge mode is none and the brief names CI (D6)', async () => {
+    const acceptedRecord = sampleRecord({
+      state: 'accepted',
+      acceptanceReceiptId: 'acc-1',
+      requiredChecks: [...sampleRecord({}).requiredChecks, 'ci'],
+    });
+    const repo = new InMemoryAssessmentRepo([acceptedRecord]);
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      attemptOwnerDecisionPort: NO_OWNER_DECISIONS,
+      forgeMode: 'none',
+    });
+
+    const receipts = await useCase.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(receipts.outcome).toBe('blocked');
+  });
+
+  it('answers a stored accepted assessment as receipts-passed in receipts scope and accepted in full scope', async () => {
+    const acceptedRecord = sampleRecord({ state: 'accepted', acceptanceReceiptId: 'acc-1' });
+    const repo = new InMemoryAssessmentRepo([acceptedRecord]);
+    const forge = blockingForge();
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      attemptOwnerDecisionPort: NO_OWNER_DECISIONS,
+      forgeMode: 'github',
+      forgeEvidence: forge,
+    });
+
+    const receipts = await useCase.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(receipts.outcome).toBe('receipts-passed');
+    if (receipts.outcome === 'receipts-passed') {
+      expect(receipts.receiptsId).toBe(`rcp-asm-1-${HEAD.slice(0, 8)}`);
+      // The stored acceptance never travels through the receipts-only result.
+      expect('assessment' in receipts).toBe(false);
+      expect(JSON.stringify(receipts)).not.toContain('acc-1');
+    }
+
+    const full = await useCase.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(full.outcome).toBe('accepted');
+    if (full.outcome === 'accepted') {
+      expect(full.receiptId).toBe('acc-1');
+    }
   });
 });

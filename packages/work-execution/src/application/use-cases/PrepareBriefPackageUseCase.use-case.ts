@@ -18,6 +18,7 @@
  */
 
 import { parseSeatTool } from '../../domain/execution-records.js';
+import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateAllowedPathPrefix } from '../../domain/lane-diff-check.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isPlanSecretShaped } from '../../domain/lane-plan-sidecar.js';
@@ -54,6 +55,8 @@ export type PrepareBriefPackageUseCaseRequest = PrepareBriefPackageRequest & {
   readonly attemptId?: string;
   readonly worktreePath?: string;
   readonly handWrittenBriefPath?: string | null;
+  /** KF-8: the recorded host of the worktree; the placement writes there. */
+  readonly recordedHost?: AttemptRunnerRecord | null;
 };
 
 /**
@@ -93,6 +96,28 @@ function isNonEmpty(value: unknown): value is string {
  * or null; never echoes a value.
  */
 const PR_NOTE_MAX_LENGTH = 4000;
+
+/**
+ * Frozen prose supplied by the caller (KF-6): a non-empty string of at most
+ * 64 KiB carrying no secret shape. Returns a fixed reason or null; never
+ * echoes a value.
+ */
+const PROSE_MARKDOWN_MAX_BYTES = 64 * 1024;
+
+function proseMarkdownError(value: unknown): string | null {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return 'proseMarkdown must be a non-empty string';
+  }
+  if (new TextEncoder().encode(value).byteLength > PROSE_MARKDOWN_MAX_BYTES) {
+    return 'proseMarkdown must be at most 64 KiB';
+  }
+  if (isPlanSecretShaped(value)) {
+    return 'proseMarkdown contains a secret-shaped value and was refused';
+  }
+  return null;
+}
+/** The runner agent pattern (KF-7): alphanumeric start, then letters, digits, dot, underscore, hyphen. */
+const AGENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 function prNotesError(notes: unknown): string | null {
   if (typeof notes !== 'object' || notes === null || Array.isArray(notes)) {
@@ -146,7 +171,7 @@ function checkSeatPlan(
       model: assignment.model,
       tool: assignment.seatTool,
       variant: assignment.variant,
-      agent: (assignment as { readonly agent?: string }).agent ?? null,
+      agent: assignment.agent,
     }),
   );
   if (!matchesFirstPass) {
@@ -184,6 +209,19 @@ function validateBriefFields(request: PrepareBriefPackageRequest): string | null
   // (H8); it is required and never defaulted to a declared kind.
   if (parseSeatTool(request.modelAssignment.seatTool) === undefined) {
     return 'Model assignment requires a declared seat tool (opencode or agy)';
+  }
+  // The runner agent (KF-7) is optional and frozen into the manifest with the
+  // rest of the assignment; when present it must be a non-empty string of at
+  // most 64 characters matching the allowed pattern.
+  const agent = request.modelAssignment.agent;
+  if (
+    agent !== undefined &&
+    (typeof agent !== 'string' ||
+      agent.length === 0 ||
+      agent.length > 64 ||
+      !AGENT_PATTERN.test(agent))
+  ) {
+    return 'Model assignment agent must be a non-empty string of at most 64 characters matching [A-Za-z0-9][A-Za-z0-9._-]*';
   }
   return null;
 }
@@ -233,6 +271,38 @@ function validatePathsAndSpec(
     return {
       reason:
         'allowedPathPrefixes is required: the acceptance spec diff check refuses every changed path outside them',
+    };
+  }
+  // KF-13a: when acceptance checks are declared they must name one check per
+  // acceptance spec command, in order; absent or empty stays allowed (reviews
+  // then refuse `assessment-unavailable` as today).
+  const acceptanceChecks = request.acceptanceChecks;
+  if (
+    acceptanceChecks !== undefined &&
+    (!Array.isArray(acceptanceChecks) ||
+      acceptanceChecks.some((entry) => typeof entry !== 'string' || entry.trim().length === 0))
+  ) {
+    return {
+      reason: 'acceptanceChecks must name one check per acceptanceSpec command, in order',
+    };
+  }
+  // Names are distinct: the evidence context keeps one receipt per name, so a
+  // repeated name would let one receipt stand for two checks.
+  if (
+    acceptanceChecks !== undefined &&
+    new Set(acceptanceChecks.map((entry) => entry.trim())).size !== acceptanceChecks.length
+  ) {
+    return {
+      reason: 'acceptanceChecks must be distinct names',
+    };
+  }
+  if (
+    acceptanceChecks !== undefined &&
+    acceptanceChecks.length > 0 &&
+    acceptanceChecks.length !== acceptanceSpec.value.getCommands().length
+  ) {
+    return {
+      reason: 'acceptanceChecks must name one check per acceptanceSpec command, in order',
     };
   }
   return { allowedPathPrefixes, acceptanceSpec: acceptanceSpec.value };
@@ -387,13 +457,29 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       return { reason: reviewerCheck.reason };
     }
 
-    const authored = await deps.briefAuthoring.authorBrief({
-      workOrderId: request.workOrderId,
-      laneId: request.laneId,
-      handWrittenBriefPath: request.handWrittenBriefPath ?? deps.handWrittenBriefPath ?? null,
-    });
-    if (authored.outcome === 'unavailable') {
-      return { reason: authored.reason };
+    let authored: Extract<AuthoredBriefResult, { readonly outcome: 'authored' }>;
+    if (request.proseMarkdown !== undefined) {
+      const proseError = proseMarkdownError(request.proseMarkdown);
+      if (proseError !== null) {
+        return { reason: proseError };
+      }
+      authored = {
+        outcome: 'authored',
+        brief: {
+          proseMarkdown: request.proseMarkdown,
+          provenance: 'hand-written-file',
+        },
+      };
+    } else {
+      const authoredResult = await deps.briefAuthoring.authorBrief({
+        workOrderId: request.workOrderId,
+        laneId: request.laneId,
+        handWrittenBriefPath: request.handWrittenBriefPath ?? deps.handWrittenBriefPath ?? null,
+      });
+      if (authoredResult.outcome === 'unavailable') {
+        return { reason: authoredResult.reason };
+      }
+      authored = authoredResult;
     }
 
     const attemptId = request.attemptId ?? deps.attemptId ?? `${request.workOrderId}-attempt-1`;
@@ -401,6 +487,9 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     const verified = await deps.artifactPort.verifyIgnoredPaths({
       worktreePath: placementCheck.worktreePath,
       candidatePaths: ['.lane/brief.md', '.lane/brief-manifest.json', ...request.expectedArtifacts],
+      // KF-8: the verification runs on the worktree's recorded host, so a
+      // worktree on an ssh host is checked against that host's ignore rules.
+      ...(request.recordedHost !== undefined ? { recordedHost: request.recordedHost } : {}),
     });
     if (verified.outcome === 'not-ignored') {
       return {
@@ -488,6 +577,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       worktreePath: built.worktreePath,
       proseMarkdown: built.authored.brief.proseMarkdown,
       manifestJson: built.manifestJson,
+      ...(request.recordedHost !== undefined ? { recordedHost: request.recordedHost } : {}),
     });
     if (placed.outcome === 'refused') {
       return { outcome: 'rejected', reason: placed.reason };

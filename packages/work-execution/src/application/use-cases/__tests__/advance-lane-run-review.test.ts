@@ -97,6 +97,17 @@ const WORK_ORDER: WorkOrderRecord = {
   updatedAtIso: NOW,
 };
 
+/** The recorded host of a conducted attempt (KF-10/Q2a-2 invariant). */
+const CONDUCTED_RUNNER = {
+  kind: 'opencode' as const,
+  remotePort: 4166,
+  host: 'lane-alias-example',
+  hostName: 'lane-host-example',
+  agent: null,
+  model: null,
+  variant: null,
+};
+
 /** A collected attempt whose head is `headCommit`; it is the run's latest attempt. */
 function collectedAttempt(headCommit: string = COMMIT_A): AttemptRecord {
   const artifacts: CollectedAttemptArtifacts = {
@@ -127,6 +138,7 @@ function collectedAttempt(headCommit: string = COMMIT_A): AttemptRecord {
       stoppedByRequest: false,
     },
     artifacts,
+    runner: CONDUCTED_RUNNER,
     seatPlan: REVIEW_SEAT_PLAN,
     seatSelection: {
       role: 'first-pass',
@@ -475,7 +487,7 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
   it('no-receipt retries the same seat once, then moves to the next seat, then parks when the plan is exhausted', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'brief-check', NOW);
-    harness.setReviewAnswer(async () => ({ outcome: 'no-receipt', reason: 'review-unavailable' }));
+    harness.setReviewAnswer(async () => ({ outcome: 'no-receipt', reason: 'review-unavailable', detail: null }));
     const first = await advance(harness);
     expect(first).toEqual({
       outcome: 'acted',
@@ -512,6 +524,34 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
     });
     const fifth = await advance(harness);
     expect(fifth).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
+  });
+
+  it('journals the fixed detail of a no-receipt result end to end', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async () => ({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'route-no-auth-file',
+    }));
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-no-receipt',
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const results = entries.filter(
+      (entry) => entry.kind === 'result' && entry.key === reviewKey('brief-check', 0, HEAD12_A),
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      outcome: 'completed',
+      reasonCode: 'review-no-receipt',
+      detail: 'route-no-auth-file',
+    });
   });
 
   it('D10: a recorded fail for the kind keeps its seat on the next head, and a seat index gone from the plan reads { ok: false }', async () => {

@@ -11,6 +11,7 @@
  */
 
 import type { AttemptRecord } from '../../domain/execution-records.js';
+import { runnerHasHostName } from '../../domain/execution-records.js';
 import { historyEntryOf, seatSelectionRecord, selectSeat } from '../../domain/seat-selection.js';
 import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
 import {
@@ -106,6 +107,14 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
     if (!Array.isArray(request.numberedFixes) || request.numberedFixes.length === 0) {
       return { outcome: 'refused', reason: 'numberedFixes must record at least one fix' };
     }
+    const hasBriefDigest = request.briefDigest !== undefined;
+    const hasBriefPackagePath = request.briefPackagePath !== undefined;
+    if (hasBriefDigest !== hasBriefPackagePath) {
+      return { outcome: 'refused', reason: 'briefDigest and briefPackagePath must be given together' };
+    }
+    if (hasBriefDigest && (!isNonEmpty(request.briefDigest) || !isNonEmpty(request.briefPackagePath))) {
+      return { outcome: 'refused', reason: 'briefDigest and briefPackagePath must be non-empty strings' };
+    }
 
     const check = await checkFixPriorSettled(this.deps.attemptRepo, {
       fixAttemptId: request.fixAttemptId,
@@ -168,7 +177,24 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
 
     const nowIso = request.nowIso ?? new Date().toISOString();
     // A fix attempt is a fresh identity: it never inherits or resumes the
-    // prior session's sessionId or conversation.
+    // prior session's sessionId or conversation. It does inherit the prior
+    // attempt's host block (its runner kind, host name, alias and port) so a
+    // conducted fix attempt keeps running on the prior attempt's host; the
+    // session fields stay null — dispatch overwrites the block with
+    // describeRunner(). A prior without a runner or host name writes no
+    // runner (the legacy hand-run behaviour).
+    const priorRunner =
+      prior.runner !== null && prior.runner !== undefined && runnerHasHostName(prior.runner)
+        ? {
+            kind: prior.runner.kind,
+            remotePort: prior.runner.remotePort,
+            host: prior.runner.host,
+            hostName: prior.runner.hostName,
+            agent: null,
+            model: null,
+            variant: null,
+          }
+        : undefined;
     const record: AttemptRecord = {
       id: request.fixAttemptId,
       workOrderId: request.workOrderId,
@@ -179,11 +205,12 @@ export class PrepareFixAttemptUseCase implements PrepareFixAttemptPort {
       baseCommit: prior.baseCommit,
       state: 'intent-recorded',
       outcome: null,
-      briefDigest: null,
-      briefPackagePath: null,
+      briefDigest: request.briefDigest ?? null,
+      briefPackagePath: request.briefPackagePath ?? null,
       sessionId: null,
       completionReceipt: null,
       artifacts: null,
+      ...(priorRunner !== undefined ? { runner: priorRunner } : {}),
       ...seatFields,
       createdAtIso: nowIso,
       updatedAtIso: nowIso,

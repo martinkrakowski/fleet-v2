@@ -69,6 +69,7 @@ export const LANE_RUN_PARK_REASONS = [
   'acceptance-rejected', // §3.2 accepting → parked: AssessHeadAcceptance rejected at the head
   'step-refused',        // a keyed action was refused (prepare, collect, gate, accept, open-pr, push, merge); qualifier = the step
   'owner-merge',         // merging without a policy grant (auto-merge off or not eligible): the owner merges
+  'fix-no-progress',     // a fix attempt collected at its prior's head: no change to gate or review
 ] as const;
 export type LaneRunParkReason = (typeof LANE_RUN_PARK_REASONS)[number];
 
@@ -89,6 +90,7 @@ export const LANE_RUN_PARK_QUALIFIER = {
   'acceptance-rejected': 'none',
   'step-refused': 'step',
   'owner-merge': 'none',
+  'fix-no-progress': 'none',
 } as const satisfies Record<LaneRunParkReason, 'none' | 'step' | 'stop-refusal'>;
 
 export interface LaneRunParkRecord {
@@ -133,4 +135,10 @@ export interface LaneRunRecord {
   readonly revision: number;
   /** The policy revision the run started under; a merge's journal entry names it (plan §5). */
   readonly runPolicyRevision: string;
+  /**
+   * The run's worktree branch (`fleet/<runId>` by K7-D7), recorded at start so forge
+   * acts and reads name the branch the run created; absent on records written before
+   * KF-5a (readers fall back to the worktree path's last segment).
+   */
+  readonly branchName?: string;
 }

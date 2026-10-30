@@ -1,18 +1,20 @@
 /** The `act prepare` and `act dispatch` steps of AdvanceLaneRunUseCase (AL-1). */
 import type { AdvanceLaneRunRefusal, AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import { AttemptRevisionConflictError } from '../../ports/out/AttemptRepositoryPort.out-port.js';
-import { parseSeatTool, type AttemptRecord, type AttemptSeatOverrideRecord } from '../../../domain/execution-records.js';
+import { parseSeatTool, type AttemptRecord, type AttemptSeatOverrideRecord, type AttemptSeatSelectionRecord } from '../../../domain/execution-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunCursorsRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { implementerRoleFor } from '../../../domain/lane-run-transitions.js';
-import { seatSelectionRecord } from '../../../domain/seat-selection.js';
+import { seatMatchesAssignment, seatSelectionRecord } from '../../../domain/seat-selection.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
+import { conductedRunnerOf } from './conducted-host.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendConduct, appendRunIntent, appendRunResult, ceilingPark, performPark, saveOrRefuse } from './step-context.js';
 import { manifestExpectedArtifacts, manifestPositiveInteger, manifestTimeLimitSeconds, readFrozenManifest } from './frozen-manifest.js';
 import { performFixPrepare } from './review-fix.js';
+import { parkSpentOneWayKey } from './merge.js';
 
 /**
  * The `act prepare` decision (K4-5): a fresh round-0 attempt on the selected
@@ -76,7 +78,24 @@ export async function performPrepare(ctx: AdvanceStepContext,
   if (intentRefusal !== null) {
     return { outcome: 'refused', reason: intentRefusal };
   }
+  // The next attempt keeps the run's host identity (seam register: a conducted
+  // attempt always carries its runner host); the session fields stay null and
+  // dispatch overwrites the block with describeRunner().
+  const sourceRunner = conductedRunnerOf(source);
   const attempt: AttemptRecord = {
+    ...(sourceRunner !== null
+      ? {
+          runner: {
+            kind: sourceRunner.kind,
+            remotePort: sourceRunner.remotePort,
+            host: sourceRunner.host,
+            hostName: sourceRunner.hostName,
+            agent: null,
+            model: null,
+            variant: null,
+          },
+        }
+      : {}),
     id: attemptId,
     workOrderId: source.workOrderId,
     kind: 'initial',
@@ -131,6 +150,129 @@ export async function performPrepare(ctx: AdvanceStepContext,
 }
 
 /**
+ * KF-16: the fixed detail code a refused dispatch journals with its result
+ * entry, derived from the refusal's stable prefix or phrase. Reason details
+ * are fixed codes, never free text; unknown refusals map to `other` and the
+ * function never returns the input text.
+ */
+export function dispatchRefusalDetail(reason: string): string {
+  // Worktree refusals name the path and then a fixed phrase. The path may hold
+  // spaces, so the first fixed phrase after it decides; a listed file name
+  // after the phrase can never change the code.
+  const worktree = /^Worktree .+? (does not match the base commit|does not match the prior attempt's head|has uncommitted changes|has untracked files|contains residue from earlier attempts)/.exec(reason);
+  if (worktree !== null) {
+    return WORKTREE_REFUSAL_DETAILS[worktree[1]!] ?? 'other';
+  }
+  if (reason.startsWith('No active capacity reservation')) {
+    return 'no-reservation';
+  }
+  if (reason.includes('is not the configured runner host')) {
+    return 'reservation-host-mismatch';
+  }
+  if (reason.includes('does not match the path allocated by the capacity reservation')) {
+    return 'reservation-worktree-mismatch';
+  }
+  if (reason.startsWith('Runner capabilities do not satisfy')) {
+    return 'capabilities-missing';
+  }
+  if (reason.endsWith('a fix attempt starts only after it is collected or cancelled')) {
+    return 'prior-not-settled';
+  }
+  if (reason.startsWith('Prior attempt not found')) {
+    return 'prior-not-found';
+  }
+  if (reason.startsWith('Prior attempt ') && reason.endsWith('is collected but has no sealed head commit')) {
+    return 'prior-head-missing';
+  }
+  if (reason.startsWith('Work order not found')) {
+    return 'work-order-missing';
+  }
+  if (reason === 'runner-not-available' || reason.startsWith('No runner port can be described')) {
+    return 'runner-unavailable';
+  }
+  // KF-18: the seat-binding refusal of a fix attempt whose fix seat differs
+  // from the frozen brief's model assignment, and the reviewer-seat family
+  // refusal of a seat override.
+  if (reason.includes('does not match seat')) {
+    return 'seat-mismatch';
+  }
+  if (reason.includes('shares underlying model family with recorded reviewer seat')) {
+    return 'seat-family-conflict';
+  }
+  return 'other';
+}
+
+const WORKTREE_REFUSAL_DETAILS: Readonly<Record<string, string>> = {
+  'does not match the base commit': 'worktree-head-mismatch',
+  "does not match the prior attempt's head": 'worktree-head-mismatch',
+  'has uncommitted changes': 'worktree-uncommitted',
+  'has untracked files': 'worktree-untracked',
+  'contains residue from earlier attempts': 'worktree-residue',
+};
+
+/** KF-18: a fix attempt's own seat, checked against its frozen plan and what an override can express. */
+type FixSeatForDispatch =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'seat'; readonly seat: AttemptSeatSelectionRecord }
+  | { readonly kind: 'refused'; readonly detail: 'seat-not-in-plan' | 'seat-not-expressible' };
+
+function isUnsetVariant(value: string | null | undefined): boolean {
+  const trimmed = (value ?? '').trim();
+  return trimmed === '' || trimmed === 'default';
+}
+
+export function fixSeatForDispatch(
+  latest: AttemptRecord,
+  manifest: Record<string, unknown> | null,
+): FixSeatForDispatch {
+  const selection = latest.seatSelection ?? null;
+  if (latest.kind !== 'fix' || selection === null) {
+    return { kind: 'none' };
+  }
+  // A fix attempt's selection must be a fix seat: any other role would let it
+  // dispatch on that seat's assignment without the fix-seat checks below.
+  if (selection.role !== 'fix') {
+    return { kind: 'refused', detail: 'seat-not-in-plan' };
+  }
+  const planResult = SeatPlan.create(latest.seatPlan);
+  const planSeat =
+    planResult.success && planResult.value !== undefined
+      ? planResult.value.getSeats('fix')[selection.seatIndex]
+      : undefined;
+  if (
+    planSeat === undefined ||
+    planSeat.id !== selection.seatId ||
+    !seatMatchesAssignment(planSeat, {
+      model: selection.model,
+      tool: selection.tool,
+      variant: selection.variant,
+      agent: selection.agent,
+    })
+  ) {
+    return { kind: 'refused', detail: 'seat-not-in-plan' };
+  }
+  // The override carries model, agent and variant only: the frozen
+  // assignment's tool is the one dispatched, and an unset override field
+  // inherits the assignment's value. Such a seat cannot be named exactly.
+  const raw = manifest?.['modelAssignment'];
+  const assignment = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  const assignmentTool = typeof assignment['seatTool'] === 'string' && assignment['seatTool'].trim() !== ''
+    ? assignment['seatTool'].trim()
+    : 'opencode';
+  const assignmentAgent = typeof assignment['agent'] === 'string' ? assignment['agent'].trim() : '';
+  const assignmentVariant = typeof assignment['variant'] === 'string' ? assignment['variant'] : null;
+  const seatTool = (selection.tool ?? '').trim() === '' ? 'opencode' : (selection.tool as string).trim();
+  if (
+    seatTool !== assignmentTool ||
+    ((selection.agent ?? '').trim() === '' && assignmentAgent !== '') ||
+    (isUnsetVariant(selection.variant) && !isUnsetVariant(assignmentVariant))
+  ) {
+    return { kind: 'refused', detail: 'seat-not-expressible' };
+  }
+  return { kind: 'seat', seat: selection };
+}
+
+/**
  * The `act dispatch` decision (K4-5): start the prepared attempt through
  * `DispatchAttemptPort` with the frozen brief's limits, raising the round and
  * the seat cursor on the record before the call (§3.2, D8). The dispatch key
@@ -166,6 +308,15 @@ export async function performDispatch(ctx: AdvanceStepContext,
     await cancel.cancelPreparedAttempt({ attemptId: latest.id, nowIso });
     return { outcome: 'waiting', reason: 'dispatch-pending' };
   }
+  // The dispatch key is one-way (KF-10): an intent already recorded for this
+  // key is never re-sent. A spent key parks step-refused dispatch without
+  // writing (the parkSpentOneWayKey shape from merge.ts) instead of hitting
+  // the journal's duplicate-key refusal on every resume. The `not-started`
+  // cancel above owns the refused-dispatch pivot, so it runs first.
+  const spent = await parkSpentOneWayKey(ctx, record, gathered, decision, request);
+  if (spent !== null) {
+    return spent;
+  }
   const manifest = await readFrozenManifest(latest, ctx.deps.artifactPort);
   const stepLimit = manifestPositiveInteger(manifest, 'stepLimit');
   const timeLimitSeconds = manifestTimeLimitSeconds(manifest);
@@ -178,9 +329,26 @@ export async function performDispatch(ctx: AdvanceStepContext,
     expectedArtifacts !== null &&
     briefPackagePath !== null &&
     briefDigest !== null;
+  // KF-18: a fix attempt dispatches on its own fix seat through a seat
+  // override; the seat-plan pivot keeps its override; a first attempt and a
+  // fix attempt with no selection carry none. A fix seat the override cannot
+  // name exactly (not the frozen plan's fix seat at its index, another tool
+  // than the frozen assignment's, or an agent/variant left unset where the
+  // assignment sets one) never dispatches: it refuses and parks with a fixed
+  // detail, never a guessed or inherited seat field.
+  const fixSeat = fixSeatForDispatch(latest, manifest);
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, latest.id);
   if (intentRefusal !== null) {
     return { outcome: 'refused', reason: intentRefusal };
+  }
+  if (fixSeat.kind === 'refused') {
+    const resultRefusal = await appendRunResult(
+      ctx, request, decision.key, 'refused', 'dispatch-refused', fixSeat.detail,
+    );
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
   }
   if (!inputsReadable) {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'dispatch-inputs-unreadable');
@@ -213,18 +381,23 @@ export async function performDispatch(ctx: AdvanceStepContext,
     // Later writes in this advance (a park) must chain on the saved revision.
     record = saved.record ?? record;
   }
-  const pivot =
-    latest.kind === 'initial' && latest.priorAttemptId !== null && latest.seatSelection != null
-      ? latest.seatSelection
-      : null;
+  const seatForOverride: AttemptSeatSelectionRecord | null =
+    latest.kind === 'initial' && latest.priorAttemptId !== null
+      ? (latest.seatSelection ?? null)
+      : fixSeat.kind === 'seat'
+        ? fixSeat.seat
+        : null;
   const seatOverride: AttemptSeatOverrideRecord | null =
-    pivot === null
+    seatForOverride === null
       ? null
       : {
-          model: pivot.model,
-          ...(pivot.agent !== null ? { agent: pivot.agent } : {}),
-          ...(pivot.variant !== null ? { variant: pivot.variant } : {}),
-          reason: 'seat-plan pivot to ' + pivot.seatId,
+          model: seatForOverride.model,
+          ...(seatForOverride.agent !== null ? { agent: seatForOverride.agent } : {}),
+          ...(seatForOverride.variant !== null ? { variant: seatForOverride.variant } : {}),
+          reason:
+            latest.kind === 'fix'
+              ? 'fix seat ' + seatForOverride.seatId
+              : 'seat-plan pivot to ' + seatForOverride.seatId,
           setBy: 'conductor',
           expiresAtIso: new Date(Date.parse(nowIso) + timeLimitSeconds * 1000).toISOString(),
         };
@@ -264,7 +437,11 @@ export async function performDispatch(ctx: AdvanceStepContext,
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
   }
   // Refused: a runner refusal saved with its stop reason (S1) pivots through
-  // seat-failed; anything else parks for the owner (the key is spent).
+  // seat-failed; anything else parks for the owner (the key is spent). A
+  // refused FIX dispatch recovers in the same round after resume: the round
+  // is already raised here, so the decider re-reads the parked attempt as
+  // still this round's and the next advance cancels it and prepares again
+  // at that round (KF-17).
   const stored = await ctx.deps.attemptRepo.findAttemptById(latest.id);
   let reasonCode: LaneRunResultReasonCode;
   if (stored !== null && stored.state === 'cancelled') {
@@ -272,7 +449,12 @@ export async function performDispatch(ctx: AdvanceStepContext,
   } else {
     reasonCode = 'dispatch-refused';
   }
-  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode);
+  // KF-16: the refused result journals a fixed detail code derived from the
+  // refusal text, for the dispatch-refused park and the runner-refused pivot
+  // alike.
+  const resultRefusal = await appendRunResult(
+    ctx, request, decision.key, 'refused', reasonCode, dispatchRefusalDetail(dispatched.reason),
+  );
   if (resultRefusal !== null) {
     return { outcome: 'refused', reason: resultRefusal };
   }

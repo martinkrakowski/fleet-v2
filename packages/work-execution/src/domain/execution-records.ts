@@ -154,6 +154,18 @@ export interface AttemptRunnerRecord {
   readonly useFreeSeats?: boolean;
 }
 
+/**
+ * Whether the recorded runner block names an installation host. A record
+ * without a host name (absent block, `null`, or a blank `hostName`) is a
+ * legacy hand-run record; pure, never throws.
+ */
+export function runnerHasHostName(
+  runner: AttemptRunnerRecord | null | undefined,
+): boolean {
+  const hostName = runner?.hostName;
+  return typeof hostName === "string" && hostName.trim() !== "";
+}
+
 /** Scoped operator seat override accepted at dispatch. */
 export interface AttemptSeatOverrideRecord {
   readonly model: string;
@@ -171,7 +183,7 @@ export interface AttemptSeatOverrideRecord {
  * is `null` and `reason` names why.
  */
 export interface AttemptUsageRecord {
-  readonly source: 'opencode-db' | 'unavailable';
+  readonly source: 'opencode-db' | 'opencode-api' | 'unavailable';
   readonly readAtIso: string;
   readonly sessionId: string | null;
   readonly steps: number | null;

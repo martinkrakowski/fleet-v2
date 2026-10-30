@@ -110,6 +110,10 @@ class FakeAcceptanceAssessment implements AcceptanceAssessmentPort {
     this.requests.push(request);
     return this.result;
   }
+
+  async assessHeadReceipts(): Promise<never> {
+    throw new Error('assessHeadReceipts is not used by this test');
+  }
 }
 
 function acceptanceRequest(overrides: Partial<RequestAttemptAcceptanceRequest> = {}): RequestAttemptAcceptanceRequest {
@@ -268,11 +272,14 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     const useCase = new RequestAttemptAcceptanceUseCase(deps);
 
     const first = await useCase.evaluateAttemptGate(gateRequest());
-    expect(first).toEqual({ verdict: 'passed' });
+    expect(first.verdict).toBe('passed');
+    if (first.verdict === 'passed') {
+      expect(first.results).toEqual(PASS_RESULTS);
+    }
     expect(gate.requests).toHaveLength(1);
 
     const second = await useCase.evaluateAttemptGate(gateRequest());
-    expect(second).toEqual({ verdict: 'passed' });
+    expect(second.verdict).toBe('passed');
     expect(gate.requests).toHaveLength(1);
   });
 
@@ -297,10 +304,14 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
 
     const result = await useCase.evaluateAttemptGate(gateRequest());
 
-    expect(result).toEqual({
-      verdict: 'failed',
-      reason: 'Gate predicate command 1: corepack yarn build fail with exit code 2: exit 2',
-    });
+    expect(result.verdict).toBe('failed');
+    if (result.verdict === 'failed') {
+      expect(result.reason).toBe(
+        'Gate predicate command 1: corepack yarn build fail with exit code 2: exit 2',
+      );
+      expect(result.results).toHaveLength(3);
+      expect(result.results?.[2]).toMatchObject({ verdict: 'fail', exitCode: 2 });
+    }
   });
 
   it('returns unknown when the first non-pass result is a skip with no earlier fail', async () => {
@@ -476,7 +487,7 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     const useCase = new RequestAttemptAcceptanceUseCase(deps);
 
     const gateResult = await useCase.evaluateAttemptGate(gateRequest());
-    expect(gateResult).toEqual({ verdict: 'passed' });
+    expect(gateResult.verdict).toBe('passed');
     expect(gate.requests).toHaveLength(1);
 
     const acceptance = await useCase.requestAttemptAcceptance(acceptanceRequest());

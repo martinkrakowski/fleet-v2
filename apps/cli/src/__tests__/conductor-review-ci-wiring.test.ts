@@ -3,14 +3,18 @@
 // state dir (in-memory), no reviewer seat (nothing spawns), no forge reached
 // except through the stub gh runner in forge mode github.
 
+import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import type { FleetInstallation, ForgeSectionV2 } from '@fleet/installation';
 import { requireValidInstallationModel } from '@fleet/installation';
 import type { EvidenceAssessmentRecord } from '@fleet/evidence-and-acceptance';
+import type { AttemptRecord } from '@fleet/work-execution';
 
 import { assessmentIdForAttempt, createFleetCliRuntime } from '../composition.js';
-import { buildLiveConductorDriver } from '../conductor-wiring.js';
+import { buildLiveConductorDriver, conductorGateOf } from '../conductor-wiring.js';
 
 const HEAD = 'a'.repeat(40);
 const ATTEMPT_ID = 'attempt-example-1';
@@ -183,7 +187,7 @@ describe('conductor review and CI wiring (PC-4)', () => {
     const runtime = createFleetCliRuntime();
     await expect(
       runtime.conductor.reviewRequest.requestReview(makeReviewRequest(REQUEST_ID)),
-    ).resolves.toEqual({ outcome: 'refused', reason: 'no-assessment' });
+    ).resolves.toEqual({ outcome: 'refused', reason: 'no-assessment', detail: null });
   });
 
   it('a request with no reviewer seat records no receipt (review-unavailable)', async () => {
@@ -191,7 +195,11 @@ describe('conductor review and CI wiring (PC-4)', () => {
     await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment(false));
     await expect(
       runtime.conductor.reviewRequest.requestReview(makeReviewRequest(REQUEST_ID)),
-    ).resolves.toEqual({ outcome: 'no-receipt', reason: 'review-unavailable' });
+    ).resolves.toEqual({
+      outcome: 'no-receipt',
+      reason: 'review-unavailable',
+      detail: 'transport-missing',
+    });
     const assessment = await runtime.evidence.evidenceAssessmentRepository.findAssessmentById(
       assessmentIdForAttempt(ATTEMPT_ID),
     );
@@ -268,6 +276,45 @@ describe('conductor review-assessment wiring (K5-6)', () => {
     ).resolves.toEqual({ outcome: 'unavailable', reason: 'head-mismatch' });
   });
 
+  it('the gate receipt adapter records one verification receipt per check into the opened assessment, and is unavailable without one (KF-13b)', async () => {
+    const runtime = createFleetCliRuntime();
+    const request = {
+      attemptId: ATTEMPT_ID,
+      projectId: PROJECT_ID,
+      candidateHeadSha: HEAD,
+      hostId: 'lane-host',
+      policyRevision: 'policy-example-1',
+      completedAtIso: '2026-10-29T12:00:00.000Z',
+      evidenceRef: 'run-journal:run-01JB0000000000000000000000/r0/gate/0',
+      receipts: [{ procedureName: 'dry-run-check', result: 'pass' as const, exitCode: 0 }],
+    };
+    const before = await runtime.conductor.gateReceipts.recordGateReceipts(request);
+    expect(before.outcome).toBe('unavailable');
+
+    await expect(runtime.conductor.reviewAssessment.openReviewAssessment(makeOpenRequest())).resolves.toEqual({ outcome: 'open' });
+    const after = await runtime.conductor.gateReceipts.recordGateReceipts(request);
+    expect(after).toEqual({ outcome: 'recorded', count: 1 });
+    const assessment = await runtime.evidence.evidenceAssessmentRepository.findAssessmentById(assessmentIdForAttempt(ATTEMPT_ID));
+    expect(assessment?.verificationReceipts.map((receipt) => [receipt.procedureName, receipt.candidateHeadSha])).toEqual([
+      ['dry-run-check', HEAD],
+    ]);
+  });
+
+  it('the live conductor evaluates the predicate-backed gate, never the predicate-less accept instance (KF-12)', async () => {
+    const runtime = createFleetCliRuntime();
+    const gate = conductorGateOf(runtime);
+    expect(gate).toBe(runtime.execution.attemptGate);
+    expect(gate).not.toBe(runtime.execution.requestAttemptAcceptance);
+    // The predicate-less instance answers 'not wired' before it reads anything; the
+    // conductor's gate reads the attempt first (and finds none here).
+    const headSha = 'a'.repeat(40);
+    const unwired = await runtime.execution.requestAttemptAcceptance.evaluateAttemptGate({ attemptId: 'attempt-missing', candidateHeadSha: headSha });
+    expect(unwired).toMatchObject({ verdict: 'unknown', reason: 'Gate predicates are not wired' });
+    const wired = await gate.evaluateAttemptGate({ attemptId: 'attempt-missing', candidateHeadSha: headSha });
+    expect(wired.verdict).toBe('unknown');
+    expect(wired).not.toMatchObject({ reason: 'Gate predicates are not wired' });
+  });
+
   it('buildLiveConductorDriver constructs over the composed runtime and calls no transport', async () => {
     const runtime = createFleetCliRuntime();
     const driver = buildLiveConductorDriver(runtime, { maxActiveRuns: 1 });
@@ -342,5 +389,149 @@ describe('conductor acceptance-to-merge wiring (K6-8)', () => {
     expect(driver.policy).toBeDefined();
     // Building objects only: the injected gh runner (the only forge transport) recorded no call.
     expect(calls).toEqual([]);
+  });
+});
+
+describe('conductor receipts-only acceptance wiring (KF-22b)', () => {
+  /** A pending evidence assessment with a completed typecheck receipt and a passing independent review. */
+  function pendingAssessment(attemptId: string, headSha: string): EvidenceAssessmentRecord {
+    const id = assessmentIdForAttempt(attemptId);
+    return {
+      id,
+      projectId: 'project-1',
+      attemptId,
+      candidateHeadSha: headSha,
+      policyRevision: 'policy-v1',
+      implementerModel: 'openrouter/openai/gpt-4o',
+      state: 'pending',
+      revision: 1,
+      requiredChecks: ['typecheck'],
+      verificationReceipts: [
+        {
+          id: `vr-${attemptId}`,
+          assessmentId: id,
+          projectId: 'project-1',
+          attemptId,
+          candidateHeadSha: headSha,
+          hostId: 'host-1',
+          procedureName: 'typecheck',
+          result: 'pass',
+          exitCode: 0,
+          evidenceRef: `seed@${headSha}`,
+          policyRevision: 'policy-v1',
+          completedAtIso: '2026-10-15T08:00:00.000Z',
+        },
+      ],
+      reviewReceipts: [
+        {
+          id: `rr-${attemptId}`,
+          assessmentId: id,
+          projectId: 'project-1',
+          attemptId,
+          candidateHeadSha: headSha,
+          reviewerModel: 'openrouter/anthropic/claude-3.5-sonnet',
+          implementerModel: 'openrouter/openai/gpt-4o',
+          readOnlyVerified: true,
+          result: 'pass',
+          findings: [],
+          evidenceRef: `review-seed@${headSha}`,
+          policyRevision: 'policy-v1',
+          completedAtIso: '2026-10-15T09:00:00.000Z',
+        },
+      ],
+      findingDispositions: [],
+      acceptanceReceiptId: null,
+      blockers: [],
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+  }
+
+  /** A collected attempt with no owner-decision doors at the given head. */
+  function collectedAttempt(attemptId: string, headSha: string): AttemptRecord {
+    return {
+      id: attemptId,
+      workOrderId: `wo-${attemptId}`,
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      state: 'collected',
+      outcome: 'done',
+      baseCommit: 'base-sha',
+      worktreePath: '/tmp/worktree',
+      briefDigest: 'digest-1',
+      briefPackagePath: null,
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: {
+        headCommit: headSha,
+        commitsSinceBase: [headSha],
+        collectedArtifactPaths: [],
+        notes: 'present',
+      },
+      ownerDecisionReferences: [],
+      createdAtIso: '2026-10-15T09:00:00.000Z',
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+  }
+
+  const registryPath = (dir: string): string => path.join(dir, 'accepted-receipts.json');
+
+  it('a receipts pass returns passed with an rcp id and stores no acceptance (KF-22b)', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-cli-receipts-'));
+    try {
+      const runtime = createFleetCliRuntime({ stateDir: tempDir });
+      const receiptsAttempt = 'attempt-receipts';
+      const receiptsHead = 'head-sha-receipts';
+      const fullAttempt = 'attempt-full';
+      const fullHead = 'head-sha-full';
+      await runtime.evidence.evidenceAssessmentRepository.saveAssessment(pendingAssessment(receiptsAttempt, receiptsHead));
+      await runtime.execution.attemptRepository.saveAttempt(collectedAttempt(receiptsAttempt, receiptsHead));
+      await runtime.evidence.evidenceAssessmentRepository.saveAssessment(pendingAssessment(fullAttempt, fullHead));
+      await runtime.execution.attemptRepository.saveAttempt(collectedAttempt(fullAttempt, fullHead));
+
+      // The receipts-only pass returns passed and writes no acceptance: the
+      // registry file stays absent.
+      const receipts = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
+        attemptId: receiptsAttempt,
+        workOrderId: 'wo-receipts',
+        candidateHeadSha: receiptsHead,
+        policyRevision: 'policy-v1',
+      });
+      expect(receipts).toEqual({
+        outcome: 'passed',
+        receiptsId: `rcp-${assessmentIdForAttempt(receiptsAttempt)}-${receiptsHead.slice(0, 8)}`,
+        assessedHeadSha: receiptsHead,
+      });
+      await expect(fs.access(registryPath(tempDir))).rejects.toThrow();
+
+      // The full acceptance path records its receipt…
+      const full = await runtime.execution.acceptanceAssessment.assessHeadAcceptance({
+        attemptId: fullAttempt,
+        workOrderId: 'wo-full',
+        candidateHeadSha: fullHead,
+        policyRevision: 'policy-v1',
+      });
+      expect(full.outcome).toBe('accepted');
+      const registry = JSON.parse(
+        await fs.readFile(registryPath(tempDir), 'utf8'),
+      ) as Record<string, string>;
+      expect(Object.keys(registry)).toEqual([fullHead]);
+      expect(registry[fullHead]).toBe(full.outcome === 'accepted' ? full.receiptId : '');
+
+      // …and a later receipts pass still leaves it unchanged.
+      const again = await runtime.execution.acceptanceAssessment.assessHeadReceipts({
+        attemptId: receiptsAttempt,
+        workOrderId: 'wo-receipts',
+        candidateHeadSha: receiptsHead,
+        policyRevision: 'policy-v1',
+      });
+      expect(again.outcome).toBe('passed');
+      const unchanged = JSON.parse(
+        await fs.readFile(registryPath(tempDir), 'utf8'),
+      ) as Record<string, string>;
+      expect(Object.keys(unchanged)).toEqual([fullHead]);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });

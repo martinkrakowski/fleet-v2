@@ -16,6 +16,13 @@ export interface PrepareFixAttemptRequest {
   readonly baseCommit?: string;
   readonly numberedFixes: readonly string[];
   /**
+   * The brief digest and package path of the fix round's brief package, placed
+   * by the conductor from the prior attempt's frozen manifest before this fix
+   * attempt starts (KF-6). Both or neither; non-empty strings.
+   */
+  readonly briefDigest?: string;
+  readonly briefPackagePath?: string;
+  /**
    * Seat ids the installation currently marks unhealthy (S1). They are only
    * ever skipped, never added; absent means none. Used only when the prior
    * attempt carries a seat plan.

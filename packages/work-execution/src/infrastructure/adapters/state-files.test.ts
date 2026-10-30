@@ -19,6 +19,10 @@ import { LaneRunRepositoryAdapter } from './LaneRunRepositoryAdapter.adapter.js'
 import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
 import { ConductorHaltAdapter } from './ConductorHaltAdapter.adapter.js';
 import { LaneRunJournalAdapter } from './LaneRunJournalAdapter.adapter.js';
+import {
+  TelemetryDispositionAdapter,
+  parseTelemetryDispositionStateRecord,
+} from './TelemetryDispositionAdapter.adapter.js';
 
 const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
   'work-orders.json': [
@@ -131,6 +135,29 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       state: null,
     },
   ],
+  'telemetry-dispositions.json': [
+    {
+      version: 1,
+      saltFingerprint: 'abc12345',
+      spans: {
+        [`${'a'.repeat(32)}`]: {
+          [`${'b'.repeat(16)}`]: 'pending',
+          [`${'c'.repeat(16)}`]: 'exported@collector',
+        },
+      },
+      counters: {
+        timeout: 0,
+        network: 0,
+        auth: 0,
+        'http-4xx': 1,
+        'http-5xx': 0,
+        partial: 0,
+        'salt-mismatch': 0,
+        'queue-drops': 2,
+      },
+      lastExportAtIso: '2026-10-27T10:00:00.000Z',
+    },
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -157,6 +184,18 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
   },
   'run-journal.json': (stateDir) =>
     new LaneRunJournalAdapter({ stateDir }).listForRun('run-01JB0000000000000000000000'),
+  'telemetry-dispositions.json': async (stateDir) => {
+    // The disposition port's `read()` never throws for an unreadable store
+    // (it reads `unreadable`), so this observes the same inspection the
+    // adapter performs, which quarantines and throws the matching detail.
+    const target = path.join(stateDir, 'telemetry-dispositions.json');
+    const buffer = await fs.readFile(target);
+    const inspection = inspectRecordListBytes(buffer, parseTelemetryDispositionStateRecord);
+    if (inspection.status === 'unreadable') {
+      return quarantineUnreadable(target, inspection.detail, buffer);
+    }
+    return new TelemetryDispositionAdapter({ stateDir }).read();
+  },
 };
 
 type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
@@ -232,6 +271,7 @@ describe('work-execution state file descriptors match the store readers', () => 
       'conductor-driver-lease.json',
       'conductor-halt.json',
       'run-journal.json',
+      'telemetry-dispositions.json',
     ]);
   });
 });

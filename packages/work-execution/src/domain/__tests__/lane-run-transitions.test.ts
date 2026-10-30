@@ -134,6 +134,14 @@ describe('LaneRun exits', () => {
     expect(canEnterLaneRunState('parked', 'stopped')).toBe(true);
   });
 
+  it('the owner-merge park enters merged by itself (CT-2a)', () => {
+    expect(canEnterLaneRunState('parked', 'merged', 'merging')).toBe(true);
+    expect(canEnterLaneRunState('parked', 'merged')).toBe(true);
+    // The exception opens nothing from a terminal state.
+    expect(canEnterLaneRunState('stopped', 'merged')).toBe(false);
+    expect(canEnterLaneRunState('merged', 'merged')).toBe(false);
+  });
+
   it('unknown strings are refused', () => {
     expect(canEnterLaneRunState('nope', 'ready')).toBe(false);
     expect(canEnterLaneRunState('ready', 'nope')).toBe(false);
@@ -283,6 +291,16 @@ describe('resume refusals', () => {
     expect(
       checkLaneRunResume({ record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision }),
     ).toEqual({ ok: false, reason: 'stop-pending' });
+  });
+
+  it('refuses a fix-no-progress park: a resume would re-collect the same head and park again (KF-21c)', () => {
+    const rec = record({
+      parked: { reason: 'fix-no-progress', qualifier: null, parkedFrom: 'collecting', questionId: null },
+      parkCount: 1,
+    });
+    expect(
+      checkLaneRunResume({ record: rec, state: 'parked', stopMode: null, expectedRevision: rec.revision }),
+    ).toEqual({ ok: false, reason: 'fix-no-progress' });
   });
 
   it('refuses a stop-refused park', () => {

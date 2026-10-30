@@ -208,6 +208,10 @@ class FakeAcceptance implements AcceptanceAssessmentPort {
     }
     return this.result;
   }
+
+  async assessHeadReceipts(): Promise<never> {
+    throw new Error('assessHeadReceipts is not used by this test');
+  }
 }
 
 interface RecordedNotice {
@@ -768,5 +772,39 @@ describe('AutoMergeAttemptUseCase (AM4a-3)', () => {
       headSha: HEAD,
       decisionRevision: DECISION_REVISION,
     });
+  });
+
+  it("forwards the run's recorded branch on the merge-pr action (KF-5b)", async () => {
+    const built = build();
+    await seed(built);
+    const useCase = new AutoMergeAttemptUseCase(built.deps);
+    const result = await useCase.autoMergeAttempt({
+      attemptId: ATTEMPT_ID,
+      branchName: 'fleet/run-01JB0000000000000000000000',
+    });
+    expect(result).toMatchObject({ outcome: 'merged' });
+    expect(built.forge.calls).toBe(1);
+    expect(built.forge.requests[0]?.branchName).toBe('fleet/run-01JB0000000000000000000000');
+  });
+
+  it.each([
+    ['null', null],
+    ['a number', 12345],
+    ['a blank string', '   '],
+  ])('refuses a present branchName that is %s as invalid-request before any grant or forge call (KF-5b review)', async (_label, branchName) => {
+    const built = build();
+    await seed(built);
+    const useCase = new AutoMergeAttemptUseCase(built.deps);
+    const result = await useCase.autoMergeAttempt({ attemptId: ATTEMPT_ID, branchName } as never);
+    expect(result).toMatchObject({ outcome: 'not-merged', reason: 'invalid-request' });
+    expect(built.forge.calls).toBe(0);
+  });
+
+  it('omits branchName on the merge-pr action when the request does not carry one (KF-5b)', async () => {
+    const built = build();
+    await seed(built);
+    await built.run();
+    expect(built.forge.calls).toBe(1);
+    expect(built.forge.requests[0]).not.toHaveProperty('branchName');
   });
 });

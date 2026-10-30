@@ -360,6 +360,7 @@ bounded_contexts:
           - ListAttemptJournalUseCase
           - ProbeProjectUseCase
           - ListUnregisteredProjectsUseCase
+          - ExportRunTelemetryUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -379,6 +380,7 @@ bounded_contexts:
             - ListAttemptJournalPort
             - ProbeProjectPort
             - ListUnregisteredProjectsPort
+            - ExportRunTelemetryPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -393,6 +395,8 @@ bounded_contexts:
             - AttemptArtifactPort
             - ForgeActionPort
             - ForgeReadPort
+            - ForgeAncestryPort
+            - ProcessTreeTerminationPort
             - AcceptanceAssessmentPort
             - AcceptanceEvidencePort
             - OwnerDecisionPort
@@ -418,8 +422,12 @@ bounded_contexts:
             - AutoMergeOwnerRoutingPort
             - ConductorForgeGrantPort
             - LaneRunParkNoticePort
+            - TelemetryDispositionPort
+            - RunTelemetryMarkPort
+            - RunTelemetryPort
+            - AcceptanceReceiptReadPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeDbUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -453,6 +461,8 @@ bounded_contexts:
       AttemptArtifactPort: "Place frozen briefs and templates under verified ignored paths and collect bounded immutable artifacts after lane completion."
       ForgeActionPort: "Perform permitted credential-bearing PR and merge operations through stable action IDs and explicit expected-head checks."
       ForgeReadPort: "Read one pull request's state by number or branch (open, merged or closed; head, base, merge time and merge commit) without mutating anything; a forge that cannot be read or a response that cannot be verified is unavailable, never a guess and never absence."
+      ForgeAncestryPort: "Answer whether one commit contains another as an ancestor (a merged PR head containing the lane head) through a read-only forge compare; no answer is unavailable, never a guess."
+      ProcessTreeTerminationPort: "Terminate every process on the attempt's recorded host whose working directory is inside the attempt's worktree, TERM then KILL after a grace period, never a process outside it; the count is reported; no recorded host or no answer is refused or unavailable, never a guess."
       AcceptanceAssessmentPort: "Consume the evidence context's exact-head assessment without importing its repositories or mutating its aggregates."
       AcceptanceEvidencePort: "Consume the evidence context's exact-head assessment to authorize merge actions."
       ReviewRequestPort: "Request a read-only review of one kind (brief-check, code-review, pre-merge) at one exact head under the conductor's request id, and find the receipt recorded for a request id; a review that recorded nothing is no-receipt, a refusal before any review is refused, anything unestablished is unknown, and read the latest receipt of one kind at a head; reason codes only."
@@ -463,18 +473,23 @@ bounded_contexts:
       PolicyMergeGrantPort: "Issue one merge-pr policy grant authorised by policy:autoMerge at the current setting revision, bound to the work order, attempt, head and acceptance receipt, through operator coordination; it never decides eligibility."
       AutoMergeOwnerRoutingPort: "Ask the owner a question or record an attention item for an auto-merge exception under a stable key, so a repeat run finds the first; a recorded notice grants nothing."
       ConductorForgeGrantPort: "Issue one push-and-open-pr or push-to-pr policy grant for an accepted attempt at an exact head under policy:conductor@<revision>; it never decides eligibility and never issues a merge grant."
+      AcceptanceReceiptReadPort: "Read the verification and review receipts of one attempt at one exact head through the evidence context's read-only inspection, projected to receipt id (hash input only), result, exit code, review kind, finding counts by severity and completion time; nothing else crosses the port; absence is an empty result, an unreadable store is unavailable."
       LaneRunParkNoticePort: "Raise one attention item per parked run and reason, and ask one keyed owner question where the owner must choose; ids and reason codes only; a repeat returns the existing notice."
+      TelemetryDispositionPort: "Per-trace span dispositions (pending, exported@route, rejected with a reason class), the recorded salt fingerprint and export counters in the state directory; every write merges per span under an exclusive lock with a 500 ms give-up, a pending never replaces a final disposition unless reopened, and a different salt fingerprint is refused."
+      RunTelemetryMarkPort: "Mark one run or attempt for telemetry export: constant time, never throws, never awaits, reads nothing; a lost mark only delays the next export."
+      RunTelemetryPort: "Send closed telemetry spans and return one disposition per span (exported@route only on an HTTP result, rejected with a reason class, else pending) and an error kind; never rejects or throws."
       OwnerDecisionPort: "Re-check the attempt's frozen one-way doors through owner coordination before forge actions; an undecided, declined or unreadable decision blocks the action."
       AttemptOwnerDecisionPort: "Read the owner decision references the product froze into an attempt's brief package; an attempt recorded without them is unknown and blocks forge actions."
       BriefKnowledgePort: "Request bounded context proposals, record selected versions and forward only completed-attempt notes to the knowledge context."
       ActionAuthorizationPort: "Obtain and durably consume an applicable scope-bound grant from operator coordination; pending or unknown results block the action."
       ExecutionObservationPort: "Publish recorded lifecycle observations through coordination; preserve a delivery gap without failing the lane."
       ListUnregisteredProjectsPort: "List each project id that has work orders but no profile, with what its work orders say about it (repositories, base commits, owned paths, counts), so it can be adopted; read-only."
+      ExportRunTelemetryPort: "For a selection of conducted runs and hand-run attempts, map the records to closed spans, apply sampling, record every span not yet final as pending before sending, send, and record each returned disposition; a span becomes final only on an HTTP result, a different salt fingerprint refuses the whole export before any send, and nothing outside the disposition store is written."
       ProbeProjectPort: "Probe one registered project read-only: read its profile, check its repository and clones and that its gate procedures exist in the installation, and record the receipt only if the profile did not change while it was probed."
       ProjectProfileReadPort: "Read one project profile and its revision from the coordination context; known absence is null."
       ProjectProbeRecordPort: "Record a probe receipt on a profile at the revision the probe started from; a changed profile is a typed rejection, never an overwrite."
       ProjectProbePort: "Read-only check of a project before registration or after an edit: the repository answers, and on each named host the clone is a git work tree whose origin matches, the worktree root exists, .lane/ is ignored and an agent instruction file is tracked; an unreachable host is unknown, a failing check carries the command that would fix it and nothing is ever run to fix it."
-      UsagePort: "Read what an attempt's recorded opencode session cost from opencode's own database on the recorded runner host; an attempt with no session id is unavailable with reason no session id, and a failed read never changes collection."
+      UsagePort: "Read what an attempt's recorded opencode session cost from the opencode server that ran it, through the same route and auth a dispatch uses (ocm-run --usage); an attempt with no session id or no route is unavailable with a named reason, and a failed read never changes collection."
       ChangeSignalPort: "Announce, after a successful save, that a record of a kind changed; carries no record state; never fails or delays the save."
     adapter_bindings:
       - { adapter: WorkOrderRepositoryAdapter, implements: WorkOrderRepositoryPort, integration: local-transactional-store }
@@ -483,6 +498,12 @@ bounded_contexts:
       - { adapter: LaneRunRepositoryAdapter, implements: LaneRunRepositoryPort, integration: local-transactional-store }
       - { adapter: ConductorDriverLeaseAdapter, implements: ConductorDriverLeasePort, integration: local-transactional-store }
       - { adapter: LaneRunJournalAdapter, implements: LaneRunJournalPort, integration: local-keyed-run-journal }
+      - { adapter: TelemetryDispositionAdapter, implements: TelemetryDispositionPort, integration: local-transactional-store }
+      - { adapter: NoopRunTelemetryMarkAdapter, implements: RunTelemetryMarkPort, integration: in-process-noop }
+      - { adapter: InMemoryRunTelemetryMarkAdapter, implements: RunTelemetryMarkPort, integration: in-process }
+      - { adapter: NoopRunTelemetryAdapter, implements: RunTelemetryPort, integration: in-process-noop }
+      - { adapter: RecordingRunTelemetryAdapter, implements: RunTelemetryPort, integration: in-process-recording }
+      - { adapter: OtlpHttpRunTelemetryAdapter, implements: RunTelemetryPort, integration: otlp-http-json-bearer-token-file }
       - { adapter: BriefAuthoringAdapter, implements: BriefAuthoringPort, integration: reviewed-harness-or-hand-written-file }
       - { adapter: ExecutionRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-ocm-run-subprocess }
       - { adapter: AgyRunnerAdapter, implements: ExecutionRunnerPort, integration: reviewed-agy-run-subprocess-behind-runner-mode }
@@ -491,7 +512,7 @@ bounded_contexts:
       - { adapter: RunnerForAttemptAdapter, implements: RunnerForAttemptPort, integration: per-host-cached-ocm-run-adapters-with-confirm-or-unknown }
       - { adapter: LaneDiffCheckAdapter, implements: LaneDiffCheckPort, integration: injected-command-executor-git-collection }
       - { adapter: GatePredicateAdapter, implements: GatePredicatePort, integration: injected-command-executor-gate-predicates }
-      - { adapter: OpencodeDbUsageAdapter, implements: UsagePort, integration: opencode-db-read-via-recorded-host-node-script }
+      - { adapter: OpencodeApiUsageAdapter, implements: UsagePort, integration: ocm-run-usage-read-over-the-dispatch-route }
       - { adapter: ProjectProbeAdapter, implements: ProjectProbePort, integration: injected-command-executor-read-only-git-probe }
       - adapter: ProjectProfileReadAdapter
         implements: ProjectProfileReadPort
@@ -507,6 +528,8 @@ bounded_contexts:
       - { adapter: AttemptArtifactAdapter, implements: AttemptArtifactPort, integration: bounded-filesystem-and-approved-remote-artifact-access }
       - { adapter: ForgeActionAdapter, implements: ForgeActionPort, integration: reviewed-github-cli-subprocess }
       - { adapter: ForgeReadAdapter, implements: ForgeReadPort, integration: reviewed-github-cli-subprocess-read-only }
+      - { adapter: ForgeReadAdapter, implements: ForgeAncestryPort, integration: reviewed-github-cli-subprocess-read-only }
+      - { adapter: ProcessTreeTerminationAdapter, implements: ProcessTreeTerminationPort, integration: host-shell-subprocess-over-recorded-host-executor }
       - adapter: AcceptanceAssessmentAdapter
         implements: AcceptanceAssessmentPort
         integration: in-process
@@ -539,6 +562,10 @@ bounded_contexts:
         implements: ConductorForgeGrantPort
         integration: in-process
         delegates_to: [operator-coordination/IssuePolicyForgeGrantPort]
+      - adapter: AcceptanceReceiptReadAdapter
+        implements: AcceptanceReceiptReadPort
+        integration: in-process
+        delegates_to: [evidence-and-acceptance/InspectAcceptanceEvidencePort]
       - adapter: LaneRunParkNoticeAdapter
         implements: LaneRunParkNoticePort
         integration: in-process
@@ -829,7 +856,7 @@ bounded_contexts:
         - "Fleet masters receive summaries and fleet-relevant proposals; project controllers own their status and raw notes."
 
 context_mappings:
-  - { upstream: evidence-and-acceptance, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "AcceptanceAssessmentAdapter delegates to supplier-owned application ports; dependency is declared on work-execution." }
+  - { upstream: evidence-and-acceptance, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "AcceptanceAssessmentAdapter delegates to supplier-owned application ports; AcceptanceReceiptReadAdapter (telemetry, OT2b) reads receipts through its own read-only InspectAcceptanceEvidenceUseCase instance; dependency is declared on work-execution." }
   - { upstream: work-execution, downstream: evidence-and-acceptance, pattern: OHS, mechanism: in-process-application-contract, notes: "AttemptOwnerDecisionAdapter delegates to supplier-owned InspectAttemptPort so acceptance reads the frozen one-way doors from the attempt record, never from a request body or worktree file; the dependency is declared on work-execution." }
   - { upstream: brief-knowledge, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "BriefKnowledgeAdapter delegates to supplier-owned context-selection and completed-note ingestion ports." }
   - { upstream: operator-coordination, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "ActionAuthorizationAdapter and ExecutionObservationAdapter delegate to supplier-owned authorization and publication ports." }

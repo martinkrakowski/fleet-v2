@@ -32,6 +32,7 @@ import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { performPark } from './step-context.js';
 import { manifestTimeLimitSeconds, readFrozenManifest } from './frozen-manifest.js';
+import { conductedRunnerOf } from './conducted-host.js';
 import { reviewFactsOf } from './review-fix.js';
 import { acceptanceFactsOf } from './merge.js';
 
@@ -40,15 +41,21 @@ export async function manifestVerdictOf(
   latest: AttemptRecord,
   artifactPort: AdvanceLaneRunDependencies['artifactPort'],
 ): Promise<Extract<ArtifactManifestVerdict, { readonly outcome: 'sealed' | 'missing' | 'mismatch' }>['outcome']> {
-  const verify = artifactPort.verifyArtifactManifest;
-  if (verify === undefined) {
+  // Called on the port, never copied off it: an adapter method reads `this` (KF-11).
+  if (artifactPort.verifyArtifactManifest === undefined) {
+    return 'missing';
+  }
+  // Q2a-2: a conducted attempt's read goes through its recorded host or is not
+  // made; a missing host never falls back to the local executor.
+  const recordedHost = conductedRunnerOf(latest);
+  if (recordedHost === null) {
     return 'missing';
   }
   try {
-    const verdict = await verify({
+    const verdict = await artifactPort.verifyArtifactManifest({
       attemptId: latest.id,
       worktreePath: latest.worktreePath,
-      recordedHost: latest.runner ?? null,
+      recordedHost,
       manifestPath: latest.artifacts?.manifestPath,
       expectedManifestSha256: latest.artifacts?.manifestSha256,
     });
@@ -61,6 +68,7 @@ export async function manifestVerdictOf(
 /** The collection fact of a collected attempt with artifacts; null before collection. */
 export async function collectionFactOf(
   latest: AttemptRecord,
+  prior: AttemptRecord | null,
   artifactPort: AdvanceLaneRunDependencies['artifactPort'],
 ): Promise<LaneRunAttemptFact['collection']> {
   if (latest.state !== 'collected' || latest.artifacts === null) {
@@ -69,6 +77,13 @@ export async function collectionFactOf(
   return {
     commits: latest.artifacts.commitsSinceBase.length,
     manifest: await manifestVerdictOf(latest, artifactPort),
+    // A fix attempt collected at its prior's head made no change: never park on a guess,
+    // so a missing prior (null) reads false.
+    headUnchanged:
+      latest.kind === 'fix' &&
+      prior !== null &&
+      prior.artifacts !== null &&
+      prior.artifacts.headCommit === latest.artifacts.headCommit,
   };
 }
 
@@ -78,6 +93,7 @@ export async function attemptFactOf(
   entries: readonly LaneRunJournalEntryRecord[],
   latestId: string,
   latest: AttemptRecord | null,
+  prior: AttemptRecord | null,
   artifactPort: AdvanceLaneRunDependencies['artifactPort'],
   deadlineIso: string | null,
 ): Promise<LaneRunAttemptFact> {
@@ -109,7 +125,7 @@ export async function attemptFactOf(
     deadlineIso,
     stopsIssued: laneRunStopsIssued(entries, record.runId, placementOfRecord.round, placementOfRecord.seatIndex),
     dispatchResult: laneRunAttemptDispatchResult(entries, record.runId, latest.id),
-    collection: await collectionFactOf(latest, artifactPort),
+    collection: await collectionFactOf(latest, prior, artifactPort),
   };
 }
 
@@ -166,7 +182,20 @@ export async function gatherFacts(ctx: AdvanceStepContext,
   const attempt: LaneRunAttemptFact | null =
     latestId === null
       ? null
-      : await attemptFactOf(record, entries, latestId, latest, ctx.deps.artifactPort, deadlineIso);
+      : await attemptFactOf(
+          record,
+          entries,
+          latestId,
+          latest,
+          // The prior attempt by the latest attempt's own `priorAttemptId` (KF-21c):
+          // read through the same repository path as every other attempt record;
+          // a missing prior reads as no unchanged head (never park on a guess).
+          latest !== null && latest.priorAttemptId !== null
+            ? await ctx.deps.attemptRepo.findAttemptById(latest.priorAttemptId)
+            : null,
+          ctx.deps.artifactPort,
+          deadlineIso,
+        );
 
   const stopFacts = laneRunJournalStopFacts(entries, record.runId);
   const head12 = latest === null ? null : head12Of(latest.artifacts?.headCommit);

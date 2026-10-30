@@ -189,6 +189,35 @@ describe('writeInstallationV2', () => {
     expect(writeInstallationV2(reordered)).toBe(forward);
   });
 
+  it('orders host and procedure names by UTF-16 code unit, not by locale', () => {
+    // The parser requires lowercase procedure names, so the mixed-case keys
+    // are installed on the parsed fixture after validation. The writer still
+    // serializes the maps in code-unit order.
+    const parsed = parseV2Fixture(validV2);
+    const host = parsed.hosts['lane-host'];
+    const installation: FleetInstallationV2 = {
+      ...parsed,
+      hosts: {
+        Zeta: host,
+        alpha: host,
+        beta: host,
+      },
+      verification: {
+        procedures: {
+          Zeta: { command: 'yarn', args: ['test'] },
+          alpha: { command: 'yarn', args: ['test'] },
+          beta: { command: 'yarn', args: ['test'] },
+        },
+      },
+    };
+    const written = JSON.parse(writeInstallationV2(installation)) as {
+      hosts: Record<string, unknown>;
+      verification: { procedures: Record<string, unknown> };
+    };
+    expect(Object.keys(written.hosts)).toEqual(['Zeta', 'alpha', 'beta']);
+    expect(Object.keys(written.verification.procedures)).toEqual(['Zeta', 'alpha', 'beta']);
+  });
+
   it('never writes a runner capability source', () => {
     const installation = parseV2Fixture(validV2);
     const written = writeInstallationV2(installation);

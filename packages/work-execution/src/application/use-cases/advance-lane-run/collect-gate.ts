@@ -2,9 +2,12 @@
 import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
+import type { AttemptRecord } from '../../../domain/execution-records.js';
+import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-port.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, performPark } from './step-context.js';
 import { manifestExpectedArtifacts, readFrozenManifest } from './frozen-manifest.js';
+import { historyEntryOf } from '../../../domain/seat-selection.js';
 
 /**
  * The `act collect` decision (K4-6): collect an ended attempt's artifacts
@@ -124,6 +127,130 @@ export async function runCollectBody(ctx: AdvanceStepContext,
   return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'collect-refused' };
 }
 
+/** `acceptanceChecks` of a frozen manifest: a non-empty array of non-empty strings, else null. */
+function manifestAcceptanceChecks(manifest: Record<string, unknown> | null): readonly string[] | null {
+  if (manifest === null) {
+    return null;
+  }
+  const value = manifest.acceptanceChecks;
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.some((entry) => typeof entry !== 'string' || entry.trim().length === 0)
+  ) {
+    return null;
+  }
+  return value as readonly string[];
+}
+
+/**
+ * KF-13a: record one verification receipt per acceptance check of the frozen
+ * brief at the collected head before the gate's run-result is appended. When
+ * wiring or manifest checks are absent nothing is recorded (today's
+ * behaviour); every other failure fails closed — `false` makes the gate
+ * `ambiguous` / `gate-unknown`, never a throw: acceptance is never attempted
+ * without the gate's evidence.
+ */
+async function recordGateReceipts(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  key: string,
+  request: AdvanceLaneRunRequest,
+  results: readonly GatePredicateResult[],
+): Promise<boolean> {
+  const gateReceipts = ctx.deps.gateReceipts;
+  if (gateReceipts === undefined) {
+    return true;
+  }
+  // Every read and write below is guarded: a throw is `false` (gate-unknown),
+  // never an exception out of the gate step.
+  try {
+    return await recordGateReceiptsGuarded(ctx, record, latest, key, request, results, gateReceipts);
+  } catch {
+    return false;
+  }
+}
+
+async function recordGateReceiptsGuarded(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  key: string,
+  request: AdvanceLaneRunRequest,
+  results: readonly GatePredicateResult[],
+  gateReceipts: NonNullable<AdvanceStepContext['deps']['gateReceipts']>,
+): Promise<boolean> {
+  const manifest = await readFrozenManifest(latest, ctx.deps.artifactPort);
+  const checks = manifestAcceptanceChecks(manifest);
+  if (checks === null || latest.artifacts === null) {
+    return true;
+  }
+  const reviewAssessment = ctx.deps.reviewAssessment;
+  const workOrderRepo = ctx.deps.workOrderRepo;
+  if (reviewAssessment === undefined || workOrderRepo === undefined) {
+    return false;
+  }
+  const workOrder = await workOrderRepo.findWorkOrderById(record.workOrderId);
+  if (workOrder === null) {
+    return false;
+  }
+  // The implementer of an attempt is the model that ran it — the same value
+  // the review step opens the evidence assessment with — so a fix attempt
+  // from another seat opens the assessment its review reopens, never a
+  // `head-mismatch`.
+  const runnerModel = historyEntryOf(latest).model;
+  const modelAssignment = manifest?.modelAssignment;
+  const manifestModel =
+    modelAssignment !== null && typeof modelAssignment === 'object'
+      ? (modelAssignment as { readonly model?: unknown }).model
+      : null;
+  // The manifest's model names only a first-pass writer: a fix attempt with no
+  // recorded model has an unknown writer, so the gate fails closed (as the
+  // review step refuses it) rather than name the first-pass seat.
+  const recorded = runnerModel !== null && runnerModel.trim().length > 0 ? runnerModel : null;
+  const implementerModel = recorded ?? (latest.kind === 'fix' ? null : manifestModel);
+  if (typeof implementerModel !== 'string' || implementerModel.trim().length === 0) {
+    return false;
+  }
+  const commandResults = results.filter((result) => result.kind === 'command');
+  // One result per check, and distinct names: a repeated name would let one
+  // recorded receipt stand for two checks in the assessment.
+  if (commandResults.length !== checks.length || new Set(checks).size !== checks.length) {
+    return false;
+  }
+  const opened = await reviewAssessment.openReviewAssessment({
+    attemptId: latest.id,
+    projectId: workOrder.projectId,
+    candidateHeadSha: latest.artifacts.headCommit,
+    policyRevision: record.runPolicyRevision,
+    implementerModel: implementerModel.trim(),
+    requiredChecks: checks,
+  });
+  if (opened.outcome !== 'open') {
+    return false;
+  }
+  const outcome = await gateReceipts.recordGateReceipts({
+      attemptId: latest.id,
+      projectId: workOrder.projectId,
+      candidateHeadSha: latest.artifacts.headCommit,
+      hostId: latest.runner?.hostName ?? 'unknown',
+      policyRevision: record.runPolicyRevision,
+      completedAtIso: request.nowIso,
+      evidenceRef: 'run-journal:' + key,
+      receipts: checks.map((check, index) => ({
+        procedureName: check,
+        result: commandResults[index]!.verdict,
+        exitCode: commandResults[index]!.exitCode,
+        ...(commandResults[index]!.coverage !== undefined
+          ? { coverage: commandResults[index]!.coverage }
+          : {}),
+      })),
+    });
+  // A recorded answer counts only when every check got its receipt.
+  return outcome.outcome === 'recorded' && outcome.count === checks.length;
+}
+
 /**
  * The `act gate` decision (K4-6): evaluate the frozen acceptance spec at the
  * collected head through `EvaluateAttemptGatePort`; only the typed verdict
@@ -193,6 +320,18 @@ export async function runGateBody(ctx: AdvanceStepContext,
     attemptId: latest.id,
     candidateHeadSha: latest.artifacts.headCommit,
   });
+  if (verdict.verdict === 'passed' || verdict.verdict === 'failed') {
+    // KF-13a: record one verification receipt per acceptance check before the
+    // run-result is appended; any failure fails closed to `gate-unknown`.
+    const recorded = await recordGateReceipts(ctx, record, latest, key, request, verdict.results ?? []);
+    if (!recorded) {
+      const resultRefusal = await appendRunResult(ctx, request, key, 'ambiguous', 'gate-unknown');
+      if (resultRefusal !== null) {
+        return { outcome: 'refused', reason: resultRefusal };
+      }
+      return { outcome: 'acted', step: decision.step, key, result: 'ambiguous', reasonCode: 'gate-unknown' };
+    }
+  }
   if (verdict.verdict === 'passed') {
     const resultRefusal = await appendRunResult(ctx, request, key, 'completed', 'gate-passed');
     if (resultRefusal !== null) {

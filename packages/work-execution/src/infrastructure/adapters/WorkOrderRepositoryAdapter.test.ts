@@ -6,7 +6,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { WorkOrderRecord } from '../../domain/execution-records.js';
 import { WorkOrderRepositoryAdapter } from './WorkOrderRepositoryAdapter.adapter.js';
-import { StateFileUnreadableError } from './file-store.js';
+import {
+  ReadOnlyStateStoreError,
+  StateFileUnreadableError,
+  StateFileUnreadableReadOnlyError,
+} from './file-store.js';
 
 describe('WorkOrderRepositoryAdapter cross-process safe persistence', () => {
   let tempDir: string;
@@ -210,5 +214,65 @@ describe('WorkOrderRepositoryAdapter quarantines unreadable state files', () => 
     const after = createHash('sha256').update(await fs.readFile(workOrdersPath())).digest('hex');
     expect(after).toBe(before);
     expect(await fs.readdir(quarantineDir())).toHaveLength(1);
+  });
+});
+
+describe('WorkOrderRepositoryAdapter read-only (telemetry plan §3.3)', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-work-order-readonly-test-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  function makeWorkOrder(): WorkOrderRecord {
+    return {
+      id: 'wo-1',
+      projectId: 'proj-1',
+      taskId: 'task-1',
+      laneId: 'lane-1',
+      repository: 'repo-1',
+      baseCommit: 'commit-1',
+      ownedPaths: ['src/a'],
+      policyRevision: 'pol-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'approved',
+      revision: 1,
+      createdAtIso: '2026-10-15T10:00:00.000Z',
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+  }
+
+  const workOrdersPath = () => path.join(tempDir, 'work-orders.json');
+
+  it('refuses saveWorkOrder with ReadOnlyStateStoreError and writes nothing', async () => {
+    const adapter = new WorkOrderRepositoryAdapter({ stateDir: tempDir, readOnly: true });
+    await expect(adapter.saveWorkOrder(makeWorkOrder())).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
+    await expect(adapter.saveWorkOrder(makeWorkOrder())).rejects.toThrow('read-only');
+    expect(await fs.readdir(tempDir)).toEqual([]);
+  });
+
+  it('refuses an in-memory save when read-only', async () => {
+    const adapter = new WorkOrderRepositoryAdapter({ readOnly: true });
+    await expect(adapter.saveWorkOrder(makeWorkOrder())).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
+  });
+
+  it('rejects an unreadable file with StateFileUnreadableReadOnlyError and writes no quarantine copy', async () => {
+    await fs.writeFile(workOrdersPath(), '{ not valid json', 'utf8');
+    const before = await fs.readdir(tempDir, { recursive: true });
+    const adapter = new WorkOrderRepositoryAdapter({ stateDir: tempDir, readOnly: true });
+    await expect(adapter.listWorkOrdersByProject()).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
+    await expect(adapter.findWorkOrderById('wo-1')).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
+    expect(await fs.readdir(tempDir, { recursive: true })).toEqual(before);
+  });
+
+  it('keeps quarantining an unreadable file when not read-only', async () => {
+    await fs.writeFile(workOrdersPath(), '{ not valid json', 'utf8');
+    const adapter = new WorkOrderRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.listWorkOrdersByProject()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    expect(await fs.readdir(path.join(tempDir, 'quarantine'))).toHaveLength(1);
   });
 });

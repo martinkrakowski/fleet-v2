@@ -23,11 +23,19 @@ export type LaneRunFirstReservationResult =
       readonly hostName: string;
       readonly hostKind: RunnerKind;
       readonly worktreePath: string;
+      /** The reservation record's transport; a legacy record derives it from the alias. */
+      readonly transport: 'local' | 'ssh';
+      readonly sshAlias: string | null;
+      readonly port: number | null;
     }
   | { readonly outcome: 'no-capacity' }
   | {
       readonly outcome: 'refused';
-      readonly reason: 'no-host' | 'reserve-refused' | 'reservation-incomplete';
+      readonly reason:
+        | 'no-host'
+        | 'no-review-route'
+        | 'reserve-refused'
+        | 'reservation-incomplete';
     };
 
 /** The first attempt of a new run: global cap and package-busy, then the reserve chooses host and worktree path (K7-D7). */

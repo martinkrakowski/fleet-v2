@@ -3,7 +3,8 @@
  * small functions, plus the §3.9.1 stop-mode and drain rules (amendment K-GC).
  * `parked` and `stopped` are reachable from every non-terminal state (§3.2
  * "stopped" row; §3.7 halt parks before any external action), so they are not
- * repeated per row; a park returns only to its recorded `parkedFrom`. Every
+ * repeated per row; a park returns only to its recorded `parkedFrom`, except
+ * that a park may end `merged` (CT-2a: the owner-merge park's PR merged). Every
  * function is total: it never throws and returns a typed result for any input
  * of its declared type (fail-closed where stated). No port, no I/O, no clock.
  */
@@ -56,8 +57,8 @@ export const LANE_RUN_STEP_OF_STATE = {
 /**
  * Whether `from → to` is a legal transition. Terminal `from` → false. `to === 'stopped'` → true.
  * `to === 'parked'` → true unless `from` is `parked`. `from === 'parked'` → true only when `to` equals
- * `parkedFrom` (pass the record's `parked.parkedFrom`; `null`/absent → false). Otherwise the table.
- * Unknown strings → false.
+ * `parkedFrom` (pass the record's `parked.parkedFrom`; `null`/absent → false) or when `to` is `merged`
+ * (CT-2a). Otherwise the table. Unknown strings → false.
  */
 export function canEnterLaneRunState(from: string, to: string, parkedFrom?: string | null): boolean {
   if (!(LANE_RUN_STATES as readonly string[]).includes(from)) {
@@ -74,6 +75,12 @@ export function canEnterLaneRunState(from: string, to: string, parkedFrom?: stri
     return state !== 'parked';
   }
   if (state === 'parked') {
+    // CT-2a: the conductor's owner-merge park enters `merged` by itself when
+    // its PR merges with the lane head (the decider's G5), even though `merged`
+    // is not the park's recorded `parkedFrom`.
+    if (to === 'merged') {
+      return true;
+    }
     return parkedFrom !== null && parkedFrom !== undefined && to === parkedFrom;
   }
   return (LANE_RUN_EXITS[state] as readonly string[]).includes(to);
@@ -275,7 +282,7 @@ export function laneRunHaltLiftExit(input: {
   return record.parked.parkedFrom;
 }
 
-export type LaneRunResumeRefusal = 'run-stopped' | 'stale-revision' | 'not-parked' | 'stop-pending' | 'one-way-door';
+export type LaneRunResumeRefusal = 'run-stopped' | 'stale-revision' | 'not-parked' | 'stop-pending' | 'one-way-door' | 'fix-no-progress';
 export type LaneRunResumeCheck =
   | { readonly ok: true; readonly to: LaneRunStateValue }
   | { readonly ok: false; readonly reason: LaneRunResumeRefusal };
@@ -314,6 +321,11 @@ export function checkLaneRunResume(input: {
   }
   if (record.parked.reason === 'one-way-door') {
     return { ok: false, reason: 'one-way-door' };
+  }
+  // A resume would re-collect the same unchanged head and park again: the
+  // run is stopped and a new run started instead (KF-21c).
+  if (record.parked.reason === 'fix-no-progress') {
+    return { ok: false, reason: 'fix-no-progress' };
   }
   return { ok: true, to: record.parked.parkedFrom };
 }

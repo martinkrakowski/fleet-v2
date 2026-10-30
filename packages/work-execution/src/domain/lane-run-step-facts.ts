@@ -27,7 +27,7 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'gate-passed', 'gate-failed', 'gate-unknown', 'reconciled',
   'review-passed', 'review-failed', 'review-no-receipt', 'review-refused', 'review-unknown',
   'assessment-unavailable', 'review-seat-unavailable',
-  'resumed', 'run-stopped', 'stale-revision', 'not-parked', 'stop-pending', 'one-way-door',
+  'resumed', 'run-stopped', 'stale-revision', 'not-parked', 'stop-pending', 'one-way-door', 'fix-no-progress',
   'accepted', 'acceptance-rejected', 'acceptance-unknown', 'pr-opened',
   'pushed', 'forge-refused', 'forge-ambiguous', 'grant-refused', 'merged', 'merge-not-merged', 'merge-waiting',
   'merge-off', 'notice-recorded', 'notice-refused',
@@ -47,6 +47,7 @@ export function laneRunConductEntry(entryId: string, runId: string, state: LaneR
     mintedId: null,
     outcome: null,
     reasonCode: null,
+    detail: null,
     grantId: null,
     state,
   });
@@ -65,6 +66,7 @@ export function laneRunIntentEntry(entryId: string, runId: string, key: string, 
     mintedId,
     outcome: null,
     reasonCode: null,
+    detail: null,
     grantId: null,
     state: null,
   });
@@ -73,6 +75,7 @@ export function laneRunIntentEntry(entryId: string, runId: string, key: string, 
 export function laneRunResultEntry(
   entryId: string, runId: string, key: string, outcome: LaneRunJournalOutcome,
   reasonCode: LaneRunResultReasonCode | null, nowIso: string,
+  detail: string | null = null,
 ): LaneRunJournalEntryRecord {
   return Object.freeze({
     version: LANE_RUN_JOURNAL_ENTRY_VERSION,
@@ -86,6 +89,7 @@ export function laneRunResultEntry(
     mintedId: null,
     outcome,
     reasonCode,
+    detail,
     grantId: null,
     state: null,
   });

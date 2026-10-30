@@ -20,8 +20,9 @@ export interface BriefContextDecision {
 }
 
 /**
- * Durable model assignment: model, variant and fallback as bound in the brief
- * manifest. Host seat names are installation and never enter this contract.
+ * Durable model assignment: model, variant, fallback, seat tool and runner
+ * agent as bound in the brief manifest. Host seat names are installation and
+ * never enter this contract.
  */
 export interface BriefModelAssignment {
   readonly model: string;
@@ -33,6 +34,13 @@ export interface BriefModelAssignment {
    * there and never from a request.
    */
   readonly seatTool: RunnerKind;
+  /**
+   * The runner agent the implementer seat runs under (`lane`, `lane-glm`);
+   * optional, frozen into the manifest with the rest of the assignment so
+   * dispatch reads it back and the start check matches the plan seat that
+   * names it.
+   */
+  readonly agent?: string;
 }
 
 /**
@@ -58,6 +66,12 @@ export interface PrepareBriefPackageRequest {
   readonly policyRevision: string;
   readonly modelAssignment: BriefModelAssignment;
 
+  /**
+   * Frozen prose supplied by the caller (a fix round's handover brief); when
+   * present the authoring step is skipped and this text is placed and digested
+   * as is; non-empty, at most 64 KiB, never secret-shaped.
+   */
+  readonly proseMarkdown?: string;
   /**
    * Frozen PR notes (D7): the three sections a conducted run requires for its
    * PR body. Each is a non-empty string of at most 4000 characters and never

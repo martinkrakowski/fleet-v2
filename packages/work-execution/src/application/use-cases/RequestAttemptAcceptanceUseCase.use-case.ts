@@ -93,16 +93,16 @@ const GATE_RESULTS_MISMATCH_REASON =
 /** The gate's typed outcome, shared by acceptance and the standalone gate port. */
 type GateVerdict = EvaluateAttemptGateResult;
 
-function gatePassed(): GateVerdict {
-  return { verdict: 'passed' };
+function gatePassed(results: readonly GatePredicateResult[]): GateVerdict {
+  return { verdict: 'passed', results };
 }
 
 function gateUnknown(reason: string): GateVerdict {
   return { verdict: 'unknown', reason };
 }
 
-function gateFailed(reason: string): GateVerdict {
-  return { verdict: 'failed', reason };
+function gateFailed(reason: string, results: readonly GatePredicateResult[]): GateVerdict {
+  return { verdict: 'failed', reason, results };
 }
 
 interface ExpectedGatePredicate {
@@ -152,10 +152,10 @@ function gateVerdictForResults(
       const exitText = result.exitCode === null ? '' : ' with exit code ' + String(result.exitCode);
       const reason =
         'Gate predicate ' + result.name + ' ' + result.verdict + exitText + ': ' + result.detail;
-      return result.verdict === 'fail' ? gateFailed(reason) : gateUnknown(reason);
+      return result.verdict === 'fail' ? gateFailed(reason, results) : gateUnknown(reason);
     }
   }
-  return gatePassed();
+  return gatePassed(results);
 }
 
 function isGatePredicateKind(value: unknown): value is GatePredicateKind {
@@ -166,7 +166,7 @@ function isGatePredicateVerdict(value: unknown): value is GatePredicateVerdict {
   return value === 'pass' || value === 'fail' || value === 'unknown' || value === 'skipped';
 }
 
-function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredicateResult | null {
+export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredicateResult | null {
   if (typeof entry.detail !== 'string') {
     return null;
   }
@@ -198,6 +198,50 @@ function parseStoredPredicateResult(entry: ActionJournalEntryRecord): GatePredic
     durationMs: record.durationMs,
     detail: record.detail,
   };
+}
+
+/**
+ * Pure projection of the stored gate predicate results for one attempt head:
+ * entries whose id starts with `${attemptId}:accept:${headSha}:`, parsed,
+ * with verdict `fail` or `unknown` only, in the id's numeric `n` order.
+ * `detail` and `durationMs` are dropped.
+ */
+export function nonPassingGatePredicatesOf(
+  entries: readonly ActionJournalEntryRecord[],
+  attemptId: string,
+  headSha: string,
+): Array<{ name: string; kind: GatePredicateKind; verdict: 'fail' | 'unknown'; exitCode: number | null }> {
+  const prefix = `${attemptId}:accept:${headSha}:`;
+  const collected: Array<{
+    readonly order: number;
+    readonly value: { name: string; kind: GatePredicateKind; verdict: 'fail' | 'unknown'; exitCode: number | null };
+  }> = [];
+  for (const entry of entries) {
+    // The id prefix alone is not trusted: the row must be this attempt's own
+    // acceptance entry.
+    if (!entry.id.startsWith(prefix) || entry.action !== 'accept' || entry.attemptId !== attemptId) {
+      continue;
+    }
+    const indexText = entry.id.slice(prefix.length);
+    if (!/^\d+$/.test(indexText)) {
+      continue;
+    }
+    const parsed = parseStoredPredicateResult(entry);
+    if (parsed === null || (parsed.verdict !== 'fail' && parsed.verdict !== 'unknown')) {
+      continue;
+    }
+    collected.push({
+      order: Number.parseInt(indexText, 10),
+      value: {
+        name: parsed.name,
+        kind: parsed.kind,
+        verdict: parsed.verdict,
+        exitCode: parsed.exitCode,
+      },
+    });
+  }
+  collected.sort((a, b) => a.order - b.order);
+  return collected.map((item) => item.value);
 }
 
 type StoredGateOutcome =

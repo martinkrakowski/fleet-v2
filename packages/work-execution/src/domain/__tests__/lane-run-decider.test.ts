@@ -177,7 +177,7 @@ describe('global rules', () => {
       stopMode: 'graceful',
       head12: HEAD,
       acceptedHead12: HEAD,
-      pr: { state: 'merged', head12: HEAD },
+      pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
       attempt: attemptFact(),
     });
     assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
@@ -187,7 +187,7 @@ describe('global rules', () => {
       stopMode: 'graceful',
       head12: HEAD,
       acceptedHead12: HEAD,
-      pr: { state: 'merged', head12: 'ffffffffffff' },
+      pr: { state: 'merged', head12: 'ffffffffffff', containsLaneHead: false },
       attempt: attemptFact(),
     });
     assertDecision(otherHead, rec, decide(rec, otherHead), {
@@ -370,6 +370,54 @@ describe('global rules', () => {
     expect(decide(rec, baseFacts({ state: 'parked' }))).toEqual({ kind: 'wait', reason: 'parked' });
   });
 
+  it('G5: an owner-merge park enters merged once its PR merges containing the lane head', () => {
+    const rec = record({ parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null }, parkCount: 1 });
+    const facts = baseFacts({
+      state: 'parked',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      pr: { state: 'merged', head12: 'ffffffffffff', containsLaneHead: true },
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('G3e: an owner-merge park with a stop recorded still ends merged, never stopped, once its PR merges (CT-2a Fable)', () => {
+    const rec = record({ parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null }, parkCount: 1 });
+    for (const stopMode of ['force', 'graceful'] as const) {
+      const facts = baseFacts({
+        state: 'parked',
+        stopMode,
+        attempt: attemptFact({ phase: 'collected' }),
+        head12: HEAD,
+        acceptedHead12: HEAD,
+        pr: { state: 'merged', head12: 'ffffffffffff', containsLaneHead: true },
+      });
+      assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+    }
+  });
+
+  it('G5: an owner-merge park waits when its merged PR does not contain the lane head', () => {
+    const rec = record({ parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null }, parkCount: 1 });
+    const facts = baseFacts({
+      state: 'parked',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      pr: { state: 'merged', head12: 'ffffffffffff', containsLaneHead: false },
+    });
+    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+
+  it('G5: a non-owner-merge park waits even when its PR merges with the lane head', () => {
+    const rec = record({ parked: { reason: 'branch-behind', qualifier: null, parkedFrom: 'merging', questionId: null }, parkCount: 1 });
+    const facts = baseFacts({
+      state: 'parked',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
+    });
+    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+
   it('G6: halted parks halted', () => {
     const facts = baseFacts({ state: 'running', halted: true, attempt: attemptFact() });
     assertDecision(facts, record({}), decide(record({}), facts), {
@@ -383,16 +431,16 @@ describe('global rules', () => {
       state: 'merging',
       head12: HEAD,
       acceptedHead12: 'aaaaaaaaaaaa',
-      pr: { state: 'open', head12: HEAD },
+      pr: { state: 'open', head12: HEAD, containsLaneHead: true },
       attempt: attemptFact(),
     });
     assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'gating' });
   });
 
   it('G7b: a head-change state with a missing head is inconsistent', () => {
-    const merging = baseFacts({ state: 'merging', head12: null, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD } });
+    const merging = baseFacts({ state: 'merging', head12: null, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: false } });
     expect(decide(record({}), merging)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
-    const pushing = baseFacts({ state: 'pushing', head12: HEAD, acceptedHead12: null, pr: { state: 'open', head12: HEAD } });
+    const pushing = baseFacts({ state: 'pushing', head12: HEAD, acceptedHead12: null, pr: { state: 'open', head12: HEAD, containsLaneHead: true } });
     expect(decide(record({}), pushing)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
   });
 
@@ -628,20 +676,20 @@ describe('collecting state', () => {
 
   it('C2: no commits enters seat-failed', () => {
     const facts = baseFacts({
-      state: 'collecting', attempt: attemptFact({ collection: { commits: 0, manifest: 'sealed' } }),
+      state: 'collecting', attempt: attemptFact({ collection: { headUnchanged: false, commits: 0, manifest: 'sealed' } }),
     });
     assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'seat-failed' });
   });
 
   it('C3: a missing or mismatched manifest parks artifacts-unsealed', () => {
     const missing = baseFacts({
-      state: 'collecting', attempt: attemptFact({ collection: { commits: 1, manifest: 'missing' } }),
+      state: 'collecting', attempt: attemptFact({ collection: { headUnchanged: false, commits: 1, manifest: 'missing' } }),
     });
     assertDecision(missing, record({}), decide(record({}), missing), {
       kind: 'park', reason: 'artifacts-unsealed', qualifier: null, parkedFrom: 'collecting',
     });
     const mismatch = baseFacts({
-      state: 'collecting', attempt: attemptFact({ collection: { commits: 1, manifest: 'mismatch' } }),
+      state: 'collecting', attempt: attemptFact({ collection: { headUnchanged: false, commits: 1, manifest: 'mismatch' } }),
     });
     assertDecision(mismatch, record({}), decide(record({}), mismatch), {
       kind: 'park', reason: 'artifacts-unsealed', qualifier: null, parkedFrom: 'collecting',
@@ -650,9 +698,18 @@ describe('collecting state', () => {
 
   it('C4: sealed with commits enters gating', () => {
     const facts = baseFacts({
-      state: 'collecting', attempt: attemptFact({ collection: { commits: 1, manifest: 'sealed' } }),
+      state: 'collecting', attempt: attemptFact({ collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
     });
     assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'gating' });
+  });
+
+  it('C4b: a fix attempt collected at its prior head parks fix-no-progress', () => {
+    const facts = baseFacts({
+      state: 'collecting', attempt: attemptFact({ collection: { headUnchanged: true, commits: 1, manifest: 'sealed' } }),
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'fix-no-progress', qualifier: null, parkedFrom: 'collecting',
+    });
   });
 });
 
@@ -788,10 +845,95 @@ describe('fixing state', () => {
     const rec = record({ attemptIds: ['attempt-example-1'] });
     const facts = baseFacts({
       state: 'fixing',
-      attempt: attemptFact({ phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+      attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
     });
     expect(decide(rec, facts)).toEqual({
       kind: 'act', step: 'prepare', key: `${RUN_ID}/r1/prepare/0/a2`, round: 1, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
+  it('KF-17: fixing round 1 with a prepared round-1 attempt refused (not-started) dispatches it even when not admitted', () => {
+    const rec = record({ round: 1, attemptIds: ['attempt-example-1', 'attempt-example-2'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      admission: 'no-capacity',
+      attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'prepared', dispatchResult: 'not-started' }),
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'dispatch', key: `${RUN_ID}/r1/dispatch/0/a2`, round: 1, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
+  it('KF-17: fixing round 1 with a cancelled round-1 attempt prepares round 1 with the next ordinal', () => {
+    const rec = record({ round: 1, attemptIds: ['attempt-example-1', 'attempt-example-2'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'cancelled', dispatchResult: 'not-started' }),
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'prepare', key: `${RUN_ID}/r1/prepare/0/a3`, round: 1, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
+  it('KF-17: fixing round 2 with a prepared or cancelled round-2 attempt does not park blocker-after-round-2', () => {
+    const rec = record({ round: 2, attemptIds: ['a1', 'a2', 'a3'] });
+    const prepared = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'a3', round: 2, phase: 'prepared', dispatchResult: 'not-started' }),
+    });
+    expect(decide(rec, prepared)).toEqual({
+      kind: 'act', step: 'dispatch', key: `${RUN_ID}/r2/dispatch/0/a3`, round: 2, seatIndex: 0, head12: null, retry: null,
+    });
+    const cancelled = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'a3', round: 2, phase: 'cancelled', dispatchResult: 'not-started' }),
+    });
+    expect(decide(rec, cancelled)).toEqual({
+      kind: 'act', step: 'prepare', key: `${RUN_ID}/r2/prepare/0/a4`, round: 2, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
+  it('KF-17: fixing round 2 with a collected round-2 attempt still parks blocker-after-round-2', () => {
+    const rec = record({ round: 2, attemptIds: ['a1', 'a2', 'a3'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'a3', round: 2, phase: 'collected', collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), {
+      kind: 'park', reason: 'blocker-after-round-2', qualifier: null, parkedFrom: 'fixing',
+    });
+  });
+
+  it('KF-17: fixing round 1 with a collected round-1 attempt prepares round 2 (unchanged)', () => {
+    const rec = record({ round: 1, attemptIds: ['attempt-example-1', 'attempt-example-2'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'collected', collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'prepare', key: `${RUN_ID}/r2/prepare/0/a3`, round: 2, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
+  it('KF-17: a cancelled round-1 attempt with no dispatch record (a burned ordinal) is not this round: round 2 is prepared', () => {
+    const rec = record({ round: 1, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'attempt-example-3', round: 1, phase: 'cancelled', dispatchResult: 'none' }),
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'prepare', key: `${RUN_ID}/r2/prepare/0/a4`, round: 2, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
+  it('KF-17: fixing round 0 with a cancelled round-1 attempt (raise save refused) prepares round 1', () => {
+    const rec = record({ attemptIds: ['attempt-example-1', 'attempt-example-2'] });
+    const facts = baseFacts({
+      state: 'fixing',
+      attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'cancelled', dispatchResult: 'not-started' }),
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'prepare', key: `${RUN_ID}/r1/prepare/0/a3`, round: 1, seatIndex: 0, head12: null, retry: null,
     });
   });
 
@@ -799,7 +941,7 @@ describe('fixing state', () => {
     const rec = record({ attemptIds: ['attempt-example-1'] });
     const facts = baseFacts({
       state: 'fixing',
-      attempt: attemptFact({ phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+      attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
       implementerSeat: { ok: false },
     });
     assertDecision(facts, rec, decide(rec, facts), {
@@ -880,14 +1022,14 @@ describe('accepting, premerge, PR and CI states', () => {
 
   it('H2: pushing at the PR head enters watching-ci', () => {
     const rec = record({ prNumber: 7 });
-    const facts = baseFacts({ state: 'pushing', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD } });
+    const facts = baseFacts({ state: 'pushing', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true } });
     assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'watching-ci' });
   });
 
   it('H3: pushing behind the PR head pushes', () => {
     const rec = record({ prNumber: 7 });
     const facts = baseFacts({
-      state: 'pushing', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: 'ffffffffffff' }, attempt: attemptFact(),
+      state: 'pushing', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: 'ffffffffffff', containsLaneHead: false }, attempt: attemptFact(),
     });
     expect(decide(rec, facts)).toEqual({
       kind: 'act', step: 'push', key: `${RUN_ID}/r0/push/0@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
@@ -927,24 +1069,34 @@ describe('merging state', () => {
   });
 
   it('M2: merged at the head enters merged', () => {
-    const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: HEAD } });
+    const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: HEAD, containsLaneHead: true } });
     assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'merged' });
   });
 
   it('M3: merged at another head or closed parks ambiguous merge', () => {
-    const otherHead = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: 'ffffffffffff' } });
+    const otherHead = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: 'ffffffffffff', containsLaneHead: false } });
     assertDecision(otherHead, record({}), decide(record({}), otherHead), {
       kind: 'park', reason: 'ambiguous', qualifier: 'merge', parkedFrom: 'merging',
     });
-    const closed = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'closed', head12: 'ffffffffffff' } });
+    const closed = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'closed', head12: 'ffffffffffff', containsLaneHead: false } });
     assertDecision(closed, record({}), decide(record({}), closed), {
       kind: 'park', reason: 'ambiguous', qualifier: 'merge', parkedFrom: 'merging',
     });
   });
 
+  it('M2b: merged at the lane head enters merged even when the ancestry answer is false (CT-2a Fable)', () => {
+    const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: HEAD, containsLaneHead: false } });
+    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('M3b: merged at another head that contains the lane head enters merged', () => {
+    const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: 'ffffffffffff', containsLaneHead: true } });
+    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'merged' });
+  });
+
   it('M4: a one-way door parks one-way-door', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD }, merge: { oneWayDoor: true, branchBehind: false, trainFree: true, policyGrant: true },
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: true, branchBehind: false, trainFree: true, policyGrant: true },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'one-way-door', qualifier: null, parkedFrom: 'merging',
@@ -953,7 +1105,7 @@ describe('merging state', () => {
 
   it('M5: a behind branch parks branch-behind', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD }, merge: { oneWayDoor: false, branchBehind: true, trainFree: true, policyGrant: true },
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: true, trainFree: true, policyGrant: true },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'branch-behind', qualifier: null, parkedFrom: 'merging',
@@ -962,7 +1114,7 @@ describe('merging state', () => {
 
   it('M6: without a policy grant parks owner-merge', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD }, merge: { oneWayDoor: false, branchBehind: false, trainFree: true, policyGrant: false },
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: false, trainFree: true, policyGrant: false },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'owner-merge', qualifier: null, parkedFrom: 'merging',
@@ -971,13 +1123,13 @@ describe('merging state', () => {
 
   it('M7: without a free train waits merge-train', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD }, merge: { oneWayDoor: false, branchBehind: false, trainFree: false, policyGrant: true },
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: false, trainFree: false, policyGrant: true },
     });
     expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'merge-train' });
   });
 
   it('M8: otherwise acts merge', () => {
-    const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD }, attempt: attemptFact() });
+    const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true }, attempt: attemptFact() });
     expect(decide(record({}), facts)).toEqual({
       kind: 'act', step: 'merge', key: `${RUN_ID}/r0/merge/0@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
     });
@@ -994,7 +1146,7 @@ describe('rounds across the run', () => {
     const rec = record({ attemptIds: ['attempt-example-1'] });
     const facts = baseFacts({
       state: 'fixing',
-      attempt: attemptFact({ phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+      attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
     });
     expect(decide(rec, facts)).toEqual({
       kind: 'act', step: 'prepare', key: `${RUN_ID}/r1/prepare/0/a2`, round: 1, seatIndex: 0, head12: null, retry: null,
@@ -1071,7 +1223,7 @@ describe('inconsistent input never throws', () => {
 
   it('a throwing merge getter is inconsistent', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD },
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true },
     });
     Object.defineProperty(facts, 'merge', {
       get() {
@@ -1220,7 +1372,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
       kind: 'act', step: 'collect', key: `${RUN_ID}/r0/collect/0`, round: 0, seatIndex: 0, head12: null, retry: null,
     });
 
-    const sealed = { commits: 2, manifest: 'sealed' as const };
+    const sealed = { commits: 2, manifest: 'sealed' as const, headUnchanged: false };
     const s4 = baseFacts({ state: 'collecting', stopMode: 'graceful', attempt: attemptFact({ phase: 'collected', collection: sealed }), ...grace });
     assertDecision(s4, rec, decide(rec, s4), { kind: 'enter', to: 'gating' });
 
@@ -1242,7 +1394,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
       state: 'gating',
       stopMode: 'graceful',
       head12: HEAD,
-      attempt: attemptFact({ phase: 'collected', collection: { commits: 2, manifest: 'sealed' } }),
+      attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'sealed' } }),
     };
     const failed = baseFacts({ ...base, gate: 'failed' });
     assertDecision(failed, rec, decide(rec, failed), { kind: 'enter', to: 'stopped' });
@@ -1252,7 +1404,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
 
   it('a zero-commit collection ends the drain stopped, never preparing the next seat', () => {
     const rec = record({});
-    const attempt = attemptFact({ phase: 'collected', collection: { commits: 0, manifest: 'sealed' } });
+    const attempt = attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 0, manifest: 'sealed' } });
     const collecting = baseFacts({ state: 'collecting', stopMode: 'graceful', attempt });
     assertDecision(collecting, rec, decide(rec, collecting), { kind: 'enter', to: 'seat-failed' });
     const seatFailed = baseFacts({ state: 'seat-failed', stopMode: 'graceful', attempt });
@@ -1260,7 +1412,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
   });
 
   it('an unsealed collection parks, then the parked run enters stopped', () => {
-    const attempt = attemptFact({ phase: 'collected', collection: { commits: 2, manifest: 'missing' } });
+    const attempt = attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'missing' } });
     const rec = record({});
     const collecting = baseFacts({ state: 'collecting', stopMode: 'graceful', attempt });
     assertDecision(collecting, rec, decide(rec, collecting), {
@@ -1294,7 +1446,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
   });
 
   it('a halt parks the drain and it continues once lifted', () => {
-    const attempt = attemptFact({ phase: 'collected', collection: { commits: 2, manifest: 'sealed' } });
+    const attempt = attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'sealed' } });
     const rec = record({});
     const halted = baseFacts({ state: 'gating', stopMode: 'graceful', halted: true, head12: HEAD, gate: 'none', attempt });
     assertDecision(halted, rec, decide(rec, halted), { kind: 'park', reason: 'halted', qualifier: null, parkedFrom: 'gating' });
@@ -1327,7 +1479,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
       const facts = baseFacts({
         state,
         stopMode: 'graceful',
-        attempt: attemptFact({ phase: 'collected', collection: { commits: 2, manifest: 'sealed' } }),
+        attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'sealed' } }),
         head12: HEAD,
         acceptedHead12: HEAD,
       });
@@ -1392,14 +1544,22 @@ describe('merged before stopped (G3d)', () => {
   it('a landed merge ends merged under a graceful stop', () => {
     const rec = record({});
     const facts = baseFacts({
-      state: 'merging', stopMode: 'graceful', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: HEAD },
+      state: 'merging', stopMode: 'graceful', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('a merge at another head that contains the lane head ends merged under a stop (CT-2a)', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'merging', stopMode: 'graceful', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: 'ffffffffffff', containsLaneHead: true },
     });
     assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
   });
 
   it('a merge at another head parks ambiguous merge under a stop', () => {
     const facts = baseFacts({
-      state: 'merging', stopMode: 'graceful', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: 'ffffffffffff' },
+      state: 'merging', stopMode: 'graceful', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: 'ffffffffffff', containsLaneHead: false },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'ambiguous', qualifier: 'merge', parkedFrom: 'merging',
@@ -1413,7 +1573,7 @@ describe('merged before stopped (G3d)', () => {
       stopMode: 'graceful',
       head12: HEAD,
       acceptedHead12: HEAD,
-      pr: { state: 'merged', head12: HEAD },
+      pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
       pendingIntent: { key: `${RUN_ID}/r0/merge/0@${HEAD}`, step: 'merge', reconciliation: 'unread' },
     });
     expect(decide(rec, facts)).toEqual({ kind: 'reconcile', step: 'merge', key: `${RUN_ID}/r0/merge/0@${HEAD}` });
@@ -1440,7 +1600,7 @@ describe('KF-1: a lost dispatching conduct is repaired, never re-prepared', () =
   });
 
   it('a fixing run with a started round+1 attempt enters dispatching (not a second prepare)', () => {
-    const rec = record({ attemptIds: ['attempt-example-1', 'attempt-example-2'] });
+    const rec = record({ round: 1, attemptIds: ['attempt-example-1', 'attempt-example-2'] });
     const facts = baseFacts({
       state: 'fixing',
       attempt: attemptFact({ attemptId: 'attempt-example-2', round: 1, phase: 'dispatching', dispatchResult: 'started' }),
@@ -1494,7 +1654,7 @@ describe('KF-1: halt blocks the collect and gate reconcile (G3a under halt)', ()
     const facts = baseFacts({
       state: 'gating',
       halted: true,
-      attempt: attemptFact({ phase: 'collected', collection: { commits: 1, manifest: 'sealed' } }),
+      attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 1, manifest: 'sealed' } }),
       pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'unread' },
     });
     expect(decide(record({}), facts)).toEqual({ kind: 'park', reason: 'halted', qualifier: null, parkedFrom: 'gating' });

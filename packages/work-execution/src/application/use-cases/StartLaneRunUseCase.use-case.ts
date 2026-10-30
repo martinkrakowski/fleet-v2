@@ -36,7 +36,7 @@ import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.
 import type { AttemptStateValue } from '../../domain/value-objects/AttemptState.vo.js';
 import { SeatPlan } from '../../domain/value-objects/SeatPlan.vo.js';
 import { WorkOrderState } from '../../domain/value-objects/WorkOrderState.vo.js';
-import type { AttemptRecord, CapacityReservationRecord } from '../../domain/execution-records.js';
+import type { AttemptRecord, AttemptRunnerRecord, CapacityReservationRecord } from '../../domain/execution-records.js';
 import type {
   AbandonStartRequest,
   AbandonStartResult,
@@ -105,6 +105,29 @@ const WORKTREE_REFUSAL_REASONS: Record<string, StartLaneRunIncompleteReason> = {
   'git-refused': 'worktree-git-refused',
   'invalid-request': 'worktree-unknown',
 };
+
+/**
+ * The recorded host of one reservation (KF-8): the ssh alias decides the
+ * transport, so an ssh host records its alias on `host` and a local host
+ * records `null`; agy runs no port (D7).
+ */
+function recordedHostOf(reservation: {
+  readonly hostKind: 'opencode' | 'agy';
+  readonly hostName: string;
+  readonly transport: 'local' | 'ssh';
+  readonly sshAlias: string | null;
+  readonly port: number | null;
+}): AttemptRunnerRecord {
+  return {
+    kind: reservation.hostKind,
+    hostName: reservation.hostName,
+    host: reservation.transport === 'ssh' ? reservation.sshAlias : null,
+    remotePort: reservation.hostKind === 'agy' ? null : reservation.port,
+    agent: null,
+    model: null,
+    variant: null,
+  };
+}
 
 function incomplete(
   runId: string,
@@ -251,6 +274,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         model: request.brief.modelAssignment.model,
         tool: request.brief.modelAssignment.seatTool,
         variant: request.brief.modelAssignment.variant,
+        agent: request.brief.modelAssignment.agent,
       })
     ) {
       return { outcome: 'refused', reason: 'invalid-request' };
@@ -275,10 +299,20 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     let hostName: string;
     let hostKind: 'opencode' | 'agy';
     let worktreePath: string;
+    let transport: 'local' | 'ssh';
+    let sshAlias: string | null;
+    let port: number | null;
     if (held !== null && held.hostName != null && held.worktreePath != null && held.hostKind != null) {
       hostName = held.hostName;
       hostKind = held.hostKind;
       worktreePath = held.worktreePath;
+      // KF-8: the reservation record carries the host's transport, alias and
+      // port; a legacy record (fields absent) derives its transport from the
+      // alias it carries.
+      // A blank alias is no alias (the same trim the completeness check applies).
+      transport = held.transport ?? (held.sshAlias?.trim() ? 'ssh' : 'local');
+      sshAlias = held.sshAlias ?? null;
+      port = held.port ?? null;
     } else if (held !== null) {
       // A held but incomplete reservation is released, never re-reserved over.
       // Both release outcomes report `incomplete reserve`: a confirmed release
@@ -307,8 +341,26 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       hostName = reserved.hostName;
       hostKind = reserved.hostKind;
       worktreePath = reserved.worktreePath;
+      transport = reserved.transport;
+      sshAlias = reserved.sshAlias;
+      port = reserved.port;
+    }
+    // KF-8: a blank alias is no alias (matching `confirmRecordedHost`'s
+    // trim), and the incomplete check runs once after both branches: an ssh
+    // reservation without an alias, or an opencode host without a port, can
+    // never be confirmed against the installation (H9b2). Such a reservation
+    // is released like any other incomplete reservation, never a null-host
+    // record.
+    sshAlias = sshAlias?.trim() || null;
+    if (
+      (transport === 'ssh' && sshAlias === null) ||
+      (hostKind === 'opencode' && port === null)
+    ) {
+      await deps.executionJournal.releaseCapacityReservation(request.attemptId, request.nowIso);
+      return incomplete(request.runId, request.attemptId, 'reserve', 'reservation-incomplete');
     }
     const reservation = { hostName, hostKind, worktreePath };
+    const recordedHost = recordedHostOf({ hostKind, hostName, transport, sshAlias, port });
 
     // Step 2: worktree at the reserved path. Every non-success from here on
     // leaves the reservation held.
@@ -321,15 +373,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       worktreePath,
       branch: branchForRun(request.runId),
       baseCommit: workOrder.baseCommit,
-      recordedHost: {
-        kind: hostKind,
-        hostName,
-        remotePort: null,
-        host: null,
-        agent: null,
-        model: null,
-        variant: null,
-      },
+      recordedHost,
     });
     if (prepared === undefined) {
       return incomplete(request.runId, request.attemptId, 'worktree', 'worktree-unknown');
@@ -349,6 +393,9 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       ...request.brief,
       attemptId: request.attemptId,
       worktreePath,
+      // KF-8: the placement goes to the reservation's recorded host, so a
+      // worktree on an ssh host writes its brief on that host.
+      recordedHost,
     };
     const briefResult = await deps.prepareBrief.prepareBriefPackage(briefRequest);
     if (briefResult.outcome === 'rejected') {
@@ -366,6 +413,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       reservation,
       briefDigest,
       briefPackagePath,
+      recordedHost,
     );
     if (attemptSave !== null) {
       return attemptSave;
@@ -391,6 +439,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         lease: null,
         revision: 1,
         runPolicyRevision: request.runPolicyRevision,
+        branchName: branchForRun(request.runId),
       });
     } catch {
       created = { outcome: 'refused', reason: 'run-exists' };
@@ -509,7 +558,10 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
    * Save the first attempt: a fresh `intent-recorded` record, or an existing
    * `intent-recorded` record at the same path and work order whose digest
    * and brief path are overwritten when they differ; any other record is
-   * `attempt-differs`. Returns null on success.
+   * `attempt-differs`. The reservation's recorded host is stamped on the
+   * attempt as `runner` (KF-10) so the first dispatch reads the frozen
+   * manifest through that host before any runner is contacted. Returns null
+   * on success.
    */
   private async saveFirstAttempt(
     request: StartLaneRunRequest,
@@ -519,6 +571,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     reservation: { hostName: string; hostKind: 'opencode' | 'agy'; worktreePath: string },
     briefDigest: string,
     briefPackagePath: string,
+    recordedHost: AttemptRunnerRecord,
   ): Promise<StartLaneRunResult | null> {
     const deps = this.deps!;
     const selectedSeat = plan.getSeats('first-pass')[seatIndex];
@@ -535,6 +588,22 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-differs');
       }
       if (existing.briefDigest === briefDigest && existing.briefPackagePath === briefPackagePath) {
+        // Same digest and path: nothing to rewrite unless the record has no
+        // runner yet, in which case the recorded host is stamped (KF-10).
+        if (existing.runner != null) {
+          return null;
+        }
+        const stamped: AttemptRecord = {
+          ...existing,
+          revision: (existing.revision ?? 0) + 1,
+          runner: recordedHost,
+          updatedAtIso: request.nowIso,
+        };
+        try {
+          await deps.attemptRepo.saveAttempt(stamped);
+        } catch {
+          return incomplete(request.runId, request.attemptId, 'attempt', 'attempt-save-failed');
+        }
         return null;
       }
       const updated: AttemptRecord = {
@@ -542,6 +611,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         revision: (existing.revision ?? 0) + 1,
         briefDigest,
         briefPackagePath,
+        ...(existing.runner == null ? { runner: recordedHost } : {}),
         updatedAtIso: request.nowIso,
       };
       try {
@@ -570,6 +640,10 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       seatSelection: seatSelectionRecord('first-pass', seatIndex, selectedSeat),
       // `reviewerSeat: null`: dispatch binds its fallback reviewer (K4-5).
       reviewerSeat: null,
+      // The reservation's recorded host rides the first attempt as `runner`
+      // (KF-10): the frozen-manifest reads before the first dispatch resolve
+      // the reserved host instead of falling back to the local executor.
+      runner: recordedHost,
       createdAtIso: request.nowIso,
       updatedAtIso: request.nowIso,
     };

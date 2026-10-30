@@ -33,6 +33,7 @@ import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isFixedProtectedPath, pathUnderPrefix } from '../../domain/lane-diff-check.js';
 import { hasRecordedHostName } from './ConfirmRecordedHost.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
+import { resolvePhysicalPath } from './ResolvePhysicalPath.helper.js';
 import { isValidAgyModel } from './AgyRunnerAdapter.adapter.js';
 import type {
   CommitLaneOutputRequest,
@@ -666,12 +667,27 @@ export class WorkspaceAdapter implements WorkspacePort {
       .split('\n')
       .filter((line) => line.startsWith('worktree '))
       .map((line) => unquotePorcelainPath(line.slice('worktree '.length).trim()));
+    // A symlinked worktree (macOS `/var/folders/...` → `/private/var/...`) has
+    // `--show-toplevel` and `worktree list` print the physical path while the
+    // request holds the path as given; accept either form. Unresolvable falls
+    // back to the plain comparison.
+    const physicalWorktreePath = await resolvePhysicalPath(
+      executor,
+      worktreePath,
+      GIT_TIMEOUT_MS,
+    );
+    const toplevelMatches =
+      toplevel === worktreePath ||
+      (physicalWorktreePath !== null && toplevel === physicalWorktreePath);
+    const listedMatches =
+      listedWorktrees.includes(worktreePath) ||
+      (physicalWorktreePath !== null && listedWorktrees.includes(physicalWorktreePath));
     const exactlyPrepared =
-      toplevel === worktreePath &&
+      toplevelMatches &&
       checkedBranch === branch &&
       head === baseCommit &&
       statusRun.stdout.trim() === '' &&
-      listedWorktrees.includes(worktreePath);
+      listedMatches;
     return exactlyPrepared
       ? { outcome: 'already-prepared' }
       : { outcome: 'refused', reason: 'path-exists-other' };

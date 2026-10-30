@@ -81,6 +81,7 @@ function baseEntry(kind: LaneRunJournalEntryKind): LaneRunJournalEntryRecord {
     mintedId: null,
     outcome: null,
     reasonCode: null,
+    detail: null,
     grantId: null,
     state: null,
   };
@@ -247,6 +248,48 @@ describe('readLaneRunJournalEntry', () => {
       return;
     }
     expect(proxyRead.error).not.toContain('boom');
+  });
+});
+
+describe('detail (KF-14a)', () => {
+  it('round-trips a result entry carrying a pattern-matching detail', () => {
+    const entry = result(STEP_KEY, 'completed', { detail: 'route-no-auth-file' });
+    const read = readLaneRunJournalEntry(entry);
+    expect(read.ok).toBe(true);
+    if (!read.ok) {
+      return;
+    }
+    expect(read.entry).toEqual(entry);
+    expect(read.entry.detail).toBe('route-no-auth-file');
+  });
+
+  it('refuses a detail on an intent or conduct entry, like a reason code (KF-14a review)', () => {
+    const intentEntry = { ...result(STEP_KEY, 'completed', { detail: null }), kind: 'intent', outcome: null, reasonCode: null, detail: 'route-no-port' };
+    const read = readLaneRunJournalEntry(intentEntry);
+    expect(read.ok).toBe(false);
+    if (!read.ok) {
+      expect(read.error).toBe('LaneRunJournal detail must be null on an intent or conduct entry');
+    }
+  });
+
+  it('refuses a free-text detail like a bad reason code', () => {
+    const read = readLaneRunJournalEntry(result(STEP_KEY, 'completed', { detail: 'Host lane-host refuses' }));
+    expect(read.ok).toBe(false);
+    if (read.ok) {
+      return;
+    }
+    expect(read.error).toBe('LaneRunJournal detail must be null or a lowercase token');
+  });
+
+  it('reads an old stored entry without the detail field as detail null', () => {
+    const legacy = { ...result(STEP_KEY, 'completed') } as Record<string, unknown>;
+    delete legacy.detail;
+    const read = readLaneRunJournalEntry(legacy);
+    expect(read.ok).toBe(true);
+    if (!read.ok) {
+      return;
+    }
+    expect(read.entry.detail).toBeNull();
   });
 });
 

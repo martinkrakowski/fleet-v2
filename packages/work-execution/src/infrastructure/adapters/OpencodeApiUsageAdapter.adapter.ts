@@ -184,7 +184,10 @@ export class OpencodeApiUsageAdapter implements UsagePort {
       return this.unavailable('executor error', attempt);
     }
 
-    if (result.exitCode === 1) {
+    // ocm-run reserves exit 1 of --usage for an unknown session, but its shared
+    // preamble (the tunnel, the /api/info probe) exits 1 too, so the session's
+    // absence is read from ocm-run's own message, never from the code alone.
+    if (result.exitCode === 1 && /\bno session \S+ on the server\b/.test(result.stderr)) {
       return this.unavailable('no-session', attempt);
     }
     if (result.exitCode !== 0) {
@@ -212,7 +215,9 @@ export class OpencodeApiUsageAdapter implements UsagePort {
     const updated = numberOrNull(time.updated);
     let wallSeconds: number | null = null;
     if (created !== null && updated !== null) {
-      wallSeconds = Math.round(((updated - created) / 1000) * 10) / 10;
+      const seconds = Math.round(((updated - created) / 1000) * 10) / 10;
+      // Two finite instants can still subtract to an overflow (Luna pass).
+      wallSeconds = Number.isFinite(seconds) ? seconds : null;
     }
     const tokens = isPlainRecord(data.tokens) ? data.tokens : {};
     const cache = isPlainRecord(tokens.cache) ? tokens.cache : {};

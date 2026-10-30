@@ -236,6 +236,30 @@ describe('OpencodeApiUsageAdapter', () => {
     }
   });
 
+  it('an exit 1 without the no-session message is a plain exit reason (a dead tunnel or probe is not a missing session)', async () => {
+    const fake = fakeRun(() => ({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'ocm-run: could not open the tunnel to sol\n',
+    }));
+    const adapter = new OpencodeApiUsageAdapter({ routeForAttempt: () => route(), run: fake.run });
+    const result = await adapter.readUsage({ attempt: attempt() });
+    expect(result.outcome).toBe('unavailable');
+    expect(result.usage.reason).toBe('exit 1: ocm-run: could not open the tunnel to sol');
+  });
+
+  it('wall seconds that overflow from two finite instants are null (Luna pass)', async () => {
+    const fake = fakeRun(() => ({
+      exitCode: 0,
+      stdout: JSON.stringify({ data: { id: 'ses_test_123', time: { created: -1e308, updated: 1e308 } } }) + '\n',
+      stderr: '',
+    }));
+    const adapter = new OpencodeApiUsageAdapter({ routeForAttempt: () => route(), run: fake.run });
+    const result = await adapter.readUsage({ attempt: attempt() });
+    expect(result.outcome).toBe('read');
+    expect(result.usage.wallSeconds).toBeNull();
+  });
+
   it('reports unavailable with no-session when ocm-run exits 1', async () => {
     const fake = fakeRun(() => ({
       exitCode: 1,

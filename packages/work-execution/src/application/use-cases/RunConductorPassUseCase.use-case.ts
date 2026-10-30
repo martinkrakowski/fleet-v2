@@ -50,9 +50,22 @@ export interface RunConductorPassDependencies {
    * tests a fake. When absent the system clock supplies the time.
    */
   readonly now?: () => string;
+  /**
+   * The pass sleep, awaited between runs when one started a lane session;
+   * production passes real time, tests a fake. When absent a `setTimeout`
+   * promise supplies the wait.
+   */
+  readonly sleep?: (ms: number) => Promise<void>;
+  /** How long to stagger lane session starts between runs, in ms. */
+  readonly dispatchStaggerMs?: number;
 }
 
+const DEFAULT_DISPATCH_STAGGER_MS = 20_000;
+
 const ID_MAX_BYTES = 256;
+
+/** The production sleep: a `setTimeout` promise. Tests inject a fake instead. */
+const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /** A non-empty id of at most 256 bytes: the driver holder rule. */
 function isValidHolderId(value: string): boolean {
@@ -126,7 +139,7 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
 
     // Each run's steps depend on the previous result, and one driver acting on
     // one run at a time keeps the host budget; a for…of with await is intended.
-    for (const record of liveRuns) {
+    for (const [index, record] of liveRuns.entries()) {
       const renewRun = (renew: LeaseRenewRequest) =>
         this.deps.runRepo.renewLease(record.runId, renew).then((result) =>
           result.outcome === 'saved' ? result.record.lease : null,
@@ -227,6 +240,20 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
         reports.push({ runId: record.runId, outcome: 'skipped', reason: lost });
       } else {
         reports.push({ runId: record.runId, outcome: 'advanced', steps });
+      }
+
+      // A run whose dispatch step started a lane session (`dispatch-started`)
+      // pauses the pass before the next live run, so concurrent session starts
+      // are staggered. No lease change is needed here: leases are already
+      // renewed with fresh time before each step, and the next run's lease is
+      // taken or renewed when its turn comes. Never pause after the last run
+      // and never for steps other than a started dispatch.
+      const startedSession = steps.some(
+        (step) => step.outcome === 'acted' && step.step === 'dispatch' && step.reasonCode === 'dispatch-started',
+      );
+      if (startedSession && index < liveRuns.length - 1) {
+        const sleep = this.deps.sleep ?? defaultSleep;
+        await sleep(this.deps.dispatchStaggerMs ?? DEFAULT_DISPATCH_STAGGER_MS);
       }
     }
 

@@ -67,6 +67,66 @@ describe('writeInstallationV2', () => {
     });
   });
 
+  it('round-trips a runner gateSlot block (KF-30b)', () => {
+    const installation = parseV2Fixture({
+      ...validV2,
+      hosts: {
+        ...validV2.hosts,
+        'lane-host': {
+          ...validV2.hosts['lane-host'],
+          runner: {
+            ...validV2.hosts['lane-host'].runner,
+            gateSlot: { path: '/usr/local/bin/gate-slot', slots: 8 },
+          },
+        },
+      },
+    });
+    expect(installation.hosts['lane-host']?.runner?.gateSlot).toEqual({
+      path: '/usr/local/bin/gate-slot',
+      slots: 8,
+    });
+    const written = writeInstallationV2(installation);
+    expect(parseInstallation(JSON.parse(written))).toEqual({
+      ok: true,
+      installation,
+    });
+  });
+
+  it('refuses a gateSlot with a relative path, a zero slot count or an unknown key', () => {
+    const runner = (gateSlot: unknown) => ({
+      ...validV2,
+      hosts: {
+        ...validV2.hosts,
+        'lane-host': {
+          ...validV2.hosts['lane-host'],
+          runner: { ...validV2.hosts['lane-host'].runner, gateSlot },
+        },
+      },
+    });
+    const relative = parseInstallation(runner({ path: 'bin/gate-slot', slots: 8 }));
+    const zeroSlots = parseInstallation(runner({ path: '/usr/local/bin/gate-slot', slots: 0 }));
+    const unknownKey = parseInstallation(
+      runner({ path: '/usr/local/bin/gate-slot', slots: 8, extra: true }),
+    );
+    const missingSlots = parseInstallation(runner({ path: '/usr/local/bin/gate-slot' }));
+    expect(relative.ok).toBe(false);
+    if (!relative.ok) {
+      expect(relative.errors).toContain('hosts.lane-host.runner.gateSlot.path: must be an absolute path');
+    }
+    expect(zeroSlots.ok).toBe(false);
+    if (!zeroSlots.ok) {
+      expect(zeroSlots.errors).toContain('hosts.lane-host.runner.gateSlot.slots: must be an integer 1 or greater');
+    }
+    expect(unknownKey.ok).toBe(false);
+    if (!unknownKey.ok) {
+      expect(unknownKey.errors).toContain('hosts.lane-host.runner.gateSlot: unknown key');
+    }
+    expect(missingSlots.ok).toBe(false);
+    if (!missingSlots.ok) {
+      expect(missingSlots.errors).toContain('hosts.lane-host.runner.gateSlot.slots: required');
+    }
+  });
+
   it('round-trips a jev decisions block', () => {
     const installation = parseV2Fixture({
       ...validV2,

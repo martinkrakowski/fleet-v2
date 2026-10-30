@@ -23,6 +23,7 @@ import type {
   LaneDiffCheckResult,
   LaneDiffFinding,
 } from '../../../application/ports/out/LaneDiffCheckPort.out-port.js';
+import type { RunnerForAttemptHostSpec } from '../ConfirmRecordedHost.js';
 import { GATE_COVERAGE_READER_UNIT_KINDS } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 import { COVERAGE_READER_UNIT_KINDS } from '@fleet/evidence-and-acceptance';
 
@@ -107,12 +108,16 @@ function makeAdapter(
   script: (argv: readonly string[]) => Partial<CommandRunResult>,
   options: Partial<GatePredicateAdapterOptions> = {},
   diff: LaneDiffCheckResult = { outcome: 'clean' },
+  hostSpec?: RunnerForAttemptHostSpec,
 ): { adapter: GatePredicateAdapter; executor: ScriptedExecutor; fakeDiff: FakeLaneDiffCheck } {
   const executor = new ScriptedExecutor(script);
   const fakeDiff = new FakeLaneDiffCheck(diff);
   let now = 0;
   const adapter = new GatePredicateAdapter({
-    executorForRecordedHost: () => ({ ok: true, executor }),
+    executorForRecordedHost: () =>
+      hostSpec === undefined
+        ? { ok: true, executor }
+        : { ok: true, executor, hostSpec },
     laneDiffCheckFor: () => fakeDiff,
     nowMs: () => {
       now += 1;
@@ -561,5 +566,132 @@ describe('GatePredicateAdapter', () => {
 
   it('keeps the gate coverage readers in parity with evidence-and-acceptance', () => {
     expect(GATE_COVERAGE_READER_UNIT_KINDS).toEqual(COVERAGE_READER_UNIT_KINDS);
+  });
+});
+
+// KF-30b: when the recorded host declares `runner.gateSlot`, every acceptance
+// command is prefixed so it takes one of the host-wide flock slots through the
+// trusted, host-installed wrapper — never the worktree's own `bin/gate-slot`.
+describe('GatePredicateAdapter gate slot (KF-30b)', () => {
+  const GATE_SLOT_PATH = '/usr/local/bin/gate-slot';
+  const HOST_SPEC: RunnerForAttemptHostSpec = {
+    transport: 'local',
+    roles: ['lane-runner'],
+    runner: { kind: 'opencode', port: 4096, gateSlot: { path: GATE_SLOT_PATH, slots: 8 } },
+  };
+
+  it('prefixes the command exactly when the host declares gateSlot', async () => {
+    const { adapter, executor } = makeAdapter(
+      (argv) => (argv[0] === 'sh' ? { exitCode: 0 } : happyGit(argv)),
+      {},
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({ verdict: 'pass', exitCode: 0 });
+    expect(executor.argvRecords.filter((argv) => argv[0] === 'sh')).toEqual([
+      [
+        'sh',
+        '-c',
+        'cd -- "$1" && shift && exec "$@"',
+        'fleet-gate',
+        WORKTREE,
+        'env',
+        'FLEET_V2_GATE_SLOTS=8',
+        // 30 min default budget / 3000 = 600, capped at 600.
+        'FLEET_V2_GATE_WAIT_MAX_SECONDS=600',
+        GATE_SLOT_PATH,
+        'corepack',
+        'yarn',
+        'build',
+      ],
+    ]);
+  });
+
+  it('leaves the command unchanged when the host declares no gateSlot', async () => {
+    const { adapter, executor } = makeAdapter(
+      (argv) => (argv[0] === 'sh' ? { exitCode: 0 } : happyGit(argv)),
+      {},
+      { outcome: 'clean' },
+      { transport: 'local', roles: ['lane-runner'], runner: { kind: 'opencode', port: 4096 } },
+    );
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({ verdict: 'pass', exitCode: 0 });
+    expect(executor.argvRecords.filter((argv) => argv[0] === 'sh')).toEqual([
+      ['sh', '-c', 'cd -- "$1" && shift && exec "$@"', 'fleet-gate', WORKTREE, 'corepack', 'yarn', 'build'],
+    ]);
+  });
+
+  it('uses the declared host path, never the worktree own bin/gate-slot', async () => {
+    const { adapter, executor } = makeAdapter(
+      (argv) => (argv[0] === 'sh' ? { exitCode: 0 } : happyGit(argv)),
+      {},
+      { outcome: 'clean' },
+      { ...HOST_SPEC, runner: { kind: 'opencode', port: 4096, gateSlot: { path: GATE_SLOT_PATH, slots: 8 } } },
+    );
+    await adapter.evaluateGatePredicates(REQUEST);
+    for (const argv of executor.argvRecords) {
+      expect(argv).not.toContain(WORKTREE + '/bin/gate-slot');
+      expect(argv).not.toContain('bin/gate-slot');
+    }
+    const prefixed = executor.argvRecords.find((argv) => argv.includes(GATE_SLOT_PATH));
+    expect(prefixed).toBeDefined();
+  });
+
+  it('caps the slot wait at a third of the command budget', async () => {
+    const { adapter, executor } = makeAdapter(
+      (argv) => (argv[0] === 'sh' ? { exitCode: 0 } : happyGit(argv)),
+      { commandTimeoutMs: 90_000 },
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    await adapter.evaluateGatePredicates(REQUEST);
+    const prefixed = executor.argvRecords.find((argv) => argv.includes(GATE_SLOT_PATH));
+    expect(prefixed).toBeDefined();
+    expect(prefixed).toContain('FLEET_V2_GATE_WAIT_MAX_SECONDS=30');
+  });
+
+  it('maps exit 75 with the fixed stderr line to unknown, detail gate slot wait limit reached', async () => {
+    const { adapter } = makeAdapter(
+      (argv) =>
+        argv[0] === 'sh'
+          ? {
+              exitCode: 75,
+              stderr: 'gate-slot: no slot within the wait limit\n',
+            }
+          : happyGit(argv),
+      {},
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({
+      kind: 'command',
+      verdict: 'unknown',
+      exitCode: 75,
+      detail: 'gate slot wait limit reached',
+    });
+  });
+
+  it('keeps a bare exit 75 as the command own fail', async () => {
+    const { adapter } = makeAdapter(
+      (argv) => (argv[0] === 'sh' ? { exitCode: 75, stderr: 'my tool: fatal' } : happyGit(argv)),
+      {},
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({ verdict: 'fail', exitCode: 75 });
+  });
+
+  it('keeps exit 75 with another stderr line as the command own fail even with a slot declared', async () => {
+    const { adapter } = makeAdapter(
+      (argv) => (argv[0] === 'sh' ? { exitCode: 75, stderr: '' } : happyGit(argv)),
+      {},
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({ verdict: 'fail', exitCode: 75 });
   });
 });

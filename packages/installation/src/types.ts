@@ -150,12 +150,25 @@ export interface AgyAcknowledgement {
   readonly acceptedAt: string;
 }
 
+/**
+ * The host-wide gate-slot throttle for conducted acceptance commands (KF-30b).
+ * `path` is the absolute path of the trusted, host-installed `gate-slot`
+ * wrapper the conducted gate prefixes every acceptance command with. `slots`
+ * must equal the host-wide budget the hand-run gate uses; the code does not
+ * enforce the equality, the operator declares it.
+ */
+export interface GateSlotSection {
+  readonly path: string;
+  readonly slots: number;
+}
+
 /** The fields a host runner carries regardless of its kind. */
 interface HostRunnerCommon {
   readonly port: number;
   readonly authFile?: string;
   readonly capabilities?: RunnerCapabilityDeclaration;
   readonly maxLanes?: number;
+  readonly gateSlot?: GateSlotSection;
 }
 
 /** The `runner` block of a v2 host (D7): the kind selects the extra fields. */
@@ -509,6 +522,7 @@ export interface OpencodeHostRunnerModel {
   readonly authFile?: string;
   readonly capabilities: DerivedRunnerCapabilities;
   readonly maxLanes?: number;
+  readonly gateSlot?: GateSlotSection;
 }
 
 /** An agy runner of the model; the mode decides the agy argv (D7). */
@@ -518,6 +532,7 @@ export interface AgyHostRunnerModel {
   readonly authFile?: string;
   readonly capabilities: DerivedRunnerCapabilities;
   readonly maxLanes?: number;
+  readonly gateSlot?: GateSlotSection;
   readonly agyMode: 'edit-only' | 'full';
   readonly agyAcknowledgement?: AgyAcknowledgement;
 }

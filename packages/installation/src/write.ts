@@ -113,6 +113,12 @@ function serializeHost(host: HostSection): Record<string, unknown> {
     if (host.runner.maxLanes !== undefined) {
       runner.maxLanes = host.runner.maxLanes;
     }
+    if (host.runner.gateSlot !== undefined) {
+      runner.gateSlot = {
+        path: host.runner.gateSlot.path,
+        slots: host.runner.gateSlot.slots,
+      };
+    }
     if (host.runner.kind === 'agy') {
       runner.agyMode = host.runner.agyMode;
       if (host.runner.agyAcknowledgement !== undefined) {

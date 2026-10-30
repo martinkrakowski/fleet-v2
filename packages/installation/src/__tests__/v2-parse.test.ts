@@ -1115,4 +1115,47 @@ describe('parseInstallation v2', () => {
     });
     expect(badWaves).toEqual({ ok: false, errors: ['waves.baseUrl: must be an https URL'] });
   });
+
+  // KF-30b: the runner's host-wide gate-slot throttle.
+  const withGateSlot = (gateSlot: unknown) => ({
+    ...validV2,
+    hosts: {
+      ...validV2.hosts,
+      'lane-host': {
+        ...validV2.hosts['lane-host'],
+        runner: { ...validV2.hosts['lane-host'].runner, gateSlot },
+      },
+    },
+  });
+
+  it('parses a runner gateSlot block and carries it into the model', () => {
+    const result = parseInstallation(withGateSlot({ path: '/usr/local/bin/gate-slot', slots: 8 }));
+    expect(result).toEqual({
+      ok: true,
+      installation: withGateSlot({ path: '/usr/local/bin/gate-slot', slots: 8 }),
+    });
+  });
+
+  it('refuses a gateSlot with a relative path, a zero slot count, a missing slot count or an unknown key', () => {
+    expect(parseInstallation(withGateSlot({ path: 'bin/gate-slot', slots: 8 }))).toEqual({
+      ok: false,
+      errors: ['hosts.lane-host.runner.gateSlot.path: must be an absolute path'],
+    });
+    expect(parseInstallation(withGateSlot({ path: '/usr/local/bin/gate-slot', slots: 0 }))).toEqual({
+      ok: false,
+      errors: ['hosts.lane-host.runner.gateSlot.slots: must be an integer 1 or greater'],
+    });
+    expect(parseInstallation(withGateSlot({ path: '/usr/local/bin/gate-slot' }))).toEqual({
+      ok: false,
+      errors: ['hosts.lane-host.runner.gateSlot.slots: required'],
+    });
+    expect(
+      parseInstallation(
+        withGateSlot({ path: '/usr/local/bin/gate-slot', slots: 8, extra: true }),
+      ),
+    ).toEqual({
+      ok: false,
+      errors: ['hosts.lane-host.runner.gateSlot: unknown key'],
+    });
+  });
 });

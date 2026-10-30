@@ -343,6 +343,12 @@ export async function performDispatch(ctx: AdvanceStepContext,
   // sets one) never dispatches: it refuses and parks with a fixed detail,
   // never a guessed or inherited seat field.
   const fixSeat = fixSeatForDispatch(latest, manifest);
+  if (fixSeat.kind !== 'refused' && inputsReadable && request.startGate !== undefined) {
+    // The wait sits before the one-way intent, so a crash during the wait spends no key.
+    if (!request.startGate.tryStart(request.runId, request.nowIso).ok) {
+      return { outcome: 'waiting', reason: 'session-stagger' };
+    }
+  }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, latest.id);
   if (intentRefusal !== null) {
     return { outcome: 'refused', reason: intentRefusal };

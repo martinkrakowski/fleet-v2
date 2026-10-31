@@ -105,17 +105,38 @@ function gateRunPrefix(attemptId: string, candidateHeadSha: string, gateRun: num
 }
 
 /**
- * Validate a request `gateRun`: absent is run 0; a present value must be an
- * integer 1–9. Any other value is out of range and returns `null`.
+ * Validate a request `gateRun`: absent means 'the highest stored run at the
+ * head' (`'latest'`); a present value must be an integer 1–9. Any other value
+ * is out of range and returns `null`. Explicit run 0 is out of range: the
+ * initial run is only ever selected by omission.
  */
-function normalizeGateRun(value: number | undefined): number | null {
+function normalizeGateRun(value: number | undefined): number | 'latest' | null {
   if (value === undefined) {
-    return 0;
+    return 'latest';
   }
   if (Number.isInteger(value) && value >= 1 && value <= GATE_RUN_MAX) {
     return value;
   }
   return null;
+}
+
+/**
+ * The highest STORED gate run 0..9 at one head: the first run (scanning from
+ * GATE_RUN_MAX down) whose journal has any stored outcome. When no run is
+ * stored, run 0 executes as today.
+ */
+function highestStoredGateRun(
+  entries: readonly ActionJournalEntryRecord[],
+  attemptId: string,
+  candidateHeadSha: string,
+  expected: readonly ExpectedGatePredicate[],
+): number {
+  for (let run = GATE_RUN_MAX; run >= 0; run -= 1) {
+    if (readStoredGateOutcome(entries, attemptId, candidateHeadSha, expected, run).kind !== 'none') {
+      return run;
+    }
+  }
+  return 0;
 }
 
 /** The gate's typed outcome, shared by acceptance and the standalone gate port. */
@@ -252,8 +273,11 @@ export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): Gat
 
 /**
  * Pure projection of the stored gate predicate results for one attempt head:
- * entries whose id starts with `${attemptId}:accept:${headSha}:`, parsed,
- * with verdict `fail` or `unknown` only, in the id's numeric `n` order.
+ * the highest STORED run's entries (`${attemptId}:accept:${headSha}:` for run
+ * 0, `.../g${n}:` for run n), parsed, with verdict `fail` or `unknown` only,
+ * in the id's numeric `n` order. A later retry run's non-passing predicates
+ * replace an earlier run's (KF-30c2) — a fix handover names the real failing
+ * predicate, never a congestion an earlier retry already recovered from.
  * `detail` and `durationMs` are dropped.
  */
 export function nonPassingGatePredicatesOf(
@@ -261,37 +285,44 @@ export function nonPassingGatePredicatesOf(
   attemptId: string,
   headSha: string,
 ): Array<{ name: string; kind: GatePredicateKind; verdict: 'fail' | 'unknown'; exitCode: number | null }> {
-  const prefix = `${attemptId}:accept:${headSha}:`;
-  const collected: Array<{
-    readonly order: number;
-    readonly value: { name: string; kind: GatePredicateKind; verdict: 'fail' | 'unknown'; exitCode: number | null };
-  }> = [];
-  for (const entry of entries) {
-    // The id prefix alone is not trusted: the row must be this attempt's own
-    // acceptance entry.
-    if (!entry.id.startsWith(prefix) || entry.action !== 'accept' || entry.attemptId !== attemptId) {
-      continue;
+  for (let run = GATE_RUN_MAX; run >= 0; run -= 1) {
+    const prefix = gateRunPrefix(attemptId, headSha, run);
+    const collected: Array<{
+      readonly order: number;
+      readonly value: { name: string; kind: GatePredicateKind; verdict: 'fail' | 'unknown'; exitCode: number | null };
+    }> = [];
+    let stored = false;
+    for (const entry of entries) {
+      // The id prefix alone is not trusted: the row must be this attempt's own
+      // acceptance entry.
+      if (!entry.id.startsWith(prefix) || entry.action !== 'accept' || entry.attemptId !== attemptId) {
+        continue;
+      }
+      const indexText = entry.id.slice(prefix.length);
+      if (!/^\d+$/.test(indexText)) {
+        continue;
+      }
+      stored = true;
+      const parsed = parseStoredPredicateResult(entry);
+      if (parsed === null || (parsed.verdict !== 'fail' && parsed.verdict !== 'unknown')) {
+        continue;
+      }
+      collected.push({
+        order: Number.parseInt(indexText, 10),
+        value: {
+          name: parsed.name,
+          kind: parsed.kind,
+          verdict: parsed.verdict,
+          exitCode: parsed.exitCode,
+        },
+      });
     }
-    const indexText = entry.id.slice(prefix.length);
-    if (!/^\d+$/.test(indexText)) {
-      continue;
+    if (stored) {
+      collected.sort((a, b) => a.order - b.order);
+      return collected.map((item) => item.value);
     }
-    const parsed = parseStoredPredicateResult(entry);
-    if (parsed === null || (parsed.verdict !== 'fail' && parsed.verdict !== 'unknown')) {
-      continue;
-    }
-    collected.push({
-      order: Number.parseInt(indexText, 10),
-      value: {
-        name: parsed.name,
-        kind: parsed.kind,
-        verdict: parsed.verdict,
-        exitCode: parsed.exitCode,
-      },
-    });
   }
-  collected.sort((a, b) => a.order - b.order);
-  return collected.map((item) => item.value);
+  return [];
 }
 
 type StoredGateOutcome =
@@ -603,7 +634,7 @@ export class RequestAttemptAcceptanceUseCase
     }
 
     if (deps.gatePredicates !== undefined) {
-      const gate = await this.runGate(deps, deps.gatePredicates, attempt, request.candidateHeadSha);
+      const gate = await this.runGate(deps, deps.gatePredicates, attempt, request.candidateHeadSha, 'latest');
       if (gate.verdict !== 'passed') {
         return { outcome: 'rejected', reason: gate.reason };
       }
@@ -654,7 +685,10 @@ export class RequestAttemptAcceptanceUseCase
   /**
    * EvaluateAttemptGatePort: the frozen gate alone, with a typed verdict and
    * no reviewer, work order, assessment or free-seat check. The gate still
-   * runs once per head; a second call reads the stored outcome.
+   * runs once per head; a second call reads the stored outcome. With no
+   * `gateRun`, the highest stored run 0..9 at the head decides — so an
+   * auto-merge read after a congested run 0 sees the retry's outcome, never
+   * run 0's congestion (KF-30c2).
    */
   async evaluateAttemptGate(request: EvaluateAttemptGateRequest): Promise<EvaluateAttemptGateResult> {
     const deps = this.deps;
@@ -710,13 +744,17 @@ export class RequestAttemptAcceptanceUseCase
    * under its own prefix (`gateRun` 0 is the original prefix; run `n >= 1`
    * adds `/g${n}`) so a congested run never seals the head against a later
    * run, and a later call for the same run reads the stored outcome.
+   * `requestedRun` 'latest' resolves the highest STORED gate run 0..9 at the
+   * head and returns that run's stored outcome; when no run is stored, run 0
+   * executes as today. An explicit run n ≥ 1 is refused (`unknown`, nothing
+   * run) unless run n-1 is stored and congested (KF-30c2).
    */
   private async runGate(
     deps: RequestAttemptAcceptanceDependencies,
     gatePort: GatePredicatePort,
     attempt: AttemptRecord,
     candidateHeadSha: string,
-    gateRun = 0,
+    requestedRun: number | 'latest',
   ): Promise<GateVerdict> {
     const id = attempt.id;
     if (deps.journal === undefined) {
@@ -788,10 +826,42 @@ export class RequestAttemptAcceptanceUseCase
         : [];
 
     const expected = expectedGatePredicates(spec);
+
+    // The effective run is resolved before anything is run (KF-30c2): the
+    // omitted run reads the highest stored run; an explicit run n >= 1 needs a
+    // stored congested run n-1 and is refused without running anything else.
+    const resolutionEntries = await journal.listJournalEntriesForAttempt(id);
+    let effectiveRun: number;
+    if (requestedRun === 'latest') {
+      effectiveRun = highestStoredGateRun(resolutionEntries, id, candidateHeadSha, expected);
+    } else {
+      if (requestedRun >= 1) {
+        const priorRun = readStoredGateOutcome(
+          resolutionEntries,
+          id,
+          candidateHeadSha,
+          expected,
+          requestedRun - 1,
+        );
+        const priorCongested =
+          priorRun.kind === 'completed' &&
+          priorRun.verdict.verdict === 'unknown' &&
+          priorRun.verdict.congested === true;
+        if (!priorCongested) {
+          return gateUnknown(
+            'Unknown: gate run ' + String(requestedRun) +
+              ' requires a stored congested gate run ' + String(requestedRun - 1) +
+              ' for head ' + candidateHeadSha,
+          );
+        }
+      }
+      effectiveRun = requestedRun;
+    }
+
     const gateKey =
-      gateRun === 0
+      effectiveRun === 0
         ? `${id}:${candidateHeadSha}`
-        : `${id}:${candidateHeadSha}/g${gateRun}`;
+        : `${id}:${candidateHeadSha}/g${effectiveRun}`;
     let journalInFlight = inFlightGateRuns.get(journal);
     if (journalInFlight === undefined) {
       journalInFlight = new Map<string, Promise<void>>();
@@ -804,7 +874,7 @@ export class RequestAttemptAcceptanceUseCase
     }
 
     const priorEntries = await journal.listJournalEntriesForAttempt(id);
-    const storedBefore = readStoredGateOutcome(priorEntries, id, candidateHeadSha, expected, gateRun);
+    const storedBefore = readStoredGateOutcome(priorEntries, id, candidateHeadSha, expected, effectiveRun);
     if (storedBefore.kind === 'completed') {
       return storedBefore.verdict;
     }
@@ -824,7 +894,7 @@ export class RequestAttemptAcceptanceUseCase
     try {
       try {
         await journal.appendJournalEntry({
-          id: gateRunPrefix(id, candidateHeadSha, gateRun) + '0',
+          id: gateRunPrefix(id, candidateHeadSha, effectiveRun) + '0',
           attemptId: id,
           workOrderId: attempt.workOrderId,
           action: 'accept',
@@ -847,7 +917,7 @@ export class RequestAttemptAcceptanceUseCase
           id,
           candidateHeadSha,
           expected,
-          gateRun,
+          effectiveRun,
         );
       }
 
@@ -860,7 +930,7 @@ export class RequestAttemptAcceptanceUseCase
           id,
           candidateHeadSha,
           expected,
-          gateRun,
+          effectiveRun,
         );
       }
 
@@ -876,7 +946,7 @@ export class RequestAttemptAcceptanceUseCase
       if (gateResult.outcome === 'unavailable') {
         try {
           await journal.appendJournalEntry({
-            id: gateRunPrefix(id, candidateHeadSha, gateRun) + '1',
+            id: gateRunPrefix(id, candidateHeadSha, effectiveRun) + '1',
             attemptId: id,
             workOrderId: attempt.workOrderId,
             action: 'accept',
@@ -895,7 +965,7 @@ export class RequestAttemptAcceptanceUseCase
             id,
             candidateHeadSha,
             expected,
-            gateRun,
+            effectiveRun,
           );
         }
         return gateUnknown('Unknown: gate predicates unavailable: ' + gateResult.reason);
@@ -905,7 +975,7 @@ export class RequestAttemptAcceptanceUseCase
       if (!resultsMatchExpectedPredicates(results, expected)) {
         try {
           await journal.appendJournalEntry({
-            id: gateRunPrefix(id, candidateHeadSha, gateRun) + '1',
+            id: gateRunPrefix(id, candidateHeadSha, effectiveRun) + '1',
             attemptId: id,
             workOrderId: attempt.workOrderId,
             action: 'accept',
@@ -924,14 +994,14 @@ export class RequestAttemptAcceptanceUseCase
             id,
             candidateHeadSha,
             expected,
-            gateRun,
+            effectiveRun,
           );
         }
         return gateUnknown(GATE_RESULTS_MISMATCH_REASON);
       }
 
       const entries = results.map((result, offset) =>
-        this.gateJournalEntry(deps, attempt, id, candidateHeadSha, offset + 1, result, gateRun),
+        this.gateJournalEntry(deps, attempt, id, candidateHeadSha, offset + 1, result, effectiveRun),
       );
       try {
         await entries.reduce(
@@ -947,7 +1017,7 @@ export class RequestAttemptAcceptanceUseCase
           id,
           candidateHeadSha,
           expected,
-          gateRun,
+          effectiveRun,
         );
       }
 

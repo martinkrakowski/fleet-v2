@@ -180,6 +180,23 @@ export function laneRunTimedOut(entries: readonly LaneRunJournalEntryRecord[], r
   return false;
 }
 
+/** The gate intent at head12 with the highest retry (no retry = run 0), or null. */
+function highestRetryGateIntent(
+  entries: readonly LaneRunJournalEntryRecord[], runId: string, head12: string,
+): { readonly key: string; readonly retry: number } | null {
+  let latest: { readonly key: string; readonly retry: number } | null = null;
+  for (const { entry, parsed } of stepIntentsOf(entries, runId)) {
+    if (parsed.step !== 'gate' || parsed.head12 !== head12 || entry.key === null) {
+      continue;
+    }
+    const retry = parsed.retry ?? 0;
+    if (latest === null || retry > latest.retry) {
+      latest = { key: entry.key, retry };
+    }
+  }
+  return latest;
+}
+
 /**
  * Gate at head12: the gate intent with the HIGHEST retry (no retry = run 0)
  * decides — its final 'gate-passed' → passed, 'gate-failed' → failed,
@@ -193,16 +210,7 @@ export function laneRunGateFact(
   if (head12 === null) {
     return 'none';
   }
-  let decided: { readonly key: string; readonly retry: number } | null = null;
-  for (const { entry, parsed } of stepIntentsOf(entries, runId)) {
-    if (parsed.step !== 'gate' || parsed.head12 !== head12 || entry.key === null) {
-      continue;
-    }
-    const retry = parsed.retry ?? 0;
-    if (decided === null || retry > decided.retry) {
-      decided = { key: entry.key, retry };
-    }
-  }
+  const decided = highestRetryGateIntent(entries, runId, head12);
   if (decided === null) {
     return 'none';
   }
@@ -234,16 +242,7 @@ export function laneRunGateCongestion(
   if (head12 === null) {
     return null;
   }
-  let latest: { readonly key: string; readonly retry: number } | null = null;
-  for (const { entry, parsed } of stepIntentsOf(entries, runId)) {
-    if (parsed.step !== 'gate' || parsed.head12 !== head12 || entry.key === null) {
-      continue;
-    }
-    const retry = parsed.retry ?? 0;
-    if (latest === null || retry > latest.retry) {
-      latest = { key: entry.key, retry };
-    }
-  }
+  const latest = highestRetryGateIntent(entries, runId, head12);
   if (latest === null) {
     return null;
   }

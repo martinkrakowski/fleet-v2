@@ -791,6 +791,40 @@ describe('gating state', () => {
       kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
     });
   });
+
+  it('T6d: the congestion backoff boundary is exact: +59_999 ms waits, +60_000 ms acts', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'congested',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateCongestion: { retry: 0, atIso: NOW },
+    });
+    const waiting = new Date(Date.parse(NOW) + 59_999).toISOString();
+    expect(decide(record({}), facts, waiting)).toEqual({ kind: 'wait', reason: 'gate-congested' });
+    const acting = new Date(Date.parse(NOW) + GATE_CONGESTION_BACKOFF_MS).toISOString();
+    expect(decide(record({}), facts, acting)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
+  it('T6e: malformed congestion facts wait facts-inconsistent instead of acting', () => {
+    const malformed: Array<{ retry: number; atIso: string }> = [
+      { retry: 0, atIso: 'not-a-timestamp' },
+      { retry: -1, atIso: NOW },
+      { retry: 1.5, atIso: NOW },
+    ];
+    for (const gateCongestion of malformed) {
+      const facts = baseFacts({
+        state: 'gating',
+        gate: 'congested',
+        head12: HEAD,
+        attempt: attemptFact(),
+        gateCongestion,
+      });
+      expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+    }
+  });
 });
 
 describe('review rules per kind', () => {

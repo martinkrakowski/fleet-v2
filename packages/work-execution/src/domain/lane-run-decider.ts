@@ -505,7 +505,15 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       // `ambiguous` at the gate, exactly as an unknown gate parks today.
       if (facts.gate === 'congested') {
         const congestion = facts.gateCongestion;
-        if (congestion === null) {
+        // Malformed congestion facts fail closed to the inconsistent-facts
+        // wait: an unparseable time or a retry that is not a non-negative
+        // safe integer can neither bound the backoff nor the retries.
+        if (
+          congestion === null ||
+          Number.isNaN(Date.parse(congestion.atIso)) ||
+          !Number.isSafeInteger(congestion.retry) ||
+          congestion.retry < 0
+        ) {
           return WAIT_FACTS_INCONSISTENT;
         }
         if (now < Date.parse(congestion.atIso) + GATE_CONGESTION_BACKOFF_MS) {

@@ -109,6 +109,42 @@ export type PrepareLaneWorktreeResult =
   /** The executor did not answer (timeout, transport): the worktree may or may not exist. */
   | { readonly outcome: 'unknown' };
 
+/**
+ * EX-2a (D17): the request to remove one finished lane run's worktree. The
+ * branch is the record of the run and is never touched; only the worktree
+ * directory goes.
+ */
+export interface RemoveLaneWorktreeRequest {
+  /** The project profile's clone the worktree belongs to (absolute, normalised). */
+  readonly clonePath: string;
+  /** The worktree root the worktree path must sit under (absolute, normalised). */
+  readonly worktreeRoot: string;
+  /** The worktree to remove (absolute, normalised, under `worktreeRoot`). */
+  readonly worktreePath: string;
+  /** The lane-run branch the worktree must be checked out on. */
+  readonly branch: string;
+  /** The attempt's recorded runner block: the removal runs on that host's executor. */
+  readonly recordedHost: AttemptRunnerRecord;
+}
+
+export type RemoveLaneWorktreeResult =
+  /** Removed; `branchTip` is the listed HEAD sha the removal answered. The branch is kept. */
+  | { readonly outcome: 'removed'; readonly branchTip: string }
+  /** The path is gone: nothing to remove. */
+  | { readonly outcome: 'already-removed' }
+  | {
+      readonly outcome: 'refused';
+      readonly reason:
+        | 'invalid-request'
+        | 'not-a-worktree'
+        | 'branch-mismatch'
+        | 'locked'
+        | 'dirty'
+        | 'git-refused';
+    }
+  /** The executor did not answer (timeout, transport): the worktree may or may not be removed. */
+  | { readonly outcome: 'unknown' };
+
 export interface WorkspacePort {
   /** Inspect the worktree as a typed record; part of readiness, once per prepared environment. */
   inspectWorktree(request: WorktreeInspectionRequest): Promise<WorktreeInspection>;
@@ -134,6 +170,21 @@ export interface WorkspacePort {
    * so a retried start is safe.
    */
   prepareLaneWorktree?(request: PrepareLaneWorktreeRequest): Promise<PrepareLaneWorktreeResult>;
+
+  /**
+   * EX-2a (D17): remove one finished lane run's clean worktree, keeping its
+   * branch. The Rules: never `--force`, never delete or touch a branch,
+   * never `prune`, never `worktree move` — the only write is `git worktree
+   * remove <path>` with no flags. Every command runs through the recorded
+   * host's executor: when the recorded host is not named, or no host
+   * executor is configured, nothing runs. A path git does not list as a
+   * worktree of the clone, a locked worktree, a dirty worktree or a
+   * worktree checked out on a branch other than the requested one is
+   * refused, never removed. Gitdir linkage is proven by the `worktree list`
+   * check: git itself lists the path as a worktree of this clone (E6,
+   * conductor-plan :146).
+   */
+  removeLaneWorktree?(request: RemoveLaneWorktreeRequest): Promise<RemoveLaneWorktreeResult>;
 }
 
 /**

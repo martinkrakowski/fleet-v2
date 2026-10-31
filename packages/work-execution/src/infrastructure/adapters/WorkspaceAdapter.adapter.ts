@@ -39,7 +39,10 @@ import type {
   CommitLaneOutputResult,
   PrepareLaneWorktreeRequest,
   PrepareLaneWorktreeResult,
+  RemoveLaneWorktreeRequest,
+  RemoveLaneWorktreeResult,
 } from '../../application/ports/out/WorkspacePort.out-port.js';
+import { runnerHasHostName } from '../../domain/execution-records.js';
 
 /**
  * Adapter-layer helper for resolving one caller-supplied path against a
@@ -174,6 +177,91 @@ export function prepareLaneWorktreeRequestIsValid(request: PrepareLaneWorktreeRe
     return false;
   }
   return LANE_RUN_BRANCH_PATTERN.test(branch) && BASE_COMMIT_PATTERN.test(baseCommit);
+}
+
+/**
+ * EX-2a validation of one `removeLaneWorktree` request, before any command
+ * runs: the recorded host is named, all three paths are absolute and
+ * normalised, the worktree path sits directly under the worktree root, it is
+ * neither equal to nor inside the clone, and the branch is a lane-run
+ * branch.
+ */
+export function removeLaneWorktreeRequestIsValid(request: RemoveLaneWorktreeRequest): boolean {
+  const { clonePath, worktreeRoot, worktreePath, branch, recordedHost } = request;
+  if (!runnerHasHostName(recordedHost)) {
+    return false;
+  }
+  if (
+    !isAbsoluteNormalisedPath(clonePath) ||
+    !isAbsoluteNormalisedPath(worktreeRoot) ||
+    !isAbsoluteNormalisedPath(worktreePath)
+  ) {
+    return false;
+  }
+  if (!worktreePath.startsWith(`${worktreeRoot}/`)) {
+    return false;
+  }
+  if (worktreePath === clonePath || worktreePath.startsWith(`${clonePath}/`)) {
+    return false;
+  }
+  return LANE_RUN_BRANCH_PATTERN.test(branch);
+}
+
+/** One entry of `git worktree list --porcelain`, as far as this adapter reads it. */
+interface ListedWorktreeEntry {
+  readonly path: string;
+  /** The entry's `HEAD` sha, or null when the list did not carry one. */
+  readonly head: string | null;
+  /** The checked-out branch without `refs/heads/`, or null when detached. */
+  readonly branch: string | null;
+  readonly locked: boolean;
+}
+
+/**
+ * Strict-enough parse of `git worktree list --porcelain`: entries split on
+ * blank lines, each starting with `worktree <path>`, optionally followed by
+ * `HEAD <sha>`, `branch refs/heads/<name>` or `detached`, and an optional
+ * `locked` (with or without a reason).
+ */
+export function parseWorktreeList(stdout: string): ListedWorktreeEntry[] {
+  const entries: ListedWorktreeEntry[] = [];
+  let current: ListedWorktreeEntry | null = null;
+  for (const line of stdout.split('\n')) {
+    if (line === '') {
+      current = null;
+      continue;
+    }
+    if (line.startsWith('worktree ')) {
+      current = {
+        path: unquotePorcelainPath(line.slice('worktree '.length).trim()),
+        head: null,
+        branch: null,
+        locked: false,
+      };
+      entries.push(current);
+      continue;
+    }
+    if (current === null) continue;
+    if (line.startsWith('HEAD ')) {
+      current = { ...current, head: line.slice('HEAD '.length).trim() };
+      entries[entries.length - 1] = current;
+    } else if (line.startsWith('branch refs/heads/')) {
+      current = {
+        ...current,
+        branch: unquotePorcelainPath(line.slice('branch refs/heads/'.length).trim()),
+      };
+      entries[entries.length - 1] = current;
+    } else if (line === 'locked' || line.startsWith('locked ')) {
+      current = { ...current, locked: true };
+      entries[entries.length - 1] = current;
+    }
+  }
+  return entries;
+}
+
+/** The listed entry whose path is exactly `targetPath`, or null. */
+function listedWorktreeAt(entries: ListedWorktreeEntry[], targetPath: string): ListedWorktreeEntry | null {
+  return entries.find((entry) => entry.path === targetPath) ?? null;
 }
 const COMMIT_HEAD_PATTERN = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 const COMMIT_ATTEMPT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -661,6 +749,129 @@ export class WorkspaceAdapter implements WorkspacePort {
       return addRun.exitCode === 0
         ? { outcome: 'prepared' }
         : { outcome: 'refused', reason: 'git-refused' };
+    } catch {
+      return { outcome: 'unknown' };
+    }
+  }
+
+  /**
+   * EX-2a (D17): remove one finished lane run's clean worktree, keeping its
+   * branch. Never `--force`, never a branch delete, never `prune`: the only
+   * write is `git worktree remove <path>` with no flags. Every command runs
+   * through the recorded host's executor — never the configured or legacy
+   * executor — and when the recorded host is not named or no host executor
+   * is configured, nothing runs. Gitdir linkage is proven by the `worktree
+   * list` check: git itself lists the path as a worktree of this clone (E6).
+   */
+  async removeLaneWorktree(request: RemoveLaneWorktreeRequest): Promise<RemoveLaneWorktreeResult> {
+    // 1. Validate before anything runs (no executor call on a bad request).
+    if (removeLaneWorktreeRequestIsValid(request) !== true) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+
+    // 2. The write runs on the recorded host's executor and nowhere else:
+    //    never the configured or legacy fallback. No host executor
+    //    configured, a refusal or a throw is `unknown` — nothing has run.
+    const selector = this.options?.executorForRecordedHost;
+    if (selector === undefined) {
+      return { outcome: 'unknown' };
+    }
+    let executor: CommandExecutorPort;
+    try {
+      const resolved = selector(request.recordedHost);
+      if (!resolved.ok) {
+        return { outcome: 'unknown' };
+      }
+      executor = resolved.executor;
+    } catch {
+      return { outcome: 'unknown' };
+    }
+
+    const { clonePath, worktreePath, branch } = request;
+
+    try {
+      // 3. Find the worktree: git must list the path (or its physical form)
+      //    as a worktree of this clone.
+      const listRun = await executor.run(
+        ['git', '-C', clonePath, 'worktree', 'list', '--porcelain'],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (listRun.exitCode === null || listRun.error !== undefined) {
+        return { outcome: 'unknown' };
+      }
+      if (listRun.exitCode !== 0) {
+        return { outcome: 'refused', reason: 'git-refused' };
+      }
+      const listed = parseWorktreeList(listRun.stdout);
+      let entry = listedWorktreeAt(listed, worktreePath);
+      if (entry === null) {
+        // A symlinked worktree path (macOS `/var/folders/...` →
+        // `/private/var/...`) is listed under its physical form; accept
+        // either, as `alreadyPreparedOutcome` does. Unresolvable falls back
+        // to the path as given.
+        const physicalWorktreePath = await resolvePhysicalPath(executor, worktreePath, GIT_TIMEOUT_MS);
+        if (physicalWorktreePath !== null && physicalWorktreePath !== worktreePath) {
+          entry = listedWorktreeAt(listed, physicalWorktreePath);
+        }
+      }
+      if (entry === null) {
+        // Not listed: gone is `already-removed`; a present path that git
+        // does not list as a worktree of this clone is never touched.
+        const exists = await this.pathExists(worktreePath, worktreePath, executor);
+        return exists
+          ? { outcome: 'refused', reason: 'not-a-worktree' }
+          : { outcome: 'already-removed' };
+      }
+
+      // 4. The branch is the record of the run (D17): a detached entry, or
+      //    one on another branch, is refused, never removed.
+      if (entry.branch === null || entry.branch !== branch) {
+        return { outcome: 'refused', reason: 'branch-mismatch' };
+      }
+
+      // 4b. The listed tip is what the reap journals as the recovery handle, so
+      //     it must be a real commit before anything is removed; an unborn or
+      //     unreadable HEAD answers unknown with nothing removed.
+      const branchTip = entry.head;
+      if (branchTip === null || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(branchTip) || /^0+$/.test(branchTip)) {
+        return { outcome: 'unknown' };
+      }
+
+      // 5. A locked worktree is never removed.
+      if (entry.locked) {
+        return { outcome: 'refused', reason: 'locked' };
+      }
+
+      // 6. Only a clean worktree goes: nothing uncommitted and no untracked
+      //    file (`--untracked-files=all` lists every untracked file; ignored
+      //    files are not listed and are lost on removal, as K-WT accepts).
+      const statusRun = await executor.run(
+        ['git', '-C', worktreePath, 'status', '--porcelain', '--untracked-files=all'],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (statusRun.exitCode === null || statusRun.error !== undefined) {
+        return { outcome: 'unknown' };
+      }
+      if (statusRun.exitCode !== 0) {
+        return { outcome: 'refused', reason: 'git-refused' };
+      }
+      if (statusRun.stdout.trim() !== '') {
+        return { outcome: 'refused', reason: 'dirty' };
+      }
+
+      // 7. Remove: one call, no flags. The branch is kept. The removal
+      //    answers the branch tip the list showed, so the reap can journal it.
+      const removeRun = await executor.run(
+        ['git', '-C', clonePath, 'worktree', 'remove', worktreePath],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (removeRun.exitCode === null || removeRun.error !== undefined) {
+        return { outcome: 'unknown' };
+      }
+      if (removeRun.exitCode !== 0) {
+        return { outcome: 'refused', reason: 'git-refused' };
+      }
+      return { outcome: 'removed', branchTip };
     } catch {
       return { outcome: 'unknown' };
     }

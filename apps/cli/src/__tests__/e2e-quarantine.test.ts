@@ -83,6 +83,21 @@ describe('quarantined', () => {
     expect(lines[0]).not.toContain('second line');
   });
 
+  it('resolves when an active body throws synchronously, writing one warning', async () => {
+    const { lines, write } = linesOf();
+    const fn = quarantined(
+      marker(),
+      1000,
+      (() => {
+        throw new Error('sync throw');
+      }) as () => Promise<void>,
+      { write },
+    );
+    await fn();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('sync throw');
+  });
+
   it('resolves when an active body hangs, writing a warning on the budget', async () => {
     const { lines, write } = linesOf();
     const fn = quarantined(marker(), 50, () => new Promise<void>(() => {}), { write });

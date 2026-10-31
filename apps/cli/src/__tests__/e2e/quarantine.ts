@@ -125,7 +125,8 @@ export function quarantined(
     if (state.kind !== 'active') {
       throw new Error(state.message);
     }
-    const bodyPromise = body();
+    // A body that throws synchronously is handled like a rejected one.
+    const bodyPromise = Promise.resolve().then(body);
     // If the budget wins the race, the body may still settle later; swallow a
     // late rejection so it never surfaces as an unhandled rejection.
     bodyPromise.catch(() => {});

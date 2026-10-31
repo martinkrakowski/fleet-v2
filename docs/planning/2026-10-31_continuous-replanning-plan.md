@@ -2,173 +2,206 @@
 
 - **Date:** 2026-10-31
 - **Target repository:** `fleet-v2`. The orchestrator's own scripts (lane log / S7 scorecard, merge-train driver) stay outside and are named only where this plan reads them.
-- **Status:** rev 0. Nothing built. Decisions D-CR1–D-CR9 (§6) are open with recommended defaults. Anchors checked against `main` at `a05c2e34`; the remaining-work plan read from `origin/docs/remaining-work-plan-2026-10-31`.
+- **Status:** rev 1, after a non-Fable (Opus) review of rev 0: four majors and six minors, all applied (§9). Nothing built. The plan is now a **first slice** (Phase 1, six PRs, one manifest commit, store-free) plus deferred phases that are re-decided once conducted Tier 2 runs have produced journal data. Decisions D-CR1–D-CR9 (§6) are split into "needed now" and "at Phase 2". Anchors checked against `main` at `a05c2e34`; the remaining-work plan is merged (#532) and its Revision 2 (parallel tracks A/B/C, #542) is read from `origin/docs/remaining-plan-rev2-tracks-2026-10-31`.
 - **Owner request (2026-10-31):** "The way that you just re-organized the work, we should have that occur regularly as part of fleet-v2."
-- **What happened by hand today:** the orchestrator noticed `2026-10-31_remaining-work-plan.md` (184 PRs, ~98–101 h) was bound by serial bottlenecks, not by work: one orchestrator driving every Tier 2 lane (~75 min each, ~3 in flight), a serial train (~10 min/PR), Waves 6–7 (98 PRs) queued behind waves they barely depend on, Tier 2 ceremony on display-only units, and predictable fix rounds (dependent-package tests missing from briefs, harness gaps, lint). It proposed levers, the owner chose, and a Fable plan revision turned the choice into tracks.
-- **Builds on:** `2026-10-31_remaining-work-plan.md` (waves, D-R1–D-R17), `2026-10-30_tier2-speed-plan.md` (S1 checklist, S7 scorecard), `2026-10-27_work-board-plan.md` (§3.2 sidecar, WB1a–c built, WB4a/WB4c/WB7a planned, D2, D12), `2026-10-27_conductor-plan.md` (lane runs, keyed journal, driver passes), `2026-10-27_lane-run-telemetry-plan.md` (§3.3 consumer-side read ports, §3.2 what never leaves), `2026-10-28_owner-todo-section-plan.md`, `AGENTS.md`.
+- **What happened by hand today:** the orchestrator noticed `2026-10-31_remaining-work-plan.md` (184 PRs, ~98–101 h) was bound by serial bottlenecks, not by work: one orchestrator driving every Tier 2 lane (~75 min, ~3 in flight), a serial train (~10 min/PR), Waves 6–7 (98 PRs) queued behind waves they barely depend on, Tier 2 ceremony on display-only units, and predictable fix rounds (dependent-package tests missing from briefs, harness gaps, lint). It proposed levers, the owner chose, and a Fable plan revision became §7 of that plan: three tracks, start-now lists, a re-tier table and an honest Fable floor.
+- **Builds on:** `2026-10-31_remaining-work-plan.md` (§2 waves, §7 tracks, D-R1–D-R17), `2026-10-30_tier2-speed-plan.md` (S1 checklist, S7 scorecard), `2026-10-27_work-board-plan.md` (§3.2 sidecar; WB1a–c built; WB4a, WB4c, WB7a planned; D2, D12), `2026-10-27_conductor-plan.md` (lane runs, keyed journal, driver passes), `2026-10-27_lane-run-telemetry-plan.md` (§3.3 consumer-side read ports and read-only stores, §3.2 what never leaves), `2026-10-28_owner-todo-section-plan.md`, `AGENTS.md`.
 
-**Short answer.** Replanning is **a read model plus a typed, advisory proposal**, not a scheduler. Every pass reads what fleet-v2 already records (lane plans, lane runs and their keyed journals, attempts, receipts, reservations, owner questions and items) plus one new input, the S7 scorecard for hand-run lanes, and derives: the critical path and wall estimate per plan, per-track utilisation and idle gaps, queue waits (admission, gate, review seat, train), fix-round causes as codes, start-now lanes, re-tier candidates and a Fable quota forecast. It writes one **`ReplanProposal`** record: levers with expected saving, quality cost, the rule each changes and whether it needs the owner. It is produced deterministically from records (no model in the loop), surfaced as `fleet-v2 plan replan`, `GET /v1/replan` and a read-only `/replan` view, and runs at wave boundaries, daily and on signals. **It applies nothing.** Owner-needed levers become keyed owner questions (later plan-decision owner items); an accepted lever becomes a plan revision (a docs PR bumping the sidecar revision, which the next `plan import` links back to the proposal) or a brief-template change made by the orchestrator. Tiers, seats, review rules and owner rules never move without a recorded owner decision.
+**Short answer.** Replanning is **a read model plus a typed, advisory proposal**, never a scheduler. Phase 1 reads the plan sidecar (the work-board plan's `<plan>.workbook.json`, whose validation and cycle check are already on `main`), the S7 scorecard rows for hand-run lanes, and review findings classified into cause codes, and prints a **`ReplanProposal`** to stdout: critical path and wall per plan and per track, utilisation, start-now lanes, re-tier candidates, fix-round causes, a Fable forecast, and levers each with an expected saving, a quality cost, the rule it would change and whether it needs the owner. It is deterministic (no model in the loop), runs as `fleet-v2 plan replan --dry-run --sidecar <file> [--scorecard <jsonl>] [--json]` on the orchestrator's machine, and **applies nothing**. Phase 2, decided only after conducted Tier 2 runs exist, adds the stored proposal, journal-derived queue waits, owner routing through keyed questions, `policy.replan` thresholds, the driver cadence and the API/web/TUI reads. Tiers, seats, review rules and owner rules never move without a recorded owner decision; accepted levers become plan revisions (a docs PR bumping the sidecar revision) or brief-template changes made by the orchestrator.
 
 ## 1. Goal
 
-After every wave, every morning, and whenever the measured pipeline drifts, the owner and orchestrator see the same analysis the orchestrator produced by hand on 2026-10-31, computed from records, with a short list of levers to accept or decline.
+After every wave or sequence, every morning, and whenever the measured pipeline drifts, the owner and orchestrator see the analysis the orchestrator produced by hand on 2026-10-31, computed from records, with a short list of levers to accept or decline.
 
-**Non-goals.** No dispatch, re-tiering, seat change, review-rule change or brief edit by fleet-v2. No model inference in v1 (the narrative plan revision stays a Fable task the orchestrator runs on the proposal). No markdown parsing as a source (work-board D2). No host names, finding texts, file paths of private repositories or secrets in a proposal. Workers never see or run it: it is a CLI/driver read on the orchestrator's machine, not in any runner environment or lane.
+**Non-goals.** No dispatch, re-tiering, seat change, review-rule change or brief edit by fleet-v2. No model inference in v1 (the narrative plan revision stays a Fable task run on the proposal). No markdown parsing as a source (work-board D2). No host names, finding texts, private paths or secrets in a proposal. Workers never run it (§3.6).
 
 ## 2. What exists (checked on `main`, a05c2e34)
 
 | Need | What exists | Anchor | Gap |
 |---|---|---|---|
-| Unit/dependency graph | `LanePlanRecord` v1 with `PlannedLaneRecord { laneId, aliases, scope, packages, sharedFiles, tier 0-2, after[], decisions[], status planned/deferred/dropped, brief, mergedPr }`, `exclusiveOrder`, plan `decisions` open/decided; sidecar validation (WB1a), aggregate (WB1b), cycle check `findLanePlanCycle` (WB1c) | `packages/work-execution/src/domain/lane-plan-records.ts:104-133`, `entities/LanePlan.ts`, `lane-plan-graph.ts:66` | No store or import (WB4a, W6), no `plan` CLI group (WB7a, W6; `apps/cli/src/index.ts` has `seats`, `conductor`, `telemetry`); no sidecar written for the remaining-work plan; no estimate, run mode or wave on a lane |
-| Lane runs and steps | `LaneRunRecord` (tier, round, attemptIds, prNumber, parked, lease); keyed journal with intent/result/conduct entries; states incl. `gating`, `awaiting-premerge`, `watching-ci`, `merging`, `merged` | `packages/work-execution/src/domain/lane-run-records.ts`, manifest `LaneRunJournalPort` | Conducted runs only; hand-run Tier 2 lanes leave attempts but no run |
-| Admission waits | `LaneRunAdmissionPort` (`admitted` / `no-capacity`), reservations in the execution journal | `.../ports/out/LaneRunAdmissionPort.out-port.ts` | Wait durations only derivable from journal conduct entries |
-| Fix-round evidence | `ReviewReceiptRecord { reviewerModel, implementerModel, kind, findings[] }`, `ReviewFindingRecord { severity, summary, filePath, state }`; verification receipts per predicate | `packages/evidence-and-acceptance/src/domain/evidence-records.ts:40-72` | `summary` is free text and untrusted; no cause taxonomy; `AcceptanceReceiptReadPort` deliberately projects counts only |
-| Seats, cost | `AttemptRecord.runner`, `seatSelection`, `usage` (tokens, `costUsd`) | `.../domain/execution-records.ts:191-210` | No Fable quota figure anywhere |
-| Owner surfaces | `AskOwnerQuestionPort`, `FindOwnerQuestionByKeyPort`, `RecordAttentionItemPort`, `OwnerItem` kind `decision`; `LaneRunParkNoticeAdapter` shows the consumer-side pattern | manifest operator-coordination; `LaneRunParkNoticePort` binding | Plan-decision items need WB4c (W6) |
-| Hand-run measurements | S7 scorecard rows in the orchestrator's lane log (fix rounds, escaped defects by stage, wait times) | tier2-speed plan §3 S7 | Outside fleet-v2; no typed read |
-| Board read model | `deriveWorkBoard` pure, never throws; `waitsOn` planned (WB2b) | `.../domain/work-board.ts:150` | Columns, not time or capacity |
+| Unit/dependency graph | `LanePlanRecord` v1 with `PlannedLaneRecord { laneId, aliases, scope, packages, sharedFiles, tier 0-2, after[], decisions[], status, brief, mergedPr }`, `exclusiveOrder`, plan `decisions`; sidecar validation (WB1a), aggregate (WB1b), cycle check `findLanePlanCycle` (WB1c) | `packages/work-execution/src/domain/lane-plan-records.ts:104-133`, `entities/LanePlan.ts`, `lane-plan-graph.ts:66` | No store (WB4a, Track A stream ii) or `plan` CLI group (WB7a); no sidecar written for the remaining-work plan; no estimate, run mode or wave per lane |
+| Lane runs and steps | `LaneRunRecord` (tier, round, attemptIds, prNumber, parked, lease); keyed journal: intent/result per step key, conduct entries for an entered state | `.../domain/lane-run-records.ts`; manifest `LaneRunJournalPort` | Conducted runs only. **Admission waits are not journalled:** `performAdmissionWait` returns `waiting/admission` and appends nothing (`advance-lane-run/facts.ts:320-340`); a conduct entry carries only a `LaneRunState` |
+| Admission | `LaneRunAdmissionPort` → `admitted` / `no-capacity` / `refused` | `.../ports/out/LaneRunAdmissionPort.out-port.ts:22-25` | Outcomes, not durations |
+| Fix-round evidence | `ReviewReceiptRecord { reviewerModel, implementerModel, kind?, findings[] }`; `ReviewFindingRecord { severity, summary, filePath, state }`; verification receipts per predicate | `packages/evidence-and-acceptance/src/domain/evidence-records.ts:40-72` | `summary` is free, untrusted text; no cause taxonomy; `AcceptanceReceiptReadPort` projects counts only, by design |
+| Seats, cost | `AttemptRecord.runner` (`:288`), `usage` with `costUsd` (`:296`), `seatSelection` (`:305`) | `.../domain/execution-records.ts:269-305` | No Fable quota figure anywhere |
+| Owner surfaces | `AskOwnerQuestionPort`, `FindOwnerQuestionByKeyPort`, `RecordAttentionItemPort`; `LaneRunParkNoticeAdapter` is the consumer-side pattern | manifest, operator-coordination | Plan-decision owner items need WB4c |
+| Hand-run measurements | S7 scorecard rows in the orchestrator's lane log | tier2-speed plan §3 S7 | Outside fleet-v2; no typed read, no fixed format |
+| Context mapping | evidence-and-acceptance → work-execution (OHS, in-process) exists | `.architecture/manifest.yaml:865` | Notes need the new consumer |
+| Worker isolation | Workers receive only `RUNNER_ENV_ALLOWLIST` / `AGY_RUNNER_ENV_ALLOWLIST` variables; `FLEET_STATE_DIR` is not among them | `ExecutionRunnerAdapter.adapter.ts:204`, `AgyRunnerAdapter.adapter.ts:104` | — |
 
 ## 3. The shape
 
 ### 3.1 Inputs
 
-| Input | Port (existing unless marked) | Notes |
+| Input | Phase 1 | Phase 2 |
 |---|---|---|
-| Lane plans | `LanePlanRepositoryPort` (**WB4a, pulled forward**, D-CR1); until then `--sidecar <file>` in `--dry-run` only | Sidecar **schemaVersion 2** (D-CR2) adds optional per-lane `estimateMinutes`, `runAs: conducted \| hand \| orchestrator \| owner \| external`, `wave`; v1 files still import; defaults by tier and runAs (`T1 conducted 15`, `T2 hand 75`, `T0 10`) |
-| Runs, journals, attempts, reservations | `LaneRunRepositoryPort`, `LaneRunJournalPort`, `AttemptRepositoryPort`, `ExecutionJournalPort` (read only) | Read-only store instances (telemetry §3.3's `readOnly` option) |
-| Merge facts | run `merged`, `PullRequestLink`, sidecar `mergedPr`; `MergeRecord` once WB5a lands | Train wait = `awaiting-premerge` or `accept` result → merged time |
-| Review and verification facts | **new** `FindingCauseReadPort` (work-execution, consumer side) → **new** `ClassifyFindingCausesPort` (evidence, in) | Only `{ attemptId, headSha, kind, causeCodes[], severityCounts }` cross; never a summary |
-| Hand-run rows | **new** `LaneScorecardReadPort` (file adapter over S7 JSONL in `<stateDir>/scorecard/`, D-CR9) | Typed `ScorecardRow { planRef, tier, fixRounds, escapedBy, waitMinutes{gate,review,train}, startedAtIso, mergedAtIso }`; a malformed line is skipped and counted |
-| Owner state | `ListOwnerQuestionsPort`, `ListOwnerItemsPort`, plan `decisions` | An open decision gating a lane blocks its start-now |
-| Thresholds and quota | **new** `policy.replan` in `installation` (D-CR4, D-CR8) | `fableWeeklyPasses`, `fableModelFamily`, trigger thresholds, cadence |
+| Lane plans | `--sidecar <file>` (one or more v1 sidecars, validated by WB1a, cycle-checked by WB1c) | `LanePlanRepositoryPort` when WB4a lands on A's stream (ii); sidecar v2 optional fields (`estimateMinutes`, `runAs`, `wave`, `replanRef`) only if tier defaults prove too coarse (D-CR2) |
+| Estimates | Defaults by tier and the §7.5 figures: T0 10 min, T1 conducted 9, T1 hand-run 35, T2 75; the sidecar's `packages`/`sharedFiles` give the serialisation | Measured per-lane medians from the scorecard and runs |
+| Hand-run rows | `--scorecard <jsonl>`: `ScorecardRow { planRef, tier, track, fixRounds, escapedBy, waitMinutes { gate, review, train }, startedAtIso, mergedAtIso }`; a malformed line is skipped and counted | Same, through `LaneScorecardReadPort` over `<stateDir>/scorecard/*.jsonl` |
+| Review and verification facts | `FindingCauseReadPort` (work-execution, consumer side) → `ClassifyFindingCausesPort` (evidence, in). Only `{ attemptId, headSha, kind, causeCodes[], severityCounts }` cross; never a summary | Same |
+| Runs, journals, attempts, reservations | Not read (no conducted Tier 2 runs exist yet) | Read-only store instances (telemetry §3.3's `readOnly`) for queue waits (§3.2) |
+| Owner state | Open plan `decisions` from the sidecar | `ListOwnerQuestionsPort`, `ListOwnerItemsPort` |
+| Thresholds and quota | `--fable-weekly-passes <n>` flag, default none (forecast prints "no quota given") | `policy.replan` in `installation` (D-CR8) |
 
 ### 3.2 Analysis (pure, in `work-execution` domain)
 
-- **Critical path.** Nodes: planned lanes not done/dropped/deferred. Edges: `after`, `exclusiveOrder`, same-package serialisation for hand-run T2 and conducted lanes (until KS5), shared-file serialisation. Weights: `estimateMinutes`. Longest path per plan and per package sequence; wall = max(chain × t, count ÷ inFlight × t, PRs × trainInterval), the same formula as the remaining-work plan §2 so figures reconcile.
-- **Per-track utilisation.** A track is a package sequence (and, when the scorecard names it, an orchestrator session). Busy minutes ÷ window; **idle gaps** = time between a run's terminal entry and the next dispatch in that package.
-- **Queue waits** (p50/p90 over the trailing N lanes): admission (`wait admission` conduct → dispatch intent), gate (collect result → gate intent), review seat (gate result → first review intent), train (accept/premerge → merged), owner (park `owner-merge`/`one-way-door` → resume). Hand-run waits from scorecard rows.
-- **Fix-round causes.** Codes from `ClassifyFindingCausesPort` (rule table in evidence: `missing-dependent-tests`, `harness-gap`, `lint`, `design-key-mismatch`, `wrong-source-of-value`, `id-collision`, `scope-widening`, `other`), plus failed verification predicates and `StopReason`. Clustered per code over the trailing N lanes; a code above `policy.replan.causeShareThreshold` yields a `brief-rule` lever.
-- **Re-tier candidates.** Down: tier 2 lanes with `packages ⊆ {web, ui, docs}`, no `sharedFiles`, no manifest. Up: tier 1 lanes with ≥ 2 fix rounds or an escaped defect at CI or later. Candidates only; the owner decides (D-CR7).
-- **Start-now.** Every `after` done, no open gating decision, not started, package track free or admissible.
-- **Quota forecast.** Fable passes needed = remaining T2 × (1 S1 + 1 pre-merge) × (1 + measured re-pass rate); consumed = review receipts in the trailing 7 days whose `reviewerModel` matches `fableModelFamily`; weeks to finish at `fableWeeklyPasses`.
+- **Critical path.** Nodes: planned lanes not done/dropped/deferred. Edges: `after`, `exclusiveOrder`, one hand-run or conducted lane per package until KS5, shared-file serialisation. Weights: estimates. Longest path per plan and per track (§7.1's package ownership gives the track of a lane); wall = max(chain × t, count ÷ inFlight × t, PRs × trainInterval), the remaining-work plan's §2 formula, so figures reconcile with §2 and §7.5.
+- **Utilisation and idle gaps.** Per track: busy minutes ÷ window from scorecard rows (Phase 1) and from runs (Phase 2); idle gap = time between a lane's merge and the next start on the same track or package.
+- **Queue waits (Phase 2).** Gate wait = `collect` result → `gate` intent; review-seat wait = `gate` result → first review intent; train wait = `accept` result or `awaiting-premerge` conduct → `merged` conduct; owner wait = park → resume. **Admission wait is approximated** as `prepare` result → `dispatch` intent of the same attempt (both keyed and journalled); it over-counts by the pass interval and is labelled `approximate`. An exact figure needs a later lane, **CR3j**, that appends a keyed `wait/<reason>` entry (a journal contract change on Track A, after the Wave 2 admission chain); until then the proposal never prints an admission p50 without the label.
+- **Fix-round causes.** Codes from `ClassifyFindingCausesPort` (rule table in evidence: `missing-dependent-tests`, `harness-gap`, `lint`, `design-key-mismatch`, `wrong-source-of-value`, `id-collision`, `scope-widening`, `other`), plus failed verification predicates and `StopReason`. Clustered over the trailing N lanes; a code above a share threshold yields a `brief-rule` lever naming the S1 checklist line to add.
+- **Re-tier candidates.** Down: tier 2 lanes with `packages ⊆ {web, ui, docs}` and no `sharedFiles` (the §7.3 rule as far as a sidecar can see it; the brief's touch list stays the proof). Up: tier 1 lanes with ≥ 2 fix rounds or an escaped defect at CI or later. Candidates only; the owner decides (D-CR7).
+- **Start-now.** Every `after` done, no open gating decision, not started, track or package free.
+- **Fable forecast.** Sittings needed = remaining T2 × (S1 + pre-merge) × (1 + measured re-pass rate) + one per re-tiered sequence; consumed = review receipts in the trailing 7 days whose `reviewerModel` matches the configured family; weeks to finish at the given weekly passes.
 
-### 3.3 Output: the `ReplanProposal` record (version 1, D-R8 convention)
+### 3.3 Output: the `ReplanProposal`
+
+The **domain emits canonical facts and levers; infrastructure adds identity.** `deriveReplanProposal(facts, now)` returns `ReplanProposalBody`; the CLI adapter computes `factsDigest` (sha256 of the canonical JSON, the `LanePlanRecord.digest` precedent) and injects `proposalId` and `producedAtIso`. Phase 1 prints the body plus digest and stores nothing; Phase 2's stored record is `{ version: 1, proposalId, producedAtIso, factsDigest, status, decisionRefs, ...body }`, introduced only after Q5b (D-R8).
 
 ```ts
-interface ReplanProposalRecord {
-  readonly version: 1; readonly proposalId: string; readonly projectId: string;
-  readonly planIds: readonly string[]; readonly producedAtIso: string;
-  readonly factsDigest: string;                      // sha256 of the canonical facts; same digest → no new proposal
-  readonly trigger: 'wave-boundary' | 'daily' | 'signal' | 'manual';
-  readonly signals: readonly { kind: ReplanSignalKind; value: number; threshold: number }[];
-  readonly baseline: { remainingLanes: number; byTier: Record<'0'|'1'|'2', number>; criticalPathMinutes: number;
-    wallMinutes: number; trainWaitP50: number; fixRoundRate: number; fablePassesNeeded: number; fableWeeksAtQuota: number };
-  readonly sources: readonly { name: string; readAtIso: string; status: 'read' | 'not-read' }[];
+interface ReplanProposalBody {
+  readonly projectId: string; readonly planIds: readonly string[];
+  readonly trigger: 'manual' | 'wave-boundary' | 'daily' | 'signal';   // Phase 1 always manual
+  readonly signals: readonly { kind: string; value: number; threshold: number }[];
+  readonly baseline: { remainingLanes: number; byTier: Record<'0'|'1'|'2', number>; byTrack: Record<string, number>;
+    criticalPathMinutes: number; wallMinutes: number; trainWaitP50: number | null; admissionWaitP50: { minutes: number; approximate: true } | null;
+    fixRoundRate: number | null; fableSittingsNeeded: number; fableWeeksAtQuota: number | null };
+  readonly sources: readonly { name: string; status: 'read' | 'not-read' | 'skipped-lines'; count: number }[];
   readonly levers: readonly ReplanLever[];
-  readonly status: 'proposed' | 'superseded' | 'decided';
-  readonly decisionRefs: readonly { leverId: string; questionId: string | null; planRevision: number | null }[];
 }
 interface ReplanLever {
-  readonly leverId: string;
+  readonly leverId: string;                          // deterministic: kind + sorted subjects
   readonly kind: 'start-now' | 'parallel-track' | 're-tier' | 'review-batching' | 'brief-rule'
                | 'pull-forward' | 'batch-tier1' | 'resequence' | 'defer';
   readonly subjects: readonly PlannedLaneRef[];
-  readonly expectedSavingMinutes: number;            // from the model; 0 when unknown
+  readonly expectedSavingMinutes: number;            // 0 when unknown
   readonly qualityCost: 'none' | 'review-coverage' | 'test-coverage' | 'ci-minutes' | 'owner-attention';
   readonly ruleChanged: { scope: 'schedule' | 'tier' | 'review' | 'brief-template' | 'batching' | 'seat' | 'owner-rule';
-    from: string; to: string } | null;                // plain text ≤ 200 code points, secret-pattern checked
-  readonly needsOwner: boolean;                      // always true for tier, review, seat, owner-rule
+    from: string; to: string } | null;                // ≤ 200 code points, `planTextError` + shared secret patterns
+  readonly needsOwner: boolean;                      // true by construction for tier, review, seat, owner-rule
   readonly reasonCodes: readonly string[];           // codes only, never a finding summary
 }
 ```
 
-Every string passes `planTextError` and the shared secret patterns; a proposal that would carry a refused string is not written and the pass reports `refused`.
+A body that would carry a refused string is not produced; the command exits 1 with `refused`.
 
 ### 3.4 Cadence and triggers
 
-| When | How | Result |
+| Phase | When | How |
 |---|---|---|
-| Wave boundary | driver pass sees every lane with `wave = n` terminal and `wave = n+1` has unstarted lanes | proposal `wave-boundary`; attention item `replan-suggested` |
-| Daily | `fleet-v2 plan replan --digest` from the owner's scheduler (as `todo --digest`, TD-D9) | plain-text digest on stdout |
-| Signals, checked each driver pass | `trainWaitP50 > 20 min`, `tier2IdleGap > 60 min`, `fixRoundRate > 1.0 / lane` over 10, `estimateSlip > 30 %` (D-CR4) | one open proposal per plan; a new one supersedes when `factsDigest` changes; debounced to `policy.replan.minIntervalMinutes` (default 180) |
-| Manual | `fleet-v2 plan replan [--dry-run] [--json] [--sidecar <file>...]` | exit 0 produced (also with zero levers), 1 refused (inputs below `minSourcesRead`), 2 usage |
+| 1 | At each sequence-end Fable pass (F-TODO, F-BOARD-1, …) and each wave boundary of §7; before the morning digest | The orchestrator runs `plan replan --dry-run` by hand and pastes the lever table into the plan revision |
+| 2 | Wave boundary (driver sees `wave n` terminal, `wave n+1` unstarted); daily (`--digest` from the owner's scheduler, as `todo --digest`); signals checked each driver pass: train p50 > 20 min, T2 idle gap > 60 min, fix-round rate > 1.0 over 10 lanes, estimate slip > 30 % (D-CR4) | One open proposal per plan; superseded when `factsDigest` changes; debounced to `policy.replan.minIntervalMinutes` (default 180); attention item `replan-suggested` |
+
+Exit codes: 0 produced (also with zero levers), 1 refused (fewer than `minSourcesRead` inputs read, or refused text), 2 usage.
 
 ### 3.5 Place in the hexagon
 
-Owned by **`work-execution`** (it already owns lane plans, runs, journals and the board read model); the dependency direction is unchanged. Evidence owns finding classification; coordination owns the owner surfaces.
+Owned by **`work-execution`** (it owns lane plans, runs, journals and the board read model); evidence owns finding classification; coordination owns the owner surfaces. Dependency direction unchanged.
 
-- **Domain (work-execution):** `replan-records.ts` (the records above, validators), `replan-graph.ts` (critical path, tracks, start-now; reuses `lane-plan-graph.ts`'s alias resolution), `replan-waits.ts` (durations from journal facts), `deriveReplanProposal(facts)`: pure, never throws, never reads a clock.
+- **Domain (work-execution):** `replan-records.ts` (body, lever, validators), `replan-graph.ts` (critical path, tracks, start-now, utilisation; reuses `lane-plan-graph.ts`), `replan-waits.ts` (Phase 2), `deriveReplanProposal`: pure, never throws, no clock, **no crypto**.
 - **Domain (evidence-and-acceptance):** `finding-causes.ts`: the rule table and `classifyFindingCauses(findings) → codes`.
-- **Application:** in-ports `ProposeReplanPort`, `InspectReplanProposalPort`, `ListReplanProposalsPort` (work-execution); `ClassifyFindingCausesPort` (evidence). Out-ports `ReplanProposalRepositoryPort`, `LaneScorecardReadPort`, `FindingCauseReadPort`, `ReplanOwnerRoutingPort` (delegates to `AskOwnerQuestionPort`, `FindOwnerQuestionByKeyPort`, `RecordAttentionItemPort`, the `LaneRunParkNoticeAdapter` pattern), `ReplanSettingsPort` (structural subset of `policy.replan`, like `AutoMergeSettingsPort`). Use cases `ProposeReplanUseCase`, `ClassifyFindingCausesUseCase`.
-- **Infrastructure:** `ReplanProposalRepositoryAdapter` (file + memory, `<stateDir>/replan-proposals.json`, CAS), `LaneScorecardFileAdapter` (JSONL), `FindingCauseReadAdapter` (in-process → evidence), `ReplanOwnerRoutingAdapter`, `ReplanSettingsAdapter`. Manifest `adapter_bindings` and a `context_mappings` row (evidence → work-execution, OHS) added in the orchestrator's manifest commit (CRM).
-- **Composition roots:** `apps/cli` wires `plan replan|replan show|replan list` and the driver cadence; `apps/api` serves `GET /v1/replan`, `GET /v1/replan/:id` (bearer today, `read` scope after T3a); `apps/web` renders `/replan` read-only with sources header, "as of" and not-read states; a TUI screen in the P9 shell later. No console logging in packages; CLI I/O at the boundary.
+- **Application:** in-ports `ProposeReplanPort` (work-execution), `ClassifyFindingCausesPort` (evidence); out-ports `LaneScorecardReadPort`, `FindingCauseReadPort`; Phase 2 adds `ReplanProposalRepositoryPort`, `ReplanOwnerRoutingPort` (delegates to `AskOwnerQuestionPort`, `FindOwnerQuestionByKeyPort`, `RecordAttentionItemPort`), `ReplanSettingsPort`, `InspectReplanProposalPort`, `ListReplanProposalsPort`.
+- **Infrastructure:** `LaneScorecardFileAdapter` (JSONL), `FindingCauseReadAdapter` (in-process → evidence), `Sha256CanonicalDigest` for the facts digest; Phase 2 adds the proposal file/memory stores, owner routing and settings adapters.
+- **Manifest (CRM, one T0 commit on Track A):** the Phase 1 ports, use cases, adapters and bindings; **extend the notes of row 865** (evidence → work-execution) with `FindingCauseReadAdapter delegates to ClassifyFindingCausesPort`; no new mapping row.
+- **Composition roots:** Phase 1 touches `apps/cli/src/{index,composition}.ts` **once** (CR8-lite). Phase 2: `GET /v1/replan[/:id]` (Track C, bearer today, `read` scope after T3a), `/replan` read-only view (Track B), a TUI screen in the P9 shell (Track B). No console logging in packages; CLI I/O at the boundary.
 
 ### 3.6 Authority and safety
 
-- A proposal grants and changes nothing: it is a reading. `ReplanProposal.status` moves to `decided` only through a recorded owner answer (question) or a plan revision whose sidecar `replanRef` names it; the record never applies itself.
-- Levers of scope `tier`, `review`, `seat`, `owner-rule` are `needsOwner: true` by construction; `schedule`/`batching` levers are the orchestrator's to adopt within existing rules, and still only through a plan revision.
-- No model participates in producing a proposal, so no model re-tiers its own work. The Fable plan-revision pass that narrates an accepted proposal is read-only, runs on the orchestrator's machine, and its output is a docs PR reviewed like any other; a re-tier of a lane whose implementer family matches the narrating model is marked in the PR body.
-- Workers never run it: the command is not in the runner environment allow-list, there is no runner route, and a proposal is never injected into a brief (candidate notes rule, `AGENTS.md`).
-- Public-repo rule: the proposal and any plan revision committed to fleet-v2 carry lane ids, counts, minutes, cause codes and reason codes only; never hosts, finding summaries, private paths, seat cost or security findings. `plan replan --json` redacts nothing further because nothing sensitive enters the record.
+- A proposal grants and changes nothing. Phase 2's `status` moves to `decided` only through a recorded owner answer or a plan revision whose sidecar `replanRef` names it.
+- Levers of scope `tier`, `review`, `seat`, `owner-rule` are `needsOwner: true` by construction; `schedule`/`batching` levers are the orchestrator's to adopt within existing rules, still only through a plan revision.
+- No model produces a proposal, so no model re-tiers its own work. The Fable pass that narrates an accepted proposal is read-only and its output is a docs PR reviewed like any other; a re-tier of a lane whose implementer family matches the narrating model is named in the PR body.
+- **Workers never apply plans.** `FLEET_STATE_DIR` is not in either runner env allow-list, so a worker that ran the CLI would see only in-memory stores and no sidecar; there is no runner route; a proposal is never injected into a brief (candidate-notes rule). The driver (Phase 2) computes and records; it dispatches nothing from a proposal.
+- Public-repo rule: proposals and plan revisions committed to fleet-v2 carry lane ids, counts, minutes, cause codes and reason codes only; never hosts, finding summaries, private paths, per-seat cost or security findings.
 
 ## 4. Workbook
 
-Each lane about 45 minutes, one PR. Shared files in bold merge one at a time. **Track CR** runs beside Waves 1–3 on packages idle there (evidence, installation, apps/api, apps/web, new `replan-*.ts` files in work-execution); it never touches `advance-lane-run/*` or `conductor.ts` before Wave 3's K11b' (Wave 0–1 untouched). It is the pilot of the second orchestrator session (D-CR3), capped at 1 lane in flight so the main track keeps 2–3.
+Each lane about 45 minutes, one PR; a Tier 2 lane costs about 75 min hand-run plus an S1 and a pre-merge Fable sitting. Shared files in bold. **Every Phase 1 lane runs on Track A** (§7.1: work-execution, the `@generated` barrels, the manifest, `index.ts`/`composition.ts` are A's); the new evidence domain file is a new file plus A's barrel. Phase 1 adds about 5 h of hand-run time and 8 Fable sittings to A's stream (iii), beside Q7b/SR/OT5; it is not free, and it enters no existing chain only because its files are new. It does not touch `advance-lane-run/*` or `conductor.ts`.
+
+### Phase 1: the first slice (6 PRs)
 
 | Lane | Scope | Package / shared files | Tier | After | Acceptance |
 |---|---|---|---|---|---|
-| CR0 | This plan; `2026-10-31_remaining-work-plan.workbook.json` (v1) | docs | 0 | — | `plan check` drift report clean once WB7a exists; cycle check passes via a unit test fixture |
-| CR1 | Sidecar v2: optional `estimateMinutes`, `runAs`, `wave`, plan `replanRef`; v1 still accepted; canonical JSON | work-execution (domain) | 2 | CR0 | v1 and v2 fixtures import; unknown field refused; `LANE_PLAN_RECORD_VERSION` unchanged |
-| CR2 | `replan-graph.ts`: weighted critical path, package/shared-file serialisation, tracks, start-now, utilisation | work-execution (domain) | 2 | CR1 | Remaining-work plan fixture reproduces §2 walls within 10 %; cycle → typed error |
-| CR3 | `replan-waits.ts`: queue waits from run/journal facts; scorecard rows merged; p50/p90 | work-execution (domain) | 2 | — | Journal fixtures with gaps and ambiguous results; a missing entry is `unknown`, never 0 |
-| CR4 | `finding-causes.ts` rule table; `ClassifyFindingCausesPort`/UseCase; codes only | evidence-and-acceptance, **manifest** | 2 | — | Golden fixtures per code; a summary with a secret-shaped string classifies without echoing it |
-| CR5 | `replan-records.ts` + `deriveReplanProposal`: levers, quality costs, `needsOwner` rule, quota forecast, `factsDigest` | work-execution (domain) | 2 | CR2, CR3 | Property test: same facts → same digest; every tier/review/seat lever `needsOwner`; refused text → no record |
-| CRM | Manifest commit: ports, adapters, bindings, context mapping; `yarn sync` | **manifest**, barrels | 0 | CR4, CR5 | `yarn lint:arch`, `yarn sync:check` |
-| CR6a | `ProposeReplanUseCase` over `--sidecar` files (no store), `LaneScorecardReadPort` + JSONL adapter, `FindingCauseReadAdapter`, `ReplanSettingsPort` | work-execution (app, infra) | 2 | CRM | Dry-run against fixtures; a throwing port leaves `sources[].status = not-read` and still produces a proposal when `minSourcesRead` is met |
-| WB4a' | `LanePlanRepositoryPort`, file/memory stores, `ImportLanePlanUseCase` (pulled from W6, D-CR1) | work-execution, **manifest** | 2 | CR1 | Work-board plan's WB4a acceptance unchanged |
-| CR6b | Store-backed proposals: `ReplanProposalRepositoryPort` + adapters, supersede rule, `replanRef` linking on import → `decided` | work-execution (app, infra) | 2 | CR6a, WB4a' | Two proposals, same digest → one record; import with `replanRef` moves status |
-| CR7 | `policy.replan` keys with validation and defaults | installation | 1 | — | Reject negative thresholds; defaults as §3.4 |
-| CR8 | `plan import` (minimal, from WB7a) and `plan replan [--dry-run\|--json\|--digest\|--sidecar]`, `replan show\|list`, exit codes | apps/cli, **`index.ts`, `composition.ts`** | 2 | CR6b, CR7 | CLI tests per exit code; composes read-only repositories; no forge adapter |
-| CR9 | `ReplanOwnerRoutingPort`/adapter: keyed questions for `needsOwner` levers, `replan-suggested` attention item; repeat returns existing | work-execution → operator-coordination, **manifest** | 2 | CR6b | One question per (proposal, lever); answer recorded → `decisionRefs` |
-| CR10 | Driver cadence: wave-boundary detection, signal checks, debounce; journalled; skipped while halted | apps/cli (`conductor.ts`) | 2 | CR8, CR9, Wave 3 K11b' | Scenario test: boundary fires once; halted driver computes nothing |
-| CR11 | `GET /v1/replan`, `/v1/replan/:id`; `replan` feed kind | apps/api, `composition.ts` | 2 | CR6b | 501 unconfigured; bearer required; `read` scope after T3a |
-| CR12 | `/replan` read-only view: baseline, levers table, sources header, not-read/as-of states | apps/web, **`view-nav.tsx`** | 2 | CR11 | Fixture render; no action buttons |
-| CR13 | TUI Replan screen in the P9 shell | apps/cli | 1 | CR8, P9 | After Wave 7's P9 |
-| CR-R | Runbook `docs/runbooks/replan.md`; S7 JSONL format in tier2-speed plan §3 | docs | 0 | CR8 | — |
+| CR0 | This plan; `2026-10-31_remaining-work-plan.workbook.json` (sidecar v1, every §1 unit with disposition, §7.1 track as a `packages` reading) | docs | 0 | — | Fixture passes WB1a validation and WB1c cycle check in a unit test; lane count matches §2 totals |
+| CR2 | `replan-graph.ts`: weighted critical path with tier defaults, package/shared-file serialisation, tracks, start-now, utilisation | work-execution (domain), **barrel** | 2 | CR0 | The CR0 fixture reproduces §2 wave walls and §7.5 track walls within 15 %; a cycle is a typed error; a `dropped` predecessor yields `after-dropped`, never a release |
+| CR4 | `finding-causes.ts` rule table; `ClassifyFindingCausesPort`/UseCase (codes and severity counts only) | evidence-and-acceptance (domain, app), **barrel** | 2 | — | Golden fixtures per code; a summary with a secret-shaped string classifies without echoing it; a port consumer test asserts no `summary` field crosses |
+| CR5 | `replan-records.ts` + `deriveReplanProposal`: levers, quality costs, `needsOwner` rule, re-tier candidates, Fable forecast, canonical facts; no digest, no clock | work-execution (domain), **barrel** | 2 | CR2, CR4 | Property test: same facts → same canonical JSON; every tier/review/seat lever `needsOwner`; refused text → no body |
+| CRM | Manifest: ports, use cases, adapters, bindings, row 865 notes; `yarn sync` | **manifest**, **barrels** | 0 | CR4, CR5 | `yarn lint:arch`, `yarn sync:check` |
+| CR8-lite | `ProposeReplanUseCase`, `LaneScorecardFileAdapter`, `FindingCauseReadAdapter`, the digest adapter; `fleet-v2 plan replan --dry-run --sidecar <file>... [--scorecard <jsonl>] [--fable-weekly-passes n] [--json]`; exit codes; read-only evidence repositories | work-execution (app, infra); apps/cli **`index.ts`, `composition.ts`** (once) | 2 | CRM | CLI tests per exit code; `--json` round-trips the body; composes no forge adapter and no writable store; a throwing scorecard read → `not-read` and still a body |
 
-Totals: 14 lanes here (11 T2, 2 T1, 1 T0 PR) plus two T0 commits; about 11 h of hand-run time at 1 in flight, landing across Waves 1–4 without entering their chains. WB4a' and CR8's `plan import` are moved out of Wave 6; its work-execution sequence shortens by one.
+Totals Phase 1: 4 T2 + 2 T0 PRs; about 5 h hand-run at one in flight on A, plus 8 Fable sittings.
+
+### Phase 2 (deferred; re-decided after ten conducted Tier 2 runs, D-CR1)
+
+| Lane | Scope | Track / shared files | Tier | After |
+|---|---|---|---|---|
+| CR1 | Sidecar v2 optional fields; v1 still imports | A, work-execution domain, **barrel** | 2 | D-CR2 decided yes |
+| CR3 | `replan-waits.ts` from run/journal facts, admission labelled approximate | A | 2 | ten conducted T2 runs |
+| CR3j | Keyed `wait/<reason>` journal entry; `performAdmissionWait` appends it | A, `advance-lane-run/*`, journal contract | 2 | Wave 2 admission chain (KS5, KS6) |
+| CR6b | `ReplanProposalRepositoryPort` + stores (record v1), supersede rule, `replanRef` linking on import | A, **manifest** | 2 | Q5b (D-R8), WB4a on stream (ii) |
+| CR7 | `policy.replan` keys | C, installation | 1 | D-CR4, D-CR8 |
+| CR9 | `ReplanOwnerRoutingPort`/adapter: keyed questions, `replan-suggested` attention item | A (new files) + **manifest** | 2 | CR6b |
+| CR10 | Driver cadence: wave boundary, signals, debounce; journalled; skipped while halted | A, `conductor.ts` | 2 | CR9, Wave 3 K11b', **Wave 5 O9** |
+| CR11 | `GET /v1/replan`, `/v1/replan/:id`; `replan` feed kind | C, api wiring queue | 1 (read route, F-READS) | CR6b; after T3a's queue position |
+| CR12 | `/replan` read-only view | B, `view-nav.tsx` | 1 (display-only, F-READS) | CR11 (fixture-first per §7.2) |
+| CR13 | TUI Replan screen | B, `tui/**` | 1 (F-TUI) | P9, CR8-lite |
+| CR-R | Runbook `docs/runbooks/replan.md`; S7 JSONL format in the speed plan §3 | docs | 0 | CR8-lite |
+
+WB4a and WB7a are **not** pulled forward: WB4a needs WB2b and WB3b, WB7a needs WB4c and WB3b (work-board plan lines 292, 301), and they already sit on A's stream (ii). Phase 2 reads the store when stream (ii) delivers it.
 
 ## 5. Hard to undo
 
-- **`ReplanProposal` record v1** and the **sidecar v2 fields**: stored data and a file format in several repositories (work-board §5). Absent version means 1; unknown refused (D-R8).
-- **Cause-code taxonomy**: codes appear in stored proposals and in committed plan revisions; renaming one needs an alias table. Keep the set small and additive.
-- **`policy.replan` keys**: an installation file change; defaults chosen so an absent block means "manual only, no signals".
-- **A proposal is public text once in a plan revision**: §3.6's rule is the guard; the record validators are the mechanism.
-- Everything else is two-way: the view, the CLI, the driver hook and the question routing are removable.
+- **The S7 scorecard JSONL format** (D-CR5): once the orchestrator writes rows, a field rename needs a reader for the old shape. Version the first line (`{"schemaVersion":1}`).
+- **The cause-code taxonomy:** codes appear in proposals and in committed plan revisions; renaming one needs an alias table. Keep it small and additive.
+- **Phase 2 only:** the `ReplanProposal` record v1 (absent is 1, unknown refused, D-R8); sidecar v2 as a file format in several repositories (work-board §5); `policy.replan` keys (absent block means manual only).
+- **A proposal is public text once in a plan revision.** §3.6 is the rule; the record validators are the mechanism.
+- Phase 1 itself is two-way: a dry-run command over files, removable with its ports.
 
 ## 6. Decisions for the owner
 
+**Needed now (Phase 1):**
+
 | # | Question | Recommended |
 |---|---|---|
-| D-CR1 | Pull WB4a and a minimal `plan import` forward from Wave 6 into Track CR? | **Yes.** They are the data foundation; `--sidecar` dry-run bridges until they land |
-| D-CR2 | Sidecar v2 with optional `estimateMinutes`, `runAs`, `wave`, `replanRef`? | **Yes**; v1 files keep importing |
-| D-CR3 | Run Track CR as the pilot of a second orchestrator session on disjoint packages, 1 lane in flight? | **Yes**; measure in S7 before a third session |
-| D-CR4 | Cadence and thresholds: wave boundary + daily digest + signals (train p50 > 20 min, T2 idle gap > 60 min, fix-round rate > 1.0, slip > 30 %), 180 min debounce | **Yes**; tune after ten proposals |
-| D-CR5 | Fix-round causes by a rule table inside evidence, codes only crossing; no model classifier | **Yes**; a model classifier is a later lever, owner-decided |
-| D-CR6 | Owner surface: keyed owner questions plus a `replan-suggested` attention item now; plan-decision owner items when WB4c lands | **Yes** |
-| D-CR7 | Re-tier levers are always owner decisions; down-tier eligibility = `packages ⊆ {web, ui, docs}`, no shared files | **Yes**; fleet-v2 never writes a tier |
-| D-CR8 | Fable quota as an owner-entered `fableWeeklyPasses`, consumption measured from receipts by model family | **Yes** |
-| D-CR9 | S7 scorecard as JSONL in the state directory, read through `LaneScorecardReadPort`; never committed | **Yes** |
+| D-CR1 | Build the first slice now on Track A's stream (iii), one lane in flight, and re-decide Phase 2 (including whether WB4a's position in stream (ii) should change) after ten conducted Tier 2 runs? | **Yes.** Phase 1 is store-free and needs no Q5b; Phase 2 is re-decided against Wave 6 with data |
+| D-CR3 | Where does Phase 1 run? | **Track A**, because every file it touches (barrels, manifest, `index.ts`/`composition.ts`) is A-owned; a second session gains nothing here |
+| D-CR5 | S7 scorecard as versioned JSONL in `<stateDir>/scorecard/`, read by `--scorecard`; never committed | **Yes** |
+| D-CR6 | Fix-round causes by a rule table inside evidence, codes only crossing; no model classifier | **Yes**; a model classifier is a later, owner-decided lever |
+| D-CR7 | Re-tier levers are always owner decisions; down-tier candidacy = `packages ⊆ {web, ui, docs}`, no shared files, the touch list the proof | **Yes**; fleet-v2 never writes a tier |
+| D-CR9 | Phase 1 cadence: the orchestrator runs `plan replan --dry-run` at each sequence-end Fable pass and wave boundary and pastes the lever table into the plan revision | **Yes** |
+
+**At Phase 2 (after ten conducted Tier 2 runs):**
+
+| # | Question | Default to re-decide |
+|---|---|---|
+| D-CR2 | Sidecar v2 optional fields (`estimateMinutes`, `runAs`, `wave`, `replanRef`) | Only if tier defaults miss measured medians by > 30 % |
+| D-CR4 | Driver cadence and thresholds (train p50 > 20 min, T2 idle gap > 60 min, fix-round rate > 1.0, slip > 30 %; 180 min debounce) | Yes, tuned to the first ten proposals |
+| D-CR8 | Fable quota: owner-entered `fableWeeklyPasses` in `policy.replan`; consumption measured from receipts by model family | Yes (Phase 1 uses the flag) |
+| D-CR10 | Owner surface: keyed owner questions + attention item (CR9), plan-decision owner items when WB4c lands | Yes |
 
 ## 7. Assumptions
 
-- WB1a–c are on `main` (verified); lane runs and the keyed journal are stored (`LaneRunRepositoryPort`, `LaneRunJournalPort` in the manifest) and conduct entries carry the time a state was entered.
-- Hand-run Tier 2 lanes have attempts but no `LaneRun`; their waits come only from S7 rows, and the orchestrator keeps those rows current.
-- `reviewerModel` on receipts identifies the Fable family by prefix; a renamed model id needs the `fableModelFamily` setting updated.
-- `MergeRecord` (WB5a) is not built; "merged" is read from runs, `PullRequestLink`, `mergedPr`, and later the merge record, in that precedence.
-- Estimates default by tier and runAs when the sidecar carries none; the first proposals are coarse until S7 fills in.
-- `hexagen arch validate` accepts the new evidence → work-execution in-process mapping as it does `AcceptanceReceiptReadAdapter`.
+- WB1a–c are on `main` (verified); their validation accepts a sidecar for a plan whose lanes span several packages and tracks.
+- Hand-run Tier 2 lanes leave attempts but no `LaneRun`; in Phase 1 every wait figure comes from scorecard rows the orchestrator keeps current, and there are none yet for conducted Tier 2 runs.
+- Admission waits are not journalled today (verified); Phase 2's approximation and CR3j are the two ways to measure them.
+- `reviewerModel` identifies the Fable family by prefix; a renamed model id needs the configured family updated.
+- `MergeRecord` (WB5a) is not built; Phase 1 reads "done" from the sidecar's `mergedPr` and `status`; Phase 2 adds runs, `PullRequestLink` and the merge record.
+- Tier defaults (T0 10, T1 conducted 9, T1 hand-run 35, T2 75 min) are the §7.5 figures; the first proposals are coarse by design.
+- `hexagen arch validate` accepts the extended row 865 as it does `AcceptanceReceiptReadAdapter`.
+- Track A has room for one more hand-run lane in stream (iii) without delaying KS1 → KS7 or Q5a/Q5b; if not, Phase 1 waits behind Q5b.
 
 ## 8. Challenge this
 
-Whether a deterministic analyser earns its keep against the orchestrator's judgement: today's re-organisation came from reading plans, not from metrics, and a record-driven proposal can only name levers it has rules for. The counter-case is that the inputs (waits, idle gaps, cause clusters, start-now sets) are exactly what the orchestrator assembled by hand and will keep needing; a reviewer should ask whether S7 plus a markdown template would deliver most of the value with none of the stores. Whether maintaining a sidecar for 184 units is hand work the plan meant to remove: WB7a's `plan check` is the mitigation, and the remaining-work plan is already in table form. Whether "parallel tracks" is fleet-v2's concern at all, since orchestrator sessions live outside it; the proposal can only recommend one. And whether signals invite Goodharting (batching to lower PR counts, wider Tier 1 to lower fix-round rates): the escaped-defect guardrail of the speed plan §4 must sit beside every saving figure.
+Whether a deterministic analyser earns its keep against the orchestrator's judgement: today's re-organisation came from reading plans, and a record-driven proposal can only name levers it has rules for. Phase 1 is sized so the answer is cheap: six PRs, one of them docs, and the test is whether its first dry-run on the CR0 sidecar reproduces §7's start-now list and re-tier table. If it does not, stop at Phase 1. Whether the sidecar is hand work the plan meant to remove: CR0 is one file for 184 units, and `plan check` (WB7a) will warn on drift later. Whether Phase 1's eight Fable sittings on Track A are worth more than eight sittings on Wave 6 views, given §7.5's Fable floor. Whether "parallel tracks" is fleet-v2's concern at all, since sessions live outside it; the proposal can only recommend one. And whether signals invite Goodharting (batching to lower PR counts, wider Tier 1 to lower fix-round rates): the escaped-defect guardrail of the speed plan §4 sits beside every saving figure, and Phase 2's thresholds are decided only on data.
+
+## 9. Review record
+
+2026-10-31, non-Fable (Opus) review of rev 0: four majors, six minors, all applied.
+- **1d (major), admission waits assumed journalled:** §2 and §3.2 now state `performAdmissionWait` appends nothing; Phase 2 approximates `prepare` result → `dispatch` intent, labelled, and CR3j is the named lane for exact figures.
+- **1b/1c (minor), anchors:** `AttemptRecord` at `execution-records.ts:269-305` (runner 288, usage 296, seatSelection 305); `LaneRunAdmissionResult` has `refused` (§2).
+- **2a (minor), mapping row:** CRM extends row 865's notes; no new `context_mappings` row (§3.5).
+- **2b (major), crypto in the domain:** the domain emits canonical facts; `factsDigest`, `proposalId` and `producedAtIso` come from infrastructure (§3.3, §3.5).
+- **2d (minor), worker guard:** the allow-lists filter env vars; the real guard is that `FLEET_STATE_DIR` never reaches a worker, so its CLI sees in-memory stores (§3.6).
+- **3b (minor):** CR10 also orders after Wave 5's O9 (§4).
+- **3c/3d (major), packages not idle, shared files:** "without entering their chains" dropped; every lane placed on its owning track per §7.1; barrel, manifest and `index.ts`/`composition.ts` lanes marked; Phase 1 touches cli shared files once (§4).
+- **3e (major), WB4a' prerequisites:** the pull-forward is withdrawn; WB4a and WB7a stay on A's stream (ii) with their prerequisites; Phase 2 reads the store when it lands (§4).
+- **3f (minor), counts:** rev 0 had 13 T2 lanes (~16–17 h), not 11; rev 1 counts Phase 1 (4 T2, ~5 h) and Phase 2 separately (§4).
+- **4a (major), first slice:** restructured into Phase 1 (CR0, CR2, CR4, CR5, CRM, CR8-lite) and deferred Phase 2; decisions split into now vs Phase 2; §5, §7, §8 rewritten accordingly.

@@ -11,6 +11,8 @@ import {
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
+  LaneRunJournalAdapter,
+  LaneRunRepositoryAdapter,
   LocalExecutor,
   OwnerDecisionAdapter,
   AttemptOwnerDecisionAdapter,
@@ -29,6 +31,7 @@ import {
   sha256HexDigest,
   type AcceptanceAssessmentDelegate,
   type AcceptanceEvidenceDelegate,
+  type CancelPreparedAttemptRequest,
   type ActionAuthorizationDelegate,
   type BriefKnowledgeDelegate,
   type ExecutionObservationDelegate,
@@ -40,6 +43,7 @@ import {
 } from "@fleet/work-execution";
 import { requireValidInstallationModel, type FleetInstallation } from "@fleet/installation";
 import {
+  CancelPreparedAttemptUseCase,
   CollectAttemptArtifactsUseCase,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
@@ -61,6 +65,7 @@ import {
 } from "@fleet/work-execution/use-cases";
 import { ProbeLimiter } from "./probe-limiter";
 import { withPendingFixLimit } from "./pending-fix-guard";
+import { withRunActiveRefusal, type GuardedCancelPreparedResult } from "./cancel-prepared-guard";
 
 /**
  * Reads the seat an attempt was actually implemented on. Absent on a
@@ -105,6 +110,18 @@ export interface WorkComposition {
    * root, not the route.
    */
   attemptLimiter: ProbeLimiter;
+  /**
+   * Throttles HTTP cancel-prepared actions: one in-flight cancel per attempt
+   * id and a small global cap. A cancel is a pure record write, so it is kept
+   * apart from attemptLimiter (stop, reconcile, fix) and never waits behind a
+   * probe. Owned by this composition root, not the route.
+   */
+  cancelPreparedLimiter: ProbeLimiter;
+  cancelPreparedAttempt: {
+    cancelPreparedAttempt(
+      request: CancelPreparedAttemptRequest,
+    ): Promise<GuardedCancelPreparedResult>;
+  };
   executeAuthorizedForgeAction: ExecuteAuthorizedForgeActionUseCase;
   /** The attempt's recorded implementer seat; never an operator value. */
   readonly resolveAttemptImplementerSeat?: AttemptImplementerSeatResolver;
@@ -236,6 +253,8 @@ function unconfiguredWorkComposition(): WorkComposition {
     probeProject: new ProbeProjectUseCase(),
     probeLimiter: new ProbeLimiter(),
     attemptLimiter: new ProbeLimiter(4),
+    cancelPreparedLimiter: new ProbeLimiter(),
+    cancelPreparedAttempt: new CancelPreparedAttemptUseCase(),
     listUnregisteredProjects: new ListUnregisteredProjectsUseCase(),
     prepareBriefPackage: new PrepareBriefPackageUseCase(),
     reserveExecutionCapacity: new ReserveExecutionCapacityUseCase(),
@@ -327,6 +346,10 @@ export function createConfiguredWorkComposition(
     stateDir,
     ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
   });
+  // EX-1c: the cancel-prepared guard reads lane runs and their journal; the
+  // route only ever reads them, so both adapters are opened read-only.
+  const laneRunRepo = new LaneRunRepositoryAdapter({ stateDir, readOnly: true });
+  const laneRunJournal = new LaneRunJournalAdapter({ stateDir, readOnly: true });
   const briefAuthoring = new BriefAuthoringAdapter();
   // H9b2: workspace and artifact reads for an attempt recorded on a named
   // host run through that recorded host's executor (the recorded host is the
@@ -438,6 +461,12 @@ export function createConfiguredWorkComposition(
     }),
     probeLimiter: new ProbeLimiter(),
     attemptLimiter: new ProbeLimiter(4),
+    cancelPreparedLimiter: new ProbeLimiter(),
+    cancelPreparedAttempt: withRunActiveRefusal(
+      new CancelPreparedAttemptUseCase({ attemptRepo, journal }),
+      laneRunRepo,
+      laneRunJournal,
+    ),
     listUnregisteredProjects: new ListUnregisteredProjectsUseCase({
       workOrderRepo,
       profileRead,

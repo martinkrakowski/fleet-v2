@@ -15,6 +15,7 @@ import type { PrepareBriefPackagePort, PrepareBriefPackageRequest } from '../../
 import type { PrepareLaneWorktreeRequest, PrepareLaneWorktreeResult } from '../../ports/out/WorkspacePort.out-port.js';
 import type { WorkspacePort } from '../../ports/out/WorkspacePort.out-port.js';
 import type { PrepareBriefPackageUseCaseRequest } from '../PrepareBriefPackageUseCase.use-case.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import type {
   LaneRunFirstReservationRequest,
   LaneRunFirstReservationResult,
@@ -37,7 +38,10 @@ const NOW = '2026-10-27T10:00:00.000Z';
 const LATER = '2026-10-27T10:01:00.000Z';
 const LEASE_UNTIL = '2026-10-27T10:05:00.000Z';
 const COMMIT = 'a'.repeat(40);
-const DIGEST = 'b'.repeat(64);
+// SEC-5b-2: the frozen brief the harness serves, and the digest that verifies it.
+const BRIEF_PROSE = '# Task\n\nExample lane brief.\n';
+const FROZEN_MANIFEST_JSON = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });
+const DIGEST = simpleDeterministicHexDigest(BRIEF_PROSE + '\n' + FROZEN_MANIFEST_JSON);
 const HOST_NAME = 'lane-example';
 const WORKTREE_ROOT = '/tmp/fleet-example/wt';
 const WORKTREE_PATH = WORKTREE_ROOT + '/example0000000000000000000000000001';
@@ -1273,8 +1277,8 @@ describe('StartLaneRunUseCase', () => {
       attemptRepo: harness.attemptRepoStore,
       executionJournal: harness.executionJournal,
       artifactPort: {
-        readBriefManifest: async () =>
-          JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] }),
+        readBriefManifest: async () => FROZEN_MANIFEST_JSON,
+        readBriefFile: async () => BRIEF_PROSE,
         verifyArtifactManifest: async () => ({ outcome: 'missing' }),
       },
       reconcileAttempt: {

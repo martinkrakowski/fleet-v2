@@ -29,6 +29,7 @@ import type { RunConductorPassDependencies } from '../RunConductorPassUseCase.us
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AttemptRecord, AttemptRunnerRecord } from '../../../domain/execution-records.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import type { DispatchAttemptRequest } from '../../ports/in/DispatchAttemptPort.in-port.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
@@ -1128,6 +1129,10 @@ describe('RunConductorPassUseCase real advance (KF-34a2)', () => {
   const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
   const COMMIT = 'a'.repeat(40);
   const SHA = 'c'.repeat(64);
+  // SEC-5b-2: the frozen brief the harness serves, and the digest that verifies it.
+  const BRIEF_PROSE = '# Task\n\nExample lane brief.\n';
+  const FROZEN_MANIFEST_JSON = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });
+  const BRIEF_DIGEST = simpleDeterministicHexDigest(BRIEF_PROSE + '\n' + FROZEN_MANIFEST_JSON);
   const CONDUCTED_RUNNER: AttemptRunnerRecord = {
     kind: 'opencode',
     remotePort: 4166,
@@ -1167,7 +1172,7 @@ describe('RunConductorPassUseCase real advance (KF-34a2)', () => {
       baseCommit: COMMIT,
       state: 'intent-recorded',
       outcome: null,
-      briefDigest: SHA,
+      briefDigest: BRIEF_DIGEST,
       briefPackagePath: '.lane/brief-package',
       sessionId: null,
       completionReceipt: null,
@@ -1222,8 +1227,8 @@ describe('RunConductorPassUseCase real advance (KF-34a2)', () => {
       attemptRepo,
       executionJournal,
       artifactPort: {
-        readBriefManifest: async () =>
-          JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] }),
+        readBriefManifest: async () => FROZEN_MANIFEST_JSON,
+        readBriefFile: async () => BRIEF_PROSE,
         verifyArtifactManifest: async () => ({ outcome: 'missing' }),
       },
       reconcileAttempt: {

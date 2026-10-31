@@ -569,7 +569,13 @@ async function makeHarness(
     prepareBrief: {
       prepareBriefPackage: async (request) => {
         briefRequests.push(request);
-        return prepareBriefAnswer(request);
+        const answer = await prepareBriefAnswer(request);
+        // SEC-5b-2: a prepared package is written to the worktree, so later
+        // verified reads of the brief serve the prose that was just frozen.
+        if (answer.outcome === 'prepared' && typeof request.proseMarkdown === 'string') {
+          prose = request.proseMarkdown;
+        }
+        return answer;
       },
       previewBriefPackage: async () => ({
         outcome: 'previewed',

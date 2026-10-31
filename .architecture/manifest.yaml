@@ -363,6 +363,7 @@ bounded_contexts:
           - ExportRunTelemetryUseCase
           - CloseWorkOrderUseCase
           - ListStaleWorkOrdersUseCase
+          - ReapLaneWorktreesUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -385,6 +386,7 @@ bounded_contexts:
             - ExportRunTelemetryPort
             - CloseWorkOrderPort
             - ListStaleWorkOrdersPort
+            - ReapLaneWorktreesPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -461,7 +463,7 @@ bounded_contexts:
       LaneDiffCheckPort: "Before any edit-only commit, collect a worktree's tracked and untracked changes against the base and run the pure lane diff check: allowed path prefixes from the frozen brief, fixed and policy protected paths, and secret patterns on added lines; findings carry path, line and rule name only, never a matched value."
       GatePredicatePort: "Evaluate a frozen acceptance spec on an attempt's worktree host in order: the commit since the base at the candidate head with a clean tree, the lane diff check, then each fixed argv command with its declared coverage; the first predicate that does not pass stops the run and later ones are skipped; results carry no command output."
       CommandExecutorPort: "Run one reviewed argv array without a shell through a local or ssh transport and report its completed outcome, never a launch as completion."
-      WorkspacePort: "Prepare scoped Git worktrees and inspect base/head commits and commit deltas without resetting user work."
+      WorkspacePort: "Prepare scoped Git worktrees and inspect base/head commits and commit deltas without resetting user work.; remove a finished lane's clean worktree on explicit request, keeping its branch."
       AttemptArtifactPort: "Place frozen briefs and templates under verified ignored paths and collect bounded immutable artifacts after lane completion."
       ForgeActionPort: "Perform permitted credential-bearing PR and merge operations through stable action IDs and explicit expected-head checks."
       ForgeReadPort: "Read one pull request's state by number or branch (open, merged or closed; head, base, merge time and merge commit) without mutating anything; a forge that cannot be read or a response that cannot be verified is unavailable, never a guess and never absence."
@@ -491,6 +493,7 @@ bounded_contexts:
       ExportRunTelemetryPort: "For a selection of conducted runs and hand-run attempts, map the records to closed spans, apply sampling, record every span not yet final as pending before sending, send, and record each returned disposition; a span becomes final only on an HTTP result, a different salt fingerprint refuses the whole export before any send, and nothing outside the disposition store is written."
       CloseWorkOrderPort: "Close one active work order as merged or stopped on the operator's explicit confirmation, releasing its owned paths; refused while any lane run naming it is not terminal, any of its attempts is outside the capacity-release states or holds a reservation, or it is already terminal; closing as merged needs a lane run naming it that ended merged; an unknown id is not-found; a stale revision is refused, never overwritten."
       ListStaleWorkOrdersPort: "List, read-only, the work orders whose state disagrees with their lane runs: active work orders whose every run is terminal, active work orders with no run, and non-terminal runs whose work order is terminal; never writes."
+      ReapLaneWorktreesPort: "On the operator's explicit request, list or remove the clean worktree of every lane run that is terminal and whose work order is terminal and whose attempts are all cancelled or collected with no held reservation; never removes a dirty, locked or unlisted worktree and never deletes a branch; a dry run removes nothing."
       ProbeProjectPort: "Probe one registered project read-only: read its profile, check its repository and clones and that its gate procedures exist in the installation, and record the receipt only if the profile did not change while it was probed."
       ProjectProfileReadPort: "Read one project profile and its revision from the coordination context; known absence is null."
       ProjectProbeRecordPort: "Record a probe receipt on a profile at the revision the probe started from; a changed profile is a typed rejection, never an overwrite."

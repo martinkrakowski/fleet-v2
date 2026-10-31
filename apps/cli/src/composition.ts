@@ -85,6 +85,7 @@ import {
   InspectLaneRunsUseCase,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
+  ReapLaneWorktreesUseCase,
   RequestLaneRunStopUseCase,
   ResumeLaneRunUseCase,
   type ProjectProfileReadPort,
@@ -699,6 +700,8 @@ export interface FleetCliRuntime {
     readonly requestLaneRunStop: RequestLaneRunStopUseCase;
     readonly inspectLaneRuns: InspectLaneRunsUseCase;
     readonly resumeLaneRun: ResumeLaneRunUseCase;
+    /** EX-2b: the operator-opt-in worktree reap (conductor reap --worktrees). */
+    readonly reapLaneWorktrees: ReapLaneWorktreesUseCase;
     /** A fresh ULID per call (journal entry ids, run and attempt ids). */
     readonly newUlid: () => string;
     /** The project profile read the root already builds; exposed for `conductor start` (K7-7). */
@@ -938,6 +941,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     issuePolicyForgeGrantUseCase,
     autoMergeLoad,
     installation: options?.installation,
+    workOrderRepository,
+    attemptRepository,
+    executionJournal,
+    workspace,
   });
 
   // KF-36b-1b: the operator's close command is built here, after the

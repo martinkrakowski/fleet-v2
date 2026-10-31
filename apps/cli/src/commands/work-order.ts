@@ -43,4 +43,8 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       }
       return rt.execution.closeWorkOrder.closeWorkOrder({ workOrderId, state });
     },
+    stale: async (p, rt) =>
+      rt.execution.listStaleWorkOrders.listStaleWorkOrders({
+        projectId: optStr(p, 'projectId'),
+      }),
 };

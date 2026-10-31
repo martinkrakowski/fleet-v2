@@ -1,6 +1,6 @@
 /** The `attempt` command group of the CLI driver; its entries moved verbatim from the command table. */
 
-import { AttemptRevisionConflictError, historyEntryOf, nextAttemptRevision, SeatPlan, selectReviewSeat, selectSeat } from '@fleet/work-execution';
+import { AttemptRevisionConflictError, historyEntryOf, laneRunJournalState, LANE_RUN_TERMINAL_STATES, nextAttemptRevision, SeatPlan, selectReviewSeat, selectSeat, type LaneRunStateValue } from '@fleet/work-execution';
 import { isSameModelFamily, underlyingModelFamily as evidenceFamily } from '@fleet/evidence-and-acceptance';
 import { join } from 'node:path';
 import type { AttemptRecord, AttemptSeatOverrideRecord, CommandCompletionReceipt } from '@fleet/work-execution';
@@ -232,4 +232,40 @@ export const attemptCommands: Readonly<Record<string, CommandHandler>> = {
     },
     'auto-merge': async (p, rt) =>
       rt.execution.autoMergeAttempt.autoMergeAttempt({ attemptId: str(p, 'attemptId') }),
+    // EX-1a: an operator cancel for a prepared, never-dispatched attempt. It
+    // refuses while a live conducted run still owns the attempt; a stray one
+    // no run lists may be cancelled.
+    'cancel-prepared': async (p, rt) => {
+      // A bare `--attempt-id` followed by another flag parses as `true`; that
+      // is a missing id, not the id "true".
+      if (typeof p.attemptId !== 'string' || p.attemptId.trim() === '') {
+        throw new CliUsageError('attempt cancel-prepared needs --attempt-id');
+      }
+      const attemptId = str(p, 'attemptId');
+      if (p.yes !== true) {
+        throw new CliUsageError(
+          'attempt cancel-prepared needs --yes: it marks a prepared, never-dispatched attempt cancelled and releases any slot it holds; it contacts no runner and changes no run, branch or pull request.',
+        );
+      }
+      for (const run of await rt.conductor.laneRunRepository.list()) {
+        if (run.attemptIds.includes(attemptId)) {
+          const state = laneRunJournalState(
+            await rt.conductor.laneRunJournal.listForRun(run.runId),
+            run.runId,
+          );
+          if (!(LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state)) {
+            return {
+              outcome: 'refused',
+              reason: 'run-active',
+              runId: run.runId,
+              message: 'a live conducted run owns this attempt; use conductor stop <runId>',
+            };
+          }
+        }
+      }
+      return rt.execution.cancelPreparedAttempt.cancelPreparedAttempt({
+        attemptId,
+        nowIso: optStr(p, 'nowIso') ?? new Date().toISOString(),
+      });
+    },
 };

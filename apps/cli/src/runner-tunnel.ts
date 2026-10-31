@@ -206,6 +206,12 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
         'ExitOnForwardFailure=yes',
         '-o',
         'BatchMode=yes',
+        // Keepalives: a released forward whose connection silently dies must exit,
+        // so the port is freed and the next driver opens a fresh forward.
+        '-o',
+        'ServerAliveInterval=30',
+        '-o',
+        'ServerAliveCountMax=3',
         '-L',
         `127.0.0.1:${dial}:127.0.0.1:${remote}`,
         '--',

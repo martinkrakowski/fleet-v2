@@ -34,16 +34,16 @@ import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
-const RUN_ID = 'run-01JB0000000000000000000000';
+export const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
-const LATER = '2026-10-27T10:01:00.000Z';
+export const LATER = '2026-10-27T10:01:00.000Z';
 const LEASE_UNTIL = '2026-10-27T10:05:00.000Z';
 const HOLDER = 'driver';
 const COMMIT = 'a'.repeat(40);
 const HEAD12 = 'a'.repeat(12);
 const PROSE = '# brief\n';
 const DEFAULT_MANIFEST_JSON = JSON.stringify({ timeLimitSeconds: 3600 });
-const digestFor = (json: string): string => simpleDeterministicHexDigest(PROSE + '\n' + json);
+export const digestFor = (json: string): string => simpleDeterministicHexDigest(PROSE + '\n' + json);
 
 const BASE_RECORD = {
   version: 1,
@@ -103,7 +103,7 @@ const CONDUCTED_RUNNER = {
   variant: null,
 };
 
-function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
+export function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     id: 'attempt-example-1',
     workOrderId: 'wo-example-1',
@@ -130,7 +130,7 @@ function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
 }
 
 /** A run record via the domain entity, like the decider's fixture. */
-function runRecord(overrides: Record<string, unknown> = {}): LaneRunRecord {
+export function runRecord(overrides: Record<string, unknown> = {}): LaneRunRecord {
   const result = LaneRun.create({ ...BASE_RECORD, ...overrides });
   expect(result.success).toBe(true);
   if (!result.success) {
@@ -148,7 +148,7 @@ function makeUlidMinter(): () => string {
   };
 }
 
-function activeAnswer(attempt: AttemptRecord): ReconcileAttemptResult {
+export function activeAnswer(attempt: AttemptRecord): ReconcileAttemptResult {
   return {
     outcome: 'active',
     attempt,
@@ -181,20 +181,22 @@ function cancelledAnswer(attempt: AttemptRecord, reason: string): ReconcileAttem
   return { outcome: 'cancelled', attempt, reason };
 }
 
-interface Harness {
+export interface Harness {
   readonly runRepo: LaneRunRepositoryAdapter;
   readonly runJournal: LaneRunJournalAdapter;
   readonly attemptRepo: AttemptRepositoryAdapter;
   readonly executionJournal: ExecutionJournalAdapter;
   readonly admissionCalls: unknown[];
   readonly reconcileCalls: unknown[];
+  readonly briefFileCalls: unknown[];
+  readonly briefManifestCalls: unknown[];
   readonly deps: AdvanceLaneRunDependencies;
   setManifest(json: string | null): void;
   setReconcileAnswer(answer: ReconcileAttemptResult): void;
   setAdmissionAnswer(answer: LaneRunAdmissionResult): void;
 }
 
-async function makeHarness(
+export async function makeHarness(
   record: LaneRunRecord,
   attempts: readonly AttemptRecord[],
   options: { readonly ceiling?: number } = {},
@@ -205,6 +207,8 @@ async function makeHarness(
   const executionJournal = new ExecutionJournalAdapter();
   const admissionCalls: unknown[] = [];
   const reconcileCalls: unknown[] = [];
+  const briefFileCalls: unknown[] = [];
+  const briefManifestCalls: unknown[] = [];
   let manifestJson: string | null = DEFAULT_MANIFEST_JSON;
   let reconcileAnswer: ReconcileAttemptResult = activeAnswer(attempts[attempts.length - 1] ?? attemptFixture());
   let admissionAnswer: LaneRunAdmissionResult = { outcome: 'admitted' };
@@ -226,8 +230,14 @@ async function makeHarness(
     attemptRepo,
     executionJournal,
     artifactPort: {
-      readBriefManifest: async () => manifestJson,
-      readBriefFile: async () => PROSE,
+      readBriefManifest: async (...request) => {
+        briefManifestCalls.push(request);
+        return manifestJson;
+      },
+      readBriefFile: async (...request) => {
+        briefFileCalls.push(request);
+        return PROSE;
+      },
       verifyArtifactManifest: async () => ({ outcome: 'missing' }),
     },
     reconcileAttempt: {
@@ -262,6 +272,8 @@ async function makeHarness(
     executionJournal,
     admissionCalls,
     reconcileCalls,
+    briefFileCalls,
+    briefManifestCalls,
     deps,
     setManifest: (json) => {
       manifestJson = json;
@@ -275,7 +287,7 @@ async function makeHarness(
   };
 }
 
-function advance(harness: Harness, overrides: Record<string, unknown> = {}) {
+export function advance(harness: Harness, overrides: Record<string, unknown> = {}) {
   const useCase = new AdvanceLaneRunUseCase(harness.deps);
   return useCase.advanceLaneRun({
     runId: RUN_ID,
@@ -286,7 +298,7 @@ function advance(harness: Harness, overrides: Record<string, unknown> = {}) {
   });
 }
 
-async function conduct(harness: Harness, state: LaneRunStateValue, nowIso: string): Promise<void> {
+export async function conduct(harness: Harness, state: LaneRunStateValue, nowIso: string): Promise<void> {
   const entry = laneRunConductEntry(harness.deps.newUlid(), RUN_ID, state, nowIso);
   const appended = await harness.runJournal.append(entry);
   expect(appended.outcome).toBe('appended');
@@ -344,7 +356,7 @@ async function appendResult(
   expect(appended.outcome).toBe('appended');
 }
 
-function dispatchIntentAndResult(harness: Harness, round: number, seatIndex: number, attemptOrdinal: number, at: string): Promise<void> {
+export function dispatchIntentAndResult(harness: Harness, round: number, seatIndex: number, attemptOrdinal: number, at: string): Promise<void> {
   const key = stepKey({ round, step: 'dispatch', seatIndex, attemptOrdinal, head12: null });
   return appendIntent(harness, key, 'attempt-example-' + attemptOrdinal, at).then(() =>
     appendResult(harness, key, 'completed', 'dispatch-started', at),
@@ -451,49 +463,57 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
     expect(result).toEqual({ outcome: 'not-wired', step: 'stop' });
   });
 
-  it('test 12: a running attempt whose on-disk manifest changed after dispatch parks ambiguous stop', async () => {
+  it('test 12: a running attempt whose on-disk manifest changed after dispatch waits for, then stops at, the conductor fallback deadline (SEC-5c)', async () => {
     const running = attemptFixture({ state: 'running', sessionId: 'session-example-1' });
     const harness = await makeHarness(runRecord(), [running]);
     await conduct(harness, 'running', NOW);
     await dispatchIntentAndResult(harness, 0, 0, 1, '2026-10-27T09:10:00.000Z');
     harness.setReconcileAnswer(activeAnswer(running));
-    // The on-disk manifest changed after dispatch: its digest no longer matches
-    // the attempt's recorded `briefDigest` (SEC-5a), so the run parks instead
-    // of silently extending the deadline.
+    // The on-disk manifest changed after dispatch: its digest no longer
+    // matches the attempt's recorded `briefDigest` (SEC-5a), so the manifest
+    // is not verified. With no recorded limit the conductor's fallback
+    // (3600 s) sets the deadline: at the default LATER (3060 s elapsed) the
+    // run waits; at 3601 s the conductor stops the lane instead of parking.
     harness.setManifest(JSON.stringify({ timeLimitSeconds: 360000 }));
-    const result = await advance(harness);
-    expect(result).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'stop' });
-    const after = await harness.runRepo.get(RUN_ID);
-    expect(after?.parked).toEqual({
-      reason: 'ambiguous',
-      qualifier: 'stop',
-      parkedFrom: 'running',
-      questionId: null,
+    const waiting = await advance(harness);
+    expect(waiting).toEqual({ outcome: 'waiting', reason: 'lane-running' });
+    const before = await harness.runRepo.get(RUN_ID);
+    expect(before?.parked).toBeNull();
+    expect(before?.parkCount).toBe(0);
+    expect(before?.revision).toBe(1);
+    // Extend the lease past the later advance's nowIso (the harness holds it).
+    await harness.runRepo.renewLease(RUN_ID, {
+      holderId: HOLDER,
+      fence: 1,
+      leaseUntilIso: '2026-10-27T10:11:00.000Z',
+      nowIso: LATER,
     });
-    expect(after?.parkCount).toBe(1);
-    expect(after?.revision).toBe(2);
-    expect(await lastJournalState(harness)).toBe('parked');
+    const result = await advance(harness, { nowIso: '2026-10-27T10:10:01.000Z' });
+    expect(result).toEqual({ outcome: 'not-wired', step: 'stop' });
   });
 
-  it('test 6: a running attempt with no readable limit parks ambiguous stop', async () => {
+  it('test 6: a running attempt with no readable limit waits for, then stops at, the conductor fallback deadline (SEC-5c)', async () => {
     const running = attemptFixture({ state: 'running', sessionId: 'session-example-1' });
     const harness = await makeHarness(runRecord(), [running]);
     await conduct(harness, 'running', NOW);
     await dispatchIntentAndResult(harness, 0, 0, 1, '2026-10-27T09:10:00.000Z');
     harness.setReconcileAnswer(activeAnswer(running));
     harness.setManifest(JSON.stringify({}));
-    const result = await advance(harness);
-    expect(result).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'stop' });
-    const after = await harness.runRepo.get(RUN_ID);
-    expect(after?.parked).toEqual({
-      reason: 'ambiguous',
-      qualifier: 'stop',
-      parkedFrom: 'running',
-      questionId: null,
+    const waiting = await advance(harness);
+    expect(waiting).toEqual({ outcome: 'waiting', reason: 'lane-running' });
+    const before = await harness.runRepo.get(RUN_ID);
+    expect(before?.parked).toBeNull();
+    expect(before?.parkCount).toBe(0);
+    expect(before?.revision).toBe(1);
+    // Extend the lease past the later advance's nowIso (the harness holds it).
+    await harness.runRepo.renewLease(RUN_ID, {
+      holderId: HOLDER,
+      fence: 1,
+      leaseUntilIso: '2026-10-27T10:11:00.000Z',
+      nowIso: LATER,
     });
-    expect(after?.parkCount).toBe(1);
-    expect(after?.revision).toBe(2);
-    expect(await lastJournalState(harness)).toBe('parked');
+    const result = await advance(harness, { nowIso: '2026-10-27T10:10:01.000Z' });
+    expect(result).toEqual({ outcome: 'not-wired', step: 'stop' });
   });
 
   it('test 7: a run over the cost ceiling parks cost-ceiling in seat-failed', async () => {
@@ -693,6 +713,104 @@ describe('collectionFactOf headUnchanged (KF-21c)', () => {
       commits: 1,
       manifest: 'sealed',
       headUnchanged: false,
+    });
+  });
+});
+
+describe('AdvanceLaneRunUseCase conductor deadline (SEC-5c-2)', () => {
+  it('a: an edited manifest cannot extend the deadline; the recorded limit wins and no brief read is made', async () => {
+    // The attempt keeps the fixture's default `briefDigest`, so the on-disk
+    // 360000 s manifest does not verify — and with the recorded 2700 s limit
+    // the manifest is not read at all (no `readBriefFile`/`readBriefManifest`).
+    const running = attemptFixture({
+      state: 'running',
+      sessionId: 'session-example-1',
+      dispatchedTimeLimitSeconds: 2700,
+    });
+    const harness = await makeHarness(runRecord(), [running]);
+    await conduct(harness, 'running', NOW);
+    await dispatchIntentAndResult(harness, 0, 0, 1, '2026-10-27T09:10:00.000Z');
+    harness.setReconcileAnswer(activeAnswer(running));
+    harness.setManifest(JSON.stringify({ timeLimitSeconds: 360000 }));
+    // 3060 s elapsed: past the recorded 2700 s limit, far below the edited one.
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'not-wired', step: 'stop' });
+    expect(harness.briefFileCalls).toHaveLength(0);
+    expect(harness.briefManifestCalls).toHaveLength(0);
+  });
+
+  it('b: the recorded limit wins over a verified, different manifest', async () => {
+    // The digest matches the on-disk 360000 s manifest, so it verifies — the
+    // recorded 2700 s still sets the deadline (3060 s elapsed at LATER).
+    const running = attemptFixture({
+      state: 'running',
+      sessionId: 'session-example-1',
+      briefDigest: digestFor(JSON.stringify({ timeLimitSeconds: 360000 })),
+      dispatchedTimeLimitSeconds: 2700,
+    });
+    const harness = await makeHarness(runRecord(), [running]);
+    await conduct(harness, 'running', NOW);
+    await dispatchIntentAndResult(harness, 0, 0, 1, '2026-10-27T09:10:00.000Z');
+    harness.setReconcileAnswer(activeAnswer(running));
+    harness.setManifest(JSON.stringify({ timeLimitSeconds: 360000 }));
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'not-wired', step: 'stop' });
+  });
+
+  it('c: an unreadable manifest with no recorded limit waits for, then stops at, the conductor fallback deadline', async () => {
+    const running = attemptFixture({ state: 'running', sessionId: 'session-example-1' });
+    const harness = await makeHarness(runRecord(), [running]);
+    await conduct(harness, 'running', NOW);
+    await dispatchIntentAndResult(harness, 0, 0, 1, '2026-10-27T09:10:00.000Z');
+    harness.setReconcileAnswer(activeAnswer(running));
+    harness.setManifest(null);
+    // 3060 s elapsed, fallback 3600 s: the run waits, no park.
+    const waiting = await advance(harness);
+    expect(waiting).toEqual({ outcome: 'waiting', reason: 'lane-running' });
+    const before = await harness.runRepo.get(RUN_ID);
+    expect(before?.parked).toBeNull();
+    expect(before?.parkCount).toBe(0);
+    expect(before?.revision).toBe(1);
+    // Extend the lease past the later advance's nowIso (the harness holds it).
+    await harness.runRepo.renewLease(RUN_ID, {
+      holderId: HOLDER,
+      fence: 1,
+      leaseUntilIso: '2026-10-27T10:11:00.000Z',
+      nowIso: LATER,
+    });
+    // 3601 s elapsed: the conductor stops the lane.
+    const result = await advance(harness, { nowIso: '2026-10-27T10:10:01.000Z' });
+    expect(result).toEqual({ outcome: 'not-wired', step: 'stop' });
+  });
+
+  it('d: regression guard — a legacy attempt with a verified 2700 s manifest still stops at 2700 s', async () => {
+    const running = attemptFixture({
+      state: 'running',
+      sessionId: 'session-example-1',
+      briefDigest: digestFor(JSON.stringify({ timeLimitSeconds: 2700 })),
+    });
+    const harness = await makeHarness(runRecord(), [running]);
+    await conduct(harness, 'running', NOW);
+    await dispatchIntentAndResult(harness, 0, 0, 1, '2026-10-27T09:10:00.000Z');
+    harness.setReconcileAnswer(activeAnswer(running));
+    harness.setManifest(JSON.stringify({ timeLimitSeconds: 2700 }));
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'not-wired', step: 'stop' });
+  });
+
+  it('e: regression guard — with no dispatch intent in the journal the run still parks ambiguous stop', async () => {
+    const running = attemptFixture({ state: 'running', sessionId: 'session-example-1' });
+    const harness = await makeHarness(runRecord(), [running]);
+    await conduct(harness, 'running', NOW);
+    harness.setReconcileAnswer(activeAnswer(running));
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'stop' });
+    const after = await harness.runRepo.get(RUN_ID);
+    expect(after?.parked).toEqual({
+      reason: 'ambiguous',
+      qualifier: 'stop',
+      parkedFrom: 'running',
+      questionId: null,
     });
   });
 });

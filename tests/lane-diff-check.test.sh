@@ -416,6 +416,174 @@ mkdir -p .devcontainer && printf '{}\n' > .devcontainer/devcontainer.json
 check 'piped with --rules, the trusted table loads and .devcontainer/ is protected' '[ "$(rc)" = 1 ] && grep -q "^protected: .devcontainer/devcontainer.json$" "$T/o"'
 rm -rf .devcontainer
 
+# KF-27: base-line allowance. A credential-shaped line already in the base version of the same path
+# is excused (reported as baseline-excused, line numbers only); a new or changed line still fails.
+head0=$(git rev-parse HEAD)
+fx='const password = "'; fx="${fx}hunter2hunter2\";"
+{ echo 'line one'; echo "$fx"; echo 'line three'; } > packages/x/src/fixture.ts
+git add packages/x/src/fixture.ts && git -c commit.gpgsign=false commit -q -m fixture
+git tag kf27base
+echo 'line four' >> packages/x/src/fixture.ts
+run "$R" --base "$(git rev-parse kf27base)"
+check 'a pre-existing fixture line in a touched file is excused (KF-27)' '[ "$(rc)" = 0 ] && grep -q "^baseline-excused: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^secret-pattern:" "$T/o"'
+check 'the excused value is never printed (KF-27)' '! grep -q "hunter2" "$T/o" && ! grep -q "hunter2" "$T/e"'
+git -c commit.gpgsign=false commit -qam 'touch fixture'
+run "$R" --base "$(git rev-parse kf27base)"
+check 'a committed edit to the file still excuses the base line (KF-27)' '[ "$(rc)" = 0 ] && grep -q "^baseline-excused: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o"'
+echo "$fx" >> packages/x/src/fixture.ts
+run "$R" --base "$(git rev-parse kf27base)"
+check 'a new copy of the same fixture line beyond the base count fails (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/fixture.ts:5 (password-assignment)$" "$T/o" && grep -q "^baseline-excused: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o"'
+git checkout -q -- packages/x/src/fixture.ts
+sed 's/hunter2hunter2/hunter3hunter3/' packages/x/src/fixture.ts > "$T/fx" && cat "$T/fx" > packages/x/src/fixture.ts
+run "$R" --base "$(git rev-parse kf27base)"
+check 'a modified fixture line fails (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o"'
+check 'the modified value is never printed (KF-27)' '! grep -q "hunter3" "$T/o"'
+git checkout -q -- packages/x/src/fixture.ts
+{ echo "$fx"; } > packages/x/src/fixture2.ts
+run "$R" --base "$(git rev-parse kf27base)"
+check 'the same line in a different, new file is not excused (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/fixture2.ts:1 (password-assignment)$" "$T/o"'
+rm -f packages/x/src/fixture2.ts
+echo 'line five' >> packages/x/src/fixture.ts
+run "$R"
+check 'with no base nothing is excused (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o"'
+git checkout -q -- packages/x/src/fixture.ts
+{ printf 'a\000b\n'; echo "$fx"; } > packages/x/src/nulfix.ts
+git add packages/x/src/nulfix.ts && git -c commit.gpgsign=false commit -q -m nulfix
+git tag kf27nul
+echo 'tail' >> packages/x/src/nulfix.ts
+run "$R" --base "$(git rev-parse kf27nul)"
+check 'a NUL byte in the file excuses nothing (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/nulfix.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o"'
+git checkout -q -- packages/x/src/nulfix.ts
+{ echo 'line one'; echo 'line two'; } > packages/x/src/repl.ts
+git add packages/x/src/repl.ts && git -c commit.gpgsign=false commit -q -m repl
+git tag kf27repl
+realblob=$(git rev-parse kf27repl:packages/x/src/repl.ts)
+forged=$({ echo 'line one'; echo "$fx"; echo 'line two'; } | git hash-object -w --stdin)
+git replace "$realblob" "$forged"
+echo "$fx" >> packages/x/src/repl.ts
+run "$R" --base "$(git rev-parse kf27repl)"
+check 'a replace ref forging the base blob excuses nothing (KF-27, Luna review)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/repl.ts:3 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o"'
+git replace -d "$realblob" > /dev/null
+git checkout -q -- packages/x/src/repl.ts
+git tag -d kf27repl > /dev/null
+# KF-27a (Fable review A1): a ref name is lane-writable, so it enables no allowance and says so once.
+echo 'line four' >> packages/x/src/fixture.ts
+run "$R" --base kf27base
+check 'a ref-name base excuses nothing and warns once (KF-27a A1)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o" && [ "$(grep -c "^lane-diff-check: base is not a commit sha; no base-line allowance$" "$T/e")" = 1 ]'
+run "$R" --base "$(git rev-parse kf27base)"
+check 'a sha base enables the allowance with no warning (KF-27a A1)' 'grep -q "^baseline-excused: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o" && ! grep -q "no base-line allowance" "$T/e"'
+git checkout -q -- packages/x/src/fixture.ts
+# A3: a base that is not an ancestor of HEAD excuses nothing (a side commit, then unrelated history).
+cur=$(git symbolic-ref --short HEAD)
+git checkout -q -b kf27side
+echo 'side' >> packages/x/src/fixture.ts
+git -c commit.gpgsign=false commit -qam side
+side=$(git rev-parse HEAD)
+git checkout -q "$cur"
+echo 'line four' >> packages/x/src/fixture.ts
+run "$R" --base "$side"
+check 'a base that is not an ancestor of HEAD excuses nothing (KF-27a A3)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o" && grep -q "^lane-diff-check: base is not an ancestor commit of HEAD; no base-line allowance$" "$T/e"'
+git checkout -q -- packages/x/src/fixture.ts
+git checkout -q --orphan kf27orphan
+git rm -rqf . > /dev/null
+mkdir -p packages/x/src
+{ echo 'line one'; echo "$fx"; echo 'line three'; } > packages/x/src/fixture.ts
+git add packages/x/src/fixture.ts && git -c commit.gpgsign=false commit -q -m orphan
+orphan=$(git rev-parse HEAD)
+git checkout -q -f "$cur"
+echo 'line four' >> packages/x/src/fixture.ts
+run "$R" --base "$orphan"
+check 'an unrelated-history base excuses nothing (KF-27a A5)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/fixture.ts:2 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o"'
+git checkout -q -- packages/x/src/fixture.ts
+git branch -q -D kf27side kf27orphan
+# A5: the base path is a tree, not a file: nothing is excused for the new file at that path.
+mkdir -p packages/x/src/tdir
+{ echo "$fx"; } > packages/x/src/tdir/inner.ts
+git add packages/x/src/tdir && git -c commit.gpgsign=false commit -q -m tdir
+git tag kf27tree
+git rm -rq packages/x/src/tdir
+{ echo "$fx"; } > packages/x/src/tdir
+run "$R" --base "$(git rev-parse kf27tree)"
+check 'a path that was a directory at the base excuses nothing (KF-27a A5)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/tdir:1 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused: packages/x/src/tdir:" "$T/o"'
+rm -f packages/x/src/tdir
+git reset -q --hard kf27tree
+# A5: two copies at the base, three in the worktree: the first two are excused, the third fails.
+{ echo "$fx"; echo "$fx"; } > packages/x/src/twice.ts
+git add packages/x/src/twice.ts && git -c commit.gpgsign=false commit -q -m twice
+git tag kf27twice
+echo "$fx" >> packages/x/src/twice.ts
+run "$R" --base "$(git rev-parse kf27twice)"
+check 'base two copies, worktree three: lines 1-2 excused, line 3 fails (KF-27a A5)' '[ "$(rc)" = 1 ] && grep -q "^baseline-excused: packages/x/src/twice.ts:1,2 (password-assignment)$" "$T/o" && grep -q "^secret-pattern: packages/x/src/twice.ts:3 (password-assignment)$" "$T/o"'
+git checkout -q -- packages/x/src/twice.ts
+# A2: a forged loose object for the base blob (valid zlib, other content) excuses nothing.
+{ echo 'line one'; echo 'line two'; } > packages/x/src/forge.ts
+git add packages/x/src/forge.ts && git -c commit.gpgsign=false commit -q -m forge
+git tag kf27forge
+realblob=$(git rev-parse kf27forge:packages/x/src/forge.ts)
+forged=$({ echo 'line one'; echo "$fx"; echo 'line two'; } | git hash-object -w --stdin)
+od=$(git rev-parse --git-path objects)
+realfile=$od/$(printf '%s' "$realblob" | cut -c1-2)/$(printf '%s' "$realblob" | cut -c3-)
+forgedfile=$od/$(printf '%s' "$forged" | cut -c1-2)/$(printf '%s' "$forged" | cut -c3-)
+cp "$realfile" "$T/realobj"
+chmod u+w "$realfile" && cat "$forgedfile" > "$realfile"
+# Test setup, not a check: a git that verifies loose objects on read only makes the gate safer.
+git cat-file blob "$realblob" 2>/dev/null | grep -q "hunter2" || echo 'note: this git verifies loose object hashes on read'
+echo "$fx" >> packages/x/src/forge.ts
+run "$R" --base "$(git rev-parse kf27forge)"
+check 'a forged loose base blob excuses nothing (KF-27a A2)' '[ "$(rc)" = 1 ] && grep -q "^secret-pattern: packages/x/src/forge.ts:3 (password-assignment)$" "$T/o" && ! grep -q "^baseline-excused:" "$T/o"'
+cat "$T/realobj" > "$realfile"
+git checkout -q -- packages/x/src/forge.ts
+git tag -d kf27tree kf27twice kf27forge > /dev/null
+git reset -q --hard "$head0" && git tag -d kf27base kf27nul > /dev/null
+
+# KF-14e follow-up: a symlink that stays inside the worktree is still a finding.
+ln -s a.ts packages/x/src/inlink
+run "$R" --base base
+check 'a symlink inside the worktree is a symlink finding (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^symlink: packages/x/src/inlink$" "$T/o"'
+rm -f packages/x/src/inlink
+
+# KF-14e follow-up: git config keys naming a helper in the repository config are findings, the
+# subsection masked.
+git config core.fsmonitor false
+run "$R" --base base
+check 'core.fsmonitor in the repository config is git-config-helper (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^git-config-helper: core.fsmonitor$" "$T/o"'
+git config --unset core.fsmonitor
+git config diff.lanepicked.command true
+run "$R" --base base
+check 'a diff driver command is git-config-helper with the subsection masked (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^git-config-helper: diff.<sub>.command$" "$T/o" && ! grep -q "lanepicked" "$T/o"'
+git config --remove-section diff.lanepicked
+git config credential.helper store
+run "$R" --base base
+check 'a credential helper is git-config-helper (KF-27)' '[ "$(rc)" = 1 ] && grep -q "^git-config-helper: credential.helper$" "$T/o"'
+git config --unset credential.helper
+# KF-27a (Fable review A4): keys the orchestrator's later git calls would honour.
+git config pager.log 'true'
+git config url.lanepicked.insteadOf https://example.invalid/
+git config include.path /nonexistent-kf27
+git config 'includeIf.onbranch:lanepicked.path' /nonexistent-kf27
+git config submodule.lanesub.update '!true'
+git config submodule.othersub.update checkout
+run "$R" --base base
+check 'pager.<cmd> is git-config-helper with the command name masked (KF-27a A4, KF-27b Fable)' '[ "$(rc)" = 1 ] && grep -q "^git-config-helper: pager.<cmd>$" "$T/o" && ! grep -q "pager.log" "$T/o"'
+check 'url.<base>.insteadOf is git-config-helper, subsection masked (KF-27a A4)' 'grep -q "^git-config-helper: url.<sub>.insteadof$" "$T/o" && ! grep -q "lanepicked" "$T/o"'
+check 'include.path and includeIf.<cond>.path are git-config-helper (KF-27a A4)' 'grep -q "^git-config-helper: include.path$" "$T/o" && grep -q "^git-config-helper: includeif.<sub>.path$" "$T/o"'
+check 'a submodule update that runs a command is reported, a plain one is not, and no value is printed (KF-27a A4)' '[ "$(grep -c "^git-config-helper: submodule.<sub>.update$" "$T/o")" = 1 ] && ! grep -q "!true" "$T/o" && ! grep -q "lanesub\|othersub" "$T/o"'
+git config --unset pager.log
+git config --remove-section url.lanepicked
+git config --unset include.path
+git config --remove-section 'includeIf.onbranch:lanepicked'
+git config --remove-section submodule.lanesub
+git config --remove-section submodule.othersub
+hd=$(git rev-parse --git-common-dir)/hooks
+mkdir -p "$hd"
+printf '#!/bin/sh\nexit 0\n' > "$hd/pre-commit"
+printf '#!/bin/sh\n' > "$hd/pre-push.sample"
+run "$R" --base base
+check 'a hook file is git-hook by name; a .sample is not (KF-27a A4)' '[ "$(rc)" = 1 ] && grep -q "^git-hook: pre-commit$" "$T/o" && ! grep -q "^git-hook: pre-push.sample$" "$T/o"'
+rm -f "$hd/pre-commit"
+run "$R" --base base
+check 'with the helper keys removed the tree is clean again (KF-27)' '[ "$(rc)" = 0 ]'
+
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"
 [ "$fails" = 0 ]

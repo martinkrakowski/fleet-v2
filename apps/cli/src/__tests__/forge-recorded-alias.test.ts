@@ -4,7 +4,7 @@
 // alias, or is refused (owner decision D2) — never the legacy local read. The
 // no-runner-block and legacy cases are regression guards: they pass before
 // and after the change and keep today's behaviour exactly.
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 type ExecFileCallback = (
   error: Error | null,
@@ -152,6 +152,13 @@ function performAction(
 describe('forge head verification resolves the recorded host through the helper', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // The legacy route reads FLEET_WORKTREE_SSH_HOST when no host is configured; keep the shell's value out.
+    vi.stubEnv('FLEET_WORKTREE_SSH_HOST', '');
+    vi.stubEnv('FLEET_FORGE_PUSH_ORIGIN', '');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it('refuses an alias-only record whose alias matches no installation host (fails before the change)', async () => {

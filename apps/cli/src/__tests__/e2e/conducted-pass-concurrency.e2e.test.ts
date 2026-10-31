@@ -146,12 +146,12 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')('conducted pass concurrency 2
     // The REAL creates: B creates after its grant, and that grant is at least
     // a stagger after A's — so B's create is at least a stagger after A's
     // grant, expressed against A's actual create time (A's dispatch may have
-    // been slow). The plain floor guards a broken gate even if A was slow.
+    // been slow). No fixed floor on the create gap: the gate spaces grants,
+    // so a slow first create legitimately shortens the gap between creates.
     const aCreate = state.createdAtMs[aSession];
     const bCreate = state.createdAtMs[bSession];
     expect(bCreate).toBeGreaterThan(aCreate);
     expect(bCreate - aCreate).toBeGreaterThanOrEqual(STAGGER_MS - (aCreate - aGrant));
-    expect(bCreate - aCreate).toBeGreaterThanOrEqual(15000);
   }, TEST_TIMEOUT_MS);
 
   it('scenario b: a halt recorded mid-pass stops the sibling run before its session start', async () => {

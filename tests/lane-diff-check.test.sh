@@ -584,6 +584,28 @@ rm -f "$hd/pre-commit"
 run "$R" --base base
 check 'with the helper keys removed the tree is clean again (KF-27)' '[ "$(rc)" = 0 ]'
 
+# Speed plan S2: the protected rules run once over the whole candidate list. A large ignored tree
+# (thousands of dependency files) gives exactly the per-path findings: protected names at any depth,
+# matched case-insensitively, package.json exempt only under node_modules/, nothing else.
+i=0
+while [ "$i" -lt 1500 ]; do
+  mkdir -p "node_modules/pkg$i"
+  : > "node_modules/pkg$i/index.js"
+  : > "node_modules/pkg$i/package.json"
+  i=$((i + 1))
+done
+mkdir -p node_modules/a/.claude "node_modules/sp ace" node_modules/B secrets
+: > node_modules/a/.claude/x
+: > node_modules/a/.npmrc
+: > "node_modules/sp ace/.npmrc"
+: > node_modules/B/.NPMRC
+: > secrets/package.json
+run "$R" --base base
+grep '^protected: ' "$T/o" > "$T/prot"
+printf '%s\n' 'protected: node_modules/B/.NPMRC' 'protected: node_modules/a/.claude/x' 'protected: node_modules/a/.npmrc' 'protected: node_modules/sp ace/.npmrc' 'protected: secrets/package.json' > "$T/prot-want"
+check 'a large ignored tree gives exactly the protected findings, in candidate order (S2)' '[ "$(rc)" = 1 ] && cmp -s "$T/prot" "$T/prot-want" && [ "$(grep -c "^protected: " "$T/o")" = 5 ]'
+rm -rf node_modules secrets
+
 echo
 echo "$(grep -o "check '" "$self" | wc -l | tr -d ' ') checks defined, $fails failed"
 [ "$fails" = 0 ]

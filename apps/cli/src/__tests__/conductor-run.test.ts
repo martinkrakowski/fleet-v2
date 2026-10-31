@@ -33,7 +33,7 @@ import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli } from '../index.js';
 import type { CliIo } from '../index.js';
 import type { ConductorCliOptions } from '../conductor.js';
-import { nextPollDelayMs } from '../conductor.js';
+import { nextPollDelayMs, PASS_CONCURRENCY_LIMIT } from '../conductor.js';
 import { buildLiveConductorDriver, type ConductorDriver } from '../conductor-wiring.js';
 import { RunnerTunnelAdapter, type TunnelChild } from '../runner-tunnel.js';
 
@@ -799,6 +799,71 @@ describe('conductor start guards (K7-7)', () => {
     });
     expect(result.code).toBe(0);
     expect(parseDocument(result.stdout)).toMatchObject({ outcome: 'started' });
+  });
+});
+
+describe('conductor run --pass-concurrency (KF-34b)', () => {
+  it('the cap constant is 4 (owner decision 2026-10-30)', () => {
+    expect(PASS_CONCURRENCY_LIMIT).toBe(4);
+  });
+
+  it('the default passes no passConcurrency to the driver builder', async () => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    const seen: ReadonlyArray<{ readonly maxActiveRuns: number; readonly passConcurrency?: number }>[] = [];
+    const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once'], {
+      stateDir: dir,
+      buildDriver: (_runtime, _mode, driverOptions) => {
+        seen.push([driverOptions]);
+        return fake.driver;
+      },
+    });
+    expect(result.code).toBe(0);
+    expect(seen).toEqual([[{ maxActiveRuns: 1 }]]);
+  });
+
+  it.each<[string, readonly string[]]>([
+    ['as a separate value', ['--max-active-runs', '2', '--pass-concurrency', '2']],
+    ['glued with =', ['--max-active-runs=2', '--pass-concurrency=2']],
+  ])('%s reaches the driver builder as { maxActiveRuns: 2, passConcurrency: 2 }', async (_label, extra) => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    const seen: ReadonlyArray<{ readonly maxActiveRuns: number; readonly passConcurrency?: number }>[] = [];
+    const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once', ...extra], {
+      stateDir: dir,
+      buildDriver: (_runtime, _mode, driverOptions) => {
+        seen.push([driverOptions]);
+        return fake.driver;
+      },
+    });
+    expect(result.code).toBe(0);
+    expect(seen).toEqual([[{ maxActiveRuns: 2, passConcurrency: 2 }]]);
+    expect(fake.passCalls).toHaveLength(1);
+    expect(fake.releaseCalls).toHaveLength(1);
+  });
+
+  it.each<[string, readonly string[]]>([
+    ['above --max-active-runs', ['--max-active-runs', '2', '--pass-concurrency', '3']],
+    ['above PASS_CONCURRENCY_LIMIT', ['--max-active-runs', '64', '--pass-concurrency', '5']],
+    ['zero', ['--max-active-runs', '2', '--pass-concurrency', '0']],
+    ['a non-numeric value', ['--max-active-runs', '2', '--pass-concurrency', 'x']],
+    ['a missing value (flag last)', ['--max-active-runs', '2', '--pass-concurrency']],
+    ['a repeated flag', ['--max-active-runs', '2', '--pass-concurrency', '2', '--pass-concurrency', '2']],
+  ])('$1 is a usage error that builds no driver', async (_label, extra) => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    const built: unknown[] = [];
+    const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once', ...extra], {
+      stateDir: dir,
+      buildDriver: () => {
+        built.push(1);
+        return fake.driver;
+      },
+    });
+    expect(result.code).toBe(2);
+    expect(result.stderr.join('\n')).toContain('--pass-concurrency');
+    expect(built).toHaveLength(0);
+    expect(fake.passCalls).toHaveLength(0);
   });
 });
 

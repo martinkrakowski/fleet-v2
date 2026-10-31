@@ -77,6 +77,8 @@ export class ConductorDriverLeaseKeeper {
   private chain: Promise<unknown> = Promise.resolve();
   /** Latched after the first loss: later calls return it without touching the port. */
   private latched: Extract<ConductorDriverLeaseRenewResult, { readonly outcome: 'lost' }> | null = null;
+  /** The last `until` this keeper sent, so a renewal never sends an older expiry. */
+  private lastSentUntilMs: number | null = null;
 
   constructor(private readonly deps: ConductorDriverLeaseKeeperDependencies) {}
 
@@ -100,11 +102,28 @@ export class ConductorDriverLeaseKeeper {
     if (latched !== null) {
       return latched;
     }
+    try {
+      return await this.holdUnlocked();
+    } catch (error) {
+      // KF-34a2 pre-merge: a throwing `read`/`renew`/`acquire` latches a loss
+      // before rethrowing, so a sibling worker never retries the port while
+      // the first unwinds.
+      this.latched = { outcome: 'lost', reason: 'driver-lease-refused' };
+      throw error;
+    }
+  }
+
+  private async holdUnlocked(): Promise<ConductorDriverLeaseRenewResult> {
     const nowIso = this.deps.now();
     if (!isZonedIsoDateTime(nowIso)) {
       return { outcome: 'invalid-clock' };
     }
-    const until = leaseUntilIso(nowIso);
+    // The keeper never sends an older expiry: keep the last sent `until` and
+    // send `max(until, lastUntil)`, so a clock stepped back between two
+    // renewals never shortens the lease.
+    const untilMs = Math.max(Date.parse(leaseUntilIso(nowIso)), this.lastSentUntilMs ?? Number.NEGATIVE_INFINITY);
+    this.lastSentUntilMs = untilMs;
+    const until = new Date(untilMs).toISOString();
     const renew = (renew: LeaseRenewRequest) =>
       this.deps.driverLease.renew(renew).then((result) =>
         result.outcome === 'ok' ? withoutLeaseVersion(result.lease) : null,

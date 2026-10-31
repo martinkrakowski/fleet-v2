@@ -379,6 +379,44 @@ describe('RequestAttemptAcceptanceUseCase with the gate wired', () => {
     expect(acceptEntries[3].status).toBe('ambiguous');
   });
 
+  it('keeps run 0 id and rejects a congested verdict like any other unknown', async () => {
+    const gate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        PASS_RESULTS[1],
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'unknown',
+          exitCode: 75,
+          durationMs: 1,
+          detail: 'gate slot wait limit reached',
+          cause: 'gate-slot-wait-limit',
+        },
+      ],
+    });
+    const { deps, journal, acceptancePort } = makeDeps({ gate });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason:
+        'Gate predicate command 1: corepack yarn build unknown with exit code 75: gate slot wait limit reached',
+    });
+    const acceptEntries = journal.entries.filter((entry) => entry.action === 'accept');
+    expect(acceptEntries.map((entry) => entry.id)).toEqual([
+      `attempt-1:accept:${HEAD_SHA}:0`,
+      `attempt-1:accept:${HEAD_SHA}:1`,
+      `attempt-1:accept:${HEAD_SHA}:2`,
+      `attempt-1:accept:${HEAD_SHA}:3`,
+    ]);
+    expect(acceptEntries[3].status).toBe('ambiguous');
+    expect(acceptancePort.requests).toHaveLength(0);
+  });
+
   it('rejects when the frozen brief manifest changed after preparation', async () => {
     const gate = new FakeGatePredicatePort(EVALUATED_ALL_PASS);
     const artifact = new FakeArtifactPort();

@@ -452,6 +452,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
         exitCode: run.exitCode,
         durationMs: this.nowMs() - started,
         detail: 'gate slot wait limit reached',
+        cause: 'gate-slot-wait-limit',
       };
     }
 

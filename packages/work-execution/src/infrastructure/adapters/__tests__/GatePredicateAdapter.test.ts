@@ -670,6 +670,7 @@ describe('GatePredicateAdapter gate slot (KF-30b)', () => {
       verdict: 'unknown',
       exitCode: 75,
       detail: 'gate slot wait limit reached',
+      cause: 'gate-slot-wait-limit',
     });
   });
 
@@ -682,6 +683,7 @@ describe('GatePredicateAdapter gate slot (KF-30b)', () => {
     );
     const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
     expect(results[2]).toMatchObject({ verdict: 'fail', exitCode: 75 });
+    expect(results[2]).not.toHaveProperty('cause');
   });
 
   it('keeps exit 75 with another stderr line as the command own fail even with a slot declared', async () => {
@@ -715,6 +717,7 @@ describe('GatePredicateAdapter gate slot (KF-30b)', () => {
       verdict: 'unknown',
       exitCode: 75,
       detail: 'gate slot wait limit reached',
+      cause: 'gate-slot-wait-limit',
     });
   });
 
@@ -730,6 +733,28 @@ describe('GatePredicateAdapter gate slot (KF-30b)', () => {
     );
     const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
     expect(results[2]).toMatchObject({ verdict: 'fail', exitCode: 75 });
+  });
+
+  it('does not set cause on an unknown from a thrown run', async () => {
+    const { adapter } = makeAdapter(
+      (argv) => {
+        if (argv[0] === 'sh') {
+          throw new Error('spawn failed');
+        }
+        return happyGit(argv);
+      },
+      {},
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({
+      kind: 'command',
+      verdict: 'unknown',
+      exitCode: null,
+      detail: 'command did not complete',
+    });
+    expect(results[2]).not.toHaveProperty('cause');
   });
 
   it('never passes a zero wait limit, whatever the command budget', async () => {

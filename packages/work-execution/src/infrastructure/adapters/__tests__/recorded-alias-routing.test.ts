@@ -198,7 +198,7 @@ describe('alias-only recorded host routing (SEC-1)', () => {
       expect(configured.calls).toEqual([]);
     });
 
-    it('AttemptArtifactAdapter.collectCompletedAttemptArtifacts rejects with the helper reason and the configured fake runs nothing', async () => {
+    it('AttemptArtifactAdapter.collectCompletedAttemptArtifacts answers a typed refusal with the helper reason and the configured fake runs nothing', async () => {
       const configured = readingFake();
       const adapter = new AttemptArtifactAdapter({
         executor: configured.executor,
@@ -221,7 +221,7 @@ describe('alias-only recorded host routing (SEC-1)', () => {
           },
           recordedHost: ALIAS_ONLY_RECORD,
         }),
-      ).rejects.toThrow(ALIAS_ONLY_REASON);
+      ).resolves.toEqual({ outcome: 'refused', reason: expect.stringContaining(ALIAS_ONLY_REASON) });
       expect(configured.calls).toEqual([]);
     });
 

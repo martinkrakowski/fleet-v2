@@ -227,7 +227,15 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
     }
 
     const { worktreePath } = request;
-    const executor = this.executorFor(request.recordedHost);
+    // A recorded host the helper refuses is a deterministic refusal, not a
+    // transport failure: answer a typed refusal so the conductor journals
+    // `collect-refused` instead of re-running the same throw on every pass.
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(request.recordedHost);
+    } catch (error) {
+      return { outcome: 'refused', reason: error instanceof Error ? error.message : String(error) };
+    }
     let headCommit: string;
     try {
       headCommit = (await this.runGit(worktreePath, ['rev-parse', 'HEAD'], executor)).trim();

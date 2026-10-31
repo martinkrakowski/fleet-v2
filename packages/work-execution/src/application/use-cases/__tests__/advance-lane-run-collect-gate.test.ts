@@ -310,7 +310,9 @@ interface Harness {
   readonly gateReceiptRequests: readonly RecordGateReceiptsRequest[];
   /** The harness's work-order store (KF-36a-2); seeded with a copy of the fixture. */
   readonly workOrders: Map<string, WorkOrderRecord>;
-  setManifest(json: string | null): void;
+  setManifest(json: string | null): Promise<void>;
+  /** Serves a changed manifest on disk without re-freezing any attempt digest (SEC-5b digest-mismatch tests). */
+  setChangedManifestOnDisk(json: string | null): void;
   setManifestVerdict(verdict: 'sealed' | 'missing' | 'mismatch'): void;
   setReconcileAnswer(answer: ReconcileAttemptResult): void;
   setStopAnswer(answer: (request: StopAttemptRequest) => Promise<StopAttemptResult>): void;
@@ -522,7 +524,26 @@ async function makeHarness(
     workOrders,
     callOrder,
     deps,
-    setManifest: (json) => {
+    setManifest: async (json) => {
+      manifestJson = json;
+      // SEC-5b: a re-frozen manifest re-freezes the stored attempts' digests
+      // too, so every read of the served manifest verifies against it.
+      if (json !== null) {
+        const digest = digestFor(json);
+        for (const attempt of await attemptRepo.listAllAttempts()) {
+          if (attempt.briefDigest !== digest) {
+            await attemptRepo.saveAttempt({
+              ...attempt,
+              revision: (attempt.revision ?? 0) + 1,
+              briefDigest: digest,
+            });
+          }
+        }
+      }
+    },
+    // The changed-on-disk path (SEC-5b): the served manifest changes without
+    // any attempt digest being re-frozen — every digest read then mismatches.
+    setChangedManifestOnDisk: (json) => {
       manifestJson = json;
     },
     setManifestVerdict: (verdict) => {
@@ -1199,7 +1220,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
   it('test 5b: a manifest whose expectedArtifacts is not a string array refuses the collect without calling it', async () => {
     const ended = endedAttempt({ runner: CONDUCTED_RUNNER });
     const harness = await makeHarness(runRecord(), [ended]);
-    harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: 'all' }));
+    await harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: 'all' }));
     await conduct(harness, 'collecting', NOW);
     expect(await advance(harness)).toEqual({
       outcome: 'acted',
@@ -1215,7 +1236,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     const agyEnded = endedAttempt({ runner: AGY_RUNNER });
     for (const attempt of [endedAttempt(), agyEnded]) {
       const harness = await makeHarness(runRecord(), [attempt]);
-      harness.setManifest(null);
+      await harness.setManifest(null);
       await conduct(harness, 'collecting', NOW);
       expect(await advance(harness)).toEqual({
         outcome: 'acted',
@@ -1227,6 +1248,28 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       expect(harness.collectRequests).toHaveLength(0);
       expect(harness.commitRequests).toHaveLength(0);
     }
+  });
+
+  it('test 5d: a changed frozen manifest refuses the collect, read digest-verified (SEC-5b)', async () => {
+    // The served manifest is a legitimate re-freeze whose bytes no attempt
+    // recorded: the collect must refuse on the digest itself, before the
+    // edit-only commit touches git (the changed-on-disk path, never
+    // `setManifest`, which re-freezes the digests).
+    const ended = endedAttempt();
+    const harness = await makeHarness(runRecord(), [ended]);
+    harness.setChangedManifestOnDisk(
+      JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: ['src/index.ts'] }),
+    );
+    await conduct(harness, 'collecting', NOW);
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'collect',
+      key: collectKey(),
+      result: 'refused',
+      reasonCode: 'collect-refused',
+    });
+    expect(harness.collectRequests).toHaveLength(0);
+    expect(harness.commitRequests).toHaveLength(0);
   });
 
   it('test 9: each absent port is not-wired with its step and writes nothing', async () => {
@@ -1362,7 +1405,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         wireReviewAssessment: true,
         wireGateReceipts: true,
       });
-      harness.setManifest(CHECKS_MANIFEST);
+      await harness.setManifest(CHECKS_MANIFEST);
       harness.setManifestVerdict('sealed');
       harness.setGateAnswer({
         verdict: 'passed',
@@ -1423,7 +1466,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         wireReviewAssessment: true,
         wireGateReceipts: true,
       });
-      harness.setManifest(CHECKS_MANIFEST);
+      await harness.setManifest(CHECKS_MANIFEST);
       harness.setManifestVerdict('sealed');
       harness.setGateAnswer({
         verdict: 'failed',
@@ -1456,7 +1499,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     it('records nothing when the gateReceipts dep is absent', async () => {
       const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
       const harness = await makeHarness(runRecord(), [collected], { wireReviewAssessment: true });
-      harness.setManifest(CHECKS_MANIFEST);
+      await harness.setManifest(CHECKS_MANIFEST);
       harness.setManifestVerdict('sealed');
       await conduct(harness, 'gating', NOW);
 
@@ -1479,7 +1522,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         wireReviewAssessment: true,
         wireGateReceipts: true,
       });
-      harness.setManifest(CHECKS_MANIFEST);
+      await harness.setManifest(CHECKS_MANIFEST);
       harness.setManifestVerdict('sealed');
       harness.setReviewAssessmentAnswer({ outcome: 'unavailable', reason: 'head-mismatch' });
       harness.setGateAnswer({
@@ -1509,7 +1552,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         wireReviewAssessment: true,
         wireGateReceipts: true,
       });
-      harness.setManifest(CHECKS_MANIFEST);
+      await harness.setManifest(CHECKS_MANIFEST);
       harness.setManifestVerdict('sealed');
       harness.setGateReceiptsAnswer({ outcome: 'unavailable', reason: 'host gone' });
       harness.setGateAnswer({
@@ -1539,7 +1582,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         wireReviewAssessment: true,
         wireGateReceipts: true,
       });
-      harness.setManifest(JSON.stringify({ ...JSON.parse(CHECKS_MANIFEST), acceptanceChecks: ['same', 'same'] }));
+      await harness.setManifest(JSON.stringify({ ...JSON.parse(CHECKS_MANIFEST), acceptanceChecks: ['same', 'same'] }));
       harness.setManifestVerdict('sealed');
       harness.setGateAnswer({
         verdict: 'passed',
@@ -1562,7 +1605,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         wireReviewAssessment: true,
         wireGateReceipts: true,
       });
-      harness.setManifest(CHECKS_MANIFEST);
+      await harness.setManifest(CHECKS_MANIFEST);
       harness.setManifestVerdict('sealed');
       harness.setGateReceiptsAnswer({ outcome: 'recorded', count: 0 });
       harness.setGateAnswer({
@@ -1585,7 +1628,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         wireReviewAssessment: true,
         wireGateReceipts: true,
       });
-      harness.setManifest(
+      await harness.setManifest(
         JSON.stringify({
           stepLimit: 100,
           timeLimitSeconds: 2700,
@@ -1627,7 +1670,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         wireReviewAssessment: true,
         wireGateReceipts: true,
       });
-      harness.setManifest(CHECKS_MANIFEST);
+      await harness.setManifest(CHECKS_MANIFEST);
       harness.setManifestVerdict('sealed');
       harness.setGateAnswer({
         verdict: 'passed',
@@ -1663,7 +1706,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         wireReviewAssessment: true,
         wireGateReceipts: true,
       });
-      harness.setManifest(CHECKS_MANIFEST);
+      await harness.setManifest(CHECKS_MANIFEST);
       harness.setManifestVerdict('sealed');
       harness.setGateAnswer({
         verdict: 'passed',
@@ -1704,7 +1747,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         wireReviewAssessment: true,
         wireGateReceipts: true,
       });
-      harness.setManifest(CHECKS_MANIFEST);
+      await harness.setManifest(CHECKS_MANIFEST);
       harness.setManifestVerdict('sealed');
       harness.setGateAnswer({
         verdict: 'passed',
@@ -1732,7 +1775,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         wireReviewAssessment: true,
         wireGateReceipts: true,
       });
-      harness.setManifest(CHECKS_MANIFEST);
+      await harness.setManifest(CHECKS_MANIFEST);
       harness.setManifestVerdict('sealed');
       harness.setGateAnswer({
         verdict: 'passed',
@@ -1756,6 +1799,83 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         attemptId: 'attempt-example-1',
         implementerModel: 'model-example-1',
       });
+    });
+
+    it('fails closed to gate-unknown when the on-disk manifest changed after the attempt froze it (SEC-5b)', async () => {
+      // The served manifest changed without any attempt digest being
+      // re-frozen: the gate receipts read digest-verified and fail closed to
+      // `gate-unknown` instead of recording receipts for a manifest no
+      // attempt recorded (the changed-on-disk path, never `setManifest`).
+      const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifestVerdict('sealed');
+      harness.setChangedManifestOnDisk(
+        JSON.stringify({
+          stepLimit: 100,
+          timeLimitSeconds: 2700,
+          expectedArtifacts: [],
+          acceptanceChecks: ['build', 'test'],
+          modelAssignment: { model: 'model-example-1' },
+        }),
+      );
+      harness.setGateAnswer({
+        verdict: 'passed',
+        results: [
+          commandResult('commit', 'pass', null, 'commit'),
+          commandResult('diff-check', 'pass', null, 'diff-check'),
+          commandResult('command 1: build', 'pass', 0),
+          commandResult('command 2: test', 'pass', 0),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'gate',
+        key: gateKey(),
+        result: 'ambiguous',
+        reasonCode: 'gate-unknown',
+      });
+      expect(harness.reviewOpenRequests).toHaveLength(0);
+      expect(harness.gateReceiptRequests).toHaveLength(0);
+    });
+
+    it('regression guard (SEC-5b): an absent manifest — no briefPackagePath — still skips the receipts and passes the gate', async () => {
+      const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, briefPackagePath: null });
+      const harness = await makeHarness(runRecord(), [collected], {
+        wireReviewAssessment: true,
+        wireGateReceipts: true,
+      });
+      harness.setManifestVerdict('sealed');
+      harness.setGateAnswer({
+        verdict: 'passed',
+        results: [
+          commandResult('commit', 'pass', null, 'commit'),
+          commandResult('diff-check', 'pass', null, 'diff-check'),
+          commandResult('command 1: build', 'pass', 0),
+          commandResult('command 2: test', 'pass', 0),
+        ],
+      });
+      await conduct(harness, 'gating', NOW);
+
+      const result = await advance(harness);
+
+      // Nothing recorded to read: no receipts are attempted and the gate is
+      // never turned `gate-unknown` by the missing manifest.
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'gate',
+        key: gateKey(),
+        result: 'completed',
+        reasonCode: 'gate-passed',
+      });
+      expect(harness.reviewOpenRequests).toHaveLength(0);
+      expect(harness.gateReceiptRequests).toHaveLength(0);
     });
   });
 });

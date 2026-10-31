@@ -13,6 +13,7 @@ import type {
 } from '../../ports/out/EvidenceSeatPolicyPort.out-port.js';
 import { RecordFindingDispositionUseCase } from '../RecordFindingDispositionUseCase.use-case.js';
 import { RecordReviewReceiptUseCase } from '../RecordReviewReceiptUseCase.use-case.js';
+import { scopeFindingIdsToReceipt } from '../RecordReviewReceiptUseCase.use-case.js';
 
 const HEAD = '1111111111111111111111111111111111111111';
 
@@ -506,5 +507,18 @@ describe('RecordReviewReceiptUseCase finding id scoping', () => {
     const stored = await repo.findAssessmentById('asm-1');
     expect(stored?.state).toBe('pending');
     expect(stored?.blockers).toEqual([]);
+  });
+});
+
+describe('scopeFindingIdsToReceipt blank ids (KF-33b1c Grok re-review)', () => {
+  it('leaves an empty, whitespace or non-string id unscoped so the receipt still rejects it', () => {
+    const base = { severity: 'major', summary: 's', filePath: null, line: null, state: 'unresolved', dispositionReason: null, dispositionEvidenceRef: null } as const;
+    const scoped = scopeFindingIdsToReceipt('rr-1', [
+      { ...base, findingId: '' },
+      { ...base, findingId: '   ' },
+      { ...base, findingId: 42 as unknown as string },
+      { ...base, findingId: 'review-1' },
+    ] as never);
+    expect(scoped.map((finding) => finding.findingId)).toEqual(['', '   ', 42, 'rr-1:review-1']);
   });
 });

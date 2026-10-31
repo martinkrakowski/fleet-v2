@@ -47,7 +47,11 @@ export function scopeFindingIdsToReceipt(
   findings: readonly ReviewFindingRecord[],
 ): ReviewFindingRecord[] {
   const prefix = `${receiptId}:`;
+  // Only a well-formed id is scoped: a blank or non-string id passes through
+  // unchanged so ReviewReceipt.create still rejects it.
   return findings.map((finding) =>
+    typeof finding.findingId !== 'string' ||
+    finding.findingId.trim() === '' ||
     finding.findingId.startsWith(prefix)
       ? { ...finding }
       : { ...finding, findingId: prefix + finding.findingId },

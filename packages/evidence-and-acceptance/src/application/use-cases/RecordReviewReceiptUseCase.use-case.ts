@@ -214,7 +214,18 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
     }
 
     const aggregate = EvidenceAssessment.fromRecord(assessment);
-    aggregate.appendReviewReceipt(normalizedReceipt, isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString());
+    // KF-33b2: a duplicate receipt id is refused, never appended.
+    try {
+      aggregate.appendReviewReceipt(
+        normalizedReceipt,
+        isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString(),
+      );
+    } catch (error) {
+      return {
+        outcome: 'rejected',
+        reason: error instanceof Error ? error.message : 'The review receipt could not be appended',
+      };
+    }
     const merged = aggregate.toRecord();
     const blockers = EvidenceAssessment.fromRecord(merged).collectBlockers();
     const updated: EvidenceAssessmentRecord = {

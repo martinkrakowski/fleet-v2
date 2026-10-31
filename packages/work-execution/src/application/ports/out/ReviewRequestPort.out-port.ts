@@ -89,6 +89,23 @@ export type FindLatestReceiptOfKindResult =
   | { readonly outcome: 'not-found' }
   | { readonly outcome: 'unavailable'; readonly reason: 'invalid-request' | 'not-configured' | 'unreadable' };
 
+/**
+ * KF-33b2: the conductor's out-of-scope dispositions for one failed review
+ * receipt. The ids are the receipt-scoped finding ids; the head is the
+ * receipt's collected head.
+ */
+export interface RecordOutOfScopeRequest {
+  readonly attemptId: string;
+  readonly candidateHeadSha: string;
+  readonly findingIds: readonly string[];
+  readonly nowIso?: string;
+}
+
+/** Any rejection, throw or missing delegate answers refused: fail closed. */
+export type RecordOutOfScopeResult =
+  | { readonly outcome: 'recorded' }
+  | { readonly outcome: 'refused' };
+
 export interface ReviewRequestPort {
   requestReview(request: ReviewRequest): Promise<ReviewRequestResult>;
   /** §3.5: a receipt with the request id counts. Read-only. */
@@ -98,4 +115,10 @@ export interface ReviewRequestPort {
    * `completedAtIso`; a receipt without a kind never matches). Read-only.
    */
   findLatestReceiptOfKind(request: FindLatestReceiptOfKindRequest): Promise<FindLatestReceiptOfKindResult>;
+  /**
+   * KF-33b2: record `out-of-scope` dispositions for the receipt-scoped finding
+   * ids a failed review raised on files the lane never changed. Optional: a
+   * port without it never records, and every finding keeps blocking.
+   */
+  recordOutOfScope?(request: RecordOutOfScopeRequest): Promise<RecordOutOfScopeResult>;
 }

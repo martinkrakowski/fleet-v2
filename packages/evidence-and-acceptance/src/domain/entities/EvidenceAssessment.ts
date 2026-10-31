@@ -292,6 +292,11 @@ export class EvidenceAssessment {
     if (validated.value.getAssessmentId() !== this.record.id) {
       throw new Error('Review receipt belongs to a different assessment');
     }
+    // KF-33b2: two receipts with one id make their receipt-scoped finding ids
+    // collide (unresolvable), so a duplicate id refuses instead of appending.
+    if (this.record.reviewReceipts.some((existing) => existing.id === receipt.id)) {
+      throw new Error(`Review receipt '${receipt.id}' is already recorded for this assessment`);
+    }
     this.record = {
       ...this.record,
       reviewReceipts: [...this.record.reviewReceipts, validated.value.toRecord()],

@@ -16,6 +16,8 @@ import type {
   InspectAcceptanceEvidenceResult,
   InspectHeadCiStateRequest,
   InspectHeadCiStateResult,
+  RecordFindingDispositionRequest,
+  RecordFindingDispositionResult,
   RequestIndependentReviewRequest,
   RequestIndependentReviewResult,
   ReviewReceiptRecord,
@@ -23,6 +25,7 @@ import type {
 } from '@fleet/evidence-and-acceptance';
 import type {
   FindLatestReceiptOfKindRequest,
+  RecordOutOfScopeRequest,
   ReviewRequest,
   ReviewRequestResult,
 } from '../../../application/ports/out/ReviewRequestPort.out-port.js';
@@ -786,6 +789,100 @@ describe('ReviewRequestAdapter.findLatestReceiptOfKind', () => {
     );
 
     expect(result).toEqual({ outcome: 'unavailable', reason: 'invalid-request' });
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe('ReviewRequestAdapter.recordOutOfScope (KF-33b2)', () => {
+  function makeDispositionFake(answer: RecordFindingDispositionResult | 'throw') {
+    const calls: RecordFindingDispositionRequest[] = [];
+    const recordFindingDisposition = async (request: RecordFindingDispositionRequest): Promise<RecordFindingDispositionResult> => {
+      calls.push(request);
+      if (answer === 'throw') {
+        throw new Error('delegate exploded');
+      }
+      return answer;
+    };
+    return { calls, recordFindingDisposition };
+  }
+
+  const outOfScopeRequest = (overrides: Partial<RecordOutOfScopeRequest> = {}): RecordOutOfScopeRequest => ({
+    attemptId: 'attempt-example-1',
+    candidateHeadSha: HEAD,
+    findingIds: ['rr-assessment-attempt-example-1-00000000:f-1'],
+    nowIso: '2026-10-30T00:00:00.000Z',
+    ...overrides,
+  });
+
+  it('delegates each id with state out-of-scope, the fixed reason and the scope:<head12> evidence ref', async () => {
+    const { calls, recordFindingDisposition } = makeDispositionFake({ outcome: 'recorded', assessment: makeAssessment() });
+    const adapter = new ReviewRequestAdapter({ recordFindingDisposition });
+
+    const result = await adapter.recordOutOfScope(outOfScopeRequest({ findingIds: ['rr-x:f-1', 'rr-x:f-2'] }));
+
+    expect(result).toEqual({ outcome: 'recorded' });
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toEqual({
+      assessmentId: ASSESSMENT_ID,
+      disposition: {
+        id: 'disp-000000000000-rr-x:f-1',
+        assessmentId: ASSESSMENT_ID,
+        findingId: 'rr-x:f-1',
+        candidateHeadSha: HEAD,
+        state: 'out-of-scope',
+        reason: 'not a file this lane changed (conductor scope rule)',
+        evidenceRef: 'scope:000000000000',
+        recordedBy: 'conductor',
+        recordedAtIso: '2026-10-30T00:00:00.000Z',
+      },
+    });
+  });
+
+  it('refuses when the delegate answers rejected', async () => {
+    const { calls, recordFindingDisposition } = makeDispositionFake({ outcome: 'rejected', reason: 'no such finding' });
+    const adapter = new ReviewRequestAdapter({ recordFindingDisposition });
+
+    expect(await adapter.recordOutOfScope(outOfScopeRequest())).toEqual({ outcome: 'refused' });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('refuses when the delegate throws', async () => {
+    const { recordFindingDisposition } = makeDispositionFake('throw');
+    const adapter = new ReviewRequestAdapter({ recordFindingDisposition });
+
+    expect(await adapter.recordOutOfScope(outOfScopeRequest())).toEqual({ outcome: 'refused' });
+  });
+
+  it('refuses when the delegate answers rejected for a later id after an earlier one recorded', async () => {
+    const calls: RecordFindingDispositionRequest[] = [];
+    const recordFindingDisposition = async (request: RecordFindingDispositionRequest): Promise<RecordFindingDispositionResult> => {
+      calls.push(request);
+      return calls.length === 1 ? { outcome: 'recorded', assessment: makeAssessment() } : { outcome: 'rejected', reason: 'gone' };
+    };
+    const adapter = new ReviewRequestAdapter({ recordFindingDisposition });
+
+    expect(await adapter.recordOutOfScope(outOfScopeRequest({ findingIds: ['a:f-1', 'a:f-2'] }))).toEqual({
+      outcome: 'refused',
+    });
+  });
+
+  it('refuses when the disposition delegate is not bound', async () => {
+    const adapter = new ReviewRequestAdapter();
+
+    expect(await adapter.recordOutOfScope(outOfScopeRequest())).toEqual({ outcome: 'refused' });
+  });
+
+  it.each([
+    ['a bad head', { candidateHeadSha: 'not-a-sha' }],
+    ['no ids', { findingIds: [] }],
+    ['a blank id', { findingIds: ['   '] }],
+  ] as const)('refuses %s without calling the delegate', async (_label, overrides) => {
+    const { calls, recordFindingDisposition } = makeDispositionFake({ outcome: 'recorded', assessment: makeAssessment() });
+    const adapter = new ReviewRequestAdapter({ recordFindingDisposition });
+
+    expect(await adapter.recordOutOfScope(outOfScopeRequest(overrides as Partial<RecordOutOfScopeRequest>))).toEqual({
+      outcome: 'refused',
+    });
     expect(calls).toHaveLength(0);
   });
 });

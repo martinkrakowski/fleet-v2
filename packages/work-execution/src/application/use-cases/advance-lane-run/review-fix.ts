@@ -6,6 +6,7 @@ import type { PrepareBriefPackageResult } from '../../ports/in/PrepareBriefPacka
 import type { PrepareBriefPackageUseCaseRequest } from '../PrepareBriefPackageUseCase.use-case.js';
 import type {
   FindReviewReceiptResult,
+  ReviewRequestFinding,
   ReviewRequestKind,
   ReviewRequestResult,
   ReviewVerdict,
@@ -171,7 +172,16 @@ async function finishReview(
   if (resultRefusal !== null) {
     return { outcome: 'refused', reason: resultRefusal };
   }
-  return { outcome: 'acted', step: decision.step, key: decision.key, result, reasonCode };
+  // KF-33b2: the acted result carries a non-null journalled detail so the
+  // conductor pass can report an `out-of-scope-findings` attention item.
+  return {
+    outcome: 'acted',
+    step: decision.step,
+    key: decision.key,
+    result,
+    reasonCode,
+    ...(detail !== null ? { detail } : {}),
+  };
 }
 
 /** Nothing is established: the intent stays pending for the review reconcile (K5-4b); no result entry. */
@@ -201,6 +211,95 @@ function reviewResultOf(
     default:
       return { ...reviewResultOfVerdict(outcome.receipt.verdict), detail: null };
   }
+}
+
+/**
+ * KF-33a: the lane's changed-path set between the run's original base (the
+ * FIRST non-null attempt record's baseCommit; a fix attempt's own base is not
+ * the lane base) and `prior`'s collected head, read through the prior's
+ * recorded host. One helper shared by the review step and the fix prepare;
+ * they never duplicate the read. An absent method, a null host, a throw or a
+ * null answer fail closed: the set is null (unknown), which keeps every
+ * finding in scope, exactly as before the rule existed.
+ */
+async function changedPathsOf(
+  ctx: AdvanceStepContext,
+  gathered: GatheredLaneRunFacts,
+  prior: AttemptRecord,
+  headCommit: string,
+): Promise<readonly string[] | null> {
+  const laneBase = gathered.attemptRecords.find((entry) => entry !== null)?.baseCommit ?? null;
+  const priorHost = conductedRunnerOf(prior);
+  if (laneBase === null || priorHost === null) {
+    return null;
+  }
+  try {
+    return (
+      (await ctx.deps.artifactPort.readChangedPaths?.(prior.worktreePath, laneBase, headCommit, priorHost)) ?? null
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** One out-of-scope recording through the port; false on any refusal or throw. */
+async function recordOutOfScopeFindings(
+  ctx: AdvanceStepContext,
+  attemptId: string,
+  candidateHeadSha: string,
+  findingIds: readonly string[],
+): Promise<boolean> {
+  const port = ctx.deps.reviewRequest;
+  if (port?.recordOutOfScope === undefined) {
+    return false;
+  }
+  try {
+    return (await port.recordOutOfScope({ attemptId, candidateHeadSha, findingIds })).outcome === 'recorded';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * KF-33b2: a failed receipt with findings is checked against the lane's
+ * changed set before it fails the run. An unknown changed set or no
+ * out-of-scope finding leaves the mapping unchanged. With out-of-scope
+ * findings the dispositions are recorded through the port: a mixed review
+ * keeps `review-failed` (some findings are this lane's); when every finding
+ * is out of scope, only an answering `recorded` journals `review-passed`
+ * with the fixed detail `out-of-scope-findings` — a `refused` recording
+ * keeps `review-failed` (fail closed). The detail is a fixed token; reviewer
+ * text is never copied into the journal.
+ */
+async function reviewScopeDispositionOf(
+  ctx: AdvanceStepContext,
+  gathered: GatheredLaneRunFacts,
+  latest: AttemptRecord,
+  head: string,
+  findings: readonly ReviewRequestFinding[],
+  mapped: { readonly result: 'completed' | 'refused'; readonly reasonCode: LaneRunResultReasonCode; readonly detail: string | null },
+): Promise<typeof mapped> {
+  const changed = await changedPathsOf(ctx, gathered, latest, head);
+  const partition = partitionFindingsByScope(
+    findings.map((finding) => ({ findingId: finding.findingId, filePath: finding.filePath })),
+    changed,
+    latest.worktreePath,
+  );
+  if (changed === null || partition.outOfScope.length === 0) {
+    return mapped;
+  }
+  const recorded = await recordOutOfScopeFindings(
+    ctx,
+    latest.id,
+    head,
+    partition.outOfScope.map((finding) => finding.findingId),
+  );
+  if (partition.outOfScope.length < findings.length) {
+    return mapped;
+  }
+  return recorded
+    ? { result: 'completed', reasonCode: 'review-passed', detail: 'out-of-scope-findings' }
+    : mapped;
 }
 
 interface ReviewInputs {
@@ -336,7 +435,16 @@ export async function performReview(
     return pendingReview(decision);
   }
   const mapped = reviewResultOf(outcome);
-  return mapped === null ? pendingReview(decision) : finishReview(ctx, request, decision, mapped.result, mapped.reasonCode, mapped.detail);
+  if (mapped === null) {
+    return pendingReview(decision);
+  }
+  // KF-33b2: a failed receipt with findings is scoped before it fails the
+  // run; everything else keeps its plain mapping.
+  const resolved =
+    outcome.outcome === 'receipt' && outcome.receipt.verdict === 'failed' && outcome.receipt.findings.length > 0
+      ? await reviewScopeDispositionOf(ctx, gathered, latest, head, outcome.receipt.findings, mapped)
+      : mapped;
+  return finishReview(ctx, request, decision, resolved.result, resolved.reasonCode, resolved.detail);
 }
 
 /**
@@ -606,29 +714,13 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     }
     findings = handoverFindingsOf(found.receipt);
     // KF-33a: only findings on files the lane changed — between the run's
-    // original base (the FIRST non-null attempt record's baseCommit; a fix
-    // attempt's own base is not the lane base) and the prior's collected head
-    // — drive the fix round. The read goes through the prior's recorded host;
-    // an absent method, a null host, a throw or a null answer fail closed
+    // original base and the prior's collected head, read through the prior's
+    // recorded host — drive the fix round; the read is the shared
+    // `changedPathsOf` helper (KF-33b2) and any unknown answer fails closed
     // (changed stays null and every finding stays in scope, as before). When
     // the receipt had findings and none is in scope, the round is refused:
     // the existing refused-prepare handling parks it for the orchestrator.
-    const laneBase = gathered.attemptRecords.find((entry) => entry !== null)?.baseCommit ?? null;
-    const priorHost = conductedRunnerOf(prior);
-    let changed: readonly string[] | null = null;
-    if (laneBase !== null && priorHost !== null) {
-      try {
-        changed =
-          (await ctx.deps.artifactPort.readChangedPaths?.(
-            prior.worktreePath,
-            laneBase,
-            prior.artifacts.headCommit,
-            priorHost,
-          )) ?? null;
-      } catch {
-        changed = null;
-      }
-    }
+    const changed = await changedPathsOf(ctx, gathered, prior, prior.artifacts.headCommit);
     const receiptFindingCount = findings.length;
     findings = partitionFindingsByScope(findings, changed, prior.worktreePath).inScope;
     if (receiptFindingCount > 0 && findings.length === 0) {

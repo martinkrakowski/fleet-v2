@@ -208,6 +208,42 @@ describe('RequestIndependentReviewUseCase assessment presence (M13)', () => {
     expect(stored?.reviewReceipts[0].reviewerModel).toBe('openai/gpt-4o');
   });
 
+  it('suffixes a second requestId-less receipt id with the receipt count on the same head (KF-33b2)', async () => {
+    const existing = sampleRecord({ candidateHeadSha: HEAD1 });
+    const repo = new InMemoryAssessmentRepo([existing]);
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer: new StubReviewer(), archive: new StubArchive() });
+
+    const first = await useCase.requestIndependentReview({
+      assessmentId: 'asm-1',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      reviewerModel: 'openai/gpt-4o',
+    });
+    expect(first.outcome).toBe('reviewed');
+    if (first.outcome === 'reviewed') {
+      expect(first.receipt.id).toBe('rr-asm-1-11111111');
+    }
+
+    const second = await useCase.requestIndependentReview({
+      assessmentId: 'asm-1',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      reviewerModel: 'openai/gpt-4o',
+    });
+    expect(second.outcome).toBe('reviewed');
+    if (second.outcome === 'reviewed') {
+      expect(second.receipt.id).toBe('rr-asm-1-11111111-1');
+    }
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored?.reviewReceipts.map((receipt) => receipt.id)).toEqual(['rr-asm-1-11111111', 'rr-asm-1-11111111-1']);
+  });
+
   it('stores reviewer-reported finding states as unresolved with no disposition', async () => {
     const existing = sampleRecord({ candidateHeadSha: HEAD1 });
     const repo = new InMemoryAssessmentRepo([existing]);

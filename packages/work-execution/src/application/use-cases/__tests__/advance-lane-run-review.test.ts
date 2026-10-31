@@ -31,6 +31,8 @@ import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-ca
 import type {
   FindReviewReceiptRequest,
   FindReviewReceiptResult,
+  RecordOutOfScopeRequest,
+  RecordOutOfScopeResult,
   ReviewRequest,
   ReviewReceiptSummary,
   ReviewRequestFinding,
@@ -554,6 +556,7 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
       key: reviewKey('brief-check', 0, HEAD12_A),
       result: 'completed',
       reasonCode: 'review-no-receipt',
+      detail: 'route-no-auth-file',
     });
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const results = entries.filter(
@@ -865,5 +868,184 @@ describe('AdvanceLaneRunUseCase review reconcile (K5-4b)', () => {
     const results = entries.filter((entry) => entry.kind === 'result' && entry.key === key);
     expect(intents).toHaveLength(1);
     expect(results).toHaveLength(1);
+  });
+});
+
+describe('AdvanceLaneRunUseCase review acts scope dispositions (KF-33b2)', () => {
+  /** Wire the changed-path read and the out-of-scope recording into the harness fakes. */
+  function wireScope(
+    harness: Harness,
+    changed: readonly string[] | null,
+    recordAnswer: RecordOutOfScopeResult | 'throw',
+  ): RecordOutOfScopeRequest[] {
+    const calls: RecordOutOfScopeRequest[] = [];
+    Object.assign(harness.deps, {
+      artifactPort: {
+        ...harness.deps.artifactPort,
+        ...(changed === null ? {} : { readChangedPaths: async () => changed }),
+      },
+      reviewRequest: {
+        ...harness.deps.reviewRequest,
+        recordOutOfScope: async (request: RecordOutOfScopeRequest): Promise<RecordOutOfScopeResult> => {
+          calls.push(request);
+          if (recordAnswer === 'throw') {
+            throw new Error('recording exploded');
+          }
+          return recordAnswer;
+        },
+      },
+    });
+    return calls;
+  }
+
+  const OUT_FINDINGS: readonly ReviewRequestFinding[] = [
+    { findingId: 'rcpt-1:f-1', severity: 'blocker', summary: 'blocks another file', filePath: 'src/other-1.ts', line: 4 },
+    { findingId: 'rcpt-1:f-2', severity: 'major', summary: 'blocks another file too', filePath: 'src/other-2.ts', line: 6 },
+  ];
+
+  it('an all-out-of-scope failed review records the dispositions and journals review-passed with the fixed detail', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async (request) => ({
+      outcome: 'receipt',
+      receipt: receiptFor(request, 'failed', OUT_FINDINGS),
+    }));
+    const calls = wireScope(harness, ['src/a.ts'], { outcome: 'recorded' });
+    const key = reviewKey('brief-check', 0, HEAD12_A);
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key,
+      result: 'completed',
+      reasonCode: 'review-passed',
+      detail: 'out-of-scope-findings',
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual({
+      attemptId: 'attempt-example-1',
+      candidateHeadSha: COMMIT_A,
+      findingIds: ['rcpt-1:f-1', 'rcpt-1:f-2'],
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const results = entries.filter((entry) => entry.kind === 'result' && entry.key === key);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ outcome: 'completed', reasonCode: 'review-passed', detail: 'out-of-scope-findings' });
+    expect(JSON.stringify(entries)).not.toContain('blocks another file');
+  });
+
+  it('a mixed failed review records only the out-of-scope ids and stays review-failed', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async (request) => ({
+      outcome: 'receipt',
+      receipt: receiptFor(request, 'failed', [
+        { findingId: 'rcpt-1:f-1', severity: 'blocker', summary: 'this lane', filePath: 'src/a.ts', line: 4 },
+        OUT_FINDINGS[1]!,
+      ]),
+    }));
+    const calls = wireScope(harness, ['src/a.ts'], { outcome: 'recorded' });
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-failed',
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.findingIds).toEqual(['rcpt-1:f-2']);
+  });
+
+  it('an unknown changed set records nothing and stays review-failed', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async (request) => ({
+      outcome: 'receipt',
+      receipt: receiptFor(request, 'failed', OUT_FINDINGS),
+    }));
+    const calls = wireScope(harness, null, { outcome: 'recorded' });
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-failed',
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a refused out-of-scope recording stays review-failed (fail closed)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async (request) => ({
+      outcome: 'receipt',
+      receipt: receiptFor(request, 'failed', OUT_FINDINGS),
+    }));
+    const calls = wireScope(harness, ['src/a.ts'], { outcome: 'refused' });
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-failed',
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('a reconciled failed review is unchanged: no dispositions are recorded', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async () => ({ outcome: 'unknown', reason: 'delegate-failed' }));
+    harness.setFindReceiptAnswer(async (request) => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-1',
+        requestId: request.requestId,
+        kind: 'brief-check',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: OUT_FINDINGS,
+      },
+    }));
+    const calls = wireScope(harness, ['src/a.ts'], { outcome: 'recorded' });
+    const key = reviewKey('brief-check', 0, HEAD12_A);
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key,
+      result: 'ambiguous',
+      reasonCode: 'review-unknown',
+    });
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key,
+      result: 'reconciled',
+      reasonCode: 'review-failed',
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a throwing out-of-scope recording stays review-failed (fail closed)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async (request) => ({
+      outcome: 'receipt',
+      receipt: receiptFor(request, 'failed', OUT_FINDINGS),
+    }));
+    wireScope(harness, ['src/a.ts'], 'throw');
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-failed',
+    });
   });
 });

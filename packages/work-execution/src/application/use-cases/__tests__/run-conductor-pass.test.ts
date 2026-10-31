@@ -15,6 +15,7 @@ import type { LaneRunParkRecord, LaneRunRecord } from '../../../domain/lane-run-
 import type { LeaseRenewRequest } from '../../../domain/lane-run-lease.js';
 import { ConductorDriverLeaseAdapter } from '../../../infrastructure/adapters/ConductorDriverLeaseAdapter.adapter.js';
 import { ConductorHaltAdapter } from '../../../infrastructure/adapters/ConductorHaltAdapter.adapter.js';
+import type { ConductorHaltState } from '../../../domain/conductor-halt.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import type { ConductorDriverLeasePort } from '../../ports/out/ConductorDriverLeasePort.out-port.js';
@@ -1442,10 +1443,9 @@ describe('RunConductorPassUseCase pass pool (KF-34b)', () => {
       if (request.runId === RUN_ID && call === 0) {
         return hold1.promise;
       }
-      if (request.runId === RUN_ID && call === 1) {
-        return grace;
-      }
-      return admission;
+      // RUN_ID_2 also drains past its grace, and finishes while run 1's first
+      // step is still held.
+      return request.runId === RUN_ID_2 && call === 0 ? grace : admission;
     });
     const passPromise = poolUseCase(fx, advance, { passConcurrency: 2 }).runPass({ holderId: HOLDER, nowIso: NOW });
     // Run 2 finishes completely while run 1's first step is still held.
@@ -1457,13 +1457,19 @@ describe('RunConductorPassUseCase pass pool (KF-34b)', () => {
       throw new Error('expected completed');
     }
     expect(result.runs.map((run) => run.runId)).toEqual([RUN_ID, RUN_ID_2]);
-    expect(result.attention).toEqual([{ runId: RUN_ID, kind: 'stop-grace-exceeded' }]);
+    // Both runs drained past their grace; the attention entries follow list
+    // order even though RUN_ID_2 finished first.
+    expect(result.attention).toEqual([
+      { runId: RUN_ID, kind: 'stop-grace-exceeded' },
+      { runId: RUN_ID_2, kind: 'stop-grace-exceeded' },
+    ]);
   });
 
   it('a worker whose advance rejects: the sibling finishes, no new step starts, and the pass rejects after the join', async () => {
     const fx = stores();
     await createRun(fx.repo);
     await createRun(fx.repo, { runId: RUN_ID_2 });
+    await createRun(fx.repo, { runId: RUN_ID_3 });
     const releases: string[] = [];
     const repo = fx.repo;
     const wrappedRepo = {
@@ -1497,10 +1503,27 @@ describe('RunConductorPassUseCase pass pool (KF-34b)', () => {
       passConcurrency: 2,
     });
     const passPromise = pass.runPass({ holderId: HOLDER, nowIso: NOW });
-    await until(() => advance.trace.includes(`in:${RUN_ID_2}`));
-    // The rejection latched the stop while run 1's step is still in flight.
+    let settled = false;
+    passPromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await until(() => advance.trace.includes(`in:${RUN_ID}`) && advance.trace.includes(`in:${RUN_ID_2}`));
+    // The rejection latched the stop while run 1's step is still in flight;
+    // the pass is still pending.
     expect(advance.trace).not.toContain(`out:${RUN_ID}`);
-    hold1.resolve(admission);
+    for (let turns = 0; turns < 25; turns += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    expect(settled).toBe(false);
+    // The sibling's held step resolves with a non-finishing step: the latched
+    // stop must end its turn without a second call, and the queued run 3 is
+    // never advanced.
+    hold1.resolve({ outcome: 'entered', state: 'dispatching' });
     const caught = await passPromise.then(
       () => 'resolved' as const,
       (thrown: unknown) => thrown,
@@ -1509,6 +1532,7 @@ describe('RunConductorPassUseCase pass pool (KF-34b)', () => {
     // The sibling's in-flight step finished and is its only step; nothing new started.
     expect(advance.callsOf(RUN_ID)).toBe(1);
     expect(advance.callsOf(RUN_ID_2)).toBe(1);
+    expect(advance.callsOf(RUN_ID_3)).toBe(0);
     expect(advance.trace).toContain(`out:${RUN_ID}`);
     // No lease was released before (or by) the pass: they are still held.
     expect(releases).toEqual([]);
@@ -1519,11 +1543,9 @@ describe('RunConductorPassUseCase pass pool (KF-34b)', () => {
     const fx = stores();
     await createRun(fx.repo);
     await createRun(fx.repo, { runId: RUN_ID_2 });
-    const holdSleep = deferred<void>();
     let sleepCalls = 0;
     const sleep = async (): Promise<void> => {
       sleepCalls += 1;
-      await holdSleep.promise;
     };
     const dispatchStarted = (runId: string): AdvanceLaneRunResult => ({
       outcome: 'acted',
@@ -1546,7 +1568,7 @@ describe('RunConductorPassUseCase pass pool (KF-34b)', () => {
     };
     // Run 1's and run 2's first advances are held so the interleaving is
     // deterministic: run 1 grants the start and takes the lease over, then
-    // run 2 is denied and sleeps on the start gate.
+    // run 2 is denied at the start gate.
     const holdRun1 = deferred<void>();
     const holdRun2 = deferred<void>();
     const advance = new ConcurrentAdvance(async (request, call) => {
@@ -1564,7 +1586,7 @@ describe('RunConductorPassUseCase pass pool (KF-34b)', () => {
       }
       if (request.runId === RUN_ID && call === 0) {
         // The driver lease lapses and a second driver takes over while the
-        // sibling worker is still asleep on the start gate.
+        // sibling worker is still held inside its first advance.
         await driverLease.acquire({
           holderId: HOLDER_2,
           observedFence: 1,
@@ -1591,15 +1613,165 @@ describe('RunConductorPassUseCase pass pool (KF-34b)', () => {
     holdRun1.resolve();
     // Run 1 grants its start and takes the lease over.
     await until(() => advance.trace.includes(`out:${RUN_ID}`));
+    // Run 1's post-takeover renewal latched the loss (four keeper reads: the
+    // pass's take, run 1 step 1, run 2 step 1, then run 1's post-takeover
+    // renewal). Only then is run 2 released.
+    await until(() => driverReads >= 4);
+    for (let turns = 0; turns < 25; turns += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
     holdRun2.resolve();
-    // Run 2 is denied and sleeps on the start gate; run 1's post-takeover
-    // renewal latched the loss (four keeper reads: the pass's take, run 1
-    // step 1, run 2 step 1, then run 1's post-takeover renewal).
-    await until(() => sleepCalls === 1 && driverReads >= 4);
-    holdSleep.resolve();
+    // Run 2 is denied the start, but the stop is already latched: it never
+    // sleeps on the start gate and never calls advance again.
+    for (let turns = 0; turns < 25; turns += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    expect(sleepCalls).toBe(0);
     const result = await passPromise;
     expect(result).toEqual({ outcome: 'refused', reason: 'driver-lease-held' });
-    // The woken worker checked the stop and never called advance again.
+    expect(advance.callsOf(RUN_ID_2)).toBe(1);
+  });
+
+  it('an invalid clock in one worker latches the stop and a sibling never starts its queued step', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    // Reads: the pass start, then run 2's fresh clock read. Run 1, the first
+    // live run, reuses the pass-start now; it is held inside its lease
+    // acquire, before any further read.
+    let clockReads = 0;
+    const now = (): string => {
+      clockReads += 1;
+      return clockReads === 2 ? 'not-an-iso-time' : NOW;
+    };
+    const repo = fx.repo;
+    const acquireHold = deferred<void>();
+    let acquireReached = false;
+    const runRepo = {
+      list: () => repo.list(),
+      acquireLease: async (runId: string, request: Parameters<typeof repo.acquireLease>[1]) => {
+        if (runId === RUN_ID) {
+          acquireReached = true;
+          await acquireHold.promise;
+        }
+        return repo.acquireLease(runId, request);
+      },
+      renewLease: (runId: string, request: Parameters<typeof repo.renewLease>[1]) => repo.renewLease(runId, request),
+      releaseLease: (runId: string, request: Parameters<typeof repo.releaseLease>[1]) => repo.releaseLease(runId, request),
+    };
+    const advance = new ConcurrentAdvance(() => admission);
+    const passPromise = poolUseCase(fx, advance, { passConcurrency: 2, now, runRepo }).runPass({
+      holderId: HOLDER,
+      nowIso: NOW,
+    });
+    // Run 1 is parked inside its lease acquire; run 2's fresh clock read is
+    // the invalid one and latched the stop.
+    await until(() => acquireReached && clockReads >= 2);
+    acquireHold.resolve();
+    const result = await passPromise;
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    // The latched stop ended run 1's turn before its queued first step.
+    expect(advance.callsOf(RUN_ID)).toBe(0);
+    expect(advance.callsOf(RUN_ID_2)).toBe(0);
+  });
+
+  it('a throw in one worker stops a sibling waiting on a deferred halt read from starting a new step', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const holdStep1 = deferred<AdvanceLaneRunResult>();
+    const error = new Error('advance exploded');
+    let rejectTrigger!: (error: unknown) => void;
+    // The sibling's second per-step halt read resolves only one microtask hop
+    // after this rejection, so its post-read stop check runs after the throw
+    // has left the worker's turn.
+    const trigger = new Promise<never>((_resolve, reject) => {
+      rejectTrigger = reject;
+    });
+    const clearHalt: ConductorHaltState = { state: 'clear', record: null };
+    let haltReads = 0;
+    const halt = {
+      read: async (): Promise<ConductorHaltState> => {
+        haltReads += 1;
+        if (haltReads === 4) {
+          // Resolves one microtask hop after the sibling worker's rejection
+          // left its turn: the post-read stop check then runs after the throw
+          // has left `advanceRun` but before the worker-loop catch latches.
+          return trigger.catch(() => clearHalt);
+        }
+        return fx.halt.read();
+      },
+    };
+    const advance = new ConcurrentAdvance((request, call) => {
+      if (request.runId === RUN_ID && call === 0) {
+        return holdStep1.promise;
+      }
+      if (request.runId === RUN_ID_2 && call === 0) {
+        return trigger;
+      }
+      return admission;
+    });
+    const passPromise = poolUseCase(fx, advance, { passConcurrency: 2, halt }).runPass({
+      holderId: HOLDER,
+      nowIso: NOW,
+    });
+    await until(() => advance.trace.includes(`in:${RUN_ID}`) && advance.trace.includes(`in:${RUN_ID_2}`));
+    holdStep1.resolve({ outcome: 'entered', state: 'dispatching' });
+    // Run 1 is parked on its second per-step halt read; run 2's step is about
+    // to throw.
+    await until(() => haltReads >= 4);
+    rejectTrigger(error);
+    const caught = await passPromise.then(
+      () => 'resolved' as const,
+      (thrown: unknown) => thrown,
+    );
+    expect(caught).toBe(error);
+    // The sibling's post-halt stop check saw the latch: no second step.
+    expect(advance.callsOf(RUN_ID)).toBe(1);
+    expect(advance.callsOf(RUN_ID_2)).toBe(1);
+  });
+
+  it('a worker whose sibling latched the stop does not sleep on the start gate', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const hold2 = deferred<AdvanceLaneRunResult>();
+    const holdThrow = deferred<void>();
+    let sleepCalls = 0;
+    const sleep = async (): Promise<void> => {
+      sleepCalls += 1;
+    };
+    const error = new Error('advance exploded');
+    const advance = new ConcurrentAdvance(async (request, call) => {
+      if (request.runId === RUN_ID && call === 0) {
+        // Held, then thrown, only after the sibling's step is in flight too.
+        await holdThrow.promise;
+        throw error;
+      }
+      if (request.runId === RUN_ID_2 && call === 0) {
+        return hold2.promise;
+      }
+      return admission;
+    });
+    const passPromise = poolUseCase(fx, advance, { passConcurrency: 2, sleep }).runPass({
+      holderId: HOLDER,
+      nowIso: NOW,
+    });
+    await until(() => advance.trace.includes(`in:${RUN_ID}`) && advance.trace.includes(`in:${RUN_ID_2}`));
+    holdThrow.resolve();
+    // Run 1's rejection latched the stop while run 2's step is still held.
+    for (let turns = 0; turns < 5; turns += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    // Run 2's held step now denies the start: the latched stop must be checked
+    // before the sleep, so the worker never sleeps.
+    hold2.resolve({ outcome: 'waiting', reason: 'session-stagger' });
+    const caught = await passPromise.then(
+      () => 'resolved' as const,
+      (thrown: unknown) => thrown,
+    );
+    expect(caught).toBe(error);
+    expect(sleepCalls).toBe(0);
     expect(advance.callsOf(RUN_ID_2)).toBe(1);
   });
 

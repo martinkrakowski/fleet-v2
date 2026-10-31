@@ -337,10 +337,24 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
   /**
    * One run's turn. Never returns from the pass: on a stop (a per-step driver
    * loss or an invalid clock) it ends this run's steps and reports the stop,
-   * and the caller returns the refusal. The run-lease renewal stays per run;
-   * the driver-lease renewal goes through the pass's keeper.
+   * and the caller returns the refusal. Any throw inside the turn latches the
+   * stop before rethrowing. The run-lease renewal stays per run; the
+   * driver-lease renewal goes through the pass's keeper.
    */
   private async advanceRun(record: LaneRunRecord, ctx: AdvanceRunContext & { readonly isFirstRun: boolean }): Promise<RunOutcome> {
+    try {
+      return await this.advanceRunTurn(record, ctx);
+    } catch (error) {
+      // Any throw inside the turn latches the stop before rethrowing: a
+      // sibling worker must start no further step off this rejection, and the
+      // worker-loop catch would only run a microtask later.
+      ctx.control.stop();
+      throw error;
+    }
+  }
+
+  /** One run's turn: leases, resume, then the step loop. See `advanceRun`. */
+  private async advanceRunTurn(record: LaneRunRecord, ctx: AdvanceRunContext & { readonly isFirstRun: boolean }): Promise<RunOutcome> {
     const renewRun = (renew: LeaseRenewRequest) =>
       this.deps.runRepo.renewLease(record.runId, renew).then((result) =>
         result.outcome === 'saved' ? result.record.lease : null,
@@ -355,6 +369,9 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
     // run reuses the pass-start now; later runs read fresh.
     const runNowIso = ctx.isFirstRun ? ctx.passNowIso : this.nowIso();
     if (!isZonedIsoDateTime(runNowIso)) {
+      // An invalid clock is a stop like any other: latch it so a sibling
+      // worker starts no further step, then report the stop.
+      ctx.control.stop();
       return {
         report: { runId: record.runId, outcome: 'advanced', steps: [] },
         attention: [],
@@ -472,6 +489,11 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
         // stagger step. The run is not finished; the loop ceiling still bounds
         // the wait. The step is reported as it was journalled: none.
         const sleep = this.deps.sleep ?? defaultSleep;
+        // Never sleep once the stop is latched: a sibling may have ended the
+        // pass while this step ran.
+        if (ctx.control.isStopped()) {
+          break;
+        }
         await sleep(ctx.startGate.pendingMs(record.runId, this.nowIso()) + 1);
         if (ctx.control.isStopped()) {
           break;

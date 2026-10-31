@@ -4,6 +4,7 @@ import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { AttemptRecord } from '../../../domain/execution-records.js';
 import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-port.js';
+import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, performPark } from './step-context.js';
 import { manifestExpectedArtifacts, readFrozenManifest } from './frozen-manifest.js';
@@ -296,10 +297,13 @@ export async function gatePreCheck(ctx: AdvanceStepContext,
 
 /**
  * The gate body after its intent (K4-6): evaluate the frozen acceptance
- * spec at the collected head and record the typed verdict's mapping. A
- * second evaluation returns the first's stored outcome (S2b journals it
- * once), so the gate reconcile (K4-7) runs this same body under the
- * pending key instead of appending a second intent.
+ * spec at the collected head and record the typed verdict's mapping. The
+ * decision key's retry names the gate run (`/retry<n>`; none = run 0) and
+ * is passed to the evaluation, so a congested run journals under its own
+ * prefix and never seals the head against a later run (KF-30c2). A second
+ * evaluation returns the first's stored outcome (S2b journals it once), so
+ * the gate reconcile (K4-7) runs this same body under the pending key
+ * instead of appending a second intent.
  */
 export async function runGateBody(ctx: AdvanceStepContext,
   record: LaneRunRecord,
@@ -316,9 +320,12 @@ export async function runGateBody(ctx: AdvanceStepContext,
   if (latest === null || latest.artifacts === null) {
     return { outcome: 'waiting', reason: 'facts-inconsistent' };
   }
+  const parsedKey = parseLaneRunKey(key);
+  const gateRun = parsedKey !== null && parsedKey.kind === 'step' ? (parsedKey.retry ?? undefined) : undefined;
   const verdict = await gate.evaluateAttemptGate({
     attemptId: latest.id,
     candidateHeadSha: latest.artifacts.headCommit,
+    ...(gateRun === undefined ? {} : { gateRun }),
   });
   if (verdict.verdict === 'passed' || verdict.verdict === 'failed') {
     // KF-13a: record one verification receipt per acceptance check before the
@@ -345,6 +352,16 @@ export async function runGateBody(ctx: AdvanceStepContext,
       return { outcome: 'refused', reason: resultRefusal };
     }
     return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'gate-failed' };
+  }
+  // KF-30c2: the typed congestion signal turns only an `unknown` into a
+  // completed `gate-congested` run (never a pass); any other `unknown` stays
+  // exactly as today (`ambiguous` / `gate-unknown`).
+  if (verdict.verdict === 'unknown' && verdict.congested === true) {
+    const congestedRefusal = await appendRunResult(ctx, request, key, 'completed', 'gate-congested');
+    if (congestedRefusal !== null) {
+      return { outcome: 'refused', reason: congestedRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'gate-congested' };
   }
   const resultRefusal = await appendRunResult(ctx, request, key, 'ambiguous', 'gate-unknown');
   if (resultRefusal !== null) {

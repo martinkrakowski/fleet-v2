@@ -5,6 +5,8 @@ import type { LaneRunRecord } from '../lane-run-records.js';
 import { canEnterLaneRunState } from '../lane-run-transitions.js';
 import { LANE_RUN_MAX_RETRY } from '../lane-run-keys.js';
 import {
+  GATE_CONGESTION_BACKOFF_MS,
+  GATE_CONGESTION_MAX_RETRIES,
   laneRunAttemptPhaseOf,
   nextLaneRunAction,
 } from '../lane-run-decider.js';
@@ -83,6 +85,7 @@ function baseFacts(overrides: Partial<LaneRunFacts> = {}): LaneRunFacts {
     head12: null,
     acceptedHead12: null,
     gate: 'none',
+    gateCongestion: null,
     briefCheck: { verdict: 'none', seatIndex: null, retries: 0 },
     codeReview: { verdict: 'none', seatIndex: null, retries: 0 },
     preMerge: 'none',
@@ -747,6 +750,45 @@ describe('gating state', () => {
     const roundTwo = baseFacts({ state: 'gating', gate: 'failed' });
     assertDecision(roundTwo, rec, decide(rec, roundTwo), {
       kind: 'park', reason: 'blocker-after-round-2', qualifier: null, parkedFrom: 'gating',
+    });
+  });
+
+  it('T6: a congested gate within the backoff waits gate-congested', () => {
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'congested',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateCongestion: { retry: 0, atIso: NOW },
+    });
+    expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'gate-congested' });
+  });
+
+  it('T6b: a congested gate after the backoff acts the gate under /retry<n+1>', () => {
+    const after = new Date(Date.parse(NOW) + GATE_CONGESTION_BACKOFF_MS + 1000).toISOString();
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'congested',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateCongestion: { retry: 0, atIso: NOW },
+    });
+    expect(decide(record({}), facts, after)).toEqual({
+      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
+  it('T6c: a congested gate past the retry bound parks ambiguous gate', () => {
+    const after = new Date(Date.parse(NOW) + GATE_CONGESTION_BACKOFF_MS + 1000).toISOString();
+    const facts = baseFacts({
+      state: 'gating',
+      gate: 'congested',
+      head12: HEAD,
+      attempt: attemptFact(),
+      gateCongestion: { retry: GATE_CONGESTION_MAX_RETRIES, atIso: NOW },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts, after), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
     });
   });
 });

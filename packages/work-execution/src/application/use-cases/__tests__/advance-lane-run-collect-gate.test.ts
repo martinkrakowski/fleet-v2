@@ -921,6 +921,102 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
     expect(await advance(hUnknown)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'gate' });
   });
 
+  it('test 8c: a congested gate run records gate-congested, waits the backoff, then retries under /retry1 and passes into brief-check', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+    const harness = await makeHarness(runRecord(), [collected]);
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+    harness.setGateAnswer({ verdict: 'unknown', reason: 'gate slot wait limit reached', congested: true });
+
+    // Run 0: congestion is completed (never ambiguous) and the run is not parked.
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: gateKey(),
+      result: 'completed',
+      reasonCode: 'gate-congested',
+    });
+    expect(harness.gateRequests).toEqual([{ attemptId: 'attempt-example-1', candidateHeadSha: COMMIT }]);
+
+    // Within the backoff the decider waits, never parks.
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'gate-congested' });
+
+    // After the backoff the next advance acts the gate under /retry1, passing gateRun 1.
+    const retryBuilt = buildLaneRunStepKey({
+      runId: RUN_ID,
+      round: 0,
+      step: 'gate',
+      seatIndex: 0,
+      attemptOrdinal: null,
+      head12: HEAD12,
+      retry: 1,
+    });
+    expect(retryBuilt.ok).toBe(true);
+    if (!retryBuilt.ok) {
+      throw new Error('fixture must build a retry gate key');
+    }
+    const retryKey = retryBuilt.key;
+    harness.setGateAnswer({ verdict: 'passed', results: [] });
+    const second = await advance(harness, { nowIso: '2026-10-27T10:02:01.000Z' });
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: retryKey,
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    expect(harness.gateRequests).toEqual([
+      { attemptId: 'attempt-example-1', candidateHeadSha: COMMIT },
+      { attemptId: 'attempt-example-1', candidateHeadSha: COMMIT, gateRun: 1 },
+    ]);
+    // The retry's journal entries exist under /retry1: run 0 never sealed the head.
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'intent' && entry.key === retryKey)).toBe(true);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.key === retryKey && entry.reasonCode === 'gate-passed')).toBe(true);
+
+    // A pass then enters brief-check.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
+  });
+
+  it('test 8d: repeated congestion retries to the bound and then parks ambiguous gate', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+    const harness = await makeHarness(runRecord(), [collected]);
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+    harness.setGateAnswer({ verdict: 'unknown', reason: 'gate slot wait limit reached', congested: true });
+
+    // Run 0 is congested (recorded at LATER by the default advance) and never parks.
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'gate', result: 'completed', reasonCode: 'gate-congested',
+    });
+
+    // The retry sequence spans the 60s backoffs, so extend the run lease past it
+    // (the lease window is bounded at 10 minutes).
+    const renewed = await harness.runRepo.renewLease(RUN_ID, {
+      holderId: HOLDER,
+      fence: 1,
+      leaseUntilIso: '2026-10-27T10:10:00.000Z',
+      nowIso: NOW,
+    });
+    expect(renewed.outcome).toBe('saved');
+
+    // Retries 1..6, each past the backoff, all congested; never parked.
+    let tick = Date.parse('2026-10-27T10:02:01.000Z');
+    for (let n = 1; n <= 6; n += 1) {
+      const acted = await advance(harness, { nowIso: new Date(tick).toISOString() });
+      expect(acted).toMatchObject({
+        outcome: 'acted', step: 'gate', result: 'completed', reasonCode: 'gate-congested',
+      });
+      tick += 61_000;
+    }
+
+    // Past the bound the next advance parks ambiguous at the gate.
+    expect(await advance(harness, { nowIso: new Date(tick).toISOString() })).toEqual({
+      outcome: 'parked', reason: 'ambiguous', qualifier: 'gate',
+    });
+  });
+
   it('test 8b: a gating run whose collection is not sealed parks artifacts-unsealed and never gates', async () => {
     const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
     for (const verdict of ['missing', 'mismatch'] as const) {

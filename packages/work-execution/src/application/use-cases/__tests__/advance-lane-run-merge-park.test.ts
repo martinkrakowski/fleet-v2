@@ -14,6 +14,7 @@ import { describe, expect, it } from 'vitest';
 import type { AttemptRecord, CollectedAttemptArtifacts, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
+import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import type {
@@ -237,12 +238,12 @@ interface Harness {
   /** The KF-36a release fake itself, for RegisterWorkOrderUseCase in tests. */
   readonly workOrderReleaseFake: WorkOrderRepositoryPort;
   workOrderById(workOrderId: string): WorkOrderRecord | null;
-  setWorkOrderReleaseRace(mode: 'none' | 'steal-merged' | 'throw-find'): void;
+  setWorkOrderReleaseRace(mode: 'none' | 'steal-merged' | 'throw-find' | 'bump-approved'): void;
   addOtherRun(options: {
     readonly runId: string;
     readonly workOrderId: string;
     readonly repository: string;
-    readonly state: 'merging';
+    readonly state: LaneRunStateValue;
   }): Promise<void>;
 }
 
@@ -339,7 +340,10 @@ async function makeHarness(
   const attentionStore = new Map<string, LaneRunParkNoticeResult>();
   const questionStore = new Map<string, LaneRunParkNoticeResult>();
   const savedWorkOrders: WorkOrderRecord[] = [];
-  let releaseRace: 'none' | 'steal-merged' | 'throw-find' = 'none';
+  let releaseRace: 'none' | 'steal-merged' | 'throw-find' | 'bump-approved' = 'none';
+  // `bump-approved` fires once: another writer bumps the revision (state stays
+  // approved) between our find and our first save, so the retry must re-save.
+  let bumpApprovedDone = false;
   const workOrderReleaseFake: WorkOrderRepositoryPort = {
     saveWorkOrder: async (record) => {
       const stored = workOrders.get(record.id);
@@ -350,6 +354,15 @@ async function makeHarness(
       if (releaseRace === 'steal-merged') {
         // Another writer (markMerged) saves first, then our save is stale.
         workOrders.set(record.id, { ...record, state: 'merged' });
+        throw new Error('stale work order revision');
+      }
+      if (releaseRace === 'bump-approved' && !bumpApprovedDone) {
+        // Another writer bumps the stored revision but keeps the state approved,
+        // so our first save is stale and the release's retry re-saves.
+        bumpApprovedDone = true;
+        if (stored !== undefined) {
+          workOrders.set(record.id, { ...stored, revision: stored.revision + 1 });
+        }
         throw new Error('stale work order revision');
       }
       workOrders.set(record.id, record);
@@ -547,6 +560,7 @@ async function makeHarness(
     workOrderById: (workOrderId) => workOrders.get(workOrderId) ?? null,
     setWorkOrderReleaseRace: (mode) => {
       releaseRace = mode;
+      bumpApprovedDone = false;
     },
     addOtherRun: async ({ runId, workOrderId, repository, state }) => {
       const other = await runRepo.create(runRecord({ runId, workOrderId }));
@@ -1311,5 +1325,47 @@ describe('AdvanceLaneRunUseCase work-order release at the run end (KF-36a)', () 
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
     expect(harness.savedWorkOrders).toHaveLength(0);
     expect(harness.workOrderById(WORK_ORDER_ID)).toMatchObject({ state: 'ready-to-merge', revision: 1 });
+  });
+
+  it('a terminal sibling run on the same work order never blocks the release (KF-36a-1 Fable minor 1)', async () => {
+    const harness = await mergingHarness({ wireWorkOrderRelease: true });
+    await harness.addOtherRun({ runId: OTHER_RUN_ID, workOrderId: WORK_ORDER_ID, repository: 'repo-example', state: 'stopped' });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'merge',
+      key: mergeKey(),
+      result: 'completed',
+      reasonCode: 'merged',
+    });
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(harness.savedWorkOrders).toHaveLength(1);
+    expect(harness.savedWorkOrders[0]).toMatchObject({
+      id: WORK_ORDER_ID,
+      state: 'merged',
+      revision: 2,
+      updatedAtIso: LATER,
+    });
+  });
+
+  it('a race that bumps the stored revision but keeps it approved retries into the merged save (KF-36a-1 Fable minor 3)', async () => {
+    const harness = await mergingHarness({ wireWorkOrderRelease: true });
+    harness.setWorkOrderReleaseRace('bump-approved');
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'merge',
+      key: mergeKey(),
+      result: 'completed',
+      reasonCode: 'merged',
+    });
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(harness.savedWorkOrders).toHaveLength(1);
+    expect(harness.savedWorkOrders[0]).toMatchObject({
+      id: WORK_ORDER_ID,
+      state: 'merged',
+      revision: 3,
+      updatedAtIso: LATER,
+    });
   });
 });

@@ -32,9 +32,12 @@ import { resolveE2eDir, startE2eFixture, type E2eFixture } from './fixture.js';
 /** [0-9A-HJKMNP-TV-Z]: the ULID charset minus I, L, O and U. */
 const ID_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 const WORK_ORDER_ID = 'wo-example-1';
+const WORK_ORDER_ID2 = 'wo-example-2';
 const PROJECT_ID = 'project-example-1';
 const TASK_ID = 'task-example-1';
+const TASK_ID2 = 'task-example-2';
 const LANE_ID = 'lane-example-1';
+const LANE_ID2 = 'lane-example-2';
 const POLICY_REVISION = 'policy-example-1';
 const SEAT_AGENT_DEFAULT = 'lane';
 const REVIEWER_AGENT = 'reviewer';
@@ -71,6 +74,13 @@ export interface ConductedFixtureOptions {
    * actually received.
    */
   readonly captureBriefs?: string;
+  /**
+   * KF-34b2: when true the fixture registers a second work order
+   * (`wo-example-2`, owning `packages/second`) and a second brief request, and
+   * raises the lane host's `maxLanes` and the profile's
+   * `maxConcurrentLanes` to 2. Default: false — today's single-run shape.
+   */
+  readonly secondRun?: boolean;
 }
 
 export interface CliRunResult {
@@ -107,6 +117,12 @@ export interface ConductedFixture extends E2eFixture {
   readonly runId: string;
   /** The fixed attempt id for this fixture. */
   readonly attemptId: string;
+  /** KF-34b2: the second fixed run id, present only with `secondRun`. */
+  readonly runId2?: string;
+  /** KF-34b2: the second fixed attempt id, present only with `secondRun`. */
+  readonly attemptId2?: string;
+  /** KF-34b2: the second accepted brief-request JSON file path, present only with `secondRun`. */
+  readonly briefRequestPath2?: string;
   /** File the ocm-run wrapper appends its argv to, one line per call. */
   readonly ocmRunArgvLog: string;
   /** ocm-run's stderr and exit codes, one block per call, for diagnosing a dispatch that went unknown. */
@@ -122,9 +138,14 @@ export interface ConductedFixture extends E2eFixture {
   /** Captured CLI I/O shared by every command this fixture runs. */
   readonly io: CapturedIo;
   /** `conductor start --brief-request ...` through the CLI. */
-  readonly start: (tier: 1 | 2) => Promise<CliRunResult>;
+  readonly start: (tier: 1 | 2, extraArgs?: readonly string[]) => Promise<CliRunResult>;
+  /**
+   * KF-34b2: `conductor start` for the second run through the CLI, mirroring
+   * `start` over the second brief request. Present only with `secondRun`.
+   */
+  readonly startSecond?: (tier: 1 | 2, extraArgs?: readonly string[]) => Promise<CliRunResult>;
   /** One `conductor run --live --once` pass through the CLI (60 s abort). */
-  readonly runPass: () => Promise<CliRunResult>;
+  readonly runPass: (extraArgs?: readonly string[]) => Promise<CliRunResult>;
   /**
    * Q1c: record one completed passing verification receipt per
    * `acceptanceChecks` name at the latest attempt's collected head through
@@ -204,6 +225,7 @@ function buildConductedInstallation(
   laneWorktreeRoot: string,
   seatAgent: string,
   laneAuthFile: string,
+  maxLanes: number,
 ): FleetInstallationV2 {
   return {
     schemaVersion: 2,
@@ -231,7 +253,7 @@ function buildConductedInstallation(
             processTreeTermination: true,
             filesystemScope: 'scoped-worktree',
           },
-          maxLanes: 1,
+          maxLanes,
         },
       },
     },
@@ -613,6 +635,17 @@ export async function startConductedFixture(
       '# example\n\nThe lane work order owns this package.\n',
       'utf8',
     );
+    if (options?.secondRun === true) {
+      // KF-34b2: a second, distinct package for the second work order. The
+      // name is not a prefix of `packages/example` — admission refuses
+      // overlapping owned paths.
+      await fs.mkdir(path.join(clonePath, 'packages', 'second'), { recursive: true });
+      await fs.writeFile(
+        path.join(clonePath, 'packages', 'second', 'README.md'),
+        '# second\n\nThe second lane work order owns this package.\n',
+        'utf8',
+      );
+    }
     git(['add', '-A'], { cwd: clonePath });
     git(['commit', '-m', 'example seed commit'], { cwd: clonePath });
     git(['push', 'origin', 'main'], { cwd: clonePath });
@@ -629,6 +662,7 @@ export async function startConductedFixture(
       worktreeRoot,
       seatAgent,
       laneAuthFile,
+      options?.secondRun === true ? 2 : 1,
     );
     const written = writeInstallationV2(installation);
     const parsed = parseInstallation(JSON.parse(written));
@@ -644,6 +678,8 @@ export async function startConductedFixture(
     // --- ids (before the runtime: the forge stub names the run's branch) ---
     const runId = 'run-0' + idChars(20261029, 25);
     const attemptId = 'attempt-' + idChars(97202610, 26);
+    const runId2 = 'run-0' + idChars(20261030, 25);
+    const attemptId2 = 'attempt-' + idChars(97202611, 26);
 
     // --- runtime ----------------------------------------------------------
     const gh = makeForgeGhRunner(() => readWorktreeHead(worktreeRoot, baseCommit), `fleet/${runId}`);
@@ -680,7 +716,7 @@ export async function startConductedFixture(
       repository: bareRepo,
       designatedDispatcherHost: 'orchestrator-host',
       policyRevision: POLICY_REVISION,
-      maxConcurrentLanes: 1,
+      maxConcurrentLanes: options?.secondRun === true ? 2 : 1,
       runnerCapabilities: {
         networkEgressRestricted: true,
         cpuAndMemoryLimited: true,
@@ -704,6 +740,21 @@ export async function startConductedFixture(
     });
     if (workOrderResult.outcome !== 'registered') {
       throw new Error(`work order registration refused: ${JSON.stringify(workOrderResult)}`);
+    }
+    if (options?.secondRun === true) {
+      const workOrderResult2 = await runtime.execution.registerWorkOrder.execute({
+        workOrderId: WORK_ORDER_ID2,
+        projectId: PROJECT_ID,
+        taskId: TASK_ID2,
+        laneId: LANE_ID2,
+        repository: bareRepo,
+        baseCommit,
+        policyRevision: POLICY_REVISION,
+        ownedPaths: ['packages/second'],
+      });
+      if (workOrderResult2.outcome !== 'registered') {
+        throw new Error(`second work order registration refused: ${JSON.stringify(workOrderResult2)}`);
+      }
     }
 
     // --- brief request ----------------------------------------------------
@@ -777,6 +828,38 @@ export async function startConductedFixture(
     const briefRequestPath = path.join(dir, 'brief-request.json');
     await fs.writeFile(briefRequestPath, JSON.stringify(briefRequest, null, 2), 'utf8');
 
+    // --- KF-34b2: the second brief request (same shape, packages/second) ---
+    const briefPath2 = path.join(dir, 'brief-2.md');
+    const briefRequest2: Record<string, unknown> = {
+      ...briefRequest,
+      workOrderId: WORK_ORDER_ID2,
+      taskId: TASK_ID2,
+      laneId: LANE_ID2,
+      ownedPaths: ['packages/second'],
+      allowedPathPrefixes: ['packages/second'],
+      handWrittenBriefPath: briefPath2,
+      prNotes: {
+        hardToUndo: 'Only the second package is touched; revert the lane branch.',
+        assumptions: 'The second package builds with the repository toolchain.',
+        challengeThis: 'Flag any acceptance command that cannot run in the lane.',
+      },
+    };
+    const briefRequestPath2 = path.join(dir, 'brief-request-2.json');
+    if (options?.secondRun === true) {
+      await fs.writeFile(
+        briefPath2,
+        [
+          '# Second lane brief',
+          '',
+          'Read and follow this brief. Work only inside packages/second.',
+          'Run the acceptance commands, commit your work, and stop.',
+          '',
+        ].join('\n'),
+        'utf8',
+      );
+      await fs.writeFile(briefRequestPath2, JSON.stringify(briefRequest2, null, 2), 'utf8');
+    }
+
     const io = captureIo();
     /** Returns stdout AND stderr both captured BEFORE the buffers clear. */
     const takeOutput = (): { stdout: string[]; stderr: string[] } => {
@@ -787,10 +870,10 @@ export async function startConductedFixture(
       return { stdout, stderr };
     };
 
-    const start = async (tier: 1 | 2): Promise<CliRunResult> => {
+    const start = async (tier: 1 | 2, extraArgs: readonly string[] = []): Promise<CliRunResult> => {
       const code = await runCli(
         ['conductor', 'start', '--brief-request', briefRequestPath, '--tier', String(tier),
-          '--run-id', runId, '--attempt-id', attemptId],
+          '--run-id', runId, '--attempt-id', attemptId, ...extraArgs],
         io,
         currentRuntime,
         undefined,
@@ -804,12 +887,29 @@ export async function startConductedFixture(
       return { code, ...takeOutput() };
     };
 
-    const runPass = async (): Promise<CliRunResult> => {
+    const startSecond = async (tier: 1 | 2, extraArgs: readonly string[] = []): Promise<CliRunResult> => {
+      const code = await runCli(
+        ['conductor', 'start', '--brief-request', briefRequestPath2, '--tier', String(tier),
+          '--run-id', runId2, '--attempt-id', attemptId2, ...extraArgs],
+        io,
+        currentRuntime,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { stateDir: e2e.stateDir },
+      );
+      return { code, ...takeOutput() };
+    };
+
+    const runPass = async (extraArgs: readonly string[] = []): Promise<CliRunResult> => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 60000);
       try {
         const code = await runCli(
-          ['conductor', 'run', '--live', '--once'],
+          ['conductor', 'run', '--live', '--once', ...extraArgs],
           io,
           currentRuntime,
           undefined,
@@ -927,6 +1027,9 @@ export async function startConductedFixture(
       briefRequest,
       runId,
       attemptId,
+      ...(options?.secondRun === true
+        ? { runId2, attemptId2, briefRequestPath2, startSecond }
+        : {}),
       ocmRunArgvLog,
       ocmRunStderrLog,
       ocmRunEnvLog,

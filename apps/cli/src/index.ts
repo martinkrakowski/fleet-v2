@@ -648,7 +648,7 @@ time window) to the collector route, or prints them with a dry run, and shows
 the configuration status. Run 'fleet-v2 telemetry --help'.
 
 Commands:
-  work-order register|inspect|close|stale
+  work-order register|inspect|close
   doctor [--probe-seats] [--host <name>] [--json]
   hosts list|add|edit|remove
   seats free-tier [status|on|off] [--yes]

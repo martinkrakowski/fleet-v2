@@ -8,7 +8,7 @@ import {
 import { readObjectBody, routeParam } from "../../../../wiring/http-input";
 
 export default defineEventHandler(async (event) => {
-  // share one single-flight slot; routeParam has fully decoded the id. The
+  // routeParam has fully decoded the id; it is the limiter key and the id the use case receives.
   // limiter is keyed on the prior attempt id: a fix round works on the
   // prior's worktree, so two fixes for the same prior never overlap.
   const priorAttemptId = routeParam(event, "id");

@@ -8,7 +8,7 @@ import {
 import { readObjectBody, routeParam } from "../../../../wiring/http-input";
 
 export default defineEventHandler(async (event) => {
-  // share one single-flight slot; routeParam has fully decoded the id.
+  // routeParam has fully decoded the id; it is the limiter key and the id the use case receives.
   const attemptId = routeParam(event, "id");
   const operationId = newOperationId();
   try {

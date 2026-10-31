@@ -33,6 +33,12 @@ const NOW = '2026-10-31T00:00:00.000Z';
 /** Run ids must satisfy the run-id pattern or the journal reads them as `ready`. */
 const RUN_1 = 'run-01JB000000000000000000000A';
 const RUN_2 = 'run-01JB000000000000000000000B';
+const RUN_3 = 'run-01JB000000000000000000000C';
+const RUN_4 = 'run-01JB000000000000000000000D';
+/** Different from the harness clock `NOW` and from any request's `nowIso`. */
+const UPDATED_AT = '2026-10-30T00:00:00.000Z';
+/** A request `nowIso` different from the harness clock `NOW`. */
+const REQUEST_NOW = '2026-10-31T12:00:00.000Z';
 const WORK_ORDER_ID = 'wo-example-1';
 const PROJECT_ID = 'project-example-1';
 const COMMIT = 'a'.repeat(40);
@@ -55,7 +61,7 @@ function makeWorkOrder(overrides: Partial<WorkOrderRecord> = {}): WorkOrderRecor
     state: 'approved',
     revision: 1,
     createdAtIso: NOW,
-    updatedAtIso: NOW,
+    updatedAtIso: UPDATED_AT,
     risk: 'standard',
     ...overrides,
   };
@@ -253,7 +259,7 @@ describe('CloseWorkOrderUseCase', () => {
         runs: [runRecord({ runId: RUN_1, workOrderId: WORK_ORDER_ID })],
         journalStates: new Map([[RUN_1, 'stopped']]),
       });
-      const result = await close(h, 'stopped');
+      const result = await close(h, 'stopped', { nowIso: REQUEST_NOW });
       expect(result).toEqual({
         outcome: 'closed',
         workOrderId: WORK_ORDER_ID,
@@ -263,7 +269,9 @@ describe('CloseWorkOrderUseCase', () => {
       const saved = h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!;
       expect(saved.state).toBe('stopped');
       expect(saved.revision).toBe(2);
-      expect(saved.updatedAtIso).toBe(NOW);
+      // The request's `nowIso` is stored, not the fixture's `updatedAtIso`
+      // (which differs) and not the harness clock.
+      expect(saved.updatedAtIso).toBe(REQUEST_NOW);
     });
 
     it('closes an approved work order whose run is merged as merged', async () => {
@@ -271,14 +279,18 @@ describe('CloseWorkOrderUseCase', () => {
         runs: [runRecord({ runId: RUN_1, workOrderId: WORK_ORDER_ID })],
         journalStates: new Map([[RUN_1, 'merged']]),
       });
-      const result = await close(h, 'merged');
+      const result = await h.useCase.execute({ workOrderId: WORK_ORDER_ID, state: 'merged' }) as CloseWorkOrderResult;
       expect(result).toEqual({
         outcome: 'closed',
         workOrderId: WORK_ORDER_ID,
         state: 'merged',
         revision: 2,
       });
-      expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!.state).toBe('merged');
+      // With no `nowIso` the clock value is stored, not the fixture's
+      // `updatedAtIso` (which differs).
+      const saved = h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!;
+      expect(saved.state).toBe('merged');
+      expect(saved.updatedAtIso).toBe(NOW);
     });
   });
 
@@ -288,17 +300,21 @@ describe('CloseWorkOrderUseCase', () => {
         runs: [runRecord({ runId: RUN_1, workOrderId: WORK_ORDER_ID })],
         journalStates: new Map([[RUN_1, 'stopped']]),
       });
+      const before = structuredClone(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!);
       expect(await close(h, 'merged')).toEqual({
         outcome: 'refused',
         workOrderId: WORK_ORDER_ID,
         reason: 'no-merged-run',
       });
       expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!.revision).toBe(1);
+      expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)).toEqual(before);
     });
 
     it('refuses merged with no run at all (a hand-carried work order)', async () => {
       const h = harness({});
+      const before = structuredClone(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!);
       expect(await close(h, 'merged')).toMatchObject({ outcome: 'refused', reason: 'no-merged-run' });
+      expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)).toEqual(before);
     });
 
     it('refuses while a non-terminal run names the work order, with its id', async () => {
@@ -306,6 +322,7 @@ describe('CloseWorkOrderUseCase', () => {
         runs: [runRecord({ runId: RUN_1, workOrderId: WORK_ORDER_ID })],
         journalStates: new Map([[RUN_1, 'dispatching']]),
       });
+      const before = structuredClone(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!);
       expect(await close(h, 'stopped')).toEqual({
         outcome: 'refused',
         workOrderId: WORK_ORDER_ID,
@@ -313,28 +330,34 @@ describe('CloseWorkOrderUseCase', () => {
         runIds: [RUN_1],
       });
       expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!.revision).toBe(1);
+      expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)).toEqual(before);
     });
 
     it('refuses a running attempt with no run as attempt-not-ended', async () => {
       const h = harness({
         attempts: [attemptFixture({ id: 'attempt-running', state: 'running' })],
       });
+      const before = structuredClone(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!);
       expect(await close(h, 'stopped')).toEqual({
         outcome: 'refused',
         workOrderId: WORK_ORDER_ID,
         reason: 'attempt-not-ended',
         attemptIds: ['attempt-running'],
       });
+      expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)).toEqual(before);
     });
 
     it('refuses a blocked attempt as attempt-not-ended', async () => {
       const h = harness({
         attempts: [attemptFixture({ id: 'attempt-blocked', state: 'blocked' })],
       });
+      const before = structuredClone(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!);
       expect(await close(h, 'stopped')).toMatchObject({
         outcome: 'refused',
         reason: 'attempt-not-ended',
+        attemptIds: ['attempt-blocked'],
       });
+      expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)).toEqual(before);
     });
 
     it('refuses a held reservation on an ended attempt as slot-held, for stopped', async () => {
@@ -342,6 +365,7 @@ describe('CloseWorkOrderUseCase', () => {
         attempts: [attemptFixture({ state: 'ended' })],
         reservations: [reservation()],
       });
+      const before = structuredClone(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!);
       expect(await close(h, 'stopped')).toEqual({
         outcome: 'refused',
         workOrderId: WORK_ORDER_ID,
@@ -349,6 +373,7 @@ describe('CloseWorkOrderUseCase', () => {
         attemptIds: ['attempt-example-1'],
       });
       expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!.revision).toBe(1);
+      expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)).toEqual(before);
     });
 
     it('refuses a held reservation on an ended attempt as slot-held, for merged too', async () => {
@@ -358,19 +383,63 @@ describe('CloseWorkOrderUseCase', () => {
         attempts: [attemptFixture({ state: 'collected' })],
         reservations: [reservation()],
       });
+      const before = structuredClone(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!);
       expect(await close(h, 'merged')).toMatchObject({
         outcome: 'refused',
         reason: 'slot-held',
       });
+      expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)).toEqual(before);
     });
 
     it('refuses an already merged work order asked stopped', async () => {
       const h = harness({ workOrders: [makeWorkOrder({ state: 'merged' })] });
+      let attemptCalls = 0;
+      let reservationCalls = 0;
+      const listAttempts = h.attemptRepo.listAttemptsByWorkOrder.bind(h.attemptRepo);
+      h.attemptRepo.listAttemptsByWorkOrder = async (workOrderId) => {
+        attemptCalls += 1;
+        return listAttempts(workOrderId);
+      };
+      const listReservations = h.executionJournal.listActiveReservations.bind(h.executionJournal);
+      h.executionJournal.listActiveReservations = async () => {
+        reservationCalls += 1;
+        return listReservations();
+      };
+      const before = structuredClone(await h.workOrderRepo.findWorkOrderById(WORK_ORDER_ID));
       expect(await close(h, 'stopped')).toEqual({
         outcome: 'refused',
         workOrderId: WORK_ORDER_ID,
         reason: 'already-terminal',
       });
+      expect(await h.workOrderRepo.findWorkOrderById(WORK_ORDER_ID)).toEqual(before);
+      // The early terminal check answers before any hold-facts read.
+      expect(attemptCalls).toBe(0);
+      expect(reservationCalls).toBe(0);
+    });
+
+    it('refuses an already stopped work order asked merged', async () => {
+      const h = harness({ workOrders: [makeWorkOrder({ state: 'stopped' })] });
+      let attemptCalls = 0;
+      let reservationCalls = 0;
+      const listAttempts = h.attemptRepo.listAttemptsByWorkOrder.bind(h.attemptRepo);
+      h.attemptRepo.listAttemptsByWorkOrder = async (workOrderId) => {
+        attemptCalls += 1;
+        return listAttempts(workOrderId);
+      };
+      const listReservations = h.executionJournal.listActiveReservations.bind(h.executionJournal);
+      h.executionJournal.listActiveReservations = async () => {
+        reservationCalls += 1;
+        return listReservations();
+      };
+      const before = structuredClone(await h.workOrderRepo.findWorkOrderById(WORK_ORDER_ID));
+      expect(await close(h, 'merged')).toEqual({
+        outcome: 'refused',
+        workOrderId: WORK_ORDER_ID,
+        reason: 'already-terminal',
+      });
+      expect(await h.workOrderRepo.findWorkOrderById(WORK_ORDER_ID)).toEqual(before);
+      expect(attemptCalls).toBe(0);
+      expect(reservationCalls).toBe(0);
     });
 
     it('answers not-found for an unknown id', async () => {
@@ -383,33 +452,39 @@ describe('CloseWorkOrderUseCase', () => {
 
     it('refuses a blank id as invalid-request', async () => {
       const h = harness({});
+      const before = structuredClone(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!);
       expect(await close(h, 'stopped', { workOrderId: '   ' })).toMatchObject({
         outcome: 'refused',
         reason: 'invalid-request',
       });
+      expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)).toEqual(before);
     });
 
     it('refuses a state outside the close states as invalid-request', async () => {
       const h = harness({});
+      const before = structuredClone(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!);
       expect(await close(h, 'ready-to-merge' as 'merged')).toMatchObject({
         outcome: 'refused',
         reason: 'invalid-request',
       });
+      expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)).toEqual(before);
     });
 
     it.each([['a blank string', '   '], ['a non-date string', 'not-a-date'], ['a number', 42]])(
       'refuses a nowIso that is %s as invalid-request and saves nothing',
       async (_label, nowIso) => {
         const h = harness({});
+        const before = structuredClone(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!);
         await expect(
           h.useCase.execute({ workOrderId: WORK_ORDER_ID, state: 'stopped', nowIso }),
         ).resolves.toMatchObject({ outcome: 'refused', reason: 'invalid-request' });
-        expect((await h.workOrderRepo.findWorkOrderById(WORK_ORDER_ID))?.state).not.toBe('stopped');
+        expect(await h.workOrderRepo.findWorkOrderById(WORK_ORDER_ID)).toEqual(before);
       },
     );
 
     it('refuses a non-object execute input as invalid-request', async () => {
       const h = harness({});
+      const before = structuredClone(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)!);
       await expect(h.useCase.execute('not-an-object')).resolves.toMatchObject({
         outcome: 'refused',
         reason: 'invalid-request',
@@ -418,6 +493,7 @@ describe('CloseWorkOrderUseCase', () => {
         outcome: 'refused',
         reason: 'invalid-request',
       });
+      expect(h.workOrderRepo.workOrders.get(WORK_ORDER_ID)).toEqual(before);
     });
   });
 
@@ -434,6 +510,20 @@ describe('CloseWorkOrderUseCase', () => {
         }
         await original(record);
       };
+      await expect(close(h, 'stopped')).resolves.toMatchObject({
+        outcome: 'refused',
+        reason: 'stale-revision',
+      });
+    });
+
+    it('answers stale-revision when the save deletes the record and throws', async () => {
+      const h = harness();
+      h.workOrderRepo.saveWorkOrder = async (record) => {
+        // Simulate the write destroying the stored record before failing.
+        h.workOrderRepo.workOrders.delete(record.id);
+        throw new Error('disk on fire');
+      };
+      // The re-read finds nothing: the write failed, it was not a race.
       await expect(close(h, 'stopped')).resolves.toMatchObject({
         outcome: 'refused',
         reason: 'stale-revision',
@@ -490,12 +580,20 @@ describe('CloseWorkOrderUseCase', () => {
 
 describe('workOrderHoldFacts', () => {
   it('sorts every list in code-unit order', async () => {
+    // All ids satisfy `LANE_RUN_ID_PATTERN`; they are given in reverse order.
     const h = harness({
       runs: [
-        runRecord({ runId: 'run-b', workOrderId: WORK_ORDER_ID }),
-        runRecord({ runId: 'run-a', workOrderId: WORK_ORDER_ID }),
+        runRecord({ runId: RUN_4, workOrderId: WORK_ORDER_ID }),
+        runRecord({ runId: RUN_3, workOrderId: WORK_ORDER_ID }),
+        runRecord({ runId: RUN_2, workOrderId: WORK_ORDER_ID }),
+        runRecord({ runId: RUN_1, workOrderId: WORK_ORDER_ID }),
       ],
-      journalStates: new Map([['run-a', 'dispatching'], ['run-b', 'ready']]),
+      journalStates: new Map([
+        [RUN_4, 'merged'],
+        [RUN_3, 'merged'],
+        [RUN_2, 'dispatching'],
+        [RUN_1, 'ready'],
+      ]),
       reservations: [
         reservation({ id: 'res-2', attemptId: 'attempt-b' }),
         reservation({ id: 'res-1', attemptId: 'attempt-a' }),
@@ -503,8 +601,8 @@ describe('workOrderHoldFacts', () => {
     });
     const facts = await workOrderHoldFacts(h, WORK_ORDER_ID, ['attempt-b', 'attempt-a'], null);
     expect(facts.heldAttemptIds).toEqual(['attempt-a', 'attempt-b']);
-    expect(facts.nonTerminalRunIds).toEqual(['run-a', 'run-b']);
-    expect(facts.mergedRunIds).toEqual([]);
+    expect(facts.nonTerminalRunIds).toEqual([RUN_1, RUN_2]);
+    expect(facts.mergedRunIds).toEqual([RUN_3, RUN_4]);
   });
 
   it('excludes exceptRunId from all three lists', async () => {
@@ -513,15 +611,16 @@ describe('workOrderHoldFacts', () => {
         runRecord({ runId: RUN_1, workOrderId: WORK_ORDER_ID, attemptIds: ['attempt-example-1'] }),
         runRecord({ runId: RUN_2, workOrderId: WORK_ORDER_ID }),
       ],
-      journalStates: new Map([[RUN_1, 'dispatching'], [RUN_2, 'stopped']]),
+      journalStates: new Map([[RUN_1, 'merged'], [RUN_2, 'stopped']]),
       reservations: [reservation()],
     });
     const facts = await workOrderHoldFacts(h, WORK_ORDER_ID, ['attempt-example-1'], RUN_1);
     // `heldAttemptIds` follows the attempt list, not runs; only the run lists
-    // drop `exceptRunId`.
+    // drop `exceptRunId` — even when it is the merged one.
     expect(facts.heldAttemptIds).toEqual(['attempt-example-1']);
     expect(facts.nonTerminalRunIds).toEqual([]);
     expect(facts.mergedRunIds).toEqual([]);
+    expect(facts.mergedRunIds).not.toContain(RUN_1);
   });
 
   it('lists a run whose journal state is merged in mergedRunIds', async () => {

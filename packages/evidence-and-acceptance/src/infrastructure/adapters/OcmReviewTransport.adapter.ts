@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 
-import { UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
+import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
 import type { FindingSeverity, ReviewFindingRecord } from '../../domain/evidence-records.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type { ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
@@ -626,7 +626,7 @@ function buildKindReviewPrompt(
         nonce,
       });
       sections.push(
-        `Brief:\n${wrappedBrief}\n\n` +
+        `${BRIEF_INPUT_RULE}\n\nBrief:\n${wrappedBrief}\n\n` +
           'Does the change satisfy every work-order item of the brief? Report a FINDING for each item the change does not satisfy.',
       );
     } else {

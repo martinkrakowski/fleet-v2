@@ -43,7 +43,7 @@ export interface FindingView {
   readonly findingId: string;
   readonly severity: "blocker" | "major" | "minor" | "nit";
   readonly summary: string;
-  readonly state: "unresolved" | "fixed" | "refuted";
+  readonly state: "unresolved" | "fixed" | "refuted" | "out-of-scope";
 }
 
 export interface ReviewView {
@@ -61,7 +61,7 @@ export interface ReviewView {
 export interface DispositionView {
   readonly id: string;
   readonly findingId: string;
-  readonly state: "unresolved" | "fixed" | "refuted";
+  readonly state: "unresolved" | "fixed" | "refuted" | "out-of-scope";
   readonly reason: string;
   readonly recordedBy: string;
   readonly recordedAtIso: string;
@@ -114,7 +114,12 @@ const ASSESSMENT_STATES: readonly AssessmentState[] = [
   "stale",
 ];
 
-const FINDING_STATES = ["unresolved", "fixed", "refuted"] as const;
+const FINDING_STATES = [
+  "unresolved",
+  "fixed",
+  "refuted",
+  "out-of-scope",
+] as const;
 const FINDING_SEVERITIES = ["blocker", "major", "minor", "nit"] as const;
 const COVERAGE_UNIT_KINDS = ["tests", "files", "checks"] as const;
 

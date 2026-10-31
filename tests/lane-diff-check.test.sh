@@ -564,7 +564,7 @@ git config 'includeIf.onbranch:lanepicked.path' /nonexistent-kf27
 git config submodule.lanesub.update '!true'
 git config submodule.othersub.update checkout
 run "$R" --base base
-check 'pager.<cmd> is git-config-helper (KF-27a A4)' '[ "$(rc)" = 1 ] && grep -q "^git-config-helper: pager.log$" "$T/o"'
+check 'pager.<cmd> is git-config-helper with the command name masked (KF-27a A4, KF-27b Fable)' '[ "$(rc)" = 1 ] && grep -q "^git-config-helper: pager.<cmd>$" "$T/o" && ! grep -q "pager.log" "$T/o"'
 check 'url.<base>.insteadOf is git-config-helper, subsection masked (KF-27a A4)' 'grep -q "^git-config-helper: url.<sub>.insteadof$" "$T/o" && ! grep -q "lanepicked" "$T/o"'
 check 'include.path and includeIf.<cond>.path are git-config-helper (KF-27a A4)' 'grep -q "^git-config-helper: include.path$" "$T/o" && grep -q "^git-config-helper: includeif.<sub>.path$" "$T/o"'
 check 'a submodule update that runs a command is reported, a plain one is not, and no value is printed (KF-27a A4)' '[ "$(grep -c "^git-config-helper: submodule.<sub>.update$" "$T/o")" = 1 ] && ! grep -q "!true" "$T/o" && ! grep -q "lanesub\|othersub" "$T/o"'

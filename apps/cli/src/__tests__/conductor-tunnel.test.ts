@@ -328,7 +328,7 @@ describe('RunnerTunnelAdapter (KF-35)', () => {
     expect(child.killCalls).toHaveLength(0);
   });
 
-  it('reports a failure when the child exits while the successful probe runs (Grok re-review)', async () => {
+  it('uses the forward unowned when the child exits while the successful probe runs (KF-35b)', async () => {
     const child = fakeChild();
     let calls = 0;
     const probe = async (): Promise<boolean> => {
@@ -342,7 +342,7 @@ describe('RunnerTunnelAdapter (KF-35)', () => {
     };
     const tunnel = tunnelOf({ sshHost: 'lane-host', remotePort: 46000, probe, child });
     const early: number[] = [];
-    expect(await tunnel.ensureTunnel({ onEarlyExit: () => early.push(1) })).toBe('failed');
+    expect(await tunnel.ensureTunnel({ onEarlyExit: () => early.push(1) })).toBe('already-listening');
     expect(tunnel.owned).toBe(false);
     expect(early).toHaveLength(0);
   });
@@ -381,6 +381,18 @@ describe('RunnerTunnelAdapter (KF-35)', () => {
     expect(early).toHaveLength(0);
     await tunnel.release();
     expect(child.releaseCalls).toHaveLength(1);
+  });
+
+  it('a child that loses the bind to a concurrent driver uses the other driver forward, unowned (KF-35b)', async () => {
+    // Two drivers start at once: both see the port closed and spawn; the loser's
+    // ssh exits (ExitOnForwardFailure) while the winner's forward now answers.
+    const child = fakeChild({ exitAt: 'immediately' });
+    const tunnel = tunnelOf({ sshHost: 'lane-host', remotePort: 46000, probe: probeOf([false, true]), child });
+    const early: number[] = [];
+    expect(await tunnel.ensureTunnel({ onEarlyExit: () => early.push(1) })).toBe('already-listening');
+    expect(tunnel.owned).toBe(false);
+    expect(early).toHaveLength(0);
+    expect(child.killCalls).toHaveLength(0);
   });
 
   it('reports a failure after the bounded wait and stops the child', async () => {

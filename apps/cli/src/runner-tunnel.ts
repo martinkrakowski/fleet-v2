@@ -170,6 +170,15 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
     return this.child !== null;
   }
 
+  /** One probe that never throws: a failing probe reads as "not listening". */
+  private async answersQuietly(port: number): Promise<boolean> {
+    try {
+      return await this.isPortListening(port);
+    } catch {
+      return false;
+    }
+  }
+
   async ensureTunnel(
     handlers: { readonly onEarlyExit?: () => void } = {},
   ): Promise<RunnerTunnelStartOutcome> {
@@ -241,13 +250,15 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
       const deadline = Date.now() + this.waitMs;
       while (Date.now() < deadline) {
         if (exited) {
-          return 'failed';
+          // Our child lost the bind (ExitOnForwardFailure): another driver may
+          // have opened the same forward a moment earlier. Use it, unowned.
+          return (await this.answersQuietly(dial)) ? 'already-listening' : 'failed';
         }
         if (await this.isPortListening(dial)) {
           // The child may have died while the probe ran: an answering port is
-          // then someone else's, never this tunnel's.
+          // then someone else's forward, used without ownership.
           if (exited) {
-            return 'failed';
+            return 'already-listening';
           }
           opened = true;
           return 'opened';

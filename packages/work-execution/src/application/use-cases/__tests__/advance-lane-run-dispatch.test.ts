@@ -37,6 +37,15 @@ import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/Attem
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
+import type { SessionStartGate } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
+
+function denyingStartGate(): SessionStartGate {
+  return { tryStart: () => ({ ok: false, retryAfterMs: 12_345 }) };
+}
+
+function grantingStartGate(): SessionStartGate {
+  return { tryStart: () => ({ ok: true }) };
+}
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -1070,5 +1079,60 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(harness.cancelRequests).toEqual([{ attemptId: 'attempt-example-1', nowIso: LATER }]);
     expect((await harness.attemptRepo.findAttemptById('attempt-example-1'))?.state).toBe('cancelled');
     expect((await harness.runJournal.listForKey(key)).filter((entry) => entry.kind === 'intent')).toHaveLength(1);
+  });
+
+  it('test 19 (KF-34a1): a denying start gate waits session-stagger before the dispatch intent and never calls the runner', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const result = await advance(harness, { startGate: denyingStartGate() });
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(harness.dispatchRequests).toEqual([]);
+    // Nothing at all is journalled: the wait sits before the one-way intent.
+    expect(await harness.runJournal.listForRun(RUN_ID)).toEqual([]);
+  });
+
+  it('test 20 (KF-34a1): with a granting gate the dispatch is exactly test 1', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const key = dispatchKey(0, 0, 1);
+    const result = await advance(harness, { startGate: grantingStartGate() });
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'dispatch',
+      key,
+      result: 'completed',
+      reasonCode: 'dispatch-started',
+    });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries[0]).toMatchObject({ kind: 'intent', key, mintedId: 'attempt-example-1' });
+  });
+
+  it('test 21 (KF-34a1): a seat-pivot dispatch is denied the same way, before the pivot intent', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    harness.setDispatchAnswer(async (request) => {
+      await harness.markAttemptCancelled(request.attemptId, 'rate-limited');
+      return { outcome: 'refused', reason: '429 rate limited' };
+    });
+    await admit(harness, 'attempt-example-1');
+    await advance(harness);
+    await advance(harness);
+    await advance(harness);
+    const after = await harness.runRepo.get(RUN_ID);
+    const pivotId = after?.attemptIds[1] as string;
+    const pivotRecord = await harness.attemptRepo.findAttemptById(pivotId);
+    if (pivotRecord !== null) {
+      await harness.attemptRepo.saveAttempt({
+        ...pivotRecord,
+        runner: CONDUCTED_RUNNER,
+        revision: (pivotRecord.revision ?? 0) + 1,
+      });
+    }
+    await admit(harness, pivotId);
+    const denied = await advance(harness, { startGate: denyingStartGate() });
+    expect(denied).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'intent' && entry.key === dispatchKey(0, 1, 2))).toBe(false);
   });
 });

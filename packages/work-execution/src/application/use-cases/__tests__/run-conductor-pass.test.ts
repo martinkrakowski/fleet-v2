@@ -9,7 +9,8 @@
 import { describe, expect, it } from 'vitest';
 
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
-import { laneRunConductEntry } from '../../../domain/lane-run-step-facts.js';
+import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
+import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunParkRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { ConductorDriverLeaseAdapter } from '../../../infrastructure/adapters/ConductorDriverLeaseAdapter.adapter.js';
 import { ConductorHaltAdapter } from '../../../infrastructure/adapters/ConductorHaltAdapter.adapter.js';
@@ -559,7 +560,7 @@ describe('RunConductorPassUseCase run lease lost mid-pass', () => {
   });
 });
 
-describe('RunConductorPassUseCase dispatch stagger', () => {
+describe('RunConductorPassUseCase session-start gate (KF-34a1)', () => {
   const dispatchStarted = (runId: string): AdvanceLaneRunResult => ({
     outcome: 'acted',
     step: 'dispatch',
@@ -568,20 +569,84 @@ describe('RunConductorPassUseCase dispatch stagger', () => {
     reasonCode: 'dispatch-started',
   });
 
-  function fakeSleep() {
-    const calls: number[] = [];
+  const reviewStarted = (runId: string): AdvanceLaneRunResult => ({
+    outcome: 'acted',
+    step: 'brief-check',
+    key: `${runId}/r0/brief-check/0@0123456789ab`,
+    result: 'completed',
+    reasonCode: 'review-passed',
+  });
+
+  /**
+   * A scripted advance whose session-start results consult the request's
+   * start gate: a denied start is answered `waiting session-stagger` without
+   * consuming the queue, exactly like the real advance before its one-way
+   * intent. Results that are not session starts (a waiting tail, a reconciled
+   * dispatch) are never gated.
+   */
+  class GatedScriptedAdvance implements AdvanceLaneRunPort {
+    readonly calls: { request: AdvanceLaneRunRequest; result: AdvanceLaneRunResult }[] = [];
+    private readonly used = new Map<string, number>();
+    private gateAsks = 0;
+
+    constructor(
+      private readonly queue: ReadonlyMap<string, readonly AdvanceLaneRunResult[]>,
+      private readonly parkedAt: () => Promise<LaneRunParkRecord | null> = async () => null,
+    ) {}
+
+    get gateAskCount(): number {
+      return this.gateAsks;
+    }
+
+    private static isSessionStart(result: AdvanceLaneRunResult): boolean {
+      return (
+        result.outcome === 'acted' &&
+        result.result === 'completed' &&
+        (result.step === 'dispatch' || result.step === 'brief-check' || result.step === 'code-review')
+      );
+    }
+
+    async advanceLaneRun(request: AdvanceLaneRunRequest): Promise<AdvanceLaneRunResult> {
+      const index = this.used.get(request.runId) ?? 0;
+      const results = this.queue.get(request.runId);
+      const next: AdvanceLaneRunResult =
+        results !== undefined && index < results.length
+          ? results[index]
+          : { outcome: 'waiting', reason: 'admission' };
+      if (GatedScriptedAdvance.isSessionStart(next) && request.startGate !== undefined) {
+        this.gateAsks += 1;
+        if (!request.startGate.tryStart(request.runId, request.nowIso).ok) {
+          this.calls.push({ request, result: { outcome: 'waiting', reason: 'session-stagger' } });
+          return { outcome: 'waiting', reason: 'session-stagger' };
+        }
+      }
+      this.calls.push({ request, result: next });
+      this.used.set(request.runId, index + 1);
+      return next;
+    }
+  }
+
+  /**
+   * A deterministic clock: `sleep` advances it by the awaited amount and
+   * records the ms, so no real timer ever runs and the waits are exact.
+   */
+  function steppingClock(startIso: string) {
+    const sleeps: number[] = [];
+    let current = Date.parse(startIso);
     return {
-      calls,
+      sleeps,
+      now: () => new Date(current).toISOString(),
       sleep: async (ms: number): Promise<void> => {
-        calls.push(ms);
+        sleeps.push(ms);
+        current += ms;
       },
     };
   }
 
-  function staggerUseCase(
+  function gateUseCase(
     fx: Stores,
-    advance: ScriptedAdvance,
-    sleep: (ms: number) => Promise<void>,
+    advance: AdvanceLaneRunPort,
+    clock: { now: () => string; sleep: (ms: number) => Promise<void> },
     dispatchStaggerMs?: number,
   ): RunConductorPassUseCase {
     return new RunConductorPassUseCase({
@@ -591,150 +656,207 @@ describe('RunConductorPassUseCase dispatch stagger', () => {
       halt: fx.halt,
       resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
       advance,
-      now: () => NOW,
-      sleep,
+      now: clock.now,
+      sleep: clock.sleep,
       ...(dispatchStaggerMs === undefined ? {} : { dispatchStaggerMs }),
     });
   }
 
-  it('two runs that both start sessions pause exactly once for 20 000 ms between them, none after the second', async () => {
+  it('two runs that both start a session at concurrency 1: A:start, B:waiting, sleep(20000), B:start', async () => {
     const fx = stores();
     await createRun(fx.repo);
     await createRun(fx.repo, { runId: RUN_ID_2 });
-    const advance = new ScriptedAdvance(
+    const advance = new GatedScriptedAdvance(
       new Map([
         [RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]],
         [RUN_ID_2, [dispatchStarted(RUN_ID_2), { outcome: 'waiting', reason: 'admission' }]],
       ]),
     );
-    const fake = fakeSleep();
-    const result = await staggerUseCase(fx, advance, fake.sleep).runPass({ holderId: HOLDER, nowIso: NOW });
+    const clock = steppingClock(NOW);
+    const result = await gateUseCase(fx, advance, clock).runPass({ holderId: HOLDER, nowIso: NOW });
     expect(result).toMatchObject({ outcome: 'completed' });
-    expect(fake.calls).toEqual([20_000]);
-    expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID_2, RUN_ID_2]);
+    expect(clock.sleeps).toEqual([20_000]);
+    expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID_2, RUN_ID_2, RUN_ID_2]);
+    expect(advance.calls.slice(2).map((call) => call.result)).toEqual([
+      { outcome: 'waiting', reason: 'session-stagger' },
+      dispatchStarted(RUN_ID_2),
+      { outcome: 'waiting', reason: 'admission' },
+    ]);
   });
 
-  it('a run that starts a session followed by a run that only waits pauses once', async () => {
+  it('a run whose next step is a review after another run\'s dispatch also waits', async () => {
     const fx = stores();
     await createRun(fx.repo);
     await createRun(fx.repo, { runId: RUN_ID_2 });
-    const advance = new ScriptedAdvance(
+    const advance = new GatedScriptedAdvance(
+      new Map([
+        [RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]],
+        [RUN_ID_2, [reviewStarted(RUN_ID_2), { outcome: 'waiting', reason: 'admission' }]],
+      ]),
+    );
+    const clock = steppingClock(NOW);
+    const result = await gateUseCase(fx, advance, clock).runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed' });
+    expect(clock.sleeps).toEqual([20_000]);
+    expect(advance.calls.slice(2).map((call) => call.result)).toEqual([
+      { outcome: 'waiting', reason: 'session-stagger' },
+      reviewStarted(RUN_ID_2),
+      { outcome: 'waiting', reason: 'admission' },
+    ]);
+  });
+
+  it('a single starting run never sleeps', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    const advance = new GatedScriptedAdvance(
+      new Map([[RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]]]),
+    );
+    const clock = steppingClock(NOW);
+    const result = await gateUseCase(fx, advance, clock).runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed' });
+    expect(clock.sleeps).toEqual([]);
+    expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID]);
+  });
+
+  it('a run whose dispatch is the last in the pass causes no trailing sleep (the KF-31 sleep is gone)', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const advance = new GatedScriptedAdvance(
       new Map([
         [RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]],
         [RUN_ID_2, [{ outcome: 'waiting', reason: 'admission' }]],
       ]),
     );
-    const fake = fakeSleep();
-    const result = await staggerUseCase(fx, advance, fake.sleep).runPass({ holderId: HOLDER, nowIso: NOW });
+    const clock = steppingClock(NOW);
+    const result = await gateUseCase(fx, advance, clock).runPass({ holderId: HOLDER, nowIso: NOW });
     expect(result).toMatchObject({ outcome: 'completed' });
-    expect(fake.calls).toEqual([20_000]);
+    expect(clock.sleeps).toEqual([]);
+    expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID_2]);
   });
 
-  it('a single run that starts a session never pauses', async () => {
-    const fx = stores();
-    await createRun(fx.repo);
-    const advance = new ScriptedAdvance(
-      new Map([[RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]]]),
-    );
-    const fake = fakeSleep();
-    const result = await staggerUseCase(fx, advance, fake.sleep).runPass({ holderId: HOLDER, nowIso: NOW });
-    expect(result).toMatchObject({ outcome: 'completed' });
-    expect(fake.calls).toEqual([]);
-  });
-
-  it('runs that collect or gate never pause, even when more runs remain', async () => {
+  it('the journal seed makes the first start wait the remainder', async () => {
     const fx = stores();
     await createRun(fx.repo);
     await createRun(fx.repo, { runId: RUN_ID_2 });
-    const advance = new ScriptedAdvance(
+    // A dispatch intent recorded 5 s ago by the previous pass or process
+    // seeds the gate: the next start is due 20 s after it, so 15 s remain.
+    const seededKeyBuilt = buildLaneRunStepKey({
+      runId: RUN_ID_2,
+      round: 0,
+      step: 'dispatch',
+      seatIndex: 0,
+      attemptOrdinal: 1,
+      head12: null,
+      retry: null,
+    });
+    expect(seededKeyBuilt.ok).toBe(true);
+    if (!seededKeyBuilt.ok) throw new Error('fixture must build a step key');
+    const seeded = laneRunIntentEntry(
+      '01JB0000000000000000000009',
+      RUN_ID_2,
+      seededKeyBuilt.key,
+      'seeded-attempt-1',
+      new Date(Date.parse(NOW) - 5_000).toISOString(),
+    );
+    expect(await fx.journal.append(seeded)).toMatchObject({ outcome: 'appended' });
+    const advance = new GatedScriptedAdvance(
       new Map([
-        [
-          RUN_ID,
-          [
-            { outcome: 'acted', step: 'collect', key: `${RUN_ID}/r0/collect`, result: 'completed', reasonCode: null },
-            { outcome: 'waiting', reason: 'admission' },
-          ],
-        ],
-        [
-          RUN_ID_2,
-          [
-            { outcome: 'acted', step: 'gate', key: `${RUN_ID_2}/r0/gate@0123456789ab`, result: 'completed', reasonCode: null },
-            { outcome: 'waiting', reason: 'admission' },
-          ],
-        ],
+        [RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]],
+        [RUN_ID_2, [{ outcome: 'waiting', reason: 'admission' }]],
       ]),
     );
-    const fake = fakeSleep();
-    const result = await staggerUseCase(fx, advance, fake.sleep).runPass({ holderId: HOLDER, nowIso: NOW });
+    const clock = steppingClock(NOW);
+    const result = await gateUseCase(fx, advance, clock).runPass({ holderId: HOLDER, nowIso: NOW });
     expect(result).toMatchObject({ outcome: 'completed' });
-    expect(fake.calls).toEqual([]);
+    expect(clock.sleeps).toEqual([15_000]);
+    expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID, RUN_ID_2]);
+    expect(advance.calls[0]!.result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(advance.calls[1]!.result).toEqual(dispatchStarted(RUN_ID));
+    expect(advance.calls[2]!.result).toEqual({ outcome: 'waiting', reason: 'admission' });
   });
 
-  it('a reconciled dispatch-started step (crash recovery) starts no session and never pauses', async () => {
+  it('a reconciled dispatch-started result (crash recovery) does not consult the gate', async () => {
     const fx = stores();
     await createRun(fx.repo);
     await createRun(fx.repo, { runId: RUN_ID_2 });
-    const advance = new ScriptedAdvance(
+    const advance = new GatedScriptedAdvance(
       new Map([
         [RUN_ID, [{ ...dispatchStarted(RUN_ID), result: 'reconciled' }, { outcome: 'waiting', reason: 'admission' }]],
         [RUN_ID_2, [{ outcome: 'waiting', reason: 'admission' }]],
       ]),
     );
-    const fake = fakeSleep();
-    const result = await staggerUseCase(fx, advance, fake.sleep).runPass({ holderId: HOLDER, nowIso: NOW });
+    const clock = steppingClock(NOW);
+    const result = await gateUseCase(fx, advance, clock).runPass({ holderId: HOLDER, nowIso: NOW });
     expect(result).toMatchObject({ outcome: 'completed' });
-    expect(fake.calls).toEqual([]);
+    expect(clock.sleeps).toEqual([]);
+    expect(advance.gateAskCount).toBe(0);
+    expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID_2]);
   });
 
-  it('after the stagger the next run decides its lease on fresh time: a lease that expired during the pause is taken', async () => {
+  it('after the wait the next run decides its lease on fresh time: a lease that expired during the pause is taken', async () => {
     const fx = stores();
     await createRun(fx.repo);
     await createRun(fx.repo, { runId: RUN_ID_2 });
     await fx.repo.acquireLease(RUN_ID_2, {
       holderId: HOLDER_2,
       observedFence: 0,
-      leaseUntilIso: SOON,
+      leaseUntilIso: new Date(Date.parse(NOW) + 10_000).toISOString(),
       nowIso: NOW,
     });
-    const advance = new ScriptedAdvance(
+    // A dispatch intent the previous pass recorded 5 s ago (with its final
+    // result, so the run stays live without a pending action) seeds the gate:
+    // the pass's first start waits 15 s, so the pause really happens.
+    const seededKeyBuilt = buildLaneRunStepKey({
+      runId: RUN_ID,
+      round: 0,
+      step: 'dispatch',
+      seatIndex: 0,
+      attemptOrdinal: 1,
+      head12: null,
+      retry: null,
+    });
+    expect(seededKeyBuilt.ok).toBe(true);
+    if (!seededKeyBuilt.ok) throw new Error('fixture must build a step key');
+    const seedIso = new Date(Date.parse(NOW) - 5_000).toISOString();
+    expect(
+      await fx.journal.append(
+        laneRunIntentEntry('01JB0000000000000000000009', RUN_ID, seededKeyBuilt.key, 'a1', seedIso),
+      ),
+    ).toMatchObject({ outcome: 'appended' });
+    expect(
+      await fx.journal.append(
+        laneRunResultEntry('01JB0000000000000000000010', RUN_ID, seededKeyBuilt.key, 'refused', null, seedIso),
+      ),
+    ).toMatchObject({ outcome: 'appended' });
+    const advance = new GatedScriptedAdvance(
       new Map([
         [RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]],
         [RUN_ID_2, [{ outcome: 'waiting', reason: 'admission' }]],
       ]),
     );
-    let clock = NOW;
-    const pass = new RunConductorPassUseCase({
-      driverLease: fx.driverLease,
-      runRepo: fx.repo,
-      runJournal: fx.journal,
-      halt: fx.halt,
-      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
-      advance,
-      now: () => clock,
-      sleep: async () => {
-        clock = LATER;
-      },
-    });
-    const result = await pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    const clock = steppingClock(NOW);
+    const result = await gateUseCase(fx, advance, clock).runPass({ holderId: HOLDER, nowIso: NOW });
     expect(result).toMatchObject({ outcome: 'completed' });
     if (result.outcome !== 'completed') return;
     expect(result.runs.map((run) => run.outcome)).toEqual(['advanced', 'advanced']);
-    expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID_2]);
+    expect(clock.sleeps).toEqual([15_000]);
+    expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID, RUN_ID_2]);
   });
 
   it('a custom dispatchStaggerMs is honoured', async () => {
     const fx = stores();
     await createRun(fx.repo);
     await createRun(fx.repo, { runId: RUN_ID_2 });
-    const advance = new ScriptedAdvance(
+    const advance = new GatedScriptedAdvance(
       new Map([
         [RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]],
         [RUN_ID_2, [dispatchStarted(RUN_ID_2), { outcome: 'waiting', reason: 'admission' }]],
       ]),
     );
-    const fake = fakeSleep();
-    const result = await staggerUseCase(fx, advance, fake.sleep, 500).runPass({ holderId: HOLDER, nowIso: NOW });
+    const clock = steppingClock(NOW);
+    const result = await gateUseCase(fx, advance, clock, 500).runPass({ holderId: HOLDER, nowIso: NOW });
     expect(result).toMatchObject({ outcome: 'completed' });
-    expect(fake.calls).toEqual([500]);
+    expect(clock.sleeps).toEqual([500]);
   });
 });

@@ -2,10 +2,11 @@
 /**
  * FindingState is an immutable value object over the manifest's finding enum.
  * An unresolved finding blocks acceptance until it is fixed or refuted with
- * evidence.
+ * evidence, or marked out-of-scope: a finding about files this lane never
+ * changed is not this lane's blocker and does not block acceptance.
  */
 
-export const FINDING_STATES = ['unresolved', 'fixed', 'refuted'] as const;
+export const FINDING_STATES = ['unresolved', 'fixed', 'refuted', 'out-of-scope'] as const;
 
 export type FindingStateValue = (typeof FINDING_STATES)[number];
 
@@ -27,7 +28,7 @@ export class FindingState {
     return this.value;
   }
 
-  /** Only unresolved findings block acceptance; fixed and refuted do not. */
+  /** Only unresolved findings block acceptance; fixed, refuted and out-of-scope do not. */
   isBlocking(): boolean {
     return this.value === 'unresolved';
   }

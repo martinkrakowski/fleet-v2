@@ -682,7 +682,7 @@ bounded_contexts:
       enum_values:
         AssessmentState: [pending, blocked, accepted, rejected, stale]
         EvidenceResult: [pending, pass, fail, unknown, not-applicable]
-        FindingState: [unresolved, fixed, refuted]
+        FindingState: [unresolved, fixed, refuted, out-of-scope]
       invariants:
         - "Receipts bind project, attempt, exact head, source, completion time and acceptance-policy revision."
         - "The reviewer's underlying model differs from the implementer's; a provider change alone is insufficient."

@@ -224,6 +224,58 @@ describe("parseEvidenceEnvelope", () => {
     ).toBeNull();
   });
 
+  it("maps an out-of-scope finding instead of dropping it", () => {
+    const outOfScopeFinding = {
+      findingId: "f_live_9",
+      severity: "minor",
+      summary: "a finding about another lane's files",
+      filePath: "src/other.ts",
+      line: 7,
+      state: "out-of-scope",
+      dispositionReason: "not this lane's change",
+      dispositionEvidenceRef: "ref-o",
+    };
+    const assessmentWithOutOfScope: Record<string, unknown> = {
+      ...ASSESSMENT,
+      reviewReceipts: [
+        {
+          ...ASSESSMENT.reviewReceipts[0],
+          findings: [outOfScopeFinding],
+        },
+        ASSESSMENT.reviewReceipts[1],
+      ],
+      findingDispositions: [
+        {
+          id: "fd_live_9",
+          assessmentId: "ev_live_1",
+          findingId: "f_live_9",
+          candidateHeadSha: HEAD,
+          state: "out-of-scope",
+          reason: "not this lane's change",
+          evidenceRef: "ref-o",
+          recordedBy: "model-impl",
+          recordedAtIso: "2026-10-24T10:30:00Z",
+        },
+      ],
+    };
+    const parsed = parseEvidenceEnvelope(
+      foundEnvelope({}, assessmentWithOutOfScope),
+      HEAD,
+    );
+    expect(parsed?.outcome === "found").toBe(true);
+    if (parsed?.outcome === "found") {
+      expect(parsed.evidence.reviews[0].findings).toEqual([
+        {
+          findingId: "f_live_9",
+          severity: "minor",
+          summary: "a finding about another lane's files",
+          state: "out-of-scope",
+        },
+      ]);
+      expect(parsed.evidence.dispositions[0].state).toBe("out-of-scope");
+    }
+  });
+
   it("keeps a served review tally and defaults an absent one to null", () => {
     const withTally = parseEvidenceEnvelope(foundEnvelope(), HEAD);
     expect(withTally?.outcome === "found").toBe(true);

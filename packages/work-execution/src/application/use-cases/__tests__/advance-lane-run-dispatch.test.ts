@@ -658,7 +658,7 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     );
   });
 
-  it('test 7e (SEC-5b): dispatch of an initial attempt with a changed-on-disk manifest refuses the dispatch inputs and parks step-refused', async () => {
+  it('test 7f (SEC-5b): dispatch of an initial attempt with a changed-on-disk manifest refuses the dispatch inputs and parks step-refused', async () => {
     const harness = await makeHarness(runRecord(), [attemptFixture()]);
     // A valid manifest whose bytes changed without any digest re-freeze: the
     // verified read fails closed, so the dispatch inputs are unreadable.

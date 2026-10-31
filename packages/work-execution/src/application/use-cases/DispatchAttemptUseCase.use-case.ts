@@ -730,9 +730,22 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       ...(seatPolicyFlag !== undefined ? { useFreeSeats: seatPolicyFlag } : {}),
     };
 
+    // SEC-5c: dispatch records the time limit it started the session with
+    // (`dispatchedTimeLimitSeconds`). A stale value from an earlier dispatch
+    // must not survive a re-dispatch, so the field is removed from the prior
+    // record first; it is added back only when the new request carries a
+    // positive safe integer.
+    const { dispatchedTimeLimitSeconds: _staleDispatchedTimeLimitSeconds, ...previousAttemptBase } =
+      existingAttempt ?? ({} as AttemptRecord);
+    void _staleDispatchedTimeLimitSeconds;
+    const dispatchedTimeLimitField =
+      Number.isSafeInteger(request.timeLimitSeconds) && request.timeLimitSeconds > 0
+        ? { dispatchedTimeLimitSeconds: request.timeLimitSeconds }
+        : {};
+
     const dispatchingAttempt: AttemptRecord = existingAttempt
       ? {
-          ...existingAttempt,
+          ...previousAttemptBase,
           revision: nextAttemptRevision(existingAttempt),
           dispatchRevision: nextAttemptRevision(existingAttempt),
           worktreePath: request.worktreePath,
@@ -746,6 +759,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           reviewerSeat: request.reviewerSeat ?? existingAttempt.reviewerSeat ?? fallbackReviewer,
           ownerDecisionReferences,
           ...seatBinding.fields,
+          ...dispatchedTimeLimitField,
           updatedAtIso: nowIso,
         }
       : {
@@ -770,6 +784,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           reviewerSeat: request.reviewerSeat ?? fallbackReviewer,
           ownerDecisionReferences,
           ...seatBinding.fields,
+          ...dispatchedTimeLimitField,
           createdAtIso: nowIso,
           updatedAtIso: nowIso,
         };

@@ -307,6 +307,12 @@ export interface AttemptRecord {
   readonly seatSelection?: AttemptSeatSelectionRecord | null;
   readonly reviewerSeat?: string | null;
   /**
+   * the time limit, in seconds, dispatch started the session with (SEC-5c);
+   * absent on records written before it was recorded, and when the dispatch
+   * carried no positive safe-integer limit.
+   */
+  readonly dispatchedTimeLimitSeconds?: number;
+  /**
    * Owner decision references the product froze into the brief package, read
    * from that frozen package at dispatch and never from a worktree file at
    * acceptance time. An absent field on records written before dispatch

@@ -86,8 +86,11 @@ describe('parseInstallation runner.gateSlot parse edges (CL-11)', () => {
   it('accepts the 1 and 4096 slot bounds', () => {
     for (const slots of [1, 4096]) {
       expect(
-        parseInstallation(withGateSlot({ path: '/usr/local/bin/gate-slot', slots })).ok,
-      ).toBe(true);
+        parseInstallation(withGateSlot({ path: '/usr/local/bin/gate-slot', slots })),
+      ).toEqual({
+        ok: true,
+        installation: withGateSlot({ path: '/usr/local/bin/gate-slot', slots }),
+      });
     }
   });
 

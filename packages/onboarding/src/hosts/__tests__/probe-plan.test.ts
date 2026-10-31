@@ -325,6 +325,38 @@ describe('planHostProbes', () => {
     });
   });
 
+  // KF-30b: the doctor --host gate-slot warning lives in the probe plan, the
+  // same convention `hostLines` uses for the full sweep.
+  it('warns that conducted gates run unthrottled when a lane runner declares no gateSlot', () => {
+    const steps = planHostProbes({ ...sshSpec, isLaneRunner: true });
+    expect(steps.filter((step) => step.check === 'gate-slot')).toEqual([
+      {
+        kind: 'note',
+        scope: 'host',
+        subject: 'lanehost',
+        check: 'gate-slot',
+        status: 'PASS',
+        detail:
+          'warning: conducted acceptance gates run unthrottled; declare runner.gateSlot to route them through the host-wide gate slot',
+      },
+    ]);
+  });
+
+  it('emits no gate-slot note when the runner declares a gateSlot', () => {
+    const steps = planHostProbes({
+      ...sshSpec,
+      isLaneRunner: true,
+      runner: { ...sshSpec.runner!, gateSlot: { path: '/usr/local/bin/gate-slot', slots: 8 } },
+    });
+    expect(steps.filter((step) => step.check === 'gate-slot')).toEqual([]);
+  });
+
+  it('emits no gate-slot note for a host that is not the lane runner', () => {
+    expect(
+      planHostProbes(sshSpec).filter((step) => step.check === 'gate-slot'),
+    ).toEqual([]);
+  });
+
   it('maps a drafted host onto its probe spec', () => {
     const drafted = draftHost({
       name: 'lanehost',
@@ -349,10 +381,38 @@ describe('planHostProbes', () => {
       sshAlias: 'lanehost',
       worktreeRoot: '/srv/fleet-v2/worktrees',
       tmpDir: '/tmp/fleet-v2',
+      isLaneRunner: true,
       runner: {
         kind: 'opencode',
         port: 4166,
         authFile: '/home/dev/.local/share/opencode/auth.json',
+      },
+    });
+  });
+
+  it('carries the drafted gateSlot and lane-runner flag onto the probe spec (KF-30b)', () => {
+    const drafted = draftHost({
+      name: 'lanehost',
+      transport: 'ssh',
+      sshAlias: 'lanehost',
+      worktreeRoot: '/srv/fleet-v2/worktrees',
+      roles: ['lane-runner'],
+      runner: {
+        kind: 'opencode',
+        port: 4166,
+        gateSlot: { path: '/usr/local/bin/gate-slot', slots: 8 },
+      },
+    });
+    expect(drafted.ok).toBe(true);
+    if (!drafted.ok) {
+      return;
+    }
+    expect(hostProbeSpecFromDraft(drafted.draft)).toMatchObject({
+      isLaneRunner: true,
+      runner: {
+        kind: 'opencode',
+        port: 4166,
+        gateSlot: { path: '/usr/local/bin/gate-slot', slots: 8 },
       },
     });
   });

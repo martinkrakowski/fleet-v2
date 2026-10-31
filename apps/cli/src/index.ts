@@ -461,6 +461,7 @@ async function doctorHostCommand(
     ...(hostEntry.sshAlias !== undefined ? { sshAlias: hostEntry.sshAlias } : {}),
     worktreeRoot: hostEntry.worktreeRoot,
     ...(hostEntry.tmpDir !== undefined ? { tmpDir: hostEntry.tmpDir } : {}),
+    ...(hostEntry.roles.includes('lane-runner') ? { isLaneRunner: true } : {}),
     ...(runner !== undefined
       ? {
           runner: {
@@ -470,6 +471,7 @@ async function doctorHostCommand(
             ...(runner.capabilities !== undefined
               ? { capabilities: runner.capabilities }
               : {}),
+            ...(runner.gateSlot !== undefined ? { gateSlot: runner.gateSlot } : {}),
           },
         }
       : {}),

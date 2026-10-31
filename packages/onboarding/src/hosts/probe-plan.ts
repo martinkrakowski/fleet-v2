@@ -64,6 +64,8 @@ export interface HostProbeRunner {
   /** Absolute path of the auth file on the orchestrator. */
   readonly authFile?: string;
   readonly capabilities?: RunnerCapabilityDeclaration;
+  /** The host-wide gate-slot throttle the runner declares (KF-30b), if any. */
+  readonly gateSlot?: { readonly path: string; readonly slots: number };
 }
 
 /** Everything the plan needs to know about one host. */
@@ -75,6 +77,13 @@ export interface HostProbeSpec {
   readonly worktreeRoot: string;
   readonly tmpDir?: string;
   readonly runner?: HostProbeRunner;
+  /**
+   * True when the host holds the `lane-runner` role (KF-30b): only a
+   * lane-runner host's conducted acceptance gates are subject to the
+   * gate-slot throttle, so only such a host can warn about running
+   * unthrottled. Absent means it does not.
+   */
+  readonly isLaneRunner?: boolean;
   /**
    * The lane-runner host's worktree root, supplied when this host is a
    * verifier: verification relies on the verifier being able to see it.
@@ -97,6 +106,7 @@ export function hostProbeSpecFromDraft(draft: HostDraft): HostProbeSpec {
       : {}),
     worktreeRoot: draft.host.worktreeRoot,
     ...(draft.host.tmpDir !== undefined ? { tmpDir: draft.host.tmpDir } : {}),
+    ...(draft.host.roles.includes('lane-runner') ? { isLaneRunner: true } : {}),
     ...(runner === undefined
       ? {}
       : {
@@ -109,6 +119,7 @@ export function hostProbeSpecFromDraft(draft: HostDraft): HostProbeSpec {
             ...(runner.capabilities !== undefined
               ? { capabilities: runner.capabilities }
               : {}),
+            ...(runner.gateSlot !== undefined ? { gateSlot: runner.gateSlot } : {}),
           },
         }),
   };
@@ -339,6 +350,23 @@ export function planHostProbes(spec: HostProbeSpec): HostProbeStep[] {
           ? 'capability source undeclared, filesystemScope unknown'
           : `capability source declared, filesystemScope ${capabilities.filesystemScope}`,
     });
+
+    // KF-30b: conducted acceptance gates are throttled only when the host
+    // declares `runner.gateSlot`; without it they run unthrottled next to
+    // hand-run gates. A missing declaration is a config gap, not a failure,
+    // so it reports as a PASS line with a warning detail (the same
+    // convention as accepted-and-ignored v1 fields).
+    if (spec.isLaneRunner === true && runner.gateSlot === undefined) {
+      steps.push({
+        kind: 'note',
+        scope: 'host',
+        subject,
+        check: 'gate-slot',
+        status: 'PASS',
+        detail:
+          'warning: conducted acceptance gates run unthrottled; declare runner.gateSlot to route them through the host-wide gate slot',
+      });
+    }
 
     const authFile = runner.authFile;
     if (authFile !== undefined) {

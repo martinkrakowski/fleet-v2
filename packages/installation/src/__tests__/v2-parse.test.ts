@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { deriveInstallationModel } from '../model.js';
 import { parseInstallation } from '../parse.js';
 
 /** A minimal valid v2 file: one host with both required roles and a runner. */
@@ -1114,5 +1115,86 @@ describe('parseInstallation v2', () => {
       waves: { baseUrl: 'http://waves.example', tokenFile: '/etc/waves/token' },
     });
     expect(badWaves).toEqual({ ok: false, errors: ['waves.baseUrl: must be an https URL'] });
+  });
+
+  // KF-30b: the runner's host-wide gate-slot throttle.
+  const withGateSlot = (gateSlot: unknown) => ({
+    ...validV2,
+    hosts: {
+      ...validV2.hosts,
+      'lane-host': {
+        ...validV2.hosts['lane-host'],
+        runner: { ...validV2.hosts['lane-host'].runner, gateSlot },
+      },
+    },
+  });
+
+  it('parses a runner gateSlot block and carries it into the model', () => {
+    const result = parseInstallation(withGateSlot({ path: '/usr/local/bin/gate-slot', slots: 8 }));
+    expect(result).toEqual({
+      ok: true,
+      installation: withGateSlot({ path: '/usr/local/bin/gate-slot', slots: 8 }),
+    });
+  });
+
+  it('refuses a gateSlot with a relative path, a zero slot count, a missing slot count or an unknown key', () => {
+    expect(parseInstallation(withGateSlot({ path: 'bin/gate-slot', slots: 8 }))).toEqual({
+      ok: false,
+      errors: ['hosts.lane-host.runner.gateSlot.path: must be an absolute path'],
+    });
+    expect(parseInstallation(withGateSlot({ path: '/usr/local/bin/gate-slot', slots: 0 }))).toEqual({
+      ok: false,
+      errors: ['hosts.lane-host.runner.gateSlot.slots: must be an integer 1 or greater'],
+    });
+    expect(parseInstallation(withGateSlot({ path: '/usr/local/bin/gate-slot' }))).toEqual({
+      ok: false,
+      errors: ['hosts.lane-host.runner.gateSlot.slots: required'],
+    });
+    expect(
+      parseInstallation(
+        withGateSlot({ path: '/usr/local/bin/gate-slot', slots: 8, extra: true }),
+      ),
+    ).toEqual({
+      ok: false,
+      errors: ['hosts.lane-host.runner.gateSlot: unknown key'],
+    });
+  });
+
+  it('refuses a slot count above 4096 or one that is not a safe integer (KF-30b Fable)', () => {
+    for (const slots of [4097, 1e21]) {
+      expect(parseInstallation(withGateSlot({ path: '/usr/local/bin/gate-slot', slots }))).toEqual({
+        ok: false,
+        errors: ['hosts.lane-host.runner.gateSlot.slots: must be an integer from 1 to 4096'],
+      });
+    }
+    expect(parseInstallation(withGateSlot({ path: '/usr/local/bin/gate-slot', slots: 4096 })).ok).toBe(true);
+  });
+
+  it('carries the parsed gateSlot onto the derived model runners (KF-30b)', () => {
+    const gateSlot = { path: '/usr/local/bin/gate-slot', slots: 8 };
+    for (const kind of ['opencode', 'agy'] as const) {
+      const runner =
+        kind === 'agy'
+          ? { kind, port: 46000, agyMode: 'edit-only', gateSlot }
+          : { kind, port: 46000, gateSlot };
+      const parsed = parseInstallation({
+        ...validV2,
+        hosts: {
+          'lane-host': {
+            ...validV2.hosts['lane-host'],
+            runner,
+          },
+        },
+      });
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) {
+        return;
+      }
+      const { model } = deriveInstallationModel(parsed.installation);
+      expect(model.hosts['lane-host']?.runner).toMatchObject({
+        kind,
+        gateSlot,
+      });
+    }
   });
 });

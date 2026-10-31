@@ -658,6 +658,45 @@ describe("fleet-v2 hosts edit", () => {
     );
   });
 
+  it("keeps the runner's gateSlot when another field is edited (KF-30b)", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const base = v2Installation(path.join(dir, "worktrees")) as {
+      hosts: Record<string, Record<string, unknown>>;
+    };
+    writeJsonFile(file, {
+      ...base,
+      hosts: {
+        ...base.hosts,
+        lanehost: {
+          ...base.hosts.lanehost,
+          runner: {
+            kind: "opencode",
+            port: 4166,
+            gateSlot: { path: "/usr/local/bin/gate-slot", slots: 8 },
+          },
+        },
+      },
+    });
+    const { code, stdout } = await runHosts(
+      ["edit", "lanehost", "--port", "4266", "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("written");
+    const parsed = readInstallationFile(file) as {
+      hosts: Record<
+        string,
+        { runner?: { port: number; gateSlot?: { path: string; slots: number } } }
+      >;
+    };
+    expect(parsed.hosts.lanehost?.runner?.port).toBe(4266);
+    expect(parsed.hosts.lanehost?.runner?.gateSlot).toEqual({
+      path: "/usr/local/bin/gate-slot",
+      slots: 8,
+    });
+  });
+
   it("refuses a host that is not in the file", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");

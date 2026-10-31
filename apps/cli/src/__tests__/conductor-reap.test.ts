@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import {
   LaneRun,
@@ -180,10 +180,14 @@ describe('conductor reap --worktrees (EX-2b)', () => {
 
   it('requires --yes without --dry-run, and calls nothing', async () => {
     const runtime = createFleetCliRuntime({ stateDir: tempStateDir() });
+    // A real candidate exists, so a removal attempted before the refusal would be observable.
+    await seedMergedRun(runtime);
+    const reap = vi.spyOn(runtime.conductor.reapLaneWorktrees, 'reapLaneWorktrees');
     const result = await runConductor(runtime, ['reap', '--worktrees']);
     expect(result.code).toBe(2);
     expect(result.stdout).toEqual([]);
     expect(result.stderr.join('')).toContain('--yes');
+    expect(reap).not.toHaveBeenCalled();
   });
 
   it('rejects an unknown flag and a positional', async () => {

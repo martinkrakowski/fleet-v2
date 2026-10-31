@@ -723,7 +723,8 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
         'Unknown: gate run 1 requires a stored congested gate run 0 for head ' + HEAD_SHA,
     });
 
-    // A passed run 0 is stored but not congested: run 2 is still refused.
+    // A passed run 0 is stored: run 2 is refused because run 1 is not stored,
+    // not because run 0 passed.
     const first = await useCase.evaluateAttemptGate(gateRequest());
     expect(first.verdict).toBe('passed');
     const refused2 = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 2 }));
@@ -732,6 +733,96 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
 
     expect(gate.requests).toHaveLength(1);
     expect(journal.entries.every((entry) => !entry.id.includes('/g'))).toBe(true);
+  });
+
+  it('refuses gate run 1 after a stored PASSED run 0 and runs nothing', async () => {
+    const gate = new FakeGatePredicatePort(EVALUATED_ALL_PASS);
+    const { deps, journal } = makeDeps({ gate });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    const run0 = await useCase.evaluateAttemptGate(gateRequest());
+    expect(run0.verdict).toBe('passed');
+
+    const refused = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 1 }));
+    expect(refused).toEqual({
+      verdict: 'unknown',
+      reason:
+        'Unknown: gate run 1 requires a stored congested gate run 0 for head ' + HEAD_SHA,
+    });
+    expect(gate.requests).toHaveLength(1);
+    expect(journal.entries.every((entry) => !entry.id.includes('/g'))).toBe(true);
+  });
+
+  it('refuses gate run 1 after a stored FAILED run 0 and runs nothing', async () => {
+    const gate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        {
+          name: 'diff-check',
+          kind: 'diff-check',
+          verdict: 'fail',
+          exitCode: 1,
+          durationMs: 1,
+          detail: 'bad diff',
+        },
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'skipped',
+          exitCode: null,
+          durationMs: 0,
+          detail: 'not run: an earlier predicate did not pass',
+        },
+      ],
+    });
+    const { deps, journal } = makeDeps({ gate });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    const run0 = await useCase.evaluateAttemptGate(gateRequest());
+    expect(run0.verdict).toBe('failed');
+
+    const refused = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 1 }));
+    expect(refused).toEqual({
+      verdict: 'unknown',
+      reason:
+        'Unknown: gate run 1 requires a stored congested gate run 0 for head ' + HEAD_SHA,
+    });
+    expect(gate.requests).toHaveLength(1);
+    expect(journal.entries.every((entry) => !entry.id.includes('/g'))).toBe(true);
+  });
+
+  it('refuses gate run 2 after a stored CONGESTED run 0 because run 1 is not stored', async () => {
+    const gate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        PASS_RESULTS[1],
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'unknown',
+          exitCode: 75,
+          durationMs: 1,
+          detail: 'gate slot wait limit reached',
+          cause: 'gate-slot-wait-limit',
+        },
+      ],
+    });
+    const { deps, journal } = makeDeps({ gate });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    const run0 = await useCase.evaluateAttemptGate(gateRequest());
+    expect(run0).toMatchObject({ verdict: 'unknown', congested: true });
+
+    const refused = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 2 }));
+    expect(refused).toEqual({
+      verdict: 'unknown',
+      reason:
+        'Unknown: gate run 2 requires a stored congested gate run 1 for head ' + HEAD_SHA,
+    });
+    expect(gate.requests).toHaveLength(1);
+    expect(journal.entries.every((entry) => !entry.id.includes('/g2'))).toBe(true);
   });
 
   it('returns the highest stored run outcome across several retries when gateRun is omitted', async () => {

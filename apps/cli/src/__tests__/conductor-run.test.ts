@@ -865,6 +865,153 @@ describe('conductor run --pass-concurrency (KF-34b)', () => {
     expect(built).toHaveLength(0);
     expect(fake.passCalls).toHaveLength(0);
   });
+
+  it('pass-concurrency first still reaches the driver builder (flag order does not matter)', async () => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    const seen: ReadonlyArray<{ readonly maxActiveRuns: number; readonly passConcurrency?: number }>[] = [];
+    const result = await runConductor(runtimeOf(dir), [
+      'run',
+      '--live',
+      '--once',
+      '--pass-concurrency',
+      '2',
+      '--max-active-runs',
+      '2',
+    ], {
+      stateDir: dir,
+      buildDriver: (_runtime, _mode, driverOptions) => {
+        seen.push([driverOptions]);
+        return fake.driver;
+      },
+    });
+    expect(result.code).toBe(0);
+    expect(seen).toEqual([[{ maxActiveRuns: 2, passConcurrency: 2 }]]);
+    expect(fake.passCalls).toHaveLength(1);
+    expect(fake.releaseCalls).toHaveLength(1);
+  });
+
+  it('pass-concurrency above max-active-runs is a usage error even when pass-concurrency comes first', async () => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    const built: unknown[] = [];
+    const result = await runConductor(runtimeOf(dir), [
+      'run',
+      '--live',
+      '--once',
+      '--pass-concurrency',
+      '3',
+      '--max-active-runs',
+      '2',
+    ], {
+      stateDir: dir,
+      buildDriver: () => {
+        built.push(1);
+        return fake.driver;
+      },
+    });
+    expect(result.code).toBe(2);
+    expect(result.stderr.join('\n')).toContain('--pass-concurrency');
+    expect(built).toHaveLength(0);
+    expect(fake.passCalls).toHaveLength(0);
+  });
+
+  it('pass-concurrency at the --max-active-runs boundary is accepted', async () => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    const seen: ReadonlyArray<{ readonly maxActiveRuns: number; readonly passConcurrency?: number }>[] = [];
+    const result = await runConductor(runtimeOf(dir), [
+      'run',
+      '--live',
+      '--once',
+      '--max-active-runs',
+      '4',
+      '--pass-concurrency',
+      '4',
+    ], {
+      stateDir: dir,
+      buildDriver: (_runtime, _mode, driverOptions) => {
+        seen.push([driverOptions]);
+        return fake.driver;
+      },
+    });
+    expect(result.code).toBe(0);
+    expect(seen).toEqual([[{ maxActiveRuns: 4, passConcurrency: 4 }]]);
+    expect(fake.passCalls).toHaveLength(1);
+    expect(fake.releaseCalls).toHaveLength(1);
+  });
+
+  it.each<[string, readonly string[]]>([
+    ['at the default cap', ['--pass-concurrency', '1']],
+  ])('%s is accepted without --max-active-runs (default 1)', async (_label, extra) => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    const seen: ReadonlyArray<{ readonly maxActiveRuns: number; readonly passConcurrency?: number }>[] = [];
+    const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once', ...extra], {
+      stateDir: dir,
+      buildDriver: (_runtime, _mode, driverOptions) => {
+        seen.push([driverOptions]);
+        return fake.driver;
+      },
+    });
+    expect(result.code).toBe(0);
+    expect(seen).toEqual([[{ maxActiveRuns: 1, passConcurrency: 1 }]]);
+    expect(fake.passCalls).toHaveLength(1);
+    expect(fake.releaseCalls).toHaveLength(1);
+  });
+
+  it('pass-concurrency above the default max-active-runs (1) is a usage error', async () => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    const built: unknown[] = [];
+    const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once', '--pass-concurrency', '2'], {
+      stateDir: dir,
+      buildDriver: () => {
+        built.push(1);
+        return fake.driver;
+      },
+    });
+    expect(result.code).toBe(2);
+    expect(result.stderr.join('\n')).toContain('--pass-concurrency');
+    expect(built).toHaveLength(0);
+    expect(fake.passCalls).toHaveLength(0);
+  });
+
+  it.each<[string, readonly string[]]>([
+    ['a negative value', ['--pass-concurrency', '-1']],
+    ['a fractional value', ['--pass-concurrency', '1.5']],
+    ['an empty glued value', ['--pass-concurrency=']],
+  ])('$1 is a usage error that builds no driver', async (_label, extra) => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    const built: unknown[] = [];
+    const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once', ...extra], {
+      stateDir: dir,
+      buildDriver: () => {
+        built.push(1);
+        return fake.driver;
+      },
+    });
+    expect(result.code).toBe(2);
+    expect(result.stderr.join('\n')).toContain('--pass-concurrency');
+    expect(built).toHaveLength(0);
+    expect(fake.passCalls).toHaveLength(0);
+  });
+
+  it('the dry-run path validates pass-concurrency the same way', async () => {
+    const dir = tempStateDir();
+    const result = await runConductor(runtimeOf(dir), [
+      'run',
+      '--dry-run',
+      '--once',
+      '--max-active-runs',
+      '1',
+      '--pass-concurrency',
+      '2',
+    ], { stateDir: dir });
+    expect(result.code).toBe(2);
+    expect(result.stderr.join('\n')).toContain('--pass-concurrency');
+  });
 });
 
 describe('the live wiring reaches no host in tests (K7-7)', () => {

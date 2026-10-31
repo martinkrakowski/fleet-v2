@@ -135,7 +135,7 @@ function storedRecord(record: WorkOrderRecord): WorkOrderRecord {
   if (Object.hasOwn(record, 'risk') && record.risk !== undefined) {
     stored.risk = record.risk;
   }
-  if (record.supersedesWorkOrderId !== undefined) {
+  if (Object.hasOwn(record, 'supersedesWorkOrderId') && record.supersedesWorkOrderId !== undefined) {
     stored.supersedesWorkOrderId = record.supersedesWorkOrderId;
   }
   return stored;

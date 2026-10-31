@@ -285,6 +285,15 @@ describe('work-order rerun (WO-2)', () => {
     expect(rerun.err).toContain('--from needs the stopped work order id');
   });
 
+  it('treats a bare --work-order-id as a usage error, not the id "true"', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-rerun-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    const rerun = await cli(runtime, ['work-order', 'rerun', '--from', 'wo-rerun-x', '--work-order-id', '--yes']);
+    expect(rerun.code).toBe(2);
+    expect(rerun.err).toContain('--work-order-id needs the new work order id');
+  });
+
   it('answers not-found for an unknown source and registers nothing', async () => {
     const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-rerun-'));
     tempStateDirs.push(stateDir);

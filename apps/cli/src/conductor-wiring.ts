@@ -105,6 +105,8 @@ function buildConductorDriver(parts: {
   readonly runPolicyRevision: string;
   /** Session-start spacing in ms; the dry-run passes 0 because it starts no session. */
   readonly dispatchStaggerMs?: number;
+  /** KF-34b: how many live runs one pass advances concurrently; absent = 1. */
+  readonly passConcurrency?: number;
 }): ConductorDriver {
   const pass = new RunConductorPassUseCase({
     driverLease: parts.driverLease,
@@ -114,6 +116,7 @@ function buildConductorDriver(parts: {
     resume: parts.resume,
     advance: parts.advance,
     ...(parts.dispatchStaggerMs === undefined ? {} : { dispatchStaggerMs: parts.dispatchStaggerMs }),
+    ...(parts.passConcurrency === undefined ? {} : { passConcurrency: parts.passConcurrency }),
   });
   return {
     pass,
@@ -139,7 +142,7 @@ export function conductorGateOf(runtime: FleetCliRuntime): FleetCliRuntime['exec
 
 export function buildLiveConductorDriver(
   runtime: FleetCliRuntime,
-  options: { readonly maxActiveRuns: number },
+  options: { readonly maxActiveRuns: number; readonly passConcurrency?: number },
 ): ConductorDriver {
   const policy = resolveConductorPolicy(runtime.installation?.policy);
   const execution = runtime.execution;
@@ -228,6 +231,7 @@ export function buildLiveConductorDriver(
     start,
     policy,
     runPolicyRevision: 'policy:conductor@' + conductorRevision(policy),
+    ...(options.passConcurrency === undefined ? {} : { passConcurrency: options.passConcurrency }),
   });
 }
 
@@ -250,7 +254,7 @@ export interface DryRunStores {
  */
 export function buildDryRunConductorDriver(
   stores: DryRunStores,
-  options: { readonly maxActiveRuns: number; readonly nowIso: () => string },
+  options: { readonly maxActiveRuns: number; readonly passConcurrency?: number; readonly nowIso: () => string },
 ): ConductorDriver {
   const policy = resolveConductorPolicy(undefined);
   const fakes = createDryRunFakes(
@@ -312,5 +316,6 @@ export function buildDryRunConductorDriver(
     runPolicyRevision: 'policy:conductor@' + conductorRevision(policy),
     // A dry-run starts no session, so it never waits for a session-start turn.
     dispatchStaggerMs: 0,
+    ...(options.passConcurrency === undefined ? {} : { passConcurrency: options.passConcurrency }),
   });
 }

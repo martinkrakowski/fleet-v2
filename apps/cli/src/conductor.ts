@@ -60,7 +60,7 @@ export interface ConductorCliOptions {
   readonly buildDriver?: (
     runtime: FleetCliRuntime,
     mode: 'live' | 'dry-run',
-    options: { readonly maxActiveRuns: number },
+    options: { readonly maxActiveRuns: number; readonly passConcurrency?: number },
   ) => ConductorDriver;
   /** Test seam for the dry-run's scratch copy (production uses fs.promises.copyFile). */
   readonly copyFile?: (source: string, destination: string) => Promise<void>;
@@ -77,7 +77,7 @@ export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
        fleet-v2 conductor resume <runId> [--revision <n>]
        fleet-v2 conductor start --brief-request <file.json> --tier 1|2 [--run-id <id> --attempt-id <id>] [--max-active-runs <n>]
        fleet-v2 conductor start --abandon --run-id <id> --attempt-id <id>
-       fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>]
+       fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>] [--pass-concurrency <n>]
 
 Read-only status of one lane run (or every run) with its projected state,
 the halt marker and the driver lease; a kill-switch halt the driver checks
@@ -86,7 +86,9 @@ lane; a stop recorded as a keyed run-journal intent — stop is graceful by
 default, --force stops the running lane now; a resume recorded for a parked
 run. The driver obeys the records; nothing here dispatches, and the CLI
 never takes a run lease. --max-active-runs on conductor start is the
-active-run cap the start's admission check uses.
+active-run cap the start's admission check uses. --pass-concurrency on
+conductor run is how many live runs one pass advances concurrently
+(default 1, the serial pass), capped at 4 and at --max-active-runs.
 
 conductor run --live dispatches real lanes. Run it only with the owner's
 explicit authority; it also needs policy.conductor.enabled and a state
@@ -503,6 +505,18 @@ function nowIsoOf(options: ConductorCliOptions): string {
   return options.now !== undefined ? options.now() : new Date().toISOString();
 }
 
+/**
+ * The options the `conductor run` driver builders take: `maxActiveRuns`
+ * always, `passConcurrency` only when the flag was given (KF-34b), so a
+ * default run's builder options stay exactly what they were before.
+ */
+function driverOptionsOf(flags: RunFlags): { readonly maxActiveRuns: number; readonly passConcurrency?: number } {
+  return {
+    maxActiveRuns: flags.maxActiveRuns,
+    ...(flags.passConcurrency === undefined ? {} : { passConcurrency: flags.passConcurrency }),
+  };
+}
+
 /** The `--brief-request` JSON payload: an object with no `worktreePath` and no `attemptId`. */
 function readBriefRequest(filePath: string, io: CliIo): Record<string, unknown> | null {
   let parsed: unknown;
@@ -531,25 +545,38 @@ interface RunFlags {
   readonly dryRun: boolean;
   readonly once: boolean;
   readonly maxActiveRuns: number;
+  /** KF-34b: present only when `--pass-concurrency` was given; absent = 1. */
+  readonly passConcurrency?: number;
 }
 
 /** `--max-active-runs` is a positive integer up to 64, default 1 (K7-D5). */
 const MAX_ACTIVE_RUNS_LIMIT = 64;
 
 /**
+ * KF-34b: `--pass-concurrency` is a positive integer up to 4, default 1
+ * (owner decision 2026-10-30: the first wide run stops at 4; KF-34d, lease
+ * upkeep during long steps, is deferred). Raising this above 4 is a one-line
+ * orchestrator change, Tier 2, whose proof in the PR names KF-34d merged and
+ * a recorded run at 4.
+ */
+export const PASS_CONCURRENCY_LIMIT = 4;
+
+/**
  * `conductor run`'s private flag reader: exactly one of `--live`/`--dry-run`,
- * `--once`, `--max-active-runs <n>`. An unknown flag, a repeated flag or a
- * positional is a usage error.
+ * `--once`, `--max-active-runs <n>`, `--pass-concurrency <n>`. An unknown
+ * flag, a repeated flag or a positional is a usage error.
  */
 function readRunFlags(argv: readonly string[], io: CliIo): RunFlags | null {
   let live = false;
   let dryRun = false;
   let once = false;
   let maxActiveRuns = 1;
+  let passConcurrency: number | undefined;
   const seen = new Set<string>();
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index]!;
     const isMaxRuns = token === '--max-active-runs' || token.startsWith('--max-active-runs=');
+    const isPassConcurrency = token === '--pass-concurrency' || token.startsWith('--pass-concurrency=');
     if (token === '--live') {
       if (live) {
         io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
@@ -574,30 +601,55 @@ function readRunFlags(argv: readonly string[], io: CliIo): RunFlags | null {
       once = true;
       continue;
     }
-    if (isMaxRuns) {
-      if (seen.has('max-active-runs')) {
-        io.stderr(`Repeated flag: --max-active-runs\n${CONDUCTOR_HELP}\n`);
+    if (isMaxRuns || isPassConcurrency) {
+      const flag = isMaxRuns ? 'max-active-runs' : 'pass-concurrency';
+      if (seen.has(flag)) {
+        io.stderr(`Repeated flag: --${flag}\n${CONDUCTOR_HELP}\n`);
         return null;
       }
-      seen.add('max-active-runs');
+      seen.add(flag);
       const value = token.includes('=')
         ? token.slice(token.indexOf('=') + 1)
         : argv[index + 1];
-      if (token === '--max-active-runs') {
+      if (!token.includes('=')) {
         index += 1;
       }
       const parsed = positiveInt(value);
-      if (parsed === null || parsed > MAX_ACTIVE_RUNS_LIMIT) {
-        io.stderr(`--max-active-runs requires a positive integer up to ${MAX_ACTIVE_RUNS_LIMIT}\n${CONDUCTOR_HELP}\n`);
+      if (parsed === null) {
+        io.stderr(
+          isMaxRuns
+            ? `--max-active-runs requires a positive integer up to ${MAX_ACTIVE_RUNS_LIMIT}\n${CONDUCTOR_HELP}\n`
+            : `--pass-concurrency requires a positive integer up to ${PASS_CONCURRENCY_LIMIT}\n${CONDUCTOR_HELP}\n`,
+        );
         return null;
       }
-      maxActiveRuns = parsed;
+      if (isMaxRuns) {
+        if (parsed > MAX_ACTIVE_RUNS_LIMIT) {
+          io.stderr(`--max-active-runs requires a positive integer up to ${MAX_ACTIVE_RUNS_LIMIT}\n${CONDUCTOR_HELP}\n`);
+          return null;
+        }
+        maxActiveRuns = parsed;
+      } else {
+        if (parsed > PASS_CONCURRENCY_LIMIT) {
+          io.stderr(`--pass-concurrency requires a positive integer up to ${PASS_CONCURRENCY_LIMIT}\n${CONDUCTOR_HELP}\n`);
+          return null;
+        }
+        passConcurrency = parsed;
+      }
       continue;
     }
     io.stderr(`Unknown conductor run flag: ${token}\n${CONDUCTOR_HELP}\n`);
     return null;
   }
-  return { live, dryRun, once, maxActiveRuns };
+  // KF-34b: more workers than the active-run cap would idle; a wider pass
+  // waits for the cap to be raised.
+  if (passConcurrency !== undefined && passConcurrency > maxActiveRuns) {
+    io.stderr(
+      `--pass-concurrency requires a positive integer up to --max-active-runs (${maxActiveRuns})\n${CONDUCTOR_HELP}\n`,
+    );
+    return null;
+  }
+  return { live, dryRun, once, maxActiveRuns, ...(passConcurrency === undefined ? {} : { passConcurrency }) };
 }
 
 /**
@@ -635,8 +687,8 @@ async function runCommand(
   }
   const driver =
     options.buildDriver !== undefined
-      ? options.buildDriver(runtime, 'live', { maxActiveRuns: flags.maxActiveRuns })
-      : buildLiveConductorDriver(runtime, { maxActiveRuns: flags.maxActiveRuns });
+      ? options.buildDriver(runtime, 'live', driverOptionsOf(flags))
+      : buildLiveConductorDriver(runtime, driverOptionsOf(flags));
   if (driver.policy.enabled !== true) {
     io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'conductor-disabled' })}\n`);
     return 1;
@@ -920,6 +972,7 @@ async function dryRunCommand(
     const stores = storesForScratch(scratchDir);
     const driver = buildDryRunConductorDriver(stores, {
       maxActiveRuns: flags.maxActiveRuns,
+      ...(flags.passConcurrency === undefined ? {} : { passConcurrency: flags.passConcurrency }),
       nowIso: () => nowIsoOf(options),
     });
     const holderId = 'driver-' + runtime.conductor.newUlid();

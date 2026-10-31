@@ -12,6 +12,7 @@ import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunParkRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
+import type { LeaseRenewRequest } from '../../../domain/lane-run-lease.js';
 import { ConductorDriverLeaseAdapter } from '../../../infrastructure/adapters/ConductorDriverLeaseAdapter.adapter.js';
 import { ConductorHaltAdapter } from '../../../infrastructure/adapters/ConductorHaltAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
@@ -20,7 +21,10 @@ import type { ConductorDriverLeasePort } from '../../ports/out/ConductorDriverLe
 import type { AdvanceLaneRunPort, AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import type { RunConductorPassResult } from '../../ports/in/RunConductorPassPort.in-port.js';
 import { ResumeLaneRunUseCase } from '../ResumeLaneRunUseCase.use-case.js';
+import { RequestLaneRunStopUseCase } from '../RequestLaneRunStopUseCase.use-case.js';
 import { RunConductorPassUseCase } from '../RunConductorPassUseCase.use-case.js';
+import { ConductorDriverLeaseKeeper } from '../conductor-driver-lease-keeper.js';
+import type { RunConductorPassDependencies } from '../RunConductorPassUseCase.use-case.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AttemptRecord, AttemptRunnerRecord } from '../../../domain/execution-records.js';
@@ -1032,6 +1036,51 @@ describe('RunConductorPassUseCase session-start gate (KF-34a1)', () => {
     expect(clock.sleeps).toEqual([20_001]);
     expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID, RUN_ID_2]);
   });
+
+  it('an unparseable journalled lastStartIso seeds the gate with no seed, not the pass time', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const seededKeyBuilt = buildLaneRunStepKey({
+      runId: RUN_ID_2,
+      round: 0,
+      step: 'dispatch',
+      seatIndex: 0,
+      attemptOrdinal: 1,
+      head12: null,
+      retry: null,
+    });
+    expect(seededKeyBuilt.ok).toBe(true);
+    if (!seededKeyBuilt.ok) throw new Error('fixture must build a step key');
+    const base = laneRunIntentEntry('01JB0000000000000000000009', RUN_ID_2, seededKeyBuilt.key, 'a1', NOW);
+    const unparseable = { ...base, recordedAtIso: 'not-an-iso-time' };
+    const advance = new GatedScriptedAdvance(
+      new Map([
+        [RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]],
+        [RUN_ID_2, [{ outcome: 'waiting', reason: 'admission' }]],
+      ]),
+    );
+    const clock = steppingClock(NOW);
+    const pass = new RunConductorPassUseCase({
+      driverLease: fx.driverLease,
+      runRepo: fx.repo,
+      runJournal: {
+        listForRun: async (runId: string) =>
+          runId === RUN_ID_2 ? [unparseable] : await fx.journal.listForRun(runId),
+      },
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: clock.now,
+      sleep: clock.sleep,
+    });
+    const result = await pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed' });
+    // No seed at all: the first start is granted at once, never seeded with
+    // the pass time (which would force a full stagger wait).
+    expect(clock.sleeps).toEqual([]);
+    expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID_2]);
+  });
 });
 
 describe('RunConductorPassUseCase real advance (KF-34a2)', () => {
@@ -1197,5 +1246,599 @@ describe('RunConductorPassUseCase real advance (KF-34a2)', () => {
     expect(result.runs[0].steps.map((step) => step.outcome)).toEqual(['acted', 'waiting']);
     expect(result.runs[1].steps.map((step) => step.outcome)).toEqual(['waiting', 'acted', 'waiting']);
     expect(clock.sleeps).toEqual([20_001]);
+  });
+
+  it('a stop recorded mid-pass is derived fresh at each admission, also in a pool (KF-34b pin)', async () => {
+    const h = await realHarness([
+      { runId: RUN_ID, attemptId: 'attempt-A' },
+      { runId: RUN_ID_2, attemptId: 'attempt-B' },
+    ]);
+    const realAdvance = new AdvanceLaneRunUseCase({
+      ...h.deps,
+      runJournal: h.runJournal,
+      stopAttempt: {
+        stopAttempt: async (request) => ({
+          outcome: 'cancelled' as const,
+          attempt: attemptFixture(request.attemptId),
+          capacityReleased: true,
+        }),
+      },
+    });
+    // Run 2's first admission is held, so the stop is recorded while it waits.
+    const hold2 = deferredIn<void>();
+    let run2Calls = 0;
+    const advance: AdvanceLaneRunPort = {
+      advanceLaneRun: async (request) => {
+        if (request.runId === RUN_ID_2 && run2Calls === 0) {
+          run2Calls += 1;
+          await hold2.promise;
+        }
+        return await realAdvance.advanceLaneRun(request);
+      },
+    };
+    const clock = steppingClockRealAdvance(NOW);
+    const pass = new RunConductorPassUseCase({
+      driverLease: h.driverLease,
+      runRepo: h.runRepo,
+      runJournal: h.runJournal,
+      halt: h.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: clock.now,
+      sleep: clock.sleep,
+      passConcurrency: 2,
+    });
+    const passPromise = pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    // Run 1 dispatches through the real advance while run 2 waits.
+    await untilRuns(() => h.dispatchRequests.some((request) => request.attemptId === 'attempt-A'));
+    const stop = new RequestLaneRunStopUseCase({ runRepo: h.runRepo, runJournal: h.runJournal });
+    expect(
+      await stop.requestLaneRunStop({ runId: RUN_ID_2, mode: 'graceful', via: 'cli', entryId: '01JC0000000000000000000001', nowIso: NOW }),
+    ).toMatchObject({ outcome: 'stop-recorded' });
+    hold2.resolveIn();
+    const result = await passPromise;
+    expect(result).toMatchObject({ outcome: 'completed' });
+    if (result.outcome !== 'completed') {
+      throw new Error('expected completed');
+    }
+    // Run 2's next admission re-derived the stop facts from the journal: the
+    // pass passed no cached stop state, and the stop was obeyed mid-pass.
+    const run2Report = result.runs.find((run) => run.runId === RUN_ID_2);    expect(run2Report).toBeDefined();
+    if (run2Report === undefined || run2Report.outcome !== 'advanced') {
+      throw new Error('expected an advanced run 2 report');
+    }
+    expect(run2Report.steps.some((step) => step.outcome === 'acted' && step.step === 'stop')).toBe(true);  });
+});
+
+/** A deferred for the KF-34b pool tests: resolve-only, no real timer. */
+function deferredIn<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolveIn: (value: T) => void;
+} {
+  let resolveIn!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolveIn = res;
+  });
+  return { promise, resolveIn };
+}
+
+/** Yield to the event loop until `condition` holds; scheduling only, no real timer. */
+async function untilRuns(condition: () => boolean): Promise<void> {
+  for (let turns = 0; turns < 1000 && !condition(); turns += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  expect(condition()).toBe(true);
+}
+
+describe('RunConductorPassUseCase pass pool (KF-34b)', () => {
+  const RUN_ID_3 = 'run-01JB0000000000000000000002';
+
+  function deferred<T>(): {
+    readonly promise: Promise<T>;
+    readonly resolve: (value: T) => void;
+  } {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((res) => {
+      resolve = res;
+    });
+    return { promise, resolve };
+  }
+
+  /** Yield to the event loop until `condition` holds; scheduling only, no real timer. */
+  async function until(condition: () => boolean): Promise<void> {
+    for (let turns = 0; turns < 1000 && !condition(); turns += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    expect(condition()).toBe(true);
+  }
+
+  type AdvanceStep = AdvanceLaneRunResult | Promise<AdvanceLaneRunResult>;
+
+  /**
+   * A traced advance fake for the pool: every call records `in:<run>` before
+   * awaiting its handler and `out:<run>` after, so an ordered trace pins what
+   * overlapped and in which order things finished.
+   */
+  class ConcurrentAdvance implements AdvanceLaneRunPort {
+    readonly trace: string[] = [];
+    readonly requests: AdvanceLaneRunRequest[] = [];
+    private readonly used = new Map<string, number>();
+
+    constructor(private readonly handler: (request: AdvanceLaneRunRequest, call: number) => AdvanceStep) {}
+
+    callsOf(runId: string): number {
+      return this.requests.filter((request) => request.runId === runId).length;
+    }
+
+    async advanceLaneRun(request: AdvanceLaneRunRequest): Promise<AdvanceLaneRunResult> {
+      const call = this.used.get(request.runId) ?? 0;
+      this.used.set(request.runId, call + 1);
+      this.requests.push(request);
+      this.trace.push(`in:${request.runId}`);
+      const result = await this.handler(request, call);
+      this.trace.push(`out:${request.runId}`);
+      return result;
+    }
+  }
+
+  function poolUseCase(
+    fx: Stores,
+    advance: AdvanceLaneRunPort,
+    extra: Partial<RunConductorPassDependencies> = {},
+  ): RunConductorPassUseCase {
+    return new RunConductorPassUseCase({
+      driverLease: fx.driverLease,
+      runRepo: fx.repo,
+      runJournal: fx.journal,
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: () => NOW,
+      ...extra,
+    });
+  }
+
+  const admission: AdvanceLaneRunResult = { outcome: 'waiting', reason: 'admission' };
+
+  it('at concurrency 2 the third run enters only after one of the first two finishes', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    await createRun(fx.repo, { runId: RUN_ID_3 });
+    const hold1 = deferred<AdvanceLaneRunResult>();
+    const hold2 = deferred<AdvanceLaneRunResult>();
+    const advance = new ConcurrentAdvance((request, call) => {
+      if (call === 0 && request.runId === RUN_ID) {
+        return hold1.promise;
+      }
+      if (call === 0 && request.runId === RUN_ID_2) {
+        return hold2.promise;
+      }
+      return admission;
+    });
+    const passPromise = poolUseCase(fx, advance, { passConcurrency: 2 }).runPass({ holderId: HOLDER, nowIso: NOW });
+    await until(() => advance.trace.includes(`in:${RUN_ID}`) && advance.trace.includes(`in:${RUN_ID_2}`));
+    // Both workers are busy; the third run waits in the queue.
+    expect(advance.trace.some((entry) => entry.includes(RUN_ID_3))).toBe(false);
+    hold1.resolve(admission);
+    await until(() => advance.trace.includes(`in:${RUN_ID_3}`));
+    expect(advance.trace.indexOf(`in:${RUN_ID_3}`)).toBeGreaterThan(advance.trace.indexOf(`out:${RUN_ID}`));
+    hold2.resolve(admission);
+    const result = await passPromise;
+    expect(result).toMatchObject({ outcome: 'completed', progressed: false });
+    if (result.outcome !== 'completed') {
+      throw new Error('expected completed');
+    }
+    expect(result.runs.map((run) => run.runId)).toEqual([RUN_ID, RUN_ID_2, RUN_ID_3]);
+  });
+
+  it('runs finishing in reverse order still report and draw attention in list order', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const hold1 = deferred<AdvanceLaneRunResult>();
+    const grace: AdvanceLaneRunResult = { outcome: 'waiting', reason: 'stop-grace-exceeded' };
+    const advance = new ConcurrentAdvance((request, call) => {
+      if (request.runId === RUN_ID && call === 0) {
+        return hold1.promise;
+      }
+      if (request.runId === RUN_ID && call === 1) {
+        return grace;
+      }
+      return admission;
+    });
+    const passPromise = poolUseCase(fx, advance, { passConcurrency: 2 }).runPass({ holderId: HOLDER, nowIso: NOW });
+    // Run 2 finishes completely while run 1's first step is still held.
+    await until(() => advance.trace.includes(`out:${RUN_ID_2}`));
+    hold1.resolve(grace);
+    const result = await passPromise;
+    expect(result).toMatchObject({ outcome: 'completed' });
+    if (result.outcome !== 'completed') {
+      throw new Error('expected completed');
+    }
+    expect(result.runs.map((run) => run.runId)).toEqual([RUN_ID, RUN_ID_2]);
+    expect(result.attention).toEqual([{ runId: RUN_ID, kind: 'stop-grace-exceeded' }]);
+  });
+
+  it('a worker whose advance rejects: the sibling finishes, no new step starts, and the pass rejects after the join', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const releases: string[] = [];
+    const repo = fx.repo;
+    const wrappedRepo = {
+      list: () => repo.list(),
+      acquireLease: (runId: string, request: Parameters<typeof repo.acquireLease>[1]) => repo.acquireLease(runId, request),
+      renewLease: (runId: string, request: Parameters<typeof repo.renewLease>[1]) => repo.renewLease(runId, request),
+      releaseLease: (runId: string, request: Parameters<typeof repo.releaseLease>[1]) => {
+        releases.push(runId);
+        return repo.releaseLease(runId, request);
+      },
+    };
+    const hold1 = deferred<AdvanceLaneRunResult>();
+    const error = new Error('advance exploded');
+    const advance = new ConcurrentAdvance((request, call) => {
+      if (request.runId === RUN_ID && call === 0) {
+        return hold1.promise;
+      }
+      if (request.runId === RUN_ID_2) {
+        throw error;
+      }
+      return admission;
+    });
+    const pass = new RunConductorPassUseCase({
+      driverLease: fx.driverLease,
+      runRepo: wrappedRepo,
+      runJournal: fx.journal,
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: () => NOW,
+      passConcurrency: 2,
+    });
+    const passPromise = pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    await until(() => advance.trace.includes(`in:${RUN_ID_2}`));
+    // The rejection latched the stop while run 1's step is still in flight.
+    expect(advance.trace).not.toContain(`out:${RUN_ID}`);
+    hold1.resolve(admission);
+    const caught = await passPromise.then(
+      () => 'resolved' as const,
+      (thrown: unknown) => thrown,
+    );
+    expect(caught).toBe(error);
+    // The sibling's in-flight step finished and is its only step; nothing new started.
+    expect(advance.callsOf(RUN_ID)).toBe(1);
+    expect(advance.callsOf(RUN_ID_2)).toBe(1);
+    expect(advance.trace).toContain(`out:${RUN_ID}`);
+    // No lease was released before (or by) the pass: they are still held.
+    expect(releases).toEqual([]);
+    expect(await pass.releaseLeases({ holderId: HOLDER, nowIso: SOON })).toEqual({ released: 3 });
+  });
+
+  it('a driver-lease loss while a worker waits on the start gate: the woken worker never advances', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const holdSleep = deferred<void>();
+    let sleepCalls = 0;
+    const sleep = async (): Promise<void> => {
+      sleepCalls += 1;
+      await holdSleep.promise;
+    };
+    const dispatchStarted = (runId: string): AdvanceLaneRunResult => ({
+      outcome: 'acted',
+      step: 'dispatch',
+      key: `${runId}/r0/dispatch/0/a1`,
+      result: 'completed',
+      reasonCode: 'dispatch-started',
+    });
+    let driverReads = 0;
+    const driverLease = fx.driverLease;
+    const wrappedDriver: ConductorDriverLeasePort = {
+      read: () => {
+        driverReads += 1;
+        return driverLease.read();
+      },
+      acquire: (request) => driverLease.acquire(request),
+      renew: (request) => driverLease.renew(request),
+      release: (request) => driverLease.release(request),
+      check: (request) => driverLease.check(request),
+    };
+    // Run 1's and run 2's first advances are held so the interleaving is
+    // deterministic: run 1 grants the start and takes the lease over, then
+    // run 2 is denied and sleeps on the start gate.
+    const holdRun1 = deferred<void>();
+    const holdRun2 = deferred<void>();
+    const advance = new ConcurrentAdvance(async (request, call) => {
+      if (call === 0 && request.runId === RUN_ID) {
+        await holdRun1.promise;
+      }
+      if (call === 0 && request.runId === RUN_ID_2) {
+        await holdRun2.promise;
+      }
+      const next = call === 0 ? dispatchStarted(request.runId) : admission;
+      if (next.outcome === 'acted' && request.startGate !== undefined) {
+        if (!request.startGate.tryStart(request.runId, request.nowIso).ok) {
+          return { outcome: 'waiting', reason: 'session-stagger' };
+        }
+      }
+      if (request.runId === RUN_ID && call === 0) {
+        // The driver lease lapses and a second driver takes over while the
+        // sibling worker is still asleep on the start gate.
+        await driverLease.acquire({
+          holderId: HOLDER_2,
+          observedFence: 1,
+          leaseUntilIso: '2026-10-27T10:11:00.000Z',
+          nowIso: LATER,
+        });
+      }
+      return next;
+    });
+    const pass = new RunConductorPassUseCase({
+      driverLease: wrappedDriver,
+      runRepo: fx.repo,
+      runJournal: fx.journal,
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: () => NOW,
+      sleep,
+      passConcurrency: 2,
+    });
+    const passPromise = pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    // Both workers are inside their first advance, held.
+    await until(() => advance.trace.includes(`in:${RUN_ID}`) && advance.trace.includes(`in:${RUN_ID_2}`));
+    holdRun1.resolve();
+    // Run 1 grants its start and takes the lease over.
+    await until(() => advance.trace.includes(`out:${RUN_ID}`));
+    holdRun2.resolve();
+    // Run 2 is denied and sleeps on the start gate; run 1's post-takeover
+    // renewal latched the loss (four keeper reads: the pass's take, run 1
+    // step 1, run 2 step 1, then run 1's post-takeover renewal).
+    await until(() => sleepCalls === 1 && driverReads >= 4);
+    holdSleep.resolve();
+    const result = await passPromise;
+    expect(result).toEqual({ outcome: 'refused', reason: 'driver-lease-held' });
+    // The woken worker checked the stop and never called advance again.
+    expect(advance.callsOf(RUN_ID_2)).toBe(1);
+  });
+
+  it('a run-lease loss stops only that run; the sibling keeps advancing', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const repo = fx.repo;
+    const renewCounts = new Map<string, number>([
+      [RUN_ID, 0],
+      [RUN_ID_2, 0],
+    ]);
+    const wrappedRepo = {
+      list: () => repo.list(),
+      acquireLease: (runId: string, request: Parameters<typeof repo.acquireLease>[1]) => repo.acquireLease(runId, request),
+      renewLease: (runId: string, request: Parameters<typeof repo.renewLease>[1]) => {
+        renewCounts.set(runId, (renewCounts.get(runId) ?? 0) + 1);
+        if (runId === RUN_ID && (renewCounts.get(runId) ?? 0) >= 2) {
+          return Promise.resolve({ outcome: 'refused', reason: 'lease-not-held' } as never);
+        }
+        return repo.renewLease(runId, request);
+      },
+      releaseLease: (runId: string, request: Parameters<typeof repo.releaseLease>[1]) => repo.releaseLease(runId, request),
+    };
+    const entered = (state: 'dispatching' | 'running'): AdvanceLaneRunResult => ({ outcome: 'entered', state });
+    const advance = new ConcurrentAdvance((request, call) => {
+      if (request.runId === RUN_ID) {
+        return entered(call === 0 ? 'dispatching' : 'running');
+      }
+      return call < 2 ? entered(call === 0 ? 'dispatching' : 'running') : admission;
+    });
+    const pass = new RunConductorPassUseCase({
+      driverLease: fx.driverLease,
+      runRepo: wrappedRepo,
+      runJournal: fx.journal,
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: () => NOW,
+      passConcurrency: 2,
+    });
+    const result = await pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed', progressed: true });
+    if (result.outcome !== 'completed') {
+      throw new Error('expected completed');
+    }
+    // Run 1 lost its lease before its second step and keeps the step that ran;
+    // run 2 was never touched by that loss.
+    expect(result.runs[0]).toMatchObject({ runId: RUN_ID, outcome: 'advanced' });
+    if (result.runs[0].outcome !== 'advanced') {
+      throw new Error('expected advanced');
+    }
+    expect(result.runs[0].steps).toEqual([entered('dispatching')]);
+    expect(advance.callsOf(RUN_ID)).toBe(1);
+    expect(advance.callsOf(RUN_ID_2)).toBe(3);
+  });
+
+  it('the pass promise stays pending while an in-flight step is unresolved, even after the sibling stopped', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const hold1 = deferred<AdvanceLaneRunResult>();
+    const advance = new ConcurrentAdvance((request, call) => {
+      if (request.runId === RUN_ID && call === 0) {
+        return hold1.promise;
+      }
+      return admission;
+    });
+    const passPromise = poolUseCase(fx, advance, { passConcurrency: 2 }).runPass({ holderId: HOLDER, nowIso: NOW });
+    let settled = false;
+    passPromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    // Run 2's worker is done; run 1's step is still in flight.
+    await until(() => advance.trace.includes(`out:${RUN_ID_2}`));
+    for (let turns = 0; turns < 25; turns += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    expect(settled).toBe(false);
+    hold1.resolve(admission);
+    const result = await passPromise;
+    expect(result).toMatchObject({ outcome: 'completed' });
+    expect(settled).toBe(true);
+  });
+
+  it('a halt recorded during run 1\'s long step: run 2\'s next advance receives halted true', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const hold1 = deferred<AdvanceLaneRunResult>();
+    const hold2 = deferred<AdvanceLaneRunResult>();
+    const advance = new ConcurrentAdvance((request, call) => {
+      if (request.runId === RUN_ID && call === 0) {
+        return hold1.promise;
+      }
+      if (request.runId === RUN_ID_2 && call === 0) {
+        return hold2.promise;
+      }
+      return admission;
+    });
+    const passPromise = poolUseCase(fx, advance, { passConcurrency: 2 }).runPass({ holderId: HOLDER, nowIso: NOW });
+    // Both workers are inside their first advance (each already read the halt
+    // marker as false for that step).
+    await until(() => advance.trace.includes(`in:${RUN_ID}`) && advance.trace.includes(`in:${RUN_ID_2}`));
+    await fx.halt.set({ halted: true, nowIso: NOW });
+    hold1.resolve(admission);
+    hold2.resolve({ outcome: 'entered', state: 'dispatching' });
+    const result = await passPromise;
+    expect(result).toMatchObject({ outcome: 'completed', halted: true });
+    // Run 1's step was admitted before the halt; run 2's next admission read it fresh.
+    expect(advance.requests[0]).toMatchObject({ runId: RUN_ID, halted: false });
+    expect(advance.requests[1]).toMatchObject({ runId: RUN_ID_2, halted: false });
+    expect(advance.requests[2]).toMatchObject({ runId: RUN_ID_2, halted: true });
+  });
+
+  it('two dispatching runs at concurrency 2 start at least dispatchStaggerMs apart', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const dispatchStarted = (runId: string): AdvanceLaneRunResult => ({
+      outcome: 'acted',
+      step: 'dispatch',
+      key: `${runId}/r0/dispatch/0/a1`,
+      result: 'completed',
+      reasonCode: 'dispatch-started',
+    });
+    const grantedStarts: { readonly runId: string; readonly nowIso: string }[] = [];
+    // A per-run index managed here: a denied session start does not consume
+    // the queue, exactly like the real advance before its one-way intent.
+    const nextIndex = new Map<string, number>();
+    const advance = new ConcurrentAdvance((request) => {
+      const index = nextIndex.get(request.runId) ?? 0;
+      const next = index === 0 ? dispatchStarted(request.runId) : admission;
+      if (next.outcome === 'acted' && request.startGate !== undefined) {
+        if (!request.startGate.tryStart(request.runId, request.nowIso).ok) {
+          return { outcome: 'waiting', reason: 'session-stagger' };
+        }
+        grantedStarts.push({ runId: request.runId, nowIso: request.nowIso });
+      }
+      nextIndex.set(request.runId, index + 1);
+      return next;
+    });
+    // The fake sleep advances the clock by the awaited amount, so the wait is
+    // exact and no real timer runs.
+    let current = Date.parse(NOW);
+    const clock = {
+      now: () => new Date(current).toISOString(),
+      sleep: async (ms: number): Promise<void> => {
+        current += ms;
+      },
+    };
+    const staggerMs = 500;
+    const result = await new RunConductorPassUseCase({
+      driverLease: fx.driverLease,
+      runRepo: fx.repo,
+      runJournal: fx.journal,
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: clock.now,
+      sleep: clock.sleep,
+      dispatchStaggerMs: staggerMs,
+      passConcurrency: 2,
+    }).runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed', progressed: true });
+    expect(grantedStarts).toHaveLength(2);
+    const ordered = [...grantedStarts].sort((left, right) => left.nowIso.localeCompare(right.nowIso));
+    const gap = Date.parse(ordered[1]!.nowIso) - Date.parse(ordered[0]!.nowIso);
+    expect(gap).toBeGreaterThanOrEqual(staggerMs);
+  });
+});
+
+describe('ConductorDriverLeaseKeeper loss latch and expiry monotonicity (KF-34b)', () => {
+  it('a throwing port latches a driver-lease-refused loss before rethrowing, and a later call never retries it', async () => {
+    let portCalls = 0;
+    const driverLease: ConductorDriverLeasePort = {
+      read: async () => {
+        portCalls += 1;
+        throw new Error('storage exploded');
+      },
+      acquire: async () => {
+        portCalls += 1;
+        throw new Error('storage exploded');
+      },
+      renew: async () => {
+        portCalls += 1;
+        throw new Error('storage exploded');
+      },
+      release: async () => {
+        portCalls += 1;
+        throw new Error('storage exploded');
+      },
+      check: async () => {
+        portCalls += 1;
+        throw new Error('storage exploded');
+      },
+    };
+    const keeper = new ConductorDriverLeaseKeeper({ driverLease, holderId: HOLDER, now: () => NOW });
+    await expect(keeper.renew()).rejects.toThrow('storage exploded');
+    expect(portCalls).toBe(1);
+    // The sibling worker's call answers the latched loss without touching the port.
+    await expect(keeper.renew()).resolves.toEqual({ outcome: 'lost', reason: 'driver-lease-refused' });
+    expect(portCalls).toBe(1);
+  });
+
+  it('a clock set backwards between two renewals never shortens the lease the keeper sends', async () => {
+    const fx = stores();
+    const renews: LeaseRenewRequest[] = [];
+    const driverLease = fx.driverLease;
+    const wrappedDriver: ConductorDriverLeasePort = {
+      read: () => driverLease.read(),
+      acquire: (request) => driverLease.acquire(request),
+      renew: (request) => {
+        renews.push(request);
+        return driverLease.renew(request);
+      },
+      release: (request) => driverLease.release(request),
+      check: (request) => driverLease.check(request),
+    };
+    let current = Date.parse(NOW);
+    const keeper = new ConductorDriverLeaseKeeper({
+      driverLease: wrappedDriver,
+      holderId: HOLDER,
+      now: () => new Date(current).toISOString(),
+    });
+    const first = await keeper.renew();
+    expect(first).toMatchObject({ outcome: 'held' });
+    expect((await driverLease.read())?.leaseUntilIso).toBe(new Date(Date.parse(NOW) + 5 * 60 * 1000).toISOString());
+    // The clock steps back a minute between the two renewals.
+    current -= 60_000;
+    const second = await keeper.renew();
+    expect(second).toMatchObject({ outcome: 'held' });
+    expect(renews).toHaveLength(1);
+    // The renewal sends the last sent expiry, never the stepped-back one.
+    expect(renews[0]!.leaseUntilIso).toBe(new Date(Date.parse(NOW) + 5 * 60 * 1000).toISOString());
   });
 });

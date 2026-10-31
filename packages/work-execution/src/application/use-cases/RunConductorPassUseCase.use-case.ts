@@ -63,6 +63,13 @@ export interface RunConductorPassDependencies {
   readonly sleep?: (ms: number) => Promise<void>;
   /** How long to space lane session starts through the start gate, in ms. */
   readonly dispatchStaggerMs?: number;
+  /**
+   * KF-34b: how many live runs one pass advances concurrently. The workers
+   * share one start gate, one driver-lease keeper and one latched stop, and
+   * take live runs from one queue in list order. Default 1: the serial pass
+   * this class has always been; nothing changes until an operator opts in.
+   */
+  readonly passConcurrency?: number;
 }
 
 const DEFAULT_DISPATCH_STAGGER_MS = 20_000;
@@ -98,6 +105,24 @@ interface AdvanceRunContext {
   readonly driverKeeper: ConductorDriverLeaseKeeper;
   /** The pass-start now: reused for the first live run's first lease decision. */
   readonly passNowIso: string;
+  /**
+   * KF-34b: the pass's one latched stop. A worker sets it on a driver-lease
+   * loss, an invalid clock or its own rejection; once set, no worker starts
+   * another step. A step already in flight finishes and is reported.
+   */
+  readonly control: PassControl;
+}
+
+/** The shared latched stop of one pass's worker pool (KF-34b). */
+interface PassControl {
+  /** Latch the stop; later calls keep the first latch. */
+  readonly stop: () => void;
+  /** True once any worker latched the stop. */
+  readonly isStopped: () => boolean;
+  /** Record a per-step halt read, so the pass reports a halt it acted under. */
+  readonly noteHalt: (halted: boolean) => void;
+  /** True when any per-step halt read in this pass saw the marker set. */
+  readonly sawHalted: () => boolean;
 }
 
 export class RunConductorPassUseCase implements RunConductorPassPort {
@@ -144,6 +169,9 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
     // One gate per pass, seeded with the latest recorded session start among the
     // dispatch, brief-check and code-review intents the filtering reads already
     // carried: a start is spaced from one the previous pass or process made.
+    // An unparseable recordedAtIso is skipped, so it never seeds the gate (not
+    // even with the pass time): the gate starts unseeded, as before KF-34a2.
+    let lastStartMs: number | null = null;
     let lastStartIso: string | null = null;
     for (const entries of journalEntriesByRun.values()) {
       for (const entry of entries) {
@@ -154,17 +182,20 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
         if (
           parsed !== null &&
           parsed.kind === 'step' &&
-          (parsed.step === 'dispatch' || parsed.step === 'brief-check' || parsed.step === 'code-review') &&
-          (lastStartIso === null || Date.parse(entry.recordedAtIso) > Date.parse(lastStartIso))
+          (parsed.step === 'dispatch' || parsed.step === 'brief-check' || parsed.step === 'code-review')
         ) {
-          lastStartIso = entry.recordedAtIso;
+          const recordedMs = Date.parse(entry.recordedAtIso);
+          if (!Number.isNaN(recordedMs) && (lastStartMs === null || recordedMs > lastStartMs)) {
+            lastStartMs = recordedMs;
+            lastStartIso = entry.recordedAtIso;
+          }
         }
       }
     }
     // Clamp the seed to this pass's now: a start recorded in the future (clock
     // stepped back, skewed process) makes the first wait at most dispatchStaggerMs.
     const seedIso =
-      lastStartIso === null || Date.parse(lastStartIso) <= Date.parse(passNowIso)
+      lastStartIso === null || lastStartMs === null || lastStartMs <= Date.parse(passNowIso)
         ? lastStartIso
         : passNowIso;
     const startGate = new SessionStartSpacing(
@@ -175,13 +206,82 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
     const reports: ConductorRunReport[] = [];
     const attention: ConductorAttentionItem[] = [];
 
-    // Each run's steps depend on the previous result, and one driver acting on
-    // one run at a time keeps the host budget; a for…of with await is intended.
-    const ctx: AdvanceRunContext = { request, halted, startGate, driverKeeper, passNowIso };
-    for (const [index, record] of liveRuns.entries()) {
-      const outcome = await this.advanceRun(record, { ...ctx, isFirstRun: index === 0 });
-      if (outcome.stop !== null) {
-        return { outcome: 'refused', reason: outcome.stop };
+    let stopped = false;
+    let haltedSeen = halted;
+    const control: PassControl = {
+      stop: (): void => {
+        stopped = true;
+      },
+      isStopped: (): boolean => stopped,
+      noteHalt: (stepHalted: boolean): void => {
+        if (stepHalted) {
+          haltedSeen = true;
+        }
+      },
+      sawHalted: (): boolean => haltedSeen,
+    };
+    const ctx: AdvanceRunContext = { request, halted, startGate, driverKeeper, passNowIso, control };
+
+    // KF-34b: the pass's worker pool. `passConcurrency` workers (default 1, the
+    // serial pass) take live runs from one queue in list order; each runs
+    // `advanceRun` for one run at a time. They share the pass's one start
+    // gate, one driver-lease keeper and one latched stop.
+    const passConcurrency = Math.max(1, Math.trunc(this.deps.passConcurrency ?? 1));
+    const outcomes: (RunOutcome | undefined)[] = new Array(liveRuns.length).fill(undefined);
+    let rejection: { readonly error: unknown } | null = null;
+    let nextIndex = 0;
+    const runWorker = async (): Promise<void> => {
+      for (;;) {
+        if (control.isStopped()) {
+          return;
+        }
+        const index = nextIndex;
+        if (index >= liveRuns.length) {
+          return;
+        }
+        nextIndex += 1;
+        let outcome: RunOutcome;
+        try {
+          outcome = await this.advanceRun(liveRuns[index]!, { ...ctx, isFirstRun: index === 0, control });
+        } catch (error) {
+          // A worker's rejection latches the stop so its siblings start no new
+          // step; the error itself is rethrown only after every worker joined.
+          rejection ??= { error };
+          control.stop();
+          return;
+        }
+        outcomes[index] = outcome;
+        if (outcome.stop !== null) {
+          control.stop();
+        }
+      }
+    };
+    const workers = Array.from({ length: Math.min(passConcurrency, liveRuns.length) }, () => runWorker());
+    // Join before returning anything, including a refusal: the CLI's
+    // `finally { releaseLeases }` then never releases a run lease while a
+    // step on that run is still in flight.
+    await Promise.allSettled(workers);
+    const thrown = rejection as { readonly error: unknown } | null;
+    if (thrown !== null) {
+      // The same error type as today's serial pass: the rejection surfaces
+      // from `runPass` exactly as an uncaught `advance` error did before.
+      throw thrown.error;
+    }
+    // The stop maps to today's refusal reason, chosen deterministically by run
+    // order when several workers stopped.
+    let stopReason: RunOutcome['stop'] = null;
+    for (const outcome of outcomes) {
+      if (outcome !== undefined && outcome.stop !== null) {
+        stopReason = outcome.stop;
+        break;
+      }
+    }
+    if (stopReason !== null) {
+      return { outcome: 'refused', reason: stopReason };
+    }
+    for (const outcome of outcomes) {
+      if (outcome === undefined) {
+        continue;
       }
       reports.push(outcome.report);
       attention.push(...outcome.attention);
@@ -194,7 +294,7 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
           (step) => step.outcome === 'entered' || step.outcome === 'repaired' || step.outcome === 'acted',
         ),
     );
-    return { outcome: 'completed', halted, progressed, runs: reports, attention };
+    return { outcome: 'completed', halted: control.sawHalted(), progressed, runs: reports, attention };
   }
 
   async releaseLeases(request: RunConductorPassRequest): Promise<{ readonly released: number }> {
@@ -263,6 +363,9 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
     }
     const runUntil = leaseUntilIso(runNowIso);
     const runHeld = await holdConductorLease(record.lease, ctx.request.holderId, runNowIso, runUntil, renewRun, acquireRun);
+    if (ctx.control.isStopped()) {
+      return { report: { runId: record.runId, outcome: 'advanced', steps: [] }, attention: [], stop: null };
+    }
     if (runHeld.outcome === 'held-by-other') {
       return {
         report: { runId: record.runId, outcome: 'skipped', reason: 'lease-held' },
@@ -288,6 +391,9 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
       lease: { holderId: lease.holderId, fence: lease.fence },
       nowIso: runNowIso,
     });
+    if (ctx.control.isStopped()) {
+      return { report: { runId: record.runId, outcome: 'advanced', steps: [] }, attention: [], stop: null };
+    }
     if (resumed.outcome === 'refused' && resumed.reason === 'save-refused') {
       return {
         report: { runId: record.runId, outcome: 'resume-refused', reason: resumed.reason },
@@ -304,17 +410,22 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
     // Set when the driver lease is lost or the clock is invalid: end this run's
     // steps and report the stop (never return from the pass).
     let stop: RunOutcome['stop'] = null;
-    while (steps.length < CONDUCTOR_MAX_STEPS_PER_RUN && !finished && stop === null) {
+    while (steps.length < CONDUCTOR_MAX_STEPS_PER_RUN && !finished && stop === null && !ctx.control.isStopped()) {
       // Renew the driver lease through the keeper; the keeper reads a fresh time
       // inside its critical section, so the lease never shortens and a refused
       // or other-held renewal ends the pass (reported as this run's stop).
       const driverRenewed = await ctx.driverKeeper.renew();
+      if (ctx.control.isStopped()) {
+        break;
+      }
       if (driverRenewed.outcome === 'invalid-clock') {
         stop = 'invalid-request';
+        ctx.control.stop();
         break;
       }
       if (driverRenewed.outcome === 'lost') {
         stop = driverRenewed.reason;
+        ctx.control.stop();
         break;
       }
       const stepNowIso = driverRenewed.nowIso;
@@ -322,6 +433,9 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
 
       // Renew this run's lease; refused or held by another stops acting on it.
       const runRenewed = await holdConductorLease(lease, ctx.request.holderId, stepNowIso, stepUntil, renewRun, acquireRun);
+      if (ctx.control.isStopped()) {
+        break;
+      }
       if (runRenewed.outcome === 'held-by-other') {
         lost = 'lease-held';
         break;
@@ -332,10 +446,18 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
       }
       lease = runRenewed.lease;
 
+      // KF-34b: the halt marker is re-read at action admission, so a halt
+      // recorded mid-pass stops new actions. Already started operations are
+      // not cancelled; they finish and their results are reported.
+      const haltedNow = isConductorHalted(await this.deps.halt.read());
+      ctx.control.noteHalt(haltedNow);
+      if (ctx.control.isStopped()) {
+        break;
+      }
       const step = await this.deps.advance.advanceLaneRun({
         runId: record.runId,
         lease: { holderId: lease.holderId, fence: lease.fence },
-        halted: ctx.halted,
+        halted: haltedNow,
         nowIso: stepNowIso,
         startGate: ctx.startGate,
       });
@@ -351,6 +473,9 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
         // the wait. The step is reported as it was journalled: none.
         const sleep = this.deps.sleep ?? defaultSleep;
         await sleep(ctx.startGate.pendingMs(record.runId, this.nowIso()) + 1);
+        if (ctx.control.isStopped()) {
+          break;
+        }
         continue;
       }
       finished = !(step.outcome === 'entered' || step.outcome === 'repaired' || step.outcome === 'acted');

@@ -31,6 +31,7 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'accepted', 'acceptance-rejected', 'acceptance-unknown', 'pr-opened',
   'pushed', 'forge-refused', 'forge-ambiguous', 'grant-refused', 'merged', 'merge-not-merged', 'merge-waiting',
   'merge-off', 'notice-recorded', 'notice-refused', 'no-in-scope-findings',
+  'gate-congested', // KF-30c2: a gate run that exhausted the gate-slot wait limit; the conductor may retry it
 ] as const;
 export type LaneRunResultReasonCode = (typeof LANE_RUN_RESULT_REASON_CODES)[number];
 
@@ -179,32 +180,77 @@ export function laneRunTimedOut(entries: readonly LaneRunJournalEntryRecord[], r
   return false;
 }
 
-/** Gate at head12: final 'gate-passed' → passed, 'gate-failed' → failed, any other final → unknown; an intent with no final → pending; none → none. */
-export function laneRunGateFact(
-  entries: readonly LaneRunJournalEntryRecord[], runId: string, head12: string | null,
-): 'none' | 'pending' | 'passed' | 'failed' | 'unknown' {
-  if (head12 === null) {
-    return 'none';
-  }
-  let sawPending = false;
+/** The gate intent at head12 with the highest retry (no retry = run 0), or null. */
+function highestRetryGateIntent(
+  entries: readonly LaneRunJournalEntryRecord[], runId: string, head12: string,
+): { readonly key: string; readonly retry: number } | null {
+  let latest: { readonly key: string; readonly retry: number } | null = null;
   for (const { entry, parsed } of stepIntentsOf(entries, runId)) {
     if (parsed.step !== 'gate' || parsed.head12 !== head12 || entry.key === null) {
       continue;
     }
-    const result = finalResultOf(entries, entry.key);
-    if (result === null) {
-      sawPending = true;
-      continue;
+    const retry = parsed.retry ?? 0;
+    if (latest === null || retry > latest.retry) {
+      latest = { key: entry.key, retry };
     }
-    if (result.reasonCode === 'gate-passed') {
-      return 'passed';
-    }
-    if (result.reasonCode === 'gate-failed') {
-      return 'failed';
-    }
-    return 'unknown';
   }
-  return sawPending ? 'pending' : 'none';
+  return latest;
+}
+
+/**
+ * Gate at head12: the gate intent with the HIGHEST retry (no retry = run 0)
+ * decides — its final 'gate-passed' → passed, 'gate-failed' → failed,
+ * 'gate-congested' → congested, any other final → unknown; that intent without
+ * a final → pending; none → none. A later run's outcome overrides an earlier
+ * one, so a congested run never hides a later run's pass or fail (KF-30c2).
+ */
+export function laneRunGateFact(
+  entries: readonly LaneRunJournalEntryRecord[], runId: string, head12: string | null,
+): 'none' | 'pending' | 'passed' | 'failed' | 'unknown' | 'congested' {
+  if (head12 === null) {
+    return 'none';
+  }
+  const decided = highestRetryGateIntent(entries, runId, head12);
+  if (decided === null) {
+    return 'none';
+  }
+  const result = finalResultOf(entries, decided.key);
+  if (result === null) {
+    return 'pending';
+  }
+  if (result.reasonCode === 'gate-passed') {
+    return 'passed';
+  }
+  if (result.reasonCode === 'gate-failed') {
+    return 'failed';
+  }
+  if (result.reasonCode === 'gate-congested') {
+    return 'congested';
+  }
+  return 'unknown';
+}
+
+/**
+ * The congested gate run at head12 (KF-30c2): the highest-retry gate intent
+ * whose final result is `gate-congested`, with that run's retry and the
+ * result's `recordedAtIso`; null when the latest gate result is not a
+ * congestion (or there is no gate intent at the head).
+ */
+export function laneRunGateCongestion(
+  entries: readonly LaneRunJournalEntryRecord[], runId: string, head12: string | null,
+): { readonly retry: number; readonly atIso: string } | null {
+  if (head12 === null) {
+    return null;
+  }
+  const latest = highestRetryGateIntent(entries, runId, head12);
+  if (latest === null) {
+    return null;
+  }
+  const result = finalResultOf(entries, latest.key);
+  if (result === null || result.reasonCode !== 'gate-congested') {
+    return null;
+  }
+  return { retry: latest.retry, atIso: result.recordedAtIso };
 }
 
 /** The step of the run's latest final step-key result when its outcome is 'refused' and its round is `round`; else null. */

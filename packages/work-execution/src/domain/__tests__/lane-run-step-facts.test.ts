@@ -10,6 +10,7 @@ import {
   laneRunAttemptPlacement,
   laneRunConductEntry,
   laneRunDispatchedAtIso,
+  laneRunGateCongestion,
   laneRunGateFact,
   laneRunIntentEntry,
   laneRunParkedConductCount,
@@ -296,6 +297,74 @@ describe('laneRunGateFact', () => {
   it('returns none for another head', () => {
     const entries = [intent(gateKey)];
     expect(laneRunGateFact(entries, RUN_ID, OTHER_HEAD)).toBe('none');
+  });
+
+  it('returns congested for a final gate-congested run', () => {
+    const entries = [
+      intent(gateKey),
+      result(gateKey, 'completed', 'gate-congested'),
+    ];
+    expect(laneRunGateFact(entries, RUN_ID, HEAD)).toBe('congested');
+  });
+
+  it('decides by the highest-retry intent: an old congested run 0 and a passed retry 1 pass', () => {
+    const retryKey = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD, retry: 1 });
+    const entries = [
+      intent(gateKey),
+      result(gateKey, 'completed', 'gate-congested'),
+      intent(retryKey),
+      result(retryKey, 'completed', 'gate-passed'),
+    ];
+    expect(laneRunGateFact(entries, RUN_ID, HEAD)).toBe('passed');
+  });
+
+  it('a congested retry 1 overrides a passed run 0', () => {
+    const retryKey = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD, retry: 1 });
+    const entries = [
+      intent(gateKey),
+      result(gateKey, 'completed', 'gate-passed'),
+      intent(retryKey),
+      result(retryKey, 'completed', 'gate-congested'),
+    ];
+    expect(laneRunGateFact(entries, RUN_ID, HEAD)).toBe('congested');
+  });
+});
+
+describe('laneRunGateCongestion', () => {
+  const run0 = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD });
+  const run1 = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD, retry: 1 });
+
+  it('returns the latest congested run\'s retry and time', () => {
+    const entries = [
+      intent(run0),
+      result(run0, 'completed', 'gate-congested'),
+    ];
+    expect(laneRunGateCongestion(entries, RUN_ID, HEAD)).toEqual({ retry: 0, atIso: NOW });
+  });
+
+  it('returns the later retry when several runs are congested', () => {
+    const entries = [
+      intent(run0),
+      result(run0, 'completed', 'gate-congested'),
+      intent(run1),
+      result(run1, 'completed', 'gate-congested'),
+    ];
+    expect(laneRunGateCongestion(entries, RUN_ID, HEAD)).toEqual({ retry: 1, atIso: NOW });
+  });
+
+  it('returns null when the latest gate result is not a congestion', () => {
+    const entries = [
+      intent(run0),
+      result(run0, 'completed', 'gate-congested'),
+      intent(run1),
+      result(run1, 'completed', 'gate-passed'),
+    ];
+    expect(laneRunGateCongestion(entries, RUN_ID, HEAD)).toBeNull();
+  });
+
+  it('returns null with no gate intent or a null head', () => {
+    expect(laneRunGateCongestion([], RUN_ID, HEAD)).toBeNull();
+    expect(laneRunGateCongestion([], RUN_ID, null)).toBeNull();
   });
 });
 

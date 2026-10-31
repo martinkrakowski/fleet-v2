@@ -703,10 +703,93 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     expect(run1Again).toEqual(run1);
     expect(passedGate.requests).toHaveLength(1);
 
-    // Run 0 keeps its stored congested verdict; run 1 neither sealed nor changed it.
+    // KF-30c2: with no gateRun the HIGHEST stored run decides — the retry's
+    // passed outcome, never run 0's congestion (the auto-merge read).
     const run0Again = await run1UseCase.evaluateAttemptGate(gateRequest());
-    expect(run0Again).toEqual(run0);
+    expect(run0Again.verdict).toBe('passed');
     expect(passedGate.requests).toHaveLength(1);
+  });
+
+  it('refuses an explicit retry run without a stored congested prior run and runs nothing', async () => {
+    const gate = new FakeGatePredicatePort(EVALUATED_ALL_PASS);
+    const { deps, journal } = makeDeps({ gate });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    // No run stored at all: run 1 needs a congested run 0.
+    const refused = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 1 }));
+    expect(refused).toEqual({
+      verdict: 'unknown',
+      reason:
+        'Unknown: gate run 1 requires a stored congested gate run 0 for head ' + HEAD_SHA,
+    });
+
+    // A passed run 0 is stored but not congested: run 2 is still refused.
+    const first = await useCase.evaluateAttemptGate(gateRequest());
+    expect(first.verdict).toBe('passed');
+    const refused2 = await useCase.evaluateAttemptGate(gateRequest({ gateRun: 2 }));
+    expect(refused2.verdict).toBe('unknown');
+    expect(refused2.verdict === 'unknown' && refused2.congested).toBeUndefined();
+
+    expect(gate.requests).toHaveLength(1);
+    expect(journal.entries.every((entry) => !entry.id.includes('/g'))).toBe(true);
+  });
+
+  it('returns the highest stored run outcome across several retries when gateRun is omitted', async () => {
+    const journal = new InMemoryJournal();
+    const congestedGate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        PASS_RESULTS[1],
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'unknown',
+          exitCode: 75,
+          durationMs: 1,
+          detail: 'gate slot wait limit reached',
+          cause: 'gate-slot-wait-limit',
+        },
+      ],
+    });
+    const congested = new RequestAttemptAcceptanceUseCase(makeDeps({ gate: congestedGate, journal }).deps);
+    const run0 = await congested.evaluateAttemptGate(gateRequest());
+    expect(run0).toMatchObject({ verdict: 'unknown', congested: true });
+
+    const failedGate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        {
+          name: 'diff-check',
+          kind: 'diff-check',
+          verdict: 'fail',
+          exitCode: 1,
+          durationMs: 1,
+          detail: 'bad diff',
+        },
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'skipped',
+          exitCode: null,
+          durationMs: 0,
+          detail: 'not run: an earlier predicate did not pass',
+        },
+      ],
+    });
+    const failedRun = new RequestAttemptAcceptanceUseCase(makeDeps({ gate: failedGate, journal }).deps);
+    const run1 = await failedRun.evaluateAttemptGate(gateRequest({ gateRun: 1 }));
+    expect(run1.verdict).toBe('failed');
+
+    // Run 1 is stored last: the omitted run reads its failed outcome, never
+    // run 0's congestion.
+    const latest = await failedRun.evaluateAttemptGate(gateRequest());
+    expect(latest.verdict).toBe('failed');
+    expect(latest.verdict === 'failed' && latest.reason).toBe(
+      'Gate predicate diff-check fail with exit code 1: bad diff',
+    );
+    expect(journal.entries.some((entry) => entry.id.endsWith('/g1:0'))).toBe(true);
   });
 
   it('round-trips cause through a stored predicate entry and leaves old entries unchanged', () => {

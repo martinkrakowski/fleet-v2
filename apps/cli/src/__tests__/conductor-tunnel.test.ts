@@ -395,6 +395,23 @@ describe('RunnerTunnelAdapter (KF-35)', () => {
     expect(child.killCalls).toHaveLength(0);
   });
 
+  it('a child that dies while the successful probe ran fails when the port then stops answering (CodeRabbit)', async () => {
+    const child = fakeChild();
+    let calls = 0;
+    const probe = async (): Promise<boolean> => {
+      calls += 1;
+      if (calls === 2) {
+        child.crash({ code: 255 });
+        await Promise.resolve();
+        return true;
+      }
+      return false;
+    };
+    const tunnel = tunnelOf({ sshHost: 'lane-host', remotePort: 46000, probe, child });
+    expect(await tunnel.ensureTunnel()).toBe('failed');
+    expect(tunnel.owned).toBe(false);
+  });
+
   it('reports a failure after the bounded wait and stops the child', async () => {
     const child = fakeChild();
     const sleeps: number[] = [];

@@ -255,10 +255,11 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
           return (await this.answersQuietly(dial)) ? 'already-listening' : 'failed';
         }
         if (await this.isPortListening(dial)) {
-          // The child may have died while the probe ran: an answering port is
-          // then someone else's forward, used without ownership.
+          // The child may have died while the probe ran, and that probe may have
+          // reached the child itself: probe again; a port still answering is
+          // someone else's forward, used without ownership.
           if (exited) {
-            return 'already-listening';
+            return (await this.answersQuietly(dial)) ? 'already-listening' : 'failed';
           }
           opened = true;
           return 'opened';

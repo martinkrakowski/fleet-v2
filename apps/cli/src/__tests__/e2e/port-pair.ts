@@ -35,7 +35,8 @@ export async function pickDialablePortPair(
   random: () => number = Math.random,
 ): Promise<number> {
   for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
-    const port = PORT_PAIR_MIN + Math.floor(random() * (PORT_PAIR_MAX - PORT_PAIR_MIN));
+    // Even server ports only, so two fixtures' pairs (P, P+1) never overlap.
+    const port = PORT_PAIR_MIN + 2 * Math.floor(random() * Math.floor((PORT_PAIR_MAX - PORT_PAIR_MIN) / 2));
     if ((await isFree(port)) && (await isFree(port + 1))) {
       return port;
     }

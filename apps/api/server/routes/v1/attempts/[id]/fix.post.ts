@@ -1,3 +1,4 @@
+import { defineEventHandler, setResponseStatus } from "h3";
 import { workComposition } from "../../../../wiring/work/composition";
 import {
   envelope,
@@ -7,14 +8,32 @@ import {
 import { readObjectBody, routeParam } from "../../../../wiring/http-input";
 
 export default defineEventHandler(async (event) => {
-  const priorAttemptId = routeParam(event, "id");
+  // Trimmed exactly as the use case trims it, so the id and a padded id
+  // share one single-flight slot; routeParam has fully decoded the id. The
+  // limiter is keyed on the prior attempt id: a fix round works on the
+  // prior's worktree, so two fixes for the same prior never overlap.
+  const priorAttemptId = routeParam(event, "id").trim();
   const operationId = newOperationId();
   try {
-    const result = await workComposition().prepareFixAttempt.execute({
-      ...(await readObjectBody(event)),
+    const composition = workComposition();
+    const body = await readObjectBody(event);
+    const prepared = await composition.attemptLimiter.run(
       priorAttemptId,
-    });
-    return envelope(operationId, "OK", result);
+      () => composition.prepareFixAttempt.execute({ ...body, priorAttemptId }),
+    );
+    if (!prepared.ok) {
+      if (prepared.reason === "busy-project") {
+        setResponseStatus(event, 409);
+        return envelope(operationId, "BUSY", {
+          reason: `a fix for ${priorAttemptId} is already running`,
+        });
+      }
+      setResponseStatus(event, 429);
+      return envelope(operationId, "BUSY", {
+        reason: "attempt capacity is busy; retry shortly",
+      });
+    }
+    return envelope(operationId, "OK", prepared.value);
   } catch (error) {
     const mapping = mapWorkError(error);
     if (mapping) {

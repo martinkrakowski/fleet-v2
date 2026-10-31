@@ -43,7 +43,6 @@ import {
   ExecuteAuthorizedForgeActionUseCase,
   InspectWorkOrderUseCase,
   PrepareBriefPackageUseCase,
-  PrepareFixAttemptUseCase,
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
   RequestAttemptAcceptanceUseCase,
@@ -374,7 +373,7 @@ describe("configured compositions execute real operations", () => {
     });
     expect(reserved.outcome).toBe("reserved");
 
-    const fixed = await work.prepareFixAttempt.prepareFixAttempt({
+    const fixed = await work.prepareFixAttempt.execute({
       fixAttemptId: "att-api-2",
       workOrderId: WORK_ORDER_REQUEST.workOrderId,
       priorAttemptId: "att-api-1",
@@ -853,7 +852,7 @@ describe("composition type surface", () => {
     expect(work.reconcileAttempt).toBeInstanceOf(ReconcileAttemptUseCase);
     expect(work.stopAttempt).toBeInstanceOf(StopAttemptUseCase);
     expect(work.collectAttemptArtifacts).toBeInstanceOf(CollectAttemptArtifactsUseCase);
-    expect(work.prepareFixAttempt).toBeInstanceOf(PrepareFixAttemptUseCase);
+    expect(work.prepareFixAttempt.execute).toBeDefined();
     expect(work.requestAttemptAcceptance).toBeInstanceOf(RequestAttemptAcceptanceUseCase);
     expect(work.executeAuthorizedForgeAction).toBeInstanceOf(ExecuteAuthorizedForgeActionUseCase);
 

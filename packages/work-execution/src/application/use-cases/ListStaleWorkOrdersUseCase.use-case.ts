@@ -22,13 +22,14 @@ import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.o
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
+import { journalsForRuns } from './run-journal-reads.js';
 
 /** The reads the listing needs; narrowed so composition supplies only what it has. */
 export interface ListStaleWorkOrdersDependencies {
   readonly workOrderRepo: Pick<WorkOrderRepositoryPort, 'listWorkOrdersByProject'>;
   readonly attemptRepo: Pick<AttemptRepositoryPort, 'listAttemptsByWorkOrder'>;
   readonly runRepo: Pick<LaneRunRepositoryPort, 'list'>;
-  readonly runJournal: Pick<LaneRunJournalPort, 'listForRun'>;
+  readonly runJournal: Pick<LaneRunJournalPort, 'listForRun' | 'listForRuns'>;
 }
 
 const byCodeUnit = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
@@ -72,10 +73,15 @@ export class ListStaleWorkOrdersUseCase implements ListStaleWorkOrdersPort {
     const workOrders = await deps.workOrderRepo.listWorkOrdersByProject(projectId);
     const runs = await deps.runRepo.list();
 
-    // Read every run's journal state exactly once, keyed by run id.
+    // Read every run's journal state exactly once, keyed by run id: one
+    // grouped journal read for the whole scan (EX-3a).
+    const entriesByRun = await journalsForRuns(
+      deps.runJournal,
+      runs.map((run) => run.runId),
+    );
     const runStates = new Map<string, LaneRunStateValue>();
     for (const run of runs) {
-      runStates.set(run.runId, laneRunJournalState(await deps.runJournal.listForRun(run.runId), run.runId));
+      runStates.set(run.runId, laneRunJournalState(entriesByRun.get(run.runId) ?? [], run.runId));
     }
 
     // Group runs by work order id. A run whose work order does not exist is out

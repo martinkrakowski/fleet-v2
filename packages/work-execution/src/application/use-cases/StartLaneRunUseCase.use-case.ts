@@ -56,6 +56,7 @@ import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.o
 import type { ProjectProfileReadPort } from '../ports/out/ProjectProfileReadPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
+import { journalsForRuns } from './run-journal-reads.js';
 import type {
   LaneRunStartCapacityPort,
 } from '../ports/out/LaneRunStartCapacityPort.out-port.js';
@@ -72,7 +73,7 @@ export interface StartLaneRunDependencies {
   readonly prepareBrief: PrepareBriefPackagePort;
   readonly attemptRepo: AttemptRepositoryPort;
   readonly runRepo: Pick<LaneRunRepositoryPort, 'get' | 'create' | 'list'>;
-  readonly runJournal: Pick<LaneRunJournalPort, 'listForRun'>;
+  readonly runJournal: Pick<LaneRunJournalPort, 'listForRun' | 'listForRuns'>;
   readonly cancelPreparedAttempt: CancelPreparedAttemptPort;
   readonly computeDigest: (content: string) => string;
 }
@@ -144,14 +145,15 @@ async function activeJournalStatesOf(
   runJournal: StartLaneRunDependencies['runJournal'],
   excludeRunId: string,
 ): Promise<readonly { readonly runId: string; readonly state: LaneRunStateValue }[]> {
-  return Promise.all(
-    runs
-      .filter((run) => run.runId !== excludeRunId)
-      .map(async (run) => ({
-        runId: run.runId,
-        state: laneRunJournalState(await runJournal.listForRun(run.runId), run.runId),
-      })),
+  const considered = runs.filter((run) => run.runId !== excludeRunId);
+  const entriesByRun = await journalsForRuns(
+    runJournal,
+    considered.map((run) => run.runId),
   );
+  return considered.map((run) => ({
+    runId: run.runId,
+    state: laneRunJournalState(entriesByRun.get(run.runId) ?? [], run.runId),
+  }));
 }
 
 function isTerminalRunState(state: LaneRunStateValue): boolean {

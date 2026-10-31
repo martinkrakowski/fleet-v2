@@ -356,24 +356,38 @@ say() { [ "$quiet" = 1 ] || echo "$@"; }
 findings=0
 warnings=0
 
+# Each protected rule runs once over the whole candidate list (speed plan S2): a worktree holds tens
+# of thousands of ignored dependency files, and a few grep processes per path took minutes. grep -n
+# prints each matching candidate's line number (-a: a path with odd bytes is still matched as text,
+# never reported as "binary"); a grep error (exit 2) fails closed. The hits are then reported in the
+# candidates' own order, exactly as the per-path loop did.
+rule_lines() { # $1: an extended regex; prints the line numbers of the matching candidates
+  grep -aEin -- "$1" "$T/protected-candidates" > "$T/rule-matches"
+  rc=$?
+  [ "$rc" -le 1 ] || { echo "lane-diff-check: a protected rule could not be applied" >&2; exit 2; }
+}
+: > "$T/protected-hit-lines"
+if [ -n "$ROOT_CI" ]; then rule_lines "$ROOT_CI"; cut -d: -f1 "$T/rule-matches" >> "$T/protected-hit-lines" || { echo "lane-diff-check: the protected hits could not be merged" >&2; exit 2; }; fi
+if [ -n "$ANY_CI" ]; then rule_lines "$ANY_CI"; cut -d: -f1 "$T/rule-matches" >> "$T/protected-hit-lines" || { echo "lane-diff-check: the protected hits could not be merged" >&2; exit 2; }; fi
+if [ -n "$NM_EXEMPT_CI" ]; then
+  # The package-manifest rule is exempt under node_modules/: drop matches whose path is there.
+  rule_lines "$NM_EXEMPT_CI"
+  grep -aEiv '^[0-9]+:(.*/)?node_modules/' "$T/rule-matches" > "$T/rule-kept"
+  rc=$?
+  [ "$rc" -le 1 ] || { echo "lane-diff-check: a protected rule could not be applied" >&2; exit 2; }
+  cut -d: -f1 "$T/rule-kept" >> "$T/protected-hit-lines" || { echo "lane-diff-check: the protected hits could not be merged" >&2; exit 2; }
+fi
+sort -un "$T/protected-hit-lines" > "$T/protected-hit-nums" || { echo "lane-diff-check: the protected hits could not be merged" >&2; exit 2; }
+# FILENAME, not NR == FNR: with no hits the first file is empty and NR == FNR would stay true.
+awk 'FILENAME == ARGV[1] { hit[$1] = 1; next } (FNR in hit)' "$T/protected-hit-nums" "$T/protected-candidates" > "$T/protected-hits" || { echo "lane-diff-check: the protected hits could not be merged" >&2; exit 2; }
 while IFS= read -r f; do
-  under_nm=0
-  printf '%s\n' "$f" | grep -Eiq '(^|/)node_modules/' && under_nm=1
-  hit=0
-  if { [ -n "$ROOT_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ROOT_CI"; } ||
-     { [ -n "$ANY_CI" ] && printf '%s\n' "$f" | grep -Eiq "$ANY_CI"; } ||
-     { [ "$under_nm" = 0 ] && [ -n "$NM_EXEMPT_CI" ] && printf '%s\n' "$f" | grep -Eiq "$NM_EXEMPT_CI"; }; then
-    hit=1
+  if [ -n "$allow" ] && printf '%s\n' "$f" | grep -Eq "$allow"; then
+    say "allowed-protected: $f"
+    continue
   fi
-  if [ "$hit" = 1 ]; then
-    if [ -n "$allow" ] && printf '%s\n' "$f" | grep -Eq "$allow"; then
-      say "allowed-protected: $f"
-      continue
-    fi
-    say "protected: $f"
-    findings=$((findings + 1))
-  fi
-done < "$T/protected-candidates"
+  say "protected: $f"
+  findings=$((findings + 1))
+done < "$T/protected-hits"
 
 # Report non-lfs filter drivers found in the shared git config; their neutralisation was applied to
 # every git call above, before any diff ran them.

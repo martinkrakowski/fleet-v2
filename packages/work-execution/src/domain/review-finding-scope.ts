@@ -35,9 +35,24 @@ function normaliseFindingPath(filePath: string, worktreePath: string | null): st
   return path;
 }
 
-/** Unknown spellings (empty, absolute, or carrying a `..` segment) fail closed. */
+/**
+ * Unknown spellings fail closed. Beyond empty, absolute and `..`-segment
+ * paths (KF-33a), a normalised path that carries a `:` (a range suffix such
+ * as `src/a.ts:4-9`), a `//` or an interior `./` segment, or that ends in
+ * `,`, `.` or `;` (trailing punctuation copied out of prose) is
+ * unrecognised too: it is never git's spelling of a changed path, so it
+ * stays in scope rather than silently dropping a real finding (KF-33b).
+ */
 function isUnrecognisedPath(path: string): boolean {
-  return path === '' || path.startsWith('/') || path.split('/').includes('..');
+  return (
+    path === '' ||
+    path.startsWith('/') ||
+    path.split('/').includes('..') ||
+    path.includes(':') ||
+    path.includes('//') ||
+    path.includes('./') ||
+    /[,.;]$/.test(path)
+  );
 }
 
 /**
@@ -47,8 +62,9 @@ function isUnrecognisedPath(path: string): boolean {
  * against the prior attempt's `worktreePath` (when given) before comparing;
  * only an exact match counts — a path that is merely a prefix of a changed
  * path is out of scope. A path that stays unrecognised after normalising
- * (empty, absolute, or with a `..` segment) stays in scope: unknown spellings
- * fail closed. Case variants are not matched — they would be dropped only if
+ * (empty, absolute, with a `..` segment, carrying a `:` or `//`, an interior
+ * `./` segment, or ending in `,`, `.` or `;`) stays in scope: unknown
+ * spellings fail closed. Case variants are not matched — they would be dropped only if
  * they are clean relative paths that differ from git's spelling; the reviewer
  * prompt asks for repository paths.
  */

@@ -47,7 +47,9 @@ export type AdvanceLaneRunResult =
   | { readonly outcome: 'waiting'; readonly reason: LaneRunWaitReason }
   | { readonly outcome: 'done' }
   | { readonly outcome: 'acted'; readonly step: LaneRunKeyStep; readonly key: string;
-      readonly result: LaneRunJournalOutcome; readonly reasonCode: LaneRunResultReasonCode | null }
+      readonly result: LaneRunJournalOutcome; readonly reasonCode: LaneRunResultReasonCode | null;
+      /** KF-33b2: the journalled result detail, for the conductor pass's attention. */
+      readonly detail?: string | null }
   | { readonly outcome: 'not-built'; readonly decision: 'act' | 'reconcile' | 'cancel'; readonly step: LaneRunKeyStep }
   | { readonly outcome: 'not-wired'; readonly step: LaneRunKeyStep }
   | { readonly outcome: 'refused'; readonly reason: AdvanceLaneRunRefusal };

@@ -238,6 +238,20 @@ describe('work-order rerun (WO-2)', () => {
     expect(short.code).toBe(2);
     expect(short.err).toContain('--base-commit needs a full commit sha');
 
+    const refName = await cli(runtime, [
+      'work-order',
+      'rerun',
+      '--from',
+      'wo-rerun-src2',
+      '--work-order-id',
+      'wo-rerun-b2',
+      '--base-commit',
+      'main',
+      '--yes',
+    ]);
+    expect(refName.code).toBe(2);
+    expect(refName.err).toContain('--base-commit needs a full commit sha');
+
     const full = await cli(runtime, [
       'work-order',
       'rerun',

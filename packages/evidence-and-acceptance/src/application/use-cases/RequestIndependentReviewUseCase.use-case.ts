@@ -65,6 +65,23 @@ function rejectedFor(
     : { outcome: 'rejected', reason };
 }
 
+/**
+ * KF-33b2: the deterministic receipt id of a manual review (no requestId).
+ * When an existing receipt already carries it — a second manual review on the
+ * same head — the id is suffixed with the receipt count, before the finding
+ * ids are scoped to it, so two receipts never share one id.
+ */
+function manualReceiptIdOf(
+  assessmentId: string,
+  candidateHeadSha: string,
+  existing: { readonly reviewReceipts: readonly { readonly id: string }[] },
+): string {
+  const base = 'rr-' + assessmentId + '-' + candidateHeadSha.slice(0, 8);
+  return existing.reviewReceipts.some((receipt) => receipt.id === base)
+    ? base + '-' + existing.reviewReceipts.length
+    : base;
+}
+
 export class RequestIndependentReviewUseCase implements RequestIndependentReviewPort {
   constructor(private readonly deps?: RequestIndependentReviewDependencies) {}
 
@@ -283,7 +300,7 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
     const receiptId =
       request.requestId !== undefined
         ? 'rr-' + request.assessmentId + '-' + request.candidateHeadSha.slice(0, 8) + '-' + request.requestId
-        : 'rr-' + request.assessmentId + '-' + request.candidateHeadSha.slice(0, 8);
+        : manualReceiptIdOf(request.assessmentId, request.candidateHeadSha, existing);
     const candidate: ReviewReceiptRecord = {
       id: receiptId,
       assessmentId: request.assessmentId,
@@ -336,7 +353,18 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       ...existing,
       requestedReviewerModel: request.reviewerModel.trim(),
     });
-    assessment.appendReviewReceipt(receipt, nowIso);
+    // KF-33b2: a duplicate receipt id is refused (never appended); the
+    // message text is a fixed template over stored ids, never reviewer text.
+    try {
+      assessment.appendReviewReceipt(receipt, nowIso);
+    } catch (error) {
+      return rejectedFor(
+        request,
+        'invalid-receipt',
+        error instanceof Error ? error.message : 'The review receipt could not be appended',
+        'invalid-receipt',
+      );
+    }
     const merged = assessment.toRecord();
     const blockers = EvidenceAssessment.fromRecord(merged).collectBlockers();
     const updated: EvidenceAssessmentRecord = {

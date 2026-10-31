@@ -384,6 +384,46 @@ describe('RunConductorPassUseCase grace', () => {
   });
 });
 
+describe('RunConductorPassUseCase out-of-scope attention (KF-33b2)', () => {
+  it('an acted step whose detail is out-of-scope-findings reports the attention item, naming the run', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    const passedOutOfScope: AdvanceLaneRunResult = {
+      outcome: 'acted',
+      step: 'code-review',
+      key: 'k-example-1',
+      result: 'completed',
+      reasonCode: 'review-passed',
+      detail: 'out-of-scope-findings',
+    };
+    const advance = new ScriptedAdvance(new Map([[RUN_ID, [passedOutOfScope, { outcome: 'waiting', reason: 'admission' }]]]));
+    const first = await runPass(fx, HOLDER, NOW, advance);
+    expect(first).toMatchObject({ outcome: 'completed' });
+    if (first.outcome !== 'completed') {
+      throw new Error('expected completed');
+    }
+    expect(first.attention).toEqual([{ runId: RUN_ID, kind: 'out-of-scope-findings' }]);
+
+    // An acted step without the detail raises nothing.
+    const fx2 = stores();
+    await createRun(fx2.repo);
+    const plainActed: AdvanceLaneRunResult = {
+      outcome: 'acted',
+      step: 'code-review',
+      key: 'k-example-2',
+      result: 'completed',
+      reasonCode: 'review-failed',
+    };
+    const advance2 = new ScriptedAdvance(new Map([[RUN_ID, [plainActed, { outcome: 'waiting', reason: 'admission' }]]]));
+    const second = await runPass(fx2, HOLDER, NOW, advance2);
+    expect(second).toMatchObject({ outcome: 'completed' });
+    if (second.outcome !== 'completed') {
+      throw new Error('expected completed');
+    }
+    expect(second.attention).toEqual([]);
+  });
+});
+
 describe('RunConductorPassUseCase releaseLeases', () => {
   it('releases the driver lease and the run leases the holder holds; another holder then acquires both', async () => {
     const fx = stores();

@@ -87,6 +87,22 @@ describe('partitionFindingsByScope (KF-33a)', () => {
     expect(partition.outOfScope).toEqual([]);
   });
 
+  // KF-33b: a line-range suffix or trailing punctuation is never git's
+  // spelling of a changed path; each unknown spelling stays in scope.
+  it.each([
+    ['a range suffix', 'src/a.ts:4-9'],
+    ['a doubled slash', 'src//a.ts'],
+    ['an interior ./ segment', 'src/./a.ts'],
+    ['a trailing comma', 'src/a.ts,'],
+    ['a trailing period', 'src/a.ts.'],
+    ['a trailing semicolon', 'src/a.ts;'],
+  ])('a path with %s stays in scope (unknown spellings fail closed)', (_label, filePath) => {
+    const findings = [finding('f1', filePath)];
+    const partition = partitionFindingsByScope(findings, ['src/a.ts']);
+    expect(partition.inScope).toEqual(findings);
+    expect(partition.outOfScope).toEqual([]);
+  });
+
   it('an empty-after-normalising path stays in scope (unknown spellings fail closed)', () => {
     const findings = [finding('f1', '``')];
     const partition = partitionFindingsByScope(findings, ['src/a.ts'], '/tmp/wo/wt');

@@ -343,6 +343,11 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
       if (step.outcome === 'waiting' && step.reason === 'stop-grace-exceeded') {
         attention.push({ runId: record.runId, kind: 'stop-grace-exceeded' });
       }
+      // KF-33b2: a review that passed only through out-of-scope dispositions
+      // is reported for the owner; the journalled detail is a fixed token.
+      if (step.outcome === 'acted' && step.detail === 'out-of-scope-findings') {
+        attention.push({ runId: record.runId, kind: 'out-of-scope-findings' });
+      }
       if (step.outcome === 'waiting' && step.reason === 'session-stagger') {
         // The start gate denied this run's session start: sleep until the run's
         // reserved turn plus one millisecond, so a timer that fires a millisecond

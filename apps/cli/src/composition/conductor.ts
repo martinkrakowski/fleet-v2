@@ -94,6 +94,10 @@ export function composeConductor(input: ComposeConductorInput) {
         evidence.requestIndependentReview.requestIndependentReview(request),
       inspectAcceptanceEvidence: (request) =>
         evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence(request),
+      // KF-33b2: the review step's out-of-scope dispositions through the
+      // evidence context's existing disposition use case, one id per call.
+      recordFindingDisposition: (request) =>
+        evidence.recordFindingDisposition.recordFindingDisposition(request),
     }),
     reviewAssessment: new ReviewAssessmentAdapter({
       openEvidenceAssessment: (request) =>

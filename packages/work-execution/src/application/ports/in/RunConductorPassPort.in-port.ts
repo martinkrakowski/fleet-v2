@@ -28,7 +28,8 @@ export type ConductorRunReport =
 
 export interface ConductorAttentionItem {
   readonly runId: string;
-  readonly kind: 'stop-grace-exceeded';
+  /** KF-33b2: `out-of-scope-findings` reports a review that passed only through out-of-scope dispositions. */
+  readonly kind: 'stop-grace-exceeded' | 'out-of-scope-findings';
 }
 
 export type RunConductorPassResult =

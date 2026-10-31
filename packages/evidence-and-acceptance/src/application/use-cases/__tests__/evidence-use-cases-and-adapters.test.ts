@@ -546,7 +546,7 @@ describe('RequestIndependentReviewUseCase', () => {
     });
     const stored = repo.records.get('ea-1');
     expect(stored?.reviewReceipts).toHaveLength(1);
-    expect(stored?.blockers).toEqual(["finding 'f-1' is unresolved"]);
+    expect(stored?.blockers).toEqual(["finding 'rr-ea-1-11111111:f-1' is unresolved"]);
     expect(stored?.state).toBe('blocked');
   });
 
@@ -925,39 +925,41 @@ describe('RecordFindingDispositionUseCase', () => {
     expect(result.assessment.state).toBe('blocked');
   });
 
-  it('refuses an out-of-scope disposition for a finding id raised by more than one receipt', async () => {
-    const repo = fakeRepository([
-      assessmentRecord({
-        requiredChecks: [],
-        reviewReceipts: [
-          reviewReceipt({ id: 'rr-1', result: 'fail', findings: [finding('f-1')] }),
-          reviewReceipt({ id: 'rr-2', result: 'fail', findings: [finding('f-1')] }),
-        ],
-      }),
-    ]);
-    const useCase = new RecordFindingDispositionUseCase({ repo });
+  it('refuses a disposition of any state for a finding id raised by more than one receipt', async () => {
+    for (const state of ['fixed', 'refuted', 'out-of-scope'] as const) {
+      const repo = fakeRepository([
+        assessmentRecord({
+          requiredChecks: [],
+          reviewReceipts: [
+            reviewReceipt({ id: 'rr-1', result: 'fail', findings: [finding('f-1')] }),
+            reviewReceipt({ id: 'rr-2', result: 'fail', findings: [finding('f-1')] }),
+          ],
+        }),
+      ]);
+      const useCase = new RecordFindingDispositionUseCase({ repo });
 
-    const result = await useCase.recordFindingDisposition({
-      assessmentId: 'ea-1',
-      disposition: disposition({ state: 'out-of-scope' }),
-    });
+      const result = await useCase.recordFindingDisposition({
+        assessmentId: 'ea-1',
+        disposition: disposition({ state }),
+      });
 
-    expect(result.outcome).toBe('rejected');
-    if (result.outcome !== 'rejected') {
-      throw new Error('expected a rejection');
-    }
-    expect(result.reason).toBe(
-      'An out-of-scope disposition needs a finding id raised by exactly one receipt',
-    );
-    // Nothing was saved: the finding stays unresolved exactly as before.
-    expect(repo.saved).toBe(0);
-    const stored = repo.records.get('ea-1');
-    if (!stored) {
-      throw new Error('expected the seeded assessment to remain');
-    }
-    for (const receipt of stored.reviewReceipts) {
-      for (const findingRecord of receipt.findings) {
-        expect(findingRecord.state).toBe('unresolved');
+      expect(result.outcome).toBe('rejected');
+      if (result.outcome !== 'rejected') {
+        throw new Error('expected a rejection');
+      }
+      expect(result.reason).toBe(
+        'A finding disposition needs a finding id raised by exactly one receipt',
+      );
+      // Nothing was saved: the finding stays unresolved exactly as before.
+      expect(repo.saved).toBe(0);
+      const stored = repo.records.get('ea-1');
+      if (!stored) {
+        throw new Error('expected the seeded assessment to remain');
+      }
+      for (const receipt of stored.reviewReceipts) {
+        for (const findingRecord of receipt.findings) {
+          expect(findingRecord.state).toBe('unresolved');
+        }
       }
     }
   });
@@ -997,7 +999,7 @@ describe('RecordFindingDispositionUseCase', () => {
     expect(repo.saved).toBe(0);
   });
 
-  it('lets a colliding receipt raise a finding id an earlier disposition resolved', async () => {
+  it('scopes a recorded receipt so an earlier disposition for the same transport id does not resolve its finding', async () => {
     const repo = fakeRepository([withFindings()]);
     const dispositionUseCase = new RecordFindingDispositionUseCase({ repo });
     const reviewUseCase = new RecordReviewReceiptUseCase({ repo });
@@ -1013,7 +1015,9 @@ describe('RecordFindingDispositionUseCase', () => {
     }
     expect(dispositionResult.assessment.blockers).toEqual(["finding 'f-2' is unresolved"]);
 
-    // A later receipt on the same head raises the same per-receipt id again.
+    // A later receipt on the same head raises the same transport-numbered id;
+    // recording scopes it to that receipt, so the earlier disposition for the
+    // seeded id cannot resolve the new, in-scope finding.
     const receiptResult = await reviewUseCase.recordReviewReceipt({
       assessmentId: 'ea-1',
       receipt: reviewReceipt({ id: 'rr-2', result: 'fail', findings: [finding('f-1')] }),
@@ -1024,8 +1028,8 @@ describe('RecordFindingDispositionUseCase', () => {
       throw new Error('expected a recorded receipt');
     }
     expect(receiptResult.assessment.blockers).toEqual([
-      "finding 'f-1' is unresolved",
       "finding 'f-2' is unresolved",
+      "finding 'rr-2:f-1' is unresolved",
     ]);
     expect(receiptResult.assessment.state).toBe('blocked');
   });

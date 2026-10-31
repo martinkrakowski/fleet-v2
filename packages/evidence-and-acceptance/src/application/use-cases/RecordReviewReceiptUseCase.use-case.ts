@@ -8,7 +8,7 @@
  * free, unknown or ambiguous reviewer is refused.
  */
 
-import type { EvidenceAssessmentRecord } from '../../domain/evidence-records.js';
+import type { EvidenceAssessmentRecord, ReviewFindingRecord } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import { ReviewReceipt, isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
@@ -30,6 +30,28 @@ const NOT_IMPLEMENTED = 'Not implemented: RecordReviewReceiptUseCase';
 
 function isNonEmptyTrimmedString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * Rewrite each finding's id to `<receiptId>:<findingId>` unless it already
+ * starts with `<receiptId>:`. Transport-numbered ids such as `review-1` are
+ * unique only inside one receipt, and several receipts land on one head
+ * (brief-check, code-review, pre-merge, re-reviews); scoping at record time
+ * makes stored ids unique across receipts so a disposition can name exactly
+ * one finding. The "exactly one receipt holds the id" evaluation rule in
+ * EvidenceAssessment stays as defence in depth for records written before
+ * this scoping.
+ */
+export function scopeFindingIdsToReceipt(
+  receiptId: string,
+  findings: readonly ReviewFindingRecord[],
+): ReviewFindingRecord[] {
+  const prefix = `${receiptId}:`;
+  return findings.map((finding) =>
+    finding.findingId.startsWith(prefix)
+      ? { ...finding }
+      : { ...finding, findingId: prefix + finding.findingId },
+  );
 }
 
 export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
@@ -161,12 +183,15 @@ export class RecordReviewReceiptUseCase implements RecordReviewReceiptPort {
     const normalizedReceipt = Array.isArray(receipt.findings)
       ? {
           ...receipt,
-          findings: receipt.findings.map((finding) => ({
-            ...finding,
-            state: 'unresolved' as const,
-            dispositionReason: null,
-            dispositionEvidenceRef: null,
-          })),
+          findings: scopeFindingIdsToReceipt(
+            receipt.id,
+            receipt.findings.map((finding) => ({
+              ...finding,
+              state: 'unresolved' as const,
+              dispositionReason: null,
+              dispositionEvidenceRef: null,
+            })),
+          ),
         }
       : receipt;
 

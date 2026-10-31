@@ -173,6 +173,7 @@ export class ReviewReceipt {
     }
     // Finding ids are numbered per receipt: one receipt may not raise two
     // findings under the same id, or dispositions could not name one finding.
+    // The real transport never produces in-receipt duplicates (positional ids).
     const findingIds = new Set<string>();
     for (const finding of props.findings) {
       if (findingIds.has(finding.findingId)) {

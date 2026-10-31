@@ -8,11 +8,11 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AttemptRecord } from '@fleet/work-execution';
 import {
@@ -429,6 +429,26 @@ function passLines(stdout: readonly string[]): PassLine[] {
 }
 
 describe('conductor run --dry-run (K7-8)', () => {
+  // Each test gets a private TMPDIR, so the scratch directories it counts are
+  // its own: other test files creating dry-run or state directories in the
+  // shared temp directory at the same time made the before/after listings
+  // differ under full-suite load (seen on macOS). tmpdir() reads TMPDIR on
+  // every call, and each test file runs in its own process.
+  const savedTmpdir = process.env.TMPDIR;
+  let privateTmp = '';
+  beforeEach(() => {
+    privateTmp = mkdtempSync(join(tmpdir(), 'fleet-v2-dry-run-scope-'));
+    process.env.TMPDIR = privateTmp;
+  });
+  afterEach(() => {
+    if (savedTmpdir === undefined) {
+      delete process.env.TMPDIR;
+    } else {
+      process.env.TMPDIR = savedTmpdir;
+    }
+    rmSync(privateTmp, { recursive: true, force: true });
+  });
+
   it('drives a seeded run end to end over a scratch copy, printing would and entered lines, and reaches no host', async () => {
     const dir = tempStateDir();
     const runSubprocess = vi.fn(throwingRunSubprocess);

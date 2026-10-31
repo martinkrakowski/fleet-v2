@@ -225,7 +225,8 @@ export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: s
             continue;
           }
           const otherOrder = facts.workOrders.get(other.workOrderId);
-          if (otherOrder !== undefined && laneRunPackagesOverlap(thisOrder, otherOrder)) {
+          // Fail closed like admission: an active run whose work order is unreadable blocks.
+          if (otherOrder === undefined || laneRunPackagesOverlap(thisOrder, otherOrder)) {
             overlap = true;
             break;
           }

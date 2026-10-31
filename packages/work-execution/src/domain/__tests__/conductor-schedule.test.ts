@@ -208,6 +208,17 @@ describe('deriveConductorSchedule', () => {
     expect(row.admissionWait).toBe('package-overlap');
   });
 
+  it('treats an active run with an unreadable work order as blocking, like admission', () => {
+    const active = runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-missing' });
+    const waiting = runRecord({ runId: RUN_B, attemptIds: ['a2'], workOrderId: 'wo-2' });
+    const workOrders = new Map([['wo-2', { repository: 'acme/repo', ownedPaths: ['packages/b'] }]]);
+    const schedule = deriveConductorSchedule(
+      facts({ runs: [active, waiting], reservations: [reservation({ attemptId: 'a1' })], workOrders }),
+      NOW,
+    );
+    expect(schedule.rows.find((row) => row.runId === RUN_B)?.admissionWait).toBe('package-overlap');
+  });
+
   it('omits caps when no trace is recorded', () => {
     const run = runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-1' });
     const workOrders = new Map([['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a'] }]]);
@@ -254,7 +265,19 @@ describe('deriveConductorSchedule', () => {
   });
 
   it('fails closed on an unknown trace schema version', () => {
-    const latestTrace = readConductorPassTrace({ schemaVersion: 2 });
+    const latestTrace = readConductorPassTrace({
+      schemaVersion: 2,
+      passId: 'pass-1',
+      nowIso: '2026-10-27T09:59:00.000Z',
+      holderId: 'driver-x',
+      halted: false,
+      progressed: true,
+      maxActiveRuns: 1,
+      passConcurrency: 1,
+      dispatchStaggerMs: 1000,
+      runs: [],
+      attention: [],
+    });
     const schedule = deriveConductorSchedule(facts({ runs: [], latestTrace }), NOW);
     expect(schedule.trace).toBe('unreadable');
     expect(schedule.caps).toBeNull();

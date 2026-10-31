@@ -547,3 +547,142 @@ A re-check confirmed 13 of the 14 findings closed. It then corrected the remaini
 - Wave 7 includes the ops lanes (about 29 h).
 
 It also stated the join rule for A-F, KW6 and MX7, and placed the workflow step of O12' in a PR.
+
+## 7. Revision 2 (2026-10-31): parallel tracks
+
+The owner decided today to shorten the §2 estimate without dropping a unit, a decision (D-R1–D-R17 stand) or a quality gate. Three things change: work runs on three orchestrator tracks instead of one; the Wave 6–7 views start now against fixtures and contracts; display-only units move to Tier 1 with one Fable pass per completed sequence (the K-chain precedent: per-lane Grok/Luna, one Fable at the end). The waves of §2 stay as the dependency order; they stop being the schedule.
+
+**State at this revision.** Wave 0: EX-1b, SEC-5b-1, EX-1c, EX-2a, SEC-3b and SEC-3 merged; EX-2b (#539) in the train; SEC-5b-2 in review; SEC-5c-2 follows SEC-5b-2 and EX-4 follows EX-2b. The host has spare capacity (8 conducted lanes used 15–26% of 112 threads). Admission is still one conducted lane per package until KS5.
+
+### 7.1 Track split
+
+One merge train, run by Track A's session; the other sessions enqueue and never merge. Each track runs its own S1 brief reviews, gates, reviewer passes and Fable passes.
+
+| Track | Owns (packages and files) | Does not touch |
+|---|---|---|
+| **A** (this session; train) | `@fleet/work-execution`; `apps/cli` except `src/tui/**` (conductor, driver, every command on `index.ts`/`composition.ts`); `scripts/`, `.github/`, `tests/`; `@fleet/shared` (Q7b, with `lane-diff-check.sh`); root `package.json`, `yarn.lock`; `.architecture/manifest.yaml` and the `@generated` barrels; the plan files' Done columns | api wiring, web, mcp |
+| **B** | `apps/web`; `@fleet/ui`; `apps/cli/src/tui/**` (the P9 shell and its screens) | `index.ts`/`composition.ts` beyond P9's one `tui` registration; `security.ts`; api routes |
+| **C** | `apps/api` (routes, `server/wiring/**`, `middleware/security.ts`, `change-feed.ts`, `runtime.ts`); `apps/mcp`; `@fleet/operator-coordination`; `@fleet/installation`; `@fleet/onboarding`; `@fleet/brief-knowledge` | work-execution use-case files except the new files of a cross-package lane it owns (below); cli; web |
+
+**Shared files: one owner each, and the hand-off rule.**
+
+| File(s) | Owner | Hand-off |
+|---|---|---|
+| `.architecture/manifest.yaml`, `@generated` barrels | A | A requesting track sends the entry text (ports, use cases, adapters, `delegates_to`). A lands it as one T0 commit with `yarn sync` through the train and replies with the PR number. The lane is dispatched only after that PR has merged; its brief forbids `.architecture/` and the barrels. A batches requests to at most one manifest commit per train interval |
+| root `package.json`, `yarn.lock` (Ink for P9, `fast-check` for Q4) | A | Same T0 route, same signal |
+| `apps/cli/src/{index,composition,conductor,conductor-wiring}.ts`, `src/composition/*` | A | B's P9 adds the `tui` subcommand to `index.ts` once, in the lines its brief names; no other TUI lane edits these files. Every other lane on them runs on A |
+| `apps/cli/src/tui/**` | B | Hand-run until KS5 (so B never takes the cli conducted slot); after KS5 the file set is disjoint and B may conduct |
+| `apps/api/server/**`, `middleware/security.ts` | C | A cross-package unit is owned by the track that owns its contended file. Units with a work-execution half and an api half (A-R, A-C, A-WO, A-F, SR7, KW6-api, MX7, MX8, U7) run on C; their work-execution files are new files plus the barrel A has pre-committed, so no A lane shares a file with them (checked by the touch lists). Units that span two contended owners split: E2 → E2 (use case + CLI, A) and E2-api (route, C, T1); KW6 → KW6-api (C) then KW6-web (B); P8 → P8-api (C) then P8-web (B); TD9 → TD9-api (C, `security.ts` tail) then TD9-web (B) |
+| `apps/web/src/lib/api-client.ts`, `lib/api/*`, `shell/{view-nav,topbar}.tsx`, `app/layout.tsx` | B | One B lane at a time on each; page directories run side by side. During T6 (web session, same-origin proxy, `instrumentation.ts`) C holds `api-client.ts`'s token read and `instrumentation.ts`; B stays off them until T6 merges |
+| `packages/ui/src/index.ts` | B | — |
+| `apps/mcp/src/registry.ts` | C | — |
+| `@fleet/installation` policy schema | C | C lands KWp and WB6p first (start-now) so A's K11b' and WB6 read real keys |
+| `scripts/`, `gate.yml`, `tests/` harness | A | Q9's path list and O12' ride in A's T0 PRs as before |
+
+**Ordered unit lists** (→ serial; ‖ side by side when touch lists don't overlap; the wave in brackets is the §2 origin).
+
+- **Track A.** EX-2b → SEC-5b-2 → SEC-5c-2 → EX-4 [W0]. Now, beside them: S5a/S5b, S3, OS-1, S7 (+Q10 columns), KS0 + S4's `gate.yml` half (T0); S4, S6, KS8 conducted; T0 devDeps `fast-check` and Ink [W1]. Then KS1 → KS7 → OS-1 posts → owner flips A-S1 [W1]. Then **Q5a → Q5b alone in work-execution** (moved up from W4: D-R8 needs them before KS2's receipt keys, K10's findings, SR3's tickets and WB5a's merge records). Then three hand-run streams, 3 in flight, touch lists disjoint: (i) KM (T0) → KS2 ‖ KS4a → KS3 ‖ KS4b → KS5 → KS6 → AD-1 → AD-2 → EX-3b → EX-3c [W2] → K10+KW1 → K11a ‖ KW2 → KW3' → KW4a → KW4b' → K11b' → C2' [W3]; (ii) TDM (T0) → TD1a → TD1b → TD2 → WB2b → WB2c → WB4a → WB4b → WB4c (after C's WB3b) → WB5a → WB5b → WB5c → WB6 → WB6w → WB11 → WB12a → TD6 [W6]; (iii) Q7b; SR3 → SR4a → SR5 → SR6+SR8 → SR4b (SR7 hands to C); OT5; F2; E2 [W4]. cli commands on `index.ts`, one at a time: TD3a → TD3b → WB7a → WB7b-r → WB7b-s → WB7c (after K11b') → WB7d → WB10 → WB12b → O5 → O9 (after C's A-C) → U2 (after C's U1) [W5–W6]. Conducted when idle: Q3 ×5 (after Q5b, under KS5), Q4a/b, Q2b, Q6a, Q8a, Q9, O11, H13, O12', K9 (after C's T3a), P1, H5/H7/H10 [W4, W7]. Last: P4, P5 ×4, P6 (D-R15).
+- **Track B.** Now: P9 (after A's Ink commit) → SV; `@fleet/ui` text input (for U4) and `WaitsForTable` (for WB9c/d); O7 (wired, `/v1/orchestrators` exists); E3c (T2; E3b merged); fixture-first TD5a → TD5b, WB9a → WB9b → WB9c, W7a, W6, WK; P11 (T2, after P9; P3 use cases exist). As inputs merge: TD5a-w, WB9a-w, WB9d, W7a-w, W6-w, WK-w, W7c, W9, KW6-web, WB12c, U8-read, WB14a → WB14b, TD8, E5-web → E5-tui, L5 → L6 (after C's L4... L4 is B's own, after C's L3). After C's T6: W5a → W5b → O8 → Q5 → W8b; WB13b (after WB13a, O8, O9, WB9b); TD7; TD9-web; U4 → U8-edit → H6; P8-web; T8b (after C's T2c).
+- **Track C.** Now: **T3a first and alone in `apps/api`** (it touches every route), then T3b → T6 → L9 (after L3) → WB13a (after WB8) → TD9-api → T2c [W5]. Beside it in other packages: B1; WB3b → O2b → O2c (manifest via A) → E4 → O10; WB6p, KWp, P2, P3; MX8's tool half. api queue after T3b, one lane at a time on the wiring files, Tier 1 read routes batched 2–3 per lane (D-R1): MX8-route → [TD4 + WB8 + WB8w] → [A-R + A-WO + A-K] → A-C → SR7 (after A's SR4b) → A-F (after A's K11a) → KW6-api → MX7 → U7 → U1 → L3 (after A's L1/L2) → P8-api → E2-api. mcp: MX5a (after A-R/A-C) → MX5b (after WB8w/A-F) → MX4 (after SR7) → MX6a → MX6b → MX6c → O4 → MX7. installation/onboarding: L1b (after A's L0), O14e2, U7's summary builder. Docs T0 as their units merge: O6, T5, U6, O13, H7, Q6.
+
+### 7.2 Start-now list (no unmerged prerequisite)
+
+| Track | Dispatch today | Fixture-first (wire later: the wiring unit) |
+|---|---|---|
+| A | S5a/S5b, S3, OS-1, S7 scripts; KS0 + S4 `gate.yml` (T0); S4, S6, KS8 (conducted, distinct packages); T0 devDeps (Ink, `fast-check`); Q2b, Q6a, Q8a, Q9 path list, O11, H13 (conducted, idle packages); TDM manifest text. KS1 waits for EX-4 | — |
+| B | P9 → SV; `@fleet/ui` text input, `WaitsForTable`; O7; E3c; P11 after P9 | TD5a/TD5b (`/todo`; wire: TD5a-w after TD4); WB9a/WB9b/WB9c (`/board`; wire: WB9a-w after WB8); W7a (run board; wire: W7a-w after A-R); W6 (work-order list, brief viewer; wire: W6-w after A-WO); WK (knowledge view; wire: WK-w after A-K). Each fixture copies the wire shape from the unit's plan section; the page shows the not-configured state until wired (TD5a's rule, applied to every new page) |
+| C | T3a; B1; WB3b; O2b (manifest via A); E4; WB6p; KWp; P2, P3; MX8 tool half (route after T3a) | MX5a/MX5b tool bodies against the route contracts in their plan; wire when A-R/A-C and WB8w/A-F merge (same units) |
+
+Not start-now although they look free: W7c (its fixture needs K10's finding kinds; start after K10 merges), W9 (needs SR3's ticket shape), U8-read (needs U7's S1-approved brief to freeze the summary shape; wire after U7), E5 (needs E3c's signal semantics; after E3c), WB14a/TD8 (in-process reads of WB6/TD2).
+
+### 7.3 Re-tier table
+
+Rule: display-only (no write, no auth or token handling, no state change, no new route that mutates) → Tier 1: lane, gate, one Grok/Luna review; one Fable pass when the sequence completes. The brief's touch list is the proof: no store write path, no `security.ts`, no token read, no POST/PATCH route. `lane-diff-check --strict-brief` fails a Tier 1 lane that strays into one.
+
+| Unit(s) | New tier | Reason | Sequence → its one Fable pass |
+|---|---|---|---|
+| TD1a, TD1b, TD2, TD6 | T1 | Pure derivations and a read use case; TDM's invariant "the To-do list writes nothing" is their test | **F-TODO**, after TD5b (covers TD1a–TD5b; TD6 later under F-BOARD-2) |
+| TD3a, TD3b | T1 | `fleet-v2 todo` composes no write ("no write composed" is already its acceptance) | F-TODO |
+| TD4 | T1 | New GET under the existing `/v1` guard, no new scope | F-TODO |
+| TD5a (+TD5a-w) | T1 | Page and sidebar badge | F-TODO |
+| WB2b, WB2c, WB6, WB6w, WB12a | T1 | Guard derivation, waits derivation, board and lane read use cases, history read model; no store writes | **F-BOARD-1**, after WB9b (derivations, routes, first web board); **F-BOARD-2**, after WB12c (waits, history, lane page, TD6) |
+| WB7b split: WB7b-r (`board`, `board lane`) T1; WB7b-s (`forge sync`) stays T2 | T1 / T2 | The read half composes no forge adapter (its own test); `forge sync` writes observations | F-BOARD-1 / per-lane Fable |
+| WB7d, WB12b | T1 | Printing the waits view and the history | F-BOARD-2 |
+| WB8, WB8w | T1 | GET routes over read use cases; feed kinds are additive | F-BOARD-1 |
+| WB9a, WB9c, WB9d, WB12c (+WB9a-w) | T1 | Board page, card affordance, lane page, history drawer | F-BOARD-1 / F-BOARD-2 |
+| A-R, A-K, A-F | T1 | GET routes (A-F is already "read-only" by amendment K-GC); A-WO already T1 | **F-READS**, after the last of W7a-w, W6-w, WK-w, W9, W7c, KW6-web, O7, U8-read |
+| W7a, W6, WK, W9, W7c, O7 (+their -w units) | T1 | Run board read, work-order list and brief viewer (plain-text rule), knowledge, seats, reaper findings, presence chip | F-READS |
+| KW6-api, KW6-web | T1 | Summary fields on an existing read route; badges | F-READS |
+| U8-read (menu entry, read-only `/settings`) | T1 | Renders only U7's summary, adds no field; the Edit `AlertBox` is U8-edit (T2, after U4) | F-READS |
+| L5 `/console`, L6 lane pane | T1 | Render only what L4 delivers, no client-side token; redaction is L3's gate | **F-LIVE**, after L6 |
+| E5-web, E5-tui | T1 | Last-known snapshot, dimming, back-off; actions disabled, not rewired | F-LIVE |
+| WB14a, WB14b, TD8 | T1 | TUI screens over in-process read use cases; copy and navigation only | **F-TUI**, after TD8 (covers P9, SV, WB14a/b, TD8, E5-tui) |
+
+36 units move (16 web, 5 api read routes, 9 work-execution read models, 3 cli reads, 3 TUI screens), plus one split (WB7b) and five small T1 wiring units. Tier 2 goes from 133 to about 97 lanes; Tier 1 from 40 to about 81.
+
+**Must stay Tier 2 although they look read-only:**
+- **U7 `GET /v1/settings`:** read-only, but its summary builder decides which installation fields leave the process (credential paths, forge settings). Exposure is the decision.
+- **E3c, L4:** SSE relays that hold the web server's token server-side. Token handling.
+- **MX7 brief preview:** a POST that stores nothing, but the marker-string test is a content-safety gate on brief text.
+- **O5 `orchestrator attach`:** registers the orchestrator (a write) beside its reads.
+- **WB11:** reads lane runs but writes K6's owner-merge item through `OwnerItemsWritePort`.
+- **L1b `policy.liveTail`:** a policy key, but `full` exposes whole session output; config that widens exposure.
+- **WB10's `--api` half:** reads `/v1/changes` behind T3a's `read` scope with a token; the local-watcher half stays T1 and lands first.
+- **P11, T8b:** TUI screens that write (project flows; messages, answers, verdicts).
+
+### 7.4 Cross-track dependencies and join points
+
+The hand-off signal is always the same: the named PR has merged to main (the merger posts the number in the shared log). A track never rebases onto another track's unmerged branch.
+
+| Waits (track) | On (track) | Note |
+|---|---|---|
+| Every manifest-bearing lane: TDM, KM, L0, O2b, O2c, A-R, A-C, O9, A-WO, A-F, WB6 amendment | A's T0 manifest commit | Entry text sent first; dispatch after the commit merges |
+| P9 (B) | A's Ink devDep commit | |
+| TD4 (C) | TD2 (A) | TD5a-w (B) then waits on TD4 |
+| WB8, WB8w (C) | WB6, WB6w (A) | WB9a-w, WB9d (B) then wait on WB8, WB8w |
+| WB4c (A) | WB3b (C) | WB7a (A) also waits on WB3b |
+| K11b' (A) | KWp (C) | |
+| SR7 (C) | SR4b (A) | MX4 (C) and W9 wiring (B) follow SR7 |
+| A-F (C) | K11a (A) | W7c-w, MX5b (B, C) follow; W7c's fixture after K10 |
+| W7a-w, MX5a (B, C) | A-R, A-C (C) | |
+| O9 (A) | A-C (C), O5 (A) | |
+| K9, WB10 `--api` (A) | T3a (C) | |
+| U2 (A) | U1 (C) | |
+| Every B write: W5a chain, TD7, U4, WB13b, P8-web, TD9-web | T6 (C); WB13b also WB13a (C), O9 (A) | |
+| L4 (B) | L3 (C) ← L1, L2 (A) ← L1b (C) ← L0 (A) | The one chain that crosses tracks four times; L0 goes first on A's slot (iii) once Q5b has merged |
+| T8b (B) | T2c (C) | |
+| U8-read fixture (B) | U7's approved brief (C); U8 wiring on U7 merged | |
+| Q3 ×5 (A) | Q5b, KS5 (A) | Same track; listed because it holds the conducted work-execution slot |
+
+### 7.5 Revised estimate
+
+Assumptions: up to 3 Tier 2 lanes in flight per track (A: 3, B: 2, C: 3); a hand-run Tier 1 lane with one Grok/Luna review ≈ 35 min; a conducted Tier 1 lane ≈ 9 min; a Tier 2 lane ≈ 75 min after S1–S3; train 10 min per PR until S5 (first day), 5.5 min after; after KS7 + A-S1, conducted Tier 1 PRs auto-merge outside the train loop; about 190 PRs in all (184 + the split and wiring units).
+
+| Track | Binding path | Wall |
+|---|---|---|
+| A | W0 tail (3 h) → KS1 → KS7 (2.5 h) → Q5a → Q5b (2.5 h) → admission chain 8 stages (10 h) → reaper chain 5 deep (6.5 h) ≈ 24.5 h; the board/to-do stream (7 T2 + 9 T1 ≈ 13 h) and the SR/Q7b/OT5 stream (≈ 9 h) run in the other two slots | ≈ 3.5–4 working days |
+| C | T3a → T3b → T6 → L9 → WB13a → TD9-api → T2c (≈ 9 h, starts today) beside the api queue (≈ 12 lanes after batching ≈ 10 h, gated by A's SR4b and K11a) and operator-coordination (5 T2 ≈ 6 h) | ≈ 2–2.5 days, finishing with L3/P8-api/E2-api in day 3–4 |
+| B | Reads (≈ 30 T1 ≈ 9 h at 2 in flight) during days 1–3, gated by C's routes; write tail after T6 (day 2): W5a → W5b → O8 → Q5 → W8b (6 deep ≈ 7.5 h) ‖ U4 → U8-edit → H6, TD7, WB13b, P8-web | ≈ 3 days, ending day 4 |
+| Train | ≈ 20 PRs × 10 min + 170 × 5.5 min ≈ 19 h over 4–5 days ≈ 4–5 h/day; bursts queue but nothing waits more than an hour | not binding |
+
+Sum: **about 5 working days, one calendar week plus a day of buffer, instead of 12–13 working days.** The sum-of-waves wall (§2) becomes a max-of-tracks wall of about 4 days, plus the Fable floor below.
+
+**The new bottleneck is Fable, honestly stated.** Tier 2 keeps its S1 brief review (Fable, SP-D1) and its pre-merge pass: about 97 S1 reviews and 97 passes, plus the 6 sequence-end passes (F-TODO, F-BOARD-1, F-BOARD-2, F-READS, F-LIVE, F-TUI) ≈ 200 Fable sittings. Over 5 days that is about 40 a day, against roughly 15 a day in the §2 schedule (the same work over 13 days). No plan records Fable's actual daily quota. If it is about 20 pre-merge passes a day, the Fable floor is 5 days and matches the track wall; at 15 a day it is 7 days and binds. Three mitigations, all within the owner's rules: S1 reviews of one sequence's briefs in a single sitting (2–3 briefs each); Tier 1 S1 on Argon or Luna, as SP-D1 already says; sequence-end Fable passes review the merged range, not each lane. After Fable, the next constraint is Track A's work-execution chain (24.5 h, about 3 days by itself), which no further splitting shortens because KS2–KS6 and the reaper lanes edit the same files.
+
+### 7.6 Risks this creates, and the rule that contains each
+
+| Risk | Rule |
+|---|---|
+| **Fixture drift:** a view built against a plan's wire shape meets a route that landed differently | The shape is frozen in the unit's plan section or S1-approved brief before the view starts, and the fixture file cites it. The wiring unit's acceptance is a parity test in `apps/web/src/lib/api/*.test.ts` that type-checks the fixture against a response recorded by the route's own tests. New pages follow TD5a: fixtures are test inputs only; until wired the page shows the not-configured state, so no stale fixture reaches the operator |
+| **Semantic conflicts across tracks:** two tracks change one behaviour from different sides (a read model on A, its route on C, its view on B) | A unit is owned by exactly one track; the downstream track waits for the PR number. Nothing starts on a predecessor's branch. Where a unit was split (E2, KW6, P8, TD9), the two halves share one brief with one touch list each |
+| **Shared-file edits from two sessions:** `index.ts`, `composition.ts`, api wiring, manifest, barrels, `yarn.lock`, `view-nav.tsx` | One owner per file (§7.1). A non-owner never edits it; it asks for a T0 commit or a slot. Every brief forbids the files its track does not own, enforced by `lane-diff-check --strict-brief` |
+| **Package admission collisions:** A and B both in `apps/cli` | B's TUI lanes are hand-run until KS5; after KS5, `tui/**` is a disjoint file set and may be conducted |
+| **Train contention:** three producers, one merger | Arrival order, with one exception: each track names its current chain-head PR, which the merger takes next. Tier 1 PRs are batched 2–3 units (D-R1). After A-S1, conducted Tier 1 PRs auto-merge via `premerge` and never enter the loop. The merger posts the queue hourly; a track holds at most 3 open PRs |
+| **Review quality under re-tiering:** a lane classified Tier 1 that quietly writes | Tier follows the touch list (no store write path, no `security.ts`, no token read, no POST/PATCH route). A gate failure on `--strict-brief` re-tiers the lane to Tier 2 before dispatch. The sequence-end Fable pass reviews the whole merged range; its findings land as Tier 1 follow-ups before the sequence is marked done |
+| **Record schema order (D-R8) under parallel streams** | Q5a/Q5b move ahead of KS2, K10, SR3 and WB5a (§7.1). No track introduces a stored record before Q5b has merged |
+| **Decisions diverging across sessions** | Decisions live in this plan only. A track that needs one posts it to A's session; no track-local decision |
+| **Rebase storms** in work-execution and apps/api | Rebase only onto main, never onto an unmerged lane; the owner of a contended file sequences its lanes, and everyone else waits for the PR number |
+
+### 7.7 Checklist changes
+
+Replace §5 steps 1–11 with: run §7.1's three ordered lists in parallel; dispatch §7.2 today; A commits the Ink and `fast-check` devDeps and the TDM manifest first; C starts T3a first and alone in `apps/api`; after each sequence-end Fable pass, mark the sequence done and record its findings as Tier 1 follow-ups; re-measure the train interval and Fable sittings per day in S7 at the end of day 1 and re-size §7.5.

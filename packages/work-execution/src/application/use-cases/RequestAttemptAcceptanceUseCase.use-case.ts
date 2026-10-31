@@ -188,9 +188,13 @@ function gateVerdictForResults(
     return gateFailed(reasonFor(failed), results);
   }
   const nonPassing = results.filter((result) => result.verdict !== 'pass');
+  // The adapter skips every command after the first non-pass, so skipped
+  // results are neutral: the gate is congested when at least one result is a
+  // gate-slot wait limit and every other non-pass result is skipped.
+  const notSkipped = nonPassing.filter((result) => result.verdict !== 'skipped');
   const congested =
-    nonPassing.length > 0 &&
-    nonPassing.every(
+    notSkipped.length > 0 &&
+    notSkipped.every(
       (result) => result.verdict === 'unknown' && result.cause === 'gate-slot-wait-limit',
     );
   const first = nonPassing[0];

@@ -528,6 +528,37 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     });
   });
 
+  it('stays congested when skipped predicates sit beside the congestion (Luna review)', async () => {
+    // The adapter skips every predicate after the first non-pass; a skipped
+    // result must not hide a congestion from the conductor.
+    const gate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        {
+          name: 'diff-check',
+          kind: 'diff-check',
+          verdict: 'skipped',
+          exitCode: null,
+          durationMs: 0,
+          detail: 'not run: an earlier predicate did not pass',
+        },
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'unknown',
+          exitCode: 75,
+          durationMs: 1,
+          detail: 'gate slot wait limit reached',
+          cause: 'gate-slot-wait-limit',
+        },
+      ],
+    });
+    const { deps } = makeDeps({ gate });
+    const result = await new RequestAttemptAcceptanceUseCase(deps).evaluateAttemptGate(gateRequest());
+    expect(result).toMatchObject({ verdict: 'unknown', congested: true });
+  });
+
   it('returns failed when a congestion coexists with a fail', async () => {
     const gate = new FakeGatePredicatePort({
       outcome: 'evaluated',

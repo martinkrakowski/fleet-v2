@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import type { ReviewReceiptRecord } from '../evidence-records.js';
 import { REVIEW_KINDS } from '../evidence-records.js';
 import {
+  isFullyDispositioned,
   latestReceiptPerReviewer,
   reviewKindOf,
+  satisfiesFullyDispositionedReviewPassGate,
   satisfiesReviewPassGate,
   tallyReviews,
 } from '../review-selection.js';
@@ -109,6 +111,131 @@ describe('satisfiesReviewPassGate', () => {
     expect(satisfiesReviewPassGate(receipt({ result: 'pass', kind: 'pre-merge' }))).toBe(false);
     expect(satisfiesReviewPassGate(receipt({ result: 'fail', kind: 'code-review' }))).toBe(false);
     expect(satisfiesReviewPassGate(receipt({ result: 'unknown' }))).toBe(false);
+  });
+});
+
+describe('isFullyDispositioned (KF-33b3)', () => {
+  const outOfScope = new Set(['rr-1:f-1', 'rr-1:f-2']);
+  const unresolved = new Set<string>();
+  const finding = (findingId: string) => ({
+    findingId,
+    severity: 'major' as const,
+    summary: `summary for ${findingId}`,
+    filePath: 'src/a.ts',
+    line: 12,
+    state: 'unresolved' as const,
+    dispositionReason: null,
+    dispositionEvidenceRef: null,
+  });
+
+  it('is false for pass and unknown receipts, whatever the dispositions', () => {
+    expect(
+      isFullyDispositioned(receipt({ result: 'pass', findings: [finding('rr-1:f-1')] }), outOfScope, unresolved),
+    ).toBe(false);
+    expect(
+      isFullyDispositioned(receipt({ result: 'unknown', findings: [finding('rr-1:f-1')] }), outOfScope, unresolved),
+    ).toBe(false);
+  });
+
+  it('is false for a fail receipt with zero findings', () => {
+    expect(isFullyDispositioned(receipt({ result: 'fail', findings: [] }), outOfScope, unresolved)).toBe(false);
+  });
+
+  it('is true for a fail receipt whose every finding is out-of-scope resolved and not unresolved', () => {
+    expect(
+      isFullyDispositioned(
+        receipt({ result: 'fail', findings: [finding('rr-1:f-1'), finding('rr-1:f-2')] }),
+        outOfScope,
+        unresolved,
+      ),
+    ).toBe(true);
+  });
+
+  it('is false when any finding is unresolved', () => {
+    expect(
+      isFullyDispositioned(
+        receipt({ result: 'fail', findings: [finding('rr-1:f-1'), finding('rr-1:f-2')] }),
+        outOfScope,
+        new Set(['rr-1:f-2']),
+      ),
+    ).toBe(false);
+  });
+
+  it('is false when a finding is not in the out-of-scope-resolved set, even when it is otherwise resolved (fixed/refuted)', () => {
+    // The set is built by the caller from out-of-scope dispositions only, so a
+    // finding resolved by fixed/refuted never appears in it (KF-33b3 S1).
+    const noOutOfScope = new Set<string>();
+    expect(
+      isFullyDispositioned(receipt({ result: 'fail', findings: [finding('rr-1:f-1')] }), noOutOfScope, unresolved),
+    ).toBe(false);
+  });
+
+  it('is false when only some findings are in the out-of-scope-resolved set (mixed)', () => {
+    const mixed = new Set(['rr-1:f-1']);
+    expect(
+      isFullyDispositioned(
+        receipt({ result: 'fail', findings: [finding('rr-1:f-1'), finding('rr-1:f-2')] }),
+        mixed,
+        unresolved,
+      ),
+    ).toBe(false);
+  });
+});
+
+describe('satisfiesFullyDispositionedReviewPassGate (KF-33b3)', () => {
+  const outOfScope = new Set(['rr-1:f-1']);
+  const unresolved = new Set<string>();
+  const finding = { findingId: 'rr-1:f-1', severity: 'major' as const, summary: 's', filePath: 'src/a.ts', line: 1, state: 'unresolved' as const, dispositionReason: null, dispositionEvidenceRef: null };
+
+  it('a fully dispositioned failing code-review satisfies the gate like a pass', () => {
+    expect(
+      satisfiesFullyDispositionedReviewPassGate(
+        receipt({ result: 'fail', kind: 'code-review', findings: [finding] }),
+        outOfScope,
+        unresolved,
+      ),
+    ).toBe(true);
+    expect(
+      satisfiesFullyDispositionedReviewPassGate(
+        receipt({ result: 'fail', findings: [finding] }),
+        outOfScope,
+        unresolved,
+      ),
+    ).toBe(true);
+  });
+
+  it('a fully dispositioned failing brief-check (or any non-code-review kind) never satisfies the gate', () => {
+    expect(
+      satisfiesFullyDispositionedReviewPassGate(
+        receipt({ result: 'fail', kind: 'brief-check', findings: [finding] }),
+        outOfScope,
+        unresolved,
+      ),
+    ).toBe(false);
+    expect(
+      satisfiesFullyDispositionedReviewPassGate(
+        receipt({ result: 'fail', kind: 'pre-merge', findings: [finding] }),
+        outOfScope,
+        unresolved,
+      ),
+    ).toBe(false);
+  });
+
+  it('a failing code-review that is not fully dispositioned never satisfies the gate', () => {
+    expect(
+      satisfiesFullyDispositionedReviewPassGate(
+        receipt({ result: 'fail', kind: 'code-review', findings: [finding] }),
+        new Set<string>(),
+        unresolved,
+      ),
+    ).toBe(false);
+    expect(
+      satisfiesFullyDispositionedReviewPassGate(
+        receipt({ result: 'fail', kind: 'code-review', findings: [] }),
+        outOfScope,
+        unresolved,
+      ),
+    ).toBe(false);
   });
 });
 

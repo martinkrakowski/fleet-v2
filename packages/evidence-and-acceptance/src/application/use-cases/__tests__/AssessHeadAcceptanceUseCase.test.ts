@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type {
   EvidenceAssessmentRecord,
+  FindingDispositionRecord,
   ReviewFindingRecord,
   ReviewReceiptRecord,
 } from '../../../domain/evidence-records.js';
@@ -643,6 +644,248 @@ describe('receipts-only head assessment (KF-22a)', () => {
     expect(full.outcome).toBe('accepted');
     if (full.outcome === 'accepted') {
       expect(full.receiptId).toBe('acc-1');
+    }
+  });
+});
+
+describe('fully dispositioned failing reviews (KF-33b3)', () => {
+  /** A disposition fixture; finding ids are receipt-scoped (`<receiptId>:<findingId>`). */
+  function disposition(
+    findingId: string,
+    state: FindingDispositionRecord['state'],
+    overrides: Partial<FindingDispositionRecord> = {},
+  ): FindingDispositionRecord {
+    return {
+      id: `fd-${findingId}`,
+      assessmentId: 'asm-1',
+      findingId,
+      candidateHeadSha: HEAD,
+      state,
+      reason: `reason for ${findingId}`,
+      evidenceRef: `evidence://${findingId}`,
+      recordedBy: 'orchestrator',
+      recordedAtIso: '2026-10-16T00:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  function assessFor(record: EvidenceAssessmentRecord): AssessHeadAcceptanceUseCase {
+    const repo = new InMemoryAssessmentRepo([record]);
+    return new AssessHeadAcceptanceUseCase({ repo, attemptOwnerDecisionPort: NO_OWNER_DECISIONS });
+  }
+
+  it('a failing code-review whose two findings are both out-of-scope passes receipts and full acceptance, with no review or finding blocker', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [
+        independentReviewReceiptWithFindings([], { kind: 'brief-check' }),
+        independentReviewReceiptWithFindings(
+          [finding('rr-2:f-1'), finding('rr-2:f-2')],
+          { id: 'rr-2', kind: 'code-review', result: 'fail' },
+        ),
+      ],
+      findingDispositions: [
+        disposition('rr-2:f-1', 'out-of-scope'),
+        disposition('rr-2:f-2', 'out-of-scope'),
+      ],
+    });
+    const assess = assessFor(record);
+
+    const receipts = await assess.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(receipts.outcome).toBe('receipts-passed');
+
+    const full = await assess.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(full.outcome).toBe('accepted');
+    if (full.outcome === 'accepted') {
+      expect(full.assessment.blockers).toEqual([]);
+    }
+  });
+
+  it('the same failing code-review with one of the two findings still unresolved blocks with both the failed review and the finding blocker', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [
+        independentReviewReceiptWithFindings(
+          [finding('rr-2:f-1'), finding('rr-2:f-2')],
+          { id: 'rr-2', kind: 'code-review', result: 'fail' },
+        ),
+      ],
+      findingDispositions: [disposition('rr-2:f-1', 'out-of-scope')],
+    });
+    const assess = assessFor(record);
+
+    const receipts = await assess.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(receipts.outcome).toBe('blocked');
+    if (receipts.outcome === 'blocked') {
+      const joined = receipts.blockers.join('\n');
+      expect(joined).toContain("review by 'seat-a/reviewer' failed");
+      expect(joined).toContain("finding 'rr-2:f-2' is unresolved");
+    }
+  });
+
+  it('a failing code-review with zero findings still blocks with failed for this head', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [
+        independentReviewReceiptWithFindings([], { id: 'rr-2', kind: 'code-review', result: 'fail' }),
+      ],
+    });
+    const assess = assessFor(record);
+
+    const receipts = await assess.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(receipts.outcome).toBe('blocked');
+    if (receipts.outcome === 'blocked') {
+      expect(receipts.blockers.join('\n')).toContain("review by 'seat-a/reviewer' failed");
+    }
+  });
+
+  it('a failing code-review whose findings are resolved by fixed and refuted still blocks with failed for this head and no finding blocker (S1)', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [
+        independentReviewReceiptWithFindings(
+          [finding('rr-2:f-1'), finding('rr-2:f-2')],
+          { id: 'rr-2', kind: 'code-review', result: 'fail' },
+        ),
+      ],
+      findingDispositions: [
+        disposition('rr-2:f-1', 'fixed'),
+        disposition('rr-2:f-2', 'refuted'),
+      ],
+    });
+    const assess = assessFor(record);
+
+    const receipts = await assess.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(receipts.outcome).toBe('blocked');
+    if (receipts.outcome === 'blocked') {
+      const joined = receipts.blockers.join('\n');
+      expect(joined).toContain("review by 'seat-a/reviewer' failed");
+      expect(joined).not.toContain('is unresolved');
+    }
+  });
+
+  it('a failing code-review whose findings are mixed out-of-scope and fixed still blocks with failed for this head and no finding blocker (S1)', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [
+        independentReviewReceiptWithFindings(
+          [finding('rr-2:f-1'), finding('rr-2:f-2')],
+          { id: 'rr-2', kind: 'code-review', result: 'fail' },
+        ),
+      ],
+      findingDispositions: [
+        disposition('rr-2:f-1', 'out-of-scope'),
+        disposition('rr-2:f-2', 'fixed'),
+      ],
+    });
+    const assess = assessFor(record);
+
+    const receipts = await assess.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(receipts.outcome).toBe('blocked');
+    if (receipts.outcome === 'blocked') {
+      const joined = receipts.blockers.join('\n');
+      expect(joined).toContain("review by 'seat-a/reviewer' failed");
+      expect(joined).not.toContain('is unresolved');
+    }
+  });
+
+  it('a passing code-review receipt behaves unchanged', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [
+        independentReviewReceiptWithFindings([], { id: 'rr-2', kind: 'code-review' }),
+      ],
+    });
+    const assess = assessFor(record);
+
+    const receipts = await assess.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(receipts.outcome).toBe('receipts-passed');
+
+    const full = await assess.assessHeadAcceptance({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(full.outcome).toBe('accepted');
+  });
+
+  it('a fully dispositioned failing brief-check beside no passing code-review still blocks with no read-only independent review passed', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [
+        independentReviewReceiptWithFindings([finding('rr-1:f-1')], {
+          kind: 'brief-check',
+          result: 'fail',
+        }),
+      ],
+      findingDispositions: [disposition('rr-1:f-1', 'out-of-scope')],
+    });
+    const assess = assessFor(record);
+
+    const receipts = await assess.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(receipts.outcome).toBe('blocked');
+    if (receipts.outcome === 'blocked') {
+      const joined = receipts.blockers.join('\n');
+      expect(joined).toContain('no read-only independent review passed for this candidate head');
+      expect(joined).not.toContain('failed for this head');
+    }
+  });
+
+  it('a disposition naming an id that two receipts hold leaves the receipt not fully dispositioned and still blocking (KF-33b1c)', async () => {
+    const record = sampleRecord({
+      reviewReceipts: [
+        independentReviewReceiptWithFindings([finding('shared-f-1')], {
+          id: 'rr-2',
+          kind: 'code-review',
+          result: 'fail',
+        }),
+        independentReviewReceiptWithFindings([finding('shared-f-1')], {
+          id: 'rr-3',
+          reviewerModel: 'seat-c/reviewer',
+          kind: 'code-review',
+          result: 'fail',
+        }),
+      ],
+      findingDispositions: [disposition('shared-f-1', 'out-of-scope')],
+    });
+    const assess = assessFor(record);
+
+    const receipts = await assess.assessHeadReceipts({
+      assessmentId: 'asm-1',
+      candidateHeadSha: HEAD,
+      policyRevision: 'pol-1',
+    });
+    expect(receipts.outcome).toBe('blocked');
+    if (receipts.outcome === 'blocked') {
+      const joined = receipts.blockers.join('\n');
+      expect(joined).toContain("review by 'seat-a/reviewer' failed");
+      expect(joined).toContain("review by 'seat-c/reviewer' failed");
+      expect(joined).toContain("finding 'shared-f-1' is unresolved");
     }
   });
 });

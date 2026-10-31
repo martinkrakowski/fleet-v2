@@ -782,4 +782,95 @@ describe('nonPassingGatePredicatesOf', () => {
       { name: 'diff-check', kind: 'diff-check', verdict: 'unknown', exitCode: 75 },
     ]);
   });
+
+  it('returns [] when the highest stored run /g1 all passes after run 0 congestion', () => {
+    const entries: ActionJournalEntryRecord[] = [
+      // Run 0: congested (an unknown gate-slot predicate) — recovered by /g1.
+      predicateEntry(headA, 1, { name: 'commit', kind: 'commit', verdict: 'pass', exitCode: null, durationMs: 1, detail: 'ok' }),
+      gateJournalEntry({
+        id: `attempt-1:accept:${headA}:2`,
+        status: 'ambiguous',
+        detail: JSON.stringify({ predicate: 'diff-check', kind: 'diff-check', verdict: 'unknown', exitCode: 75, durationMs: 1, detail: 'gate slot wait limit reached', cause: 'gate-slot-wait-limit' }),
+      }),
+      // Run 1 under /g1: intent and two passing predicates.
+      gateJournalEntry({
+        id: `attempt-1:accept:${headA}/g1:0`,
+        status: 'intent-recorded',
+      }),
+      gateJournalEntry({
+        id: `attempt-1:accept:${headA}/g1:1`,
+        status: 'completed',
+        detail: JSON.stringify({ predicate: 'commit', kind: 'commit', verdict: 'pass', exitCode: null, durationMs: 1, detail: 'ok' }),
+      }),
+      gateJournalEntry({
+        id: `attempt-1:accept:${headA}/g1:2`,
+        status: 'completed',
+        detail: JSON.stringify({ predicate: 'diff-check', kind: 'diff-check', verdict: 'pass', exitCode: null, durationMs: 1, detail: 'clean' }),
+      }),
+    ];
+    expect(nonPassingGatePredicatesOf(entries, 'attempt-1', headA)).toEqual([]);
+  });
+
+  it('reads only the highest stored run when runs 0, /g1 and /g2 each have a failing predicate', () => {
+    const entries: ActionJournalEntryRecord[] = [
+      // Run 0: commit passes, diff-check fails.
+      predicateEntry(headA, 1, { name: 'commit', kind: 'commit', verdict: 'pass', exitCode: null, durationMs: 1, detail: 'ok' }),
+      predicateEntry(headA, 2, { name: 'diff-check', kind: 'diff-check', verdict: 'fail', exitCode: 1, durationMs: 1, detail: 'bad diff' }),
+      // Run 1 under /g1: commit passes, command fails.
+      gateJournalEntry({
+        id: `attempt-1:accept:${headA}/g1:1`,
+        status: 'completed',
+        detail: JSON.stringify({ predicate: 'commit', kind: 'commit', verdict: 'pass', exitCode: null, durationMs: 1, detail: 'ok' }),
+      }),
+      gateJournalEntry({
+        id: `attempt-1:accept:${headA}/g1:2`,
+        status: 'refused',
+        detail: JSON.stringify({ predicate: 'command 1: x', kind: 'command', verdict: 'fail', exitCode: 2, durationMs: 1, detail: 'bad command' }),
+      }),
+      // Run 2 under /g2: commit fails.
+      gateJournalEntry({
+        id: `attempt-1:accept:${headA}/g2:1`,
+        status: 'refused',
+        detail: JSON.stringify({ predicate: 'commit', kind: 'commit', verdict: 'fail', exitCode: null, durationMs: 1, detail: 'bad commit' }),
+      }),
+    ];
+    expect(nonPassingGatePredicatesOf(entries, 'attempt-1', headA)).toEqual([
+      { name: 'commit', kind: 'commit', verdict: 'fail', exitCode: null },
+    ]);
+  });
+
+  it('ignores a failing /g1 stored for a different attempt id', () => {
+    const entries: ActionJournalEntryRecord[] = [
+      // Run 0 for attempt-1: commit passes, diff-check fails.
+      predicateEntry(headA, 1, { name: 'commit', kind: 'commit', verdict: 'pass', exitCode: null, durationMs: 1, detail: 'ok' }),
+      predicateEntry(headA, 2, { name: 'diff-check', kind: 'diff-check', verdict: 'fail', exitCode: 1, durationMs: 1, detail: 'bad diff' }),
+      // Run 1 under /g1 for attempt-2, not attempt-1: must be ignored.
+      gateJournalEntry({
+        id: `attempt-2:accept:${headA}/g1:1`,
+        attemptId: 'attempt-2',
+        status: 'refused',
+        detail: JSON.stringify({ predicate: 'commit', kind: 'commit', verdict: 'fail', exitCode: null, durationMs: 1, detail: 'bad commit' }),
+      }),
+    ];
+    expect(nonPassingGatePredicatesOf(entries, 'attempt-1', headA)).toEqual([
+      { name: 'diff-check', kind: 'diff-check', verdict: 'fail', exitCode: 1 },
+    ]);
+  });
+
+  it('ignores a failing /g1 stored for headB when asking for headA', () => {
+    const entries: ActionJournalEntryRecord[] = [
+      // Run 0 for headA: commit passes, diff-check fails.
+      predicateEntry(headA, 1, { name: 'commit', kind: 'commit', verdict: 'pass', exitCode: null, durationMs: 1, detail: 'ok' }),
+      predicateEntry(headA, 2, { name: 'diff-check', kind: 'diff-check', verdict: 'fail', exitCode: 1, durationMs: 1, detail: 'bad diff' }),
+      // Run 1 under /g1 for headB, not headA: must be ignored.
+      gateJournalEntry({
+        id: `attempt-1:accept:${headB}/g1:1`,
+        status: 'refused',
+        detail: JSON.stringify({ predicate: 'commit', kind: 'commit', verdict: 'fail', exitCode: null, durationMs: 1, detail: 'bad commit' }),
+      }),
+    ];
+    expect(nonPassingGatePredicatesOf(entries, 'attempt-1', headA)).toEqual([
+      { name: 'diff-check', kind: 'diff-check', verdict: 'fail', exitCode: 1 },
+    ]);
+  });
 });

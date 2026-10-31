@@ -21,7 +21,13 @@ import {
 } from '../../domain/acceptance-blockers.js';
 import type { EvidenceAssessmentRecord, ReviewReceiptRecord } from '../../domain/evidence-records.js';
 import type { ReviewTally } from '../../domain/review-selection.js';
-import { latestReceiptPerReviewer, satisfiesReviewPassGate, tallyReviews } from '../../domain/review-selection.js';
+import {
+  isFullyDispositioned,
+  latestReceiptPerReviewer,
+  satisfiesFullyDispositionedReviewPassGate,
+  satisfiesReviewPassGate,
+  tallyReviews,
+} from '../../domain/review-selection.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
@@ -170,10 +176,17 @@ function selectReviewEvidence(assessment: EvidenceAssessmentRecord): {
  *
  * Among the independent read-only receipts, the latest per reviewer model
  * decides — recording order wins, never `completedAtIso` — and any of those
- * that says `fail` blocks acceptance even when another reviewer passed.
- * Only receipts whose kind is absent or `code-review` satisfy the passing
- * gate; a receipt of another kind never passes on its own. Agreement between
- * reviewers never strengthens a result.
+ * that says `fail` blocks acceptance even when another reviewer passed, UNLESS
+ * the receipt is fully dispositioned (KF-33b3): a fail that raised findings
+ * every one of which is resolved by an out-of-scope disposition no longer
+ * blocks, and a fully dispositioned failing `code-review` satisfies the
+ * passing gate like a `pass` would. Only receipts whose kind is absent or
+ * `code-review` satisfy the passing gate; a receipt of another kind never
+ * passes on its own. Agreement between reviewers never strengthens a result.
+ *
+ * The rule keys on `selection.latest`, which is per reviewer and kind, so it
+ * also applies to a failed `pre-merge` receipt; harmless today (no
+ * dispositions are recorded for pre-merge) — a work-execution change (KF-33b4).
  */
 function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly AcceptanceBlocker[] {
   const selection = selectReviewEvidence(assessment);
@@ -183,8 +196,20 @@ function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly A
   const blockers: AcceptanceBlocker[] = selection.blockers.map((text) =>
     acceptanceBlocker('review-missing', text),
   );
+  // KF-33b3: compute the unresolved and the out-of-scope-resolved finding-id
+  // sets once per assessment (the aggregate derives the unresolved set).
+  const aggregate = EvidenceAssessment.fromRecord(assessment);
+  const unresolvedFindingIds = new Set(aggregate.unresolvedFindingIds());
+  const outOfScopeResolvedFindingIds = new Set(
+    assessment.findingDispositions
+      .filter((disposition) => disposition.state === 'out-of-scope')
+      .map((disposition) => disposition.findingId),
+  );
   for (const receipt of selection.latest) {
-    if (receipt.result === 'fail') {
+    if (
+      receipt.result === 'fail' &&
+      !isFullyDispositioned(receipt, outOfScopeResolvedFindingIds, unresolvedFindingIds)
+    ) {
       blockers.push(
         acceptanceBlocker(
           'other',
@@ -193,7 +218,15 @@ function collectReviewBlockers(assessment: EvidenceAssessmentRecord): readonly A
       );
     }
   }
-  const passing = selection.latest.some(satisfiesReviewPassGate);
+  const passing = selection.latest.some(
+    (receipt) =>
+      satisfiesReviewPassGate(receipt) ||
+      satisfiesFullyDispositionedReviewPassGate(
+        receipt,
+        outOfScopeResolvedFindingIds,
+        unresolvedFindingIds,
+      ),
+  );
   if (!passing && blockers.length === 0) {
     return [acceptanceBlocker('review-missing', 'no read-only independent review passed for this candidate head')];
   }

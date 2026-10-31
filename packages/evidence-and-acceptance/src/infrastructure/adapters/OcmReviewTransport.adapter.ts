@@ -975,7 +975,8 @@ export function createOcmReviewTransport(
       after === request.candidateHeadSha;
 
     // 8. Parse verdict, findings, and rawOutput
-    const finalText = textParts.join('');
+    // Each text part is a whole message part; a part that does not end in a newline must not glue its last line onto the next part's first.
+    const finalText = textParts.join('\n');
     const lastText = textParts.at(-1) ?? '';
     // A conductor request (a kind) is validated strictly; a manual request keeps today's parse.
     const { result, findings } =

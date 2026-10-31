@@ -529,6 +529,103 @@ describe('OcmReviewTransport', () => {
     expect(result.findings[0]?.severity).toBe('blocker');
   });
 
+  it('CL-15 shape, strict: a finding after a preamble in a later text part is parsed (KF-37a)', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"text","part":{"text":"I\'ll inspect the candidate using read-only tools."}}',
+      '{"type":"tool","part":{"tool":"read"}}',
+      '{"type":"text","part":{"text":"FINDING: major src/a.ts:3 The guard is missing.\\n\\nVERDICT: FAIL"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport({ ...baseRequest, kind: 'code-review' });
+    expect(result.result).toBe('fail');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.severity).toBe('major');
+    expect(result.findings[0]?.filePath).toBe('src/a.ts');
+    expect(result.findings[0]?.line).toBe(3);
+    expect(result.findings[0]?.summary).toBe('The guard is missing.');
+  });
+
+  it('CL-15 shape, manual: the finding is parsed even though the FAIL result was already fail (KF-37a)', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"text","part":{"text":"I\'ll inspect the candidate using read-only tools."}}',
+      '{"type":"tool","part":{"tool":"read"}}',
+      '{"type":"text","part":{"text":"FINDING: major src/a.ts:3 The guard is missing.\\n\\nVERDICT: FAIL"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport(baseRequest);
+    expect(result.result).toBe('fail');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.severity).toBe('major');
+    expect(result.findings[0]?.filePath).toBe('src/a.ts');
+    expect(result.findings[0]?.line).toBe(3);
+  });
+
+  it('a blocker behind PASS is not lost when the preamble glues onto the finding part (KF-37a)', async () => {
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      '{"type":"text","part":{"text":"I\'ll inspect the candidate using read-only tools."}}',
+      '{"type":"tool","part":{"tool":"read"}}',
+      '{"type":"text","part":{"text":"FINDING: blocker src/b.ts:9 Data loss on retry.\\nVERDICT: PASS"}}',
+    ].join('\n');
+
+    const fakeSpawn: OcmReviewTransportSpawn = async () => ({
+      exitCode: 0,
+      stdout: recordedFixture,
+      stderr: '',
+    });
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    const result = await transport({ ...baseRequest, kind: 'code-review' });
+    expect(result.result).toBe('fail');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]?.severity).toBe('blocker');
+    expect(result.findings[0]?.filePath).toBe('src/b.ts');
+    expect(result.findings[0]?.line).toBe(9);
+  });
+
   it('finding parsing with and without line', async () => {
     const recordedFixture = [
       '{"type":"tool","part":{"tool":"read"}}',

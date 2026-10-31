@@ -1,6 +1,6 @@
 /** The `work-order` command group of the CLI driver; its entries moved verbatim from the command table. */
 
-import { CLOSE_WORK_ORDER_STATES, WORK_ORDER_RISKS } from '@fleet/work-execution';
+import { CLOSE_WORK_ORDER_STATES, WORK_ORDER_RISKS, resolveWorkOrderRisk } from '@fleet/work-execution';
 import { CliUsageError, str, optStr, strArr, enumOf } from './payload.js';
 import type {
   CommandHandler,
@@ -61,6 +61,49 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       }
       return rt.execution.listStaleWorkOrders.listStaleWorkOrders({
         projectId: optStr(p, 'projectId'),
+      });
+    },
+    rerun: async (p, rt) => {
+      // Usage checks, in order, before any read. A bare flag parses as `true`, so it is a missing value.
+      if (typeof p.from !== 'string' || p.from.trim() === '') {
+        throw new CliUsageError('work-order rerun --from needs the stopped work order id');
+      }
+      if (typeof p.workOrderId !== 'string' || p.workOrderId.trim() === '') {
+        throw new CliUsageError('work-order rerun --work-order-id needs the new work order id');
+      }
+      // An explicit --base-commit must be a full sha; a base commit copied from the source is not
+      // re-validated, because registration accepts any. That asymmetry is intentional.
+      if (Object.hasOwn(p, 'baseCommit') && (typeof p.baseCommit !== 'string' || !/^[0-9a-f]{40}$/.test(p.baseCommit))) {
+        throw new CliUsageError('work-order rerun --base-commit needs a full commit sha (40 hex characters)');
+      }
+      const from = str(p, 'from');
+      const newId = str(p, 'workOrderId');
+      if (p.yes !== true) {
+        throw new CliUsageError(
+          `work-order rerun needs --yes: it registers ${newId} as a new work order copying ${from}'s project, task, lane, repository, owned paths, policy revision and risk, superseding ${from}; it starts no run, changes nothing on ${from}, and the brief is frozen again by conductor start.`,
+        );
+      }
+      const inspected = await rt.execution.inspectWorkOrder.inspectWorkOrder({ workOrderId: from });
+      if (inspected.outcome !== 'found') {
+        return inspected;
+      }
+      const source = inspected.workOrder;
+      if (source.state !== 'stopped') {
+        return { outcome: 'refused' as const, reason: 'source-not-stopped', workOrderId: from, state: source.state };
+      }
+      return rt.execution.registerWorkOrder.registerWorkOrder({
+        workOrderId: newId,
+        projectId: source.projectId,
+        taskId: source.taskId,
+        laneId: source.laneId,
+        repository: source.repository,
+        ownedPaths: source.ownedPaths,
+        policyRevision: source.policyRevision,
+        risk: resolveWorkOrderRisk(source),
+        baseCommit: p.baseCommit !== undefined ? String(p.baseCommit) : source.baseCommit,
+        prerequisiteWorkOrderIds: [],
+        supersedesWorkOrderId: from,
+        nowIso: optStr(p, 'nowIso'),
       });
     },
 };

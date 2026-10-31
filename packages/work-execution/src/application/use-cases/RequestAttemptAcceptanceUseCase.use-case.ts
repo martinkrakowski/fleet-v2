@@ -90,6 +90,34 @@ const GATE_PREDICATE_VERDICT_TO_STATUS: Record<
 const GATE_RESULTS_MISMATCH_REASON =
   'Gate predicate results do not match the frozen acceptance spec';
 
+/** Maximum gate retry run number (KF-30c); run 0 is the initial run. */
+const GATE_RUN_MAX = 9;
+
+/**
+ * The journal id prefix for one gate run of a head. Run 0 is exactly the
+ * original `${attemptId}:accept:${headSha}:`; run `n >= 1` adds `/g${n}`
+ * so retried runs never collide with or seal the earlier run.
+ */
+function gateRunPrefix(attemptId: string, candidateHeadSha: string, gateRun: number): string {
+  return gateRun === 0
+    ? `${attemptId}:accept:${candidateHeadSha}:`
+    : `${attemptId}:accept:${candidateHeadSha}/g${gateRun}:`;
+}
+
+/**
+ * Validate a request `gateRun`: absent is run 0; a present value must be an
+ * integer 1–9. Any other value is out of range and returns `null`.
+ */
+function normalizeGateRun(value: number | undefined): number | null {
+  if (value === undefined) {
+    return 0;
+  }
+  if (Number.isInteger(value) && value >= 1 && value <= GATE_RUN_MAX) {
+    return value;
+  }
+  return null;
+}
+
 /** The gate's typed outcome, shared by acceptance and the standalone gate port. */
 type GateVerdict = EvaluateAttemptGateResult;
 
@@ -135,10 +163,12 @@ function resultsMatchExpectedPredicates(
 }
 
 /**
- * The typed verdict for one evaluated head: a mismatch is `unknown`, the
- * first non-`pass` result decides (`fail` → `failed`, `unknown` or
- * `skipped` → `unknown`, since a skipped predicate before any failure means
- * the gate did not finish), and all pass is `passed`.
+ * The typed verdict for one evaluated head: a mismatch is `unknown`, a
+ * `fail` anywhere is `failed`, and otherwise the first non-`pass` result
+ * decides (`unknown` or `skipped` → `unknown`, since a skipped predicate
+ * before any failure means the gate did not finish), and all pass is
+ * `passed`. When nothing failed and every non-pass result is a gate-slot
+ * congestion (KF-30c), the `unknown` verdict carries `congested: true`.
  */
 function gateVerdictForResults(
   results: readonly GatePredicateResult[],
@@ -147,15 +177,32 @@ function gateVerdictForResults(
   if (!resultsMatchExpectedPredicates(results, expected)) {
     return gateUnknown(GATE_RESULTS_MISMATCH_REASON);
   }
-  for (const result of results) {
-    if (result.verdict !== 'pass') {
-      const exitText = result.exitCode === null ? '' : ' with exit code ' + String(result.exitCode);
-      const reason =
-        'Gate predicate ' + result.name + ' ' + result.verdict + exitText + ': ' + result.detail;
-      return result.verdict === 'fail' ? gateFailed(reason, results) : gateUnknown(reason);
-    }
+  const reasonFor = (result: GatePredicateResult): string => {
+    const exitText = result.exitCode === null ? '' : ' with exit code ' + String(result.exitCode);
+    return (
+      'Gate predicate ' + result.name + ' ' + result.verdict + exitText + ': ' + result.detail
+    );
+  };
+  const failed = results.find((result) => result.verdict === 'fail');
+  if (failed !== undefined) {
+    return gateFailed(reasonFor(failed), results);
   }
-  return gatePassed(results);
+  const nonPassing = results.filter((result) => result.verdict !== 'pass');
+  // The adapter skips every command after the first non-pass, so skipped
+  // results are neutral: the gate is congested when at least one result is a
+  // gate-slot wait limit and every other non-pass result is skipped.
+  const notSkipped = nonPassing.filter((result) => result.verdict !== 'skipped');
+  const congested =
+    notSkipped.length > 0 &&
+    notSkipped.every(
+      (result) => result.verdict === 'unknown' && result.cause === 'gate-slot-wait-limit',
+    );
+  const first = nonPassing[0];
+  if (first === undefined) {
+    return gatePassed(results);
+  }
+  const reason = reasonFor(first);
+  return congested ? { verdict: 'unknown', reason, congested: true } : gateUnknown(reason);
 }
 
 function isGatePredicateKind(value: unknown): value is GatePredicateKind {
@@ -186,10 +233,12 @@ export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): Gat
     !isGatePredicateVerdict(record.verdict) ||
     (record.exitCode !== null && typeof record.exitCode !== 'number') ||
     typeof record.durationMs !== 'number' ||
-    typeof record.detail !== 'string'
+    typeof record.detail !== 'string' ||
+    (record.cause !== undefined && record.cause !== 'gate-slot-wait-limit')
   ) {
     return null;
   }
+  const cause = record.cause === undefined ? undefined : record.cause;
   return {
     name: record.predicate,
     kind: record.kind,
@@ -197,6 +246,7 @@ export function parseStoredPredicateResult(entry: ActionJournalEntryRecord): Gat
     exitCode: record.exitCode,
     durationMs: record.durationMs,
     detail: record.detail,
+    ...(cause === undefined ? {} : { cause }),
   };
 }
 
@@ -254,17 +304,23 @@ function readStoredGateOutcome(
   attemptId: string,
   candidateHeadSha: string,
   expected: readonly ExpectedGatePredicate[],
+  gateRun: number,
 ): StoredGateOutcome {
-  const prefix = `${attemptId}:accept:${candidateHeadSha}:`;
+  const prefix = gateRunPrefix(attemptId, candidateHeadSha, gateRun);
   const headSuffix = ` for head ${candidateHeadSha}`;
+  // The intent-detail fallback matches only run 0's own intent ids and never
+  // a `/g{n}` retry-run id, so a later run's intent cannot block or pollute
+  // an earlier run's stored outcome.
   const matching = entries.filter(
     (entry) =>
       entry.attemptId === attemptId &&
       entry.action === 'accept' &&
       (entry.id.startsWith(prefix) ||
-        (entry.status === 'intent-recorded' &&
+        (gateRun === 0 &&
+          entry.status === 'intent-recorded' &&
           typeof entry.detail === 'string' &&
-          entry.detail.endsWith(headSuffix))),
+          entry.detail.endsWith(headSuffix) &&
+          !/\/g[1-9]:/.test(entry.id))),
   );
   if (matching.length === 0) {
     return { kind: 'none' };
@@ -275,7 +331,7 @@ function readStoredGateOutcome(
     byId.set(entry.id, entry);
   }
 
-  const firstResultEntry = byId.get(`${prefix}1`);
+  const firstResultEntry = byId.get(prefix + '1');
   if (firstResultEntry !== undefined && parseStoredPredicateResult(firstResultEntry) === null) {
     if (firstResultEntry.status === 'ambiguous') {
       return {
@@ -605,6 +661,10 @@ export class RequestAttemptAcceptanceUseCase
     if (!deps) {
       throw new Error('Not implemented: RequestAttemptAcceptanceUseCase');
     }
+    const gateRun = normalizeGateRun(request.gateRun);
+    if (gateRun === null) {
+      return gateUnknown(`Unknown: gate run ${String(request.gateRun)} is out of range`);
+    }
     if (deps.gatePredicates === undefined) {
       return gateUnknown('Gate predicates are not wired');
     }
@@ -621,7 +681,7 @@ export class RequestAttemptAcceptanceUseCase
     if (attempt.artifacts.headCommit !== request.candidateHeadSha) {
       return gateUnknown('Candidate head is not the collected head');
     }
-    return this.runGate(deps, deps.gatePredicates, attempt, request.candidateHeadSha);
+    return this.runGate(deps, deps.gatePredicates, attempt, request.candidateHeadSha, gateRun);
   }
 
   /** Accepted heads may move a non-terminal work order to 'ready-to-merge'. */
@@ -646,14 +706,17 @@ export class RequestAttemptAcceptanceUseCase
 
   /**
    * Plan S2: evaluate the frozen acceptance spec predicate by predicate before
-   * the evidence assessment. Returns the typed gate verdict; the gate runs
-   * once per head and a later call reads the stored outcome.
+   * the evidence assessment. Returns the typed gate verdict; a run journals
+   * under its own prefix (`gateRun` 0 is the original prefix; run `n >= 1`
+   * adds `/g${n}`) so a congested run never seals the head against a later
+   * run, and a later call for the same run reads the stored outcome.
    */
   private async runGate(
     deps: RequestAttemptAcceptanceDependencies,
     gatePort: GatePredicatePort,
     attempt: AttemptRecord,
     candidateHeadSha: string,
+    gateRun = 0,
   ): Promise<GateVerdict> {
     const id = attempt.id;
     if (deps.journal === undefined) {
@@ -725,7 +788,10 @@ export class RequestAttemptAcceptanceUseCase
         : [];
 
     const expected = expectedGatePredicates(spec);
-    const gateKey = `${id}:${candidateHeadSha}`;
+    const gateKey =
+      gateRun === 0
+        ? `${id}:${candidateHeadSha}`
+        : `${id}:${candidateHeadSha}/g${gateRun}`;
     let journalInFlight = inFlightGateRuns.get(journal);
     if (journalInFlight === undefined) {
       journalInFlight = new Map<string, Promise<void>>();
@@ -738,7 +804,7 @@ export class RequestAttemptAcceptanceUseCase
     }
 
     const priorEntries = await journal.listJournalEntriesForAttempt(id);
-    const storedBefore = readStoredGateOutcome(priorEntries, id, candidateHeadSha, expected);
+    const storedBefore = readStoredGateOutcome(priorEntries, id, candidateHeadSha, expected, gateRun);
     if (storedBefore.kind === 'completed') {
       return storedBefore.verdict;
     }
@@ -758,7 +824,7 @@ export class RequestAttemptAcceptanceUseCase
     try {
       try {
         await journal.appendJournalEntry({
-          id: `${id}:accept:${candidateHeadSha}:0`,
+          id: gateRunPrefix(id, candidateHeadSha, gateRun) + '0',
           attemptId: id,
           workOrderId: attempt.workOrderId,
           action: 'accept',
@@ -781,6 +847,7 @@ export class RequestAttemptAcceptanceUseCase
           id,
           candidateHeadSha,
           expected,
+          gateRun,
         );
       }
 
@@ -793,6 +860,7 @@ export class RequestAttemptAcceptanceUseCase
           id,
           candidateHeadSha,
           expected,
+          gateRun,
         );
       }
 
@@ -808,7 +876,7 @@ export class RequestAttemptAcceptanceUseCase
       if (gateResult.outcome === 'unavailable') {
         try {
           await journal.appendJournalEntry({
-            id: `${id}:accept:${candidateHeadSha}:1`,
+            id: gateRunPrefix(id, candidateHeadSha, gateRun) + '1',
             attemptId: id,
             workOrderId: attempt.workOrderId,
             action: 'accept',
@@ -827,6 +895,7 @@ export class RequestAttemptAcceptanceUseCase
             id,
             candidateHeadSha,
             expected,
+            gateRun,
           );
         }
         return gateUnknown('Unknown: gate predicates unavailable: ' + gateResult.reason);
@@ -836,7 +905,7 @@ export class RequestAttemptAcceptanceUseCase
       if (!resultsMatchExpectedPredicates(results, expected)) {
         try {
           await journal.appendJournalEntry({
-            id: `${id}:accept:${candidateHeadSha}:1`,
+            id: gateRunPrefix(id, candidateHeadSha, gateRun) + '1',
             attemptId: id,
             workOrderId: attempt.workOrderId,
             action: 'accept',
@@ -855,13 +924,14 @@ export class RequestAttemptAcceptanceUseCase
             id,
             candidateHeadSha,
             expected,
+            gateRun,
           );
         }
         return gateUnknown(GATE_RESULTS_MISMATCH_REASON);
       }
 
       const entries = results.map((result, offset) =>
-        this.gateJournalEntry(deps, attempt, id, candidateHeadSha, offset + 1, result),
+        this.gateJournalEntry(deps, attempt, id, candidateHeadSha, offset + 1, result, gateRun),
       );
       try {
         await entries.reduce(
@@ -877,6 +947,7 @@ export class RequestAttemptAcceptanceUseCase
           id,
           candidateHeadSha,
           expected,
+          gateRun,
         );
       }
 
@@ -897,6 +968,7 @@ export class RequestAttemptAcceptanceUseCase
     attemptId: string,
     candidateHeadSha: string,
     expected: readonly ExpectedGatePredicate[],
+    gateRun: number,
   ): Promise<GateVerdict> {
     if (!isOwner) {
       const active = journalInFlight.get(gateKey);
@@ -905,7 +977,7 @@ export class RequestAttemptAcceptanceUseCase
       }
     }
     const entries = await journal.listJournalEntriesForAttempt(attemptId);
-    const stored = readStoredGateOutcome(entries, attemptId, candidateHeadSha, expected);
+    const stored = readStoredGateOutcome(entries, attemptId, candidateHeadSha, expected, gateRun);
     if (stored.kind === 'none') {
       return gateUnknown(
         `Unknown: gate evaluation for head ${candidateHeadSha} has an unfinished intent in the journal`,
@@ -924,6 +996,7 @@ export class RequestAttemptAcceptanceUseCase
     candidateHeadSha: string,
     predicateIndex: number,
     result: GatePredicateResult,
+    gateRun: number,
   ): ActionJournalEntryRecord {
     const detailObject: Record<string, unknown> = {
       predicate: result.name,
@@ -936,8 +1009,11 @@ export class RequestAttemptAcceptanceUseCase
     if (result.coverage !== undefined) {
       detailObject.coverage = result.coverage;
     }
+    if (result.cause !== undefined) {
+      detailObject.cause = result.cause;
+    }
     return {
-      id: `${id}:accept:${candidateHeadSha}:${predicateIndex}`,
+      id: gateRunPrefix(id, candidateHeadSha, gateRun) + String(predicateIndex),
       attemptId: id,
       workOrderId: attempt.workOrderId,
       action: 'accept',

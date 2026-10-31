@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { RequestAttemptAcceptanceUseCase } from '../RequestAttemptAcceptanceUseCase.use-case.js';
+import { RequestAttemptAcceptanceUseCase, parseStoredPredicateResult } from '../RequestAttemptAcceptanceUseCase.use-case.js';
 import type { RequestAttemptAcceptanceDependencies } from '../RequestAttemptAcceptanceUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import type { RequestAttemptAcceptanceRequest } from '../../ports/in/RequestAttemptAcceptancePort.in-port.js';
@@ -261,7 +261,9 @@ const PASS_RESULTS: readonly GatePredicateResult[] = [
 
 const EVALUATED_ALL_PASS: EvaluateGatePredicatesResult = { outcome: 'evaluated', results: PASS_RESULTS };
 
-function gateRequest(overrides: { attemptId?: string; candidateHeadSha?: string } = {}) {
+function gateRequest(
+  overrides: { attemptId?: string; candidateHeadSha?: string; gateRun?: number } = {},
+) {
   return { attemptId: 'attempt-1', candidateHeadSha: HEAD_SHA, ...overrides };
 }
 
@@ -494,5 +496,274 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     expect(acceptance.outcome).toBe('accepted');
     expect(gate.requests).toHaveLength(1);
     expect(acceptancePort.requests).toHaveLength(1);
+  });
+
+  it('returns congested when the only non-pass is a gate-slot congestion', async () => {
+    const gate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        PASS_RESULTS[1],
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'unknown',
+          exitCode: 75,
+          durationMs: 1,
+          detail: 'gate slot wait limit reached',
+          cause: 'gate-slot-wait-limit',
+        },
+      ],
+    });
+    const { deps } = makeDeps({ gate });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    const result = await useCase.evaluateAttemptGate(gateRequest());
+
+    expect(result).toEqual({
+      verdict: 'unknown',
+      reason:
+        'Gate predicate command 1: corepack yarn build unknown with exit code 75: gate slot wait limit reached',
+      congested: true,
+    });
+  });
+
+  it('stays congested when skipped predicates sit beside the congestion (Luna review)', async () => {
+    // The adapter skips every predicate after the first non-pass; a skipped
+    // result must not hide a congestion from the conductor.
+    const gate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        {
+          name: 'diff-check',
+          kind: 'diff-check',
+          verdict: 'skipped',
+          exitCode: null,
+          durationMs: 0,
+          detail: 'not run: an earlier predicate did not pass',
+        },
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'unknown',
+          exitCode: 75,
+          durationMs: 1,
+          detail: 'gate slot wait limit reached',
+          cause: 'gate-slot-wait-limit',
+        },
+      ],
+    });
+    const { deps } = makeDeps({ gate });
+    const result = await new RequestAttemptAcceptanceUseCase(deps).evaluateAttemptGate(gateRequest());
+    expect(result).toMatchObject({ verdict: 'unknown', congested: true });
+  });
+
+  it('returns failed when a congestion coexists with a fail', async () => {
+    const gate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        {
+          name: 'diff-check',
+          kind: 'diff-check',
+          verdict: 'fail',
+          exitCode: 1,
+          durationMs: 1,
+          detail: '1 finding(s): package.json protected-path',
+        },
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'unknown',
+          exitCode: 75,
+          durationMs: 1,
+          detail: 'gate slot wait limit reached',
+          cause: 'gate-slot-wait-limit',
+        },
+      ],
+    });
+    const { deps } = makeDeps({ gate });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    const result = await useCase.evaluateAttemptGate(gateRequest());
+
+    expect(result.verdict).toBe('failed');
+    if (result.verdict === 'failed') {
+      expect(result.reason).toBe(
+        'Gate predicate diff-check fail with exit code 1: 1 finding(s): package.json protected-path',
+      );
+    }
+  });
+
+  it('returns unknown without the congested flag when congestion coexists with another unknown', async () => {
+    const gate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        {
+          name: 'diff-check',
+          kind: 'diff-check',
+          verdict: 'unknown',
+          exitCode: null,
+          durationMs: 1,
+          detail: 'diff check error: unsupported-path-characters',
+        },
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'unknown',
+          exitCode: 75,
+          durationMs: 1,
+          detail: 'gate slot wait limit reached',
+          cause: 'gate-slot-wait-limit',
+        },
+      ],
+    });
+    const { deps } = makeDeps({ gate });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    const result = await useCase.evaluateAttemptGate(gateRequest());
+
+    expect(result).toEqual({
+      verdict: 'unknown',
+      reason: 'Gate predicate diff-check unknown: diff check error: unsupported-path-characters',
+    });
+  });
+
+  it('writes and reads exactly today ids ids when gateRun is absent', async () => {
+    const gate = new FakeGatePredicatePort(EVALUATED_ALL_PASS);
+    const { deps, journal } = makeDeps({ gate });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    const first = await useCase.evaluateAttemptGate(gateRequest());
+    expect(first.verdict).toBe('passed');
+    const second = await useCase.evaluateAttemptGate(gateRequest());
+    expect(second.verdict).toBe('passed');
+    expect(gate.requests).toHaveLength(1);
+
+    const acceptEntries = journal.entries.filter((entry) => entry.action === 'accept');
+    expect(acceptEntries.map((entry) => entry.id)).toEqual([
+      `attempt-1:accept:${HEAD_SHA}:0`,
+      `attempt-1:accept:${HEAD_SHA}:1`,
+      `attempt-1:accept:${HEAD_SHA}:2`,
+      `attempt-1:accept:${HEAD_SHA}:3`,
+    ]);
+  });
+
+  it('re-runs under the /gN prefix after a congested run and never blocks a later run', async () => {
+    const journal = new InMemoryJournal();
+    const congestedGate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        PASS_RESULTS[1],
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'unknown',
+          exitCode: 75,
+          durationMs: 1,
+          detail: 'gate slot wait limit reached',
+          cause: 'gate-slot-wait-limit',
+        },
+      ],
+    });
+    const run0UseCase = new RequestAttemptAcceptanceUseCase(
+      makeDeps({ gate: congestedGate, journal }).deps,
+    );
+    const run0 = await run0UseCase.evaluateAttemptGate(gateRequest());
+    expect(run0).toEqual({
+      verdict: 'unknown',
+      reason:
+        'Gate predicate command 1: corepack yarn build unknown with exit code 75: gate slot wait limit reached',
+      congested: true,
+    });
+
+    const passedGate = new FakeGatePredicatePort(EVALUATED_ALL_PASS);
+    const run1UseCase = new RequestAttemptAcceptanceUseCase(
+      makeDeps({ gate: passedGate, journal }).deps,
+    );
+    const run1 = await run1UseCase.evaluateAttemptGate(gateRequest({ gateRun: 1 }));
+    expect(run1.verdict).toBe('passed');
+    if (run1.verdict === 'passed') {
+      expect(run1.results).toEqual(PASS_RESULTS);
+    }
+    expect(passedGate.requests).toHaveLength(1);
+
+    const run1Ids = journal.entries.filter((entry) => entry.id.includes('/g1')).map((entry) => entry.id);
+    expect(run1Ids).toEqual([
+      `attempt-1:accept:${HEAD_SHA}/g1:0`,
+      `attempt-1:accept:${HEAD_SHA}/g1:1`,
+      `attempt-1:accept:${HEAD_SHA}/g1:2`,
+      `attempt-1:accept:${HEAD_SHA}/g1:3`,
+    ]);
+
+    const run1Again = await run1UseCase.evaluateAttemptGate(gateRequest({ gateRun: 1 }));
+    expect(run1Again).toEqual(run1);
+    expect(passedGate.requests).toHaveLength(1);
+
+    // Run 0 keeps its stored congested verdict; run 1 neither sealed nor changed it.
+    const run0Again = await run1UseCase.evaluateAttemptGate(gateRequest());
+    expect(run0Again).toEqual(run0);
+    expect(passedGate.requests).toHaveLength(1);
+  });
+
+  it('round-trips cause through a stored predicate entry and leaves old entries unchanged', () => {
+    const congestedEntry: ActionJournalEntryRecord = {
+      id: `attempt-1:accept:${HEAD_SHA}:3`,
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-1',
+      action: 'accept',
+      baseCommit: BASE_COMMIT,
+      recordedAtIso: FIXED_NOW,
+      sessionId: 'session-1',
+      status: 'ambiguous',
+      detail: JSON.stringify({
+        predicate: 'command 1: corepack yarn build',
+        kind: 'command',
+        verdict: 'unknown',
+        exitCode: 75,
+        durationMs: 1,
+        detail: 'gate slot wait limit reached',
+        cause: 'gate-slot-wait-limit',
+      }),
+    };
+    expect(parseStoredPredicateResult(congestedEntry)).toMatchObject({
+      name: 'command 1: corepack yarn build',
+      kind: 'command',
+      verdict: 'unknown',
+      exitCode: 75,
+      cause: 'gate-slot-wait-limit',
+    });
+
+    const oldEntry: ActionJournalEntryRecord = {
+      ...congestedEntry,
+      detail: JSON.stringify({
+        predicate: 'command 1: corepack yarn build',
+        kind: 'command',
+        verdict: 'unknown',
+        exitCode: null,
+        durationMs: 1,
+        detail: 'no exit code',
+      }),
+    };
+    const parsed = parseStoredPredicateResult(oldEntry);
+    expect(parsed).not.toBeNull();
+    expect(parsed).not.toHaveProperty('cause');
+  });
+
+  it('returns unknown and runs nothing for out-of-range gateRun values', async () => {
+    const gate = new FakeGatePredicatePort(EVALUATED_ALL_PASS);
+    const { deps, journal } = makeDeps({ gate });
+    const useCase = new RequestAttemptAcceptanceUseCase(deps);
+
+    for (const gateRun of [0, 10, 1.5]) {
+      const result = await useCase.evaluateAttemptGate(gateRequest({ gateRun }));
+      expect(result.verdict).toBe('unknown');
+      expect(result.verdict === 'unknown' && result.congested).toBeUndefined();
+    }
+    expect(gate.requests).toHaveLength(0);
+    expect(journal.entries).toHaveLength(0);
   });
 });

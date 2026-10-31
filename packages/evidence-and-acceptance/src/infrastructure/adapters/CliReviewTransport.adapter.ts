@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
-import { UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
+import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
 import {
   DEFAULT_REVIEW_TIMEOUT_MS,
@@ -228,7 +228,7 @@ export function buildEmbeddedReviewPrompt(request: RunIndependentReviewRequest, 
     if (typeof request.briefText === 'string' && request.briefText.trim() !== '') {
       const wrappedBrief = wrapUntrusted({ label: 'brief', text: request.briefText, nonce });
       sections.push(
-        `Brief:\n${wrappedBrief}\n\n` +
+        `${BRIEF_INPUT_RULE}\n\nBrief:\n${wrappedBrief}\n\n` +
           'Does the change satisfy every work-order item of the brief? Report a FINDING for each item the change does not satisfy.',
       );
     } else {

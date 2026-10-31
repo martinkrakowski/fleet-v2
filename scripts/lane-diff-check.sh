@@ -372,10 +372,14 @@ if [ -n "$ANY_CI" ]; then rule_lines "$ANY_CI"; cut -d: -f1 "$T/rule-matches" >>
 if [ -n "$NM_EXEMPT_CI" ]; then
   # The package-manifest rule is exempt under node_modules/: drop matches whose path is there.
   rule_lines "$NM_EXEMPT_CI"
-  grep -aEiv '^[0-9]+:(.*/)?node_modules/' "$T/rule-matches" | cut -d: -f1 >> "$T/protected-hit-lines"
+  grep -aEiv '^[0-9]+:(.*/)?node_modules/' "$T/rule-matches" > "$T/rule-kept"
+  rc=$?
+  [ "$rc" -le 1 ] || { echo "lane-diff-check: a protected rule could not be applied" >&2; exit 2; }
+  cut -d: -f1 "$T/rule-kept" >> "$T/protected-hit-lines"
 fi
 sort -un "$T/protected-hit-lines" > "$T/protected-hit-nums"
-awk 'NR == FNR { hit[$1] = 1; next } (FNR in hit)' "$T/protected-hit-nums" "$T/protected-candidates" > "$T/protected-hits"
+# FILENAME, not NR == FNR: with no hits the first file is empty and NR == FNR would stay true.
+awk 'FILENAME == ARGV[1] { hit[$1] = 1; next } (FNR in hit)' "$T/protected-hit-nums" "$T/protected-candidates" > "$T/protected-hits"
 while IFS= read -r f; do
   if [ -n "$allow" ] && printf '%s\n' "$f" | grep -Eq "$allow"; then
     say "allowed-protected: $f"

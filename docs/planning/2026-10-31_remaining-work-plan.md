@@ -725,3 +725,14 @@ Replace §5 steps 1–11 with: run §7.1's three ordered lists in parallel; disp
 9. **Major, L9 mid-chain:** security chain reordered to T3a → (T2c ‖ T3b) → T6 → WB13a → TD9-api, with L9 last after L3.
 10. **Minor, split-half joins:** E2-api, KW6-web, P8-web, TD9-web, P2-cli, O14e2-cli each wait on their first half; W7a's W8b dependency placed on W7a-w.
 11. **Major, estimate:** all ≈ 208 Fable sittings counted (S1 + pre-merge + sequence-end); headline split into track-bound (~5 days) and Fable-bound (7–10 days, 20/day as §2 implied, batched S1 ≈ 142 sittings ≈ 7 days); Track A's load now includes the 17-lane `index.ts` sequence and train/manifest duty; Track C's chain reflects the L9 fix; Argon/Luna for Tier 1 S1 and Fable reserved for Tier 2 stated as a mitigation.
+
+### 7.9 Amendment (2026-10-31): conductor visualizer
+
+The conductor concurrency visualizer (`2026-10-31_conductor-visualizer-plan.md`) is the first cut of two planned units, so they are not dispatched twice:
+- **A-R-1:** `GET /v1/runs`, the `InspectLaneRuns` view plus reservations, package keys and an `admission` block. It is also `fleet-v2 conductor schedule`.
+- **W7a-1:** the `/conductor` page. A-R and W7a extend these later instead of starting fresh.
+- **New routes:** `GET /v1/runs/passes` and the pass-trace ring are new.
+
+**D-R8 exception (owner, 2026-10-31; D-VZ8):** the pass-trace record `conductor-passes.json` lands before Q5b, with `schemaVersion: 1` (absent means 1; unknown is refused). It adopts Q5a's convention unchanged when Q5a lands. No other stored record is excused.
+
+Tracks B and C had no sessions when this was built. Track A built every slice at the owner's request, including the two api routes ahead of T3a, which declares scope for them when it lands (§7.1 rule: default `read`).

@@ -364,6 +364,7 @@ bounded_contexts:
           - CloseWorkOrderUseCase
           - ListStaleWorkOrdersUseCase
           - ReapLaneWorktreesUseCase
+          - ReapOrphanSessionsUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -387,6 +388,7 @@ bounded_contexts:
             - CloseWorkOrderPort
             - ListStaleWorkOrdersPort
             - ReapLaneWorktreesPort
+            - ReapOrphanSessionsPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -494,6 +496,7 @@ bounded_contexts:
       CloseWorkOrderPort: "Close one active work order as merged or stopped on the operator's explicit confirmation, releasing its owned paths; refused while any lane run naming it is not terminal, any of its attempts is outside the capacity-release states or holds a reservation, or it is already terminal; closing as merged needs a lane run naming it that ended merged; an unknown id is not-found; a stale revision is refused, never overwritten."
       ListStaleWorkOrdersPort: "List, read-only, the work orders whose state disagrees with their lane runs: active work orders whose every run is terminal, active work orders with no run, and non-terminal runs whose work order is terminal; never writes."
       ReapLaneWorktreesPort: "On the operator's explicit request, list or remove the clean worktree of every lane run that is terminal and whose work order is terminal and whose attempts are all cancelled or collected with no held reservation; never removes a dirty, locked or unlisted worktree and never deletes a branch; a dry run removes nothing."
+      ReapOrphanSessionsPort: "On the operator's explicit request, list worktrees whose latest attempt is finished (cancelled, collected or ended) but where the runner still reports a running session, and abort those by directory only with confirmation; never touches a worktree with a live attempt or a held reservation; a dry run aborts nothing."
       ProbeProjectPort: "Probe one registered project read-only: read its profile, check its repository and clones and that its gate procedures exist in the installation, and record the receipt only if the profile did not change while it was probed."
       ProjectProfileReadPort: "Read one project profile and its revision from the coordination context; known absence is null."
       ProjectProbeRecordPort: "Record a probe receipt on a profile at the revision the probe started from; a changed profile is a typed rejection, never an overwrite."

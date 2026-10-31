@@ -18,6 +18,7 @@ import {
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
   ReapLaneWorktreesUseCase,
+  ReapOrphanSessionsUseCase,
   RequestLaneRunStopUseCase,
   ResumeLaneRunUseCase,
   ReviewAssessmentAdapter,
@@ -25,6 +26,7 @@ import {
   WorkspaceAdapter,
   WorkOrderRepositoryAdapter,
   type ProjectProfileReadPort,
+  type RunnerForAttemptPort,
 } from '@fleet/work-execution';
 
 import { conductorRevision, resolveConductorPolicy } from '@fleet/installation';
@@ -54,6 +56,8 @@ export interface ComposeConductorInput {
   readonly attemptRepository: AttemptRepositoryAdapter;
   readonly executionJournal: ExecutionJournalAdapter;
   readonly workspace: WorkspaceAdapter;
+  /** H9b1: resolves the runner addressed by an attempt's recorded host (EX-4). */
+  readonly runnerForAttempt: RunnerForAttemptPort;
 }
 
 export function composeConductor(input: ComposeConductorInput) {
@@ -69,6 +73,7 @@ export function composeConductor(input: ComposeConductorInput) {
     attemptRepository,
     executionJournal,
     workspace,
+    runnerForAttempt,
   } = input;
 
   // K7: the conductor's stores and its record-only controls. Nothing here
@@ -117,6 +122,13 @@ export function composeConductor(input: ComposeConductorInput) {
       executionJournal,
       profileRead,
       workspace,
+    }),
+    // EX-4: the operator-opt-in orphan-session reap, built beside the worktree
+    // reap from the execution stores it scans and the per-host runner resolver.
+    reapOrphanSessions: new ReapOrphanSessionsUseCase({
+      attemptRepo: attemptRepository,
+      executionJournal,
+      runnerForAttempt,
     }),
     newUlid: conductorNewUlid,
     profileRead,

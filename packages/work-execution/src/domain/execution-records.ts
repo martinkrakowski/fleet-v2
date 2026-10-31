@@ -107,6 +107,8 @@ export interface WorkOrderRecord {
   readonly updatedAtIso: string;
   /** Absent on a work order with no plan and on every record written before the field existed. */
   readonly planRef?: PlanRef;
+  /** Terminal work order this one supersedes; absent on records that start a new lineage. */
+  readonly supersedesWorkOrderId?: string;
 }
 
 /** Fix rounds are fresh attempts; they never resume the prior conversation. */

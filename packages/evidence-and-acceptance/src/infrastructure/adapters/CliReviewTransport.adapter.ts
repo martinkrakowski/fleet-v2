@@ -55,13 +55,13 @@ export const GROK_REVIEW_ARGV_TEMPLATE: readonly string[] = [
 ];
 
 /**
- * Copied from AGY_TOOL.invocation.argvTemplate in packages/tooling/src/agy.ts
- * (the conservative edit-only template). It differs from the rulebook shape in
- * the lane brief: the tooling template carries `--mode accept-edits` and no
- * `--effort`/`--print-timeout` flags, and the tooling one is used per the
- * brief. `--output-format json` wraps the reply; `readAgyReviewReply` below
- * unwraps it. The evidence context may not import @fleet/tooling; change both
- * in the same PR.
+ * Deliberately differs from AGY_TOOL.invocation.argvTemplate in
+ * packages/tooling/src/agy.ts (which keeps `--mode accept-edits` for
+ * implementers). A reviewer runs in agy's plan mode, pinned, mirroring grok's
+ * `--permission-mode plan`; the change under review is embedded in the prompt,
+ * so an edit-accepting mode is not needed. `--output-format json` wraps the
+ * reply; `readAgyReviewReply` below unwraps it. The evidence context may not
+ * import @fleet/tooling.
  */
 export const AGY_REVIEW_ARGV_TEMPLATE: readonly string[] = [
   'agy',
@@ -72,7 +72,7 @@ export const AGY_REVIEW_ARGV_TEMPLATE: readonly string[] = [
   '--output-format',
   'json',
   '--mode',
-  'accept-edits',
+  'plan',
 ];
 
 /**
@@ -107,6 +107,23 @@ export function substituteReviewArgv(
   }
   if (template.includes('--dangerously-skip-permissions') || template.includes('--yolo')) {
     throw new Error('review argv template must not carry --dangerously-skip-permissions or --yolo');
+  }
+  if (template[0] === 'agy') {
+    for (let i = 0; i < template.length; i += 1) {
+      const element = template[i];
+      if (element.startsWith('--mode=')) {
+        throw new Error('review argv template must not grant an edit mode');
+      }
+      if (element === '--mode') {
+        if (template[i + 1] !== 'plan') {
+          throw new Error('review argv template must not grant an edit mode');
+        }
+        continue;
+      }
+      if (element.startsWith('-') && !['--print', '--model', '--output-format', '--mode'].includes(element)) {
+        throw new Error(`review argv template carries a flag the agy review does not use: ${element}`);
+      }
+    }
   }
 
   let modelSeen = 0;

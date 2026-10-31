@@ -85,6 +85,33 @@ describe('OcmReviewTransport', () => {
     expect(spawnCalled).toBe(false);
   });
 
+  it('a brief-check request without the brief throws before spawn', async () => {
+    let spawnCalled = false;
+    const fakeSpawn: OcmReviewTransportSpawn = async () => {
+      spawnCalled = true;
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+
+    const transport = createOcmReviewTransport({
+      ocmRunBin: '/test/ocm-run',
+      remotePort: 4096,
+      agent: 'reviewer',
+      model: baseRequest.reviewerModel,
+      resolveReviewDir: async () => '/tmp/review-dir',
+      readHead: async () => baseRequest.candidateHeadSha,
+      spawn: fakeSpawn,
+    });
+
+    await expect(transport({ ...baseRequest, kind: 'brief-check' })).rejects.toBeInstanceOf(
+      ReviewTransportError,
+    );
+    await expect(transport({ ...baseRequest, kind: 'brief-check' })).rejects.toMatchObject({
+      message: 'a brief-check review requires the brief text',
+      code: 'transport-failed',
+    });
+    expect(spawnCalled).toBe(false);
+  });
+
   it('a route of kind none without a code is route-unresolved', async () => {
     const transport = createOcmReviewTransport({
       ocmRunBin: '/test/ocm-run',
@@ -1476,11 +1503,13 @@ describe('OcmReviewTransport', () => {
       expect(prompt).toContain(REVIEW_REPLY_CONTRACT);
     });
 
-    it('a brief-check prompt without a briefText still builds and says the brief was not supplied', () => {
-      const prompt = buildReviewPrompt({ ...baseRequest, kind: 'brief-check' }, nonce);
-      expect(prompt).toContain('Independent read-only brief-check review');
-      expect(prompt).toContain('The brief was not supplied.');
-      expect(prompt).not.toContain('label="brief"');
+    it('a brief-check prompt without a briefText refuses before building the prompt', () => {
+      expect(() => buildReviewPrompt({ ...baseRequest, kind: 'brief-check' }, nonce)).toThrow(
+        ReviewTransportError,
+      );
+      expect(() => buildReviewPrompt({ ...baseRequest, kind: 'brief-check' }, nonce)).toThrow(
+        'a brief-check review requires the brief text',
+      );
     });
 
     it('code-review and pre-merge prompts carry the checklist; the checklist names every item', () => {

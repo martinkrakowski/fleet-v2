@@ -136,6 +136,15 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
         'Independent review requires a known kind and a well-formed requestId together',
       );
     }
+    // A brief-check review answers against the frozen brief; without the brief
+    // text it must never reach a reviewer or become evidence (SEC-4).
+    if (request.kind === 'brief-check' && !isNonEmptyTrimmedString(request.briefText)) {
+      return rejectedFor(
+        request,
+        'invalid-request',
+        'A brief-check review requires the brief text',
+      );
+    }
     if (sharesUnderlyingModel(request.implementerModel, request.reviewerModel)) {
       return rejectedFor(
         request,

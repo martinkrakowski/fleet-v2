@@ -740,6 +740,15 @@ describe('CliReviewTransport', () => {
       expect(() => substituteReviewArgv(AGY_REVIEW_ARGV_TEMPLATE, AGY_MODEL, 'p')).not.toThrow();
     });
 
+    it('refuses an agy template that leaves the mode to the default or pins it twice', () => {
+      const modeless = AGY_REVIEW_ARGV_TEMPLATE.slice(0, -2);
+      expect(modeless).not.toContain('--mode');
+      expect(() => substituteReviewArgv(modeless, AGY_MODEL, 'p')).toThrow('must pin --mode plan exactly once');
+      expect(() =>
+        substituteReviewArgv([...AGY_REVIEW_ARGV_TEMPLATE, '--mode', 'plan'], AGY_MODEL, 'p'),
+      ).toThrow('must pin --mode plan exactly once');
+    });
+
     it('spawns agy with the prompt preceded by the no-shell preamble', async () => {
       let capturedFile = '';
       let capturedPrompt = '';

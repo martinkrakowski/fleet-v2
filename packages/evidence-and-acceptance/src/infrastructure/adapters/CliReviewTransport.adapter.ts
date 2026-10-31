@@ -109,6 +109,8 @@ export function substituteReviewArgv(
     throw new Error('review argv template must not carry --dangerously-skip-permissions or --yolo');
   }
   if (template[0] === 'agy') {
+    // Plan mode must be pinned, never left to agy's undocumented default: exactly one `--mode plan` pair.
+    let planModes = 0;
     for (let i = 0; i < template.length; i += 1) {
       const element = template[i];
       if (element.startsWith('--mode=')) {
@@ -118,11 +120,15 @@ export function substituteReviewArgv(
         if (template[i + 1] !== 'plan') {
           throw new Error('review argv template must not grant an edit mode');
         }
+        planModes += 1;
         continue;
       }
       if (element.startsWith('-') && !['--print', '--model', '--output-format', '--mode'].includes(element)) {
         throw new Error(`review argv template carries a flag the agy review does not use: ${element}`);
       }
+    }
+    if (planModes !== 1) {
+      throw new Error('review argv template must pin --mode plan exactly once');
     }
   }
 

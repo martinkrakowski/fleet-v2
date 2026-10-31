@@ -173,6 +173,8 @@ describe('work order supersedes (WO-1)', () => {
       validWorkOrderRequest({
         workOrderId: 'wo-sup-second',
         supersedesWorkOrderId: 'wo-sup-parent',
+        // distinct paths: only the lineage guard can refuse this, not path overlap
+        ownedPaths: ['packages/example-other/**'],
       }),
     );
     expect(second).toEqual({
@@ -237,7 +239,11 @@ describe('work order supersedes (WO-1)', () => {
     expect(c.outcome).toBe('registered');
 
     const d = await useCase.registerWorkOrder(
-      validWorkOrderRequest({ workOrderId: 'wo-chain-d', supersedesWorkOrderId: 'wo-chain-a' }),
+      validWorkOrderRequest({
+        workOrderId: 'wo-chain-d',
+        supersedesWorkOrderId: 'wo-chain-a',
+        ownedPaths: ['packages/example-other/**'],
+      }),
     );
     expect(d).toEqual({
       outcome: 'rejected',

@@ -46,6 +46,7 @@ import { RecordVerificationReceiptUseCase } from '../RecordVerificationReceiptUs
 import { RequestIndependentReviewUseCase } from '../RequestIndependentReviewUseCase.use-case.js';
 import { RequestVerificationUseCase } from '../RequestVerificationUseCase.use-case.js';
 import { EvidenceArchiveAdapter } from '../../../infrastructure/adapters/EvidenceArchiveAdapter.adapter.js';
+import { EvidenceAssessment } from '../../../domain/entities/EvidenceAssessment.js';
 import { EvidenceAssessmentRepositoryAdapter } from '../../../infrastructure/adapters/EvidenceAssessmentRepositoryAdapter.adapter.js';
 import { ForgeEvidenceAdapter } from '../../../infrastructure/adapters/ForgeEvidenceAdapter.adapter.js';
 import { IndependentReviewAdapter } from '../../../infrastructure/adapters/IndependentReviewAdapter.adapter.js';
@@ -977,6 +978,74 @@ describe('RecordFindingDispositionUseCase', () => {
 
     expect(withoutReason.outcome).toBe('rejected');
     expect(withoutEvidence.outcome).toBe('rejected');
+  });
+
+  it('refuses an out-of-scope disposition for a finding id no receipt raised', async () => {
+    const repo = fakeRepository([withFindings()]);
+    const useCase = new RecordFindingDispositionUseCase({ repo });
+
+    const result = await useCase.recordFindingDisposition({
+      assessmentId: 'ea-1',
+      disposition: disposition({ state: 'out-of-scope', findingId: 'f-404' }),
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome !== 'rejected') {
+      throw new Error('expected a rejection');
+    }
+    expect(result.reason).toContain("No finding 'f-404'");
+    expect(repo.saved).toBe(0);
+  });
+
+  it('lets a colliding receipt raise a finding id an earlier disposition resolved', async () => {
+    const repo = fakeRepository([withFindings()]);
+    const dispositionUseCase = new RecordFindingDispositionUseCase({ repo });
+    const reviewUseCase = new RecordReviewReceiptUseCase({ repo });
+
+    const dispositionResult = await dispositionUseCase.recordFindingDisposition({
+      assessmentId: 'ea-1',
+      disposition: disposition(),
+      nowIso: NOW,
+    });
+    expect(dispositionResult.outcome).toBe('recorded');
+    if (dispositionResult.outcome !== 'recorded') {
+      throw new Error('expected a recorded disposition');
+    }
+    expect(dispositionResult.assessment.blockers).toEqual(["finding 'f-2' is unresolved"]);
+
+    // A later receipt on the same head raises the same per-receipt id again.
+    const receiptResult = await reviewUseCase.recordReviewReceipt({
+      assessmentId: 'ea-1',
+      receipt: reviewReceipt({ id: 'rr-2', result: 'fail', findings: [finding('f-1')] }),
+      nowIso: NOW,
+    });
+    expect(receiptResult.outcome).toBe('recorded');
+    if (receiptResult.outcome !== 'recorded') {
+      throw new Error('expected a recorded receipt');
+    }
+    expect(receiptResult.assessment.blockers).toEqual([
+      "finding 'f-1' is unresolved",
+      "finding 'f-2' is unresolved",
+    ]);
+    expect(receiptResult.assessment.state).toBe('blocked');
+  });
+
+  it('keeps an id held by two receipts blocked under fixed and refuted dispositions', async () => {
+    for (const state of ['fixed', 'refuted'] as const) {
+      const repo = fakeRepository([
+        assessmentRecord({
+          requiredChecks: [],
+          reviewReceipts: [
+            reviewReceipt({ id: 'rr-1', result: 'fail', findings: [finding('f-1')] }),
+            reviewReceipt({ id: 'rr-2', result: 'fail', findings: [finding('f-1')] }),
+          ],
+          findingDispositions: [disposition({ state })],
+        }),
+      ]);
+      const assessment = EvidenceAssessment.fromRecord(repo.records.get('ea-1')!);
+      expect(assessment.unresolvedFindingIds()).toEqual(['f-1']);
+      expect(assessment.collectBlockers()).toEqual(["finding 'f-1' is unresolved"]);
+    }
   });
 });
 

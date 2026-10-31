@@ -286,6 +286,34 @@ describe('RecordReviewReceiptUseCase finding normalisation', () => {
       },
     ]);
   });
+
+  it('rejects a receipt raising two findings under the same id', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const useCase = new RecordReviewReceiptUseCase({ repo });
+
+    const finding = {
+      findingId: 'f-1',
+      severity: 'major' as const,
+      summary: 'summary for f-1',
+      filePath: null,
+      line: null,
+      state: 'unresolved' as const,
+      dispositionReason: null,
+      dispositionEvidenceRef: null,
+    };
+    const result = await useCase.recordReviewReceipt({
+      assessmentId: 'asm-1',
+      receipt: sampleReceipt({ findings: [finding, { ...finding, summary: 'second occurrence' }] }),
+    });
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome !== 'rejected') {
+      throw new Error('expected a rejection');
+    }
+    expect(result.reason).toContain("duplicate finding id 'f-1'");
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored?.reviewReceipts).toHaveLength(0);
+  });
 });
 
 describe('free-seat policy and requested reviewer (FS3b)', () => {

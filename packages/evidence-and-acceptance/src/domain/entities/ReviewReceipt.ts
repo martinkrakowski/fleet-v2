@@ -171,6 +171,18 @@ export class ReviewReceipt {
         error: new Error('ReviewReceipt contains an invalid finding'),
       };
     }
+    // Finding ids are numbered per receipt: one receipt may not raise two
+    // findings under the same id, or dispositions could not name one finding.
+    const findingIds = new Set<string>();
+    for (const finding of props.findings) {
+      if (findingIds.has(finding.findingId)) {
+        return {
+          success: false,
+          error: new Error(`ReviewReceipt contains duplicate finding id '${finding.findingId}'`),
+        };
+      }
+      findingIds.add(finding.findingId);
+    }
     if (props.kind !== undefined && !REVIEW_KINDS.includes(props.kind)) {
       return {
         success: false,

@@ -217,20 +217,27 @@ export class EvidenceAssessment {
     });
   }
 
-  /** Unresolved findings still block acceptance; fixed and refuted do not. */
+  /**
+   * Unresolved findings still block acceptance; fixed and refuted do not.
+   * A disposition resolves a finding id only while exactly one receipt holds
+   * that id: finding ids are numbered per receipt, so a later receipt on the
+   * same head may raise the same id, and an earlier disposition for that id
+   * must not silently resolve the new, in-scope finding.
+   */
   unresolvedFindingIds(): readonly string[] {
+    const receiptHoldCounts = new Map<string, number>();
+    for (const receipt of this.record.reviewReceipts) {
+      for (const finding of receipt.findings) {
+        receiptHoldCounts.set(finding.findingId, (receiptHoldCounts.get(finding.findingId) ?? 0) + 1);
+      }
+    }
     const resolved = new Set(
       this.record.findingDispositions
         .filter((disposition) => !FindingState.create(disposition.state).value?.isBlocking())
+        .filter((disposition) => receiptHoldCounts.get(disposition.findingId) === 1)
         .map((disposition) => disposition.findingId),
     );
-    const findingIds = new Set<string>();
-    for (const receipt of this.record.reviewReceipts) {
-      for (const finding of receipt.findings) {
-        findingIds.add(finding.findingId);
-      }
-    }
-    return [...findingIds].filter((findingId) => !resolved.has(findingId));
+    return [...receiptHoldCounts.keys()].filter((findingId) => !resolved.has(findingId));
   }
 
   /**

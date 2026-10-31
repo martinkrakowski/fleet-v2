@@ -1880,12 +1880,11 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
     const harness = await makeHarness(runRecord(), [running]);
     await conduct(harness, 'running', NOW);
     await appendStopIntent(harness, 'force', NOW);
+    const before = structuredClone(harness.workOrders.get('wo-example-1'));
     const result = await advance(harness);
     expect(result).toMatchObject({ reasonCode: 'stop-force' });
-    expect(harness.workOrders.get('wo-example-1')).toMatchObject({
-      state: 'approved',
-      revision: 1,
-    });
+    expect(before).toMatchObject({ state: 'approved', revision: 1 });
+    expect(harness.workOrders.get('wo-example-1')).toEqual(before);
   });
 
   it('test 17: a held reservation for an attempt outside the run still releases stopped (pins the attemptIds filter)', async () => {

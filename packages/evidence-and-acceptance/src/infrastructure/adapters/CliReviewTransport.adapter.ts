@@ -123,7 +123,16 @@ export function substituteReviewArgv(
         planModes += 1;
         continue;
       }
-      if (element.startsWith('-') && !['--print', '--model', '--output-format', '--mode'].includes(element)) {
+      if (['--print', '--model', '--output-format'].includes(element)) {
+        // A value-taking flag must be followed by its value, never by another flag it would swallow.
+        const value = template[i + 1];
+        if (value === undefined || value.startsWith('-')) {
+          throw new Error(`review argv template flag ${element} has no value`);
+        }
+        i += 1;
+        continue;
+      }
+      if (element.startsWith('-')) {
         throw new Error(`review argv template carries a flag the agy review does not use: ${element}`);
       }
     }

@@ -719,8 +719,24 @@ describe('CliReviewTransport', () => {
     it('substituteReviewArgv refuses a template that carries skip-permissions or --yolo', () => {
       expect(() =>
         substituteReviewArgv([...AGY_REVIEW_ARGV_TEMPLATE, '--dangerously-skip-permissions'], AGY_MODEL, 'p'),
-      ).toThrow('--dangerously-skip-permissions');
-      expect(() => substituteReviewArgv(['agy', '--print', '{prompt}', '--yolo'], AGY_MODEL, 'p')).toThrow('--yolo');
+      ).toThrow('must not carry --dangerously-skip-permissions or --yolo');
+      expect(() => substituteReviewArgv(['agy', '--print', '{prompt}', '--yolo'], AGY_MODEL, 'p')).toThrow(
+        'must not carry --dangerously-skip-permissions or --yolo',
+      );
+      // grok templates skip the agy allow-list, so only the skip-permissions check can refuse this one
+      expect(() =>
+        substituteReviewArgv([...GROK_REVIEW_ARGV_TEMPLATE, '--yolo'], 'grok-4.7', 'p', '/tmp/prompt.txt'),
+      ).toThrow('must not carry --dangerously-skip-permissions or --yolo');
+    });
+
+    it('refuses an agy template where a value-taking flag swallows another flag', () => {
+      expect(() =>
+        substituteReviewArgv(
+          ['agy', '--print', '{prompt}', '--model', '{model}', '--output-format', '--mode', 'plan'],
+          AGY_MODEL,
+          'p',
+        ),
+      ).toThrow('flag --output-format has no value');
     });
 
     it('refuses agy templates that grant an edit mode or carry unused flags', () => {

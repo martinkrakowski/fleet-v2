@@ -1,3 +1,60 @@
-// @generated inbound contract scaffold — refine before implementation.
-/** See this context's contracts registry in manifest.yaml. */
-export interface ReapOrphanSessionsPort {}
+// @generated inbound contract scaffold — refined for EX-4.
+/**
+ * ReapOrphanSessionsPort: on the operator's explicit request, list worktrees
+ * whose every attempt is finished (cancelled, collected or ended) and none
+ * holds a reservation, but where the runner still reports a running session,
+ * and abort those by directory only with confirmation; never touches a
+ * worktree with a live attempt or a held reservation; a dry run aborts
+ * nothing and never deletes a session record, worktree, branch or run.
+ */
+
+export interface ReapOrphanSessionsRequest {
+  /** Dry run: scan and list orphans exactly like a real run, but call no `abortWorktreeRun`. */
+  readonly dryRun: boolean;
+}
+
+/** One orphan: a worktree whose attempts are finished but a session still runs in it. */
+export interface ReapOrphanSessionEntry {
+  readonly worktreePath: string;
+  /** The worktree's latest finished attempt with a recorded host. */
+  readonly attemptId: string;
+  /** The session the runner reports running in the worktree. */
+  readonly sessionId: string;
+}
+
+/** A worktree that is not an orphan candidate, with its typed reason. */
+export interface ReapOrphanSkippedEntry {
+  readonly worktreePath: string;
+  readonly reason: string;
+}
+
+/** An abort that did not confirm termination, with the runner's outcome. */
+export interface ReapOrphanFailedEntry {
+  readonly worktreePath: string;
+  readonly outcome: string;
+}
+
+/** A worktree the runner could not inspect; reported, never acted on. */
+export interface ReapOrphanUnknownEntry {
+  readonly worktreePath: string;
+  readonly reason: string;
+}
+
+export type ReapOrphanSessionsResult = {
+  readonly outcome: 'reaped';
+  readonly dryRun: boolean;
+  /** Orphans found (on a real run, the ones the abort pass then processes). */
+  readonly orphans: readonly ReapOrphanSessionEntry[];
+  /** Worktrees whose running session was aborted. */
+  readonly aborted: readonly { readonly worktreePath: string }[];
+  /** Aborts that did not confirm termination (still-running, refused, unknown). */
+  readonly failed: readonly ReapOrphanFailedEntry[];
+  /** Worktrees that are not candidates, with why. */
+  readonly skipped: readonly ReapOrphanSkippedEntry[];
+  /** Worktrees whose runner state is unknown; reported, never aborted. */
+  readonly unknown: readonly ReapOrphanUnknownEntry[];
+};
+
+export interface ReapOrphanSessionsPort {
+  reapOrphanSessions(request: ReapOrphanSessionsRequest): Promise<ReapOrphanSessionsResult>;
+}

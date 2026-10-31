@@ -238,7 +238,8 @@ interface Harness {
   readonly manifestReads: readonly (AttemptRunnerRecord | null)[];
   readonly cancelRequests: readonly CancelPreparedAttemptRequest[];
   readonly deps: AdvanceLaneRunDependencies;
-  setManifest(json: string | null): void;
+  setManifest(json: string | null): Promise<void>;
+  setChangedManifestOnDisk(json: string | null): void;
   setDispatchAnswer(answer: (request: DispatchAttemptRequest) => Promise<DispatchAttemptResult>): void;
   setCancelAnswer(answer: CancelPreparedAttemptResult): void;
   markAttemptCancelled(attemptId: string, stopReason: AttemptRecord['stopReason']): Promise<void>;
@@ -362,7 +363,26 @@ async function makeHarness(
     manifestReads,
     cancelRequests,
     deps,
-    setManifest: (json) => {
+    setManifest: async (json) => {
+      manifestJson = json;
+      // SEC-5b: a re-frozen manifest re-freezes the stored attempts' digests
+      // too, so every read of the served manifest verifies against it.
+      if (json !== null) {
+        const digest = digestFor(json);
+        for (const attempt of await attemptRepo.listAllAttempts()) {
+          if (attempt.briefDigest !== digest) {
+            await attemptRepo.saveAttempt({
+              ...attempt,
+              revision: (attempt.revision ?? 0) + 1,
+              briefDigest: digest,
+            });
+          }
+        }
+      }
+    },
+    // The changed-on-disk path (SEC-5b): the served manifest changes without
+    // any attempt digest being re-frozen — every digest read then mismatches.
+    setChangedManifestOnDisk: (json) => {
       manifestJson = json;
     },
     setDispatchAnswer: (answer) => {
@@ -623,7 +643,26 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
 
   it('test 7: a frozen manifest without stepLimit refuses the dispatch inputs and never calls the runner', async () => {
     const harness = await makeHarness(runRecord(), [attemptFixture()]);
-    harness.setManifest(JSON.stringify({ timeLimitSeconds: 2700 }));
+    await harness.setManifest(JSON.stringify({ timeLimitSeconds: 2700 }));
+    await admit(harness, 'attempt-example-1');
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    expect(harness.dispatchRequests).toHaveLength(0);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries).toContainEqual(
+      expect.objectContaining({
+        kind: 'result',
+        outcome: 'refused',
+        reasonCode: 'dispatch-inputs-unreadable',
+      }),
+    );
+  });
+
+  it('test 7e (SEC-5b): dispatch of an initial attempt with a changed-on-disk manifest refuses the dispatch inputs and parks step-refused', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    // A valid manifest whose bytes changed without any digest re-freeze: the
+    // verified read fails closed, so the dispatch inputs are unreadable.
+    harness.setChangedManifestOnDisk(JSON.stringify({ stepLimit: 101, timeLimitSeconds: 2700, expectedArtifacts: [] }));
     await admit(harness, 'attempt-example-1');
     const result = await advance(harness);
     expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
@@ -659,7 +698,7 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
 
   it('test 7c (KF-10): after a refused first dispatch parks, a resume pivots to the next first-pass seat under a new key', async () => {
     const harness = await makeHarness(runRecord(), [attemptFixture()]);
-    harness.setManifest(null);
+    await harness.setManifest(null);
     await admit(harness, 'attempt-example-1');
     const key = dispatchKey(0, 0, 1);
     const first = await advance(harness);
@@ -711,7 +750,7 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     const harness = await makeHarness(runRecord(), [
       attemptFixture({ seatPlan: SEAT_PLAN_ONE }),
     ]);
-    harness.setManifest(null);
+    await harness.setManifest(null);
     await admit(harness, 'attempt-example-1');
     const key = dispatchKey(0, 0, 1);
     const first = await advance(harness);

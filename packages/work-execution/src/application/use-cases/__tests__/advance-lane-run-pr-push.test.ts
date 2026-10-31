@@ -27,9 +27,9 @@ import type {
   ExecuteAuthorizedForgeActionResult,
 } from '../../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
 import type { ReadPullRequestRequest, ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
-import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
-import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
+import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
@@ -41,7 +41,6 @@ const LEASE_UNTIL = '2026-10-27T10:05:00.000Z';
 const HOLDER = 'driver';
 const COMMIT = 'a'.repeat(40);
 const MOVED_COMMIT = 'b'.repeat(40);
-const SHA = 'c'.repeat(64);
 const HEAD12 = 'a'.repeat(12);
 const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
 const PROJECT_ID = 'project-example';
@@ -108,6 +107,12 @@ const DEFAULT_MANIFEST = {
     challengeThis: CHALLENGE_THIS,
   },
 };
+
+// SEC-5b: the open-PR read of the frozen manifest is digest-verified, so the
+// attempt's recorded `briefDigest` is the digest of the frozen prose and the
+// frozen manifest, frozen together.
+const PROSE = '# brief\n';
+const SHA = simpleDeterministicHexDigest(PROSE + '\n' + JSON.stringify(DEFAULT_MANIFEST));
 
 function makeWorkOrder(overrides: Partial<WorkOrderRecord> = {}): WorkOrderRecord {
   return {
@@ -230,7 +235,8 @@ interface Harness {
   readonly forgeReadRequests: readonly ReadPullRequestRequest[];
   readonly portCalls: readonly string[];
   readonly deps: AdvanceLaneRunDependencies;
-  setManifest(json: string | null): void;
+  setManifest(json: string | null): Promise<void>;
+  setChangedManifestOnDisk(json: string | null): void;
   setAcceptanceAnswer(answer: AcceptanceAssessmentResult | 'throw'): void;
   setReceiptsAnswer(answer: AcceptanceReceiptsResult | 'throw'): void;
   setGrantAnswer(answer: ConductorForgeGrantResult | 'throw'): void;
@@ -320,6 +326,7 @@ async function makeHarness(
     executionJournal,
     artifactPort: {
       readBriefManifest: async () => manifestJson,
+      readBriefFile: async () => PROSE,
       verifyArtifactManifest: async () => ({ outcome: 'missing' }) as never,
     },
     reconcileAttempt: {
@@ -425,7 +432,26 @@ async function makeHarness(
     forgeReadRequests,
     portCalls,
     deps,
-    setManifest: (json) => {
+    setManifest: async (json) => {
+      manifestJson = json;
+      // SEC-5b: a re-frozen manifest re-freezes the stored attempts' digests
+      // too, so every read of the served manifest verifies against it.
+      if (json !== null) {
+        const digest = simpleDeterministicHexDigest(PROSE + '\n' + json);
+        for (const attempt of await attemptRepo.listAllAttempts()) {
+          if (attempt.briefDigest !== digest) {
+            await attemptRepo.saveAttempt({
+              ...attempt,
+              revision: (attempt.revision ?? 0) + 1,
+              briefDigest: digest,
+            });
+          }
+        }
+      }
+    },
+    // The changed-on-disk path (SEC-5b): the served manifest changes without
+    // any attempt digest being re-frozen — every digest read then mismatches.
+    setChangedManifestOnDisk: (json) => {
       manifestJson = json;
     },
     setAcceptanceAnswer: (answer) => {
@@ -574,7 +600,7 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
 
   it('test 2: missing frozen prNotes refuses forge-refused with no grant and no forge call, then the next advance parks step-refused open-pr', async () => {
     const harness = await openingPrHarness();
-    harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] }));
+    await harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] }));
     expect(await advance(harness)).toEqual({
       outcome: 'acted',
       step: 'open-pr',
@@ -593,6 +619,26 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
       reason: 'step-refused',
       qualifier: 'open-pr',
     });
+  });
+
+  it('test 2b (SEC-5b): a changed-on-disk frozen manifest refuses forge-refused with no intent, grant or forge call', async () => {
+    const harness = await openingPrHarness();
+    // A valid manifest whose bytes changed without any digest re-freeze: the
+    // verified read fails closed before any intent, grant or forge call.
+    harness.setChangedManifestOnDisk(JSON.stringify({ ...DEFAULT_MANIFEST, stepLimit: 101 }));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'refused',
+      reasonCode: 'forge-refused',
+    });
+    expect(harness.grantRequests).toEqual([]);
+    expect(harness.forgeRequests).toEqual([]);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === openPrKey());
+    expect(intents).toHaveLength(1);
+    expect(intents[0]!.mintedId).toBeNull();
   });
 
   it('test 3: a refused grant journals grant-refused with the keyed intent minted to the action id and no forge call', async () => {

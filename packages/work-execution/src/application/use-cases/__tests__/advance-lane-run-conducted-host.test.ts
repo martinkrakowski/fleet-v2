@@ -36,7 +36,7 @@ import type { FindReviewReceiptRequest, FindReviewReceiptResult, ReviewRequest, 
 import type { PrepareFixAttemptRequest, PrepareFixAttemptResult } from '../../ports/in/PrepareFixAttemptPort.in-port.js';
 import type { PrepareBriefPackageResult } from '../../ports/in/PrepareBriefPackagePort.in-port.js';
 import type { PrepareBriefPackageUseCaseRequest } from '../PrepareBriefPackageUseCase.use-case.js';
-import { readFrozenManifest } from '../advance-lane-run/frozen-manifest.js';
+import { readVerifiedFrozenManifest } from '../advance-lane-run/frozen-manifest.js';
 import { manifestVerdictOf } from '../advance-lane-run/facts.js';
 import { performReview } from '../advance-lane-run/review-fix.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from '../advance-lane-run/step-context.js';
@@ -50,7 +50,6 @@ const COMMIT_A = 'a'.repeat(40);
 const HEAD12_A = 'a'.repeat(12);
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
-const SHA = 'c'.repeat(64);
 /** The frozen prose the harness reads for an attempt's `.lane/brief.md`; its digest seals the prior (KF-21b). */
 const DEFAULT_PROSE = '# Task\n\nFix the acceptance problem.\n';
 const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
@@ -89,6 +88,11 @@ const FULL_MANIFEST_JSON = JSON.stringify({
   ownerDecisionReferences: [],
   prNotes: { hardToUndo: 'undo', assumptions: 'assume', challengeThis: 'challenge' },
 });
+
+// SEC-5b: the dispatch read of the frozen manifest is digest-verified, so the
+// harness's prepare-brief fake freezes the digest of the prose and manifest it
+// actually serves.
+const SHA = simpleDeterministicHexDigest(DEFAULT_PROSE + '\n' + FULL_MANIFEST_JSON);
 
 const BASE_RECORD = {
   version: 1,
@@ -583,12 +587,12 @@ async function expectParkedStepRefused(
   expect(entries.filter((entry) => entry.kind === 'intent' || entry.kind === 'result')).toEqual([]);
 }
 
-describe('readFrozenManifest and manifestVerdictOf go through the recorded host or are not made (Q2a-2)', () => {
+describe('readVerifiedFrozenManifest and manifestVerdictOf go through the recorded host or are not made (Q2a-2)', () => {
   it('a conducted attempt with runner null calls no port and reads the unreadable value', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt({ runner: null })]);
     const attempt = (await harness.attemptRepo.findAttemptById('attempt-example-1'))!;
 
-    expect(await readFrozenManifest(attempt, harness.deps.artifactPort)).toBeNull();
+    expect(await readVerifiedFrozenManifest(attempt, harness.deps.artifactPort)).toBeNull();
     expect(harness.manifestReads).toEqual([]);
 
     expect(await manifestVerdictOf(attempt, harness.deps.artifactPort)).toBe('missing');
@@ -599,7 +603,7 @@ describe('readFrozenManifest and manifestVerdictOf go through the recorded host 
     const harness = await makeHarness(runRecord(), [collectedAttempt({ runner: CONDUCTED_RUNNER })]);
     const attempt = (await harness.attemptRepo.findAttemptById('attempt-example-1'))!;
 
-    const manifest = await readFrozenManifest(attempt, harness.deps.artifactPort);
+    const manifest = await readVerifiedFrozenManifest(attempt, harness.deps.artifactPort);
     expect(manifest).not.toBeNull();
     expect(harness.manifestReads).toEqual([CONDUCTED_RUNNER]);
 

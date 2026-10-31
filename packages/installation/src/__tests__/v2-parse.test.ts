@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { deriveInstallationModel } from '../model.js';
 import { parseInstallation } from '../parse.js';
 
 /** A minimal valid v2 file: one host with both required roles and a runner. */
@@ -1157,5 +1158,33 @@ describe('parseInstallation v2', () => {
       ok: false,
       errors: ['hosts.lane-host.runner.gateSlot: unknown key'],
     });
+  });
+
+  it('carries the parsed gateSlot onto the derived model runners (KF-30b)', () => {
+    const gateSlot = { path: '/usr/local/bin/gate-slot', slots: 8 };
+    for (const kind of ['opencode', 'agy'] as const) {
+      const runner =
+        kind === 'agy'
+          ? { kind, port: 46000, agyMode: 'edit-only', gateSlot }
+          : { kind, port: 46000, gateSlot };
+      const parsed = parseInstallation({
+        ...validV2,
+        hosts: {
+          'lane-host': {
+            ...validV2.hosts['lane-host'],
+            runner,
+          },
+        },
+      });
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) {
+        return;
+      }
+      const { model } = deriveInstallationModel(parsed.installation);
+      expect(model.hosts['lane-host']?.runner).toMatchObject({
+        kind,
+        gateSlot,
+      });
+    }
   });
 });

@@ -411,7 +411,8 @@ describe('runDoctor', () => {
     expect(lines.filter((line) => line.check === 'gate-slot')).toEqual([]);
   });
 
-  it('reports UNKNOWN with the source in detail for a legacy-asserted runner', async () => {    const legacy: FleetInstallationModel = {
+  it('reports UNKNOWN with the source in detail for a legacy-asserted runner', async () => {
+    const legacy: FleetInstallationModel = {
       ...sampleModel(),
       hosts: {
         main: {

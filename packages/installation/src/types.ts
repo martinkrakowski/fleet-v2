@@ -155,7 +155,9 @@ export interface AgyAcknowledgement {
  * `path` is the absolute path of the trusted, host-installed `gate-slot`
  * wrapper the conducted gate prefixes every acceptance command with. `slots`
  * must equal the host-wide budget the hand-run gate uses; the code does not
- * enforce the equality, the operator declares it.
+ * enforce the equality, the operator declares it. A congestion `unknown`
+ * verdict parks the run `ambiguous` at the gate (fail closed, visible to the
+ * owner); automatic wait-and-retry is a separate unit (KF-30c).
  */
 export interface GateSlotSection {
   readonly path: string;

@@ -87,6 +87,13 @@ function gitFailed(run: CommandRunResult): boolean {
   return run.error !== undefined || run.exitCode === null;
 }
 
+/** The last stderr line after stripping one trailing newline, trimmed. */
+function lastStderrLine(stderr: string): string {
+  const stripped = stderr.replace(/\r?\n$/, '');
+  const lines = stripped.split(/\r?\n/);
+  return (lines[lines.length - 1] ?? '').trim();
+}
+
 function skipped(name: string, kind: GatePredicateKind): GatePredicateResult {
   return {
     name,
@@ -383,10 +390,14 @@ export class GatePredicateAdapter implements GatePredicatePort {
     // KF-30b: with a declared gate slot the command is prefixed so it takes
     // one of the host-wide flock slots through the trusted, host-installed
     // wrapper — never the worktree's own `bin/gate-slot`. The slot wait may
-    // use at most a third of the command budget, capped at 600 s.
-    const waitSeconds = Math.min(
-      GATE_SLOT_MAX_WAIT_SECONDS,
-      Math.floor(this.commandTimeoutMs / GATE_SLOT_WAIT_DIVISOR_MS),
+    // use at most a third of the command budget, capped at 600 s and never
+    // below 1 s.
+    const waitSeconds = Math.max(
+      1,
+      Math.min(
+        GATE_SLOT_MAX_WAIT_SECONDS,
+        Math.floor(this.commandTimeoutMs / GATE_SLOT_WAIT_DIVISOR_MS),
+      ),
     );
     const argv = [
       'sh',
@@ -422,13 +433,17 @@ export class GatePredicateAdapter implements GatePredicatePort {
       };
     }
 
-    // KF-30b: exit 75 with the fixed stderr line — and only that combination —
-    // is the host being full, not the command's own verdict. The run then
-    // waits and retries; it is never failed for host congestion. Any other
-    // exit 75 stays the command's own result.
+    // KF-30b: with a declared gate slot, exit 75 whose LAST stderr line (after
+    // one trailing newline) is the fixed `gate-slot` line is host congestion,
+    // not the command's own verdict — earlier stderr lines (ssh warnings) do
+    // not matter. A congestion `unknown` verdict parks the run `ambiguous` at
+    // the gate, fail closed and visible to the owner; automatic wait-and-retry
+    // is a separate unit (KF-30c). Without a declared gate slot, exit 75 is
+    // the command's own result. Any other exit 75 stays the command's result.
     if (
+      gateSlot !== undefined &&
       run.exitCode === GATE_SLOT_EXIT_CODE &&
-      run.stderr.trim() === GATE_SLOT_WAIT_LIMIT_LINE
+      lastStderrLine(run.stderr) === GATE_SLOT_WAIT_LIMIT_LINE
     ) {
       return {
         name,

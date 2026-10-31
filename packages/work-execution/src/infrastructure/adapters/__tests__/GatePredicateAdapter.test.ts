@@ -694,4 +694,54 @@ describe('GatePredicateAdapter gate slot (KF-30b)', () => {
     const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
     expect(results[2]).toMatchObject({ verdict: 'fail', exitCode: 75 });
   });
+
+  it('treats the fixed line as the last stderr line, ignoring ssh warnings before it', async () => {
+    const { adapter } = makeAdapter(
+      (argv) =>
+        argv[0] === 'sh'
+          ? {
+              exitCode: 75,
+              stderr:
+                'ssh: Warning: Permanently added to the list of known hosts.\ngate-slot: no slot within the wait limit\n',
+            }
+          : happyGit(argv),
+      {},
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({
+      kind: 'command',
+      verdict: 'unknown',
+      exitCode: 75,
+      detail: 'gate slot wait limit reached',
+    });
+  });
+
+  it('keeps exit 75 with the fixed stderr line as the command own fail without a declared gateSlot', async () => {
+    const { adapter } = makeAdapter(
+      (argv) =>
+        argv[0] === 'sh'
+          ? { exitCode: 75, stderr: 'gate-slot: no slot within the wait limit\n' }
+          : happyGit(argv),
+      {},
+      { outcome: 'clean' },
+      { transport: 'local', roles: ['lane-runner'], runner: { kind: 'opencode', port: 4096 } },
+    );
+    const results = evaluatedResults(await adapter.evaluateGatePredicates(REQUEST));
+    expect(results[2]).toMatchObject({ verdict: 'fail', exitCode: 75 });
+  });
+
+  it('never passes a zero wait limit, whatever the command budget', async () => {
+    const { adapter, executor } = makeAdapter(
+      (argv) => (argv[0] === 'sh' ? { exitCode: 0 } : happyGit(argv)),
+      { commandTimeoutMs: 2000 },
+      { outcome: 'clean' },
+      HOST_SPEC,
+    );
+    await adapter.evaluateGatePredicates(REQUEST);
+    const prefixed = executor.argvRecords.find((argv) => argv.includes(GATE_SLOT_PATH));
+    expect(prefixed).toBeDefined();
+    expect(prefixed).toContain('FLEET_V2_GATE_WAIT_MAX_SECONDS=1');
+  });
 });

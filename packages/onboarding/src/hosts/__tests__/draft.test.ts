@@ -225,6 +225,45 @@ describe('draftHost', () => {
     }
   });
 
+  it('carries the drafted gateSlot on either runner kind (KF-30b)', () => {
+    const opencode = draftHost(
+      sshInput({
+        runner: {
+          kind: 'opencode',
+          port: 4166,
+          gateSlot: { path: '/usr/local/bin/gate-slot', slots: 8 },
+        },
+      }),
+    );
+    expect(opencode.ok).toBe(true);
+    if (opencode.ok) {
+      expect(opencode.draft.host.runner).toMatchObject({
+        kind: 'opencode',
+        port: 4166,
+        gateSlot: { path: '/usr/local/bin/gate-slot', slots: 8 },
+      });
+    }
+
+    const agy = draftHost(
+      sshInput({
+        runner: {
+          kind: 'agy',
+          agyMode: 'edit-only',
+          port: 4166,
+          gateSlot: { path: '/usr/local/bin/gate-slot', slots: 8 },
+        },
+      }),
+    );
+    expect(agy.ok).toBe(true);
+    if (agy.ok) {
+      expect(agy.draft.host.runner).toMatchObject({
+        kind: 'agy',
+        agyMode: 'edit-only',
+        gateSlot: { path: '/usr/local/bin/gate-slot', slots: 8 },
+      });
+    }
+  });
+
   it('carries the agy fields on an agy runner and never on an opencode one', () => {
     const agy = draftHost(
       sshInput({

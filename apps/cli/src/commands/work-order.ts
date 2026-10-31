@@ -7,8 +7,16 @@ import type {
 } from './payload.js';
 
 export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
-    register: async (p, rt) =>
-      rt.execution.registerWorkOrder.registerWorkOrder({
+    register: async (p, rt) => {
+      // A given --supersedes-work-order-id must carry a value: a bare flag parses as `true`
+      // and an empty value would name nothing to supersede, so both are usage errors.
+      if (
+        Object.hasOwn(p, 'supersedesWorkOrderId') &&
+        (typeof p.supersedesWorkOrderId !== 'string' || p.supersedesWorkOrderId.trim() === '')
+      ) {
+        throw new CliUsageError('work-order register --supersedes-work-order-id needs a work order id');
+      }
+      return rt.execution.registerWorkOrder.registerWorkOrder({
         workOrderId: str(p, 'workOrderId'),
         projectId: str(p, 'projectId'),
         taskId: str(p, 'taskId'),
@@ -22,8 +30,10 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
           p.risk === undefined
             ? undefined
             : enumOf(p, 'risk', WORK_ORDER_RISKS, 'work-order register --risk'),
+        supersedesWorkOrderId: optStr(p, 'supersedesWorkOrderId'),
         nowIso: optStr(p, 'nowIso'),
-      }),
+      });
+    },
     inspect: async (p, rt) =>
       rt.execution.inspectWorkOrder.inspectWorkOrder({ workOrderId: str(p, 'workOrderId') }),
     close: async (p, rt) => {

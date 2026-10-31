@@ -4,6 +4,7 @@ export * from "./advance-lane-run/index.js";
 export * from "./AdvanceLaneRunUseCase.use-case.js";
 export * from "./AutoMergeAttemptUseCase.use-case.js";
 export * from "./CancelPreparedAttemptUseCase.use-case.js";
+export * from "./CloseWorkOrderUseCase.use-case.js";
 export * from "./CollectAttemptArtifactsUseCase.use-case.js";
 export * from "./CommitEditOnlyAttemptUseCase.use-case.js";
 export * from "./conductor-driver-lease-keeper.js";

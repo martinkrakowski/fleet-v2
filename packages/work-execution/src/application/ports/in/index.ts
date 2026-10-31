@@ -3,6 +3,7 @@
 export * from "./AdvanceLaneRunPort.in-port.js";
 export * from "./AutoMergeAttemptPort.in-port.js";
 export * from "./CancelPreparedAttemptPort.in-port.js";
+export * from "./CloseWorkOrderPort.in-port.js";
 export * from "./CollectAttemptArtifactsPort.in-port.js";
 export * from "./CommitEditOnlyAttemptPort.in-port.js";
 export * from "./DispatchAttemptPort.in-port.js";

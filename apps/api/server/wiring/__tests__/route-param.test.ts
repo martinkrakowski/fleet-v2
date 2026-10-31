@@ -24,6 +24,7 @@ import { configureFleetApiRuntime } from "../runtime";
 import attemptIdGet from "../../routes/v1/attempts/[id].get";
 import attemptAcceptancePost from "../../routes/v1/attempts/[id]/acceptance.post";
 import attemptArtifactsPost from "../../routes/v1/attempts/[id]/artifacts.post";
+import attemptCancelPreparedPost from "../../routes/v1/attempts/[id]/cancel-prepared.post";
 import attemptFixPost from "../../routes/v1/attempts/[id]/fix.post";
 import attemptJournalGet from "../../routes/v1/attempts/[id]/journal.get";
 import attemptNotesPost from "../../routes/v1/attempts/[id]/notes.post";
@@ -152,6 +153,7 @@ describe("routeParam on the work and evidence routes", () => {
     ["attempts/:id", "/v1/attempts/:id", attemptIdGet],
     ["attempts/:id/acceptance", "/v1/attempts/:id/acceptance", attemptAcceptancePost],
     ["attempts/:id/artifacts", "/v1/attempts/:id/artifacts", attemptArtifactsPost],
+    ["attempts/:id/cancel-prepared", "/v1/attempts/:id/cancel-prepared", attemptCancelPreparedPost],
     ["attempts/:id/fix", "/v1/attempts/:id/fix", attemptFixPost],
     ["attempts/:id/journal", "/v1/attempts/:id/journal", attemptJournalGet],
     ["attempts/:id/notes", "/v1/attempts/:id/notes", attemptNotesPost],

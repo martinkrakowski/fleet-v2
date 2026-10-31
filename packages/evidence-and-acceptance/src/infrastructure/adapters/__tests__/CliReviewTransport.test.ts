@@ -638,13 +638,12 @@ describe('CliReviewTransport', () => {
       expect(prompt.split(NONCE).length - 1).toBe(4);
     });
 
-    it('a brief-check embedded prompt without a briefText still builds and says the brief was not supplied', async () => {
-      const { transport, capturedPrompts } = buildHarness();
-      await transport({ ...BASE_REQUEST, kind: 'brief-check' });
-
-      const prompt = capturedPrompts[0];
-      expect(prompt).toContain('The brief was not supplied.');
-      expect(prompt).not.toContain('label="brief"');
+    it('a brief-check embedded prompt without a briefText refuses before any spawn', async () => {
+      const { transport, spawnCalls } = buildHarness();
+      await expect(transport({ ...BASE_REQUEST, kind: 'brief-check' })).rejects.toThrow(
+        'a brief-check review requires the brief text',
+      );
+      expect(spawnCalls).toHaveLength(0);
     });
 
     it('code-review and pre-merge embedded prompts carry the checklist', async () => {
@@ -742,6 +741,15 @@ describe('CliReviewTransport', () => {
       expect(prompt.startsWith(`${AGY_NO_SHELL_PREAMBLE}\n\n`)).toBe(true);
       expect(prompt).toContain('Independent read-only code review');
       expect(result.result).toBe('pass');
+    });
+
+    it('a brief-check request without the brief throws before spawn (agy template)', async () => {
+      const { transport, spawnCalls } = buildAgyHarness();
+
+      await expect(transport({ ...AGY_REQUEST, kind: 'brief-check' })).rejects.toThrow(
+        'a brief-check review requires the brief text',
+      );
+      expect(spawnCalls).toHaveLength(0);
     });
 
     it('the grok prompt is byte-identical to buildEmbeddedReviewPrompt (no preamble)', async () => {

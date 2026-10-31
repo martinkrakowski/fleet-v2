@@ -90,259 +90,291 @@ for (let i = 2; i < process.argv.length; i += 1) {
 }
 if (!baseArg) usage("--base <rev> is required");
 
-let root;
-function gitOrDie(args) {
+try {
+  let root;
+  const gitDir = () => (rootArg ? path.resolve(rootArg) : process.cwd());
+  function gitOrDie(args) {
+    try {
+      return execFileSync("git", ["-C", gitDir(), ...args], {
+        maxBuffer: 1 << 28,
+        encoding: "utf8",
+      }).trim();
+    } catch {
+      console.error(`${NAME}: git ${args[0]} failed under ${gitDir()}`);
+      process.exit(2);
+    }
+  }
+  root = rootArg
+    ? path.resolve(rootArg)
+    : gitOrDie(["rev-parse", "--show-toplevel"]);
+
+  const mergeBase = gitOrDie(["merge-base", baseArg, "HEAD"]).trim();
+  const nulNames = (args) => gitOrDie(args).split("\0").filter(Boolean);
+  // Added, modified and renamed files between the merge base and the working tree,
+  // plus untracked non-ignored files.
+  const changedNames = new Set([
+    ...nulNames(["diff", "--name-only", "-z", "--diff-filter=AMR", mergeBase]),
+    ...nulNames(["ls-files", "-z", "--others", "--exclude-standard"]),
+  ]);
+  // An untracked file's lines are all added; git diff says nothing about it.
+  const untracked = new Set(
+    nulNames(["ls-files", "-z", "--others", "--exclude-standard"]),
+  );
+  const corpusNames = nulNames(["ls-files", "-z", "-co", "--exclude-standard"]);
+
+  // Exclusions come from SonarCloud's own settings, one source of truth.
+  let properties;
   try {
-    return execFileSync(
-      "git",
-      ["-C", rootArg ? path.resolve(rootArg) : process.cwd(), ...args],
-      { maxBuffer: 1 << 28, encoding: "utf8" },
-    ).trim();
+    properties = readFileSync(path.join(root, ".sonarcloud.properties"), "utf8");
   } catch {
-    console.error(`${NAME}: git ${args[0]} failed under ${root}`);
+    console.error(`${NAME}: cannot read .sonarcloud.properties under ${root}`);
     process.exit(2);
   }
-}
-root = rootArg ? path.resolve(rootArg) : gitOrDie(["rev-parse", "--show-toplevel"]);
+  const property = (key) => {
+    const line = properties.split("\n").find((l) => l.startsWith(`${key}=`));
+    return line ? line.slice(key.length + 1) : "";
+  };
+  // Glob to RegExp: `**/` is zero or more directories, `**` anything, `*` within
+  // one segment, `?` one non-slash character; anchored to the repository root.
+  const globToRegExp = (glob) =>
+    new RegExp(
+      `^${glob
+        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+        .replace(/\*\*\/|\*\*|\*|\?/g, (m) =>
+          m === "**/"
+            ? "(?:.*/)?"
+            : m === "**"
+              ? ".*"
+              : m === "*"
+                ? "[^/]*"
+                : "[^/]",
+        )}$`,
+    );
+  const excluded = `${property("sonar.exclusions")},${property("sonar.cpd.exclusions")}`
+    .split(",")
+    .filter(Boolean)
+    .map(globToRegExp);
 
-const mergeBase = gitOrDie(["merge-base", baseArg, "HEAD"]).trim();
-const nulNames = (args) => gitOrDie(args).split("\0").filter(Boolean);
-// Added, modified and renamed files between the merge base and the working tree,
-// plus untracked non-ignored files.
-const changedNames = new Set([
-  ...nulNames(["diff", "--name-only", "-z", "--diff-filter=AMR", mergeBase]),
-  ...nulNames(["ls-files", "-z", "--others", "--exclude-standard"]),
-]);
-// An untracked file's lines are all added; git diff says nothing about it.
-const untracked = new Set(nulNames(["ls-files", "-z", "--others", "--exclude-standard"]));
-const corpusNames = nulNames(["ls-files", "-z", "-co", "--exclude-standard"]);
+  const wanted = (rel) =>
+    EXTENSIONS.has(path.extname(rel)) &&
+    !rel.split("/").some((segment) => SKIP_SEGMENTS.has(segment)) &&
+    !excluded.some((re) => re.test(rel));
 
-// Exclusions come from SonarCloud's own settings, one source of truth.
-let properties;
-try {
-  properties = readFileSync(path.join(root, ".sonarcloud.properties"), "utf8");
-} catch {
-  console.error(`${NAME}: cannot read .sonarcloud.properties under ${root}`);
-  process.exit(2);
-}
-const property = (key) => {
-  const line = properties.split("\n").find((l) => l.startsWith(`${key}=`));
-  return line ? line.slice(key.length + 1) : "";
-};
-// Glob to RegExp: `**/` is zero or more directories, `**` anything, `*` within
-// one segment, `?` one non-slash character; anchored to the repository root.
-const globToRegExp = (glob) =>
-  new RegExp(
-    `^${glob
-      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-      .replace(/\*\*\/|\*\*|\*|\?/g, (m) =>
-        m === "**/" ? "(?:.*/)?" : m === "**" ? ".*" : m === "*" ? "[^/]*" : "[^/]",
-      )}$`,
-  );
-const excluded = `${property("sonar.exclusions")},${property("sonar.cpd.exclusions")}`
-  .split(",")
-  .filter(Boolean)
-  .map(globToRegExp);
+  // TypeScript comes from the checked tree, so a trusted copy of this script
+  // outside the worktree still uses the worktree's install.
+  let ts;
+  try {
+    ts = createRequire(path.join(root, "package.json"))("typescript");
+  } catch {
+    console.error(`${NAME}: typescript is not resolvable from ${root}`);
+    process.exit(2);
+  }
+  const scriptKind = (rel) => {
+    const ext = path.extname(rel);
+    if (ext === ".tsx") return ts.ScriptKind.TSX;
+    if (ext === ".jsx") return ts.ScriptKind.JSX;
+    if (ext === ".ts" || ext === ".mts" || ext === ".cts")
+      return ts.ScriptKind.TS;
+    return ts.ScriptKind.JS;
+  };
 
-const wanted = (rel) =>
-  EXTENSIONS.has(path.extname(rel)) &&
-  !rel.split("/").some((segment) => SKIP_SEGMENTS.has(segment)) &&
-  !excluded.some((re) => re.test(rel));
-
-// TypeScript comes from the checked tree, so a trusted copy of this script
-// outside the worktree still uses the worktree's install.
-let ts;
-try {
-  ts = createRequire(path.join(root, "package.json"))("typescript");
-} catch {
-  console.error(`${NAME}: typescript is not resolvable from ${root}`);
-  process.exit(2);
-}
-const scriptKind = (rel) => {
-  const ext = path.extname(rel);
-  if (ext === ".tsx") return ts.ScriptKind.TSX;
-  if (ext === ".jsx") return ts.ScriptKind.JSX;
-  if (ext === ".ts" || ext === ".mts" || ext === ".cts") return ts.ScriptKind.TS;
-  return ts.ScriptKind.JS;
-};
-
-// Leaf nodes (no children) other than EndOfFileToken are tokens; JSDoc nodes are
-// skipped. A file that fails to parse is still tokenised as far as the parser
-// goes — one bad file never crashes the check.
-function tokenNodes(node, sf, out) {
-  const children = node.getChildren(sf);
-  if (children.length === 0) {
-    if (node.kind !== ts.SyntaxKind.EndOfFileToken) out.push(node);
+  // Leaf nodes (no children) other than EndOfFileToken are tokens; JSDoc nodes are
+  // skipped. A file that fails to parse is still tokenised as far as the parser
+  // goes — one bad file never crashes the check.
+  function tokenNodes(node, sf, out) {
+    const children = node.getChildren(sf);
+    if (children.length === 0) {
+      if (node.kind !== ts.SyntaxKind.EndOfFileToken) out.push(node);
+      return out;
+    }
+    for (const child of children) {
+      if (
+        child.kind >= ts.SyntaxKind.FirstJSDocNode &&
+        child.kind <= ts.SyntaxKind.LastJSDocNode
+      )
+        continue;
+      tokenNodes(child, sf, out);
+    }
     return out;
   }
-  for (const child of children) {
-    if (
-      child.kind >= ts.SyntaxKind.FirstJSDocNode &&
-      child.kind <= ts.SyntaxKind.LastJSDocNode
-    )
-      continue;
-    tokenNodes(child, sf, out);
+
+  const cache = new Map(); // rel -> [{ text, line }]
+  function tokens(rel) {
+    const known = cache.get(rel);
+    if (known) return known;
+    const found = [];
+    try {
+      const text = readFileSync(path.join(root, rel), "utf8");
+      const sf = ts.createSourceFile(
+        rel,
+        text,
+        ts.ScriptTarget.Latest,
+        /* setParentNodes */ true,
+        scriptKind(rel),
+      );
+      for (const node of tokenNodes(sf, sf, []))
+        found.push({
+          text: LITERAL_KINDS.has(ts.SyntaxKind[node.kind])
+            ? LITERAL_TEXT
+            : node.getText(sf),
+          line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1,
+        });
+    } catch {
+      // An unreadable file simply has no tokens.
+    }
+    cache.set(rel, found);
+    return found;
   }
-  return out;
-}
 
-const cache = new Map(); // rel -> [{ text, line }]
-function tokens(rel) {
-  const known = cache.get(rel);
-  if (known) return known;
-  const found = [];
-  try {
-    const text = readFileSync(path.join(root, rel), "utf8");
-    const sf = ts.createSourceFile(
-      rel,
-      text,
-      ts.ScriptTarget.Latest,
-      /* setParentNodes */ true,
-      scriptKind(rel),
-    );
-    for (const node of tokenNodes(sf, sf, []))
-      found.push({
-        text: LITERAL_KINDS.has(ts.SyntaxKind[node.kind])
-          ? LITERAL_TEXT
-          : node.getText(sf),
-        line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1,
-      });
-  } catch {
-    // An unreadable file simply has no tokens.
-  }
-  cache.set(rel, found);
-  return found;
-}
+  const windowHash = (list, start) =>
+    createHash("sha1")
+      .update(
+        list
+          .slice(start, start + MIN_TOKENS)
+          .map((t) => t.text)
+          .join("\u0000"),
+      )
+      .digest("hex");
 
-const windowHash = (list, start) =>
-  createHash("sha1")
-    .update(
-      list
-        .slice(start, start + MIN_TOKENS)
-        .map((t) => t.text)
-        .join("\u0000"),
-    )
-    .digest("hex");
+  const changed = [...changedNames].filter(wanted).sort(byCodeUnit);
+  const corpus = [...new Set([...corpusNames, ...changed])]
+    .filter(wanted)
+    .sort(byCodeUnit);
 
-const changed = [...changedNames].filter(wanted).sort(byCodeUnit);
-const corpus = [...new Set([...corpusNames, ...changed])]
-  .filter(wanted)
-  .sort(byCodeUnit);
-
-// Only changed-file window hashes go in the lookup set, so memory stays bounded.
-const hashes = new Set();
-for (const rel of changed) {
-  const list = tokens(rel);
-  for (let start = 0; start + MIN_TOKENS <= list.length; start += 1)
-    hashes.add(windowHash(list, start));
-}
-
-// Corpus occurrences (file, window start) whose hash is in the lookup set; each
-// one is verified token by token later — a hash match alone never reports.
-const occurrences = []; // { rel, start }
-for (const rel of corpus) {
-  const list = tokens(rel);
-  for (let start = 0; start + MIN_TOKENS <= list.length; start += 1)
-    if (hashes.has(windowHash(list, start))) occurrences.push({ rel, start });
-}
-
-// Added lines per changed file, from the `+start,count` of the -U0 hunk headers.
-const addedLines = new Map(); // rel -> Set of 1-based line numbers
-for (const rel of changed) {
-  const lines = new Set();
-  for (const hunk of gitOrDie(["diff", "-U0", mergeBase, "--", rel])
-    .split("\n")
-    .filter((l) => l.startsWith("@@"))) {
-    const m = hunk.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
-    if (!m) continue;
-    const start = Number(m[1]);
-    const count = m[2] === undefined ? 1 : Number(m[2]);
-    for (let n = start; n < start + count; n += 1) lines.add(n);
-  }
-  addedLines.set(rel, lines);
-}
-
-function equalWindows(a, aStart, b, bStart) {
-  for (let i = 0; i < MIN_TOKENS; i += 1)
-    if (a[aStart + i].text !== b[bStart + i].text) return false;
-  return true;
-}
-
-// A changed window is duplicated when an equal window exists in another file, or
-// in the same file starting at least MIN_TOKENS tokens away.
-const matchesAt = new Map(); // changed rel -> Map window start -> occurrences
-for (const rel of changed) {
-  const list = tokens(rel);
-  const here = new Map();
-  for (let start = 0; start + MIN_TOKENS <= list.length; start += 1) {
-    const hash = windowHash(list, start);
-    const valid = occurrences.filter(
-      (o) =>
-        (o.rel !== rel || Math.abs(o.start - start) >= MIN_TOKENS) &&
-        equalWindows(list, start, tokens(o.rel), o.start),
-    );
-    if (valid.length > 0) here.set(start, valid);
-  }
-  if (here.size > 0) matchesAt.set(rel, here);
-}
-
-// Overlapping or adjacent duplicated windows merge into blocks; a block is
-// reported only when it covers at least MIN_LINES distinct lines and at least
-// one of those lines is an added line. One line per block, from a deterministic
-// representative occurrence (bytewise first other file, then lowest start),
-// extended by the block's full token span from its window alignment.
-const blocks = [];
-for (const [rel, windows] of matchesAt) {
-  const starts = [...windows.keys()].sort((a, b) => a - b);
-  let group = [];
-  const flush = () => {
-    if (group.length === 0) return;
-    const first = group[0];
-    const last = group[group.length - 1];
-    const span = last + MIN_TOKENS - 1 - first;
+  // Only changed-file window hashes go in the lookup set, so memory stays bounded.
+  const hashes = new Set();
+  for (const rel of changed) {
     const list = tokens(rel);
-    const blockLines = new Set(
-      list.slice(first, last + MIN_TOKENS).map((t) => t.line),
-    );
-    let best;
-    const added = addedLines.get(rel);
-    const addedHere =
-      untracked.has(rel) || [...blockLines].some((line) => added.has(line));
-    if (blockLines.size >= MIN_LINES && addedHere) {
-      for (const start of group) {
-        for (const o of windows.get(start)) {
-          const otherStart = o.start - (start - first);
-          const candidate = {
-            rel: o.rel,
-            start: otherStart,
-            end: otherStart + span,
-          };
-          if (!best || candidate.rel < best.rel) best = candidate;
-          else if (candidate.rel === best.rel && candidate.start < best.start)
+    for (let start = 0; start + MIN_TOKENS <= list.length; start += 1)
+      hashes.add(windowHash(list, start));
+  }
+
+  // Corpus occurrences (file, window start) whose hash is in the lookup set; each
+  // one is verified token by token later — a hash match alone never reports.
+  const occurrences = []; // { rel, start }
+  for (const rel of corpus) {
+    const list = tokens(rel);
+    for (let start = 0; start + MIN_TOKENS <= list.length; start += 1)
+      if (hashes.has(windowHash(list, start))) occurrences.push({ rel, start });
+  }
+
+  // Added lines per changed file, from the `+start,count` of the -U0 hunk headers.
+  const addedLines = new Map(); // rel -> Set of 1-based line numbers
+  for (const rel of changed) {
+    const lines = new Set();
+    for (const hunk of gitOrDie(["diff", "-U0", mergeBase, "--", rel])
+      .split("\n")
+      .filter((l) => l.startsWith("@@"))) {
+      const m = hunk.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
+      if (!m) continue;
+      const start = Number(m[1]);
+      const count = m[2] === undefined ? 1 : Number(m[2]);
+      for (let n = start; n < start + count; n += 1) lines.add(n);
+    }
+    addedLines.set(rel, lines);
+  }
+
+  function equalWindows(a, aStart, b, bStart) {
+    for (let i = 0; i < MIN_TOKENS; i += 1)
+      if (a[aStart + i].text !== b[bStart + i].text) return false;
+    return true;
+  }
+
+  // A changed window is duplicated when an equal window exists in another file, or
+  // in the same file starting at least MIN_TOKENS tokens away.
+  const matchesAt = new Map(); // changed rel -> Map window start -> occurrences
+  for (const rel of changed) {
+    const list = tokens(rel);
+    const here = new Map();
+    for (let start = 0; start + MIN_TOKENS <= list.length; start += 1) {
+      const hash = windowHash(list, start);
+      const valid = occurrences.filter(
+        (o) =>
+          (o.rel !== rel || Math.abs(o.start - start) >= MIN_TOKENS) &&
+          equalWindows(list, start, tokens(o.rel), o.start),
+      );
+      if (valid.length > 0) here.set(start, valid);
+    }
+    if (here.size > 0) matchesAt.set(rel, here);
+  }
+
+  // Overlapping or adjacent duplicated windows merge into blocks; a block is
+  // reported only when it covers at least MIN_LINES distinct lines and at least
+  // one of those lines is an added line. One line per block, from a deterministic
+  // representative occurrence: the other-side matches are grouped by (other file,
+  // shifted start), each group's span is its own contiguous window run — never
+  // the whole merged block, which can span several copies — and the representative
+  // is the lowest valid start, ties broken by file path.
+  const blocks = [];
+  for (const [rel, windows] of matchesAt) {
+    const starts = [...windows.keys()].sort((a, b) => a - b);
+    let group = [];
+    const flush = () => {
+      if (group.length === 0) return;
+      const first = group[0];
+      const last = group[group.length - 1];
+      const list = tokens(rel);
+      const blockLines = new Set(
+        list.slice(first, last + MIN_TOKENS).map((t) => t.line),
+      );
+      let best;
+      const added = addedLines.get(rel);
+      const addedHere =
+        untracked.has(rel) || [...blockLines].some((line) => added.has(line));
+      if (blockLines.size >= MIN_LINES && addedHere) {
+        const groups = new Map(); // key -> { rel, start, lo, hi }
+        for (const start of group) {
+          for (const o of windows.get(start)) {
+            const otherStart = o.start - (start - first);
+            const key = `${o.rel}\u0000${otherStart}`;
+            let g = groups.get(key);
+            if (!g) {
+              groups.set(key, { rel: o.rel, start: otherStart, lo: start, hi: start });
+            } else {
+              if (start < g.lo) g.lo = start;
+              if (start > g.hi) g.hi = start;
+            }
+          }
+        }
+        for (const g of groups.values()) {
+          const end = g.start + (g.hi - g.lo) + MIN_TOKENS - 1;
+          const otherTokens = tokens(g.rel);
+          // A shifted span outside the other file is invalid, never clamped.
+          if (g.start < 0 || end >= otherTokens.length) continue;
+          const candidate = { rel: g.rel, start: g.start, end };
+          if (
+            !best ||
+            candidate.start < best.start ||
+            (candidate.start === best.start && candidate.rel < best.rel)
+          )
             best = candidate;
         }
       }
+      group = [];
+      if (!best) return;
+      const other = tokens(best.rel);
+      blocks.push(
+        `${NAME}: ${rel}:${list[first].line}-${list[last + MIN_TOKENS - 1].line}` +
+          ` duplicates ${best.rel}:${other[best.start].line}-${other[best.end].line}` +
+          ` (${blockLines.size} lines)`,
+      );
+    };
+    for (const start of starts) {
+      if (group.length > 0 && start > group[group.length - 1] + MIN_TOKENS)
+        flush();
+      group.push(start);
     }
-    group = [];
-    if (!best) return;
-    const other = tokens(best.rel);
-    blocks.push(
-      `${NAME}: ${rel}:${list[first].line}-${list[last + MIN_TOKENS - 1].line}` +
-        ` duplicates ${best.rel}:${other[best.start].line}-${other[best.end].line}` +
-        ` (${blockLines.size} lines)`,
-    );
-  };
-  for (const start of starts) {
-    if (group.length > 0 && start > group[group.length - 1] + MIN_TOKENS) flush();
-    group.push(start);
+    flush();
   }
-  flush();
-}
 
-if (blocks.length === 0) {
-  console.log(`${NAME}: clean`);
-  process.exit(0);
+  if (blocks.length === 0) {
+    console.log(`${NAME}: clean`);
+    process.exit(0);
+  }
+  for (const line of [...blocks].sort(byCodeUnit)) console.log(line);
+  console.log(`${NAME}: ${blocks.length} duplicated block(s)`);
+  process.exit(1);
+} catch {
+  console.error(`${NAME}: internal error`);
+  process.exit(2);
 }
-for (const line of [...blocks].sort(byCodeUnit)) console.log(line);
-console.log(`${NAME}: ${blocks.length} duplicated block(s)`);
-process.exit(1);

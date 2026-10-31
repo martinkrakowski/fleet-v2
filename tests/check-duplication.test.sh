@@ -110,9 +110,40 @@ export const uvarovite = topaz + rutile;
 EOF
 }
 
-check() { # $1 = repo, $2 = base, rest = extra expectation label; sets rc/out
-  out=$(node "$SCRIPT" --root "$1" --base "$2" 2>&1)
+check() { # $1 = repo, $2 = base; sets rc, stdout, stderr
+  out_file=$T/check.out
+  err_file=$T/check.err
+  node "$SCRIPT" --root "$1" --base "$2" >"$out_file" 2>"$err_file"
   rc=$?
+  stdout=$(cat "$out_file")
+  stderr=$(cat "$err_file")
+}
+
+# Every finding case must show the finding line format on stdout and never a
+# crash (TypeError or stack trace) on stderr.
+finding_format() { # $1 = stream to inspect
+  if printf '%s\n' "$1" |
+    grep -Eq '^check-duplication: .+:[0-9]+-[0-9]+ duplicates .+:[0-9]+-[0-9]+ \([0-9]+ lines\)$'; then
+    ok 'stdout has the finding line format'
+  else
+    bad 'stdout has the finding line format'
+  fi
+}
+
+clean_stderr() { # $1 = stderr stream to inspect
+  case $1 in
+  *TypeError*) bad 'stderr has no TypeError' ;;
+  *'    at '*) bad 'stderr has no stack trace' ;;
+  *) ok 'stderr has no TypeError or stack trace' ;;
+  esac
+}
+
+# The fixture identifier must never appear in stdout in any case.
+no_zebra() { # $1 = stream to inspect
+  case $1 in
+  *zebraCounter*) bad 'no output line names the fixture identifier' ;;
+  *) ok 'no output line names the fixture identifier' ;;
+  esac
 }
 
 # a. an unrelated new 15-line file: clean.
@@ -123,11 +154,12 @@ git -C "$R" add -A >/dev/null && git -C "$R" commit -qm base
 base_a=$(git -C "$R" rev-parse HEAD)
 other >"$R/packages/b/src/new.ts"
 check "$R" "$base_a"
-if [ $rc -eq 0 ] && [ "$out" = 'check-duplication: clean' ]; then
+if [ $rc -eq 0 ] && [ "$stdout" = 'check-duplication: clean' ]; then
   ok 'an unrelated new file is clean'
 else
-  bad "an unrelated new file is clean (rc $rc: $out)"
+  bad "an unrelated new file is clean (rc $rc: $stdout)"
 fi
+no_zebra "$stdout"
 
 # b. the same function copied to packages/b/src/two.ts, uncommitted: exit 1 and
 # both file names in the output, but never the fixture's identifier.
@@ -138,24 +170,26 @@ git -C "$R" add -A >/dev/null && git -C "$R" commit -qm base
 base_b=$(git -C "$R" rev-parse HEAD)
 fixture copy >"$R/packages/b/src/two.ts"
 check "$R" "$base_b"
-if [ $rc -eq 1 ]; then ok 'an uncommitted copy exits 1'; else bad "an uncommitted copy exits 1 (rc $rc: $out)"; fi
-case $out in
+if [ $rc -eq 1 ]; then ok 'an uncommitted copy exits 1'; else bad "an uncommitted copy exits 1 (rc $rc: $stdout)"; fi
+finding_format "$stdout"
+clean_stderr "$stderr"
+case $stdout in
 *packages/b/src/two.ts:*) ok 'the copy is named in the output' ;;
 *) bad 'the copy is named in the output' ;;
 esac
-case $out in
+case $stdout in
 *packages/a/src/one.ts:*) ok 'the original is named in the output' ;;
 *) bad 'the original is named in the output' ;;
 esac
-case $out in
-*zebraCounter*) bad 'no output line names the fixture identifier' ;;
-*) ok 'no output line names the fixture identifier' ;;
-esac
+no_zebra "$stdout"
 
 # c. the same copy committed on top of the base: still exit 1.
 git -C "$R" add -A >/dev/null && git -C "$R" commit -qm copy >/dev/null
 check "$R" "$base_b"
-if [ $rc -eq 1 ]; then ok 'a committed copy also exits 1'; else bad "a committed copy also exits 1 (rc $rc: $out)"; fi
+if [ $rc -eq 1 ]; then ok 'a committed copy also exits 1'; else bad "a committed copy also exits 1 (rc $rc: $stdout)"; fi
+finding_format "$stdout"
+clean_stderr "$stderr"
+no_zebra "$stdout"
 
 # d. only 6 lines of the function copied: clean (under both thresholds).
 R=$T/d
@@ -165,7 +199,8 @@ git -C "$R" add -A >/dev/null && git -C "$R" commit -qm base
 base_d=$(git -C "$R" rev-parse HEAD)
 fixture base | sed -n '12,17p' >"$R/packages/b/src/six.ts"
 check "$R" "$base_d"
-if [ $rc -eq 0 ]; then ok 'a 6-line copy is clean'; else bad "a 6-line copy is clean (rc $rc: $out)"; fi
+if [ $rc -eq 0 ]; then ok 'a 6-line copy is clean'; else bad "a 6-line copy is clean (rc $rc: $stdout)"; fi
+no_zebra "$stdout"
 
 # e. the copy written to a cpd-excluded path: clean.
 R=$T/e
@@ -175,7 +210,8 @@ git -C "$R" add -A >/dev/null && git -C "$R" commit -qm base
 base_e=$(git -C "$R" rev-parse HEAD)
 fixture copy >"$R/packages/b/src/spawn-run.ts"
 check "$R" "$base_e"
-if [ $rc -eq 0 ]; then ok 'a cpd-excluded copy is clean'; else bad "a cpd-excluded copy is clean (rc $rc: $out)"; fi
+if [ $rc -eq 0 ]; then ok 'a cpd-excluded copy is clean'; else bad "a cpd-excluded copy is clean (rc $rc: $stdout)"; fi
+no_zebra "$stdout"
 
 # f. the copy with every string literal changed: still exit 1 (literals are
 # normalised before comparison).
@@ -186,7 +222,10 @@ git -C "$R" add -A >/dev/null && git -C "$R" commit -qm base
 base_f=$(git -C "$R" rev-parse HEAD)
 fixture beta >"$R/packages/b/src/two.ts"
 check "$R" "$base_f"
-if [ $rc -eq 1 ]; then ok 'changed literals still duplicate'; else bad "changed literals still duplicate (rc $rc: $out)"; fi
+if [ $rc -eq 1 ]; then ok 'changed literals still duplicate'; else bad "changed literals still duplicate (rc $rc: $stdout)"; fi
+finding_format "$stdout"
+clean_stderr "$stderr"
+no_zebra "$stdout"
 
 # g. both copies already in the base commit, then an unrelated committed change:
 # clean, because only added lines count.
@@ -199,7 +238,8 @@ base_g=$(git -C "$R" rev-parse HEAD)
 other >"$R/packages/c-extra.ts"
 git -C "$R" add -A >/dev/null && git -C "$R" commit -qm unrelated >/dev/null
 check "$R" "$base_g"
-if [ $rc -eq 0 ]; then ok 'pre-existing copies with an unrelated change are clean'; else bad "pre-existing copies with an unrelated change are clean (rc $rc: $out)"; fi
+if [ $rc -eq 0 ]; then ok 'pre-existing copies with an unrelated change are clean'; else bad "pre-existing copies with an unrelated change are clean (rc $rc: $stdout)"; fi
+no_zebra "$stdout"
 
 # h. two copies inside one new file: exit 1 (same-file duplication, far apart).
 R=$T/h
@@ -209,7 +249,19 @@ git -C "$R" add -A >/dev/null && git -C "$R" commit -qm base
 base_h=$(git -C "$R" rev-parse HEAD)
 { fixture first; echo; fixture second; } >"$R/packages/b/src/twin.ts"
 check "$R" "$base_h"
-if [ $rc -eq 1 ]; then ok 'two copies in one file exit 1'; else bad "two copies in one file exit 1 (rc $rc: $out)"; fi
+if [ $rc -eq 1 ]; then ok 'two copies in one file exit 1'; else bad "two copies in one file exit 1 (rc $rc: $stdout)"; fi
+finding_format "$stdout"
+clean_stderr "$stderr"
+case $stdout in
+*packages/b/src/twin.ts:*) ok 'the twin copy is named in the output' ;;
+*) bad 'the twin copy is named in the output' ;;
+esac
+if printf '%s\n' "$stdout" | grep -q 'duplicated block(s)'; then
+  ok 'the summary line is present'
+else
+  bad 'the summary line is present'
+fi
+no_zebra "$stdout"
 
 # j. usage and setup errors exit 2.
 node "$SCRIPT" --root "$R" >/dev/null 2>&1
@@ -227,6 +279,7 @@ if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q 'check-duplication'; then
 else
   bad "-h prints the header and exits 0 (rc $rc)"
 fi
+no_zebra "$out"
 
 [ "$fails" -eq 0 ] && echo 'check-duplication: all tests passed' || echo "check-duplication: $fails failure(s)"
 [ "$fails" -eq 0 ]

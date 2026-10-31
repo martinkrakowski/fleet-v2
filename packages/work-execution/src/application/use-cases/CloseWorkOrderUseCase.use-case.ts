@@ -15,7 +15,8 @@ import type {
   CloseWorkOrderResult,
   CloseWorkOrderState,
 } from '../ports/in/CloseWorkOrderPort.in-port.js';
-import { CLOSE_WORK_ORDER_STATES, CloseWorkOrderPort as CloseWorkOrderPortContract } from '../ports/in/CloseWorkOrderPort.in-port.js';
+import { CLOSE_WORK_ORDER_STATES } from '../ports/in/CloseWorkOrderPort.in-port.js';
+import type { CloseWorkOrderPort as CloseWorkOrderPortContract } from '../ports/in/CloseWorkOrderPort.in-port.js';
 import { workOrderHoldFacts } from './work-order-hold-facts.js';
 import type { WorkOrderHoldFactsDeps } from './work-order-hold-facts.js';
 

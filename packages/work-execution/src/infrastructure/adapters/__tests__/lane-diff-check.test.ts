@@ -1049,7 +1049,7 @@ describe("LaneDiffCheckAdapter", () => {
       expect(JSON.stringify(result)).not.toContain("pager.less");
     });
 
-    it("the grafts override travels inside the argv and the child env is the local allow-list (KF-27b)", async () => {
+    it("the grafts override travels inside the argv and no child env is passed, so the executor builds its own at spawn time (KF-27b)", async () => {
       const repo = makeRepo();
       const argvs: string[][] = [];
       const envs: (Readonly<Record<string, string>> | undefined)[] = [];
@@ -1084,14 +1084,40 @@ describe("LaneDiffCheckAdapter", () => {
           "git",
         ]);
       }
-      // These git calls never touch a remote over git, so the local
-      // allow-list applies even when the host has an ssh agent.
+      // No environment is handed to the executor: an ssh executor's client
+      // keeps its agent socket, and PATH is read at spawn time.
       for (let index = 0; index < argvs.length; index += 1) {
         if (argvs[index][0] !== "env") continue;
-        const env = envs[index];
-        expect(env).toBeDefined();
-        expect(env && "SSH_AUTH_SOCK" in env).toBe(false);
+        expect(envs[index]).toBeUndefined();
       }
+    });
+
+    it("a PATH change made after the module loads reaches every git call (the e2e fixture's wrapper)", async () => {
+      const repo = makeRepo();
+      const bin = mkdtempSync(join(tmpdir(), "lane-diff-path-"));
+      const marker = join(bin, "used");
+      const realEnv = execFileSync("sh", ["-c", "command -v env"], { encoding: "utf8" }).trim();
+      writeFileSync(join(bin, "env"), `#!/bin/sh\necho x >> '${marker}'\nexec '${realEnv}' "$@"\n`, { mode: 0o755 });
+      const previousPath = process.env.PATH;
+      process.env.PATH = `${bin}:${previousPath ?? ""}`;
+      try {
+        const result = await new LaneDiffCheckAdapter(new LocalExecutor()).checkLaneDiff({
+          worktreePath: repo,
+          baseCommit: base(repo),
+          allowedPathPrefixes: PREFIXES,
+        });
+        expect(result).toEqual({ outcome: "clean" });
+      } finally {
+        process.env.PATH = previousPath;
+      }
+      let used = "";
+      try {
+        used = execFileSync("cat", [marker], { encoding: "utf8" });
+      } catch {
+        used = "";
+      }
+      expect(used.length).toBeGreaterThan(0);
+      rmSync(bin, { recursive: true, force: true });
     });
   });
 });

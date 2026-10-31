@@ -50,7 +50,6 @@ import type {
 } from "../../domain/lane-diff-check.js";
 import { checkLaneDiff } from "../../domain/lane-diff-check.js";
 import { LANE_DIFF_SECRET_PATTERNS } from "@fleet/shared";
-import { allowListedChildEnv } from "./spawn-run.js";
 
 interface CommandOutcome {
   readonly ok: boolean;
@@ -112,23 +111,15 @@ const GIT_CONFIG_ARGS = [
 const GIT_GRAFT_FILE_NEVER =
   "/nonexistent/fleet-v2-lane-diff-check-no-grafts";
 
-/**
- * Applied to every git call as the child's environment: replace refs and
- * grafts in the shared clone cannot forge the base blob or hide a changed
- * file (KF-27 review), because replace-object lookup is off and the grafts
- * file points nowhere. The base is the local allow-list — these git calls
- * never touch a remote over git, so `SSH_AUTH_SOCK` is not needed — plus
- * the two overrides; the port takes a complete environment when given, so
- * the allow-list is rebuilt here rather than widened. The two overrides
- * also travel INSIDE the argv (below): a remote executor carries only the
- * argv to the remote shell, so an environment variable set here would never
- * reach the remote git.
+/*
+ * No child environment is passed to the executor: it builds its own
+ * per-transport allow-list at spawn time (an ssh client keeps the agent
+ * socket it needs; `PATH` is read when the call runs, not when this module
+ * loads). The replace-ref and grafts overrides travel in the argv instead
+ * (`env GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=<never-existing path> git
+ * --no-replace-objects …`), which is the only form that reaches a remote git
+ * over the ssh executor and works the same locally.
  */
-const GIT_HARDENED_ENV: Readonly<Record<string, string>> = {
-  ...allowListedChildEnv("local"),
-  GIT_NO_REPLACE_OBJECTS: "1",
-  GIT_GRAFT_FILE: GIT_GRAFT_FILE_NEVER,
-};
 
 /**
  * The repository's own git config key names that make git run a helper
@@ -266,7 +257,6 @@ export class LaneDiffCheckAdapter implements LaneDiffCheckPort {
         ],
         {
           cwd: request.worktreePath,
-          env: GIT_HARDENED_ENV,
           ...(input !== undefined ? { input } : {}),
         },
       );

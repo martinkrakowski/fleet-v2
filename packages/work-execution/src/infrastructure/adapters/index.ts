@@ -17,6 +17,7 @@ export * from "./CiStateAdapter.adapter.js";
 export * from "./ConductorDriverLeaseAdapter.adapter.js";
 export * from "./ConductorForgeGrantAdapter.adapter.js";
 export * from "./ConductorHaltAdapter.adapter.js";
+export * from "./ConductorPassTraceAdapter.adapter.js";
 export * from "./ConfirmRecordedHost.js";
 export * from "./ExecutionJournalAdapter.adapter.js";
 export * from "./ExecutionObservationAdapter.adapter.js";

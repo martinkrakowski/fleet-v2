@@ -23,6 +23,8 @@ function readBody(req) {
 const sessions = new Map();
 const interrupts = [];
 const createdIds = [];
+// KF-34b2: the wall-clock ms of each real session create, keyed by session id.
+const createdAtMs = {};
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -54,6 +56,7 @@ const server = http.createServer((req, res) => {
         }
         const id = `ses_it${createdIds.length + 1}`;
         createdIds.push(id);
+        createdAtMs[id] = Date.now();
         sessions.set(id, { state: 'created', directory });
         return send(200, { data: { id, location: { directory } } });
       }
@@ -105,7 +108,7 @@ const server = http.createServer((req, res) => {
       if (url.pathname === '/__state' && req.method === 'GET') {
         const snapshot = {};
         for (const [id, session] of sessions) snapshot[id] = session.state;
-        return send(200, { sessions: snapshot, interrupts, createdIds });
+        return send(200, { sessions: snapshot, interrupts, createdIds, createdAtMs });
       }
       return send(404, { error: 'not found' });
     } catch {

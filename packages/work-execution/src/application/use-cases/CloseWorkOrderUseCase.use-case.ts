@@ -67,7 +67,8 @@ export class CloseWorkOrderUseCase implements CloseWorkOrderPortContract {
     const workOrderId = typeof request.workOrderId === 'string' ? request.workOrderId.trim() : '';
     const state = request.state;
     if (workOrderId.length === 0
-      || !(CLOSE_WORK_ORDER_STATES as readonly unknown[]).includes(state)) {
+      || !(CLOSE_WORK_ORDER_STATES as readonly unknown[]).includes(state)
+      || !isValidNowIso(request.nowIso)) {
       return { outcome: 'refused', workOrderId, reason: 'invalid-request' };
     }
     const workOrder = await deps.workOrderRepo.findWorkOrderById(workOrderId);
@@ -138,4 +139,10 @@ export class CloseWorkOrderUseCase implements CloseWorkOrderPortContract {
     }
     return { outcome: 'closed', workOrderId, state: answer, revision };
   }
+}
+
+/** An absent `nowIso` falls back to the clock; a present one must be a non-blank ISO timestamp. */
+function isValidNowIso(nowIso: unknown): boolean {
+  if (nowIso === undefined) return true;
+  return typeof nowIso === 'string' && nowIso.trim().length > 0 && !Number.isNaN(Date.parse(nowIso));
 }

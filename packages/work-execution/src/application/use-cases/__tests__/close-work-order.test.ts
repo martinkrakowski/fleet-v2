@@ -397,6 +397,17 @@ describe('CloseWorkOrderUseCase', () => {
       });
     });
 
+    it.each([['a blank string', '   '], ['a non-date string', 'not-a-date'], ['a number', 42]])(
+      'refuses a nowIso that is %s as invalid-request and saves nothing',
+      async (_label, nowIso) => {
+        const h = harness({});
+        await expect(
+          h.useCase.execute({ workOrderId: WORK_ORDER_ID, state: 'stopped', nowIso }),
+        ).resolves.toMatchObject({ outcome: 'refused', reason: 'invalid-request' });
+        expect((await h.workOrderRepo.findWorkOrderById(WORK_ORDER_ID))?.state).not.toBe('stopped');
+      },
+    );
+
     it('refuses a non-object execute input as invalid-request', async () => {
       const h = harness({});
       await expect(h.useCase.execute('not-an-object')).resolves.toMatchObject({

@@ -58,6 +58,7 @@ import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/Attem
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -65,7 +66,12 @@ const LATER = '2026-10-27T10:01:00.000Z';
 const LEASE_UNTIL = '2026-10-27T10:05:00.000Z';
 const HOLDER = 'driver';
 const COMMIT = 'a'.repeat(40);
-const SHA = 'c'.repeat(64);
+// SEC-5b: the collect reads the frozen manifest digest-verified, so the
+// harness's frozen prose and manifest are frozen together with the attempt's
+// recorded `briefDigest`.
+const PROSE = '# brief\n';
+const FROZEN_MANIFEST_JSON = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });
+const SHA = simpleDeterministicHexDigest(PROSE + '\n' + FROZEN_MANIFEST_JSON);
 const HEAD12 = 'a'.repeat(12);
 const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
 
@@ -336,7 +342,8 @@ async function makeHarness(
     attemptRepo,
     executionJournal,
     artifactPort: {
-      readBriefManifest: async () => JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] }),
+      readBriefFile: async () => PROSE,
+      readBriefManifest: async () => FROZEN_MANIFEST_JSON,
       verifyArtifactManifest: async () => ({ outcome: 'sealed' }) as never,
     },
     reconcileAttempt: {

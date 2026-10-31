@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-30
 - **Target repository:** `fleet-v2` for the gate script, CI configuration and the e2e suite; the orchestrator's own scripts (lane gate, review and merge-train drivers) live outside this repository and are listed so the plan is whole, not as lanes here.
-- **Status:** rev 0. Built from two independent assessments of the same written facts (Fable and Grok 4.7, 2026-10-30), which agreed on the first change. Nothing built. Decisions SP-D1 to SP-D6 (§5) are open with recommended defaults.
+- **Status:** rev 1 (S3 changed to a split gate at the owner's request: static checks before the review, slow checks beside it). Built from two independent assessments of the same written facts (Fable and Grok 4.7, 2026-10-30), which agreed on the first change. Nothing built. Decisions SP-D1 to SP-D6 (§5) are open with recommended defaults.
 - **Owner request (2026-10-30):** "Ask fable and grok-4.7 how we can improve End-to-end speed (Tier 2)", then "Please create a plan to proceed with the speed improving recommendations."
 - **Relation to earlier plans:** continues `2026-10-28_lane-pipeline-speed-plan.md`. Its Horizon A already decided to run the review beside the gate (§3 there); the orchestrator's scripts never adopted it, and this plan schedules it (S3).
 
@@ -44,11 +44,18 @@ Model cost is negligible (cents per lane). Wall clock and the orchestrator's att
 - **Saving:** about 6 min per gate run, 12–18 min per unit. **Risk:** a semantic slip; the parity test against the TypeScript rule table and the synthetic-tree test guard it.
 - **Proof:** diff-check step time p50 (baseline about 7 min; target under 1 min) with identical findings on the last 20 lane worktrees.
 
-### S3. Gate and first review in parallel
+### S3. Split gate: static checks first, then the review beside the slow checks
 
-- **What:** the review starts as soon as the lane commits, on the diff; the gate runs at the same time. A gate failure and review findings go into one fix brief. Orchestrator scripts first; the conductor later (SP-D4).
-- **Saving:** 5–10 min per round. **Risk:** a review spent on code that fails typecheck (about one lane in ten; cents).
-- **Proof:** minutes from lane commit to the first fix brief or approval.
+- **What:** the gate is split in two.
+  1. **Static checks first** (build, typecheck, lint, architecture lint, generated-code sync check; about 2–3 min). A failure goes straight to a fix round; no review is spent on code that does not compile.
+  2. **The first review starts as soon as they pass.** Its prompt carries those results as trusted facts and states plainly that the tests, the ssh e2e suite and the diff check are still running and must not be assumed to pass.
+  3. **Slow checks run beside the review** (unit tests, the ssh e2e suite, the API tests where relevant, the diff check; about 5–15 min, the diff check about 1 min after S2).
+  4. **One fix brief** carries review findings and any slow-check failure.
+  Orchestrator scripts first; the conductor later (SP-D4).
+- **Why not fully parallel:** a review started on the bare diff (rev 0's S3) wastes reviews on code that fails to compile and leaves the reviewer without the facts that let it skip what the gate proves (it builds, types check). The split keeps most of the saving and only the test results are unknown at review time; the reviewers' findings on 2026-10-30 were design and correctness issues, not test outcomes.
+- **Unchanged:** a merge still requires the full gate and the review; the Fable pre-merge pass sees the complete gate output.
+- **Saving:** about 3–8 min per round (the review waits for the static checks). **Risk:** a review of code whose tests later fail (its findings still stand; the fix brief merges both).
+- **Proof:** minutes from lane commit to the first fix brief or approval; reviews spent on lanes that later failed a static check (target near zero).
 
 ### S4. Duplication check in the lane gate
 
@@ -85,7 +92,7 @@ Model cost is negligible (cents per lane). Wall clock and the orchestrator's att
 | SP-D1 | Who reviews Tier 2 briefs before dispatch | **Fable** on the design section; Argon or Luna for Tier 1 | The flaws were subtle design errors; Fable found them reliably. Grok suggested Luna or Argon to save Fable's quota; the design-section scope and fewer second pre-merge passes keep Fable's use roughly flat. |
 | SP-D2 | Flakes: one automatic retry or a quarantine with expiry | **Quarantine with expiry, no retries** | A silent retry can hide a real race in exactly the concurrency code Tier 2 covers (Fable). Grok's one-retry option is faster to build but weaker. |
 | SP-D3 | Speculative pre-update of the next PR (S5b) | **Yes**, discarding on failure | Cuts the queue tail; nothing merges without its own green CI. |
-| SP-D4 | Parallel gate and review in the conductor | **Scripts now, conductor after the wide run** | The conductor's state machine is mid-change (KF-34); avoid a third concurrent change there. |
+| SP-D4 | Split gate with the review beside the slow checks, in the conductor | **Scripts now, conductor after the wide run** (the conductor adopts the same split: static checks, then review beside the slow checks) | The conductor's state machine is mid-change (KF-34); avoid a third concurrent change there. |
 | SP-D5 | Duplication tool | **The SonarCloud rule's threshold, run locally** | Matching the rule that blocks the PR avoids false confidence. |
 | SP-D6 | Order | **S1, S2, S3, S4, then S5 and S6, with S7 from the start** | S1 attacks the largest cost with no code; S2 is mechanical and pays on every gate. |
 

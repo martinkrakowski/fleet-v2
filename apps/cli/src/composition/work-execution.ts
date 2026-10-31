@@ -17,6 +17,7 @@ import {
   AutoMergeAttemptUseCase,
   AutoMergeOwnerRoutingAdapter,
   BriefKnowledgeAdapter,
+  CancelPreparedAttemptUseCase,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
   DispatchAttemptUseCase,
@@ -607,6 +608,10 @@ export function composeExecution(input: ComposeExecutionInput) {
       processTreeTermination,
     }),
     prepareFixAttempt: new PrepareFixAttemptUseCase({ attemptRepo: attemptRepository }),
+    cancelPreparedAttempt: new CancelPreparedAttemptUseCase({
+      attemptRepo: attemptRepository,
+      journal: executionJournal,
+    }),
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({
       attemptRepo: attemptRepository,
       workOrderRepo: workOrderRepository,

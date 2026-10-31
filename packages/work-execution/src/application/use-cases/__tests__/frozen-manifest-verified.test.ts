@@ -7,7 +7,8 @@
  * `verified`, `absent` (nothing recorded to read) and `unverified` (read made
  * and not verified) — so callers can distinguish a skip from a fail-closed
  * refusal. `readFrozenManifest` stays the unverified reader (regression
- * guard).
+ * guard). SEC-3b: `readFrozenBriefVerified` is the same verified read with the
+ * exact prose bytes carried on `verified`.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -16,6 +17,7 @@ import type { AttemptRecord, AttemptRunnerRecord } from '../../../domain/executi
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import { readFrozenManifest, readFrozenManifestVerified, readVerifiedFrozenManifest } from '../advance-lane-run/frozen-manifest.js';
+import { readFrozenBriefVerified } from '../advance-lane-run/frozen-manifest.js';
 
 const PROSE = '# brief\n';
 const WORKTREE_PATH = '/tmp/opencode/wo-example-1/wt-example-1';
@@ -327,6 +329,47 @@ describe('readFrozenManifestVerified (SEC-5b)', () => {
     const harness = makeHarness();
     harness.setManifest(JSON.stringify([1, 2]));
     await expect(readFrozenManifestVerified(attemptFixture(), harness.artifactPort)).resolves.toEqual({ kind: 'unverified' });
+  });
+});
+
+describe('readFrozenBriefVerified (SEC-3b)', () => {
+  it('carries the exact prose bytes alongside the manifest when the read verifies', async () => {
+    const harness = makeHarness();
+    const attempt = attemptFixture();
+    await expect(readFrozenBriefVerified(attempt, harness.artifactPort)).resolves.toEqual({
+      kind: 'verified',
+      prose: PROSE,
+      manifest: MANIFEST,
+    });
+    // the prose is returned as read, through the recorded host
+    expect(harness.briefReads).toEqual([[WORKTREE_PATH, BRIEF_PATH, CONDUCTED_RUNNER]]);
+  });
+
+  it('carries prose with no trim or normalisation', async () => {
+    const harness = makeHarness();
+    harness.setProse('  # brief with padding\n\n');
+    harness.setManifest(DEFAULT_MANIFEST_JSON);
+    const attempt = attemptFixture({ briefDigest: simpleDeterministicHexDigest('  # brief with padding\n\n' + '\n' + DEFAULT_MANIFEST_JSON) });
+    await expect(readFrozenBriefVerified(attempt, harness.artifactPort)).resolves.toEqual({
+      kind: 'verified',
+      prose: '  # brief with padding\n\n',
+      manifest: MANIFEST,
+    });
+  });
+
+  it('reads unverified when the prose changed on disk (single flip)', async () => {
+    const harness = makeHarness();
+    harness.setProse('# changed brief\n');
+    await expect(readFrozenBriefVerified(attemptFixture(), harness.artifactPort)).resolves.toEqual({ kind: 'unverified' });
+  });
+
+  it('reads absent when no briefPackagePath is recorded, before any read', async () => {
+    const harness = makeHarness();
+    await expect(readFrozenBriefVerified(attemptFixture({ briefPackagePath: null }), harness.artifactPort)).resolves.toEqual({
+      kind: 'absent',
+    });
+    expect(harness.briefReads).toEqual([]);
+    expect(harness.manifestReads).toEqual([]);
   });
 });
 

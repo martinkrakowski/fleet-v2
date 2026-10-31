@@ -341,172 +341,175 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
    * stop before rethrowing. The run-lease renewal stays per run; the
    * driver-lease renewal goes through the pass's keeper.
    */
-  private async advanceRun(record: LaneRunRecord, ctx: AdvanceRunContext & { readonly isFirstRun: boolean }): Promise<RunOutcome> {
-    try {
-      return await this.advanceRunTurn(record, ctx);
-    } catch (error) {
-      // Any throw inside the turn latches the stop before rethrowing: a
-      // sibling worker must start no further step off this rejection, and the
-      // worker-loop catch would only run a microtask later.
-      ctx.control.stop();
-      throw error;
-    }
+  private advanceRun(record: LaneRunRecord, ctx: AdvanceRunContext & { readonly isFirstRun: boolean }): Promise<RunOutcome> {
+    // Not async, and no await here: the try/catch that latches the stop sits
+    // inside `advanceRunTurn` itself, so a throw latches it in the same
+    // microtask the turn resumes in, before any sibling continuation runs.
+    return this.advanceRunTurn(record, ctx);
   }
 
   /** One run's turn: leases, resume, then the step loop. See `advanceRun`. */
   private async advanceRunTurn(record: LaneRunRecord, ctx: AdvanceRunContext & { readonly isFirstRun: boolean }): Promise<RunOutcome> {
-    const renewRun = (renew: LeaseRenewRequest) =>
-      this.deps.runRepo.renewLease(record.runId, renew).then((result) =>
-        result.outcome === 'saved' ? result.record.lease : null,
-      );
-    const acquireRun = (acquire: LeaseAcquireRequest) =>
-      this.deps.runRepo.acquireLease(record.runId, acquire).then((result) =>
-        result.outcome === 'saved' ? result.record.lease : null,
-      );
+    // Any throw anywhere in the turn latches the stop in the same microtask
+    // (no await boundary between the throwing await and `stop()`), then
+    // rethrows: a sibling worker resuming in that turn starts no new step.
+    try {
+      const renewRun = (renew: LeaseRenewRequest) =>
+        this.deps.runRepo.renewLease(record.runId, renew).then((result) =>
+          result.outcome === 'saved' ? result.record.lease : null,
+        );
+      const acquireRun = (acquire: LeaseAcquireRequest) =>
+        this.deps.runRepo.acquireLease(record.runId, acquire).then((result) =>
+          result.outcome === 'saved' ? result.record.lease : null,
+        );
 
-    // Fresh time for this run's first lease decision: earlier runs' steps and
-    // the dispatch stagger can make the pass-start time stale. The first live
-    // run reuses the pass-start now; later runs read fresh.
-    const runNowIso = ctx.isFirstRun ? ctx.passNowIso : this.nowIso();
-    if (!isZonedIsoDateTime(runNowIso)) {
-      // An invalid clock is a stop like any other: latch it so a sibling
-      // worker starts no further step, then report the stop.
-      ctx.control.stop();
-      return {
-        report: { runId: record.runId, outcome: 'advanced', steps: [] },
-        attention: [],
-        stop: 'invalid-request',
-      };
-    }
-    const runUntil = leaseUntilIso(runNowIso);
-    const runHeld = await holdConductorLease(record.lease, ctx.request.holderId, runNowIso, runUntil, renewRun, acquireRun);
-    if (ctx.control.isStopped()) {
-      return { report: { runId: record.runId, outcome: 'advanced', steps: [] }, attention: [], stop: null };
-    }
-    if (runHeld.outcome === 'held-by-other') {
-      return {
-        report: { runId: record.runId, outcome: 'skipped', reason: 'lease-held' },
-        attention: [],
-        stop: null,
-      };
-    }
-    if (runHeld.outcome === 'refused') {
-      return {
-        report: { runId: record.runId, outcome: 'skipped', reason: 'lease-refused' },
-        attention: [],
-        stop: null,
-      };
-    }
-
-    let lease: LaneRunLeaseRecord = {
-      holderId: ctx.request.holderId,
-      fence: runHeld.lease.fence,
-      leaseUntilIso: runHeld.lease.leaseUntilIso,
-    };
-    const resumed = await this.deps.resume.applyPendingResume({
-      runId: record.runId,
-      lease: { holderId: lease.holderId, fence: lease.fence },
-      nowIso: runNowIso,
-    });
-    if (ctx.control.isStopped()) {
-      return { report: { runId: record.runId, outcome: 'advanced', steps: [] }, attention: [], stop: null };
-    }
-    if (resumed.outcome === 'refused' && resumed.reason === 'save-refused') {
-      return {
-        report: { runId: record.runId, outcome: 'resume-refused', reason: resumed.reason },
-        attention: [],
-        stop: null,
-      };
-    }
-
-    const steps: AdvanceLaneRunResult[] = [];
-    const attention: ConductorAttentionItem[] = [];
-    let finished = false;
-    // Set when this run's lease could not be renewed: stop acting on the run at once.
-    let lost: 'lease-held' | 'lease-refused' | null = null;
-    // Set when the driver lease is lost or the clock is invalid: end this run's
-    // steps and report the stop (never return from the pass).
-    let stop: RunOutcome['stop'] = null;
-    while (steps.length < CONDUCTOR_MAX_STEPS_PER_RUN && !finished && stop === null && !ctx.control.isStopped()) {
-      // Renew the driver lease through the keeper; the keeper reads a fresh time
-      // inside its critical section, so the lease never shortens and a refused
-      // or other-held renewal ends the pass (reported as this run's stop).
-      const driverRenewed = await ctx.driverKeeper.renew();
-      if (ctx.control.isStopped()) {
-        break;
-      }
-      if (driverRenewed.outcome === 'invalid-clock') {
-        stop = 'invalid-request';
+      // Fresh time for this run's first lease decision: earlier runs' steps and
+      // the dispatch stagger can make the pass-start time stale. The first live
+      // run reuses the pass-start now; later runs read fresh.
+      const runNowIso = ctx.isFirstRun ? ctx.passNowIso : this.nowIso();
+      if (!isZonedIsoDateTime(runNowIso)) {
+        // An invalid clock is a stop like any other: latch it so a sibling
+        // worker starts no further step, then report the stop.
         ctx.control.stop();
-        break;
+        return {
+          report: { runId: record.runId, outcome: 'advanced', steps: [] },
+          attention: [],
+          stop: 'invalid-request',
+        };
       }
-      if (driverRenewed.outcome === 'lost') {
-        stop = driverRenewed.reason;
-        ctx.control.stop();
-        break;
-      }
-      const stepNowIso = driverRenewed.nowIso;
-      const stepUntil = leaseUntilIso(stepNowIso);
-
-      // Renew this run's lease; refused or held by another stops acting on it.
-      const runRenewed = await holdConductorLease(lease, ctx.request.holderId, stepNowIso, stepUntil, renewRun, acquireRun);
+      const runUntil = leaseUntilIso(runNowIso);
+      const runHeld = await holdConductorLease(record.lease, ctx.request.holderId, runNowIso, runUntil, renewRun, acquireRun);
       if (ctx.control.isStopped()) {
-        break;
+        return { report: { runId: record.runId, outcome: 'advanced', steps: [] }, attention: [], stop: null };
       }
-      if (runRenewed.outcome === 'held-by-other') {
-        lost = 'lease-held';
-        break;
+      if (runHeld.outcome === 'held-by-other') {
+        return {
+          report: { runId: record.runId, outcome: 'skipped', reason: 'lease-held' },
+          attention: [],
+          stop: null,
+        };
       }
-      if (runRenewed.outcome === 'refused') {
-        lost = 'lease-refused';
-        break;
+      if (runHeld.outcome === 'refused') {
+        return {
+          report: { runId: record.runId, outcome: 'skipped', reason: 'lease-refused' },
+          attention: [],
+          stop: null,
+        };
       }
-      lease = runRenewed.lease;
 
-      // KF-34b: the halt marker is re-read at action admission, so a halt
-      // recorded mid-pass stops new actions. Already started operations are
-      // not cancelled; they finish and their results are reported.
-      const haltedNow = isConductorHalted(await this.deps.halt.read());
-      ctx.control.noteHalt(haltedNow);
-      if (ctx.control.isStopped()) {
-        break;
-      }
-      const step = await this.deps.advance.advanceLaneRun({
+      let lease: LaneRunLeaseRecord = {
+        holderId: ctx.request.holderId,
+        fence: runHeld.lease.fence,
+        leaseUntilIso: runHeld.lease.leaseUntilIso,
+      };
+      const resumed = await this.deps.resume.applyPendingResume({
         runId: record.runId,
         lease: { holderId: lease.holderId, fence: lease.fence },
-        halted: haltedNow,
-        nowIso: stepNowIso,
-        startGate: ctx.startGate,
+        nowIso: runNowIso,
       });
-      steps.push(step);
-      if (step.outcome === 'waiting' && step.reason === 'stop-grace-exceeded') {
-        attention.push({ runId: record.runId, kind: 'stop-grace-exceeded' });
+      if (ctx.control.isStopped()) {
+        return { report: { runId: record.runId, outcome: 'advanced', steps: [] }, attention: [], stop: null };
       }
-      if (step.outcome === 'waiting' && step.reason === 'session-stagger') {
-        // The start gate denied this run's session start: sleep until the run's
-        // reserved turn plus one millisecond, so a timer that fires a millisecond
-        // early still lands on or after the slot and does not spend an extra
-        // stagger step. The run is not finished; the loop ceiling still bounds
-        // the wait. The step is reported as it was journalled: none.
-        const sleep = this.deps.sleep ?? defaultSleep;
-        // Never sleep once the stop is latched: a sibling may have ended the
-        // pass while this step ran.
+      if (resumed.outcome === 'refused' && resumed.reason === 'save-refused') {
+        return {
+          report: { runId: record.runId, outcome: 'resume-refused', reason: resumed.reason },
+          attention: [],
+          stop: null,
+        };
+      }
+
+      const steps: AdvanceLaneRunResult[] = [];
+      const attention: ConductorAttentionItem[] = [];
+      let finished = false;
+      // Set when this run's lease could not be renewed: stop acting on the run at once.
+      let lost: 'lease-held' | 'lease-refused' | null = null;
+      // Set when the driver lease is lost or the clock is invalid: end this run's
+      // steps and report the stop (never return from the pass).
+      let stop: RunOutcome['stop'] = null;
+      while (steps.length < CONDUCTOR_MAX_STEPS_PER_RUN && !finished && stop === null && !ctx.control.isStopped()) {
+        // Renew the driver lease through the keeper; the keeper reads a fresh time
+        // inside its critical section, so the lease never shortens and a refused
+        // or other-held renewal ends the pass (reported as this run's stop).
+        const driverRenewed = await ctx.driverKeeper.renew();
         if (ctx.control.isStopped()) {
           break;
         }
-        await sleep(ctx.startGate.pendingMs(record.runId, this.nowIso()) + 1);
+        if (driverRenewed.outcome === 'invalid-clock') {
+          stop = 'invalid-request';
+          ctx.control.stop();
+          break;
+        }
+        if (driverRenewed.outcome === 'lost') {
+          stop = driverRenewed.reason;
+          ctx.control.stop();
+          break;
+        }
+        const stepNowIso = driverRenewed.nowIso;
+        const stepUntil = leaseUntilIso(stepNowIso);
+
+        // Renew this run's lease; refused or held by another stops acting on it.
+        const runRenewed = await holdConductorLease(lease, ctx.request.holderId, stepNowIso, stepUntil, renewRun, acquireRun);
         if (ctx.control.isStopped()) {
           break;
         }
-        continue;
+        if (runRenewed.outcome === 'held-by-other') {
+          lost = 'lease-held';
+          break;
+        }
+        if (runRenewed.outcome === 'refused') {
+          lost = 'lease-refused';
+          break;
+        }
+        lease = runRenewed.lease;
+
+        // KF-34b: the halt marker is re-read at action admission, so a halt
+        // recorded mid-pass stops new actions. Already started operations are
+        // not cancelled; they finish and their results are reported.
+        const haltedNow = isConductorHalted(await this.deps.halt.read());
+        ctx.control.noteHalt(haltedNow);
+        if (ctx.control.isStopped()) {
+          break;
+        }
+        const step = await this.deps.advance.advanceLaneRun({
+          runId: record.runId,
+          lease: { holderId: lease.holderId, fence: lease.fence },
+          halted: haltedNow,
+          nowIso: stepNowIso,
+          startGate: ctx.startGate,
+        });
+        steps.push(step);
+        if (step.outcome === 'waiting' && step.reason === 'stop-grace-exceeded') {
+          attention.push({ runId: record.runId, kind: 'stop-grace-exceeded' });
+        }
+        if (step.outcome === 'waiting' && step.reason === 'session-stagger') {
+          // The start gate denied this run's session start: sleep until the run's
+          // reserved turn plus one millisecond, so a timer that fires a millisecond
+          // early still lands on or after the slot and does not spend an extra
+          // stagger step. The run is not finished; the loop ceiling still bounds
+          // the wait. The step is reported as it was journalled: none.
+          const sleep = this.deps.sleep ?? defaultSleep;
+          // Never sleep once the stop is latched: a sibling may have ended the
+          // pass while this step ran.
+          if (ctx.control.isStopped()) {
+            break;
+          }
+          await sleep(ctx.startGate.pendingMs(record.runId, this.nowIso()) + 1);
+          if (ctx.control.isStopped()) {
+            break;
+          }
+          continue;
+        }
+        finished = !(step.outcome === 'entered' || step.outcome === 'repaired' || step.outcome === 'acted');
       }
-      finished = !(step.outcome === 'entered' || step.outcome === 'repaired' || step.outcome === 'acted');
+      // One report per run: skipped when the lease was lost before any step, else the steps that ran.
+      const report: ConductorRunReport =
+        lost !== null && steps.length === 0
+          ? { runId: record.runId, outcome: 'skipped', reason: lost }
+          : { runId: record.runId, outcome: 'advanced', steps };
+      return { report, attention, stop };
+    } catch (error) {
+      ctx.control.stop();
+      throw error;
     }
-    // One report per run: skipped when the lease was lost before any step, else the steps that ran.
-    const report: ConductorRunReport =
-      lost !== null && steps.length === 0
-        ? { runId: record.runId, outcome: 'skipped', reason: lost }
-        : { runId: record.runId, outcome: 'advanced', steps };
-    return { report, attention, stop };
   }
 }

@@ -305,6 +305,8 @@ interface Harness {
   readonly deps: AdvanceLaneRunDependencies;
   readonly reviewOpenRequests: readonly OpenReviewAssessmentRequest[];
   readonly gateReceiptRequests: readonly RecordGateReceiptsRequest[];
+  /** The harness's work-order store (KF-36a-2); seeded with a copy of the fixture. */
+  readonly workOrders: Map<string, WorkOrderRecord>;
   setManifest(json: string | null): void;
   setManifestVerdict(verdict: 'sealed' | 'missing' | 'mismatch'): void;
   setReconcileAnswer(answer: ReconcileAttemptResult): void;
@@ -324,6 +326,8 @@ interface HarnessOptions {
   readonly wireGate?: boolean;
   readonly wireReviewAssessment?: boolean;
   readonly wireGateReceipts?: boolean;
+  /** Wire the KF-36a `workOrderRelease` fake over the harness's work-order map. */
+  readonly wireWorkOrderRelease?: boolean;
 }
 
 async function makeHarness(
@@ -342,6 +346,9 @@ async function makeHarness(
   const reviewOpenRequests: OpenReviewAssessmentRequest[] = [];
   const gateReceiptRequests: RecordGateReceiptsRequest[] = [];
   const callOrder: string[] = [];
+  // KF-36a-2: a per-harness work-order store, seeded with a copy of the fixture
+  // (never the fixture itself — the release fake writes only into this map).
+  const workOrders = new Map<string, WorkOrderRecord>([['wo-example-1', { ...WORK_ORDER_FIXTURE }]]);
   let manifestJson: string | null = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });
   let manifestVerdict: 'sealed' | 'missing' | 'mismatch' = 'missing';
   let reconcileAnswer: ReconcileAttemptResult = activeAnswer(attempts[attempts.length - 1] ?? attemptFixture());
@@ -417,6 +424,21 @@ async function makeHarness(
     workOrderRepo: {
       findWorkOrderById: async () => WORK_ORDER_FIXTURE,
     },
+    ...(options.wireWorkOrderRelease === true
+      ? {
+          workOrderRelease: {
+            saveWorkOrder: async (record: WorkOrderRecord) => {
+              const stored = workOrders.get(record.id);
+              // Mirror WorkOrderRepositoryAdapter.adapter.ts:76-78: a stale revision is an error.
+              if (stored !== undefined && record.revision <= stored.revision) {
+                throw new Error('stale work order revision');
+              }
+              workOrders.set(record.id, record);
+            },
+            findWorkOrderById: async (workOrderId: string) => workOrders.get(workOrderId) ?? null,
+          },
+        }
+      : {}),
     newUlid: makeUlidMinter(),
     ...(options.ceiling !== undefined ? { perLaneCostCeiling: options.ceiling } : {}),
     ...(options.wireStop === false
@@ -493,6 +515,7 @@ async function makeHarness(
     gateRequests,
     reviewOpenRequests,
     gateReceiptRequests,
+    workOrders,
     callOrder,
     deps,
     setManifest: (json) => {
@@ -1729,6 +1752,153 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
         attemptId: 'attempt-example-1',
         implementerModel: 'model-example-1',
       });
+    });
+  });
+});
+
+describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', () => {
+  function heldReservation(harness: Harness, attemptId: string): void {
+    void harness.executionJournal.saveCapacityReservation({
+      id: harness.deps.newUlid(),
+      attemptId,
+      hostId: 'host-example-1',
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      reservedAtIso: NOW,
+      releasedAtIso: null,
+    });
+  }
+
+  it('test 13: finishForceStop stop-force releases the work order stopped at revision + 1 and nowIso', async () => {
+    const running = attemptFixture({ state: 'running', sessionId: 'session-example-1' });
+    const harness = await makeHarness(runRecord(), [running], { wireWorkOrderRelease: true });
+    await conduct(harness, 'running', NOW);
+    await appendStopIntent(harness, 'force', NOW);
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'stop',
+      key: stopKey(),
+      result: 'completed',
+      reasonCode: 'stop-force',
+    });
+    expect(await lastJournalState(harness)).toBe('stopped');
+    expect(harness.workOrders.get('wo-example-1')).toMatchObject({
+      id: 'wo-example-1',
+      state: 'stopped',
+      revision: 2,
+      updatedAtIso: LATER,
+    });
+  });
+
+  it('test 14: finishForceStop stop-force-slot-held leaves the work order approved at its revision', async () => {
+    const running = attemptFixture({ state: 'running', sessionId: 'session-example-1' });
+    const harness = await makeHarness(runRecord(), [running], { wireWorkOrderRelease: true });
+    await conduct(harness, 'running', NOW);
+    await appendStopIntent(harness, 'force', NOW);
+    heldReservation(harness, 'attempt-example-1');
+    harness.setStopAnswer(async (request) => {
+      const existing = await harness.attemptRepo.findAttemptById(request.attemptId);
+      const heldReceipt: CommandCompletionReceipt = {
+        attemptId: existing?.id ?? request.attemptId,
+        sessionId: existing?.sessionId ?? 'session-example-1',
+        endedAtIso: request.nowIso ?? LATER,
+        authoritative: true,
+        exitStatus: 0,
+        stoppedByRequest: true,
+      };
+      const ended: AttemptRecord = {
+        ...(existing ?? attemptFixture({ id: request.attemptId })),
+        revision: (existing?.revision ?? 0) + 1,
+        state: 'ended',
+        outcome: 'stopped',
+        completionReceipt: heldReceipt,
+        updatedAtIso: request.nowIso ?? LATER,
+      };
+      await harness.attemptRepo.saveAttempt(ended);
+      return { outcome: 'terminated', attempt: ended, receipt: heldReceipt, capacityReleased: false };
+    });
+    const held = await advance(harness);
+    expect(held).toEqual({
+      outcome: 'acted',
+      step: 'stop',
+      key: stopKey(),
+      result: 'completed',
+      reasonCode: 'stop-force-slot-held',
+    });
+    expect(await lastJournalState(harness)).toBe('stopped');
+    expect(harness.workOrders.get('wo-example-1')).toMatchObject({
+      id: 'wo-example-1',
+      state: 'approved',
+      revision: 1,
+    });
+  });
+
+  it('test 15: the forced-stop reconcile releases stopped when released and keeps approved when held', async () => {
+    const terminal = () => attemptFixture({ state: 'ended', sessionId: 'session-example-1', completionReceipt: receipt() });
+
+    const releasedHarness = await makeHarness(runRecord(), [terminal()], { wireWorkOrderRelease: true });
+    await conduct(releasedHarness, 'running', NOW);
+    await appendStopIntent(releasedHarness, 'force', NOW);
+    await appendIntent(releasedHarness, stopKey(), null, NOW);
+    const released = await advance(releasedHarness);
+    expect(released).toEqual({
+      outcome: 'acted',
+      step: 'stop',
+      key: stopKey(),
+      result: 'completed',
+      reasonCode: 'stop-force',
+    });
+    expect(releasedHarness.workOrders.get('wo-example-1')).toMatchObject({
+      state: 'stopped',
+      revision: 2,
+      updatedAtIso: LATER,
+    });
+
+    const heldHarness = await makeHarness(runRecord(), [terminal()], { wireWorkOrderRelease: true });
+    await conduct(heldHarness, 'running', NOW);
+    await appendStopIntent(heldHarness, 'force', NOW);
+    await appendIntent(heldHarness, stopKey(), null, NOW);
+    heldReservation(heldHarness, 'attempt-example-1');
+    const held = await advance(heldHarness);
+    expect(held).toEqual({
+      outcome: 'acted',
+      step: 'stop',
+      key: stopKey(),
+      result: 'completed',
+      reasonCode: 'stop-force-slot-held',
+    });
+    expect(heldHarness.workOrders.get('wo-example-1')).toMatchObject({
+      state: 'approved',
+      revision: 1,
+    });
+  });
+
+  it('test 16: without wireWorkOrderRelease a force stop leaves the work-order map unchanged', async () => {
+    const running = attemptFixture({ state: 'running', sessionId: 'session-example-1' });
+    const harness = await makeHarness(runRecord(), [running]);
+    await conduct(harness, 'running', NOW);
+    await appendStopIntent(harness, 'force', NOW);
+    const result = await advance(harness);
+    expect(result).toMatchObject({ reasonCode: 'stop-force' });
+    expect(harness.workOrders.get('wo-example-1')).toMatchObject({
+      state: 'approved',
+      revision: 1,
+    });
+  });
+
+  it('test 17: a held reservation for an attempt outside the run still releases stopped (pins the attemptIds filter)', async () => {
+    const running = attemptFixture({ state: 'running', sessionId: 'session-example-1' });
+    const harness = await makeHarness(runRecord(), [running], { wireWorkOrderRelease: true });
+    await conduct(harness, 'running', NOW);
+    await appendStopIntent(harness, 'force', NOW);
+    heldReservation(harness, 'attempt-other-1');
+    const result = await advance(harness);
+    expect(result).toMatchObject({ reasonCode: 'stop-force' });
+    expect(harness.workOrders.get('wo-example-1')).toMatchObject({
+      state: 'stopped',
+      revision: 2,
     });
   });
 });

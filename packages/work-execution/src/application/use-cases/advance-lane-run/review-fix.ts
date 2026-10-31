@@ -25,7 +25,7 @@ import { historyEntryOf, selectReviewSeat } from '../../../domain/seat-selection
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { AcceptanceSpec } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
-import { readFrozenManifest } from './frozen-manifest.js';
+import { readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, saveOrRefuse } from './step-context.js';
@@ -401,7 +401,12 @@ export async function performReview(
   if (intentRefusal !== null) {
     return { outcome: 'refused', reason: intentRefusal };
   }
-  const requiredChecks = manifestAcceptanceChecks(await readFrozenManifest(latest, ctx.deps.artifactPort));
+  // The required checks come from the frozen manifest, read digest-verified
+  // here (SEC-5b): a manifest that does not verify against the attempt's
+  // recorded digest reads unavailable, never trusted.
+  const requiredChecks = manifestAcceptanceChecks(
+    await readVerifiedFrozenManifest(latest, ctx.deps.artifactPort, ctx.deps.computeDigest),
+  );
   if (requiredChecks === null) {
     return finishReview(ctx, request, decision, 'refused', 'assessment-unavailable');
   }

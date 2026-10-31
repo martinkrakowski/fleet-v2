@@ -7,7 +7,7 @@ import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-
 import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, performPark } from './step-context.js';
-import { manifestExpectedArtifacts, readFrozenManifest } from './frozen-manifest.js';
+import { manifestExpectedArtifacts, readFrozenManifestVerified, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { historyEntryOf } from '../../../domain/seat-selection.js';
 
 /**
@@ -76,9 +76,11 @@ export async function runCollectBody(ctx: AdvanceStepContext,
     }
     return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'no-completion-receipt' };
   }
-  // The frozen artifact list is read before any write: an absent or unreadable manifest, or an
-  // unreadable expectedArtifacts, refuses the collect before the edit-only commit touches git.
-  const manifest = await readFrozenManifest(latest, ctx.deps.artifactPort);
+  // The frozen artifact list is read before any write: an absent or unreadable
+  // manifest, a manifest that does not verify against the attempt's recorded
+  // digest (SEC-5b), or an unreadable expectedArtifacts refuses the collect
+  // before the edit-only commit touches git.
+  const manifest = await readVerifiedFrozenManifest(latest, ctx.deps.artifactPort, ctx.deps.computeDigest);
   const expectedArtifacts = manifest === null ? null : manifestExpectedArtifacts(manifest);
   if (expectedArtifacts === null) {
     const resultRefusal = await appendRunResult(ctx, request, key, 'refused', 'collect-refused');
@@ -146,9 +148,11 @@ function manifestAcceptanceChecks(manifest: Record<string, unknown> | null): rea
 
 /**
  * KF-13a: record one verification receipt per acceptance check of the frozen
- * brief at the collected head before the gate's run-result is appended. When
- * wiring or manifest checks are absent nothing is recorded (today's
- * behaviour); every other failure fails closed — `false` makes the gate
+ * brief at the collected head before the gate's run-result is appended. The
+ * frozen manifest is read digest-verified here (SEC-5b): an absent manifest
+ * (nothing recorded to read) keeps today's skip; anything read but not
+ * verified fails closed. When wiring or manifest checks are absent nothing
+ * is recorded; every other failure fails closed — `false` makes the gate
  * `ambiguous` / `gate-unknown`, never a throw: acceptance is never attempted
  * without the gate's evidence.
  */
@@ -182,7 +186,18 @@ async function recordGateReceiptsGuarded(
   results: readonly GatePredicateResult[],
   gateReceipts: NonNullable<AdvanceStepContext['deps']['gateReceipts']>,
 ): Promise<boolean> {
-  const manifest = await readFrozenManifest(latest, ctx.deps.artifactPort);
+  // The manifest read verifies the digest itself (SEC-5b): the gate receipts
+  // never depend on a check made in another step. An absent manifest (nothing
+  // recorded to read) keeps today's skip; anything read but not verified
+  // fails closed, never trusting a changed manifest.
+  const read = await readFrozenManifestVerified(latest, ctx.deps.artifactPort, ctx.deps.computeDigest);
+  if (read.kind === 'absent') {
+    return true;
+  }
+  if (read.kind === 'unverified') {
+    return false;
+  }
+  const manifest = read.manifest;
   const checks = manifestAcceptanceChecks(manifest);
   if (checks === null || latest.artifacts === null) {
     return true;
@@ -201,7 +216,7 @@ async function recordGateReceiptsGuarded(
   // from another seat opens the assessment its review reopens, never a
   // `head-mismatch`.
   const runnerModel = historyEntryOf(latest).model;
-  const modelAssignment = manifest?.modelAssignment;
+  const modelAssignment = manifest.modelAssignment;
   const manifestModel =
     modelAssignment !== null && typeof modelAssignment === 'object'
       ? (modelAssignment as { readonly model?: unknown }).model

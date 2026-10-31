@@ -105,15 +105,13 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
       // concurrently between the first check and this one. The re-check
       // excludes this attempt's own reservation from being double-counted;
       // if it now blocks, THIS reservation is released and the start is
-      // refused `no-capacity`. A re-check that throws must not leave the
-      // reservation held (a duplicate on the next pass parks the run), so
-      // the attempt's reservation is released before the throw propagates.
-      // The re-check breaks racer ties deterministically: held racer
-      // reservations whose attemptId sorts after ours are ignored, so two
-      // symmetric racers do not both refuse on every pass (livelock).
+      // refused `no-capacity`. Both racers may refuse (safe; the caller
+      // retries). A re-check that throws must not leave the reservation
+      // held (a duplicate on the next pass parks the run), so the attempt's
+      // reservation is released before the throw propagates.
       let stillBlocked: boolean;
       try {
-        stillBlocked = await this.admissionBlocked(request.workOrderId, request.attemptId, true);
+        stillBlocked = await this.admissionBlocked(request.workOrderId, request.attemptId);
       } catch (error) {
         await this.options.executionJournal.releaseCapacityReservation(
           request.attemptId,
@@ -197,16 +195,14 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
       // The cap and package-busy checks are re-run after the reservation is
       // written (KF-34c1): concurrent admissions or starts may have reserved
       // between the first check and this one. If it now blocks, THIS
-      // reservation is released and the attempt is refused `no-capacity`. A
-      // re-check that throws must not leave the reservation held (a duplicate
-      // on the next pass parks the run), so the attempt's reservation is
-      // released before the throw propagates. The re-check breaks racer ties
-      // deterministically: held racer reservations whose attemptId sorts
-      // after ours are ignored, so two symmetric racers do not both refuse on
-      // every pass (livelock).
+      // reservation is released and the attempt is refused `no-capacity`;
+      // both racers may refuse (safe; the caller retries on its next pass).
+      // A re-check that throws must not leave the reservation held (a
+      // duplicate on the next pass parks the run), so the attempt's
+      // reservation is released before the throw propagates.
       let stillBlocked: boolean;
       try {
-        stillBlocked = await this.admissionBlocked(request.workOrderId, request.attemptId, true);
+        stillBlocked = await this.admissionBlocked(request.workOrderId, request.attemptId);
       } catch (error) {
         await this.options.executionJournal.releaseCapacityReservation(
           request.attemptId,
@@ -277,25 +273,12 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
    * that lists `excludeAttemptId` is excluded. Work orders are read with
    * `Promise.all`; an unreadable work order counts as overlapping (fail
    * closed).
-   *
-   * `tieBreak` is set by the post-reserve re-check only: held racer
-   * reservations whose attemptId sorts after `excludeAttemptId` (ours) are
-   * ignored, so two symmetric racers do not both refuse on every pass; the
-   * lower attemptId wins deterministically. The pre-reserve check keeps
-   * every held reservation (fail closed).
    */
-  private async admissionBlocked(
-    workOrderId: string,
-    excludeAttemptId: string,
-    tieBreak = false,
-  ): Promise<boolean> {
-    const [runs, allHeldReservations] = await Promise.all([
+  private async admissionBlocked(workOrderId: string, excludeAttemptId: string): Promise<boolean> {
+    const [runs, heldReservations] = await Promise.all([
       this.options.runRepo.list(),
       this.options.executionJournal.listActiveReservations(),
     ]);
-    const heldReservations = tieBreak
-      ? allHeldReservations.filter((reservation) => reservation.attemptId <= excludeAttemptId)
-      : allHeldReservations;
     const heldByAttempt = new Map<string, CapacityReservationRecord>();
     for (const reservation of heldReservations) {
       if (reservation.held) {

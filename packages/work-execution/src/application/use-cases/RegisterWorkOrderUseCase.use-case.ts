@@ -108,6 +108,54 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
 
     const existing = await this.deps.workOrderRepo.listWorkOrdersByProject(projectId);
 
+    // Lineage (WO-1): a new work order may name the terminal work order it supersedes. Validated
+    // after the duplicate-id check and the project listing, before the path-overlap loop; the
+    // listing above is the full candidate set for the "already superseded" scan because a
+    // successor is always in its parent's project.
+    if (request.supersedesWorkOrderId !== undefined) {
+      const supersededId =
+        typeof request.supersedesWorkOrderId === 'string'
+          ? request.supersedesWorkOrderId.trim()
+          : '';
+      if (supersededId === '') {
+        return {
+          outcome: 'rejected',
+          reason: 'supersedesWorkOrderId must be a non-empty string',
+        };
+      }
+      if (supersededId === request.workOrderId.trim()) {
+        return { outcome: 'rejected', reason: 'A work order cannot supersede itself' };
+      }
+      const superseded = await this.deps.workOrderRepo.findWorkOrderById(supersededId);
+      if (superseded === null) {
+        return {
+          outcome: 'rejected',
+          reason: `Superseded work order not found: ${supersededId}`,
+        };
+      }
+      if (superseded.projectId !== projectId) {
+        return {
+          outcome: 'rejected',
+          reason: `Superseded work order is in another project: ${supersededId}`,
+        };
+      }
+      if (superseded.state !== 'stopped' && superseded.state !== 'merged') {
+        return {
+          outcome: 'rejected',
+          reason: `Superseded work order is not terminal: ${supersededId} (${superseded.state})`,
+        };
+      }
+      const priorSuccessor = existing.find(
+        (order) => order.supersedesWorkOrderId === supersededId,
+      );
+      if (priorSuccessor !== undefined) {
+        return {
+          outcome: 'rejected',
+          reason: `Work order ${supersededId} is already superseded by ${priorSuccessor.id}`,
+        };
+      }
+    }
+
     for (const order of existing) {
       if (!isActiveWorkOrder(order.state)) {
         continue;
@@ -143,6 +191,9 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       policyRevision: request.policyRevision,
       risk,
       prerequisiteWorkOrderIds: [...prerequisites],
+      ...(request.supersedesWorkOrderId !== undefined
+        ? { supersedesWorkOrderId: request.supersedesWorkOrderId.trim() }
+        : {}),
       state: 'approved',
       revision: 1,
       createdAtIso: nowIso,

@@ -28,6 +28,12 @@ export interface GatePredicateResult {
   readonly durationMs: number;
   /** One short line; never command output. */
   readonly detail: string;
+  /**
+   * Set only by the gate-slot congestion branch (KF-30c): an `unknown`
+   * command verdict whose run exited 75 with the fixed gate-slot wait-limit
+   * stderr line. Any other result omits it.
+   */
+  readonly cause?: 'gate-slot-wait-limit';
   /** Commands with a coverage declaration that ran. */
   readonly coverage?: CheckCoverage;
 }

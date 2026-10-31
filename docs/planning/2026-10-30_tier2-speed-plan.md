@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-30
 - **Target repository:** `fleet-v2` for the gate script, CI configuration and the e2e suite; the orchestrator's own scripts (lane gate, review and merge-train drivers) live outside this repository and are listed so the plan is whole, not as lanes here.
-- **Status:** rev 1 (S3 changed to a split gate at the owner's request: static checks before the review, slow checks beside it). Built from two independent assessments of the same written facts (Fable and Grok 4.7, 2026-10-30), which agreed on the first change. Nothing built. Decisions SP-D1 to SP-D6 (§5) are open with recommended defaults.
+- **Status:** rev 1 (S3 changed to a split gate at the owner's request: static checks before the review, slow checks beside it). Built from two independent assessments of the same written facts (Fable and Grok 4.7, 2026-10-30), which agreed on the first change. Nothing built. Decisions SP-D1 to SP-D6 (§5): **the owner accepted all six as recommended on 2026-10-30 ("Ack, proceed").**
 - **Owner request (2026-10-30):** "Ask fable and grok-4.7 how we can improve End-to-end speed (Tier 2)", then "Please create a plan to proceed with the speed improving recommendations."
 - **Relation to earlier plans:** continues `2026-10-28_lane-pipeline-speed-plan.md`. Its Horizon A already decided to run the review beside the gate (§3 there); the orchestrator's scripts never adopted it, and this plan schedules it (S3).
 

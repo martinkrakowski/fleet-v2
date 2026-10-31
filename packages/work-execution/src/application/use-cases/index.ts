@@ -29,3 +29,4 @@ export * from "./ResumeLaneRunUseCase.use-case.js";
 export * from "./RunConductorPassUseCase.use-case.js";
 export * from "./StartLaneRunUseCase.use-case.js";
 export * from "./StopAttemptUseCase.use-case.js";
+export * from "./work-order-hold-facts.js";

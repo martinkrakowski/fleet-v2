@@ -9,9 +9,8 @@ import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js'
 import type { LaneRunParkReason, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.out-port.js';
 import { canEnterLaneRunState, workOrderReleaseFor } from '../../../domain/lane-run-transitions.js';
-import { laneRunJournalState } from '../../../domain/lane-run-journal.js';
-import { LANE_RUN_TERMINAL_STATES } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
+import { workOrderHoldFacts } from '../work-order-hold-facts.js';
 
 /** What every advance step reads: the use case's dependencies. Per call, never per run. */
 export interface AdvanceStepContext {
@@ -161,22 +160,13 @@ export async function releaseWorkOrderAtEnd(ctx: AdvanceStepContext,
     if (workOrder === null) {
       return;
     }
-    const reservations = await ctx.deps.executionJournal.listActiveReservations();
-    const slotHeld = reservations.some((reservation) =>
-      reservation.held && record.attemptIds.includes(reservation.attemptId)
+    const holdFacts = await workOrderHoldFacts(ctx.deps,
+      record.workOrderId,
+      record.attemptIds,
+      record.runId,
     );
-    const runs = await ctx.deps.runRepo.list();
-    let otherRunActive = false;
-    for (const other of runs) {
-      if (other.workOrderId !== record.workOrderId || other.runId === record.runId) {
-        continue;
-      }
-      const state = laneRunJournalState(await ctx.deps.runJournal.listForRun(other.runId), other.runId);
-      if (!(LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state)) {
-        otherRunActive = true;
-        break;
-      }
-    }
+    const slotHeld = holdFacts.heldAttemptIds.length > 0;
+    const otherRunActive = holdFacts.nonTerminalRunIds.length > 0;
     const answer = workOrderReleaseFor({
       runEnds,
       workOrderState: workOrder.state,

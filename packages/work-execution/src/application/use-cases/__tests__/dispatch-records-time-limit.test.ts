@@ -39,6 +39,7 @@ import type { WorkspacePort, WorktreeInspection } from '../../ports/out/Workspac
 import { DispatchAttemptUseCase } from '../DispatchAttemptUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
+import { AttemptRevisionConflictError } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 
 const FAKE_BRIEF_PROSE = '# Frozen brief prose';
 
@@ -460,5 +461,57 @@ describe('attempt record round-trip without the field (regression, SEC-5c-1)', (
     const loaded = await adapter.findAttemptById('attempt-roundtrip');
     expect(loaded).not.toBeNull();
     expect(Object.hasOwn(loaded ?? {}, 'dispatchedTimeLimitSeconds')).toBe(false);
+  });
+});
+
+describe('the preserved branch re-applies the dispatched time limit (SEC-5c-2)', () => {
+  // The second save (the running record) loses a revision race against a
+  // non-terminal, session-less foreign record; the third save (the preserved
+  // record) succeeds.
+  function makeConflictSetup(): ReturnType<typeof makeDispatchSetup> {
+    const setup = makeDispatchSetup();
+    const repo = setup.attemptRepo;
+    const realSave = repo.saveAttempt.bind(repo);
+    let saveCount = 0;
+    repo.saveAttempt = async (record) => {
+      saveCount += 1;
+      if (saveCount === 2) {
+        repo.attempts.set(
+          'attempt-1',
+          storedAttempt({
+            state: 'running',
+            sessionId: null,
+            runner: null,
+            revision: 4,
+            dispatchedTimeLimitSeconds: 999,
+          }),
+        );
+        throw new AttemptRevisionConflictError('attempt-1', 4, 2);
+      }
+      return realSave(record);
+    };
+    return setup;
+  }
+
+  it('the preserved foreign record gains the dispatched session, runner and time limit', async () => {
+    const setup = makeConflictSetup();
+    const result = await setup.useCase.dispatchAttempt(validDispatchRequest({ timeLimitSeconds: 2700 }));
+
+    expect(result.outcome).toBe('unknown');
+    const stored = setup.attemptRepo.attempts.get('attempt-1');
+    expect(stored?.sessionId).toBe('session-1');
+    expect(stored?.runner).not.toBeNull();
+    expect(stored?.dispatchedTimeLimitSeconds).toBe(2700);
+    expect(stored?.revision).toBe(5);
+  });
+
+  it('the preserved foreign record drops a stale limit when the request carries none', async () => {
+    const setup = makeConflictSetup();
+    const result = await setup.useCase.dispatchAttempt(validDispatchRequest({ timeLimitSeconds: 0 }));
+
+    expect(result.outcome).toBe('unknown');
+    const stored = setup.attemptRepo.attempts.get('attempt-1');
+    expect(stored?.sessionId).toBe('session-1');
+    expect(Object.hasOwn(stored ?? {}, 'dispatchedTimeLimitSeconds')).toBe(false);
   });
 });

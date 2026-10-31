@@ -81,7 +81,7 @@ export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
        fleet-v2 conductor start --brief-request <file.json> --tier 1|2 [--run-id <id> --attempt-id <id>] [--max-active-runs <n>]
        fleet-v2 conductor start --abandon --run-id <id> --attempt-id <id>
        fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>] [--pass-concurrency <n>]
-       fleet-v2 conductor reap --worktrees [--dry-run] [--yes]
+       fleet-v2 conductor reap --worktrees|--sessions [--dry-run] [--yes]
 
 Read-only status of one lane run (or every run) with its projected state,
 the halt marker and the driver lease; a kill-switch halt the driver checks
@@ -94,7 +94,13 @@ worktree of every finished lane run (terminal run, terminal work order,
 every attempt cancelled or collected, no held reservation) on explicit
 request: --dry-run lists the candidates and removes nothing, and without it
 --yes is required; the branch fleet/<runId> is kept — no branch, run record
-or evidence is removed. --max-active-runs on conductor start is the
+or evidence is removed. conductor reap --sessions lists and, on request,
+aborts sessions with no live attempt: worktrees whose every attempt is
+finished (cancelled, collected or ended) and none holds a reservation, but
+where the runner still reports a running session; --dry-run lists them and
+aborts nothing, and without it --yes is required; it interrupts those
+sessions and does not delete session records, worktrees, branches or runs.
+--max-active-runs on conductor start is the
 active-run cap the start's admission check uses. --pass-concurrency on
 conductor run is how many live runs one pass advances concurrently
 (default 1, the serial pass), capped at 4 and at --max-active-runs.
@@ -1065,17 +1071,19 @@ async function dryRunCommand(
 
 interface ReapFlags {
   readonly worktrees: boolean;
+  readonly sessions: boolean;
   readonly dryRun: boolean;
   readonly yes: boolean;
 }
 
 /**
- * `conductor reap`'s private flag reader: `--worktrees` (required), and
- * `--dry-run`/`--yes`. An unknown flag, a repeated flag or a positional is a
- * usage error.
+ * `conductor reap`'s private flag reader: exactly one of `--worktrees` or
+ * `--sessions`, and `--dry-run`/`--yes`. An unknown flag, a repeated flag or
+ * a positional is a usage error.
  */
 function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
   let worktrees = false;
+  let sessions = false;
   let dryRun = false;
   let yes = false;
   for (let index = 0; index < argv.length; index += 1) {
@@ -1086,6 +1094,14 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
         return null;
       }
       worktrees = true;
+      continue;
+    }
+    if (token === '--sessions') {
+      if (sessions) {
+        io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
+        return null;
+      }
+      sessions = true;
       continue;
     }
     if (token === '--dry-run') {
@@ -1111,15 +1127,27 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
     io.stderr(`conductor reap takes no positional arguments\n${CONDUCTOR_HELP}\n`);
     return null;
   }
-  return { worktrees, dryRun, yes };
+  return { worktrees, sessions, dryRun, yes };
 }
 
 /**
- * `conductor reap --worktrees` (EX-2b): on explicit request (with `--yes`,
- * or `--dry-run` to only list), remove the clean worktree of every finished
- * lane run and keep the branch `fleet/<runId>`. It needs a durable state
- * directory; a dry run removes nothing and calls no `removeLaneWorktree`.
- * Exit 0 when nothing was refused or unknown, otherwise 1.
+ * `conductor reap` (EX-2b, EX-4): exactly one of `--worktrees` or
+ * `--sessions` is required.
+ *
+ * `--worktrees` (EX-2b): on explicit request (with `--yes`, or `--dry-run`
+ * to only list), remove the clean worktree of every finished lane run and
+ * keep the branch `fleet/<runId>`. It needs a durable state directory; a dry
+ * run removes nothing and calls no `removeLaneWorktree`. Exit 0 when nothing
+ * was refused or unknown, otherwise 1.
+ *
+ * `--sessions` (EX-4): on explicit request (with `--yes`, or `--dry-run` to
+ * only list), abort sessions that outlived their attempt: worktrees whose
+ * every attempt is finished (cancelled, collected or ended) and none holds a
+ * reservation, but where the runner still reports a running session. It needs
+ * a durable state directory; a dry run aborts nothing and calls no
+ * `abortWorktreeRun`. The message states it interrupts sessions with no live
+ * attempt and does not delete session records, worktrees, branches or runs.
+ * Exit 0 when nothing failed or was unknown, otherwise 1.
  */
 async function reapCommand(
   argv: readonly string[],
@@ -1131,12 +1159,20 @@ async function reapCommand(
   if (flags === null) {
     return 2;
   }
-  if (!flags.worktrees) {
-    io.stderr(`conductor reap requires --worktrees\n${CONDUCTOR_HELP}\n`);
+  if (!flags.worktrees && !flags.sessions) {
+    io.stderr(`conductor reap requires --worktrees or --sessions\n${CONDUCTOR_HELP}\n`);
+    return 2;
+  }
+  if (flags.worktrees && flags.sessions) {
+    io.stderr(`conductor reap takes only one of --worktrees or --sessions\n${CONDUCTOR_HELP}\n`);
     return 2;
   }
   if (!flags.dryRun && !flags.yes) {
-    io.stderr(`conductor reap --worktrees requires --yes unless --dry-run is given\n${CONDUCTOR_HELP}\n`);
+    io.stderr(
+      flags.worktrees
+        ? `conductor reap --worktrees requires --yes unless --dry-run is given\n${CONDUCTOR_HELP}\n`
+        : `conductor reap --sessions requires --yes unless --dry-run is given; it interrupts sessions with no live attempt and does not delete session records, worktrees, branches or runs\n${CONDUCTOR_HELP}\n`,
+    );
     return 2;
   }
   if (options.stateDir === undefined) {
@@ -1144,6 +1180,14 @@ async function reapCommand(
       `conductor reap needs a durable state directory (--state-dir or FLEET_STATE_DIR)\n${CONDUCTOR_HELP}\n`,
     );
     return 2;
+  }
+  if (flags.sessions) {
+    const result = await runtime.conductor.reapOrphanSessions.reapOrphanSessions({
+      dryRun: flags.dryRun,
+    });
+    io.stdout(`${JSON.stringify(result)}\n`);
+    // Failures and unknowns both mean the operator must look; nothing failed or unknown exits 0.
+    return result.failed.length > 0 || result.unknown.length > 0 ? 1 : 0;
   }
   const result = await runtime.conductor.reapLaneWorktrees.reapLaneWorktrees({
     dryRun: flags.dryRun,

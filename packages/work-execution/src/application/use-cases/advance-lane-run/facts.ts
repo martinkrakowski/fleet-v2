@@ -32,7 +32,7 @@ import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunSta
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { performPark } from './step-context.js';
-import { manifestTimeLimitSeconds, readVerifiedFrozenManifest } from './frozen-manifest.js';
+import { conductorTimeLimitSeconds, manifestTimeLimitSeconds, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import { reviewFactsOf } from './review-fix.js';
 import { acceptanceFactsOf } from './merge.js';
@@ -167,20 +167,28 @@ export async function gatherFacts(ctx: AdvanceStepContext,
 
   const state = journalState;
   const phase = latest === null ? null : laneRunAttemptPhaseOf(latest.state);
-  // The frozen manifest is used only while running; a verified read then, and
-  // no remote read otherwise (SEC-5a).
-  const manifest =
-    latest !== null && phase === 'running'
-      ? await readVerifiedFrozenManifest(latest, ctx.deps.artifactPort, ctx.deps.computeDigest)
-      : null;
 
   let deadlineIso: string | null = null;
   if (phase === 'running' && latest !== null) {
     const dispatchedAt = laneRunDispatchedAtIso(entries, record.runId, latest.id);
-    const timeLimitSeconds = manifestTimeLimitSeconds(manifest);
-    if (dispatchedAt !== null && timeLimitSeconds !== null) {
-      deadlineIso = new Date(Date.parse(dispatchedAt) + timeLimitSeconds * 1000).toISOString();
+    // SEC-5c: the deadline comes from the limit dispatch recorded on the
+    // attempt, otherwise from a verified frozen manifest, otherwise from the
+    // conductor-owned fallback. The recorded limit wins: when it is a
+    // positive safe integer the manifest is not read at all, so there is no
+    // remote read, and an edited manifest cannot extend the deadline. When
+    // the recorded limit is absent, the manifest read stays as SEC-5a left
+    // it: a verified read only while running, and no remote read otherwise.
+    const recorded = latest.dispatchedTimeLimitSeconds;
+    const manifest =
+      typeof recorded === 'number' && Number.isSafeInteger(recorded) && recorded > 0
+        ? null
+        : await readVerifiedFrozenManifest(latest, ctx.deps.artifactPort, ctx.deps.computeDigest);
+    const { seconds } = conductorTimeLimitSeconds(recorded, manifestTimeLimitSeconds(manifest));
+    if (dispatchedAt !== null) {
+      deadlineIso = new Date(Date.parse(dispatchedAt) + seconds * 1000).toISOString();
     } else {
+      // Only a running attempt with no dispatch intent time leaves the
+      // deadline unknown (the park remains for that case alone).
       deadlineUnknown = true;
     }
   }

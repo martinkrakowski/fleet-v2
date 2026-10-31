@@ -70,10 +70,13 @@ const EXPIRED = '2026-10-27T11:00:00.000Z';
 const LEASE_UNTIL = '2026-10-27T10:05:00.000Z';
 const HOLDER = 'driver';
 const COMMIT = 'a'.repeat(40);
-const SHA = 'c'.repeat(64);
 const HEAD12 = 'a'.repeat(12);
 const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
 const DISPATCHED_AT = '2026-10-27T09:10:00.000Z';
+const PROSE = '# brief\n';
+const DEFAULT_MANIFEST_JSON = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });
+const digestFor = (json: string): string => simpleDeterministicHexDigest(PROSE + '\n' + json);
+const SHA = digestFor(DEFAULT_MANIFEST_JSON);
 
 const BASE_RECORD = {
   version: 1,
@@ -349,7 +352,7 @@ async function makeHarness(
   // KF-36a-2: a per-harness work-order store, seeded with a copy of the fixture
   // (never the fixture itself — the release fake writes only into this map).
   const workOrders = new Map<string, WorkOrderRecord>([['wo-example-1', { ...WORK_ORDER_FIXTURE }]]);
-  let manifestJson: string | null = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });
+  let manifestJson: string | null = DEFAULT_MANIFEST_JSON;
   let manifestVerdict: 'sealed' | 'missing' | 'mismatch' = 'missing';
   let reconcileAnswer: ReconcileAttemptResult = activeAnswer(attempts[attempts.length - 1] ?? attemptFixture());
   let reviewAssessmentAnswer: OpenReviewAssessmentResult = { outcome: 'open' };
@@ -413,6 +416,7 @@ async function makeHarness(
     executionJournal,
     artifactPort: {
       readBriefManifest: async () => manifestJson,
+      readBriefFile: async () => PROSE,
       verifyArtifactManifest: async () => ({ outcome: manifestVerdict }) as never,
     },
     reconcileAttempt: {

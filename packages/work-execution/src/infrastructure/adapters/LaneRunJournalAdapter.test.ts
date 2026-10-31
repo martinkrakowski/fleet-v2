@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
   LaneRunJournalEntryKind,
@@ -353,6 +353,51 @@ describe('LaneRunJournalAdapter', () => {
 
       const escaping = new LaneRunJournalAdapter({ stateDir: tempDir, fileName: '../x.json' });
       await expect(escaping.listForRun(RUN_ID)).rejects.toThrow(/unsafe state file name/);
+    });
+  });
+
+  describe('listForRuns (EX-3a: one read, grouped by run)', () => {
+    it('returns every requested id, matching listForRun per id, with [] for an unknown or non-string id', async () => {
+      const adapter = adapterFor('memory');
+      const dispatchKey = stepKeyFor('dispatch');
+      const intent1 = stepIntent('dispatch');
+      const result1 = resultEntry(dispatchKey, 'completed');
+      await adapter.append(intent1);
+      await adapter.append(result1);
+      await adapter.append(conductEntry());
+
+      const otherRunId = `run-${nextUlid()}`;
+      await adapter.append(baseEntry('conduct', { runId: otherRunId, state: 'running' }));
+
+      const unknownRunId = `run-${nextUlid()}`;
+      const grouped = await adapter.listForRuns([RUN_ID, otherRunId, unknownRunId, 123 as unknown as string]);
+      // Every requested id is present, `[]` when it has no entries; a
+      // non-string id is ignored, as in listForRun.
+      expect([...grouped.keys()].sort()).toEqual([RUN_ID, otherRunId, unknownRunId].sort());
+      expect(grouped.get(unknownRunId)).toEqual([]);
+      expect(grouped.get(RUN_ID)).toEqual(await adapter.listForRun(RUN_ID));
+      expect(grouped.get(otherRunId)).toEqual(await adapter.listForRun(otherRunId));
+      expect(grouped.get(otherRunId)![0]!.runId).toBe(otherRunId);
+    });
+
+    it('reads the backing file once for several runs, in file mode', async () => {
+      const adapter = new LaneRunJournalAdapter({ stateDir: tempDir });
+      await adapter.append(stepIntent('dispatch'));
+      await adapter.append(conductEntry());
+
+      // The adapter's one store read for a scan is `readEntriesFromDisk`; a
+      // plain listForRun pair for two runs would read twice.
+      const readSpy = vi.spyOn(
+        adapter as unknown as { readEntriesFromDisk: (target: string) => Promise<LaneRunJournalEntryRecord[]> },
+        'readEntriesFromDisk',
+      );
+      try {
+        const grouped = await adapter.listForRuns([RUN_ID, `run-${nextUlid()}`]);
+        expect(readSpy).toHaveBeenCalledTimes(1);
+        expect(grouped.get(RUN_ID)).toEqual(await adapter.listForRun(RUN_ID));
+      } finally {
+        readSpy.mockRestore();
+      }
     });
   });
 });

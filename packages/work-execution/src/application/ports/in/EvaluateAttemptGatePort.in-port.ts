@@ -11,6 +11,13 @@ export interface EvaluateAttemptGateRequest {
   readonly attemptId: string;
   /** The exact collected head; any other head is `unknown`. */
   readonly candidateHeadSha: string;
+  /**
+   * Retry run number for this head: an integer 1–9; absent means run 0.
+   * Each run journals under its own prefix, so a congested run never seals
+   * the head against a later run. Out-of-range values return `unknown` and
+   * run nothing.
+   */
+  readonly gateRun?: number;
 }
 
 /**
@@ -26,7 +33,15 @@ export type EvaluateAttemptGateResult =
       readonly reason: string;
       readonly results?: readonly GatePredicateResult[];
     }
-  | { readonly verdict: 'unknown'; readonly reason: string };
+  | {
+      readonly verdict: 'unknown';
+      readonly reason: string;
+      /**
+       * Set only when every non-pass predicate result is a gate-slot
+       * congestion and nothing failed (KF-30c); any other `unknown` omits it.
+       */
+      readonly congested?: true;
+    };
 
 export interface EvaluateAttemptGatePort {
   /** Run (or read the stored outcome of) the frozen gate at one collected head; never requests a review. */

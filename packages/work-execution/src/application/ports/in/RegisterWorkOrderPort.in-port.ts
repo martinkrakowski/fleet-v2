@@ -19,6 +19,13 @@ export interface RegisterWorkOrderRequest {
   readonly prerequisiteWorkOrderIds?: readonly string[];
   /** `standard` or `high`; absent registers `high` (plan A5). Frozen once registered. */
   readonly risk?: WorkOrderRisk;
+  /**
+   * Optional terminal work order this one supersedes. When present it is
+   * refused unless it is a non-empty string, not the new work order itself,
+   * an existing work order in the same project, terminal (stopped or merged),
+   * and not already superseded by another work order.
+   */
+  readonly supersedesWorkOrderId?: string;
   readonly nowIso?: string;
 }
 

@@ -46,6 +46,15 @@ export class WorkOrder {
         throw new Error(planRefErrorMessage);
       }
     }
+    if (record.supersedesWorkOrderId !== undefined) {
+      const supersededId = record.supersedesWorkOrderId;
+      if (typeof supersededId !== 'string' || supersededId.trim().length === 0) {
+        throw new Error('WorkOrder supersedesWorkOrderId must be a non-empty string');
+      }
+      if (supersededId === record.id) {
+        throw new Error('WorkOrder cannot supersede itself');
+      }
+    }
     return new WorkOrder(storedRecord(record));
   }
 
@@ -97,9 +106,10 @@ export class WorkOrder {
 
 /** A fresh record; `planRef` and `risk` are copied when present and omitted when absent. */
 function storedRecord(record: WorkOrderRecord): WorkOrderRecord {
-  const stored: Omit<WorkOrderRecord, 'planRef' | 'risk'> & {
+  const stored: Omit<WorkOrderRecord, 'planRef' | 'risk' | 'supersedesWorkOrderId'> & {
     planRef?: PlanRef;
     risk?: WorkOrderRisk;
+    supersedesWorkOrderId?: string;
   } = {
     id: record.id,
     projectId: record.projectId,
@@ -124,6 +134,9 @@ function storedRecord(record: WorkOrderRecord): WorkOrderRecord {
   }
   if (Object.hasOwn(record, 'risk') && record.risk !== undefined) {
     stored.risk = record.risk;
+  }
+  if (record.supersedesWorkOrderId !== undefined) {
+    stored.supersedesWorkOrderId = record.supersedesWorkOrderId;
   }
   return stored;
 }

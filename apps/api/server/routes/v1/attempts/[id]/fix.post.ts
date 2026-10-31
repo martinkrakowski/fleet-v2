@@ -8,11 +8,10 @@ import {
 import { readObjectBody, routeParam } from "../../../../wiring/http-input";
 
 export default defineEventHandler(async (event) => {
-  // Trimmed exactly as the use case trims it, so the id and a padded id
   // share one single-flight slot; routeParam has fully decoded the id. The
   // limiter is keyed on the prior attempt id: a fix round works on the
   // prior's worktree, so two fixes for the same prior never overlap.
-  const priorAttemptId = routeParam(event, "id").trim();
+  const priorAttemptId = routeParam(event, "id");
   const operationId = newOperationId();
   try {
     const composition = workComposition();

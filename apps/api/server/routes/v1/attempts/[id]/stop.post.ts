@@ -8,9 +8,8 @@ import {
 import { readObjectBody, routeParam } from "../../../../wiring/http-input";
 
 export default defineEventHandler(async (event) => {
-  // Trimmed exactly as the use case trims it, so the id and a padded id
   // share one single-flight slot; routeParam has fully decoded the id.
-  const attemptId = routeParam(event, "id").trim();
+  const attemptId = routeParam(event, "id");
   const operationId = newOperationId();
   try {
     const composition = workComposition();

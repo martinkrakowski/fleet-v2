@@ -852,7 +852,7 @@ describe("composition type surface", () => {
     expect(work.reconcileAttempt).toBeInstanceOf(ReconcileAttemptUseCase);
     expect(work.stopAttempt).toBeInstanceOf(StopAttemptUseCase);
     expect(work.collectAttemptArtifacts).toBeInstanceOf(CollectAttemptArtifactsUseCase);
-    expect(work.prepareFixAttempt.execute).toBeDefined();
+    expect(typeof work.prepareFixAttempt.execute).toBe("function");
     expect(work.requestAttemptAcceptance).toBeInstanceOf(RequestAttemptAcceptanceUseCase);
     expect(work.executeAuthorizedForgeAction).toBeInstanceOf(ExecuteAuthorizedForgeActionUseCase);
 

@@ -34,10 +34,34 @@ function withoutLeaseVersion(lease: LaneRunLeaseRecord | null): LaneRunLeaseReco
   return { holderId: lease.holderId, fence: lease.fence, leaseUntilIso: lease.leaseUntilIso };
 }
 
-type HoldLeaseResult =
+export type HoldLeaseResult =
   | { readonly outcome: 'held'; readonly lease: LaneRunLeaseRecord }
   | { readonly outcome: 'held-by-other' }
   | { readonly outcome: 'refused' };
+
+/** Take or renew one lease by CAS; another live holder is 'held-by-other', a refused write 'refused'. Shared by the keeper and the pass's run leases. */
+export async function holdConductorLease(
+  current: LaneRunLeaseRecord | null,
+  holderId: string,
+  nowIso: string,
+  until: string,
+  renew: (request: LeaseRenewRequest) => Promise<LaneRunLeaseRecord | null>,
+  acquire: (request: LeaseAcquireRequest) => Promise<LaneRunLeaseRecord | null>,
+): Promise<HoldLeaseResult> {
+  if (current !== null && current.holderId !== holderId && !isLeaseLapsed(current, nowIso)) {
+    return { outcome: 'held-by-other' };
+  }
+  let lease: LaneRunLeaseRecord | null;
+  if (current !== null && current.holderId === holderId && !isLeaseLapsed(current, nowIso)) {
+    lease = await renew({ holderId, fence: current.fence, leaseUntilIso: until, nowIso });
+  } else {
+    lease = await acquire({ holderId, observedFence: current?.fence ?? 0, leaseUntilIso: until, nowIso });
+  }
+  if (lease === null) {
+    return { outcome: 'refused' };
+  }
+  return { outcome: 'held', lease };
+}
 
 export interface ConductorDriverLeaseKeeperDependencies {
   /** The state directory's driver lease port (the one lease of the directory). */
@@ -90,7 +114,7 @@ export class ConductorDriverLeaseKeeper {
         result.outcome === 'ok' ? withoutLeaseVersion(result.lease) : null,
       );
     const driverLease = withoutLeaseVersion(await this.deps.driverLease.read());
-    const held = await this.holdLease(driverLease, this.deps.holderId, nowIso, until, renew, acquire);
+    const held = await holdConductorLease(driverLease, this.deps.holderId, nowIso, until, renew, acquire);
     if (held.outcome === 'held-by-other') {
       this.latched = { outcome: 'lost', reason: 'driver-lease-held' };
       return this.latched;
@@ -100,29 +124,5 @@ export class ConductorDriverLeaseKeeper {
       return this.latched;
     }
     return { outcome: 'held', nowIso };
-  }
-
-  /** Take or renew one lease by CAS; another live holder is 'held-by-other', a refused write 'refused'. */
-  private async holdLease(
-    current: LaneRunLeaseRecord | null,
-    holderId: string,
-    nowIso: string,
-    until: string,
-    renew: (request: LeaseRenewRequest) => Promise<LaneRunLeaseRecord | null>,
-    acquire: (request: LeaseAcquireRequest) => Promise<LaneRunLeaseRecord | null>,
-  ): Promise<HoldLeaseResult> {
-    if (current !== null && current.holderId !== holderId && !isLeaseLapsed(current, nowIso)) {
-      return { outcome: 'held-by-other' };
-    }
-    let lease: LaneRunLeaseRecord | null;
-    if (current !== null && current.holderId === holderId && !isLeaseLapsed(current, nowIso)) {
-      lease = await renew({ holderId, fence: current.fence, leaseUntilIso: until, nowIso });
-    } else {
-      lease = await acquire({ holderId, observedFence: current?.fence ?? 0, leaseUntilIso: until, nowIso });
-    }
-    if (lease === null) {
-      return { outcome: 'refused' };
-    }
-    return { outcome: 'held', lease };
   }
 }

@@ -18,7 +18,6 @@
 
 import { isConductorHalted, isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { laneRunJournalState } from '../../domain/lane-run-journal.js';
-import { isLeaseLapsed } from '../../domain/lane-run-lease.js';
 import type { LeaseAcquireRequest, LeaseRenewRequest } from '../../domain/lane-run-lease.js';
 import type { LaneRunLeaseRecord, LaneRunRecord } from '../../domain/lane-run-records.js';
 import { LANE_RUN_TERMINAL_STATES } from '../../domain/value-objects/LaneRunState.vo.js';
@@ -42,7 +41,7 @@ import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLease
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
-import { ConductorDriverLeaseKeeper } from './conductor-driver-lease-keeper.js';
+import { ConductorDriverLeaseKeeper, holdConductorLease } from './conductor-driver-lease-keeper.js';
 
 export interface RunConductorPassDependencies {
   readonly driverLease: ConductorDriverLeasePort;
@@ -83,10 +82,6 @@ function leaseUntilIso(nowIso: string): string {
   return new Date(Date.parse(nowIso) + CONDUCTOR_LEASE_MS).toISOString();
 }
 
-type HoldLeaseResult =
-  | { readonly outcome: 'held'; readonly lease: LaneRunLeaseRecord }
-  | { readonly outcome: 'held-by-other' }
-  | { readonly outcome: 'refused' };
 
 /** One run's turn: its report, its attention items, and the stop that ended the pass, if any. */
 type RunOutcome = {
@@ -267,7 +262,7 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
       };
     }
     const runUntil = leaseUntilIso(runNowIso);
-    const runHeld = await this.holdLease(record.lease, ctx.request.holderId, runNowIso, runUntil, renewRun, acquireRun);
+    const runHeld = await holdConductorLease(record.lease, ctx.request.holderId, runNowIso, runUntil, renewRun, acquireRun);
     if (runHeld.outcome === 'held-by-other') {
       return {
         report: { runId: record.runId, outcome: 'skipped', reason: 'lease-held' },
@@ -326,7 +321,7 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
       const stepUntil = leaseUntilIso(stepNowIso);
 
       // Renew this run's lease; refused or held by another stops acting on it.
-      const runRenewed = await this.holdLease(lease, ctx.request.holderId, stepNowIso, stepUntil, renewRun, acquireRun);
+      const runRenewed = await holdConductorLease(lease, ctx.request.holderId, stepNowIso, stepUntil, renewRun, acquireRun);
       if (runRenewed.outcome === 'held-by-other') {
         lost = 'lease-held';
         break;
@@ -366,29 +361,5 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
         ? { runId: record.runId, outcome: 'skipped', reason: lost }
         : { runId: record.runId, outcome: 'advanced', steps };
     return { report, attention, stop };
-  }
-
-  /** Take or renew one lease by CAS; another live holder is 'held-by-other', a refused write 'refused'. */
-  private async holdLease(
-    current: LaneRunLeaseRecord | null,
-    holderId: string,
-    nowIso: string,
-    until: string,
-    renew: (request: LeaseRenewRequest) => Promise<LaneRunLeaseRecord | null>,
-    acquire: (request: LeaseAcquireRequest) => Promise<LaneRunLeaseRecord | null>,
-  ): Promise<HoldLeaseResult> {
-    if (current !== null && current.holderId !== holderId && !isLeaseLapsed(current, nowIso)) {
-      return { outcome: 'held-by-other' };
-    }
-    let lease: LaneRunLeaseRecord | null;
-    if (current !== null && current.holderId === holderId && !isLeaseLapsed(current, nowIso)) {
-      lease = await renew({ holderId, fence: current.fence, leaseUntilIso: until, nowIso });
-    } else {
-      lease = await acquire({ holderId, observedFence: current?.fence ?? 0, leaseUntilIso: until, nowIso });
-    }
-    if (lease === null) {
-      return { outcome: 'refused' };
-    }
-    return { outcome: 'held', lease };
   }
 }

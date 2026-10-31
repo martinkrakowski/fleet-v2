@@ -20,6 +20,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
+import { RunnerTunnelAdapter } from './runner-tunnel.js';
 import { composeCoordination } from './composition/coordination.js';
 import { composeKnowledge } from './composition/knowledge.js';
 import { composeEvidence } from './composition/evidence.js';
@@ -201,6 +202,14 @@ export interface FleetCliRuntimeOptions {
   readonly runnerRemoteHost?: string;
   /** SSH host alias holding the worktree when it is not on this host. */
   readonly worktreeSshHost?: string;
+  /**
+   * The runtime's own environment object (tests inject a record here).
+   * Defaults to `process.env`. The runner tunnel reads `OCM_HOST` and
+   * `OCM_REMOTE_PORT` from this object only, so a test runtime with an
+   * environment without them never opens a tunnel even when the real process
+   * environment carries the variables.
+   */
+  readonly env?: Record<string, string | undefined>;
   /** Owner Ed25519 public key in base64 format for verifying approved decisions. */
   readonly ownerPublicKey?: string;
   /** Deterministic subprocess execution for runner tests. */
@@ -272,6 +281,7 @@ export interface ResolvedRunnerSettings {
  * passed to the runner adapter separately through `resolveExecutionRunnerHost`.
  * A v1 or absent installation keeps today's behaviour byte-for-byte.
  */
+
 export function resolveRunnerSettings(
   options?: FleetCliRuntimeOptions,
   installation?: FleetInstallation,
@@ -316,6 +326,35 @@ export function resolveRunnerSettings(
       options?.runnerRemoteHost ??
       inst?.runner?.host ??
       (env.OCM_HOST?.trim() || undefined),
+  };
+}
+
+/**
+ * KF-35: the runner tunnel's target. A v2 installation's selected lane-runner
+ * host decides alone (an `ssh` host forwards to its alias and port; a `local`
+ * host needs no tunnel); otherwise the resolved runner settings decide. A port
+ * outside 1..65534 (the dial port is one above it) opens no tunnel.
+ */
+export function resolveRunnerTunnelTarget(
+  runnerHost: ExecutionRunnerHost | undefined,
+  settings: { readonly runnerRemoteHost?: string; readonly runnerRemotePort?: number },
+): { readonly sshHost?: string; readonly remotePort?: number } {
+  const usablePort = (port: number | null | undefined): number | undefined =>
+    typeof port === 'number' && Number.isInteger(port) && port >= 1 && port <= 65534 ? port : undefined;
+  if (runnerHost !== undefined) {
+    if (runnerHost.transport !== 'ssh') {
+      return {};
+    }
+    const remotePort = usablePort(runnerHost.remotePort);
+    return {
+      ...(runnerHost.sshAlias !== undefined ? { sshHost: runnerHost.sshAlias } : {}),
+      ...(remotePort !== undefined ? { remotePort } : {}),
+    };
+  }
+  const remotePort = usablePort(settings.runnerRemotePort);
+  return {
+    ...(settings.runnerRemoteHost !== undefined ? { sshHost: settings.runnerRemoteHost } : {}),
+    ...(remotePort !== undefined ? { remotePort } : {}),
   };
 }
 
@@ -670,6 +709,12 @@ export interface FleetCliRuntime {
     /** The auto-merge setting read once at composition; a toggle takes a restart (K6-8). */
     readonly autoMergeEnabled: boolean;
   };
+  /**
+   * KF-35: the runner tunnel the conductor driver holds for its lifetime,
+   * resolved from the runtime's own environment object's `OCM_HOST` and
+   * `OCM_REMOTE_PORT`. Absent values mean the driver opens nothing.
+   */
+  readonly runnerTunnel: RunnerTunnelAdapter;
   readonly telemetry: {
     /** Telemetry's own read-only receipt read (OT2b); OT2c/OT4b consume it. */
     readonly acceptanceReceiptRead: AcceptanceReceiptReadAdapter;
@@ -744,7 +789,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     runnerRemotePort,
     ocmRunBin,
     runnerRemoteHost,
-  } = resolveRunnerSettings(options);
+  } = resolveRunnerSettings(options, undefined, options?.env ?? process.env);
   // an invalid installation throws here, never runs
   const installationModel = options?.installation
     ? requireValidInstallationModel(options.installation)
@@ -892,6 +937,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     env: process.env,
   });
 
+  // KF-35: the driver's one runner tunnel, aimed at the same target the runner
+  // dispatches to: the installation's selected lane-runner host for v2, else the
+  // resolved runner settings (which read the runtime's own environment object,
+  // never the process environment when a test supplies one). Nothing is spawned
+  // here; the conductor driver opens the forward before its first pass and stops
+  // it in the same finally that releases its leases.
+  const tunnelTarget = resolveRunnerTunnelTarget(runnerHost, { runnerRemoteHost, runnerRemotePort });
+  const runnerTunnel = new RunnerTunnelAdapter(tunnelTarget);
+
   return {
     installation: options?.installation,
     coordination,
@@ -899,6 +953,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     evidence,
     execution,
     conductor,
+    runnerTunnel,
     telemetry,
   };
 }

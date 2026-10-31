@@ -784,13 +784,16 @@ async function pollConductorPasses(options: {
       }
     }
   } finally {
-    await options.driver.pass.releaseLeases({
-      holderId: options.holderId,
-      nowIso: options.nowIso(),
-    });
-    // The tunnel is stopped after the leases it outlived; a tunnel that was
-    // never owned (operator's, or never applicable) is a no-op.
-    await options.stopTunnel?.();
+    try {
+      await options.driver.pass.releaseLeases({
+        holderId: options.holderId,
+        nowIso: options.nowIso(),
+      });
+    } finally {
+      // The tunnel is stopped after the leases it outlived, even when releasing
+      // them throws; a tunnel that was never owned is a no-op.
+      await options.stopTunnel?.();
+    }
     if (signalHandlersBound) {
       process.removeListener('SIGINT', onSignal);
       process.removeListener('SIGTERM', onSignal);

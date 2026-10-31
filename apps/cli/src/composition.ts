@@ -281,6 +281,35 @@ export interface ResolvedRunnerSettings {
  * passed to the runner adapter separately through `resolveExecutionRunnerHost`.
  * A v1 or absent installation keeps today's behaviour byte-for-byte.
  */
+/**
+ * KF-35: the runner tunnel's target. A v2 installation's selected lane-runner
+ * host decides alone (an `ssh` host forwards to its alias and port; a `local`
+ * host needs no tunnel); otherwise the resolved runner settings decide. A port
+ * outside 1..65534 (the dial port is one above it) opens no tunnel.
+ */
+export function resolveRunnerTunnelTarget(
+  runnerHost: ExecutionRunnerHost | undefined,
+  settings: { readonly runnerRemoteHost?: string; readonly runnerRemotePort?: number },
+): { readonly sshHost?: string; readonly remotePort?: number } {
+  const usablePort = (port: number | null | undefined): number | undefined =>
+    typeof port === 'number' && Number.isInteger(port) && port >= 1 && port <= 65534 ? port : undefined;
+  if (runnerHost !== undefined) {
+    if (runnerHost.transport !== 'ssh') {
+      return {};
+    }
+    const remotePort = usablePort(runnerHost.remotePort);
+    return {
+      ...(runnerHost.sshAlias !== undefined ? { sshHost: runnerHost.sshAlias } : {}),
+      ...(remotePort !== undefined ? { remotePort } : {}),
+    };
+  }
+  const remotePort = usablePort(settings.runnerRemotePort);
+  return {
+    ...(settings.runnerRemoteHost !== undefined ? { sshHost: settings.runnerRemoteHost } : {}),
+    ...(remotePort !== undefined ? { remotePort } : {}),
+  };
+}
+
 export function resolveRunnerSettings(
   options?: FleetCliRuntimeOptions,
   installation?: FleetInstallation,
@@ -907,21 +936,14 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     env: process.env,
   });
 
-  // KF-35: the driver's one runner tunnel, resolved from the runtime's own
-  // environment object — the same environment `bin/ocm-run` variables would
-  // come from, and the one tests control. A runtime environment without
-  // OCM_HOST/OCM_REMOTE_PORT opens no tunnel even when the real process
-  // environment carries them. Nothing is spawned here; the conductor driver
-  // opens the forward before its first pass and stops it in the same finally
-  // that releases its leases.
-  const runtimeEnv = options?.env ?? process.env;
-  const parsedTunnelPort = runtimeEnv.OCM_REMOTE_PORT
-    ? Number(runtimeEnv.OCM_REMOTE_PORT)
-    : Number.NaN;
-  const runnerTunnel = new RunnerTunnelAdapter({
-    sshHost: runtimeEnv.OCM_HOST?.trim() || undefined,
-    remotePort: Number.isSafeInteger(parsedTunnelPort) ? parsedTunnelPort : undefined,
-  });
+  // KF-35: the driver's one runner tunnel, aimed at the same target the runner
+  // dispatches to: the installation's selected lane-runner host for v2, else the
+  // resolved runner settings (which read the runtime's own environment object,
+  // never the process environment when a test supplies one). Nothing is spawned
+  // here; the conductor driver opens the forward before its first pass and stops
+  // it in the same finally that releases its leases.
+  const tunnelTarget = resolveRunnerTunnelTarget(runnerHost, { runnerRemoteHost, runnerRemotePort });
+  const runnerTunnel = new RunnerTunnelAdapter(tunnelTarget);
 
   return {
     installation: options?.installation,

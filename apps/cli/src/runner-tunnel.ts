@@ -177,8 +177,13 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
     }
     // An already-listening dial port is somebody else's tunnel: open nothing
     // and take no ownership.
-    if (await this.isPortListening(dial)) {
-      return 'already-listening';
+    try {
+      if (await this.isPortListening(dial)) {
+        return 'already-listening';
+      }
+    } catch {
+      // Nothing is spawned yet, so a throwing probe is simply a start failure.
+      return 'failed';
     }
     const remote = this.dialPortOverride !== undefined ? dial - 1 : (this.remotePort as number);
     let child: TunnelChild;

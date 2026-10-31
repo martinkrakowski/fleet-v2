@@ -16,7 +16,7 @@ import { describe, expect, it } from 'vitest';
 import type { RunConductorPassResult } from '@fleet/work-execution';
 import { resolveConductorPolicy } from '@fleet/installation';
 
-import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
+import { createFleetCliRuntime, resolveRunnerTunnelTarget, type FleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
 import type { ConductorCliOptions } from '../conductor.js';
 import type { ConductorDriver } from '../conductor-wiring.js';
@@ -205,6 +205,42 @@ function tunnelOf(options: {
   });
 }
 
+describe('resolveRunnerTunnelTarget (KF-35, Fable pre-merge)', () => {
+  it('a v2 ssh lane-runner host decides alone: its alias and port, never the settings', () => {
+    expect(
+      resolveRunnerTunnelTarget(
+        { hostName: 'lane-host', transport: 'ssh', sshAlias: 'fleet-e2e', remotePort: 46000 },
+        { runnerRemoteHost: 'other-host', runnerRemotePort: 47000 },
+      ),
+    ).toEqual({ sshHost: 'fleet-e2e', remotePort: 46000 });
+  });
+
+  it('a v2 local lane-runner host needs no tunnel', () => {
+    expect(
+      resolveRunnerTunnelTarget(
+        { hostName: 'here', transport: 'local', remotePort: 46000 },
+        { runnerRemoteHost: 'other-host', runnerRemotePort: 47000 },
+      ),
+    ).toEqual({});
+  });
+
+  it('without a v2 runner host the resolved settings decide', () => {
+    expect(resolveRunnerTunnelTarget(undefined, { runnerRemoteHost: 'lane-host', runnerRemotePort: 46000 })).toEqual({
+      sshHost: 'lane-host',
+      remotePort: 46000,
+    });
+    expect(resolveRunnerTunnelTarget(undefined, {})).toEqual({});
+  });
+
+  it('a port outside 1..65534 opens no tunnel', () => {
+    for (const port of [0, 65535, 70000, 1.5, Number.NaN]) {
+      expect(resolveRunnerTunnelTarget(undefined, { runnerRemoteHost: 'lane-host', runnerRemotePort: port })).toEqual({
+        sshHost: 'lane-host',
+      });
+    }
+  });
+});
+
 describe('RunnerTunnelAdapter (KF-35)', () => {
   it('opens one ssh forward when the dial port is closed and stops it on stop', async () => {
     const child = fakeChild();
@@ -289,6 +325,26 @@ describe('RunnerTunnelAdapter (KF-35)', () => {
     expect(await tunnel.ensureTunnel({ onEarlyExit: () => early.push(1) })).toBe('failed');
     expect(tunnel.owned).toBe(false);
     expect(early).toHaveLength(0);
+  });
+
+  it('a throwing probe before any spawn is a start failure and spawns nothing (Fable pre-merge)', async () => {
+    const child = fakeChild();
+    let spawned = 0;
+    const tunnel = new RunnerTunnelAdapter({
+      sshHost: 'lane-host',
+      remotePort: 46000,
+      isPortListening: async () => {
+        throw new Error('probe failed');
+      },
+      spawner: () => {
+        spawned += 1;
+        return child;
+      },
+      sleep: async () => undefined,
+    });
+    expect(await tunnel.ensureTunnel()).toBe('failed');
+    expect(spawned).toBe(0);
+    expect(tunnel.owned).toBe(false);
   });
 
   it('reports a failure after the bounded wait and stops the child', async () => {
@@ -425,6 +481,30 @@ describe('conductor run --live holds one runner tunnel (KF-35)', () => {
     expect(fake.releaseCalls).toHaveLength(1);
     expect(tunnel.stopCalls).toHaveLength(1);
     expect(order).toEqual(['ensure', 'runPass', 'releaseLeases', 'stop']);
+  });
+
+  it('still stops the tunnel when releasing the leases throws (Fable pre-merge)', async () => {
+    const dir = tempStateDir();
+    const order: string[] = [];
+    const fake = makeFakeDriver([completedPass()], order);
+    const throwing: ConductorDriver = {
+      ...fake.driver,
+      pass: {
+        ...fake.driver.pass,
+        releaseLeases: async () => {
+          order.push('releaseLeases');
+          throw new Error('state directory unwritable');
+        },
+      },
+    };
+    const tunnel = fakeTunnel('opened', order);
+    await runConductor(runtimeOf(dir), ['run', '--live', '--once'], {
+      stateDir: dir,
+      buildDriver: () => throwing,
+      tunnel,
+    }).catch(() => undefined);
+    expect(order).toEqual(['ensure', 'runPass', 'releaseLeases', 'stop']);
+    expect(tunnel.stopCalls).toHaveLength(1);
   });
 
   it('stops the tunnel once in finally after a multi-pass loop ends on the stop signal', async () => {

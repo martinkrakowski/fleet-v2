@@ -12,7 +12,7 @@ import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendConduct, appendRunIntent, appendRunResult, ceilingPark, performPark, saveOrRefuse } from './step-context.js';
-import { manifestExpectedArtifacts, manifestPositiveInteger, manifestTimeLimitSeconds, readFrozenManifest } from './frozen-manifest.js';
+import { manifestExpectedArtifacts, manifestPositiveInteger, manifestTimeLimitSeconds, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { performFixPrepare } from './review-fix.js';
 import { parkSpentOneWayKey } from './merge.js';
 
@@ -323,7 +323,7 @@ export async function performDispatch(ctx: AdvanceStepContext,
   if (spent !== null) {
     return spent;
   }
-  const manifest = await readFrozenManifest(latest, ctx.deps.artifactPort);
+  const manifest = await readVerifiedFrozenManifest(latest, ctx.deps.artifactPort, ctx.deps.computeDigest);
   const stepLimit = manifestPositiveInteger(manifest, 'stepLimit');
   const timeLimitSeconds = manifestTimeLimitSeconds(manifest);
   const expectedArtifacts = manifestExpectedArtifacts(manifest);

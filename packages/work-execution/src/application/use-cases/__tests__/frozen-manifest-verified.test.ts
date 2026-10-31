@@ -6,8 +6,7 @@
  * SEC-5b: `readFrozenManifestVerified` classifies the same read three ways —
  * `verified`, `absent` (nothing recorded to read) and `unverified` (read made
  * and not verified) — so callers can distinguish a skip from a fail-closed
- * refusal. `readFrozenManifest` stays the unverified reader (regression
- * guard). SEC-3b: `readFrozenBriefVerified` is the same verified read with the
+ * refusal. SEC-3b: `readFrozenBriefVerified` is the same verified read with the
  * exact prose bytes carried on `verified`.
  */
 
@@ -16,7 +15,7 @@ import { describe, expect, it } from 'vitest';
 import type { AttemptRecord, AttemptRunnerRecord } from '../../../domain/execution-records.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
-import { readFrozenManifest, readFrozenManifestVerified, readVerifiedFrozenManifest } from '../advance-lane-run/frozen-manifest.js';
+import { readFrozenManifestVerified, readVerifiedFrozenManifest } from '../advance-lane-run/frozen-manifest.js';
 import { readFrozenBriefVerified } from '../advance-lane-run/frozen-manifest.js';
 
 const PROSE = '# brief\n';
@@ -373,12 +372,3 @@ describe('readFrozenBriefVerified (SEC-3b)', () => {
   });
 });
 
-describe('readFrozenManifest regression guard (SEC-5a)', () => {
-  it('readFrozenManifest stays the unverified reader', async () => {
-    const harness = makeHarness();
-    // A mismatching on-disk manifest is still read and parsed by the legacy
-    // reader; only readVerifiedFrozenManifest fail-closes on it.
-    harness.setManifest(JSON.stringify({ timeLimitSeconds: 3333 }));
-    await expect(readFrozenManifest(attemptFixture(), harness.artifactPort)).resolves.toEqual({ timeLimitSeconds: 3333 });
-  });
-});

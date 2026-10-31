@@ -84,6 +84,7 @@ describe('work-order close (KF-36b-1b)', () => {
     const runtime = createFleetCliRuntime({ stateDir });
     await registerProfile(runtime);
     await registerWorkOrder(runtime, 'wo-close-1');
+    const before = await cli(runtime, ['work-order', 'inspect', '--work-order-id', 'wo-close-1']);
 
     const closed = await cli(runtime, [
       'work-order',
@@ -104,6 +105,16 @@ describe('work-order close (KF-36b-1b)', () => {
     ]);
     expect(inspected.code).toBe(0);
     expect(JSON.parse(inspected.out).workOrder.state).toBe('approved');
+    expect(JSON.parse(inspected.out)).toEqual(JSON.parse(before.out));
+  });
+
+  it('treats a bare --work-order-id as a usage error, not the id "true"', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-close-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    const closed = await cli(runtime, ['work-order', 'close', '--work-order-id', '--state', 'stopped', '--yes']);
+    expect(closed.code).toBe(2);
+    expect(closed.err).toContain('work-order close requires --work-order-id');
   });
 
   it('closes with --yes and reports the stopped state', async () => {

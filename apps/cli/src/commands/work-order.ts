@@ -27,6 +27,10 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
     inspect: async (p, rt) =>
       rt.execution.inspectWorkOrder.inspectWorkOrder({ workOrderId: str(p, 'workOrderId') }),
     close: async (p, rt) => {
+      // A bare `--work-order-id` followed by another flag parses as `true`; that is a missing id, not the id "true".
+      if (typeof p.workOrderId !== 'string' || p.workOrderId.trim() === '') {
+        throw new CliUsageError('work-order close requires --work-order-id');
+      }
       const workOrderId = str(p, 'workOrderId');
       if (workOrderId.trim() === '') {
         throw new CliUsageError('work-order close requires --work-order-id');

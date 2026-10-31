@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { RunIndependentReviewRequest } from '../../../application/ports/out/IndependentReviewPort.out-port.js';
-import { UNTRUSTED_INPUT_RULE } from '../../../domain/untrusted-input.js';
+import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE } from '../../../domain/untrusted-input.js';
 import type { IndependentReviewTransportResult } from '../IndependentReviewAdapter.adapter.js';
 import { IndependentReviewAdapter } from '../IndependentReviewAdapter.adapter.js';
 import {
@@ -638,6 +638,28 @@ describe('CliReviewTransport', () => {
       expect(prompt.split(NONCE).length - 1).toBe(4);
     });
 
+    it('a grok brief-check embedded prompt places BRIEF_INPUT_RULE after the untrusted rule and before the brief marker', async () => {
+      const { transport, capturedPrompts } = buildHarness();
+      await transport({ ...BASE_REQUEST, kind: 'brief-check', briefText: BRIEF });
+
+      const prompt = capturedPrompts[0];
+      expect(prompt).toContain(BRIEF_INPUT_RULE);
+      const briefRuleIndex = prompt.indexOf(BRIEF_INPUT_RULE);
+      const untrustedRuleIndex = prompt.indexOf(UNTRUSTED_INPUT_RULE);
+      const briefOpeningMarkerIndex = prompt.indexOf(`<<<UNTRUSTED nonce=${NONCE} label="brief">>>`);
+      expect(untrustedRuleIndex).toBeGreaterThanOrEqual(0);
+      expect(briefRuleIndex).toBeGreaterThan(untrustedRuleIndex);
+      expect(briefOpeningMarkerIndex).toBeGreaterThan(briefRuleIndex);
+    });
+
+    it('code-review and pre-merge embedded prompts never contain BRIEF_INPUT_RULE', async () => {
+      for (const kind of ['code-review', 'pre-merge'] as const) {
+        const { transport, capturedPrompts } = buildHarness();
+        await transport({ ...BASE_REQUEST, kind });
+        expect(capturedPrompts[0]).not.toContain(BRIEF_INPUT_RULE);
+      }
+    });
+
     it('a brief-check embedded prompt without a briefText refuses before any spawn', async () => {
       const { transport, spawnCalls } = buildHarness();
       await expect(transport({ ...BASE_REQUEST, kind: 'brief-check' })).rejects.toThrow(
@@ -792,6 +814,25 @@ describe('CliReviewTransport', () => {
         'a brief-check review requires the brief text',
       );
       expect(spawnCalls).toHaveLength(0);
+    });
+
+    it('an agy brief-check prompt places BRIEF_INPUT_RULE after the untrusted rule and before the brief marker', async () => {
+      let capturedPrompt = '';
+      const spawn: CliReviewSpawn = async (_file, args) => {
+        capturedPrompt = args[args.indexOf('--print') + 1];
+        return { exitCode: 0, signal: null, stdout: agyStdout(AGY_PASS), stderr: '' };
+      };
+      const { transport } = buildAgyHarness({ spawn });
+
+      await transport({ ...AGY_REQUEST, kind: 'brief-check', briefText: '1. Add the review seat.\n2. Wire the checklist.' });
+
+      expect(capturedPrompt).toContain(BRIEF_INPUT_RULE);
+      const briefRuleIndex = capturedPrompt.indexOf(BRIEF_INPUT_RULE);
+      const untrustedRuleIndex = capturedPrompt.indexOf(UNTRUSTED_INPUT_RULE);
+      const briefOpeningMarkerIndex = capturedPrompt.indexOf(`<<<UNTRUSTED nonce=${NONCE} label="brief">>>`);
+      expect(untrustedRuleIndex).toBeGreaterThanOrEqual(0);
+      expect(briefRuleIndex).toBeGreaterThan(untrustedRuleIndex);
+      expect(briefOpeningMarkerIndex).toBeGreaterThan(briefRuleIndex);
     });
 
     it('the grok prompt is byte-identical to buildEmbeddedReviewPrompt (no preamble)', async () => {

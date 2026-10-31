@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { RunIndependentReviewRequest } from '../../../application/ports/out/IndependentReviewPort.out-port.js';
-import { UNTRUSTED_INPUT_RULE } from '../../../domain/untrusted-input.js';
+import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE } from '../../../domain/untrusted-input.js';
 import { IndependentReviewAdapter } from '../IndependentReviewAdapter.adapter.js';
 import {
   ALLOWED_PART_TYPES,
@@ -1501,6 +1501,31 @@ describe('OcmReviewTransport', () => {
       expect(prompt).toContain('every work-order item of the brief');
       expect(prompt).not.toContain(REVIEW_CHECKLIST);
       expect(prompt).toContain(REVIEW_REPLY_CONTRACT);
+    });
+
+    it('a brief-check prompt places BRIEF_INPUT_RULE after the untrusted rule and before the brief marker', () => {
+      const prompt = buildReviewPrompt(
+        {
+          ...baseRequest,
+          kind: 'brief-check',
+          briefText: '1. Add the review seat.\n2. Wire the checklist.',
+        },
+        nonce,
+      );
+      expect(prompt).toContain(BRIEF_INPUT_RULE);
+      const briefRuleIndex = prompt.indexOf(BRIEF_INPUT_RULE);
+      const untrustedRuleIndex = prompt.indexOf(UNTRUSTED_INPUT_RULE);
+      const briefOpeningMarkerIndex = prompt.indexOf(`<<<UNTRUSTED nonce=${nonce} label="brief">>>`);
+      expect(untrustedRuleIndex).toBeGreaterThanOrEqual(0);
+      expect(briefRuleIndex).toBeGreaterThan(untrustedRuleIndex);
+      expect(briefOpeningMarkerIndex).toBeGreaterThan(briefRuleIndex);
+    });
+
+    it('code-review and pre-merge prompts never contain BRIEF_INPUT_RULE', () => {
+      for (const kind of ['code-review', 'pre-merge'] as const) {
+        const prompt = buildReviewPrompt({ ...baseRequest, kind }, nonce);
+        expect(prompt).not.toContain(BRIEF_INPUT_RULE);
+      }
     });
 
     it('a brief-check prompt without a briefText refuses before building the prompt', () => {

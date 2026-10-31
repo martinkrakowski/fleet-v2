@@ -868,8 +868,29 @@ describe('review rules per kind', () => {
     });
   });
 
-  it.each(['brief-check', 'code-review'] as const)('V7: %s unknown parks ambiguous', (kind) => {
-    const facts = reviewFacts(kind, { verdict: 'unknown' });
+  it.each(['brief-check', 'code-review'] as const)('V7: %s a review verdict the conductor could not read retries the same seat once', (kind) => {
+    const facts = reviewFacts(kind, { verdict: 'unknown', seatIndex: 0, retries: 0 });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V7b: %s unknown with retries: 1 parks ambiguous', (kind) => {
+    const facts = reviewFacts(kind, { verdict: 'unknown', seatIndex: 0, retries: 1 });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: kind, parkedFrom: kind,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V7c: %s unknown with seatIndex: null parks ambiguous', (kind) => {
+    const facts = reviewFacts(kind, { verdict: 'unknown', seatIndex: null, retries: 0 });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: kind, parkedFrom: kind,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V7d: %s unknown with retries: 1 and a different seat offered still parks ambiguous (no seat switch)', (kind) => {
+    const facts = reviewFacts(kind, { verdict: 'unknown', seatIndex: 0, retries: 1 }, { reviewSeat: { ok: true, seatIndex: 2 } });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'ambiguous', qualifier: kind, parkedFrom: kind,
     });

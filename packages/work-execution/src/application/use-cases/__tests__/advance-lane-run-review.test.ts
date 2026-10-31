@@ -28,6 +28,7 @@ import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/Attem
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import type {
   FindReviewReceiptRequest,
   FindReviewReceiptResult,
@@ -52,7 +53,13 @@ const COMMIT_A = 'a'.repeat(40);
 const COMMIT_B = 'b'.repeat(40);
 const HEAD12_A = 'a'.repeat(12);
 const HEAD12_B = 'b'.repeat(12);
-const SHA = 'c'.repeat(64);
+// SEC-5b: the review's frozen manifest is read digest-verified. The served
+// manifest and the recorded digest are frozen together so every default read
+// verifies.
+const PROSE = '# brief\n';
+const DEFAULT_MANIFEST_JSON = JSON.stringify({ acceptanceChecks: ['check-1'] });
+const digestFor = (json: string): string => simpleDeterministicHexDigest(PROSE + '\n' + json);
+const SHA = digestFor(DEFAULT_MANIFEST_JSON);
 const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
 
 const BASE_RECORD = {
@@ -234,7 +241,9 @@ interface Harness {
   readonly deps: AdvanceLaneRunDependencies;
   readonly journalLengthWhenCalled: number;
   readonly journalLengthWhenOpened: number;
-  setManifest(json: string | null): void;
+  setManifest(json: string | null): Promise<void>;
+  /** Serves a changed manifest on disk without re-freezing any attempt digest (SEC-5b digest-mismatch tests). */
+  setChangedManifestOnDisk(json: string | null): void;
   setBriefText(text: string | null): void;
   setReviewAnswer(answer: (request: ReviewRequest) => Promise<ReviewRequestResult>): void;
   setFindReceiptAnswer(answer: (request: FindReviewReceiptRequest) => Promise<FindReviewReceiptResult>): void;
@@ -261,7 +270,7 @@ async function makeHarness(
   const reviewRequests: ReviewRequest[] = [];
   const openRequests: OpenReviewAssessmentRequest[] = [];
   const workOrderLookups: string[] = [];
-  let manifestJson: string | null = JSON.stringify({ acceptanceChecks: ['check-1'] });
+  let manifestJson: string | null = DEFAULT_MANIFEST_JSON;
   let briefText: string | null = null;
   let openAnswer: OpenReviewAssessmentResult = { outcome: 'open' };
   let workOrderAnswer: WorkOrderRecord | null = WORK_ORDER;
@@ -301,7 +310,11 @@ async function makeHarness(
     executionJournal,
     artifactPort: {
       readBriefManifest: async () => manifestJson,
-      readBriefFile: async () => briefText,
+      // SEC-5b: the frozen prose is served for the digest read (at the
+      // attempt's brief package path); the brief text forwarded to a brief
+      // check is read separately at `.lane/brief.md`.
+      readBriefFile: async (worktreePath: string, relativePath: string) =>
+        relativePath === '.lane/brief.md' ? briefText : PROSE,
       verifyArtifactManifest: async () => ({ outcome: 'sealed' }) as never,
     },
     reconcileAttempt: {
@@ -374,7 +387,26 @@ async function makeHarness(
     get journalLengthWhenOpened() {
       return journalLengthWhenOpened;
     },
-    setManifest: (json) => {
+    setManifest: async (json) => {
+      manifestJson = json;
+      // SEC-5b: a re-frozen manifest re-freezes the stored attempts' digests
+      // too, so every read of the served manifest verifies against it.
+      if (json !== null) {
+        const digest = digestFor(json);
+        for (const attempt of await attemptRepo.listAllAttempts()) {
+          if (attempt.briefDigest !== digest) {
+            await attemptRepo.saveAttempt({
+              ...attempt,
+              revision: (attempt.revision ?? 0) + 1,
+              briefDigest: digest,
+            });
+          }
+        }
+      }
+    },
+    // The changed-on-disk path (SEC-5b): the served manifest changes without
+    // any attempt digest being re-frozen — every digest read then mismatches.
+    setChangedManifestOnDisk: (json) => {
       manifestJson = json;
     },
     setBriefText: (text) => {
@@ -660,7 +692,7 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
   it('forwards the frozen manifest acceptanceChecks as requiredChecks and refuses an empty list without opening or requesting', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'brief-check', NOW);
-    harness.setManifest(JSON.stringify({ acceptanceChecks: ['check-a', 'check-b'] }));
+    await harness.setManifest(JSON.stringify({ acceptanceChecks: ['check-a', 'check-b'] }));
     const result = await advance(harness);
     expect(result).toEqual({
       outcome: 'acted',
@@ -673,7 +705,7 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
 
     const hEmpty = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(hEmpty, 'brief-check', NOW);
-    hEmpty.setManifest(JSON.stringify({ acceptanceChecks: [] }));
+    await hEmpty.setManifest(JSON.stringify({ acceptanceChecks: [] }));
     const refused = await advance(hEmpty);
     expect(refused).toEqual({
       outcome: 'acted',
@@ -684,6 +716,26 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
     });
     expect(hEmpty.openRequests).toHaveLength(0);
     expect(hEmpty.reviewRequests).toHaveLength(0);
+  });
+
+  it('a changed frozen manifest refuses assessment-unavailable, read digest-verified (SEC-5b)', async () => {
+    // The served manifest is a legitimate re-freeze whose bytes no attempt
+    // recorded: the review must refuse on the digest itself, before the
+    // assessment is opened (the changed-on-disk path, never `setManifest`,
+    // which re-freezes the digests).
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setChangedManifestOnDisk(JSON.stringify({ acceptanceChecks: ['check-a', 'check-b'] }));
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'refused',
+      reasonCode: 'assessment-unavailable',
+    });
+    expect(harness.openRequests).toHaveLength(0);
+    expect(harness.reviewRequests).toHaveLength(0);
   });
 
   it('forwards briefText only for brief-check from readBriefFile', async () => {

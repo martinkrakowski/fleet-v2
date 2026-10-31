@@ -84,8 +84,10 @@ const ATTEMPT: AttemptRecord = {
   state: 'intent-recorded',
   outcome: null,
   revision: 0,
-  briefDigest: 'c'.repeat(64),
-  briefPackagePath: '.lane/brief-package',
+  // SEC-5b-1: collect reads the frozen manifest digest-verified, so the seeded
+  // attempt carries the digest of the dry-run fake's frozen prose and manifest.
+  briefDigest: createHash('sha256').update(DRY_RUN_BRIEF_PROSE + '\n' + DRY_RUN_MANIFEST_JSON, 'utf8').digest('hex'),
+  briefPackagePath: '.lane/brief.md',
   sessionId: null,
   completionReceipt: null,
   artifacts: null,

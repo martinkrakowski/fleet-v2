@@ -165,6 +165,7 @@ export function laneRunAttemptPhaseOf(state: unknown): LaneRunAttemptPhase {
 export type LaneRunWaitReason =
   | 'admission' | 'dispatch-pending' | 'lane-running' | 'prior-not-ended' | 'gate-pending'
   | 'review-pending' | 'premerge-pending' | 'ci-pending' | 'ci-unknown' | 'merge-train' | 'parked'
+  | 'session-stagger'
   | 'stop-unconfirmed' | 'facts-inconsistent' | 'stop-draining' | 'stop-grace-exceeded';
 
 export type LaneRunDecision =

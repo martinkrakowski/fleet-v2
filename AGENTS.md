@@ -73,13 +73,21 @@ runner environment allowlist to smuggle a setting through.
 - `bin/gate-slot <command> [args...]` runs one acceptance command inside a host-wide check
   slot (`FLEET_V2_GATE_SLOTS`, default 8; the same lock files as the orchestrator's gate), so
   conducted runs share the host's gate budget. Worker caps stay in the command's own flags;
-  `FLEET_V2_GATE_TMPDIR` sets the command's `TMPDIR`. It needs `flock`.
+  `FLEET_V2_GATE_TMPDIR` sets the command's `TMPDIR`. `FLEET_V2_GATE_WAIT_MAX_SECONDS` (default 600)
+  bounds the wait for a slot: past it the script prints `gate-slot: no slot within the wait limit` and
+  exits 75. Treat 75 as "host full" only with that exact last stderr line (a command may exit 75
+  itself), and cap retries. `scripts/gate-slot-hash.txt` pins the script. It needs `flock`.
 
-Before committing what any lane produced, run `scripts/lane-diff-check.sh <worktree>`
+Before committing what any lane produced, run `scripts/lane-diff-check.sh <worktree> --base <sha>`
 (protected paths including ignored ones — github workflows, agent/editor instruction and tool files,
 yarn/npm/package manifests and lockfiles, git attributes/modules, lane plumbing, install trees;
 plus git config filter drivers, credential-shaped strings, files outside the brief); it prints
-file, line and pattern name only, never a matched value.
+file, line and pattern name only, never a matched value. Pass `--base` as the full commit sha
+recorded at dispatch: only then is a credential-shaped line the base file already had excused
+(`baseline-excused`); a ref name or no base excuses nothing and prints one warning. Run a trusted
+copy of the script installed outside any worktree, never the worktree's own copy. Helper keys in the
+clone's git config and non-sample files in its hooks directory are findings, so lane-host clones keep
+no installed hooks.
 
 ## Web UI action rules
 

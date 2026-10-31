@@ -1,7 +1,7 @@
 # Decision: a Jev veto before an unattended merge
 
 - **Date:** 2026-10-31
-- **Status:** proposed. The owner asked for this write-up after approving unattended merging the same day. Decisions D-JV1 to D-JV5 (§7) are open, each with a recommendation.
+- **Status:** decided. On 2026-10-31 the owner accepted D-JV1 to D-JV5 (§7) as recommended. Shadow mode starts on the bridge merge train the same day.
 - **Builds on:**
   - `2026-10-16_decision-port.md`: invariants 1–6, the Jev mapping and the budget ledger. Its "Later consumers" names "an escalation-only risk gate"; this is that consumer.
   - `2026-10-31_daemon-tick-plan.md`, in draft: the merge pass that this hook belongs to.
@@ -82,11 +82,11 @@ There is one question, `merge`, of type `choice`, with criteria `merge-safe` and
 
 | # | Question | Recommended |
 |---|---|---|
-| D-JV1 | Adopt the veto as an escalation-only gate before unattended merges? | **Yes**, under §2: only `hold-for-human` at or above `holdConfidence` has an effect |
-| D-JV2 | Start in shadow mode on the bridge script now, logging only? | **Yes**. The data starts accumulating with the first unattended merges |
-| D-JV3 | Criteria to turn the veto live | After at least 20 shadow merges, if the false-hold rate is at most 1 in 10 and no missed problem is one a hold would have caught at a lower threshold; the owner decides on the record |
-| D-JV4 | Starting `holdConfidence` | **0.8**, re-tuned at D-JV3 |
-| D-JV5 | Projects | fleet-v2 only (public). Every other project stays in `disabledProjects` until its owner opts in |
+| D-JV1 | Adopt the veto as an escalation-only gate before unattended merges? | **Accepted** (owner, 2026-10-31). **Yes**, under §2: only `hold-for-human` at or above `holdConfidence` has an effect |
+| D-JV2 | Start in shadow mode on the bridge script now, logging only? | **Accepted** (owner, 2026-10-31). **Yes**. The data starts accumulating with the first unattended merges |
+| D-JV3 | Criteria to turn the veto live | **Accepted** (owner, 2026-10-31). After at least 20 shadow merges, if the false-hold rate is at most 1 in 10 and no missed problem is one a hold would have caught at a lower threshold; the owner decides on the record |
+| D-JV4 | Starting `holdConfidence` | **Accepted** (owner, 2026-10-31). **0.8**, re-tuned at D-JV3 |
+| D-JV5 | Projects | **Accepted** (owner, 2026-10-31). fleet-v2 only (public). Every other project stays in `disabledProjects` until its owner opts in |
 
 ## Hard to undo
 

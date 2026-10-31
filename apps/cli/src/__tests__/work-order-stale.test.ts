@@ -133,4 +133,32 @@ describe('work-order stale (KF-36b-2)', () => {
     expect(doc.entries.map((entry) => entry.workOrderId)).toEqual(['wo-stale-b']);
     expect(doc.entries[0].kind).toBe('no-run');
   });
+
+  it('--project-id narrows the listing to that project', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-stale-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await registerProfile(runtime);
+    await registerWorkOrder(runtime, 'wo-stale-a', 'packages/example-a');
+
+    const mine = await cli(runtime, ['work-order', 'stale', '--project-id', 'example-project']);
+    expect(mine.code).toBe(0);
+    expect((JSON.parse(mine.out) as { entries: StaleEntry[] }).entries.map((e) => e.workOrderId)).toEqual(['wo-stale-a']);
+
+    const other = await cli(runtime, ['work-order', 'stale', '--project-id', 'another-project']);
+    expect(other.code).toBe(0);
+    expect((JSON.parse(other.out) as { entries: StaleEntry[] }).entries).toEqual([]);
+  });
+
+  it.each([
+    ['a bare --project-id', ['work-order', 'stale', '--project-id']],
+    ['an empty --project-id', ['work-order', 'stale', '--project-id', '']],
+  ])('treats %s as a usage error, never a fleet-wide listing', async (_label, args) => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-stale-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    const listed = await cli(runtime, args);
+    expect(listed.code).toBe(2);
+    expect(listed.err).toContain('work-order stale --project-id needs a project id');
+  });
 });

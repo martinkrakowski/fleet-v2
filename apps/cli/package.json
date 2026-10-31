@@ -19,11 +19,15 @@
     "@fleet/installation": "workspace:*",
     "@fleet/onboarding": "workspace:*",
     "@fleet/operator-coordination": "workspace:*",
-    "@fleet/work-execution": "workspace:*"
+    "@fleet/work-execution": "workspace:*",
+    "ink": "^8.0.0",
+    "react": "^19.3.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
+    "@types/react": "^19.3.0",
     "eslint": "^9.0.0",
+    "ink-testing-library": "^4.0.0",
     "typescript": "^5.5.4",
     "typescript-eslint": "^8.0.0"
   }

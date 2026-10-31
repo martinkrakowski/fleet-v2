@@ -112,7 +112,9 @@ export interface WorkComposition {
   attemptLimiter: ProbeLimiter;
   /**
    * Throttles HTTP cancel-prepared actions: one in-flight cancel per attempt
-   * id and a small global cap. Owned by this composition root, not the route.
+   * id and a small global cap. A cancel is a pure record write, so it is kept
+   * apart from attemptLimiter (stop, reconcile, fix) and never waits behind a
+   * probe. Owned by this composition root, not the route.
    */
   cancelPreparedLimiter: ProbeLimiter;
   cancelPreparedAttempt: {

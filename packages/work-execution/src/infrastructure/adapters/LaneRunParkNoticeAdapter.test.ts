@@ -152,7 +152,7 @@ describe('LaneRunParkNoticeAdapter', () => {
         if (reason === 'fix-no-progress') {
           // A resume would re-collect the same head and park again: stop is the only option.
           expect(ask.options).toEqual([
-            { id: 'stop', label: 'Stop the run', consequence: 'The lane run stops and releases the work order; register a new work order to run the lane again.' },
+            { id: 'stop', label: 'Stop the run', consequence: 'The lane run stops; its work order is released once no slot or other run still holds it, and the lane is re-run under a new work order.' },
           ]);
           expect(ask.recommendation).toEqual({
             optionId: 'stop',

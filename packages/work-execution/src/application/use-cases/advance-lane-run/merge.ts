@@ -19,7 +19,7 @@ import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-fact
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, performPark, saveOrRefuse } from './step-context.js';
-import { readFrozenManifest } from './frozen-manifest.js';
+import { readVerifiedFrozenManifest } from './frozen-manifest.js';
 
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
 type ReconcileDecision = Extract<LaneRunDecision, { kind: 'reconcile' }>;
@@ -634,7 +634,7 @@ async function runPrPushBody(
   // body) refuses before any intent, grant or forge call.
   let rendered: RenderPrBodyResult | null = null;
   if (kind === 'push-and-open-pr') {
-    const manifest = await readFrozenManifest(latest, ctx.deps.artifactPort);
+    const manifest = await readVerifiedFrozenManifest(latest, ctx.deps.artifactPort, ctx.deps.computeDigest);
     const frozen = frozenPrNotesOf(manifest);
     const title = 'Fleet work order ' + record.workOrderId;
     rendered = frozen === null ? null : renderPrBody({

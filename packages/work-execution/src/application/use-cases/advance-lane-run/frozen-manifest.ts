@@ -4,39 +4,6 @@ import type { AttemptRecord } from '../../../domain/execution-records.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
-/** The frozen brief manifest as a plain object; null when absent or unreadable (K4-4b). */
-export async function readFrozenManifest(
-  attempt: AttemptRecord,
-  artifactPort: AdvanceLaneRunDependencies['artifactPort'],
-): Promise<Record<string, unknown> | null> {
-  // Called on the port, never copied off it: an adapter method reads `this` (KF-11).
-  if (artifactPort.readBriefManifest === undefined || attempt.briefPackagePath === null) {
-    return null;
-  }
-  // Q2a-2: a conducted attempt's read goes through its recorded host or is not
-  // made; a missing host never falls back to the local executor.
-  const recordedHost = conductedRunnerOf(attempt);
-  if (recordedHost === null) {
-    return null;
-  }
-  try {
-    const text = await artifactPort.readBriefManifest(
-      attempt.worktreePath,
-      attempt.briefPackagePath.replace(/\.md$/, '-manifest.json'),
-      recordedHost,
-    );
-    if (text === null) {
-      return null;
-    }
-    const parsed: unknown = JSON.parse(text);
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * A conducted attempt's frozen brief manifest read with its digest verified
  * (SEC-5b): `verified` carries the manifest; `absent` means there is nothing
@@ -152,6 +119,34 @@ export async function readVerifiedFrozenManifest(
 ): Promise<Record<string, unknown> | null> {
   const read = await readFrozenManifestVerified(attempt, artifactPort, computeDigest);
   return read.kind === 'verified' ? read.manifest : null;
+}
+
+/**
+ * The conductor-owned fallback lane time limit (SEC-5c): 60 minutes. Used
+ * when neither a recorded dispatch limit nor a verified manifest limit
+ * exists; no project profile, installation or policy field holds a default
+ * lane time limit, so this is a named constant.
+ */
+export const CONDUCTOR_FALLBACK_TIME_LIMIT_SECONDS = 3600;
+
+/**
+ * The conductor's lane time limit in seconds (SEC-5c): precedence is the
+ * limit dispatch recorded on the attempt (`recorded`) over a verified frozen
+ * manifest limit (`manifestLimit`) over the conductor-owned fallback. A
+ * recorded value counts only when it is a positive safe integer; anything
+ * else is absent.
+ */
+export function conductorTimeLimitSeconds(
+  recorded: unknown,
+  manifestLimit: number | null,
+): { seconds: number; source: 'recorded' | 'manifest' | 'fallback' } {
+  if (typeof recorded === 'number' && Number.isSafeInteger(recorded) && recorded > 0) {
+    return { seconds: recorded, source: 'recorded' };
+  }
+  if (manifestLimit !== null) {
+    return { seconds: manifestLimit, source: 'manifest' };
+  }
+  return { seconds: CONDUCTOR_FALLBACK_TIME_LIMIT_SECONDS, source: 'fallback' };
 }
 
 /** A positive safe-integer field of a frozen manifest; null when absent or invalid. */

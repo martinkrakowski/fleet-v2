@@ -831,7 +831,14 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
         sessionId: startResult.sessionId,
         detail: `Session started: ${startResult.sessionId}`,
       });
-      const runningSave = await this.saveRunningOrConflict(runningAttempt, startResult.sessionId, runnerValue, nowIso, runner);
+      const runningSave = await this.saveRunningOrConflict(
+        runningAttempt,
+        startResult.sessionId,
+        runnerValue,
+        nowIso,
+        runner,
+        request.timeLimitSeconds,
+      );
       if (runningSave.kind === 'conflict') {
         return runningSave.result;
       }
@@ -1065,6 +1072,7 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
     runnerValue: AttemptRecord['runner'],
     nowIso: string,
     runner: ExecutionRunnerPort,
+    timeLimitSeconds: number,
   ): Promise<RunningSaveOutcome> {
     const deps = this.deps!;
     const alreadyRecorded = (record: AttemptRecord): RunningSaveOutcome => {
@@ -1223,11 +1231,20 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
       {
         // A non-terminal record without a session: the state stays whatever
         // someone else set it to; only the session is recorded so reconcile
-        // can find it.
+        // can find it. SEC-5c-2: the same `dispatchedTimeLimitSeconds` the
+        // `dispatching` save applied is re-applied here — a stale value from
+        // `fresh` is dropped, and the new one is added only when it is a
+        // positive safe integer — so the recorded session and the recorded
+        // limit cannot disagree on this save.
+        const { dispatchedTimeLimitSeconds: _staleDispatchedTimeLimitSeconds, ...freshBase } = fresh;
+        void _staleDispatchedTimeLimitSeconds;
         const preserved: AttemptRecord = {
-          ...fresh,
+          ...freshBase,
           sessionId,
           runner: runnerValue,
+          ...(Number.isSafeInteger(timeLimitSeconds) && timeLimitSeconds > 0
+            ? { dispatchedTimeLimitSeconds: timeLimitSeconds }
+            : {}),
           revision: nextAttemptRevision(fresh),
           updatedAtIso: nowIso,
         };

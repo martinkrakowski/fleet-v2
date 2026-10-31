@@ -18,15 +18,21 @@ import type {
   ReapOrphanSessionsPort,
   ReapOrphanSessionsRequest,
   ReapOrphanSessionsResult,
-  ReapOrphanSkippedEntry,
   ReapOrphanUnknownEntry,
 } from '../ports/in/ReapOrphanSessionsPort.in-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import type {
+  AbortWorktreeRunResult,
+  WorktreeRunState,
+} from '../ports/out/ExecutionRunnerPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 
 /** The states of a finished attempt; any other state means the worktree is live. */
 const FINISHED_ATTEMPT_STATES = new Set(['cancelled', 'collected', 'ended']);
+
+/** Every reason the reap can skip a worktree with. */
+type ReapOrphanSkippedReason = 'attempt-live' | 'slot-held' | 'no-runner' | 'became-live';
 
 /** The reads and writes the reap needs; narrowed so composition supplies only what it has. */
 export interface ReapOrphanSessionsDependencies {
@@ -76,7 +82,7 @@ export class ReapOrphanSessionsUseCase implements ReapOrphanSessionsPort {
     const orphans: ReapOrphanSessionEntry[] = [];
     const aborted: { readonly worktreePath: string }[] = [];
     const failed: ReapOrphanFailedEntry[] = [];
-    const skipped: ReapOrphanSkippedEntry[] = [];
+    const skipped: { readonly worktreePath: string; readonly reason: ReapOrphanSkippedReason }[] = [];
     const unknown: ReapOrphanUnknownEntry[] = [];
 
     const byWorktree = new Map<string, AttemptRecord[]>();
@@ -121,16 +127,24 @@ export class ReapOrphanSessionsUseCase implements ReapOrphanSessionsPort {
         continue;
       }
       const runner = selection.runner;
-      const inspect = runner.inspectWorktreeRun;
-      if (inspect === undefined) {
+      if (runner.inspectWorktreeRun === undefined) {
         skipped.push({ worktreePath, reason: 'no-runner' });
         continue;
       }
-      const worktreeState = await inspect({
-        attemptId: latest.id,
-        worktreePath,
-        runner: latest.runner,
-      });
+      let worktreeState: WorktreeRunState;
+      try {
+        // Called on the runner, never copied off it: the production adapters
+        // read `this`, so an unbound call would throw.
+        worktreeState = await runner.inspectWorktreeRun({
+          attemptId: latest.id,
+          worktreePath,
+          runner: latest.runner,
+        });
+      } catch {
+        // A throwing inspect must not end the scan: report it and move on.
+        unknown.push({ worktreePath, reason: 'inspect-failed' });
+        continue;
+      }
       if (worktreeState.state === 'running') {
         const orphan: ReapOrphanSessionEntry = {
           worktreePath,
@@ -139,18 +153,51 @@ export class ReapOrphanSessionsUseCase implements ReapOrphanSessionsPort {
         };
         orphans.push(orphan);
         if (!dryRun) {
+          // Re-read the attempt store and the journal immediately before the
+          // abort: the opening snapshot may be stale because an attempt went
+          // live, took a reservation, or a new attempt appeared since it was
+          // taken. The abort proceeds only when all three still hold for this
+          // worktree: every attempt finished, none holds a reservation, and
+          // the attempt ids are exactly the first snapshot's.
+          // A residual window between this re-read and the abort still
+          // remains; it is bounded by the runner's own refusal to abort a
+          // session it does not own.
+          const reAttempts = await this.deps.attemptRepo.listAllAttempts();
+          const reHeldAttemptIds = new Set(
+            (await this.deps.executionJournal.listActiveReservations())
+              .filter((reservation) => reservation.held)
+              .map((reservation) => reservation.attemptId),
+          );
+          const reGroup = reAttempts.filter((attempt) => attempt.worktreePath === worktreePath);
+          const reIds = new Set(reGroup.map((attempt) => attempt.id));
+          const stillFinished = reGroup.every((attempt) => FINISHED_ATTEMPT_STATES.has(attempt.state));
+          const stillUnheld = reGroup.every((attempt) => !reHeldAttemptIds.has(attempt.id));
+          const sameAttempts =
+            reGroup.length === group.length && group.every((attempt) => reIds.has(attempt.id));
+          if (!stillFinished || !stillUnheld || !sameAttempts) {
+            skipped.push({ worktreePath, reason: 'became-live' });
+            continue;
+          }
           // Abort one worktree at a time; `abortWorktreeRun` is the only write.
-          const abort = runner.abortWorktreeRun;
-          if (abort === undefined) {
+          if (runner.abortWorktreeRun === undefined) {
             failed.push({ worktreePath, outcome: 'refused' });
             continue;
           }
-          const abortResult = await abort({
-            attemptId: latest.id,
-            worktreePath,
-            runner: latest.runner,
-            gracePeriodSeconds: 10,
-          });
+          let abortResult: AbortWorktreeRunResult;
+          try {
+            // Called on the runner, never copied off it: the production
+            // adapters read `this`, so an unbound call would throw.
+            abortResult = await runner.abortWorktreeRun({
+              attemptId: latest.id,
+              worktreePath,
+              runner: latest.runner,
+              gracePeriodSeconds: 10,
+            });
+          } catch {
+            // A throwing abort must not end the scan: report it and move on.
+            failed.push({ worktreePath, outcome: 'unknown' });
+            continue;
+          }
           if (abortResult.outcome === 'aborted') {
             aborted.push({ worktreePath });
           } else {

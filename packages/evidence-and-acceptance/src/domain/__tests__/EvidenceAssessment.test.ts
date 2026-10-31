@@ -141,6 +141,51 @@ describe('EvidenceAssessment entity', () => {
     });
   });
 
+  describe('appendReviewReceipt duplicate-id guard (KF-33b2)', () => {
+    const receipt = (id: string): ReviewReceiptRecord => ({
+      id,
+      assessmentId: 'asm-1',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD,
+      reviewerModel: 'provider-a/other-reviewer',
+      implementerModel: 'provider-b/model-implementer',
+      readOnlyVerified: true,
+      result: 'fail',
+      evidenceRef: 'n/a',
+      policyRevision: 'pol-1',
+      completedAtIso: '2026-10-15T12:00:00.000Z',
+      findings: [
+        {
+          findingId: 'f-1',
+          severity: 'major',
+          summary: 'n/a',
+          filePath: null,
+          line: null,
+          state: 'unresolved',
+          dispositionReason: null,
+          dispositionEvidenceRef: null,
+        },
+      ],
+    });
+
+    it('refuses a second receipt with an id the assessment already holds', () => {
+      const assessment = EvidenceAssessment.create(sampleProps()).value!;
+      assessment.appendReviewReceipt(receipt('rr-1'), '2026-10-15T12:01:00.000Z');
+      expect(() => assessment.appendReviewReceipt(receipt('rr-1'), '2026-10-15T12:02:00.000Z')).toThrow(
+        "Review receipt 'rr-1' is already recorded for this assessment",
+      );
+      expect(assessment.toRecord().reviewReceipts).toHaveLength(1);
+    });
+
+    it('still appends a receipt with a distinct id', () => {
+      const assessment = EvidenceAssessment.create(sampleProps()).value!;
+      assessment.appendReviewReceipt(receipt('rr-1'), '2026-10-15T12:01:00.000Z');
+      assessment.appendReviewReceipt(receipt('rr-2'), '2026-10-15T12:02:00.000Z');
+      expect(assessment.toRecord().reviewReceipts.map((entry) => entry.id)).toEqual(['rr-1', 'rr-2']);
+    });
+  });
+
   describe('stored placeholder evidence (D1)', () => {
     it('still loads receipts and dispositions whose placeholder text predates A2', () => {
       const receipt: ReviewReceiptRecord = {

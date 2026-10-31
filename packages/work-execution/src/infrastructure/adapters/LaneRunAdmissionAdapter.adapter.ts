@@ -106,9 +106,19 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
       // excludes this attempt's own reservation from being double-counted;
       // if it now blocks, THIS reservation is released and the start is
       // refused `no-capacity`. Both racers may refuse (safe; the caller
-      // retries). A reservation that was not made, or a re-check that
-      // passes, keeps the existing result.
-      const stillBlocked = await this.admissionBlocked(request.workOrderId, request.attemptId);
+      // retries). A re-check that throws must not leave the reservation
+      // held (a duplicate on the next pass parks the run), so the attempt's
+      // reservation is released before the throw propagates.
+      let stillBlocked: boolean;
+      try {
+        stillBlocked = await this.admissionBlocked(request.workOrderId, request.attemptId);
+      } catch (error) {
+        await this.options.executionJournal.releaseCapacityReservation(
+          request.attemptId,
+          request.nowIso,
+        );
+        throw error;
+      }
       if (stillBlocked) {
         await this.options.executionJournal.releaseCapacityReservation(
           request.attemptId,
@@ -187,7 +197,19 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
       // between the first check and this one. If it now blocks, THIS
       // reservation is released and the attempt is refused `no-capacity`;
       // both racers may refuse (safe; the caller retries on its next pass).
-      const stillBlocked = await this.admissionBlocked(request.workOrderId, request.attemptId);
+      // A re-check that throws must not leave the reservation held (a
+      // duplicate on the next pass parks the run), so the attempt's
+      // reservation is released before the throw propagates.
+      let stillBlocked: boolean;
+      try {
+        stillBlocked = await this.admissionBlocked(request.workOrderId, request.attemptId);
+      } catch (error) {
+        await this.options.executionJournal.releaseCapacityReservation(
+          request.attemptId,
+          request.nowIso,
+        );
+        throw error;
+      }
       if (stillBlocked) {
         await this.options.executionJournal.releaseCapacityReservation(
           request.attemptId,

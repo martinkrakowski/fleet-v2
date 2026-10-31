@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-31
 - **Target repository:** `fleet-v2`. The orchestrator's own scripts (lane log / S7 scorecard, merge-train driver) stay outside and are named only where this plan reads them.
-- **Status:** rev 1, after a non-Fable (Opus) review of rev 0: four majors and six minors, all applied (§9). Nothing built. The plan is now a **first slice** (Phase 1, six PRs, one manifest commit, store-free) plus deferred phases that are re-decided once conducted Tier 2 runs have produced journal data. Decisions D-CR1–D-CR9 (§6) are split into "needed now" and "at Phase 2". Anchors checked against `main` at `a05c2e34`; the remaining-work plan is merged (#532) and its Revision 2 (parallel tracks A/B/C, #542) is read from `origin/docs/remaining-plan-rev2-tracks-2026-10-31`.
+- **Status:** rev 1, after a non-Fable (Opus) review of rev 0: four majors and six minors, all applied (§9). Nothing built. The plan is now a **first slice** (Phase 1, six PRs, one manifest commit, store-free) plus deferred phases that are re-decided once conducted Tier 2 runs have produced journal data. Decisions D-CR1–D-CR9 (§6) are split into "needed now" and "at Phase 2". The owner accepted the Phase 1 decisions (D-CR1, D-CR3, D-CR5, D-CR6, D-CR7, D-CR9) as recommended on 2026-10-31. Anchors checked against `main` at `a05c2e34`; the remaining-work plan is merged (#532) and its Revision 2 (parallel tracks A/B/C, #542) is read from `origin/docs/remaining-plan-rev2-tracks-2026-10-31`.
 - **Owner request (2026-10-31):** "The way that you just re-organized the work, we should have that occur regularly as part of fleet-v2."
 - **What happened by hand today:** the orchestrator noticed `2026-10-31_remaining-work-plan.md` (184 PRs, ~98–101 h) was bound by serial bottlenecks, not by work: one orchestrator driving every Tier 2 lane (~75 min, ~3 in flight), a serial train (~10 min/PR), Waves 6–7 (98 PRs) queued behind waves they barely depend on, Tier 2 ceremony on display-only units, and predictable fix rounds (dependent-package tests missing from briefs, harness gaps, lint). It proposed levers, the owner chose, and a Fable plan revision became §7 of that plan: three tracks, start-now lists, a re-tier table and an honest Fable floor.
 - **Builds on:** `2026-10-31_remaining-work-plan.md` (§2 waves, §7 tracks, D-R1–D-R17), `2026-10-30_tier2-speed-plan.md` (S1 checklist, S7 scorecard), `2026-10-27_work-board-plan.md` (§3.2 sidecar; WB1a–c built; WB4a, WB4c, WB7a planned; D2, D12), `2026-10-27_conductor-plan.md` (lane runs, keyed journal, driver passes), `2026-10-27_lane-run-telemetry-plan.md` (§3.3 consumer-side read ports and read-only stores, §3.2 what never leaves), `2026-10-28_owner-todo-section-plan.md`, `AGENTS.md`.
@@ -161,12 +161,12 @@ WB4a and WB7a are **not** pulled forward: WB4a needs WB2b and WB3b, WB7a needs W
 
 | # | Question | Recommended |
 |---|---|---|
-| D-CR1 | Build the first slice now on Track A's stream (iii), one lane in flight, and re-decide Phase 2 (including whether WB4a's position in stream (ii) should change) after ten conducted Tier 2 runs? | **Yes.** Phase 1 is store-free and needs no Q5b; Phase 2 is re-decided against Wave 6 with data |
-| D-CR3 | Where does Phase 1 run? | **Track A**, because every file it touches (barrels, manifest, `index.ts`/`composition.ts`) is A-owned; a second session gains nothing here |
-| D-CR5 | S7 scorecard as versioned JSONL in `<stateDir>/scorecard/`, read by `--scorecard`; never committed | **Yes** |
-| D-CR6 | Fix-round causes by a rule table inside evidence, codes only crossing; no model classifier | **Yes**; a model classifier is a later, owner-decided lever |
-| D-CR7 | Re-tier levers are always owner decisions; down-tier candidacy = `packages ⊆ {web, ui, docs}`, no shared files, the touch list the proof | **Yes**; fleet-v2 never writes a tier |
-| D-CR9 | Phase 1 cadence: the orchestrator runs `plan replan --dry-run` at each sequence-end Fable pass and wave boundary and pastes the lever table into the plan revision | **Yes** |
+| D-CR1 | Build the first slice now on Track A's stream (iii), one lane in flight, and re-decide Phase 2 (including whether WB4a's position in stream (ii) should change) after ten conducted Tier 2 runs? | **Accepted** (owner, 2026-10-31). **Yes.** Phase 1 is store-free and needs no Q5b; Phase 2 is re-decided against Wave 6 with data |
+| D-CR3 | Where does Phase 1 run? | **Accepted** (owner, 2026-10-31). **Track A**, because every file it touches (barrels, manifest, `index.ts`/`composition.ts`) is A-owned; a second session gains nothing here |
+| D-CR5 | S7 scorecard as versioned JSONL in `<stateDir>/scorecard/`, read by `--scorecard`; never committed | **Accepted** (owner, 2026-10-31). **Yes** |
+| D-CR6 | Fix-round causes by a rule table inside evidence, codes only crossing; no model classifier | **Accepted** (owner, 2026-10-31). **Yes**; a model classifier is a later, owner-decided lever |
+| D-CR7 | Re-tier levers are always owner decisions; down-tier candidacy = `packages ⊆ {web, ui, docs}`, no shared files, the touch list the proof | **Accepted** (owner, 2026-10-31). **Yes**; fleet-v2 never writes a tier |
+| D-CR9 | Phase 1 cadence: the orchestrator runs `plan replan --dry-run` at each sequence-end Fable pass and wave boundary and pastes the lever table into the plan revision | **Accepted** (owner, 2026-10-31). **Yes** |
 
 **At Phase 2 (after ten conducted Tier 2 runs):**
 

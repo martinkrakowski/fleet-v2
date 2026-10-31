@@ -17,6 +17,7 @@ import { isAbsolute } from 'node:path';
 import { isSafeSshHost } from '@fleet/installation';
 import type {
   AgyAcknowledgement,
+  GateSlotSection,
   HostRole,
   HostRunnerSection,
   HostSection,
@@ -49,6 +50,8 @@ export interface OpencodeHostRunnerDraft {
   readonly authFile?: string;
   readonly maxLanes?: number;
   readonly capabilities?: RunnerCapabilityDeclaration;
+  /** The host-wide gate-slot throttle the host already declares (KF-30b). */
+  readonly gateSlot?: GateSlotSection;
 }
 
 /** An agy runner as the operator described it; `full` needs its mode typed. */
@@ -61,6 +64,8 @@ export interface AgyHostRunnerDraft {
   readonly authFile?: string;
   readonly maxLanes?: number;
   readonly capabilities?: RunnerCapabilityDeclaration;
+  /** The host-wide gate-slot throttle the host already declares (KF-30b). */
+  readonly gateSlot?: GateSlotSection;
 }
 
 /** One drafted runner, discriminated by the kind that selects its fields. */
@@ -154,6 +159,7 @@ function buildHostRunner(
     ...(input.authFile !== undefined ? { authFile: input.authFile } : {}),
     ...(capabilities !== undefined ? { capabilities } : {}),
     ...(input.maxLanes !== undefined ? { maxLanes: input.maxLanes } : {}),
+    ...(input.gateSlot !== undefined ? { gateSlot: input.gateSlot } : {}),
   };
   if (input.kind === 'agy') {
     return {

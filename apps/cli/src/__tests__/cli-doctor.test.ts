@@ -305,6 +305,20 @@ describe('fleet-v2 doctor --host', () => {
     expect(text).not.toContain('seat');
   });
 
+  it('warns that the lane-runner host runs unthrottled gates (KF-30b)', async () => {
+    const { io, stdout } = captureIo();
+    const { executor } = hostProbeExecutor(() => false);
+    const code = await runCli(['doctor', '--host', 'lanehost'], io, undefined, {
+      loadResult: HOST_LOAD_RESULT,
+      hostProbeExecutor: executor,
+    });
+    expect(code).toBe(0);
+    const text = stdout.join('');
+    expect(text).toContain(
+      'PASS host lanehost gate-slot — warning: conducted acceptance gates run unthrottled; declare runner.gateSlot to route them through the host-wide gate slot',
+    );
+  });
+
   it('reports a listening forward on a port no configured host owns as FAIL', async () => {
     const { io, stdout } = captureIo();
     const { executor } = hostProbeExecutor(() => true);

@@ -3,7 +3,11 @@
  * global cap and package-busy checks first, then the reserve chooses host
  * and worktree path) and `admit` (a later attempt of a run, pinned to the
  * run's own host and worktree, with the fail-closed `worktree-mismatch`
- * guard), plus the pure `laneRunPackageKeys`. Every store is in-memory; a
+ * guard), plus the pure `laneRunPackageKeys`. The post-reserve re-check
+ * releases the attempt's reservation when it throws, and breaks racer ties
+ * deterministically by attemptId (KF-34c2): held racer reservations whose
+ * attemptId sorts after ours are ignored, so the lower attemptId wins and
+ * the loser's reservation is released. Every store is in-memory; a
  * recording `ReserveExecutionCapacityPort` fake; no runner, no subprocess,
  * no network.
  */
@@ -423,10 +427,12 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     expect(harness.reserveCalls).toHaveLength(1);
   });
 
-  it('test 9c: the checks are re-run after the reservation is written; a concurrent start makes this attempt release and refuse no-capacity', async () => {
+  it('test 9c: the checks are re-run after the reservation is written; a concurrent start whose attemptId sorts after ours does not block this start (KF-34c2)', async () => {
     const harness = makeHarness({ maxActiveRuns: 1 });
     // While this start is reserving, another start reserves concurrently for
-    // another attempt (an in-flight held reservation with no run).
+    // another attempt (an in-flight held reservation with no run). Its
+    // attemptId sorts after ours, so the re-check's deterministic tie-break
+    // ignores it and this start keeps its reservation.
     harness.setReserveAnswer(async (request) => {
       await harness.executionJournal.saveCapacityReservation(
         reservationFixture('attempt-example-9'),
@@ -439,12 +445,39 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
 
     const result = await harness.adapter.reserveFirst(firstReservationRequest());
 
-    expect(result).toEqual({ outcome: 'no-capacity' });
+    expect(result).toEqual({
+      outcome: 'reserved',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      worktreePath: WORKTREE_PATH,
+      transport: 'local',
+      sshAlias: null,
+      port: null,
+    });
     expect(harness.reserveCalls).toHaveLength(1);
+    expect(releaseSpy).not.toHaveBeenCalled();
+    expect(await heldFor(harness.executionJournal, 'attempt-example-1')).toBe(true);
+    // The concurrent racer keeps its reservation; it loses the tie and will
+    // release on its own re-check.
+    expect(await heldFor(harness.executionJournal, 'attempt-example-9')).toBe(true);
+  });
+
+  it('test 9d: a re-check that throws releases this attempt\'s reservation and rethrows (KF-34c2)', async () => {
+    const harness = makeHarness();
+    const originalList = harness.executionJournal.listActiveReservations.bind(harness.executionJournal);
+    let reads = 0;
+    vi.spyOn(harness.executionJournal, 'listActiveReservations').mockImplementation(async (...args) => {
+      reads += 1;
+      if (reads === 2) {
+        throw new Error('journal read failed');
+      }
+      return originalList(...args);
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+
+    await expect(harness.adapter.reserveFirst(firstReservationRequest())).rejects.toThrow('journal read failed');
     expect(releaseSpy).toHaveBeenCalledWith('attempt-example-1', NOW);
     expect(await heldFor(harness.executionJournal, 'attempt-example-1')).toBe(false);
-    // The concurrent racer keeps its reservation; the caller retries.
-    expect(await heldFor(harness.executionJournal, 'attempt-example-9')).toBe(true);
   });
 
   it('test 8b: no candidate hosts refuses no-host; an incomplete reservation is released and refused', async () => {
@@ -519,7 +552,7 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
     expect(request.host).toMatchObject({ hostName: HOST_NAME, hostKind: 'opencode', transport: 'local' });
   });
 
-  it('test 11d: a concurrent start during admit makes this attempt release and refuse no-capacity (KF-34c1)', async () => {
+  it('test 11d: a concurrent start during admit whose attemptId sorts after ours does not block this admit (KF-34c2)', async () => {
     const harness = makeHarness({ maxActiveRuns: 1 });
     await harness.createRun(
       runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']),
@@ -527,9 +560,9 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
     harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
     await harness.holdReservation('attempt-example-1');
     // While this admit is reserving, another start reserves concurrently for
-    // another attempt (an in-flight held reservation with no run), so the
-    // post-reservation re-check of the cap blocks and this attempt releases
-    // its own reservation and refuses `no-capacity`.
+    // another attempt (an in-flight held reservation with no run). Its
+    // attemptId sorts after ours, so the re-check's deterministic tie-break
+    // ignores it and this admit is admitted.
     harness.setReserveAnswer(async (request) => {
       await harness.executionJournal.saveCapacityReservation(
         reservationFixture('attempt-example-9'),
@@ -542,15 +575,16 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
 
     const result = await harness.adapter.admit(admitRequest());
 
-    expect(result).toEqual({ outcome: 'no-capacity' });
+    expect(result).toEqual({ outcome: 'admitted' });
     expect(harness.reserveCalls).toHaveLength(1);
-    expect(releaseSpy).toHaveBeenCalledWith('attempt-example-2', NOW);
-    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
-    // The concurrent racer keeps its reservation; the caller retries.
+    expect(releaseSpy).not.toHaveBeenCalled();
+    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(true);
+    // The concurrent racer keeps its reservation; it loses the tie and will
+    // release on its own re-check.
     expect(await heldFor(harness.executionJournal, 'attempt-example-9')).toBe(true);
   });
 
-  it('test 11e: two admits racing for different runs with maxActiveRuns 1 admit at most one (KF-34c1)', async () => {
+  it('test 11e: two admits racing for different runs with maxActiveRuns 1 admit at most one and release the loser (KF-34c2)', async () => {
     const harness = makeHarness({ maxActiveRuns: 1 });
     await harness.createRun(
       runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']),
@@ -584,13 +618,12 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
       harness.adapter.admit(admitRequest({ attemptId: 'attempt-example-4' })),
     ]);
 
-    expect([first, second].filter((outcome) => outcome.outcome === 'admitted')).toHaveLength(0);
-    expect(first).toEqual({ outcome: 'no-capacity' });
-    expect(second).toEqual({ outcome: 'no-capacity' });
-    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
+    expect([first, second].filter((outcome) => outcome.outcome === 'admitted')).toHaveLength(1);
+    expect([first, second].filter((outcome) => outcome.outcome === 'no-capacity')).toHaveLength(1);
+    // At most one admitted: the deterministic tie-break keeps the lower
+    // attemptId and releases the loser's reservation.
+    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(true);
     expect(await heldFor(harness.executionJournal, 'attempt-example-4')).toBe(false);
-    // Both refusing is the safe outcome: each released its own reservation and
-    // the runs retry on their next pass.
   });
 
   it('test 11f: with maxActiveRuns 2 the same race admits both (KF-34c1)', async () => {
@@ -652,7 +685,7 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
     expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(true);
   });
 
-  it('test 11h: two admits racing over an overlapping package admit at most one (KF-34c1)', async () => {
+  it('test 11h: two admits racing over an overlapping package admit at most one and release the loser (KF-34c2)', async () => {
     const harness = makeHarness({ maxActiveRuns: 2 });
     await harness.createRun(
       runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2'], 'wo-example-1'),
@@ -693,16 +726,15 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
       ),
     ]);
 
-    expect([first, second].filter((outcome) => outcome.outcome === 'admitted')).toHaveLength(0);
-    expect(first).toEqual({ outcome: 'no-capacity' });
-    expect(second).toEqual({ outcome: 'no-capacity' });
-    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
+    expect([first, second].filter((outcome) => outcome.outcome === 'admitted')).toHaveLength(1);
+    expect([first, second].filter((outcome) => outcome.outcome === 'no-capacity')).toHaveLength(1);
+    // At most one admitted: the deterministic tie-break keeps the lower
+    // attemptId and releases the loser's reservation.
+    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(true);
     expect(await heldFor(harness.executionJournal, 'attempt-example-4')).toBe(false);
-    // Both refusing is the safe outcome: each released its own reservation and
-    // the runs retry on their next pass.
   });
 
-  it('test 11i: a reserveFirst and an admit racing with maxActiveRuns 1 admit at most one (KF-34c1)', async () => {
+  it('test 11i: a reserveFirst and an admit racing with maxActiveRuns 1 admit at most one and release the loser (KF-34c2)', async () => {
     const harness = makeHarness({ maxActiveRuns: 1 });
     await harness.createRun(
       runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']),
@@ -732,11 +764,73 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
     ]);
 
     expect(startResult).toEqual({ outcome: 'no-capacity' });
-    expect(admitResult).toEqual({ outcome: 'no-capacity' });
+    expect(admitResult).toEqual({ outcome: 'admitted' });
     expect(await heldFor(harness.executionJournal, 'attempt-example-9')).toBe(false);
+    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(true);
+    // At most one admitted: the lower attemptId (the admit) wins and the
+    // loser's (the start's) reservation is released.
+  });
+
+  it('test 11j: when two admits tie, the lower attemptId wins regardless of call order (KF-34c2)', async () => {
+    const harness = makeHarness({ maxActiveRuns: 1 });
+    await harness.createRun(
+      runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']),
+    );
+    await harness.createRun(
+      runRecord(RUN_B_ID, ['attempt-example-3', 'attempt-example-4']),
+    );
+    harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
+    harness.attempts.set('attempt-example-3', attemptFixture('attempt-example-3'));
+    let resolveBarrier: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      resolveBarrier = resolve;
+    });
+    let reserveArrivals = 0;
+    harness.setReserveAnswer(async (request) => {
+      reserveArrivals += 1;
+      if (reserveArrivals === 2) {
+        resolveBarrier();
+      }
+      await barrier;
+      const reservation = reservationFixture(request.attemptId);
+      await harness.executionJournal.saveCapacityReservation(reservation);
+      return { outcome: 'reserved', reservation };
+    });
+
+    // The higher attemptId is listed first: the tie-break must still pick
+    // the lower one ('attempt-example-2'), not the first caller.
+    const [higher, lower] = await Promise.all([
+      harness.adapter.admit(admitRequest({ attemptId: 'attempt-example-4' })),
+      harness.adapter.admit(admitRequest()),
+    ]);
+
+    expect(higher).toEqual({ outcome: 'no-capacity' });
+    expect(lower).toEqual({ outcome: 'admitted' });
+    expect(await heldFor(harness.executionJournal, 'attempt-example-4')).toBe(false);
+    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(true);
+  });
+
+  it('test 11k: an admit re-check that throws releases this attempt\'s reservation and rethrows (KF-34c2)', async () => {
+    const harness = makeHarness();
+    await harness.createRun(
+      runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']),
+    );
+    harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
+    await harness.holdReservation('attempt-example-1');
+    const originalList = harness.executionJournal.listActiveReservations.bind(harness.executionJournal);
+    let reads = 0;
+    vi.spyOn(harness.executionJournal, 'listActiveReservations').mockImplementation(async (...args) => {
+      reads += 1;
+      if (reads === 2) {
+        throw new Error('journal read failed');
+      }
+      return originalList(...args);
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+
+    await expect(harness.adapter.admit(admitRequest())).rejects.toThrow('journal read failed');
+    expect(releaseSpy).toHaveBeenCalledWith('attempt-example-2', NOW);
     expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
-    // Both refusing is the safe outcome: each released its own reservation and
-    // the callers retry on their next pass.
   });
 
   it('test 11c: a later attempt whose request path differs from the first attempt\'s is refused before the reserve', async () => {

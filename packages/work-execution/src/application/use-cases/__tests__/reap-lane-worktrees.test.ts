@@ -303,6 +303,17 @@ describe('ReapLaneWorktreesUseCase', () => {
     expect(h.journal.entries).toHaveLength(0);
   });
 
+  it.each([['no dryRun', {}], ['a non-boolean dryRun', { dryRun: 'false' }], ['a null input', null]])(
+    'an execute with %s is a dry run and removes nothing',
+    async (_label, input) => {
+      const h = harness(eligibleSeed());
+      const result = await h.useCase.execute(input);
+      expect(result).toMatchObject({ outcome: 'reaped', dryRun: true });
+      expect(h.calls()).toHaveLength(0);
+      expect(h.journal.entries).toHaveLength(0);
+    },
+  );
+
   it('a dry run never calls remove and lists the candidate with a null tip', async () => {
     const h = harness(eligibleSeed());
     const result = await reap(h, { dryRun: true });

@@ -86,7 +86,9 @@ export class ReapLaneWorktreesUseCase implements ReapLaneWorktreesPort {
     deps: ReapLaneWorktreesDependencies,
     request: ReapLaneWorktreesRequest,
   ): Promise<ReapLaneWorktreesResult> {
-    const dryRun = request.dryRun === true;
+    // Fail safe: only an explicit `dryRun: false` removes anything; a missing
+    // or malformed value (an unchecked `execute` input) is a dry run.
+    const dryRun = request.dryRun !== false;
     const nowIso = request.nowIso ?? deps.now?.() ?? new Date().toISOString();
 
     const runs = await deps.runRepo.list();

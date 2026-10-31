@@ -253,7 +253,7 @@ describe('RequestIndependentReviewUseCase assessment presence (M13)', () => {
     const stored = await repo.findAssessmentById('asm-1');
     expect(stored?.reviewReceipts[0].findings).toEqual([
       expect.objectContaining({
-        findingId: 'f-1',
+        findingId: 'rr-asm-1-11111111:f-1',
         state: 'unresolved',
         dispositionReason: null,
         dispositionEvidenceRef: null,

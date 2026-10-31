@@ -13,6 +13,7 @@ import { REVIEW_KINDS, REVIEW_REQUEST_ID_PATTERN } from '../../domain/evidence-r
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import { ReviewReceipt, isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
+import { scopeFindingIdsToReceipt } from './RecordReviewReceiptUseCase.use-case.js';
 import { placeholderEvidenceRefusal, placeholderReviewReceiptField } from '../../domain/placeholder-evidence.js';
 import {
   EvidenceAssessmentRevisionConflictError,
@@ -295,12 +296,15 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       result: run.result,
       // A reviewer-reported state is not a disposition: findings are stored
       // unresolved, and only RecordFindingDispositionUseCase resolves them.
-      findings: run.findings.map((finding) => ({
-        ...finding,
-        state: 'unresolved' as const,
-        dispositionReason: null,
-        dispositionEvidenceRef: null,
-      })),
+      findings: scopeFindingIdsToReceipt(
+        receiptId,
+        run.findings.map((finding) => ({
+          ...finding,
+          state: 'unresolved' as const,
+          dispositionReason: null,
+          dispositionEvidenceRef: null,
+        })),
+      ),
       evidenceRef: archived.evidenceRef,
       policyRevision: request.policyRevision,
       completedAtIso: run.completedAtIso,

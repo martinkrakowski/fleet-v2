@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { parseInstallation, writeInstallationV2 } from '@fleet/installation';
 import type { FleetInstallationV2 } from '@fleet/installation';
 import type { RunnerForAttemptHostSpec } from '@fleet/work-execution';
+import { pickDialablePortPair } from './port-pair.js';
 
 export interface E2eFixture {
   /** The disposable fixture directory (contains home/, bin/, worktrees/ and state/). */
@@ -160,11 +161,12 @@ interface FakeServer {
   readonly exited: Promise<void>;
 }
 
-function spawnFakeOpencodeServer(e2eDir: string): Promise<FakeServer> {
+function spawnFakeOpencodeServer(e2eDir: string, port: number): Promise<FakeServer> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(e2eDir, 'fake-opencode-server.mjs')], {
       cwd: e2eDir,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, FAKE_OPENCODE_PORT: String(port) },
     });
     let releaseExit = (): void => {};
     const exited = new Promise<void>((resolveExit) => {
@@ -328,7 +330,8 @@ export async function startE2eFixture(): Promise<E2eFixture> {
     const stateDir = path.join(ssh.dir, 'state');
     await fs.mkdir(path.join(stateDir, 'installation'), { recursive: true });
 
-    fake = await spawnFakeOpencodeServer(e2eDir);
+    // KF-35b: a port pair below the ephemeral range, both free (port-pair.ts).
+    fake = await spawnFakeOpencodeServer(e2eDir, await pickDialablePortPair());
     const fakePort = Number(new URL(fake.url).port);
     const installation = buildInstallation(
       fakePort,

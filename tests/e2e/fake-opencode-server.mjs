@@ -114,7 +114,14 @@ const server = http.createServer((req, res) => {
   })();
 });
 
-server.listen(0, '127.0.0.1', () => {
+// KF-35b: the fixture picks a port pair below the ephemeral range (FAKE_OPENCODE_PORT); 0 when unset.
+const requestedPort = Number(process.env.FAKE_OPENCODE_PORT ?? '0');
+const listenPort = Number.isInteger(requestedPort) && requestedPort > 0 && requestedPort < 65535 ? requestedPort : 0;
+server.once('error', (error) => {
+  console.error(`fake opencode server could not listen: ${error.message}`);
+  process.exit(1);
+});
+server.listen(listenPort, '127.0.0.1', () => {
   const address = server.address();
   if (address !== null && typeof address === 'object') {
     console.log(`port=${address.port}`);

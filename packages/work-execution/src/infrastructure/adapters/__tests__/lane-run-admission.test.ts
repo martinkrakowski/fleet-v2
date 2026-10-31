@@ -3,7 +3,9 @@
  * global cap and package-busy checks first, then the reserve chooses host
  * and worktree path) and `admit` (a later attempt of a run, pinned to the
  * run's own host and worktree, with the fail-closed `worktree-mismatch`
- * guard), plus the pure `laneRunPackageKeys`. Every store is in-memory; a
+ * guard), plus the pure `laneRunPackageKeys`. The post-reserve re-check
+ * releases the attempt's reservation when it throws (KF-34c2). Every store
+ * is in-memory; a
  * recording `ReserveExecutionCapacityPort` fake; no runner, no subprocess,
  * no network.
  */
@@ -447,6 +449,24 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     expect(await heldFor(harness.executionJournal, 'attempt-example-9')).toBe(true);
   });
 
+  it('test 9d: a re-check that throws releases this attempt\'s reservation and rethrows (KF-34c2)', async () => {
+    const harness = makeHarness();
+    const originalList = harness.executionJournal.listActiveReservations.bind(harness.executionJournal);
+    let reads = 0;
+    vi.spyOn(harness.executionJournal, 'listActiveReservations').mockImplementation(async (...args) => {
+      reads += 1;
+      if (reads === 2) {
+        throw new Error('journal read failed');
+      }
+      return originalList(...args);
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+
+    await expect(harness.adapter.reserveFirst(firstReservationRequest())).rejects.toThrow('journal read failed');
+    expect(releaseSpy).toHaveBeenCalledWith('attempt-example-1', NOW);
+    expect(await heldFor(harness.executionJournal, 'attempt-example-1')).toBe(false);
+  });
+
   it('test 8b: no candidate hosts refuses no-host; an incomplete reservation is released and refused', async () => {
     const noHost = makeHarness({ candidateHosts: [] });
     expect(await noHost.adapter.reserveFirst(firstReservationRequest())).toEqual({
@@ -737,6 +757,29 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
     expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
     // Both refusing is the safe outcome: each released its own reservation and
     // the callers retry on their next pass.
+  });
+
+  it('test 11k: an admit re-check that throws releases this attempt\'s reservation and rethrows (KF-34c2)', async () => {
+    const harness = makeHarness();
+    await harness.createRun(
+      runRecord(RUN_A_ID, ['attempt-example-1', 'attempt-example-2']),
+    );
+    harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
+    await harness.holdReservation('attempt-example-1');
+    const originalList = harness.executionJournal.listActiveReservations.bind(harness.executionJournal);
+    let reads = 0;
+    vi.spyOn(harness.executionJournal, 'listActiveReservations').mockImplementation(async (...args) => {
+      reads += 1;
+      if (reads === 2) {
+        throw new Error('journal read failed');
+      }
+      return originalList(...args);
+    });
+    const releaseSpy = vi.spyOn(harness.executionJournal, 'releaseCapacityReservation');
+
+    await expect(harness.adapter.admit(admitRequest())).rejects.toThrow('journal read failed');
+    expect(releaseSpy).toHaveBeenCalledWith('attempt-example-2', NOW);
+    expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
   });
 
   it('test 11c: a later attempt whose request path differs from the first attempt\'s is refused before the reserve', async () => {

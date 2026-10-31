@@ -752,7 +752,8 @@ describe("501-vs-validation matrix", () => {
     );
 
     // POST /v1/findings/:id/disposition — `:id` becomes `disposition.findingId`.
-    const disposition = await callRoute("post", "/v1/findings/f-matrix-1/disposition", {
+    // KF-33b1c: a recorded receipt scopes its finding ids as <receiptId>:<findingId>.
+    const disposition = await callRoute("post", "/v1/findings/rr-merged-1:f-matrix-1/disposition", {
       assessmentId: "assessment-matrix-1",
       disposition: {
         id: "fd-matrix-1",
@@ -778,10 +779,10 @@ describe("501-vs-validation matrix", () => {
       };
     };
     expect(dispositionResult.outcome).toBe("recorded");
-    expect(dispositionResult.assessment?.findingDispositions?.[0]?.findingId).toBe("f-matrix-1");
+    expect(dispositionResult.assessment?.findingDispositions?.[0]?.findingId).toBe("rr-merged-1:f-matrix-1");
     const finding = dispositionResult.assessment?.reviewReceipts
       ?.flatMap((receipt) => receipt.findings ?? [])
-      .find((entry) => entry.findingId === "f-matrix-1");
+      .find((entry) => entry.findingId === "rr-merged-1:f-matrix-1");
     expect(finding?.state).toBe("fixed");
   });
 });

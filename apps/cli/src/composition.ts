@@ -281,34 +281,6 @@ export interface ResolvedRunnerSettings {
  * passed to the runner adapter separately through `resolveExecutionRunnerHost`.
  * A v1 or absent installation keeps today's behaviour byte-for-byte.
  */
-/**
- * KF-35: the runner tunnel's target. A v2 installation's selected lane-runner
- * host decides alone (an `ssh` host forwards to its alias and port; a `local`
- * host needs no tunnel); otherwise the resolved runner settings decide. A port
- * outside 1..65534 (the dial port is one above it) opens no tunnel.
- */
-export function resolveRunnerTunnelTarget(
-  runnerHost: ExecutionRunnerHost | undefined,
-  settings: { readonly runnerRemoteHost?: string; readonly runnerRemotePort?: number },
-): { readonly sshHost?: string; readonly remotePort?: number } {
-  const usablePort = (port: number | null | undefined): number | undefined =>
-    typeof port === 'number' && Number.isInteger(port) && port >= 1 && port <= 65534 ? port : undefined;
-  if (runnerHost !== undefined) {
-    if (runnerHost.transport !== 'ssh') {
-      return {};
-    }
-    const remotePort = usablePort(runnerHost.remotePort);
-    return {
-      ...(runnerHost.sshAlias !== undefined ? { sshHost: runnerHost.sshAlias } : {}),
-      ...(remotePort !== undefined ? { remotePort } : {}),
-    };
-  }
-  const remotePort = usablePort(settings.runnerRemotePort);
-  return {
-    ...(settings.runnerRemoteHost !== undefined ? { sshHost: settings.runnerRemoteHost } : {}),
-    ...(remotePort !== undefined ? { remotePort } : {}),
-  };
-}
 
 export function resolveRunnerSettings(
   options?: FleetCliRuntimeOptions,
@@ -354,6 +326,35 @@ export function resolveRunnerSettings(
       options?.runnerRemoteHost ??
       inst?.runner?.host ??
       (env.OCM_HOST?.trim() || undefined),
+  };
+}
+
+/**
+ * KF-35: the runner tunnel's target. A v2 installation's selected lane-runner
+ * host decides alone (an `ssh` host forwards to its alias and port; a `local`
+ * host needs no tunnel); otherwise the resolved runner settings decide. A port
+ * outside 1..65534 (the dial port is one above it) opens no tunnel.
+ */
+export function resolveRunnerTunnelTarget(
+  runnerHost: ExecutionRunnerHost | undefined,
+  settings: { readonly runnerRemoteHost?: string; readonly runnerRemotePort?: number },
+): { readonly sshHost?: string; readonly remotePort?: number } {
+  const usablePort = (port: number | null | undefined): number | undefined =>
+    typeof port === 'number' && Number.isInteger(port) && port >= 1 && port <= 65534 ? port : undefined;
+  if (runnerHost !== undefined) {
+    if (runnerHost.transport !== 'ssh') {
+      return {};
+    }
+    const remotePort = usablePort(runnerHost.remotePort);
+    return {
+      ...(runnerHost.sshAlias !== undefined ? { sshHost: runnerHost.sshAlias } : {}),
+      ...(remotePort !== undefined ? { remotePort } : {}),
+    };
+  }
+  const remotePort = usablePort(settings.runnerRemotePort);
+  return {
+    ...(settings.runnerRemoteHost !== undefined ? { sshHost: settings.runnerRemoteHost } : {}),
+    ...(remotePort !== undefined ? { remotePort } : {}),
   };
 }
 

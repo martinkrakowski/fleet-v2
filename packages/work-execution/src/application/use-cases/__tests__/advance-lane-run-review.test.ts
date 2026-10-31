@@ -39,6 +39,7 @@ import type {
   ReviewRequestResult,
 } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { OpenReviewAssessmentRequest, OpenReviewAssessmentResult } from '../../ports/out/ReviewAssessmentPort.out-port.js';
+import type { AcceptanceAssessmentRequest } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
 import { reviewFactsOf } from '../advance-lane-run/review-fix.js';
 import type { AdvanceStepContext } from '../advance-lane-run/step-context.js';
 
@@ -201,6 +202,23 @@ function reviewKey(step: 'brief-check' | 'code-review', seatIndex: number, head1
   expect(built.ok).toBe(true);
   if (!built.ok) {
     throw new Error('fixture must build a review key');
+  }
+  return built.key;
+}
+
+function acceptKey(): string {
+  const built = buildLaneRunStepKey({
+    runId: RUN_ID,
+    round: 0,
+    step: 'accept',
+    seatIndex: 0,
+    attemptOrdinal: null,
+    head12: HEAD12_A,
+    retry: null,
+  });
+  expect(built.ok).toBe(true);
+  if (!built.ok) {
+    throw new Error('fixture must build an accept key');
   }
   return built.key;
 }
@@ -1047,5 +1065,75 @@ describe('AdvanceLaneRunUseCase review acts scope dispositions (KF-33b2)', () =>
       result: 'completed',
       reasonCode: 'review-failed',
     });
+  });
+
+  it('a brief-check and code-review whose findings are all out-of-scope reach accepting and the run is accepted, never acceptance-rejected', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setReviewAnswer(async (request) => ({
+      outcome: 'receipt',
+      receipt: receiptFor(request, 'failed', OUT_FINDINGS),
+    }));
+    const scopeCalls = wireScope(harness, ['src/a.ts'], { outcome: 'recorded' });
+
+    // The brief-check fails with two findings, both out of scope → review-passed.
+    const brief = await advance(harness);
+    expect(brief).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-passed',
+      detail: 'out-of-scope-findings',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
+
+    // The code-review fails with two findings, both out of scope → review-passed.
+    const code = await advance(harness);
+    expect(code).toEqual({
+      outcome: 'acted',
+      step: 'code-review',
+      key: reviewKey('code-review', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-passed',
+      detail: 'out-of-scope-findings',
+    });
+    expect(scopeCalls).toHaveLength(2);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'accepting' });
+
+    // At accepting the receipts-only assessment sees no blocker for the fully
+    // dispositioned fail (the rule under test): the run is accepted and never
+    // parks acceptance-rejected. The fake assessment port mirrors the evidence
+    // side's answer for an all-out-of-scope failed review.
+    const receiptsRequests: AcceptanceAssessmentRequest[] = [];
+    Object.assign(harness.deps, {
+      acceptanceAssessment: {
+        assessHeadAcceptance: async () => {
+          throw new Error('assessHeadAcceptance is not used by the accept step');
+        },
+        assessHeadReceipts: async (request: AcceptanceAssessmentRequest) => {
+          receiptsRequests.push(request);
+          return { outcome: 'passed', receiptsId: 'rcp-kf-33b3', assessedHeadSha: COMMIT_A };
+        },
+      },
+    });
+
+    const accepted = await advance(harness);
+    expect(accepted).toEqual({
+      outcome: 'acted',
+      step: 'accept',
+      key: acceptKey(),
+      result: 'completed',
+      reasonCode: 'accepted',
+    });
+    expect(receiptsRequests).toEqual([
+      {
+        attemptId: 'attempt-example-1',
+        workOrderId: 'wo-example-1',
+        candidateHeadSha: COMMIT_A,
+        policyRevision: 'policy-example-1',
+      },
+    ]);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'awaiting-premerge' });
   });
 });

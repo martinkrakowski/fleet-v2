@@ -52,18 +52,30 @@ export type FrozenManifestRead =
   | { readonly kind: 'unverified' };
 
 /**
- * Reads a conducted attempt's frozen brief manifest and verifies it against
+ * A conducted attempt's frozen brief read with its digest verified (SEC-3b):
+ * like `FrozenManifestRead`, but `verified` also carries the exact prose bytes
+ * the digest covered, so a caller needs only this one read for both the
+ * manifest's required checks and the brief text handed to a reviewer.
+ */
+export type FrozenBriefRead =
+  | { readonly kind: 'verified'; readonly prose: string; readonly manifest: Record<string, unknown> }
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'unverified' };
+
+/**
+ * Reads a conducted attempt's frozen brief (prose and manifest) and verifies
+ * it against
  * the attempt's recorded `briefDigest` before anything is taken from it. The
  * digest compared is exactly the one the gate uses: `compute(prose + '\n' +
  * manifestRaw)` against `attempt.briefDigest`, the prose read at
  * `briefPackagePath` and the manifest at its `-manifest.json` sibling, both
  * through the recorded host.
  */
-export async function readFrozenManifestVerified(
+export async function readFrozenBriefVerified(
   attempt: AttemptRecord,
   artifactPort: AdvanceLaneRunDependencies['artifactPort'],
   computeDigest: (content: string) => string = simpleDeterministicHexDigest,
-): Promise<FrozenManifestRead> {
+): Promise<FrozenBriefRead> {
   // Fail closed: a missing or empty brief path, or a port without the
   // manifest reader, reads "absent" — there is nothing recorded to read.
   if (
@@ -109,8 +121,23 @@ export async function readFrozenManifestVerified(
     return { kind: 'unverified' };
   }
   return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-    ? { kind: 'verified', manifest: parsed as Record<string, unknown> }
+    ? { kind: 'verified', prose, manifest: parsed as Record<string, unknown> }
     : { kind: 'unverified' };
+}
+
+/**
+ * Reads a conducted attempt's frozen brief manifest and verifies it against
+ * the attempt's recorded `briefDigest` before anything is taken from it
+ * (SEC-5b). A wrapper over `readFrozenBriefVerified` that drops the prose:
+ * there is one implementation of the read-and-compare.
+ */
+export async function readFrozenManifestVerified(
+  attempt: AttemptRecord,
+  artifactPort: AdvanceLaneRunDependencies['artifactPort'],
+  computeDigest: (content: string) => string = simpleDeterministicHexDigest,
+): Promise<FrozenManifestRead> {
+  const read = await readFrozenBriefVerified(attempt, artifactPort, computeDigest);
+  return read.kind === 'verified' ? { kind: 'verified', manifest: read.manifest } : read;
 }
 
 /**

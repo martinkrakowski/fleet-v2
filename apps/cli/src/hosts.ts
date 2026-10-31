@@ -457,6 +457,7 @@ function runnerDraftFor(
       ? { capabilities: runner.capabilities }
       : {}),
     ...(runner.maxLanes !== undefined ? { maxLanes: runner.maxLanes } : {}),
+    ...(runner.gateSlot !== undefined ? { gateSlot: runner.gateSlot } : {}),
   };
   if (runner.kind === "agy") {
     return {

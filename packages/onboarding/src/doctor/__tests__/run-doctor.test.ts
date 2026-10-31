@@ -374,6 +374,43 @@ describe('runDoctor', () => {
     expect(byHost.get('secondary')?.detail).toContain('unknown');
   });
 
+  it('warns that conducted gates are unthrottled when the lane-runner host declares no gateSlot', async () => {
+    const { probes } = fakeProbes();
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    const gateLines = lines.filter((line) => line.check === 'gate-slot');
+    expect(gateLines).toEqual([
+      {
+        scope: 'host',
+        subject: 'main',
+        check: 'gate-slot',
+        status: 'PASS',
+        detail: 'warning: conducted acceptance gates run unthrottled; declare runner.gateSlot to route them through the host-wide gate slot',
+      },
+    ]);
+  });
+
+  it('reports no gate-slot warning when the lane-runner host declares a gateSlot', async () => {
+    const model = sampleModel({
+      host: {
+        runner: {
+          kind: 'opencode',
+          port: 4096,
+          capabilities: {
+            source: 'declared',
+            filesystemScope: 'scoped-worktree',
+            networkEgressRestricted: true,
+            cpuAndMemoryLimited: true,
+            processTreeTermination: true,
+          },
+          gateSlot: { path: '/usr/local/bin/gate-slot', slots: 8 },
+        },
+      },
+    });
+    const { probes } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes);
+    expect(lines.filter((line) => line.check === 'gate-slot')).toEqual([]);
+  });
+
   it('reports UNKNOWN with the source in detail for a legacy-asserted runner', async () => {
     const legacy: FleetInstallationModel = {
       ...sampleModel(),
@@ -587,14 +624,16 @@ describe('runDoctor', () => {
 
     expect(lines.length).toBeGreaterThan(0);
     // The only lines that do not depend on a throwing probe are the schema
-    // line, the runner capability declaration and the free-tier policy line
-    // (all derived, not probed).
+    // line, the runner capability declaration, the free-tier policy line and
+    // the gate-slot warning (all derived, not probed; the gate-slot warning
+    // is a PASS line like the ignored-v1-fields warnings).
     const expectedUnknown = lines.filter(
       (line) =>
         line.check !== 'schema-version' &&
         line.check !== 'runner-capabilities' &&
         line.check !== 'free-tier' &&
-        line.check !== 'auto-merge',
+        line.check !== 'auto-merge' &&
+        line.check !== 'gate-slot',
     );
     const unknownLines = lines.filter((line) => line.status === 'UNKNOWN');
     expect(unknownLines).toHaveLength(expectedUnknown.length);

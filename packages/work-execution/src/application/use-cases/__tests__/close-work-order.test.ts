@@ -405,11 +405,13 @@ describe('CloseWorkOrderUseCase', () => {
         reservationCalls += 1;
         return listReservations();
       };
+      const before = structuredClone(await h.workOrderRepo.findWorkOrderById(WORK_ORDER_ID));
       expect(await close(h, 'stopped')).toEqual({
         outcome: 'refused',
         workOrderId: WORK_ORDER_ID,
         reason: 'already-terminal',
       });
+      expect(await h.workOrderRepo.findWorkOrderById(WORK_ORDER_ID)).toEqual(before);
       // The early terminal check answers before any hold-facts read.
       expect(attemptCalls).toBe(0);
       expect(reservationCalls).toBe(0);
@@ -429,11 +431,13 @@ describe('CloseWorkOrderUseCase', () => {
         reservationCalls += 1;
         return listReservations();
       };
+      const before = structuredClone(await h.workOrderRepo.findWorkOrderById(WORK_ORDER_ID));
       expect(await close(h, 'merged')).toEqual({
         outcome: 'refused',
         workOrderId: WORK_ORDER_ID,
         reason: 'already-terminal',
       });
+      expect(await h.workOrderRepo.findWorkOrderById(WORK_ORDER_ID)).toEqual(before);
       expect(attemptCalls).toBe(0);
       expect(reservationCalls).toBe(0);
     });

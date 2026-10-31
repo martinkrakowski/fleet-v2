@@ -25,6 +25,7 @@ import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.
 import type { AdvanceLaneRunPort, AdvanceLaneRunResult } from '../ports/in/AdvanceLaneRunPort.in-port.js';
 import type { ResumeLaneRunPort } from '../ports/in/ResumeLaneRunPort.in-port.js';
 import { SessionStartSpacing } from './advance-lane-run/session-start-gate.js';
+import { journalsForRuns, type RunJournalRunReads } from './run-journal-reads.js';
 import { parseLaneRunKey } from '../../domain/lane-run-keys.js';
 import {
   CONDUCTOR_LEASE_MS,
@@ -39,14 +40,13 @@ import type {
 } from '../ports/in/RunConductorPassPort.in-port.js';
 import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLeasePort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
-import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
 import { ConductorDriverLeaseKeeper, holdConductorLease } from './conductor-driver-lease-keeper.js';
 
 export interface RunConductorPassDependencies {
   readonly driverLease: ConductorDriverLeasePort;
   readonly runRepo: Pick<LaneRunRepositoryPort, 'list' | 'acquireLease' | 'renewLease' | 'releaseLease'>;
-  readonly runJournal: Pick<LaneRunJournalPort, 'listForRun'>;
+  readonly runJournal: RunJournalRunReads;
   readonly halt: Pick<ConductorHaltPort, 'read'>;
   readonly resume: Pick<ResumeLaneRunPort, 'applyPendingResume'>;
   readonly advance: AdvanceLaneRunPort;
@@ -151,20 +151,18 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
     const halted = isConductorHalted(await this.deps.halt.read());
 
     const runs = await this.deps.runRepo.list();
-    // Each run's journal read is independent, so the filtering reads run in parallel.
-    // The entries are kept: the start gate's seed reads the latest session-start
-    // intent from them, so the journals are never read twice.
-    const journalEntriesByRun = new Map<string, Awaited<ReturnType<LaneRunJournalPort['listForRun']>>>();
-    const liveRuns = (
-      await Promise.all(
-        runs.map(async (record) => {
-          const entries = await this.deps.runJournal.listForRun(record.runId);
-          journalEntriesByRun.set(record.runId, entries);
-          const state = laneRunJournalState(entries, record.runId);
-          return (LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state) ? null : record;
-        }),
-      )
-    ).filter((record): record is LaneRunRecord => record !== null);
+    // One grouped journal read for the whole pass (EX-3a): the filtering reads
+    // the entries per run from a single store read. The map is kept: the start
+    // gate's seed reads the latest session-start intent from it, so the
+    // journals are never read twice.
+    const journalEntriesByRun = await journalsForRuns(
+      this.deps.runJournal,
+      runs.map((record) => record.runId),
+    );
+    const liveRuns = runs.filter((record) => {
+      const state = laneRunJournalState(journalEntriesByRun.get(record.runId) ?? [], record.runId);
+      return !(LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state);
+    });
 
     // One gate per pass, seeded with the latest recorded session start among the
     // dispatch, brief-check and code-review intents the filtering reads already

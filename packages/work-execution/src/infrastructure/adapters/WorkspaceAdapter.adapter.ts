@@ -31,7 +31,6 @@ import type { CommandExecutorPort } from '../../application/ports/out/CommandExe
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isFixedProtectedPath, pathUnderPrefix } from '../../domain/lane-diff-check.js';
-import { hasRecordedHostName } from './ConfirmRecordedHost.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
 import { resolvePhysicalPath } from './ResolvePhysicalPath.helper.js';
 import { isValidAgyModel } from './AgyRunnerAdapter.adapter.js';
@@ -101,10 +100,12 @@ export interface WorkspaceAdapterOptions {
    */
   readonly executor?: CommandExecutorPort;
   /**
-   * H9b2. When given, a read for an attempt recorded on a named host runs
-   * through that recorded host's executor (the recorded host is the truth);
-   * a host that changed or was removed is refused, naming the recorded
-   * host. Legacy records (no recorded host name) keep `executor`.
+   * H9b2. When given, a request carrying a recorded runner block (reads,
+   * brief placement, manifest sealing, worktree prepare and commit) goes
+   * through this helper, which confirms a named host, resolves an alias-only
+   * record through the installation or refuses it (D2), and keeps the legacy
+   * executor otherwise. A request with no recorded block (manual prepare)
+   * keeps `executor`.
    */
   readonly executorForRecordedHost?: (
     recorded: AttemptRunnerRecord | null | undefined,
@@ -238,17 +239,21 @@ export class WorkspaceAdapter implements WorkspacePort {
   constructor(private readonly options?: WorkspaceAdapterOptions) {}
 
   /**
-   * The executor for one read: a read carrying a recorded host name goes to
-   * that recorded host's executor when the helper is wired; everything else
-   * keeps the configured executor. The executor is the only transport;
-   * without one there is nothing to run.
+   * When given, a request carrying a recorded runner block (reads, brief
+   * placement, manifest sealing, worktree prepare and commit) goes through
+   * this helper, which confirms a named host, resolves an alias-only record
+   * through the installation or refuses it (D2), and keeps the legacy
+   * executor otherwise. A request with no recorded block (manual prepare)
+   * keeps `executor`. The executor is the only transport; without one there
+   * is nothing to run.
    */
   private executorFor(
     recordedHost?: AttemptRunnerRecord | null,
   ): CommandExecutorPort {
     if (
       this.options?.executorForRecordedHost !== undefined &&
-      hasRecordedHostName(recordedHost)
+      recordedHost !== null &&
+      recordedHost !== undefined
     ) {
       const resolved = this.options.executorForRecordedHost(recordedHost);
       if (!resolved.ok) {

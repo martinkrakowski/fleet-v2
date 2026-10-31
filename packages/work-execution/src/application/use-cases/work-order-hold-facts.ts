@@ -5,11 +5,12 @@ import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
+import { journalsForRuns } from './run-journal-reads.js';
 
 /** The reads the hold facts need; narrowed so every caller supplies only what it has. */
 export interface WorkOrderHoldFactsDeps {
   readonly runRepo: Pick<LaneRunRepositoryPort, 'list'>;
-  readonly runJournal: Pick<LaneRunJournalPort, 'listForRun'>;
+  readonly runJournal: Pick<LaneRunJournalPort, 'listForRun' | 'listForRuns'>;
   readonly executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations'>;
 }
 
@@ -43,12 +44,16 @@ export async function workOrderHoldFacts(deps: WorkOrderHoldFactsDeps,
     .sort(byCodeUnit);
   const nonTerminalRunIds: string[] = [];
   const mergedRunIds: string[] = [];
-  const runs = await deps.runRepo.list();
+  const runs = (await deps.runRepo.list()).filter(
+    (run) => run.workOrderId === workOrderId && run.runId !== exceptRunId,
+  );
+  // One grouped journal read for every considered run (EX-3a).
+  const entriesByRun = await journalsForRuns(
+    deps.runJournal,
+    runs.map((run) => run.runId),
+  );
   for (const run of runs) {
-    if (run.workOrderId !== workOrderId || run.runId === exceptRunId) {
-      continue;
-    }
-    const state = laneRunJournalState(await deps.runJournal.listForRun(run.runId), run.runId);
+    const state = laneRunJournalState(entriesByRun.get(run.runId) ?? [], run.runId);
     if ((LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state)) {
       if (state === 'merged') {
         mergedRunIds.push(run.runId);

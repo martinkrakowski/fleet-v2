@@ -46,7 +46,7 @@ import type { WorkOrderRepositoryPort } from '../../application/ports/out/WorkOr
 export interface LaneRunAdmissionAdapterOptions {
   readonly reserve: ReserveExecutionCapacityPort;
   readonly runRepo: Pick<LaneRunRepositoryPort, 'list'>;
-  readonly runJournal: Pick<LaneRunJournalPort, 'listForRun'>;
+  readonly runJournal: Pick<LaneRunJournalPort, 'listForRun' | 'listForRuns'>;
   readonly workOrderRepo: Pick<WorkOrderRepositoryPort, 'findWorkOrderById'>;
   readonly attemptRepo: Pick<AttemptRepositoryPort, 'findAttemptById'>;
   readonly executionJournal: Pick<
@@ -286,14 +286,22 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
       }
     }
     const active: ActiveRun[] = [];
-    for (const run of runs) {
-      if (run.attemptIds.includes(excludeAttemptId)) {
-        continue;
-      }
-      if (!run.attemptIds.some((attemptId) => heldByAttempt.has(attemptId))) {
-        continue;
-      }
-      const state = laneRunJournalState(await this.options.runJournal.listForRun(run.runId), run.runId);
+    const considered = runs.filter(
+      (run) =>
+        !run.attemptIds.includes(excludeAttemptId) &&
+        run.attemptIds.some((attemptId) => heldByAttempt.has(attemptId)),
+    );
+    // One grouped journal read for every run holding a reservation (EX-3a);
+    // infrastructure inlines the fallback the application helper implements.
+    const entriesByRun = this.options.runJournal.listForRuns
+      ? await this.options.runJournal.listForRuns(considered.map((run) => run.runId))
+      : new Map(
+          await Promise.all(
+            considered.map(async (run) => [run.runId, await this.options.runJournal.listForRun(run.runId)] as const),
+          ),
+        );
+    for (const run of considered) {
+      const state = laneRunJournalState(entriesByRun.get(run.runId) ?? [], run.runId);
       if (!isTerminalRunState(state)) {
         active.push({ run, state });
       }

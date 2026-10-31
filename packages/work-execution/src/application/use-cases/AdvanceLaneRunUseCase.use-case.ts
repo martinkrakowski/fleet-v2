@@ -139,6 +139,8 @@ export interface AdvanceLaneRunDependencies {
   readonly sameModelFamily?: SameModelFamily;
   /** Read the work order for its project id (K5); absent → `not-wired`. */
   readonly workOrderRepo?: Pick<WorkOrderRepositoryPort, 'findWorkOrderById'>;
+  /** KF-36a: release the work order when the run ends; absent → the work order is left as it is. */
+  readonly workOrderRelease?: Pick<WorkOrderRepositoryPort, 'findWorkOrderById' | 'saveWorkOrder'>;
   /** K5-5: prepares a fix-round attempt from numbered findings (plan §3.3 Fix row). */
   readonly prepareFixAttempt?: PrepareFixAttemptPort;
   /** KF-6: places the fix round's brief package from the prior attempt's frozen manifest before dispatch. */

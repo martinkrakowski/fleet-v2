@@ -39,6 +39,7 @@ import {
   BriefAuthoringAdapter,
   BriefKnowledgeAdapter,
   CiStateAdapter,
+  CloseWorkOrderUseCase,
   GateReceiptAdapter,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
@@ -665,6 +666,8 @@ export interface FleetCliRuntime {
     readonly forgeRead: ForgeReadAdapter;
     readonly registerWorkOrder: RegisterWorkOrderUseCase;
     readonly inspectWorkOrder: InspectWorkOrderUseCase;
+    /** KF-36b-1b: the operator's close command; built after the conductor composes its lane-run stores. */
+    readonly closeWorkOrder: CloseWorkOrderUseCase;
     readonly inspectAttempt: InspectAttemptUseCase;
     readonly prepareBriefPackage: PrepareBriefPackageUseCase;
     readonly reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
@@ -931,6 +934,17 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     installation: options?.installation,
   });
 
+  // KF-36b-1b: the operator's close command is built here, after the
+  // conductor composes its lane-run stores, because composeExecution holds no
+  // lane-run stores of its own.
+  const closeWorkOrder = new CloseWorkOrderUseCase({
+    workOrderRepo: workOrderRepository,
+    attemptRepo: attemptRepository,
+    executionJournal,
+    runRepo: conductor.laneRunRepository,
+    runJournal: conductor.laneRunJournal,
+  });
+
   const { telemetry } = composeTelemetry({
     stateDir,
     policy: resolveTelemetryPolicy(options?.installation?.policy),
@@ -951,7 +965,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     coordination,
     knowledge,
     evidence,
-    execution,
+    execution: { ...execution, closeWorkOrder },
     conductor,
     runnerTunnel,
     telemetry,

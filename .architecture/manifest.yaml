@@ -361,6 +361,7 @@ bounded_contexts:
           - ProbeProjectUseCase
           - ListUnregisteredProjectsUseCase
           - ExportRunTelemetryUseCase
+          - CloseWorkOrderUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -381,6 +382,7 @@ bounded_contexts:
             - ProbeProjectPort
             - ListUnregisteredProjectsPort
             - ExportRunTelemetryPort
+            - CloseWorkOrderPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -485,6 +487,7 @@ bounded_contexts:
       ExecutionObservationPort: "Publish recorded lifecycle observations through coordination; preserve a delivery gap without failing the lane."
       ListUnregisteredProjectsPort: "List each project id that has work orders but no profile, with what its work orders say about it (repositories, base commits, owned paths, counts), so it can be adopted; read-only."
       ExportRunTelemetryPort: "For a selection of conducted runs and hand-run attempts, map the records to closed spans, apply sampling, record every span not yet final as pending before sending, send, and record each returned disposition; a span becomes final only on an HTTP result, a different salt fingerprint refuses the whole export before any send, and nothing outside the disposition store is written."
+      CloseWorkOrderPort: "Close one active work order as merged or stopped on the operator's explicit confirmation, releasing its owned paths; refused while any lane run naming it is not terminal, any of its attempts is outside the capacity-release states or holds a reservation, or it is already terminal; closing as merged needs a lane run naming it that ended merged; an unknown id is not-found; a stale revision is refused, never overwritten."
       ProbeProjectPort: "Probe one registered project read-only: read its profile, check its repository and clones and that its gate procedures exist in the installation, and record the receipt only if the profile did not change while it was probed."
       ProjectProfileReadPort: "Read one project profile and its revision from the coordination context; known absence is null."
       ProjectProbeRecordPort: "Record a probe receipt on a profile at the revision the probe started from; a changed profile is a typed rejection, never an overwrite."

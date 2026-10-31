@@ -25,6 +25,7 @@ import {
   laneRunRoundsLeft,
   laneRunStopEffect,
   strongerStopMode,
+  workOrderReleaseFor,
 } from '../lane-run-transitions.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
@@ -421,5 +422,37 @@ describe('halt-marker exit', () => {
     expect(
       checkLaneRunResume({ record: rec, state: 'parked', stopMode: 'graceful', expectedRevision: rec.revision }),
     ).toEqual({ ok: false, reason: 'stop-pending' });
+  });
+});
+
+describe('work order release at a terminal transition (KF-36a)', () => {
+  const ACTIVE = 'ready-to-merge' as const;
+
+  it('a merged run releases a non-terminal work order as merged', () => {
+    expect(workOrderReleaseFor({ runEnds: 'merged', workOrderState: ACTIVE, slotHeld: false, otherRunActive: false })).toBe('merged');
+  });
+
+  it('a stopped run releases a non-terminal work order as stopped', () => {
+    expect(workOrderReleaseFor({ runEnds: 'stopped', workOrderState: ACTIVE, slotHeld: false, otherRunActive: false })).toBe('stopped');
+  });
+
+  it('a stopped run with a held slot fails closed (null)', () => {
+    expect(workOrderReleaseFor({ runEnds: 'stopped', workOrderState: ACTIVE, slotHeld: true, otherRunActive: false })).toBe(null);
+  });
+
+  it('a held slot does NOT block a merged release (the paths are on main)', () => {
+    expect(workOrderReleaseFor({ runEnds: 'merged', workOrderState: ACTIVE, slotHeld: true, otherRunActive: false })).toBe('merged');
+  });
+
+  it('never overwrites one terminal state with the other', () => {
+    expect(workOrderReleaseFor({ runEnds: 'stopped', workOrderState: 'merged', slotHeld: false, otherRunActive: false })).toBe(null);
+    expect(workOrderReleaseFor({ runEnds: 'merged', workOrderState: 'stopped', slotHeld: false, otherRunActive: false })).toBe(null);
+    expect(workOrderReleaseFor({ runEnds: 'merged', workOrderState: 'merged', slotHeld: false, otherRunActive: false })).toBe(null);
+    expect(workOrderReleaseFor({ runEnds: 'stopped', workOrderState: 'stopped', slotHeld: false, otherRunActive: false })).toBe(null);
+  });
+
+  it('another non-terminal run on the same work order blocks both ends', () => {
+    expect(workOrderReleaseFor({ runEnds: 'merged', workOrderState: ACTIVE, slotHeld: false, otherRunActive: true })).toBe(null);
+    expect(workOrderReleaseFor({ runEnds: 'stopped', workOrderState: ACTIVE, slotHeld: false, otherRunActive: true })).toBe(null);
   });
 });

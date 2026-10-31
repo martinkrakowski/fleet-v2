@@ -281,7 +281,8 @@ describe('forge head verification resolves the recorded host through the helper'
         runGh: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
       },
     });
-    await saveAttempt(runtime, makeRunner('legacy.example', null));
+    // A recorded alias different from the configured host: the read must go to worktreeSshHost.
+    await saveAttempt(runtime, makeRunner('recorded-only.example', null));
     // Keep the sha mismatch so the case stops at the HEAD check.
     execFileMock.mockImplementation(
       (_file: string, _args: readonly string[], cb?: ExecFileCallback) => {
@@ -296,5 +297,8 @@ describe('forge head verification resolves the recorded host through the helper'
     expect(result.outcome).toBe('refused');
     expect(execFileMock.mock.calls[0]![0]).toBe('ssh');
     expect(execFileMock.mock.calls[0]![1]![0]).toBe('legacy.example');
+    expect(
+      execFileMock.mock.calls.some(([, args]) => (args as readonly string[])?.[0] === 'recorded-only.example'),
+    ).toBe(false);
   });
 });

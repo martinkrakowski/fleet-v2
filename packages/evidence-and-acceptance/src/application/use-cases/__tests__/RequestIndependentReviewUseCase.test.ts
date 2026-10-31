@@ -20,6 +20,7 @@ import type {
   EvidenceSeatPolicyPort,
   ReviewerSeatCheck,
 } from '../../ports/out/EvidenceSeatPolicyPort.out-port.js';
+import type { RequestIndependentReviewRequest } from '../../ports/in/RequestIndependentReviewPort.in-port.js';
 import { RequestIndependentReviewUseCase } from '../RequestIndependentReviewUseCase.use-case.js';
 
 const HEAD1 = '1111111111111111111111111111111111111111';
@@ -428,5 +429,99 @@ describe('free-seat policy and requested reviewer (FS3b)', () => {
     if (result.outcome === 'rejected') {
       expect(result.reason).toBe('seat is busy');
     }
+  });
+});
+
+describe('brief-check requires the brief text (SEC-4)', () => {
+  const REQUEST_ID = 'review-01JB0000000000000000000001';
+
+  function requestFor(
+    kind: 'brief-check' | 'code-review',
+    briefText?: string,
+  ): RequestIndependentReviewRequest {
+    return {
+      assessmentId: 'asm-1',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      reviewerModel: 'openai/gpt-4o',
+      kind,
+      ...(briefText !== undefined ? { briefText } : {}),
+    };
+  }
+
+  it('refuses a brief-check without the brief text as invalid-request before any transport call or write', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const reviewer = new StubReviewer();
+    const archive = new StubArchive();
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
+
+    const requests = [
+      { ...requestFor('brief-check'), requestId: REQUEST_ID },
+      { ...requestFor('brief-check', ''), requestId: REQUEST_ID },
+      { ...requestFor('brief-check', '   '), requestId: REQUEST_ID },
+    ];
+    for (const request of requests) {
+      const result = await useCase.requestIndependentReview(request);
+      expect(result.outcome).toBe('rejected');
+      if (result.outcome === 'rejected') {
+        expect(result.rejection).toBe('invalid-request');
+        expect(result.reason).toBe('A brief-check review requires the brief text');
+      }
+    }
+    expect(reviewer.calls).toHaveLength(0);
+    expect(archive.calls).toHaveLength(0);
+    const stored = await repo.findAssessmentById('asm-1');
+    expect(stored?.reviewReceipts).toHaveLength(0);
+    expect(stored?.revision).toBe(0);
+  });
+
+  it('a refused brief-check consumes no request id: the same id with a real brief is reviewed', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const reviewer = new StubReviewer();
+    const archive = new StubArchive();
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
+
+    const refused = await useCase.requestIndependentReview({ ...requestFor('brief-check'), requestId: REQUEST_ID });
+    expect(refused.outcome).toBe('rejected');
+
+    const retried = await useCase.requestIndependentReview({
+      ...requestFor('brief-check', 'Do the thing.'),
+      requestId: REQUEST_ID,
+    });
+    expect(retried.outcome).toBe('reviewed');
+    expect(reviewer.calls).toHaveLength(1);
+  });
+
+  it('still runs a brief-check carrying a real briefText', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const reviewer = new StubReviewer();
+    const archive = new StubArchive();
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
+
+    const result = await useCase.requestIndependentReview(
+      requestFor('brief-check', 'Do the thing.'),
+    );
+
+    expect(result.outcome).toBe('reviewed');
+    expect(reviewer.calls).toHaveLength(1);
+    expect(reviewer.calls[0]?.kind).toBe('brief-check');
+    expect(reviewer.calls[0]?.briefText).toBe('Do the thing.');
+  });
+
+  it('still runs a code-review without a briefText', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const reviewer = new StubReviewer();
+    const archive = new StubArchive();
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
+
+    const result = await useCase.requestIndependentReview(requestFor('code-review'));
+
+    expect(result.outcome).toBe('reviewed');
+    expect(reviewer.calls).toHaveLength(1);
+    expect(reviewer.calls[0]?.kind).toBe('code-review');
+    expect('briefText' in reviewer.calls[0]).toBe(false);
   });
 });

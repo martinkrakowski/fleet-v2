@@ -161,6 +161,9 @@ function baseRequest(overrides: Partial<RequestIndependentReviewRequest> = {}): 
     policyRevision: 'policy-example-1',
     implementerModel: IMPLEMENTER,
     reviewerModel: REVIEWER,
+    // A conductor brief-check request carries the frozen brief; a default here
+    // keeps the 24 brief-check kind/requestId cases at the checks they test.
+    briefText: 'Do the thing.',
     ...overrides,
   };
 }

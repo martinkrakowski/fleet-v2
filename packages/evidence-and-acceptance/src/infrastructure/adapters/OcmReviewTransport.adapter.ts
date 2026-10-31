@@ -630,8 +630,7 @@ function buildKindReviewPrompt(
           'Does the change satisfy every work-order item of the brief? Report a FINDING for each item the change does not satisfy.',
       );
     } else {
-      // The conductor always supplies the brief; a missing one still builds.
-      sections.push('The brief was not supplied.');
+      throw new ReviewTransportError('a brief-check review requires the brief text', 'transport-failed');
     }
   } else {
     sections.push(REVIEW_CHECKLIST);

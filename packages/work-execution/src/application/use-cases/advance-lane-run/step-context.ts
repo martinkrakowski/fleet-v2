@@ -8,7 +8,9 @@ import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-fact
 import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
 import type { LaneRunParkReason, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.out-port.js';
-import { canEnterLaneRunState } from '../../../domain/lane-run-transitions.js';
+import { canEnterLaneRunState, workOrderReleaseFor } from '../../../domain/lane-run-transitions.js';
+import { laneRunJournalState } from '../../../domain/lane-run-journal.js';
+import { LANE_RUN_TERMINAL_STATES } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 
 /** What every advance step reads: the use case's dependencies. Per call, never per run. */
@@ -42,6 +44,11 @@ export async function performEnter(ctx: AdvanceStepContext,
 ): Promise<AdvanceLaneRunResult> {
   if (!canEnterLaneRunState(from, to, record.parked?.parkedFrom ?? null)) {
     return { outcome: 'refused', reason: 'illegal-transition' };
+  }
+  if (to === 'merged' || to === 'stopped') {
+    // Before the terminal conduct entry: a crash between the two leaves a
+    // non-terminal run the next pass re-ends (the release is idempotent).
+    await releaseWorkOrderAtEnd(ctx, record, to, request);
   }
   const appended = await appendConduct(ctx, request, to);
   if (!appended.ok) {
@@ -129,6 +136,91 @@ export async function raiseParkNotice(
     }
   } catch {
     // A notice failure or throw never blocks the park; the park stands as saved.
+  }
+}
+
+/**
+ * KF-36a: release the run's work order at a terminal transition (`merged` or
+ * `stopped`), BEFORE the terminal conduct entry is appended. The rule
+ * (`workOrderReleaseFor`) reads the reservations itself. Failure-tolerant like
+ * `raiseParkNotice`: any throw (a read, the lists, the second save) is caught
+ * and swallowed — the run still ends; the work order simply stays claimed (the
+ * safe direction), for KF-36b's reconciliation.
+ */
+export async function releaseWorkOrderAtEnd(ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  runEnds: 'merged' | 'stopped',
+  request: AdvanceLaneRunRequest,
+): Promise<void> {
+  const workOrderRelease = ctx.deps.workOrderRelease;
+  if (workOrderRelease === undefined) {
+    return;
+  }
+  try {
+    const workOrder = await workOrderRelease.findWorkOrderById(record.workOrderId);
+    if (workOrder === null) {
+      return;
+    }
+    const reservations = await ctx.deps.executionJournal.listActiveReservations();
+    const slotHeld = reservations.some((reservation) =>
+      reservation.held && record.attemptIds.includes(reservation.attemptId)
+    );
+    const runs = await ctx.deps.runRepo.list();
+    let otherRunActive = false;
+    for (const other of runs) {
+      if (other.workOrderId !== record.workOrderId || other.runId === record.runId) {
+        continue;
+      }
+      const state = laneRunJournalState(await ctx.deps.runJournal.listForRun(other.runId), other.runId);
+      if (!(LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state)) {
+        otherRunActive = true;
+        break;
+      }
+    }
+    const answer = workOrderReleaseFor({
+      runEnds,
+      workOrderState: workOrder.state,
+      slotHeld,
+      otherRunActive,
+    });
+    if (answer === null) {
+      return;
+    }
+    try {
+      await workOrderRelease.saveWorkOrder({
+        ...workOrder,
+        state: answer,
+        revision: workOrder.revision + 1,
+        updatedAtIso: request.nowIso,
+      });
+    } catch {
+      // A stale revision: another writer (such as `markMerged`) saved first.
+      // Re-read once, re-apply the rule to the fresh record, and save once
+      // more if it still answers non-null (the release is idempotent).
+      const fresh = await workOrderRelease.findWorkOrderById(record.workOrderId);
+      if (fresh === null) {
+        return;
+      }
+      const retry = workOrderReleaseFor({
+        runEnds,
+        workOrderState: fresh.state,
+        slotHeld,
+        otherRunActive,
+      });
+      if (retry === null) {
+        return;
+      }
+      await workOrderRelease.saveWorkOrder({
+        ...fresh,
+        state: retry,
+        revision: fresh.revision + 1,
+        updatedAtIso: request.nowIso,
+      });
+    }
+  } catch {
+    // Swallowed on purpose (see above): a failed release never blocks the
+    // terminal transition; the work order stays claimed and KF-36b's
+    // reconciliation closes it later.
   }
 }
 

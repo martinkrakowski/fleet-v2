@@ -19,6 +19,7 @@ import { RUN_STOP_REFUSAL_KINDS } from './lane-run-records.js';
 import { LANE_RUN_STATES, LANE_RUN_TERMINAL_STATES } from './value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { ImplementerSeatRole } from './value-objects/SeatPlan.vo.js';
+import type { WorkOrderStateValue } from './value-objects/WorkOrderState.vo.js';
 
 /** Exits of each state besides the universal `parked` and `stopped` (plan §3.2 "Exits"). */
 export const LANE_RUN_EXITS = {
@@ -323,9 +324,38 @@ export function checkLaneRunResume(input: {
     return { ok: false, reason: 'one-way-door' };
   }
   // A resume would re-collect the same unchanged head and park again: the
-  // run is stopped and a new run started instead (KF-21c).
+  // run is stopped, which releases its work order, and the lane is re-run
+  // under a new work order (KF-21c, KF-36a).
   if (record.parked.reason === 'fix-no-progress') {
     return { ok: false, reason: 'fix-no-progress' };
   }
   return { ok: true, to: record.parked.parkedFrom };
+}
+
+/**
+ * KF-36a: the work-order state a run's terminal transition releases. Answers
+ * null (no save) when the work order is already `merged` or `stopped` (never
+ * overwrite one terminal state with the other), when `otherRunActive` (another
+ * non-terminal run still names the same work order), or when the run ends
+ * `stopped` with a slot still held (a live session's paths stay claimed: fail
+ * closed). A held slot does NOT block `merged` — the PR has merged, so the
+ * paths' content is on main. Otherwise it answers `runEnds`.
+ */
+export function workOrderReleaseFor(input: {
+  readonly runEnds: 'merged' | 'stopped';
+  readonly workOrderState: WorkOrderStateValue;
+  readonly slotHeld: boolean;
+  readonly otherRunActive: boolean;
+}): 'merged' | 'stopped' | null {
+  const { runEnds, workOrderState, slotHeld, otherRunActive } = input;
+  if (workOrderState === 'merged' || workOrderState === 'stopped') {
+    return null;
+  }
+  if (otherRunActive) {
+    return null;
+  }
+  if (runEnds === 'stopped' && slotHeld) {
+    return null;
+  }
+  return runEnds;
 }

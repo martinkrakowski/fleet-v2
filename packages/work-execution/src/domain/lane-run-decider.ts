@@ -381,11 +381,13 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         return park('review-seat-unavailable', null);
       }
       if (review.verdict === 'unknown') {
-        // An unknown, refused or unavailable review result (all map to `unknown`
-        // in the facts module) is a result the conductor could not use, not a
-        // verdict on the code: it gets one fresh review on the same seat at the
-        // same head, then parks. A retry never counts as a pass, and there is
-        // no seat switch — an unread verdict is not a seat outage.
+        // A review whose verdict the conductor could not read is not a verdict on
+        // the code: it gets one fresh review on the same seat at the same head,
+        // then parks. A refused or unavailable review never reaches this branch:
+        // its journalled `refused` result makes G8 park the run `step-refused`
+        // first, which is right for a deterministic refusal. A retry never counts
+        // as a pass, and there is no seat switch — an unread verdict is not a
+        // seat outage.
         if (review.retries === 0 && review.seatIndex !== null) {
           return act({
             step: kind,

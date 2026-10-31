@@ -1,6 +1,7 @@
 # Plan: finish the remaining planned work in fleet-v2
 
 - **Date:** 2026-10-31. The work was surveyed against origin/main at #524. This revision follows an independent review: 14 findings, all applied (§6).
+- **Decisions:** the owner accepted D-R1–D-R17, and D-R13', as recommended on 2026-10-31. D-R11 therefore defers the OrchestratorThread units.
 - **Scope:** every open unit in `docs/planning/*.md`, plus six Tier 2 hardening lanes that are already briefed and waiting behind #525–#531. Units owned outside this repo (hexagen HS/HM, the orchestrator scripts OS/S5/S7) are listed only so the waves can be sequenced around them.
 - **How work runs today:**
   - A conductor runs up to 8 Tier 1 lanes at once, one per package, because admission is package-level. Each lane takes about 9 min to reach a green PR.
@@ -237,9 +238,9 @@ Six Tier 2 hand-run lanes (see the table above) run behind #525–#531, in work-
 - **Parallel:** S4, S6 and KS8, which are in distinct packages.
 - **Serial:** KS1 → KS7 → OS-1 posts → A-S1.
 - **Decisions:**
-  - **D-R1:** batch Tier 1 work at 2–3 units per PR (D25 Horizon A) until S5 has been measured, then 1–2. Recommended: yes.
-  - **D-R2:** flip A-S1 (D22 + D33), in this order only: KS7 merged → OS-1 has posted `premerge` on every open PR → the owner flips. Recommended: yes.
-  - **D-R3:** drop A-R4. Recommended: yes.
+  - **D-R1:** batch Tier 1 work at 2–3 units per PR (D25 Horizon A) until S5 has been measured, then 1–2. **Accepted** (owner, 2026-10-31).
+  - **D-R2:** flip A-S1 (D22 + D33), in this order only: KS7 merged → OS-1 has posted `premerge` on every open PR → the owner flips. **Accepted** (owner, 2026-10-31).
+  - **D-R3:** drop A-R4. **Accepted** (owner, 2026-10-31).
 - **PRs:** 6 (2 T2, 3 T1, 1 T0).
 - **Wall:** about 3–4 h; KS1 → KS7 is the critical path.
 
@@ -264,8 +265,8 @@ Six Tier 2 hand-run lanes (see the table above) run behind #525–#531, in work-
   - Then KS3 and KS4b, under the same rule.
   - Then KS5 → KS6 → AD-1 → AD-2 → EX-3b → EX-3c.
 - **Decisions:**
-  - **D-R4:** the brief author (the orchestrator) writes the touch list, checked by `lane-diff-check --strict-brief`. A lane never widens its own list. Recommended: yes.
-  - **D-R5:** enforce `maxConcurrentLanes` for hand reserves. Recommended: yes.
+  - **D-R4:** the brief author (the orchestrator) writes the touch list, checked by `lane-diff-check --strict-brief`. A lane never widens its own list. **Accepted** (owner, 2026-10-31).
+  - **D-R5:** enforce `maxConcurrentLanes` for hand reserves. **Accepted** (owner, 2026-10-31).
 - **PRs:** 11 (10 T2, 1 T0).
 - **Wall:** about 11 h. With each pair collapsed, the chain is 9 deep (KM, the KS2/KS4a stage, the KS3/KS4b stage, KS5, KS6, AD-1, AD-2, EX-3b, EX-3c); fully serial it is 11 deep, about 14 h. Dividing 10 Tier 2 lanes by 3 in flight would give only about 4 h, so the chain is what binds. Train ≈ 1 h after S5.
 - **Result:** the conductor admits several work-execution lanes at once when their files don't overlap.
@@ -285,8 +286,8 @@ Six Tier 2 hand-run lanes (see the table above) run behind #525–#531, in work-
 
 - **Prerequisites:** Wave 0 (the methods) and Wave 2 (KS5, for parallel work-execution lanes).
 - **Decisions:**
-  - **D-R6:** keep the D14/D17 opt-ins off by default. The briefed flags stand in until KWp's keys exist. Turn the opt-ins on after ten dry-run passes have matched the manual rule. Recommended: yes.
-  - **D-R7:** drop K8. Recommended: yes.
+  - **D-R6:** keep the D14/D17 opt-ins off by default. The briefed flags stand in until KWp's keys exist. Turn the opt-ins on after ten dry-run passes have matched the manual rule. **Accepted** (owner, 2026-10-31).
+  - **D-R7:** drop K8. **Accepted** (owner, 2026-10-31).
 - **PRs:** 9 (8 T2, 1 T1).
 - **Wall:** about 6–7 h. The chain is 5 deep: K10 → K11a → KW2 → KW3' → KW4b' (KW4b' waits on both KW4a and KW3').
 
@@ -309,8 +310,8 @@ Six Tier 2 hand-run lanes (see the table above) run behind #525–#531, in work-
 
 - **Prerequisites:** Wave 2 (KS5) for Q3 to run in parallel; Wave 3 for SR7's composition slot. Verify H10 in this wave.
 - **Decisions:**
-  - **D-R8:** one `schemaVersion` convention (D6: absent means 1 forever, an unknown version is refused) for every stored record introduced from here on: reaper findings, seat tickets, receipt keys, lane plans and merge records. Recommended: yes.
-  - **D-R9:** fold Q10 into S7. Recommended: yes.
+  - **D-R8:** one `schemaVersion` convention (D6: absent means 1 forever, an unknown version is refused) for every stored record introduced from here on: reaper findings, seat tickets, receipt keys, lane plans and merge records. **Accepted** (owner, 2026-10-31).
+  - **D-R9:** fold Q10 into S7. **Accepted** (owner, 2026-10-31).
 - **PRs:** 34 (13 T2, 18 T1, 3 T0).
 - **Wall:** about 10 h, or 1.5 working days. The chain is 8 deep: Q5a → Q5b → the SR chain. Train ≈ 3 h after S5, 5.7 h today.
 
@@ -335,8 +336,8 @@ Six Tier 2 hand-run lanes (see the table above) run behind #525–#531, in work-
   - `security.ts`: T3a → T3b → T6 → L9 → WB13a.
   - Manifest (the orchestrator commits each step): O2b → O2c → A-R → A-C → O9 → A-WO.
 - **Decisions:**
-  - **D-R10:** freeze the scope set at seven: `read`, `message`, `hook`, `verdict`, `operate`, `orchestrate`, `tail`. Web session tokens live in memory only, and no web token ever holds `orchestrate` or dispatch. Recommended: yes.
-  - **D-R11:** defer the OrchestratorThread units (T1a/b, T2a/b, T4, T7, T9, T10). Recommended: defer.
+  - **D-R10:** freeze the scope set at seven: `read`, `message`, `hook`, `verdict`, `operate`, `orchestrate`, `tail`. Web session tokens live in memory only, and no web token ever holds `orchestrate` or dispatch. **Accepted** (owner, 2026-10-31).
+  - **D-R11:** defer the OrchestratorThread units (T1a/b, T2a/b, T4, T7, T9, T10). **Accepted: defer** (owner, 2026-10-31).
 - **PRs:** 20 (16 T2, 4 T1).
 - **Wall:** about 8–10 h, or 1–1.5 days. The manifest chain is 6 deep. Train ≈ 2 h after S5.
 
@@ -358,8 +359,8 @@ Every unit sits on exactly one sequence, and Tier 1 units are conducted when the
 
 - **Prerequisites:** Wave 5 (WB13a for the writes the reads link to; A-R/A-C for W7a); Wave 3 (K11a) for A-F; E4 before O10.
 - **Decisions:**
-  - **D-R12:** `/todo` before the full board (TD-D2). Recommended: yes.
-  - **D-R13':** the board stays read-only until WB13b and O8 (board D9). Recommended: yes.
+  - **D-R12:** `/todo` before the full board (TD-D2). **Accepted** (owner, 2026-10-31).
+  - **D-R13':** the board stays read-only until WB13b and O8 (board D9). **Accepted** (owner, 2026-10-31).
 - **PRs:** 55.
   - 44 T2: 7 to-do, 16 board core, 4 waits-for, 3 notifications, 3 run board, 11 reads.
   - 9 T1: TD3b, TD5b, WB6p, WB8w, WB9b, WB10, WB12b, MX5a, MX5b.
@@ -383,11 +384,11 @@ Every unit sits on exactly one sequence, and Tier 1 units are conducted when the
   - **apps/api:** L3 → P8's routes.
   - **Ops:** after everything else.
 - **Decisions:**
-  - **D-R13:** web setup (U2/U4) before TUI setup. Defer P10a/b and the FS7/AM8 writes, and keep SV read-only. Recommended: yes.
-  - **D-R14:** the live tail is L0–L6; L7/L8 wait for T4. Recommended: yes.
-  - **D-R15:** host-programs P4–P6 come after the tail, hand-run when there's room. Recommended: yes.
-  - **D-R16:** archive the structure-and-process proposal as not scheduled. Recommended: yes.
-  - **D-R17:** F6 and MX9 wait for a hexagen release. Recommended: yes.
+  - **D-R13:** web setup (U2/U4) before TUI setup. Defer P10a/b and the FS7/AM8 writes, and keep SV read-only. **Accepted** (owner, 2026-10-31).
+  - **D-R14:** the live tail is L0–L6; L7/L8 wait for T4. **Accepted** (owner, 2026-10-31).
+  - **D-R15:** host-programs P4–P6 come after the tail, hand-run when there's room. **Accepted** (owner, 2026-10-31).
+  - **D-R16:** archive the structure-and-process proposal as not scheduled. **Accepted** (owner, 2026-10-31).
+  - **D-R17:** F6 and MX9 wait for a hexagen release. **Accepted** (owner, 2026-10-31).
 - **PRs:** 43 (34 T2, 5 T1, 4 T0; one more if H10 is kept).
 - **Wall:** about 29 h, or 3.5–4 working days. The 19-deep apps/web sequence binds, and the four serial P5 ops lanes add about 5 h after it. Train ≈ 4 h after S5.
 

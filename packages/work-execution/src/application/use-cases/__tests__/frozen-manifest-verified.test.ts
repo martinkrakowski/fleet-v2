@@ -137,21 +137,32 @@ describe('readVerifiedFrozenManifest (SEC-5a)', () => {
   it('returns null when briefDigest is null', async () => {
     const harness = makeHarness();
     await expect(readVerifiedFrozenManifest(attemptFixture({ briefDigest: null }), harness.artifactPort)).resolves.toBeNull();
+    // refused before any remote read
+    expect(harness.briefReads).toEqual([]);
+    expect(harness.manifestReads).toEqual([]);
   });
 
   it('returns null when briefDigest is empty', async () => {
     const harness = makeHarness();
     await expect(readVerifiedFrozenManifest(attemptFixture({ briefDigest: '' }), harness.artifactPort)).resolves.toBeNull();
+    // refused before any remote read
+    expect(harness.briefReads).toEqual([]);
+    expect(harness.manifestReads).toEqual([]);
   });
 
   it('returns null when no briefPackagePath is recorded', async () => {
     const harness = makeHarness();
     await expect(readVerifiedFrozenManifest(attemptFixture({ briefPackagePath: null }), harness.artifactPort)).resolves.toBeNull();
+    // refused before any remote read
+    expect(harness.briefReads).toEqual([]);
+    expect(harness.manifestReads).toEqual([]);
   });
 
   it('returns null when readBriefFile is missing', async () => {
     const harness = makeHarness({ readBriefFile: false });
     await expect(readVerifiedFrozenManifest(attemptFixture(), harness.artifactPort)).resolves.toBeNull();
+    // refused before any remote read
+    expect(harness.manifestReads).toEqual([]);
   });
 
   it('returns null when a read throws', async () => {
@@ -163,13 +174,27 @@ describe('readVerifiedFrozenManifest (SEC-5a)', () => {
   it('returns null when prose is null', async () => {
     const harness = makeHarness();
     harness.setProse(null);
-    await expect(readVerifiedFrozenManifest(attemptFixture(), harness.artifactPort)).resolves.toBeNull();
+    const digestCalls: string[] = [];
+    const recordingDigest = (content: string): string => {
+      digestCalls.push(content);
+      return 'never-matches';
+    };
+    await expect(readVerifiedFrozenManifest(attemptFixture(), harness.artifactPort, recordingDigest)).resolves.toBeNull();
+    // a missing file is refused before any digest is computed
+    expect(digestCalls).toEqual([]);
   });
 
   it('returns null when the manifest is missing', async () => {
     const harness = makeHarness();
     harness.setManifest(null);
-    await expect(readVerifiedFrozenManifest(attemptFixture(), harness.artifactPort)).resolves.toBeNull();
+    const digestCalls: string[] = [];
+    const recordingDigest = (content: string): string => {
+      digestCalls.push(content);
+      return 'never-matches';
+    };
+    await expect(readVerifiedFrozenManifest(attemptFixture(), harness.artifactPort, recordingDigest)).resolves.toBeNull();
+    // a missing file is refused before any digest is computed
+    expect(digestCalls).toEqual([]);
   });
 
   it('returns null when the manifest is not an object', async () => {

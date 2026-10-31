@@ -60,6 +60,7 @@ import {
   type ImplementerSeatResolution,
 } from "@fleet/work-execution/use-cases";
 import { ProbeLimiter } from "./probe-limiter";
+import { withPendingFixLimit } from "./pending-fix-guard";
 
 /**
  * Reads the seat an attempt was actually implemented on. Absent on a
@@ -96,8 +97,14 @@ export interface WorkComposition {
   reconcileAttempt: ReconcileAttemptUseCase;
   stopAttempt: StopAttemptUseCase;
   collectAttemptArtifacts: CollectAttemptArtifactsUseCase;
-  prepareFixAttempt: PrepareFixAttemptUseCase;
+  prepareFixAttempt: Pick<PrepareFixAttemptUseCase, "execute">;
   requestAttemptAcceptance: RequestAttemptAcceptanceUseCase;
+  /**
+   * Throttles HTTP attempt actions (stop, reconcile, fix): one in-flight
+   * action per attempt id and a small global cap. Owned by this composition
+   * root, not the route.
+   */
+  attemptLimiter: ProbeLimiter;
   executeAuthorizedForgeAction: ExecuteAuthorizedForgeActionUseCase;
   /** The attempt's recorded implementer seat; never an operator value. */
   readonly resolveAttemptImplementerSeat?: AttemptImplementerSeatResolver;
@@ -228,6 +235,7 @@ function unconfiguredWorkComposition(): WorkComposition {
     listAttemptJournal: new ListAttemptJournalUseCase(),
     probeProject: new ProbeProjectUseCase(),
     probeLimiter: new ProbeLimiter(),
+    attemptLimiter: new ProbeLimiter(4),
     listUnregisteredProjects: new ListUnregisteredProjectsUseCase(),
     prepareBriefPackage: new PrepareBriefPackageUseCase(),
     reserveExecutionCapacity: new ReserveExecutionCapacityUseCase(),
@@ -429,6 +437,7 @@ export function createConfiguredWorkComposition(
           : null,
     }),
     probeLimiter: new ProbeLimiter(),
+    attemptLimiter: new ProbeLimiter(4),
     listUnregisteredProjects: new ListUnregisteredProjectsUseCase({
       workOrderRepo,
       profileRead,
@@ -475,7 +484,10 @@ export function createConfiguredWorkComposition(
       briefKnowledge,
       runnerForAttempt,
     }),
-    prepareFixAttempt: new PrepareFixAttemptUseCase({ attemptRepo }),
+    prepareFixAttempt: withPendingFixLimit(
+      new PrepareFixAttemptUseCase({ attemptRepo }),
+      attemptRepo,
+    ),
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({
       attemptRepo,
       workOrderRepo,

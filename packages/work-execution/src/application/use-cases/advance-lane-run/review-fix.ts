@@ -25,7 +25,7 @@ import { historyEntryOf, selectReviewSeat } from '../../../domain/seat-selection
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { AcceptanceSpec } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
-import { readFrozenManifest } from './frozen-manifest.js';
+import { readFrozenBriefVerified } from './frozen-manifest.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, saveOrRefuse } from './step-context.js';
@@ -349,21 +349,6 @@ async function reviewInputsOf(
   };
 }
 
-/** The frozen brief text for a brief check (`.lane/brief.md`); undefined for a code review or when unreadable. */
-async function briefTextFor(ctx: AdvanceStepContext, latest: AttemptRecord, step: string): Promise<string | undefined> {
-  if (step !== 'brief-check') {
-    return undefined;
-  }
-  // Q2a-2: a conducted attempt's read goes through its recorded host or is not
-  // made; a missing host never falls back to the local executor.
-  const recordedHost = conductedRunnerOf(latest);
-  if (recordedHost === null) {
-    return undefined;
-  }
-  const read = await ctx.deps.artifactPort.readBriefFile?.(latest.worktreePath, '.lane/brief.md', recordedHost);
-  return read ?? undefined;
-}
-
 /**
  * The `act brief-check` and `act code-review` steps (K5, plan §3.3, §3.4):
  * one review through `ReviewRequestPort` under a journalled request id, after
@@ -401,7 +386,17 @@ export async function performReview(
   if (intentRefusal !== null) {
     return { outcome: 'refused', reason: intentRefusal };
   }
-  const requiredChecks = manifestAcceptanceChecks(await readFrozenManifest(latest, ctx.deps.artifactPort));
+  // The frozen brief is read ONCE, digest-verified here (SEC-3b): the
+  // required checks come from its manifest and a brief check's reviewer text
+  // is exactly the prose the digest covered. A read that does not verify
+  // against the attempt's recorded digest refuses before the assessment is
+  // opened and before any reviewer runs; an absent read (nothing recorded to
+  // read) keeps today's unavailable refusal.
+  const frozen = await readFrozenBriefVerified(latest, ctx.deps.artifactPort, ctx.deps.computeDigest);
+  if (frozen.kind === 'unverified') {
+    return finishReview(ctx, request, decision, 'refused', 'assessment-unavailable');
+  }
+  const requiredChecks = manifestAcceptanceChecks(frozen.kind === 'verified' ? frozen.manifest : null);
   if (requiredChecks === null) {
     return finishReview(ctx, request, decision, 'refused', 'assessment-unavailable');
   }
@@ -416,7 +411,7 @@ export async function performReview(
   if (opened.outcome !== 'open') {
     return finishReview(ctx, request, decision, 'refused', 'assessment-unavailable');
   }
-  const briefText = await briefTextFor(ctx, latest, decision.step);
+  const briefText = decision.step === 'brief-check' && frozen.kind === 'verified' ? frozen.prose : undefined;
   let outcome: ReviewRequestResult;
   try {
     outcome = await ctx.deps.reviewRequest!.requestReview({

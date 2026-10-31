@@ -20,6 +20,7 @@ export * from "./ListUnregisteredProjectsPort.in-port.js";
 export * from "./PrepareBriefPackagePort.in-port.js";
 export * from "./PrepareFixAttemptPort.in-port.js";
 export * from "./ProbeProjectPort.in-port.js";
+export * from "./ReapLaneWorktreesPort.in-port.js";
 export * from "./ReconcileAttemptPort.in-port.js";
 export * from "./RegisterWorkOrderPort.in-port.js";
 export * from "./RequestAttemptAcceptancePort.in-port.js";

@@ -15,6 +15,7 @@ export * from "./InspectLaneRunsPort.in-port.js";
 export * from "./InspectWorkOrderPort.in-port.js";
 export * from "./ListAttemptJournalPort.in-port.js";
 export * from "./ListAttemptsPort.in-port.js";
+export * from "./ListStaleWorkOrdersPort.in-port.js";
 export * from "./ListUnregisteredProjectsPort.in-port.js";
 export * from "./PrepareBriefPackagePort.in-port.js";
 export * from "./PrepareFixAttemptPort.in-port.js";

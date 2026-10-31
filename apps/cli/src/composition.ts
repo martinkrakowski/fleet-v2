@@ -43,6 +43,7 @@ import {
   GateReceiptAdapter,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
+  ListStaleWorkOrdersUseCase,
   ConductorForgeGrantAdapter,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
@@ -668,6 +669,8 @@ export interface FleetCliRuntime {
     readonly inspectWorkOrder: InspectWorkOrderUseCase;
     /** KF-36b-1b: the operator's close command; built after the conductor composes its lane-run stores. */
     readonly closeWorkOrder: CloseWorkOrderUseCase;
+    /** KF-36b-2: the read-only stale work-order listing; built beside closeWorkOrder from the same stores. */
+    readonly listStaleWorkOrders: ListStaleWorkOrdersUseCase;
     readonly inspectAttempt: InspectAttemptUseCase;
     readonly prepareBriefPackage: PrepareBriefPackageUseCase;
     readonly reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
@@ -945,6 +948,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     runJournal: conductor.laneRunJournal,
   });
 
+  // KF-36b-2: the read-only stale listing reads the same stores as the close,
+  // so it is built beside it, after the conductor composes its lane-run stores.
+  const listStaleWorkOrders = new ListStaleWorkOrdersUseCase({
+    workOrderRepo: workOrderRepository,
+    attemptRepo: attemptRepository,
+    runRepo: conductor.laneRunRepository,
+    runJournal: conductor.laneRunJournal,
+  });
+
   const { telemetry } = composeTelemetry({
     stateDir,
     policy: resolveTelemetryPolicy(options?.installation?.policy),
@@ -965,7 +977,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     coordination,
     knowledge,
     evidence,
-    execution: { ...execution, closeWorkOrder },
+    execution: { ...execution, closeWorkOrder, listStaleWorkOrders },
     conductor,
     runnerTunnel,
     telemetry,

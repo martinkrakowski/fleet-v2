@@ -43,4 +43,14 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       }
       return rt.execution.closeWorkOrder.closeWorkOrder({ workOrderId, state });
     },
+    stale: async (p, rt) => {
+      // A given --project-id must carry a value: a bare flag parses as `true` and an empty value would widen the
+      // listing to every project, so both are usage errors rather than a silent fleet-wide answer.
+      if (Object.hasOwn(p, 'projectId') && (typeof p.projectId !== 'string' || p.projectId.trim() === '')) {
+        throw new CliUsageError('work-order stale --project-id needs a project id');
+      }
+      return rt.execution.listStaleWorkOrders.listStaleWorkOrders({
+        projectId: optStr(p, 'projectId'),
+      });
+    },
 };

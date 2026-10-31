@@ -478,6 +478,23 @@ describe('brief-check requires the brief text (SEC-4)', () => {
     expect(stored?.revision).toBe(0);
   });
 
+  it('a refused brief-check consumes no request id: the same id with a real brief is reviewed', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const reviewer = new StubReviewer();
+    const archive = new StubArchive();
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
+
+    const refused = await useCase.requestIndependentReview({ ...requestFor('brief-check'), requestId: REQUEST_ID });
+    expect(refused.outcome).toBe('rejected');
+
+    const retried = await useCase.requestIndependentReview({
+      ...requestFor('brief-check', 'Do the thing.'),
+      requestId: REQUEST_ID,
+    });
+    expect(retried.outcome).toBe('reviewed');
+    expect(reviewer.calls).toHaveLength(1);
+  });
+
   it('still runs a brief-check carrying a real briefText', async () => {
     const repo = new InMemoryAssessmentRepo([sampleRecord()]);
     const reviewer = new StubReviewer();

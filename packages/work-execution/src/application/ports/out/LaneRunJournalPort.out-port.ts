@@ -19,6 +19,13 @@ export interface LaneRunJournalPort {
   append(entry: LaneRunJournalEntryRecord): Promise<LaneRunJournalAppendResult>;
   /** Every entry whose runId is `runId`, in append order; [] for an unknown or malformed run id. */
   listForRun(runId: string): Promise<readonly LaneRunJournalEntryRecord[]>;
+  /**
+   * Optional grouped read: every requested run id's entries in one read of the
+   * store. Every requested id is present in the returned map (`[]` when it has
+   * no entries), and each list is in append order, exactly as `listForRun`
+   * returns it. Non-string ids are ignored, as in `listForRun`.
+   */
+  listForRuns?(runIds: readonly string[]): Promise<ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]>>;
   /** The intent and results of one key, in append order (request and reaper keys have no run); [] when none. */
   listForKey(key: string): Promise<readonly LaneRunJournalEntryRecord[]>;
 }

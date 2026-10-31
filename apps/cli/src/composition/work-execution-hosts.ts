@@ -20,7 +20,6 @@ import {
   RunnerSelectorAdapter,
   WorkOrderRepositoryAdapter,
   WorkspaceAdapter,
-  hasRecordedHostName,
   isSafeSshHost,
   resolveRunnerCapabilityProfile,
   type ExecutionRunnerHost,
@@ -260,25 +259,28 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
       if (attempt === null) {
         throw new Error(`No attempt is recorded for ${request.attemptId}`);
       }
-      // H9b2: the recorded host is the truth. An attempt recorded on a named
-      // host reads its HEAD and pushes from that host's transport — local
-      // reads locally, an ssh host through its alias — and a host that
-      // changed or was removed refuses, naming the recorded host. The
-      // `existsSync(worktreePath)` heuristic stays behind the legacy branch
-      // only (legacy records keep today's behaviour exactly).
+      // H9b2: the recorded host is the truth. Every recorded runner block is
+      // resolved through the ExecutorForHost helper: a record with a hostName
+      // is confirmed against the installation, and an alias-only record
+      // resolves through the single installation ssh host with that alias or
+      // is refused, naming the record (owner decision D2) — it never falls
+      // back to the legacy route. When the helper resolves an installation
+      // host, the recorded host's transport reads HEAD, seeds and fetches —
+      // local reads locally, an ssh host through its alias — and a host that
+      // changed or was removed refuses. A legacy record (no runner block, or
+      // the helper's legacy executor) keeps today's behaviour exactly, with
+      // the `existsSync(worktreePath)` heuristic behind the legacy branch
+      // only.
       const recorded = attempt.runner ?? null;
-      const recordedIsNamed = hasRecordedHostName(recorded);
-      const recordedExecutor = recordedIsNamed
-        ? executorForHost.executorForRecordedHost(recorded)
-        : null;
-      if (recordedExecutor !== null && !recordedExecutor.ok) {
-        // A changed or removed host refuses, naming the recorded host.
-        throw new Error(recordedExecutor.reason);
+      const recordedResolution = executorForHost.executorForRecordedHost(recorded);
+      if (!recordedResolution.ok) {
+        // A changed, removed or unresolvable host refuses, naming the record.
+        throw new Error(recordedResolution.reason);
       }
-      const recordedRoute =
-        recordedExecutor !== null && recordedExecutor.ok
-          ? headRouteForExecutor(recordedExecutor.executor)
-          : null;
+      const recordedResolved = recordedResolution.hostSpec !== undefined;
+      const recordedRoute = recordedResolved
+        ? headRouteForExecutor(recordedResolution.executor)
+        : null;
       const recordedSshAlias = recordedRoute?.route === 'ssh' ? recordedRoute.alias : null;
       const head =
         recordedRoute !== null
@@ -298,7 +300,7 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
           ? ['push', 'origin', branchRef]
           : ['push', '-f', 'origin', branchRef];
       const recordedWantsSeed =
-        recordedIsNamed
+        recordedResolved
           ? recordedSshAlias !== null ||
             process.env.FLEET_FORGE_PUSH_ORIGIN === '1'
           : null;
@@ -324,7 +326,7 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
         await runGitCommand(pushArgs);
       } else if (
         shouldSeedOrigin &&
-        recordedIsNamed &&
+        recordedResolved &&
         recordedSshAlias === null &&
         process.env.FLEET_FORGE_PUSH_ORIGIN === '1'
       ) {
@@ -334,7 +336,7 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
         await runGitCommand(pushArgs);
       } else if (
         shouldSeedOrigin &&
-        !recordedIsNamed &&
+        !recordedResolved &&
         worktreeSshHost !== undefined &&
         !existsSync(attempt.worktreePath)
       ) {

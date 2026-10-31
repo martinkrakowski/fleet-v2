@@ -59,6 +59,7 @@ import {
   OpencodeApiUsageAdapter,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
+  CancelPreparedAttemptUseCase,
   ProbeProjectUseCase,
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
@@ -681,6 +682,8 @@ export interface FleetCliRuntime {
     readonly stopAttempt: StopAttemptUseCase;
     readonly collectAttemptArtifacts: CollectAttemptArtifactsUseCase;
     readonly prepareFixAttempt: PrepareFixAttemptUseCase;
+    /** EX-1a: the operator's record-only cancel for a prepared, never-dispatched attempt. */
+    readonly cancelPreparedAttempt: CancelPreparedAttemptUseCase;
     readonly requestAttemptAcceptance: RequestAttemptAcceptanceUseCase;
     readonly attemptGate: RequestAttemptAcceptanceUseCase;
     readonly executeAuthorizedForgeAction: ExecuteAuthorizedForgeActionUseCase;

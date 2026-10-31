@@ -209,11 +209,23 @@ describe('removeLaneWorktree over a fake executor', () => {
   it('answers unknown when status never reports an exit code', async () => {
     const { result, calls } = await removeWith({
       [LIST_MARKER]: { stdout: worktreeList() },
-      [STATUS_MARKER]: { exitCode: null, error: 'timeout' },
+      [STATUS_MARKER]: { exitCode: null, signal: 'SIGTERM' },
     });
     expect(result).toEqual({ outcome: 'unknown' });
     expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
   });
+
+  it.each([['an unborn HEAD', '0'.repeat(40)], ['an unreadable HEAD', 'not-a-sha']])(
+    'answers unknown for %s before anything is removed',
+    async (_label, head) => {
+      const { result, calls } = await removeWith({
+        [LIST_MARKER]: { stdout: worktreeList(head) },
+        [STATUS_MARKER]: { stdout: '' },
+      });
+      expect(result).toEqual({ outcome: 'unknown' });
+      expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+    },
+  );
 
   it('refuses git-refused when the remove exits non-zero', async () => {
     const { result } = await removeWith({
@@ -228,7 +240,7 @@ describe('removeLaneWorktree over a fake executor', () => {
     const { result } = await removeWith({
       [LIST_MARKER]: { stdout: worktreeList() },
       [STATUS_MARKER]: { stdout: '' },
-      [REMOVE_MARKER]: { exitCode: null, error: 'timeout' },
+      [REMOVE_MARKER]: { exitCode: null, signal: 'SIGTERM' },
     });
     expect(result).toEqual({ outcome: 'unknown' });
   });
@@ -314,6 +326,7 @@ describe('removeLaneWorktree against real git', () => {
     clonePath: string;
     worktreeRoot: string;
     worktreePath: string;
+    physicalWorktreePath: string;
     branch: string;
     head: string;
     adapter: WorkspaceAdapter;
@@ -347,6 +360,7 @@ describe('removeLaneWorktree against real git', () => {
       clonePath,
       worktreeRoot,
       worktreePath,
+      physicalWorktreePath: await fs.realpath(worktreePath),
       branch,
       head: head.trim(),
       adapter,
@@ -373,7 +387,9 @@ describe('removeLaneWorktree against real git', () => {
     );
     expect(result).toEqual({ outcome: 'removed', branchTip: setup_.head });
     const after = await cloneState(setup_.clonePath);
-    expect(after.listed).not.toContain(setup_.worktreePath);
+    // git lists the physical path; compare against it so a symlinked TMPDIR cannot make this vacuous.
+    expect(before.listed).toContain(setup_.physicalWorktreePath);
+    expect(after.listed).not.toContain(setup_.physicalWorktreePath);
     await expect(
       execFileAsync('git', ['rev-parse', '--verify', `refs/heads/${setup_.branch}`], { cwd: setup_.clonePath }),
     ).resolves.toBeTruthy();
@@ -394,7 +410,7 @@ describe('removeLaneWorktree against real git', () => {
     );
     expect(result).toEqual({ outcome: 'refused', reason: 'dirty' });
     const listed = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: setup_.clonePath });
-    expect(listed.stdout).toContain(setup_.worktreePath);
+    expect(listed.stdout).toContain(setup_.physicalWorktreePath);
   });
 
   it('refuses locked for a locked worktree and keeps the worktree listed', async () => {
@@ -410,7 +426,7 @@ describe('removeLaneWorktree against real git', () => {
     );
     expect(result).toEqual({ outcome: 'refused', reason: 'locked' });
     const listed = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: setup_.clonePath });
-    expect(listed.stdout).toContain(setup_.worktreePath);
+    expect(listed.stdout).toContain(setup_.physicalWorktreePath);
   });
 
   it('refuses not-a-worktree for a plain directory and leaves it untouched', async () => {

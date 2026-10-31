@@ -829,14 +829,22 @@ export class WorkspaceAdapter implements WorkspacePort {
         return { outcome: 'refused', reason: 'branch-mismatch' };
       }
 
+      // 4b. The listed tip is what the reap journals as the recovery handle, so
+      //     it must be a real commit before anything is removed; an unborn or
+      //     unreadable HEAD answers unknown with nothing removed.
+      const branchTip = entry.head;
+      if (branchTip === null || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(branchTip) || /^0+$/.test(branchTip)) {
+        return { outcome: 'unknown' };
+      }
+
       // 5. A locked worktree is never removed.
       if (entry.locked) {
         return { outcome: 'refused', reason: 'locked' };
       }
 
-      // 6. Only a clean worktree goes: nothing uncommitted, nothing
-      //    untracked (ignored files included in the listing through
-      //    `--untracked-files=all`).
+      // 6. Only a clean worktree goes: nothing uncommitted and no untracked
+      //    file (`--untracked-files=all` lists every untracked file; ignored
+      //    files are not listed and are lost on removal, as K-WT accepts).
       const statusRun = await executor.run(
         ['git', '-C', worktreePath, 'status', '--porcelain', '--untracked-files=all'],
         { timeoutMs: GIT_TIMEOUT_MS },
@@ -863,9 +871,7 @@ export class WorkspaceAdapter implements WorkspacePort {
       if (removeRun.exitCode !== 0) {
         return { outcome: 'refused', reason: 'git-refused' };
       }
-      return entry.head === null
-        ? { outcome: 'unknown' }
-        : { outcome: 'removed', branchTip: entry.head };
+      return { outcome: 'removed', branchTip };
     } catch {
       return { outcome: 'unknown' };
     }

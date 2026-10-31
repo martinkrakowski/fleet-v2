@@ -15,8 +15,10 @@ import {
 import type {
   EvidenceAssessmentRecord,
   EvidenceResultValue,
+  FindingDispositionRecord,
   InspectAcceptanceEvidencePort,
   InspectAcceptanceEvidenceResult,
+  RecordFindingDispositionPort,
   RequestIndependentReviewPort,
   RequestIndependentReviewResult,
   ReviewReceiptRecord,
@@ -28,6 +30,8 @@ import type {
   FindLatestReceiptOfKindResult,
   FindReviewReceiptRequest,
   FindReviewReceiptResult,
+  RecordOutOfScopeRequest,
+  RecordOutOfScopeResult,
   ReviewRequest,
   ReviewRequestPort,
   ReviewRequestResult,
@@ -45,9 +49,14 @@ const HEAD_PATTERN = /^[0-9a-f]{40}$/;
 const REVIEW_KIND_VALUES: readonly string[] = REVIEW_KINDS;
 const BRIEF_TEXT_MAX_BYTES = 64 * 1024;
 
+/** The fixed out-of-scope reason (KF-33b2): never reviewer text. */
+const OUT_OF_SCOPE_REASON = 'not a file this lane changed (conductor scope rule)';
+
 export interface ReviewRequestDelegates {
   readonly requestIndependentReview?: RequestIndependentReviewPort['requestIndependentReview'];
   readonly inspectAcceptanceEvidence?: InspectAcceptanceEvidencePort['inspectAcceptanceEvidence'];
+  /** KF-33b2: the evidence context's disposition recorder, one id per call. */
+  readonly recordFindingDisposition?: RecordFindingDispositionPort['recordFindingDisposition'];
 }
 
 function isNonEmptyTrimmed(value: unknown): boolean {
@@ -303,5 +312,47 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       outcome: 'found',
       receipt: receiptOfKindSummaryOf(latest, latest.kind, latest.requestId ?? null),
     };
+  }
+
+  /**
+   * KF-33b2: delegate each id to the evidence context's disposition recorder
+   * with state `out-of-scope`, the fixed reason and the `scope:<head12>`
+   * evidence reference. Any rejection, throw or missing delegate refuses the
+   * whole call: fail closed, so no finding is half-dispositioned silently.
+   */
+  async recordOutOfScope(request: RecordOutOfScopeRequest): Promise<RecordOutOfScopeResult> {
+    const delegate = this.delegates.recordFindingDisposition;
+    if (
+      delegate === undefined ||
+      !HEAD_PATTERN.test(request.candidateHeadSha) ||
+      request.findingIds.length === 0 ||
+      request.findingIds.some((findingId) => !isNonEmptyTrimmed(findingId))
+    ) {
+      return { outcome: 'refused' };
+    }
+    const evidenceRef = 'scope:' + request.candidateHeadSha.slice(0, 12);
+    const recordedAtIso = request.nowIso ?? new Date().toISOString();
+    for (const findingId of request.findingIds) {
+      const disposition: FindingDispositionRecord = {
+        id: 'disp-' + request.candidateHeadSha.slice(0, 12) + '-' + findingId,
+        assessmentId: assessmentIdForAttempt(request.attemptId),
+        findingId,
+        candidateHeadSha: request.candidateHeadSha,
+        state: 'out-of-scope',
+        reason: OUT_OF_SCOPE_REASON,
+        evidenceRef,
+        recordedBy: 'conductor',
+        recordedAtIso,
+      };
+      try {
+        const answered = await delegate({ assessmentId: disposition.assessmentId, disposition });
+        if (answered.outcome !== 'recorded') {
+          return { outcome: 'refused' };
+        }
+      } catch {
+        return { outcome: 'refused' };
+      }
+    }
+    return { outcome: 'recorded' };
   }
 }

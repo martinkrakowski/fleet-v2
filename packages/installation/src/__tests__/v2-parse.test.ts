@@ -1160,6 +1160,16 @@ describe('parseInstallation v2', () => {
     });
   });
 
+  it('refuses a slot count above 4096 or one that is not a safe integer (KF-30b Fable)', () => {
+    for (const slots of [4097, 1e21]) {
+      expect(parseInstallation(withGateSlot({ path: '/usr/local/bin/gate-slot', slots }))).toEqual({
+        ok: false,
+        errors: ['hosts.lane-host.runner.gateSlot.slots: must be an integer from 1 to 4096'],
+      });
+    }
+    expect(parseInstallation(withGateSlot({ path: '/usr/local/bin/gate-slot', slots: 4096 })).ok).toBe(true);
+  });
+
   it('carries the parsed gateSlot onto the derived model runners (KF-30b)', () => {
     const gateSlot = { path: '/usr/local/bin/gate-slot', slots: 8 };
     for (const kind of ['opencode', 'agy'] as const) {

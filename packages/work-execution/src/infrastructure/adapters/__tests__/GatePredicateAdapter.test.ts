@@ -596,7 +596,7 @@ describe('GatePredicateAdapter gate slot (KF-30b)', () => {
         'cd -- "$1" && shift && exec "$@"',
         'fleet-gate',
         WORKTREE,
-        'env',
+        '/usr/bin/env',
         'FLEET_V2_GATE_SLOTS=8',
         // 30 min default budget / 3000 = 600, capped at 600.
         'FLEET_V2_GATE_WAIT_MAX_SECONDS=600',

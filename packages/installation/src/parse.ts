@@ -1044,6 +1044,9 @@ function parseAgyAcknowledgement(
   return { textVersion, acceptedAt };
 }
 
+/** The largest gate slot count `runner.gateSlot.slots` accepts. */
+const MAX_GATE_SLOTS = 4096;
+
 function parseGateSlot(
   runner: JsonObject,
   runnerPath: string,
@@ -1065,6 +1068,11 @@ function parseGateSlot(
   }
   const slots = readOptionalPositiveInteger(section, 'slots', `${fieldPath}.slots`, errors);
   if (path === undefined || slots === undefined) {
+    return undefined;
+  }
+  // gate-slot opens one lock file per slot on every poll: keep the count small and exact.
+  if (!Number.isSafeInteger(slots) || slots > MAX_GATE_SLOTS) {
+    errors.push(`${fieldPath}.slots: must be an integer from 1 to ${MAX_GATE_SLOTS}`);
     return undefined;
   }
   return { path, slots };

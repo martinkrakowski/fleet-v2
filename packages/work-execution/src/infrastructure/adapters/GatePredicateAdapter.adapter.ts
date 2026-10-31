@@ -408,7 +408,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
       ...(gateSlot === undefined
         ? []
         : [
-            'env',
+            '/usr/bin/env',
             'FLEET_V2_GATE_SLOTS=' + String(gateSlot.slots),
             'FLEET_V2_GATE_WAIT_MAX_SECONDS=' + String(waitSeconds),
             gateSlot.path,

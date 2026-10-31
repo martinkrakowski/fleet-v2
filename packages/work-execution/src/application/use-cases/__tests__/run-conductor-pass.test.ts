@@ -1128,7 +1128,6 @@ describe('RunConductorPassUseCase session-start gate (KF-34a1)', () => {
 describe('RunConductorPassUseCase real advance (KF-34a2)', () => {
   const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
   const COMMIT = 'a'.repeat(40);
-  const SHA = 'c'.repeat(64);
   // SEC-5b-2: the frozen brief the harness serves, and the digest that verifies it.
   const BRIEF_PROSE = '# Task\n\nExample lane brief.\n';
   const FROZEN_MANIFEST_JSON = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });

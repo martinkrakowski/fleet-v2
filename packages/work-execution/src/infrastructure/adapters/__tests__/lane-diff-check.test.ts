@@ -938,6 +938,56 @@ describe("LaneDiffCheckAdapter", () => {
       ]);
     });
 
+    it("a forged base blob served with exit 0 is caught by the re-hash, not git's own checks", async () => {
+      // KF-27b overwrites the loose base blob file; git itself could reject
+      // the tampered object on read, so that test would pass even without
+      // the re-hash. Here the forged bytes are served by the executor with
+      // exit 0 for exactly the base blob's 40-hex id, so git never sees the
+      // tampered object: only readVerifiedObject's re-hash can catch it.
+      const repo = makeFixtureRepo();
+      writeFileSync(
+        join(repo, "packages/x/src/a.ts"),
+        `export const a = 1;\nconst fixture = "${tok}";\nexport const a = 2;\n`,
+      );
+      // Stage the change: the index blob then differs from the base blob,
+      // so the forged object is served only for the base read.
+      git(repo, "add", "packages/x/src/a.ts");
+      const sha = base(repo);
+      const blobSha = execFileSync(
+        "git",
+        ["rev-parse", `${sha}:packages/x/src/a.ts`],
+        { cwd: repo, encoding: "utf8" },
+      ).trim();
+      const forged = `const fixture = "${tok}";\nconst fixture = "${tok}";\n`;
+      const local = new LocalExecutor();
+      const forgedBase = {
+        async run(argv: readonly string[], options?: { cwd?: string; input?: string }) {
+          if (
+            argv.includes("cat-file") &&
+            argv.includes("blob") &&
+            argv.includes(blobSha)
+          ) {
+            return { exitCode: 0, signal: null, stdout: forged, stderr: "" };
+          }
+          return local.run(argv, options as never);
+        },
+      };
+      const result = await new LaneDiffCheckAdapter(forgedBase).checkLaneDiff({
+        worktreePath: repo,
+        baseCommit: sha,
+        allowedPathPrefixes: PREFIXES,
+      });
+      if (result.outcome !== "findings")
+        throw new Error(`expected findings, got ${result.outcome}`);
+      expect(result.findings).toEqual([
+        {
+          path: "packages/x/src/a.ts",
+          line: 2,
+          rule: "secret-pattern:github-token",
+        },
+      ]);
+    });
+
     it("a base that is not an ancestor of HEAD excuses nothing (KF-27b)", async () => {
       // An orphan commit holds the same fixture line in the same path, but
       // it sits on an unrelated root: merge-base --is-ancestor fails, and

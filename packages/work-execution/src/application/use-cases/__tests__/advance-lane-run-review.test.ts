@@ -818,6 +818,68 @@ describe('AdvanceLaneRunUseCase review reconcile (K5-4b)', () => {
     expect(harness.reviewRequests[1]!.requestId).not.toBe(firstRequestId);
   });
 
+  it('a receipt with an unknown verdict retries the same seat once at the same head, then a passed receipt enters accepting', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    // The brief-check passes so the run reaches code-review; the review under test is code-review.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted', step: 'brief-check', key: reviewKey('brief-check', 0, HEAD12_A), result: 'completed', reasonCode: 'review-passed',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
+    harness.setReviewAnswer(async (r) => ({ outcome: 'receipt', receipt: receiptFor(r, 'unknown') }));
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'code-review',
+      key: reviewKey('code-review', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-unknown',
+    });
+    // One brief-check request (its answer defaults to passed) plus the code-review request under test.
+    expect(harness.reviewRequests).toHaveLength(2);
+    const firstRequestId = harness.reviewRequests[1]!.requestId;
+    harness.setReviewAnswer(async (r) => ({ outcome: 'receipt', receipt: receiptFor(r, 'passed') }));
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'code-review',
+      key: reviewKey('code-review', 0, HEAD12_A, 1),
+      result: 'completed',
+      reasonCode: 'review-passed',
+    });
+    // Brief-check (default passed) plus the two code-review requests under test.
+    expect(harness.reviewRequests).toHaveLength(3);
+    expect(harness.reviewRequests[2]!.requestId).not.toBe(firstRequestId);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'accepting' });
+  });
+
+  it('a receipt with an unknown verdict twice parks ambiguous with the review step as qualifier after the one retry', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    // The brief-check passes so the run reaches code-review; the review under test is code-review.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted', step: 'brief-check', key: reviewKey('brief-check', 0, HEAD12_A), result: 'completed', reasonCode: 'review-passed',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
+    harness.setReviewAnswer(async (r) => ({ outcome: 'receipt', receipt: receiptFor(r, 'unknown') }));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'code-review',
+      key: reviewKey('code-review', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-unknown',
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'code-review',
+      key: reviewKey('code-review', 0, HEAD12_A, 1),
+      result: 'completed',
+      reasonCode: 'review-unknown',
+    });
+    expect(harness.reviewRequests).toHaveLength(3);
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'code-review' });
+  });
+
   it('an unavailable receipt parks the run ambiguous with the review step as qualifier', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'brief-check', NOW);

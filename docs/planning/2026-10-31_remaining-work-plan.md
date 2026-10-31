@@ -267,7 +267,7 @@ Six Tier 2 hand-run lanes (see the table above) run behind #525–#531, in work-
   - **D-R4:** the brief author (the orchestrator) writes the touch list, checked by `lane-diff-check --strict-brief`. A lane never widens its own list. Recommended: yes.
   - **D-R5:** enforce `maxConcurrentLanes` for hand reserves. Recommended: yes.
 - **PRs:** 11 (10 T2, 1 T0).
-- **Wall:** about 9 h. The chain is 7 deep. Dividing 10 Tier 2 lanes by 3 in flight would give only about 4 h, so the chain is what binds. Train ≈ 1 h after S5.
+- **Wall:** about 11 h. With each pair collapsed, the chain is 9 deep (KM, the KS2/KS4a stage, the KS3/KS4b stage, KS5, KS6, AD-1, AD-2, EX-3b, EX-3c); fully serial it is 11 deep, about 14 h. Dividing 10 Tier 2 lanes by 3 in flight would give only about 4 h, so the chain is what binds. Train ≈ 1 h after S5.
 - **Result:** the conductor admits several work-execution lanes at once when their files don't overlap.
 
 ### Wave 3: cleanup and reaper
@@ -288,7 +288,7 @@ Six Tier 2 hand-run lanes (see the table above) run behind #525–#531, in work-
   - **D-R6:** keep the D14/D17 opt-ins off by default. The briefed flags stand in until KWp's keys exist. Turn the opt-ins on after ten dry-run passes have matched the manual rule. Recommended: yes.
   - **D-R7:** drop K8. Recommended: yes.
 - **PRs:** 9 (8 T2, 1 T1).
-- **Wall:** about 5–6 h. The chain is 4 deep: K10 → K11a → KW4a → KW4b'.
+- **Wall:** about 6–7 h. The chain is 5 deep: K10 → K11a → KW2 → KW3' → KW4b' (KW4b' waits on both KW4a and KW3').
 
 ### Wave 4: reliability, versioning, seats, telemetry
 | Unit | Tier | Lanes | Run as |
@@ -305,7 +305,7 @@ Six Tier 2 hand-run lanes (see the table above) run behind #525–#531, in work-
 | F2 hexagen-state probe | T2 | 1 | hand-run |
 | P1, P3 (T1); P2 (T2) | mixed | 3 | mixed |
 | B1 `claimKind` | T2 | 1 | hand-run (brief-knowledge) |
-| MX8, O11, H13, O12' | T1 | 4 | conducted (idle packages) |
+| MX8, O11, H13, O12' | T1 | 4 | conducted (idle packages); the `gate.yml` step of O12' rides in the Q8b T0 PR |
 
 - **Prerequisites:** Wave 2 (KS5) for Q3 to run in parallel; Wave 3 for SR7's composition slot. Verify H10 in this wave.
 - **Decisions:**
@@ -351,7 +351,10 @@ Every unit sits on exactly one sequence, and Tier 1 units are conducted when the
 - **installation:** WB6p (T1), any time.
 - **T0:** the TDM manifest (before TD2) and the TD-R docs.
 
-KW6 is one lane holding the api slot after A-F and the web slot after W7c. It starts when both are free.
+**Join rule.** A unit listed on two sequences is **one lane**. It starts only when both of its predecessors have merged, and it holds both slots while it runs:
+- **A-F:** after WB6w → TD6 (work-execution) and after WB8w (api).
+- **KW6:** after A-F (api) and after W7c (web).
+- **MX7:** after A-K (api) and after MX4 (mcp).
 
 - **Prerequisites:** Wave 5 (WB13a for the writes the reads link to; A-R/A-C for W7a); Wave 3 (K11a) for A-F; E4 before O10.
 - **Decisions:**
@@ -361,7 +364,7 @@ KW6 is one lane holding the api slot after A-F and the web slot after W7c. It st
   - 44 T2: 7 to-do, 16 board core, 4 waits-for, 3 notifications, 3 run board, 11 reads.
   - 9 T1: TD3b, TD5b, WB6p, WB8w, WB9b, WB10, WB12b, MX5a, MX5b.
   - 2 T0.
-- **Wall:** about 21 h, or 2.5–3 working days. The work-execution chain is 17 deep; 44 Tier 2 lanes ÷ 3 × 75 min would be 18 h. Train ≈ 5 h after S5, 9 h today.
+- **Wall:** about 26 h, or 3–3.5 working days. The binding path is the 17-deep work-execution chain through A-F, followed by the api tail KW6 → A-K → MX7 → U7 → U1 (22 deep). 44 Tier 2 lanes ÷ 3 × 75 min would be 18 h. Train ≈ 5 h after S5, 9 h today.
 
 ### Wave 7: UI and TUI tail, settings pages, live tail, ops
 | Group | Units | Lanes |
@@ -386,24 +389,24 @@ KW6 is one lane holding the api slot after A-F and the web slot after W7c. It st
   - **D-R16:** archive the structure-and-process proposal as not scheduled. Recommended: yes.
   - **D-R17:** F6 and MX9 wait for a hexagen release. Recommended: yes.
 - **PRs:** 43 (34 T2, 5 T1, 4 T0; one more if H10 is kept).
-- **Wall:** about 24 h, or 3 working days. The apps/web sequence, 19 deep, binds. Train ≈ 4 h after S5.
+- **Wall:** about 29 h, or 3.5–4 working days. The 19-deep apps/web sequence binds, and the four serial P5 ops lanes add about 5 h after it. Train ≈ 4 h after S5.
 
 ### Totals (from the tables)
 | Wave | PRs | T2 | T1 | T0 | Wall |
 |---|---|---|---|---|---|
 | 0 | 6 (+7 in train) | 6 | 0 | 0 | ~4 h |
 | 1 | 6 | 2 | 3 | 1 | 3–4 h |
-| 2 | 11 | 10 | 0 | 1 | ~9 h |
-| 3 | 9 | 8 | 1 | 0 | 5–6 h |
+| 2 | 11 | 10 | 0 | 1 | ~11 h |
+| 3 | 9 | 8 | 1 | 0 | 6–7 h |
 | 4 | 34 | 13 | 18 | 3 | ~10 h |
 | 5 | 20 | 16 | 4 | 0 | 8–10 h |
-| 6 | 55 | 44 | 9 | 2 | ~21 h |
-| 7 | 43 | 34 | 5 | 4 | ~24 h |
-| **All** | **184** | **133** | **40** | **11** | **~85–88 h** |
+| 6 | 55 | 44 | 9 | 2 | ~26 h |
+| 7 | 43 | 34 | 5 | 4 | ~29 h |
+| **All** | **184** | **133** | **40** | **11** | **~98–101 h** |
 
 - **Pure train time:** 184 PRs × 10 min ≈ 31 h today; × 5.5 min ≈ 17 h after S5.
 - **Hand-run Tier 2 floor:** 133 lanes × 75 min ÷ 3 in flight ≈ 55 h, about 7 working days.
-- **Overall:** the chain-bound waves push the sum of wave walls to about 85–88 h, **about 11 working days, or two to three calendar weeks**. From Wave 2 on, the bottleneck is Tier 2 hand-run throughput, not the train.
+- **Overall:** the chain-bound waves push the sum of wave walls to about 98–101 h, **about 12–13 working days, or roughly three calendar weeks**. From Wave 2 on, the bottleneck is Tier 2 hand-run throughput, not the train.
 
 ## 3. How the train's speed-up changes the later waves
 - **S5a (macOS beside CI):** about 10 → 6–7 min per PR. Train time in Waves 4–7 falls by about 35%.
@@ -535,3 +538,11 @@ KW6 is one lane holding the api slot after A-F and the web slot after W7c. It st
   - L7/L8 deferred until T4 is scheduled.
 
 There was no public-safety finding.
+
+A re-check confirmed 13 of the 14 findings closed. It then corrected the remaining depth and wall arithmetic:
+- Wave 2 is 9 deep (about 11 h).
+- Wave 3 is 5 deep.
+- Wave 6 includes its api tail (about 26 h).
+- Wave 7 includes the ops lanes (about 29 h).
+
+It also stated the join rule for A-F, KW6 and MX7, and placed the workflow step of O12' in a PR.

@@ -739,4 +739,47 @@ describe('nonPassingGatePredicatesOf', () => {
       { name: 'commit', kind: 'commit', verdict: 'fail', exitCode: null },
     ]);
   });
+
+  it('reads the highest stored run: a failing /g1 predicate replaces run 0 congestion (KF-30c2)', () => {
+    const entries: ActionJournalEntryRecord[] = [
+      // Run 0: congested (an unknown gate-slot predicate) — recovered by /g1.
+      predicateEntry(headA, 1, { name: 'commit', kind: 'commit', verdict: 'pass', exitCode: null, durationMs: 1, detail: 'ok' }),
+      gateJournalEntry({
+        id: `attempt-1:accept:${headA}:2`,
+        status: 'ambiguous',
+        detail: JSON.stringify({ predicate: 'diff-check', kind: 'diff-check', verdict: 'unknown', exitCode: 75, durationMs: 1, detail: 'gate slot wait limit reached', cause: 'gate-slot-wait-limit' }),
+      }),
+      // Run 1 under /g1: diff-check fails for real.
+      gateJournalEntry({
+        id: `attempt-1:accept:${headA}/g1:0`,
+        status: 'intent-recorded',
+      }),
+      gateJournalEntry({
+        id: `attempt-1:accept:${headA}/g1:1`,
+        status: 'completed',
+        detail: JSON.stringify({ predicate: 'commit', kind: 'commit', verdict: 'pass', exitCode: null, durationMs: 1, detail: 'ok' }),
+      }),
+      gateJournalEntry({
+        id: `attempt-1:accept:${headA}/g1:2`,
+        status: 'refused',
+        detail: JSON.stringify({ predicate: 'diff-check', kind: 'diff-check', verdict: 'fail', exitCode: 2, durationMs: 1, detail: 'bad diff' }),
+      }),
+    ];
+    expect(nonPassingGatePredicatesOf(entries, 'attempt-1', headA)).toEqual([
+      { name: 'diff-check', kind: 'diff-check', verdict: 'fail', exitCode: 2 },
+    ]);
+  });
+
+  it('returns the run-0 congestion when a later run is not stored (KF-30c2)', () => {
+    const entries: ActionJournalEntryRecord[] = [
+      gateJournalEntry({
+        id: `attempt-1:accept:${headA}:2`,
+        status: 'ambiguous',
+        detail: JSON.stringify({ predicate: 'diff-check', kind: 'diff-check', verdict: 'unknown', exitCode: 75, durationMs: 1, detail: 'gate slot wait limit reached', cause: 'gate-slot-wait-limit' }),
+      }),
+    ];
+    expect(nonPassingGatePredicatesOf(entries, 'attempt-1', headA)).toEqual([
+      { name: 'diff-check', kind: 'diff-check', verdict: 'unknown', exitCode: 75 },
+    ]);
+  });
 });

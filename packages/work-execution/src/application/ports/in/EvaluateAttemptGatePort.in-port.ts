@@ -12,7 +12,7 @@ export interface EvaluateAttemptGateRequest {
   /** The exact collected head; any other head is `unknown`. */
   readonly candidateHeadSha: string;
   /**
-   * Retry run number for this head: an integer 1–9; absent means run 0.
+   * Retry run number for this head: an integer 1–9; absent means the latest stored run (run 0 when none is stored).
    * Each run journals under its own prefix, so a congested run never seals
    * the head against a later run. Out-of-range values return `unknown` and
    * run nothing.

@@ -52,7 +52,10 @@ import type {
   RecordGateReceiptsRequest,
   RecordGateReceiptsResult,
 } from '../../ports/out/GateReceiptPort.out-port.js';
+import type { GatePredicatePort, EvaluateGatePredicatesResult } from '../../ports/out/GatePredicatePort.out-port.js';
 import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-port.js';
+import { RequestAttemptAcceptanceUseCase } from '../RequestAttemptAcceptanceUseCase.use-case.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
@@ -919,6 +922,238 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       reasonCode: 'gate-unknown',
     });
     expect(await advance(hUnknown)).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'gate' });
+  });
+
+  it('test 8c: a congested gate run records gate-congested, waits the backoff, then retries under /retry1 and passes into brief-check', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+    const harness = await makeHarness(runRecord(), [collected]);
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+    harness.setGateAnswer({ verdict: 'unknown', reason: 'gate slot wait limit reached', congested: true });
+
+    // Run 0: congestion is completed (never ambiguous) and the run is not parked.
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: gateKey(),
+      result: 'completed',
+      reasonCode: 'gate-congested',
+    });
+    expect(harness.gateRequests).toEqual([{ attemptId: 'attempt-example-1', candidateHeadSha: COMMIT }]);
+
+    // Within the backoff the decider waits, never parks.
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'gate-congested' });
+
+    // After the backoff the next advance acts the gate under /retry1, passing gateRun 1.
+    const retryBuilt = buildLaneRunStepKey({
+      runId: RUN_ID,
+      round: 0,
+      step: 'gate',
+      seatIndex: 0,
+      attemptOrdinal: null,
+      head12: HEAD12,
+      retry: 1,
+    });
+    expect(retryBuilt.ok).toBe(true);
+    if (!retryBuilt.ok) {
+      throw new Error('fixture must build a retry gate key');
+    }
+    const retryKey = retryBuilt.key;
+    harness.setGateAnswer({ verdict: 'passed', results: [] });
+    const second = await advance(harness, { nowIso: '2026-10-27T10:02:01.000Z' });
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: retryKey,
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    expect(harness.gateRequests).toEqual([
+      { attemptId: 'attempt-example-1', candidateHeadSha: COMMIT },
+      { attemptId: 'attempt-example-1', candidateHeadSha: COMMIT, gateRun: 1 },
+    ]);
+    // The retry's journal entries exist under /retry1: run 0 never sealed the head.
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'intent' && entry.key === retryKey)).toBe(true);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.key === retryKey && entry.reasonCode === 'gate-passed')).toBe(true);
+
+    // A pass then enters brief-check.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
+  });
+
+  it('test 8d: repeated congestion retries to the bound and then parks ambiguous gate', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS });
+    const harness = await makeHarness(runRecord(), [collected]);
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+    harness.setGateAnswer({ verdict: 'unknown', reason: 'gate slot wait limit reached', congested: true });
+
+    // Run 0 is congested (recorded at LATER by the default advance) and never parks.
+    expect(await advance(harness)).toMatchObject({
+      outcome: 'acted', step: 'gate', result: 'completed', reasonCode: 'gate-congested',
+    });
+
+    // The retry sequence spans the 60s backoffs, so extend the run lease past it
+    // (the lease window is bounded at 10 minutes).
+    const renewed = await harness.runRepo.renewLease(RUN_ID, {
+      holderId: HOLDER,
+      fence: 1,
+      leaseUntilIso: '2026-10-27T10:10:00.000Z',
+      nowIso: NOW,
+    });
+    expect(renewed.outcome).toBe('saved');
+
+    // Retries 1..6, each past the backoff, all congested; never parked.
+    let tick = Date.parse('2026-10-27T10:02:01.000Z');
+    for (let n = 1; n <= 6; n += 1) {
+      const acted = await advance(harness, { nowIso: new Date(tick).toISOString() });
+      expect(acted).toMatchObject({
+        outcome: 'acted', step: 'gate', result: 'completed', reasonCode: 'gate-congested',
+      });
+      tick += 61_000;
+    }
+
+    // Past the bound the next advance parks ambiguous at the gate.
+    expect(await advance(harness, { nowIso: new Date(tick).toISOString() })).toEqual({
+      outcome: 'parked', reason: 'ambiguous', qualifier: 'gate',
+    });
+  });
+
+  it('test 8e (KF-30c2, real path): a real gate recovers a congested run under /retry1 and journals /g1 predicates', async () => {
+    // A real RequestAttemptAcceptanceUseCase over the harness's execution
+    // journal: its first evaluation hits a gate-slot congestion, its second
+    // passes. The conductor's gate step runs it through AdvanceLaneRunUseCase,
+    // so the run waits out the backoff and the retry reads /retry1.
+    const GATE_PROSE = '# Brief\n';
+    const GATE_SPEC = { commitRequired: true, diffCheck: true, commands: [{ argv: ['corepack', 'yarn', 'build'] }] };
+    const GATE_MANIFEST = JSON.stringify({
+      baseCommit: COMMIT,
+      allowedPathPrefixes: ['src'],
+      acceptanceSpec: GATE_SPEC,
+    });
+    const gateAttempt = attemptFixture({
+      state: 'collected',
+      artifacts: COLLECTED_ARTIFACTS,
+      briefDigest: simpleDeterministicHexDigest(GATE_PROSE + '\n' + GATE_MANIFEST),
+    });
+    const harness = await makeHarness(runRecord(), [gateAttempt]);
+    harness.setManifestVerdict('sealed');
+
+    class FlakyGatePredicatePort implements GatePredicatePort {
+      private calls = 0;
+      async evaluateGatePredicates(): Promise<EvaluateGatePredicatesResult> {
+        this.calls += 1;
+        const verdict: GatePredicateResult['verdict'] = this.calls === 1 ? 'unknown' : 'pass';
+        return {
+          outcome: 'evaluated',
+          results: [
+            { name: 'commit', kind: 'commit', verdict: 'pass', exitCode: null, durationMs: 1, detail: 'head ' + COMMIT },
+            { name: 'diff-check', kind: 'diff-check', verdict: 'pass', exitCode: null, durationMs: 1, detail: 'clean' },
+            {
+              name: 'command 1: corepack yarn build',
+              kind: 'command',
+              verdict,
+              exitCode: this.calls === 1 ? 75 : 0,
+              durationMs: 1,
+              detail: this.calls === 1 ? 'gate slot wait limit reached' : 'exit 0',
+              ...(this.calls === 1 ? { cause: 'gate-slot-wait-limit' as const } : {}),
+            },
+          ],
+        };
+      }
+    }
+    const realGate = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: harness.attemptRepo,
+      acceptancePort: {
+        assessHeadAcceptance: async () => {
+          throw new Error('not used by this test');
+        },
+        assessHeadReceipts: async () => {
+          throw new Error('not used by this test');
+        },
+      },
+      artifactPort: {
+        readBriefFile: async () => GATE_PROSE,
+        readBriefManifest: async () => GATE_MANIFEST,
+      },
+      gatePredicates: new FlakyGatePredicatePort(),
+      journal: harness.executionJournal,
+    });
+    const wired = {
+      evaluateAttemptGate: async (request: Parameters<typeof realGate.evaluateAttemptGate>[0]) => {
+        (harness.gateRequests as EvaluateAttemptGateRequest[]).push(request);
+        return realGate.evaluateAttemptGate(request);
+      },
+    };
+    Object.assign(harness.deps, { evaluateAttemptGate: wired });
+
+    await conduct(harness, 'gating', NOW);
+
+    // Run 0: the real gate is congested and the conductor records it completed.
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: gateKey(),
+      result: 'completed',
+      reasonCode: 'gate-congested',
+    });
+    expect(harness.gateRequests).toEqual([{ attemptId: 'attempt-example-1', candidateHeadSha: COMMIT }]);
+
+    // Within the backoff the run waits.
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'gate-congested' });
+
+    // After the backoff the next advance re-runs under /retry1 and passes.
+    const retryBuilt = buildLaneRunStepKey({
+      runId: RUN_ID,
+      round: 0,
+      step: 'gate',
+      seatIndex: 0,
+      attemptOrdinal: null,
+      head12: HEAD12,
+      retry: 1,
+    });
+    expect(retryBuilt.ok).toBe(true);
+    if (!retryBuilt.ok) {
+      throw new Error('fixture must build a retry gate key');
+    }
+    const second = await advance(harness, { nowIso: '2026-10-27T10:02:01.000Z' });
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: retryBuilt.key,
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    expect(harness.gateRequests).toEqual([
+      { attemptId: 'attempt-example-1', candidateHeadSha: COMMIT },
+      { attemptId: 'attempt-example-1', candidateHeadSha: COMMIT, gateRun: 1 },
+    ]);
+
+    // The execution journal holds the /g1 predicate entries and run 0's are
+    // unchanged (still the congestion, with its cause).
+    const journalEntries = await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1');
+    const g1 = journalEntries.filter((entry) => entry.id.startsWith(`attempt-example-1:accept:${COMMIT}/g1:`));
+    expect(g1.map((entry) => entry.id)).toEqual([
+      `attempt-example-1:accept:${COMMIT}/g1:0`,
+      `attempt-example-1:accept:${COMMIT}/g1:1`,
+      `attempt-example-1:accept:${COMMIT}/g1:2`,
+      `attempt-example-1:accept:${COMMIT}/g1:3`,
+    ]);
+    const run0 = journalEntries.filter((entry) => entry.id.startsWith(`attempt-example-1:accept:${COMMIT}:`));
+    expect(run0.map((entry) => entry.id)).toEqual([
+      `attempt-example-1:accept:${COMMIT}:0`,
+      `attempt-example-1:accept:${COMMIT}:1`,
+      `attempt-example-1:accept:${COMMIT}:2`,
+      `attempt-example-1:accept:${COMMIT}:3`,
+    ]);
+    expect(run0[3]).toMatchObject({ status: 'ambiguous' });
+    expect(JSON.parse(run0[3]?.detail ?? '{}')).toMatchObject({
+      predicate: 'command 1: corepack yarn build',
+      verdict: 'unknown',
+      cause: 'gate-slot-wait-limit',
+    });
   });
 
   it('test 8b: a gating run whose collection is not sealed parks artifacts-unsealed and never gates', async () => {

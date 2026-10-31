@@ -36,6 +36,12 @@ import { SEAT_TRIGGER_CLASSES } from './value-objects/StopReason.vo.js';
 import type { StopReasonValue } from './value-objects/StopReason.vo.js';
 import type { AttemptStateValue } from './value-objects/AttemptState.vo.js';
 
+/** Minimum wait after a congested gate result before the gate is re-run (KF-30c2). */
+export const GATE_CONGESTION_BACKOFF_MS = 60_000;
+
+/** Maximum gate retry runs beyond run 0 (KF-30c2); below LANE_RUN_MAX_RETRY. */
+export const GATE_CONGESTION_MAX_RETRIES = 6;
+
 /** A seat the caller chose with selectSeat / selectReviewSeat (S1a), or none eligible. */
 export type LaneRunSeatFact = { readonly ok: true; readonly seatIndex: number } | { readonly ok: false };
 
@@ -114,7 +120,13 @@ export interface LaneRunFacts {
   /** Head of the run's last `accepted` acceptance (K1b). */
   readonly acceptedHead12: string | null;
   /** Gate result at `head12`; `unknown` is not a pass (K4, S2b). */
-  readonly gate: 'none' | 'pending' | 'passed' | 'failed' | 'unknown';
+  readonly gate: 'none' | 'pending' | 'passed' | 'failed' | 'unknown' | 'congested';
+  /**
+   * The congested gate run at `head12` (KF-30c2): its retry (0 = run 0) and
+   * the `gate-congested` result's time, or null when the latest gate result
+   * is not a congestion. Non-null only when `gate === 'congested'`.
+   */
+  readonly gateCongestion: { readonly retry: number; readonly atIso: string } | null;
   /** Receipts per (reviewer, kind) at `head12` (RW1) (PC/K5). */
   readonly briefCheck: LaneRunReviewFact;
   readonly codeReview: LaneRunReviewFact;
@@ -166,7 +178,8 @@ export type LaneRunWaitReason =
   | 'admission' | 'dispatch-pending' | 'lane-running' | 'prior-not-ended' | 'gate-pending'
   | 'review-pending' | 'premerge-pending' | 'ci-pending' | 'ci-unknown' | 'merge-train' | 'parked'
   | 'session-stagger'
-  | 'stop-unconfirmed' | 'facts-inconsistent' | 'stop-draining' | 'stop-grace-exceeded';
+  | 'stop-unconfirmed' | 'facts-inconsistent' | 'stop-draining' | 'stop-grace-exceeded'
+  | 'gate-congested';
 
 export type LaneRunDecision =
   | { readonly kind: 'act'; readonly step: LaneRunKeyStep; readonly key: string; readonly round: number;
@@ -485,6 +498,42 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       }
       if (facts.gate === 'pending') {
         return wait('gate-pending');
+      }
+      // T6 (KF-30c2): a congested gate waits out the backoff, then re-runs
+      // the gate under a retry key (same round, seat and head as the attempt),
+      // bounded by GATE_CONGESTION_MAX_RETRIES; past the bound it parks
+      // `ambiguous` at the gate, exactly as an unknown gate parks today.
+      if (facts.gate === 'congested') {
+        const congestion = facts.gateCongestion;
+        // Malformed congestion facts fail closed to the inconsistent-facts
+        // wait: an unparseable time or a retry that is not a non-negative
+        // safe integer can neither bound the backoff nor the retries.
+        if (
+          congestion === null ||
+          Number.isNaN(Date.parse(congestion.atIso)) ||
+          !Number.isSafeInteger(congestion.retry) ||
+          congestion.retry < 0
+        ) {
+          return WAIT_FACTS_INCONSISTENT;
+        }
+        if (now < Date.parse(congestion.atIso) + GATE_CONGESTION_BACKOFF_MS) {
+          return wait('gate-congested');
+        }
+        if (congestion.retry + 1 <= GATE_CONGESTION_MAX_RETRIES) {
+          const attempt = facts.attempt;
+          if (attempt === null) {
+            return WAIT_FACTS_INCONSISTENT;
+          }
+          return act({
+            step: 'gate',
+            round: attempt.round,
+            seatIndex: attempt.seatIndex,
+            head12: facts.head12,
+            retry: congestion.retry + 1,
+            attemptOrdinal: null,
+          });
+        }
+        return park('ambiguous', 'gate');
       }
       if (facts.gate === 'unknown') {
         return park('ambiguous', 'gate');
@@ -826,7 +875,11 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
     if (facts.stopMode === 'graceful') {
       const phase = facts.attempt === null ? null : facts.attempt.phase;
       const live = phase === 'dispatching' || phase === 'running' || phase === 'blocked';
-      const drainContinues = laneRunDrainContinues(facts.state, facts.gate);
+      // A congested gate is a decided gate: the drain treats it like any other
+      // decided gate (nothing more to drain), not like a running gate.
+      const drainGate: Exclude<LaneRunFacts['gate'], 'congested'> =
+        facts.gate === 'congested' ? 'unknown' : facts.gate;
+      const drainContinues = laneRunDrainContinues(facts.state, drainGate);
       const drainWait = (): LaneRunDecision => {
         if (facts.stopRequestedAtIso === null || Number.isNaN(Date.parse(facts.stopRequestedAtIso))) {
           return wait('stop-grace-exceeded');

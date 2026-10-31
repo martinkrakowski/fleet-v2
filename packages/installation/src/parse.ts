@@ -22,6 +22,7 @@ import type {
   FleetInstallationV2,
   ForgeSection,
   ForgeSectionV2,
+  GateSlotSection,
   HostRole,
   HostSection,
   HostRunnerSection,
@@ -124,7 +125,9 @@ const HOST_RUNNER_KEYS: readonly string[] = [
   'authFile',
   'capabilities',
   'maxLanes',
+  'gateSlot',
 ];
+const GATE_SLOT_KEYS: readonly string[] = ['path', 'slots'];
 // An agy runner carries the mode and, for `full`, the security acknowledgement (D7).
 const AGY_HOST_RUNNER_KEYS: readonly string[] = [
   ...HOST_RUNNER_KEYS,
@@ -1041,6 +1044,40 @@ function parseAgyAcknowledgement(
   return { textVersion, acceptedAt };
 }
 
+/** The largest gate slot count `runner.gateSlot.slots` accepts. */
+const MAX_GATE_SLOTS = 4096;
+
+function parseGateSlot(
+  runner: JsonObject,
+  runnerPath: string,
+  errors: string[],
+): GateSlotSection | undefined {
+  if (!Object.hasOwn(runner, 'gateSlot')) {
+    return undefined;
+  }
+  const section = runner.gateSlot;
+  const fieldPath = `${runnerPath}.gateSlot`;
+  if (!isJsonObject(section)) {
+    errors.push(`${fieldPath}: must be an object`);
+    return undefined;
+  }
+  collectUnknownKeys(section, GATE_SLOT_KEYS, fieldPath, errors);
+  const path = readRequiredAbsolutePath(section, 'path', `${fieldPath}.path`, errors);
+  if (!Object.hasOwn(section, 'slots')) {
+    errors.push(`${fieldPath}.slots: required`);
+  }
+  const slots = readOptionalPositiveInteger(section, 'slots', `${fieldPath}.slots`, errors);
+  if (path === undefined || slots === undefined) {
+    return undefined;
+  }
+  // gate-slot opens one lock file per slot on every poll: keep the count small and exact.
+  if (!Number.isSafeInteger(slots) || slots > MAX_GATE_SLOTS) {
+    errors.push(`${fieldPath}.slots: must be an integer from 1 to ${MAX_GATE_SLOTS}`);
+    return undefined;
+  }
+  return { path, slots };
+}
+
 function parseHostRunner(
   runner: JsonObject,
   runnerPath: string,
@@ -1077,6 +1114,7 @@ function parseHostRunner(
     `${runnerPath}.maxLanes`,
     errors,
   );
+  const gateSlot = parseGateSlot(runner, runnerPath, errors);
   let agyMode: 'edit-only' | 'full' | undefined;
   let agyAcknowledgement:
     { textVersion: string; acceptedAt: string } | undefined;
@@ -1120,6 +1158,7 @@ function parseHostRunner(
     ...(authFile !== undefined ? { authFile } : {}),
     ...(capabilities !== undefined ? { capabilities } : {}),
     ...(maxLanes !== undefined ? { maxLanes } : {}),
+    ...(gateSlot !== undefined ? { gateSlot } : {}),
   };
   if (kind === 'agy') {
     if (agyMode === undefined) {

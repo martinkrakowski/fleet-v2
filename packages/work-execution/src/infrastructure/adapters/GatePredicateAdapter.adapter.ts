@@ -26,6 +26,14 @@ import type {
   CommandRunResult,
 } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
+
+/** The trusted host-wide gate slot a host may declare (KF-30b). */
+export interface GateSlotConfiguration {
+  /** Absolute path of the host-installed `gate-slot` wrapper. */
+  readonly path: string;
+  /** The host-wide slot budget; equal to the hand-run gate's `FLEET_V2_GATE_SLOTS`. */
+  readonly slots: number;
+}
 import { LaneDiffCheckAdapter } from './LaneDiffCheckAdapter.adapter.js';
 import type {
   LaneDiffCheckPort,
@@ -60,6 +68,12 @@ export interface GatePredicateAdapterOptions {
 const COMMIT_PATTERN = /^[0-9a-f]{40,64}$/;
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
+/** The fixed last stderr line `bin/gate-slot` prints when no slot freed up (KF-30a). */
+const GATE_SLOT_WAIT_LIMIT_LINE = 'gate-slot: no slot within the wait limit';
+const GATE_SLOT_EXIT_CODE = 75;
+/** The slot wait may use at most a third of the command budget, capped at 600 s. */
+const GATE_SLOT_MAX_WAIT_SECONDS = 600;
+const GATE_SLOT_WAIT_DIVISOR_MS = 3000;
 const GIT_TIMEOUT_MS = 60 * 1000;
 const GIT_HARDENING: readonly string[] = [
   '-c',
@@ -71,6 +85,13 @@ const GIT_HARDENING: readonly string[] = [
 /** A run that never reported a completed exit is not a verdict. */
 function gitFailed(run: CommandRunResult): boolean {
   return run.error !== undefined || run.exitCode === null;
+}
+
+/** The last stderr line after stripping one trailing newline, trimmed. */
+function lastStderrLine(stderr: string): string {
+  const stripped = stderr.replace(/\r?\n$/, '');
+  const lines = stripped.split(/\r?\n/);
+  return (lines[lines.length - 1] ?? '').trim();
 }
 
 function skipped(name: string, kind: GatePredicateKind): GatePredicateResult {
@@ -163,6 +184,15 @@ export class GatePredicateAdapter implements GatePredicatePort {
       return { outcome: 'unavailable', reason: resolved.reason };
     }
     const executor = resolved.executor;
+    // KF-30b: the host's declared gate-slot throttle. Absent means the
+    // command runs exactly as before, without any prefix.
+    const gateSlot: GateSlotConfiguration | undefined =
+      resolved.hostSpec?.runner?.gateSlot === undefined
+        ? undefined
+        : {
+            path: resolved.hostSpec.runner.gateSlot.path,
+            slots: resolved.hostSpec.runner.gateSlot.slots,
+          };
 
     const commit = await this.commitPredicate(executor, request);
     const diff =
@@ -178,7 +208,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
             diff.verdict !== 'pass' || done.some((result) => result.verdict !== 'pass');
           const next = blocked
             ? skipped(commandName(command, index), 'command')
-            : await this.runCommand(executor, request.worktreePath, command, index);
+            : await this.runCommand(executor, request.worktreePath, command, index, gateSlot);
           return [...done, next];
         }),
       initial,
@@ -353,19 +383,45 @@ export class GatePredicateAdapter implements GatePredicatePort {
     worktreePath: string,
     command: GateCommand,
     index: number,
+    gateSlot: GateSlotConfiguration | undefined,
   ): Promise<GatePredicateResult> {
     const started = this.nowMs();
     const name = commandName(command, index);
+    // KF-30b: with a declared gate slot the command is prefixed so it takes
+    // one of the host-wide flock slots through the trusted, host-installed
+    // wrapper — never the worktree's own `bin/gate-slot`. The slot wait may
+    // use at most a third of the command budget, capped at 600 s and never
+    // below 1 s.
+    const waitSeconds = Math.max(
+      1,
+      Math.min(
+        GATE_SLOT_MAX_WAIT_SECONDS,
+        Math.floor(this.commandTimeoutMs / GATE_SLOT_WAIT_DIVISOR_MS),
+      ),
+    );
+    const argv = [
+      'sh',
+      '-c',
+      'cd -- "$1" && shift && exec "$@"',
+      'fleet-gate',
+      worktreePath,
+      ...(gateSlot === undefined
+        ? []
+        : [
+            '/usr/bin/env',
+            'FLEET_V2_GATE_SLOTS=' + String(gateSlot.slots),
+            'FLEET_V2_GATE_WAIT_MAX_SECONDS=' + String(waitSeconds),
+            gateSlot.path,
+          ]),
+      ...command.argv,
+    ];
     let run: CommandRunResult;
     try {
-      run = await executor.run(
-        ['sh', '-c', 'cd -- "$1" && shift && exec "$@"', 'fleet-gate', worktreePath, ...command.argv],
-        {
-          cwd: worktreePath,
-          timeoutMs: this.commandTimeoutMs,
-          maxBufferBytes: MAX_OUTPUT_BYTES,
-        },
-      );
+      run = await executor.run(argv, {
+        cwd: worktreePath,
+        timeoutMs: this.commandTimeoutMs,
+        maxBufferBytes: MAX_OUTPUT_BYTES,
+      });
     } catch {
       return {
         name,
@@ -374,6 +430,28 @@ export class GatePredicateAdapter implements GatePredicatePort {
         exitCode: null,
         durationMs: this.nowMs() - started,
         detail: 'command did not complete',
+      };
+    }
+
+    // KF-30b: with a declared gate slot, exit 75 whose LAST stderr line (after
+    // one trailing newline) is the fixed `gate-slot` line is host congestion,
+    // not the command's own verdict — earlier stderr lines (ssh warnings) do
+    // not matter. A congestion `unknown` verdict parks the run `ambiguous` at
+    // the gate, fail closed and visible to the owner; automatic wait-and-retry
+    // is a separate unit (KF-30c). Without a declared gate slot, exit 75 is
+    // the command's own result. Any other exit 75 stays the command's result.
+    if (
+      gateSlot !== undefined &&
+      run.exitCode === GATE_SLOT_EXIT_CODE &&
+      lastStderrLine(run.stderr) === GATE_SLOT_WAIT_LIMIT_LINE
+    ) {
+      return {
+        name,
+        kind: 'command',
+        verdict: 'unknown',
+        exitCode: run.exitCode,
+        durationMs: this.nowMs() - started,
+        detail: 'gate slot wait limit reached',
       };
     }
 

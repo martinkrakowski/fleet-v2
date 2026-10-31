@@ -67,6 +67,31 @@ describe('writeInstallationV2', () => {
     });
   });
 
+  it('round-trips a runner gateSlot block (KF-30b)', () => {
+    const installation = parseV2Fixture({
+      ...validV2,
+      hosts: {
+        ...validV2.hosts,
+        'lane-host': {
+          ...validV2.hosts['lane-host'],
+          runner: {
+            ...validV2.hosts['lane-host'].runner,
+            gateSlot: { path: '/usr/local/bin/gate-slot', slots: 8 },
+          },
+        },
+      },
+    });
+    expect(installation.hosts['lane-host']?.runner?.gateSlot).toEqual({
+      path: '/usr/local/bin/gate-slot',
+      slots: 8,
+    });
+    const written = writeInstallationV2(installation);
+    expect(parseInstallation(JSON.parse(written))).toEqual({
+      ok: true,
+      installation,
+    });
+  });
+
   it('round-trips a jev decisions block', () => {
     const installation = parseV2Fixture({
       ...validV2,

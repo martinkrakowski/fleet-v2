@@ -306,6 +306,22 @@ async function hostLines(
           `capability source ${capabilities.source}, filesystemScope ${capabilities.filesystemScope}`,
         ),
       );
+      // KF-30b: conducted acceptance gates are throttled only when the host
+      // declares `runner.gateSlot`; without it they run unthrottled next to
+      // hand-run gates. A missing declaration is a config gap, not a failure,
+      // so it reports as a PASS line with a warning detail (the same
+      // convention as accepted-and-ignored v1 fields).
+      if (host.roles.includes('lane-runner') && host.runner.gateSlot === undefined) {
+        lines.push(
+          line(
+            'host',
+            name,
+            'gate-slot',
+            'PASS',
+            'warning: conducted acceptance gates run unthrottled; declare runner.gateSlot to route them through the host-wide gate slot',
+          ),
+        );
+      }
     }
   }
   return lines;

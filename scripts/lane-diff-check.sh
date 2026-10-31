@@ -221,6 +221,8 @@ grep -aEi -- '^submodule\..+\.update$' "$T/config-keys" | sort -u | while IFS= r
 done > "$T/command-updates"
 { grep -aEi -- "$HELPER_KEYS" "$T/config-keys"; cat "$T/command-updates"; } | while IFS= read -r key; do
   case "$key" in
+    # pager.<cmd>: the command name is lane-chosen text, so it is masked too.
+    [Pp][Aa][Gg][Ee][Rr].*) printf 'pager.<cmd>\n' ;;
     *.*.*) printf '%s.<sub>.%s\n' "${key%%.*}" "${key##*.}" ;;
     *) printf '%s\n' "$key" ;;
   esac

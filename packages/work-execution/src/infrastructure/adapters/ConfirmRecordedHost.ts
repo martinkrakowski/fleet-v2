@@ -33,6 +33,14 @@ export interface RunnerForAttemptHostSpec {
     readonly authFile?: string;
     /** The installation's declared agy mode (D7); absent for opencode hosts. */
     readonly agyMode?: 'edit-only' | 'full';
+    /**
+     * The host-wide gate-slot throttle for conducted acceptance commands
+     * (KF-30b). Absent means the host runs its gates unthrottled.
+     */
+    readonly gateSlot?: {
+      readonly path: string;
+      readonly slots: number;
+    };
   };
 }
 

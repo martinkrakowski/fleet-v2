@@ -154,7 +154,7 @@ describe('EvidenceResult', () => {
 
 describe('FindingState', () => {
   it('accepts every manifest enum value', () => {
-    for (const value of ['unresolved', 'fixed', 'refuted'] as const) {
+    for (const value of ['unresolved', 'fixed', 'refuted', 'out-of-scope'] as const) {
       expect(requireValue(FindingState.create(value)).getValue()).toBe(value);
     }
   });
@@ -167,6 +167,7 @@ describe('FindingState', () => {
     expect(requireValue(FindingState.create('unresolved')).isBlocking()).toBe(true);
     expect(requireValue(FindingState.create('fixed')).isBlocking()).toBe(false);
     expect(requireValue(FindingState.create('refuted')).isBlocking()).toBe(false);
+    expect(requireValue(FindingState.create('out-of-scope')).isBlocking()).toBe(false);
   });
 });
 

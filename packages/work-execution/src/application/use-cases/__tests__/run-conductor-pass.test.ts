@@ -21,6 +21,12 @@ import type { AdvanceLaneRunPort, AdvanceLaneRunRequest, AdvanceLaneRunResult } 
 import type { RunConductorPassResult } from '../../ports/in/RunConductorPassPort.in-port.js';
 import { ResumeLaneRunUseCase } from '../ResumeLaneRunUseCase.use-case.js';
 import { RunConductorPassUseCase } from '../RunConductorPassUseCase.use-case.js';
+import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
+import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
+import type { AttemptRecord, AttemptRunnerRecord } from '../../../domain/execution-records.js';
+import type { DispatchAttemptRequest } from '../../ports/in/DispatchAttemptPort.in-port.js';
+import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
+import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const RUN_ID_2 = 'run-01JB0000000000000000000001';
@@ -560,6 +566,76 @@ describe('RunConductorPassUseCase run lease lost mid-pass', () => {
   });
 });
 
+describe('RunConductorPassUseCase stops from inside a run (KF-34a2)', () => {
+  it('a mid-run invalid clock ends the pass with the same refusal', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    const advance = new ScriptedAdvance(
+      new Map([
+        [RUN_ID, [{ outcome: 'entered', state: 'dispatching' }, { outcome: 'entered', state: 'running' }] as AdvanceLaneRunResult[]],
+      ]),
+    );
+    // Reads: the pass start, step 1, then an invalid clock before step 2.
+    const times = [NOW, NOW, 'not-an-iso-time'];
+    let index = 0;
+    const clock = () => times[Math.min(index++, times.length - 1)];
+    const pass = new RunConductorPassUseCase({
+      driverLease: fx.driverLease,
+      runRepo: fx.repo,
+      runJournal: fx.journal,
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: clock,
+    });
+    const result = await pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(advance.calls).toHaveLength(1);
+  });
+
+  it('a mid-run driver loss still returns the same refusal, with the earlier runs\' reports unchanged', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const runIds: string[] = [];
+    let nowValue = NOW;
+    const advance: AdvanceLaneRunPort = {
+      async advanceLaneRun(request: AdvanceLaneRunRequest): Promise<AdvanceLaneRunResult> {
+        runIds.push(request.runId);
+        if (request.runId === RUN_ID_2) {
+          // After run A's full turn, on B's first step the driver lease lapses
+          // and a second driver takes over before B's next step.
+          nowValue = LATER;
+          await fx.driverLease.acquire({
+            holderId: HOLDER_2,
+            observedFence: 1,
+            leaseUntilIso: '2026-10-27T10:11:00.000Z',
+            nowIso: LATER,
+          });
+          return { outcome: 'entered', state: 'dispatching' };
+        }
+        return runIds.filter((runId) => runId === RUN_ID).length === 1
+          ? { outcome: 'entered', state: 'dispatching' }
+          : { outcome: 'waiting', reason: 'admission' };
+      },
+    };
+    const pass = new RunConductorPassUseCase({
+      driverLease: fx.driverLease,
+      runRepo: fx.repo,
+      runJournal: fx.journal,
+      halt: fx.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance,
+      now: () => nowValue,
+    });
+    const result = await pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toEqual({ outcome: 'refused', reason: 'driver-lease-held' });
+    // Run A's full turn (entered, then waiting admission) ran before B started.
+    expect(runIds).toEqual([RUN_ID, RUN_ID, RUN_ID_2]);
+    expect(await fx.driverLease.read()).toMatchObject({ holderId: HOLDER_2, fence: 2 });
+  });
+});
+
 describe('RunConductorPassUseCase session-start gate (KF-34a1)', () => {
   const dispatchStarted = (runId: string): AdvanceLaneRunResult => ({
     outcome: 'acted',
@@ -675,7 +751,7 @@ describe('RunConductorPassUseCase session-start gate (KF-34a1)', () => {
     const clock = steppingClock(NOW);
     const result = await gateUseCase(fx, advance, clock).runPass({ holderId: HOLDER, nowIso: NOW });
     expect(result).toMatchObject({ outcome: 'completed' });
-    expect(clock.sleeps).toEqual([20_000]);
+    expect(clock.sleeps).toEqual([20_001]);
     expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID_2, RUN_ID_2, RUN_ID_2]);
     expect(advance.calls.slice(2).map((call) => call.result)).toEqual([
       { outcome: 'waiting', reason: 'session-stagger' },
@@ -697,7 +773,7 @@ describe('RunConductorPassUseCase session-start gate (KF-34a1)', () => {
     const clock = steppingClock(NOW);
     const result = await gateUseCase(fx, advance, clock).runPass({ holderId: HOLDER, nowIso: NOW });
     expect(result).toMatchObject({ outcome: 'completed' });
-    expect(clock.sleeps).toEqual([20_000]);
+    expect(clock.sleeps).toEqual([20_001]);
     expect(advance.calls.slice(2).map((call) => call.result)).toEqual([
       { outcome: 'waiting', reason: 'session-stagger' },
       reviewStarted(RUN_ID_2),
@@ -769,7 +845,7 @@ describe('RunConductorPassUseCase session-start gate (KF-34a1)', () => {
     const clock = steppingClock(NOW);
     const result = await gateUseCase(fx, advance, clock).runPass({ holderId: HOLDER, nowIso: NOW });
     expect(result).toMatchObject({ outcome: 'completed' });
-    expect(clock.sleeps).toEqual([15_000]);
+    expect(clock.sleeps).toEqual([15_001]);
     expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID, RUN_ID_2]);
     expect(advance.calls[0]!.result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
     expect(advance.calls[1]!.result).toEqual(dispatchStarted(RUN_ID));
@@ -840,7 +916,7 @@ describe('RunConductorPassUseCase session-start gate (KF-34a1)', () => {
     expect(result).toMatchObject({ outcome: 'completed' });
     if (result.outcome !== 'completed') return;
     expect(result.runs.map((run) => run.outcome)).toEqual(['advanced', 'advanced']);
-    expect(clock.sleeps).toEqual([15_000]);
+    expect(clock.sleeps).toEqual([15_001]);
     expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID, RUN_ID_2]);
   });
 
@@ -857,6 +933,269 @@ describe('RunConductorPassUseCase session-start gate (KF-34a1)', () => {
     const clock = steppingClock(NOW);
     const result = await gateUseCase(fx, advance, clock, 500).runPass({ holderId: HOLDER, nowIso: NOW });
     expect(result).toMatchObject({ outcome: 'completed' });
-    expect(clock.sleeps).toEqual([500]);
+    expect(clock.sleeps).toEqual([501]);
+  });
+
+  const codeReviewStarted = (runId: string): AdvanceLaneRunResult => ({
+    outcome: 'acted',
+    step: 'code-review',
+    key: `${runId}/r0/code-review/0@0123456789ab`,
+    result: 'completed',
+    reasonCode: 'review-passed',
+  });
+
+  it('a run whose next step is a code review after another run\'s dispatch also waits', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const advance = new GatedScriptedAdvance(
+      new Map([
+        [RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]],
+        [RUN_ID_2, [codeReviewStarted(RUN_ID_2), { outcome: 'waiting', reason: 'admission' }]],
+      ]),
+    );
+    const clock = steppingClock(NOW);
+    const result = await gateUseCase(fx, advance, clock).runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed' });
+    expect(clock.sleeps).toEqual([20_001]);
+    expect(advance.calls.slice(2).map((call) => call.result)).toEqual([
+      { outcome: 'waiting', reason: 'session-stagger' },
+      codeReviewStarted(RUN_ID_2),
+      { outcome: 'waiting', reason: 'admission' },
+    ]);
+  });
+
+  it('a timer that fires a millisecond early does not spend an extra stagger step', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    const advance = new GatedScriptedAdvance(
+      new Map([
+        [RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]],
+        [RUN_ID_2, [dispatchStarted(RUN_ID_2), { outcome: 'waiting', reason: 'admission' }]],
+      ]),
+    );
+    // The fake sleep lands one millisecond short of the requested wait, mimicking
+    // a real timer that fires a millisecond early; the +1 overshoot still crosses
+    // the slot, so B grants on the immediate retry (no extra stagger step).
+    let current = Date.parse(NOW);
+    const sleeps: number[] = [];
+    const earlyClock = {
+      now: () => new Date(current).toISOString(),
+      sleep: async (ms: number): Promise<void> => {
+        sleeps.push(ms);
+        current += ms - 1;
+      },
+    };
+    const result = await gateUseCase(fx, advance, earlyClock).runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed' });
+    expect(sleeps).toEqual([20_001]);
+    expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID_2, RUN_ID_2, RUN_ID_2]);
+  });
+
+  it('a journal seed in the future is clamped to this pass\'s now, so the first wait is at most the stagger', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    await createRun(fx.repo, { runId: RUN_ID_2 });
+    // A dispatch intent the previous pass recorded 10 minutes in the FUTURE
+    // (clock stepped back, skewed process) seeds the gate; clamping to the
+    // pass's now makes the first wait the full stagger, not 10 minutes + stagger.
+    const seededKeyBuilt = buildLaneRunStepKey({
+      runId: RUN_ID_2,
+      round: 0,
+      step: 'dispatch',
+      seatIndex: 0,
+      attemptOrdinal: 1,
+      head12: null,
+      retry: null,
+    });
+    expect(seededKeyBuilt.ok).toBe(true);
+    if (!seededKeyBuilt.ok) throw new Error('fixture must build a step key');
+    const futureIso = new Date(Date.parse(NOW) + 600_000).toISOString();
+    const seeded = laneRunIntentEntry(
+      '01JB0000000000000000000009',
+      RUN_ID_2,
+      seededKeyBuilt.key,
+      'seeded-attempt-1',
+      futureIso,
+    );
+    expect(await fx.journal.append(seeded)).toMatchObject({ outcome: 'appended' });
+    const advance = new GatedScriptedAdvance(
+      new Map([
+        [RUN_ID, [dispatchStarted(RUN_ID), { outcome: 'waiting', reason: 'admission' }]],
+        [RUN_ID_2, [{ outcome: 'waiting', reason: 'admission' }]],
+      ]),
+    );
+    const clock = steppingClock(NOW);
+    const result = await gateUseCase(fx, advance, clock).runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed' });
+    expect(clock.sleeps).toEqual([20_001]);
+    expect(advance.calls.map((call) => call.request.runId)).toEqual([RUN_ID, RUN_ID, RUN_ID, RUN_ID_2]);
+  });
+});
+
+describe('RunConductorPassUseCase real advance (KF-34a2)', () => {
+  const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
+  const COMMIT = 'a'.repeat(40);
+  const SHA = 'c'.repeat(64);
+  const CONDUCTED_RUNNER: AttemptRunnerRecord = {
+    kind: 'opencode',
+    remotePort: 4166,
+    host: 'lane-alias-example',
+    hostName: 'lane-host-example',
+    agent: null,
+    model: null,
+    variant: null,
+  };
+  const SEAT_PLAN = {
+    version: 1 as const,
+    'first-pass': [
+      { id: 'fp-1', model: 'model-example-1', tool: 'opencode' },
+      { id: 'fp-2', model: 'model-example-2', tool: 'opencode' },
+    ],
+    fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'opencode' }],
+    review: [],
+  };
+  const SEAT_SELECTION = {
+    role: 'first-pass' as const,
+    seatIndex: 0,
+    seatId: 'fp-1',
+    model: 'model-example-1',
+    tool: 'opencode',
+    variant: null,
+    agent: null,
+  };
+
+  function attemptFixture(id: string): AttemptRecord {
+    return {
+      id,
+      workOrderId: 'wo-example-1',
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: WORKTREE,
+      baseCommit: COMMIT,
+      state: 'intent-recorded',
+      outcome: null,
+      briefDigest: SHA,
+      briefPackagePath: '.lane/brief-package',
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: null,
+      runner: CONDUCTED_RUNNER,
+      seatPlan: SEAT_PLAN,
+      seatSelection: SEAT_SELECTION,
+      stopReason: 'none',
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    };
+  }
+
+  interface RealHarness {
+    readonly runRepo: LaneRunRepositoryAdapter;
+    readonly runJournal: LaneRunJournalAdapter;
+    readonly attemptRepo: AttemptRepositoryAdapter;
+    readonly executionJournal: ExecutionJournalAdapter;
+    readonly driverLease: ConductorDriverLeaseAdapter;
+    readonly halt: ConductorHaltAdapter;
+    readonly dispatchRequests: DispatchAttemptRequest[];
+    readonly deps: AdvanceLaneRunDependencies;
+  }
+
+  async function realHarness(runs: { runId: string; attemptId: string }[]): Promise<RealHarness> {
+    const runRepo = new LaneRunRepositoryAdapter();
+    const runJournal = new LaneRunJournalAdapter();
+    const attemptRepo = new AttemptRepositoryAdapter();
+    const executionJournal = new ExecutionJournalAdapter();
+    const driverLease = new ConductorDriverLeaseAdapter();
+    const halt = new ConductorHaltAdapter();
+    const dispatchRequests: DispatchAttemptRequest[] = [];
+    const ulid = freshUlidFactory();
+    for (const { runId, attemptId } of runs) {
+      const record = runRecord({ runId, attemptIds: [attemptId] });
+      expect((await runRepo.create(record)).outcome).toBe('saved');
+      await attemptRepo.saveAttempt(attemptFixture(attemptId));
+      await executionJournal.saveCapacityReservation({
+        id: ulid(),
+        attemptId,
+        hostId: 'host-example-1',
+        slotIndex: 0,
+        held: true,
+        seatTool: 'opencode',
+        reservedAtIso: NOW,
+        releasedAtIso: null,
+      });
+    }
+    const deps: AdvanceLaneRunDependencies = {
+      runRepo,
+      runJournal,
+      attemptRepo,
+      executionJournal,
+      artifactPort: {
+        readBriefManifest: async () =>
+          JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] }),
+        verifyArtifactManifest: async () => ({ outcome: 'missing' }),
+      },
+      reconcileAttempt: {
+        reconcileAttempt: async () => ({ outcome: 'refused', reason: 'not-found' }),
+      },
+      admission: { admit: async () => ({ outcome: 'admitted' }) },
+      newUlid: ulid,
+      dispatchAttempt: {
+        dispatchAttempt: async (request) => {
+          dispatchRequests.push(request);
+          return { outcome: 'started', attempt: attemptFixture(request.attemptId), sessionId: 'session-example-1' };
+        },
+      },
+      cancelPreparedAttempt: {
+        cancelPreparedAttempt: async () => ({ outcome: 'cancelled', attempt: attemptFixture('attempt-cancelled'), capacity: 'released' }),
+      },
+    };
+    return { runRepo, runJournal, attemptRepo, executionJournal, driverLease, halt, dispatchRequests, deps };
+  }
+
+  function steppingClockRealAdvance(startIso: string) {
+    const sleeps: number[] = [];
+    let current = Date.parse(startIso);
+    return {
+      sleeps,
+      now: () => new Date(current).toISOString(),
+      sleep: async (ms: number): Promise<void> => {
+        sleeps.push(ms);
+        current += ms;
+      },
+    };
+  }
+
+  it('two ready runs dispatch through the real advance: first grants, second is denied, sleeps, then grants and dispatches', async () => {
+    const h = await realHarness([
+      { runId: RUN_ID, attemptId: 'attempt-A' },
+      { runId: RUN_ID_2, attemptId: 'attempt-B' },
+    ]);
+    const clock = steppingClockRealAdvance(NOW);
+    const pass = new RunConductorPassUseCase({
+      driverLease: h.driverLease,
+      runRepo: h.runRepo,
+      runJournal: h.runJournal,
+      halt: h.halt,
+      resume: { applyPendingResume: async () => ({ outcome: 'none' }) },
+      advance: new AdvanceLaneRunUseCase(h.deps),
+      now: clock.now,
+      sleep: clock.sleep,
+    });
+    const result = await pass.runPass({ holderId: HOLDER, nowIso: NOW });
+    expect(result).toMatchObject({ outcome: 'completed', progressed: true });
+    if (result.outcome !== 'completed') {
+      throw new Error('expected completed, got ' + JSON.stringify(result));
+    }
+    expect(result.runs.map((run) => run.outcome)).toEqual(['advanced', 'advanced']);
+    expect(h.dispatchRequests.map((request) => request.attemptId)).toEqual(['attempt-A', 'attempt-B']);
+    expect(result.runs[0]).toMatchObject({ runId: RUN_ID, outcome: 'advanced' });
+    if (result.runs[0].outcome !== 'advanced' || result.runs[1].outcome !== 'advanced') {
+      throw new Error('expected advanced runs');
+    }
+    expect(result.runs[0].steps.map((step) => step.outcome)).toEqual(['acted', 'waiting']);
+    expect(result.runs[1].steps.map((step) => step.outcome)).toEqual(['waiting', 'acted', 'waiting']);
+    expect(clock.sleeps).toEqual([20_001]);
   });
 });

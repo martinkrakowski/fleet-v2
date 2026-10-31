@@ -157,6 +157,7 @@ function deriveHostRunner(runner: NonNullable<HostSection['runner']>): HostRunne
     ...(runner.authFile !== undefined ? { authFile: runner.authFile } : {}),
     capabilities,
     ...(runner.maxLanes !== undefined ? { maxLanes: runner.maxLanes } : {}),
+    ...(runner.gateSlot !== undefined ? { gateSlot: runner.gateSlot } : {}),
   };
   if (runner.kind === 'agy') {
     return {

@@ -35,6 +35,7 @@ import type { CliIo } from '../index.js';
 import type { ConductorCliOptions } from '../conductor.js';
 import { nextPollDelayMs } from '../conductor.js';
 import { buildLiveConductorDriver, type ConductorDriver } from '../conductor-wiring.js';
+import { RunnerTunnelAdapter, type TunnelChild } from '../runner-tunnel.js';
 
 const NOW = '2026-10-27T10:00:00.000Z';
 const RUN_ID = 'run-01JB0000000000000000000000';
@@ -271,6 +272,9 @@ function runtimeOf(stateDir?: string, installation?: FleetInstallation): FleetCl
     ...(stateDir !== undefined ? { stateDir } : {}),
     ...(installation !== undefined ? { installation } : {}),
     runSubprocess: throwingRunSubprocess,
+    // The runtime's own environment carries no OCM_HOST/OCM_REMOTE_PORT, so
+    // no live test here ever opens a real tunnel from the process environment.
+    env: {},
   });
 }
 
@@ -465,6 +469,80 @@ describe('conductor run live loop (K7-7)', () => {
     const attentionLines = result.stdout.filter((line) => line.startsWith('{"attention"'));
     expect(attentionLines).toHaveLength(1);
     expect(JSON.parse(attentionLines[0]!)).toEqual({ attention: 'stop-grace-exceeded', runId: RUN_ID });
+  });
+});
+
+describe('conductor run --live tunnel wiring (KF-35 fix 1)', () => {
+  it('a live run whose runtime environment has no OCM_HOST starts no tunnel even with OCM_HOST in the process environment', async () => {
+    const savedHost = process.env.OCM_HOST;
+    const savedPort = process.env.OCM_REMOTE_PORT;
+    process.env.OCM_HOST = 'leak.example';
+    process.env.OCM_REMOTE_PORT = '46000';
+    try {
+      const dir = tempStateDir();
+      const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+      const runtime = runtimeOf(dir);
+      const result = await runConductor(runtime, ['run', '--live', '--once'], {
+        stateDir: dir,
+        buildDriver: () => fake.driver,
+      });
+      expect(result.code).toBe(0);
+      expect(fake.passCalls).toHaveLength(1);
+      expect(runtime.runnerTunnel.owned).toBe(false);
+      expect(result.stderr.join('\n')).not.toContain('the runner tunnel could not be opened');
+    } finally {
+      if (savedHost === undefined) {
+        delete process.env.OCM_HOST;
+      } else {
+        process.env.OCM_HOST = savedHost;
+      }
+      if (savedPort === undefined) {
+        delete process.env.OCM_REMOTE_PORT;
+      } else {
+        process.env.OCM_REMOTE_PORT = savedPort;
+      }
+    }
+  });
+
+  it('an interrupt during the tunnel startup wait stops the tunnel child', async () => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    let resolveExit: (value: { readonly code: number | null }) => void = () => undefined;
+    const exited = new Promise<{ readonly code: number | null }>((resolve) => {
+      resolveExit = resolve;
+    });
+    const killCalls: number[] = [];
+    const child: TunnelChild = {
+      exited,
+      stop: () => {
+        killCalls.push(1);
+        resolveExit({ code: null });
+      },
+      release: () => undefined,
+    };
+    const controller = new AbortController();
+    const tunnel = new RunnerTunnelAdapter({
+      sshHost: 'lane-host',
+      remotePort: 46000,
+      isPortListening: async () => false,
+      spawner: () => child,
+      sleep: async () => {
+        // The interrupt arrives while the tunnel is still opening.
+        controller.abort();
+      },
+      waitMs: 10_000,
+      pollMs: 1,
+    });
+    const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once'], {
+      stateDir: dir,
+      buildDriver: () => fake.driver,
+      tunnel,
+      stopSignal: controller.signal,
+    });
+    expect(result.code).toBe(0);
+    expect(fake.passCalls).toHaveLength(0);
+    expect(killCalls).toHaveLength(1);
+    expect(tunnel.owned).toBe(false);
   });
 });
 

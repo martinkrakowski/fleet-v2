@@ -47,9 +47,14 @@ export interface ExecutorForHostOptions {
   readonly legacyExecutor: CommandExecutorPort;
 }
 
-/** `ok: true` carries the executor for the recorded host; `ok: false` refuses. */
+/** `ok: true` carries the executor for the recorded host (and its confirmed spec); `ok: false` refuses. */
 export type ExecutorForRecordedHostResult =
-  | { readonly ok: true; readonly executor: CommandExecutorPort }
+  | {
+      readonly ok: true;
+      readonly executor: CommandExecutorPort;
+      /** The confirmed installation host spec; absent for a legacy record. */
+      readonly hostSpec?: RunnerForAttemptHostSpec;
+    }
   | { readonly ok: false; readonly reason: string };
 
 export class ExecutorForHost {
@@ -121,12 +126,12 @@ export class ExecutorForHost {
     transport: "local" | "ssh",
   ): ExecutorForRecordedHostResult {
     const cached = this.executors.get(name);
-    if (cached !== undefined) return { ok: true, executor: cached };
-    const built =
-      transport === "ssh"
+    const executor =
+      cached ??
+      (transport === "ssh"
         ? new SshExecutor({ host: spec.sshAlias?.trim() ?? "" })
-        : new LocalExecutor();
-    this.executors.set(name, built);
-    return { ok: true, executor: built };
+        : new LocalExecutor());
+    if (cached === undefined) this.executors.set(name, executor);
+    return { ok: true, executor, hostSpec: spec };
   }
 }

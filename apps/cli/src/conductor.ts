@@ -45,6 +45,7 @@ import {
 import type { FleetCliRuntime } from './composition.js';
 import type { CliIo } from './index.js';
 import { buildLiveConductorDriver, buildDryRunConductorDriver, type ConductorDriver, type DryRunStores } from './conductor-wiring.js';
+import type { RunnerTunnelPort } from './runner-tunnel.js';
 
 export interface ConductorCliOptions {
   /** Clock override for tests; production uses the system clock. */
@@ -63,6 +64,11 @@ export interface ConductorCliOptions {
   ) => ConductorDriver;
   /** Test seam for the dry-run's scratch copy (production uses fs.promises.copyFile). */
   readonly copyFile?: (source: string, destination: string) => Promise<void>;
+  /**
+   * Test seam for the driver's runner tunnel (KF-35); production uses the
+   * runtime's `RunnerTunnelAdapter`.
+   */
+  readonly tunnel?: RunnerTunnelPort;
 }
 
 export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
@@ -214,6 +220,14 @@ export function nextPollDelayMs(previousMs: number | null, progressed: boolean):
   }
   return Math.min(previousMs * 2, MAX_POLL_MS);
 }
+
+/** KF-35: the one fixed failure message; the driver exits 1 and runs no pass. */
+const RUNNER_TUNNEL_FAILED_MESSAGE =
+  'conductor run --live: the runner tunnel could not be opened; no pass was driven';
+
+/** KF-35: logged once when the owned tunnel child exits mid-run. */
+const RUNNER_TUNNEL_EXITED_MESSAGE =
+  'the runner tunnel child exited; later passes open their own forward';
 
 /** Real-timer sleep the stop signal cuts short; the default of `options.sleep`. */
 function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -627,31 +641,86 @@ async function runCommand(
     io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'conductor-disabled' })}\n`);
     return 1;
   }
-  const holderId = 'driver-' + runtime.conductor.newUlid();
-  const seenAttention = new Set<string>();
-  return await pollConductorPasses({
-    driver,
-    holderId,
-    nowIso: () => nowIsoOf(options),
-    sleep: options.sleep ?? defaultSleep,
-    stopSignal: options.stopSignal,
-    once: flags.once,
-    eachPass: async (pass, result) => {
-      io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
-      if (result.outcome === 'refused') {
-        return { stop: true, exitCode: 1 };
-      }
-      for (const item of result.attention) {
-        const key = `${item.runId}:${item.kind}`;
-        if (seenAttention.has(key)) {
-          continue;
-        }
-        seenAttention.add(key);
-        io.stdout(`${JSON.stringify({ attention: item.kind, runId: item.runId })}\n`);
-      }
-      return { stop: false };
-    },
+  // KF-35: one runner tunnel for the driver's whole lifetime. Opened before
+  // the first pass (also with --once, never with --dry-run) so every ocm-run
+  // call of every pass finds the dial port listening and races no forward.
+  // A failure exits 1 and drives no pass; an already-listening port is an
+  // operator's tunnel and takes no ownership; an owned child that exits
+  // mid-run is logged once and later passes fall back to their own forwards.
+  // The SIGINT/SIGTERM handlers are bound before the tunnel starts, so an
+  // interrupt during the startup wait stops the tunnel child too.
+  const tunnel = options.tunnel ?? runtime.runnerTunnel;
+  const controller = new AbortController();
+  const signal = options.stopSignal ?? controller.signal;
+  const onSignal = (): void => {
+    controller.abort();
+  };
+  const bindOwnSignals = options.stopSignal === undefined;
+  if (bindOwnSignals) {
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
+  }
+  // The startup wait races the stop signal: an interrupt before the tunnel
+  // opens stops the (possibly already spawned) child instead of orphaning it.
+  let onAbort: (() => void) | null = null;
+  const interrupted = new Promise<'interrupted'>((resolve) => {
+    onAbort = () => resolve('interrupted');
+    signal.addEventListener('abort', onAbort, { once: true });
   });
+  try {
+    const startPromise = tunnel.ensureTunnel({
+      onEarlyExit: () => {
+        io.stderr(`${RUNNER_TUNNEL_EXITED_MESSAGE}\n`);
+      },
+    });
+    const raced = await Promise.race([startPromise.then((outcome) => ({ outcome })), interrupted]);
+    if (raced === 'interrupted') {
+      // Stop what the startup already spawned, let its bounded wait finish,
+      // and stop again for whatever the tail of that wait may have opened.
+      await tunnel.stop();
+      await startPromise;
+      await tunnel.stop();
+      return 0;
+    }
+    if (raced.outcome === 'failed') {
+      io.stderr(`${RUNNER_TUNNEL_FAILED_MESSAGE}\n`);
+      return 1;
+    }
+    const holderId = 'driver-' + runtime.conductor.newUlid();
+    const seenAttention = new Set<string>();
+    return await pollConductorPasses({
+      driver,
+      holderId,
+      nowIso: () => nowIsoOf(options),
+      sleep: options.sleep ?? defaultSleep,
+      stopSignal: signal,
+      once: flags.once,
+      releaseTunnel: () => tunnel.release(),
+      eachPass: async (pass, result) => {
+        io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
+        if (result.outcome === 'refused') {
+          return { stop: true, exitCode: 1 };
+        }
+        for (const item of result.attention) {
+          const key = `${item.runId}:${item.kind}`;
+          if (seenAttention.has(key)) {
+            continue;
+          }
+          seenAttention.add(key);
+          io.stdout(`${JSON.stringify({ attention: item.kind, runId: item.runId })}\n`);
+        }
+        return { stop: false };
+      },
+    });
+  } finally {
+    if (onAbort !== null) {
+      signal.removeEventListener('abort', onAbort);
+    }
+    if (bindOwnSignals) {
+      process.removeListener('SIGINT', onSignal);
+      process.removeListener('SIGTERM', onSignal);
+    }
+  }
 }
 
 /** The outcome of one pass in the shared poll loop: stop, and the exit code to carry. */
@@ -673,6 +742,11 @@ async function pollConductorPasses(options: {
   readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   readonly stopSignal?: AbortSignal;
   readonly once: boolean;
+  /**
+   * KF-35: releases the driver's runner tunnel after `releaseLeases`, leaving
+   * the forward running: detached lanes still talk to the server through it.
+   */
+  readonly releaseTunnel?: () => Promise<void>;
   readonly eachPass: (pass: number, result: RunConductorPassResult) => Promise<PollPassOutcome>;
 }): Promise<number> {
   const controller = new AbortController();
@@ -713,10 +787,16 @@ async function pollConductorPasses(options: {
       }
     }
   } finally {
-    await options.driver.pass.releaseLeases({
-      holderId: options.holderId,
-      nowIso: options.nowIso(),
-    });
+    try {
+      await options.driver.pass.releaseLeases({
+        holderId: options.holderId,
+        nowIso: options.nowIso(),
+      });
+    } finally {
+      // The tunnel is released (never killed) after the leases it outlived, even
+      // when releasing them throws: detached lanes keep using the forward.
+      await options.releaseTunnel?.();
+    }
     if (signalHandlersBound) {
       process.removeListener('SIGINT', onSignal);
       process.removeListener('SIGTERM', onSignal);

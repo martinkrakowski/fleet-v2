@@ -64,9 +64,8 @@ export type FrozenBriefRead =
 
 /**
  * Reads a conducted attempt's frozen brief (prose and manifest) and verifies
- * it against
- * the attempt's recorded `briefDigest` before anything is taken from it. The
- * digest compared is exactly the one the gate uses: `compute(prose + '\n' +
+ * it against the attempt's recorded `briefDigest` before anything is taken
+ * from it. The digest compared is exactly the one the gate uses: `compute(prose + '\n' +
  * manifestRaw)` against `attempt.briefDigest`, the prose read at
  * `briefPackagePath` and the manifest at its `-manifest.json` sibling, both
  * through the recorded host.

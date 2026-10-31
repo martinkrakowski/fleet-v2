@@ -19,6 +19,15 @@ export interface LaneDiffChangedPath {
     readonly line: number;
     readonly text: string;
   }[];
+  /**
+   * The base version's lines of the same path (split the same way as the
+   * scanned content), when the adapter could read a plain base blob free of
+   * NUL bytes on both sides. `null` or absent means unknown: the base-line
+   * allowance excuses nothing (fail closed).
+   */
+  readonly baseLines?: readonly string[] | null;
+  /** True when the worktree path is a symbolic link (a finding in itself). */
+  readonly isSymlink?: boolean;
 }
 
 /** One secret shape to scan added lines against, with its reporting rule name. */
@@ -43,6 +52,13 @@ export interface CheckLaneDiffInput {
    * must not report clean when it could not scan.
    */
   readonly secretPatterns: readonly LaneDiffSecretPattern[];
+  /**
+   * The repository's own git config key names that match a helper shape,
+   * already masked (subsection replaced) and lowercased by the adapter. Each
+   * distinct key is one `git-config-helper:<key>` finding on `.git/config`;
+   * no config value is ever read or carried.
+   */
+  readonly helperConfigKeys?: readonly string[];
 }
 
 export interface LaneDiffFinding {
@@ -282,6 +298,15 @@ function prefixExplicitlyAllowsProtected(
  * paths) for secret shapes and report every hit as
  * `secret-pattern:<name>` with its 1-based line. The matched text is never
  * part of a finding.
+ *
+ * Base-line allowance (KF-27): a hit is excused when the exact same line
+ * text occurs in the base version of the same path (`baseLines`), at most
+ * as many times as it occurs there. Hits are consumed in ascending line
+ * order and one base occurrence is decremented per excused line, so a
+ * duplicated fixture line beyond the base count still fails. A line hit by
+ * two patterns is excused or not as one line. `baseLines` null or absent
+ * (no base blob, a read failure, a NUL byte on either side) is unknown and
+ * excuses nothing.
  */
 function secretFindings(
   changed: LaneDiffChangedPath,
@@ -299,15 +324,33 @@ function secretFindings(
       pattern.regex.flags.replace(/[gy]/g, ""),
     ),
   }));
-  for (const added of changed.addedLines ?? []) {
-    for (const { name, matcher } of matchers) {
-      if (matcher.test(added.text)) {
-        findings.push({
-          path: changed.path,
-          line: added.line,
-          rule: `secret-pattern:${name}`,
-        });
-      }
+  // Base occurrences by exact line text; only built when the base is known.
+  const baseCounts = new Map<string, number>();
+  if (changed.baseLines) {
+    for (const text of changed.baseLines) {
+      baseCounts.set(text, (baseCounts.get(text) ?? 0) + 1);
+    }
+  }
+  // Hits are consumed in ascending line order.
+  const lines = [...(changed.addedLines ?? [])].sort(
+    (a, b) => a.line - b.line,
+  );
+  for (const added of lines) {
+    const matched = matchers.filter(({ matcher }) => matcher.test(added.text));
+    if (matched.length === 0) continue;
+    const remaining = baseCounts.get(added.text) ?? 0;
+    if (remaining > 0) {
+      // The base already had this exact line: one base occurrence is
+      // consumed and the whole line is excused, for every pattern.
+      baseCounts.set(added.text, remaining - 1);
+      continue;
+    }
+    for (const { name } of matched) {
+      findings.push({
+        path: changed.path,
+        line: added.line,
+        rule: `secret-pattern:${name}`,
+      });
     }
   }
   return findings;
@@ -353,6 +396,21 @@ export function checkLaneDiff(input: CheckLaneDiffInput): LaneDiffVerdict {
     } else {
       findings.push(...secretFindings(changed, patterns));
     }
+    // Rule 4 (KF-27): a changed path that is a symbolic link is a finding
+    // even when its target stays inside the worktree.
+    if (changed.isSymlink) {
+      findings.push({ path: changed.path, rule: "symlink" });
+    }
+  }
+
+  // Rule 5 (KF-27): config key names that make git run a helper program are
+  // findings on `.git/config`; one finding per distinct masked key, and no
+  // config value is ever part of a finding.
+  const seenHelperKeys = new Set<string>();
+  for (const key of input.helperConfigKeys ?? []) {
+    if (seenHelperKeys.has(key)) continue;
+    seenHelperKeys.add(key);
+    findings.push({ path: ".git/config", rule: `git-config-helper:${key}` });
   }
 
   return { ok: findings.length === 0, findings };

@@ -736,3 +736,170 @@ describe("isFixedProtectedPath (script parity, O14d1)", () => {
     ]);
   });
 });
+
+describe("checkLaneDiff (KF-27: base-line allowance, symlinks, helper config keys)", () => {
+  it("a hit on a line the base already had is excused", () => {
+    const fixture = `const fixture = "${tok}";`;
+    // Without a known base the same content fails.
+    const withoutBase = check([
+      {
+        path: "packages/x/src/a.ts",
+        status: "modified",
+        addedLines: [
+          { line: 1, text: "export const a = 2;" },
+          { line: 2, text: fixture },
+        ],
+      },
+    ]);
+    expect(withoutBase.findings).toEqual([
+      {
+        path: "packages/x/src/a.ts",
+        line: 2,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+    // The base already held that exact line: excused.
+    const excused = check([
+      {
+        path: "packages/x/src/a.ts",
+        status: "modified",
+        addedLines: [
+          { line: 1, text: "export const a = 2;" },
+          { line: 2, text: fixture },
+        ],
+        baseLines: ["export const a = 1;", fixture],
+      },
+    ]);
+    expect(excused).toEqual({ ok: true, findings: [] });
+  });
+
+  it("a second copy beyond the base count fails on the copy's line", () => {
+    const fixture = `const fixture = "${tok}";`;
+    const verdict = check([
+      {
+        path: "packages/x/src/a.ts",
+        status: "modified",
+        addedLines: [
+          { line: 1, text: fixture },
+          { line: 2, text: fixture },
+        ],
+        baseLines: [fixture],
+      },
+    ]);
+    expect(verdict.findings).toEqual([
+      {
+        path: "packages/x/src/a.ts",
+        line: 2,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+  });
+
+  it("a changed line the base had in a different form is not excused", () => {
+    const verdict = check([
+      {
+        path: "packages/x/src/a.ts",
+        status: "modified",
+        addedLines: [{ line: 1, text: `const t = "${tok}";` }],
+        baseLines: [`const t = "${tok}" // different text`],
+      },
+    ]);
+    expect(verdict.findings).toEqual([
+      {
+        path: "packages/x/src/a.ts",
+        line: 1,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+  });
+
+  it("baseLines null excuses nothing (fail closed: unknown base)", () => {
+    const fixture = `const fixture = "${tok}";`;
+    const verdict = check([
+      {
+        path: "packages/x/src/a.ts",
+        status: "modified",
+        addedLines: [{ line: 1, text: fixture }],
+        baseLines: null,
+      },
+    ]);
+    expect(verdict.findings).toEqual([
+      {
+        path: "packages/x/src/a.ts",
+        line: 1,
+        rule: "secret-pattern:github-token",
+      },
+    ]);
+  });
+
+  it("a line hit by two patterns is excused or not as one line", () => {
+    // One line matching two patterns, base has it once: one excusal.
+    // The password value is built at runtime so this file holds no credential-shaped literal.
+    const pw = ["hunter2", "hunter2"].join("");
+    const both = `const t = "${tok}"; password = "${pw}";`;
+    const excused = check([
+      {
+        path: "packages/x/src/a.ts",
+        status: "modified",
+        addedLines: [{ line: 1, text: both }],
+        baseLines: [both],
+      },
+    ]);
+    expect(excused).toEqual({ ok: true, findings: [] });
+    // The base has it once but the file carries it twice: the second copy
+    // fails once per pattern, on the copy's line.
+    const secondCopy = check([
+      {
+        path: "packages/x/src/a.ts",
+        status: "modified",
+        addedLines: [
+          { line: 1, text: both },
+          { line: 2, text: both },
+        ],
+        baseLines: [both],
+      },
+    ]);
+    expect(secondCopy.findings).toEqual([
+      {
+        path: "packages/x/src/a.ts",
+        line: 2,
+        rule: "secret-pattern:github-token",
+      },
+      {
+        path: "packages/x/src/a.ts",
+        line: 2,
+        rule: "secret-pattern:password-assignment",
+      },
+    ]);
+  });
+
+  it("a changed path that is a symbolic link is a symlink finding even when its target stays inside the worktree", () => {
+    const verdict = check([
+      {
+        path: "packages/x/src/link.ts",
+        status: "added",
+        addedLines: [{ line: 1, text: "../other.ts" }],
+        isSymlink: true,
+      },
+    ]);
+    expect(verdict.findings).toEqual([
+      { path: "packages/x/src/link.ts", rule: "symlink" },
+    ]);
+  });
+
+  it("helper config keys produce one finding each, deduplicated, with no value", () => {
+    const verdict = check([
+      { path: "packages/x/src/a.ts", status: "modified" },
+    ], {
+      helperConfigKeys: [
+        "credential.<sub>.helper",
+        "core.fsmonitor",
+        "credential.<sub>.helper",
+      ],
+    });
+    expect(verdict.findings).toEqual([
+      { path: ".git/config", rule: "git-config-helper:credential.<sub>.helper" },
+      { path: ".git/config", rule: "git-config-helper:core.fsmonitor" },
+    ]);
+  });
+});

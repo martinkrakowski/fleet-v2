@@ -688,9 +688,9 @@ describe('CliReviewTransport', () => {
     }
 
     it('pins the agy review argv template element by element', () => {
-      // Copied from AGY_TOOL.invocation.argvTemplate (the edit-only mode in
-      // packages/tooling/src/agy.ts): `--print`, `--model`, `--output-format
-      // json` and `--mode accept-edits`, never `--dangerously-skip-permissions`.
+      // The review template runs agy in plan mode, pinned, and deliberately
+      // differs from the tooling lane template (packages/tooling/src/agy.ts),
+      // which keeps `--mode accept-edits` for implementers.
       expect(AGY_REVIEW_ARGV_TEMPLATE).toEqual([
         'agy',
         '--print',
@@ -700,7 +700,7 @@ describe('CliReviewTransport', () => {
         '--output-format',
         'json',
         '--mode',
-        'accept-edits',
+        'plan',
       ]);
       expect(CLI_REVIEW_ARGV_TEMPLATES.agy).toBe(AGY_REVIEW_ARGV_TEMPLATE);
       expect(substituteReviewArgv(AGY_REVIEW_ARGV_TEMPLATE, AGY_MODEL, 'PROMPT')).toEqual([
@@ -712,15 +712,57 @@ describe('CliReviewTransport', () => {
         '--output-format',
         'json',
         '--mode',
-        'accept-edits',
+        'plan',
       ]);
     });
 
     it('substituteReviewArgv refuses a template that carries skip-permissions or --yolo', () => {
       expect(() =>
-        substituteReviewArgv([...AGY_REVIEW_ARGV_TEMPLATE.slice(0, -1), '--dangerously-skip-permissions'], AGY_MODEL, 'p'),
-      ).toThrow('--dangerously-skip-permissions');
-      expect(() => substituteReviewArgv(['agy', '--print', '{prompt}', '--yolo'], AGY_MODEL, 'p')).toThrow('--yolo');
+        substituteReviewArgv([...AGY_REVIEW_ARGV_TEMPLATE, '--dangerously-skip-permissions'], AGY_MODEL, 'p'),
+      ).toThrow('must not carry --dangerously-skip-permissions or --yolo');
+      expect(() => substituteReviewArgv(['agy', '--print', '{prompt}', '--yolo'], AGY_MODEL, 'p')).toThrow(
+        'must not carry --dangerously-skip-permissions or --yolo',
+      );
+      // grok templates skip the agy allow-list, so only the skip-permissions check can refuse this one
+      expect(() =>
+        substituteReviewArgv([...GROK_REVIEW_ARGV_TEMPLATE, '--yolo'], 'grok-4.7', 'p', '/tmp/prompt.txt'),
+      ).toThrow('must not carry --dangerously-skip-permissions or --yolo');
+    });
+
+    it('refuses an agy template where a value-taking flag swallows another flag', () => {
+      expect(() =>
+        substituteReviewArgv(
+          ['agy', '--print', '{prompt}', '--model', '{model}', '--output-format', '--mode', 'plan'],
+          AGY_MODEL,
+          'p',
+        ),
+      ).toThrow('flag --output-format has no value');
+    });
+
+    it('refuses agy templates that grant an edit mode or carry unused flags', () => {
+      const base = AGY_REVIEW_ARGV_TEMPLATE.slice(0, -2);
+      expect(() => substituteReviewArgv([...base, '--mode', 'accept-edits'], AGY_MODEL, 'p')).toThrow(
+        'must not grant an edit mode',
+      );
+      expect(() => substituteReviewArgv([...base, '--mode', 'auto'], AGY_MODEL, 'p')).toThrow(
+        'must not grant an edit mode',
+      );
+      expect(() => substituteReviewArgv([...base, '--mode=accept-edits'], AGY_MODEL, 'p')).toThrow(
+        'must not grant an edit mode',
+      );
+      expect(() => substituteReviewArgv([...base, '--agent', 'x'], AGY_MODEL, 'p')).toThrow(
+        'carries a flag the agy review does not use: --agent',
+      );
+      expect(() => substituteReviewArgv(AGY_REVIEW_ARGV_TEMPLATE, AGY_MODEL, 'p')).not.toThrow();
+    });
+
+    it('refuses an agy template that leaves the mode to the default or pins it twice', () => {
+      const modeless = AGY_REVIEW_ARGV_TEMPLATE.slice(0, -2);
+      expect(modeless).not.toContain('--mode');
+      expect(() => substituteReviewArgv(modeless, AGY_MODEL, 'p')).toThrow('must pin --mode plan exactly once');
+      expect(() =>
+        substituteReviewArgv([...AGY_REVIEW_ARGV_TEMPLATE, '--mode', 'plan'], AGY_MODEL, 'p'),
+      ).toThrow('must pin --mode plan exactly once');
     });
 
     it('spawns agy with the prompt preceded by the no-shell preamble', async () => {

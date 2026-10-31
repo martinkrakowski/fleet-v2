@@ -32,6 +32,7 @@ import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/Attem
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -39,8 +40,10 @@ const LATER = '2026-10-27T10:01:00.000Z';
 const LEASE_UNTIL = '2026-10-27T10:05:00.000Z';
 const HOLDER = 'driver';
 const COMMIT = 'a'.repeat(40);
-const SHA = 'c'.repeat(64);
 const HEAD12 = 'a'.repeat(12);
+const PROSE = '# brief\n';
+const DEFAULT_MANIFEST_JSON = JSON.stringify({ timeLimitSeconds: 3600 });
+const digestFor = (json: string): string => simpleDeterministicHexDigest(PROSE + '\n' + json);
 
 const BASE_RECORD = {
   version: 1,
@@ -111,7 +114,7 @@ function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     baseCommit: COMMIT,
     state: 'intent-recorded',
     outcome: null,
-    briefDigest: SHA,
+    briefDigest: digestFor(DEFAULT_MANIFEST_JSON),
     briefPackagePath: '.lane/brief-package',
     sessionId: null,
     completionReceipt: null,
@@ -202,7 +205,7 @@ async function makeHarness(
   const executionJournal = new ExecutionJournalAdapter();
   const admissionCalls: unknown[] = [];
   const reconcileCalls: unknown[] = [];
-  let manifestJson: string | null = JSON.stringify({ timeLimitSeconds: 3600 });
+  let manifestJson: string | null = DEFAULT_MANIFEST_JSON;
   let reconcileAnswer: ReconcileAttemptResult = activeAnswer(attempts[attempts.length - 1] ?? attemptFixture());
   let admissionAnswer: LaneRunAdmissionResult = { outcome: 'admitted' };
   const created = await runRepo.create(record);
@@ -224,6 +227,7 @@ async function makeHarness(
     executionJournal,
     artifactPort: {
       readBriefManifest: async () => manifestJson,
+      readBriefFile: async () => PROSE,
       verifyArtifactManifest: async () => ({ outcome: 'missing' }),
     },
     reconcileAttempt: {
@@ -429,7 +433,13 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
   });
 
   it('test 5: a running attempt past its time limit decides stop; unwired it is not-wired', async () => {
-    const running = attemptFixture({ state: 'running', sessionId: 'session-example-1' });
+    // Regression guard (SEC-5a): a matching manifest still yields the deadline
+    // and the stop decision.
+    const running = attemptFixture({
+      state: 'running',
+      sessionId: 'session-example-1',
+      briefDigest: digestFor(JSON.stringify({ timeLimitSeconds: 2700 })),
+    });
     const harness = await makeHarness(runRecord(), [running]);
     await conduct(harness, 'running', NOW);
     await dispatchIntentAndResult(harness, 0, 0, 1, '2026-10-27T09:10:00.000Z');
@@ -439,6 +449,30 @@ describe('AdvanceLaneRunUseCase facts (K4-4b)', () => {
     // K4-6 built the stop act; this harness wires no stop port, so the reached
     // decision reports not-wired (the old not-built pin is superseded).
     expect(result).toEqual({ outcome: 'not-wired', step: 'stop' });
+  });
+
+  it('test 12: a running attempt whose on-disk manifest changed after dispatch parks ambiguous stop', async () => {
+    const running = attemptFixture({ state: 'running', sessionId: 'session-example-1' });
+    const harness = await makeHarness(runRecord(), [running]);
+    await conduct(harness, 'running', NOW);
+    await dispatchIntentAndResult(harness, 0, 0, 1, '2026-10-27T09:10:00.000Z');
+    harness.setReconcileAnswer(activeAnswer(running));
+    // The on-disk manifest changed after dispatch: its digest no longer matches
+    // the attempt's recorded `briefDigest` (SEC-5a), so the run parks instead
+    // of silently extending the deadline.
+    harness.setManifest(JSON.stringify({ timeLimitSeconds: 360000 }));
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'ambiguous', qualifier: 'stop' });
+    const after = await harness.runRepo.get(RUN_ID);
+    expect(after?.parked).toEqual({
+      reason: 'ambiguous',
+      qualifier: 'stop',
+      parkedFrom: 'running',
+      questionId: null,
+    });
+    expect(after?.parkCount).toBe(1);
+    expect(after?.revision).toBe(2);
+    expect(await lastJournalState(harness)).toBe('parked');
   });
 
   it('test 6: a running attempt with no readable limit parks ambiguous stop', async () => {

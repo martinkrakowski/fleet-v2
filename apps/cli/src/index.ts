@@ -648,7 +648,7 @@ time window) to the collector route, or prints them with a dry run, and shows
 the configuration status. Run 'fleet-v2 telemetry --help'.
 
 Commands:
-  work-order register|inspect|close|stale
+  work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
   hosts list|add|edit|remove
   seats free-tier [status|on|off] [--yes]
@@ -660,7 +660,7 @@ Commands:
   telemetry export|status
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
-  attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge
+  attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared
   forge execute
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede

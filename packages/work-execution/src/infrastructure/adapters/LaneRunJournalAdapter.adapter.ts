@@ -100,17 +100,41 @@ export class LaneRunJournalAdapter implements LaneRunJournalPort {
     if (typeof runId !== 'string') {
       return [];
     }
-    const target = this.statePath;
-    const entries = target === null ? this.inMemoryEntries : await this.readEntriesFromDisk(target);
+    const entries = await this.entriesForScan();
     return entries.filter((entry) => entry.runId === runId).map(copyEntry);
+  }
+
+  async listForRuns(
+    runIds: readonly string[],
+  ): Promise<ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]>> {
+    const wanted = new Set(runIds.filter((runId): runId is string => typeof runId === 'string'));
+    const grouped = new Map<string, LaneRunJournalEntryRecord[]>();
+    for (const runId of wanted) {
+      grouped.set(runId, []);
+    }
+    if (wanted.size > 0) {
+      const entries = await this.entriesForScan();
+      for (const entry of entries) {
+        const list = typeof entry.runId === 'string' ? grouped.get(entry.runId) : undefined;
+        if (list !== undefined) {
+          list.push(copyEntry(entry));
+        }
+      }
+    }
+    return grouped;
+  }
+
+  /** One read of the store for a scan: the in-memory list, or one file read. */
+  private async entriesForScan(): Promise<readonly LaneRunJournalEntryRecord[]> {
+    const target = this.statePath;
+    return target === null ? this.inMemoryEntries : await this.readEntriesFromDisk(target);
   }
 
   async listForKey(key: string): Promise<readonly LaneRunJournalEntryRecord[]> {
     if (typeof key !== 'string') {
       return [];
     }
-    const target = this.statePath;
-    const entries = target === null ? this.inMemoryEntries : await this.readEntriesFromDisk(target);
+    const entries = await this.entriesForScan();
     return entries.filter((entry) => entry.key === key).map(copyEntry);
   }
 

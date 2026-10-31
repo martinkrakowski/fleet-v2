@@ -37,6 +37,7 @@ import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/Attem
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import type { SessionStartGate } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 
 function denyingStartGate(): SessionStartGate {
@@ -53,8 +54,11 @@ const LATER = '2026-10-27T10:01:00.000Z';
 const LEASE_UNTIL = '2026-10-27T10:05:00.000Z';
 const HOLDER = 'driver';
 const COMMIT = 'a'.repeat(40);
-const SHA = 'c'.repeat(64);
 const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
+const PROSE = '# brief\n';
+const DEFAULT_MANIFEST_JSON = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });
+const digestFor = (json: string): string => simpleDeterministicHexDigest(PROSE + '\n' + json);
+const SHA = digestFor(DEFAULT_MANIFEST_JSON);
 
 const BASE_RECORD = {
   version: 1,
@@ -284,7 +288,7 @@ async function makeHarness(
   });
   const cancelRequests: CancelPreparedAttemptRequest[] = [];
   let cancelAnswer: CancelPreparedAttemptResult = { outcome: 'cancelled', attempt: attemptFixture(), capacity: 'released' };
-  let manifestJson: string | null = JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [] });
+  let manifestJson: string | null = DEFAULT_MANIFEST_JSON;
   const created = await runRepoPort.create(record);
   expect(created.outcome).toBe('saved');
   const leased = await runRepoPort.acquireLease(record.runId, {
@@ -307,6 +311,7 @@ async function makeHarness(
         manifestReads.push(recordedHost ?? null);
         return manifestJson;
       },
+      readBriefFile: async () => PROSE,
       verifyArtifactManifest: async () => ({ outcome: 'missing' }),
     },
     reconcileAttempt: {

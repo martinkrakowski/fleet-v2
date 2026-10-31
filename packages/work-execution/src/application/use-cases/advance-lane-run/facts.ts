@@ -32,7 +32,7 @@ import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunSta
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { performPark } from './step-context.js';
-import { manifestTimeLimitSeconds, readFrozenManifest } from './frozen-manifest.js';
+import { manifestTimeLimitSeconds, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import { reviewFactsOf } from './review-fix.js';
 import { acceptanceFactsOf } from './merge.js';
@@ -167,7 +167,12 @@ export async function gatherFacts(ctx: AdvanceStepContext,
 
   const state = journalState;
   const phase = latest === null ? null : laneRunAttemptPhaseOf(latest.state);
-  const manifest = latest === null ? null : await readFrozenManifest(latest, ctx.deps.artifactPort);
+  // The frozen manifest is used only while running; a verified read then, and
+  // no remote read otherwise (SEC-5a).
+  const manifest =
+    latest !== null && phase === 'running'
+      ? await readVerifiedFrozenManifest(latest, ctx.deps.artifactPort, ctx.deps.computeDigest)
+      : null;
 
   let deadlineIso: string | null = null;
   if (phase === 'running' && latest !== null) {

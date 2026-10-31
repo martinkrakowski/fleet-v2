@@ -4,39 +4,6 @@ import type { AttemptRecord } from '../../../domain/execution-records.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
-/** The frozen brief manifest as a plain object; null when absent or unreadable (K4-4b). */
-export async function readFrozenManifest(
-  attempt: AttemptRecord,
-  artifactPort: AdvanceLaneRunDependencies['artifactPort'],
-): Promise<Record<string, unknown> | null> {
-  // Called on the port, never copied off it: an adapter method reads `this` (KF-11).
-  if (artifactPort.readBriefManifest === undefined || attempt.briefPackagePath === null) {
-    return null;
-  }
-  // Q2a-2: a conducted attempt's read goes through its recorded host or is not
-  // made; a missing host never falls back to the local executor.
-  const recordedHost = conductedRunnerOf(attempt);
-  if (recordedHost === null) {
-    return null;
-  }
-  try {
-    const text = await artifactPort.readBriefManifest(
-      attempt.worktreePath,
-      attempt.briefPackagePath.replace(/\.md$/, '-manifest.json'),
-      recordedHost,
-    );
-    if (text === null) {
-      return null;
-    }
-    const parsed: unknown = JSON.parse(text);
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * A conducted attempt's frozen brief manifest read with its digest verified
  * (SEC-5b): `verified` carries the manifest; `absent` means there is nothing

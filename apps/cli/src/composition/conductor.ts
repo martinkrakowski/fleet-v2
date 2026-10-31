@@ -6,19 +6,24 @@ import { newUlid } from '../ulid.js';
 import { autoMergeSettingsFromLoad } from '../auto-merge-settings.js';
 
 import {
+  AttemptRepositoryAdapter,
   ConductorForgeGrantAdapter,
   LaneRunParkNoticeAdapter,
   CiStateAdapter,
   ConductorDriverLeaseAdapter,
   ConductorHaltAdapter,
+  ExecutionJournalAdapter,
   GateReceiptAdapter,
   InspectLaneRunsUseCase,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
+  ReapLaneWorktreesUseCase,
   RequestLaneRunStopUseCase,
   ResumeLaneRunUseCase,
   ReviewAssessmentAdapter,
   ReviewRequestAdapter,
+  WorkspaceAdapter,
+  WorkOrderRepositoryAdapter,
   type ProjectProfileReadPort,
 } from '@fleet/work-execution';
 
@@ -44,10 +49,27 @@ export interface ComposeConductorInput {
   readonly autoMergeLoad: () => LoadResult;
   /** The parsed installation the conductor revision is resolved from. */
   readonly installation?: FleetInstallation;
+  /** The execution stores the worktree reap reads (EX-2b). */
+  readonly workOrderRepository: WorkOrderRepositoryAdapter;
+  readonly attemptRepository: AttemptRepositoryAdapter;
+  readonly executionJournal: ExecutionJournalAdapter;
+  readonly workspace: WorkspaceAdapter;
 }
 
 export function composeConductor(input: ComposeConductorInput) {
-  const { stateDir, evidence, profileRead, coordination, issuePolicyForgeGrantUseCase, autoMergeLoad, installation } = input;
+  const {
+    stateDir,
+    evidence,
+    profileRead,
+    coordination,
+    issuePolicyForgeGrantUseCase,
+    autoMergeLoad,
+    installation,
+    workOrderRepository,
+    attemptRepository,
+    executionJournal,
+    workspace,
+  } = input;
 
   // K7: the conductor's stores and its record-only controls. Nothing here
   // dispatches.
@@ -84,6 +106,17 @@ export function composeConductor(input: ComposeConductorInput) {
       runRepo: laneRunRepository,
       runJournal: laneRunJournal,
       newUlid: conductorNewUlid,
+    }),
+    // EX-2b: the operator-opt-in worktree reap, built beside the lane-run
+    // stores it scans and the execution stores it journals to.
+    reapLaneWorktrees: new ReapLaneWorktreesUseCase({
+      workOrderRepo: workOrderRepository,
+      attemptRepo: attemptRepository,
+      runRepo: laneRunRepository,
+      runJournal: laneRunJournal,
+      executionJournal,
+      profileRead,
+      workspace,
     }),
     newUlid: conductorNewUlid,
     profileRead,

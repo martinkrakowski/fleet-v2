@@ -244,7 +244,11 @@ interface Harness {
   setManifest(json: string | null): Promise<void>;
   /** Serves a changed manifest on disk without re-freezing any attempt digest (SEC-5b digest-mismatch tests). */
   setChangedManifestOnDisk(json: string | null): void;
-  setBriefText(text: string | null): void;
+  /** Serves changed prose on disk without re-freezing any attempt digest (SEC-3b prose-mismatch tests). */
+  setChangedProseOnDisk(text: string): void;
+  /** Serves changed prose from the second read on: the first read of the step still returns the frozen bytes (SEC-3b race test). */
+  setProseAfterFirstRead(text: string): void;
+  readonly readBriefFileCalls: number;
   setReviewAnswer(answer: (request: ReviewRequest) => Promise<ReviewRequestResult>): void;
   setFindReceiptAnswer(answer: (request: FindReviewReceiptRequest) => Promise<FindReviewReceiptResult>): void;
   setOpenAnswer(answer: OpenReviewAssessmentResult): void;
@@ -271,7 +275,9 @@ async function makeHarness(
   const openRequests: OpenReviewAssessmentRequest[] = [];
   const workOrderLookups: string[] = [];
   let manifestJson: string | null = DEFAULT_MANIFEST_JSON;
-  let briefText: string | null = null;
+  let prose = PROSE;
+  let proseAfterFirstRead: string | null = null;
+  let readBriefFileCalls = 0;
   let openAnswer: OpenReviewAssessmentResult = { outcome: 'open' };
   let workOrderAnswer: WorkOrderRecord | null = WORK_ORDER;
   let journalLengthWhenCalled = 0;
@@ -310,11 +316,15 @@ async function makeHarness(
     executionJournal,
     artifactPort: {
       readBriefManifest: async () => manifestJson,
-      // SEC-5b: the frozen prose is served for the digest read (at the
-      // attempt's brief package path); the brief text forwarded to a brief
-      // check is read separately at `.lane/brief.md`.
-      readBriefFile: async (worktreePath: string, relativePath: string) =>
-        relativePath === '.lane/brief.md' ? briefText : PROSE,
+      // SEC-3b: the frozen prose is served from a single value regardless of
+      // path; the review's digest read and any brief text both come from it.
+      readBriefFile: async () => {
+        readBriefFileCalls += 1;
+        if (proseAfterFirstRead !== null && readBriefFileCalls === 1) {
+          return PROSE;
+        }
+        return prose;
+      },
       verifyArtifactManifest: async () => ({ outcome: 'sealed' }) as never,
     },
     reconcileAttempt: {
@@ -409,8 +419,15 @@ async function makeHarness(
     setChangedManifestOnDisk: (json) => {
       manifestJson = json;
     },
-    setBriefText: (text) => {
-      briefText = text;
+    setChangedProseOnDisk: (text) => {
+      prose = text;
+    },
+    setProseAfterFirstRead: (text) => {
+      proseAfterFirstRead = text;
+      prose = text;
+    },
+    get readBriefFileCalls() {
+      return readBriefFileCalls;
     },
     setReviewAnswer: (answer) => {
       reviewAnswer = answer;
@@ -493,6 +510,7 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
       policyRevision: 'policy-example-1',
       implementerModel: 'model-example-1',
       reviewerModel: 'review-model-1',
+      briefText: PROSE,
       nowIso: LATER,
     });
     expect(harness.openRequests).toHaveLength(1);
@@ -738,20 +756,71 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
     expect(harness.reviewRequests).toHaveLength(0);
   });
 
-  it('forwards briefText only for brief-check from readBriefFile', async () => {
+  it('forwards the digest-verified prose as briefText only for brief-check (SEC-3b)', async () => {
+    // The brief text is no longer read separately: it is the prose the
+    // verified frozen-brief read already covered.
     const hBrief = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(hBrief, 'brief-check', NOW);
-    hBrief.setBriefText('the frozen brief prose');
     await advance(hBrief);
-    expect(hBrief.reviewRequests[0]!.briefText).toBe('the frozen brief prose');
+    expect(hBrief.reviewRequests[0]!.briefText).toBe(PROSE);
 
     const hCode = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(hCode, 'code-review', NOW);
-    hCode.setBriefText('the frozen brief prose');
     await advance(hCode);
     expect(hCode.reviewRequests).toHaveLength(1);
     expect(hCode.reviewRequests[0]!.kind).toBe('code-review');
     expect(hCode.reviewRequests[0]!.briefText).toBeUndefined();
+  });
+
+  it('regression guard: prose changed on disk after dispatch refuses assessment-unavailable before opening or requesting (SEC-3b)', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setChangedProseOnDisk('# changed brief\n');
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'refused',
+      reasonCode: 'assessment-unavailable',
+    });
+    expect(harness.openRequests).toHaveLength(0);
+    expect(harness.reviewRequests).toHaveLength(0);
+  });
+
+  it('a prose race between the verified read and the reviewer text is impossible: one read feeds both (SEC-3b)', async () => {
+    // The harness serves the frozen bytes on the first `readBriefFile` call of
+    // the step and changed bytes on every later call. After SEC-3b the review
+    // act reads the brief once, so the reviewer gets the verified bytes; the
+    // pre-change act read twice and handed the reviewer the changed bytes.
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    harness.setProseAfterFirstRead('# changed brief\n');
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'review-passed',
+    });
+    expect(harness.reviewRequests[0]!.briefText).toBe(PROSE);
+    expect(harness.readBriefFileCalls).toBe(1);
+  });
+
+  it('regression guard: no recorded brief package path reads absent and refuses assessment-unavailable (SEC-3b)', async () => {
+    const harness = await makeHarness(runRecord(), [{ ...collectedAttempt(), briefPackagePath: null }]);
+    await conduct(harness, 'brief-check', NOW);
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'refused',
+      reasonCode: 'assessment-unavailable',
+    });
+    expect(harness.openRequests).toHaveLength(0);
+    expect(harness.reviewRequests).toHaveLength(0);
   });
 
   it('never journals the review reply finding summary text', async () => {

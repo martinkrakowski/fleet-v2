@@ -24,12 +24,14 @@ export type RunnerTunnelStartOutcome =
   | 'not-applicable'
   | 'failed';
 
-/** The child process seam: an exit promise and a kill, nothing more. */
+/** The child process seam: an exit promise, a kill and a release, nothing more. */
 export interface TunnelChild {
   /** Resolves when the child exits (code null on signal or spawn error). */
   readonly exited: Promise<{ readonly code: number | null }>;
   /** Asks the child to terminate; never throws. */
   readonly stop: () => void;
+  /** Lets the child outlive this process (no kill); never throws. */
+  readonly release: () => void;
 }
 
 /** Spawns the ssh forward child; injectable for deterministic tests. */
@@ -45,6 +47,13 @@ export interface RunnerTunnelPort {
   ensureTunnel(handlers?: { readonly onEarlyExit?: () => void }): Promise<RunnerTunnelStartOutcome>;
   /** Stop the owned child, if any; a tunnel that was never owned is a no-op. */
   stop(): Promise<void>;
+  /**
+   * Give up ownership of the forward WITHOUT killing it, so it outlives the
+   * driver: detached lanes (`opencode run --attach` through the dial port) keep
+   * talking to the server after the driver ends, exactly as with `ocm-run`'s
+   * own `ssh -f -N` forward. A tunnel that was never owned is a no-op.
+   */
+  release(): Promise<void>;
 }
 
 export interface RunnerTunnelOptions {
@@ -104,12 +113,14 @@ function dialLoopback(port: number): Promise<boolean> {
 
 /** Production spawner: `ssh -N` without a command, forwarding the dial port. */
 function spawnSsh(argv: readonly string[]): TunnelChild {
-  const child = spawn(argv[0]!, argv.slice(1), { stdio: 'ignore' });
+  // Its own process group, so a terminal interrupt to the driver does not end
+  // the forward the detached lanes still use.
+  const child = spawn(argv[0]!, argv.slice(1), { stdio: 'ignore', detached: true });
   const exited = new Promise<{ code: number | null }>((resolve) => {
     child.once('error', () => resolve({ code: null }));
     child.once('close', (code) => resolve({ code: code ?? null }));
   });
-  return { exited, stop: () => child.kill() };
+  return { exited, stop: () => child.kill(), release: () => child.unref() };
 }
 
 /**
@@ -262,5 +273,16 @@ export class RunnerTunnelAdapter implements RunnerTunnelPort {
     this.child = null;
     child.stop();
     await child.exited;
+  }
+
+  async release(): Promise<void> {
+    const child = this.child;
+    if (child === null) {
+      return;
+    }
+    // Dropped first so the early-exit watcher stays quiet; the forward keeps
+    // running for the detached lanes and later drivers find it listening.
+    this.child = null;
+    child.release();
   }
 }

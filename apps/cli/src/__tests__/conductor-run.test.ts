@@ -518,6 +518,7 @@ describe('conductor run --live tunnel wiring (KF-35 fix 1)', () => {
         killCalls.push(1);
         resolveExit({ code: null });
       },
+      release: () => undefined,
     };
     const controller = new AbortController();
     const tunnel = new RunnerTunnelAdapter({

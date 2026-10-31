@@ -97,12 +97,18 @@ function makeFakeDriver(
 function fakeTunnel(
   outcome: RunnerTunnelStartOutcome,
   order: string[],
-): RunnerTunnelPort & { readonly ensureCalls: number[]; readonly stopCalls: number[] } {
+): RunnerTunnelPort & {
+  readonly ensureCalls: number[];
+  readonly stopCalls: number[];
+  readonly releaseCalls: number[];
+} {
   const ensureCalls: number[] = [];
   const stopCalls: number[] = [];
+  const releaseCalls: number[] = [];
   return {
     ensureCalls,
     stopCalls,
+    releaseCalls,
     ensureTunnel: async (handlers) => {
       ensureCalls.push(1);
       order.push('ensure');
@@ -112,6 +118,10 @@ function fakeTunnel(
     stop: async () => {
       stopCalls.push(1);
       order.push('stop');
+    },
+    release: async () => {
+      releaseCalls.push(1);
+      order.push('release');
     },
   };
 }
@@ -152,6 +162,7 @@ function runtimeOf(stateDir?: string): FleetCliRuntime {
 
 interface FakeChild extends TunnelChild {
   readonly killCalls: number[];
+  readonly releaseCalls: number[];
   /** Simulates the child dying on its own (no kill recorded). */
   crash(value: { code: number | null }): void;
 }
@@ -165,13 +176,18 @@ function fakeChild(options: { readonly exitAt?: 'immediately' } = {}): FakeChild
   if (options.exitAt === 'immediately') {
     resolveExit({ code: 255 });
   }
+  const releaseCalls: number[] = [];
   return {
     exited,
     stop: () => {
       killCalls.push(1);
       resolveExit({ code: null });
     },
+    release: () => {
+      releaseCalls.push(1);
+    },
     killCalls,
+    releaseCalls,
     crash: (value) => resolveExit(value),
   };
 }
@@ -347,6 +363,22 @@ describe('RunnerTunnelAdapter (KF-35)', () => {
     expect(tunnel.owned).toBe(false);
   });
 
+  it('release drops ownership without killing the forward; a later exit is not reported (e2e fix)', async () => {
+    const child = fakeChild();
+    const tunnel = tunnelOf({ sshHost: 'lane-host', remotePort: 46000, probe: probeOf([false, true]), child });
+    const early: number[] = [];
+    expect(await tunnel.ensureTunnel({ onEarlyExit: () => early.push(1) })).toBe('opened');
+    await tunnel.release();
+    expect(tunnel.owned).toBe(false);
+    expect(child.killCalls).toHaveLength(0);
+    expect(child.releaseCalls).toHaveLength(1);
+    child.crash({ code: 0 });
+    await child.exited;
+    expect(early).toHaveLength(0);
+    await tunnel.release();
+    expect(child.releaseCalls).toHaveLength(1);
+  });
+
   it('reports a failure after the bounded wait and stops the child', async () => {
     const child = fakeChild();
     const sleeps: number[] = [];
@@ -384,6 +416,7 @@ describe('RunnerTunnelAdapter (KF-35)', () => {
         // The kill takes a tick to take effect, like a real child's exit.
         setTimeout(() => resolveExit({ code: null }), 0);
       },
+      release: () => undefined,
     };
     const tunnel = new RunnerTunnelAdapter({
       sshHost: 'lane-host',
@@ -465,7 +498,7 @@ describe('RunnerTunnelAdapter (KF-35)', () => {
 // ---------------------------------------------------------------------------
 
 describe('conductor run --live holds one runner tunnel (KF-35)', () => {
-  it('starts the tunnel once before pass 1 and stops it after releaseLeases, also with --once', async () => {
+  it('starts the tunnel once before pass 1 and releases it (never kills it) after releaseLeases, also with --once', async () => {
     const dir = tempStateDir();
     const order: string[] = [];
     const fake = makeFakeDriver([completedPass()], order);
@@ -479,11 +512,12 @@ describe('conductor run --live holds one runner tunnel (KF-35)', () => {
     expect(tunnel.ensureCalls).toHaveLength(1);
     expect(fake.passCalls).toHaveLength(1);
     expect(fake.releaseCalls).toHaveLength(1);
-    expect(tunnel.stopCalls).toHaveLength(1);
-    expect(order).toEqual(['ensure', 'runPass', 'releaseLeases', 'stop']);
+    expect(tunnel.releaseCalls).toHaveLength(1);
+    expect(tunnel.stopCalls).toHaveLength(0);
+    expect(order).toEqual(['ensure', 'runPass', 'releaseLeases', 'release']);
   });
 
-  it('still stops the tunnel when releasing the leases throws (Fable pre-merge)', async () => {
+  it('still releases the tunnel when releasing the leases throws (Fable pre-merge)', async () => {
     const dir = tempStateDir();
     const order: string[] = [];
     const fake = makeFakeDriver([completedPass()], order);
@@ -503,11 +537,12 @@ describe('conductor run --live holds one runner tunnel (KF-35)', () => {
       buildDriver: () => throwing,
       tunnel,
     }).catch(() => undefined);
-    expect(order).toEqual(['ensure', 'runPass', 'releaseLeases', 'stop']);
-    expect(tunnel.stopCalls).toHaveLength(1);
+    expect(order).toEqual(['ensure', 'runPass', 'releaseLeases', 'release']);
+    expect(tunnel.releaseCalls).toHaveLength(1);
+    expect(tunnel.stopCalls).toHaveLength(0);
   });
 
-  it('stops the tunnel once in finally after a multi-pass loop ends on the stop signal', async () => {
+  it('releases the tunnel once in finally after a multi-pass loop ends on the stop signal', async () => {
     const dir = tempStateDir();
     const order: string[] = [];
     const fake = makeFakeDriver([completedPass(), completedPass(), completedPass()]);
@@ -529,7 +564,8 @@ describe('conductor run --live holds one runner tunnel (KF-35)', () => {
     expect(result.code).toBe(0);
     expect(fake.passCalls).toHaveLength(3);
     expect(tunnel.ensureCalls).toHaveLength(1);
-    expect(tunnel.stopCalls).toHaveLength(1);
+    expect(tunnel.releaseCalls).toHaveLength(1);
+    expect(tunnel.stopCalls).toHaveLength(0);
   });
 
   it('never starts a tunnel with --dry-run', async () => {
@@ -546,7 +582,7 @@ describe('conductor run --live holds one runner tunnel (KF-35)', () => {
     expect(order).toEqual([]);
   });
 
-  it('an already-listening dial port still runs the passes; the stop call is a harmless no-op', async () => {
+  it('an already-listening dial port still runs the passes; the release call is a harmless no-op', async () => {
     const dir = tempStateDir();
     const fake = makeFakeDriver([completedPass()]);
     const tunnel = fakeTunnel('already-listening', []);
@@ -558,7 +594,8 @@ describe('conductor run --live holds one runner tunnel (KF-35)', () => {
     expect(result.code).toBe(0);
     expect(fake.passCalls).toHaveLength(1);
     expect(tunnel.ensureCalls).toHaveLength(1);
-    expect(tunnel.stopCalls).toHaveLength(1);
+    expect(tunnel.releaseCalls).toHaveLength(1);
+    expect(tunnel.stopCalls).toHaveLength(0);
   });
 
   it('a tunnel start failure exits 1 with the fixed message and drives no pass', async () => {

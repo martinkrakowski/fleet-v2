@@ -695,7 +695,7 @@ async function runCommand(
       sleep: options.sleep ?? defaultSleep,
       stopSignal: signal,
       once: flags.once,
-      stopTunnel: () => tunnel.stop(),
+      releaseTunnel: () => tunnel.release(),
       eachPass: async (pass, result) => {
         io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
         if (result.outcome === 'refused') {
@@ -742,8 +742,11 @@ async function pollConductorPasses(options: {
   readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   readonly stopSignal?: AbortSignal;
   readonly once: boolean;
-  /** KF-35: stops the driver's runner tunnel; called after `releaseLeases`. */
-  readonly stopTunnel?: () => Promise<void>;
+  /**
+   * KF-35: releases the driver's runner tunnel after `releaseLeases`, leaving
+   * the forward running: detached lanes still talk to the server through it.
+   */
+  readonly releaseTunnel?: () => Promise<void>;
   readonly eachPass: (pass: number, result: RunConductorPassResult) => Promise<PollPassOutcome>;
 }): Promise<number> {
   const controller = new AbortController();
@@ -790,9 +793,9 @@ async function pollConductorPasses(options: {
         nowIso: options.nowIso(),
       });
     } finally {
-      // The tunnel is stopped after the leases it outlived, even when releasing
-      // them throws; a tunnel that was never owned is a no-op.
-      await options.stopTunnel?.();
+      // The tunnel is released (never killed) after the leases it outlived, even
+      // when releasing them throws: detached lanes keep using the forward.
+      await options.releaseTunnel?.();
     }
     if (signalHandlersBound) {
       process.removeListener('SIGINT', onSignal);

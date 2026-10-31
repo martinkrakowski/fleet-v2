@@ -7,7 +7,7 @@ import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendConduct, appendRunIntent, appendRunResult, intentMintedIdOf, saveOrRefuse } from './step-context.js';
+import { appendConduct, appendRunIntent, appendRunResult, intentMintedIdOf, releaseWorkOrderAtEnd, saveOrRefuse } from './step-context.js';
 import { conductDispatching } from './prepare-dispatch.js';
 import { gatePreCheck, runCollectBody, runGateBody } from './collect-gate.js';
 import { reconcileReview } from './review-fix.js';
@@ -46,7 +46,7 @@ export async function performReconcile(ctx: AdvanceStepContext,
     return reconcileMerge(ctx, record, gathered, decision, request);
   }
   if (decision.step === 'stop') {
-    return reconcileStop(ctx, gathered, decision, request);
+    return reconcileStop(ctx, record, gathered, decision, request);
   }
   if (decision.step === 'collect') {
     return reconcileCollect(ctx, record, gathered, decision, request);
@@ -289,6 +289,7 @@ export async function closeDispatchNotStarted(ctx: AdvanceStepContext,
  * `stop-unconfirmed`, which the decider retries under a retry key.
  */
 export async function reconcileStop(ctx: AdvanceStepContext,
+  record: LaneRunRecord,
   gathered: GatheredLaneRunFacts,
   decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
   request: AdvanceLaneRunRequest,
@@ -322,6 +323,9 @@ export async function reconcileStop(ctx: AdvanceStepContext,
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
+    // Before the terminal conduct entry: a crash between the two leaves a
+    // non-terminal run the next pass re-ends (the release is idempotent).
+    await releaseWorkOrderAtEnd(ctx, record, 'stopped', request);
     const appended = await appendConduct(ctx, request, 'stopped');
     if (!appended.ok) {
       return { outcome: 'refused', reason: appended.reason };

@@ -9,7 +9,7 @@ import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { laneRunStopEffect } from '../../../domain/lane-run-transitions.js';
 import type { RunStopEffect, RunStopOutcome } from '../../../domain/lane-run-transitions.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendConduct, appendRunIntent, appendRunResult, performPark } from './step-context.js';
+import { appendConduct, appendRunIntent, appendRunResult, performPark, releaseWorkOrderAtEnd } from './step-context.js';
 
 /** Map a StopAttempt port result onto the domain's RunStopOutcome; a refusal re-reads the attempt for its kind. */
 export async function runStopOutcomeOf(
@@ -105,6 +105,9 @@ export async function finishForceStop(ctx: AdvanceStepContext,
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
+    // Before the terminal conduct entry: a crash between the two leaves a
+    // non-terminal run the next pass re-ends (the release is idempotent).
+    await releaseWorkOrderAtEnd(ctx, record, 'stopped', request);
     const appended = await appendConduct(ctx, request, 'stopped');
     if (!appended.ok) {
       return { outcome: 'refused', reason: appended.reason };

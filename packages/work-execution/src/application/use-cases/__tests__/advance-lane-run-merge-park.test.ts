@@ -37,6 +37,8 @@ import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneR
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
+import { RegisterWorkOrderUseCase } from '../RegisterWorkOrderUseCase.use-case.js';
+import type { WorkOrderRepositoryPort } from '../../ports/out/WorkOrderRepositoryPort.out-port.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 
@@ -230,6 +232,12 @@ interface Harness {
   setAncestryAnswer(answer: ContainsCommitResult | 'throw'): void;
   updateAttempt(attempt: AttemptRecord): Promise<void>;
   addWorkOrder(workOrder: WorkOrderRecord): void;
+  /** The work orders the release fake saved, in save order (KF-36a). */
+  readonly savedWorkOrders: readonly WorkOrderRecord[];
+  /** The KF-36a release fake itself, for RegisterWorkOrderUseCase in tests. */
+  readonly workOrderReleaseFake: WorkOrderRepositoryPort;
+  workOrderById(workOrderId: string): WorkOrderRecord | null;
+  setWorkOrderReleaseRace(mode: 'none' | 'steal-merged' | 'throw-find'): void;
   addOtherRun(options: {
     readonly runId: string;
     readonly workOrderId: string;
@@ -244,6 +252,8 @@ interface HarnessOptions {
   readonly wireForgeRead?: boolean;
   readonly wireForgeAncestry?: boolean;
   readonly wireWorkOrder?: boolean;
+  /** Wire the KF-36a `workOrderRelease` fake over the harness's work orders map. */
+  readonly wireWorkOrderRelease?: boolean;
   readonly autoMergeEnabled?: boolean;
 }
 
@@ -328,6 +338,32 @@ async function makeHarness(
   let ancestryAnswer: ContainsCommitResult | 'throw' = { outcome: 'answered', contains: false };
   const attentionStore = new Map<string, LaneRunParkNoticeResult>();
   const questionStore = new Map<string, LaneRunParkNoticeResult>();
+  const savedWorkOrders: WorkOrderRecord[] = [];
+  let releaseRace: 'none' | 'steal-merged' | 'throw-find' = 'none';
+  const workOrderReleaseFake: WorkOrderRepositoryPort = {
+    saveWorkOrder: async (record) => {
+      const stored = workOrders.get(record.id);
+      // Mirror WorkOrderRepositoryAdapter: a stale revision is an error.
+      if (stored !== undefined && record.revision <= stored.revision) {
+        throw new Error('stale work order revision');
+      }
+      if (releaseRace === 'steal-merged') {
+        // Another writer (markMerged) saves first, then our save is stale.
+        workOrders.set(record.id, { ...record, state: 'merged' });
+        throw new Error('stale work order revision');
+      }
+      workOrders.set(record.id, record);
+      savedWorkOrders.push(record);
+    },
+    findWorkOrderById: async (workOrderId) => {
+      if (releaseRace === 'throw-find') {
+        throw new Error('work order read unavailable');
+      }
+      return workOrders.get(workOrderId) ?? null;
+    },
+    listWorkOrdersByProject: async (projectId) =>
+      [...workOrders.values()].filter((order) => projectId === undefined || order.projectId === projectId),
+  };
 
   const created = await runRepo.create(record);
   expect(created.outcome).toBe('saved');
@@ -470,6 +506,9 @@ async function makeHarness(
             },
           },
         }),
+    ...(options.wireWorkOrderRelease === true
+      ? { workOrderRelease: workOrderReleaseFake }
+      : {}),
   };
   return {
     runRepo,
@@ -502,6 +541,12 @@ async function makeHarness(
     },
     addWorkOrder: (workOrder) => {
       workOrders.set(workOrder.id, workOrder);
+    },
+    savedWorkOrders,
+    workOrderReleaseFake,
+    workOrderById: (workOrderId) => workOrders.get(workOrderId) ?? null,
+    setWorkOrderReleaseRace: (mode) => {
+      releaseRace = mode;
     },
     addOtherRun: async ({ runId, workOrderId, repository, state }) => {
       const other = await runRepo.create(runRecord({ runId, workOrderId }));
@@ -1152,5 +1197,119 @@ describe('AdvanceLaneRunUseCase park notice re-raise (KF-4)', () => {
     const record = await harness.runRepo.get(RUN_ID);
     expect(record?.attemptIds).toContain('attempt-fix-1');
     expect(record?.parked?.questionId).toBe(QUESTION_ID);
+  });
+});
+
+describe('AdvanceLaneRunUseCase work-order release at the run end (KF-36a)', () => {
+  function makeReleaseRequest(): Parameters<RegisterWorkOrderUseCase['registerWorkOrder']>[0] {
+    return {
+      workOrderId: 'wo-example-2',
+      projectId: PROJECT_ID,
+      taskId: 'task-example-2',
+      laneId: 'lane-example',
+      repository: 'repo-example',
+      baseCommit: COMMIT,
+      ownedPaths: ['src/example.ts/neighbor.ts'],
+      policyRevision: 'policy-example-1',
+      nowIso: LATER,
+    };
+  }
+
+  it('entering merged saves the work order merged at revision + 1 and frees its paths for a new registration', async () => {
+    const harness = await mergingHarness({ wireWorkOrderRelease: true });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'merge',
+      key: mergeKey(),
+      result: 'completed',
+      reasonCode: 'merged',
+    });
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(harness.savedWorkOrders).toHaveLength(1);
+    expect(harness.savedWorkOrders[0]).toMatchObject({
+      id: WORK_ORDER_ID,
+      state: 'merged',
+      revision: 2,
+      updatedAtIso: LATER,
+    });
+    // The released paths are free: a new work order owning an overlapping path registers.
+    const register = new RegisterWorkOrderUseCase({ workOrderRepo: harness.workOrderReleaseFake });
+    expect(await register.registerWorkOrder(makeReleaseRequest())).toMatchObject({ outcome: 'registered' });
+  });
+
+  it('the owner-merge park exit (CT-2a) releases the work order too', async () => {
+    const harness = await ownerMergeParkedHarness({ wireWorkOrderRelease: true });
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(harness.savedWorkOrders).toHaveLength(1);
+    expect(harness.savedWorkOrders[0]).toMatchObject({ id: WORK_ORDER_ID, state: 'merged', revision: 2 });
+  });
+
+  it('with workOrderRelease absent the work order is left as it is', async () => {
+    const harness = await mergingHarness();
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'merge',
+      key: mergeKey(),
+      result: 'completed',
+      reasonCode: 'merged',
+    });
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(harness.savedWorkOrders).toHaveLength(0);
+    expect(harness.workOrderById(WORK_ORDER_ID)).toMatchObject({ state: 'ready-to-merge', revision: 1 });
+  });
+
+  it('a stale save whose re-read shows merged makes no second save and the run still enters merged', async () => {
+    const harness = await mergingHarness({ wireWorkOrderRelease: true });
+    harness.setWorkOrderReleaseRace('steal-merged');
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'merge',
+      key: mergeKey(),
+      result: 'completed',
+      reasonCode: 'merged',
+    });
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    // The other writer's merged save stands; the release never saved a second revision.
+    expect(harness.savedWorkOrders).toHaveLength(0);
+    expect(harness.workOrderById(WORK_ORDER_ID)).toMatchObject({ state: 'merged' });
+  });
+
+  it('a throwing work-order read never blocks the run and leaves the work order unchanged', async () => {
+    const harness = await mergingHarness({ wireWorkOrderRelease: true });
+    harness.setWorkOrderReleaseRace('throw-find');
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'merge',
+      key: mergeKey(),
+      result: 'completed',
+      reasonCode: 'merged',
+    });
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(harness.savedWorkOrders).toHaveLength(0);
+    expect(harness.workOrderById(WORK_ORDER_ID)).toMatchObject({ state: 'ready-to-merge', revision: 1 });
+  });
+
+  it('another non-terminal run of the same work order blocks the release (no save)', async () => {
+    const harness = await mergingHarness({ wireWorkOrderRelease: true });
+    const other = await harness.runRepo.create(runRecord({ runId: OTHER_RUN_ID, workOrderId: WORK_ORDER_ID }));
+    expect(other.outcome).toBe('saved');
+    const otherConduct = laneRunConductEntry(harness.deps.newUlid(), OTHER_RUN_ID, 'gating', NOW);
+    expect((await harness.runJournal.append(otherConduct)).outcome).toBe('appended');
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'merge',
+      key: mergeKey(),
+      result: 'completed',
+      reasonCode: 'merged',
+    });
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(harness.savedWorkOrders).toHaveLength(0);
+    expect(harness.workOrderById(WORK_ORDER_ID)).toMatchObject({ state: 'ready-to-merge', revision: 1 });
   });
 });

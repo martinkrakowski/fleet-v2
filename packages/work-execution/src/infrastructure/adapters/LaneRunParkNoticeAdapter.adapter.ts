@@ -107,7 +107,7 @@ const PARK_RECOMMENDATION: OwnerQuestionRecommendationRecord = {
 
 /** `fix-no-progress` cannot resume (the same head would park again): stop is the only option. */
 const STOP_ONLY_OPTIONS: readonly OwnerQuestionOptionRecord[] = [
-  { id: 'stop', label: 'Stop the run', consequence: 'The lane run stops; start a new run for the work order.' },
+  { id: 'stop', label: 'Stop the run', consequence: 'The lane run stops and releases the work order; register a new work order to run the lane again.' },
 ];
 
 const STOP_RECOMMENDATION: OwnerQuestionRecommendationRecord = {

@@ -160,8 +160,12 @@ export class ReapOrphanSessionsUseCase implements ReapOrphanSessionsPort {
           // worktree: every attempt finished, none holds a reservation, and
           // the attempt ids are exactly the first snapshot's.
           // A residual window between this re-read and the abort still
-          // remains; it is bounded by the runner's own refusal to abort a
-          // session it does not own.
+          // remains. The runner does not check session ownership: the abort
+          // stops every session running in the directory. The window is
+          // bounded by the runner script refusing to start a second session
+          // in a directory where one already runs, so a new dispatch here is
+          // refused while the orphan runs; only an orphan that ends and is
+          // replaced within the sub-second gap could be hit.
           const reAttempts = await this.deps.attemptRepo.listAllAttempts();
           const reHeldAttemptIds = new Set(
             (await this.deps.executionJournal.listActiveReservations())

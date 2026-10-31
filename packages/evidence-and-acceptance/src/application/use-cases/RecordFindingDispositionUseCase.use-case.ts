@@ -3,7 +3,7 @@
  * RecordFindingDispositionUseCase resolves one finding with a fix, an
  * evidence-backed refutation, or an out-of-scope marking for the exact head
  * it was raised against. Only the named finding changes: unrelated unresolved
- * findings keep blocking. An out-of-scope disposition may only name a finding
+ * findings keep blocking. A disposition of any state may only name a finding
  * id that a single receipt raised, so it can never resolve a same-id finding
  * in another receipt.
  */
@@ -145,14 +145,13 @@ export class RecordFindingDispositionUseCase implements RecordFindingDisposition
       };
     }
     if (
-      dispositionState === 'out-of-scope' &&
       assessment.reviewReceipts.filter((receipt) =>
         receipt.findings.some((finding) => finding.findingId === disposition.findingId),
       ).length > 1
     ) {
       return {
         outcome: 'rejected',
-        reason: 'An out-of-scope disposition needs a finding id raised by exactly one receipt',
+        reason: 'A finding disposition needs a finding id raised by exactly one receipt',
       };
     }
     if (AssessmentState.create(assessment.state).value?.isTerminal()) {

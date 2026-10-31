@@ -226,7 +226,9 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
     // serial pass) take live runs from one queue in list order; each runs
     // `advanceRun` for one run at a time. They share the pass's one start
     // gate, one driver-lease keeper and one latched stop.
-    const passConcurrency = Math.max(1, Math.trunc(this.deps.passConcurrency ?? 1));
+    // A non-finite value (NaN, Infinity) means the default 1, never zero workers.
+    const requestedConcurrency = this.deps.passConcurrency ?? 1;
+    const passConcurrency = Number.isFinite(requestedConcurrency) ? Math.max(1, Math.trunc(requestedConcurrency)) : 1;
     const outcomes: (RunOutcome | undefined)[] = new Array(liveRuns.length).fill(undefined);
     let rejection: { readonly error: unknown } | null = null;
     let nextIndex = 0;

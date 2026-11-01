@@ -119,6 +119,64 @@ jobs:
       - name: shell tests (shard ${{ matrix.shard }} of 4)
         run: yarn test:bin --shard ${{ matrix.shard }}/4
 
+  # macOS coverage per pull request (owner, 2026-11-01). The merge train no longer waits for the
+  # Mac mini's serial verification; the surface that has ever broken macOS-only (POSIX sh on bash 3.2
+  # with BSD userland in bin/ and scripts/, the darwin branches in the CLI and onboarding packages) runs
+  # here on an arm64 macOS runner, in parallel with the Linux jobs. The Mini still verifies every new
+  # main head after the merge. gate-slot tests skip on macOS (no flock), as they do on the Mini.
+  shell-macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The shard count is also the denominator below; change both together.
+        shard: [1, 2]
+    name: shell-macos (${{ matrix.shard }}/2)
+    steps:
+      - uses: actions/checkout@v4
+      - name: corepack enable (cache lookup)
+        run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: yarn
+      - name: corepack enable
+        run: corepack enable
+      - name: yarn install --immutable --mode=skip-build
+        run: yarn install --immutable --mode=skip-build
+      - name: shell tests on macOS (shard ${{ matrix.shard }} of 2)
+        run: yarn test:bin --shard ${{ matrix.shard }}/2
+
+  unit-macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      TURBO_FORCE: ${{ github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: corepack enable (cache lookup)
+        run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: yarn
+      - name: corepack enable
+        run: corepack enable
+      - name: turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo/cache
+          key: turbo-${{ runner.os }}-${{ hashFiles('yarn.lock') }}-${{ github.sha }}
+          restore-keys: |
+            turbo-${{ runner.os }}-${{ hashFiles('yarn.lock') }}-
+      - name: yarn install --immutable
+        run: yarn install --immutable
+      # The two packages with darwin branches (gh-binary candidates, BSD stat fallback, uname detection)
+      # and their dependencies, built and tested on macOS.
+      - name: cli and onboarding unit tests on macOS
+        run: yarn turbo run test --filter=@fleet/cli --filter=@fleet/onboarding
+
   # Q1d: the end-to-end conductor job (production quality plan §4.1). A real
   # ssh hop to the same runner through a disposable sshd on a loopback high
   # port, a fake opencode server behind bin/ocm-run's tunnel, a gh stub and
@@ -157,7 +215,7 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [build-test, sync, shell, e2e]
+    needs: [build-test, sync, shell, e2e, shell-macos, unit-macos]
     # Runs whatever the needed jobs did, and fails unless every one succeeded: a failed,
     # cancelled or skipped job (or matrix shard) is never a pass.
     if: ${{ always() }}
@@ -168,9 +226,11 @@ jobs:
           SYNC: ${{ needs.sync.result }}
           SHELL_SHARDS: ${{ needs.shell.result }}
           E2E: ${{ needs.e2e.result }}
+          SHELL_MACOS: ${{ needs.shell-macos.result }}
+          UNIT_MACOS: ${{ needs.unit-macos.result }}
         run: |
           status=0
-          for pair in "build-test=$BUILD_TEST" "sync=$SYNC" "shell=$SHELL_SHARDS" "e2e=$E2E"; do
+          for pair in "build-test=$BUILD_TEST" "sync=$SYNC" "shell=$SHELL_SHARDS" "e2e=$E2E" "shell-macos=$SHELL_MACOS" "unit-macos=$UNIT_MACOS"; do
             job=${pair%%=*}
             result=${pair#*=}
             echo "$job: $result"

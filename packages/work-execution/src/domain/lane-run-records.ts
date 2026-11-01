@@ -10,8 +10,12 @@
 import type { SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { BaseBranchValue } from './base-branch.js';
+import { INITIAL_RECORD_SCHEMA_VERSION } from './record-schema-version.js';
 
 export const LANE_RUN_RECORD_VERSION = 1 as const;
+
+/** Record schema version for lane-run records on disk (Q5a, D6). */
+export const LANE_RUN_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
 
 /** Tier 0 has no lane (fleet policy), so a run is Tier 1 or Tier 2. Tier 2 waits in awaiting-premerge. */
 export const LANE_RUN_TIERS = [1, 2] as const;
@@ -149,4 +153,6 @@ export interface LaneRunRecord {
    * `resolveLaneRunBaseBranch`, which treats an absent value as `main`.
    */
   readonly baseBranch?: BaseBranchValue;
+  /** Record schema version on disk (Q5a, D6); absent reads as 1. */
+  readonly schemaVersion?: number;
 }

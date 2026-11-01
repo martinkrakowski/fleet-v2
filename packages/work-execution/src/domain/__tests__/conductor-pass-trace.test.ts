@@ -69,6 +69,48 @@ describe('readConductorPassTrace', () => {
     }
   });
 
+  it('refuses an own enumerable schemaVersion undefined as unknown-schema-version (Q5a)', () => {
+    const input: JsonRecord = validRecord();
+    input.schemaVersion = undefined;
+    expect(readConductorPassTrace(input)).toEqual({ ok: false, reason: 'unknown-schema-version' });
+  });
+
+  it('refuses a future schemaVersion with an unknown future field before the key check (Q5a)', () => {
+    expect(readConductorPassTrace({ ...validRecord(), schemaVersion: 99, unknownFutureField: 'x' })).toEqual({
+      ok: false,
+      reason: 'unknown-schema-version',
+    });
+  });
+
+  it('accepts the previous version window under { currentVersion: 2 } (Q5a)', () => {
+    const current = readConductorPassTrace(validRecord(), { currentVersion: 2 });
+    expect(current.ok).toBe(true);
+    if (current.ok) {
+      expect(current.record.schemaVersion).toBe(1);
+    }
+    const explicitTwo = readConductorPassTrace(validRecord({ schemaVersion: 2 }), { currentVersion: 2 });
+    expect(explicitTwo).toEqual({
+      ok: true,
+      record: { ...validRecord({ schemaVersion: 1 }), schemaVersion: 2 },
+    });
+    expect(readConductorPassTrace(validRecord({ schemaVersion: 3 }), { currentVersion: 2 })).toEqual({
+      ok: false,
+      reason: 'unknown-schema-version',
+    });
+  });
+
+  it('refuses a throwing getter on schemaVersion as malformed without throwing (Q5a)', () => {
+    const input: JsonRecord = validRecord();
+    Object.defineProperty(input, 'schemaVersion', {
+      get() {
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    expect(() => readConductorPassTrace(input)).not.toThrow();
+    expect(readConductorPassTrace(input)).toEqual({ ok: false, reason: 'malformed' });
+  });
+
   it('drops unknown step fields', () => {
     const read = readConductorPassTrace(
       validRecord({

@@ -17,12 +17,32 @@ import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
-import { prepareLaneRunJournalAppend, readLaneRunJournalEntry } from '../../domain/lane-run-journal.js';
+import {
+  LANE_RUN_JOURNAL_SCHEMA_VERSION,
+  prepareLaneRunJournalAppend,
+  readLaneRunJournalEntry,
+} from '../../domain/lane-run-journal.js';
 import type {
   LaneRunJournalAppendResult,
   LaneRunJournalPort,
 } from '../../application/ports/out/LaneRunJournalPort.out-port.js';
-import { assertStoreWritable, inspectRecordListBytes, rejectUnreadableStateFile, withFileLock, writeJsonAtomically } from './file-store.js';
+import {
+  assertStoreWritable,
+  assertValidSchemaVersionPolicy,
+  inspectVersionedRecordListBytes,
+  readStoreRecordSchemaVersion,
+  rejectUnreadableStateFile,
+  StateFileUnknownVersionError,
+  withFileLock,
+  writeJsonAtomically,
+  type VersionedRecordParseResult,
+} from './file-store.js';
+
+/** The schema-version policy of `run-journal.json` (Q5a, D6). */
+export const LANE_RUN_JOURNAL_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy('run-journal.json', {
+  writerVersion: LANE_RUN_JOURNAL_SCHEMA_VERSION,
+  acceptedVersions: [1],
+});
 
 export interface LaneRunJournalAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
@@ -49,17 +69,34 @@ const SAFE_FILE_NAME = /^[A-Za-z0-9._-]{1,128}$/;
 
 /** Fresh copies: entries hold only primitives, so a spread is a full copy. */
 function copyEntry(entry: LaneRunJournalEntryRecord): LaneRunJournalEntryRecord {
-  return { ...entry };
+  return { ...entry, schemaVersion: LANE_RUN_JOURNAL_STORE_VERSION_POLICY.writerVersion };
+}
+
+/**
+ * The versioned run journal reader's record parser, shared with
+ * `fleet-v2 state check`: the `schemaVersion` check runs first, then the
+ * full `readLaneRunJournalEntry` body validation. Never throws.
+ */
+export function parseVersionedLaneRunJournalStateRecord(raw: unknown): VersionedRecordParseResult<LaneRunJournalEntryRecord> {
+  const versionCheck = readStoreRecordSchemaVersion(raw, LANE_RUN_JOURNAL_STORE_VERSION_POLICY);
+  if (versionCheck.status !== 'ok') {
+    return versionCheck;
+  }
+  try {
+    const read = readLaneRunJournalEntry(raw);
+    if (!read.ok) {
+      return { status: 'invalid' };
+    }
+    return { status: 'ok', record: copyEntry(read.entry), schemaVersion: versionCheck.schemaVersion };
+  } catch {
+    return { status: 'invalid' };
+  }
 }
 
 /** The run journal reader's record parser, shared with `fleet-v2 state check`. Never throws. */
 export function parseLaneRunJournalStateRecord(raw: unknown): LaneRunJournalEntryRecord | undefined {
-  try {
-    const read = readLaneRunJournalEntry(raw);
-    return read.ok ? read.entry : undefined;
-  } catch {
-    return undefined;
-  }
+  const parsed = parseVersionedLaneRunJournalStateRecord(raw);
+  return parsed.status === 'ok' ? parsed.record : undefined;
 }
 
 export class LaneRunJournalAdapter implements LaneRunJournalPort {
@@ -79,8 +116,9 @@ export class LaneRunJournalAdapter implements LaneRunJournalPort {
       if (!decision.ok) {
         return { outcome: 'refused', reason: decision.reason, detail: decision.detail };
       }
-      this.inMemoryEntries.push(decision.entry);
-      return { outcome: 'appended', entry: copyEntry(decision.entry) };
+      const stamped = copyEntry(decision.entry);
+      this.inMemoryEntries.push(stamped);
+      return { outcome: 'appended', entry: copyEntry(stamped) };
     }
 
     const lockPath = `${target}.lock`;
@@ -90,9 +128,10 @@ export class LaneRunJournalAdapter implements LaneRunJournalPort {
       if (!decision.ok) {
         return { outcome: 'refused', reason: decision.reason, detail: decision.detail };
       }
-      entries.push(decision.entry);
+      const stamped = copyEntry(decision.entry);
+      entries.push(stamped);
       await writeJsonAtomically(target, entries);
-      return { outcome: 'appended', entry: copyEntry(decision.entry) };
+      return { outcome: 'appended', entry: copyEntry(stamped) };
     });
   }
 
@@ -171,7 +210,10 @@ export class LaneRunJournalAdapter implements LaneRunJournalPort {
       }
       throw error;
     }
-    const inspection = inspectRecordListBytes(buffer, parseLaneRunJournalStateRecord);
+    const inspection = inspectVersionedRecordListBytes(buffer, parseVersionedLaneRunJournalStateRecord);
+    if (inspection.status === 'unknown-version') {
+      throw new StateFileUnknownVersionError(target, inspection.recordIndex);
+    }
     if (inspection.status === 'unreadable') {
       return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
     }

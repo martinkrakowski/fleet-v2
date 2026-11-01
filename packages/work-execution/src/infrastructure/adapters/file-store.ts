@@ -529,6 +529,196 @@ export function assertStoreWritable(readOnly: boolean, storeName: string): void 
   }
 }
 
+export const UNKNOWN_SCHEMA_VERSION_REASON = 'unknown-schema-version' as const;
+
+/**
+ * Thrown when a state store holds a record whose `schemaVersion` is not
+ * accepted by this reader (plan §4.5, D6). Never echoes the stored value and
+ * never quarantines the file.
+ */
+export class StateFileUnknownVersionError extends Error {
+  readonly filePath: string;
+  readonly recordIndex: number;
+  readonly reason = UNKNOWN_SCHEMA_VERSION_REASON;
+  readonly detail: string;
+
+  constructor(filePath: string, recordIndex: number) {
+    const detail = `record ${recordIndex} has an unsupported schemaVersion (${UNKNOWN_SCHEMA_VERSION_REASON})`;
+    super(
+      `State file ${filePath} refused (${detail}); nothing was quarantined — upgrade fleet-v2 to a reader that accepts this schemaVersion`,
+    );
+    this.name = 'StateFileUnknownVersionError';
+    this.filePath = filePath;
+    this.recordIndex = recordIndex;
+    this.detail = detail;
+  }
+}
+
+/**
+ * Migration rule (plan §4.5, D6):
+ * - absent `schemaVersion` on disk reads as `1` forever (D6);
+ * - `acceptedVersions` must include `writerVersion` (bump only together with a
+ *   reader that accepts it);
+ * - whenever `writerVersion > 1`, `acceptedVersions` must also include
+ *   `writerVersion - 1` (a reader always accepts the previous version).
+ */
+export interface StoreSchemaVersionPolicy<V extends number = number> {
+  readonly writerVersion: V;
+  readonly acceptedVersions: readonly number[];
+}
+
+export function assertValidSchemaVersionPolicy<V extends number>(
+  storeName: string,
+  policy: StoreSchemaVersionPolicy<V>,
+): StoreSchemaVersionPolicy<V> {
+  if (!Number.isInteger(policy.writerVersion) || policy.writerVersion < 1) {
+    throw new Error(`${storeName}: writerVersion must be a positive integer`);
+  }
+  if (!policy.acceptedVersions.includes(policy.writerVersion)) {
+    throw new Error(
+      `${storeName}: writer bumps schemaVersion only together with a reader that accepts it`,
+    );
+  }
+  if (policy.writerVersion > 1 && !policy.acceptedVersions.includes(policy.writerVersion - 1)) {
+    throw new Error(
+      `${storeName}: reader must still accept previous schemaVersion ${policy.writerVersion - 1}`,
+    );
+  }
+  return policy;
+}
+
+export type StoreRecordVersionCheck =
+  | { readonly status: 'ok'; readonly schemaVersion: number }
+  | { readonly status: 'unknown-version' }
+  | { readonly status: 'invalid' };
+
+function isPlainRecordObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function checkAcceptedVersion(
+  policy: StoreSchemaVersionPolicy,
+  version: unknown,
+): StoreRecordVersionCheck {
+  if (typeof version === 'number' && Number.isInteger(version) && policy.acceptedVersions.includes(version)) {
+    return { status: 'ok', schemaVersion: version };
+  }
+  return { status: 'unknown-version' };
+}
+
+/**
+ * Pure: inspect `raw`'s own `schemaVersion` descriptor without invoking getters.
+ * Absent `schemaVersion` reads as `1` (D6). Non-objects and accessor properties
+ * are `'invalid'` (corrupt); any unaccepted present `schemaVersion` is `'unknown-version'`.
+ */
+export function readStoreRecordSchemaVersion(
+  raw: unknown,
+  policy: StoreSchemaVersionPolicy,
+): StoreRecordVersionCheck {
+  if (!isPlainRecordObject(raw)) {
+    return { status: 'invalid' };
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(raw, 'schemaVersion');
+  if (descriptor === undefined) {
+    return checkAcceptedVersion(policy, 1);
+  }
+  if (!('value' in descriptor) || !descriptor.enumerable) {
+    return { status: 'invalid' };
+  }
+  return checkAcceptedVersion(policy, descriptor.value);
+}
+
+export type VersionedRecordParseResult<T> =
+  | { readonly status: 'ok'; readonly record: T; readonly schemaVersion: number }
+  | { readonly status: 'unknown-version' }
+  | { readonly status: 'invalid' };
+
+export type VersionedRecordListInspection<T> =
+  | {
+      readonly status: 'ok';
+      readonly records: readonly T[];
+      readonly schemaVersions: readonly number[];
+    }
+  | {
+      readonly status: 'unknown-version';
+      readonly detail: string;
+      readonly recordIndex: number;
+    }
+  | {
+      readonly status: 'unreadable';
+      readonly detail: string;
+      readonly recordIndex: number | null;
+    };
+
+function parseVersionedElement<T>(
+  raw: unknown,
+  parseRecord: (raw: unknown) => VersionedRecordParseResult<T>,
+): VersionedRecordParseResult<T> {
+  try {
+    return parseRecord(raw);
+  } catch {
+    return { status: 'invalid' };
+  }
+}
+
+/**
+ * Pure: parse `bytes` as a JSON array and inspect each element's
+ * `schemaVersion` (D6). The first `'unknown-version'` element refuses the
+ * whole file immediately; the first invalid element is remembered and the
+ * scan continues, so an unknown version later in the list still wins.
+ */
+export function inspectVersionedRecordListBytes<T>(
+  bytes: Buffer,
+  parseRecord: (raw: unknown) => VersionedRecordParseResult<T>,
+): VersionedRecordListInspection<T> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString('utf8'));
+  } catch {
+    return { status: 'unreadable', detail: 'not valid JSON', recordIndex: null };
+  }
+  if (!Array.isArray(parsed)) {
+    return { status: 'unreadable', detail: 'expects a record list', recordIndex: null };
+  }
+  const records: T[] = [];
+  const versionSet = new Set<number>();
+  let firstInvalidIndex: number | null = null;
+  for (const [index, raw] of parsed.entries()) {
+    const check = parseVersionedElement(raw, parseRecord);
+    if (check.status === 'unknown-version') {
+      return {
+        status: 'unknown-version',
+        detail: `record ${index} has an unsupported schemaVersion (${UNKNOWN_SCHEMA_VERSION_REASON})`,
+        recordIndex: index,
+      };
+    }
+    if (check.status === 'invalid') {
+      if (firstInvalidIndex === null) {
+        firstInvalidIndex = index;
+      }
+      continue;
+    }
+    records.push(check.record);
+    versionSet.add(check.schemaVersion);
+  }
+  if (firstInvalidIndex !== null) {
+    return {
+      status: 'unreadable',
+      detail: `record ${firstInvalidIndex} failed validation`,
+      recordIndex: firstInvalidIndex,
+    };
+  }
+  return {
+    status: 'ok',
+    records,
+    schemaVersions: [...versionSet].sort((left, right) => left - right),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // State-file inspection (E1b): the one parser every store reader and
 // `fleet-v2 state check` share, so a check and a read can never disagree.
@@ -580,8 +770,21 @@ export function inspectRecordListBytes<T>(
 
 /** A store file's inspection without its records. */
 export type StateFileInspection =
-  | { readonly status: 'ok'; readonly recordCount: number }
-  | { readonly status: 'unreadable'; readonly detail: string; readonly recordIndex: number | null };
+  | {
+      readonly status: 'ok';
+      readonly recordCount: number;
+      readonly schemaVersions?: readonly number[];
+    }
+  | {
+      readonly status: 'unknown-version';
+      readonly detail: string;
+      readonly recordIndex: number;
+    }
+  | {
+      readonly status: 'unreadable';
+      readonly detail: string;
+      readonly recordIndex: number | null;
+    };
 
 /** A read-only look at one file on disk. */
 export type StateFileReadResult =
@@ -732,6 +935,30 @@ async function readQuarantineCopyFor(
   }
 }
 
+function checkCurrentStoreRefusal(
+  basename: string,
+  current: Buffer | null,
+  inspect: (bytes: Buffer) => StateFileInspection,
+): { readonly refused: true; readonly reason: string } | { readonly refused: false } {
+  if (current === null) {
+    return { refused: false };
+  }
+  const currentInspection = inspect(current);
+  if (currentInspection.status === 'ok') {
+    return {
+      refused: true,
+      reason: `${basename} is readable; state restore replaces only a missing or unreadable store`,
+    };
+  }
+  if (currentInspection.status === 'unknown-version') {
+    return {
+      refused: true,
+      reason: `${basename} has an unsupported schemaVersion; state restore replaces only a missing or unreadable store`,
+    };
+  }
+  return { refused: false };
+}
+
 async function restoreRecordListStore(
   basename: string,
   inspect: (bytes: Buffer) => StateFileInspection,
@@ -761,8 +988,9 @@ async function restoreRecordListStore(
       if (currentSha !== request.expectedCurrentSha256) {
         return { status: 'refused', reason: 'the store changed since it was inspected; run state restore again' };
       }
-      if (current !== null && inspect(current).status === 'ok') {
-        return { status: 'refused', reason: `${basename} is readable; state restore replaces only a missing or unreadable store` };
+      const refusal = checkCurrentStoreRefusal(basename, current, inspect);
+      if (refusal.refused) {
+        return { status: 'refused', reason: refusal.reason };
       }
       let previousCopyPath: string | null = null;
       if (current !== null) {
@@ -781,26 +1009,16 @@ async function restoreRecordListStore(
   );
 }
 
-/** Build the descriptor of one record-list store from the parser its reader uses.
- * `validateList`, when given, runs once over the parsed records after every
- * record parsed; a returned string marks the whole file unreadable with that
- * detail, exactly as the store's own reader would refuse it. */
-export function describeRecordListStore<T>(
+/**
+ * The descriptor plumbing shared by every record-list store: quarantine-name
+ * recognition, the read-only `check`, quarantine-copy reads and `restore`.
+ * `inspect` is the pure parser the store's reader applies.
+ */
+function buildStateFileDescriptor(
   basename: string,
-  parseRecord: (raw: unknown) => T | undefined,
-  validateList?: (records: readonly T[]) => string | undefined,
+  inspect: (bytes: Buffer) => StateFileInspection,
 ): StateFileDescriptor {
   const pattern = quarantineCopyPattern(basename);
-  const inspect = (bytes: Buffer): StateFileInspection => {
-    const result = inspectRecordListBytes(bytes, parseRecord);
-    if (result.status !== 'ok') {
-      return result;
-    }
-    const listError = validateList === undefined ? undefined : validateList(result.records);
-    return listError === undefined
-      ? { status: 'ok', recordCount: result.records.length }
-      : { status: 'unreadable', detail: listError, recordIndex: null };
-  };
   return {
     basename,
     inspect,
@@ -826,4 +1044,50 @@ export function describeRecordListStore<T>(
     readQuarantineCopy: (stateDir, from) => readQuarantineCopyFor(basename, pattern, stateDir, from),
     restore: (request) => restoreRecordListStore(basename, inspect, request),
   };
+}
+
+/** Build the descriptor of one record-list store from the parser its reader uses.
+ * `validateList`, when given, runs once over the parsed records after every
+ * record parsed; a returned string marks the whole file unreadable with that
+ * detail, exactly as the store's own reader would refuse it. */
+export function describeRecordListStore<T>(
+  basename: string,
+  parseRecord: (raw: unknown) => T | undefined,
+  validateList?: (records: readonly T[]) => string | undefined,
+): StateFileDescriptor {
+  const inspect = (bytes: Buffer): StateFileInspection => {
+    const result = inspectRecordListBytes(bytes, parseRecord);
+    if (result.status !== 'ok') {
+      return result;
+    }
+    const listError = validateList === undefined ? undefined : validateList(result.records);
+    return listError === undefined
+      ? { status: 'ok', recordCount: result.records.length }
+      : { status: 'unreadable', detail: listError, recordIndex: null };
+  };
+  return buildStateFileDescriptor(basename, inspect);
+}
+
+/**
+ * Build the descriptor of one versioned record-list store: the `inspect`
+ * runs the schema-version check first, so an unsupported `schemaVersion`
+ * reports `'unknown-version'` (never quarantined) and a valid file reports
+ * the observed `schemaVersions`.
+ */
+export function describeVersionedRecordListStore<T>(
+  basename: string,
+  parseRecord: (raw: unknown) => VersionedRecordParseResult<T>,
+  validateList?: (records: readonly T[]) => string | undefined,
+): StateFileDescriptor {
+  const inspect = (bytes: Buffer): StateFileInspection => {
+    const result = inspectVersionedRecordListBytes(bytes, parseRecord);
+    if (result.status !== 'ok') {
+      return result;
+    }
+    const listError = validateList === undefined ? undefined : validateList(result.records);
+    return listError === undefined
+      ? { status: 'ok', recordCount: result.records.length, schemaVersions: result.schemaVersions }
+      : { status: 'unreadable', detail: listError, recordIndex: null };
+  };
+  return buildStateFileDescriptor(basename, inspect);
 }

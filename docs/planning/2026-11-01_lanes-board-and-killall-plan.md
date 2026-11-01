@@ -2,7 +2,7 @@
 
 - **Date:** 2026-11-01
 - **Target repository:** `fleet-v2`
-- **Status:** rev 1, after one Grok and one Luna review (§11). Nothing built. **The owner decided every §10 item as recommended on 2026-11-01** ("proceed with your recommended defaults").
+- **Status:** rev 2, after a second Luna pass on §6 (§11). Nothing built. **The owner decided the §10 items through D-LB3, D-AC1 and D-AC2 as recommended on 2026-11-01** ("proceed with your recommended defaults"). D-KA7 to D-KA9 and D-LB4 are new in rev 2 and not yet decided.
 - **Owner request (2026-11-01):** the UI is "kind of useless"; the owner ends up asking the orchestrator for statuses. `/lanes` becomes a kanban board per project, with the live tail and interactive features already planned, plus a KILLALL emergency stop. Also: "The status of the lanes/briefs should be surfaced within the ui."
 - **Owner's decisions, relayed:** (1) the tail shows summaries by default, full output opt-in per installation (existing D10); (2) KILLALL has one confirmation with a typed word; (3) the real UI runs on staging; (4) scope is all projects, KILLALL included.
 - **Builds on:** `2026-10-27_web-ui-interactivity-plan.md`, `2026-10-27_work-board-plan.md`, `2026-10-31_conductor-visualizer-plan.md`, `2026-10-31_daemon-tick-plan.md`.
@@ -64,7 +64,7 @@ This is a display of recorded time, not an inferred state, which reconciles it w
 | Train, parks, chains | Train state, then DT4's records | The orchestrator host |
 | Lane and brief steps by hand-run work | `plan declare`, extended | The orchestrator's scripts |
 | Plans, owner items, merges | Work board stores | As planned there |
-| Seat availability, pace | Recorded probes and runs | The orchestrator host |
+| Seat availability, pace | Recorded runs and the probes of lane LB2a | The orchestrator host |
 
 ### 5.2 Extending `plan declare`, not a second record
 
@@ -102,9 +102,24 @@ Tail summaries use the allow-listed fields of interactivity §3.7. **Private and
 
 **Late starts, and what "confirmed" means.** The servers have no admission control this plan can switch on without restarting them, and restarts stay the owner's. So a client that skips the shared scripts can still start a session after a check. While halted, the agent keeps sweeping, stops any new session and lists it. "Confirmed" therefore means stopped, and no session found on two consecutive sweeps, with the time; it is not a guarantee that none can start. A late start reopens the report. Other orchestrators learn of the halt when their next dispatch is refused with the reason, and any session that slipped through is stopped.
 
-**Reporting.** Per lane, one line: stopped and confirmed; or unconfirmed, with why. The marker and the train pause report the same way. Exit codes: `0` only when the marker, the train pause and every lane sweep are confirmed; `1` for anything refused, blocked, unknown or unconfirmed, which also shows on the board; `2` for a usage error. Gates and reviews started beside a lane are in scope (D-KA2).
+**Reporting.** Per lane, one line: stopped and confirmed; or unconfirmed, with why. The marker and the train pause report the same way. Each kind of work has its own stop and its own check that does not rely on the stop's answer: sessions are asked for again at the server, and agent runs, gates and reviews are looked for as processes. A failed, unreadable or incomplete check reports unconfirmed, and the next sweep retries it. Exit codes: `0` only when the marker, the train pause and every lane sweep are confirmed; `1` for anything refused, blocked, unknown or unconfirmed, which also shows on the board; `2` for a usage error. Gates and reviews started beside a lane are in scope (D-KA2).
 
-**In-flight merges.** The train checks the pause immediately before a merge. A merge call already sent completes, and the report names any merge recorded after the marker. Chain refresh and landing steps run under the same pause.
+**In-flight merges.** The train checks the pause immediately before a merge. A merge call already sent completes, and the report names any merge recorded after the marker.
+
+**A pause does not wait on the train's lock.** Setting a pause takes no lock, and a running train pass reads it at each step. So a long train run does not delay it: new passes stop at once, and a running pass stops at its next check, about every 15 s while waiting on checks, and immediately before its merge. KILLALL's pause must keep this property, and the marker read has a short time limit, so a slow read delays a step and never admits it.
+
+**Every train step, not only the merge.** Rev 1 said chain steps run under the same pause. Today they do not: the merge of main into a chain, the opening of an integration pull request and the enqueue check nothing. The guard therefore goes immediately before each of these, as well as before each pass and merge, with both pause records read and any read failure closed. Lane KA3 carries this.
+
+**Silence is reported.** A fail-closed train looks like a quiet train, so a stop that has failed must not stay quiet. While halted, each sweep records its time in the marker. Whatever reads the marker notifies the owner when it has been unreadable for more than five minutes (D-KA9), when the last sweep is older than three periods, or when work stays unconfirmed for three sweeps. Each repeats at most hourly until it clears. The readers do this, not the sweep, because a dead sweep cannot report itself. Readable and clear again also notifies once. The train stays closed throughout. A notifier that fails silently defeats this, so a failed send is logged and reported on the board, and the drill proves delivery end to end.
+
+**Who lifts.** Only the owner lifts a halt (D-KA7). The lift is the CLI's own command, needs a terminal and a typed word, and refuses when no terminal is attached, so an unattended script or agent run cannot lift by accident. An agent with the owner's shell could still type it, so this is a guard against accidents, backed by the rule that no agent lifts a halt even when another session asks. The web and the API refuse lifts (D-KA4). A lift clears the marker only: it does not lift a verification pause, restart anything or re-dispatch.
+
+**Live drill.** Fakes cannot prove session listing across directories, abort behaviour, process-tree stops, timer recovery or the race between a marker and a merge. So a drill runs the real stop against scratch work only: a scratch lane server with no real project, synthetic sessions, a gate-shaped process tree that ignores a polite stop, a scratch agent run, and a test train against a scratch repository and pull request. It covers a partial failure, a late start, two clean sweeps, an unreadable marker, a merge raced against the marker, the lift, and delivery of each notification.
+
+- **Never on real lanes,** and it never pauses the real train: the scratch train has its own state and marker.
+- **Owner-authorized each time** (D-KA8). Nothing runs it on a schedule or by another session's request.
+- **Before the stop is relied on,** and again after a major change: a new lane-server major version, a new kind of seat or server, or a change to the stop path.
+- **Until it has passed,** the report and the board say "stop not drilled", and the record names the date and the version it passed on.
 
 **Confirmation.** One dialog through `AlertBox` with a typed word. Body: stops every running lane in every project; pauses the merge train; refuses new dispatches until lifted (a client that skips the shared scripts is stopped by a repeating sweep instead); keeps worktrees, commits and pull requests; **cannot recall a merge that has completed**; running work in progress since the last commit is lost. The body also states whether the live route exists: "Live route: available", or "Live route: not available" until the button's lane is complete.
 
@@ -143,16 +158,18 @@ The audit keeps the proposed order. Slice 2 is the thin path: the board tolerate
 |---|---|---|---|---|
 | KA1 | Halt marker rules and the domain contract for stop reports | work-execution domain | 2 | none |
 | KA2 | `fleet-v2 killall` and `--lift`: marker, pause, ask the stop agent, report | apps/cli | 2 | KA1 |
-| KA3 | Stop agent beside the servers, sweep, confirmation, shared wrapper and script guards (other repository) | orchestration scripts | 2 | KA1 |
+| KA3 | Stop agent beside the servers, sweep, a separate check per kind of work, shared wrapper, guards on every train step, the notifications of §6 (other repository) | orchestration scripts | 2 | KA1 |
 | KA4 | Conductor refuses while halted; a test on recorded fakes of every path, never live | work-execution | 2 | KA1 |
 | LB1 | Snapshot section contract and read projection; narrow push scope | work-execution, apps/api | 2 | Q5a contract |
 | LB2 | Publishers for running, train, parks (other repository) | orchestration scripts | 2 | LB1 |
+| LB2a | Seat probes: a recorded availability and time per seat, D-LB4 (other repository) | orchestration scripts | 1 | LB1 |
 | LB3 | Thin path: WB4a, WB4c, a thin WB6, WB8 | as in the board plan | 2 | LB1 |
 | LB4 | Declaration kinds, steps, `outcome`; schema and source lists; manifest | work-execution | 2 | WB4c |
 | LB5 | `/lanes` read: projects, tiles, top line, Needs you, table toggle; fixture removed; replaces WB9a | apps/web | 2 | LB3 |
-| LB6 | Stalled flag and seat panel; pace in `policy.board` | work-execution, apps/web | 2 | LB4, LB5 |
+| LB6 | Stalled flag (from the server's event stream, §4) and seat panel (from LB2a); pace in `policy.board` | work-execution, apps/web | 2 | LB2a, LB4, LB5 |
 | LB7 | Backlog stages and plan progress | work-execution, apps/web | 1 | LB4, WB-S |
 | — | Live updates and tail in the drawer: E3c, L0–L4, with the D11 interim read | as planned | 2 | LB5 |
+| KA3a | Live drill script for §6 on scratch work, and its first run once the owner authorizes it | orchestration scripts | 2 | KA2, KA3, KA4 |
 | KA5 | `halt` scope, request route, button with the dialog | apps/api, apps/web | 2 | T3a, T6, KA3 |
 | — | Answers, stop and resume on tiles | as planned | 2 | T6 |
 
@@ -174,9 +191,13 @@ The audit keeps the proposed order. Slice 2 is the thin path: the board tolerate
 | D-KA4 | May the web lift a halt? | No, CLI only in v1 |
 | D-KA5 | Typed word | `KILLALL` |
 | D-KA6 | Merges wait while the marker's host is unreachable? | Yes: fail closed, resume by itself when it reads clear |
+| D-KA7 | Who may lift a halt? | The owner only, through the CLI at a terminal |
+| D-KA8 | Who may start a live drill? | The owner only, each time; required before the stop is relied on and after a major change |
+| D-KA9 | How long may the marker stay unreadable before the owner is told? | Five minutes, repeating at most hourly |
 | D-LB1 | Pull the thin board path (§8) ahead of the remaining wave order? | Yes |
 | D-LB2 | Reduced tail for private and client projects by default? | Yes |
 | D-LB3 | Show seat names on tiles? | Yes, role and model tokens as attempts do |
+| D-LB4 | Where do seat probes come from? | Recorded lane and review outcomes first; a one-word probe only for a seat with no run in six hours, never more than once an hour per seat, free seats and plan seats only, no paid probe |
 | D-AC1 | Is the question list complete? | Treat as a minimum; the owner adds more |
 | D-AC2 | Add finding, options and recommendation fields to owner items? | Yes |
 
@@ -184,4 +205,5 @@ The audit keeps the proposed order. Slice 2 is the thin path: the board tolerate
 
 - **Grok 4.7 CLI (read-only), one round, on rev 0.** A blocker (the train read a marker never written where it looked, so it could fail open; the single fail-closed marker in §6 fixes it), a major (declarations must not reach guards; §5.2), three minors (publisher wording, a pointer to private notes, the dialog's claim about refusal). All applied, except that a declaration still places a card, because the board plan already says so.
 - **GPT-6 Luna, read-only, one pass on rev 0, standing in for Fable.** Four majors: stop independence (§6), a sweep cannot guarantee a stop ("confirmed" redefined), one writer per pause, and public detail (trimmed). All applied. Neither reviewer re-read rev 1.
+- **GPT-6 Luna, read-only, one narrow pass on §6 of rev 1.** A blocker: chain steps and the enqueue had no halt check, which the plan had implied they did (§6). Four majors: no per-kind confirmation, no notification for a dead sweep or an unreadable marker, no decided lifter, and no live proof (§6, D-KA7 to D-KA9, KA3a). A minor: no named seat source (LB2a, D-LB4). All applied in rev 2. Luna has not re-read rev 2.
 - **Sonnet 5.5 in agy, on the earlier status draft:** extend `plan declare`, no inferred states, no chain or train claims without a source. Applied in §5.2; §4 reconciles the stalled flag.

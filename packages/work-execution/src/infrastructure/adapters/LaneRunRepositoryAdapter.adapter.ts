@@ -32,6 +32,7 @@ import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
+import { LANE_RUN_SCHEMA_VERSION } from '../../domain/lane-run-records.js';
 import { LaneRun } from '../../domain/entities/LaneRun.js';
 import type {
   LeaseAcquireRequest,
@@ -50,11 +51,21 @@ import type {
 } from '../../application/ports/out/LaneRunRepositoryPort.out-port.js';
 import {
   assertStoreWritable,
-  inspectRecordListBytes,
+  assertValidSchemaVersionPolicy,
+  inspectVersionedRecordListBytes,
+  readStoreRecordSchemaVersion,
   rejectUnreadableStateFile,
+  StateFileUnknownVersionError,
   withFileLock,
   writeJsonAtomically,
+  type VersionedRecordParseResult,
 } from './file-store.js';
+
+/** The schema-version policy of `lane-runs.json` (Q5a, D6). */
+export const LANE_RUN_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy('lane-runs.json', {
+  writerVersion: LANE_RUN_SCHEMA_VERSION,
+  acceptedVersions: [1],
+});
 
 export interface LaneRunRepositoryAdapterOptions {
   /** When set, runs persist here and reload on first use. */
@@ -98,6 +109,7 @@ function copy(record: LaneRunRecord): LaneRunRecord {
     runPolicyRevision: record.runPolicyRevision,
     ...(record.branchName === undefined ? {} : { branchName: record.branchName }),
     ...(record.baseBranch === undefined ? {} : { baseBranch: record.baseBranch }),
+    schemaVersion: LANE_RUN_STORE_VERSION_POLICY.writerVersion,
   };
 }
 
@@ -135,20 +147,32 @@ function identityChanged(stored: LaneRunRecord, candidate: LaneRunRecord): boole
 }
 
 /**
- * The reader's record parser, shared with `fleet-v2 state check`. Never throws:
- * any malformed entry is `undefined`, which makes the file unreadable so the
- * exact bytes are quarantined instead of silently dropped.
+ * The versioned reader's record parser, shared with `fleet-v2 state check`:
+ * the `schemaVersion` check runs first, then the full `LaneRun.create`
+ * body validation. Never throws: a version failure or malformed entry is a
+ * fixed status, and the exact bytes are quarantined (or refused) by the
+ * store reader.
  */
-export function parseLaneRunStateRecord(raw: unknown): LaneRunRecord | undefined {
+export function parseVersionedLaneRunStateRecord(raw: unknown): VersionedRecordParseResult<LaneRunRecord> {
+  const versionCheck = readStoreRecordSchemaVersion(raw, LANE_RUN_STORE_VERSION_POLICY);
+  if (versionCheck.status !== 'ok') {
+    return versionCheck;
+  }
   try {
     const result = LaneRun.create(raw);
     if (!result.success) {
-      return undefined;
+      return { status: 'invalid' };
     }
-    return result.value.toRecord();
+    return { status: 'ok', record: copy(result.value.toRecord()), schemaVersion: versionCheck.schemaVersion };
   } catch {
-    return undefined;
+    return { status: 'invalid' };
   }
+}
+
+/** The reader's record parser, shared with `fleet-v2 state check`. Never throws. */
+export function parseLaneRunStateRecord(raw: unknown): LaneRunRecord | undefined {
+  const parsed = parseVersionedLaneRunStateRecord(raw);
+  return parsed.status === 'ok' ? parsed.record : undefined;
 }
 
 export class LaneRunRepositoryAdapter implements LaneRunRepositoryPort {
@@ -273,7 +297,9 @@ export class LaneRunRepositoryAdapter implements LaneRunRepositoryPort {
       const stored = this.inMemoryRuns.get(runId);
       const result = decide(stored);
       if (result.outcome === 'saved') {
-        this.inMemoryRuns.set(runId, result.record);
+        const saved = copy(result.record);
+        this.inMemoryRuns.set(runId, saved);
+        return { outcome: 'saved', record: copy(saved) };
       }
       return result;
     }
@@ -282,11 +308,13 @@ export class LaneRunRepositoryAdapter implements LaneRunRepositoryPort {
       const stored = records.get(runId);
       const result = decide(stored);
       if (result.outcome === 'saved') {
-        records.set(runId, result.record);
+        const saved = copy(result.record);
+        records.set(runId, saved);
         const list = [...records.values()]
           .sort((left, right) => left.runId.localeCompare(right.runId))
           .map(copy);
         await writeJsonAtomically(target, list);
+        return { outcome: 'saved', record: copy(saved) };
       }
       return result;
     });
@@ -324,7 +352,10 @@ export class LaneRunRepositoryAdapter implements LaneRunRepositoryPort {
       }
       throw error;
     }
-    const inspection = inspectRecordListBytes(buffer, parseLaneRunStateRecord);
+    const inspection = inspectVersionedRecordListBytes(buffer, parseVersionedLaneRunStateRecord);
+    if (inspection.status === 'unknown-version') {
+      throw new StateFileUnknownVersionError(target, inspection.recordIndex);
+    }
     if (inspection.status === 'unreadable') {
       return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options.readOnly === true);
     }

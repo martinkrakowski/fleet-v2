@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   StateFileUnreadableError,
+  StateFileUnknownVersionError,
   inspectRecordListBytes,
   quarantineUnreadable,
   type StateFileDescriptor,
@@ -347,5 +348,55 @@ describe('work-execution state file descriptors match the store readers', () => 
       'telemetry-dispositions.json',
       'conductor-passes.json',
     ]);
+  });
+});
+
+describe('versioned store descriptors', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-e1b-versioned-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  const VERSIONED_STORES = [
+    'attempts.json',
+    'journal.json',
+    'reservations.json',
+    'lane-runs.json',
+    'run-journal.json',
+  ];
+
+  it('reports schemaVersions [1] on valid fixtures', () => {
+    for (const basename of VERSIONED_STORES) {
+      const descriptor = WORK_EXECUTION_STATE_FILES.find((d) => d.basename === basename)!;
+      const bytes = Buffer.from(JSON.stringify(VALID_FIXTURES[basename]));
+      expect(descriptor.inspect(bytes)).toEqual({
+        status: 'ok',
+        recordCount: 2,
+        schemaVersions: [1],
+      });
+    }
+  });
+
+  it.each(VERSIONED_STORES)('refuses an unknown schemaVersion on %s without quarantine', async (basename) => {
+    const fixture = VALID_FIXTURES[basename]!;
+    const bad = [...fixture];
+    bad[1] = { ...(bad[1] as Record<string, unknown>), schemaVersion: 2 };
+    const bytes = Buffer.from(JSON.stringify(bad));
+    await fs.writeFile(path.join(tempDir, basename), bytes);
+
+    const descriptor = WORK_EXECUTION_STATE_FILES.find((d) => d.basename === basename)!;
+    expect(descriptor.inspect(bytes)).toEqual({
+      status: 'unknown-version',
+      detail: 'record 1 has an unsupported schemaVersion (unknown-schema-version)',
+      recordIndex: 1,
+    });
+
+    await expect(READS[basename]!(tempDir)).rejects.toBeInstanceOf(StateFileUnknownVersionError);
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
   });
 });

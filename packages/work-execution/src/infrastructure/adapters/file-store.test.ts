@@ -6,15 +6,20 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  assertValidSchemaVersionPolicy,
   describeRecordListStore,
+  describeVersionedRecordListStore,
   FileLockTimeoutError,
   inspectRecordListBytes,
+  inspectVersionedRecordListBytes,
   keepQuarantineCopy,
   type QuarantineFs,
+  readStoreRecordSchemaVersion,
   StateFileUnreadableError,
   quarantineUnreadable,
   withFileLock,
   writeJsonAtomically,
+  type VersionedRecordParseResult,
 } from './file-store.js';
 
 /** An explicit one-way latch: the test decides when the holder may proceed. */
@@ -1143,6 +1148,30 @@ describe('restore', () => {
     expect(await snapshot()).toEqual(before);
   });
 
+  it('refuses an unknown-version current store and leaves bytes and directory listing unchanged', async () => {
+    const versioned = describeVersionedRecordListStore('x.json', (raw) => {
+      const versionCheck = readStoreRecordSchemaVersion(raw, { writerVersion: 1, acceptedVersions: [1] });
+      if (versionCheck.status !== 'ok') {
+        return versionCheck;
+      }
+      return typeof (raw as { id?: unknown }).id === 'string'
+        ? { status: 'ok', record: raw as { id: string }, schemaVersion: versionCheck.schemaVersion }
+        : { status: 'invalid' };
+    });
+    const currentBytes = Buffer.from(JSON.stringify([{ id: 'existing', schemaVersion: 2 }]));
+    await fs.writeFile(filePath, currentBytes);
+    const before = await snapshot();
+    const dirBefore = await fs.readdir(stateDir);
+    const currentSha = createHash('sha256').update(currentBytes).digest('hex');
+    const outcome = await versioned.restore({ stateDir, candidate, expectedCurrentSha256: currentSha });
+    expect(outcome).toEqual({
+      status: 'refused',
+      reason: 'x.json has an unsupported schemaVersion; state restore replaces only a missing or unreadable store',
+    });
+    expect(await snapshot()).toEqual(before);
+    expect(await fs.readdir(stateDir)).toEqual(dirBefore);
+  });
+
   it('refuses an invalid candidate', async () => {
     await fs.writeFile(filePath, currentGarbage);
     const before = await snapshot();
@@ -1225,5 +1254,152 @@ describe('restore', () => {
     });
     expect(await snapshot()).toEqual(before);
     await expect(fs.stat(filePath)).rejects.toThrow();
+  });
+});
+
+describe('assertValidSchemaVersionPolicy', () => {
+  it('refuses a writer bumped without a reader that accepts it', () => {
+    expect(() =>
+      assertValidSchemaVersionPolicy('s.json', { writerVersion: 2, acceptedVersions: [1] }),
+    ).toThrow(/bumps schemaVersion only together with a reader that accepts it/);
+  });
+
+  it('refuses a reader that dropped the previous version', () => {
+    expect(() =>
+      assertValidSchemaVersionPolicy('s.json', { writerVersion: 2, acceptedVersions: [2] }),
+    ).toThrow(/reader must still accept previous schemaVersion 1/);
+  });
+
+  it('accepts a policy whose reader accepts the writer and the previous version', () => {
+    const policy = assertValidSchemaVersionPolicy('s.json', { writerVersion: 2, acceptedVersions: [1, 2] });
+    expect(policy.writerVersion).toBe(2);
+  });
+
+  it('refuses a non-positive or non-integer writerVersion', () => {
+    expect(() => assertValidSchemaVersionPolicy('s.json', { writerVersion: 0, acceptedVersions: [0] })).toThrow(
+      /writerVersion must be a positive integer/,
+    );
+    expect(() => assertValidSchemaVersionPolicy('s.json', { writerVersion: 1.5, acceptedVersions: [1.5] })).toThrow(
+      /writerVersion must be a positive integer/,
+    );
+  });
+});
+
+describe('readStoreRecordSchemaVersion', () => {
+  const policy = { writerVersion: 1 as const, acceptedVersions: [1] };
+
+  it('reads an absent schemaVersion as 1', () => {
+    expect(readStoreRecordSchemaVersion({ id: 'x' }, policy)).toEqual({ status: 'ok', schemaVersion: 1 });
+  });
+
+  it('accepts an accepted integer schemaVersion', () => {
+    expect(readStoreRecordSchemaVersion({ schemaVersion: 1 }, policy)).toEqual({ status: 'ok', schemaVersion: 1 });
+  });
+
+  it.each([2, 0, -1, '1', null, { v: 1 }])('refuses %p as unknown-version', (bad: unknown) => {
+    expect(readStoreRecordSchemaVersion({ schemaVersion: bad }, policy)).toEqual({ status: 'unknown-version' });
+  });
+
+  it('reports non-objects as invalid', () => {
+    expect(readStoreRecordSchemaVersion(null, policy)).toEqual({ status: 'invalid' });
+    expect(readStoreRecordSchemaVersion([], policy)).toEqual({ status: 'invalid' });
+    expect(readStoreRecordSchemaVersion('x', policy)).toEqual({ status: 'invalid' });
+  });
+
+  it('reports a getter property as invalid without invoking it', () => {
+    let invoked = false;
+    const raw: Record<string, unknown> = {};
+    Object.defineProperty(raw, 'schemaVersion', {
+      enumerable: true,
+      get: () => {
+        invoked = true;
+        return 1;
+      },
+    });
+    expect(readStoreRecordSchemaVersion(raw, policy)).toEqual({ status: 'invalid' });
+    expect(invoked).toBe(false);
+  });
+});
+
+describe('inspectVersionedRecordListBytes', () => {
+  const policy = { writerVersion: 1 as const, acceptedVersions: [1] };
+  const parseRecord = (raw: unknown): VersionedRecordParseResult<{ id: string }> => {
+    const versionCheck = readStoreRecordSchemaVersion(raw, policy);
+    if (versionCheck.status !== 'ok') {
+      return versionCheck;
+    }
+    const id = (raw as { id?: unknown }).id;
+    return typeof id === 'string'
+      ? { status: 'ok', record: { id }, schemaVersion: versionCheck.schemaVersion }
+      : { status: 'invalid' };
+  };
+  const multiPolicy = { writerVersion: 2 as const, acceptedVersions: [1, 2] };
+  const parseMulti = (raw: unknown): VersionedRecordParseResult<{ id: string }> => {
+    const versionCheck = readStoreRecordSchemaVersion(raw, multiPolicy);
+    if (versionCheck.status !== 'ok') {
+      return versionCheck;
+    }
+    const id = (raw as { id?: unknown }).id;
+    return typeof id === 'string'
+      ? { status: 'ok', record: { id }, schemaVersion: versionCheck.schemaVersion }
+      : { status: 'invalid' };
+  };
+
+  it('collects unique schemaVersions sorted ascending', () => {
+    const bytes = Buffer.from(
+      JSON.stringify([{ id: 'a', schemaVersion: 2 }, { id: 'b' }, { id: 'c', schemaVersion: 1 }]),
+    );
+    const result = inspectVersionedRecordListBytes(bytes, parseMulti);
+    expect(result).toEqual({
+      status: 'ok',
+      records: [{ id: 'a' }, { id: 'b' }, { id: 'c' }],
+      schemaVersions: [1, 2],
+    });
+  });
+
+  it('reports non-JSON bytes', () => {
+    expect(inspectVersionedRecordListBytes(Buffer.from('{ not json'), parseRecord)).toEqual({
+      status: 'unreadable',
+      detail: 'not valid JSON',
+      recordIndex: null,
+    });
+  });
+
+  it('rejects a non-array document', () => {
+    expect(inspectVersionedRecordListBytes(Buffer.from('{}'), parseRecord)).toEqual({
+      status: 'unreadable',
+      detail: 'expects a record list',
+      recordIndex: null,
+    });
+  });
+
+  it('returns unknown-version for the bad element even when an earlier element was invalid', () => {
+    const bytes = Buffer.from(JSON.stringify([{ bogus: true }, { id: 'b', schemaVersion: 2 }]));
+    const result = inspectVersionedRecordListBytes(bytes, parseRecord);
+    expect(result).toEqual({
+      status: 'unknown-version',
+      detail: 'record 1 has an unsupported schemaVersion (unknown-schema-version)',
+      recordIndex: 1,
+    });
+  });
+
+  it('returns unreadable for the first invalid element when no element has an unknown version', () => {
+    const bytes = Buffer.from(JSON.stringify([{ bogus: true }, { id: 'b' }]));
+    const result = inspectVersionedRecordListBytes(bytes, parseRecord);
+    expect(result).toEqual({
+      status: 'unreadable',
+      detail: 'record 0 failed validation',
+      recordIndex: 0,
+    });
+  });
+
+  it('never echoes an unknown schemaVersion value in the detail', () => {
+    const bytes = Buffer.from(JSON.stringify([{ id: 'a', schemaVersion: 'CANARY-secret-version' }]));
+    const result = inspectVersionedRecordListBytes(bytes, parseRecord);
+    expect(result.status).toBe('unknown-version');
+    if (result.status === 'unknown-version') {
+      expect(result.detail).not.toContain('CANARY');
+      expect(result.recordIndex).toBe(0);
+    }
   });
 });

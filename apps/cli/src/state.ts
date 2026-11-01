@@ -44,8 +44,10 @@ export const STATE_HELP = `Usage: fleet-v2 [--state-dir <path>] state check | st
 
 Read-only check of every JSON state store under the state directory
 (--state-dir or FLEET_STATE_DIR): one line per store file (ok, missing,
-unreadable: <reason>, or invalid record <n>), then each quarantine copy kept
-for it. It never writes, locks or quarantines anything.
+unreadable: <reason>, invalid record <n>, or unsupported schemaVersion at
+record <n>), then each quarantine copy kept for it. It never writes, locks
+or quarantines anything. Readable versioned stores report their observed
+schemaVersion values, e.g. ok (2 records, schemaVersion 1).
 
 restore replaces only a missing or unreadable store file with a quarantine copy
 of the same store that validates fully; <file> is one of the store file names
@@ -55,19 +57,29 @@ dir>/quarantine (no symlinks); it shows both record counts, asks y/N unless
 quarantine copy; it never repairs.
 
 Exit codes: 0 every store file is readable or missing, 1 any store file is
-unreadable, 2 usage error (including no state directory). Exit codes for
-restore: 0 restored; 1 refused, declined or invalid candidate; 2 usage.`;
+unreadable or holds an unsupported schemaVersion, 2 usage error (including
+no state directory). Exit codes for restore: 0 restored; 1 refused, declined
+or invalid candidate; 2 usage.`;
 
 /** `record` or `records` for a count. */
 function recordWord(count: number): string {
   return count === 1 ? 'record' : 'records';
 }
 
+/** The `, schemaVersion 1` / `, schemaVersions 1, 2` suffix of an ok line. */
+function formatSchemaVersions(versions: readonly number[] | undefined): string {
+  if (versions === undefined || versions.length === 0) {
+    return '';
+  }
+  const label = versions.length === 1 ? 'schemaVersion' : 'schemaVersions';
+  return `, ${label} ${versions.join(', ')}`;
+}
+
 /** One status phrase for a store file or quarantine copy. */
 export function describeStateFileResult(result: StateFileReadResult): string {
   switch (result.status) {
     case 'ok':
-      return `ok (${result.recordCount} ${result.recordCount === 1 ? 'record' : 'records'})`;
+      return `ok (${result.recordCount} ${recordWord(result.recordCount)}${formatSchemaVersions(result.schemaVersions)})`;
     case 'missing':
       return 'missing';
     case 'read-error':
@@ -76,16 +88,33 @@ export function describeStateFileResult(result: StateFileReadResult): string {
       return result.recordIndex === null
         ? `unreadable: ${result.detail}`
         : `invalid record ${result.recordIndex}`;
+    case 'unknown-version':
+      return `unsupported schemaVersion at record ${result.recordIndex}`;
   }
 }
 
 export function isBadStateFileResult(result: StateFileReadResult): boolean {
-  return result.status === 'unreadable' || result.status === 'read-error';
+  return (
+    result.status === 'unreadable' ||
+    result.status === 'read-error' ||
+    result.status === 'unknown-version'
+  );
 }
 
 /** Check every store; Promise.all keeps the descriptors' order, so output is stable. */
 export async function checkStateDirectory(stateDir: string): Promise<StateFileCheck[]> {
   return Promise.all(STATE_FILE_DESCRIPTORS.map((descriptor) => descriptor.check(stateDir)));
+}
+
+function errorCodeOf(error: unknown): string {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    typeof (error as { code?: unknown }).code === 'string'
+  ) {
+    return (error as { code: string }).code;
+  }
+  return 'unknown';
 }
 
 /** How the state directory looks, for the first output line. Never creates it. */
@@ -94,10 +123,7 @@ async function describeStateDirectory(directory: string): Promise<string> {
     const stat = await fs.stat(directory);
     return stat.isDirectory() ? '' : ' (not a directory)';
   } catch (error: unknown) {
-    const code =
-      typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string'
-        ? (error as { code: string }).code
-        : 'unknown';
+    const code = errorCodeOf(error);
     return code === 'ENOENT' ? ' (does not exist yet)' : ` (cannot read: ${code})`;
   }
 }
@@ -138,13 +164,31 @@ async function stateCheck(argv: readonly string[], io: CliIo, stateDir: string):
   return 1;
 }
 
-/** `fleet-v2 state restore <file> --from <copy> [--yes]` (lane E1b-3b). */
-async function stateRestore(
+interface ParsedRestoreArgs {
+  readonly from?: string;
+  readonly yes: boolean;
+  readonly positionals: readonly string[];
+}
+
+function parseFromValue(
+  token: string,
+  argv: readonly string[],
+  index: number,
+): { readonly value: string | undefined; readonly nextIndex: number } {
+  if (token === '--from') {
+    return { value: argv[index + 1], nextIndex: index + 1 };
+  }
+  return { value: token.slice('--from='.length), nextIndex: index };
+}
+
+function isInvalidFromValue(value: string | undefined): boolean {
+  return value === undefined || value.trim() === '' || value.startsWith('--');
+}
+
+function parseRestoreArgs(
   argv: readonly string[],
   io: CliIo,
-  stateDir: string,
-  options: StateCliOptions,
-): Promise<number> {
+): ParsedRestoreArgs | null {
   let from: string | undefined;
   let yes = false;
   const positionals: string[] = [];
@@ -155,27 +199,68 @@ async function stateRestore(
       continue;
     }
     if (token === '--from' || token.startsWith('--from=')) {
-      const value = token === '--from' ? argv[index + 1] : token.slice('--from='.length);
-      if (token === '--from') {
-        index += 1;
-      }
-      if (value === undefined || value.trim() === '' || value.startsWith('--')) {
-        io.stderr(`--from requires a quarantine copy name\n${STATE_HELP}\n`);
-        return 2;
-      }
       if (from !== undefined) {
         io.stderr(`Unknown state restore option: ${token}\n${STATE_HELP}\n`);
-        return 2;
+        return null;
       }
-      from = value;
+      const parsed = parseFromValue(token, argv, index);
+      index = parsed.nextIndex;
+      if (isInvalidFromValue(parsed.value)) {
+        io.stderr(`--from requires a quarantine copy name\n${STATE_HELP}\n`);
+        return null;
+      }
+      from = parsed.value;
       continue;
     }
     if (token.startsWith('--')) {
       io.stderr(`Unknown state restore option: ${token}\n${STATE_HELP}\n`);
-      return 2;
+      return null;
     }
     positionals.push(token);
   }
+  return { from, yes, positionals };
+}
+
+async function readCurrentStoreFile(
+  filePath: string,
+): Promise<{ readonly status: 'ok'; readonly bytes: Buffer | null } | { readonly status: 'error'; readonly code: string }> {
+  try {
+    const bytes = await fs.readFile(filePath);
+    return { status: 'ok', bytes };
+  } catch (error: unknown) {
+    const code = errorCodeOf(error);
+    if (code === 'ENOENT') {
+      return { status: 'ok', bytes: null };
+    }
+    return { status: 'error', code };
+  }
+}
+
+function formatBeforeRecords(result: StateFileReadResult): string {
+  if (result.status === 'ok') {
+    return String(result.recordCount);
+  }
+  if (result.status === 'missing') {
+    return 'missing';
+  }
+  if (result.status === 'unknown-version') {
+    return 'unsupported';
+  }
+  return 'unreadable';
+}
+
+/** `fleet-v2 state restore <file> --from <copy> [--yes]` (lane E1b-3b). */
+async function stateRestore(
+  argv: readonly string[],
+  io: CliIo,
+  stateDir: string,
+  options: StateCliOptions,
+): Promise<number> {
+  const parsed = parseRestoreArgs(argv, io);
+  if (parsed === null) {
+    return 2;
+  }
+  const { from, yes, positionals } = parsed;
   if (positionals.length !== 1) {
     io.stderr(`state restore requires exactly one store file\n${STATE_HELP}\n`);
     return 2;
@@ -205,33 +290,17 @@ async function stateRestore(
     return 1;
   }
   const currentPath = path.join(stateDir, file);
-  let current: Buffer | null;
-  try {
-    current = await fs.readFile(currentPath);
-  } catch (error: unknown) {
-    const code =
-      typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string'
-        ? (error as { code: string }).code
-        : 'unknown';
-    if (code === 'ENOENT') {
-      current = null;
-    } else {
-      io.stderr(`cannot read ${currentPath} (${code})\n`);
-      io.stdout('nothing changed\n');
-      return 1;
-    }
+  const currentRead = await readCurrentStoreFile(currentPath);
+  if (currentRead.status === 'error') {
+    io.stderr(`cannot read ${currentPath} (${currentRead.code})\n`);
+    io.stdout('nothing changed\n');
+    return 1;
   }
+  const current = currentRead.bytes;
   const currentResult: StateFileReadResult = current === null ? { status: 'missing' } : descriptor.inspect(current);
   const sha = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex');
   const currentSuffix = current === null ? '' : `, ${current.length} bytes, sha256 ${sha(current).slice(0, 12)}`;
-  let before: string;
-  if (currentResult.status === 'ok') {
-    before = String(currentResult.recordCount);
-  } else if (currentResult.status === 'missing') {
-    before = 'missing';
-  } else {
-    before = 'unreadable';
-  }
+  const before = formatBeforeRecords(currentResult);
   io.stdout(`restore ${currentPath}\n`);
   io.stdout(`  current:   ${describeStateFileResult(currentResult)}${currentSuffix}\n`);
   io.stdout(
@@ -241,6 +310,13 @@ async function stateRestore(
   if (currentResult.status === 'ok') {
     io.stderr(
       `${file} is readable (${currentResult.recordCount} ${recordWord(currentResult.recordCount)}); state restore replaces only a missing or unreadable store\n`,
+    );
+    io.stdout('nothing changed\n');
+    return 1;
+  }
+  if (currentResult.status === 'unknown-version') {
+    io.stderr(
+      `${file} has an unsupported schemaVersion; state restore replaces only a missing or unreadable store\n`,
     );
     io.stdout('nothing changed\n');
     return 1;

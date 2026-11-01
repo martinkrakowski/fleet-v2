@@ -23,6 +23,7 @@ import {
 import type {
   AbandonStartRequest,
   AbandonStartResult,
+  AdvanceLaneRunResult,
   RunConductorPassRequest,
   RunConductorPassResult,
   StartLaneRunRequest,
@@ -33,7 +34,7 @@ import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli } from '../index.js';
 import type { CliIo } from '../index.js';
 import type { ConductorCliOptions } from '../conductor.js';
-import { nextPollDelayMs, PASS_CONCURRENCY_LIMIT } from '../conductor.js';
+import { nextPollDelayMs, PASS_CONCURRENCY_LIMIT, runsWaitOnForge, pollSleepMs } from '../conductor.js';
 import { buildLiveConductorDriver, type ConductorDriver } from '../conductor-wiring.js';
 import { RunnerTunnelAdapter, type TunnelChild } from '../runner-tunnel.js';
 
@@ -227,6 +228,13 @@ function makeFakeDriver(options: {
     runPolicyRevision: 'policy:conductor@0123456789ab',
   };
   return { driver, passCalls, releaseCalls, startCalls, abandonCalls };
+}
+
+/** A completed pass whose only run is advanced with the given last step. */
+function forgePass(steps: readonly AdvanceLaneRunResult[]): RunConductorPassResult {
+  return completedPass({
+    runs: [{ runId: RUN_ID, outcome: 'advanced', steps }],
+  });
 }
 
 /** A `sleep` that resolves at once, records each delay and can abort the stop signal. */
@@ -446,6 +454,79 @@ describe('conductor run live loop (K7-7)', () => {
     expect(result.code).toBe(1);
     expect(parseDocument(result.stdout)).toMatchObject({ pass: 1, outcome: 'refused' });
     expect(fake.releaseCalls).toHaveLength(1);
+  });
+
+  describe('poll floor (KS8)', () => {
+    it('runsWaitOnForge is true for the forge-wait last steps', () => {
+      expect(runsWaitOnForge(forgePass([{ outcome: 'waiting', reason: 'ci-pending' }]))).toBe(true);
+      expect(runsWaitOnForge(forgePass([{ outcome: 'waiting', reason: 'ci-unknown' }]))).toBe(true);
+      expect(runsWaitOnForge(forgePass([{ outcome: 'waiting', reason: 'merge-train' }]))).toBe(true);
+      expect(runsWaitOnForge(forgePass([{ outcome: 'entered', state: 'watching-ci' }]))).toBe(true);
+      expect(runsWaitOnForge(forgePass([{ outcome: 'entered', state: 'merging' }]))).toBe(true);
+    });
+
+    it('runsWaitOnForge is false for non-forge last steps, non-advanced reports and empty runs', () => {
+      expect(runsWaitOnForge(forgePass([{ outcome: 'waiting', reason: 'review-pending' }]))).toBe(false);
+      expect(runsWaitOnForge(forgePass([{ outcome: 'entered', state: 'gating' }]))).toBe(false);
+      expect(
+        runsWaitOnForge(
+          forgePass([{ outcome: 'waiting', reason: 'ci-pending' }, { outcome: 'entered', state: 'merged' }]),
+        ),
+      ).toBe(false);
+      expect(
+        runsWaitOnForge(
+          completedPass({ runs: [{ runId: RUN_ID, outcome: 'skipped', reason: 'lease-held' }] }),
+        ),
+      ).toBe(false);
+      expect(runsWaitOnForge({ outcome: 'refused', reason: 'driver-lease-held' })).toBe(false);
+      expect(runsWaitOnForge(completedPass())).toBe(false);
+    });
+
+    it('pollSleepMs floors the back-off to 10 s only for forge waits', () => {
+      const forge = forgePass([{ outcome: 'waiting', reason: 'ci-pending' }]);
+      expect(pollSleepMs(120000, forge)).toBe(10000);
+      expect(pollSleepMs(30000, forge)).toBe(10000);
+      expect(pollSleepMs(120000, completedPass())).toBe(120000);
+    });
+
+    it('the live loop keeps doubling the back-off track while the floor applies', async () => {
+      const dir = tempStateDir();
+      const forge = forgePass([{ outcome: 'waiting', reason: 'ci-pending' }]);
+      const fake = makeFakeDriver({
+        enabled: true,
+        passes: [forge, forge, completedPass(), completedPass()],
+      });
+      const controller = new AbortController();
+      const delays: number[] = [];
+      const result = await runConductor(runtimeOf(dir), ['run', '--live'], {
+        stateDir: dir,
+        buildDriver: () => fake.driver,
+        stopSignal: controller.signal,
+        sleep: recorderSleep(delays, 4, controller),
+      });
+      expect(result.code).toBe(0);
+      expect(delays).toEqual([10000, 10000, 120000, 120000]);
+      expect(fake.releaseCalls).toHaveLength(1);
+    });
+
+    it('the live loop floors a progressed pass that ends in a forge wait and resumes the back-off after', async () => {
+      const dir = tempStateDir();
+      const forgeRun = completedPass({
+        progressed: true,
+        runs: [{ runId: RUN_ID, outcome: 'advanced', steps: [{ outcome: 'entered', state: 'watching-ci' }] }],
+      });
+      const fake = makeFakeDriver({ enabled: true, passes: [forgeRun, completedPass()] });
+      const controller = new AbortController();
+      const delays: number[] = [];
+      const result = await runConductor(runtimeOf(dir), ['run', '--live'], {
+        stateDir: dir,
+        buildDriver: () => fake.driver,
+        stopSignal: controller.signal,
+        sleep: recorderSleep(delays, 2, controller),
+      });
+      expect(result.code).toBe(0);
+      expect(delays).toEqual([10000, 60000]);
+    });
   });
 
   it('prints the same run grace attention item once per process', async () => {

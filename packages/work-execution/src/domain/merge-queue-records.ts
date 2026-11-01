@@ -474,7 +474,13 @@ export function compareMergeQueueEntries(
   if (left.enqueuedAtIso !== right.enqueuedAtIso) {
     return left.enqueuedAtIso < right.enqueuedAtIso ? -1 : 1;
   }
-  return left.entryId < right.entryId ? -1 : 1;
+  if (left.entryId < right.entryId) {
+    return -1;
+  }
+  if (left.entryId > right.entryId) {
+    return 1;
+  }
+  return 0;
 }
 
 export function orderMergeQueue(

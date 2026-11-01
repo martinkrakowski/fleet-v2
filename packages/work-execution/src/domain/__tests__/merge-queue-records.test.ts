@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   MERGE_QUEUE_ENTRY_VERSION,
+  compareMergeQueueEntries,
   createUpdateSuccessorEntry,
   effectiveVerifiedHeadOid,
   findMergeQueueHead,
@@ -391,17 +392,28 @@ describe('findMergeQueueHead', () => {
     const parkedEarly = makeEntry({ state: 'parked', reason: 'checks', enqueuedAtIso: '2026-11-01T10:00:00.000Z' });
     const live = makeEntry({ state: 'queued', enqueuedAtIso: '2026-11-01T11:00:00.000Z' });
     const parkedLate = makeEntry({ state: 'parked', reason: 'checks', enqueuedAtIso: '2026-11-01T12:00:00.000Z' });
-    const permutations = [
-      [parkedEarly, live, parkedLate],
-      [parkedEarly, parkedLate, live],
-      [live, parkedEarly, parkedLate],
-      [live, parkedLate, parkedEarly],
-      [parkedLate, parkedEarly, live],
-      [parkedLate, live, parkedEarly],
-    ];
+    const liveLater = makeEntry({ state: 'queued', enqueuedAtIso: '2026-11-01T12:30:00.000Z' });
+    const rows = [parkedEarly, live, parkedLate, liveLater];
+    const permutations: (typeof rows)[] = [];
+    const permute = (prefix: typeof rows, rest: typeof rows): void => {
+      if (rest.length === 0) {
+        permutations.push(prefix);
+        return;
+      }
+      rest.forEach((row, index) => permute([...prefix, row], [...rest.slice(0, index), ...rest.slice(index + 1)]));
+    };
+    permute([], rows);
+    expect(permutations).toHaveLength(24);
     for (const permutation of permutations) {
       expect(findMergeQueueHead(permutation)?.entryId).toBe(live.entryId);
     }
+  });
+
+  it('compares equal timestamps by entryId and answers 0 for the same entry', () => {
+    const a = makeEntry({ enqueuedAtIso: '2026-11-01T10:00:00.000Z' });
+    const b = { ...a, entryId: a.entryId < 'zzzz' ? 'zzzz' : 'aaaa' };
+    expect(compareMergeQueueEntries(a, a)).toBe(0);
+    expect(Math.sign(compareMergeQueueEntries(a, b))).toBe(-Math.sign(compareMergeQueueEntries(b, a)));
   });
 
   it('returns null when every live entry is parked', () => {

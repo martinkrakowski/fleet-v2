@@ -20,6 +20,7 @@ import { createAttemptReaders, type AttemptReaders } from "./api/attempts";
 import { createCoordinationReaders, type CoordinationReaders } from "./api/coordination";
 import { createEvidenceReaders, type EvidenceReaders } from "./api/evidence";
 import { createProjectReaders, type ProjectReaders } from "./api/projects";
+import { createRunReaders, type RunReaders } from "./api/runs";
 import { createWorkOrderReaders, type WorkOrderReaders } from "./api/work-orders";
 
 export { NOT_IMPLEMENTED_STATUS } from "./api/transport";
@@ -43,7 +44,8 @@ export type FleetWebApiClient = WorkOrderReaders &
   AttemptReaders &
   EvidenceReaders &
   CoordinationReaders &
-  ProjectReaders;
+  ProjectReaders &
+  RunReaders;
 
 export function readWebClientApiToken(tokenFile?: string): string | null {
   if (typeof window !== "undefined") {
@@ -104,5 +106,6 @@ export function createFleetWebApiClient(
     ...createEvidenceReaders(read),
     ...createCoordinationReaders(read),
     ...createProjectReaders(read),
+    ...createRunReaders(read),
   };
 }

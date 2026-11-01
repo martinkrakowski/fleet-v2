@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { StateFileUnreadableError } from './file-store.js';
+import { ReadOnlyStateStoreError, StateFileUnreadableError } from './file-store.js';
 import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
 
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -182,5 +182,38 @@ describe('ConductorDriverLeaseAdapter file shape, read-back and quarantine', () 
       const dot = new ConductorDriverLeaseAdapter({ stateDir: tempDir, fileName: dotName });
       await expect(dot.read()).rejects.toThrow(/unsafe state file name/);
     }
+  });
+});
+
+describe('ConductorDriverLeaseAdapter read-only mode', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-conductor-driver-lease-readonly-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('read-only leaves a malformed marker untouched and reads null while the default quarantines', async () => {
+    const garbage = '{ not json CANARY-bytes';
+    const file = path.join(tempDir, 'conductor-driver-lease.json');
+    await fs.writeFile(file, garbage, 'utf8');
+
+    const readonlyAdapter = new ConductorDriverLeaseAdapter({ stateDir: tempDir, readOnly: true });
+    expect(await readonlyAdapter.read()).toBeNull();
+    expect(await fs.readFile(file, 'utf8')).toBe(garbage);
+    await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+
+    const defaultAdapter = new ConductorDriverLeaseAdapter({ stateDir: tempDir });
+    await expect(defaultAdapter.read()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    const entries = await fs.readdir(path.join(tempDir, 'quarantine'));
+    expect(entries).toHaveLength(1);
+    expect(await fs.readFile(path.join(tempDir, 'quarantine', entries[0]), 'utf8')).toBe(garbage);
+
+    await expect(readonlyAdapter.acquire(ACQUIRE)).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
   });
 });

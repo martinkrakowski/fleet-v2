@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 
 import {
   CONDUCTOR_PASS_TRACE_MAX_STEPS,
+  conductorPassTraceOf,
   parseConductorPassTraceStateRecord,
   readConductorPassTrace,
+  type ConductorPassTraceInput,
 } from '../conductor-pass-trace.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
@@ -145,5 +147,166 @@ describe('readConductorPassTrace', () => {
     expect(parseConductorPassTraceStateRecord(validRecord())).toBeDefined();
     expect(parseConductorPassTraceStateRecord(validRecord({ schemaVersion: 2 }))).toBeUndefined();
     expect(parseConductorPassTraceStateRecord(null)).toBeUndefined();
+  });
+});
+
+const DISPATCH_KEY = 'run-01JB0000000000000000000000/r0/dispatch/0/a1';
+const LIMITS = { maxActiveRuns: 2, passConcurrency: 1, dispatchStaggerMs: 20000 };
+
+describe('conductorPassTraceOf', () => {
+  it('builds a valid trace from a real-shaped advanced report and copies the limits', () => {
+    const input: ConductorPassTraceInput = {
+      passId: 'pass-1',
+      nowIso: NOW,
+      holderId: 'driver-x',
+      halted: false,
+      progressed: true,
+      runs: [
+        {
+          runId: RUN_ID,
+          outcome: 'advanced',
+          steps: [
+            { outcome: 'entered', state: 'gating' },
+            { outcome: 'waiting', reason: 'admission' },
+            {
+              outcome: 'acted',
+              step: 'dispatch',
+              key: DISPATCH_KEY,
+              result: 'completed',
+              reasonCode: null,
+              detail: null,
+            },
+          ],
+        },
+        { runId: RUN_ID, outcome: 'skipped', reason: 'lease-held' },
+        { runId: RUN_ID, outcome: 'resume-refused', reason: 'save-refused' },
+      ],
+      attention: [{ runId: RUN_ID, kind: 'stop-grace-exceeded' }],
+    };
+    const read = conductorPassTraceOf(input, LIMITS);
+    expect(read.ok).toBe(true);
+    if (read.ok) {
+      expect(read.record.schemaVersion).toBe(1);
+      expect(read.record.maxActiveRuns).toBe(2);
+      expect(read.record.passConcurrency).toBe(1);
+      expect(read.record.dispatchStaggerMs).toBe(20000);
+      expect(read.record.runs).toHaveLength(3);
+      expect(read.record.runs[0]!.report).toEqual({
+        outcome: 'advanced',
+        steps: [
+          { outcome: 'entered', state: 'gating' },
+          { outcome: 'waiting', reason: 'admission' },
+          {
+            outcome: 'acted',
+            step: 'dispatch',
+            key: DISPATCH_KEY,
+            result: 'completed',
+            reasonCode: null,
+            detail: null,
+          },
+        ],
+      });
+      expect(read.record.runs[1]!.report).toEqual({ outcome: 'skipped', reason: 'lease-held' });
+      expect(read.record.runs[2]!.report).toEqual({ outcome: 'resume-refused', reason: 'save-refused' });
+    }
+  });
+
+  it('caps nine steps at eight, keeping the first eight in order', () => {
+    const nineSteps = Array.from({ length: 9 }, (_, index) => ({
+      outcome: 'entered',
+      state: `gating-${index}`,
+    }));
+    const read = conductorPassTraceOf(
+      {
+        passId: 'pass-1',
+        nowIso: NOW,
+        holderId: 'driver-x',
+        halted: false,
+        progressed: true,
+        runs: [{ runId: RUN_ID, outcome: 'advanced', steps: nineSteps }],
+        attention: [],
+      },
+      { maxActiveRuns: 1, passConcurrency: 1, dispatchStaggerMs: 20000 },
+    );
+    expect(read.ok).toBe(true);
+    if (read.ok) {
+      const report = read.record.runs[0]!.report;
+      if (report.outcome === 'advanced') {
+        expect(report.steps).toHaveLength(8);
+        expect(report.steps).toEqual(nineSteps.slice(0, 8));
+      }
+    }
+  });
+
+  it('drops worktree paths, ssh aliases and ports wherever they appear', () => {
+    const input = {
+      passId: 'pass-1',
+      nowIso: NOW,
+      holderId: 'driver-x',
+      halted: false,
+      progressed: true,
+      worktreePath: '/srv/x',
+      sshAlias: 'mac-mini',
+      port: 2222,
+      runs: [
+        {
+          runId: RUN_ID,
+          outcome: 'advanced',
+          worktreePath: '/srv/x',
+          sshAlias: 'mac-mini',
+          port: 2222,
+          steps: [{ outcome: 'entered', state: 'running', worktreePath: '/srv/x', sshAlias: 'mac-mini', port: 2222 }],
+        },
+      ],
+      attention: [],
+    } as unknown as ConductorPassTraceInput;
+    const read = conductorPassTraceOf(input, { maxActiveRuns: 1, passConcurrency: 1, dispatchStaggerMs: 20000 });
+    expect(read.ok).toBe(true);
+    if (read.ok) {
+      const text = JSON.stringify(read.record);
+      expect(text).not.toContain('/srv/x');
+      expect(text).not.toContain('mac-mini');
+      expect(text).not.toContain('2222');
+    }
+  });
+
+  it('refuses an invalid time and zero limits as malformed', () => {
+    const base = {
+      passId: 'pass-1',
+      nowIso: NOW,
+      holderId: 'driver-x',
+      halted: false,
+      progressed: true,
+      runs: [],
+      attention: [],
+    } as ConductorPassTraceInput;
+    expect(
+      conductorPassTraceOf({ ...base, nowIso: 'later' }, { maxActiveRuns: 1, passConcurrency: 1, dispatchStaggerMs: 20000 }),
+    ).toEqual({ ok: false, reason: 'malformed' });
+    expect(conductorPassTraceOf(base, { maxActiveRuns: 0, passConcurrency: 1, dispatchStaggerMs: 20000 })).toEqual({
+      ok: false,
+      reason: 'malformed',
+    });
+  });
+
+  it('refuses limits that carry extra fields and stamps schemaVersion 1 on the record', () => {
+    const base = {
+      passId: 'pass-1',
+      nowIso: NOW,
+      holderId: 'driver-x',
+      halted: false,
+      progressed: true,
+      runs: [],
+      attention: [],
+    } as ConductorPassTraceInput;
+    expect(conductorPassTraceOf(base, { ...LIMITS, schemaVersion: 2 } as never)).toEqual({
+      ok: false,
+      reason: 'malformed',
+    });
+    const read = conductorPassTraceOf(base, LIMITS);
+    expect(read.ok).toBe(true);
+    if (read.ok) {
+      expect(read.record.schemaVersion).toBe(1);
+    }
   });
 });

@@ -25,8 +25,18 @@ import {
 import { MergeVerificationAdapter } from '../MergeVerificationAdapter.adapter.js';
 import type {
   MergeVerificationReadRequest,
+  MergeVerificationResult,
   MergeVerificationTriggerRequest,
 } from '../../../application/ports/out/MergeVerificationPort.out-port.js';
+
+function assertUnknown(
+  result: MergeVerificationResult,
+): asserts result is Extract<MergeVerificationResult, { outcome: 'unknown' }> {
+  expect(result.outcome).toBe('unknown');
+  if (result.outcome !== 'unknown') {
+    throw new Error(`expected unknown outcome, got ${result.outcome}`);
+  }
+}
 
 const ATTEMPT = 'attempt-dt8';
 const ASSESSMENT_ID = assessmentIdForAttempt(ATTEMPT);
@@ -431,6 +441,7 @@ describe('MergeVerificationAdapter', () => {
       const readResult = await adapter.readVerification(
         readRequest({ deadlineIso: new Date(baseNow + 60_000).toISOString() }),
       );
+      assertUnknown(readResult);
       expect(readResult).toEqual({
         outcome: 'unknown',
         reasonCode: 'no-receipt',
@@ -507,6 +518,7 @@ describe('MergeVerificationAdapter', () => {
       const readResult = await adapter.readVerification(
         readRequest({ deadlineIso: new Date(baseNow + 60_000).toISOString() }),
       );
+      assertUnknown(readResult);
       expect(readResult).toEqual({
         outcome: 'unknown',
         reasonCode: 'no-receipt',

@@ -15,6 +15,7 @@ import {
 import {
   AdvanceLaneRunUseCase,
   CancelPreparedAttemptUseCase,
+  ConductorPassTraceAdapter,
   LaneRunAdmissionAdapter,
   PrepareFixAttemptUseCase,
   ResumeLaneRunUseCase,
@@ -24,6 +25,7 @@ import {
   type AttemptRepositoryAdapter,
   type ConductorDriverLeaseAdapter,
   type ConductorHaltAdapter,
+  type ConductorPassTracePort,
   type ExecutionJournalAdapter,
   type LaneRunJournalAdapter,
   type LaneRunRepositoryAdapter,
@@ -78,6 +80,13 @@ export function laneRunnerCandidateHosts(
   return candidates;
 }
 
+/**
+ * VZ5b: the live driver's pass-trace write side. It equals the use-case
+ * default (20_000) and is recorded on each completed pass trace; the dry-run
+ * driver never sets a passTrace, so a dry-run writes nothing structurally.
+ */
+export const LIVE_DISPATCH_STAGGER_MS = 20_000;
+
 /** The conductor driver the CLI loops over: one pass port, the start port, the resolved policy. */
 export interface ConductorDriver {
   readonly pass: RunConductorPassPort;
@@ -85,6 +94,8 @@ export interface ConductorDriver {
   readonly start: StartLaneRunPort | null;
   readonly policy: ResolvedConductorPolicy;
   readonly runPolicyRevision: string; // 'policy:conductor@' + conductorRevision(policy)
+  /** VZ5b: appends completed pass traces; absent in the dry-run driver. */
+  readonly passTrace?: Pick<ConductorPassTracePort, 'append'>;
 }
 
 /**
@@ -142,7 +153,7 @@ export function conductorGateOf(runtime: FleetCliRuntime): FleetCliRuntime['exec
 
 export function buildLiveConductorDriver(
   runtime: FleetCliRuntime,
-  options: { readonly maxActiveRuns: number; readonly passConcurrency?: number },
+  options: { readonly maxActiveRuns: number; readonly passConcurrency?: number; readonly stateDir?: string },
 ): ConductorDriver {
   const policy = resolveConductorPolicy(runtime.installation?.policy);
   const execution = runtime.execution;
@@ -222,18 +233,30 @@ export function buildLiveConductorDriver(
     cancelPreparedAttempt,
     computeDigest: sha256HexDigest,
   });
-  return buildConductorDriver({
-    driverLease: conductor.driverLease,
-    runRepo: conductor.laneRunRepository,
-    runJournal: conductor.laneRunJournal,
-    halt: conductor.halt,
-    resume: conductor.resumeLaneRun,
-    advance,
-    start,
-    policy,
-    runPolicyRevision: 'policy:conductor@' + conductorRevision(policy),
-    ...(options.passConcurrency === undefined ? {} : { passConcurrency: options.passConcurrency }),
+  const passTrace = new ConductorPassTraceAdapter({
+    stateDir: options.stateDir,
+    limits: {
+      maxActiveRuns: options.maxActiveRuns,
+      passConcurrency: options.passConcurrency ?? 1,
+      dispatchStaggerMs: LIVE_DISPATCH_STAGGER_MS,
+    },
   });
+  return {
+    ...buildConductorDriver({
+      driverLease: conductor.driverLease,
+      runRepo: conductor.laneRunRepository,
+      runJournal: conductor.laneRunJournal,
+      halt: conductor.halt,
+      resume: conductor.resumeLaneRun,
+      advance,
+      start,
+      policy,
+      runPolicyRevision: 'policy:conductor@' + conductorRevision(policy),
+      dispatchStaggerMs: LIVE_DISPATCH_STAGGER_MS,
+      ...(options.passConcurrency === undefined ? {} : { passConcurrency: options.passConcurrency }),
+    }),
+    passTrace,
+  };
 }
 
 /** The scratch stores the dry-run driver composes over (K7-8). */

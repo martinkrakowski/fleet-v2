@@ -24,6 +24,15 @@ export interface ForgeActionRequest {
   readonly title?: string;
   /** PR body override used only for `push-and-open-pr`; absent keeps the default. */
   readonly body?: string;
+  /**
+   * Status to post for `post-status`: the pre-merge review receipt of the
+   * expected head. Only `post-status` may carry it.
+   */
+  readonly status?: {
+    readonly context: 'premerge';
+    readonly state: 'success' | 'pending' | 'failure';
+    readonly description: string;
+  };
 }
 
 export type ForgeActionResult =

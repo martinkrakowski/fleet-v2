@@ -75,6 +75,12 @@ export type ParsedLaneRunKey =
   | { readonly kind: 'resume'; readonly runId: string; readonly parkOrdinal: number; readonly via: LaneRunKeyVia }
   | { readonly kind: 'request'; readonly requestId: string }
   | {
+      readonly kind: 'premerge';
+      readonly runId: string;
+      readonly round: number;
+      readonly head12: string;
+    }
+  | {
       readonly kind: 'reaper';
       readonly subjectId: string;
       readonly findingKind: ReaperFindingKind;
@@ -163,6 +169,12 @@ export function buildLaneRunStepKey(parts: LaneRunStepKeyParts): LaneRunKeyResul
       head12: read('head12'),
       retry: read('retry'),
     };
+
+    // The premerge step has no seat-index key shape: its key is built by
+    // laneRunPremergeKey instead (`<runId>/r<round>/premerge@<head12>`).
+    if (snapshot.step === 'premerge') {
+      return { ok: false, error: 'LaneRun key step premerge has no seat index' };
+    }
 
     // Validate only the snapshot.
     const error = stepKeyError(snapshot as LaneRunStepKeyParts);
@@ -260,6 +272,23 @@ export function requestKey(requestId: string): LaneRunKeyResult {
   return { ok: true, key: 'request/' + requestId };
 }
 
+/**
+ * The premerge receipt's key `<runId>/r<round>/premerge@<head12>` (speed plan
+ * §3.6.2): no seat index, no attempt ordinal, no retry. Never throws.
+ */
+export function laneRunPremergeKey(runId: string, round: number, head12: string): LaneRunKeyResult {
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+    return { ok: false, error: 'LaneRun key runId must be run- followed by a ULID' };
+  }
+  if (!Number.isInteger(round) || round < 0 || round > 2) {
+    return { ok: false, error: 'LaneRun key round must be 0, 1 or 2' };
+  }
+  if (typeof head12 !== 'string' || !HEAD12_PATTERN.test(head12)) {
+    return { ok: false, error: 'LaneRun key head12 must be 12 lowercase hex characters' };
+  }
+  return { ok: true, key: runId + '/r' + round + '/premerge@' + head12 };
+}
+
 function parseStepKeySegments(segments: string[], key: string): ParsedLaneRunKey | null {
   if (!ROUND_SEGMENT_PATTERN.test(segments[1])) {
     return null;
@@ -336,6 +365,31 @@ function parseStopKeySegments(segments: string[], key: string): ParsedLaneRunKey
   return { kind: 'stop', runId: segments[0], via: via as LaneRunKeyVia, mode };
 }
 
+/** The three-segment premerge key `<runId>/r<round>/premerge@<head12>`; null for any other shape. */
+function parsePremergeKeySegments(segments: string[], key: string): ParsedLaneRunKey | null {
+  if (segments[0] === 'reaper') {
+    return null;
+  }
+  if (!ROUND_SEGMENT_PATTERN.test(segments[1])) {
+    return null;
+  }
+  const tail = segments[2];
+  const atIndex = tail.indexOf('@');
+  if (atIndex === -1 || tail.indexOf('@', atIndex + 1) !== -1) {
+    return null;
+  }
+  if (tail.slice(0, atIndex) !== 'premerge') {
+    return null;
+  }
+  const round = Number(segments[1].slice(1));
+  const head12 = tail.slice(atIndex + 1);
+  const built = laneRunPremergeKey(segments[0], round, head12);
+  if (!built.ok || built.key !== key) {
+    return null;
+  }
+  return { kind: 'premerge', runId: segments[0], round, head12 };
+}
+
 function parseReaperKeySegments(segments: string[], key: string): ParsedLaneRunKey | null {
   if (segments[0] !== 'reaper') {
     return null;
@@ -370,7 +424,8 @@ export function parseLaneRunKey(key: unknown): ParsedLaneRunKey | null {
   }
 
   if (segments.length === 3) {
-    return parseReaperKeySegments(segments, key);
+    const premerge = parsePremergeKeySegments(segments, key);
+    return premerge !== null ? premerge : parseReaperKeySegments(segments, key);
   }
 
   if (segments.length === 4 && segments[1] === 'park') {

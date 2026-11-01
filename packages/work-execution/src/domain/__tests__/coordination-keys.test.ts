@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   consumptionId,
+  forgeActionPushesBranch,
   forgeActionScope,
   observationEventKind,
   FORGE_ACTION_KINDS,
@@ -54,8 +55,15 @@ describe('FORGE_REFUSAL_KINDS', () => {
 });
 
 describe('FORGE_ACTION_KINDS', () => {
-  it('lists all three forge action kinds and scopes push-to-pr', () => {
-    expect(FORGE_ACTION_KINDS).toEqual(['push-and-open-pr', 'push-to-pr', 'merge-pr']);
-    expect(forgeActionScope('push-to-pr')).toBe('forge:push-to-pr');
+  it('lists all four forge action kinds and scopes post-status', () => {
+    expect(FORGE_ACTION_KINDS).toEqual(['push-and-open-pr', 'push-to-pr', 'merge-pr', 'post-status']);
+    expect(forgeActionScope('post-status')).toBe('forge:post-status');
+  });
+
+  it('reports which kinds push a branch', () => {
+    expect(forgeActionPushesBranch('push-and-open-pr')).toBe(true);
+    expect(forgeActionPushesBranch('push-to-pr')).toBe(true);
+    expect(forgeActionPushesBranch('merge-pr')).toBe(false);
+    expect(forgeActionPushesBranch('post-status')).toBe(false);
   });
 });

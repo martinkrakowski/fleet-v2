@@ -6,8 +6,8 @@
 
 import type { CoordinationRequestRecord } from './coordination-records.js';
 
-/** Forge kinds a policy grant may authorise (A3; the conductor's three forge steps). */
-export const POLICY_GRANT_FORGE_KINDS = ['push-and-open-pr', 'push-to-pr', 'merge-pr'] as const;
+/** Forge kinds a policy grant may authorise (A3; the conductor's forge steps). */
+export const POLICY_GRANT_FORGE_KINDS = ['push-and-open-pr', 'push-to-pr', 'merge-pr', 'post-status'] as const;
 export type PolicyGrantForgeKind = (typeof POLICY_GRANT_FORGE_KINDS)[number];
 
 /** Installation settings that may authorise a policy grant. */
@@ -16,7 +16,12 @@ export type PolicyGrantSource = (typeof POLICY_GRANT_SOURCES)[number];
 
 /** The one setting that may authorise each kind; the pairing is closed. */
 export const POLICY_GRANT_SOURCE_FOR_KIND: Readonly<Record<PolicyGrantForgeKind, PolicyGrantSource>> =
-  Object.freeze({ 'push-and-open-pr': 'conductor', 'push-to-pr': 'conductor', 'merge-pr': 'autoMerge' });
+  Object.freeze({
+    'push-and-open-pr': 'conductor',
+    'push-to-pr': 'conductor',
+    'merge-pr': 'autoMerge',
+    'post-status': 'conductor',
+  });
 
 /** A setting revision: 12 lower-case hex characters (installation's autoMergeRevision / conductorRevision). */
 export const POLICY_SETTING_REVISION_PATTERN = /^[0-9a-f]{12}$/;

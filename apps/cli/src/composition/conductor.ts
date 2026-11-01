@@ -12,11 +12,13 @@ import {
   CiStateAdapter,
   ConductorDriverLeaseAdapter,
   ConductorHaltAdapter,
+  ConductorPassTraceAdapter,
   ExecutionJournalAdapter,
   GateReceiptAdapter,
   InspectLaneRunsUseCase,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
+  ListConductorPassesUseCase,
   ListLaneRunsUseCase,
   ReapLaneWorktreesUseCase,
   ReapOrphanSessionsUseCase,
@@ -83,6 +85,9 @@ export function composeConductor(input: ComposeConductorInput) {
   const laneRunJournal = new LaneRunJournalAdapter({ stateDir });
   const conductorDriverLease = new ConductorDriverLeaseAdapter({ stateDir });
   const conductorHalt = new ConductorHaltAdapter({ stateDir });
+  // The pass-trace ring: the live driver appends to it (with limits) and the
+  // read side here has no limits — listing and the schedule's cap read it.
+  const conductorPassTraces = new ConductorPassTraceAdapter({ stateDir });
   const conductorNewUlid = () => newUlid();
   // The auto-merge setting is read once at composition; a toggle takes a
   // restart (K6-8). An unreadable setting fails closed.
@@ -116,7 +121,9 @@ export function composeConductor(input: ComposeConductorInput) {
       attemptRepo: attemptRepository,
       executionJournal,
       workOrderRepo: workOrderRepository,
+      passTrace: conductorPassTraces,
     }),
+    listConductorPasses: new ListConductorPassesUseCase({ passTrace: conductorPassTraces }),
     resumeLaneRun: new ResumeLaneRunUseCase({
       runRepo: laneRunRepository,
       runJournal: laneRunJournal,

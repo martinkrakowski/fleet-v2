@@ -46,6 +46,8 @@ import {
   type AdvanceLaneRunResult,
   type ListLaneRunsResult,
   type ConductorScheduleRow,
+  type ConductorPassTraceInput,
+  type ConductorPassTracePort,
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
@@ -78,7 +80,7 @@ export interface ConductorCliOptions {
 }
 
 export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
-       fleet-v2 conductor schedule [--json]
+       fleet-v2 conductor schedule [--json] [--passes]
        fleet-v2 conductor halt [--lift]
        fleet-v2 conductor stop <runId> [--force] [--revision <n>]
        fleet-v2 conductor resume <runId> [--revision <n>]
@@ -122,7 +124,8 @@ policy.conductor.enabled and a state directory, and dispatches nothing.
 start --abandon works while the conductor is disabled.
 
 Each subcommand prints one JSON document on stdout (conductor run prints one
-JSON line per pass; conductor schedule without --json prints text lines).
+JSON line per pass; conductor schedule without --json prints text lines and,
+with --passes, the recorded passes).
 
 Exit codes: 0 completed (a stop already recorded still exits 0), 1 refused,
 not found or blocked, 2 usage error.`;
@@ -754,7 +757,7 @@ async function runCommand(
   const driver =
     options.buildDriver !== undefined
       ? options.buildDriver(runtime, 'live', driverOptionsOf(flags))
-      : buildLiveConductorDriver(runtime, driverOptionsOf(flags));
+      : buildLiveConductorDriver(runtime, { ...driverOptionsOf(flags), stateDir: options.stateDir });
   if (driver.policy.enabled !== true) {
     io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'conductor-disabled' })}\n`);
     return 1;
@@ -814,11 +817,20 @@ async function runCommand(
       stopSignal: signal,
       once: flags.once,
       releaseTunnel: () => tunnel.release(),
-      eachPass: async (pass, result) => {
+      eachPass: async (pass, result, nowIso) => {
         io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
         if (result.outcome === 'refused') {
           return { stop: true, exitCode: 1 };
         }
+        await recordPassTrace(io, driver.passTrace, {
+          passId: 'pass-' + runtime.conductor.newUlid(),
+          nowIso,
+          holderId,
+          halted: result.halted,
+          progressed: result.progressed,
+          runs: result.runs,
+          attention: result.attention,
+        });
         for (const item of result.attention) {
           const key = `${item.runId}:${item.kind}`;
           if (seenAttention.has(key)) {
@@ -848,6 +860,29 @@ interface PollPassOutcome {
 }
 
 /**
+ * VZ5b: append one completed pass trace from the live loop. A not-recorded
+ * answer or a throw prints exactly one stderr line and never throws, so a
+ * trace failure can never end the loop; an absent seam writes nothing.
+ */
+async function recordPassTrace(
+  io: CliIo,
+  passTrace: Pick<ConductorPassTracePort, 'append'> | undefined,
+  input: ConductorPassTraceInput,
+): Promise<void> {
+  if (passTrace === undefined) {
+    return;
+  }
+  try {
+    const result = await passTrace.append(input);
+    if (result.outcome === 'not-recorded') {
+      io.stderr(`conductor run: pass trace not recorded (${result.reason})\n`);
+    }
+  } catch {
+    io.stderr('conductor run: pass trace not recorded (write-failed)\n');
+  }
+}
+
+/**
  * The shared poll loop of `conductor run`: one pass at a time under the
  * driver lease, printing one line per pass through `eachPass`, polling with
  * back-off from 30 seconds to 2 minutes, with a 10-second floor while a run
@@ -866,7 +901,7 @@ async function pollConductorPasses(options: {
    * the forward running: detached lanes still talk to the server through it.
    */
   readonly releaseTunnel?: () => Promise<void>;
-  readonly eachPass: (pass: number, result: RunConductorPassResult) => Promise<PollPassOutcome>;
+  readonly eachPass: (pass: number, result: RunConductorPassResult, nowIso: string) => Promise<PollPassOutcome>;
 }): Promise<number> {
   const controller = new AbortController();
   const signal = options.stopSignal ?? controller.signal;
@@ -883,11 +918,12 @@ async function pollConductorPasses(options: {
   let previousDelay: number | null = null;
   try {
     for (let pass = 1; ; pass += 1) {
+      const passNowIso = options.nowIso();
       const result = await options.driver.pass.runPass({
         holderId: options.holderId,
-        nowIso: options.nowIso(),
+        nowIso: passNowIso,
       });
-      const outcome = await options.eachPass(pass, result);
+      const outcome = await options.eachPass(pass, result, passNowIso);
       if (outcome.exitCode !== undefined) {
         exitCode = outcome.exitCode;
       }
@@ -1200,8 +1236,10 @@ async function reapCommand(
     nowIso: nowIsoOf(options),
   });
   io.stdout(`${JSON.stringify(result)}\n`);
-  // Refusals and unknowns both land in `refused`; nothing refused or unknown exits 0.
-  return result.refused.length > 0 ? 1 : 0;
+  // Refusals and unknowns both land in `refused`; a failed post-removal
+  // journal append lands in `journalFailed`. Nothing refused, unknown or
+  // un-journalled exits 0.
+  return result.refused.length > 0 || result.journalFailed.length > 0 ? 1 : 0;
 }
 
 /**
@@ -1261,11 +1299,35 @@ function scheduleRowText(row: ConductorScheduleRow): string {
 }
 
 /**
- * `conductor schedule` (VZ2): the read-only schedule view. It accepts only
- * `--json` (at most once) and needs no durable state directory — in-memory
- * stores read empty, as `status` does. A `rejected` result prints its JSON
- * on stdout and exits 1; `--json` prints the whole listed view and exits 0;
- * text mode prints `scheduleText` lines and exits 0.
+ * The text-mode `--passes` block: `passes <total> recorded` (or `passes
+ * unreadable`), then one line per pass — never per-run lines, which lane 7
+ * renders and `--json` carries.
+ */
+async function printSchedulePasses(io: CliIo, runtime: FleetCliRuntime): Promise<number> {
+  const passesResult = await runtime.conductor.listConductorPasses.listConductorPasses({});
+  if (passesResult.outcome === 'rejected') {
+    io.stdout(`${JSON.stringify(passesResult)}\n`);
+    return 1;
+  }
+  if (passesResult.store === 'unreadable') {
+    io.stdout('passes unreadable\n');
+    return 0;
+  }
+  io.stdout(`passes ${passesResult.total} recorded\n`);
+  for (const pass of passesResult.passes) {
+    io.stdout(
+      `pass ${pass.passId} ${pass.nowIso} runs ${pass.runs.length} progressed ${pass.progressed} halted ${pass.halted} cap ${pass.maxActiveRuns}\n`,
+    );
+  }
+  return 0;
+}
+
+/**
+ * `conductor schedule` (VZ2, VZ5b): the read-only schedule view. It accepts
+ * `--json` and `--passes` (each at most once) and needs no durable state
+ * directory — in-memory stores read empty, as `status` does. A `rejected`
+ * result prints its JSON on stdout and exits 1; `--json` prints the whole
+ * listed view and exits 0; text mode prints `scheduleText` lines and exits 0.
  */
 async function scheduleCommand(
   argv: readonly string[],
@@ -1274,6 +1336,7 @@ async function scheduleCommand(
   options: ConductorCliOptions,
 ): Promise<number> {
   let json = false;
+  let passes = false;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index]!;
     if (token === '--json') {
@@ -1284,7 +1347,15 @@ async function scheduleCommand(
       json = true;
       continue;
     }
-    io.stderr(`conductor schedule takes only --json\n${CONDUCTOR_HELP}\n`);
+    if (token === '--passes') {
+      if (passes) {
+        io.stderr(`Repeated flag: --passes\n${CONDUCTOR_HELP}\n`);
+        return 2;
+      }
+      passes = true;
+      continue;
+    }
+    io.stderr(`conductor schedule takes only --json and --passes\n${CONDUCTOR_HELP}\n`);
     return 2;
   }
   const result = await runtime.conductor.listLaneRuns.listLaneRuns({
@@ -1295,11 +1366,20 @@ async function scheduleCommand(
     return 1;
   }
   if (json) {
-    io.stdout(`${JSON.stringify(result)}\n`);
+    const printed = passes
+      ? {
+          ...result,
+          passes: await runtime.conductor.listConductorPasses.listConductorPasses({}),
+        }
+      : result;
+    io.stdout(`${JSON.stringify(printed)}\n`);
     return 0;
   }
   for (const line of scheduleText(result)) {
     io.stdout(`${line}\n`);
+  }
+  if (passes) {
+    return await printSchedulePasses(io, runtime);
   }
   return 0;
 }
@@ -1312,9 +1392,9 @@ export async function conductorCommand(
   options: ConductorCliOptions,
 ): Promise<number> {
   const subcommand = argv[0] ?? '';
-  // Schedule validates its own arguments (only --json), so it must be reached
-  // before the generic help shortcut below; otherwise `schedule --help` would
-  // print the conductor help instead of being rejected.
+  // Schedule validates its own arguments (--json and --passes), so it must be
+  // reached before the generic help shortcut below; otherwise
+  // `schedule --help` would print the conductor help instead of being rejected.
   if (subcommand === 'schedule') {
     return await scheduleCommand(argv.slice(1), io, runtime, options);
   }

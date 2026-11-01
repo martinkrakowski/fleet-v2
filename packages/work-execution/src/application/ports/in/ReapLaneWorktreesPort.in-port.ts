@@ -27,6 +27,14 @@ export interface RefusedOrSkippedRunEntry {
   readonly reason: string;
 }
 
+/** One removed worktree whose post-removal journal append failed, with the failure reason. */
+export interface ReapWorktreeJournalFailureEntry {
+  readonly runId: string;
+  readonly attemptId: string;
+  readonly branchTip: string;
+  readonly reason: string;
+}
+
 export type ReapLaneWorktreesResult = {
   readonly outcome: 'reaped';
   readonly dryRun: boolean;
@@ -38,6 +46,8 @@ export type ReapLaneWorktreesResult = {
   readonly refused: readonly RefusedOrSkippedRunEntry[];
   /** Runs that are not removable candidates, with why. */
   readonly skipped: readonly RefusedOrSkippedRunEntry[];
+  /** Removals whose post-removal journal append failed, one entry per removal with the failure reason. */
+  readonly journalFailed: readonly ReapWorktreeJournalFailureEntry[];
 };
 
 export interface ReapLaneWorktreesPort {

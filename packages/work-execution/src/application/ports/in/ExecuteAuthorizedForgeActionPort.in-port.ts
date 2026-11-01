@@ -28,9 +28,19 @@ export interface ExecuteAuthorizedForgeActionRequest {
   readonly body?: string;
   /**
    * The run's recorded branch (KF-5b): a safe branch name validated like the
-   * forge read's rule; absent keeps the use case's `feat/<laneId>` default.
+   * forge read's rule; absent keeps the use case's `feat/<laneId>` default,
+   * except for `post-status`, which refuses when it is absent.
    */
   readonly branchName?: string;
+  /**
+   * Status to post for `post-status`: the pre-merge review receipt of the
+   * expected head. Only `post-status` may carry it.
+   */
+  readonly status?: {
+    readonly context: 'premerge';
+    readonly state: 'success' | 'pending' | 'failure';
+    readonly description: string;
+  };
 }
 
 export type ExecuteAuthorizedForgeActionResult =

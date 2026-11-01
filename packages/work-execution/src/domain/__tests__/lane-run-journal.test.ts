@@ -16,6 +16,7 @@ import type {
 } from '../lane-run-journal.js';
 import {
   buildLaneRunStepKey,
+  laneRunPremergeKey,
   laneRunResumeKey,
   laneRunStopForceKey,
   laneRunStopKey,
@@ -58,6 +59,7 @@ const STOP_CLI_KEY = mustBuild(laneRunStopKey(RUN_ID, 'cli'));
 const FORCE_KEY = mustBuild(laneRunStopForceKey(RUN_ID, 'cli'));
 const FORCE_WEB_KEY = mustBuild(laneRunStopForceKey(RUN_ID, 'web'));
 const RESUME_KEY = mustBuild(laneRunResumeKey(RUN_ID, 1));
+const PREMERGE_KEY = mustBuild(laneRunPremergeKey(RUN_ID, 1, HEAD12));
 const REQUEST_KEY = mustBuild(requestKey(ULID));
 const REAPER_KEY = mustBuild(reaperRepairKey('attempt-example-1', 'dead-attempt', ULID));
 
@@ -89,9 +91,11 @@ function baseEntry(kind: LaneRunJournalEntryKind): LaneRunJournalEntryRecord {
 
 function intent(key: string, extra: Partial<LaneRunJournalEntryRecord> = {}): LaneRunJournalEntryRecord {
   const parsed = parseLaneRunKey(key);
-  const runId = parsed !== null && (parsed.kind === 'step' || parsed.kind === 'stop' || parsed.kind === 'resume')
-    ? parsed.runId
-    : null;
+  const runId =
+    parsed !== null &&
+    (parsed.kind === 'step' || parsed.kind === 'stop' || parsed.kind === 'resume' || parsed.kind === 'premerge')
+      ? parsed.runId
+      : null;
   const mode = parsed !== null && parsed.kind === 'stop' ? parsed.mode : null;
   const expectedRevision = parsed !== null && (parsed.kind === 'stop' || parsed.kind === 'resume') ? 1 : null;
   return { ...baseEntry('intent'), key, runId, mode, expectedRevision, ...extra };
@@ -99,9 +103,11 @@ function intent(key: string, extra: Partial<LaneRunJournalEntryRecord> = {}): La
 
 function result(key: string, outcome: LaneRunJournalOutcome, extra: Partial<LaneRunJournalEntryRecord> = {}): LaneRunJournalEntryRecord {
   const parsed = parseLaneRunKey(key);
-  const runId = parsed !== null && (parsed.kind === 'step' || parsed.kind === 'stop' || parsed.kind === 'resume')
-    ? parsed.runId
-    : null;
+  const runId =
+    parsed !== null &&
+    (parsed.kind === 'step' || parsed.kind === 'stop' || parsed.kind === 'resume' || parsed.kind === 'premerge')
+      ? parsed.runId
+      : null;
   return { ...baseEntry('result'), key, runId, outcome, ...extra };
 }
 
@@ -122,6 +128,7 @@ describe('readLaneRunJournalEntry', () => {
       intent(STOP_KEY),
       intent(FORCE_KEY),
       intent(RESUME_KEY),
+      intent(PREMERGE_KEY),
       intent(REQUEST_KEY),
       intent(REAPER_KEY),
       result(STEP_KEY, 'completed'),
@@ -130,6 +137,7 @@ describe('readLaneRunJournalEntry', () => {
       result(FORCE_KEY, 'completed'),
       result(FORCE_WEB_KEY, 'completed'),
       result(RESUME_KEY, 'completed'),
+      result(PREMERGE_KEY, 'completed'),
       conduct('running'),
     ];
     for (const entry of entries) {
@@ -172,6 +180,8 @@ describe('readLaneRunJournalEntry', () => {
     [{ ...intent(STEP_KEY), grantId: 'example-id' }, 'LaneRunJournal grantId must be null except on a result'],
     [{ ...conduct('running'), grantId: 'example-id' }, 'LaneRunJournal grantId must be null except on a result'],
     [{ ...intent(STEP_KEY), runId: RUN_ID_2 }, 'LaneRunJournal runId does not match its key'],
+    [{ ...intent(PREMERGE_KEY), runId: null }, 'LaneRunJournal runId does not match its key'],
+    [{ ...intent(PREMERGE_KEY), runId: RUN_ID_2 }, 'LaneRunJournal runId does not match its key'],
     [{ ...conduct('running'), runId: null }, 'LaneRunJournal runId does not match its key'],
     [{ ...intent(RESUME_KEY), expectedRevision: null }, 'LaneRunJournal expectedRevision must be a positive integer on stop and resume intents and null elsewhere'],
     [{ ...intent(STEP_KEY), expectedRevision: 3 }, 'LaneRunJournal expectedRevision must be a positive integer on stop and resume intents and null elsewhere'],
@@ -476,6 +486,26 @@ describe('laneRunJournalPendingIntent', () => {
 
   it('never treats a stop intent as pending', () => {
     expect(laneRunJournalPendingIntent([intent(STOP_KEY)], RUN_ID)).toBeNull();
+  });
+
+  it('reports an unread premerge intent as pending', () => {
+    expect(laneRunJournalPendingIntent([intent(PREMERGE_KEY)], RUN_ID)).toEqual({
+      key: PREMERGE_KEY,
+      step: 'premerge',
+      reconciliation: 'unread',
+    });
+  });
+
+  it('returns null for a premerge intent with a final result', () => {
+    expect(laneRunJournalPendingIntent([intent(PREMERGE_KEY), result(PREMERGE_KEY, 'completed')], RUN_ID)).toBeNull();
+  });
+
+  it('reports an ambiguous premerge intent as pending', () => {
+    expect(laneRunJournalPendingIntent([intent(PREMERGE_KEY), result(PREMERGE_KEY, 'ambiguous')], RUN_ID)).toEqual({
+      key: PREMERGE_KEY,
+      step: 'premerge',
+      reconciliation: 'ambiguous',
+    });
   });
 
   it('prefers the later of two open step intents', () => {

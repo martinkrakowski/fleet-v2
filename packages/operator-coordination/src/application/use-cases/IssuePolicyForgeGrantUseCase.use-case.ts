@@ -198,7 +198,7 @@ export class IssuePolicyForgeGrantUseCase implements IssuePolicyForgeGrantPort {
       }
     }
     if (!POLICY_GRANT_FORGE_KINDS.includes(request.forgeKind)) {
-      return 'a policy grant forgeKind must be one of push-and-open-pr, push-to-pr, merge-pr';
+      return 'a policy grant forgeKind must be one of push-and-open-pr, push-to-pr, merge-pr, post-status';
     }
     if (!POLICY_GRANT_SOURCES.includes(request.source)) {
       return 'a policy grant source must be autoMerge or conductor';

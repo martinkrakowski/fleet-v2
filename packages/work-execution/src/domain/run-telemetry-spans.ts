@@ -109,6 +109,7 @@ const STEP_SPAN_KINDS: Readonly<Record<LaneRunKeyStep, TelemetrySpanKind>> = Obj
   'open-pr': 'TOOL',
   push: 'TOOL',
   merge: 'TOOL',
+  premerge: 'TOOL',
 });
 
 /** The steps whose span hangs under the round span; the rest hang under the root (plan §3.1). */
@@ -458,6 +459,12 @@ function buildStepSpan(
   const hashInput = telemetryHashInput(group.key);
   if (hashInput === null) {
     ctx.rejected.count += 1;
+    return;
+  }
+  // A premerge step key never builds a step span: it parses as kind
+  // 'premerge' (never kind 'step'), so this guard is unreachable at runtime
+  // and only keeps the span name within the fixed span-name union.
+  if (parsed.step === 'premerge') {
     return;
   }
   const final = finalResultOf(group.results);

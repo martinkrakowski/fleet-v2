@@ -19,7 +19,7 @@ export interface ConductorForgeGrantIssueRequest {
   readonly projectId: string;
   readonly workOrderId: string;
   readonly attemptId: string;
-  readonly forgeKind: 'push-and-open-pr' | 'push-to-pr';
+  readonly forgeKind: 'push-and-open-pr' | 'push-to-pr' | 'post-status';
   readonly expectedHeadSha: string;
   readonly policyRevision: string;
   readonly acceptanceReceiptId: string;
@@ -51,7 +51,7 @@ export interface ConductorForgeGrantDelegate {
   readonly conductorRevision?: () => string | null;
 }
 
-const CONDUCTOR_FORGE_KINDS = ['push-and-open-pr', 'push-to-pr'] as const;
+const CONDUCTOR_FORGE_KINDS = ['push-and-open-pr', 'push-to-pr', 'post-status'] as const;
 const FULL_COMMIT_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const SETTING_REVISION_PATTERN = /^[0-9a-f]{12}$/;
 const POLICY_DECISION_REVISION_PREFIX = 'policy:conductor@';
@@ -71,7 +71,7 @@ function validate(request: ConductorForgeGrantRequest): string | null {
     }
   }
   if (!CONDUCTOR_FORGE_KINDS.includes(request.forgeKind)) {
-    return 'a conductor grant forgeKind must be push-and-open-pr or push-to-pr';
+    return 'a conductor grant forgeKind must be push-and-open-pr, push-to-pr or post-status';
   }
   if (
     typeof request.expectedHeadSha !== 'string' ||

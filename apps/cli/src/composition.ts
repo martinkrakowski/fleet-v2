@@ -85,6 +85,7 @@ import {
   InspectLaneRunsUseCase,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
+  ListLaneRunsUseCase,
   ReapLaneWorktreesUseCase,
   ReapOrphanSessionsUseCase,
   RequestLaneRunStopUseCase,
@@ -700,6 +701,7 @@ export interface FleetCliRuntime {
     readonly halt: ConductorHaltAdapter;
     readonly requestLaneRunStop: RequestLaneRunStopUseCase;
     readonly inspectLaneRuns: InspectLaneRunsUseCase;
+    readonly listLaneRuns: ListLaneRunsUseCase;
     readonly resumeLaneRun: ResumeLaneRunUseCase;
     /** EX-2b: the operator-opt-in worktree reap (conductor reap --worktrees). */
     readonly reapLaneWorktrees: ReapLaneWorktreesUseCase;

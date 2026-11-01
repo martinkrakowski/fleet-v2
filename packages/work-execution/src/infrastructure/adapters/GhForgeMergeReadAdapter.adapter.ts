@@ -179,7 +179,8 @@ function parsePageInfo(value: unknown): PageInfo | null {
   if (endCursor !== null && endCursor !== undefined && typeof endCursor !== 'string') {
     return null;
   }
-  return { hasNextPage, endCursor: typeof endCursor === 'string' ? endCursor : null };
+  const cursor = typeof endCursor === 'string' && endCursor.trim().length > 0 ? endCursor : null;
+  return { hasNextPage, endCursor: cursor };
 }
 
 function extractCreatorLogin(creator: unknown): string | null | undefined {
@@ -272,9 +273,6 @@ export function parseReviewThreadsPage(stdout: string): MergeThreadsPageResult {
     return { kind: 'unreadable' };
   }
   const threads = pullRequest.reviewThreads;
-  if (threads === null) {
-    return { kind: 'page', unresolved: 0, hasNextPage: false, endCursor: null };
-  }
   if (!isRecord(threads)) {
     return { kind: 'unreadable' };
   }
@@ -476,11 +474,10 @@ export class GhForgeMergeReadAdapter implements ForgeMergeReadPort {
       if (fetched.kind !== 'page') {
         return mapFetchFailure(fetched);
       }
-      if (meta === null) {
-        meta = fetched.meta;
-      } else if (fetched.meta.liveHeadSha !== meta.liveHeadSha) {
+      if (meta !== null && fetched.meta.liveHeadSha !== meta.liveHeadSha) {
         return { outcome: 'unavailable', code: 'unknown', reason: 'the head oid changed between pages' };
       }
+      meta = fetched.meta;
       applyContextsPage(contexts, contextsByName, fetched.contexts);
       applyThreadsPage(threads, fetched.threads);
     }
@@ -577,10 +574,10 @@ export class GhForgeMergeReadAdapter implements ForgeMergeReadPort {
       '-F',
       `number=${request.pullRequestNumber}`,
     ];
-    if (contextsCursor !== null) {
+    if (contextsCursor !== null && contextsCursor.trim().length > 0) {
       args.push('-f', `contextsAfter=${contextsCursor}`);
     }
-    if (threadsCursor !== null) {
+    if (threadsCursor !== null && threadsCursor.trim().length > 0) {
       args.push('-f', `threadsAfter=${threadsCursor}`);
     }
     return args;

@@ -694,6 +694,126 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
       ]),
     });
   });
+
+  it('treats null reviewThreads as unknown, not zero unresolved threads', async () => {
+    const payloadWithNullThreads = JSON.stringify({
+      data: {
+        repository: {
+          pullRequest: {
+            state: 'OPEN',
+            headRefOid: VALID_SHA,
+            mergeStateStatus: 'CLEAN',
+            statusCheckRollup: {
+              contexts: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [checkRun('gate', 'SUCCESS')],
+              },
+            },
+            reviewThreads: null,
+          },
+        },
+      },
+    });
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: payloadWithNullThreads, stderr: '' });
+    const result = await makeAdapter({ runGh }).readForgeMerge({
+      ...BASE_REQUEST,
+      requiredContexts: ['gate'],
+    });
+
+    expect(result).toMatchObject({
+      outcome: 'ok',
+      unresolvedThreads: 'unknown',
+    });
+  });
+
+  it('updates prState and mergeState from a later page when the head oid matches', async () => {
+    const page1 = page({
+      contextsNodes: [checkRun('gate', 'SUCCESS')],
+      contextsHasNextPage: true,
+      contextsEndCursor: 'c1',
+      mergeStateStatus: 'CLEAN',
+      state: 'OPEN',
+    });
+    const page2 = page({
+      contextsNodes: [statusContext('premerge', 'SUCCESS', 'poster')],
+      contextsHasNextPage: false,
+      mergeStateStatus: 'BLOCKED',
+      state: 'CLOSED',
+    });
+    const responses = [page1, page2];
+    const runGh = async () => ({
+      exitCode: 0,
+      stdout: responses.shift() ?? '',
+      stderr: '',
+    });
+
+    const result = await makeAdapter({ runGh }).readForgeMerge({
+      ...BASE_REQUEST,
+      posterLogin: 'poster',
+    });
+
+    expect(result).toMatchObject({
+      outcome: 'ok',
+      prState: 'closed',
+      mergeState: 'blocked',
+    });
+  });
+
+  it('fails as unknown when hasNextPage is true but endCursor is an empty string', async () => {
+    const malformedPage = page({
+      contextsHasNextPage: true,
+      contextsEndCursor: '',
+    });
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: malformedPage, stderr: '' });
+    const result = await makeAdapter({ runGh }).readForgeMerge(BASE_REQUEST);
+
+    expect(result).toEqual({
+      outcome: 'unavailable',
+      code: 'unknown',
+      reason: 'pageInfo hasNextPage is true but endCursor is null',
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).not.toContain('contextsAfter=');
+  });
+
+  it('returns budget-exhausted when the clock advances under 2s before a second page', async () => {
+    const page1 = page({
+      contextsNodes: [checkRun('gate', 'SUCCESS')],
+      contextsHasNextPage: true,
+      contextsEndCursor: 'c1',
+    });
+    const page2 = page({
+      contextsNodes: [statusContext('premerge', 'SUCCESS', 'poster')],
+      contextsHasNextPage: false,
+    });
+    const calls: string[][] = [];
+    const responses = [page1, page2];
+    const runGh = async (args: readonly string[]) => {
+      calls.push([...args]);
+      return { exitCode: 0, stdout: responses.shift() ?? '', stderr: '' };
+    };
+
+    const startMs = Date.parse(NOW_ISO);
+    let currentMs = startMs;
+    const advancingRunGh = async (args: readonly string[]) => {
+      const res = await runGh(args);
+      currentMs = startMs + 9_000;
+      return res;
+    };
+    const adapter = makeAdapter({
+      runGh: advancingRunGh,
+      now: () => currentMs,
+    });
+
+    const result = await adapter.readForgeMerge({
+      ...BASE_REQUEST,
+      deadlineIso: new Date(startMs + 10_000).toISOString(),
+      posterLogin: 'poster',
+    });
+
+    expect(result).toEqual({ outcome: 'budget-exhausted' });
+    expect(calls).toHaveLength(1);
+  });
 });
 
 describe('GhForgeMergeReadAdapter.isConfigured', () => {
@@ -751,6 +871,33 @@ describe('pure GraphQL parsers', () => {
   it('parseMergeContextsPage reports pageInfo with hasNextPage true and null endCursor as unknown', () => {
     const result = parseMergeContextsPage(
       page({ contextsHasNextPage: true, contextsEndCursor: null }),
+    );
+    expect(result).toEqual({
+      kind: 'unknown',
+      reason: 'pageInfo hasNextPage is true but endCursor is null',
+    });
+  });
+
+  it('parseReviewThreadsPage returns unreadable when reviewThreads is null', () => {
+    const payload = JSON.stringify({
+      data: {
+        repository: {
+          pullRequest: {
+            state: 'OPEN',
+            headRefOid: VALID_SHA,
+            mergeStateStatus: 'CLEAN',
+            reviewThreads: null,
+          },
+        },
+      },
+    });
+    const result = parseReviewThreadsPage(payload);
+    expect(result).toEqual({ kind: 'unreadable' });
+  });
+
+  it('parseMergeContextsPage reports pageInfo with hasNextPage true and empty string endCursor as unknown', () => {
+    const result = parseMergeContextsPage(
+      page({ contextsHasNextPage: true, contextsEndCursor: '' }),
     );
     expect(result).toEqual({
       kind: 'unknown',

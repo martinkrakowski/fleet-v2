@@ -43,7 +43,7 @@ The conductor is an **application service in `work-execution`**, not a fifth con
 
 ### 3.2 State, derived first
 
-The run's state is a projection of attempts, the keyed journal, receipts and forge evidence. `LaneRunRecord` stores only what cannot be derived: `workOrderId`, `tier`, `seatPlanRef` and a cursor per role, `round` (0–2), the attempt ids in order, `prNumber`, `parked` (reason, parked-from state, question id), `lease`, `revision`, `runPolicyRevision`.
+The run's state is a projection of attempts, the keyed journal, receipts and forge evidence. `LaneRunRecord` stores only what cannot be derived: `workOrderId`, `tier`, `seatPlanRef` and a cursor per role, `round` (0–2), the attempt ids in order, `prNumber`, `baseBranch` (Amendment CB; absent means `main`), `parked` (reason, parked-from state, question id), `lease`, `revision`, `runPolicyRevision`.
 
 | State | Enters when | Exits | Guard |
 |---|---|---|---|
@@ -381,7 +381,7 @@ Amended 2026-11-01 by the owner's decision on the merge path ("creating a branch
 
 **Why.** GitHub's merge queue is not offered for this repository (A-0, D22 applies), so strict up-to-date merges into `main` are serial: about six to eight per hour, and a chain of dependent lanes paid one merge wait per link. A chain now merges link by link into its own base branch `chain/<name>`, each link strictly up to date with that branch and tested as merged into it, and the whole chain lands on `main` by one integration PR. Merges into different bases proceed in parallel; each base stays strictly serial. Singletons (docs, Tier 0, standalone fixes) keep targeting `main`.
 
-**What already exists outside this repository.** The orchestrator's merge train (private tooling) works one PR per base at a time with the bases in parallel, enforces up-to-date against the PR's base itself, merges `main` into every open chain branch after each merge to `main` (a conflict becomes an attention item that blocks landing), opens the integration PR with every link's evidence and `premerge` success carrying that evidence, and after the integration merge deletes the chain branch, the links' branches and their lane worktrees. The ruleset extension to `refs/heads/chain/**` is an owner setting.
+**What already exists outside this repository.** The orchestrator's merge train (private tooling) works one PR per base at a time with the bases in parallel, enforces up-to-date against the PR's base itself, merges `main` into every open chain branch after each merge to `main` (a conflict becomes an attention item that blocks landing), opens the integration PR with every link's evidence and `premerge` success carrying that evidence, and after the integration merge deletes the chain branch, the links' branches and their lane worktrees. No ruleset covers `refs/heads/chain/**` yet: extending the `main` ruleset to the chain branches is an owner setting still to be made, and until then the train is the only enforcer of gate, premerge, thread resolution and up-to-date on a chain branch.
 
 **What this repository adds (the conductor side).**
 

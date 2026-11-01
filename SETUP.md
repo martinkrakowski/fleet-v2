@@ -8,7 +8,7 @@ yarn install --immutable        # install dependencies reproducibly from yarn.lo
 yarn build                      # build every workspace in dependency order
 ```
 
-`yarn build --filter=<pkg>...` builds one workspace and everything it depends on; `yarn workspace <pkg> build` alone leaves dependency `dist/` stale and is not used. See the README's Quick start paragraph.
+`yarn build --filter=<pkg>...` builds one workspace and everything it depends on; `yarn workspace <pkg> build` runs only that package's own `build` script and does not build its dependencies, so their `dist/` can be stale; it is not used. See the README's Quick start paragraph.
 
 The gate workflow in `.github/workflows/gate.yml` runs on every pull request and push to `main`:
 

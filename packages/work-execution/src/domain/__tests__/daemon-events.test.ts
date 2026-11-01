@@ -439,9 +439,11 @@ describe('builders and cursor', () => {
       throw new Error('fixture');
     }
     const hostile = [a.record];
-    hostile[Symbol.iterator] = function* () {
-      // yields nothing
-    };
+    Object.defineProperty(hostile, Symbol.iterator, {
+      value: function* () {
+        // yields nothing
+      },
+    });
     const result = eventsAfterCursor(hostile, null);
     if (result.ok) {
       expect(result.events).toContainEqual(a.record);

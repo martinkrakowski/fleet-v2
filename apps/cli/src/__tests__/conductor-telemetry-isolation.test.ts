@@ -134,7 +134,7 @@ function makePassDriver(
     pass: {
       runPass: async (request) => {
         passCalls.push(request);
-        await runtime.conductor.laneRunJournal.appendEntry({
+        await runtime.conductor.laneRunJournal.append({
           version: 1,
           entryId: 'entry-pass-' + passCalls.length,
           kind: 'conduct',
@@ -260,7 +260,7 @@ async function seedConductorRunState(runtime: FleetCliRuntime): Promise<void> {
   };
   await runtime.conductor.laneRunRepository.create(run);
 
-  await runtime.conductor.laneRunJournal.appendEntry({
+  await runtime.conductor.laneRunJournal.append({
     version: 1,
     entryId: 'entry-seed-1',
     kind: 'conduct',
@@ -434,6 +434,7 @@ const ISOLATION_FAULTS: readonly IsolationFault[] = [
       const realRunRepo = new LaneRunRepositoryAdapter({ stateDir: dir, readOnly: true });
       const faultedRunRepo = {
         ...realRunRepo,
+        list: () => realRunRepo.list(),
         get: () => Promise.reject(new Error('repository read fault')),
       };
       const useCase = buildRealExportTelemetry(dir, { runRepo: faultedRunRepo });
@@ -451,6 +452,7 @@ const ISOLATION_FAULTS: readonly IsolationFault[] = [
       });
       const faultedRunRepo = {
         ...realRunRepo,
+        list: () => realRunRepo.list(),
         get: () => pendingPromise,
       };
       const useCase = buildRealExportTelemetry(dir, { runRepo: faultedRunRepo });
@@ -502,6 +504,7 @@ const ISOLATION_FAULTS: readonly IsolationFault[] = [
       const realDispositions = new TelemetryDispositionAdapter({ stateDir: dir });
       const faultedDispositions = {
         ...realDispositions,
+        read: () => realDispositions.read(),
         write: () =>
           new Promise<TelemetryDispositionWriteResult>((_resolve, reject) => {
             setTimeout(() => reject(new Error('store write fault')), 0);

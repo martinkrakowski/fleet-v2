@@ -332,10 +332,10 @@ export function conductorPassTraceOf(
   input: ConductorPassTraceInput,
   limits: ConductorPassTraceLimits,
 ): ConductorPassTraceRead {
-  if (!isExactLimits(limits)) {
-    return malformed();
-  }
   try {
+    if (!isExactLimits(limits)) {
+      return malformed();
+    }
     const runs = input.runs.map((run) => {
       if (run.outcome === 'advanced') {
         return {

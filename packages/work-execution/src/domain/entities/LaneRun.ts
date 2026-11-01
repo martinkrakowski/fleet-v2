@@ -117,9 +117,9 @@ export class LaneRun {
     if (recordInput === null) {
       return invalid('LaneRun has an unknown key');
     }
-    const scalarError = validateScalarFields(recordInput);
-    if (scalarError !== null) {
-      return invalid(scalarError);
+    const scalars = validateScalarFields(recordInput);
+    if (!scalars.ok) {
+      return invalid(scalars.error);
     }
     const countersError = validateCounterFields(recordInput);
     if (countersError !== null) {
@@ -133,29 +133,22 @@ export class LaneRun {
     if (!parkAndLease.ok) {
       return invalid(parkAndLease.error);
     }
-    const runPolicyRevisionError = idError('runPolicyRevision', recordInput.runPolicyRevision);
-    if (runPolicyRevisionError !== null) {
-      return invalid(runPolicyRevisionError);
+    const branchFields = readOptionalBranchFields(recordInput);
+    if (!branchFields.ok) {
+      return invalid(branchFields.error);
     }
-    const branchName = readOptionalBranchName(recordInput);
-    if (!branchName.ok) {
-      return invalid(branchName.error);
-    }
-    const baseBranch = readOptionalBaseBranch(recordInput);
-    if (!baseBranch.ok) {
-      return invalid(baseBranch.error);
-    }
-    const cursorsSnapshot = readExactPlainRecord(recordInput.cursors, SEAT_PLAN_ROLES) as Record<string, unknown>;
     const record: LaneRunRecord = {
       version: LANE_RUN_RECORD_VERSION,
       runId: recordInput.runId as string,
       workOrderId: recordInput.workOrderId as string,
       tier: recordInput.tier as LaneRunTier,
       seatPlanRef: recordInput.seatPlanRef as string,
+      // The stored cursors are the snapshot validateScalarFields already read and
+      // validated, never a second read of the original input (fix round 1).
       cursors: Object.freeze({
-        'first-pass': cursorsSnapshot['first-pass'] as number | null,
-        fix: cursorsSnapshot.fix as number | null,
-        review: cursorsSnapshot.review as number | null,
+        'first-pass': scalars.cursors['first-pass'] as number | null,
+        fix: scalars.cursors.fix as number | null,
+        review: scalars.cursors.review as number | null,
       }),
       round: recordInput.round as number,
       attemptIds: attempts.attemptIds,
@@ -165,8 +158,8 @@ export class LaneRun {
       lease: parkAndLease.lease,
       revision: recordInput.revision as number,
       runPolicyRevision: recordInput.runPolicyRevision as string,
-      ...(branchName.branchName === undefined ? {} : { branchName: branchName.branchName }),
-      ...(baseBranch.baseBranch === undefined ? {} : { baseBranch: baseBranch.baseBranch }),
+      ...(branchFields.branchName === undefined ? {} : { branchName: branchFields.branchName }),
+      ...(branchFields.baseBranch === undefined ? {} : { baseBranch: branchFields.baseBranch }),
       ...(versionRead.explicit ? { schemaVersion: versionRead.schemaVersion } : {}),
     };
     return { success: true, value: new LaneRun(Object.freeze(record)) };
@@ -255,34 +248,41 @@ export function readLaneRunRecord(input: unknown, options?: ReadRecordSchemaOpti
   return LaneRun.readStoredRecord(input, options);
 }
 
-/** Version, runId, workOrderId, tier, seatPlanRef, cursors and runPolicyRevision. */
-function validateScalarFields(recordInput: Record<string, unknown>): string | null {
+/**
+ * Version, runId, workOrderId, tier, seatPlanRef, cursors and runPolicyRevision.
+ * Returns the cursors snapshot it validated so the caller stores exactly that
+ * snapshot and never reads the original nested object a second time.
+ */
+function validateScalarFields(recordInput: Record<string, unknown>): {
+  ok: true;
+  cursors: Record<string, unknown>;
+} | { ok: false; error: string } {
   if (recordInput.version !== LANE_RUN_RECORD_VERSION) {
-    return 'LaneRun version must be 1';
+    return { ok: false, error: 'LaneRun version must be 1' };
   }
   if (typeof recordInput.runId !== 'string' || !LANE_RUN_ID_PATTERN.test(recordInput.runId)) {
-    return 'LaneRun runId must be run- followed by a ULID';
+    return { ok: false, error: 'LaneRun runId must be run- followed by a ULID' };
   }
   const workOrderIdError = idError('workOrderId', recordInput.workOrderId);
   if (workOrderIdError !== null) {
-    return workOrderIdError;
+    return { ok: false, error: workOrderIdError };
   }
   if (!LANE_RUN_TIERS.includes(recordInput.tier as LaneRunTier)) {
-    return 'LaneRun tier must be 1 or 2';
+    return { ok: false, error: 'LaneRun tier must be 1 or 2' };
   }
   if (typeof recordInput.seatPlanRef !== 'string' || !SEAT_PLAN_REF_PATTERN.test(recordInput.seatPlanRef)) {
-    return 'LaneRun seatPlanRef must be a sha256 hex digest';
+    return { ok: false, error: 'LaneRun seatPlanRef must be a sha256 hex digest' };
   }
   const cursorsSnapshot = readExactPlainRecord(recordInput.cursors, SEAT_PLAN_ROLES);
   const cursorsError = cursorsSnapshotError(cursorsSnapshot);
   if (cursorsError !== null) {
-    return cursorsError;
+    return { ok: false, error: cursorsError };
   }
   const runPolicyRevisionError = idError('runPolicyRevision', recordInput.runPolicyRevision);
   if (runPolicyRevisionError !== null) {
-    return runPolicyRevisionError;
+    return { ok: false, error: runPolicyRevisionError };
   }
-  return null;
+  return { ok: true, cursors: cursorsSnapshot as Record<string, unknown> };
 }
 
 /** round, prNumber, parkCount and revision. */
@@ -434,6 +434,32 @@ function readOptionalBaseBranch(recordInput: Record<string, unknown>): {
     return { ok: false, error: 'LaneRun ' + BASE_BRANCH_INVALID_MESSAGE };
   }
   return { ok: true, baseBranch: parsed };
+}
+
+/**
+ * runPolicyRevision, branchName (KF-5a) and baseBranch (CB1): the last field
+ * checks of the body, moved here (fix round 1) so createUnchecked stays under
+ * the file's complexity cap of 12. Returns the first refusal, with the same
+ * messages as the inline checks it replaced.
+ */
+function readOptionalBranchFields(recordInput: Record<string, unknown>): {
+  ok: true;
+  branchName: string | undefined;
+  baseBranch: BaseBranchValue | undefined;
+} | { ok: false; error: string } {
+  const runPolicyRevisionError = idError('runPolicyRevision', recordInput.runPolicyRevision);
+  if (runPolicyRevisionError !== null) {
+    return { ok: false, error: runPolicyRevisionError };
+  }
+  const branchName = readOptionalBranchName(recordInput);
+  if (!branchName.ok) {
+    return { ok: false, error: branchName.error };
+  }
+  const baseBranch = readOptionalBaseBranch(recordInput);
+  if (!baseBranch.ok) {
+    return { ok: false, error: baseBranch.error };
+  }
+  return { ok: true, branchName: branchName.branchName, baseBranch: baseBranch.baseBranch };
 }
 
 function invalid(message: string): LaneRunResult {

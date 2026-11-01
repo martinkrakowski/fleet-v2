@@ -493,6 +493,35 @@ describe('readLaneRunRecord', () => {
     });
   });
 
+  it('stores the cursors snapshot that was validated, never a second read (fix round 1)', () => {
+    // A proxy whose getOwnPropertyDescriptor answers the valid snapshot on the
+    // first read (one call per role: first-pass, fix, review) and an invalid
+    // one (review: 1000) on any later read. The stored record must carry the
+    // validated values; if the body ever re-read recordInput.cursors, the
+    // second snapshot's 1000 would leak into the record.
+    const validCursors = { 'first-pass': 0, fix: null, review: null };
+    const secondReadCursors = { 'first-pass': 0, fix: null, review: 1000 };
+    let descriptorCalls = 0;
+    const cursorsProxy = new Proxy(
+      {},
+      {
+        ownKeys() {
+          return ['first-pass', 'fix', 'review'];
+        },
+        getOwnPropertyDescriptor(_target, key) {
+          descriptorCalls += 1;
+          const snapshot = descriptorCalls <= 3 ? validCursors : secondReadCursors;
+          return { configurable: true, enumerable: true, writable: true, value: Reflect.get(snapshot, key) };
+        },
+      },
+    );
+    const read = readLaneRunRecord({ ...VALID, cursors: cursorsProxy });
+    expect(descriptorCalls).toBeGreaterThanOrEqual(3);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.record.cursors).toEqual(validCursors);
+  });
+
   it('never throws on hostile input and never echoes a refused value', () => {
     const getterRecord: Record<string, unknown> = { ...VALID };
     Object.defineProperty(getterRecord, 'version', {
@@ -520,7 +549,7 @@ describe('readLaneRunRecord', () => {
     expect(result.success).toBe(false);
     if (result.success) return;
     expect(result.error.message).toBe('LaneRun workOrderId contains a secret-shaped value and was refused');
-    expect(result.error.message).not.toContain('ghp_');
+    expect(result.error.message).not.toContain(fakeSecretShape());
   });
 });
 

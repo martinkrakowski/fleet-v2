@@ -15,7 +15,7 @@ import { describe, expect, it } from 'vitest';
 import type { AttemptRecord, AttemptRunnerRecord } from '../../../domain/execution-records.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
-import { readFrozenManifestVerified, readVerifiedFrozenManifest } from '../advance-lane-run/frozen-manifest.js';
+import { readFrozenManifestAtHostVerified, readFrozenManifestVerified, readVerifiedFrozenManifest } from '../advance-lane-run/frozen-manifest.js';
 import { readFrozenBriefVerified } from '../advance-lane-run/frozen-manifest.js';
 
 const PROSE = '# brief\n';
@@ -328,6 +328,87 @@ describe('readFrozenManifestVerified (SEC-5b)', () => {
     const harness = makeHarness();
     harness.setManifest(JSON.stringify([1, 2]));
     await expect(readFrozenManifestVerified(attemptFixture(), harness.artifactPort)).resolves.toEqual({ kind: 'unverified' });
+  });
+});
+
+describe('readFrozenManifestAtHostVerified (SEC-5b-3)', () => {
+  /** Reads are recorded for every path, but content only flows at the canonical paths. */
+  function makeStrictPathHarness(): Harness {
+    const harness = makeHarness();
+    const artifactPort = harness.artifactPort;
+    return {
+      ...harness,
+      artifactPort: {
+        ...artifactPort,
+        readBriefFile: async (worktreePath, relativePath, recordedHost) => {
+          const read = await artifactPort.readBriefFile!(worktreePath, relativePath, recordedHost);
+          return relativePath === BRIEF_PATH ? read : null;
+        },
+        readBriefManifest: async (worktreePath, manifestPath, recordedHost) => {
+          const read = await artifactPort.readBriefManifest!(worktreePath, manifestPath, recordedHost);
+          return manifestPath === MANIFEST_PATH ? read : null;
+        },
+      },
+    };
+  }
+
+  it('verifies prose + manifest through a null recordedHost for a seatless attempt', async () => {
+    const harness = makeHarness();
+    await expect(
+      readFrozenManifestAtHostVerified(attemptFixture({ runner: null }), harness.artifactPort, null),
+    ).resolves.toEqual({ kind: 'verified', manifest: MANIFEST });
+    // the null host is passed through to both reads
+    expect(harness.briefReads).toEqual([[WORKTREE_PATH, BRIEF_PATH, null]]);
+    expect(harness.manifestReads).toEqual([[WORKTREE_PATH, MANIFEST_PATH, null]]);
+  });
+
+  it('reads absent with zero reads when no artifact port is supplied', async () => {
+    await expect(
+      readFrozenManifestAtHostVerified(attemptFixture({ runner: null }), undefined, null),
+    ).resolves.toEqual({ kind: 'absent' });
+  });
+
+  it('attempts and fails unverified on a whitespace-only brief path', async () => {
+    const harness = makeStrictPathHarness();
+    await expect(
+      readFrozenManifestAtHostVerified(
+        attemptFixture({ runner: null, briefPackagePath: '   ' }),
+        harness.artifactPort,
+        null,
+      ),
+    ).resolves.toEqual({ kind: 'unverified' });
+    // the whitespace-only path is never skipped: both reads were attempted
+    expect(harness.briefReads).toEqual([[WORKTREE_PATH, '   ', null]]);
+    expect(harness.manifestReads).toEqual([[WORKTREE_PATH, '   ', null]]);
+  });
+
+  it('reads unverified when the manifest is tampered on disk', async () => {
+    const harness = makeHarness();
+    harness.setManifest(JSON.stringify({ timeLimitSeconds: 3333 }));
+    await expect(
+      readFrozenManifestAtHostVerified(attemptFixture({ runner: null }), harness.artifactPort, null),
+    ).resolves.toEqual({ kind: 'unverified' });
+  });
+
+  it('reads unverified when the manifest is missing on disk', async () => {
+    const harness = makeHarness();
+    harness.setManifest(null);
+    await expect(
+      readFrozenManifestAtHostVerified(attemptFixture({ runner: null }), harness.artifactPort, null),
+    ).resolves.toEqual({ kind: 'unverified' });
+  });
+
+  it('reads unverified when briefDigest is whitespace-only, before any read', async () => {
+    const harness = makeHarness();
+    await expect(
+      readFrozenManifestAtHostVerified(
+        attemptFixture({ runner: null, briefDigest: '   ' }),
+        harness.artifactPort,
+        null,
+      ),
+    ).resolves.toEqual({ kind: 'unverified' });
+    expect(harness.briefReads).toEqual([]);
+    expect(harness.manifestReads).toEqual([]);
   });
 });
 

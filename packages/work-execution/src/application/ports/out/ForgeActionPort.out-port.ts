@@ -25,6 +25,11 @@ export interface ForgeActionRequest {
   /** PR body override used only for `push-and-open-pr`; absent keeps the default. */
   readonly body?: string;
   /**
+   * The PR base branch, used only for `push-and-open-pr` (CB-D2); absent
+   * keeps the forge's default base.
+   */
+  readonly baseBranch?: string;
+  /**
    * Status to post for `post-status`: the pre-merge review receipt of the
    * expected head. Only `post-status` may carry it.
    */

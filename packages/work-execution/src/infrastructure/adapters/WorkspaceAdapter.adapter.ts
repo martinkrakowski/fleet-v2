@@ -23,10 +23,13 @@ import * as path from 'node:path';
 
 import {
   WorktreePathRefusedError,
+  type ResolveBaseTipRequest,
+  type ResolveBaseTipResult,
   type WorktreeInspection,
   type WorktreeInspectionRequest,
   type WorkspacePort,
 } from '../../application/ports/out/WorkspacePort.out-port.js';
+import { parseBaseBranch } from '../../domain/base-branch.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
@@ -749,6 +752,69 @@ export class WorkspaceAdapter implements WorkspacePort {
       return addRun.exitCode === 0
         ? { outcome: 'prepared' }
         : { outcome: 'refused', reason: 'git-refused' };
+    } catch {
+      return { outcome: 'unknown' };
+    }
+  }
+
+  /**
+   * CB-D2 (CB2): resolve the tip of one lane run's base branch on the forge,
+   * through the reserved host's executor. The only command is a hardened
+   * `git ls-remote --exit-code origin refs/heads/<baseBranch>`; exit 2 is a
+   * missing base; a resolved tip is the single listed 40-hex head of exactly
+   * that ref. Nothing is fetched, no stderr reaches the result, and any
+   * other answer is `unknown` — never a guess.
+   */
+  async resolveBaseTip(request: ResolveBaseTipRequest): Promise<ResolveBaseTipResult> {
+    // 1. Validate before any command runs (no executor call on a bad request).
+    if (
+      !isAbsoluteNormalisedPath(request.clonePath) ||
+      parseBaseBranch(request.baseBranch) === undefined
+    ) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+
+    // 2. The read runs on the reserved host's executor; an unresolvable host
+    //    or a throw is unknown — nothing is known to have been read.
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(request.recordedHost);
+    } catch {
+      return { outcome: 'unknown' };
+    }
+
+    const ref = `refs/heads/${request.baseBranch}`;
+    try {
+      const run = await executor.run(
+        [
+          'git', '-C', request.clonePath, '-c', 'core.hooksPath=/dev/null',
+          'ls-remote', '--exit-code', 'origin', ref,
+        ],
+        { timeoutMs: GIT_FETCH_TIMEOUT_MS },
+      );
+      if (run.exitCode === null || run.error !== undefined) {
+        return { outcome: 'unknown' };
+      }
+      if (run.exitCode === 2) {
+        return { outcome: 'missing' };
+      }
+      if (run.exitCode !== 0) {
+        return { outcome: 'unknown' };
+      }
+      // One line, one trailing newline stripped: `<40 lowercase hex><TAB>refs/heads/<baseBranch>`.
+      const lines = run.stdout.replace(/\n$/, '').split('\n');
+      if (lines.length !== 1) {
+        return { outcome: 'unknown' };
+      }
+      const fields = lines[0]!.split('\t');
+      if (fields.length !== 2) {
+        return { outcome: 'unknown' };
+      }
+      const [tip, listedRef] = fields;
+      if (tip === undefined || !BASE_COMMIT_PATTERN.test(tip) || listedRef !== ref) {
+        return { outcome: 'unknown' };
+      }
+      return { outcome: 'resolved', tip };
     } catch {
       return { outcome: 'unknown' };
     }

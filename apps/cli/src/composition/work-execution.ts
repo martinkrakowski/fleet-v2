@@ -618,6 +618,7 @@ export function composeExecution(input: ComposeExecutionInput) {
       acceptancePort: acceptanceAssessment,
       artifactPort: attemptArtifact,
       allowedSeats,
+      computeDigest: sha256HexDigest,
     }),
     attemptGate: composedAttemptGate,
     executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase({

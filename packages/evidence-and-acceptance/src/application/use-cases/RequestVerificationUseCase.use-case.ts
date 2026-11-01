@@ -18,7 +18,6 @@ import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAsse
 import type { EvidenceArchivePort } from '../ports/out/EvidenceArchivePort.out-port.js';
 import type {
   ExecuteVerificationCheckReceipt,
-  ExecuteVerificationCheckResult,
   VerificationExecutorPort,
 } from '../ports/out/VerificationExecutorPort.out-port.js';
 import type {

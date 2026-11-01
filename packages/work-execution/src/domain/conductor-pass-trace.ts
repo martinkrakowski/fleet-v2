@@ -283,6 +283,24 @@ function readConductorPassTraceUnchecked(input: unknown, currentVersion: number)
   };
 }
 
+export type VersionedConductorPassTraceParseResult =
+  | { readonly status: 'ok'; readonly record: ConductorPassTraceRecord; readonly schemaVersion: number }
+  | { readonly status: 'unknown-version' }
+  | { readonly status: 'invalid' };
+
+export function parseVersionedConductorPassTraceStateRecord(
+  raw: unknown,
+): VersionedConductorPassTraceParseResult {
+  const read = readConductorPassTrace(raw);
+  if (read.ok) {
+    return { status: 'ok', record: read.record, schemaVersion: read.record.schemaVersion };
+  }
+  if (read.reason === 'unknown-schema-version') {
+    return { status: 'unknown-version' };
+  }
+  return { status: 'invalid' };
+}
+
 /** The trace record when readable, else undefined (VZ5's adapter and `state check` use it). */
 export function parseConductorPassTraceStateRecord(raw: unknown): ConductorPassTraceRecord | undefined {
   const read = readConductorPassTrace(raw);

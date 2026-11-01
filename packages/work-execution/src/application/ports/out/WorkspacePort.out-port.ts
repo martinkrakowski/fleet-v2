@@ -9,6 +9,7 @@
  */
 
 import type { AttemptRunnerRecord } from '../../../domain/execution-records.js';
+import type { BaseBranchValue } from '../../../domain/base-branch.js';
 
 export interface WorktreeInspectionRequest {
   readonly worktreePath: string;
@@ -110,6 +111,29 @@ export type PrepareLaneWorktreeResult =
   | { readonly outcome: 'unknown' };
 
 /**
+ * CB-D2 (CB2): the request to resolve the tip of one lane run's base branch
+ * on the forge, through the reserved host's executor, at start time. The
+ * answer feeds the worktree's base commit and the frozen brief, so the
+ * run's chain link starts exactly at its base's tip.
+ */
+export interface ResolveBaseTipRequest {
+  /** The project profile's clone on the reserved host (absolute, normalised). */
+  readonly clonePath: string;
+  /** The resolved base branch (`main` or `chain/<name>`). */
+  readonly baseBranch: BaseBranchValue;
+  /** Routes the executor to the reserved host. */
+  readonly recordedHost: AttemptRunnerRecord;
+}
+
+export type ResolveBaseTipResult =
+  | { readonly outcome: 'resolved'; readonly tip: string }
+  /** The base branch does not exist on the forge; never a fallback to `main`. */
+  | { readonly outcome: 'missing' }
+  /** The executor did not answer (timeout, transport): nothing is known. */
+  | { readonly outcome: 'unknown' }
+  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' };
+
+/**
  * EX-2a (D17): the request to remove one finished lane run's worktree. The
  * branch is the record of the run and is never touched; only the worktree
  * directory goes.
@@ -170,6 +194,13 @@ export interface WorkspacePort {
    * so a retried start is safe.
    */
   prepareLaneWorktree?(request: PrepareLaneWorktreeRequest): Promise<PrepareLaneWorktreeResult>;
+
+  /**
+   * CB-D2 (CB2): resolve the tip of the run's base branch on the forge,
+   * through the reserved host's executor. A base branch that does not exist
+   * on the forge is `missing`, never a fallback to `main`.
+   */
+  resolveBaseTip?(request: ResolveBaseTipRequest): Promise<ResolveBaseTipResult>;
 
   /**
    * EX-2a (D17): remove one finished lane run's clean worktree, keeping its

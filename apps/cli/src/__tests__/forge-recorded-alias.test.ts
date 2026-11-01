@@ -308,4 +308,153 @@ describe('forge head verification resolves the recorded host through the helper'
       execFileMock.mock.calls.some(([, args]) => (args as readonly string[])?.[0] === 'recorded-only.example'),
     ).toBe(false);
   });
+
+  it('post-status verifies the live head and returns it unchanged, never building the push plumbing (KS7a-2)', async () => {
+    const ghCalls: string[][] = [];
+    const runtime = createFleetCliRuntime({
+      installation: makeInstallation({
+        mode: 'github',
+        owner: 'example-owner',
+        repo: 'example-repo',
+      }),
+      forgeActionDelegate: {
+        runGh: async (args) => {
+          ghCalls.push([...args]);
+          return { exitCode: 0, stdout: '', stderr: '' };
+        },
+      },
+    });
+    await saveAttempt(runtime, makeRunner('lane.example', null));
+    execFileMock.mockImplementation(
+      (_file: string, _args: readonly string[], cb?: ExecFileCallback) => {
+        if (cb) {
+          cb(null, `${EXPECTED_HEAD}\n`, '');
+        }
+      },
+    );
+
+    const result = (await runtime.execution.forgeAction.performForgeAction({
+      actionId: 'act-status-1',
+      attemptId: 'att-sec-1b-1',
+      workOrderId: 'wo-1',
+      kind: 'post-status',
+      expectedHeadSha: EXPECTED_HEAD,
+      branchName: BRANCH,
+      status: { context: 'premerge', state: 'success', description: 'pre-merge receipt recorded' },
+    })) as { outcome: string; headSha: string };
+
+    expect(result.outcome).toBe('executed');
+    expect(result.headSha).toBe(EXPECTED_HEAD);
+    // Only the head read ran — no git fetch/push; the push arguments are never built.
+    expect(execFileMock.mock.calls).toEqual([
+      [
+        'ssh',
+        [
+          'lane.example',
+          '--',
+          expect.stringContaining(
+            `'git' '-C' '${WORKTREE_PATH}' 'rev-parse' 'HEAD'`,
+          ),
+        ],
+        expect.any(Function),
+      ],
+    ]);
+    expect(ghCalls).toEqual([
+      [
+        'api',
+        '-X',
+        'POST',
+        `repos/example-owner/example-repo/statuses/${EXPECTED_HEAD}`,
+        '-f',
+        'state=success',
+        '-f',
+        'context=premerge',
+        '-f',
+        'description=pre-merge receipt recorded',
+      ],
+    ]);
+  });
+
+  it('push-to-pr still verifies the live head before pushing (KS7a-2)', async () => {
+    let prReads = 0;
+    const runtime = createFleetCliRuntime({
+      installation: makeInstallation({
+        mode: 'github',
+        owner: 'example-owner',
+        repo: 'example-repo',
+      }),
+      forgeActionDelegate: {
+        runGh: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+      },
+      forgeGhRunner: async () => {
+        prReads += 1;
+        // The pre-push read shows an open PR at ANOTHER head so the push reaches
+        // the live-head check; the post-push read shows the pushed head.
+        const head = prReads === 1 ? OTHER_HEAD : EXPECTED_HEAD;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            baseRefName: 'main',
+            closedAt: null,
+            headRefName: BRANCH,
+            headRefOid: head,
+            mergeCommit: null,
+            mergedAt: null,
+            number: 7,
+            state: 'OPEN',
+          }),
+          stderr: '',
+        };
+      },
+    });
+    await saveAttempt(runtime, makeRunner('lane.example', null));
+    execFileMock.mockImplementation(
+      (_file: string, _args: readonly string[], cb?: ExecFileCallback) => {
+        if (cb) {
+          cb(null, `${EXPECTED_HEAD}\n`, '');
+        }
+      },
+    );
+
+    const result = (await runtime.execution.forgeAction.performForgeAction({
+      actionId: 'act-push-1',
+      attemptId: 'att-sec-1b-1',
+      workOrderId: 'wo-1',
+      kind: 'push-to-pr',
+      expectedHeadSha: EXPECTED_HEAD,
+      branchName: BRANCH,
+    })) as { outcome: string; pullRequestNumber: number; headSha: string };
+
+    expect(result.outcome).toBe('executed');
+    expect(result.pullRequestNumber).toBe(7);
+    expect(result.headSha).toBe(EXPECTED_HEAD);
+    expect(execFileMock.mock.calls).toEqual([
+      [
+        'ssh',
+        [
+          'lane.example',
+          '--',
+          expect.stringContaining(
+            `'git' '-C' '${WORKTREE_PATH}' 'rev-parse' 'HEAD'`,
+          ),
+        ],
+        expect.any(Function),
+      ],
+      [
+        'git',
+        [
+          'fetch',
+          `lane.example:${WORKTREE_PATH}`,
+          `${EXPECTED_HEAD}:refs/heads/${BRANCH}`,
+          '--force',
+        ],
+        expect.any(Function),
+      ],
+      [
+        'git',
+        ['push', 'origin', `${EXPECTED_HEAD}:refs/heads/${BRANCH}`],
+        expect.any(Function),
+      ],
+    ]);
+  });
 });

@@ -1200,8 +1200,10 @@ async function reapCommand(
     nowIso: nowIsoOf(options),
   });
   io.stdout(`${JSON.stringify(result)}\n`);
-  // Refusals and unknowns both land in `refused`; nothing refused or unknown exits 0.
-  return result.refused.length > 0 ? 1 : 0;
+  // Refusals and unknowns both land in `refused`; a failed post-removal
+  // journal append lands in `journalFailed`. Nothing refused, unknown or
+  // un-journalled exits 0.
+  return result.refused.length > 0 || result.journalFailed.length > 0 ? 1 : 0;
 }
 
 /**

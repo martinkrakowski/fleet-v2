@@ -45,6 +45,7 @@ export function SessionStrip({ marks }: { marks: readonly SessionMarkView[] }) {
           aria-label="Session starts over time"
           viewBox={`0 0 ${STRIP_WIDTH} ${STRIP_HEIGHT}`}
           width="100%"
+          style={{ minWidth: STRIP_WIDTH }}
           height={STRIP_HEIGHT}
           preserveAspectRatio="xMidYMid meet"
         >

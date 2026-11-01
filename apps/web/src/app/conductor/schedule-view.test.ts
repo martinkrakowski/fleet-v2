@@ -5,6 +5,7 @@ import {
   filterRows,
   gaugeFraction,
   gaugeText,
+  gaugeValue,
   placementText,
 } from "./schedule-view";
 
@@ -86,6 +87,13 @@ describe("gauge helpers", () => {
       gaugeText({ active: 2, inFlight: 1, maxActiveRuns: 4 }),
     ).toBe("3 of 4 held (2 active, 1 in flight)");
     expect(gaugeFraction({ active: 3, inFlight: 0, maxActiveRuns: 2 })).toBe(1);
+  });
+
+  it("clamps the meter value and treats a zero cap", () => {
+    expect(gaugeValue({ active: 3, inFlight: 0, maxActiveRuns: 2 })).toBe(2);
+    expect(gaugeValue({ active: 2, inFlight: 1, maxActiveRuns: null })).toBe(3);
+    expect(gaugeValue({ active: 1, inFlight: 1, maxActiveRuns: 0 })).toBe(0);
+    expect(gaugeFraction({ active: 1, inFlight: 0, maxActiveRuns: 0 })).toBe(0);
   });
 });
 

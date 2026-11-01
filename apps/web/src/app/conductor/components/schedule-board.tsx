@@ -37,6 +37,9 @@ function detailText(row: ScheduleRowView): string {
   if (row.leaseLapsed === true) {
     parts.push("lease lapsed");
   }
+  if (row.leaseLapsed === false) {
+    parts.push("lease held");
+  }
   if (row.overlapsWith.length > 0) {
     parts.push(`overlaps with ${row.overlapsWith.join(", ")}`);
   }
@@ -61,17 +64,22 @@ function SlotList({ host }: { host: ScheduleHostView }) {
 export function ScheduleBoard({
   visibleRows,
   hosts,
+  truncated = false,
 }: {
   visibleRows: readonly ScheduleRowView[];
   hosts: readonly ScheduleHostView[];
+  truncated?: boolean;
 }) {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const caption = truncated
+    ? "Live runs in creation order (list truncated)"
+    : "Live runs in creation order";
 
   return (
     <div>
       <TableContainer className={styles.boardWrap}>
         <Table>
-          <caption>Live runs in creation order</caption>
+          <caption>{caption}</caption>
           <Thead>
             <Tr>
               <Th>Run</Th>
@@ -85,6 +93,7 @@ export function ScheduleBoard({
           <Tbody>
             {visibleRows.map((row) => {
               const selected = selectedRunId === row.runId;
+              const detail = detailText(row);
               return (
                 <Fragment key={row.runId}>
                   <Tr>
@@ -110,10 +119,10 @@ export function ScheduleBoard({
                   </Tr>
                   {selected ? (
                     <Tr>
-                      <Td className={styles.detailRow}>
-                        {detailText(row) === ""
+                      <Td className={styles.detailRow} colSpan={6}>
+                        {detail === ""
                           ? "No pending step, park record, lease lapse or overlap recorded."
-                          : detailText(row)}
+                          : detail}
                       </Td>
                     </Tr>
                   ) : null}

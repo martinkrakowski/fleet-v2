@@ -11,6 +11,39 @@ const CONDUCTOR_DIR = join(import.meta.dirname);
 const read = (...parts: string[]) =>
   readFileSync(join(CONDUCTOR_DIR, ...parts), "utf8");
 
+/**
+ * Rough per-function cognitive complexity counter, used as a regression guard
+ * for the brief's cap: every function stays at Sonar cognitive complexity 15
+ * or below. Strips comments and string literals, slices each top-level
+ * `function` body up to the next top-level declaration, then counts the
+ * branching tokens Sonar charges (if, loops, case, catch, ternaries and each
+ * logical operator sequence).
+ */
+function complexityByFunction(source: string): Record<string, number> {
+  const stripped = source
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/\/\/[^\n]*/g, " ")
+    .replace(/`(?:\\.|[^`\\])*`/g, "` `")
+    .replace(/"(?:\\.|[^"\\])*"/g, '" "')
+    .replace(/'(?:\\.|[^'\\])*'/g, "' '");
+  const scores: Record<string, number> = {};
+  const starts = [...stripped.matchAll(/(^|\n)(?:export )?function ([A-Za-z0-9_$]+)/g)];
+  for (let index = 0; index < starts.length; index += 1) {
+    const start = starts[index][1] === "\n" ? starts[index].index + 1 : starts[index].index;
+    const name = starts[index][2];
+    const next =
+      index + 1 < starts.length
+        ? (starts[index + 1][1] === "\n" ? starts[index + 1].index + 1 : starts[index + 1].index)
+        : stripped.length;
+    const body = stripped.slice(start, next);
+    const tokens = body.match(
+      /\b(if|for|while|case|catch)\b|&&|\|\||\?\?|\?(?![.(\d])/g,
+    );
+    scores[name] = tokens === null ? 0 : tokens.length;
+  }
+  return scores;
+}
+
 function walk(dir: string): string[] {
   const entries: string[] = [];
   for (const name of readdirSync(dir, { withFileTypes: true })) {
@@ -81,6 +114,50 @@ describe("Conductor source wiring", () => {
   it("keeps the responsive and reduced-motion media rules", () => {
     expect(css).toContain("@media (max-width: 720px)");
     expect(css).toContain("@media (prefers-reduced-motion: reduce)");
+  });
+
+  it("spans the expanded detail across the six table columns", () => {
+    expect(board).toContain("colSpan={6}");
+  });
+
+  it("stacks the board rows as block-level boxes under 720px", () => {
+    const start = css.indexOf("@media (max-width: 720px)");
+    expect(start).toBeGreaterThanOrEqual(0);
+    let depth = 0;
+    let end = start;
+    for (let i = start; i < css.length; i += 1) {
+      if (css[i] === "{") {
+        depth += 1;
+      }
+      if (css[i] === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    const media = css.slice(start, end);
+    expect(media).toContain(".boardWrap table tr");
+    expect(media).toContain(".boardWrap table td");
+    expect(media).toContain(".boardWrap table th");
+    expect(media.match(/display: block;/g)?.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("keeps the session strip scrollable rather than scaled", () => {
+    expect(strip).toContain("minWidth");
+  });
+
+  it("keeps every schedule mapping function simple", () => {
+    const source = read("map-schedule.ts");
+    const scores = complexityByFunction(source);
+    expect(Object.keys(scores).length).toBeGreaterThan(5);
+    for (const [name, score] of Object.entries(scores)) {
+      expect(
+        score,
+        `${name} has cognitive complexity ${score}, cap is 15`,
+      ).toBeLessThanOrEqual(15);
+    }
   });
 
   it("never borrows the work board's Waiting column name", () => {

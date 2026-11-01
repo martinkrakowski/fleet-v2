@@ -183,10 +183,16 @@ function parsePackageKeys(
   return parseStringArray(value);
 }
 
-function parseRow(value: unknown): ScheduleRowView | null {
-  if (!isRecord(value)) {
-    return null;
-  }
+function parseRowBase(
+  value: Record<string, unknown>,
+): {
+  runId: string;
+  workOrderId: string;
+  state: string;
+  tier: number;
+  round: number;
+  placement: Placement;
+} | null {
   const runId = parseString(value.runId);
   const workOrderId = parseString(value.workOrderId);
   const state = parseString(value.state);
@@ -198,6 +204,37 @@ function parseRow(value: unknown): ScheduleRowView | null {
   }
   const placement = parseString(value.placement);
   if (placement === undefined || !PLACEMENTS.has(placement)) {
+    return null;
+  }
+  return {
+    runId,
+    workOrderId,
+    state,
+    tier: value.tier,
+    round: value.round,
+    placement: placement as Placement,
+  };
+}
+
+function parseAdmissionWait(
+  value: unknown,
+): AdmissionWait | null | undefined {
+  const admissionWait = parseNullableString(value);
+  if (admissionWait === undefined) {
+    return undefined;
+  }
+  if (admissionWait !== null && !ADMISSION_WAITS.has(admissionWait)) {
+    return undefined;
+  }
+  return admissionWait as AdmissionWait | null;
+}
+
+function parseRow(value: unknown): ScheduleRowView | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const base = parseRowBase(value);
+  if (base === null) {
     return null;
   }
   const pendingStep = parsePendingStep(value.pendingStep);
@@ -226,20 +263,17 @@ function parseRow(value: unknown): ScheduleRowView | null {
   if (slot === undefined) {
     return null;
   }
-  const admissionWait = parseNullableString(value.admissionWait);
-  if (
-    admissionWait === undefined ||
-    (admissionWait !== null && !ADMISSION_WAITS.has(admissionWait))
-  ) {
+  const admissionWait = parseAdmissionWait(value.admissionWait);
+  if (admissionWait === undefined) {
     return null;
   }
   return {
-    runId,
-    workOrderId,
-    tier: value.tier,
-    state,
-    round: value.round,
-    placement: placement as Placement,
+    runId: base.runId,
+    workOrderId: base.workOrderId,
+    tier: base.tier,
+    state: base.state,
+    round: base.round,
+    placement: base.placement,
     pendingStep,
     park,
     leaseLapsed: value.leaseLapsed,
@@ -247,7 +281,7 @@ function parseRow(value: unknown): ScheduleRowView | null {
     workOrderUnreadable: value.workOrderUnreadable,
     overlapsWith,
     slot,
-    admissionWait: admissionWait as AdmissionWait | null,
+    admissionWait,
   };
 }
 
@@ -345,7 +379,22 @@ function parseAdmission(value: unknown): ScheduleAdmissionView | null {
   };
 }
 
-export function parseScheduleEnvelope(value: unknown): ScheduleView | null {
+function parseList<T>(
+  items: readonly unknown[],
+  parseItem: (item: unknown) => T | null,
+): T[] | null {
+  const parsed: T[] = [];
+  for (const item of items) {
+    const value = parseItem(item);
+    if (value === null) {
+      return null;
+    }
+    parsed.push(value);
+  }
+  return parsed;
+}
+
+function parseEnvelopeResult(value: unknown): Record<string, unknown> | null {
   if (!isRecord(value) || value.code !== "OK") {
     return null;
   }
@@ -353,10 +402,17 @@ export function parseScheduleEnvelope(value: unknown): ScheduleView | null {
   if (!isRecord(result) || result.outcome !== "listed") {
     return null;
   }
-  const schedule = result.schedule;
-  if (!isRecord(schedule)) {
-    return null;
-  }
+  return result;
+}
+
+function parseScheduleHeader(
+  schedule: Record<string, unknown>,
+): {
+  observedAtIso: string;
+  halt: HaltState;
+  driverLeaseLapsed: boolean | null;
+  trace: TraceState;
+} | null {
   const observedAtIso = parseString(schedule.observedAtIso);
   if (observedAtIso === undefined) {
     return null;
@@ -368,11 +424,32 @@ export function parseScheduleEnvelope(value: unknown): ScheduleView | null {
   if (!isNullableBoolean(schedule.driverLeaseLapsed)) {
     return null;
   }
+  const trace = parseString(schedule.trace);
+  if (trace === undefined || !TRACE_STATES.has(trace)) {
+    return null;
+  }
+  return {
+    observedAtIso,
+    halt: halt as HaltState,
+    driverLeaseLapsed: schedule.driverLeaseLapsed,
+    trace: trace as TraceState,
+  };
+}
+
+export function parseScheduleEnvelope(value: unknown): ScheduleView | null {
+  const result = parseEnvelopeResult(value);
+  if (result === null) {
+    return null;
+  }
+  const schedule = result.schedule;
+  if (!isRecord(schedule)) {
+    return null;
+  }
   if (typeof result.truncated !== "boolean") {
     return null;
   }
-  const trace = parseString(schedule.trace);
-  if (trace === undefined || !TRACE_STATES.has(trace)) {
+  const header = parseScheduleHeader(schedule);
+  if (header === null) {
     return null;
   }
   const admission = parseAdmission(schedule.admission);
@@ -380,48 +457,37 @@ export function parseScheduleEnvelope(value: unknown): ScheduleView | null {
     return null;
   }
   const caps = parseCaps(schedule.caps);
-  if (caps === undefined || !Array.isArray(schedule.rows)) {
+  if (caps === undefined) {
     return null;
   }
-  const rows: ScheduleRowView[] = [];
-  for (const item of schedule.rows) {
-    const parsed = parseRow(item);
-    if (parsed === null) {
-      return null;
-    }
-    rows.push(parsed);
-  }
-  if (!Array.isArray(schedule.hosts)) {
+  if (
+    !Array.isArray(schedule.rows) ||
+    !Array.isArray(schedule.hosts) ||
+    !Array.isArray(result.sessionStarts)
+  ) {
     return null;
   }
-  const hosts: ScheduleHostView[] = [];
-  for (const item of schedule.hosts) {
-    const parsed = parseHost(item);
-    if (parsed === null) {
-      return null;
-    }
-    hosts.push(parsed);
-  }
-  if (!Array.isArray(result.sessionStarts)) {
+  const rows = parseList(schedule.rows, parseRow);
+  if (rows === null) {
     return null;
   }
-  const sessionStarts: SessionMarkView[] = [];
-  for (const item of result.sessionStarts) {
-    const parsed = parseSessionMark(item);
-    if (parsed === null) {
-      return null;
-    }
-    sessionStarts.push(parsed);
+  const hosts = parseList(schedule.hosts, parseHost);
+  if (hosts === null) {
+    return null;
+  }
+  const sessionStarts = parseList(result.sessionStarts, parseSessionMark);
+  if (sessionStarts === null) {
+    return null;
   }
   return {
-    observedAtIso,
-    halt: halt as HaltState,
-    driverLeaseLapsed: schedule.driverLeaseLapsed,
+    observedAtIso: header.observedAtIso,
+    halt: header.halt,
+    driverLeaseLapsed: header.driverLeaseLapsed,
     rows,
     hosts,
     admission,
     caps,
-    trace: trace as TraceState,
+    trace: header.trace,
     sessionStarts,
     truncated: result.truncated,
   };

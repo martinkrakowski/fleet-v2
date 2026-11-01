@@ -22,10 +22,15 @@ function haltedBannerTitle(halt: string): string {
   return "Conductor halted";
 }
 
-function actions(data: ConductorData, liveCount: number): ReactNode {
+function actions(
+  data: ConductorData,
+  liveCount: number,
+  truncated: boolean,
+): ReactNode {
   if (data.view === "listed") {
+    const tail = truncated ? " · list truncated" : "";
     return (
-      <RouteChip>live · GET /v1/runs · {liveCount} live</RouteChip>
+      <RouteChip>live · GET /v1/runs · {liveCount} live{tail}</RouteChip>
     );
   }
   if (data.view === "error") {
@@ -91,7 +96,11 @@ export function ConductorClient({ data }: { data: ConductorData }) {
         {schedule.rows.length === 0 ? (
           <EmptyState title="No live runs." />
         ) : (
-          <ScheduleBoard visibleRows={rows} hosts={schedule.hosts} />
+          <ScheduleBoard
+            visibleRows={rows}
+            hosts={schedule.hosts}
+            truncated={schedule.truncated}
+          />
         )}
         <SessionStrip marks={schedule.sessionStarts} />
       </>
@@ -100,13 +109,14 @@ export function ConductorClient({ data }: { data: ConductorData }) {
 
   const liveCount =
     schedule === null ? 0 : filterRows(schedule.rows, "all").length;
+  const truncated = schedule !== null && schedule.truncated;
 
   return (
     <div className={styles.page}>
       <PageHeader
         title="Conductor"
         description="Read-only picture of the conductor's live runs: who holds a host slot, which package keys they own and how full admission is. Nothing here starts, stops, halts, resumes or reorders a run."
-        actions={actions(data, liveCount)}
+        actions={actions(data, liveCount, truncated)}
       />
       <p className={styles.meta} aria-live="polite">
         {schedule === null

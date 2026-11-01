@@ -60,8 +60,19 @@ export function gaugeFraction(admission: AdmissionCount): number | null {
   if (admission.maxActiveRuns === null) {
     return null;
   }
+  if (admission.maxActiveRuns <= 0) {
+    return 0;
+  }
   const held = admission.active + admission.inFlight;
   return Math.min(1, held / admission.maxActiveRuns);
+}
+
+export function gaugeValue(admission: AdmissionCount): number {
+  const held = admission.active + admission.inFlight;
+  if (admission.maxActiveRuns === null) {
+    return held;
+  }
+  return Math.min(held, admission.maxActiveRuns);
 }
 
 export function capNote(schedule: ScheduleView): string {

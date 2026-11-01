@@ -1,7 +1,7 @@
 "use client";
 
 import type { ScheduleAdmissionView } from "../map-schedule";
-import { gaugeFraction, gaugeText } from "../schedule-view";
+import { gaugeFraction, gaugeText, gaugeValue } from "../schedule-view";
 import styles from "../conductor.module.css";
 
 export function CapGauge({
@@ -18,7 +18,7 @@ export function CapGauge({
           role="meter"
           aria-valuemin={0}
           aria-valuemax={admission.maxActiveRuns ?? 0}
-          aria-valuenow={admission.active + admission.inFlight}
+          aria-valuenow={gaugeValue(admission)}
           aria-label="Admission"
           className={styles.gaugeBar}
         >

@@ -267,6 +267,34 @@ describe('conductor reap --worktrees (EX-2b)', () => {
     expect(doc.refused[0]!.runId).toBe(RUN_ID);
   });
 
+  it('prints journalFailed and exits 1 when any journal append failed', async () => {
+    const runtime = createFleetCliRuntime({ stateDir: tempStateDir() });
+    await seedMergedRun(runtime);
+    const reap = vi
+      .spyOn(runtime.conductor.reapLaneWorktrees, 'reapLaneWorktrees')
+      .mockResolvedValue({
+        outcome: 'reaped',
+        dryRun: false,
+        removed: [{ runId: RUN_ID, branchTip: COMMIT }],
+        alreadyRemoved: [],
+        refused: [],
+        skipped: [],
+        journalFailed: [
+          { runId: RUN_ID, attemptId: 'attempt-example-1', branchTip: COMMIT, reason: 'journal write failed' },
+        ],
+      });
+    const result = await runConductor(runtime, ['reap', '--worktrees', '--yes']);
+    expect(result.code).toBe(1);
+    expect(result.stdout).toHaveLength(1);
+    const doc = JSON.parse(result.stdout[0]!) as {
+      journalFailed: { runId: string; attemptId: string; branchTip: string; reason: string }[];
+    };
+    expect(doc.journalFailed).toEqual([
+      { runId: RUN_ID, attemptId: 'attempt-example-1', branchTip: COMMIT, reason: 'journal write failed' },
+    ]);
+    expect(reap).toHaveBeenCalledTimes(1);
+  });
+
   it('help names reap', async () => {
     const runtime = createFleetCliRuntime({ stateDir: tempStateDir() });
     const result = await runConductor(runtime, ['--help']);

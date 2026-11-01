@@ -102,6 +102,9 @@ export class MergeVerificationAdapter implements MergeVerificationPort {
     if (result.outcome === 'rejected') {
       return unknownResult('evidence-unreadable');
     }
+    if (result.outcome === 'not-started') {
+      return unknownResult('budget-exhausted');
+    }
     return this.resolveFromAssessment(result.assessment, request);
   }
 

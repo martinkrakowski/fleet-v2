@@ -693,8 +693,28 @@ describe('VerificationExecutorAdapter deadline budget', () => {
       checkRequest({ deadlineIso: new Date(Date.now() - 60_000).toISOString() }),
     );
 
-    expect(result).toMatchObject({ result: 'unknown', exitCode: null });
-    expect(result.outputSummary).toContain('did not start');
+    expect(result).toEqual({
+      outcome: 'not-started',
+      reason: 'verification check did not start: the remaining budget is under 2 seconds',
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it('does not start a check when the deadline is malformed', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    const result = await adapter.executeVerificationCheck(
+      checkRequest({ deadlineIso: 'malformed-deadline' }),
+    );
+
+    expect(result).toEqual({
+      outcome: 'not-started',
+      reason: 'verification check did not start: the remaining budget is under 2 seconds',
+    });
     expect(calls).toEqual([]);
   });
 

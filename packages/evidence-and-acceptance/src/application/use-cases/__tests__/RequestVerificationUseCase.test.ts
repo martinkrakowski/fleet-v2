@@ -118,6 +118,20 @@ class SecondCheckMalformedStubExecutor implements VerificationExecutorPort {
   }
 }
 
+class NotStartedStubExecutor implements VerificationExecutorPort {
+  calls: ExecuteVerificationCheckRequest[] = [];
+
+  async executeVerificationCheck(
+    request: ExecuteVerificationCheckRequest,
+  ): Promise<ExecuteVerificationCheckResult> {
+    this.calls.push(request);
+    return {
+      outcome: 'not-started',
+      reason: 'verification check did not start: the remaining budget is under 2 seconds',
+    };
+  }
+}
+
 class StubArchive implements EvidenceArchivePort {
   calls: ArchiveEvidenceRequest[] = [];
 
@@ -468,5 +482,86 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
     expect(executor.calls.map((call) => call.procedureName)).toEqual(['lint', 'test']);
     expect(archive.calls).toHaveLength(0);
     expect(await repo.findAssessmentById('asm-second-malformed')).toBeNull();
+  });
+
+  it('returns not-started and archives nothing when deadline leaves under 2 seconds', async () => {
+    const repo = new InMemoryAssessmentRepo([]);
+    const executor = new StubExecutor();
+    const archive = new StubArchive();
+    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'asm-budget-exhausted',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      requiredChecks: ['lint'],
+      deadlineIso: new Date(Date.now() + 500).toISOString(),
+    });
+
+    expect(result.outcome).toBe('not-started');
+    if (result.outcome === 'not-started') {
+      expect(result.reason).toContain('budget exhausted');
+    }
+    expect(executor.calls).toHaveLength(0);
+    expect(archive.calls).toHaveLength(0);
+    expect(await repo.findAssessmentById('asm-budget-exhausted')).toBeNull();
+  });
+
+  it('treats a malformed deadline as no budget and returns not-started without archiving or saving', async () => {
+    const repo = new InMemoryAssessmentRepo([]);
+    const executor = new StubExecutor();
+    const archive = new StubArchive();
+    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'asm-malformed-deadline',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      requiredChecks: ['lint'],
+      deadlineIso: 'invalid-deadline-iso',
+    });
+
+    expect(result.outcome).toBe('not-started');
+    if (result.outcome === 'not-started') {
+      expect(result.reason).toContain('budget exhausted');
+    }
+    expect(executor.calls).toHaveLength(0);
+    expect(archive.calls).toHaveLength(0);
+    expect(await repo.findAssessmentById('asm-malformed-deadline')).toBeNull();
+  });
+
+  it('surfaces a not-started outcome from the executor without archiving or saving', async () => {
+    const repo = new InMemoryAssessmentRepo([]);
+    const executor = new NotStartedStubExecutor();
+    const archive = new StubArchive();
+    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'asm-executor-not-started',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      hostId: 'host-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      requiredChecks: ['lint'],
+      deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+    });
+
+    expect(result.outcome).toBe('not-started');
+    if (result.outcome === 'not-started') {
+      expect(result.reason).toContain('did not start');
+    }
+    expect(executor.calls).toHaveLength(1);
+    expect(archive.calls).toHaveLength(0);
+    expect(await repo.findAssessmentById('asm-executor-not-started')).toBeNull();
   });
 });

@@ -32,7 +32,8 @@ export interface RequestVerificationRequest {
 
 export type RequestVerificationResult =
   | { readonly outcome: 'completed'; readonly assessment: EvidenceAssessmentRecord; readonly receipts: readonly VerificationReceiptRecord[] }
-  | { readonly outcome: 'rejected'; readonly reason: string };
+  | { readonly outcome: 'rejected'; readonly reason: string }
+  | { readonly outcome: 'not-started'; readonly reason: string };
 
 export interface RequestVerificationPort {
   requestVerification(request: RequestVerificationRequest): Promise<RequestVerificationResult>;

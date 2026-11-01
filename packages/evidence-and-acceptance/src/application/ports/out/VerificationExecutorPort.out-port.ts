@@ -19,13 +19,23 @@ export interface ExecuteVerificationCheckRequest {
   readonly deadlineIso?: string;
 }
 
-export interface ExecuteVerificationCheckResult {
+export interface ExecuteVerificationCheckReceipt {
+  readonly outcome?: 'completed';
   readonly result: EvidenceResultValue;
   readonly exitCode: number | null;
   readonly coverage?: CheckCoverage;
   readonly outputSummary: string;
   readonly completedAtIso: string;
 }
+
+export interface ExecuteVerificationCheckNotStarted {
+  readonly outcome: 'not-started';
+  readonly reason: string;
+}
+
+export type ExecuteVerificationCheckResult =
+  | ExecuteVerificationCheckReceipt
+  | ExecuteVerificationCheckNotStarted;
 
 export interface VerificationExecutorPort {
   executeVerificationCheck(request: ExecuteVerificationCheckRequest): Promise<ExecuteVerificationCheckResult>;

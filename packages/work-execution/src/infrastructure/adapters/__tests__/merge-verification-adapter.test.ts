@@ -5,7 +5,7 @@
 // failure is unknown, not a throw. Fake delegates only — no subprocess, no
 // live host.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type {
   EvidenceAssessmentRecord,
@@ -15,7 +15,12 @@ import type {
   RequestVerificationResult,
   VerificationReceiptRecord,
 } from '@fleet/evidence-and-acceptance';
-import { assessmentIdForAttempt } from '@fleet/evidence-and-acceptance';
+import {
+  InspectAcceptanceEvidenceUseCase,
+  RequestVerificationUseCase,
+  VerificationExecutorAdapter,
+  assessmentIdForAttempt,
+} from '@fleet/evidence-and-acceptance';
 
 import { MergeVerificationAdapter } from '../MergeVerificationAdapter.adapter.js';
 import type {
@@ -349,5 +354,166 @@ describe('MergeVerificationAdapter', () => {
     });
     expect(inspector.requests).toEqual([]);
     expect(requester.calls).toEqual([]);
+  });
+
+  it('trigger path maps a not-started outcome from the requester to budget-exhausted', async () => {
+    const requester = new RecordingRequester([
+      { outcome: 'not-started', reason: 'Verification budget exhausted before starting check' },
+    ]);
+    const adapter = new MergeVerificationAdapter({ requester });
+
+    const result = await adapter.runVerification(triggerRequest());
+
+    expect(result).toEqual({ outcome: 'unknown', reasonCode: 'budget-exhausted' });
+  });
+
+  it('composes the use case with the adapter: a check that cannot start returns budget-exhausted, archives and saves nothing, and a later read is not receipt-failed', async () => {
+    const baseNow = 1_700_000_000_000;
+    let callCount = 0;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
+      callCount += 1;
+      return callCount === 1 ? baseNow : baseNow + 1_500;
+    });
+
+    try {
+      const repoRecords = new Map<string, EvidenceAssessmentRecord>();
+      const repo = {
+        async saveAssessment(record: EvidenceAssessmentRecord): Promise<void> {
+          repoRecords.set(record.id, { ...record });
+        },
+        async findAssessmentById(id: string): Promise<EvidenceAssessmentRecord | null> {
+          const found = repoRecords.get(id);
+          return found ? { ...found } : null;
+        },
+        async findAssessmentByHead(sha: string): Promise<EvidenceAssessmentRecord | null> {
+          for (const record of repoRecords.values()) {
+            if (record.candidateHeadSha === sha) return { ...record };
+          }
+          return null;
+        },
+      };
+
+      const archiveCalls: unknown[] = [];
+      const archive = {
+        async archiveEvidence(req: { artifactId: string; candidateHeadSha: string; content: string }) {
+          archiveCalls.push(req);
+          return { evidenceRef: `ref-${req.artifactId}`, digest: 'digest-1' };
+        },
+        async readArchivedEvidence(_ref: string) {
+          return 'content';
+        },
+      };
+
+      const spawnCalls: unknown[] = [];
+      const executor = new VerificationExecutorAdapter({
+        allowListedCommands: { [MACOS_PROCEDURE]: '/opt/verify-run.sh' },
+        spawn: (file, args, options) => {
+          spawnCalls.push({ file, args, options });
+          return { status: 0, signal: null, stdout: 'ok', stderr: '' };
+        },
+      });
+
+      const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+      const inspector = new InspectAcceptanceEvidenceUseCase({ repo });
+      const adapter = new MergeVerificationAdapter({ requester: useCase, inspector });
+
+      const deadlineIso = new Date(baseNow + 2_500).toISOString();
+      const triggerResult = await adapter.runVerification(triggerRequest({ deadlineIso }));
+
+      expect(triggerResult).toEqual({
+        outcome: 'unknown',
+        reasonCode: 'budget-exhausted',
+      });
+      expect(archiveCalls).toHaveLength(0);
+      expect(spawnCalls).toHaveLength(0);
+      expect(repoRecords.size).toBe(0);
+
+      const readResult = await adapter.readVerification(
+        readRequest({ deadlineIso: new Date(baseNow + 60_000).toISOString() }),
+      );
+      expect(readResult).toEqual({
+        outcome: 'unknown',
+        reasonCode: 'no-receipt',
+      });
+      expect(readResult.reasonCode).not.toBe('receipt-failed');
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('composes the use case with the adapter when the executor path deadline check returns not-started: returns budget-exhausted, archives and saves nothing, and a later read is not receipt-failed', async () => {
+    const baseNow = 1_700_000_000_000;
+    let callCount = 0;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
+      callCount += 1;
+      if (callCount === 1) return baseNow;
+      if (callCount === 2) return baseNow + 400;
+      return baseNow + 700;
+    });
+
+    try {
+      const repoRecords = new Map<string, EvidenceAssessmentRecord>();
+      const repo = {
+        async saveAssessment(record: EvidenceAssessmentRecord): Promise<void> {
+          repoRecords.set(record.id, { ...record });
+        },
+        async findAssessmentById(id: string): Promise<EvidenceAssessmentRecord | null> {
+          const found = repoRecords.get(id);
+          return found ? { ...found } : null;
+        },
+        async findAssessmentByHead(sha: string): Promise<EvidenceAssessmentRecord | null> {
+          for (const record of repoRecords.values()) {
+            if (record.candidateHeadSha === sha) return { ...record };
+          }
+          return null;
+        },
+      };
+
+      const archiveCalls: unknown[] = [];
+      const archive = {
+        async archiveEvidence(req: { artifactId: string; candidateHeadSha: string; content: string }) {
+          archiveCalls.push(req);
+          return { evidenceRef: `ref-${req.artifactId}`, digest: 'digest-1' };
+        },
+        async readArchivedEvidence(_ref: string) {
+          return 'content';
+        },
+      };
+
+      const spawnCalls: unknown[] = [];
+      const executor = new VerificationExecutorAdapter({
+        allowListedCommands: { [MACOS_PROCEDURE]: '/opt/verify-run.sh' },
+        spawn: (file, args, options) => {
+          spawnCalls.push({ file, args, options });
+          return { status: 0, signal: null, stdout: 'ok', stderr: '' };
+        },
+      });
+
+      const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+      const inspector = new InspectAcceptanceEvidenceUseCase({ repo });
+      const adapter = new MergeVerificationAdapter({ requester: useCase, inspector });
+
+      const deadlineIso = new Date(baseNow + 2_500).toISOString();
+      const triggerResult = await adapter.runVerification(triggerRequest({ deadlineIso }));
+
+      expect(triggerResult).toEqual({
+        outcome: 'unknown',
+        reasonCode: 'budget-exhausted',
+      });
+      expect(archiveCalls).toHaveLength(0);
+      expect(spawnCalls).toHaveLength(0);
+      expect(repoRecords.size).toBe(0);
+
+      const readResult = await adapter.readVerification(
+        readRequest({ deadlineIso: new Date(baseNow + 60_000).toISOString() }),
+      );
+      expect(readResult).toEqual({
+        outcome: 'unknown',
+        reasonCode: 'no-receipt',
+      });
+      expect(readResult.reasonCode).not.toBe('receipt-failed');
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });

@@ -135,7 +135,7 @@ function makeExecutor(answers: Record<string, ScriptedAnswer>) {
 }
 
 function happyAnswers(
-  overrides: Partial<Record<string, ScriptedAnswer>> = {},
+  overrides: Record<string, ScriptedAnswer> = {},
 ): Record<string, ScriptedAnswer> {
   return {
     [PROBE_ARGV.join(' ')]: BARE_TRUE,
@@ -147,7 +147,7 @@ function happyAnswers(
       stderr: '',
     },
     [NEW_PATCH_DIFF_ARGV.join(' ')]: { exitCode: 0, signal: null, stdout: DIFF_OLD_STDOUT, stderr: '' },
-    [PATCH_ID_ARGV.join(' ')]: (options) => {
+    [PATCH_ID_ARGV.join(' ')]: (options?: CommandRunOptions): CommandRunResult => {
       if (options?.input === DIFF_NEW_STDOUT) {
         return { exitCode: 0, signal: null, stdout: `${PATCH_ID_NEW} ${OBJECT_ID}\n`, stderr: '' };
       }

@@ -28,6 +28,8 @@ import { LocalExecutor } from './LocalExecutor.adapter.js';
 const DIGEST_PATTERN = /^[0-9a-f]{12}$/;
 /** Every SHA argument is validated before it can touch argv. */
 const SHA40_PATTERN = /^[0-9a-f]{40}$/;
+/** Wall-clock milliseconds before deadline under which a git command is not started. */
+const MIN_TIMEOUT_MS = 2000;
 
 export interface GitMirrorPatchIdentityAdapterOptions {
   readonly stateDir: string;
@@ -59,13 +61,29 @@ export function deadlineTimeoutMs(deadlineIso: string): number | null {
   return remaining > 0 ? remaining : null;
 }
 
-/** A clean `git diff --patch-id` run: non-empty trimmed stdout, else null. */
+/**
+ * Positive wall-clock milliseconds remaining until `deadlineIso` when at least
+ * 2 seconds remain, or null when invalid, expired or under 2000 ms.
+ */
+export function commandRemainingTimeoutMs(deadlineIso: string): number | null {
+  const remaining = deadlineTimeoutMs(deadlineIso);
+  if (remaining === null || remaining < MIN_TIMEOUT_MS) {
+    return null;
+  }
+  return remaining;
+}
+
+/** A clean `git patch-id --stable` run: extracts the first field, else null. */
 export function parsePatchId(outcome: CommandRunResult): string | null {
   if (outcome.exitCode !== 0 || outcome.signal !== null || outcome.error !== undefined) {
     return null;
   }
   const trimmed = outcome.stdout.trim();
-  return trimmed.length === 0 ? null : trimmed;
+  if (trimmed.length === 0) {
+    return null;
+  }
+  const [first] = trimmed.split(/\s+/);
+  return first !== undefined && first.length > 0 ? first : null;
 }
 
 /** A clean NUL-split `git diff --name-only -z` run, or null on failure. */
@@ -118,6 +136,7 @@ export function carryVerdict(facts: PatchIdentityFacts): {
 function unknownResult(
   oldPatchId: string | null,
   newPatchId: string | null,
+  filesChangedByUpdate: readonly string[] = [],
 ): {
   ok: true;
   carry: false;
@@ -133,7 +152,7 @@ function unknownResult(
     reason: 'unknown',
     oldPatchId,
     newPatchId,
-    filesChangedByUpdate: [],
+    filesChangedByUpdate,
     overlapWithLaneDiff: [],
   };
 }
@@ -160,48 +179,82 @@ export class GitMirrorPatchIdentityAdapter implements PatchIdentityPort {
     ) {
       return { ok: false, reason: 'refused', code: 'bad-sha' };
     }
-    const timeoutMs = deadlineTimeoutMs(request.deadlineIso);
-    if (timeoutMs === null) {
+    if (commandRemainingTimeoutMs(request.deadlineIso) === null) {
       return unknownResult(null, null);
     }
     const mirror = await this.resolveMirror(request.repositoryDigest);
     if (mirror === null) {
       return { ok: false, reason: 'refused', code: 'no-mirror' };
     }
-    if (!(await this.isBareMirror(mirror, timeoutMs))) {
+    const bareStatus = await this.isBareMirror(mirror, request.deadlineIso);
+    if (bareStatus === 'unknown') {
+      return unknownResult(null, null);
+    }
+    if (bareStatus === 'not-bare') {
       return { ok: false, reason: 'refused', code: 'no-mirror' };
     }
-    const oldPatchId = await this.patchId(request.baseSha, request.oldHeadSha, mirror, timeoutMs);
+    const oldPatchId = await this.patchId(
+      request.baseSha,
+      request.oldHeadSha,
+      mirror,
+      request.deadlineIso,
+    );
     if (oldPatchId === null) {
       return unknownResult(null, null);
     }
-    const newPatchId = await this.patchId(request.baseSha, request.newHeadSha, mirror, timeoutMs);
+    const secondParentSha = await this.resolveSecondParent(
+      request.newHeadSha,
+      mirror,
+      request.deadlineIso,
+    );
+    if (secondParentSha === null) {
+      return unknownResult(oldPatchId, null);
+    }
+    const newPatchId = await this.patchId(
+      secondParentSha,
+      request.newHeadSha,
+      mirror,
+      request.deadlineIso,
+    );
     if (newPatchId === null) {
       return unknownResult(oldPatchId, null);
     }
     const filesChangedByUpdate = await this.changedFiles(
-      ['git', 'diff', '--name-only', '-z', request.oldHeadSha, request.newHeadSha],
+      [
+        'git',
+        'diff',
+        '--name-only',
+        '-z',
+        '--no-renames',
+        '--no-ext-diff',
+        '--no-textconv',
+        request.oldHeadSha,
+        request.newHeadSha,
+        '--',
+      ],
       mirror,
-      timeoutMs,
+      request.deadlineIso,
     );
     if (filesChangedByUpdate === null) {
       return unknownResult(oldPatchId, newPatchId);
     }
     const laneDiffFiles = await this.changedFiles(
-      ['git', 'diff', '--name-only', '-z', `${request.baseSha}...${request.oldHeadSha}`],
+      [
+        'git',
+        'diff',
+        '--name-only',
+        '-z',
+        '--no-renames',
+        '--no-ext-diff',
+        '--no-textconv',
+        `${request.baseSha}...${request.oldHeadSha}`,
+        '--',
+      ],
       mirror,
-      timeoutMs,
+      request.deadlineIso,
     );
     if (laneDiffFiles === null) {
-      return {
-        ok: true,
-        carry: false,
-        reason: 'unknown',
-        oldPatchId,
-        newPatchId,
-        filesChangedByUpdate,
-        overlapWithLaneDiff: [],
-      };
+      return unknownResult(oldPatchId, newPatchId, filesChangedByUpdate);
     }
     const overlapWithLaneDiff = intersectPaths(laneDiffFiles, filesChangedByUpdate);
     const verdict = carryVerdict({ oldPatchId, newPatchId, overlapWithLaneDiff });
@@ -218,61 +271,124 @@ export class GitMirrorPatchIdentityAdapter implements PatchIdentityPort {
 
   private async resolveMirror(digest: string): Promise<string | null> {
     const mirrorsRoot = join(this.stateDir, 'mirrors');
-    const candidate = this.mirrorDirOverride ?? join(mirrorsRoot, `${digest}.git`);
+    const expected = join(mirrorsRoot, `${digest}.git`);
+    const candidate = this.mirrorDirOverride ?? expected;
     let rootReal: string;
     let mirrorReal: string;
+    let expectedReal: string;
     try {
       rootReal = await fs.realpath(mirrorsRoot);
       mirrorReal = await fs.realpath(candidate);
+      expectedReal = await fs.realpath(expected);
     } catch {
       return null;
     }
     if (mirrorReal === rootReal || !mirrorReal.startsWith(rootReal + sep)) {
       return null;
     }
+    if (mirrorReal !== expectedReal) {
+      return null;
+    }
     return mirrorReal;
   }
 
-  private async isBareMirror(mirror: string, timeoutMs: number): Promise<boolean> {
+  private async isBareMirror(
+    mirror: string,
+    deadlineIso: string,
+  ): Promise<'bare' | 'not-bare' | 'unknown'> {
     const outcome = await this.runGit(
       ['git', 'rev-parse', '--is-bare-repository'],
       mirror,
-      timeoutMs,
+      deadlineIso,
     );
-    if (outcome.exitCode !== 0 || outcome.signal !== null || outcome.error !== undefined) {
-      return false;
+    if (outcome === null || outcome.signal !== null || outcome.error !== undefined) {
+      return 'unknown';
     }
-    return outcome.stdout.trim() === 'true';
+    if (outcome.exitCode === 0 && outcome.stdout.trim() === 'true') {
+      return 'bare';
+    }
+    return 'not-bare';
+  }
+
+  private async resolveSecondParent(
+    newHeadSha: string,
+    mirror: string,
+    deadlineIso: string,
+  ): Promise<string | null> {
+    const outcome = await this.runGit(
+      ['git', 'rev-parse', `${newHeadSha}^2`],
+      mirror,
+      deadlineIso,
+    );
+    if (
+      outcome === null ||
+      outcome.exitCode !== 0 ||
+      outcome.signal !== null ||
+      outcome.error !== undefined
+    ) {
+      return null;
+    }
+    const trimmed = outcome.stdout.trim();
+    return isValidSha40(trimmed) ? trimmed : null;
   }
 
   private async patchId(
     base: string,
     head: string,
     mirror: string,
-    timeoutMs: number,
+    deadlineIso: string,
   ): Promise<string | null> {
-    const outcome = await this.runGit(
-      ['git', 'diff', '--patch-id', '--stable', `${base}...${head}`],
+    const diffOutcome = await this.runGit(
+      ['git', 'diff', '--no-renames', '--no-ext-diff', '--no-textconv', `${base}...${head}`, '--'],
       mirror,
-      timeoutMs,
+      deadlineIso,
     );
-    return parsePatchId(outcome);
+    if (
+      diffOutcome === null ||
+      diffOutcome.exitCode !== 0 ||
+      diffOutcome.signal !== null ||
+      diffOutcome.error !== undefined
+    ) {
+      return null;
+    }
+    const patchIdOutcome = await this.runGit(
+      ['git', 'patch-id', '--stable'],
+      mirror,
+      deadlineIso,
+      { input: diffOutcome.stdout },
+    );
+    if (patchIdOutcome === null) {
+      return null;
+    }
+    return parsePatchId(patchIdOutcome);
   }
 
   private async changedFiles(
     argv: readonly string[],
     mirror: string,
-    timeoutMs: number,
+    deadlineIso: string,
   ): Promise<readonly string[] | null> {
-    const outcome = await this.runGit(argv, mirror, timeoutMs);
+    const outcome = await this.runGit(argv, mirror, deadlineIso);
+    if (outcome === null) {
+      return null;
+    }
     return parseChangedFilesNul(outcome);
   }
 
   private async runGit(
     argv: readonly string[],
     mirror: string,
-    timeoutMs: number,
-  ): Promise<CommandRunResult> {
-    return this.executor.run(argv, { cwd: mirror, timeoutMs });
+    deadlineIso: string,
+    options?: { readonly input?: string },
+  ): Promise<CommandRunResult | null> {
+    const timeoutMs = commandRemainingTimeoutMs(deadlineIso);
+    if (timeoutMs === null) {
+      return null;
+    }
+    return this.executor.run(argv, {
+      cwd: mirror,
+      timeoutMs,
+      ...(options?.input !== undefined ? { input: options.input } : {}),
+    });
   }
 }

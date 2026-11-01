@@ -12,6 +12,7 @@ import * as path from 'node:path';
 import { GitMirrorPatchIdentityAdapter } from '../GitMirrorPatchIdentityAdapter.adapter.js';
 import {
   carryVerdict,
+  commandRemainingTimeoutMs,
   deadlineTimeoutMs,
   intersectPaths,
   isValidRepositoryDigest,
@@ -30,32 +31,98 @@ const DIGEST = '0123456789ab';
 const BASE = 'a'.repeat(40);
 const OLD_HEAD = 'b'.repeat(40);
 const NEW_HEAD = 'c'.repeat(40);
+const SECOND_PARENT = 'd'.repeat(40);
+const OBJECT_ID = 'e'.repeat(40);
 const PATCH_ID_OLD = '1111111111111111111111111111111111111111';
 const PATCH_ID_NEW = '2222222222222222222222222222222222222222';
+
+const DIFF_OLD_STDOUT =
+  'diff --git a/packages/a.ts b/packages/a.ts\n' +
+  'index 0000000..1111111 100644\n' +
+  '--- a/packages/a.ts\n' +
+  '+++ b/packages/a.ts\n' +
+  '@@ -1 +1 @@\n' +
+  '-old\n' +
+  '+new\n';
+const DIFF_NEW_STDOUT =
+  'diff --git a/packages/a.ts b/packages/a.ts\n' +
+  'index 0000000..2222222 100644\n' +
+  '--- a/packages/a.ts\n' +
+  '+++ b/packages/a.ts\n' +
+  '@@ -1 +1 @@\n' +
+  '-old\n' +
+  '+newer\n';
 
 const BARE_TRUE: CommandRunResult = { exitCode: 0, signal: null, stdout: 'true\n', stderr: '' };
 const BARE_FALSE: CommandRunResult = { exitCode: 0, signal: null, stdout: 'false\n', stderr: '' };
 
 const PROBE_ARGV = ['git', 'rev-parse', '--is-bare-repository'];
-const OLD_PATCH_ARGV = ['git', 'diff', '--patch-id', '--stable', `${BASE}...${OLD_HEAD}`];
-const NEW_PATCH_ARGV = ['git', 'diff', '--patch-id', '--stable', `${BASE}...${NEW_HEAD}`];
-const UPDATE_FILES_ARGV = ['git', 'diff', '--name-only', '-z', OLD_HEAD, NEW_HEAD];
-const LANE_DIFF_ARGV = ['git', 'diff', '--name-only', '-z', `${BASE}...${OLD_HEAD}`];
+const OLD_PATCH_DIFF_ARGV = [
+  'git',
+  'diff',
+  '--no-renames',
+  '--no-ext-diff',
+  '--no-textconv',
+  `${BASE}...${OLD_HEAD}`,
+  '--',
+];
+const RESOLVE_SECOND_PARENT_ARGV = ['git', 'rev-parse', `${NEW_HEAD}^2`];
+const NEW_PATCH_DIFF_ARGV = [
+  'git',
+  'diff',
+  '--no-renames',
+  '--no-ext-diff',
+  '--no-textconv',
+  `${SECOND_PARENT}...${NEW_HEAD}`,
+  '--',
+];
+const PATCH_ID_ARGV = ['git', 'patch-id', '--stable'];
+const UPDATE_FILES_ARGV = [
+  'git',
+  'diff',
+  '--name-only',
+  '-z',
+  '--no-renames',
+  '--no-ext-diff',
+  '--no-textconv',
+  OLD_HEAD,
+  NEW_HEAD,
+  '--',
+];
+const LANE_DIFF_ARGV = [
+  'git',
+  'diff',
+  '--name-only',
+  '-z',
+  '--no-renames',
+  '--no-ext-diff',
+  '--no-textconv',
+  `${BASE}...${OLD_HEAD}`,
+  '--',
+];
 
 interface RecordedRun {
   readonly argv: readonly string[];
   readonly options: CommandRunOptions | undefined;
 }
 
+type ScriptedAnswer =
+  | CommandRunResult
+  | ((options?: CommandRunOptions) => CommandRunResult);
+
 /** A scripted executor that records argv + options and answers by argv string. */
-function makeExecutor(answers: Record<string, CommandRunResult>) {
+function makeExecutor(answers: Record<string, ScriptedAnswer>) {
   const recorded: RecordedRun[] = [];
   const executor: CommandExecutorPort = {
     async run(argv, options) {
       recorded.push({ argv: [...argv], options });
       const key = argv.join(' ');
+      const candidate = answers[key];
+      if (typeof candidate === 'function') {
+        return candidate(options);
+      }
       return (
-        answers[key] ?? {
+        candidate ?? {
           exitCode: 1,
           signal: null,
           stdout: '',
@@ -68,12 +135,24 @@ function makeExecutor(answers: Record<string, CommandRunResult>) {
 }
 
 function happyAnswers(
-  overrides: Partial<Record<string, CommandRunResult>> = {},
-): Record<string, CommandRunResult> {
+  overrides: Partial<Record<string, ScriptedAnswer>> = {},
+): Record<string, ScriptedAnswer> {
   return {
     [PROBE_ARGV.join(' ')]: BARE_TRUE,
-    [OLD_PATCH_ARGV.join(' ')]: { exitCode: 0, signal: null, stdout: PATCH_ID_OLD + '\n', stderr: '' },
-    [NEW_PATCH_ARGV.join(' ')]: { exitCode: 0, signal: null, stdout: PATCH_ID_OLD + '\n', stderr: '' },
+    [OLD_PATCH_DIFF_ARGV.join(' ')]: { exitCode: 0, signal: null, stdout: DIFF_OLD_STDOUT, stderr: '' },
+    [RESOLVE_SECOND_PARENT_ARGV.join(' ')]: {
+      exitCode: 0,
+      signal: null,
+      stdout: SECOND_PARENT + '\n',
+      stderr: '',
+    },
+    [NEW_PATCH_DIFF_ARGV.join(' ')]: { exitCode: 0, signal: null, stdout: DIFF_OLD_STDOUT, stderr: '' },
+    [PATCH_ID_ARGV.join(' ')]: (options) => {
+      if (options?.input === DIFF_NEW_STDOUT) {
+        return { exitCode: 0, signal: null, stdout: `${PATCH_ID_NEW} ${OBJECT_ID}\n`, stderr: '' };
+      }
+      return { exitCode: 0, signal: null, stdout: `${PATCH_ID_OLD} ${OBJECT_ID}\n`, stderr: '' };
+    },
     [UPDATE_FILES_ARGV.join(' ')]: { exitCode: 0, signal: null, stdout: 'docs/b.md\0', stderr: '' },
     [LANE_DIFF_ARGV.join(' ')]: {
       exitCode: 0,
@@ -82,7 +161,7 @@ function happyAnswers(
       stderr: '',
     },
     ...overrides,
-  } as Record<string, CommandRunResult>;
+  };
 }
 
 function request(overrides: Partial<PatchIdentityRequest> = {}): PatchIdentityRequest {
@@ -144,7 +223,7 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
       filesChangedByUpdate: ['docs/b.md'],
       overlapWithLaneDiff: [],
     });
-    expect(recorded).toHaveLength(5);
+    expect(recorded).toHaveLength(8);
   });
 
   it('blocks carry when the update touches a lane file even though the patch id is unchanged', async () => {
@@ -171,7 +250,7 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
       filesChangedByUpdate: ['packages/a.ts', 'docs/b.md'],
       overlapWithLaneDiff: ['packages/a.ts'],
     });
-    expect(recorded).toHaveLength(5);
+    expect(recorded).toHaveLength(8);
   });
 
   it('blocks carry when the patch id changed, even with no file overlap', async () => {
@@ -179,10 +258,10 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
     cleanups.push(fixture.cleanup);
     const { executor } = makeExecutor(
       happyAnswers({
-        [NEW_PATCH_ARGV.join(' ')]: {
+        [NEW_PATCH_DIFF_ARGV.join(' ')]: {
           exitCode: 0,
           signal: null,
-          stdout: PATCH_ID_NEW + '\n',
+          stdout: DIFF_NEW_STDOUT,
           stderr: '',
         },
       }),
@@ -209,7 +288,7 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
       const fixture = await makeStateDir();
       cleanups.push(fixture.cleanup);
       const { executor, recorded } = makeExecutor(
-        happyAnswers({ [OLD_PATCH_ARGV.join(' ')]: { ...BARE_TRUE, ...failure } }),
+        happyAnswers({ [OLD_PATCH_DIFF_ARGV.join(' ')]: { ...BARE_TRUE, ...failure } }),
       );
       const adapter = new GitMirrorPatchIdentityAdapter({ stateDir: fixture.stateDir, executor });
       const result = await adapter.lanePatchIdentity(request());
@@ -222,16 +301,21 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
         filesChangedByUpdate: [],
         overlapWithLaneDiff: [],
       });
-      expect(recorded.map((entry) => entry.argv)).toEqual([PROBE_ARGV, OLD_PATCH_ARGV]);
+      expect(recorded.map((entry) => entry.argv)).toEqual([PROBE_ARGV, OLD_PATCH_DIFF_ARGV]);
     }
   });
 
-  it('returns unknown with the old patch id when the new patch-id run fails', async () => {
+  it('returns unknown with the old patch id when second parent resolution fails', async () => {
     const fixture = await makeStateDir();
     cleanups.push(fixture.cleanup);
     const { executor, recorded } = makeExecutor(
       happyAnswers({
-        [NEW_PATCH_ARGV.join(' ')]: { exitCode: 1, signal: null, stdout: '', stderr: 'boom' },
+        [RESOLVE_SECOND_PARENT_ARGV.join(' ')]: {
+          exitCode: 128,
+          signal: null,
+          stdout: '',
+          stderr: 'fatal: needed a single revision',
+        },
       }),
     );
     const adapter = new GitMirrorPatchIdentityAdapter({ stateDir: fixture.stateDir, executor });
@@ -245,15 +329,20 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
       filesChangedByUpdate: [],
       overlapWithLaneDiff: [],
     });
-    expect(recorded.map((entry) => entry.argv)).toEqual([PROBE_ARGV, OLD_PATCH_ARGV, NEW_PATCH_ARGV]);
+    expect(recorded.map((entry) => entry.argv)).toEqual([
+      PROBE_ARGV,
+      OLD_PATCH_DIFF_ARGV,
+      PATCH_ID_ARGV,
+      RESOLVE_SECOND_PARENT_ARGV,
+    ]);
   });
 
-  it('returns unknown with empty file facts when the update file-fact run fails', async () => {
+  it('returns unknown with the old patch id when the new patch-id run fails', async () => {
     const fixture = await makeStateDir();
     cleanups.push(fixture.cleanup);
     const { executor, recorded } = makeExecutor(
       happyAnswers({
-        [UPDATE_FILES_ARGV.join(' ')]: { exitCode: 128, signal: null, stdout: '', stderr: 'boom' },
+        [NEW_PATCH_DIFF_ARGV.join(' ')]: { exitCode: 1, signal: null, stdout: '', stderr: 'boom' },
       }),
     );
     const adapter = new GitMirrorPatchIdentityAdapter({ stateDir: fixture.stateDir, executor });
@@ -263,44 +352,92 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
       carry: false,
       reason: 'unknown',
       oldPatchId: PATCH_ID_OLD,
-      newPatchId: PATCH_ID_OLD,
+      newPatchId: null,
       filesChangedByUpdate: [],
       overlapWithLaneDiff: [],
     });
     expect(recorded.map((entry) => entry.argv)).toEqual([
       PROBE_ARGV,
-      OLD_PATCH_ARGV,
-      NEW_PATCH_ARGV,
-      UPDATE_FILES_ARGV,
+      OLD_PATCH_DIFF_ARGV,
+      PATCH_ID_ARGV,
+      RESOLVE_SECOND_PARENT_ARGV,
+      NEW_PATCH_DIFF_ARGV,
     ]);
   });
 
+  it('returns unknown with empty file facts when the update file-fact run fails', async () => {
+    const failureModes: Array<Partial<CommandRunResult>> = [
+      { exitCode: 128, signal: null, stdout: '', stderr: 'boom' },
+      { exitCode: null, signal: 'SIGKILL', stdout: '', stderr: '' },
+      { exitCode: null, signal: null, stdout: '', stderr: '', error: 'command timed out' },
+    ];
+    for (const failure of failureModes) {
+      const fixture = await makeStateDir();
+      cleanups.push(fixture.cleanup);
+      const { executor, recorded } = makeExecutor(
+        happyAnswers({
+          [UPDATE_FILES_ARGV.join(' ')]: { ...BARE_TRUE, ...failure },
+        }),
+      );
+      const adapter = new GitMirrorPatchIdentityAdapter({ stateDir: fixture.stateDir, executor });
+      const result = await adapter.lanePatchIdentity(request());
+      expect(result).toEqual({
+        ok: true,
+        carry: false,
+        reason: 'unknown',
+        oldPatchId: PATCH_ID_OLD,
+        newPatchId: PATCH_ID_OLD,
+        filesChangedByUpdate: [],
+        overlapWithLaneDiff: [],
+      });
+      expect(recorded.map((entry) => entry.argv)).toEqual([
+        PROBE_ARGV,
+        OLD_PATCH_DIFF_ARGV,
+        PATCH_ID_ARGV,
+        RESOLVE_SECOND_PARENT_ARGV,
+        NEW_PATCH_DIFF_ARGV,
+        PATCH_ID_ARGV,
+        UPDATE_FILES_ARGV,
+      ]);
+    }
+  });
+
   it('returns unknown with the update facts when the lane-diff file-fact run fails', async () => {
-    const fixture = await makeStateDir();
-    cleanups.push(fixture.cleanup);
-    const { executor, recorded } = makeExecutor(
-      happyAnswers({
-        [LANE_DIFF_ARGV.join(' ')]: { exitCode: 128, signal: null, stdout: '', stderr: 'boom' },
-      }),
-    );
-    const adapter = new GitMirrorPatchIdentityAdapter({ stateDir: fixture.stateDir, executor });
-    const result = await adapter.lanePatchIdentity(request());
-    expect(result).toEqual({
-      ok: true,
-      carry: false,
-      reason: 'unknown',
-      oldPatchId: PATCH_ID_OLD,
-      newPatchId: PATCH_ID_OLD,
-      filesChangedByUpdate: ['docs/b.md'],
-      overlapWithLaneDiff: [],
-    });
-    expect(recorded.map((entry) => entry.argv)).toEqual([
-      PROBE_ARGV,
-      OLD_PATCH_ARGV,
-      NEW_PATCH_ARGV,
-      UPDATE_FILES_ARGV,
-      LANE_DIFF_ARGV,
-    ]);
+    const failureModes: Array<Partial<CommandRunResult>> = [
+      { exitCode: 128, signal: null, stdout: '', stderr: 'boom' },
+      { exitCode: null, signal: 'SIGKILL', stdout: '', stderr: '' },
+      { exitCode: null, signal: null, stdout: '', stderr: '', error: 'command timed out' },
+    ];
+    for (const failure of failureModes) {
+      const fixture = await makeStateDir();
+      cleanups.push(fixture.cleanup);
+      const { executor, recorded } = makeExecutor(
+        happyAnswers({
+          [LANE_DIFF_ARGV.join(' ')]: { ...BARE_TRUE, ...failure },
+        }),
+      );
+      const adapter = new GitMirrorPatchIdentityAdapter({ stateDir: fixture.stateDir, executor });
+      const result = await adapter.lanePatchIdentity(request());
+      expect(result).toEqual({
+        ok: true,
+        carry: false,
+        reason: 'unknown',
+        oldPatchId: PATCH_ID_OLD,
+        newPatchId: PATCH_ID_OLD,
+        filesChangedByUpdate: ['docs/b.md'],
+        overlapWithLaneDiff: [],
+      });
+      expect(recorded.map((entry) => entry.argv)).toEqual([
+        PROBE_ARGV,
+        OLD_PATCH_DIFF_ARGV,
+        PATCH_ID_ARGV,
+        RESOLVE_SECOND_PARENT_ARGV,
+        NEW_PATCH_DIFF_ARGV,
+        PATCH_ID_ARGV,
+        UPDATE_FILES_ARGV,
+        LANE_DIFF_ARGV,
+      ]);
+    }
   });
 
   it('refuses bad-digest before any executor call', async () => {
@@ -395,6 +532,34 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
     expect(recorded.map((entry) => entry.argv)).toEqual([PROBE_ARGV]);
   });
 
+  it('returns unknown with no further calls when the bare probe times out or suffers a signal', async () => {
+    const probeFailures: Array<Partial<CommandRunResult>> = [
+      { exitCode: null, signal: null, stdout: '', stderr: '', error: 'command timed out' },
+      { exitCode: null, signal: 'SIGTERM', stdout: '', stderr: '' },
+    ];
+    for (const failure of probeFailures) {
+      const fixture = await makeStateDir();
+      cleanups.push(fixture.cleanup);
+      const { executor, recorded } = makeExecutor(
+        happyAnswers({
+          [PROBE_ARGV.join(' ')]: { ...BARE_FALSE, ...failure },
+        }),
+      );
+      const adapter = new GitMirrorPatchIdentityAdapter({ stateDir: fixture.stateDir, executor });
+      const result = await adapter.lanePatchIdentity(request());
+      expect(result).toEqual({
+        ok: true,
+        carry: false,
+        reason: 'unknown',
+        oldPatchId: null,
+        newPatchId: null,
+        filesChangedByUpdate: [],
+        overlapWithLaneDiff: [],
+      });
+      expect(recorded.map((entry) => entry.argv)).toEqual([PROBE_ARGV]);
+    }
+  });
+
   it('records only allow-listed git argv with the resolved mirror as cwd', async () => {
     const fixture = await makeStateDir();
     cleanups.push(fixture.cleanup);
@@ -404,8 +569,11 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
     const mirrorReal = await resolvedMirrorDir(fixture.mirrorDir);
     expect(recorded.map((entry) => entry.argv)).toEqual([
       PROBE_ARGV,
-      OLD_PATCH_ARGV,
-      NEW_PATCH_ARGV,
+      OLD_PATCH_DIFF_ARGV,
+      PATCH_ID_ARGV,
+      RESOLVE_SECOND_PARENT_ARGV,
+      NEW_PATCH_DIFF_ARGV,
+      PATCH_ID_ARGV,
       UPDATE_FILES_ARGV,
       LANE_DIFF_ARGV,
     ]);
@@ -413,19 +581,30 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
       expect(entry.options?.cwd).toBe(mirrorReal);
       expect(entry.options?.timeoutMs).toBeGreaterThan(0);
       expect(entry.argv[0]).toBe('git');
-      expect(['rev-parse', 'diff']).toContain(entry.argv[1]);
+      expect(['rev-parse', 'diff', 'patch-id']).toContain(entry.argv[1]);
       if (entry.argv[1] === 'rev-parse') {
-        expect(entry.argv).toEqual(['git', 'rev-parse', '--is-bare-repository']);
+        if (entry.argv[2] === '--is-bare-repository') {
+          expect(entry.argv).toEqual(['git', 'rev-parse', '--is-bare-repository']);
+        } else {
+          expect(entry.argv).toEqual(['git', 'rev-parse', `${NEW_HEAD}^2`]);
+        }
+        continue;
+      }
+      if (entry.argv[1] === 'patch-id') {
+        expect(entry.argv).toEqual(['git', 'patch-id', '--stable']);
+        expect(entry.options?.input).toBeDefined();
         continue;
       }
       const args = entry.argv.slice(2);
-      const flags = args.slice(0, 2);
-      const ranges = args.slice(2);
+      expect(args.at(-1)).toBe('--');
+      const withoutEnd = args.slice(0, -1);
+      const flags = withoutEnd.slice(0, withoutEnd.length <= 3 ? 3 : 5);
+      const ranges = withoutEnd.slice(flags.length);
       expect([
-        ['--patch-id', '--stable'],
-        ['--name-only', '-z'],
+        ['--no-renames', '--no-ext-diff', '--no-textconv'],
+        ['--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv'],
       ]).toContainEqual(flags);
-      for (const arg of args) {
+      for (const arg of withoutEnd) {
         expect(arg).not.toContain(fixture.stateDir);
         expect(arg).not.toContain('worktrees');
         expect(arg).not.toContain('checkout');
@@ -436,7 +615,7 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
     }
   });
 
-  it('uses mirrorDirOverride for tests', async () => {
+  it('uses mirrorDirOverride for tests when pointing to the same mirror', async () => {
     const fixture = await makeStateDir();
     cleanups.push(fixture.cleanup);
     const { executor } = makeExecutor(happyAnswers());
@@ -447,6 +626,23 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
     });
     const result = await adapter.lanePatchIdentity(request());
     expect(result).toMatchObject({ ok: true, carry: true });
+  });
+
+  it('refuses no-mirror when mirrorDirOverride points to another digest mirror', async () => {
+    const fixture = await makeStateDir();
+    cleanups.push(fixture.cleanup);
+    const otherDigest = 'fedcba987654';
+    const otherMirrorDir = path.join(fixture.stateDir, 'mirrors', `${otherDigest}.git`);
+    await fs.mkdir(otherMirrorDir, { recursive: true });
+    const { executor, recorded } = makeExecutor(happyAnswers());
+    const adapter = new GitMirrorPatchIdentityAdapter({
+      stateDir: fixture.stateDir,
+      executor,
+      mirrorDirOverride: otherMirrorDir,
+    });
+    const result = await adapter.lanePatchIdentity(request());
+    expect(result).toEqual({ ok: false, reason: 'refused', code: 'no-mirror' });
+    expect(recorded).toEqual([]);
   });
 
   it('splits file facts on NUL so a path containing a newline survives', async () => {
@@ -508,6 +704,25 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
     });
     expect(recorded).toEqual([]);
   });
+
+  it('returns unknown with no executor call when deadline has under 2 seconds remaining', async () => {
+    const fixture = await makeStateDir();
+    cleanups.push(fixture.cleanup);
+    const { executor, recorded } = makeExecutor(happyAnswers());
+    const adapter = new GitMirrorPatchIdentityAdapter({ stateDir: fixture.stateDir, executor });
+    const underTwoSeconds = new Date(Date.now() + 1_500).toISOString();
+    const result = await adapter.lanePatchIdentity(request({ deadlineIso: underTwoSeconds }));
+    expect(result).toEqual({
+      ok: true,
+      carry: false,
+      reason: 'unknown',
+      oldPatchId: null,
+      newPatchId: null,
+      filesChangedByUpdate: [],
+      overlapWithLaneDiff: [],
+    });
+    expect(recorded).toEqual([]);
+  });
 });
 
 describe('pure decision helpers', () => {
@@ -533,16 +748,31 @@ describe('pure decision helpers', () => {
     expect(deadlineTimeoutMs(new Date(Date.now() + 60_000).toISOString())).toBeGreaterThan(0);
   });
 
-  it('parsePatchId returns trimmed stdout only on a clean run', () => {
-    const clean: CommandRunResult = { exitCode: 0, signal: null, stdout: PATCH_ID_OLD + '\n', stderr: '' };
-    expect(parsePatchId(clean)).toBe(PATCH_ID_OLD);
-    expect(parsePatchId({ ...clean, exitCode: 1 })).toBeNull();
-    expect(parsePatchId({ ...clean, signal: 'SIGTERM' })).toBeNull();
-    expect(parsePatchId({ ...clean, error: 'spawn failed' })).toBeNull();
-    expect(parsePatchId({ ...clean, stdout: '' })).toBeNull();
+  it('commandRemainingTimeoutMs enforces 2000 ms minimum threshold', () => {
+    expect(commandRemainingTimeoutMs('not-a-date')).toBeNull();
+    expect(commandRemainingTimeoutMs(new Date(Date.now() - 5_000).toISOString())).toBeNull();
+    expect(commandRemainingTimeoutMs(new Date(Date.now() + 1_000).toISOString())).toBeNull();
+    expect(commandRemainingTimeoutMs(new Date(Date.now() + 1_999).toISOString())).toBeNull();
+    expect(commandRemainingTimeoutMs(new Date(Date.now() + 60_000).toISOString())).toBeGreaterThan(0);
   });
 
-  it('parseChangedFilesNul splits on NUL only', () => {
+  it('parsePatchId extracts the patch-id from two-field output and handles failures', () => {
+    const twoField: CommandRunResult = {
+      exitCode: 0,
+      signal: null,
+      stdout: `${PATCH_ID_OLD} ${OBJECT_ID}\n`,
+      stderr: '',
+    };
+    expect(parsePatchId(twoField)).toBe(PATCH_ID_OLD);
+    expect(parsePatchId({ ...twoField, stdout: PATCH_ID_OLD + '\n' })).toBe(PATCH_ID_OLD);
+    expect(parsePatchId({ ...twoField, exitCode: 1 })).toBeNull();
+    expect(parsePatchId({ ...twoField, signal: 'SIGTERM' })).toBeNull();
+    expect(parsePatchId({ ...twoField, error: 'spawn failed' })).toBeNull();
+    expect(parsePatchId({ ...twoField, stdout: '' })).toBeNull();
+    expect(parsePatchId({ ...twoField, stdout: '   \t  \n' })).toBeNull();
+  });
+
+  it('parseChangedFilesNul splits on NUL only and handles failures including signal', () => {
     const clean: CommandRunResult = {
       exitCode: 0,
       signal: null,
@@ -551,6 +781,7 @@ describe('pure decision helpers', () => {
     };
     expect(parseChangedFilesNul(clean)).toEqual(['docs/a.md', 'pkg/\nweird.ts']);
     expect(parseChangedFilesNul({ ...clean, exitCode: 128 })).toBeNull();
+    expect(parseChangedFilesNul({ ...clean, signal: 'SIGTERM' })).toBeNull();
     expect(parseChangedFilesNul({ ...clean, error: 'timed out' })).toBeNull();
   });
 

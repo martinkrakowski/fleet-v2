@@ -1317,6 +1317,6 @@ describe('AdvanceLaneRunUseCase review acts scope dispositions (KF-33b2)', () =>
         policyRevision: 'policy-example-1',
       },
     ]);
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'awaiting-premerge' });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'opening-pr' });
   });
 });

@@ -1026,7 +1026,12 @@ function printDryRunAppendedLines(io: CliIo, appended: readonly LaneRunJournalEn
   for (const entry of appended) {
     if (entry.kind === 'intent' && entry.key !== null) {
       const parsed = parseLaneRunKey(entry.key);
-      const step = parsed !== null && parsed.kind === 'step' ? parsed.step : null;
+      let step: string | null = null;
+      if (parsed !== null && parsed.kind === 'step') {
+        step = parsed.step;
+      } else if (parsed !== null && parsed.kind === 'premerge') {
+        step = 'premerge';
+      }
       const result = resultsByKey.get(entry.key);
       io.stdout(
         `${JSON.stringify({

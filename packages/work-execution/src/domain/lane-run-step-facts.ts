@@ -32,6 +32,7 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'pushed', 'forge-refused', 'forge-ambiguous', 'grant-refused', 'merged', 'merge-not-merged', 'merge-waiting',
   'merge-off', 'notice-recorded', 'notice-refused', 'no-in-scope-findings',
   'gate-congested', // KF-30c2: a gate run that exhausted the gate-slot wait limit; the conductor may retry it
+  'premerge-success', 'premerge-failure', 'premerge-overtaken', // KS7a-2: the merge hold's `premerge` commit status
 ] as const;
 export type LaneRunResultReasonCode = (typeof LANE_RUN_RESULT_REASON_CODES)[number];
 
@@ -251,6 +252,46 @@ export function laneRunGateCongestion(
     return null;
   }
   return { retry: latest.retry, atIso: result.recordedAtIso };
+}
+
+const PREMERGE_HEAD12_PATTERN = /^[0-9a-f]{12}$/;
+
+/**
+ * KS7a-2: the latest final result of the run's `premerge` key at `head12`
+ * (`<runId>/r<round>/premerge@<head12>`), as the merging hold reads it. A
+ * final result (outcome not `ambiguous`) whose parsed key is kind `premerge`,
+ * same `runId` and same `head12` maps `premerge-success` → `success`,
+ * `premerge-failure` → `failure`, and `forge-refused` / `grant-refused` (or
+ * any other reason code) → `refused`; the last such result wins. An
+ * `overtaken` result sits on the old head's key, so filtering by `head12`
+ * leaves a new head `'none'`. A null or non-12-hex head12 is `'none'`.
+ */
+export function laneRunPremergePost(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  head12: string | null,
+): 'none' | 'success' | 'failure' | 'refused' {
+  if (typeof head12 !== 'string' || !PREMERGE_HEAD12_PATTERN.test(head12)) {
+    return 'none';
+  }
+  let post: 'none' | 'success' | 'failure' | 'refused' = 'none';
+  for (const entry of entries) {
+    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'premerge' || parsed.head12 !== head12) {
+      continue;
+    }
+    if (entry.reasonCode === 'premerge-success') {
+      post = 'success';
+    } else if (entry.reasonCode === 'premerge-failure') {
+      post = 'failure';
+    } else {
+      post = 'refused';
+    }
+  }
+  return post;
 }
 
 /** The step of the run's latest final step-key result when its outcome is 'refused' and its round is `round`; else null. */

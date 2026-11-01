@@ -4,7 +4,12 @@
  * `reconcile`), the control keys `<runId>/stop@<via>` (graceful) and
  * `<runId>/stop-force@<via>` (force), with via web or cli and the mode read from
  * the key, `<runId>/park/<n>/resume@<via>` (with via web or cli), the request channel's
- * `request/<requestId>`, and the reaper's `reaper/<subjectId>/<kind>@<findingId>`.
+ * `request/<requestId>`, the reaper's `reaper/<subjectId>/<kind>@<findingId>`,
+ * the premerge receipt key `<runId>/r<round>/premerge@<head12>` (KS7a-1, PR #571),
+ * and the `merge/` family: `merge/<repoDigest>/<pr>/<head12>/<action>[/r<n>]`
+ * for one-way actions with proof-gated retry, and
+ * `merge/<repoDigest>/<pr>/<head12>/<action>/a<n>` for two-way actions
+ * (daemon-tick plan §3.3).
  * Pure; builders and the parser never throw and never echo input.
  * `parseLaneRunKey(buildX(…))` always returns the same parts, and building a
  * parsed key returns the same string. K1b's journal refuses a second intent with the
@@ -46,6 +51,26 @@ export type ReaperFindingKind = (typeof REAPER_FINDING_KINDS)[number];
 /** A record id (attempt, reservation, run, attention item) or `wt-<12 hex>` for a worktree: printable ASCII without `/` or `@`, 1–128 characters. */
 export const REAPER_SUBJECT_ID_PATTERN = /^[!-.0-?A-~]{1,128}$/;
 
+/** One-way merge actions (daemon-tick plan §3.3). Stored in merge/ keys; DT1/DT9 share these literals. */
+export const MERGE_KEY_ONE_WAY_ACTIONS = ['merge-pr', 'update-branch', 'post-status'] as const;
+export type MergeKeyOneWayAction = (typeof MERGE_KEY_ONE_WAY_ACTIONS)[number];
+
+/** Two-way merge actions (daemon-tick plan §3.3); keyed with `/a<n>` (1..32). */
+export const MERGE_KEY_TWO_WAY_ACTIONS = ['macos-verify', 'veto'] as const;
+export type MergeKeyTwoWayAction = (typeof MERGE_KEY_TWO_WAY_ACTIONS)[number];
+
+export const MERGE_KEY_ACTIONS = [
+  ...MERGE_KEY_ONE_WAY_ACTIONS,
+  ...MERGE_KEY_TWO_WAY_ACTIONS,
+] as const;
+export type MergeKeyAction = (typeof MERGE_KEY_ACTIONS)[number];
+
+/** Prior final outcomes eligible to mint a proof-gated `/r<n>` retry on a one-way merge key (daemon-tick plan §3.3). */
+export const MERGE_KEY_RETRYABLE_OUTCOMES = ['refused', 'not-started'] as const;
+export type MergeKeyRetryableOutcome = (typeof MERGE_KEY_RETRYABLE_OUTCOMES)[number];
+
+export const MERGE_KEY_TRANSIENT_REFUSAL_REASON = 'forge-error' as const;
+
 const HEAD12_PATTERN = /^[0-9a-f]{12}$/;
 const COMMIT_HEX_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const ROUND_SEGMENT_PATTERN = /^r[0-2]$/;
@@ -53,6 +78,8 @@ const SEAT_INDEX_TEXT_PATTERN = /^(?:0|[1-9][0-9]{0,2})$/;
 const ATTEMPT_SEGMENT_PATTERN = /^a[1-9][0-9]*$/;
 const RETRY_SEGMENT_PATTERN = /^retry[1-9]$/;
 const PARK_ORDINAL_TEXT_PATTERN = /^[1-9][0-9]*$/;
+const MERGE_RETRY_SEGMENT_PATTERN = /^r[1-9]$/;
+const MERGE_REASON_CODE_PATTERN = /^[a-z][a-z0-9-]{0,63}$/;
 
 export interface LaneRunStepKeyParts {
   readonly runId: string;
@@ -62,6 +89,36 @@ export interface LaneRunStepKeyParts {
   readonly attemptOrdinal: number | null; // 1..32; per LANE_RUN_KEY_ATTEMPT_RULE
   readonly head12: string | null;         // 12 lowercase hex; per LANE_RUN_KEY_HEAD_RULE
   readonly retry: number | null;          // 1..9; only for steps outside LANE_RUN_ONE_WAY_STEPS
+}
+
+/**
+ * Read-only reconcile proof required to mint `/r<n>` on a one-way merge key (daemon-tick plan §3.3):
+ * the prior key settled to a final `refused` with reason `'forge-error'` or a final `'not-started'`,
+ * and `postconditionAbsent: true` attests the forge postcondition was observed absent.
+ */
+export interface MergeKeyRetryProof {
+  readonly priorOutcome: string;
+  readonly priorReasonCode?: string | null;
+  readonly postconditionAbsent: boolean;
+}
+
+export interface MergeKeyParts {
+  readonly repoDigest: string;            // 12 lowercase hex
+  readonly pullRequest: number;           // positive safe integer (>= 1), written without leading zeros
+  readonly head12: string;                // 12 lowercase hex
+  readonly action: MergeKeyAction;
+  readonly attemptOrdinal: number | null; // 1..32 on two-way actions; null on one-way actions
+  readonly retry: number | null;          // 1..9 on one-way actions with retryProof; null elsewhere
+  readonly retryProof?: MergeKeyRetryProof | null;
+}
+
+export interface ParsedMergeKeyParts {
+  readonly repoDigest: string;
+  readonly pullRequest: number;
+  readonly head12: string;
+  readonly action: MergeKeyAction;
+  readonly attemptOrdinal: number | null;
+  readonly retry: number | null;
 }
 
 export type ParsedLaneRunKey =
@@ -80,6 +137,7 @@ export type ParsedLaneRunKey =
       readonly round: number;
       readonly head12: string;
     }
+  | ({ readonly kind: 'merge' } & ParsedMergeKeyParts)
   | {
       readonly kind: 'reaper';
       readonly subjectId: string;
@@ -289,6 +347,158 @@ export function laneRunPremergeKey(runId: string, round: number, head12: string)
   return { ok: true, key: runId + '/r' + round + '/premerge@' + head12 };
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function readOwnValue(record: object, key: string): unknown {
+  const descriptor = Reflect.getOwnPropertyDescriptor(record, key);
+  return descriptor === undefined ? undefined : descriptor.value;
+}
+
+function isOneWayMergeAction(action: MergeKeyAction): action is MergeKeyOneWayAction {
+  return (MERGE_KEY_ONE_WAY_ACTIONS as readonly string[]).includes(action);
+}
+
+function isBoundedPositiveInt(value: unknown, max: number): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= max;
+}
+
+function isValidOptionalReasonCode(reasonCode: unknown): boolean {
+  if (reasonCode === undefined || reasonCode === null) {
+    return true;
+  }
+  return typeof reasonCode === 'string' && MERGE_REASON_CODE_PATTERN.test(reasonCode);
+}
+
+function mergeKeyBaseError(parts: ParsedMergeKeyParts): string | null {
+  const { repoDigest, pullRequest, head12, action } = parts;
+  if (typeof repoDigest !== 'string' || !HEAD12_PATTERN.test(repoDigest)) {
+    return 'LaneRun merge key repoDigest must be 12 lowercase hex characters';
+  }
+  if (!Number.isSafeInteger(pullRequest) || pullRequest < 1) {
+    return 'LaneRun merge key pullRequest must be a positive safe integer';
+  }
+  if (typeof head12 !== 'string' || !HEAD12_PATTERN.test(head12)) {
+    return 'LaneRun merge key head must be 12 lowercase hex characters';
+  }
+  if (!(MERGE_KEY_ACTIONS as readonly string[]).includes(action)) {
+    return 'LaneRun merge key action is not a known merge action';
+  }
+  return null;
+}
+
+function mergeKeyOrdinalsError(parts: ParsedMergeKeyParts): string | null {
+  const { action, attemptOrdinal, retry } = parts;
+  if (attemptOrdinal !== null && !isBoundedPositiveInt(attemptOrdinal, LANE_RUN_MAX_ATTEMPTS)) {
+    return 'LaneRun merge key attemptOrdinal must be an integer from 1 to 32';
+  }
+  if (retry !== null && !isBoundedPositiveInt(retry, LANE_RUN_MAX_RETRY)) {
+    return 'LaneRun merge key retry must be an integer from 1 to 9';
+  }
+  if (isOneWayMergeAction(action)) {
+    if (attemptOrdinal !== null) {
+      return 'LaneRun merge key attemptOrdinal is not allowed for a one-way action';
+    }
+    return null;
+  }
+  if (attemptOrdinal === null) {
+    return 'LaneRun merge key attemptOrdinal is required for a two-way action';
+  }
+  if (retry !== null) {
+    return 'LaneRun merge key retry is not allowed for a two-way action';
+  }
+  return null;
+}
+
+function mergeRetryPriorResultError(priorOutcome: unknown, priorReasonCode: unknown): string | null {
+  if (priorOutcome === 'refused') {
+    if (priorReasonCode !== MERGE_KEY_TRANSIENT_REFUSAL_REASON) {
+      return 'LaneRun merge key retry after refused requires priorReasonCode forge-error';
+    }
+    return null;
+  }
+  if (priorOutcome === 'not-started') {
+    if (!isValidOptionalReasonCode(priorReasonCode)) {
+      return 'LaneRun merge key retry priorReasonCode must be a reason token or null';
+    }
+    return null;
+  }
+  return 'LaneRun merge key retry is only allowed after refused forge-error or not-started';
+}
+
+function mergeRetryProofError(retry: number | null, rawProof: unknown): string | null {
+  if (retry === null) {
+    if (rawProof !== undefined && rawProof !== null) {
+      return 'LaneRun merge key retryProof is only allowed when retry is set';
+    }
+    return null;
+  }
+  if (!isPlainObject(rawProof)) {
+    return 'LaneRun merge key retry requires a postcondition-absent proof';
+  }
+  if (readOwnValue(rawProof, 'postconditionAbsent') !== true) {
+    return 'LaneRun merge key retry requires postconditionAbsent to be true';
+  }
+  return mergeRetryPriorResultError(
+    readOwnValue(rawProof, 'priorOutcome'),
+    readOwnValue(rawProof, 'priorReasonCode'),
+  );
+}
+
+function formatMergeKey(parts: ParsedMergeKeyParts): LaneRunKeyResult {
+  let key =
+    'merge/' +
+    parts.repoDigest +
+    '/' +
+    String(parts.pullRequest) +
+    '/' +
+    parts.head12 +
+    '/' +
+    parts.action;
+  if (parts.attemptOrdinal !== null) {
+    key += '/a' + String(parts.attemptOrdinal);
+  }
+  if (parts.retry !== null) {
+    key += '/r' + String(parts.retry);
+  }
+  if (key.length > LANE_RUN_KEY_MAX_LENGTH) {
+    return { ok: false, error: 'LaneRun merge key exceeds maximum length' };
+  }
+  return { ok: true, key };
+}
+
+export function buildMergeKey(parts: MergeKeyParts): LaneRunKeyResult {
+  try {
+    if (!isPlainObject(parts)) {
+      return { ok: false, error: 'LaneRun merge key parts must be a plain object' };
+    }
+    const snapshot: ParsedMergeKeyParts = {
+      repoDigest: readOwnValue(parts, 'repoDigest') as string,
+      pullRequest: readOwnValue(parts, 'pullRequest') as number,
+      head12: readOwnValue(parts, 'head12') as string,
+      action: readOwnValue(parts, 'action') as MergeKeyAction,
+      attemptOrdinal: readOwnValue(parts, 'attemptOrdinal') as number | null,
+      retry: readOwnValue(parts, 'retry') as number | null,
+    };
+    const retryProof = readOwnValue(parts, 'retryProof');
+    const error =
+      mergeKeyBaseError(snapshot) ??
+      mergeKeyOrdinalsError(snapshot) ??
+      mergeRetryProofError(snapshot.retry, retryProof);
+    if (error !== null) {
+      return { ok: false, error };
+    }
+    return formatMergeKey(snapshot);
+  } catch {
+    return { ok: false, error: 'LaneRun merge key parts must be a plain object' };
+  }
+}
+
 function parseStepKeySegments(segments: string[], key: string): ParsedLaneRunKey | null {
   if (!ROUND_SEGMENT_PATTERN.test(segments[1])) {
     return null;
@@ -407,50 +617,113 @@ function parseReaperKeySegments(segments: string[], key: string): ParsedLaneRunK
   return { kind: 'reaper', subjectId: segments[1], findingKind: kind as ReaperFindingKind, findingId };
 }
 
+function readMergeTailOrdinals(
+  action: MergeKeyAction,
+  tail: string | undefined,
+): { readonly attemptOrdinal: number | null; readonly retry: number | null } | null {
+  if (isOneWayMergeAction(action)) {
+    if (tail === undefined) {
+      return { attemptOrdinal: null, retry: null };
+    }
+    if (!MERGE_RETRY_SEGMENT_PATTERN.test(tail)) {
+      return null;
+    }
+    return { attemptOrdinal: null, retry: Number(tail.slice(1)) };
+  }
+  if (tail === undefined || !ATTEMPT_SEGMENT_PATTERN.test(tail)) {
+    return null;
+  }
+  return { attemptOrdinal: Number(tail.slice(1)), retry: null };
+}
+
+function parseMergeKeySegments(segments: string[], key: string): ParsedLaneRunKey | null {
+  if (segments.length !== 5 && segments.length !== 6) {
+    return null;
+  }
+  if (!PARK_ORDINAL_TEXT_PATTERN.test(segments[2])) {
+    return null;
+  }
+  const action = segments[4] as MergeKeyAction;
+  if (!(MERGE_KEY_ACTIONS as readonly string[]).includes(action)) {
+    return null;
+  }
+  const ordinals = readMergeTailOrdinals(action, segments[5]);
+  if (ordinals === null) {
+    return null;
+  }
+  const parts: ParsedMergeKeyParts = {
+    repoDigest: segments[1],
+    pullRequest: Number(segments[2]),
+    head12: segments[3],
+    action,
+    attemptOrdinal: ordinals.attemptOrdinal,
+    retry: ordinals.retry,
+  };
+  if (mergeKeyBaseError(parts) !== null || mergeKeyOrdinalsError(parts) !== null) {
+    return null;
+  }
+  const formatted = formatMergeKey(parts);
+  if (!formatted.ok || formatted.key !== key) {
+    return null;
+  }
+  return { kind: 'merge', ...parts };
+}
+
+function parseRequestKeySegments(segments: string[], key: string): ParsedLaneRunKey | null {
+  const built = requestKey(segments[1]);
+  if (!built.ok || built.key !== key) {
+    return null;
+  }
+  return { kind: 'request', requestId: segments[1] };
+}
+
+function parseResumeKeySegments(segments: string[], key: string): ParsedLaneRunKey | null {
+  if (!PARK_ORDINAL_TEXT_PATTERN.test(segments[2])) {
+    return null;
+  }
+  const atIndex = segments[3].indexOf('@');
+  if (atIndex === -1 || segments[3].indexOf('@', atIndex + 1) !== -1) {
+    return null;
+  }
+  const action = segments[3].slice(0, atIndex);
+  const via = segments[3].slice(atIndex + 1);
+  if (action !== 'resume' || !LANE_RUN_KEY_VIAS.includes(via as LaneRunKeyVia)) {
+    return null;
+  }
+  const parkOrdinal = Number(segments[2]);
+  const built = laneRunResumeKey(segments[0], parkOrdinal, via as LaneRunKeyVia);
+  if (!built.ok || built.key !== key) {
+    return null;
+  }
+  return { kind: 'resume', runId: segments[0], parkOrdinal, via: via as LaneRunKeyVia };
+}
+
 export function parseLaneRunKey(key: unknown): ParsedLaneRunKey | null {
   if (typeof key !== 'string' || key.length > LANE_RUN_KEY_MAX_LENGTH) {
     return null;
   }
   const segments = key.split('/');
-
+  if (segments[0] === 'merge') {
+    return parseMergeKeySegments(segments, key);
+  }
   if (segments.length === 2) {
     if (segments[0] === 'request') {
-      const built = requestKey(segments[1]);
-      return built.ok && built.key === key
-        ? { kind: 'request', requestId: segments[1] }
-        : null;
+      return parseRequestKeySegments(segments, key);
     }
     return parseStopKeySegments(segments, key);
   }
-
   if (segments.length === 3) {
     const premerge = parsePremergeKeySegments(segments, key);
-    return premerge !== null ? premerge : parseReaperKeySegments(segments, key);
+    if (premerge !== null) {
+      return premerge;
+    }
+    return parseReaperKeySegments(segments, key);
   }
-
   if (segments.length === 4 && segments[1] === 'park') {
-    if (!PARK_ORDINAL_TEXT_PATTERN.test(segments[2])) {
-      return null;
-    }
-    const atIndex = segments[3].indexOf('@');
-    if (atIndex === -1 || segments[3].indexOf('@', atIndex + 1) !== -1) {
-      return null;
-    }
-    const action = segments[3].slice(0, atIndex);
-    const via = segments[3].slice(atIndex + 1);
-    if (action !== 'resume' || !LANE_RUN_KEY_VIAS.includes(via as LaneRunKeyVia)) {
-      return null;
-    }
-    const parkOrdinal = Number(segments[2]);
-    const built = laneRunResumeKey(segments[0], parkOrdinal, via as LaneRunKeyVia);
-    return built.ok && built.key === key
-      ? { kind: 'resume', runId: segments[0], parkOrdinal, via: via as LaneRunKeyVia }
-      : null;
+    return parseResumeKeySegments(segments, key);
   }
-
   if (segments.length === 4 || segments.length === 5) {
     return parseStepKeySegments(segments, key);
   }
-
   return null;
 }

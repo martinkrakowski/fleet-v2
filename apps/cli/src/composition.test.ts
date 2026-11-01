@@ -5,7 +5,10 @@ import {
   consumptionId,
   observationEventKind,
   assessmentIdForAttempt,
+  buildGhChildEnvironment,
 } from './composition.js';
+import { buildMergeGhChildEnv } from './composition/work-execution-hosts.js';
+import { composeEvidence } from './composition/evidence.js';
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 import type { AttemptRecord, WorkOrderRecord } from '@fleet/work-execution';
 import { nextAttemptRevision } from '@fleet/work-execution';
@@ -562,6 +565,84 @@ describe('apps/cli composition', () => {
     const grant =
       await rt.coordination.coordinationRequestRepository.findRequestByGrantId(grantId);
     expect(grant?.consumptions).toHaveLength(0);
+    });
+  });
+
+  describe('DT6a finding 1: child environment strips ambient gh credentials on merge path', () => {
+    it('buildMergeGhChildEnv removes ambient tokens and sets GH_CONFIG_DIR', () => {
+      const parentEnv: NodeJS.ProcessEnv = {
+        PATH: '/usr/local/bin:/usr/bin',
+        GH_TOKEN: 'ambient-tok-a',
+        GITHUB_TOKEN: 'ambient-tok-b',
+        GH_ENTERPRISE_TOKEN: 'ambient-tok-c',
+        GITHUB_ENTERPRISE_TOKEN: 'ambient-tok-d',
+        CUSTOM_VAR: 'preserved-value',
+      };
+      const child = buildMergeGhChildEnv('/state/gh/merge', parentEnv);
+
+      expect(child.GH_CONFIG_DIR).toBe('/state/gh/merge');
+      expect(child.GH_TOKEN).toBeUndefined();
+      expect(child.GITHUB_TOKEN).toBeUndefined();
+      expect(child.GH_ENTERPRISE_TOKEN).toBeUndefined();
+      expect(child.GITHUB_ENTERPRISE_TOKEN).toBeUndefined();
+      expect(child.PATH).toBe('/usr/local/bin:/usr/bin');
+      expect(child.CUSTOM_VAR).toBe('preserved-value');
+    });
+
+    it('buildGhChildEnvironment strips ambient tokens when GH_CONFIG_DIR is present', () => {
+      const parentEnv: NodeJS.ProcessEnv = {
+        PATH: '/usr/bin',
+        GH_TOKEN: 'ambient-token-1',
+        GITHUB_TOKEN: 'ambient-token-2',
+        GH_ENTERPRISE_TOKEN: 'ambient-token-3',
+        GITHUB_ENTERPRISE_TOKEN: 'ambient-token-4',
+      };
+      const child = buildGhChildEnvironment(parentEnv, { GH_CONFIG_DIR: '/state/gh/premerge' });
+
+      expect(child).toBeDefined();
+      expect(child?.GH_CONFIG_DIR).toBe('/state/gh/premerge');
+      expect(child?.GH_TOKEN).toBeUndefined();
+      expect(child?.GITHUB_TOKEN).toBeUndefined();
+      expect(child?.GH_ENTERPRISE_TOKEN).toBeUndefined();
+      expect(child?.GITHUB_ENTERPRISE_TOKEN).toBeUndefined();
+      expect(child?.PATH).toBe('/usr/bin');
+    });
+  });
+
+  describe('DT6a finding 4: timeoutMs is threaded through forgeGhRunner closure to runGhSubprocess', () => {
+    it('passes timeoutMs from forgeRead to runGhSubprocess in composeEvidence', async () => {
+      const calls: Array<{ args: readonly string[]; timeoutMs?: number }> = [];
+      const dummyRunGhSubprocess = async (
+        args: readonly string[],
+        _candidates?: readonly string[],
+        _env?: Record<string, string>,
+        timeoutMs?: number,
+      ) => {
+        calls.push({ args, timeoutMs });
+        return { exitCode: 0, stdout: JSON.stringify({ state: 'OPEN', headRefOid: 'a'.repeat(40) }), stderr: '' };
+      };
+
+      const { forgeRead } = composeEvidence({
+        roleExecutors: {
+          worktree: {} as never,
+          orchestrator: {} as never,
+          verifier: {} as never,
+        },
+        forgeMode: 'github',
+        installationModel: {
+          forge: { mode: 'github', owner: 'fleet', repo: 'fleet-v2' },
+        } as never,
+        coordination: {} as never,
+        runGhSubprocess: dummyRunGhSubprocess,
+      });
+
+      await forgeRead.readPullRequest({
+        ref: { kind: 'number', number: 42 },
+        timeoutMs: 7500,
+      });
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0].timeoutMs).toBe(7500);
     });
   });
 });

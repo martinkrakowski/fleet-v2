@@ -226,7 +226,10 @@ export interface FleetCliRuntimeOptions {
    * reviewed subprocess runner shared with the forge action adapter; tests
    * inject a stub transport here.
    */
-  readonly forgeGhRunner?: (args: readonly string[]) => Promise<GhInvocationResult>;
+  readonly forgeGhRunner?: (
+    args: readonly string[],
+    timeoutMs?: number,
+  ) => Promise<GhInvocationResult>;
   /**
    * Absolute gh locations overriding the fixed defaults (tests only).
    * Production always resolves the reviewed GitHub CLI from
@@ -449,6 +452,28 @@ function isExecutableRegularFile(path: string): boolean {
 const GH_SUBPROCESS_TIMEOUT_MS = 30_000;
 
 /**
+ * Build the child environment for a GitHub CLI subprocess. When `env` sets
+ * `GH_CONFIG_DIR`, ambient token credentials (which gh prefers over hosts.yml)
+ * are stripped so the configured identity authenticates the child.
+ */
+export function buildGhChildEnvironment(
+  ambient: NodeJS.ProcessEnv = process.env,
+  env?: Record<string, string>,
+): NodeJS.ProcessEnv | undefined {
+  if (env === undefined) {
+    return undefined;
+  }
+  const child: NodeJS.ProcessEnv = { ...ambient, ...env };
+  if ('GH_CONFIG_DIR' in env) {
+    delete child.GH_TOKEN;
+    delete child.GITHUB_TOKEN;
+    delete child.GH_ENTERPRISE_TOKEN;
+    delete child.GITHUB_ENTERPRISE_TOKEN;
+  }
+  return child;
+}
+
+/**
  * Run the reviewed GitHub CLI subprocess for the forge adapter. The binary is
  * resolved from fixed absolute locations (S4036), never through PATH; when
  * none is found the invocation rejects so the adapter reports the forge as
@@ -456,12 +481,12 @@ const GH_SUBPROCESS_TIMEOUT_MS = 30_000;
  * invocation resolves with its exit code and captured output; a spawn failure
  * rejects so the adapter reports the outcome as ambiguous for reconciliation
  * instead of guessing. `env` (when provided) is merged over the inherited
- * environment, so a per-kind `GH_CONFIG_DIR` can be set explicitly without
- * losing the rest of the environment; the value is never logged. A timeout
- * that kills the subprocess also rejects: an expired write may have reached
- * the forge, so the adapters report it ambiguous, never as proof of success.
+ * environment, with ambient tokens stripped when `GH_CONFIG_DIR` is set; the
+ * value is never logged. A timeout that kills the subprocess also rejects: an
+ * expired write may have reached the forge, so the adapters report it ambiguous,
+ * never as proof of success.
  */
-function runGhSubprocess(
+export function runGhSubprocess(
   args: readonly string[],
   candidates: readonly string[] = GH_BINARY_CANDIDATES,
   env?: Record<string, string>,
@@ -476,8 +501,9 @@ function runGhSubprocess(
     env?: NodeJS.ProcessEnv;
     timeout?: number;
   } = { encoding: 'utf8', timeout: timeoutMs ?? GH_SUBPROCESS_TIMEOUT_MS };
-  if (env !== undefined) {
-    executionOptions.env = { ...process.env, ...env };
+  const childEnv = buildGhChildEnvironment(process.env, env);
+  if (childEnv !== undefined) {
+    executionOptions.env = childEnv;
   }
   return new Promise((resolve, reject) => {
     execFile(ghBinary, [...applyGhEnvironmentOverrides(args)], executionOptions, (error, stdout, stderr) => {

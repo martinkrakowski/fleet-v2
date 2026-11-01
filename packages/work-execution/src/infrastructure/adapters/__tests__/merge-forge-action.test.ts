@@ -285,7 +285,7 @@ describe('ForgeActionAdapter merge-pass path (MergeForgeActionPort)', () => {
   it('refuses a merge without a merger identity even when GH_CONFIG_DIR is inherited', async () => {
     process.env.GH_CONFIG_DIR = '/inherited/config';
     try {
-      const { adapter, calls } = makeAdapter({
+      const { adapter, calls, requests } = makeAdapter({
         config: { premergeGhConfigDir: PREMERGE_DIR },
       });
       const result = await adapter.performMergeForgeAction(mergeRequest());
@@ -295,9 +295,154 @@ describe('ForgeActionAdapter merge-pass path (MergeForgeActionPort)', () => {
         refusalKind: 'other',
       });
       expect(calls).toHaveLength(0);
+      expect(requests).toHaveLength(0);
     } finally {
       delete process.env.GH_CONFIG_DIR;
     }
+  });
+
+  it('refuses post-status without a premerge identity before reading the head', async () => {
+    const { adapter, calls, requests } = makeAdapter({
+      config: { mergeGhConfigDir: MERGE_DIR },
+    });
+    const result = await adapter.performMergeForgeAction(
+      mergeRequest({
+        kind: 'post-status',
+        status: {
+          context: 'premerge',
+          state: 'success',
+          description: 'pre-merge receipt recorded',
+        },
+      }),
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'no premerge identity is configured',
+      refusalKind: 'other',
+    });
+    expect(calls).toHaveLength(0);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('refuses an unsafe branch name before reading the head or calling gh', async () => {
+    const { adapter, calls, requests } = makeAdapter({
+      config: { mergeGhConfigDir: MERGE_DIR },
+    });
+    const result = await adapter.performMergeForgeAction(
+      mergeRequest({ branchName: '--admin' }),
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Invalid branch name: --admin',
+      refusalKind: 'other',
+    });
+    expect(calls).toHaveLength(0);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('refuses an invalid expected head SHA before reading the head or calling gh', async () => {
+    const { adapter, calls, requests } = makeAdapter({
+      config: { mergeGhConfigDir: MERGE_DIR },
+    });
+    const result = await adapter.performMergeForgeAction(
+      mergeRequest({ expectedHeadSha: 'not-a-valid-sha' }),
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Invalid expected head SHA: not-a-valid-sha',
+      refusalKind: 'other',
+    });
+    expect(calls).toHaveLength(0);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('refuses an invalid repository owner or repo before reading the head', async () => {
+    const { adapter, calls, requests } = makeAdapter({
+      config: { mergeGhConfigDir: MERGE_DIR },
+    });
+    const result = await adapter.performMergeForgeAction(
+      mergeRequest({ repository: { owner: 'bad/owner', repo: REPO } }),
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'Invalid repository owner or repo',
+      refusalKind: 'other',
+    });
+    expect(calls).toHaveLength(0);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('refuses an unpaired status description on post-status before reading the head', async () => {
+    const { adapter, calls, requests } = makeAdapter({
+      config: { premergeGhConfigDir: PREMERGE_DIR },
+    });
+    const result = await adapter.performMergeForgeAction(
+      mergeRequest({
+        kind: 'post-status',
+        status: {
+          context: 'premerge',
+          state: 'success',
+          description: 'arbitrary description phrase',
+        },
+      }),
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'status description does not match its state',
+      refusalKind: 'other',
+    });
+    expect(calls).toHaveLength(0);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('refuses an unparseable deadline before any call', async () => {
+    const { adapter, calls, requests } = makeAdapter({
+      config: { mergeGhConfigDir: MERGE_DIR },
+    });
+    const result = await adapter.performMergeForgeAction(
+      mergeRequest({ deadlineIso: 'not-a-valid-iso-date' }),
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'unparseable deadline',
+      refusalKind: 'other',
+    });
+    expect(calls).toHaveLength(0);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('reports ambiguous with head-could-not-be-read when update-branch re-reads never answer', async () => {
+    const { adapter, calls, requests } = makeAdapter({
+      reader: [
+        foundSnapshot(),
+        { outcome: 'unavailable', reason: 'read timed out' },
+        { outcome: 'unavailable', reason: 'read timed out' },
+        { outcome: 'unavailable', reason: 'read timed out' },
+      ],
+      config: { mergeGhConfigDir: MERGE_DIR },
+    });
+    const result = await adapter.performMergeForgeAction(mergeRequest({ kind: 'update-branch' }));
+    expect(result).toEqual({
+      outcome: 'ambiguous',
+      reason: 'branch update accepted but the head could not be read',
+    });
+    expect(calls).toHaveLength(1);
+    expect(requests).toHaveLength(4);
+  });
+
+  it('continues update-branch re-reading after an unavailable read and reports the new head', async () => {
+    const { adapter, calls, requests } = makeAdapter({
+      reader: [
+        foundSnapshot(),
+        { outcome: 'unavailable', reason: 'temporary hiccup' },
+        foundSnapshot({ headSha: OTHER_SHA }),
+      ],
+      config: { mergeGhConfigDir: MERGE_DIR },
+    });
+    const result = await adapter.performMergeForgeAction(mergeRequest({ kind: 'update-branch' }));
+    expect(result).toEqual({ outcome: 'executed', headSha: OTHER_SHA });
+    expect(calls).toHaveLength(1);
+    expect(requests).toHaveLength(3);
   });
 
   it('refuses past the deadline without starting any call', async () => {

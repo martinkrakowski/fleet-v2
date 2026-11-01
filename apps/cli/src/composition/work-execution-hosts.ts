@@ -259,11 +259,12 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
       // The merge-pass path routes per-kind gh identities (D-DT8): the
       // premerge poster's config dir for post-status, the merger's for
       // merge-pr and update-branch. Config dir values are never logged.
+      // Ambient token credentials are stripped so GH_CONFIG_DIR authenticates.
       runGh: (args, ghConfigDir, timeoutMs) =>
         runGhSubprocess(
           args,
           ghBinaryCandidates,
-          ghConfigDir === undefined ? undefined : { GH_CONFIG_DIR: ghConfigDir },
+          ghConfigDir === undefined ? undefined : buildMergeGhChildEnv(ghConfigDir),
           timeoutMs,
         ),
       verifyCurrentHeadSha: async (branchName, request) => {
@@ -403,3 +404,30 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     forgeAction,
   };
 }
+
+/**
+ * Build the child environment for a merge-path gh invocation. GH_CONFIG_DIR
+ * is set explicitly, and ambient token credentials (which gh would prefer over
+ * hosts.yml in GH_CONFIG_DIR) are stripped so the configured identity is
+ * always the one that authenticates the call.
+ */
+export function buildMergeGhChildEnv(
+  ghConfigDir: string,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const child: Record<string, string> = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (
+      value !== undefined &&
+      key !== 'GH_TOKEN' &&
+      key !== 'GITHUB_TOKEN' &&
+      key !== 'GH_ENTERPRISE_TOKEN' &&
+      key !== 'GITHUB_ENTERPRISE_TOKEN'
+    ) {
+      child[key] = value;
+    }
+  }
+  child.GH_CONFIG_DIR = ghConfigDir;
+  return child;
+}
+

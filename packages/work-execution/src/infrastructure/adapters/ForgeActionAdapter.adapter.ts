@@ -583,6 +583,14 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     if (statusRefusal !== null) {
       return statusRefusal;
     }
+    const validationRefusal = this.mergeValidationRefusal(request);
+    if (validationRefusal !== null) {
+      return validationRefusal;
+    }
+    const identityRefusal = this.mergeIdentityRefusal(request);
+    if (identityRefusal !== null) {
+      return identityRefusal;
+    }
     const headGuard = await this.mergeReadHeadGuard(request);
     if (headGuard !== null) {
       return headGuard;
@@ -604,8 +612,56 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
       }
       return null;
     }
-    if (!('status' in request)) {
+    if (!('status' in request) || request.status === undefined) {
       return this.mergeRefusedOther('status is required for post-status');
+    }
+    if (request.status.context !== 'premerge') {
+      return this.mergeRefusedOther('status context must be premerge');
+    }
+    if (
+      request.status.state !== 'success' &&
+      request.status.state !== 'pending' &&
+      request.status.state !== 'failure'
+    ) {
+      return this.mergeRefusedOther('status state must be success, pending or failure');
+    }
+    if (!pairedDescription(request.status.state, request.status.description)) {
+      return this.mergeRefusedOther('status description does not match its state');
+    }
+    return null;
+  }
+
+  /** Refusal when the per-kind identity config dir is missing; checked before any head read. */
+  private mergeIdentityRefusal(request: MergeForgeActionRequest): MergeForgeActionResult | null {
+    if (request.kind === 'post-status') {
+      if (this.premergeConfigDir() === null) {
+        return this.mergeRefusedOther('no premerge identity is configured');
+      }
+      return null;
+    }
+    if (this.mergeConfigDir() === null) {
+      return this.mergeRefusedOther('no merger identity is configured');
+    }
+    return null;
+  }
+
+  /** Attempt-bound validation mirrored for merge requests before any subprocess or read runs. */
+  private mergeValidationRefusal(request: MergeForgeActionRequest): MergeForgeActionResult | null {
+    if (!Number.isFinite(Date.parse(request.deadlineIso))) {
+      return this.mergeRefusedOther('unparseable deadline');
+    }
+    if (!REPOSITORY_PATTERN.test(request.repository.owner) || !REPOSITORY_PATTERN.test(request.repository.repo)) {
+      return this.mergeRefusedOther('Invalid repository owner or repo');
+    }
+    if (!isSafeBranchName(request.branchName)) {
+      return this.mergeRefusedOther(`Invalid branch name: ${request.branchName}`);
+    }
+    const validSha =
+      request.kind === 'post-status'
+        ? HEX_40_PATTERN.test(request.expectedHeadSha)
+        : isCommitSha(request.expectedHeadSha);
+    if (!validSha) {
+      return this.mergeRefusedOther(`Invalid expected head SHA: ${request.expectedHeadSha}`);
     }
     return null;
   }
@@ -623,7 +679,11 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
   private budgetCallTimeoutMs(
     deadlineIso: string,
   ): { ok: true; timeoutMs: number } | { ok: false; reason: string } {
-    const remainingMs = Date.parse(deadlineIso) - Date.parse(this.nowIso());
+    const deadlineMs = Date.parse(deadlineIso);
+    if (!Number.isFinite(deadlineMs)) {
+      return { ok: false, reason: 'unparseable deadline' };
+    }
+    const remainingMs = deadlineMs - Date.parse(this.nowIso());
     if (remainingMs <= 0) {
       return { ok: false, reason: 'the deadline passed before the forge action could start' };
     }
@@ -752,7 +812,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     }
     const snapshot = read.pullRequest;
     if (snapshot.state === 'merged') {
-      if (snapshot.headSha.startsWith(request.expectedHeadSha)) {
+      if (isCommitSha(request.expectedHeadSha) && snapshot.headSha.startsWith(request.expectedHeadSha)) {
         return { outcome: 'executed', headSha: request.expectedHeadSha };
       }
       return { outcome: 'ambiguous', reason: 'the pull request merged at a different head' };
@@ -799,20 +859,25 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
       };
     }
     // The PUT is 202 async: re-read the head up to 3 times (plan §3.3).
+    let observedOldHead = false;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const readBudget = this.budgetCallTimeoutMs(request.deadlineIso);
       if (!readBudget.ok) {
-        return { outcome: 'ambiguous', reason: 'branch update accepted but the head is unchanged' };
+        break;
       }
       const read = await this.mergeReadPullRequest(request, readBudget.timeoutMs);
       if (read === null || read.outcome === 'not-found' || read.outcome === 'unavailable') {
-        return { outcome: 'ambiguous', reason: 'branch update accepted but the head is unchanged' };
+        continue;
       }
       if (read.pullRequest.headSha !== request.expectedHeadSha) {
         return { outcome: 'executed', headSha: read.pullRequest.headSha };
       }
+      observedOldHead = true;
     }
-    return { outcome: 'ambiguous', reason: 'branch update accepted but the head is unchanged' };
+    if (observedOldHead) {
+      return { outcome: 'ambiguous', reason: 'branch update accepted but the head is unchanged' };
+    }
+    return { outcome: 'ambiguous', reason: 'branch update accepted but the head could not be read' };
   }
 
   private async runMergePostStatus(

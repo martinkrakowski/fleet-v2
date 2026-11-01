@@ -284,3 +284,82 @@ export function parseConductorPassTraceStateRecord(raw: unknown): ConductorPassT
   const read = readConductorPassTrace(raw);
   return read.ok ? read.record : undefined;
 }
+
+/**
+ * VZ5a: the pass-trace builder. Takes a completed RunConductorPassResult's
+ * structural shape plus the limits the pass honoured, and returns the frozen
+ * record the ring stores. Pure: it never throws, never echoes a value and
+ * drops every field the stored step and record shapes do not allow.
+ */
+export interface ConductorPassTraceLimits {
+  readonly maxActiveRuns: number;
+  readonly passConcurrency: number;
+  readonly dispatchStaggerMs: number;
+}
+
+const LIMIT_KEYS = ['maxActiveRuns', 'passConcurrency', 'dispatchStaggerMs'] as const;
+
+/** The limits must carry exactly the three honoured numbers, nothing else. */
+function isExactLimits(limits: ConductorPassTraceLimits): boolean {
+  if (!isPlainRecord(limits)) {
+    return false;
+  }
+  const keys = Object.keys(limits);
+  return (
+    keys.length === LIMIT_KEYS.length &&
+    keys.every((key) => (LIMIT_KEYS as readonly string[]).includes(key)) &&
+    LIMIT_KEYS.every((key) => typeof limits[key] === 'number' && Number.isFinite(limits[key]))
+  );
+}
+
+/** Structural: a RunConductorPassResult's completed fields fit it without importing application types. */
+export interface ConductorPassTraceInput {
+  readonly passId: string;
+  readonly nowIso: string;
+  readonly holderId: string;
+  readonly halted: boolean;
+  readonly progressed: boolean;
+  readonly runs: readonly {
+    readonly runId: string;
+    readonly outcome: string;
+    readonly steps?: readonly object[];
+    readonly reason?: string;
+  }[];
+  readonly attention: readonly { readonly runId: string; readonly kind: string }[];
+}
+
+export function conductorPassTraceOf(
+  input: ConductorPassTraceInput,
+  limits: ConductorPassTraceLimits,
+): ConductorPassTraceRead {
+  try {
+    if (!isExactLimits(limits)) {
+      return malformed();
+    }
+    const runs = input.runs.map((run) => {
+      if (run.outcome === 'advanced') {
+        return {
+          runId: run.runId,
+          report: {
+            outcome: 'advanced' as const,
+            steps: (run.steps ?? []).slice(0, CONDUCTOR_PASS_TRACE_MAX_STEPS),
+          },
+        };
+      }
+      return { runId: run.runId, report: { outcome: run.outcome, reason: run.reason } };
+    });
+    return readConductorPassTrace({
+      passId: input.passId,
+      nowIso: input.nowIso,
+      holderId: input.holderId,
+      halted: input.halted,
+      progressed: input.progressed,
+      ...limits,
+      runs,
+      attention: input.attention,
+      schemaVersion: CONDUCTOR_PASS_TRACE_SCHEMA_VERSION,
+    });
+  } catch {
+    return { ok: false, reason: 'malformed' };
+  }
+}

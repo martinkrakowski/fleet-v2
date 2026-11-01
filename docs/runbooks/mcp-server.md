@@ -17,8 +17,10 @@ over HTTP.
 Build the server:
 
 ```
-corepack yarn workspace @fleet/mcp build
+corepack yarn build --filter=@fleet/mcp...
 ```
+
+The `--filter=@fleet/mcp...` form is turbo's dependency selector: the workspace and its dependencies build with it, so no `dist/` is left stale.
 
 Start the API on loopback (see the README's API section). Copy the tracked
 example to the per-machine, ignored configuration file:

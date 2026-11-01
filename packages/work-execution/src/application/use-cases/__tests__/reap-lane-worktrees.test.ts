@@ -266,6 +266,7 @@ describe('ReapLaneWorktreesUseCase', () => {
       alreadyRemoved: [],
       refused: [],
       skipped: [],
+      journalFailed: [],
     });
     // The only workspace call is the removal itself; no branch command exists.
     expect(h.calls()).toHaveLength(1);
@@ -299,6 +300,7 @@ describe('ReapLaneWorktreesUseCase', () => {
       alreadyRemoved: [{ runId: RUN_1 }],
       refused: [],
       skipped: [],
+      journalFailed: [],
     });
     expect(h.journal.entries).toHaveLength(0);
   });
@@ -324,6 +326,7 @@ describe('ReapLaneWorktreesUseCase', () => {
       alreadyRemoved: [],
       refused: [],
       skipped: [],
+      journalFailed: [],
     });
     expect(h.calls()).toHaveLength(0);
     expect(h.journal.entries).toHaveLength(0);
@@ -349,6 +352,7 @@ describe('ReapLaneWorktreesUseCase', () => {
       alreadyRemoved: [],
       refused: [],
       skipped: [{ runId: RUN_1, reason }],
+      journalFailed: [],
     });
     expect(h.calls()).toHaveLength(0);
   });
@@ -433,5 +437,53 @@ describe('ReapLaneWorktreesUseCase', () => {
     expect(result.alreadyRemoved.map((entry) => entry.runId)).toEqual([RUN_2]);
     expect(result.refused.map((entry) => entry.runId)).toEqual([runD]);
     expect(result.skipped).toEqual([]);
+  });
+
+  it('reports a failed post-removal journal append per removal and continues the scan', async () => {
+    const h = harness({
+      workOrders: [makeWorkOrder('wo-a')],
+      attempts: [
+        attemptFixture('wo-a', 'attempt-1'),
+        attemptFixture('wo-a', 'attempt-2'),
+      ],
+      runs: [
+        runRecord(RUN_1, 'wo-a', { attemptIds: ['attempt-1'] }),
+        runRecord(RUN_2, 'wo-a', { attemptIds: ['attempt-2'] }),
+      ],
+      journalStates: new Map([
+        [RUN_1, 'merged'],
+        [RUN_2, 'merged'],
+      ]),
+    });
+    // The primary completed append throws for every removal; RUN_2's fallback
+    // ambiguous append throws too, yet the scan still finishes.
+    const originalAppend = h.journal.appendJournalEntry;
+    h.journal.appendJournalEntry = async (entry) => {
+      if (entry.status === 'completed' || entry.attemptId === 'attempt-2') {
+        throw new Error('journal write failed');
+      }
+      await originalAppend(entry);
+    };
+    const result = await reap(h, { dryRun: false });
+    expect(result.removed).toEqual([
+      { runId: RUN_1, branchTip: COMMIT },
+      { runId: RUN_2, branchTip: COMMIT },
+    ]);
+    expect(result.journalFailed).toEqual([
+      { runId: RUN_1, attemptId: 'attempt-1', branchTip: COMMIT, reason: 'journal write failed' },
+      { runId: RUN_2, attemptId: 'attempt-2', branchTip: COMMIT, reason: 'journal write failed' },
+    ]);
+    // The best-effort ambiguous fallback records RUN_1's failure reason; RUN_2's
+    // fallback also threw, so no ambiguous entry exists for it.
+    const ambiguous = h.journal.entries.filter((entry) => entry.status === 'ambiguous');
+    expect(ambiguous).toHaveLength(1);
+    expect(ambiguous[0]).toMatchObject({
+      attemptId: 'attempt-1',
+      workOrderId: 'wo-a',
+      action: 'collect',
+      status: 'ambiguous',
+      sessionId: null,
+    });
+    expect(ambiguous[0]!.detail).toContain('journal write failed');
   });
 });

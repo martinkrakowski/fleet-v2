@@ -29,8 +29,10 @@ import type {
 } from '../../application/ports/out/ConductorHaltPort.out-port.js';
 import {
   StateFileUnreadableError,
+  StateFileUnreadableReadOnlyError,
+  assertStoreWritable,
   inspectRecordListBytes,
-  quarantineUnreadable,
+  rejectUnreadableStateFile,
   withFileLock,
   writeJsonAtomically,
 } from './file-store.js';
@@ -39,6 +41,8 @@ export interface ConductorHaltAdapterOptions {
   /** When set, the halt marker persists here and reloads on first use. */
   readonly stateDir?: string;
   readonly fileName?: string;
+  /** Read-only mode: an unreadable marker reads as `unreadable` without quarantining or writing. */
+  readonly readOnly?: boolean;
 }
 
 const DEFAULT_FILE_NAME = 'conductor-halt.json';
@@ -101,7 +105,10 @@ export class ConductorHaltAdapter implements ConductorHaltPort {
     try {
       return stateOfRecord(currentRecordOf(await this.readRecordsFromDisk(target)));
     } catch (error: unknown) {
-      if (error instanceof StateFileUnreadableError) {
+      if (
+        error instanceof StateFileUnreadableError ||
+        error instanceof StateFileUnreadableReadOnlyError
+      ) {
         return { state: 'unreadable' };
       }
       throw error;
@@ -109,6 +116,7 @@ export class ConductorHaltAdapter implements ConductorHaltPort {
   }
 
   async set(request: { readonly halted: boolean; readonly nowIso: string }): Promise<ConductorHaltSetResult> {
+    assertStoreWritable(this.options?.readOnly === true, 'ConductorHaltAdapter');
     if (!isZonedIsoDateTime(request.nowIso)) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
@@ -191,7 +199,7 @@ export class ConductorHaltAdapter implements ConductorHaltPort {
     }
     const inspection = inspectRecordListBytes(buffer, parseConductorHaltStateRecord);
     if (inspection.status === 'unreadable') {
-      return quarantineUnreadable(target, inspection.detail, buffer);
+      return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
     }
     return inspection.records;
   }

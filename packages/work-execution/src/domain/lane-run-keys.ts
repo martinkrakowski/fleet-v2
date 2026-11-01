@@ -12,8 +12,9 @@
  * (daemon-tick plan §3.3).
  * Pure; builders and the parser never throw and never echo input.
  * `parseLaneRunKey(buildX(…))` always returns the same parts, and building a
- * parsed key returns the same string. K1b's journal refuses a second intent with the
- * same key.
+ * parsed key returns the same string, except a `/r<n>` merge key: its parsed parts
+ * carry no retry proof, so rebuilding one is refused by design. K1b's journal refuses
+ * a second intent with the same key.
  */
 
 import { containsSecretShape } from '@fleet/shared';

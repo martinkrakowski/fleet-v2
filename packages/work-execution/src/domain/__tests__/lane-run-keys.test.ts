@@ -781,6 +781,9 @@ describe('merge keys', () => {
       });
       if (trap === 'get') {
         expect(trapRan).toBe(false);
+        expect(result.ok).toBe(true);
+      } else {
+        expect(result.ok).toBe(false);
       }
       if (!result.ok) {
         expect(result.error).not.toContain('boom');

@@ -54,6 +54,7 @@ export type SpawnVerificationTransport = (
 ) => SpawnedVerificationOutcome;
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+const MIN_REMAINING_BUDGET_MS = 2_000;
 const OUTPUT_SUMMARY_LIMIT = 4000;
 const SHA_PATTERN = /^[0-9a-f]{7,40}$/;
 
@@ -235,6 +236,19 @@ function coverageNote(
   return 'coverage: not read (' + coverage.reason + ')';
 }
 
+/**
+ * `min(normalTimeoutMs, remaining budget)` for a check that may start, or
+ * `null` when under 2 seconds remain (the call is not started). A malformed
+ * deadline never starts a call.
+ */
+function boundedByDeadline(normalTimeoutMs: number, deadlineIso: string): number | null {
+  const remainingMs = Date.parse(deadlineIso) - Date.now();
+  if (!Number.isFinite(remainingMs) || remainingMs < MIN_REMAINING_BUDGET_MS) {
+    return null;
+  }
+  return Math.min(normalTimeoutMs, remainingMs);
+}
+
 function completedReceipt(
   exitCode: number,
   output: string,
@@ -304,11 +318,22 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
     }
 
     const timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const deadlineIso = request.deadlineIso;
+    const boundedTimeoutMs =
+      deadlineIso === undefined ? timeoutMs : boundedByDeadline(timeoutMs, deadlineIso);
+    if (boundedTimeoutMs === null) {
+      return receipt(
+        'unknown',
+        null,
+        'verification check did not start: the remaining budget is under 2 seconds',
+        completedAtIso,
+      );
+    }
 
     const executor = this.options.executor;
     if (executor !== undefined) {
       const executed = await executor.run([resolved.command, ...resolved.args, request.candidateHeadSha], {
-        timeoutMs,
+        timeoutMs: boundedTimeoutMs,
       });
       const output = [executed.stdout, executed.stderr]
         .filter((part) => part.trim().length > 0)
@@ -376,7 +401,7 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
       argv = [...resolved.args, request.candidateHeadSha];
     }
 
-    const execution = spawn(file, argv, { timeout: timeoutMs });
+    const execution = spawn(file, argv, { timeout: boundedTimeoutMs });
 
     if (execution.error !== undefined) {
       const failure = execution.error as NodeJS.ErrnoException;

@@ -680,3 +680,77 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
     expect('coverage' in result).toBe(false);
   });
 });
+
+describe('VerificationExecutorAdapter deadline budget', () => {
+  it('does not start a check when the deadline leaves under 2 seconds', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    const result = await adapter.executeVerificationCheck(
+      checkRequest({ deadlineIso: new Date(Date.now() - 60_000).toISOString() }),
+    );
+
+    expect(result).toMatchObject({ result: 'unknown', exitCode: null });
+    expect(result.outputSummary).toContain('did not start');
+    expect(calls).toEqual([]);
+  });
+
+  it('bounds a started check by the remaining budget', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    const deadlineIso = new Date(Date.now() + 5_000).toISOString();
+    const result = await adapter.executeVerificationCheck(checkRequest({ deadlineIso }));
+
+    expect(result.result).toBe('pass');
+    expect(calls).toHaveLength(1);
+    const timeout = calls[0]?.options.timeout ?? 0;
+    expect(timeout).toBeGreaterThan(0);
+    expect(timeout).toBeLessThan(6_000);
+  });
+
+  it('keeps the configured normal timeout when the deadline is further away', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      timeoutMs: 1_000,
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    const deadlineIso = new Date(Date.now() + 60_000).toISOString();
+    await adapter.executeVerificationCheck(checkRequest({ deadlineIso }));
+
+    expect(calls).toEqual([
+      { file: '/opt/verify-run.sh', args: [HEAD], options: { timeout: 1_000 } },
+    ]);
+  });
+
+  it('bounds the command-executor path by the remaining budget too', async () => {
+    const recorded: Array<{ argv: readonly string[]; options?: { timeoutMs?: number } }> = [];
+    const fake = {
+      async run(argv: readonly string[], options?: { timeoutMs?: number }) {
+        recorded.push({ argv, options });
+        return { exitCode: 0, signal: null, stdout: 'ok\n', stderr: '' };
+      },
+    };
+    const adapter = new VerificationExecutorAdapter({
+      executor: fake,
+      allowListedCommands: { ci: { command: '/opt/verify-run.sh', args: ['--strict'] } },
+    });
+
+    const deadlineIso = new Date(Date.now() + 5_000).toISOString();
+    const result = await adapter.executeVerificationCheck(checkRequest({ deadlineIso }));
+
+    expect(result.result).toBe('pass');
+    expect(recorded).toHaveLength(1);
+    const timeoutMs = recorded[0]?.options?.timeoutMs ?? 0;
+    expect(timeoutMs).toBeGreaterThan(0);
+    expect(timeoutMs).toBeLessThan(6_000);
+  });
+});

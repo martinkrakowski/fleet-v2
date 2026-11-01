@@ -38,6 +38,13 @@ function isNonEmptyTrimmedString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+const MIN_REMAINING_BUDGET_MS = 2_000;
+
+/** Remaining budget between a deadline and the reference now; NaN when malformed. */
+function remainingBudgetMs(deadlineIso: string, nowIso: string): number {
+  return Date.parse(deadlineIso) - Date.parse(nowIso);
+}
+
 /** Replace any earlier receipt for the same procedure, keeping one per check. */
 function mergeReceiptsByProcedure(
   existing: readonly VerificationReceiptRecord[],
@@ -161,10 +168,20 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
     // coverage from any check leaves no archived evidence and no receipt.
     const executions: { procedureName: string; execution: ExecuteVerificationCheckResult }[] = [];
     for (const procedureName of request.requiredChecks) {
+      if (
+        request.deadlineIso !== undefined &&
+        remainingBudgetMs(request.deadlineIso, nowIso) < MIN_REMAINING_BUDGET_MS
+      ) {
+        return {
+          outcome: 'rejected',
+          reason: `Verification budget exhausted before starting check '${procedureName}'`,
+        };
+      }
       const execution = await deps.executor.executeVerificationCheck({
         hostId: request.hostId,
         candidateHeadSha: request.candidateHeadSha,
         procedureName,
+        ...(request.deadlineIso !== undefined ? { deadlineIso: request.deadlineIso } : {}),
       });
       executions.push({ procedureName, execution });
     }

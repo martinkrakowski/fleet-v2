@@ -31,6 +31,7 @@ import type {
 } from '../../domain/execution-records.js';
 import { WorkOrder } from '../../domain/entities/WorkOrder.js';
 import { AUTHORIZED_BY_PATTERN } from '../../domain/auto-merge.js';
+import { BASE_BRANCH_INVALID_MESSAGE, parseBaseBranch } from '../../domain/base-branch.js';
 
 /** A safe branch name, the forge read's rule (KF-5b): one safe git ref, never all digits. */
 function isSafeBranchName(value: unknown): value is string {
@@ -112,6 +113,17 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     // request is untrusted here and refuses before a grant is consumed.
     if (request.branchName !== undefined && !isSafeBranchName(request.branchName)) {
       return { outcome: 'refused', reason: 'branchName must be a safe branch name' };
+    }
+
+    // A requested base branch is only meaningful for push-and-open-pr, and
+    // must parse as `main` or `chain/<lowercase-dashes>` before a grant is
+    // consumed (CB-D2).
+    if (
+      request.kind === 'push-and-open-pr' &&
+      request.baseBranch !== undefined &&
+      parseBaseBranch(request.baseBranch) === undefined
+    ) {
+      return { outcome: 'refused', reason: BASE_BRANCH_INVALID_MESSAGE };
     }
 
     // post-status has no default branch: it posts the receipt of the run's
@@ -258,11 +270,13 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         // applies to it.
         branchName: request.branchName ?? `feat/${workOrder.laneId}`,
         // Title/body are forwarded only when opening a PR; push-to-pr and
-        // merge never carry them (K6-2).
+        // merge never carry them (K6-2). The PR base branch (CB-D2) is
+        // forwarded the same way.
         ...(request.kind === 'push-and-open-pr'
           ? {
               ...(request.title !== undefined ? { title: request.title } : {}),
               ...(request.body !== undefined ? { body: request.body } : {}),
+              ...(request.baseBranch !== undefined ? { baseBranch: request.baseBranch } : {}),
             }
           : {}),
         // The status body is forwarded only for post-status.

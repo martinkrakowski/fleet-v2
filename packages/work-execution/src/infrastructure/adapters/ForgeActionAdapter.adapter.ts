@@ -27,6 +27,7 @@ import type {
   ReadPullRequestResult,
 } from '../../application/ports/out/ForgeReadPort.out-port.js';
 import type { ForgeRefusalKind } from '../../domain/coordination-keys.js';
+import { parseBaseBranch } from '../../domain/base-branch.js';
 
 /** Result of one reviewed gh invocation. */
 export interface GhInvocationResult {
@@ -440,12 +441,20 @@ export class ForgeActionAdapter implements ForgeActionPort {
     runGh: (args: readonly string[]) => Promise<GhInvocationResult>,
     request: ForgeActionRequest,
   ): Promise<ForgeActionResult> {
+    // CB-D2: the PR base follows the run's base branch when the request
+    // carries one; an unparsable base refuses before `gh` runs.
+    const baseBranch = request.baseBranch === undefined ? undefined : parseBaseBranch(request.baseBranch);
+    if (request.baseBranch !== undefined && baseBranch === undefined) {
+      return refusedOther('Invalid base branch');
+    }
+    const baseArgs = baseBranch === undefined ? [] : ['--base', baseBranch];
     const args = [
       'pr',
       'create',
       ...this.repositoryArgs(),
       '--head',
       request.branchName,
+      ...baseArgs,
       '--title',
       request.title ?? `Fleet work order ${request.workOrderId}`,
       '--body',

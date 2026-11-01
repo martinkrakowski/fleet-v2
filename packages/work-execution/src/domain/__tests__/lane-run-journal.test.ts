@@ -273,6 +273,27 @@ describe('detail (KF-14a)', () => {
     expect(read.entry.detail).toBe('route-no-auth-file');
   });
 
+  it('round-trips a result entry carrying a chain base branch detail (CB-D2)', () => {
+    const entry = result(STEP_KEY, 'completed', { detail: 'chain/example' });
+    const read = readLaneRunJournalEntry(entry);
+    expect(read.ok).toBe(true);
+    if (!read.ok) {
+      return;
+    }
+    expect(read.entry).toEqual(entry);
+    expect(read.entry.detail).toBe('chain/example');
+  });
+
+  it('round-trips a result entry carrying a main base branch detail (CB-D2)', () => {
+    const entry = result(STEP_KEY, 'completed', { detail: 'main' });
+    const read = readLaneRunJournalEntry(entry);
+    expect(read.ok).toBe(true);
+    if (!read.ok) {
+      return;
+    }
+    expect(read.entry.detail).toBe('main');
+  });
+
   it('refuses a detail on an intent or conduct entry, like a reason code (KF-14a review)', () => {
     const intentEntry = { ...result(STEP_KEY, 'completed', { detail: null }), kind: 'intent', outcome: null, reasonCode: null, detail: 'route-no-port' };
     const read = readLaneRunJournalEntry(intentEntry);

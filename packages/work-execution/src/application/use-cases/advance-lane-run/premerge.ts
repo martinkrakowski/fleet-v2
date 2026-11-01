@@ -86,7 +86,25 @@ async function refuseKeyedPremerge(
   return appendPremergeResult(ctx, request, decision, 'refused', reasonCode);
 }
 
-/** The grant's acceptance receipt id, read like `runPrPushBody` at the exact head; null refuses the grant. */
+/** The grant's acceptance receipt id. A `fail` hold is authorised by the
+ * re-read FAILED pre-merge receipt itself (its own receipt id, never a
+ * receipts pass); a `wait` or `released` hold is authorised by the receipts
+ * pass (`premergeReceiptIdOf`). Null refuses the grant. */
+function premergeAuthorisationReceiptIdOf(
+  ctx: AdvanceStepContext,
+  latest: { readonly id: string },
+  record: LaneRunRecord,
+  headSha: string,
+  hold: LaneRunMergeHold,
+  receipt: ReviewReceiptOfKind | null,
+): Promise<string | null> {
+  if (hold.kind === 'fail') {
+    return Promise.resolve(receipt === null ? null : receipt.receiptId);
+  }
+  return premergeReceiptIdOf(ctx, latest, record, headSha);
+}
+
+/** The receipts-pass receipt id, read like `runPrPushBody` at the exact head; null refuses the grant. */
 async function premergeReceiptIdOf(
   ctx: AdvanceStepContext,
   latest: { readonly id: string },
@@ -146,7 +164,10 @@ async function premergeVerdictOf(
   }
 }
 
-/** Mint the action id, append the intent (act only), issue the grant and execute the post. */
+/** Mint the action id, append the intent (act only), issue the grant and
+ * execute the post. The `wait` and `released` posts are authorised by the
+ * receipts pass (`premergeReceiptIdOf`); the `fail` post is authorised by the
+ * failed pre-merge receipt itself (`premergeAuthorisationReceiptIdOf`). */
 async function postPremerge(
   ctx: AdvanceStepContext,
   record: LaneRunRecord,
@@ -275,7 +296,7 @@ export async function performPremerge(
     }
     return appendPremergeResult(ctx, request, decision, 'ambiguous', 'review-unknown');
   }
-  const receiptId = await premergeReceiptIdOf(ctx, latest, record, headSha);
+  const receiptId = await premergeAuthorisationReceiptIdOf(ctx, latest, record, headSha, hold, read.receipt);
   if (receiptId === null) {
     return refuseKeyedPremerge(ctx, request, decision, 'grant-refused');
   }
@@ -356,7 +377,7 @@ export async function reconcilePremerge(
   if (workOrder === null) {
     return { outcome: 'waiting', reason: 'facts-inconsistent' };
   }
-  const receiptId = await premergeReceiptIdOf(ctx, latest, record, headSha);
+  const receiptId = await premergeAuthorisationReceiptIdOf(ctx, latest, record, headSha, hold, read.receipt);
   if (receiptId === null) {
     return appendPremergeResult(ctx, request, decision, 'refused', 'grant-refused');
   }

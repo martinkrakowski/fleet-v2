@@ -267,6 +267,14 @@ async function makeHarness(
     acceptanceAssessment: {
       assessHeadAcceptance: async () => ({ outcome: 'accepted', receiptId: RECEIPT_ID, assessedHeadSha: COMMIT }),
       assessHeadReceipts: async (_request) => {
+        if (
+          receiptAnswer !== 'throw' &&
+          receiptAnswer.outcome === 'found' &&
+          receiptAnswer.receipt.kind === 'pre-merge' &&
+          receiptAnswer.receipt.verdict === 'failed'
+        ) {
+          return { outcome: 'rejected', reason: 'review-blocker' };
+        }
         if (receiptsAnswer === 'throw') {
           throw new Error('receipts assessment unavailable');
         }
@@ -534,6 +542,8 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
       result: 'completed',
       reasonCode: 'premerge-failure',
     });
+    expect(harness.grantRequests).toHaveLength(1);
+    expect(harness.grantRequests[0]!.acceptanceReceiptId).toBe('pm-example-2');
     expect(harness.forgeRequests).toHaveLength(1);
     expect(harness.forgeRequests[0]!.status).toEqual({
       context: 'premerge',
@@ -625,5 +635,21 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
       state: 'success',
       description: 'not required for tier 1',
     });
+  });
+
+  it('test 9: a released hold with a rejected receipts assessment still refuses with grant-refused', async () => {
+    const harness = await mergingHarness();
+    harness.setReceiptAnswer(passedReceipt());
+    harness.setReceiptsAnswer({ outcome: 'rejected', reason: 'review-blocker' });
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'premerge',
+      key: premergeKey(),
+      result: 'refused',
+      reasonCode: 'grant-refused',
+    });
+    expect(harness.forgeRequests).toHaveLength(0);
+    expect(harness.grantRequests).toHaveLength(0);
   });
 });

@@ -127,7 +127,7 @@ describe('work-order rerun (WO-2)', () => {
     ]);
     expect(rerun.code).toBe(2);
     expect(rerun.err).toContain(
-      "work-order rerun needs --yes: it registers wo-rerun-new as a new work order copying wo-rerun-src's project, task, lane, repository, owned paths, policy revision and risk, superseding wo-rerun-src; it starts no run, changes nothing on wo-rerun-src, and the brief is frozen again by conductor start.",
+      "work-order rerun needs --yes: it registers wo-rerun-new as a new work order copying wo-rerun-src's project, task, lane, repository, owned paths, policy revision, risk and base branch, superseding wo-rerun-src; it starts no run, changes nothing on wo-rerun-src, and the brief is frozen again by conductor start.",
     );
 
     const inspected = await inspectWorkOrder(runtime, 'wo-rerun-new');

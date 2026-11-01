@@ -284,3 +284,64 @@ export function parseConductorPassTraceStateRecord(raw: unknown): ConductorPassT
   const read = readConductorPassTrace(raw);
   return read.ok ? read.record : undefined;
 }
+
+/**
+ * VZ5a: the pass-trace builder. Takes a completed RunConductorPassResult's
+ * structural shape plus the limits the pass honoured, and returns the frozen
+ * record the ring stores. Pure: it never throws, never echoes a value and
+ * drops every field the stored step and record shapes do not allow.
+ */
+export interface ConductorPassTraceLimits {
+  readonly maxActiveRuns: number;
+  readonly passConcurrency: number;
+  readonly dispatchStaggerMs: number;
+}
+
+/** Structural: a RunConductorPassResult's completed fields fit it without importing application types. */
+export interface ConductorPassTraceInput {
+  readonly passId: string;
+  readonly nowIso: string;
+  readonly holderId: string;
+  readonly halted: boolean;
+  readonly progressed: boolean;
+  readonly runs: readonly {
+    readonly runId: string;
+    readonly outcome: string;
+    readonly steps?: readonly object[];
+    readonly reason?: string;
+  }[];
+  readonly attention: readonly { readonly runId: string; readonly kind: string }[];
+}
+
+export function conductorPassTraceOf(
+  input: ConductorPassTraceInput,
+  limits: ConductorPassTraceLimits,
+): ConductorPassTraceRead {
+  try {
+    const runs = input.runs.map((run) => {
+      if (run.outcome === 'advanced') {
+        return {
+          runId: run.runId,
+          report: {
+            outcome: 'advanced' as const,
+            steps: (run.steps ?? []).slice(0, CONDUCTOR_PASS_TRACE_MAX_STEPS),
+          },
+        };
+      }
+      return { runId: run.runId, report: { outcome: run.outcome, reason: run.reason } };
+    });
+    return readConductorPassTrace({
+      schemaVersion: CONDUCTOR_PASS_TRACE_SCHEMA_VERSION,
+      passId: input.passId,
+      nowIso: input.nowIso,
+      holderId: input.holderId,
+      halted: input.halted,
+      progressed: input.progressed,
+      ...limits,
+      runs,
+      attention: input.attention,
+    });
+  } catch {
+    return { ok: false, reason: 'malformed' };
+  }
+}

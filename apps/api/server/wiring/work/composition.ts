@@ -543,6 +543,7 @@ export function createConfiguredWorkComposition(
       acceptancePort,
       artifactPort,
       allowedSeats,
+      computeDigest: sha256HexDigest,
     }),
     executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase({
       attemptRepo,
@@ -567,7 +568,7 @@ export function createConfiguredWorkComposition(
       if (attempt === null) {
         return { outcome: "unknown", reason: `Attempt not found: '${attemptId}'` };
       }
-      return resolveImplementerSeat(attempt, { artifactPort });
+      return resolveImplementerSeat(attempt, { artifactPort, computeDigest: sha256HexDigest });
     },
   };
 }

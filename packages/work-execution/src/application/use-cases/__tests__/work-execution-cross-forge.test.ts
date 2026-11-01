@@ -11,7 +11,8 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { RequestAttemptAcceptanceUseCase } from '../RequestAttemptAcceptanceUseCase.use-case.js';
+import { RequestAttemptAcceptanceUseCase, resolveImplementerSeat } from '../RequestAttemptAcceptanceUseCase.use-case.js';
+import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import { ExecuteAuthorizedForgeActionUseCase } from '../ExecuteAuthorizedForgeActionUseCase.use-case.js';
 import { AcceptanceAssessmentAdapter } from '../../../infrastructure/adapters/AcceptanceAssessmentAdapter.adapter.js';
 import { ActionAuthorizationAdapter } from '../../../infrastructure/adapters/ActionAuthorizationAdapter.adapter.js';
@@ -76,6 +77,14 @@ const FIXED_NOW = '2026-10-15T08:00:00.000Z';
 const LANE_ID = 'wk-p4-cross-forge';
 /** The seat the frozen manifest dispatched this attempt on. */
 const SEAT_MODEL = 'nvidia/z-ai/glm-5.3';
+/** The seatless attempt's frozen brief prose and manifest (SEC-5b-3). */
+const FROZEN_PROSE = '# Frozen brief\n';
+const FROZEN_BRIEF_PATH = '/tmp/opencode/lanes/attempt-1/.lane/brief.md';
+const FROZEN_MANIFEST_PATH = '/tmp/opencode/lanes/attempt-1/.lane/brief-manifest.json';
+const frozenManifestJson = (model: string): string =>
+  JSON.stringify({ modelAssignment: { model } });
+const frozenDigestFor = (manifestJson: string): string =>
+  simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + manifestJson);
 
 function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
@@ -461,6 +470,8 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const workOrderRepo = new InMemoryWorkOrderRepository([makeWorkOrder()]);
     const manifestReads: string[] = [];
+    const briefReads: string[] = [];
+    const manifestJson = frozenManifestJson('opencode/longcat-2.5-preview-free');
     const readManifest = async (
       _worktreePath: string,
       manifestPath?: string,
@@ -470,17 +481,25 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       if (manifestPath === undefined || !manifestPath.endsWith('.json')) {
         return null;
       }
-      return JSON.stringify({ modelAssignment: { model: 'opencode/longcat-2.5-preview-free' } });
+      return manifestJson;
+    };
+    const readBriefFile = async (
+      _worktreePath: string,
+      briefPath?: string,
+    ): Promise<string | null> => {
+      briefReads.push(briefPath ?? '');
+      return briefPath === undefined || !briefPath.endsWith('.md') ? null : FROZEN_PROSE;
     };
     const seatlessAttempt = makeAttempt({
       runner: null,
-      briefPackagePath: '/tmp/opencode/lanes/attempt-1/.lane/brief.md',
+      briefPackagePath: FROZEN_BRIEF_PATH,
+      briefDigest: frozenDigestFor(manifestJson),
     });
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
       workOrderRepo,
       acceptancePort,
-      artifactPort: { readBriefManifest: readManifest },
+      artifactPort: { readBriefManifest: readManifest, readBriefFile: readBriefFile },
     });
 
     const accepted = await useCase.requestAttemptAcceptance(acceptanceRequest());
@@ -490,14 +509,14 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       candidateHeadSha: HEAD_SHA,
       receiptId: 'receipt-1',
     });
-    expect(manifestReads).toContain('/tmp/opencode/lanes/attempt-1/.lane/brief-manifest.json');
+    expect(manifestReads).toContain(FROZEN_MANIFEST_PATH);
 
     // The same manifest seat refuses its own reviewer on another provider.
     const sameFamily = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
       workOrderRepo,
       acceptancePort: new FakeAcceptanceAssessment(),
-      artifactPort: { readBriefManifest: readManifest },
+      artifactPort: { readBriefManifest: readManifest, readBriefFile: readBriefFile },
     });
 
     const refused = await sameFamily.requestAttemptAcceptance(
@@ -522,6 +541,7 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       ]),
       acceptancePort,
       artifactPort: {
+        readBriefFile: async () => '# Frozen brief\n',
         readBriefManifest: async (_worktreePath: string, manifestPath?: string) => {
           manifestReads.push(manifestPath ?? '');
           // A worker-writable worktree manifest would happily "confirm" any seat.
@@ -535,12 +555,270 @@ describe('RequestAttemptAcceptanceUseCase', () => {
 
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
-    expect(result.outcome).toBe('rejected');
-    expect(result.outcome === 'rejected' && result.reason).toBe(
-      "Attempt attempt-1 records no implementer seat: neither the dispatched runner model nor the frozen brief manifest's model assignment is known",
-    );
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+    });
     expect(manifestReads).not.toContain('.lane/brief-manifest.json');
     expect(acceptancePort.requests).toHaveLength(0);
+  });
+
+  it('rejects a tampered frozen manifest and never reaches the assessment', async () => {
+    const acceptancePort = new FakeAcceptanceAssessment();
+    const workOrderRepo = new InMemoryWorkOrderRepository([makeWorkOrder()]);
+    // The recorded digest covers prose + '\n' + the ORIGINAL manifest whose
+    // model assignment matches the reviewer's family; on disk the manifest
+    // was rewritten to a different seat.
+    const originalManifestJson = frozenManifestJson('openrouter/anthropic/claude-sonnet-4.5');
+    const rewrittenManifestJson = frozenManifestJson('opencode/longcat-2.5-preview-free');
+    const seatlessAttempt = makeAttempt({
+      runner: null,
+      briefPackagePath: FROZEN_BRIEF_PATH,
+      briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + originalManifestJson),
+    });
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
+      workOrderRepo,
+      acceptancePort,
+      artifactPort: {
+        readBriefFile: async () => FROZEN_PROSE,
+        readBriefManifest: async () => rewrittenManifestJson,
+      },
+    });
+
+    const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+    });
+    expect(acceptancePort.requests).toHaveLength(0);
+    const storedOrder = await workOrderRepo.findWorkOrderById('wo-1');
+    expect(storedOrder?.state).toBe('verifying');
+    expect(workOrderRepo.saved).toHaveLength(0);
+
+    const seat = await resolveImplementerSeat(seatlessAttempt, {
+      artifactPort: {
+        readBriefFile: async () => FROZEN_PROSE,
+        readBriefManifest: async () => rewrittenManifestJson,
+      },
+    });
+    expect(seat).toEqual({
+      outcome: 'unknown',
+      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+    });
+  });
+
+  it('rejects a tampered frozen brief prose file', async () => {
+    const acceptancePort = new FakeAcceptanceAssessment();
+    const manifestJson = frozenManifestJson('opencode/longcat-2.5-preview-free');
+    const seatlessAttempt = makeAttempt({
+      runner: null,
+      briefPackagePath: FROZEN_BRIEF_PATH,
+      briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + manifestJson),
+    });
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
+      acceptancePort,
+      artifactPort: {
+        readBriefFile: async () => '# Altered brief prose\n',
+        readBriefManifest: async () => manifestJson,
+      },
+    });
+
+    const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+    });
+    expect(acceptancePort.requests).toHaveLength(0);
+  });
+
+  it('rejects when the frozen manifest or prose is missing on disk', async () => {
+    const manifestJson = frozenManifestJson('opencode/longcat-2.5-preview-free');
+    const seatlessAttempt = makeAttempt({
+      runner: null,
+      briefPackagePath: FROZEN_BRIEF_PATH,
+      briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + manifestJson),
+    });
+    const missingManifestPort = new FakeAcceptanceAssessment();
+    const missingProsePort = new FakeAcceptanceAssessment();
+    const missingManifest = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
+      acceptancePort: missingManifestPort,
+      artifactPort: {
+        readBriefFile: async () => FROZEN_PROSE,
+        readBriefManifest: async () => null,
+      },
+    });
+    const missingProse = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
+      acceptancePort: missingProsePort,
+      artifactPort: {
+        readBriefFile: async () => null,
+        readBriefManifest: async () => manifestJson,
+      },
+    });
+
+    const noManifest = await missingManifest.requestAttemptAcceptance(acceptanceRequest());
+    const noProse = await missingProse.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(noManifest).toEqual({
+      outcome: 'rejected',
+      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+    });
+    expect(noProse).toEqual({
+      outcome: 'rejected',
+      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+    });
+    expect(missingManifestPort.requests).toHaveLength(0);
+    expect(missingProsePort.requests).toHaveLength(0);
+  });
+
+  it('fails closed on a missing or empty briefDigest or a port without readBriefFile', async () => {
+    const manifestReads: string[] = [];
+    const acceptancePort = new FakeAcceptanceAssessment();
+    const artifactPort = {
+      readBriefManifest: async (_worktreePath: string, manifestPath?: string) => {
+        manifestReads.push(manifestPath ?? '');
+        return frozenManifestJson('opencode/longcat-2.5-preview-free');
+      },
+    };
+    const seatless = (briefDigest: string | null) =>
+      makeAttempt({
+        runner: null,
+        briefPackagePath: FROZEN_BRIEF_PATH,
+        briefDigest,
+      });
+    const cases = [
+      new RequestAttemptAcceptanceUseCase({
+        attemptRepo: new InMemoryAttemptRepository([seatless(null)]),
+        acceptancePort,
+        artifactPort,
+      }),
+      new RequestAttemptAcceptanceUseCase({
+        attemptRepo: new InMemoryAttemptRepository([seatless('')]),
+        acceptancePort,
+        artifactPort,
+      }),
+      new RequestAttemptAcceptanceUseCase({
+        attemptRepo: new InMemoryAttemptRepository([seatless('digest-1')]),
+        acceptancePort,
+        artifactPort: { readBriefManifest: artifactPort.readBriefManifest },
+      }),
+    ];
+
+    for (const useCase of cases) {
+      await expect(useCase.requestAttemptAcceptance(acceptanceRequest())).resolves.toEqual({
+        outcome: 'rejected',
+        reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+      });
+    }
+    expect(manifestReads).toHaveLength(0);
+    expect(acceptancePort.requests).toHaveLength(0);
+  });
+
+  it('fails closed on a throwing manifest read or non-object manifest JSON', async () => {
+    const manifestJson = frozenManifestJson('opencode/longcat-2.5-preview-free');
+    const seatlessAttempt = makeAttempt({
+      runner: null,
+      briefPackagePath: FROZEN_BRIEF_PATH,
+      briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + manifestJson),
+    });
+    const throwing = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
+      acceptancePort: new FakeAcceptanceAssessment(),
+      artifactPort: {
+        readBriefFile: async () => FROZEN_PROSE,
+        readBriefManifest: async () => {
+          throw new Error('manifest read failed');
+        },
+      },
+    });
+    const notAnObject = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([
+        makeAttempt({
+          runner: null,
+          briefPackagePath: FROZEN_BRIEF_PATH,
+          briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + '[]'),
+        }),
+      ]),
+      acceptancePort: new FakeAcceptanceAssessment(),
+      artifactPort: {
+        readBriefFile: async () => FROZEN_PROSE,
+        readBriefManifest: async () => '[]',
+      },
+    });
+
+    const thrownResult = await throwing.requestAttemptAcceptance(acceptanceRequest());
+    const arrayResult = await notAnObject.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(thrownResult).toEqual({
+      outcome: 'rejected',
+      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+    });
+    expect(arrayResult).toEqual({
+      outcome: 'rejected',
+      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+    });
+  });
+
+  it('rejects a verified manifest that carries no model assignment', async () => {
+    const acceptancePort = new FakeAcceptanceAssessment();
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([
+        makeAttempt({
+          runner: null,
+          briefPackagePath: FROZEN_BRIEF_PATH,
+          briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + '{}'),
+        }),
+      ]),
+      acceptancePort,
+      artifactPort: {
+        readBriefFile: async () => FROZEN_PROSE,
+        readBriefManifest: async () => '{}',
+      },
+    });
+
+    const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: "Attempt attempt-1 records no implementer seat: neither the dispatched runner model nor the frozen brief manifest's model assignment is known",
+    });
+    expect(acceptancePort.requests).toHaveLength(0);
+  });
+
+  it('forwards a custom computeDigest from the dependencies to seat resolution', async () => {
+    const acceptancePort = new FakeAcceptanceAssessment();
+    const workOrderRepo = new InMemoryWorkOrderRepository([makeWorkOrder()]);
+    const manifestJson = frozenManifestJson('opencode/longcat-2.5-preview-free');
+    const customDigest = (content: string): string =>
+      'custom-' + simpleDeterministicHexDigest(content);
+    const seatlessAttempt = makeAttempt({
+      runner: null,
+      briefPackagePath: FROZEN_BRIEF_PATH,
+      briefDigest: customDigest(FROZEN_PROSE + '\n' + manifestJson),
+    });
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
+      workOrderRepo,
+      acceptancePort,
+      artifactPort: {
+        readBriefFile: async () => FROZEN_PROSE,
+        readBriefManifest: async () => manifestJson,
+      },
+      computeDigest: customDigest,
+    });
+
+    const accepted = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(accepted).toEqual({
+      outcome: 'accepted',
+      candidateHeadSha: HEAD_SHA,
+      receiptId: 'receipt-1',
+    });
   });
 
   it('prefers the recorded runner seat over a differing frozen manifest', async () => {

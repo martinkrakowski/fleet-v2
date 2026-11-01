@@ -6,7 +6,7 @@
 
 import { readFileSync } from 'node:fs';
 
-import { SeatPlan, type SeatPlanProps } from '@fleet/work-execution';
+import { SeatPlan, sha256HexDigest, type SeatPlanProps } from '@fleet/work-execution';
 import { resolveImplementerSeat } from '@fleet/work-execution/use-cases';
 import { assessmentIdForAttempt } from '@fleet/evidence-and-acceptance';
 import type { RankingTrialContextFigures, TrialFigure } from '@fleet/brief-knowledge';
@@ -241,6 +241,7 @@ export async function bindImplementerSeat(
   }
   const seat = await resolveImplementerSeat(attempt, {
     artifactPort: runtime.execution.attemptArtifact,
+    computeDigest: sha256HexDigest,
   });
   if (seat.outcome === 'unknown') {
     return { bound: false, rejection: { outcome: 'rejected', reason: seat.reason } };

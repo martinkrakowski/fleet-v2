@@ -3,6 +3,7 @@
  * (E1b). Each parser is the one the store's reader uses.
  */
 import { describeRecordListStore, type StateFileDescriptor } from './file-store.js';
+import { parseConductorPassTraceStateRecord } from '../../domain/conductor-pass-trace.js';
 import { parseAttemptStateRecord } from './AttemptRepositoryAdapter.adapter.js';
 import { parseConductorDriverLeaseStateRecord } from './ConductorDriverLeaseAdapter.adapter.js';
 import { parseConductorHaltStateRecord } from './ConductorHaltAdapter.adapter.js';
@@ -25,4 +26,5 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('conductor-halt.json', parseConductorHaltStateRecord),
   describeRecordListStore('run-journal.json', parseLaneRunJournalStateRecord),
   describeRecordListStore('telemetry-dispositions.json', parseTelemetryDispositionStateRecord),
+  describeRecordListStore('conductor-passes.json', parseConductorPassTraceStateRecord),
 ];

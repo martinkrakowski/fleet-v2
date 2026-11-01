@@ -368,6 +368,35 @@ describe('execution-record-readers: attempt tightening (D6)', () => {
       expect(result.record.usage?.wallSeconds).toBe(0.25);
     }
   });
+
+  it('omits optional attempt fields when their value is undefined', () => {
+    const inputWithUndefined = {
+      ...clone(validAttempt),
+      dispatchRevision: undefined,
+      dispatchedTimeLimitSeconds: undefined,
+      seatOverride: undefined,
+      usage: undefined,
+      seatSelection: undefined,
+      seatPlan: undefined,
+      stopReason: undefined,
+      reviewerSeat: undefined,
+      ownerDecisionReferences: undefined,
+    };
+    const result = readAttemptRecord(inputWithUndefined);
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(Object.hasOwn(result.record, 'dispatchRevision')).toBe(false);
+    expect(Object.hasOwn(result.record, 'dispatchedTimeLimitSeconds')).toBe(false);
+    expect(Object.hasOwn(result.record, 'seatOverride')).toBe(false);
+    expect(Object.hasOwn(result.record, 'usage')).toBe(false);
+    expect(Object.hasOwn(result.record, 'seatSelection')).toBe(false);
+    expect(Object.hasOwn(result.record, 'seatPlan')).toBe(false);
+    expect(Object.hasOwn(result.record, 'stopReason')).toBe(false);
+    expect(Object.hasOwn(result.record, 'reviewerSeat')).toBe(false);
+    expect(Object.hasOwn(result.record, 'ownerDecisionReferences')).toBe(false);
+  });
 });
 
 describe('execution-record-readers: reservation null normalizations', () => {
@@ -490,6 +519,23 @@ describe('execution-record-readers: action journal', () => {
       expect(withSessions.record.observedSessionIds).toEqual(input.observedSessionIds);
     }
   });
+
+  it('omits optional action-journal fields when their value is undefined', () => {
+    const inputWithUndefined = {
+      ...clone(validJournal),
+      stopReason: undefined,
+      observedSessionIds: undefined,
+      authorizedBy: undefined,
+    };
+    const result = readActionJournalEntryRecord(inputWithUndefined);
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(Object.hasOwn(result.record, 'stopReason')).toBe(false);
+    expect(Object.hasOwn(result.record, 'observedSessionIds')).toBe(false);
+    expect(Object.hasOwn(result.record, 'authorizedBy')).toBe(false);
+  });
 });
 
 describe('execution-record-readers: hostile input', () => {
@@ -522,32 +568,54 @@ describe('execution-record-readers: hostile input', () => {
   });
 
   it('refuses throwing getters on nested seatPlan and seat fields without running them', () => {
+    let getterCalls = 0;
+
     const planGetter = clone(validAttempt);
     Object.defineProperty(planGetter.seatPlan, 'version', {
       get() {
+        getterCalls += 1;
         throw new Error('seatPlan getter must never run');
       },
       enumerable: true,
     });
     expect(readAttemptRecord(planGetter)).toEqual({ ok: false, reason: 'malformed' });
+    expect(getterCalls).toBe(0);
 
     const seatGetter = clone(validAttempt);
     Object.defineProperty(seatGetter.seatPlan['first-pass'][0], 'model', {
       get() {
+        getterCalls += 1;
         throw new Error('seat getter must never run');
       },
       enumerable: true,
     });
     expect(readAttemptRecord(seatGetter)).toEqual({ ok: false, reason: 'malformed' });
+    expect(getterCalls).toBe(0);
 
     const indexGetter = clone(validAttempt);
     Object.defineProperty(indexGetter.seatPlan['first-pass'], 0, {
       get() {
+        getterCalls += 1;
         throw new Error('array-index getter must never run');
       },
       enumerable: true,
     });
     expect(readAttemptRecord(indexGetter)).toEqual({ ok: false, reason: 'malformed' });
+    expect(getterCalls).toBe(0);
+
+    const seatProto = {
+      get model() {
+        getterCalls += 1;
+        throw new Error('prototype getter must never run');
+      },
+    };
+    const nonPlainSeat = Object.create(seatProto);
+    nonPlainSeat.id = 's1';
+    nonPlainSeat.tool = 'opencode';
+    const nonPlainAttempt = clone(validAttempt);
+    nonPlainAttempt.seatPlan['first-pass'] = [nonPlainSeat];
+    expect(readAttemptRecord(nonPlainAttempt)).toEqual({ ok: false, reason: 'malformed' });
+    expect(getterCalls).toBe(0);
   });
 
   it('refuses throwing proxy traps without throwing', () => {

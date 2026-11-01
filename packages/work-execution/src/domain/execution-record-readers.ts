@@ -116,6 +116,15 @@ function nullableNonNegativeFinite(snap: Record<string, unknown>, key: string): 
   return value;
 }
 
+function isPlainDataDescriptor(
+  descriptor: PropertyDescriptor | undefined,
+): descriptor is PropertyDescriptor & { value: unknown } {
+  if (descriptor === undefined || !descriptor.enumerable) {
+    return false;
+  }
+  return descriptor.get === undefined && descriptor.set === undefined;
+}
+
 /** An array of strings copied by index through own-property descriptors; getters never run. */
 function copyStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
@@ -124,10 +133,7 @@ function copyStringArray(value: unknown): string[] {
   const copy: string[] = [];
   for (let index = 0; index < value.length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, index);
-    if (descriptor === undefined || !descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
-      malformed();
-    }
-    if (typeof descriptor.value !== 'string') {
+    if (!isPlainDataDescriptor(descriptor) || typeof descriptor.value !== 'string') {
       malformed();
     }
     copy.push(descriptor.value);
@@ -143,10 +149,11 @@ function copyNonEmptyStringArray(value: unknown): string[] {
   const copy: string[] = [];
   for (let index = 0; index < value.length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, index);
-    if (descriptor === undefined || !descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
-      malformed();
-    }
-    if (typeof descriptor.value !== 'string' || descriptor.value.trim().length === 0) {
+    if (
+      !isPlainDataDescriptor(descriptor) ||
+      typeof descriptor.value !== 'string' ||
+      descriptor.value.trim().length === 0
+    ) {
       malformed();
     }
     copy.push(descriptor.value);
@@ -178,32 +185,46 @@ function readExactDataRecord(value: unknown, keys: readonly string[]): Record<st
   return snap;
 }
 
+function copyPlainArray(value: unknown[]): unknown[] {
+  const copy: unknown[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, index);
+    if (!isPlainDataDescriptor(descriptor)) {
+      malformed();
+    }
+    copy.push(deepCopyPlainData(descriptor.value));
+  }
+  return copy;
+}
+
+function copyPlainRecord(value: Record<string, unknown>): Record<string, unknown> {
+  const copy: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string' || key === '__proto__') {
+      malformed();
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!isPlainDataDescriptor(descriptor)) {
+      malformed();
+    }
+    copy[key] = deepCopyPlainData(descriptor.value);
+  }
+  return copy;
+}
+
 /** A descriptor-safe deep copy of a plain data value; accessors and holes are malformed. */
 function deepCopyPlainData(value: unknown): unknown {
   if (Array.isArray(value)) {
-    const copy: unknown[] = [];
-    for (let index = 0; index < value.length; index += 1) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, index);
-      if (descriptor === undefined || !descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
-        malformed();
-      }
-      copy.push(deepCopyPlainData(descriptor.value));
-    }
-    return copy;
+    return copyPlainArray(value);
   }
-  if (typeof value === 'object' && value !== null && isPlainRecordObject(value)) {
-    const copy: Record<string, unknown> = {};
-    for (const key of Reflect.ownKeys(value)) {
-      if (typeof key !== 'string' || key === '__proto__') {
-        malformed();
-      }
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor || !descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
-        malformed();
-      }
-      copy[key] = deepCopyPlainData(descriptor.value);
-    }
-    return copy;
+  if (isPlainRecordObject(value)) {
+    return copyPlainRecord(value);
+  }
+  if (typeof value === 'object' && value !== null) {
+    malformed();
+  }
+  if (typeof value === 'function') {
+    malformed();
   }
   return value;
 }
@@ -226,6 +247,18 @@ const ARTIFACT_KEYS: readonly string[] = [
   'manifestSha256',
 ];
 
+function validateAttemptPriorAttempt(kind: unknown, priorAttemptId: unknown): void {
+  if (priorAttemptId === null) {
+    if (kind === 'fix') {
+      malformed();
+    }
+    return;
+  }
+  if (typeof priorAttemptId !== 'string' || priorAttemptId.trim().length === 0) {
+    malformed();
+  }
+}
+
 /** Validate the attempt's identity and scalar fields; any failure throws. */
 function readAttemptIdentity(snap: Record<string, unknown>): void {
   readRecordId(snap);
@@ -241,20 +274,12 @@ function readAttemptIdentity(snap: Record<string, unknown>): void {
   if (!Number.isSafeInteger(snap.fixNumber) || (snap.fixNumber as number) < 0) {
     malformed();
   }
-  if (snap.priorAttemptId === null) {
-    if (kind === 'fix') {
-      malformed();
-    }
-  } else if (typeof snap.priorAttemptId !== 'string' || (snap.priorAttemptId as string).trim().length === 0) {
-    malformed();
-  }
+  validateAttemptPriorAttempt(kind, snap.priorAttemptId);
   if (!AttemptState.create(snap.state).success) {
     malformed();
   }
-  if (snap.outcome !== null) {
-    if (!AttemptOutcome.create(snap.outcome).success) {
-      malformed();
-    }
+  if (snap.outcome !== null && !AttemptOutcome.create(snap.outcome).success) {
+    malformed();
   }
   requireNullableString(snap, 'briefDigest');
   requireNullableString(snap, 'briefPackagePath');
@@ -292,29 +317,35 @@ function readHostName(value: unknown): string | null {
   return value.trim() !== '' ? value : null;
 }
 
+function readRunnerKind(kind: unknown): AttemptRunnerRecord['kind'] {
+  if (kind === 'agy') {
+    return 'agy';
+  }
+  if (kind === undefined || kind === 'opencode') {
+    return 'opencode';
+  }
+  malformed();
+}
+
+function readOptionalBoolean(value: unknown): boolean | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'boolean') {
+    malformed();
+  }
+  return value;
+}
+
 /** The runner block: a plain data record with the declared runner fields. */
 function readAttemptRunner(value: unknown): AttemptRunnerRecord {
   const snap = snapshotPlainDataRecord(value);
   if (snap === null) {
     malformed();
   }
-  let kind: AttemptRunnerRecord['kind'];
-  if (snap.kind === 'agy') {
-    kind = 'agy';
-  } else if (snap.kind === undefined || snap.kind === 'opencode') {
-    kind = 'opencode';
-  } else {
-    malformed();
-  }
-  let useFreeSeats: boolean | undefined;
-  if (Object.hasOwn(snap, 'useFreeSeats')) {
-    if (typeof snap.useFreeSeats !== 'boolean') {
-      malformed();
-    }
-    useFreeSeats = snap.useFreeSeats;
-  }
+  const useFreeSeats = readOptionalBoolean(snap.useFreeSeats);
   return {
-    kind,
+    kind: readRunnerKind(snap.kind),
     remotePort: readRemotePort(snap.remotePort),
     host: nullableString(snap, 'host'),
     hostName: readHostName(snap.hostName),
@@ -427,6 +458,33 @@ function readAttemptUsage(value: unknown): AttemptUsageRecord | null {
   };
 }
 
+function validateSeatRole(role: unknown): AttemptSeatSelectionRecord['role'] {
+  if (role !== 'first-pass' && role !== 'fix' && role !== 'review') {
+    malformed();
+  }
+  return role as AttemptSeatSelectionRecord['role'];
+}
+
+function readSeatTicket(value: unknown): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    malformed();
+  }
+  return value as number;
+}
+
+function readSeatAvailableCount(value: unknown): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    malformed();
+  }
+  return value as number;
+}
+
 /** The seat selection block: null, or a plain data record with declared seat fields. */
 function readAttemptSeatSelection(value: unknown): AttemptSeatSelectionRecord | null {
   if (value === null) {
@@ -436,29 +494,14 @@ function readAttemptSeatSelection(value: unknown): AttemptSeatSelectionRecord | 
   if (snap === null) {
     malformed();
   }
-  const role = snap.role;
-  if (role !== 'first-pass' && role !== 'fix' && role !== 'review') {
-    malformed();
-  }
+  const role = validateSeatRole(snap.role);
   if (!Number.isSafeInteger(snap.seatIndex) || (snap.seatIndex as number) < 0) {
     malformed();
   }
-  let ticket: number | undefined;
-  if (Object.hasOwn(snap, 'ticket')) {
-    if (!Number.isSafeInteger(snap.ticket) || (snap.ticket as number) < 0) {
-      malformed();
-    }
-    ticket = snap.ticket as number;
-  }
-  let availableCount: number | undefined;
-  if (Object.hasOwn(snap, 'availableCount')) {
-    if (!Number.isSafeInteger(snap.availableCount) || (snap.availableCount as number) < 1) {
-      malformed();
-    }
-    availableCount = snap.availableCount as number;
-  }
+  const ticket = readSeatTicket(snap.ticket);
+  const availableCount = readSeatAvailableCount(snap.availableCount);
   return {
-    role: role as AttemptSeatSelectionRecord['role'],
+    role,
     seatIndex: snap.seatIndex as number,
     seatId: requiredString(snap, 'seatId'),
     model: requiredString(snap, 'model'),
@@ -516,59 +559,87 @@ interface AttemptOptionalFields {
   ownerDecisionReferences?: readonly string[];
 }
 
+function readOptionalNonNegativeSafeInt(value: unknown): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    malformed();
+  }
+  return value as number;
+}
+
+function readOptionalPositiveSafeInt(value: unknown): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    malformed();
+  }
+  return value as number;
+}
+
 function assignAttemptNumberFields(snap: Record<string, unknown>): AttemptOptionalFields {
   const out: AttemptOptionalFields = {};
-  if (Object.hasOwn(snap, 'dispatchRevision')) {
-    const value = snap.dispatchRevision;
-    if (!Number.isSafeInteger(value) || (value as number) < 0) {
-      malformed();
-    }
-    out.dispatchRevision = value as number;
+  const dispatchRevision = readOptionalNonNegativeSafeInt(snap.dispatchRevision);
+  if (dispatchRevision !== undefined) {
+    out.dispatchRevision = dispatchRevision;
   }
-  if (Object.hasOwn(snap, 'dispatchedTimeLimitSeconds')) {
-    const value = snap.dispatchedTimeLimitSeconds;
-    if (!Number.isSafeInteger(value) || (value as number) < 1) {
-      malformed();
-    }
-    out.dispatchedTimeLimitSeconds = value as number;
+  const dispatchedTimeLimitSeconds = readOptionalPositiveSafeInt(snap.dispatchedTimeLimitSeconds);
+  if (dispatchedTimeLimitSeconds !== undefined) {
+    out.dispatchedTimeLimitSeconds = dispatchedTimeLimitSeconds;
   }
   return out;
 }
 
 function assignAttemptRecordFields(snap: Record<string, unknown>): AttemptOptionalFields {
   const out: AttemptOptionalFields = {};
-  if (Object.hasOwn(snap, 'seatOverride')) {
+  if (snap.seatOverride !== undefined) {
     out.seatOverride = readAttemptSeatOverride(snap.seatOverride);
   }
-  if (Object.hasOwn(snap, 'usage')) {
+  if (snap.usage !== undefined) {
     out.usage = readAttemptUsage(snap.usage);
   }
-  if (Object.hasOwn(snap, 'seatSelection')) {
+  if (snap.seatSelection !== undefined) {
     out.seatSelection = readAttemptSeatSelection(snap.seatSelection);
   }
-  if (Object.hasOwn(snap, 'seatPlan')) {
+  if (snap.seatPlan !== undefined) {
     out.seatPlan = readAttemptSeatPlan(snap.seatPlan);
   }
   return out;
 }
 
+function readOptionalStopReason(value: unknown): StopReasonValue | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'string') {
+    malformed();
+  }
+  return parseStopReason(value);
+}
+
+function readOptionalReviewerSeat(value: unknown): string | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value !== null && typeof value !== 'string') {
+    malformed();
+  }
+  return value as string | null;
+}
+
 function assignAttemptScalarFields(snap: Record<string, unknown>): AttemptOptionalFields {
   const out: AttemptOptionalFields = {};
-  if (Object.hasOwn(snap, 'stopReason')) {
-    const value = snap.stopReason;
-    if (typeof value !== 'string') {
-      malformed();
-    }
-    out.stopReason = parseStopReason(value);
+  const stopReason = readOptionalStopReason(snap.stopReason);
+  if (stopReason !== undefined) {
+    out.stopReason = stopReason;
   }
-  if (Object.hasOwn(snap, 'reviewerSeat')) {
-    const value = snap.reviewerSeat;
-    if (value !== null && typeof value !== 'string') {
-      malformed();
-    }
-    out.reviewerSeat = value as string | null;
+  const reviewerSeat = readOptionalReviewerSeat(snap.reviewerSeat);
+  if (reviewerSeat !== undefined) {
+    out.reviewerSeat = reviewerSeat;
   }
-  if (Object.hasOwn(snap, 'ownerDecisionReferences')) {
+  if (snap.ownerDecisionReferences !== undefined) {
     out.ownerDecisionReferences = copyNonEmptyStringArray(snap.ownerDecisionReferences);
   }
   return out;
@@ -729,20 +800,32 @@ interface JournalOptionalFields {
 
 function applyJournalOptionalFields(snap: Record<string, unknown>): JournalOptionalFields {
   const out: JournalOptionalFields = {};
-  if (Object.hasOwn(snap, 'stopReason')) {
-    const value = snap.stopReason;
-    if (typeof value !== 'string') {
-      malformed();
-    }
-    out.stopReason = parseStopReason(value);
+  const stopReason = readOptionalStopReason(snap.stopReason);
+  if (stopReason !== undefined) {
+    out.stopReason = stopReason;
   }
-  if (Object.hasOwn(snap, 'observedSessionIds')) {
+  if (snap.observedSessionIds !== undefined) {
     out.observedSessionIds = copyStringArray(snap.observedSessionIds);
   }
-  if (Object.hasOwn(snap, 'authorizedBy')) {
+  if (snap.authorizedBy !== undefined) {
     out.authorizedBy = requiredString(snap, 'authorizedBy');
   }
   return out;
+}
+
+function isDeclaredJournalAction(action: unknown): action is ActionJournalEntryRecord['action'] {
+  return (
+    action === 'dispatch' ||
+    action === 'reconcile' ||
+    action === 'stop' ||
+    action === 'collect' ||
+    action === 'forge' ||
+    action === 'accept'
+  );
+}
+
+function isDeclaredJournalStatus(status: unknown): status is ActionJournalEntryRecord['status'] {
+  return status === 'intent-recorded' || status === 'completed' || status === 'ambiguous' || status === 'refused';
 }
 
 /**
@@ -767,29 +850,20 @@ export function readActionJournalEntryRecord(
     const workOrderId = requiredString(snap, 'workOrderId');
     const baseCommit = requiredString(snap, 'baseCommit');
     const recordedAtIso = requiredString(snap, 'recordedAtIso');
-    const action = snap.action;
-    if (
-      action !== 'dispatch' &&
-      action !== 'reconcile' &&
-      action !== 'stop' &&
-      action !== 'collect' &&
-      action !== 'forge' &&
-      action !== 'accept'
-    ) {
+    if (!isDeclaredJournalAction(snap.action)) {
       return { ok: false, reason: 'malformed' };
     }
-    const status = snap.status;
-    if (status !== 'intent-recorded' && status !== 'completed' && status !== 'ambiguous' && status !== 'refused') {
+    if (!isDeclaredJournalStatus(snap.status)) {
       return { ok: false, reason: 'malformed' };
     }
     const record: ActionJournalEntryRecord = {
       id,
       attemptId,
       workOrderId,
-      action: action as ActionJournalEntryRecord['action'],
+      action: snap.action,
       baseCommit,
       recordedAtIso,
-      status: status as ActionJournalEntryRecord['status'],
+      status: snap.status,
       sessionId: nullableNormalizedToNull(snap.sessionId),
       detail: nullableNormalizedToNull(snap.detail),
       schemaVersion: versionRead.schemaVersion,

@@ -63,6 +63,8 @@ yarn install --immutable
 yarn build
 ```
 
+`yarn build` is the one build entrypoint. `yarn build --filter=<pkg>...` builds one workspace and everything it depends on (the trailing `...` is turbo's dependency selector). `yarn workspace <pkg> build` runs that package's `tsc` alone and leaves its dependencies' `dist/` stale, so it is not used.
+
 Run the CLI:
 
 ```sh

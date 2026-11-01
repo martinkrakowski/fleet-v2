@@ -433,7 +433,7 @@ export function projectJournalEntryToDaemonEvent(params: {
       jobId: params.jobId,
       kind,
       key: params.journalEntry.key,
-      entryId: kind === 'intent' ? (params.queueEntryId ?? null) : null,
+      entryId: kind === 'intent' && typeof params.queueEntryId === 'string' ? params.queueEntryId : null,
       outcome: kind === 'result' ? params.journalEntry.outcome : null,
       reasonCode: kind === 'result' ? params.journalEntry.reasonCode : null,
       recordedAtIso: params.journalEntry.recordedAtIso,
@@ -495,22 +495,26 @@ export function eventsAfterCursor(
     if (cursorEventId !== null && !isValidCursorEventId(cursorEventId)) {
       return { ok: false, reason: 'invalid-cursor' };
     }
-    for (const event of events) {
-      if (!isValidEventItem(event)) {
+    const length = events.length;
+    const snapshot: DaemonEventRecord[] = [];
+    for (let i = 0; i < length; i += 1) {
+      const item = events[i];
+      if (!isValidEventItem(item)) {
         return { ok: false, reason: 'cursor-not-found' };
       }
+      snapshot.push(item);
     }
-    const lastEventId = events.length > 0 ? events[events.length - 1].eventId : null;
+    const lastEventId = snapshot.length > 0 ? snapshot[snapshot.length - 1].eventId : null;
     if (cursorEventId === null) {
-      return { ok: true, events: Object.freeze([...events]), nextCursor: lastEventId };
+      return { ok: true, events: Object.freeze(snapshot), nextCursor: lastEventId };
     }
-    const index = events.findIndex((event) => event.eventId === cursorEventId);
+    const index = snapshot.findIndex((event) => event.eventId === cursorEventId);
     if (index === -1) {
       return { ok: false, reason: 'cursor-not-found' };
     }
     return {
       ok: true,
-      events: Object.freeze(events.slice(index + 1)),
+      events: Object.freeze(snapshot.slice(index + 1)),
       nextCursor: lastEventId ?? cursorEventId,
     };
   } catch {

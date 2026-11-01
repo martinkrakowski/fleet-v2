@@ -295,6 +295,18 @@ describe('builders and cursor', () => {
       expect(intent.record.reasonCode).toBeNull();
       expect(intent.record.key).toBe(ONE_WAY_KEY);
     }
+
+    const intentWithNumberQueue = projectJournalEntryToDaemonEvent({
+      eventId: EVENT_A,
+      tickId: TICK,
+      jobId: 'notifier',
+      journalEntry: { kind: 'intent', key: ONE_WAY_KEY, outcome: null, reasonCode: null, recordedAtIso: NOW },
+      queueEntryId: 42 as never,
+    });
+    expect(intentWithNumberQueue.ok).toBe(true);
+    if (intentWithNumberQueue.ok) {
+      expect(intentWithNumberQueue.record.entryId).toBeNull();
+    }
   });
 
   it('projects result entries with their outcome', () => {
@@ -418,6 +430,29 @@ describe('builders and cursor', () => {
     expect(eventsAfterCursor(throwingProxy as never, null)).toEqual({
       ok: false,
       reason: 'cursor-not-found',
+    });
+  });
+
+  it('never advances past unreturned events when array iterator is empty', () => {
+    const a = readDaemonEventRecord(intentBody({ eventId: EVENT_A }));
+    if (!a.ok) {
+      throw new Error('fixture');
+    }
+    const hostile = [a.record];
+    hostile[Symbol.iterator] = function* () {
+      // yields nothing
+    };
+    const result = eventsAfterCursor(hostile, null);
+    if (result.ok) {
+      expect(result.events).toContainEqual(a.record);
+      expect(result.nextCursor).toBe(a.record.eventId);
+    } else {
+      expect(result.reason).toBe('cursor-not-found');
+    }
+    expect(result).toEqual({
+      ok: true,
+      events: [a.record],
+      nextCursor: a.record.eventId,
     });
   });
 });

@@ -1,6 +1,94 @@
-// @generated use-case scaffold — no operation is implemented.
-export class ListLaneRunsUseCase {
-  async execute(_input: unknown): Promise<never> {
-    throw new Error('Not implemented: ListLaneRunsUseCase');
+/**
+ * ListLaneRunsUseCase: the read-only schedule view of the live lane runs
+ * (plan §3.6, lane A-R-1) that the CLI (`conductor schedule`) and, next,
+ * `GET /v1/runs` share. Every dependency is a `Pick` of read methods only,
+ * so listing cannot change anything. The result carries only what VZ1's
+ * `deriveConductorSchedule` returns plus the session-start marks: never a
+ * lease holder id, ssh alias, port, transport or worktree path.
+ */
+
+import type {
+  ListLaneRunsPort,
+  ListLaneRunsRequest,
+  ListLaneRunsResult,
+} from '../ports/in/ListLaneRunsPort.in-port.js';
+import { LIST_LANE_RUNS_SESSION_MARK_LIMIT } from '../ports/in/ListLaneRunsPort.in-port.js';
+import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
+import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
+import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
+import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLeasePort.out-port.js';
+import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
+import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
+import { deriveConductorSchedule, deriveSessionStartMarks } from '../../domain/conductor-schedule.js';
+import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { journalsForRuns } from './run-journal-reads.js';
+
+export interface ListLaneRunsDependencies {
+  readonly runRepo: Pick<LaneRunRepositoryPort, 'list'>;
+  readonly runJournal: Pick<LaneRunJournalPort, 'listForRun' | 'listForRuns'>;
+  readonly halt: Pick<ConductorHaltPort, 'read'>;
+  readonly driverLease: Pick<ConductorDriverLeasePort, 'read'>;
+  readonly attemptRepo: Pick<AttemptRepositoryPort, 'listAllAttempts'>;
+  readonly executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations'>;
+  readonly workOrderRepo: Pick<WorkOrderRepositoryPort, 'listWorkOrdersByProject'>;
+}
+
+export class ListLaneRunsUseCase implements ListLaneRunsPort {
+  constructor(private readonly deps?: ListLaneRunsDependencies) {}
+
+  async listLaneRuns(request: ListLaneRunsRequest): Promise<ListLaneRunsResult> {
+    if (!this.deps) {
+      throw new Error('Not implemented: ListLaneRunsUseCase');
+    }
+    const isPlainObject =
+      typeof request === 'object' &&
+      request !== null &&
+      (Object.getPrototypeOf(request) === Object.prototype ||
+        Object.getPrototypeOf(request) === null);
+    if (!isPlainObject || !isZonedIsoDateTime(request.nowIso)) {
+      return { outcome: 'rejected', reason: 'invalid-request' };
+    }
+
+    const [halt, driver, runs, reservations, attempts, orders] = await Promise.all([
+      this.deps.halt.read(),
+      this.deps.driverLease.read(),
+      this.deps.runRepo.list(),
+      this.deps.executionJournal.listActiveReservations(),
+      this.deps.attemptRepo.listAllAttempts(),
+      this.deps.workOrderRepo.listWorkOrdersByProject(),
+    ]);
+
+    const journals = await journalsForRuns(
+      this.deps.runJournal,
+      runs.map((run) => run.runId),
+    );
+
+    const schedule = deriveConductorSchedule(
+      {
+        halt: halt.state,
+        driverLease: driver,
+        runs,
+        journals,
+        reservations,
+        attemptWorkOrderIds: new Map(
+          attempts.map((attempt) => [attempt.id, attempt.workOrderId]),
+        ),
+        workOrders: new Map(
+          orders.map((order) => [order.id, { repository: order.repository, ownedPaths: order.ownedPaths }]),
+        ),
+      },
+      request.nowIso,
+    );
+
+    const { marks, truncated } = deriveSessionStartMarks(
+      [...journals.values()].flat(),
+      {
+        dispatchStaggerMs: schedule.caps?.dispatchStaggerMs ?? null,
+        limit: LIST_LANE_RUNS_SESSION_MARK_LIMIT,
+      },
+    );
+
+    return { outcome: 'listed', schedule, sessionStarts: marks, truncated };
   }
 }

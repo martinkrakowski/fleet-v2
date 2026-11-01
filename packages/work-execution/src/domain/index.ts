@@ -6,6 +6,7 @@ export * from "./conductor-halt.js";
 export * from "./conductor-pass-trace.js";
 export * from "./conductor-schedule.js";
 export * from "./coordination-keys.js";
+export * from "./daemon-tick.js";
 export * from "./entities/index.js";
 export * from "./execution-records.js";
 export * from "./lane-diff-check.js";

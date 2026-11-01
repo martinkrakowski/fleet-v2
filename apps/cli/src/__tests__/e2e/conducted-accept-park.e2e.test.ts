@@ -148,6 +148,7 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')('conducted accept + park over
       'review-passed',
       'accepted',
       'pr-opened',
+      'premerge-success',
     ]);
 
     // The lane's commit: exactly one, on the run's branch, inside the owned package.
@@ -176,15 +177,44 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')('conducted accept + park over
     });
     expect(run!.parkCount).toBe(1);
 
-    // The `gh` stub saw exactly one call — the PR create for the run's branch — and no merge.
+    // The `gh` stub saw exactly two calls: the PR create for the run's
+    // branch, then the KS7a-2 premerge commit-status post on the worktree
+    // head — and no merge. Scenario 5 is a Tier 1 run, and the brief's tier
+    // rule releases Tier 1's merging hold even with no pre-merge receipt, so
+    // the single post is already terminal: `success` with the fixed Tier 1
+    // description (no `pending` phase exists for Tier 1).
+    const head = git(['rev-parse', 'HEAD'], worktreePath);
     const ghLines = (await fs.readFile(current.ghArgvLog, 'utf8'))
       .split('\n')
       .filter((line) => line.length > 0);
-    expect(ghLines).toHaveLength(1);
+    expect(ghLines).toHaveLength(2);
 
     expect(ghLines[0]).toContain('pr create');
     expect(ghLines[0]).toContain(`--head fleet/${current.runId}`);
     expect(ghLines[0]).not.toContain('merge');
+
+    const statusLine = ghLines[1]!;
+    expect(statusLine).toContain('-X POST');
+    expect(statusLine).toContain(`repos/example-owner/example-repo/statuses/${head}`);
+    expect(statusLine).toContain('-f state=success');
+    expect(statusLine).toContain('-f context=premerge');
+    expect(statusLine).toContain('-f description=not required for tier 1');
+
+    // A later status read of that head reports the posted `premerge` success.
+    const statusRead = execFileSync(
+      'gh',
+      ['api', `repos/example-owner/example-repo/commits/${head}/status`],
+      {
+        env: { ...process.env, PATH: `${current.ghPathBin}:${process.env.PATH ?? ''}` },
+        encoding: 'utf8',
+        timeout: 20000,
+      },
+    );
+    const reported = JSON.parse(statusRead) as {
+      statuses: Array<{ state: string; context: string }>;
+    };
+    expect(reported.statuses).toHaveLength(1);
+    expect(reported.statuses[0]).toMatchObject({ state: 'success', context: 'premerge' });
 
     // The park raised one attention item and asked one keyed owner question.
     const attention = await current.runtime.coordination.attentionItemRepository.list({

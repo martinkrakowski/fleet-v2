@@ -28,6 +28,7 @@ import {
   type ForgeReadAdapter,
   type GhInvocationResult,
   type resolveRoleExecutors,
+  forgeActionPushesBranch,
 } from '@fleet/work-execution';
 import type { FleetInstallationModel } from '@fleet/installation';
 
@@ -288,6 +289,12 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
             ? await readGitHeadOverSsh(attempt.worktreePath, recordedRoute.alias)
             : await readGitHeadLocally(attempt.worktreePath)
           : await readGitHead(attempt.worktreePath, worktreeSshHost);
+      // Only the branch-pushing kinds (push-and-open-pr, push-to-pr) build the
+      // push plumbing; every other kind (post-status, merge-pr) returns the
+      // verified head unchanged (KS7a-2).
+      if (!forgeActionPushesBranch(request.kind)) {
+        return head;
+      }
       // A worktree that lives on another host has its branch only on that
       // host's repository; `gh pr create` (and `push-to-pr`, which updates an
       // existing PR's branch) needs the branch on origin, so the verified head
@@ -305,7 +312,7 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
             process.env.FLEET_FORGE_PUSH_ORIGIN === '1'
           : null;
       const shouldSeedOrigin =
-        (request.kind === 'push-and-open-pr' || request.kind === 'push-to-pr') &&
+        forgeActionPushesBranch(request.kind) &&
         head === request.expectedHeadSha &&
         (recordedWantsSeed !== null
           ? recordedWantsSeed

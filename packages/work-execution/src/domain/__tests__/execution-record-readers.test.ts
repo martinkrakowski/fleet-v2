@@ -397,6 +397,56 @@ describe('execution-record-readers: attempt tightening (D6)', () => {
     expect(Object.hasOwn(result.record, 'reviewerSeat')).toBe(false);
     expect(Object.hasOwn(result.record, 'ownerDecisionReferences')).toBe(false);
   });
+
+  it('refuses a missing key on usage sessionId, model, agent, and reason', () => {
+    const fields = ['sessionId', 'model', 'agent', 'reason'] as const;
+    for (const field of fields) {
+      const missingAttempt = clone(validAttempt);
+      const usageCopy = { ...missingAttempt.usage };
+      delete (usageCopy as Record<string, unknown>)[field];
+      missingAttempt.usage = usageCopy as typeof validAttempt.usage;
+      expect(readAttemptRecord(missingAttempt)).toEqual({
+        ok: false,
+        reason: 'malformed',
+      });
+
+      const nullAttempt = clone(validAttempt);
+      nullAttempt.usage = {
+        ...nullAttempt.usage,
+        [field]: null,
+      };
+      const nullResult = readAttemptRecord(nullAttempt);
+      expect(nullResult.ok).toBe(true);
+      if (nullResult.ok) {
+        expect(nullResult.record.usage?.[field]).toBeNull();
+      }
+    }
+  });
+
+  it('refuses a missing key on seatSelection tool, variant, and agent', () => {
+    const fields = ['tool', 'variant', 'agent'] as const;
+    for (const field of fields) {
+      const missingAttempt = clone(validAttempt);
+      const seatSelectionCopy = { ...missingAttempt.seatSelection };
+      delete (seatSelectionCopy as Record<string, unknown>)[field];
+      missingAttempt.seatSelection = seatSelectionCopy as typeof validAttempt.seatSelection;
+      expect(readAttemptRecord(missingAttempt)).toEqual({
+        ok: false,
+        reason: 'malformed',
+      });
+
+      const nullAttempt = clone(validAttempt);
+      nullAttempt.seatSelection = {
+        ...nullAttempt.seatSelection,
+        [field]: null,
+      };
+      const nullResult = readAttemptRecord(nullAttempt);
+      expect(nullResult.ok).toBe(true);
+      if (nullResult.ok) {
+        expect(nullResult.record.seatSelection?.[field]).toBeNull();
+      }
+    }
+  });
 });
 
 describe('execution-record-readers: reservation null normalizations', () => {
@@ -748,5 +798,106 @@ describe('execution-record-readers: hostile input', () => {
     const jsonAttempt = JSON.parse(JSON.stringify(validAttempt));
     const attemptRead = readAttemptRecord(jsonAttempt);
     expect(attemptRead.ok).toBe(true);
+  });
+
+  it('reads revision as 0 when absent even if Object.prototype has revision 7', () => {
+    let result: ReturnType<typeof readAttemptRecord> | undefined;
+    Object.defineProperty(Object.prototype, 'revision', {
+      value: 7,
+      configurable: true,
+      writable: true,
+    });
+    try {
+      result = readAttemptRecord(without(clone(validAttempt), 'revision'));
+    } finally {
+      delete (Object.prototype as { revision?: unknown }).revision;
+    }
+    expect(result?.ok).toBe(true);
+    if (result?.ok) {
+      expect(result.record.revision).toBe(0);
+    }
+  });
+
+  it('does not treat an inherited negative revision on Object.prototype as malformed', () => {
+    let result: ReturnType<typeof readAttemptRecord> | undefined;
+    Object.defineProperty(Object.prototype, 'revision', {
+      value: -1,
+      configurable: true,
+      writable: true,
+    });
+    try {
+      result = readAttemptRecord(without(clone(validAttempt), 'revision'));
+    } finally {
+      delete (Object.prototype as { revision?: unknown }).revision;
+    }
+    expect(result?.ok).toBe(true);
+    if (result?.ok) {
+      expect(result.record.revision).toBe(0);
+    }
+  });
+
+  it('does not allow SeatPlan.create to see inherited id or model from Object.prototype', () => {
+    let resultWithoutId: ReturnType<typeof readAttemptRecord> | undefined;
+    let resultWithoutModel: ReturnType<typeof readAttemptRecord> | undefined;
+    Object.defineProperty(Object.prototype, 'id', {
+      value: 'hostile-id',
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(Object.prototype, 'model', {
+      value: 'hostile-model',
+      configurable: true,
+      writable: true,
+    });
+    try {
+      const attemptMissingSeatId = clone(validAttempt);
+      const seatWithoutId = { ...attemptMissingSeatId.seatPlan['first-pass'][0] } as Record<string, unknown>;
+      delete seatWithoutId.id;
+      attemptMissingSeatId.seatPlan = {
+        ...attemptMissingSeatId.seatPlan,
+        'first-pass': [seatWithoutId],
+      } as typeof validAttempt.seatPlan;
+      resultWithoutId = readAttemptRecord(attemptMissingSeatId);
+
+      const attemptMissingSeatModel = clone(validAttempt);
+      const seatWithoutModel = { ...attemptMissingSeatModel.seatPlan['first-pass'][0] } as Record<string, unknown>;
+      delete seatWithoutModel.model;
+      attemptMissingSeatModel.seatPlan = {
+        ...attemptMissingSeatModel.seatPlan,
+        'first-pass': [seatWithoutModel],
+      } as typeof validAttempt.seatPlan;
+      resultWithoutModel = readAttemptRecord(attemptMissingSeatModel);
+    } finally {
+      delete (Object.prototype as { id?: unknown }).id;
+      delete (Object.prototype as { model?: unknown }).model;
+    }
+    expect(resultWithoutId).toEqual({ ok: false, reason: 'malformed' });
+    expect(resultWithoutModel).toEqual({ ok: false, reason: 'malformed' });
+  });
+
+  it('does not treat inherited optional fields on Object.prototype as present', () => {
+    let result: ReturnType<typeof readAttemptRecord> | undefined;
+    Object.defineProperty(Object.prototype, 'seatPlan', {
+      value: validAttempt.seatPlan,
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(Object.prototype, 'usage', {
+      value: validAttempt.usage,
+      configurable: true,
+      writable: true,
+    });
+    try {
+      const input = without(without(clone(validAttempt), 'seatPlan'), 'usage');
+      result = readAttemptRecord(input);
+    } finally {
+      delete (Object.prototype as { seatPlan?: unknown }).seatPlan;
+      delete (Object.prototype as { usage?: unknown }).usage;
+    }
+    expect(result?.ok).toBe(true);
+    if (result?.ok) {
+      expect(Object.hasOwn(result.record, 'seatPlan')).toBe(false);
+      expect(Object.hasOwn(result.record, 'usage')).toBe(false);
+    }
   });
 });

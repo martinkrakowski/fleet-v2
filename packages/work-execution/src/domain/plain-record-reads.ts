@@ -87,7 +87,7 @@ export function snapshotPlainDataRecord(value: unknown): Record<string, unknown>
   if (!isPlainRecordObject(value)) {
     return null;
   }
-  const out: Record<string, unknown> = {};
+  const out: Record<string, unknown> = Object.create(null);
   for (const key of Reflect.ownKeys(value)) {
     if (copyEnumerableDataKey(value, key, out) === false) {
       return null;

@@ -64,11 +64,12 @@ function readRecordId(snap: Record<string, unknown>): string {
 }
 
 /** A required `string | null` field: null is kept, anything non-string is malformed. */
-function requireNullableString(snap: Record<string, unknown>, key: string): void {
+function requireNullableString(snap: Record<string, unknown>, key: string): string | null {
   const value = snap[key];
   if (value !== null && typeof value !== 'string') {
     malformed();
   }
+  return value as string | null;
 }
 
 /** A `string | null` field where `undefined` and `null` both normalize to null. */
@@ -214,7 +215,7 @@ function copyPlainArray(value: unknown[]): unknown[] {
 }
 
 function copyPlainRecord(value: Record<string, unknown>): Record<string, unknown> {
-  const copy: Record<string, unknown> = {};
+  const copy: Record<string, unknown> = Object.create(null);
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== 'string' || key === '__proto__') {
       malformed();
@@ -459,7 +460,7 @@ function readAttemptUsage(value: unknown): AttemptUsageRecord | null {
   return {
     source: source as AttemptUsageRecord['source'],
     readAtIso: requiredString(snap, 'readAtIso'),
-    sessionId: nullableString(snap, 'sessionId'),
+    sessionId: requireNullableString(snap, 'sessionId'),
     steps: nullableNonNegativeSafeInt(snap, 'steps'),
     wallSeconds: nullableNonNegativeFinite(snap, 'wallSeconds'),
     tokensInput: nullableNonNegativeSafeInt(snap, 'tokensInput'),
@@ -468,9 +469,9 @@ function readAttemptUsage(value: unknown): AttemptUsageRecord | null {
     tokensCacheRead: nullableNonNegativeSafeInt(snap, 'tokensCacheRead'),
     tokensCacheWrite: nullableNonNegativeSafeInt(snap, 'tokensCacheWrite'),
     costUsd: nullableNonNegativeFinite(snap, 'costUsd'),
-    model: nullableString(snap, 'model'),
-    agent: nullableString(snap, 'agent'),
-    reason: nullableString(snap, 'reason'),
+    model: requireNullableString(snap, 'model'),
+    agent: requireNullableString(snap, 'agent'),
+    reason: requireNullableString(snap, 'reason'),
   };
 }
 
@@ -521,9 +522,9 @@ function readAttemptSeatSelection(value: unknown): AttemptSeatSelectionRecord | 
     seatIndex: snap.seatIndex as number,
     seatId: requiredString(snap, 'seatId'),
     model: requiredString(snap, 'model'),
-    tool: nullableString(snap, 'tool'),
-    variant: nullableString(snap, 'variant'),
-    agent: nullableString(snap, 'agent'),
+    tool: requireNullableString(snap, 'tool'),
+    variant: requireNullableString(snap, 'variant'),
+    agent: requireNullableString(snap, 'agent'),
     ...(ticket === undefined ? {} : { ticket }),
     ...(availableCount === undefined ? {} : { availableCount }),
   };

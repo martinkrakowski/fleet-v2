@@ -68,6 +68,9 @@ describe("Conductor source wiring", () => {
   const board = read("components", "schedule-board.tsx");
   const gauge = read("components", "cap-gauge.tsx");
   const strip = read("components", "session-strip.tsx");
+  const strip2 = read("components", "concurrency-strip.tsx");
+  const passes = read("components", "pass-list.tsx");
+  const mapPasses = read("map-passes.ts");
   const css = read("conductor.module.css");
 
   it("keeps /conductor a dynamic server page", () => {
@@ -82,7 +85,9 @@ describe("Conductor source wiring", () => {
   });
 
   it("keeps the read-only view free of actions and links", () => {
-    const all = [page, live, client, board, gauge, strip].join("\n");
+    const all = [page, live, client, board, gauge, strip, strip2, passes].join(
+      "\n",
+    );
     expect(all).not.toContain("AlertBox");
     expect(all).not.toContain("onConfirm");
     expect(all).not.toContain("fetch(");
@@ -90,10 +95,61 @@ describe("Conductor source wiring", () => {
     expect(all).not.toContain("href=");
   });
 
-  it("wires the live route and auto-refresh in the client", () => {
+  it("wires the live routes and auto-refresh in the client", () => {
     expect(client).toContain("GET /v1/runs");
+    expect(client).toContain("GET /v1/runs/passes");
     expect(client).toContain("useAutoRefresh");
     expect(client.match(/aria-live=/g)).toHaveLength(1);
+  });
+
+  it("keeps wait reasons sourced only from traces, never sorted", () => {
+    expect(mapPasses).not.toContain(".sort(");
+    expect(passes).not.toContain(".sort(");
+    for (const file of [mapPasses, passes, strip2]) {
+      expect(file).not.toContain("holderId");
+      expect(file).not.toContain("sshAlias");
+      expect(file).not.toContain("worktreePath");
+    }
+  });
+
+  it("mounts the concurrency strip with a semantic table fallback", () => {
+    expect(strip2).toContain("use client");
+    expect(strip2).toContain('role="img"');
+    expect(strip2).toContain("TableContainer");
+    expect(strip2).toContain("<Table");
+    expect(strip2).toContain("<Thead");
+  });
+
+  it("draws the held count as a step chart with filled sample points", () => {
+    expect(strip2).toContain("buildReservationStepSegments");
+    expect(strip2).toContain("className={styles.reservationLine}");
+    expect(strip2).toContain("className={styles.reservationPoint}");
+    expect(css).toContain(".reservationPoint");
+    expect(css).not.toMatch(/\.reservationPoint\s*{[^}]*fill:\s*none/);
+  });
+
+  it("shares one time axis between the held points and the session marks", () => {
+    expect(strip2).toContain(
+      "positionSessionMarks(sessionMarks, dispatchStaggerMs, domain)",
+    );
+  });
+
+  it("keys attention badges per entry so repeats never collapse", () => {
+    expect(passes).toContain('key={`${pass.passId}-${index}`}');
+    expect(passes).not.toContain('key={`${item.runId}-${item.kind}`}');
+  });
+
+  it("wires the passes truncation and recorded stagger into the strip", () => {
+    expect(client).toContain("truncated={data.passes.truncated}");
+    expect(client).toContain(
+      "dispatchStaggerMs={schedule.caps?.dispatchStaggerMs ?? null}",
+    );
+  });
+
+  it("renders the pass list as an accordion of traces", () => {
+    expect(passes).toContain("Accordion");
+    expect(passes).toContain("unreadable");
+    expect(passes).toContain("No passes recorded yet");
   });
 
   it("keeps truncation on the session strip only, never on the schedule", () => {
@@ -156,15 +212,16 @@ describe("Conductor source wiring", () => {
     expect(strip).toContain("minWidth");
   });
 
-  it("keeps every schedule mapping function simple", () => {
-    const source = read("map-schedule.ts");
-    const scores = complexityByFunction(source);
-    expect(Object.keys(scores).length).toBeGreaterThan(5);
-    for (const [name, score] of Object.entries(scores)) {
-      expect(
-        score,
-        `${name} has cognitive complexity ${score}, cap is 15`,
-      ).toBeLessThanOrEqual(15);
+  it("keeps every pure mapping and timeline function simple", () => {
+    for (const file of ["map-schedule.ts", "map-passes.ts", "timeline-scale.ts"]) {
+      const scores = complexityByFunction(read(file));
+      expect(Object.keys(scores).length, file).toBeGreaterThan(3);
+      for (const [name, score] of Object.entries(scores)) {
+        expect(
+          score,
+          `${file} ${name} has cognitive complexity ${score}, cap is 15`,
+        ).toBeLessThanOrEqual(15);
+      }
     }
   });
 

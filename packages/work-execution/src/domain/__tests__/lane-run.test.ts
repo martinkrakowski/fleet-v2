@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import { LaneRun } from '../entities/LaneRun.js';
 import { LANE_RUN_MAX_PARK_ORDINAL } from '../lane-run-keys.js';
-import { LANE_RUN_PARK_REASONS } from '../lane-run-records.js';
+import { LANE_RUN_PARK_REASONS, LANE_RUN_SCHEMA_VERSION } from '../lane-run-records.js';
+import { readLaneRunRecord } from '../entities/LaneRun.js';
 import {
   LANE_RUN_RESUMABLE_STATES,
   LANE_RUN_STATES,
@@ -130,12 +131,58 @@ describe('LaneRun.create', () => {
     if (!result.success) return;
     expect(result.value.toRecord()).toEqual(withBase);
 
-    // baseBranch also round-trips on a record that has no branchName at all.
+    // baseBranch also round-trips on a record that has no branchName at all (CB1),
+    // and schemaVersion stays absent when the key is absent (Q5a).
     const legacyWithBase = { ...VALID, baseBranch: 'chain/example' };
     const legacy = LaneRun.create(legacyWithBase);
     expect(legacy.success).toBe(true);
     if (!legacy.success) return;
     expect(legacy.value.toRecord()).toEqual(legacyWithBase);
+    expect(Object.hasOwn(legacy.value.toRecord(), 'schemaVersion')).toBe(false);
+  });
+
+  it('round-trips an explicit schemaVersion 1 and refuses schemaVersion 2 by default (Q5a)', () => {
+    const withSchema = { ...VALID, schemaVersion: 1 };
+    const result = LaneRun.create(withSchema);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.value.toRecord()).toEqual(withSchema);
+
+    const refused = LaneRun.create({ ...VALID, schemaVersion: 2 });
+    expect(refused.success).toBe(false);
+    if (refused.success) return;
+    expect(refused.error.message).toBe('LaneRun schemaVersion is not supported');
+  });
+
+  it('refuses a future schemaVersion with the schema message before the unknown-key check (Q5a)', () => {
+    const result = LaneRun.create({ ...VALID, schemaVersion: 99, unknownFutureField: 'x' });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.message).toBe('LaneRun schemaVersion is not supported');
+  });
+
+  it('refuses a hostile schemaVersion key shape with the schema message (Q5a)', () => {
+    // An enumerable getter is never run: the descriptor's read value is undefined,
+    // but the key is present, so the schema read refuses the shape before any
+    // field check.
+    const getterRecord: Record<string, unknown> = { ...VALID };
+    Object.defineProperty(getterRecord, 'schemaVersion', {
+      get() {
+        throw new Error('the reader must never run an accessor');
+      },
+      enumerable: true,
+    });
+    const inputs: unknown[] = [
+      { ...VALID, schemaVersion: undefined },
+      { ...VALID, schemaVersion: null },
+      getterRecord,
+    ];
+    for (const input of inputs) {
+      const result = LaneRun.create(input);
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      expect(result.error.message).toBe('LaneRun schemaVersion is not supported');
+    }
   });
 
   it.each(['release', null])('refuses %j as baseBranch with the fixed message (CB1)', (baseBranch) => {
@@ -386,6 +433,94 @@ describe('LaneRun.create', () => {
       if (result.success) return;
       expect(result.error.message).not.toContain('boom');
     }
+  });
+});
+
+describe('readLaneRunRecord', () => {
+  it('stamps schemaVersion 1 on a record that omits the key', () => {
+    const read = readLaneRunRecord(VALID);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.record.version).toBe(1);
+    expect(Object.hasOwn(read.record, 'schemaVersion')).toBe(true);
+    expect(read.record.schemaVersion).toBe(1);
+    expect(LANE_RUN_SCHEMA_VERSION).toBe(1);
+  });
+
+  it('round-trips every field through the versioned reader', () => {
+    const read = readLaneRunRecord(VALID);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    const { schemaVersion, ...rest } = read.record;
+    expect(schemaVersion).toBe(1);
+    expect(rest).toEqual(VALID);
+  });
+
+  it('accepts schemaVersion 2 under { currentVersion: 2 } on a version 1 record', () => {
+    const read = readLaneRunRecord({ ...VALID, schemaVersion: 2 }, { currentVersion: 2 });
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.record.version).toBe(1);
+    expect(read.record.schemaVersion).toBe(2);
+  });
+
+  it('refuses an aggregate version 2 as malformed even with an accepted schemaVersion', () => {
+    const read = readLaneRunRecord({ ...VALID, version: 2, schemaVersion: 2 }, { currentVersion: 2 });
+    expect(read).toEqual({ ok: false, reason: 'malformed' });
+    const created = LaneRun.create({ ...VALID, version: 2 });
+    expect(created.success).toBe(false);
+    if (created.success) return;
+    expect(created.error.message).toBe('LaneRun version must be 1');
+  });
+
+  it('reads the accepted window under { currentVersion: 3 }', () => {
+    expect(readLaneRunRecord({ ...VALID, schemaVersion: 2 }, { currentVersion: 3 })).toEqual({
+      ok: true,
+      record: { ...VALID, schemaVersion: 2 },
+    });
+    expect(readLaneRunRecord({ ...VALID, schemaVersion: 3 }, { currentVersion: 3 })).toEqual({
+      ok: true,
+      record: { ...VALID, schemaVersion: 3 },
+    });
+    expect(readLaneRunRecord(VALID, { currentVersion: 3 })).toEqual({ ok: false, reason: 'unknown-schema-version' });
+    expect(readLaneRunRecord({ ...VALID, schemaVersion: 1 }, { currentVersion: 3 })).toEqual({
+      ok: false,
+      reason: 'unknown-schema-version',
+    });
+    expect(readLaneRunRecord({ ...VALID, schemaVersion: 4 }, { currentVersion: 3 })).toEqual({
+      ok: false,
+      reason: 'unknown-schema-version',
+    });
+  });
+
+  it('never throws on hostile input and never echoes a refused value', () => {
+    const getterRecord: Record<string, unknown> = { ...VALID };
+    Object.defineProperty(getterRecord, 'version', {
+      get() {
+        throw new Error('boom');
+      },
+      enumerable: true,
+    });
+    const throwingProxy = new Proxy({ ...VALID }, {
+      ownKeys() {
+        throw new Error('boom');
+      },
+    });
+    const inputs: unknown[] = [getterRecord, throwingProxy, null, [], 'x', 42, new Date()];
+    for (const input of inputs) {
+      const read = readLaneRunRecord(input);
+      expect(read.ok).toBe(false);
+      if (read.ok) return;
+      expect(['malformed', 'unknown-schema-version']).toContain(read.reason);
+    }
+  });
+
+  it('keeps the secret-shaped field message and never echoes the value', () => {
+    const result = LaneRun.create({ ...VALID, workOrderId: `gh${'p_'}${'A'.repeat(30)}` });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.message).toBe('LaneRun workOrderId contains a secret-shaped value and was refused');
+    expect(result.error.message).not.toContain('ghp_');
   });
 });
 

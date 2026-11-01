@@ -1,20 +1,19 @@
 /**
- * Shared pure readers for the lane-run records (K1-1 LaneRun, K3-1 leases). Values are read
- * through their own property descriptors, so no getter ever runs.
+ * Shared pure readers for the lane-run records (K1-1 LaneRun, K3-1 leases).
+ * Values are read through their own property descriptors, so no getter ever
+ * runs. The optional-key and data-snapshot helpers are shared by the
+ * `schemaVersion` readers (Q5a).
  */
 
-/**
- * A plain object with exactly the given own enumerable string keys, values
+import { isPlainRecordObject } from './record-schema-version.js';
+
+/** A plain object with exactly the given own enumerable string keys, values
  * read through their own property descriptors (so no getter ever runs).
  * Anything else — a non-object, a prototype outside Object.prototype/null, a
  * missing or extra or non-enumerable key, a symbol key — returns null.
  */
 export function readExactPlainRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return null;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
+  if (!isPlainRecordObject(value)) {
     return null;
   }
   const ownKeys = Reflect.ownKeys(value);
@@ -23,16 +22,91 @@ export function readExactPlainRecord(value: unknown, keys: readonly string[]): R
   }
   const out: Record<string, unknown> = {};
   for (const key of ownKeys) {
-    if (typeof key !== 'string' || !keys.includes(key)) {
+    if (copyAllowedEnumerableKey(value, key, keys, out) === false) {
       return null;
     }
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor?.enumerable) {
-      return null;
-    }
-    out[key] = descriptor.value;
   }
   return out;
+}
+
+/** Copy `key` when it is an allowed enumerable string key; false when the key is disallowed. */
+function copyAllowedEnumerableKey(
+  value: Record<string, unknown>,
+  key: string | symbol,
+  allowed: readonly string[],
+  out: Record<string, unknown>,
+): boolean {
+  if (typeof key !== 'string' || !allowed.includes(key)) {
+    return false;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (!descriptor?.enumerable) {
+    return false;
+  }
+  out[key] = descriptor.value;
+  return true;
+}
+
+/**
+ * A plain object whose own enumerable string keys are all in `allowed`, with
+ * every `required` key present. Extra keys and symbol keys return null. An
+ * enumerable getter on an allowed key is not invoked: the key is present in
+ * the snapshot and its copied value is `undefined` (the same descriptor
+ * semantics as `readExactPlainRecord`).
+ */
+export function readPlainRecordWithOptionalKeys(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[],
+): Record<string, unknown> | null {
+  if (!isPlainRecordObject(value)) {
+    return null;
+  }
+  const allowed = [...required, ...optional];
+  const out: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (copyAllowedEnumerableKey(value, key, allowed, out) === false) {
+      return null;
+    }
+  }
+  for (const key of required) {
+    if (!Object.hasOwn(out, key)) {
+      return null;
+    }
+  }
+  return out;
+}
+
+/**
+ * A fresh copy of `value` when it is a plain object whose own keys are all
+ * enumerable string data properties (no getter, no setter, nothing
+ * non-enumerable); null otherwise. Stricter than the optional-key reader: an
+ * enumerable getter here returns null rather than a copied `undefined`.
+ */
+export function snapshotPlainDataRecord(value: unknown): Record<string, unknown> | null {
+  if (!isPlainRecordObject(value)) {
+    return null;
+  }
+  const out: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (copyEnumerableDataKey(value, key, out) === false) {
+      return null;
+    }
+  }
+  return out;
+}
+
+/** Copy `key` when it is an enumerable string data property; false otherwise. */
+function copyEnumerableDataKey(value: Record<string, unknown>, key: string | symbol, out: Record<string, unknown>): boolean {
+  if (typeof key !== 'string') {
+    return false;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (!descriptor || !descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
+    return false;
+  }
+  out[key] = descriptor.value;
+  return true;
 }
 
 /**

@@ -7,7 +7,15 @@
  * rules under their own guard.
  */
 
-import { isCalendarDateTime, readExactPlainRecord } from './plain-record-reads.js';
+import { isCalendarDateTime, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
+import {
+  INITIAL_RECORD_SCHEMA_VERSION,
+  isPlainRecordObject,
+  readRecordSchemaVersion,
+  type ReadRecordSchemaOptions,
+  type RecordSchemaFailureReason,
+  type VersionedRecordRead,
+} from './record-schema-version.js';
 import { containsSecretShape } from '@fleet/shared';
 import { parseLaneRunKey, REQUEST_ID_PATTERN } from './lane-run-keys.js';
 import type { LaneRunStopKeyMode, ParsedLaneRunKey } from './lane-run-keys.js';
@@ -17,6 +25,9 @@ import { LANE_RUN_STATES } from './value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 
 export const LANE_RUN_JOURNAL_ENTRY_VERSION = 1 as const;
+
+/** Record schema version for run-journal entries on disk (Q5a, D6). */
+export const LANE_RUN_JOURNAL_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
 
 /** intent: before an external action (or a stop, resume, request or reaper repair); result: after it; conduct: a state the driver entered. */
 export const LANE_RUN_JOURNAL_ENTRY_KINDS = ['intent', 'result', 'conduct'] as const;
@@ -65,6 +76,8 @@ export interface LaneRunJournalEntryRecord {
   readonly grantId: string | null;
   /** conduct: the state entered. Other kinds: null. */
   readonly state: LaneRunStateValue | null;
+  /** Record schema version on disk (Q5a, D6); absent reads as 1. */
+  readonly schemaVersion?: number;
 }
 
 export type LaneRunJournalEntryRead =
@@ -73,9 +86,150 @@ export type LaneRunJournalEntryRead =
 
 export function readLaneRunJournalEntry(input: unknown): LaneRunJournalEntryRead {
   try {
-    return readLaneRunJournalEntryUnchecked(input);
+    const outcome = readJournalEntryWithVersion(input, LANE_RUN_JOURNAL_SCHEMA_VERSION);
+    if (!outcome.ok) {
+      return { ok: false, error: outcome.error };
+    }
+    return { ok: true, entry: outcome.entry };
   } catch {
     return { ok: false, error: 'LaneRunJournal input could not be read' };
+  }
+}
+
+/** The versioned stored-record read: `reason` for the schema layer, `error` for the body. */
+type JournalEntryVersionedRead =
+  | { readonly ok: true; readonly entry: LaneRunJournalEntryRecord; readonly schemaVersion: number }
+  | { readonly ok: false; readonly reason: RecordSchemaFailureReason; readonly error: string };
+
+function readJournalEntryWithVersion(input: unknown, currentVersion: number): JournalEntryVersionedRead {
+  if (!isPlainRecordObject(input)) {
+    return journalEntryBodyError('LaneRunJournal entry must be a record with exactly the entry keys');
+  }
+  const versionRead = readRecordSchemaVersion(input, currentVersion);
+  if (!versionRead.ok) {
+    return { ok: false, reason: versionRead.reason, error: 'LaneRunJournal schemaVersion is not supported' };
+  }
+  const snapshot = readPlainRecordWithOptionalKeys(input, LEGACY_ENTRY_KEYS, ['detail', 'schemaVersion']);
+  if (snapshot === null) {
+    return journalEntryBodyError('LaneRunJournal entry must be a record with exactly the entry keys');
+  }
+  const hasDetail = Object.hasOwn(snapshot, 'detail');
+  const headError = entryHeadError(snapshot);
+  if (headError !== null) {
+    return journalEntryBodyError(headError);
+  }
+  const detailError = entryDetailError(snapshot, hasDetail);
+  if (detailError !== null) {
+    return journalEntryBodyError(detailError);
+  }
+  const kind = snapshot.kind as LaneRunJournalEntryKind;
+  const parsedKey = kind === 'conduct' ? null : parseLaneRunKey(snapshot.key);
+  const identityError = entryIdentityError(kind, snapshot);
+  if (identityError !== null) {
+    return journalEntryBodyError(identityError);
+  }
+  const payloadError = entryPayloadError(kind, parsedKey, snapshot);
+  if (payloadError !== null) {
+    return journalEntryBodyError(payloadError);
+  }
+  const entry = buildJournalEntry(snapshot, hasDetail, versionRead.explicit ? versionRead.schemaVersion : null);
+  return { ok: true, entry, schemaVersion: versionRead.schemaVersion };
+}
+
+/** A body failure after the schema read passed: always the `'malformed'` reason. */
+function journalEntryBodyError(error: string): JournalEntryVersionedRead {
+  return { ok: false, reason: 'malformed', error };
+}
+
+/** The entry object used by `readLaneRunJournalEntry`; `schemaVersion` only when the input carried it. */
+function buildJournalEntry(
+  snapshot: Record<string, unknown>,
+  hasDetail: boolean,
+  schemaVersion: number | null,
+): LaneRunJournalEntryRecord {
+  return Object.freeze({
+    version: LANE_RUN_JOURNAL_ENTRY_VERSION,
+    entryId: snapshot.entryId as string,
+    kind: snapshot.kind as LaneRunJournalEntryKind,
+    key: snapshot.key as string | null,
+    runId: snapshot.runId as string | null,
+    recordedAtIso: new Date(snapshot.recordedAtIso as string).toISOString(),
+    mode: snapshot.mode as LaneRunStopKeyMode | null,
+    expectedRevision: snapshot.expectedRevision as number | null,
+    mintedId: snapshot.mintedId as string | null,
+    outcome: snapshot.outcome as LaneRunJournalOutcome | null,
+    reasonCode: snapshot.reasonCode as string | null,
+    detail: hasDetail ? (snapshot.detail as string | null) : null,
+    grantId: snapshot.grantId as string | null,
+    state: snapshot.state as LaneRunStateValue | null,
+    ...(schemaVersion === null ? {} : { schemaVersion }),
+  });
+}
+
+/** The entry's identity: its key and runId against the parsed key (§3.5). */
+function entryIdentityError(kind: LaneRunJournalEntryKind, snapshot: Record<string, unknown>): string | null {
+  const keyError = entryKeyError(kind, snapshot.key);
+  if (keyError !== null) {
+    return keyError;
+  }
+  const parsedKey = kind === 'conduct' ? null : parseLaneRunKey(snapshot.key);
+  const runIdError = entryRunIdError(kind, parsedKey, snapshot.runId);
+  if (runIdError !== null) {
+    return runIdError;
+  }
+  return null;
+}
+
+/** The kind-specific payload fields, in the order their helpers pin. */
+function entryPayloadError(
+  kind: LaneRunJournalEntryKind,
+  parsedKey: ParsedLaneRunKey | null,
+  snapshot: Record<string, unknown>,
+): string | null {
+  const modeError = entryModeError(kind, parsedKey, snapshot.mode);
+  if (modeError !== null) {
+    return modeError;
+  }
+  const expectedRevisionError = entryExpectedRevisionError(kind, parsedKey, snapshot.expectedRevision);
+  if (expectedRevisionError !== null) {
+    return expectedRevisionError;
+  }
+  const mintedIdError = entryMintedIdError(kind, snapshot.mintedId);
+  if (mintedIdError !== null) {
+    return mintedIdError;
+  }
+  const outcomeError = entryOutcomeError(kind, snapshot.outcome);
+  if (outcomeError !== null) {
+    return outcomeError;
+  }
+  const reasonCodeError = entryReasonCodeError(kind, snapshot.reasonCode);
+  if (reasonCodeError !== null) {
+    return reasonCodeError;
+  }
+  const grantIdError = entryGrantIdError(kind, snapshot.grantId);
+  if (grantIdError !== null) {
+    return grantIdError;
+  }
+  const stateError = entryStateError(kind, snapshot.state);
+  if (stateError !== null) {
+    return stateError;
+  }
+  return null;
+}
+
+/** The versioned stored-record read of a run-journal entry; always stamps `schemaVersion` (absent → 1). */
+export function readLaneRunJournalEntryRecord(
+  input: unknown,
+  options?: ReadRecordSchemaOptions,
+): VersionedRecordRead<LaneRunJournalEntryRecord> {
+  try {
+    const outcome = readJournalEntryWithVersion(input, options?.currentVersion ?? LANE_RUN_JOURNAL_SCHEMA_VERSION);
+    if (!outcome.ok) {
+      return { ok: false, reason: outcome.reason };
+    }
+    return { ok: true, record: Object.freeze({ ...outcome.entry, schemaVersion: outcome.schemaVersion }) };
+  } catch {
+    return { ok: false, reason: 'malformed' };
   }
 }
 
@@ -101,83 +255,6 @@ const LEGACY_ENTRY_KEYS: readonly string[] = ENTRY_KEYS.filter((key) => key !== 
 
 const ID_MAX_BYTES = 256;
 const LEASE_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
-
-function readLaneRunJournalEntryUnchecked(input: unknown): LaneRunJournalEntryRead {
-  let snapshot = readExactPlainRecord(input, ENTRY_KEYS);
-  let hasDetail = true;
-  if (snapshot === null) {
-    // Old stored entries carry no `detail`; read them as `detail: null`.
-    snapshot = readExactPlainRecord(input, LEGACY_ENTRY_KEYS);
-    if (snapshot === null) {
-      return { ok: false, error: 'LaneRunJournal entry must be a record with exactly the entry keys' };
-    }
-    hasDetail = false;
-  }
-  const headError = entryHeadError(snapshot);
-  if (headError !== null) {
-    return { ok: false, error: headError };
-  }
-  const detailError = entryDetailError(snapshot, hasDetail);
-  if (detailError !== null) {
-    return { ok: false, error: detailError };
-  }
-  const kind = snapshot.kind as LaneRunJournalEntryKind;
-  const key = snapshot.key;
-  const keyError = entryKeyError(kind, key);
-  if (keyError !== null) {
-    return { ok: false, error: keyError };
-  }
-  const parsedKey = kind === 'conduct' ? null : parseLaneRunKey(key);
-  const runIdError = entryRunIdError(kind, parsedKey, snapshot.runId);
-  if (runIdError !== null) {
-    return { ok: false, error: runIdError };
-  }
-  const modeError = entryModeError(kind, parsedKey, snapshot.mode);
-  if (modeError !== null) {
-    return { ok: false, error: modeError };
-  }
-  const expectedRevisionError = entryExpectedRevisionError(kind, parsedKey, snapshot.expectedRevision);
-  if (expectedRevisionError !== null) {
-    return { ok: false, error: expectedRevisionError };
-  }
-  const mintedIdError = entryMintedIdError(kind, snapshot.mintedId);
-  if (mintedIdError !== null) {
-    return { ok: false, error: mintedIdError };
-  }
-  const outcomeError = entryOutcomeError(kind, snapshot.outcome);
-  if (outcomeError !== null) {
-    return { ok: false, error: outcomeError };
-  }
-  const reasonCodeError = entryReasonCodeError(kind, snapshot.reasonCode);
-  if (reasonCodeError !== null) {
-    return { ok: false, error: reasonCodeError };
-  }
-  const grantIdError = entryGrantIdError(kind, snapshot.grantId);
-  if (grantIdError !== null) {
-    return { ok: false, error: grantIdError };
-  }
-  const stateError = entryStateError(kind, snapshot.state);
-  if (stateError !== null) {
-    return { ok: false, error: stateError };
-  }
-  const entry: LaneRunJournalEntryRecord = Object.freeze({
-    version: LANE_RUN_JOURNAL_ENTRY_VERSION,
-    entryId: snapshot.entryId as string,
-    kind,
-    key: key as string | null,
-    runId: snapshot.runId as string | null,
-    recordedAtIso: new Date(snapshot.recordedAtIso as string).toISOString(),
-    mode: snapshot.mode as LaneRunStopKeyMode | null,
-    expectedRevision: snapshot.expectedRevision as number | null,
-    mintedId: snapshot.mintedId as string | null,
-    outcome: snapshot.outcome as LaneRunJournalOutcome | null,
-    reasonCode: snapshot.reasonCode as string | null,
-    detail: hasDetail ? (snapshot.detail as string | null) : null,
-    grantId: snapshot.grantId as string | null,
-    state: snapshot.state as LaneRunStateValue | null,
-  });
-  return { ok: true, entry };
-}
 
 function entryHeadError(snapshot: Record<string, unknown>): string | null {
   if (snapshot.version !== LANE_RUN_JOURNAL_ENTRY_VERSION) {

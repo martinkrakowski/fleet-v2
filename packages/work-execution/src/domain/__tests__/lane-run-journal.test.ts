@@ -2,12 +2,14 @@ import { describe, expect, it } from 'vitest';
 
 import {
   LANE_RUN_JOURNAL_ENTRY_VERSION,
+  LANE_RUN_JOURNAL_SCHEMA_VERSION,
   laneRunJournalDispatchResult,
   laneRunJournalPendingIntent,
   laneRunJournalState,
   laneRunJournalStopFacts,
   prepareLaneRunJournalAppend,
   readLaneRunJournalEntry,
+  readLaneRunJournalEntryRecord,
 } from '../lane-run-journal.js';
 import type {
   LaneRunJournalEntryKind,
@@ -558,5 +560,103 @@ describe('laneRunJournalDispatchResult', () => {
 
   it('returns started for any other final outcome', () => {
     expect(laneRunJournalDispatchResult([intent(DISPATCH_KEY), result(DISPATCH_KEY, 'completed')], DISPATCH_KEY)).toBe('started');
+  });
+});
+
+describe('readLaneRunJournalEntryRecord and schemaVersion (Q5a)', () => {
+  it('keeps LANE_RUN_JOURNAL_SCHEMA_VERSION at 1', () => {
+    expect(LANE_RUN_JOURNAL_SCHEMA_VERSION).toBe(1);
+  });
+
+  it('round-trips an explicit schemaVersion 1 and omits the key when absent', () => {
+    const withSchema = { ...intent(STEP_KEY), schemaVersion: 1 };
+    const read = readLaneRunJournalEntry(withSchema);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.entry).toEqual(withSchema);
+    expect(Object.hasOwn(read.entry, 'schemaVersion')).toBe(true);
+
+    const absent = readLaneRunJournalEntry(intent(STEP_KEY));
+    expect(absent.ok).toBe(true);
+    if (!absent.ok) return;
+    expect(Object.hasOwn(absent.entry, 'schemaVersion')).toBe(false);
+  });
+
+  it('refuses schemaVersion 2 with the fixed message under the default current version', () => {
+    const read = readLaneRunJournalEntry({ ...intent(STEP_KEY), schemaVersion: 2 });
+    expect(read).toEqual({ ok: false, error: 'LaneRunJournal schemaVersion is not supported' });
+  });
+
+  it('refuses a future schemaVersion before the unknown-key check', () => {
+    const read = readLaneRunJournalEntry({ ...intent(STEP_KEY), schemaVersion: 99, unknownFutureField: 'x' });
+    expect(read).toEqual({ ok: false, error: 'LaneRunJournal schemaVersion is not supported' });
+  });
+
+  it('readLaneRunJournalEntryRecord always stamps schemaVersion (absent reads as 1)', () => {
+    const read = readLaneRunJournalEntryRecord(intent(STEP_KEY));
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.record.schemaVersion).toBe(1);
+    expect(Object.hasOwn(read.record, 'schemaVersion')).toBe(true);
+    expect(Object.isFrozen(read.record)).toBe(true);
+  });
+
+  it('accepts schemaVersion 2 under { currentVersion: 2 } on a version 1 entry', () => {
+    const read = readLaneRunJournalEntryRecord({ ...intent(STEP_KEY), schemaVersion: 2 }, { currentVersion: 2 });
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.record.schemaVersion).toBe(2);
+    expect(read.record.version).toBe(LANE_RUN_JOURNAL_ENTRY_VERSION);
+  });
+
+  it('reports unknown-schema-version for versions outside the accepted window', () => {
+    expect(readLaneRunJournalEntryRecord({ ...intent(STEP_KEY), schemaVersion: 3 }, { currentVersion: 2 })).toEqual({
+      ok: false,
+      reason: 'unknown-schema-version',
+    });
+    expect(readLaneRunJournalEntryRecord({ ...intent(STEP_KEY), schemaVersion: 1 }, { currentVersion: 3 })).toEqual({
+      ok: false,
+      reason: 'unknown-schema-version',
+    });
+    expect(readLaneRunJournalEntryRecord(intent(STEP_KEY), { currentVersion: 3 })).toEqual({
+      ok: false,
+      reason: 'unknown-schema-version',
+    });
+  });
+
+  it('reports malformed for an aggregate version 2 even with an accepted schemaVersion', () => {
+    const aggregateTwo = { ...intent(STEP_KEY), version: 2, schemaVersion: 2 };
+    expect(readLaneRunJournalEntryRecord(aggregateTwo, { currentVersion: 2 })).toEqual({
+      ok: false,
+      reason: 'malformed',
+    });
+    // The twin refusal without a schemaVersion keeps the aggregate message.
+    const twin = readLaneRunJournalEntry({ ...intent(STEP_KEY), version: 2 });
+    expect(twin).toEqual({ ok: false, error: 'LaneRunJournal version must be 1' });
+  });
+
+  it('does not throw on hostile input and never echoes a refused value', () => {
+    const throwingProxy = new Proxy(intent(STEP_KEY), {
+      ownKeys() {
+        throw new Error('boom');
+      },
+    });
+    expect(readLaneRunJournalEntryRecord(throwingProxy)).toEqual({ ok: false, reason: 'malformed' });
+    expect(readLaneRunJournalEntryRecord({ ...intent(STEP_KEY), schemaVersion: 'XYZZY' })).toEqual({
+      ok: false,
+      reason: 'unknown-schema-version',
+    });
+    expect(readLaneRunJournalEntryRecord(null)).toEqual({ ok: false, reason: 'malformed' });
+  });
+
+  it('still reads a legacy entry without detail as detail: null', () => {
+    const legacy = intent(STEP_KEY);
+    const raw: Record<string, unknown> = { ...legacy };
+    delete raw.detail;
+    const read = readLaneRunJournalEntry(raw);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.entry.detail).toBeNull();
+    expect(Object.hasOwn(read.entry, 'schemaVersion')).toBe(false);
   });
 });

@@ -9,7 +9,13 @@
  * is refused with a fixed message, never echoed.
  */
 
-import { isCalendarDateTime, readExactPlainRecord } from '../plain-record-reads.js';
+import { isCalendarDateTime, readPlainRecordWithOptionalKeys, readExactPlainRecord } from '../plain-record-reads.js';
+import {
+  isPlainRecordObject,
+  readRecordSchemaVersion,
+  type ReadRecordSchemaOptions,
+  type VersionedRecordRead,
+} from '../record-schema-version.js';
 import { containsSecretShape } from '@fleet/shared';
 import { BASE_BRANCH_INVALID_MESSAGE, parseBaseBranch } from '../base-branch.js';
 import type { BaseBranchValue } from '../base-branch.js';
@@ -22,6 +28,7 @@ import {
   LANE_RUN_PARK_QUALIFIER,
   LANE_RUN_PARK_REASONS,
   LANE_RUN_RECORD_VERSION,
+  LANE_RUN_SCHEMA_VERSION,
   LANE_RUN_TIERS,
   RUN_STOP_REFUSAL_KINDS,
 } from '../lane-run-records.js';
@@ -46,7 +53,8 @@ const ID_MAX_BYTES = 256;
 const SEAT_PLAN_REF_PATTERN = /^[0-9a-f]{64}$/;
 const LEASE_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 
-const CORE_RECORD_KEYS: readonly string[] = [
+/** The keys every stored record must carry. */
+const REQUIRED_RECORD_KEYS: readonly string[] = [
   'version',
   'runId',
   'workOrderId',
@@ -61,39 +69,14 @@ const CORE_RECORD_KEYS: readonly string[] = [
   'lease',
   'revision',
   'runPolicyRevision',
-  'branchName',
 ];
-
-/** Keys before KF-5a: records without `branchName` stay readable. */
-const LEGACY_RECORD_KEYS: readonly string[] = CORE_RECORD_KEYS.filter((key) => key !== 'branchName');
-/** Keys since CB1: records with an own `baseBranch` key. */
-const LEGACY_RECORD_KEYS_WITH_BASE_BRANCH: readonly string[] = [...LEGACY_RECORD_KEYS, 'baseBranch'];
-const RECORD_KEYS: readonly string[] = [...CORE_RECORD_KEYS, 'baseBranch'];
-const RECORD_KEYS_WITHOUT_BASE_BRANCH: readonly string[] = CORE_RECORD_KEYS;
 
 /**
- * The four exact key sets, newest first (CB1 added `baseBranch`, KF-5a added
- * `branchName`). An exact-key-set fallback keeps every stored record readable
- * without a version bump: a record whose keys match one set exactly is read;
- * anything else is an unknown key.
+ * The keys a record may omit: `branchName` (KF-5a), `baseBranch` (CB1) and
+ * `schemaVersion` (Q5a, D6). One optional-key read keeps every stored record
+ * readable without a version bump; anything else is an unknown key.
  */
-const RECORD_KEY_SETS: readonly (readonly string[])[] = [
-  RECORD_KEYS,
-  RECORD_KEYS_WITHOUT_BASE_BRANCH,
-  LEGACY_RECORD_KEYS_WITH_BASE_BRANCH,
-  LEGACY_RECORD_KEYS,
-];
-
-/** Read the input against the first key set it matches exactly; null otherwise. */
-function exactRunRecordInput(input: unknown): Record<string, unknown> | null {
-  for (const keys of RECORD_KEY_SETS) {
-    const recordInput = readExactPlainRecord(input, keys);
-    if (recordInput !== null) {
-      return recordInput;
-    }
-  }
-  return null;
-}
+const OPTIONAL_RECORD_KEYS: readonly string[] = ['branchName', 'baseBranch', 'schemaVersion'];
 
 const PARKED_KEYS: readonly string[] = ['reason', 'qualifier', 'parkedFrom', 'questionId'];
 const LEASE_KEYS: readonly string[] = ['holderId', 'fence', 'leaseUntilIso'];
@@ -115,148 +98,54 @@ export class LaneRun {
   /**
    * Body of create. Hostile input (a throwing getter or proxy trap) may throw
    * out of this body; the public wrapper turns that into the fixed failure
-   * result, never the exception's message. Only a plain object with exactly
-   * the allowed own enumerable string keys is accepted, and every field is
-   * read through its own property descriptor so no getter ever runs. Each
-   * nested object is then snapshotted once the same way, and the stored
-   * record is built only from those snapshots — the original nested objects
-   * are never read again.
+   * result, never the exception's message. Only a plain object with the
+   * required own enumerable string keys (plus the optional ones) is accepted,
+   * and every field is read through its own property descriptor so no getter
+   * ever runs. Each nested object is then snapshotted once the same way, and
+   * the stored record is built only from those snapshots — the original
+   * nested objects are never read again.
    */
-  private static createUnchecked(input: unknown): LaneRunResult {
-    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+  private static createUnchecked(input: unknown, currentVersion: number = LANE_RUN_SCHEMA_VERSION): LaneRunResult {
+    if (!isPlainRecordObject(input)) {
       return invalid('LaneRun requires a record');
     }
-    const inputPrototype = Object.getPrototypeOf(input);
-    if (inputPrototype !== Object.prototype && inputPrototype !== null) {
-      return invalid('LaneRun requires a record');
+    const versionRead = readRecordSchemaVersion(input, currentVersion);
+    if (!versionRead.ok) {
+      return invalid('LaneRun schemaVersion is not supported');
     }
-    const recordInput = exactRunRecordInput(input);
+    const recordInput = readPlainRecordWithOptionalKeys(input, REQUIRED_RECORD_KEYS, OPTIONAL_RECORD_KEYS);
     if (recordInput === null) {
       return invalid('LaneRun has an unknown key');
     }
-
-    if (recordInput.version !== LANE_RUN_RECORD_VERSION) {
-      return invalid('LaneRun version must be 1');
+    const scalarError = validateScalarFields(recordInput);
+    if (scalarError !== null) {
+      return invalid(scalarError);
     }
-    if (typeof recordInput.runId !== 'string' || !LANE_RUN_ID_PATTERN.test(recordInput.runId)) {
-      return invalid('LaneRun runId must be run- followed by a ULID');
+    const countersError = validateCounterFields(recordInput);
+    if (countersError !== null) {
+      return invalid(countersError);
     }
-    const workOrderIdError = idError('workOrderId', recordInput.workOrderId);
-    if (workOrderIdError !== null) {
-      return invalid(workOrderIdError);
+    const attempts = readValidatedAttempts(recordInput);
+    if (!attempts.ok) {
+      return invalid(attempts.error);
     }
-    if (!LANE_RUN_TIERS.includes(recordInput.tier as LaneRunTier)) {
-      return invalid('LaneRun tier must be 1 or 2');
-    }
-    if (typeof recordInput.seatPlanRef !== 'string' || !SEAT_PLAN_REF_PATTERN.test(recordInput.seatPlanRef)) {
-      return invalid('LaneRun seatPlanRef must be a sha256 hex digest');
-    }
-
-    const cursorsSnapshot = readExactPlainRecord(recordInput.cursors, SEAT_PLAN_ROLES);
-    const cursorsError = cursorsSnapshotError(cursorsSnapshot);
-    if (cursorsError !== null) {
-      return invalid(cursorsError);
-    }
-
-    if (!Number.isInteger(recordInput.round) || (recordInput.round as number) < 0 || (recordInput.round as number) > LANE_RUN_MAX_ROUND) {
-      return invalid('LaneRun round must be 0, 1 or 2');
-    }
-    const round = recordInput.round as number;
-
-    const attemptIds = plainArrayCopy(recordInput.attemptIds);
-    const attemptListError = attemptIdsError(attemptIds);
-    if (attemptListError !== null) {
-      return invalid(attemptListError);
-    }
-    const attemptList = attemptIds as unknown[];
-    if (round !== 0 && attemptList.length < round + 1) {
-      return invalid('LaneRun round exceeds its attempts');
-    }
-
-    const prNumber = recordInput.prNumber;
-    if (prNumber !== null && (!Number.isSafeInteger(prNumber) || (prNumber as number) < 1)) {
-      return invalid('LaneRun prNumber must be null or a positive integer');
-    }
-    const parkCount = recordInput.parkCount;
-    if (
-      !Number.isSafeInteger(parkCount) ||
-      (parkCount as number) < 0 ||
-      (parkCount as number) > LANE_RUN_MAX_PARK_ORDINAL
-    ) {
-      return invalid('LaneRun parkCount must be a non-negative integer');
-    }
-
-    let parked: LaneRunParkRecord | null = null;
-    if (recordInput.parked !== null) {
-      const parkedSnapshot = readExactPlainRecord(recordInput.parked, PARKED_KEYS);
-      const parkedError = parkedSnapshotError(parkedSnapshot);
-      if (parkedError !== null) {
-        return invalid(parkedError);
-      }
-      parked = buildParkedRecord(parkedSnapshot as Record<string, unknown>);
-    }
-    if (parked !== null && (parkCount as number) < 1) {
-      return invalid('LaneRun parkCount must count the current park');
-    }
-
-    let lease: LaneRunLeaseRecord | null = null;
-    if (recordInput.lease !== null) {
-      const leaseSnapshot = readExactPlainRecord(recordInput.lease, LEASE_KEYS);
-      const leaseError = leaseSnapshotError(leaseSnapshot);
-      if (leaseError !== null) {
-        return invalid(leaseError);
-      }
-      lease = buildLeaseRecord(leaseSnapshot as Record<string, unknown>);
-    }
-
-    if (!Number.isSafeInteger(recordInput.revision) || (recordInput.revision as number) < 1) {
-      return invalid('LaneRun revision must be a positive integer');
+    const parkAndLease = readValidatedParkAndLease(recordInput);
+    if (!parkAndLease.ok) {
+      return invalid(parkAndLease.error);
     }
     const runPolicyRevisionError = idError('runPolicyRevision', recordInput.runPolicyRevision);
     if (runPolicyRevisionError !== null) {
       return invalid(runPolicyRevisionError);
     }
-
-    // The same rule as ForgeActionAdapter's `isSafeBranchName`, with ForgeReadAdapter's
-    // all-digit refusal; the domain copies it rather than importing an adapter (KF-5a).
-    // Presence is decided with Object.hasOwn so a hostile key shape is refused like a
-    // hostile workOrderId: `readExactPlainRecord` exposes an accessor's descriptor value,
-    // which is undefined, so a getter or an explicit `{ branchName: undefined }` key
-    // arrives here as present-but-not-a-string (fix round 1).
-    let branchName: string | undefined;
-    if (Object.hasOwn(recordInput, 'branchName')) {
-      const branch = recordInput.branchName;
-      const allDigits = /^\d+$/;
-      const safe =
-        typeof branch === 'string' &&
-        branch.length <= 200 &&
-        branch.length > 0 &&
-        !branch.includes('..') &&
-        !branch.endsWith('/') &&
-        !branch.endsWith('.') &&
-        !branch.endsWith('.lock') &&
-        /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) &&
-        !allDigits.test(branch) &&
-        !containsSecretShape(branch);
-      if (!safe) {
-        return invalid('LaneRun branchName must be a safe branch name');
-      }
-      branchName = branch;
+    const branchName = readOptionalBranchName(recordInput);
+    if (!branchName.ok) {
+      return invalid(branchName.error);
     }
-
-    // The same own-property presence rule as branchName: `readExactPlainRecord`
-    // exposes an accessor's descriptor value, so an enumerable getter or an
-    // explicit `{ baseBranch: undefined }` key arrives here as present-but-not-
-    // a-string and is refused rather than skipped (CB1).
-    let baseBranch: BaseBranchValue | undefined;
-    if (Object.hasOwn(recordInput, 'baseBranch')) {
-      const parsed = parseBaseBranch(recordInput.baseBranch);
-      if (parsed === undefined) {
-        return invalid('LaneRun ' + BASE_BRANCH_INVALID_MESSAGE);
-      }
-      baseBranch = parsed;
+    const baseBranch = readOptionalBaseBranch(recordInput);
+    if (!baseBranch.ok) {
+      return invalid(baseBranch.error);
     }
-
+    const cursorsSnapshot = readExactPlainRecord(recordInput.cursors, SEAT_PLAN_ROLES) as Record<string, unknown>;
     const record: LaneRunRecord = {
       version: LANE_RUN_RECORD_VERSION,
       runId: recordInput.runId as string,
@@ -264,22 +153,49 @@ export class LaneRun {
       tier: recordInput.tier as LaneRunTier,
       seatPlanRef: recordInput.seatPlanRef as string,
       cursors: Object.freeze({
-        'first-pass': (cursorsSnapshot as Record<string, unknown>)['first-pass'] as number | null,
-        fix: (cursorsSnapshot as Record<string, unknown>).fix as number | null,
-        review: (cursorsSnapshot as Record<string, unknown>).review as number | null,
+        'first-pass': cursorsSnapshot['first-pass'] as number | null,
+        fix: cursorsSnapshot.fix as number | null,
+        review: cursorsSnapshot.review as number | null,
       }),
-      round,
-      attemptIds: Object.freeze([...attemptList]) as readonly string[],
-      prNumber: prNumber as number | null,
-      parked,
-      parkCount: parkCount as number,
-      lease,
+      round: recordInput.round as number,
+      attemptIds: attempts.attemptIds,
+      prNumber: recordInput.prNumber as number | null,
+      parked: parkAndLease.parked,
+      parkCount: recordInput.parkCount as number,
+      lease: parkAndLease.lease,
       revision: recordInput.revision as number,
       runPolicyRevision: recordInput.runPolicyRevision as string,
-      ...(branchName === undefined ? {} : { branchName }),
-      ...(baseBranch === undefined ? {} : { baseBranch }),
+      ...(branchName.branchName === undefined ? {} : { branchName: branchName.branchName }),
+      ...(baseBranch.baseBranch === undefined ? {} : { baseBranch: baseBranch.baseBranch }),
+      ...(versionRead.explicit ? { schemaVersion: versionRead.schemaVersion } : {}),
     };
     return { success: true, value: new LaneRun(Object.freeze(record)) };
+  }
+
+  /**
+   * The versioned stored-record read (Q5a): the schema check runs first so a
+   * newer schema is refused as `'unknown-schema-version'` and never
+   * quarantined, then the full body validates. The success record always
+   * stamps `schemaVersion` (absent reads as 1).
+   */
+  static readStoredRecord(input: unknown, options?: ReadRecordSchemaOptions): VersionedRecordRead<LaneRunRecord> {
+    const currentVersion = options?.currentVersion ?? LANE_RUN_SCHEMA_VERSION;
+    try {
+      const versionRead = readRecordSchemaVersion(input, currentVersion);
+      if (!versionRead.ok) {
+        return { ok: false, reason: versionRead.reason };
+      }
+      const created = LaneRun.createUnchecked(input, currentVersion);
+      if (!created.success) {
+        return { ok: false, reason: 'malformed' };
+      }
+      return {
+        ok: true,
+        record: Object.freeze({ ...created.value.toRecord(), schemaVersion: versionRead.schemaVersion }),
+      };
+    } catch {
+      return { ok: false, reason: 'malformed' };
+    }
   }
 
   /** Fresh plain record; nested objects are fresh copies. */
@@ -301,6 +217,7 @@ export class LaneRun {
       runPolicyRevision: this.record.runPolicyRevision,
       ...(this.record.branchName === undefined ? {} : { branchName: this.record.branchName }),
       ...(this.record.baseBranch === undefined ? {} : { baseBranch: this.record.baseBranch }),
+      ...(this.record.schemaVersion === undefined ? {} : { schemaVersion: this.record.schemaVersion }),
     };
   }
 
@@ -331,6 +248,192 @@ export class LaneRun {
   isParked(): boolean {
     return this.record.parked !== null;
   }
+}
+
+/** Versioned stored-record read for lane-run records (Q5a, D6). */
+export function readLaneRunRecord(input: unknown, options?: ReadRecordSchemaOptions): VersionedRecordRead<LaneRunRecord> {
+  return LaneRun.readStoredRecord(input, options);
+}
+
+/** Version, runId, workOrderId, tier, seatPlanRef, cursors and runPolicyRevision. */
+function validateScalarFields(recordInput: Record<string, unknown>): string | null {
+  if (recordInput.version !== LANE_RUN_RECORD_VERSION) {
+    return 'LaneRun version must be 1';
+  }
+  if (typeof recordInput.runId !== 'string' || !LANE_RUN_ID_PATTERN.test(recordInput.runId)) {
+    return 'LaneRun runId must be run- followed by a ULID';
+  }
+  const workOrderIdError = idError('workOrderId', recordInput.workOrderId);
+  if (workOrderIdError !== null) {
+    return workOrderIdError;
+  }
+  if (!LANE_RUN_TIERS.includes(recordInput.tier as LaneRunTier)) {
+    return 'LaneRun tier must be 1 or 2';
+  }
+  if (typeof recordInput.seatPlanRef !== 'string' || !SEAT_PLAN_REF_PATTERN.test(recordInput.seatPlanRef)) {
+    return 'LaneRun seatPlanRef must be a sha256 hex digest';
+  }
+  const cursorsSnapshot = readExactPlainRecord(recordInput.cursors, SEAT_PLAN_ROLES);
+  const cursorsError = cursorsSnapshotError(cursorsSnapshot);
+  if (cursorsError !== null) {
+    return cursorsError;
+  }
+  const runPolicyRevisionError = idError('runPolicyRevision', recordInput.runPolicyRevision);
+  if (runPolicyRevisionError !== null) {
+    return runPolicyRevisionError;
+  }
+  return null;
+}
+
+/** round, prNumber, parkCount and revision. */
+function validateCounterFields(recordInput: Record<string, unknown>): string | null {
+  if (!Number.isInteger(recordInput.round) || (recordInput.round as number) < 0 || (recordInput.round as number) > LANE_RUN_MAX_ROUND) {
+    return 'LaneRun round must be 0, 1 or 2';
+  }
+  const prNumber = recordInput.prNumber;
+  if (prNumber !== null && (!Number.isSafeInteger(prNumber) || (prNumber as number) < 1)) {
+    return 'LaneRun prNumber must be null or a positive integer';
+  }
+  const parkCount = recordInput.parkCount;
+  if (
+    !Number.isSafeInteger(parkCount) ||
+    (parkCount as number) < 0 ||
+    (parkCount as number) > LANE_RUN_MAX_PARK_ORDINAL
+  ) {
+    return 'LaneRun parkCount must be a non-negative integer';
+  }
+  if (!Number.isSafeInteger(recordInput.revision) || (recordInput.revision as number) < 1) {
+    return 'LaneRun revision must be a positive integer';
+  }
+  return null;
+}
+
+/** The run's attempt list, frozen; refused when it cannot carry the run's round. */
+function readValidatedAttempts(recordInput: Record<string, unknown>): {
+  ok: true;
+  attemptIds: readonly string[];
+} | { ok: false; error: string } {
+  const attemptIds = plainArrayCopy(recordInput.attemptIds);
+  const attemptListError = attemptIdsError(attemptIds);
+  if (attemptListError !== null) {
+    return { ok: false, error: attemptListError };
+  }
+  const attemptList = attemptIds as unknown[];
+  const round = recordInput.round as number;
+  if (round !== 0 && attemptList.length < round + 1) {
+    return { ok: false, error: 'LaneRun round exceeds its attempts' };
+  }
+  return { ok: true, attemptIds: Object.freeze([...attemptList]) as readonly string[] };
+}
+
+/** The run's park and lease snapshot records, frozen; refused with the fixed field messages. */
+function readValidatedParkAndLease(recordInput: Record<string, unknown>): {
+  ok: true;
+  parked: LaneRunParkRecord | null;
+  lease: LaneRunLeaseRecord | null;
+} | { ok: false; error: string } {
+  const parkRead = readValidatedPark(recordInput);
+  if (!parkRead.ok) {
+    return parkRead;
+  }
+  const leaseRead = readValidatedLease(recordInput);
+  if (!leaseRead.ok) {
+    return leaseRead;
+  }
+  return { ok: true, parked: parkRead.parked, lease: leaseRead.lease };
+}
+
+function readValidatedPark(recordInput: Record<string, unknown>): {
+  ok: true;
+  parked: LaneRunParkRecord | null;
+} | { ok: false; error: string } {
+  let parked: LaneRunParkRecord | null = null;
+  if (recordInput.parked !== null) {
+    const parkedSnapshot = readExactPlainRecord(recordInput.parked, PARKED_KEYS);
+    const parkedError = parkedSnapshotError(parkedSnapshot);
+    if (parkedError !== null) {
+      return { ok: false, error: parkedError };
+    }
+    parked = buildParkedRecord(parkedSnapshot as Record<string, unknown>);
+  }
+  if (parked !== null && (recordInput.parkCount as number) < 1) {
+    return { ok: false, error: 'LaneRun parkCount must count the current park' };
+  }
+  return { ok: true, parked };
+}
+
+function readValidatedLease(recordInput: Record<string, unknown>): {
+  ok: true;
+  lease: LaneRunLeaseRecord | null;
+} | { ok: false; error: string } {
+  let lease: LaneRunLeaseRecord | null = null;
+  if (recordInput.lease !== null) {
+    const leaseSnapshot = readExactPlainRecord(recordInput.lease, LEASE_KEYS);
+    const leaseError = leaseSnapshotError(leaseSnapshot);
+    if (leaseError !== null) {
+      return { ok: false, error: leaseError };
+    }
+    lease = buildLeaseRecord(leaseSnapshot as Record<string, unknown>);
+  }
+  return { ok: true, lease };
+}
+
+/**
+ * The same rule as ForgeActionAdapter's `isSafeBranchName`, with ForgeReadAdapter's
+ * all-digit refusal; the domain copies it rather than importing an adapter (KF-5a).
+ */
+function isSafeBranchName(branch: unknown): boolean {
+  if (typeof branch !== 'string') {
+    return false;
+  }
+  const allDigits = /^\d+$/;
+  return (
+    branch.length <= 200 &&
+    branch.length > 0 &&
+    !branch.includes('..') &&
+    !branch.endsWith('/') &&
+    !branch.endsWith('.') &&
+    !branch.endsWith('.lock') &&
+    /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) &&
+    !allDigits.test(branch) &&
+    !containsSecretShape(branch)
+  );
+}
+
+/** `branchName` is optional; when the key is present the value must be a safe branch name. */
+function readOptionalBranchName(recordInput: Record<string, unknown>): {
+  ok: true;
+  branchName: string | undefined;
+} | { ok: false; error: string } {
+  if (!Object.hasOwn(recordInput, 'branchName')) {
+    return { ok: true, branchName: undefined };
+  }
+  // Presence is decided with Object.hasOwn so a hostile key shape is refused like a
+  // hostile workOrderId: an enumerable getter is never run, and its descriptor value
+  // (undefined) arrives here as present-but-not-a-string (fix round 1).
+  const branch = recordInput.branchName;
+  if (!isSafeBranchName(branch)) {
+    return { ok: false, error: 'LaneRun branchName must be a safe branch name' };
+  }
+  return { ok: true, branchName: branch as string };
+}
+
+/** `baseBranch` is optional (CB1); when the key is present the value must parse as one. */
+function readOptionalBaseBranch(recordInput: Record<string, unknown>): {
+  ok: true;
+  baseBranch: BaseBranchValue | undefined;
+} | { ok: false; error: string } {
+  if (!Object.hasOwn(recordInput, 'baseBranch')) {
+    return { ok: true, baseBranch: undefined };
+  }
+  // The same own-property presence rule as branchName: an enumerable getter is never
+  // run, so a getter or an explicit `{ baseBranch: undefined }` key arrives here as
+  // present-but-not-parseable and is refused rather than skipped (CB1).
+  const parsed = parseBaseBranch(recordInput.baseBranch);
+  if (parsed === undefined) {
+    return { ok: false, error: 'LaneRun ' + BASE_BRANCH_INVALID_MESSAGE };
+  }
+  return { ok: true, baseBranch: parsed };
 }
 
 function invalid(message: string): LaneRunResult {

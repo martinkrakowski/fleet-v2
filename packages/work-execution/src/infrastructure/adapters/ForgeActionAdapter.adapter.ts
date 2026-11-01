@@ -21,6 +21,11 @@ import type {
   ForgeActionResult,
 } from '../../application/ports/out/ForgeActionPort.out-port.js';
 import type {
+  MergeForgeActionPort,
+  MergeForgeActionRequest,
+  MergeForgeActionResult,
+} from '../../application/ports/out/MergeForgeActionPort.out-port.js';
+import type {
   ForgeReadPort,
   ForgeRepositoryRef,
   ReadPullRequestRequest,
@@ -28,6 +33,14 @@ import type {
 } from '../../application/ports/out/ForgeReadPort.out-port.js';
 import type { ForgeRefusalKind } from '../../domain/coordination-keys.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
+import { classifyGhRefusal } from './gh-refusal.js';
+
+export {
+  PERMISSION_NEEDLES,
+  PROTECTION_NEEDLES,
+  CONFLICT_NEEDLES,
+  classifyGhRefusal,
+} from './gh-refusal.js';
 
 /** Result of one reviewed gh invocation. */
 export interface GhInvocationResult {
@@ -38,7 +51,16 @@ export interface GhInvocationResult {
 
 /** Host-side delegates; the composition root binds the reviewed subprocess. */
 export interface ForgeActionDelegate {
-  readonly runGh?: (args: readonly string[]) => Promise<GhInvocationResult>;
+  /**
+   * Run one reviewed `gh` invocation. The merge path (MergeForgeActionPort)
+   * passes the per-kind `GH_CONFIG_DIR` and a subprocess-terminating timeout;
+   * the attempt-bound path leaves both undefined.
+   */
+  readonly runGh?: (
+    args: readonly string[],
+    ghConfigDir?: string,
+    timeoutMs?: number,
+  ) => Promise<GhInvocationResult>;
   /**
    * Resolve the branch's current live head for exactly this request; a
    * delegate that cannot verify the head is required to refuse instead of
@@ -50,7 +72,8 @@ export interface ForgeActionDelegate {
   ) => Promise<string>;
   /**
    * Read-only PR state (AM4b-2). Required for `push-to-pr`: without it the
-   * push refuses, since the open PR and its head cannot be checked.
+   * push refuses, since the open PR and its head cannot be checked, and for
+   * the merge path's head guard and A13/update-branch re-reads.
    */
   readonly pullRequestRead?: Pick<ForgeReadPort, 'readPullRequest'>;
   /**
@@ -58,6 +81,16 @@ export interface ForgeActionDelegate {
    * argv carries `-R owner/repo` and reads name it explicitly.
    */
   readonly repository?: ForgeRepositoryRef;
+  /** Wall-clock supplier for the merge path's deadline budget; tests inject a fixed clock. */
+  readonly nowIso?: () => string;
+}
+
+/** Per-kind `GH_CONFIG_DIR` routing for the merge path (D-DT8). Values are never logged or printed. */
+export interface ForgeActionAdapterConfig {
+  /** The statuses-only poster identity's config dir; required for `post-status`. */
+  readonly premergeGhConfigDir?: string;
+  /** The merger identity's config dir; required for `merge-pr` and `update-branch`. */
+  readonly mergeGhConfigDir?: string;
 }
 
 function errorMessage(error: unknown): string {
@@ -66,51 +99,6 @@ function errorMessage(error: unknown): string {
 
 function firstLine(text: string): string {
   return text.trim().split('\n')[0] ?? '';
-}
-
-/** Lower-case needles checked in this order: permission, then protection, then conflict. */
-const PERMISSION_NEEDLES: readonly string[] = [
-  'resource not accessible by integration',
-  'does not have the correct permissions',
-  'must have admin rights',
-  'must have write access',
-  'permission denied',
-  'bad credentials',
-  'http 401',
-  'http 403',
-  'gh auth login',
-];
-const PROTECTION_NEEDLES: readonly string[] = [
-  'base branch policy prohibits the merge',
-  'required status check',
-  'approving review',
-  'review is required',
-  'repository rule violation',
-  'protected branch',
-  'branch protection',
-];
-const CONFLICT_NEEDLES: readonly string[] = [
-  'merge commit cannot be cleanly created',
-  'merge conflict',
-  'has conflicts',
-];
-
-/**
- * Classify a failed `gh` run by its whole output (plan AM4b). Permission wins
- * over protection, protection over conflict; anything unrecognised is `other`.
- */
-export function classifyGhRefusal(stderr: string, stdout: string): ForgeRefusalKind {
-  const text = (stderr + '\n' + stdout).toLowerCase();
-  if (PERMISSION_NEEDLES.some((needle) => text.includes(needle))) {
-    return 'permission';
-  }
-  if (PROTECTION_NEEDLES.some((needle) => text.includes(needle))) {
-    return 'protection';
-  }
-  if (CONFLICT_NEEDLES.some((needle) => text.includes(needle))) {
-    return 'conflict';
-  }
-  return 'other';
 }
 
 /** Commit SHAs are 7-40 lowercase hex characters. */
@@ -155,13 +143,24 @@ export function isSafeBranchName(value: string): boolean {
   );
 }
 
-export class ForgeActionAdapter implements ForgeActionPort {
+/** Normal one-call timeout for `gh`, matching ForgeReadAdapter's read deadline. */
+const NORMAL_FORGE_TIMEOUT_MS = 30_000;
+/** A call with less than this much budget left is not started (plan §3.1). */
+const MIN_REMAINING_TO_START_MS = 2_000;
+
+export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort {
   private readonly delegate?: ForgeActionDelegate;
   private readonly forgeRead?: ForgeReadPort;
+  private readonly config?: ForgeActionAdapterConfig;
 
-  constructor(delegate?: ForgeActionDelegate, forgeRead?: ForgeReadPort) {
+  constructor(
+    delegate?: ForgeActionDelegate,
+    forgeRead?: ForgeReadPort,
+    config?: ForgeActionAdapterConfig,
+  ) {
     this.delegate = delegate;
     this.forgeRead = forgeRead;
+    this.config = config;
   }
 
   isConfigured(): boolean {
@@ -575,5 +574,287 @@ export class ForgeActionAdapter implements ForgeActionPort {
       reason: 'gh pr merge exited non-zero; the pull request is not merged',
       refusalKind,
     };
+  }
+
+  // --- MergeForgeActionPort (repo-scoped merge pass path, DT6a) ---------------
+
+  async performMergeForgeAction(request: MergeForgeActionRequest): Promise<MergeForgeActionResult> {
+    const statusRefusal = this.mergeStatusRefusal(request);
+    if (statusRefusal !== null) {
+      return statusRefusal;
+    }
+    const headGuard = await this.mergeReadHeadGuard(request);
+    if (headGuard !== null) {
+      return headGuard;
+    }
+    if (request.kind === 'merge-pr') {
+      return this.runMergePr(request);
+    }
+    if (request.kind === 'update-branch') {
+      return this.runMergeUpdateBranch(request);
+    }
+    return this.runMergePostStatus(request);
+  }
+
+  /** The reader's status rule (mirrors the attempt-bound path): only `post-status` may carry `status`. */
+  private mergeStatusRefusal(request: MergeForgeActionRequest): MergeForgeActionResult | null {
+    if (request.kind !== 'post-status') {
+      if ('status' in request) {
+        return this.mergeRefusedOther('status is only valid for post-status');
+      }
+      return null;
+    }
+    if (!('status' in request)) {
+      return this.mergeRefusedOther('status is required for post-status');
+    }
+    return null;
+  }
+
+  /** The wall clock; tests inject a fixed `nowIso`. */
+  private nowIso(): string {
+    return this.delegate?.nowIso?.() ?? new Date().toISOString();
+  }
+
+  /**
+   * The timeout bound for one call, or a budget refusal when the call must
+   * not start: past the deadline, or fewer than 2 s remain. The caller maps
+   * the refusal reason to `budget-exhausted`.
+   */
+  private budgetCallTimeoutMs(
+    deadlineIso: string,
+  ): { ok: true; timeoutMs: number } | { ok: false; reason: string } {
+    const remainingMs = Date.parse(deadlineIso) - Date.parse(this.nowIso());
+    if (remainingMs <= 0) {
+      return { ok: false, reason: 'the deadline passed before the forge action could start' };
+    }
+    if (remainingMs < MIN_REMAINING_TO_START_MS) {
+      return { ok: false, reason: 'less than 2 seconds remained before the deadline' };
+    }
+    return { ok: true, timeoutMs: Math.min(NORMAL_FORGE_TIMEOUT_MS, remainingMs) };
+  }
+
+  private mergeRefusedOther(reason: string): MergeForgeActionResult {
+    return { outcome: 'refused', reason, refusalKind: 'other' };
+  }
+
+  private mergeConfigDir(): string | null {
+    const dir = this.config?.mergeGhConfigDir;
+    return dir !== undefined && dir.trim().length > 0 ? dir.trim() : null;
+  }
+
+  private premergeConfigDir(): string | null {
+    const dir = this.config?.premergeGhConfigDir;
+    return dir !== undefined && dir.trim().length > 0 ? dir.trim() : null;
+  }
+
+  /**
+   * Read the pull request by number for the merge path, bounded by the
+   * remaining budget. Returns null when the read cannot answer so the caller
+   * reports ambiguous rather than writing.
+   */
+  private async mergeReadPullRequest(
+    request: MergeForgeActionRequest,
+    timeoutMs: number,
+  ): Promise<ReadPullRequestResult | null> {
+    const reader = this.delegate?.pullRequestRead;
+    if (reader === undefined) {
+      return null;
+    }
+    try {
+      return await reader.readPullRequest({
+        ref: { kind: 'number', number: request.pullRequestNumber },
+        repository: request.repository,
+        timeoutMs,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /** Head guard for every merge-pass request, before any write. */
+  private async mergeReadHeadGuard(request: MergeForgeActionRequest): Promise<MergeForgeActionResult | null> {
+    const budget = this.budgetCallTimeoutMs(request.deadlineIso);
+    if (!budget.ok) {
+      return this.mergeRefusedOther(budget.reason);
+    }
+    const read = await this.mergeReadPullRequest(request, budget.timeoutMs);
+    if (read === null || read.outcome === 'not-found' || read.outcome === 'unavailable') {
+      return { outcome: 'ambiguous', reason: 'could not read the pull request to verify its head' };
+    }
+    if (read.pullRequest.state !== 'open') {
+      return this.mergeRefusedOther(
+        `pull request #${request.pullRequestNumber} is ${read.pullRequest.state}, not open`,
+      );
+    }
+    if (read.pullRequest.headSha !== request.expectedHeadSha) {
+      return this.mergeRefusedOther('the pull request head moved since verification');
+    }
+    return null;
+  }
+
+  private async runMergePr(request: MergeForgeActionRequest): Promise<MergeForgeActionResult> {
+    const configDir = this.mergeConfigDir();
+    if (configDir === null) {
+      return this.mergeRefusedOther('no merger identity is configured');
+    }
+    const runGh = this.delegate?.runGh;
+    if (runGh === undefined) {
+      return { outcome: 'ambiguous', reason: 'no gh subprocess is configured' };
+    }
+    const budget = this.budgetCallTimeoutMs(request.deadlineIso);
+    if (!budget.ok) {
+      return this.mergeRefusedOther(budget.reason);
+    }
+    const args = [
+      'pr',
+      'merge',
+      '-R',
+      `${request.repository.owner}/${request.repository.repo}`,
+      request.branchName,
+      '--match-head-commit',
+      request.expectedHeadSha,
+      '--merge',
+    ];
+    let gh: GhInvocationResult;
+    try {
+      gh = await runGh(args, configDir, budget.timeoutMs);
+    } catch {
+      return { outcome: 'ambiguous', reason: 'gh pr merge could not complete' };
+    }
+    if (gh.exitCode !== 0) {
+      return this.confirmMergeAfterRefusalScoped(request, classifyGhRefusal(gh.stderr, gh.stdout));
+    }
+    return { outcome: 'executed', headSha: request.expectedHeadSha };
+  }
+
+  /**
+   * A13 for the merge path: a non-zero `gh pr merge` exit does not prove the
+   * merge failed, so the pull request state is re-read (deadline-bounded)
+   * before any refusal is reported.
+   */
+  private async confirmMergeAfterRefusalScoped(
+    request: MergeForgeActionRequest,
+    refusalKind: ForgeRefusalKind,
+  ): Promise<MergeForgeActionResult> {
+    const budget = this.budgetCallTimeoutMs(request.deadlineIso);
+    if (!budget.ok) {
+      return {
+        outcome: 'ambiguous',
+        reason: 'gh pr merge exited non-zero and the pull request state could not be read',
+      };
+    }
+    const read = await this.mergeReadPullRequest(request, budget.timeoutMs);
+    if (read === null || read.outcome === 'not-found' || read.outcome === 'unavailable') {
+      return {
+        outcome: 'ambiguous',
+        reason: 'gh pr merge exited non-zero and the pull request state could not be read',
+      };
+    }
+    const snapshot = read.pullRequest;
+    if (snapshot.state === 'merged') {
+      if (snapshot.headSha.startsWith(request.expectedHeadSha)) {
+        return { outcome: 'executed', headSha: request.expectedHeadSha };
+      }
+      return { outcome: 'ambiguous', reason: 'the pull request merged at a different head' };
+    }
+    return {
+      outcome: 'refused',
+      reason: 'gh pr merge exited non-zero; the pull request is not merged',
+      refusalKind,
+    };
+  }
+
+  private async runMergeUpdateBranch(request: MergeForgeActionRequest): Promise<MergeForgeActionResult> {
+    const configDir = this.mergeConfigDir();
+    if (configDir === null) {
+      return this.mergeRefusedOther('no merger identity is configured');
+    }
+    const runGh = this.delegate?.runGh;
+    if (runGh === undefined) {
+      return { outcome: 'ambiguous', reason: 'no gh subprocess is configured' };
+    }
+    const budget = this.budgetCallTimeoutMs(request.deadlineIso);
+    if (!budget.ok) {
+      return this.mergeRefusedOther(budget.reason);
+    }
+    const args = [
+      'api',
+      `repos/${request.repository.owner}/${request.repository.repo}/pulls/${request.pullRequestNumber}/update-branch`,
+      '-f',
+      `expected_head_sha=${request.expectedHeadSha}`,
+      '-X',
+      'PUT',
+    ];
+    let gh: GhInvocationResult;
+    try {
+      gh = await runGh(args, configDir, budget.timeoutMs);
+    } catch {
+      return { outcome: 'ambiguous', reason: 'gh api update-branch could not complete' };
+    }
+    if (gh.exitCode !== 0) {
+      return {
+        outcome: 'refused',
+        reason: `gh api update-branch failed (exit ${gh.exitCode})`,
+        refusalKind: classifyGhRefusal(gh.stderr, gh.stdout),
+      };
+    }
+    // The PUT is 202 async: re-read the head up to 3 times (plan §3.3).
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const readBudget = this.budgetCallTimeoutMs(request.deadlineIso);
+      if (!readBudget.ok) {
+        return { outcome: 'ambiguous', reason: 'branch update accepted but the head is unchanged' };
+      }
+      const read = await this.mergeReadPullRequest(request, readBudget.timeoutMs);
+      if (read === null || read.outcome === 'not-found' || read.outcome === 'unavailable') {
+        return { outcome: 'ambiguous', reason: 'branch update accepted but the head is unchanged' };
+      }
+      if (read.pullRequest.headSha !== request.expectedHeadSha) {
+        return { outcome: 'executed', headSha: read.pullRequest.headSha };
+      }
+    }
+    return { outcome: 'ambiguous', reason: 'branch update accepted but the head is unchanged' };
+  }
+
+  private async runMergePostStatus(
+    request: Extract<MergeForgeActionRequest, { kind: 'post-status' }>,
+  ): Promise<MergeForgeActionResult> {
+    const configDir = this.premergeConfigDir();
+    if (configDir === null) {
+      return this.mergeRefusedOther('no premerge identity is configured');
+    }
+    const runGh = this.delegate?.runGh;
+    if (runGh === undefined) {
+      return { outcome: 'ambiguous', reason: 'no gh subprocess is configured' };
+    }
+    const budget = this.budgetCallTimeoutMs(request.deadlineIso);
+    if (!budget.ok) {
+      return this.mergeRefusedOther(budget.reason);
+    }
+    const args = [
+      'api',
+      '-X',
+      'POST',
+      `repos/${request.repository.owner}/${request.repository.repo}/statuses/${request.expectedHeadSha}`,
+      '-f',
+      `state=${request.status.state}`,
+      '-f',
+      'context=premerge',
+      '-f',
+      `description=${request.status.description}`,
+    ];
+    let gh: GhInvocationResult;
+    try {
+      gh = await runGh(args, configDir, budget.timeoutMs);
+    } catch {
+      return { outcome: 'ambiguous', reason: 'gh api statuses could not complete' };
+    }
+    if (gh.exitCode !== 0) {
+      return {
+        outcome: 'refused',
+        reason: `gh api statuses failed (exit ${gh.exitCode})`,
+        refusalKind: classifyGhRefusal(gh.stderr, gh.stdout),
+      };
+    }
+    return { outcome: 'executed', headSha: request.expectedHeadSha };
   }
 }

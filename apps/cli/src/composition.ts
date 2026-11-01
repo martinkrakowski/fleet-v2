@@ -445,6 +445,9 @@ function isExecutableRegularFile(path: string): boolean {
   }
 }
 
+/** Normal one-call timeout for a `gh` subprocess; the subprocess is killed on expiry. */
+const GH_SUBPROCESS_TIMEOUT_MS = 30_000;
+
 /**
  * Run the reviewed GitHub CLI subprocess for the forge adapter. The binary is
  * resolved from fixed absolute locations (S4036), never through PATH; when
@@ -452,18 +455,32 @@ function isExecutableRegularFile(path: string): boolean {
  * unreadable (fail closed, as a missing binary does today). A completed
  * invocation resolves with its exit code and captured output; a spawn failure
  * rejects so the adapter reports the outcome as ambiguous for reconciliation
- * instead of guessing.
+ * instead of guessing. `env` (when provided) is merged over the inherited
+ * environment, so a per-kind `GH_CONFIG_DIR` can be set explicitly without
+ * losing the rest of the environment; the value is never logged. A timeout
+ * that kills the subprocess also rejects: an expired write may have reached
+ * the forge, so the adapters report it ambiguous, never as proof of success.
  */
 function runGhSubprocess(
   args: readonly string[],
   candidates: readonly string[] = GH_BINARY_CANDIDATES,
+  env?: Record<string, string>,
+  timeoutMs?: number,
 ): Promise<GhInvocationResult> {
   const ghBinary = resolveGhBinary(candidates, isExecutableRegularFile);
   if (ghBinary === undefined) {
     return Promise.reject(new Error('gh not found in fixed locations'));
   }
+  const executionOptions: {
+    encoding: 'utf8';
+    env?: NodeJS.ProcessEnv;
+    timeout?: number;
+  } = { encoding: 'utf8', timeout: timeoutMs ?? GH_SUBPROCESS_TIMEOUT_MS };
+  if (env !== undefined) {
+    executionOptions.env = { ...process.env, ...env };
+  }
   return new Promise((resolve, reject) => {
-    execFile(ghBinary, [...applyGhEnvironmentOverrides(args)], { encoding: 'utf8' }, (error, stdout, stderr) => {
+    execFile(ghBinary, [...applyGhEnvironmentOverrides(args)], executionOptions, (error, stdout, stderr) => {
       if (error === null) {
         resolve({ exitCode: 0, stdout: String(stdout), stderr: String(stderr) });
         return;

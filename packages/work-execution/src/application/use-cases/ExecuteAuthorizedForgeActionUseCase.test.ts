@@ -1084,6 +1084,103 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       expect(seen[0]).toMatchObject({ branchName: 'fleet/run-01JB0000000000000000000000' });
     });
 
+    it("forwards the PR base branch for push-and-open-pr (CB-D2)", async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-open',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'push-and-open-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-001',
+        branchName: 'fleet/run-01JB0000000000000000000000',
+        baseBranch: 'chain/example',
+      });
+
+      expect(result.outcome).toBe('executed');
+      expect(seen).toHaveLength(1);
+      expect(seen[0]?.baseBranch).toBe('chain/example');
+    });
+
+    it('does not forward baseBranch for merge-pr (CB-D2)', async () => {
+      const { useCase, seen } = capturingDeps();
+
+      const result = await useCase.executeAuthorizedForgeAction({
+        actionId: 'act-merge',
+        attemptId: 'att-001',
+        workOrderId: 'wo-001',
+        kind: 'merge-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-001',
+        baseBranch: 'chain/example',
+      });
+
+      expect(result.outcome).toBe('executed');
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).not.toHaveProperty('baseBranch');
+    });
+
+    it('refuses an unparsable base branch for push-and-open-pr before any grant is consumed (CB-D2)', async () => {
+      for (const baseBranch of ['release', 'main ', 'chain/example/', 'chain/a--b', 42] as unknown as string[]) {
+        const journal = new InMemoryJournal();
+        const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+        const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
+        let consumed = false;
+        let forgeCalls = 0;
+        const authorizationPort: ActionAuthorizationPort = {
+          async resolveActionAuthorization() {
+            return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+          },
+          async consumeActionAuthorization(req) {
+            consumed = true;
+            return { outcome: 'consumed', actionId: req.actionId };
+          },
+        };
+        const forgePort: ForgeActionPort = {
+          isConfigured: () => true,
+          async performForgeAction(): Promise<ForgeActionResult> {
+            forgeCalls += 1;
+            return { outcome: 'executed', headSha: HEAD };
+          },
+        };
+        const useCase = new ExecuteAuthorizedForgeActionUseCase({
+          attemptRepo,
+          attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
+          workOrderRepo,
+          journal,
+          authorizationPort,
+          forgePort,
+          acceptanceEvidencePort: new InMemoryAcceptanceEvidencePort({
+            outcome: 'found',
+            assessment: {
+              candidateHeadSha: HEAD,
+              policyRevision: 'pol-1',
+              state: 'accepted',
+              acceptanceReceiptId: 'receipt-001',
+            },
+          }),
+        });
+
+        const result = await useCase.executeAuthorizedForgeAction({
+          actionId: 'act-1',
+          attemptId: 'att-001',
+          workOrderId: 'wo-001',
+          kind: 'push-and-open-pr',
+          expectedHeadSha: HEAD,
+          authorizationGrantId: 'grant-001',
+          baseBranch,
+        });
+
+        expect(result).toEqual({
+          outcome: 'refused',
+          reason: 'baseBranch must be main or chain/<lowercase-dashes>',
+        });
+        expect(consumed).toBe(false);
+        expect(forgeCalls).toBe(0);
+      }
+    });
+
     it('refuses an unsafe branch name before any grant is consumed or forge call runs', async () => {
       for (const branchName of ['bad branch', '12345', 'a..b', null, ['fleet/x'], 42] as unknown as string[]) {
         const journal = new InMemoryJournal();

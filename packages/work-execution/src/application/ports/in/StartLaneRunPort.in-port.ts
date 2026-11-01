@@ -65,7 +65,8 @@ export type StartLaneRunRefusal =
   | 'run-exists'
   | 'no-host'
   | 'no-review-route'
-  | 'reserve-refused';
+  | 'reserve-refused'
+  | 'base-branch-missing';
 
 export interface AbandonStartRequest {
   readonly runId: string;

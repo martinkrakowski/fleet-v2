@@ -10,6 +10,7 @@ import type { ReviewRequestPort } from '../../ports/out/ReviewRequestPort.out-po
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { laneRunJournalState } from '../../../domain/lane-run-journal.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import { resolveLaneRunBaseBranch } from '../../../domain/base-branch.js';
 import { head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunPrBodyFrozen, RenderPrBodyResult } from '../../../domain/lane-run-pr-body.js';
 import { renderPrBody } from '../../../domain/lane-run-pr-body.js';
@@ -567,12 +568,13 @@ async function refuseKeyed(
   request: AdvanceLaneRunRequest,
   decision: ActDecision,
   reasonCode: Extract<LaneRunResultReasonCode, 'forge-refused' | 'grant-refused'>,
+  detail: string | null = null,
 ): Promise<AdvanceLaneRunResult> {
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
   if (intentRefusal !== null) {
     return { outcome: 'refused', reason: intentRefusal };
   }
-  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode);
+  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode, detail);
   if (resultRefusal !== null) {
     return { outcome: 'refused', reason: resultRefusal };
   }
@@ -618,6 +620,11 @@ async function runPrPushBody(
   }
   const headSha = latest.artifacts.headCommit;
 
+  // CB-D2 (CB2): open-pr opens against the run's recorded base branch; the
+  // same string names the base on the result's detail. Push-to-pr carries no
+  // base and keeps a null detail.
+  const baseBranch = kind === 'push-and-open-pr' ? resolveLaneRunBaseBranch(record) : null;
+
   // The work order carries the project id; a null one is facts-inconsistent.
   let workOrder: WorkOrderRecord | null;
   try {
@@ -648,7 +655,7 @@ async function runPrPushBody(
       frozen,
     });
     if (rendered === null || !rendered.ok) {
-      return refuseKeyed(ctx, request, decision, 'forge-refused');
+      return refuseKeyed(ctx, request, decision, 'forge-refused', baseBranch);
     }
   }
 
@@ -670,7 +677,7 @@ async function runPrPushBody(
     // fall through: no receipt.
   }
   if (receiptId === null) {
-    return refuseKeyed(ctx, request, decision, 'grant-refused');
+    return refuseKeyed(ctx, request, decision, 'grant-refused', baseBranch);
   }
 
   // Mint the forge action id under the keyed intent BEFORE any grant is issued:
@@ -684,7 +691,7 @@ async function runPrPushBody(
     return { outcome: 'refused', reason: intentRefusal };
   }
   const refuseGrant = async (): Promise<AdvanceLaneRunResult> => {
-    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'grant-refused');
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'grant-refused', baseBranch);
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
@@ -724,6 +731,7 @@ async function runPrPushBody(
       title: rendered.title,
       body: rendered.body,
       ...recordedBranch,
+      baseBranch: resolveLaneRunBaseBranch(record),
     };
   } else {
     forgeRequest = {
@@ -755,7 +763,7 @@ async function runPrPushBody(
       }
     }
     const reasonCode = kind === 'push-and-open-pr' ? 'pr-opened' : 'pushed';
-    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', reasonCode);
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', reasonCode, baseBranch);
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
@@ -764,7 +772,7 @@ async function runPrPushBody(
   if (forged.forgeAmbiguous === true) {
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'forge-ambiguous' };
   }
-  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'forge-refused');
+  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'forge-refused', baseBranch);
   if (resultRefusal !== null) {
     return { outcome: 'refused', reason: resultRefusal };
   }

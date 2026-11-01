@@ -281,6 +281,19 @@ describe('pause and halt planning', () => {
     }
   });
 
+  it('a paused or unreadable pause with a clear halt is not halted', () => {
+    for (const pause of [
+      { state: 'paused', record: { version: DAEMON_RECORD_VERSION, paused: true, changedAtIso: NOW } },
+      { state: 'unreadable' },
+    ] as readonly DaemonPauseState[]) {
+      const plan = planDaemonTick(planInput({ candidates: ['notifier'], pause, halt: clearHalt() }));
+      expect(plan.paused).toBe(true);
+      expect(plan.halted).toBe(false);
+      expect(plan.entries).toEqual([]);
+      expect(plan.settleDelayMs).toBe(0);
+    }
+  });
+
   it('a halted tick with a clear pause still has its entries', () => {
     for (const halt of [
       { state: 'halted', record: { version: 1, halted: true, changedAtIso: NOW } },
@@ -423,6 +436,26 @@ describe('lease decision', () => {
     const refusedOutcome = { outcome: 'refused', reasonCode: 'invalid-lease-request' };
     expect(refusalOutcomeOf(decideDaemonJobLease(null, acquireRequest() as never, '../x'))).toEqual(refusedOutcome);
     expect(refusalOutcomeOf(decideDaemonJobLease(null, acquireRequest() as never, 'nope'))).toEqual(refusedOutcome);
+  });
+
+  it('never throws on a throwing getter in the request or in the current lease', () => {
+    const throwingRequest = Object.defineProperty({}, 'holderId', {
+      enumerable: true,
+      get() {
+        throw new Error('boom');
+      },
+    });
+    const refused = decideDaemonJobLease(null, throwingRequest as never, 'notifier');
+    expect(JSON.stringify(refused)).not.toContain('boom');
+    expect(refused).toEqual({ action: 'refuse', outcome: { outcome: 'refused', reasonCode: 'invalid-lease-request' } });
+    const throwingCurrent = {
+      get holderId(): string {
+        throw new Error('boom');
+      },
+    };
+    const refusedCurrent = decideDaemonJobLease(throwingCurrent as never, acquireRequest() as never, 'notifier');
+    expect(JSON.stringify(refusedCurrent)).not.toContain('boom');
+    expect(refusedCurrent).toEqual({ action: 'refuse', outcome: { outcome: 'refused', reasonCode: 'invalid-lease-request' } });
   });
 });
 
@@ -608,6 +641,51 @@ describe('status v1 records, versions, exit codes and health', () => {
       expect(evaluateDaemonStatusHealth(refusedHealth.record, NOW).reasons).toEqual(['job-refused']);
     }
     expect(evaluateDaemonStatusHealth(statusRecord(), 'not-a-time').reasons).toEqual(['invalid-clock']);
+  });
+
+  it('freezes the jobs and repositories arrays of an accepted record', () => {
+    const read = readDaemonStatusRecord(validStatusBody());
+    expect(read.ok).toBe(true);
+    if (read.ok) {
+      expect(Object.isFrozen(read.record)).toBe(true);
+      expect(Object.isFrozen(read.record.jobs)).toBe(true);
+      expect(Object.isFrozen(read.record.repositories)).toBe(true);
+      expect(() => (read.record.jobs as unknown as unknown[]).push(jobItem())).toThrow();
+      expect(() => (read.record.repositories as unknown as unknown[]).push(repoItem(DIGEST_B, null))).toThrow();
+    }
+  });
+
+  it('does not read required keys from a polluted Object.prototype', () => {
+    const sentinels: ReadonlyArray<[string, unknown]> = [
+      ['paused', false],
+      ['changedAtIso', NOW],
+      ['tickId', TICK_A],
+      ['startedAtIso', NOW],
+      ['finishedAtIso', NOW],
+      ['exitCode', 0],
+      ['halted', false],
+      ['forgeReachable', true],
+      ['jobs', []],
+      ['repositories', []],
+      ['notifierCursor', null],
+    ];
+    try {
+      for (const [key, value] of sentinels) {
+        Object.defineProperty(Object.prototype, key, { value, enumerable: false, configurable: true });
+      }
+      const pause = readDaemonPauseRecord({});
+      expect(pause.ok).toBe(false);
+      expect(reasonOf(pause)).toBe('malformed');
+      expect(errorOf(pause)).toBe('DaemonPause is malformed');
+      const status = readDaemonStatusRecord({});
+      expect(status.ok).toBe(false);
+      expect(reasonOf(status)).toBe('malformed');
+      expect(errorOf(status)).toBe('DaemonStatus is malformed');
+    } finally {
+      for (const [key] of sentinels) {
+        delete (Object.prototype as Record<string, unknown>)[key];
+      }
+    }
   });
 });
 

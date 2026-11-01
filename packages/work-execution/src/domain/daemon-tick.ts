@@ -269,7 +269,7 @@ function readVersionedSnapshot(value: unknown, requiredKeys: readonly string[]):
     snapshot[key] = descriptor.value;
   }
   for (const key of requiredKeys) {
-    if (!(key in snapshot)) {
+    if (!Object.hasOwn(snapshot, key)) {
       return { ok: false, reason: 'malformed' };
     }
   }
@@ -526,6 +526,18 @@ export function planDaemonTick(input: DaemonTickPlanInput): DaemonTickPlan {
 
 /** The stored daemon lease decision: CAS rules stay in decideLeaseAcquire. */
 export function decideDaemonJobLease(
+  current: LaneRunLeaseRecord | null,
+  request: LeaseAcquireRequest,
+  scope: string,
+): DaemonJobLeaseDecision {
+  try {
+    return decideDaemonJobLeaseInner(current, request, scope);
+  } catch {
+    return refuseLeaseRequest();
+  }
+}
+
+function decideDaemonJobLeaseInner(
   current: LaneRunLeaseRecord | null,
   request: LeaseAcquireRequest,
   scope: string,
@@ -891,8 +903,8 @@ function parseStatusSnapshot(snapshot: Record<string, unknown>): DaemonStatusRec
     paused: snapshot.paused,
     halted: snapshot.halted,
     forgeReachable: snapshot.forgeReachable as boolean | null,
-    jobs,
-    repositories,
+    jobs: Object.freeze(jobs),
+    repositories: Object.freeze(repositories),
     notifierCursor: notifierCursor as string | null,
   });
 }

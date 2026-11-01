@@ -112,3 +112,45 @@ describe('RegisterWorkOrderUseCase (Appendix A)', () => {
     }
   });
 });
+
+describe('RegisterWorkOrderUseCase baseBranch (CB1)', () => {
+  function request(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      workOrderId: 'wo-base-branch-1',
+      projectId: 'proj-alpha',
+      taskId: 'task-1',
+      laneId: 'lane-1',
+      repository: 'github.com/org/repo',
+      baseCommit: '0000000000000000000000000000000000000000',
+      ownedPaths: ['src/a/'],
+      policyRevision: 'pol-1',
+      ...overrides,
+    };
+  }
+
+  it('stores main when the payload omits baseBranch', async () => {
+    const repo = new InMemoryWorkOrderRepo();
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: repo });
+    const result = await useCase.registerWorkOrder(request() as never);
+    expect(result.outcome).toBe('registered');
+    const stored = await repo.findWorkOrderById('wo-base-branch-1');
+    expect(stored?.baseBranch).toBe('main');
+  });
+
+  it('stores a parsed chain base branch', async () => {
+    const repo = new InMemoryWorkOrderRepo();
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: repo });
+    const result = await useCase.registerWorkOrder(request({ baseBranch: 'chain/example' }) as never);
+    expect(result.outcome).toBe('registered');
+    const stored = await repo.findWorkOrderById('wo-base-branch-1');
+    expect(stored?.baseBranch).toBe('chain/example');
+  });
+
+  it('refuses an unparsable base branch with the reason code and registers nothing', async () => {
+    const repo = new InMemoryWorkOrderRepo();
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo: repo });
+    const result = await useCase.registerWorkOrder(request({ baseBranch: 'release' }) as never);
+    expect(result).toEqual({ outcome: 'rejected', reason: 'invalid-base-branch' });
+    expect(await repo.findWorkOrderById('wo-base-branch-1')).toBeNull();
+  });
+});

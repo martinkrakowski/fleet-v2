@@ -9,6 +9,7 @@ import type { AttemptStateValue } from './value-objects/AttemptState.vo.js';
 import type { AttemptOutcomeValue } from './value-objects/AttemptOutcome.vo.js';
 import type { StopReasonValue } from './value-objects/StopReason.vo.js';
 import type { SeatPlanProps, SeatPlanRole } from './value-objects/SeatPlan.vo.js';
+import type { BaseBranchValue } from './base-branch.js';
 
 /**
  * Completion receipt bound to the attempt and the runner session. A runner
@@ -109,6 +110,13 @@ export interface WorkOrderRecord {
   readonly planRef?: PlanRef;
   /** Terminal work order this one supersedes; absent on records that start a new lineage. */
   readonly supersedesWorkOrderId?: string;
+  /**
+   * The base branch the lane works against (`main`, or a `chain/<name>`;
+   * lane CB1). Set once at registration and never changed afterwards;
+   * optional only for records stored before CB1 — read it through
+   * `resolveWorkOrderBaseBranch`, which treats an absent value as `main`.
+   */
+  readonly baseBranch?: BaseBranchValue;
 }
 
 /** Fix rounds are fresh attempts; they never resume the prior conversation. */

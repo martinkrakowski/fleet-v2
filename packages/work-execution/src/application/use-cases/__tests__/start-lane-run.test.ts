@@ -286,6 +286,9 @@ function makeHarness(options: HarnessOptions = {}) {
     setCapacityAnswer: (answer: LaneRunFirstReservationResult | null) => {
       capacityAnswer = answer;
     },
+    setWorkOrder: (order: WorkOrderRecord) => {
+      workOrders.set(order.id, order);
+    },
     worktreeCalls,
     setWorktreeAnswers: (answers: PrepareLaneWorktreeResult[]) => {
       worktreeAnswers = answers;
@@ -1312,5 +1315,41 @@ describe('StartLaneRunUseCase', () => {
     expect(result).toMatchObject({ outcome: 'acted', step: 'dispatch' });
     expect(dispatchCalls).toHaveLength(1);
     expect(admitCalls).toHaveLength(0);
+  });
+
+  it('test 8: the run records the work order base branch and the worktree keeps baseCommit (CB1)', async () => {
+    const withBranch = makeHarness({ workOrder: storedWorkOrder({ baseBranch: 'chain/example' }) });
+    expect(await withBranch.useCase.startLaneRun(requestFixture())).toMatchObject({ outcome: 'started' });
+    const branchRun = await withBranch.runRepoStore.get(RUN_ID);
+    expect(branchRun?.baseBranch).toBe('chain/example');
+    expect(withBranch.worktreeCalls).toHaveLength(1);
+    expect(withBranch.worktreeCalls[0]).toMatchObject({
+      branch: 'fleet/' + RUN_ID,
+      baseCommit: COMMIT,
+    });
+    expect(Object.hasOwn(withBranch.worktreeCalls[0], 'baseBranch')).toBe(false);
+
+    const withoutKey = makeHarness();
+    expect(await withoutKey.useCase.startLaneRun(requestFixture())).toMatchObject({ outcome: 'started' });
+    const plainRun = await withoutKey.runRepoStore.get(RUN_ID);
+    expect(plainRun?.baseBranch).toBe('main');
+  });
+
+  it('test 9: a later work-order edit does not rewrite a started run (CB1)', async () => {
+    const harness = makeHarness({ workOrder: storedWorkOrder({ baseBranch: 'chain/example' }) });
+    const first = await harness.useCase.startLaneRun(requestFixture());
+    expect(first).toMatchObject({ outcome: 'started' });
+    const before = await harness.runRepoStore.get(RUN_ID);
+    expect(before?.baseBranch).toBe('chain/example');
+
+    // The work order is edited afterwards: the run keeps its recorded value.
+    harness.setWorkOrder(storedWorkOrder({ baseBranch: 'main', revision: 2, updatedAtIso: LATER }));
+    const run = await harness.runRepoStore.get(RUN_ID);
+    expect(run?.baseBranch).toBe('chain/example');
+
+    // The retry with the same ids returns the existing run and writes it again never.
+    const retry = await harness.useCase.startLaneRun(requestFixture());
+    expect(retry).toMatchObject({ outcome: 'started' });
+    expect(await harness.runRepoStore.get(RUN_ID)).toEqual(before);
   });
 });

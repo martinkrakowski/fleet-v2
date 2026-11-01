@@ -34,16 +34,16 @@ import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
-export const RUN_ID = 'run-01JB0000000000000000000000';
+const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
-export const LATER = '2026-10-27T10:01:00.000Z';
+const LATER = '2026-10-27T10:01:00.000Z';
 const LEASE_UNTIL = '2026-10-27T10:05:00.000Z';
 const HOLDER = 'driver';
 const COMMIT = 'a'.repeat(40);
 const HEAD12 = 'a'.repeat(12);
 const PROSE = '# brief\n';
 const DEFAULT_MANIFEST_JSON = JSON.stringify({ timeLimitSeconds: 3600 });
-export const digestFor = (json: string): string => simpleDeterministicHexDigest(PROSE + '\n' + json);
+const digestFor = (json: string): string => simpleDeterministicHexDigest(PROSE + '\n' + json);
 
 const BASE_RECORD = {
   version: 1,
@@ -103,7 +103,7 @@ const CONDUCTED_RUNNER = {
   variant: null,
 };
 
-export function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
+function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     id: 'attempt-example-1',
     workOrderId: 'wo-example-1',
@@ -130,7 +130,7 @@ export function attemptFixture(overrides: Partial<AttemptRecord> = {}): AttemptR
 }
 
 /** A run record via the domain entity, like the decider's fixture. */
-export function runRecord(overrides: Record<string, unknown> = {}): LaneRunRecord {
+function runRecord(overrides: Record<string, unknown> = {}): LaneRunRecord {
   const result = LaneRun.create({ ...BASE_RECORD, ...overrides });
   expect(result.success).toBe(true);
   if (!result.success) {
@@ -148,7 +148,7 @@ function makeUlidMinter(): () => string {
   };
 }
 
-export function activeAnswer(attempt: AttemptRecord): ReconcileAttemptResult {
+function activeAnswer(attempt: AttemptRecord): ReconcileAttemptResult {
   return {
     outcome: 'active',
     attempt,
@@ -181,22 +181,21 @@ function cancelledAnswer(attempt: AttemptRecord, reason: string): ReconcileAttem
   return { outcome: 'cancelled', attempt, reason };
 }
 
-export interface Harness {
+interface Harness {
   readonly runRepo: LaneRunRepositoryAdapter;
   readonly runJournal: LaneRunJournalAdapter;
   readonly attemptRepo: AttemptRepositoryAdapter;
   readonly executionJournal: ExecutionJournalAdapter;
   readonly admissionCalls: unknown[];
   readonly reconcileCalls: unknown[];
-  readonly briefFileCalls: unknown[];
-  readonly briefManifestCalls: unknown[];
+  readonly artifactPort: { readonly reads: number };
   readonly deps: AdvanceLaneRunDependencies;
   setManifest(json: string | null): void;
   setReconcileAnswer(answer: ReconcileAttemptResult): void;
   setAdmissionAnswer(answer: LaneRunAdmissionResult): void;
 }
 
-export async function makeHarness(
+async function makeHarness(
   record: LaneRunRecord,
   attempts: readonly AttemptRecord[],
   options: { readonly ceiling?: number } = {},
@@ -207,9 +206,23 @@ export async function makeHarness(
   const executionJournal = new ExecutionJournalAdapter();
   const admissionCalls: unknown[] = [];
   const reconcileCalls: unknown[] = [];
-  const briefFileCalls: unknown[] = [];
-  const briefManifestCalls: unknown[] = [];
   let manifestJson: string | null = DEFAULT_MANIFEST_JSON;
+  const artifactPort = {
+    reads: 0,
+    readBriefManifest: async () => {
+      artifactPort.reads += 1;
+      return manifestJson;
+    },
+    readBriefFile: async () => {
+      artifactPort.reads += 1;
+      return PROSE;
+    },
+    verifyArtifactManifest: async () => {
+      artifactPort.reads += 1;
+      return { outcome: 'missing' } as const;
+    },
+  };
+
   let reconcileAnswer: ReconcileAttemptResult = activeAnswer(attempts[attempts.length - 1] ?? attemptFixture());
   let admissionAnswer: LaneRunAdmissionResult = { outcome: 'admitted' };
   const created = await runRepo.create(record);
@@ -229,17 +242,7 @@ export async function makeHarness(
     runJournal,
     attemptRepo,
     executionJournal,
-    artifactPort: {
-      readBriefManifest: async (...request) => {
-        briefManifestCalls.push(request);
-        return manifestJson;
-      },
-      readBriefFile: async (...request) => {
-        briefFileCalls.push(request);
-        return PROSE;
-      },
-      verifyArtifactManifest: async () => ({ outcome: 'missing' }),
-    },
+    artifactPort,
     reconcileAttempt: {
       reconcileAttempt: async (request) => {
         reconcileCalls.push(request);
@@ -272,8 +275,7 @@ export async function makeHarness(
     executionJournal,
     admissionCalls,
     reconcileCalls,
-    briefFileCalls,
-    briefManifestCalls,
+    artifactPort,
     deps,
     setManifest: (json) => {
       manifestJson = json;
@@ -287,7 +289,7 @@ export async function makeHarness(
   };
 }
 
-export function advance(harness: Harness, overrides: Record<string, unknown> = {}) {
+function advance(harness: Harness, overrides: Record<string, unknown> = {}) {
   const useCase = new AdvanceLaneRunUseCase(harness.deps);
   return useCase.advanceLaneRun({
     runId: RUN_ID,
@@ -298,7 +300,7 @@ export function advance(harness: Harness, overrides: Record<string, unknown> = {
   });
 }
 
-export async function conduct(harness: Harness, state: LaneRunStateValue, nowIso: string): Promise<void> {
+async function conduct(harness: Harness, state: LaneRunStateValue, nowIso: string): Promise<void> {
   const entry = laneRunConductEntry(harness.deps.newUlid(), RUN_ID, state, nowIso);
   const appended = await harness.runJournal.append(entry);
   expect(appended.outcome).toBe('appended');
@@ -356,7 +358,7 @@ async function appendResult(
   expect(appended.outcome).toBe('appended');
 }
 
-export function dispatchIntentAndResult(harness: Harness, round: number, seatIndex: number, attemptOrdinal: number, at: string): Promise<void> {
+function dispatchIntentAndResult(harness: Harness, round: number, seatIndex: number, attemptOrdinal: number, at: string): Promise<void> {
   const key = stepKey({ round, step: 'dispatch', seatIndex, attemptOrdinal, head12: null });
   return appendIntent(harness, key, 'attempt-example-' + attemptOrdinal, at).then(() =>
     appendResult(harness, key, 'completed', 'dispatch-started', at),
@@ -721,7 +723,7 @@ describe('AdvanceLaneRunUseCase conductor deadline (SEC-5c-2)', () => {
   it('a: an edited manifest cannot extend the deadline; the recorded limit wins and no brief read is made', async () => {
     // The attempt keeps the fixture's default `briefDigest`, so the on-disk
     // 360000 s manifest does not verify — and with the recorded 2700 s limit
-    // the manifest is not read at all (no `readBriefFile`/`readBriefManifest`).
+    // the manifest is not read at all (`artifactPort.reads` stays zero).
     const running = attemptFixture({
       state: 'running',
       sessionId: 'session-example-1',
@@ -735,8 +737,7 @@ describe('AdvanceLaneRunUseCase conductor deadline (SEC-5c-2)', () => {
     // 3060 s elapsed: past the recorded 2700 s limit, far below the edited one.
     const result = await advance(harness);
     expect(result).toEqual({ outcome: 'not-wired', step: 'stop' });
-    expect(harness.briefFileCalls).toHaveLength(0);
-    expect(harness.briefManifestCalls).toHaveLength(0);
+    expect(harness.artifactPort.reads).toBe(0);
   });
 
   it('b: the recorded limit wins over a verified, different manifest', async () => {
@@ -796,6 +797,8 @@ describe('AdvanceLaneRunUseCase conductor deadline (SEC-5c-2)', () => {
     harness.setManifest(JSON.stringify({ timeLimitSeconds: 2700 }));
     const result = await advance(harness);
     expect(result).toEqual({ outcome: 'not-wired', step: 'stop' });
+    // One `readBriefFile` and one `readBriefManifest`: the legacy path reads.
+    expect(harness.artifactPort.reads).toBe(2);
   });
 
   it('e: regression guard — with no dispatch intent in the journal the run still parks ambiguous stop', async () => {

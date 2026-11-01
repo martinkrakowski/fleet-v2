@@ -97,13 +97,16 @@ function isKillallStopUnconfirmedReason(value: unknown): value is KillallStopUnc
   );
 }
 
+/** An opaque session reference: no path, no spaces, no free text. */
+const SESSION_REF_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
 /** One session-result entry: a non-content reference and a stop status only. */
 function readKillallSessionResult(input: unknown): KillallSessionResultRecord | null {
   const snapshot = readExactPlainRecord(input, SESSION_RESULT_KEYS);
   if (snapshot === null) {
     return null;
   }
-  if (typeof snapshot.sessionRef !== 'string' || snapshot.sessionRef.length === 0) {
+  if (typeof snapshot.sessionRef !== 'string' || !SESSION_REF_PATTERN.test(snapshot.sessionRef)) {
     return null;
   }
   if (typeof snapshot.stopped !== 'boolean') {

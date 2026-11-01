@@ -66,6 +66,12 @@ describe('report read', () => {
     expect(parsed(report()).version).toBe(KILLALL_STOP_REPORT_RECORD_VERSION);
   });
 
+  it('names the rule without echoing a supplied value', () => {
+    const result = readKillallStopReportRecord(report({ haltedAtIso: 'SENTINEL-VALUE' }));
+    expect(result).toMatchObject({ ok: false });
+    expect(JSON.stringify(result)).not.toContain('SENTINEL-VALUE');
+  });
+
   it('refuses an extra or missing key', () => {
     expect(readKillallStopReportRecord(report({ extra: 'x' }))).toMatchObject({ ok: false });
     const missingKey = report();
@@ -97,6 +103,13 @@ describe('report read', () => {
 });
 
 describe('confirmed lane shape', () => {
+  it('refuses a session reference that is not an opaque identifier', () => {
+    for (const sessionRef of ['/clients/acme/transcript', 'free text', '', 'x'.repeat(129)]) {
+      const input = lane({ sessionResults: [{ sessionRef, stopped: true }] });
+      expect(readKillallLaneStop(input)).toBeNull();
+    }
+  });
+
   it('accepts a confirmed lane with a null reason, cleanSweeps >= 2 and a zoned time', () => {
     expect(readKillallLaneStop(lane())).toEqual({
       projectId: 'project-1',

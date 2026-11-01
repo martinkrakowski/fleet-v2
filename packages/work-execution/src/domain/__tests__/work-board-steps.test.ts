@@ -336,8 +336,8 @@ describe('S3.1 run step', () => {
       runs: [run('run-example-1', { state: 'parked', parkReason: 'owner-merge' })],
     });
     const a1 = board.lanes.find((l) => l.key === A1_KEY);
-    expect(a1?.step).toEqual({ kind: 'run', runId: 'run-example-1', state: 'parked', round: 0, parkReason: 'owner-merge' });
-    expect(a1?.stepText).toBe('parked: owner-merge');
+    expect(a1?.step).toEqual({ kind: 'run', runId: 'run-example-1', state: 'parked', round: 0, parkReason: 'owner-merge', baseBranch: 'main' });
+    expect(a1?.stepText).toBe('parked: owner-merge on main');
   });
 
   it('a stopped run is run-stopped', () => {
@@ -346,8 +346,18 @@ describe('S3.1 run step', () => {
       runs: [run('run-example-1', { state: 'stopped' })],
     });
     const a1 = board.lanes.find((l) => l.key === A1_KEY);
-    expect(a1?.step).toEqual({ kind: 'run-stopped', runId: 'run-example-1', round: 0 });
-    expect(a1?.stepText).toBe('run stopped, not merged');
+    expect(a1?.step).toEqual({ kind: 'run-stopped', runId: 'run-example-1', round: 0, baseBranch: 'main' });
+    expect(a1?.stepText).toBe('run stopped, not merged on main');
+  });
+
+  it('a chain base branch on the run shows in the step and its text', () => {
+    const board = boardOf({
+      workOrders: [wo('wo-example-1')],
+      runs: [run('run-example-1', { baseBranch: 'chain/example' })],
+    });
+    const a1 = board.lanes.find((l) => l.key === A1_KEY);
+    expect(a1?.step).toEqual({ kind: 'run', runId: 'run-example-1', state: 'running', round: 0, parkReason: null, baseBranch: 'chain/example' });
+    expect(a1?.stepText).toBe('running, round 0 on chain/example');
   });
 
   it('a run beats a live attempt', () => {
@@ -509,9 +519,9 @@ describe('S3.5 dropped after start', () => {
 
 describe('S4 step text', () => {
   it('renders every row of the text table and appends "may have changed" on a stale PR step', () => {
-    expect(boardStepText({ kind: 'run', runId: 'run-1', state: 'parked', round: 0, parkReason: 'owner-merge' })).toBe('parked: owner-merge');
-    expect(boardStepText({ kind: 'run', runId: 'run-1', state: 'running', round: 2, parkReason: null })).toBe('running, round 2');
-    expect(boardStepText({ kind: 'run-stopped', runId: 'run-1', round: 0 })).toBe('run stopped, not merged');
+    expect(boardStepText({ kind: 'run', runId: 'run-1', state: 'parked', round: 0, parkReason: 'owner-merge', baseBranch: 'main' })).toBe('parked: owner-merge on main');
+    expect(boardStepText({ kind: 'run', runId: 'run-1', state: 'running', round: 2, parkReason: null, baseBranch: 'main' })).toBe('running, round 2 on main');
+    expect(boardStepText({ kind: 'run-stopped', runId: 'run-1', round: 0, baseBranch: 'main' })).toBe('run stopped, not merged on main');
     expect(boardStepText({ kind: 'attempt-live', attemptId: 'a-1', attemptKind: 'initial', fixNumber: 0, state: 'running' })).toBe('first pass running');
     expect(boardStepText({ kind: 'attempt-live', attemptId: 'a-1', attemptKind: 'fix', fixNumber: 1, state: 'running' })).toBe('fix round 1 running');
     expect(boardStepText({

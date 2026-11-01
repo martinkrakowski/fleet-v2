@@ -338,6 +338,52 @@ describe('deriveConductorSchedule', () => {
     expect(first).toEqual(second);
     expect(baseFacts.runs).toEqual(runsClone);
   });
+
+  it('shows the resolved base branch of each run', () => {
+    const chain = runRecord({ runId: RUN_A, baseBranch: 'chain/example' });
+    const main = runRecord({ runId: RUN_B });
+    const schedule = deriveConductorSchedule(facts({ runs: [chain, main] }), NOW);
+    expect(schedule.rows.find((row) => row.runId === RUN_A)?.baseBranch).toBe('chain/example');
+    expect(schedule.rows.find((row) => row.runId === RUN_B)?.baseBranch).toBe('main');
+  });
+
+  it('groups live runs into one queue per base in code-unit order', () => {
+    const runs = [
+      runRecord({ runId: RUN_A, baseBranch: 'chain/a' }),
+      runRecord({ runId: RUN_B, baseBranch: 'main' }),
+      runRecord({ runId: RUN_C, baseBranch: 'chain/a' }),
+    ];
+    const schedule = deriveConductorSchedule(facts({ runs }), NOW);
+    expect(schedule.queues).toEqual([
+      { baseBranch: 'chain/a', runIds: [RUN_A, RUN_C] },
+      { baseBranch: 'main', runIds: [RUN_B] },
+    ]);
+  });
+
+  it('a terminal run is in no queue', () => {
+    const merged = runRecord({ runId: RUN_A, attemptIds: ['a1'], baseBranch: 'chain/a' });
+    const journals = new Map<string, readonly LaneRunJournalEntryRecord[]>([
+      [RUN_A, [laneRunConductEntry('e1', RUN_A, 'merged', NOW)]],
+    ]);
+    const schedule = deriveConductorSchedule(facts({ runs: [merged], journals }), NOW);
+    expect(schedule.rows).toEqual([]);
+    expect(schedule.queues).toEqual([]);
+  });
+
+  it('two runs sharing a package on different bases still overlap and wait', () => {
+    const active = runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-1', baseBranch: 'chain/a' });
+    const waiting = runRecord({ runId: RUN_B, attemptIds: ['a2'], workOrderId: 'wo-2', baseBranch: 'main' });
+    const workOrders = new Map([
+      ['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a'] }],
+      ['wo-2', { repository: 'acme/repo', ownedPaths: ['packages/a'] }],
+    ]);
+    const schedule = deriveConductorSchedule(
+      facts({ runs: [active, waiting], reservations: [reservation({ attemptId: 'a1' })], workOrders }),
+      NOW,
+    );
+    expect(schedule.rows.find((row) => row.runId === RUN_A)?.overlapsWith).toEqual([RUN_B]);
+    expect(schedule.rows.find((row) => row.runId === RUN_B)?.admissionWait).toBe('package-overlap');
+  });
 });
 
 describe('deriveSessionStartMarks', () => {

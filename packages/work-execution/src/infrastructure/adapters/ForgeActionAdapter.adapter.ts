@@ -117,6 +117,31 @@ function isCommitSha(value: string): boolean {
   return /^[0-9a-f]{7,40}$/.test(value);
 }
 
+/** A repository owner/repo segment: the forge-read's one-line rule, duplicated here (never imported). */
+const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+$/;
+
+/** The exact 40-lowercase-hex commit id the post-status url pins. */
+const HEX_40_PATTERN = /^[0-9a-f]{40}$/;
+
+/** A refused `other` result; the shared refusal shape for post-status validation. */
+function refusedOther(reason: string): ForgeActionResult {
+  return { outcome: 'refused', reason, refusalKind: 'other' };
+}
+
+/** Whether a status description is paired with its state (rule: exactly these pairs). */
+function pairedDescription(state: string, description: string): boolean {
+  if (state === 'pending') {
+    return description === 'waiting for the pre-merge review';
+  }
+  if (state === 'success') {
+    return description === 'pre-merge receipt recorded' || description === 'not required for tier 1';
+  }
+  if (state === 'failure') {
+    return /^findings: (?:0|[1-9][0-9]{0,2})$/.test(description);
+  }
+  return false;
+}
+
 /** Branch names stay one safe git ref segment path. */
 export function isSafeBranchName(value: string): boolean {
   return (
@@ -147,19 +172,25 @@ export class ForgeActionAdapter implements ForgeActionPort {
     if (!runGh) {
       throw new Error('Not implemented: ForgeActionAdapter.performForgeAction');
     }
+    if (request.kind !== 'post-status' && request.status !== undefined) {
+      return refusedOther('status is only valid for post-status');
+    }
+    if (request.kind === 'post-status') {
+      const statusRefusal = this.statusFieldRefusal(request);
+      if (statusRefusal !== null) {
+        return statusRefusal;
+      }
+      const verified = await this.verifyHead(request);
+      if (verified !== null) {
+        return verified;
+      }
+      return this.runPostStatus(runGh, request);
+    }
     if (!isCommitSha(request.expectedHeadSha)) {
-      return {
-        outcome: 'refused',
-        reason: `Invalid expected head SHA: ${request.expectedHeadSha}`,
-        refusalKind: 'other',
-      };
+      return refusedOther(`Invalid expected head SHA: ${request.expectedHeadSha}`);
     }
     if (!isSafeBranchName(request.branchName)) {
-      return {
-        outcome: 'refused',
-        reason: `Invalid branch name: ${request.branchName}`,
-        refusalKind: 'other',
-      };
+      return refusedOther(`Invalid branch name: ${request.branchName}`);
     }
 
     // `push-to-pr` reads the pull request first (the pre-read happens before
@@ -176,7 +207,93 @@ export class ForgeActionAdapter implements ForgeActionPort {
     if (request.kind === 'push-and-open-pr') {
       return this.runPrCreate(runGh, request);
     }
-    return this.runPrMerge(runGh, request);
+    if (request.kind === 'merge-pr') {
+      return this.runPrMerge(runGh, request);
+    }
+    return refusedOther('Unknown forge action kind');
+  }
+
+  /**
+   * Validate the `post-status` request before the head is verified or `gh`
+   * runs: status presence, context, state, the exact 40-hex head, the branch,
+   * the repository and the description/state pairing. Returns a refused
+   * `other` result, or null when the post may proceed. Never calls `runGh`.
+   */
+  private statusFieldRefusal(request: ForgeActionRequest): ForgeActionResult | null {
+    const status = request.status;
+    if (status === undefined) {
+      return refusedOther('status is required for post-status');
+    }
+    if (status.context !== 'premerge') {
+      return refusedOther('status context must be premerge');
+    }
+    if (status.state !== 'success' && status.state !== 'pending' && status.state !== 'failure') {
+      return refusedOther('status state must be success, pending or failure');
+    }
+    if (!HEX_40_PATTERN.test(request.expectedHeadSha)) {
+      return refusedOther(`Invalid expected head SHA: ${request.expectedHeadSha}`);
+    }
+    if (!isSafeBranchName(request.branchName)) {
+      return refusedOther(`Invalid branch name: ${request.branchName}`);
+    }
+    const repository = this.delegate?.repository;
+    if (repository === undefined) {
+      return refusedOther('Cannot post status without a configured repository');
+    }
+    if (!REPOSITORY_PATTERN.test(repository.owner) || !REPOSITORY_PATTERN.test(repository.repo)) {
+      return refusedOther('Invalid repository owner or repo');
+    }
+    if (!pairedDescription(status.state, status.description)) {
+      return refusedOther('status description does not match its state');
+    }
+    return null;
+  }
+
+  /** Post the pre-merge review receipt to `gh api .../statuses/<sha>`. */
+  private async runPostStatus(
+    runGh: (args: readonly string[]) => Promise<GhInvocationResult>,
+    request: ForgeActionRequest,
+  ): Promise<ForgeActionResult> {
+    const status = request.status;
+    if (status === undefined) {
+      return refusedOther('status is required for post-status');
+    }
+    const repository = this.delegate?.repository;
+    if (repository === undefined) {
+      return refusedOther('Cannot post status without a configured repository');
+    }
+    const args = [
+      'api',
+      '-X',
+      'POST',
+      `repos/${repository.owner}/${repository.repo}/statuses/${request.expectedHeadSha}`,
+      '-f',
+      `state=${status.state}`,
+      '-f',
+      'context=premerge',
+      '-f',
+      `description=${status.description}`,
+    ];
+    let gh: GhInvocationResult;
+    try {
+      gh = await runGh(args);
+    } catch (error) {
+      return {
+        outcome: 'ambiguous',
+        reason: `gh api statuses could not complete: ${errorMessage(error)}`,
+      };
+    }
+    if (gh.exitCode !== 0) {
+      return {
+        outcome: 'refused',
+        reason: `gh api statuses failed (exit ${gh.exitCode}): ${firstLine(gh.stderr) || 'gh api statuses failed'}`,
+        refusalKind: classifyGhRefusal(gh.stderr, gh.stdout),
+      };
+    }
+    return {
+      outcome: 'executed',
+      headSha: request.expectedHeadSha,
+    };
   }
 
   /**

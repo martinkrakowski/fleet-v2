@@ -169,6 +169,28 @@ describe('fleet-v2 state', () => {
     expect(stdout.join('')).toContain('reservations.json: invalid record 1\n');
   });
 
+  it('refuses a work order with an unparsable baseBranch and accepts a valid one (CB1)', async () => {
+    const invalidDir = makeTempDir();
+    await fs.writeFile(
+      path.join(invalidDir, 'work-orders.json'),
+      JSON.stringify([{ id: 'wo-1', revision: 1 }, { id: 'wo-2', revision: 1, baseBranch: 'release' }]),
+    );
+    const invalid = mockIo();
+    const invalidCode = await runCli(['--state-dir', invalidDir, 'state', 'check'], invalid.io);
+    expect(invalidCode).toBe(1);
+    expect(invalid.stdout.join('')).toContain('work-orders.json: invalid record 1\n');
+
+    const validDir = makeTempDir();
+    await fs.writeFile(
+      path.join(validDir, 'work-orders.json'),
+      JSON.stringify([{ id: 'wo-1', revision: 1, baseBranch: 'chain/example' }]),
+    );
+    const valid = mockIo();
+    const validCode = await runCli(['--state-dir', validDir, 'state', 'check'], valid.io);
+    expect(validCode).toBe(0);
+    expect(valid.stdout.join('')).toContain('work-orders.json: ok (1 record)\n');
+  });
+
   it('never writes, locks, creates or quarantines anything', async () => {
     const dir = makeTempDir();
     await fs.writeFile(path.join(dir, 'journal.json'), '{ nope');

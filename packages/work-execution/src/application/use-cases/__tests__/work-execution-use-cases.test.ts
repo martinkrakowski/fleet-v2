@@ -342,6 +342,7 @@ describe('RegisterWorkOrderUseCase', () => {
       ownedPaths: ['packages/app-a/**'],
       policyRevision: 'policy-7',
       risk: 'high',
+      baseBranch: 'main',
       prerequisiteWorkOrderIds: [],
       state: 'approved',
       revision: 1,

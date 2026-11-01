@@ -10,6 +10,7 @@
       "rows": [
         {
           "runId": "run-01JB0000000000000000000000",
+          "baseBranch": "main",
           "workOrderId": "wo-1",
           "tier": 2,
           "state": "running",
@@ -36,6 +37,7 @@
         },
         {
           "runId": "run-01JB0000000000000000000001",
+          "baseBranch": "main",
           "workOrderId": "wo-2",
           "tier": 2,
           "state": "ready",
@@ -53,6 +55,15 @@
           ],
           "slot": null,
           "admissionWait": "package-overlap"
+        }
+      ],
+      "queues": [
+        {
+          "baseBranch": "main",
+          "runIds": [
+            "run-01JB0000000000000000000000",
+            "run-01JB0000000000000000000001"
+          ]
         }
       ],
       "hosts": [

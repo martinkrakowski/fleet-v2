@@ -539,4 +539,69 @@ describe('ForgeActionAdapter push-to-pr', () => {
     });
   });
 
+  describe('push-and-open-pr base branch (CB-D2)', () => {
+    it('appends --base chain/example right after --head on push-and-open-pr', async () => {
+      const { calls, runGh } = makeRunGh({
+        exitCode: 0,
+        stdout: 'https://github.com/org/repo/pull/200\n',
+        stderr: '',
+      });
+      const adapter = new ForgeActionAdapter({
+        runGh,
+        verifyCurrentHeadSha: async () => HEAD_SHA,
+      });
+
+      const result = await adapter.performForgeAction(
+        forgeActionRequest({ kind: 'push-and-open-pr', baseBranch: 'chain/example' }),
+      );
+
+      expect(result).toEqual({ outcome: 'executed', pullRequestNumber: 200, headSha: HEAD_SHA });
+      expect(calls).toHaveLength(1);
+      const headIndex = calls[0]!.indexOf('--head');
+      expect(calls[0]![headIndex + 1]).toBe(`feat/${LANE_ID}`);
+      expect(calls[0]![headIndex + 2]).toBe('--base');
+      expect(calls[0]![headIndex + 3]).toBe('chain/example');
+    });
+
+    it('appends --base main right after --head on push-and-open-pr', async () => {
+      const { calls, runGh } = makeRunGh({
+        exitCode: 0,
+        stdout: 'https://github.com/org/repo/pull/201\n',
+        stderr: '',
+      });
+      const adapter = new ForgeActionAdapter({
+        runGh,
+        verifyCurrentHeadSha: async () => HEAD_SHA,
+      });
+
+      const result = await adapter.performForgeAction(
+        forgeActionRequest({ kind: 'push-and-open-pr', baseBranch: 'main' }),
+      );
+
+      expect(result).toEqual({ outcome: 'executed', pullRequestNumber: 201, headSha: HEAD_SHA });
+      const headIndex = calls[0]!.indexOf('--head');
+      expect(calls[0]![headIndex + 2]).toBe('--base');
+      expect(calls[0]![headIndex + 3]).toBe('main');
+    });
+
+    it('refuses an unparsable base branch without calling gh', async () => {
+      const { calls, runGh } = makeRunGh({
+        exitCode: 0,
+        stdout: 'https://github.com/org/repo/pull/202\n',
+        stderr: '',
+      });
+      const adapter = new ForgeActionAdapter({
+        runGh,
+        verifyCurrentHeadSha: async () => HEAD_SHA,
+      });
+
+      const result = await adapter.performForgeAction(
+        forgeActionRequest({ kind: 'push-and-open-pr', baseBranch: 'release' }),
+      );
+
+      expect(result).toEqual({ outcome: 'refused', reason: 'Invalid base branch', refusalKind: 'other' });
+      expect(calls).toEqual([]);
+    });
+  });
+
 });

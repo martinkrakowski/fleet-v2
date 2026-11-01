@@ -9,6 +9,7 @@
 
 import { isCalendarDateTime, readExactPlainRecord } from './plain-record-reads.js';
 import { containsSecretShape } from '@fleet/shared';
+import { parseBaseBranch } from './base-branch.js';
 import { parseLaneRunKey, REQUEST_ID_PATTERN } from './lane-run-keys.js';
 import type { LaneRunStopKeyMode, ParsedLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN } from './lane-run-records.js';
@@ -326,7 +327,13 @@ function entryDetailError(snapshot: Record<string, unknown>, present: boolean): 
   if (snapshot.kind !== 'result') {
     return 'LaneRunJournal detail must be null on an intent or conduct entry';
   }
-  if (typeof detail !== 'string' || !LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(detail)) {
+  // The existing token pattern or a declared base branch (`main` or
+  // `chain/<lowercase-dashes>`, CB-D2) is accepted; anything else is refused
+  // with the unchanged error string.
+  if (
+    typeof detail !== 'string' ||
+    (!LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(detail) && parseBaseBranch(detail) === undefined)
+  ) {
     return 'LaneRunJournal detail must be null or a lowercase token';
   }
   return null;

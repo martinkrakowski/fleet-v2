@@ -13,6 +13,7 @@ import {
   ForgeActionAdapter,
   ConductorHaltAdapter,
   ConductorDriverLeaseAdapter,
+  ConductorPassTraceAdapter,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
   LocalExecutor,
@@ -54,6 +55,7 @@ import {
   ListLaneRunsUseCase,
   ListAttemptsUseCase,
   ListAttemptJournalUseCase,
+  ListConductorPassesUseCase,
   ListUnregisteredProjectsUseCase,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
@@ -93,6 +95,8 @@ export interface WorkComposition {
   listAttempts: ListAttemptsUseCase;
   // GET /v1/runs: the read-only conductor schedule (A-R-1)
   listLaneRuns: ListLaneRunsUseCase;
+  // GET /v1/runs/passes: the recorded conductor pass traces (VZ6)
+  listConductorPasses: ListConductorPassesUseCase;
   listAttemptJournal: ListAttemptJournalUseCase;
   probeProject: ProbeProjectUseCase;
   /**
@@ -255,6 +259,7 @@ function unconfiguredWorkComposition(): WorkComposition {
     inspectAttempt: new InspectAttemptUseCase(),
     listAttempts: new ListAttemptsUseCase(),
     listLaneRuns: new ListLaneRunsUseCase(),
+    listConductorPasses: new ListConductorPassesUseCase(),
     listAttemptJournal: new ListAttemptJournalUseCase(),
     probeProject: new ProbeProjectUseCase(),
     probeLimiter: new ProbeLimiter(),
@@ -361,6 +366,9 @@ export function createConfiguredWorkComposition(
   // / null and is never quarantined (moved) by a GET.
   const conductorHalt = new ConductorHaltAdapter({ stateDir, readOnly: true });
   const conductorDriverLease = new ConductorDriverLeaseAdapter({ stateDir, readOnly: true });
+  // VZ6: the pass list is a read-only GET; open the trace ring read-only so a
+  // malformed ring is reported unreadable and never quarantined by a GET.
+  const conductorPassTrace = new ConductorPassTraceAdapter({ stateDir, readOnly: true });
   const briefAuthoring = new BriefAuthoringAdapter();
   // H9b2: workspace and artifact reads for an attempt recorded on a named
   // host run through that recorded host's executor (the recorded host is the
@@ -495,6 +503,7 @@ export function createConfiguredWorkComposition(
       executionJournal: journal,
       workOrderRepo,
     }),
+    listConductorPasses: new ListConductorPassesUseCase({ passTrace: conductorPassTrace }),
     listAttemptJournal: new ListAttemptJournalUseCase({ attemptRepo, journal }),
     prepareBriefPackage: new PrepareBriefPackageUseCase({
       briefAuthoring,
@@ -543,6 +552,7 @@ export function createConfiguredWorkComposition(
       acceptancePort,
       artifactPort,
       allowedSeats,
+      computeDigest: sha256HexDigest,
     }),
     executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase({
       attemptRepo,
@@ -567,7 +577,7 @@ export function createConfiguredWorkComposition(
       if (attempt === null) {
         return { outcome: "unknown", reason: `Attempt not found: '${attemptId}'` };
       }
-      return resolveImplementerSeat(attempt, { artifactPort });
+      return resolveImplementerSeat(attempt, { artifactPort, computeDigest: sha256HexDigest });
     },
   };
 }

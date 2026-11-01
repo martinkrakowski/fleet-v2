@@ -26,6 +26,7 @@
   "devDependencies": {
     "@hexagen-monaco/arch-linter": "0.15.0",
     "@hexagen-monaco/sync": "0.15.0",
+    "@vitest/coverage-v8": "^4.1.0",
     "eslint": "^9.0.0",
     "prettier": "^3.0.0",
     "turbo": "^2.11.5",

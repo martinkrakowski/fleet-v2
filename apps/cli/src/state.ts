@@ -243,6 +243,9 @@ function formatBeforeRecords(result: StateFileReadResult): string {
   if (result.status === 'missing') {
     return 'missing';
   }
+  if (result.status === 'unknown-version') {
+    return 'unsupported';
+  }
   return 'unreadable';
 }
 

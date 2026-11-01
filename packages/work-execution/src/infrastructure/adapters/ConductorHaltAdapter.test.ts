@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { isConductorHalted, readConductorHaltRecord } from '../../domain/conductor-halt.js';
 import { ConductorHaltAdapter } from './ConductorHaltAdapter.adapter.js';
+import { ReadOnlyStateStoreError } from './file-store.js';
 
 const NOW = '2026-10-27T10:00:00.000Z';
 const HALTED_RECORD = { version: 1, halted: true, changedAtIso: NOW };
@@ -187,5 +188,40 @@ describe('readConductorHaltRecord', () => {
     if (!bad.ok) {
       expect(bad.error).not.toContain('XYZZY');
     }
+  });
+});
+
+describe('ConductorHaltAdapter read-only mode', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-conductor-halt-readonly-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('read-only leaves a malformed marker untouched while the default quarantines it', async () => {
+    const garbage = '{ not json CANARY-bytes';
+    const file = path.join(tempDir, 'conductor-halt.json');
+    await fs.writeFile(file, garbage, 'utf8');
+
+    const readonlyAdapter = new ConductorHaltAdapter({ stateDir: tempDir, readOnly: true });
+    expect(await readonlyAdapter.read()).toEqual({ state: 'unreadable' });
+    expect(await fs.readFile(file, 'utf8')).toBe(garbage);
+    await expect(fs.readdir(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+
+    const defaultAdapter = new ConductorHaltAdapter({ stateDir: tempDir });
+    expect(await defaultAdapter.read()).toEqual({ state: 'unreadable' });
+    const entries = await fs.readdir(path.join(tempDir, 'quarantine'));
+    expect(entries).toHaveLength(1);
+    expect(await fs.readFile(path.join(tempDir, 'quarantine', entries[0]), 'utf8')).toBe(garbage);
+
+    await expect(
+      readonlyAdapter.set({ halted: true, nowIso: NOW }),
+    ).rejects.toBeInstanceOf(ReadOnlyStateStoreError);
   });
 });

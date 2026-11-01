@@ -5,7 +5,7 @@
 import "./nitro-globals.js";
 
 import { createServer, type Server } from "node:http";
-import { mkdtemp, readdir, readFile, rm, writeFile, mkdir } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -291,6 +291,21 @@ async function snapshotState(stateDir: string): Promise<string[]> {
   );
 }
 
+/** Snapshot every entry under the state dir (names plus bytes), including quarantine copies. */
+async function snapshotWholeDir(stateDir: string): Promise<string[]> {
+  const names = (await readdir(stateDir, { recursive: true })).sort();
+  return Promise.all(
+    names.map(async (name) => {
+      const full = join(stateDir, name);
+      const stat = await lstat(full);
+      if (stat.isFile()) {
+        return `${name}:${(await readFile(full)).toString("base64")}`;
+      }
+      return `${name}/`;
+    }),
+  );
+}
+
 type RunsEnvelope = {
   code: string;
   operationId: string;
@@ -298,6 +313,8 @@ type RunsEnvelope = {
     outcome: string;
     schedule: {
       observedAtIso: string;
+      halt: "clear" | "halted" | "unreadable";
+      driverLeaseLapsed: boolean | null;
       admission: { active: number; inFlight: number; maxActiveRuns: number | null };
       rows: ReadonlyArray<{
         runId: string;
@@ -385,6 +402,27 @@ describe("GET /v1/runs", () => {
     const response = await callList();
     expect(response.status).toBe(200);
     const after = await snapshotState(stateDir);
+    expect(after).toEqual(before);
+  });
+
+  it("reads malformed halt and driver-lease markers without quarantining or moving anything", async () => {
+    const stateDir = await makeTempDir();
+    await seedState(stateDir);
+    await writeFile(join(stateDir, "conductor-halt.json"), "{not json CANARY-halt-bytes");
+    await writeFile(
+      join(stateDir, "conductor-driver-lease.json"),
+      "{not json CANARY-lease-bytes",
+    );
+    configureWorkComposition(createConfiguredWorkComposition({ stateDir }));
+
+    const before = await snapshotWholeDir(stateDir);
+    const response = await callList();
+    expect(response.status).toBe(200);
+    const envelope = response.payload as RunsEnvelope;
+    expect(envelope.result.schedule.halt).toBe("unreadable");
+    expect(envelope.result.schedule.driverLeaseLapsed).toBeNull();
+
+    const after = await snapshotWholeDir(stateDir);
     expect(after).toEqual(before);
   });
 });

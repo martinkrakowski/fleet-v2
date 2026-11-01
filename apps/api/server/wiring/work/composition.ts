@@ -356,10 +356,11 @@ export function createConfiguredWorkComposition(
   // route only ever reads them, so both adapters are opened read-only.
   const laneRunRepo = new LaneRunRepositoryAdapter({ stateDir, readOnly: true });
   const laneRunJournal = new LaneRunJournalAdapter({ stateDir, readOnly: true });
-  // A-R-1: only the halt and driver-lease `read()` is reachable through the
-  // schedule use case; these adapters are built for that read alone.
-  const conductorHalt = new ConductorHaltAdapter({ stateDir });
-  const conductorDriverLease = new ConductorDriverLeaseAdapter({ stateDir });
+  // A-R-1: the schedule read is the only caller of the halt and driver-lease
+  // `read()`; open both read-only so a malformed marker reads as unreadable
+  // / null and is never quarantined (moved) by a GET.
+  const conductorHalt = new ConductorHaltAdapter({ stateDir, readOnly: true });
+  const conductorDriverLease = new ConductorDriverLeaseAdapter({ stateDir, readOnly: true });
   const briefAuthoring = new BriefAuthoringAdapter();
   // H9b2: workspace and artifact reads for an attempt recorded on a named
   // host run through that recorded host's executor (the recorded host is the

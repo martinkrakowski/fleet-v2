@@ -1,26 +1,38 @@
 /**
- * `fleet-v2 seats free-tier` (free-seat plan FS4, F1 and F8): show or
- * change `policy.useFreeSeats` in the v2 installation file. The flag's rules
- * come from the onboarding engine's `draftFreeTier`; this module owns only
- * argument handling and output, and every write goes through the shared
- * compare-and-swap `confirmAndWrite`. There is no `--force`.
+ * `fleet-v2 seats`: list the installation file's seats, check them with the
+ * loader and the doctor's seat probes, and show or change
+ * `policy.useFreeSeats` (`seats free-tier`, free-seat plan FS4, F1 and F8).
+ * The flag's rules come from the onboarding engine's `draftFreeTier`; this
+ * module owns only argument handling and output, and every write goes
+ * through the shared compare-and-swap `confirmAndWrite`. There is no
+ * `--force`.
  */
 
 import {
+  createNodeDoctorProbes,
+  doctorExitCode,
   draftFreeTier,
   renderFreeTierImpact,
   renderFreeTierStatus,
+  runDoctor,
   summariseFreeTier,
+  type DoctorLine,
+  type DoctorProbes,
   type FreeTierAction,
 } from "@fleet/onboarding";
-import { resolveInstallationFile } from "@fleet/installation";
+import {
+  loadInstallation,
+  resolveInstallationFile,
+  type LoadResult,
+  type SeatSection,
+} from "@fleet/installation";
 import {
   confirmAndWrite,
   printDiff,
   printErrors,
   readInstallationState,
 } from "./hosts.js";
-import type { CliIo } from "./index.js";
+import { formatDoctorLine, type CliIo } from "./index.js";
 
 /** Options the driver and tests inject; every default composes the real thing. */
 export interface SeatsCliOptions {
@@ -32,6 +44,8 @@ export interface SeatsCliOptions {
    * refuses the write.
    */
   readonly confirm?: (question: string) => Promise<boolean>;
+  /** Probe implementation for `seats check`; the node probes compose when omitted. */
+  readonly probes?: DoctorProbes;
 }
 
 const SEATS_HELP = `Usage: fleet-v2 seats free-tier [status|on|off] [--yes]
@@ -64,6 +78,14 @@ type ParsedSeatsArgs =
       readonly yes: boolean;
     }
   | { readonly ok: false; readonly error: string };
+
+const SEATS_GROUP_HELP = `Usage: fleet-v2 seats list | check | free-tier [status|on|off] [--yes]
+
+  list       print every seat declared in the installation file
+  check      run the loader and the doctor's seat probes over each seat
+  free-tier  show or change policy.useFreeSeats (see 'fleet-v2 seats free-tier --help')
+
+Exit codes: 0 shown or healthy, 1 refused or failing, 2 usage error.`;
 
 function isHelpToken(token: string): boolean {
   return token === "help" || token === "--help" || token === "-h";
@@ -241,11 +263,85 @@ async function changeFreeTier(
   return code;
 }
 
-/** `fleet-v2 seats <subcommand>`; exit codes: 0 shown/written, 1 refused, 2 usage. */
-export async function seatsCommand(
+/** One line of `seats list`: the seat's identity, routing and health. */
+function renderSeatLine(seat: SeatSection): string {
+  const model =
+    seat.variant === undefined ? seat.model : `${seat.model}#${seat.variant}`;
+  const agent = seat.agent === undefined ? "" : ` agent=${seat.agent}`;
+  return `${seat.id}  tool=${seat.tool} model=${model}${agent} roles=${seat.roles.join(",")} cost=${seat.costClass} health=${seat.health ?? "healthy"}`;
+}
+
+/** `seats list`: one line per seat of the installation file, in file order. */
+async function listSeats(file: string, io: CliIo): Promise<number> {
+  const state = await readInstallationState(file);
+  if (state.status === "unreadable") {
+    io.stderr(`${file}: could not be read (${state.reason})\n`);
+    return 1;
+  }
+  if (state.status === "invalid") {
+    io.stderr("the installation file is invalid; fix it by hand:\n");
+    printErrors(io, state.errors);
+    return 1;
+  }
+  if (state.status === "absent") {
+    io.stderr("no installation file; run fleet-v2 init first\n");
+    return 1;
+  }
+  if (state.status === "v1") {
+    io.stdout("schema version 1 has no seats section; migrate to v2\n");
+    return 0;
+  }
+  const seats = state.installation.seats ?? [];
+  if (seats.length === 0) {
+    io.stdout("no seats declared\n");
+    return 0;
+  }
+  for (const seat of seats) {
+    io.stdout(`${renderSeatLine(seat)}\n`);
+  }
+  return 0;
+}
+
+/** `seats check`: the loader's verdict plus the doctor's seat probes. */
+async function checkSeats(
+  file: string,
+  io: CliIo,
+  options: SeatsCliOptions,
+): Promise<number> {
+  const loadResult: LoadResult = loadInstallation({ file });
+  if (loadResult.status === "invalid") {
+    io.stderr(`installation invalid (${file}):\n`);
+    printErrors(io, loadResult.errors);
+    return 1;
+  }
+  if (loadResult.status === "absent") {
+    io.stderr("no installation file; run fleet-v2 init first\n");
+    return 1;
+  }
+  const probes = options.probes ?? createNodeDoctorProbes();
+  const seatLines: DoctorLine[] = [];
+  for await (const doctorLine of runDoctor(loadResult, probes, {
+    probeSeats: true,
+    env: process.env,
+  })) {
+    if (doctorLine.scope !== "seat") {
+      continue;
+    }
+    seatLines.push(doctorLine);
+    io.stdout(`${formatDoctorLine(doctorLine)}\n`);
+  }
+  if (seatLines.length === 0) {
+    io.stdout("no seats declared\n");
+    return 0;
+  }
+  return doctorExitCode(seatLines);
+}
+
+/** `seats free-tier`: the pre-existing subcommand, unchanged. */
+async function freeTierCommand(
   argv: readonly string[],
   io: CliIo,
-  options: SeatsCliOptions = {},
+  options: SeatsCliOptions,
 ): Promise<number> {
   const parsed = parseSeatsArgs(argv);
   if (!parsed.ok) {
@@ -262,4 +358,40 @@ export async function seatsCommand(
   return parsed.action === "status"
     ? showFreeTierStatus(file, io)
     : changeFreeTier(file, parsed.action, parsed.yes, io, options);
+}
+
+/** `fleet-v2 seats <subcommand>`; exit codes: 0 shown/written, 1 refused, 2 usage. */
+export async function seatsCommand(
+  argv: readonly string[],
+  io: CliIo,
+  options: SeatsCliOptions = {},
+): Promise<number> {
+  const [head, ...rest] = argv;
+  if (head === undefined) {
+    io.stderr(`no seats subcommand\n${SEATS_GROUP_HELP}\n`);
+    return 2;
+  }
+  if (isHelpToken(head)) {
+    io.stdout(`${SEATS_GROUP_HELP}\n`);
+    return 0;
+  }
+  if (head === "free-tier") {
+    return freeTierCommand(argv, io, options);
+  }
+  if (head !== "list" && head !== "check") {
+    io.stderr(`Unknown seats subcommand: ${head}\n${SEATS_GROUP_HELP}\n`);
+    return 2;
+  }
+  if (rest.some((token) => !isHelpToken(token))) {
+    io.stderr(`Unexpected argument for seats ${head}\n${SEATS_GROUP_HELP}\n`);
+    return 2;
+  }
+  if (rest.length > 0) {
+    io.stdout(`${SEATS_GROUP_HELP}\n`);
+    return 0;
+  }
+  const file =
+    options.installationFile ??
+    resolveInstallationFile(undefined, process.env, process.cwd());
+  return head === "list" ? listSeats(file, io) : checkSeats(file, io, options);
 }

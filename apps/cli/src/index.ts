@@ -618,8 +618,10 @@ doctor --host <name> prints only that host's probe subset.
 The hosts group manages the installation file's named hosts: list, add,
 edit and remove, each write confirmed and compare-and-swapped.
 
-The seats group shows or changes policy.useFreeSeats: seats free-tier status|on|off,
-each change confirmed and compare-and-swapped.
+The seats group lists the installation file's seats, checks them with the
+loader and the doctor's seat probes (seats list, seats check), and shows or
+changes policy.useFreeSeats: seats free-tier status|on|off, each change
+confirmed and compare-and-swapped.
 
 The policy group shows or changes policy.autoMerge: policy auto-merge status|on|off,
 each change confirmed and compare-and-swapped.
@@ -651,7 +653,7 @@ Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
   hosts list|add|edit|remove
-  seats free-tier [status|on|off] [--yes]
+  seats list|check|free-tier [status|on|off] [--yes]
   policy auto-merge [status|on|off] [--allow-high-risk true|false] [--on-blocked ask-owner|hold] [--yes]
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]

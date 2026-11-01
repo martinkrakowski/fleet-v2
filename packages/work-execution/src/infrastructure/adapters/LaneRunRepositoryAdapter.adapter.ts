@@ -97,6 +97,7 @@ function copy(record: LaneRunRecord): LaneRunRecord {
     revision: record.revision,
     runPolicyRevision: record.runPolicyRevision,
     ...(record.branchName === undefined ? {} : { branchName: record.branchName }),
+    ...(record.baseBranch === undefined ? {} : { baseBranch: record.baseBranch }),
   };
 }
 
@@ -128,6 +129,7 @@ function identityChanged(stored: LaneRunRecord, candidate: LaneRunRecord): boole
     stored.seatPlanRef !== candidate.seatPlanRef ||
     stored.runPolicyRevision !== candidate.runPolicyRevision ||
     stored.branchName !== candidate.branchName ||
+    stored.baseBranch !== candidate.baseBranch ||
     !isPrefix(stored.attemptIds, candidate.attemptIds)
   );
 }

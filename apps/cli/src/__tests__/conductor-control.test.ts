@@ -128,8 +128,11 @@ function parseDocument(lines: readonly string[]): Record<string, unknown> {
 }
 
 /** A plain run, revision 1, no lease, no journal entries. */
-async function seedPlainRun(runtime: FleetCliRuntime): Promise<void> {
-  const record = runRecord();
+async function seedPlainRun(
+  runtime: FleetCliRuntime,
+  overrides: Partial<LaneRunRecord> = {},
+): Promise<void> {
+  const record = runRecord(overrides);
   expect(await runtime.conductor.laneRunRepository.create(record)).toMatchObject({ outcome: 'saved' });
 }
 
@@ -170,6 +173,22 @@ describe('fleet-v2 conductor (K7-4)', () => {
     const runs = document.runs as readonly Record<string, unknown>[];
     expect(runs).toHaveLength(1);
     expect(runs[0]).toMatchObject({ runId: RUN_ID, workOrderId: 'wo-example-1' });
+  });
+
+  it('status shows the run base branch, with main for a seeded record without the key (CB1)', async () => {
+    const runtime = makeRuntime(tempStateDir());
+    await seedPlainRun(runtime, { baseBranch: 'chain/example' });
+    const result = await runConductor(runtime, ['status']);
+    expect(result.code).toBe(0);
+    const runs = (parseDocument(result.stdout).runs as readonly Record<string, unknown>[])[0];
+    expect(runs).toMatchObject({ runId: RUN_ID, baseBranch: 'chain/example' });
+
+    const withoutKey = makeRuntime(tempStateDir());
+    await seedPlainRun(withoutKey);
+    const plain = await runConductor(withoutKey, ['status']);
+    expect(plain.code).toBe(0);
+    const plainRuns = (parseDocument(plain.stdout).runs as readonly Record<string, unknown>[])[0];
+    expect(plainRuns).toMatchObject({ runId: RUN_ID, baseBranch: 'main' });
   });
 
   it('halt sets and lifts the kill switch; status shows it', async () => {

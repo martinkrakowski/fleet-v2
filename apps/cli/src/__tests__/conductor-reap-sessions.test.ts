@@ -9,7 +9,7 @@ import { join } from 'node:path';
 
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
-import type { ReapOrphanSessionsResult } from '@fleet/work-execution';
+import type { AttemptRecord, ReapOrphanSessionsResult } from '@fleet/work-execution';
 
 import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli } from '../index.js';
@@ -83,7 +83,31 @@ function okResult(overrides: Partial<ReapOrphanSessionsResult> = {}): ReapOrphan
     failed: [],
     skipped: [],
     unknown: [],
+    legacyAttempts: [],
     ...overrides,
+  };
+}
+
+/** One finished legacy-runner attempt (no installation host name) for the store. */
+function legacyAttempt(id: string, runner: AttemptRecord['runner']): AttemptRecord {
+  return {
+    id,
+    workOrderId: 'wo-a',
+    kind: 'initial',
+    fixNumber: 0,
+    priorAttemptId: null,
+    worktreePath: WORKTREE,
+    baseCommit: 'a'.repeat(40),
+    state: 'collected',
+    outcome: null,
+    briefDigest: 'b'.repeat(64),
+    briefPackagePath: '.lane/brief-package',
+    sessionId: null,
+    completionReceipt: null,
+    artifacts: null,
+    runner,
+    createdAtIso: NOW,
+    updatedAtIso: NOW,
   };
 }
 
@@ -179,6 +203,46 @@ describe('conductor reap --sessions (EX-4)', () => {
     const result = await runConductor(runtime, ['reap', '--sessions', '--yes']);
     expect(result.code).toBe(0);
     expect(reap).toHaveBeenCalledWith({ dryRun: false });
+  });
+
+  it('--dry-run lists legacy-runner attempts from the store', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+    await runtime.execution.attemptRepository.saveAttempt(legacyAttempt('attempt-legacy-1', null));
+    await runtime.execution.attemptRepository.saveAttempt(
+      legacyAttempt('attempt-legacy-2', {
+        kind: 'opencode',
+        remotePort: null,
+        host: 'legacy-alias',
+        hostName: null,
+        agent: null,
+        model: null,
+        variant: null,
+      }),
+    );
+
+    const result = await runConductor(runtime, ['reap', '--sessions', '--dry-run'], stateDir);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toHaveLength(1);
+    const doc = JSON.parse(result.stdout[0]!) as ReapOrphanSessionsResult;
+    expect(doc.legacyAttempts).toEqual([
+      {
+        attemptId: 'attempt-legacy-1',
+        workOrderId: 'wo-a',
+        worktreePath: WORKTREE,
+        state: 'collected',
+        sessionId: null,
+        reason: 'no-runner',
+      },
+      {
+        attemptId: 'attempt-legacy-2',
+        workOrderId: 'wo-a',
+        worktreePath: WORKTREE,
+        state: 'collected',
+        sessionId: null,
+        reason: 'alias-only',
+      },
+    ]);
   });
 
   it('help names sessions', async () => {

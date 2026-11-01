@@ -9,10 +9,13 @@ import type { LaneRunKeyStep, LaneRunTier } from '../../../domain/lane-run-recor
 import type { LaneRunParkRecord } from '../../../domain/lane-run-records.js';
 import type { RunStopMode } from '../../../domain/lane-run-transitions.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
+import type { BaseBranchValue } from '../../../domain/base-branch.js';
 
 export interface LaneRunStatusView {
   readonly runId: string;
   readonly workOrderId: string;
+  /** The base branch the run was started against (lane CB1). */
+  readonly baseBranch: BaseBranchValue;
   readonly tier: LaneRunTier;
   /** The state of the run's last conduct entry (laneRunJournalState). */
   readonly state: LaneRunStateValue;

@@ -1,7 +1,7 @@
 "use client";
 
 import type { SessionMarkView } from "../map-schedule";
-import { markLayout } from "../svg-scale";
+import { markLayout, type StripMarkLayout } from "../svg-scale";
 import styles from "../conductor.module.css";
 
 const STRIP_WIDTH = 600;
@@ -26,7 +26,31 @@ function staggerCell(mark: SessionMarkView): string {
   return mark.underStagger ? "yes" : "no";
 }
 
-export function SessionStrip({ marks }: { marks: readonly SessionMarkView[] }) {
+function markTitle(mark: StripMarkLayout): string {
+  const base = `${mark.runId} ${mark.step} ${mark.recordedAtIso}`;
+  if (mark.underStagger === true) {
+    return `${base} · under stagger`;
+  }
+  return base;
+}
+
+function labelAnchor(x: number): "start" | "middle" | "end" {
+  if (x <= STRIP_PADDING * 2) {
+    return "start";
+  }
+  if (x >= STRIP_WIDTH - STRIP_PADDING * 2) {
+    return "end";
+  }
+  return "middle";
+}
+
+export function SessionStrip({
+  marks,
+  truncated = false,
+}: {
+  marks: readonly SessionMarkView[];
+  truncated?: boolean;
+}) {
   const layout = markLayout(marks, STRIP_WIDTH, STRIP_PADDING);
 
   if (marks.length === 0) {
@@ -39,6 +63,11 @@ export function SessionStrip({ marks }: { marks: readonly SessionMarkView[] }) {
 
   return (
     <section className={styles.stripSection} aria-label="Session starts">
+      {truncated ? (
+        <p className={styles.muted}>
+          Older session-start marks were cut: the strip shows only the newest 50.
+        </p>
+      ) : null}
       <div className={styles.strip}>
         <svg
           role="img"
@@ -61,15 +90,13 @@ export function SessionStrip({ marks }: { marks: readonly SessionMarkView[] }) {
                     : styles.mark
                 }
               >
-                <title>
-                  {mark.runId} {mark.step} {mark.recordedAtIso}
-                </title>
+                <title>{markTitle(mark)}</title>
               </circle>
               {staggerText(mark) !== null ? (
                 <text
                   x={mark.x}
                   y={STRIP_PADDING}
-                  textAnchor="middle"
+                  textAnchor={labelAnchor(mark.x)}
                   className={styles.markLabel}
                 >
                   under stagger

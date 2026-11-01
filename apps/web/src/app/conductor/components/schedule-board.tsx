@@ -64,16 +64,12 @@ function SlotList({ host }: { host: ScheduleHostView }) {
 export function ScheduleBoard({
   visibleRows,
   hosts,
-  truncated = false,
 }: {
   visibleRows: readonly ScheduleRowView[];
   hosts: readonly ScheduleHostView[];
-  truncated?: boolean;
 }) {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-  const caption = truncated
-    ? "Live runs in creation order (list truncated)"
-    : "Live runs in creation order";
+  const caption = "Live runs in creation order";
 
   return (
     <div>
@@ -97,7 +93,7 @@ export function ScheduleBoard({
               return (
                 <Fragment key={row.runId}>
                   <Tr>
-                    <Td mono>
+                    <Td mono data-label="Run">
                       <button
                         type="button"
                         className={styles.runToggle}
@@ -111,11 +107,11 @@ export function ScheduleBoard({
                       {overlapChips(row)}
                       {workOrderText(row)}
                     </Td>
-                    <Td>{row.state}</Td>
-                    <Td>{row.round}</Td>
-                    <Td>{placementText(row)}</Td>
-                    <Td mono>{slotText(row)}</Td>
-                    <Td mono>{packagesText(row)}</Td>
+                    <Td data-label="State">{row.state}</Td>
+                    <Td data-label="Round">{row.round}</Td>
+                    <Td data-label="Placement">{placementText(row)}</Td>
+                    <Td mono data-label="Slot">{slotText(row)}</Td>
+                    <Td mono data-label="Packages">{packagesText(row)}</Td>
                   </Tr>
                   {selected ? (
                     <Tr>

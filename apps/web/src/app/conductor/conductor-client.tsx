@@ -3,6 +3,7 @@
 import { useState, type ReactNode } from "react";
 import { Banner, EmptyState, PageHeader, RouteChip, Select } from "@fleet/ui";
 import type { ConductorData } from "./live";
+import type { ScheduleRowView, ScheduleView } from "./map-schedule";
 import {
   PLACEMENT_FILTERS,
   capNote,
@@ -22,15 +23,10 @@ function haltedBannerTitle(halt: string): string {
   return "Conductor halted";
 }
 
-function actions(
-  data: ConductorData,
-  liveCount: number,
-  truncated: boolean,
-): ReactNode {
+function actions(data: ConductorData, liveCount: number): ReactNode {
   if (data.view === "listed") {
-    const tail = truncated ? " · list truncated" : "";
     return (
-      <RouteChip>live · GET /v1/runs · {liveCount} live{tail}</RouteChip>
+      <RouteChip>live · GET /v1/runs · {liveCount} live</RouteChip>
     );
   }
   if (data.view === "error") {
@@ -55,6 +51,23 @@ function unreadBanner(data: ConductorData): ReactNode {
       </p>
     </Banner>
   );
+}
+
+function scheduleList(
+  schedule: ScheduleView,
+  rows: readonly ScheduleRowView[],
+): ReactNode {
+  if (schedule.rows.length === 0) {
+    return <EmptyState title="No live runs." />;
+  }
+  if (rows.length === 0) {
+    return (
+      <EmptyState
+        title={`Nothing matches this filter: ${schedule.rows.length} runs are live; the filter hides them.`}
+      />
+    );
+  }
+  return <ScheduleBoard visibleRows={rows} hosts={schedule.hosts} />;
 }
 
 export function ConductorClient({ data }: { data: ConductorData }) {
@@ -93,30 +106,24 @@ export function ConductorClient({ data }: { data: ConductorData }) {
             ))}
           </Select>
         </div>
-        {schedule.rows.length === 0 ? (
-          <EmptyState title="No live runs." />
-        ) : (
-          <ScheduleBoard
-            visibleRows={rows}
-            hosts={schedule.hosts}
-            truncated={schedule.truncated}
-          />
-        )}
-        <SessionStrip marks={schedule.sessionStarts} />
+        {scheduleList(schedule, rows)}
+        <SessionStrip
+          marks={schedule.sessionStarts}
+          truncated={schedule.truncated}
+        />
       </>
     );
   }
 
   const liveCount =
     schedule === null ? 0 : filterRows(schedule.rows, "all").length;
-  const truncated = schedule !== null && schedule.truncated;
 
   return (
     <div className={styles.page}>
       <PageHeader
         title="Conductor"
         description="Read-only picture of the conductor's live runs: who holds a host slot, which package keys they own and how full admission is. Nothing here starts, stops, halts, resumes or reorders a run."
-        actions={actions(data, liveCount, truncated)}
+        actions={actions(data, liveCount)}
       />
       <p className={styles.meta} aria-live="polite">
         {schedule === null

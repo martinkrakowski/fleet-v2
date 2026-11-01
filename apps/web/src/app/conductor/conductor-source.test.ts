@@ -96,6 +96,14 @@ describe("Conductor source wiring", () => {
     expect(client.match(/aria-live=/g)).toHaveLength(1);
   });
 
+  it("keeps truncation on the session strip only, never on the schedule", () => {
+    expect(board).not.toContain("truncated");
+    expect(board).toContain("Live runs in creation order");
+    expect(client).not.toContain("list truncated");
+    expect(client).toContain("truncated={schedule.truncated}");
+    expect(strip).toContain("truncated");
+  });
+
   it("never ships a fixture for the page", () => {
     expect(existsSync(join(CONDUCTOR_DIR, "fixture.ts"))).toBe(false);
     for (const file of nonTestFiles) {

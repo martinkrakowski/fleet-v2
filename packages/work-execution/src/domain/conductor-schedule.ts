@@ -108,15 +108,34 @@ interface ScheduleRow {
   admissionWait: ConductorScheduleRow['admissionWait'];
 }
 
-export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: string): ConductorSchedule {
+/** Bytewise string order; deterministic regardless of locale. */
+function byCodeUnit(left: string, right: string): number {
+  if (left < right) {
+    return -1;
+  }
+  if (left > right) {
+    return 1;
+  }
+  return 0;
+}
+
+function buildHeldByAttempt(
+  reservations: readonly CapacityReservationRecord[],
+): Map<string, CapacityReservationRecord> {
   const heldByAttempt = new Map<string, CapacityReservationRecord>();
-  for (const reservation of facts.reservations) {
+  for (const reservation of reservations) {
     if (reservation.held) {
       heldByAttempt.set(reservation.attemptId, reservation);
     }
   }
+  return heldByAttempt;
+}
 
-  // In-flight starts: held reservations whose attempt id no run lists (terminal ones included).
+/** In-flight starts: held reservations whose attempt id no run lists (terminal ones included). */
+function findInFlightReservations(
+  facts: ConductorScheduleFacts,
+  heldByAttempt: ReadonlyMap<string, CapacityReservationRecord>,
+): CapacityReservationRecord[] {
   const inFlightReservations: CapacityReservationRecord[] = [];
   for (const reservation of heldByAttempt.values()) {
     const referenced = facts.runs.some((run) => run.attemptIds.includes(reservation.attemptId));
@@ -124,7 +143,44 @@ export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: s
       inFlightReservations.push(reservation);
     }
   }
+  return inFlightReservations;
+}
 
+function resolveSlot(
+  run: LaneRunRecord,
+  heldByAttempt: ReadonlyMap<string, CapacityReservationRecord>,
+): { hostName: string; slotIndex: number } | null {
+  for (const attemptId of run.attemptIds) {
+    const reservation = heldByAttempt.get(attemptId);
+    if (reservation !== undefined) {
+      return { hostName: reservation.hostName ?? reservation.hostId, slotIndex: reservation.slotIndex };
+    }
+  }
+  return null;
+}
+
+function computePlacement(
+  state: LaneRunStateValue,
+  halt: ConductorScheduleHalt,
+  slot: { hostName: string; slotIndex: number } | null,
+): ConductorSchedulePlacement {
+  if (state === 'parked') {
+    return 'parked';
+  }
+  if (halt !== 'clear') {
+    return 'halted';
+  }
+  if (slot !== null) {
+    return 'running';
+  }
+  return 'waiting';
+}
+
+function buildRows(
+  facts: ConductorScheduleFacts,
+  heldByAttempt: ReadonlyMap<string, CapacityReservationRecord>,
+  nowIso: string,
+): ScheduleRow[] {
   const rows: ScheduleRow[] = [];
   for (const run of facts.runs) {
     const entries = facts.journals.get(run.runId) ?? [];
@@ -132,14 +188,7 @@ export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: s
     if ((LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state)) {
       continue;
     }
-    let slot: { hostName: string; slotIndex: number } | null = null;
-    for (const attemptId of run.attemptIds) {
-      const reservation = heldByAttempt.get(attemptId);
-      if (reservation !== undefined) {
-        slot = { hostName: reservation.hostName ?? reservation.hostId, slotIndex: reservation.slotIndex };
-        break;
-      }
-    }
+    const slot = resolveSlot(run, heldByAttempt);
     const pending = laneRunJournalPendingIntent(entries, run.runId);
     const workOrder = facts.workOrders.get(run.workOrderId);
     rows.push({
@@ -148,11 +197,7 @@ export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: s
       tier: run.tier,
       state,
       round: run.round,
-      placement:
-        state === 'parked' ? 'parked'
-        : facts.halt !== 'clear' ? 'halted'
-        : slot !== null ? 'running'
-        : 'waiting',
+      placement: computePlacement(state, facts.halt, slot),
       pendingStep:
         pending === null ? null : { step: pending.step, reconciliation: pending.reconciliation },
       park: run.parked === null ? null : { reason: run.parked.reason, qualifier: run.parked.qualifier },
@@ -165,7 +210,10 @@ export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: s
     });
   }
   rows.sort((left, right) => left.runId.localeCompare(right.runId));
+  return rows;
+}
 
+function computeOverlaps(facts: ConductorScheduleFacts, rows: ScheduleRow[]): void {
   for (const row of rows) {
     const thisOrder = facts.workOrders.get(row.workOrderId);
     if (thisOrder === undefined) {
@@ -184,10 +232,14 @@ export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: s
         overlaps.push(other.runId);
       }
     }
-    overlaps.sort();
+    overlaps.sort(byCodeUnit);
     row.overlapsWith = overlaps;
   }
+}
 
+function readCaps(
+  facts: ConductorScheduleFacts,
+): { caps: ConductorScheduleCaps | null; trace: 'none' | 'recorded' | 'unreadable' } {
   let caps: ConductorScheduleCaps | null = null;
   let trace: 'none' | 'recorded' | 'unreadable' = 'none';
   if (facts.latestTrace !== undefined && facts.latestTrace !== null) {
@@ -203,60 +255,103 @@ export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: s
       trace = 'unreadable';
     }
   }
+  return { caps, trace };
+}
 
-  const active = rows.filter((row) => row.slot !== null).length;
-  const inFlight = inFlightReservations.length;
-
-  for (const row of rows) {
-    if (row.placement !== 'waiting') {
+/** Does a waiting row's work order overlap an active run's? Fail closed like admission. */
+function overlapsActiveRun(facts: ConductorScheduleFacts, rows: ScheduleRow[], row: ScheduleRow): boolean {
+  const thisOrder = facts.workOrders.get(row.workOrderId);
+  if (thisOrder === undefined) {
+    return false;
+  }
+  for (const other of rows) {
+    if (other.runId === row.runId || other.slot === null) {
       continue;
     }
-    let admissionWait: 'cap' | 'package-overlap' | null = null;
-    if (caps !== null && active + inFlight >= caps.maxActiveRuns) {
-      admissionWait = 'cap';
-    } else if (row.workOrderUnreadable) {
-      admissionWait = 'package-overlap';
-    } else {
-      const thisOrder = facts.workOrders.get(row.workOrderId);
-      let overlap = false;
-      if (thisOrder !== undefined) {
-        for (const other of rows) {
-          if (other.runId === row.runId || other.slot === null) {
-            continue;
-          }
-          const otherOrder = facts.workOrders.get(other.workOrderId);
-          // Fail closed like admission: an active run whose work order is unreadable blocks.
-          if (otherOrder === undefined || laneRunPackagesOverlap(thisOrder, otherOrder)) {
-            overlap = true;
-            break;
-          }
-        }
-      }
-      if (!overlap) {
-        for (const reservation of inFlightReservations) {
-          const workOrderId = facts.attemptWorkOrderIds.get(reservation.attemptId);
-          if (workOrderId === undefined) {
-            overlap = true;
-            break;
-          }
-          const order = facts.workOrders.get(workOrderId);
-          if (order === undefined) {
-            overlap = true;
-            break;
-          }
-          if (thisOrder !== undefined && laneRunPackagesOverlap(order, thisOrder)) {
-            overlap = true;
-            break;
-          }
-        }
-      }
-      if (overlap) {
-        admissionWait = 'package-overlap';
-      }
+    const otherOrder = facts.workOrders.get(other.workOrderId);
+    // Fail closed like admission: an active run whose work order is unreadable blocks.
+    if (otherOrder === undefined || laneRunPackagesOverlap(thisOrder, otherOrder)) {
+      return true;
     }
-    row.admissionWait = admissionWait;
   }
+  return false;
+}
 
+/** Does a waiting row's work order overlap an in-flight reservation's? */
+function overlapsInFlight(
+  facts: ConductorScheduleFacts,
+  inFlightReservations: readonly CapacityReservationRecord[],
+  row: ScheduleRow,
+): boolean {
+  const thisOrder = facts.workOrders.get(row.workOrderId);
+  for (const reservation of inFlightReservations) {
+    const workOrderId = facts.attemptWorkOrderIds.get(reservation.attemptId);
+    if (workOrderId === undefined) {
+      return true;
+    }
+    const order = facts.workOrders.get(workOrderId);
+    if (order === undefined) {
+      return true;
+    }
+    if (thisOrder !== undefined && laneRunPackagesOverlap(order, thisOrder)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function computeAdmissionWait(
+  facts: ConductorScheduleFacts,
+  inFlightReservations: readonly CapacityReservationRecord[],
+  rows: ScheduleRow[],
+  caps: ConductorScheduleCaps | null,
+  admission: { active: number; inFlight: number },
+  row: ScheduleRow,
+): 'cap' | 'package-overlap' | null {
+  if (row.placement !== 'waiting') {
+    return null;
+  }
+  if (caps !== null && admission.active + admission.inFlight >= caps.maxActiveRuns) {
+    return 'cap';
+  }
+  if (row.workOrderUnreadable) {
+    return 'package-overlap';
+  }
+  if (overlapsActiveRun(facts, rows, row)) {
+    return 'package-overlap';
+  }
+  if (overlapsInFlight(facts, inFlightReservations, row)) {
+    return 'package-overlap';
+  }
+  return null;
+}
+
+function findRunIdForAttempt(facts: ConductorScheduleFacts, attemptId: string): string | null {
+  for (const run of facts.runs) {
+    if (run.attemptIds.includes(attemptId)) {
+      return run.runId;
+    }
+  }
+  return null;
+}
+
+function byHostName(
+  left: { hostName: string },
+  right: { hostName: string },
+): number {
+  if (left.hostName < right.hostName) {
+    return -1;
+  }
+  if (left.hostName > right.hostName) {
+    return 1;
+  }
+  return 0;
+}
+
+function groupHostLanes(
+  facts: ConductorScheduleFacts,
+  heldByAttempt: ReadonlyMap<string, CapacityReservationRecord>,
+): ConductorScheduleHostLane[] {
   const hostMap = new Map<string, { hostName: string; slots: { slotIndex: number; runId: string | null }[] }>();
   for (const reservation of heldByAttempt.values()) {
     const hostKey = reservation.hostName ?? reservation.hostId;
@@ -265,29 +360,35 @@ export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: s
       lane = { hostName: hostKey, slots: [] };
       hostMap.set(hostKey, lane);
     }
-    let runId: string | null = null;
-    for (const run of facts.runs) {
-      if (run.attemptIds.includes(reservation.attemptId)) {
-        runId = run.runId;
-        break;
-      }
-    }
-    lane.slots.push({ slotIndex: reservation.slotIndex, runId });
+    lane.slots.push({ slotIndex: reservation.slotIndex, runId: findRunIdForAttempt(facts, reservation.attemptId) });
   }
-  const hosts: ConductorScheduleHostLane[] = [...hostMap.values()]
-    .sort((left, right) => (left.hostName < right.hostName ? -1 : left.hostName > right.hostName ? 1 : 0))
+  return [...hostMap.values()]
+    .sort(byHostName)
     .map((lane) => ({
       hostName: lane.hostName,
       slots: [...lane.slots].sort((left, right) => left.slotIndex - right.slotIndex),
     }));
+}
 
+export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: string): ConductorSchedule {
+  const heldByAttempt = buildHeldByAttempt(facts.reservations);
+  const inFlightReservations = findInFlightReservations(facts, heldByAttempt);
+  const rows = buildRows(facts, heldByAttempt, nowIso);
+  computeOverlaps(facts, rows);
+  const { caps, trace } = readCaps(facts);
+  const active = rows.filter((row) => row.slot !== null).length;
+  const admission = { active, inFlight: inFlightReservations.length };
+  for (const row of rows) {
+    row.admissionWait = computeAdmissionWait(facts, inFlightReservations, rows, caps, admission, row);
+  }
+  const hosts = groupHostLanes(facts, heldByAttempt);
   return {
     observedAtIso: nowIso,
     halt: facts.halt,
     driverLeaseLapsed: facts.driverLease === null ? null : isLeaseLapsed(facts.driverLease, nowIso),
     rows,
     hosts,
-    admission: { active, inFlight, maxActiveRuns: caps?.maxActiveRuns ?? null },
+    admission: { active: admission.active, inFlight: admission.inFlight, maxActiveRuns: caps?.maxActiveRuns ?? null },
     caps,
     trace,
   };
@@ -310,6 +411,26 @@ function isSessionStartStep(step: LaneRunKeyStep): step is SessionStartStep {
   return (SESSION_START_STEPS as readonly string[]).includes(step);
 }
 
+function compareCandidates(
+  left: { ts: number; runId: string; key: string },
+  right: { ts: number; runId: string; key: string },
+): number {
+  if (left.ts !== right.ts) {
+    return left.ts - right.ts;
+  }
+  if (left.runId !== right.runId) {
+    return left.runId < right.runId ? -1 : 1;
+  }
+  return byCodeUnit(left.key, right.key);
+}
+
+function computeUnderStagger(gapMs: number | null, dispatchStaggerMs: number | null): boolean | null {
+  if (gapMs === null || dispatchStaggerMs === null) {
+    return null;
+  }
+  return gapMs < dispatchStaggerMs;
+}
+
 export function deriveSessionStartMarks(
   entries: readonly LaneRunJournalEntryRecord[],
   options: { readonly dispatchStaggerMs: number | null; readonly limit: number },
@@ -329,7 +450,7 @@ export function deriveSessionStartMarks(
       continue;
     }
     const parsed = parseLaneRunKey(entry.key);
-    if (parsed === null || parsed.kind !== 'step' || !isSessionStartStep(parsed.step)) {
+    if (parsed?.kind !== 'step' || !isSessionStartStep(parsed.step)) {
       continue;
     }
     const ts = Date.parse(entry.recordedAtIso);
@@ -344,15 +465,7 @@ export function deriveSessionStartMarks(
       recordedAtIso: entry.recordedAtIso,
     });
   }
-  candidates.sort((left, right) => {
-    if (left.ts !== right.ts) {
-      return left.ts - right.ts;
-    }
-    if (left.runId !== right.runId) {
-      return left.runId < right.runId ? -1 : 1;
-    }
-    return left.key < right.key ? -1 : left.key > right.key ? 1 : 0;
-  });
+  candidates.sort(compareCandidates);
   const marks: ConductorSessionStartMark[] = candidates.map((candidate, index) => {
     const previous = candidates[index - 1];
     const gapMs = previous === undefined ? null : candidate.ts - previous.ts;
@@ -361,7 +474,7 @@ export function deriveSessionStartMarks(
       step: candidate.step,
       recordedAtIso: candidate.recordedAtIso,
       gapMs,
-      underStagger: gapMs === null || options.dispatchStaggerMs === null ? null : gapMs < options.dispatchStaggerMs,
+      underStagger: computeUnderStagger(gapMs, options.dispatchStaggerMs),
     };
   });
   if (marks.length > options.limit) {

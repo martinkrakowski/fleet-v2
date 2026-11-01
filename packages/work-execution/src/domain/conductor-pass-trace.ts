@@ -84,6 +84,27 @@ interface TraceStepBuilder {
   decision?: string;
 }
 
+function isNullableToken(value: unknown): boolean {
+  return value === null || isToken(value);
+}
+
+function isLaneRunKey(value: unknown): boolean {
+  return typeof value === 'string' && parseLaneRunKey(value) !== null;
+}
+
+/** Optional step fields: validated when present, only fixed names copied. */
+const TRACE_STEP_FIELDS: readonly (readonly [keyof TraceStepBuilder, (value: unknown) => boolean])[] = [
+  ['state', isToken],
+  ['reason', isToken],
+  ['qualifier', isNullableToken],
+  ['step', isToken],
+  ['key', isLaneRunKey],
+  ['result', isToken],
+  ['reasonCode', isNullableToken],
+  ['detail', isNullableToken],
+  ['decision', isToken],
+];
+
 /** One stored step: outcome a token, and only the ten fixed names copied when present. */
 function readTraceStep(value: unknown): ConductorTraceStep | null {
   if (!isPlainRecord(value)) {
@@ -94,59 +115,15 @@ function readTraceStep(value: unknown): ConductorTraceStep | null {
     return null;
   }
   const step: TraceStepBuilder = { outcome };
-  if (value.state !== undefined) {
-    if (!isToken(value.state)) {
+  for (const [field, validate] of TRACE_STEP_FIELDS) {
+    const raw = value[field];
+    if (raw === undefined) {
+      continue;
+    }
+    if (!validate(raw)) {
       return null;
     }
-    step.state = value.state;
-  }
-  if (value.reason !== undefined) {
-    if (!isToken(value.reason)) {
-      return null;
-    }
-    step.reason = value.reason;
-  }
-  if (value.qualifier !== undefined) {
-    if (value.qualifier !== null && !isToken(value.qualifier)) {
-      return null;
-    }
-    step.qualifier = value.qualifier;
-  }
-  if (value.step !== undefined) {
-    if (!isToken(value.step)) {
-      return null;
-    }
-    step.step = value.step;
-  }
-  if (value.key !== undefined) {
-    if (typeof value.key !== 'string' || parseLaneRunKey(value.key) === null) {
-      return null;
-    }
-    step.key = value.key;
-  }
-  if (value.result !== undefined) {
-    if (!isToken(value.result)) {
-      return null;
-    }
-    step.result = value.result;
-  }
-  if (value.reasonCode !== undefined) {
-    if (value.reasonCode !== null && !isToken(value.reasonCode)) {
-      return null;
-    }
-    step.reasonCode = value.reasonCode;
-  }
-  if (value.detail !== undefined) {
-    if (value.detail !== null && !isToken(value.detail)) {
-      return null;
-    }
-    step.detail = value.detail;
-  }
-  if (value.decision !== undefined) {
-    if (!isToken(value.decision)) {
-      return null;
-    }
-    step.decision = value.decision;
+    step[field] = raw as never;
   }
   return step;
 }
@@ -160,6 +137,110 @@ export function readConductorPassTrace(input: unknown): ConductorPassTraceRead {
   }
 }
 
+/** Header fields validated as plain malformed; read once each, in order. */
+const TRACE_HEADER_FIELDS: readonly (readonly [field: string, validate: (value: unknown) => boolean])[] = [
+  ['passId', (value) => typeof value === 'string' && PASS_ID_PATTERN.test(value)],
+  ['nowIso', isZonedIsoDateTime],
+  ['holderId', (value) => typeof value === 'string' && value.length >= 1 && value.length <= 256],
+  ['halted', (value) => typeof value === 'boolean'],
+  ['progressed', (value) => typeof value === 'boolean'],
+  ['maxActiveRuns', (value) => Number.isSafeInteger(value) && (value as number) >= 1],
+  ['passConcurrency', (value) => Number.isSafeInteger(value) && (value as number) >= 1],
+  ['dispatchStaggerMs', (value) => Number.isSafeInteger(value) && (value as number) >= 0],
+  ['runs', Array.isArray],
+  ['attention', Array.isArray],
+];
+
+function readHeader(
+  input: Record<string, unknown>,
+): { ok: true; fields: ReadonlyMap<string, unknown> } | { ok: false; reason: 'malformed' } {
+  const fields = new Map<string, unknown>();
+  for (const [field, validate] of TRACE_HEADER_FIELDS) {
+    const raw = input[field];
+    if (!validate(raw)) {
+      return { ok: false, reason: 'malformed' };
+    }
+    fields.set(field, raw);
+  }
+  return { ok: true, fields };
+}
+
+function readAdvancedSteps(stepsRaw: readonly unknown[]): ConductorTraceStep[] | null {
+  const steps: ConductorTraceStep[] = [];
+  for (const stepRaw of stepsRaw) {
+    const step = readTraceStep(stepRaw);
+    if (step === null) {
+      return null;
+    }
+    steps.push(step);
+  }
+  return steps;
+}
+
+function readRunReport(report: Record<string, unknown>): ConductorTraceRunReport | null {
+  const outcome = report.outcome;
+  if (outcome === 'advanced') {
+    const stepsRaw = report.steps;
+    if (!Array.isArray(stepsRaw) || stepsRaw.length > CONDUCTOR_PASS_TRACE_MAX_STEPS) {
+      return null;
+    }
+    const steps = readAdvancedSteps(stepsRaw);
+    if (steps === null) {
+      return null;
+    }
+    return { outcome: 'advanced', steps };
+  }
+  if (outcome === 'skipped' || outcome === 'resume-refused') {
+    const reason = report.reason;
+    if (!isToken(reason)) {
+      return null;
+    }
+    return { outcome, reason };
+  }
+  return null;
+}
+
+function readRunEntries(runsRaw: readonly unknown[]): { runId: string; report: ConductorTraceRunReport }[] | null {
+  const runs: { runId: string; report: ConductorTraceRunReport }[] = [];
+  for (const item of runsRaw) {
+    if (!isPlainRecord(item)) {
+      return null;
+    }
+    const runId = item.runId;
+    if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+      return null;
+    }
+    const report = item.report;
+    if (!isPlainRecord(report)) {
+      return null;
+    }
+    const readReport = readRunReport(report);
+    if (readReport === null) {
+      return null;
+    }
+    runs.push({ runId, report: readReport });
+  }
+  return runs;
+}
+
+function readAttentionEntries(
+  attentionRaw: readonly unknown[],
+): { readonly runId: string; readonly kind: string }[] | null {
+  const attention: { readonly runId: string; readonly kind: string }[] = [];
+  for (const item of attentionRaw) {
+    if (!isPlainRecord(item)) {
+      return null;
+    }
+    const runId = item.runId;
+    const kind = item.kind;
+    if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId) || !isToken(kind)) {
+      return null;
+    }
+    attention.push({ runId, kind });
+  }
+  return attention;
+}
+
 function readConductorPassTraceUnchecked(input: unknown): ConductorPassTraceRead {
   if (!isPlainRecord(input)) {
     return malformed();
@@ -168,112 +249,30 @@ function readConductorPassTraceUnchecked(input: unknown): ConductorPassTraceRead
   if (schemaVersion !== undefined && schemaVersion !== CONDUCTOR_PASS_TRACE_SCHEMA_VERSION) {
     return { ok: false, reason: 'unknown-schema-version' };
   }
-  const passId = input.passId;
-  if (typeof passId !== 'string' || !PASS_ID_PATTERN.test(passId)) {
+  const header = readHeader(input);
+  if (!header.ok) {
     return malformed();
   }
-  const nowIso = input.nowIso;
-  if (!isZonedIsoDateTime(nowIso)) {
+  const runs = readRunEntries(header.fields.get('runs') as readonly unknown[]);
+  if (runs === null) {
     return malformed();
   }
-  const holderId = input.holderId;
-  if (typeof holderId !== 'string' || holderId.length < 1 || holderId.length > 256) {
+  const attention = readAttentionEntries(header.fields.get('attention') as readonly unknown[]);
+  if (attention === null) {
     return malformed();
-  }
-  const halted = input.halted;
-  const progressed = input.progressed;
-  if (typeof halted !== 'boolean' || typeof progressed !== 'boolean') {
-    return malformed();
-  }
-  const maxActiveRuns = input.maxActiveRuns;
-  const passConcurrency = input.passConcurrency;
-  const dispatchStaggerMs = input.dispatchStaggerMs;
-  if (
-    !Number.isSafeInteger(maxActiveRuns) ||
-    (maxActiveRuns as number) < 1 ||
-    !Number.isSafeInteger(passConcurrency) ||
-    (passConcurrency as number) < 1 ||
-    !Number.isSafeInteger(dispatchStaggerMs) ||
-    (dispatchStaggerMs as number) < 0
-  ) {
-    return malformed();
-  }
-  const runsRaw = input.runs;
-  if (!Array.isArray(runsRaw)) {
-    return malformed();
-  }
-  const runs: { readonly runId: string; readonly report: ConductorTraceRunReport }[] = [];
-  for (const item of runsRaw) {
-    if (!isPlainRecord(item)) {
-      return malformed();
-    }
-    const runId = item.runId;
-    if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
-      return malformed();
-    }
-    const report = item.report;
-    if (!isPlainRecord(report)) {
-      return malformed();
-    }
-    const outcome = report.outcome;
-    if (outcome === 'advanced') {
-      const stepsRaw = report.steps;
-      if (!Array.isArray(stepsRaw) || stepsRaw.length > CONDUCTOR_PASS_TRACE_MAX_STEPS) {
-        return malformed();
-      }
-      const steps: ConductorTraceStep[] = [];
-      for (const stepRaw of stepsRaw) {
-        const step = readTraceStep(stepRaw);
-        if (step === null) {
-          return malformed();
-        }
-        steps.push(step);
-      }
-      runs.push({ runId, report: { outcome: 'advanced', steps } });
-    } else if (outcome === 'skipped') {
-      const reason = report.reason;
-      if (!isToken(reason)) {
-        return malformed();
-      }
-      runs.push({ runId, report: { outcome: 'skipped', reason } });
-    } else if (outcome === 'resume-refused') {
-      const reason = report.reason;
-      if (!isToken(reason)) {
-        return malformed();
-      }
-      runs.push({ runId, report: { outcome: 'resume-refused', reason } });
-    } else {
-      return malformed();
-    }
-  }
-  const attentionRaw = input.attention;
-  if (!Array.isArray(attentionRaw)) {
-    return malformed();
-  }
-  const attention: { readonly runId: string; readonly kind: string }[] = [];
-  for (const item of attentionRaw) {
-    if (!isPlainRecord(item)) {
-      return malformed();
-    }
-    const runId = item.runId;
-    const kind = item.kind;
-    if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId) || !isToken(kind)) {
-      return malformed();
-    }
-    attention.push({ runId, kind });
   }
   return {
     ok: true,
     record: {
       schemaVersion: CONDUCTOR_PASS_TRACE_SCHEMA_VERSION,
-      passId,
-      nowIso,
-      holderId,
-      halted,
-      progressed,
-      maxActiveRuns: maxActiveRuns as number,
-      passConcurrency: passConcurrency as number,
-      dispatchStaggerMs: dispatchStaggerMs as number,
+      passId: header.fields.get('passId') as string,
+      nowIso: header.fields.get('nowIso') as string,
+      holderId: header.fields.get('holderId') as string,
+      halted: header.fields.get('halted') as boolean,
+      progressed: header.fields.get('progressed') as boolean,
+      maxActiveRuns: header.fields.get('maxActiveRuns') as number,
+      passConcurrency: header.fields.get('passConcurrency') as number,
+      dispatchStaggerMs: header.fields.get('dispatchStaggerMs') as number,
       runs,
       attention,
     },

@@ -20,6 +20,7 @@ import * as path from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
+import type { DoctorProbes } from "@fleet/onboarding";
 import {
   isFleetInstallationV2,
   parseInstallation,
@@ -460,5 +461,165 @@ describe("fleet-v2 seats free-tier usage", () => {
     const { code, stdout } = await runSeats(["--help"], file);
     expect(code).toBe(0);
     expect(stdout).toContain("Usage: fleet-v2 seats free-tier");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// list and check
+// ---------------------------------------------------------------------------
+
+/** The seat probe result the fake probes return for every seat. */
+type FakeSeatOutcome =
+  | { outcome: "pass"; reason: string }
+  | { outcome: "fail"; reason: string }
+  | { outcome: "unknown"; reason: string };
+
+/** Full-accepting probes whose seat probe records calls and returns `outcome`. */
+function fakeProbes(
+  outcome: FakeSeatOutcome,
+  calls?: string[],
+): DoctorProbes {
+  return {
+    hostReachable: async () => true,
+    commandAvailable: async () => true,
+    toolVersion: async () => "1.0.0",
+    fileMode: async () => 0o600,
+    worktreeRootWritable: async () => true,
+    ocmRunBinary: async () => ({ path: "/repo/bin/ocm-run", sha256: "c".repeat(64) }),
+    expectedOcmRunHash: async () => "c".repeat(64),
+    seatProbe: async () => {
+      calls?.push("seatProbe");
+      return outcome;
+    },
+  };
+}
+
+async function runSeatsGroup(
+  argv: readonly string[],
+  file: string,
+  options: Record<string, unknown> = {},
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const { io, stdout, stderr } = mockIo();
+  const code = await runCli(argv, io, undefined, undefined, undefined, undefined, {
+    installationFile: file,
+    ...options,
+  });
+  return { code, stdout: stdout.join(""), stderr: stderr.join("") };
+}
+
+describe("fleet-v2 seats list", () => {
+  it("m: prints every seat of the v2 fixture in file order", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeCanonical(file, fixture());
+
+    const { code, stdout } = await runSeatsGroup(["seats", "list"], file);
+    const lines = stdout.split("\n").filter((line) => line !== "");
+    expect(code).toBe(0);
+    expect(lines).toHaveLength(5);
+    expect(lines[0]).toBe(
+      "free-impl  tool=opencode model=acme/alpha-1 roles=implementer cost=free health=healthy",
+    );
+    expect(lines).toContain(
+      "paid-rev  tool=opencode model=acme/beta-2 roles=reviewer cost=paid health=healthy",
+    );
+  });
+
+  it("m: a v1 file prints the migration hint and exits 0", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 1,
+      forge: { owner: "example-owner", repo: "example-repo" },
+    });
+
+    const { code, stdout } = await runSeatsGroup(["seats", "list"], file);
+    expect(code).toBe(0);
+    expect(stdout).toContain(
+      "schema version 1 has no seats section; migrate to v2",
+    );
+  });
+
+  it("m: a missing file is refused with exit 1", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "absent", "fleet.json");
+
+    const { code, stderr } = await runSeatsGroup(["seats", "list"], file);
+    expect(code).toBe(1);
+    expect(stderr).toContain("no installation file; run fleet-v2 init first");
+  });
+});
+
+describe("fleet-v2 seats check", () => {
+  it("m: every seat probes PASS and the seat probe runs once per seat", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeCanonical(file, fixture());
+    const calls: string[] = [];
+
+    const { code, stdout } = await runSeatsGroup(["seats", "check"], file, {
+      probes: fakeProbes({ outcome: "pass", reason: "answered" }, calls),
+    });
+    const lines = stdout.split("\n").filter((line) => line !== "");
+    expect(code).toBe(0);
+    expect(lines).toHaveLength(5);
+    expect(lines[0]).toBe("PASS seat free-impl probe — answered");
+    expect(calls).toHaveLength(5);
+    expect(calls.every((call) => call === "seatProbe")).toBe(true);
+  });
+
+  it("m: a failing seat probe exits 1", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeCanonical(file, fixture());
+    const calls: string[] = [];
+
+    const { code, stdout } = await runSeatsGroup(["seats", "check"], file, {
+      probes: fakeProbes({ outcome: "fail", reason: "no answer" }, calls),
+    });
+    expect(code).toBe(1);
+    expect(stdout).toContain("FAIL seat free-impl probe — no answer");
+    expect(calls).toHaveLength(5);
+  });
+
+  it("m: invalid JSON is refused before any probe runs", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeFileSync(file, `{"schemaVersion": 2,\n`, "utf8");
+    const calls: string[] = [];
+
+    const { code, stderr } = await runSeatsGroup(["seats", "check"], file, {
+      probes: fakeProbes({ outcome: "pass", reason: "answered" }, calls),
+    });
+    expect(code).toBe(1);
+    expect(stderr).toContain(`installation invalid (${file}):`);
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("fleet-v2 seats group usage", () => {
+  it("m: an unknown subcommand prints the group help to stderr and exits 2", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeCanonical(file, fixture());
+
+    const { code, stderr } = await runSeatsGroup(["seats", "bogus"], file);
+    expect(code).toBe(2);
+    expect(stderr).toContain("Unknown seats subcommand: bogus");
+    expect(stderr).toContain(
+      "Usage: fleet-v2 seats list | check | free-tier [status|on|off] [--yes]",
+    );
+  });
+
+  it("m: --help prints the group help naming every subcommand and exits 0", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeCanonical(file, fixture());
+
+    const { code, stdout } = await runSeatsGroup(["seats", "--help"], file);
+    expect(code).toBe(0);
+    expect(stdout).toContain("list");
+    expect(stdout).toContain("check");
+    expect(stdout).toContain("free-tier");
   });
 });

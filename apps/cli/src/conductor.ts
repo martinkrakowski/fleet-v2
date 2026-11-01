@@ -1312,6 +1312,12 @@ export async function conductorCommand(
   options: ConductorCliOptions,
 ): Promise<number> {
   const subcommand = argv[0] ?? '';
+  // Schedule validates its own arguments (only --json), so it must be reached
+  // before the generic help shortcut below; otherwise `schedule --help` would
+  // print the conductor help instead of being rejected.
+  if (subcommand === 'schedule') {
+    return await scheduleCommand(argv.slice(1), io, runtime, options);
+  }
   if (subcommand === 'help' || subcommand === '--help' || subcommand === '-h' || argv[1] === '--help' || argv[1] === '-h') {
     io.stdout(`${CONDUCTOR_HELP}\n`);
     return 0;
@@ -1326,9 +1332,6 @@ export async function conductorCommand(
   }
   if (subcommand === 'reap') {
     return await reapCommand(argv.slice(1), io, runtime, options);
-  }
-  if (subcommand === 'schedule') {
-    return await scheduleCommand(argv.slice(1), io, runtime, options);
   }
   const parsed = readControlOptions(argv.slice(1), io);
   if (parsed === null) {

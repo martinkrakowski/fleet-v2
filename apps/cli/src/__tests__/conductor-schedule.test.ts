@@ -199,6 +199,16 @@ describe('fleet-v2 conductor schedule (VZ2)', () => {
     expect(repeated.code).toBe(2);
   });
 
+  it('rejects --help and -h like any other token', async () => {
+    const runtime = makeRuntime(tempStateDir());
+    for (const token of ['--help', '-h']) {
+      const result = await runSchedule(runtime, [token]);
+      expect(result.code).toBe(2);
+      expect(result.stderr.join('')).toContain('conductor schedule takes only --json');
+      expect(result.stdout).toEqual([]);
+    }
+  });
+
   it('help lists the schedule command', async () => {
     const runtime = makeRuntime(tempStateDir());
     const io = captureIo();

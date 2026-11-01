@@ -1,6 +1,7 @@
 // This root vitest config exists for the root coverage run CI makes (Q6b):
 // one run from the repository root writes coverage/lcov.info over the twelve
-// vitest workspaces. The per-workspace `test` scripts do not read this file.
+// vitest workspaces. The projects and coverage block apply only when the
+// process cwd is the repository root.
 //
 // Vitest 4 searches upward from the process working directory for
 // `vitest.config.*`, and no workspace ships one, so a workspace `test` script

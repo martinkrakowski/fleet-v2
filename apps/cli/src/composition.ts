@@ -85,6 +85,7 @@ import {
   InspectLaneRunsUseCase,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
+  ListConductorPassesUseCase,
   ListLaneRunsUseCase,
   ReapLaneWorktreesUseCase,
   ReapOrphanSessionsUseCase,
@@ -702,6 +703,8 @@ export interface FleetCliRuntime {
     readonly requestLaneRunStop: RequestLaneRunStopUseCase;
     readonly inspectLaneRuns: InspectLaneRunsUseCase;
     readonly listLaneRuns: ListLaneRunsUseCase;
+    /** VZ5b: the recorded conductor passes newest first (conductor schedule --passes). */
+    readonly listConductorPasses: ListConductorPassesUseCase;
     readonly resumeLaneRun: ResumeLaneRunUseCase;
     /** EX-2b: the operator-opt-in worktree reap (conductor reap --worktrees). */
     readonly reapLaneWorktrees: ReapLaneWorktreesUseCase;

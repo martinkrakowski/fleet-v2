@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-27
 - **Target repository:** `fleet-v2`
-- **Status:** rev 1 + KS markers (2026-11-01), the Opus review of rev 0 applied (two blockers, five majors, two notes; §8). Approved in principle by the owner (2026-10-27: "Agreed and approved. Much of this you should be able to run in parallel."). Decisions in §6 are open with defaults. Nothing built. Anchors checked against `main` at `f04b825`. Amended 2026-10-27 by the web UI interactivity plan, lane UI-B (§3.8): how a stop ends a run, the park reason `stop-unconfirmed`, and the `run-stopped` refusal in `ResumeLaneRun`. Amended 2026-10-27 by K-GC (§3.9), rev 2 after Grok 4.7's review (one blocker, six majors, three minors): a graceful and a forced run stop, the record-only cancel of an undispatched attempt, and the reaper; D11, D13, D14 and D15 decided by the owner, D12 and D16 recommended defaults still open (§6). Amended 2026-10-27 by K-WT (§3.10), rev 1 after Grok 4.7's review (four majors, five minors; §8): merged-worktree cleanup as a reaper finding kind with an opt-in removal; it revisits D15 and proposes D17 and D18, open for the owner. **Amendment K-WT (§3.10):** rev 2 after two Grok rounds and CodeRabbit; the owner decided D17 (merged-worktree removal opt-in, off by default) and D18 (listing per registered clone only) on 2026-10-27. **Amendment KS (§3.11):** amended 2026-11-01 by lane KS0 of the lane-pipeline speed plan (`2026-10-28_lane-pipeline-speed-plan.md`, decisions D19–D35, decided by the owner): markers in §3.2, §3.6, D3, D6 and the K4, K5, K6, K7 and K9 rows; the speed plan is the source of truth for their wording.
+- **Status:** rev 1 + KS markers + Amendment CB (2026-11-01), the Opus review of rev 0 applied (two blockers, five majors, two notes; §8). Approved in principle by the owner (2026-10-27: "Agreed and approved. Much of this you should be able to run in parallel."). Decisions in §6 are open with defaults. Nothing built. Anchors checked against `main` at `f04b825`. Amended 2026-10-27 by the web UI interactivity plan, lane UI-B (§3.8): how a stop ends a run, the park reason `stop-unconfirmed`, and the `run-stopped` refusal in `ResumeLaneRun`. Amended 2026-10-27 by K-GC (§3.9), rev 2 after Grok 4.7's review (one blocker, six majors, three minors): a graceful and a forced run stop, the record-only cancel of an undispatched attempt, and the reaper; D11, D13, D14 and D15 decided by the owner, D12 and D16 recommended defaults still open (§6). Amended 2026-10-27 by K-WT (§3.10), rev 1 after Grok 4.7's review (four majors, five minors; §8): merged-worktree cleanup as a reaper finding kind with an opt-in removal; it revisits D15 and proposes D17 and D18, open for the owner. **Amendment K-WT (§3.10):** rev 2 after two Grok rounds and CodeRabbit; the owner decided D17 (merged-worktree removal opt-in, off by default) and D18 (listing per registered clone only) on 2026-10-27. **Amendment KS (§3.11):** amended 2026-11-01 by lane KS0 of the lane-pipeline speed plan (`2026-10-28_lane-pipeline-speed-plan.md`, decisions D19–D35, decided by the owner): markers in §3.2, §3.6, D3, D6 and the K4, K5, K6, K7 and K9 rows; the speed plan is the source of truth for their wording.
 - **Owner request (2026-10-27):** "How far away are we from lane orchestrators being implemented?" The answer: the stations exist, the missing design is a **conductor** that moves one lane through them.
 - **Builds on:** the 2026-10-23 seat/gate/usage plan (S1, S2), 2026-10-20 auto-merge (AM1–AM5), 2026-10-24 live updates (E3), 2026-10-25 Agensh (C1), 2026-10-26 vacuous-pass (R1, V1, V2) and untrusted-input (U1, U2) plans, and the 2026-10-26 execution order.
 
@@ -43,7 +43,7 @@ The conductor is an **application service in `work-execution`**, not a fifth con
 
 ### 3.2 State, derived first
 
-The run's state is a projection of attempts, the keyed journal, receipts and forge evidence. `LaneRunRecord` stores only what cannot be derived: `workOrderId`, `tier`, `seatPlanRef` and a cursor per role, `round` (0–2), the attempt ids in order, `prNumber`, `parked` (reason, parked-from state, question id), `lease`, `revision`, `runPolicyRevision`.
+The run's state is a projection of attempts, the keyed journal, receipts and forge evidence. `LaneRunRecord` stores only what cannot be derived: `workOrderId`, `tier`, `seatPlanRef` and a cursor per role, `round` (0–2), the attempt ids in order, `prNumber`, `baseBranch` (Amendment CB; absent means `main`), `parked` (reason, parked-from state, question id), `lease`, `revision`, `runPolicyRevision`.
 
 | State | Enters when | Exits | Guard |
 |---|---|---|---|
@@ -374,6 +374,32 @@ Amended 2026-11-01 by lane KS0 of the lane-pipeline speed plan (`2026-10-28_lane
 | K9 | none; D9 unchanged | K9 itself | Moves up the queue once the other waits are short |
 
 Where a K lane named above has merged before its amendment is dispatched, the amendment lands as that lane's follow-up (speed plan §4.4). KM, the orchestrator's manifest commit for KS2's and KS4a's port changes, is a Tier 0 commit, not a lane here. D34 is listed under D3 because it answers the same question for a head produced by fixing Fable's own findings; the speed plan's §7 notes its tension with D10.
+
+### 3.12 Amendment CB: chain base branches
+
+Amended 2026-11-01 by the owner's decision on the merge path ("creating a branching strategy that allows chains to merge onto a common chain-dev branch, allowing all branches to be enforced to stay up to date and allow more simultaneous merging"; "agreed, build this approach"). The text above is unchanged; this section adds the chain base branch to the shape and names the lanes.
+
+**Why.** GitHub's merge queue is not offered for this repository (A-0, D22 applies), so strict up-to-date merges into `main` are serial: about six to eight per hour, and a chain of dependent lanes paid one merge wait per link. A chain now merges link by link into its own base branch `chain/<name>`, each link strictly up to date with that branch and tested as merged into it, and the whole chain lands on `main` by one integration PR. Merges into different bases proceed in parallel; each base stays strictly serial. Singletons (docs, Tier 0, standalone fixes) keep targeting `main`.
+
+**What already exists outside this repository.** The orchestrator's merge train (private tooling) works one PR per base at a time with the bases in parallel, enforces up-to-date against the PR's base itself, merges `main` into every open chain branch after each merge to `main` (a conflict becomes an attention item that blocks landing), opens the integration PR with every link's evidence and `premerge` success carrying that evidence, and after the integration merge deletes the chain branch, the links' branches and their lane worktrees. No ruleset covers `refs/heads/chain/**` yet: extending the `main` ruleset to the chain branches is an owner setting still to be made, and until then the train is the only enforcer of gate, premerge, thread resolution and up-to-date on a chain branch.
+
+**What this repository adds (the conductor side).**
+
+| Where | Decisions | Lane | What changes |
+|---|---|---|---|
+| Work order (§3.1), lane run record (§3.2) | CB-D1 | CB1 | An optional `baseBranch` on the work order (`register` payload and `--base-branch` flag; `main` or `chain/<lowercase letters, digits, dashes>`; absent means `main`; anything else is refused with a reason code), carried into the lane plan sidecar where one exists and frozen into the lane run at `conductor start` so a later work-order change never moves a running lane; exposed by `work-order inspect` and `conductor status`; `state check` and `state restore` accept the key and reject a malformed one |
+| §3.3 workspace, §3.2 `opening-pr` | CB-D2 | CB2 | The lane worktree is created from `origin/<baseBranch>` and the recorded tip is that base's tip; `push-and-open-pr` opens the PR against `baseBranch`; the one-way key and the journal detail name the base; a base branch that does not exist on the forge refuses the dispatch with a reason code and never falls back to `main`. PR-state, CI-state and `premerge` reads are unchanged (keyed by PR number and head) |
+| §3.4 schedule read model, `conductor schedule`, `conductor status`, the dry-run report, the work board | CB-D3 | CB3 | Each run shows its base branch; the schedule groups active runs by base so the operator sees one serial queue per base. Read-only |
+| §3.6 Admission | CB-D4 (default: unchanged) | CB3 | The package-level rule (and, after KS5, the file-level rule) is unchanged across bases: two runs touching the same package do not run at once even on different chains, because the chain integration lands them on `main` together |
+
+**Decisions (defaults apply unless the owner says otherwise).**
+
+- CB-D1 `baseBranch` lives on the work order and is frozen into the run; it is not a per-attempt field.
+- CB-D2 A missing base branch on the forge is a refusal at dispatch, never a silent fallback to `main`.
+- CB-D3 Display groups by base; no new state is written.
+- CB-D4 Admission is unchanged across bases.
+
+**Not in scope here.** Landing a chain on `main` (the integration PR), refreshing chain branches from `main`, and deleting branches and worktrees after landing stay with the orchestrator's tooling; a later amendment may move them into the conductor once the base branch is a first-class field.
 
 ## 4. Workbook
 

@@ -125,11 +125,25 @@ function isPlainDataDescriptor(
   return descriptor.get === undefined && descriptor.set === undefined;
 }
 
+/** Refuse any array whose own keys are not exactly the index keys and 'length'. */
+function requirePlainArrayKeys(value: unknown[]): void {
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== value.length + 1 || keys[value.length] !== 'length') {
+    malformed();
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    if (keys[index] !== String(index)) {
+      malformed();
+    }
+  }
+}
+
 /** An array of strings copied by index through own-property descriptors; getters never run. */
 function copyStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
     malformed();
   }
+  requirePlainArrayKeys(value);
   const copy: string[] = [];
   for (let index = 0; index < value.length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, index);
@@ -146,6 +160,7 @@ function copyNonEmptyStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
     malformed();
   }
+  requirePlainArrayKeys(value);
   const copy: string[] = [];
   for (let index = 0; index < value.length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, index);
@@ -186,6 +201,7 @@ function readExactDataRecord(value: unknown, keys: readonly string[]): Record<st
 }
 
 function copyPlainArray(value: unknown[]): unknown[] {
+  requirePlainArrayKeys(value);
   const copy: unknown[] = [];
   for (let index = 0; index < value.length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, index);

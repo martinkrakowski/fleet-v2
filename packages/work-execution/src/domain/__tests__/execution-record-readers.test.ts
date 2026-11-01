@@ -637,4 +637,116 @@ describe('execution-record-readers: hostile input', () => {
       expect(JSON.stringify(result)).not.toContain(secretId);
     }
   });
+
+  it('refuses an array with an extra getter without running the getter', () => {
+    let getterCalls = 0;
+    const journal = clone(validJournal);
+    Object.defineProperty(journal.observedSessionIds, 'extra', {
+      get() {
+        getterCalls += 1;
+        throw new Error('observedSessionIds extra getter must never run');
+      },
+      enumerable: true,
+    });
+    expect(readActionJournalEntryRecord(journal)).toEqual({ ok: false, reason: 'malformed' });
+    expect(getterCalls).toBe(0);
+
+    const attempt = clone(validAttempt);
+    Object.defineProperty(attempt.artifacts.commitsSinceBase, 'extra', {
+      get() {
+        getterCalls += 1;
+        throw new Error('commitsSinceBase extra getter must never run');
+      },
+      enumerable: true,
+    });
+    expect(readAttemptRecord(attempt)).toEqual({ ok: false, reason: 'malformed' });
+    expect(getterCalls).toBe(0);
+
+    const attemptDecisions = clone(validAttempt);
+    Object.defineProperty(attemptDecisions.ownerDecisionReferences, 'extra', {
+      get() {
+        getterCalls += 1;
+        throw new Error('ownerDecisionReferences extra getter must never run');
+      },
+      enumerable: true,
+    });
+    expect(readAttemptRecord(attemptDecisions)).toEqual({ ok: false, reason: 'malformed' });
+    expect(getterCalls).toBe(0);
+
+    const attemptPlan = clone(validAttempt);
+    Object.defineProperty(attemptPlan.seatPlan['first-pass'], 'extra', {
+      get() {
+        getterCalls += 1;
+        throw new Error('seatPlan extra getter must never run');
+      },
+      enumerable: true,
+    });
+    expect(readAttemptRecord(attemptPlan)).toEqual({ ok: false, reason: 'malformed' });
+    expect(getterCalls).toBe(0);
+  });
+
+  it('refuses an array with a symbol key', () => {
+    const journal = clone(validJournal);
+    (journal.observedSessionIds as unknown as Record<symbol, unknown>)[Symbol('extra')] = 'ses_extra';
+    expect(readActionJournalEntryRecord(journal)).toEqual({ ok: false, reason: 'malformed' });
+
+    const attempt = clone(validAttempt);
+    (attempt.artifacts.commitsSinceBase as unknown as Record<symbol, unknown>)[Symbol('extra')] = 'extra_commit';
+    expect(readAttemptRecord(attempt)).toEqual({ ok: false, reason: 'malformed' });
+
+    const attemptDecisions = clone(validAttempt);
+    (attemptDecisions.ownerDecisionReferences as unknown as Record<symbol, unknown>)[Symbol('extra')] = 'extra_ref';
+    expect(readAttemptRecord(attemptDecisions)).toEqual({ ok: false, reason: 'malformed' });
+
+    const attemptPlan = clone(validAttempt);
+    (attemptPlan.seatPlan['first-pass'] as unknown as Record<symbol, unknown>)[Symbol('extra')] = { id: 's99' };
+    expect(readAttemptRecord(attemptPlan)).toEqual({ ok: false, reason: 'malformed' });
+  });
+
+  it('refuses an array with a non-enumerable property', () => {
+    const journal = clone(validJournal);
+    Object.defineProperty(journal.observedSessionIds, 'extra', {
+      value: 'ses_hidden',
+      enumerable: false,
+    });
+    expect(readActionJournalEntryRecord(journal)).toEqual({ ok: false, reason: 'malformed' });
+
+    const journalNonEnumIndex = clone(validJournal);
+    Object.defineProperty(journalNonEnumIndex.observedSessionIds, 0, {
+      value: 'ses_1',
+      enumerable: false,
+    });
+    expect(readActionJournalEntryRecord(journalNonEnumIndex)).toEqual({ ok: false, reason: 'malformed' });
+
+    const attempt = clone(validAttempt);
+    Object.defineProperty(attempt.artifacts.commitsSinceBase, 'extra', {
+      value: 'hidden',
+      enumerable: false,
+    });
+    expect(readAttemptRecord(attempt)).toEqual({ ok: false, reason: 'malformed' });
+
+    const attemptNonEnumIndex = clone(validAttempt);
+    Object.defineProperty(attemptNonEnumIndex.artifacts.commitsSinceBase, 0, {
+      value: 'aaa',
+      enumerable: false,
+    });
+    expect(readAttemptRecord(attemptNonEnumIndex)).toEqual({ ok: false, reason: 'malformed' });
+
+    const attemptPlan = clone(validAttempt);
+    Object.defineProperty(attemptPlan.seatPlan['first-pass'], 'extra', {
+      value: 'hidden',
+      enumerable: false,
+    });
+    expect(readAttemptRecord(attemptPlan)).toEqual({ ok: false, reason: 'malformed' });
+  });
+
+  it('still reads a plain JSON array', () => {
+    const jsonJournal = JSON.parse(JSON.stringify(validJournal));
+    const journalRead = readActionJournalEntryRecord(jsonJournal);
+    expect(journalRead.ok).toBe(true);
+
+    const jsonAttempt = JSON.parse(JSON.stringify(validAttempt));
+    const attemptRead = readAttemptRecord(jsonAttempt);
+    expect(attemptRead.ok).toBe(true);
+  });
 });

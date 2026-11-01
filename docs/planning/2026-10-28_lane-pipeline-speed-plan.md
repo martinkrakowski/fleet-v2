@@ -330,7 +330,7 @@ Parallel means different packages and no shared file. **The orchestrator owns th
 | KS7 | K6 amendment: `premerge` post action and its key (a new forge action kind, so AM4b's kinds and AM3a's grants cover it), merge-group answers; `CiStatePort` `queued`/`merge-group`; merge action = enable auto-merge at the expected head | work-execution, **`apps/cli/src/composition.ts`** | 2 | KS1, K6, AM4b, D20, D21/D22, D33 | no |
 | KS8 | K7 amendment: 10 s poll floor in `watching-ci` and `merging` | apps/cli | 1 | K7, D31 | no |
 
-**After KM, KS2 and KS4a can run in parallel** (different files, no manifest edit in either). Without KM they run one after the other, each with its own manifest edit, merged and rebased in turn. KS7 joins the `composition.ts` sequence. If a K lane named here has already merged when its amendment is dispatched, the amendment lands as that lane's follow-up.
+**After KM, KS2 and KS4a can run in parallel** (different files, no manifest edit in either). Without KM they run one after the other, each with its own manifest edit, merged and rebased in turn (under D22 and D24 the rebase is a forge branch update with CI on the merged result, never a local rebase; KS1, KS7). KS7 joins the `composition.ts` sequence. If a K lane named here has already merged when its amendment is dispatched, the amendment lands as that lane's follow-up.
 
 ## 5. Hard to undo
 

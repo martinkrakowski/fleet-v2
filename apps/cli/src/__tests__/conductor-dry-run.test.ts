@@ -14,7 +14,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { AttemptRecord } from '@fleet/work-execution';
+import type { AttemptRecord, BaseBranchValue } from '@fleet/work-execution';
 import {
   buildLaneRunStepKey,
   laneRunConductEntry,
@@ -184,7 +184,7 @@ function recorderSleep(delays: number[], abortAfter: number, controller: AbortCo
 }
 
 /** What a completed `conductor start` leaves: a work order, a held reservation, the intent-recorded attempt, the run. */
-async function seedCompletedStart(runtime: FleetCliRuntime): Promise<void> {
+async function seedCompletedStart(runtime: FleetCliRuntime, baseBranch?: BaseBranchValue): Promise<void> {
   await runtime.execution.workOrderRepository.saveWorkOrder({
     id: 'wo-example-1',
     projectId: 'project-example-1',
@@ -233,6 +233,7 @@ async function seedCompletedStart(runtime: FleetCliRuntime): Promise<void> {
     revision: 1,
     runPolicyRevision: 'policy-example-1',
     branchName: 'fleet/' + RUN_ID,
+    ...(baseBranch !== undefined ? { baseBranch } : {}),
   });
   expect(run.outcome).toBe('saved');
 }
@@ -414,6 +415,7 @@ interface PassLine {
     readonly runId: string;
     readonly outcome: string;
     readonly steps: ReadonlyArray<Record<string, unknown>>;
+    readonly baseBranch?: string;
   }>;
   readonly attention: readonly unknown[];
 }
@@ -509,6 +511,7 @@ describe('conductor run --dry-run (K7-8)', () => {
     const firstPass = passes[0];
     expect(firstPass.runs).toHaveLength(1);
     expect(firstPass.runs[0].outcome).toBe('advanced');
+    expect(firstPass.runs[0].baseBranch).toBe('main');
     // The seeded run is done: the run reached merged, and the decider's final
     // step is the pass's done marker — never a park.
     const allSteps = passes.flatMap((pass) => pass.runs.flatMap((run) => run.steps));
@@ -593,6 +596,24 @@ describe('conductor run --dry-run (K7-8)', () => {
     expect(stopSpy).not.toHaveBeenCalled();
     expect(reconcileSpy).not.toHaveBeenCalled();
     expect(collectSpy).not.toHaveBeenCalled();
+  });
+
+  it('a --once pass line carries the run base branch from the record', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir);
+    await seedCompletedStart(runtime, 'chain/example');
+
+    const controller = new AbortController();
+    const result = await runConductor(runtime, ['run', '--dry-run', '--once'], {
+      stateDir: dir,
+      stopSignal: controller.signal,
+      sleep: async () => undefined,
+    });
+
+    expect(result.code).toBe(0);
+    const passes = passLines(result.stdout);
+    expect(passes).toHaveLength(1);
+    expect(passes[0].runs[0].baseBranch).toBe('chain/example');
   });
 
   it('without a state directory runs over in-memory stores: exit 0, one pass line with no runs', async () => {

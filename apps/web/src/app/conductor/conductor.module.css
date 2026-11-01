@@ -1,0 +1,278 @@
+/* Conductor view layout — colours come from globals.css custom properties only. */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.meta {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+}
+
+.tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.runToggle {
+  background: none;
+  border: none;
+  padding: 0;
+  margin-right: var(--space-2);
+  color: var(--primary);
+  font: inherit;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  border-radius: var(--radius);
+}
+
+.runToggle:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.detailRow {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
+.unreadable {
+  color: var(--yellow);
+  margin-left: var(--space-2);
+}
+
+.hostSection {
+  margin-top: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.hostHeading {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin: 0;
+}
+
+.hostGroup {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+}
+
+.hostName {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+.slotList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+}
+
+.slotItem {
+  white-space: nowrap;
+}
+
+.gauge {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.gaugeText {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text);
+}
+
+.gaugeBar {
+  height: 0.5rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.gaugeFill {
+  height: 100%;
+  background: var(--green);
+  transition: width 300ms ease;
+}
+
+.stripSection {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.strip {
+  overflow-x: auto;
+  min-width: 0;
+}
+
+.mark {
+  fill: var(--primary);
+}
+
+.markUnderStagger {
+  fill: var(--yellow);
+}
+
+.markLabel {
+  fill: var(--text-muted);
+  font-size: 8px;
+}
+
+.stripTable table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+}
+
+.stripTable th,
+.stripTable td {
+  border: 1px solid var(--border-color);
+  padding: var(--space-1) var(--space-2);
+  text-align: left;
+  color: var(--text-muted);
+}
+
+.stripTable th {
+  color: var(--text);
+}
+
+.boardWrap table {
+  width: 100%;
+}
+
+.reservationLine {
+  stroke: var(--primary);
+  stroke-width: 1.5;
+  fill: none;
+}
+
+.reservationPoint {
+  fill: var(--primary);
+  stroke: var(--primary);
+  stroke-width: 1.5;
+}
+
+.overlay {
+  fill: var(--blue);
+  stroke: var(--text);
+  stroke-width: 0.5;
+}
+
+.passList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.badge {
+  display: inline-block;
+  padding: 0 0.375rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.passRuns {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.passSteps {
+  margin: var(--space-1) 0 0 0;
+  padding-left: var(--space-4);
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
+.passRunId {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+.passAttention {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 0 0;
+}
+
+@media (max-width: 720px) {
+  .page {
+    gap: var(--space-3);
+  }
+
+  .hostGroup {
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .boardWrap table {
+    display: block;
+    overflow-x: auto;
+  }
+
+  .boardWrap table tr {
+    display: block;
+  }
+
+  .boardWrap table th {
+    display: block;
+  }
+
+  .boardWrap table td {
+    display: block;
+  }
+
+  .boardWrap table td::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin-bottom: var(--space-1);
+  }
+
+  .stripTable table {
+    display: table;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .strip *,
+  .gaugeBar,
+  .gaugeFill,
+  .reservationLine,
+  .reservationPoint,
+  .overlay {
+    transition: none;
+    animation: none;
+  }
+}

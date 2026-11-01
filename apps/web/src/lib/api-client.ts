@@ -17,9 +17,14 @@ import * as fs from "node:fs";
 
 import { createEndpointReader } from "./api/transport";
 import { createAttemptReaders, type AttemptReaders } from "./api/attempts";
+import {
+  createConductorPassReaders,
+  type ConductorPassReaders,
+} from "./api/conductor-passes";
 import { createCoordinationReaders, type CoordinationReaders } from "./api/coordination";
 import { createEvidenceReaders, type EvidenceReaders } from "./api/evidence";
 import { createProjectReaders, type ProjectReaders } from "./api/projects";
+import { createRunReaders, type RunReaders } from "./api/runs";
 import { createWorkOrderReaders, type WorkOrderReaders } from "./api/work-orders";
 
 export { NOT_IMPLEMENTED_STATUS } from "./api/transport";
@@ -43,7 +48,9 @@ export type FleetWebApiClient = WorkOrderReaders &
   AttemptReaders &
   EvidenceReaders &
   CoordinationReaders &
-  ProjectReaders;
+  ConductorPassReaders &
+  ProjectReaders &
+  RunReaders;
 
 export function readWebClientApiToken(tokenFile?: string): string | null {
   if (typeof window !== "undefined") {
@@ -103,6 +110,8 @@ export function createFleetWebApiClient(
     ...createAttemptReaders(read),
     ...createEvidenceReaders(read),
     ...createCoordinationReaders(read),
+    ...createConductorPassReaders(read),
     ...createProjectReaders(read),
+    ...createRunReaders(read),
   };
 }

@@ -12,7 +12,12 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { PrepareBriefPackagePort, PrepareBriefPackageRequest } from '../../ports/in/PrepareBriefPackagePort.in-port.js';
-import type { PrepareLaneWorktreeRequest, PrepareLaneWorktreeResult } from '../../ports/out/WorkspacePort.out-port.js';
+import type {
+  PrepareLaneWorktreeRequest,
+  PrepareLaneWorktreeResult,
+  ResolveBaseTipRequest,
+  ResolveBaseTipResult,
+} from '../../ports/out/WorkspacePort.out-port.js';
 import type { WorkspacePort } from '../../ports/out/WorkspacePort.out-port.js';
 import type { PrepareBriefPackageUseCaseRequest } from '../PrepareBriefPackageUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
@@ -224,13 +229,19 @@ function makeHarness(options: HarnessOptions = {}) {
 
   const worktreeCalls: PrepareLaneWorktreeRequest[] = [];
   let worktreeAnswers: PrepareLaneWorktreeResult[] = [];
-  const workspace: Pick<WorkspacePort, 'prepareLaneWorktree'> = {
+  const resolveTipCalls: ResolveBaseTipRequest[] = [];
+  let resolveTipAnswer: ResolveBaseTipResult | null = null;
+  const workspace: Pick<WorkspacePort, 'prepareLaneWorktree' | 'resolveBaseTip'> = {
     prepareLaneWorktree: async (request) => {
       worktreeCalls.push(request);
       if (worktreeAnswers.length > 0) {
         return worktreeAnswers.shift() as PrepareLaneWorktreeResult;
       }
       return worktreeCalls.length > 1 ? { outcome: 'already-prepared' } : { outcome: 'prepared' };
+    },
+    resolveBaseTip: async (request) => {
+      resolveTipCalls.push(request);
+      return resolveTipAnswer ?? { outcome: 'resolved', tip: COMMIT };
     },
   };
 
@@ -286,9 +297,16 @@ function makeHarness(options: HarnessOptions = {}) {
     setCapacityAnswer: (answer: LaneRunFirstReservationResult | null) => {
       capacityAnswer = answer;
     },
+    setWorkOrder: (order: WorkOrderRecord) => {
+      workOrders.set(order.id, order);
+    },
     worktreeCalls,
     setWorktreeAnswers: (answers: PrepareLaneWorktreeResult[]) => {
       worktreeAnswers = answers;
+    },
+    resolveTipCalls,
+    setResolveTipAnswer: (answer: ResolveBaseTipResult | null) => {
+      resolveTipAnswer = answer;
     },
     briefCalls,
     setBriefAnswers: (answers: ('prepared' | 'rejected')[]) => {
@@ -1312,5 +1330,117 @@ describe('StartLaneRunUseCase', () => {
     expect(result).toMatchObject({ outcome: 'acted', step: 'dispatch' });
     expect(dispatchCalls).toHaveLength(1);
     expect(admitCalls).toHaveLength(0);
+  });
+
+  it('test 8: the worktree, brief and attempt follow the resolved forge base tip (CB2)', async () => {
+    const TIP = 'b'.repeat(40);
+    const withBranch = makeHarness({ workOrder: storedWorkOrder({ baseBranch: 'chain/example' }) });
+    withBranch.setResolveTipAnswer({ outcome: 'resolved', tip: TIP });
+    expect(await withBranch.useCase.startLaneRun(requestFixture())).toMatchObject({ outcome: 'started' });
+    const branchRun = await withBranch.runRepoStore.get(RUN_ID);
+    expect(branchRun?.baseBranch).toBe('chain/example');
+    expect(withBranch.worktreeCalls).toHaveLength(1);
+    expect(withBranch.worktreeCalls[0]).toMatchObject({
+      branch: 'fleet/' + RUN_ID,
+      baseCommit: TIP,
+    });
+    expect(Object.hasOwn(withBranch.worktreeCalls[0], 'baseBranch')).toBe(false);
+    expect(withBranch.briefCalls).toHaveLength(1);
+    expect(withBranch.briefCalls[0]?.baseCommit).toBe(TIP);
+    const attempt = await withBranch.attemptRepoStore.findAttemptById(ATTEMPT_ID);
+    expect(attempt?.baseCommit).toBe(TIP);
+    expect(withBranch.resolveTipCalls).toHaveLength(1);
+    expect(withBranch.resolveTipCalls[0]?.baseBranch).toBe('chain/example');
+
+    const withoutKey = makeHarness();
+    expect(await withoutKey.useCase.startLaneRun(requestFixture())).toMatchObject({ outcome: 'started' });
+    const plainRun = await withoutKey.runRepoStore.get(RUN_ID);
+    expect(plainRun?.baseBranch).toBe('main');
+    expect(withoutKey.resolveTipCalls).toHaveLength(1);
+    expect(withoutKey.resolveTipCalls[0]?.baseBranch).toBe('main');
+  });
+
+  it('test 8b: a missing forge base refuses base-branch-missing and releases the reservation', async () => {
+    const harness = makeHarness();
+    harness.setResolveTipAnswer({ outcome: 'missing' });
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({ outcome: 'refused', reason: 'base-branch-missing' });
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await harness.attemptRepoStore.listAllAttempts()).toEqual([]);
+    expect(await harness.runRepoStore.list()).toEqual([]);
+  });
+
+  it('test 8c: an unknown forge tip is incomplete worktree base-tip-unknown with the reservation held', async () => {
+    for (const answer of [{ outcome: 'unknown' }, { outcome: 'refused', reason: 'invalid-request' }] as const) {
+      const harness = makeHarness();
+      harness.setResolveTipAnswer(answer);
+      const result = await harness.useCase.startLaneRun(requestFixture());
+      expect(result).toEqual({
+        outcome: 'incomplete',
+        runId: RUN_ID,
+        attemptId: ATTEMPT_ID,
+        step: 'worktree',
+        reason: 'base-tip-unknown',
+      });
+      expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
+      expect(harness.worktreeCalls).toHaveLength(0);
+      expect(harness.briefCalls).toHaveLength(0);
+      expect(await harness.attemptRepoStore.listAllAttempts()).toEqual([]);
+    }
+  });
+
+  it('test 8d: a pre-seeded intent-recorded attempt reuses its base tip without resolving the forge tip', async () => {
+    const harness = makeHarness();
+    const OTHER_TIP = 'c'.repeat(40);
+    await harness.attemptRepoStore.saveAttempt({
+      id: ATTEMPT_ID,
+      workOrderId: 'wo-example-1',
+      kind: 'initial',
+      fixNumber: 0,
+      priorAttemptId: null,
+      worktreePath: WORKTREE_PATH,
+      baseCommit: OTHER_TIP,
+      state: 'intent-recorded',
+      outcome: null,
+      briefDigest: DIGEST,
+      briefPackagePath: WORKTREE_PATH + '/.lane/brief.md',
+      sessionId: null,
+      completionReceipt: null,
+      artifacts: null,
+      seatPlan: SEAT_PLAN,
+      seatSelection: { role: 'first-pass', seatIndex: 0, seatId: 'fp-1', model: 'model-example-1', tool: 'opencode', variant: null, agent: null },
+      reviewerSeat: null,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    } as AttemptRecord);
+    const result = await harness.useCase.startLaneRun(requestFixture({ nowIso: LATER }));
+    expect(result).toMatchObject({ outcome: 'started' });
+    expect(harness.resolveTipCalls).toHaveLength(0);
+    expect(harness.worktreeCalls).toHaveLength(1);
+    expect(harness.worktreeCalls[0]?.baseCommit).toBe(OTHER_TIP);
+    expect(harness.briefCalls[0]?.baseCommit).toBe(OTHER_TIP);
+    const attempt = await harness.attemptRepoStore.findAttemptById(ATTEMPT_ID);
+    expect(attempt?.baseCommit).toBe(OTHER_TIP);
+    expect(attempt?.state).toBe('intent-recorded');
+  });
+
+  it('test 9: a later work-order edit does not rewrite a started run (CB1)', async () => {
+    const harness = makeHarness({ workOrder: storedWorkOrder({ baseBranch: 'chain/example' }) });
+    const first = await harness.useCase.startLaneRun(requestFixture());
+    expect(first).toMatchObject({ outcome: 'started' });
+    const before = await harness.runRepoStore.get(RUN_ID);
+    expect(before?.baseBranch).toBe('chain/example');
+
+    // The work order is edited afterwards: the run keeps its recorded value.
+    harness.setWorkOrder(storedWorkOrder({ baseBranch: 'main', revision: 2, updatedAtIso: LATER }));
+    const run = await harness.runRepoStore.get(RUN_ID);
+    expect(run?.baseBranch).toBe('chain/example');
+
+    // The retry with the same ids returns the existing run and writes it again never.
+    const retry = await harness.useCase.startLaneRun(requestFixture());
+    expect(retry).toMatchObject({ outcome: 'started' });
+    expect(await harness.runRepoStore.get(RUN_ID)).toEqual(before);
   });
 });

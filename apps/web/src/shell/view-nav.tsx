@@ -49,6 +49,17 @@ const VIEWS = [
     ),
   },
   {
+    href: "/conductor",
+    label: "Conductor",
+    sample: false,
+    icon: (
+      <svg className="ic" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="8" />
+        <path d="M12 8v4l3 2" />
+      </svg>
+    ),
+  },
+  {
     href: "/brief",
     label: "Brief",
     sample: true,

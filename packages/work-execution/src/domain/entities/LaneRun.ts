@@ -11,6 +11,8 @@
 
 import { isCalendarDateTime, readExactPlainRecord } from '../plain-record-reads.js';
 import { containsSecretShape } from '@fleet/shared';
+import { BASE_BRANCH_INVALID_MESSAGE, parseBaseBranch } from '../base-branch.js';
+import type { BaseBranchValue } from '../base-branch.js';
 import { LANE_RUN_MAX_PARK_ORDINAL, LANE_RUN_MAX_SEAT_INDEX } from '../lane-run-keys.js';
 import {
   LANE_RUN_ID_PATTERN,
@@ -44,7 +46,7 @@ const ID_MAX_BYTES = 256;
 const SEAT_PLAN_REF_PATTERN = /^[0-9a-f]{64}$/;
 const LEASE_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 
-const RECORD_KEYS: readonly string[] = [
+const CORE_RECORD_KEYS: readonly string[] = [
   'version',
   'runId',
   'workOrderId',
@@ -63,7 +65,35 @@ const RECORD_KEYS: readonly string[] = [
 ];
 
 /** Keys before KF-5a: records without `branchName` stay readable. */
-const LEGACY_RECORD_KEYS: readonly string[] = RECORD_KEYS.filter((key) => key !== 'branchName');
+const LEGACY_RECORD_KEYS: readonly string[] = CORE_RECORD_KEYS.filter((key) => key !== 'branchName');
+/** Keys since CB1: records with an own `baseBranch` key. */
+const LEGACY_RECORD_KEYS_WITH_BASE_BRANCH: readonly string[] = [...LEGACY_RECORD_KEYS, 'baseBranch'];
+const RECORD_KEYS: readonly string[] = [...CORE_RECORD_KEYS, 'baseBranch'];
+const RECORD_KEYS_WITHOUT_BASE_BRANCH: readonly string[] = CORE_RECORD_KEYS;
+
+/**
+ * The four exact key sets, newest first (CB1 added `baseBranch`, KF-5a added
+ * `branchName`). An exact-key-set fallback keeps every stored record readable
+ * without a version bump: a record whose keys match one set exactly is read;
+ * anything else is an unknown key.
+ */
+const RECORD_KEY_SETS: readonly (readonly string[])[] = [
+  RECORD_KEYS,
+  RECORD_KEYS_WITHOUT_BASE_BRANCH,
+  LEGACY_RECORD_KEYS_WITH_BASE_BRANCH,
+  LEGACY_RECORD_KEYS,
+];
+
+/** Read the input against the first key set it matches exactly; null otherwise. */
+function exactRunRecordInput(input: unknown): Record<string, unknown> | null {
+  for (const keys of RECORD_KEY_SETS) {
+    const recordInput = readExactPlainRecord(input, keys);
+    if (recordInput !== null) {
+      return recordInput;
+    }
+  }
+  return null;
+}
 
 const PARKED_KEYS: readonly string[] = ['reason', 'qualifier', 'parkedFrom', 'questionId'];
 const LEASE_KEYS: readonly string[] = ['holderId', 'fence', 'leaseUntilIso'];
@@ -100,7 +130,7 @@ export class LaneRun {
     if (inputPrototype !== Object.prototype && inputPrototype !== null) {
       return invalid('LaneRun requires a record');
     }
-    const recordInput = readExactPlainRecord(input, RECORD_KEYS) ?? readExactPlainRecord(input, LEGACY_RECORD_KEYS);
+    const recordInput = exactRunRecordInput(input);
     if (recordInput === null) {
       return invalid('LaneRun has an unknown key');
     }
@@ -214,6 +244,19 @@ export class LaneRun {
       branchName = branch;
     }
 
+    // The same own-property presence rule as branchName: `readExactPlainRecord`
+    // exposes an accessor's descriptor value, so an enumerable getter or an
+    // explicit `{ baseBranch: undefined }` key arrives here as present-but-not-
+    // a-string and is refused rather than skipped (CB1).
+    let baseBranch: BaseBranchValue | undefined;
+    if (Object.hasOwn(recordInput, 'baseBranch')) {
+      const parsed = parseBaseBranch(recordInput.baseBranch);
+      if (parsed === undefined) {
+        return invalid('LaneRun ' + BASE_BRANCH_INVALID_MESSAGE);
+      }
+      baseBranch = parsed;
+    }
+
     const record: LaneRunRecord = {
       version: LANE_RUN_RECORD_VERSION,
       runId: recordInput.runId as string,
@@ -234,6 +277,7 @@ export class LaneRun {
       revision: recordInput.revision as number,
       runPolicyRevision: recordInput.runPolicyRevision as string,
       ...(branchName === undefined ? {} : { branchName }),
+      ...(baseBranch === undefined ? {} : { baseBranch }),
     };
     return { success: true, value: new LaneRun(Object.freeze(record)) };
   }
@@ -256,6 +300,7 @@ export class LaneRun {
       revision: this.record.revision,
       runPolicyRevision: this.record.runPolicyRevision,
       ...(this.record.branchName === undefined ? {} : { branchName: this.record.branchName }),
+      ...(this.record.baseBranch === undefined ? {} : { baseBranch: this.record.baseBranch }),
     };
   }
 

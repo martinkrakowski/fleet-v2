@@ -33,6 +33,8 @@ import { join } from 'node:path';
 
 import {
   parseLaneRunKey,
+  resolveLaneRunBaseBranch,
+  DEFAULT_BASE_BRANCH,
   AttemptRepositoryAdapter,
   ConductorDriverLeaseAdapter,
   ConductorHaltAdapter,
@@ -96,7 +98,7 @@ lane; a stop recorded as a keyed run-journal intent — stop is graceful by
 default, --force stops the running lane now; a resume recorded for a parked
 run. The driver obeys the records; nothing here dispatches, and the CLI
 never takes a run lease. conductor schedule is a read-only view of the live
-runs in creation order with their held slots, package keys and the admission
+runs grouped by base branch, in creation order within each, with their held slots, package keys and the admission
 count; --json prints the whole view. conductor reap --worktrees removes the clean
 worktree of every finished lane run (terminal run, terminal work order,
 every attempt cancelled or collected, no held reservation) on explicit
@@ -1046,6 +1048,38 @@ function printDryRunAppendedLines(io: CliIo, appended: readonly LaneRunJournalEn
 }
 
 /**
+ * The pass line of a dry-run: `{ pass, ...result }`, with every completed
+ * run's `baseBranch` resolved from its stored record (lane CB3). A record
+ * that is missing or unparsable reads as `main`; a refused result prints
+ * unchanged.
+ */
+async function dryRunPassLine(
+  stores: DryRunStores,
+  pass: number,
+  result: RunConductorPassResult,
+): Promise<Record<string, unknown>> {
+  if (result.outcome !== 'completed') {
+    return { pass, ...result };
+  }
+  let records: Awaited<ReturnType<typeof stores.runRepo.list>>;
+  try {
+    records = await stores.runRepo.list();
+  } catch {
+    // The base branch is display only: a failed read never hides the completed pass.
+    return { pass, ...result };
+  }
+  const recordByRunId = new Map(records.map((record) => [record.runId, record]));
+  const runs = result.runs.map((run) => {
+    const record = recordByRunId.get(run.runId);
+    return {
+      ...run,
+      baseBranch: record === undefined ? DEFAULT_BASE_BRANCH : resolveLaneRunBaseBranch(record),
+    };
+  });
+  return { pass, ...result, runs };
+}
+
+/**
  * `conductor run --dry-run` (K7-8): copy the state stores into a fresh scratch
  * directory and drive them with recording fakes, printing what the driver
  * would do. It acts on nothing: no `policy.conductor.enabled` check, no
@@ -1102,7 +1136,8 @@ async function dryRunCommand(
         const appended = after.filter((entry) => !currentEntryIds.has(entry.entryId));
         printDryRunAppendedLines(io, appended);
         currentEntryIds = new Set(after.map((entry) => entry.entryId));
-        io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
+        const passLine = await dryRunPassLine(stores, pass, result);
+        io.stdout(`${JSON.stringify(passLine)}\n`);
         return {
           stop: result.outcome === 'refused',
           exitCode: result.outcome === 'refused' ? 1 : undefined,
@@ -1270,13 +1305,20 @@ export function scheduleText(result: Extract<ListLaneRunsResult, { readonly outc
     lines.push('no live runs');
     return lines;
   }
-  for (const row of schedule.rows) {
-    lines.push(scheduleRowText(row));
+  const rowByRunId = new Map(schedule.rows.map((row) => [row.runId, row]));
+  for (const queue of schedule.queues) {
+    lines.push(`queue ${queue.baseBranch}`);
+    for (const runId of queue.runIds) {
+      const row = rowByRunId.get(runId);
+      if (row !== undefined) {
+        lines.push(scheduleRowText(row));
+      }
+    }
   }
   return lines;
 }
 
-/** One schedule row as text: `<runId> <state> r<round> <placement> <slot> <packages>` plus the optional suffixes. */
+/** One schedule row as text: `<runId> <baseBranch> <state> r<round> <placement> <slot> <packages>` plus the optional suffixes. */
 function scheduleRowText(row: ConductorScheduleRow): string {
   const slot = row.slot === null ? '-' : `${row.slot.hostName}#${row.slot.slotIndex}`;
   let packages: string;
@@ -1287,7 +1329,7 @@ function scheduleRowText(row: ConductorScheduleRow): string {
   } else {
     packages = row.packageKeys.join(',');
   }
-  let text = `${row.runId} ${row.state} r${row.round} ${row.placement} ${slot} ${packages}`;
+  let text = `${row.runId} ${row.baseBranch} ${row.state} r${row.round} ${row.placement} ${slot} ${packages}`;
   if (row.pendingStep !== null) {
     text += ` pending ${row.pendingStep.step}`;
   }

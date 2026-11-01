@@ -309,7 +309,7 @@ describe('RequestLaneRunStopUseCase', () => {
 describe('InspectLaneRunsUseCase', () => {
   it('lists runs in run-id order with each projected state and stop', async () => {
     const fx = await seeded([
-      runRecord({ runId: RUN_ID_2 }),
+      runRecord({ runId: RUN_ID_2, baseBranch: 'chain/example' }),
       runRecord({ runId: RUN_ID }),
     ]);
     await fx.stop.requestLaneRunStop({ runId: RUN_ID, mode: 'graceful', via: 'cli', entryId: ENTRY_1, nowIso: NOW });
@@ -321,7 +321,9 @@ describe('InspectLaneRunsUseCase', () => {
     expect(result.halt).toBe('clear');
     expect(result.driver).toBeNull();
     expect(result.runs.map((run) => run.runId)).toEqual([RUN_ID, RUN_ID_2]);
-    const [first] = result.runs;
+    const [first, second] = result.runs;
+    expect(first.baseBranch).toBe('main');
+    expect(second.baseBranch).toBe('chain/example');
     expect(first).toMatchObject({
       workOrderId: 'wo-example-1',
       tier: 2,

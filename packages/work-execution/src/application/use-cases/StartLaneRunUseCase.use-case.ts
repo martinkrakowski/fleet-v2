@@ -27,6 +27,8 @@
 
 import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
+import { resolveWorkOrderBaseBranch } from '../../domain/base-branch.js';
+import type { BaseBranchValue } from '../../domain/base-branch.js';
 import { laneRunJournalState } from '../../domain/lane-run-journal.js';
 import type { SeatHistoryEntry } from '../../domain/seat-selection.js';
 import { selectSeat, seatMatchesAssignment, seatSelectionRecord } from '../../domain/seat-selection.js';
@@ -55,7 +57,11 @@ import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-por
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
 import type { ProjectProfileReadPort } from '../ports/out/ProjectProfileReadPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
-import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
+import type {
+  ResolveBaseTipRequest,
+  ResolveBaseTipResult,
+  WorkspacePort,
+} from '../ports/out/WorkspacePort.out-port.js';
 import { journalsForRuns } from './run-journal-reads.js';
 import type {
   LaneRunStartCapacityPort,
@@ -69,7 +75,7 @@ export interface StartLaneRunDependencies {
     ExecutionJournalPort,
     'listActiveReservations' | 'releaseCapacityReservation'
   >;
-  readonly workspace: Pick<WorkspacePort, 'prepareLaneWorktree'>;
+  readonly workspace: Pick<WorkspacePort, 'prepareLaneWorktree' | 'resolveBaseTip'>;
   readonly prepareBrief: PrepareBriefPackagePort;
   readonly attemptRepo: AttemptRepositoryPort;
   readonly runRepo: Pick<LaneRunRepositoryPort, 'get' | 'create' | 'list'>;
@@ -80,6 +86,14 @@ export interface StartLaneRunDependencies {
 
 /** `attempt-` followed by a short, key-safe id; a ULID in production. */
 const ATTEMPT_ID_PATTERN = /^attempt-[0-9A-Za-z][0-9A-Za-z-]{0,63}$/;
+
+/**
+ * The attempt's frozen base commit (CB-D2): 40 lowercase hex. The
+ * application layer may not import the infrastructure `BASE_COMMIT_PATTERN`;
+ * a matching base commit is the re-resolved tip of a retried start, so the
+ * forge tip is not asked for again.
+ */
+const ATTEMPT_BASE_COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 
 /** The run's worktree branch (K7-5b default under K7-D7): `fleet/<runId>`. */
 function branchForRun(runId: string): string {
@@ -92,6 +106,7 @@ export type StartLaneRunIncompleteReason =
   | 'worktree-branch-exists-other'
   | 'worktree-git-refused'
   | 'worktree-unknown'
+  | 'base-tip-unknown'
   | 'no-clone-on-host'
   | 'brief-rejected'
   | 'attempt-differs'
@@ -370,11 +385,26 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     if (clone === undefined) {
       return incomplete(request.runId, request.attemptId, 'worktree', 'no-clone-on-host');
     }
+    // CB-D2 (CB2): choose the worktree's base commit. A retried start whose
+    // attempt already froze a 40-hex base commit reuses that tip; otherwise
+    // the forge tip of the run's base branch is resolved now. A missing base
+    // branch releases the reservation and refuses; an unknown or refused tip
+    // is an incomplete `worktree` step with the reservation held.
+    const baseTip = await this.resolveWorktreeBaseTip(
+      request,
+      attempt,
+      clone.path,
+      recordedHost,
+      resolveWorkOrderBaseBranch(workOrder),
+    );
+    if (baseTip.outcome === 'refused') {
+      return baseTip.result;
+    }
     const prepared = await deps.workspace.prepareLaneWorktree?.({
       clonePath: clone.path,
       worktreePath,
       branch: branchForRun(request.runId),
-      baseCommit: workOrder.baseCommit,
+      baseCommit: baseTip.tip,
       recordedHost,
     });
     if (prepared === undefined) {
@@ -398,6 +428,9 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       // KF-8: the placement goes to the reservation's recorded host, so a
       // worktree on an ssh host writes its brief on that host.
       recordedHost,
+      // CB-D2: the frozen manifest names the base tip, so the chain run's
+      // accept refuses when the attempt's baseCommit moved off it.
+      baseCommit: baseTip.tip,
     };
     const briefResult = await deps.prepareBrief.prepareBriefPackage(briefRequest);
     if (briefResult.outcome === 'rejected') {
@@ -409,7 +442,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     // Step 4: the first attempt, intent-recorded.
     const attemptSave = await this.saveFirstAttempt(
       request,
-      workOrder.baseCommit,
+      baseTip.tip,
       planValue,
       seat.seatIndex,
       reservation,
@@ -442,6 +475,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         revision: 1,
         runPolicyRevision: request.runPolicyRevision,
         branchName: branchForRun(request.runId),
+        baseBranch: resolveWorkOrderBaseBranch(workOrder),
       });
     } catch {
       created = { outcome: 'refused', reason: 'run-exists' };
@@ -554,6 +588,57 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
       (reservation) => reservation.attemptId === attemptId && reservation.held,
     );
     return held ?? null;
+  }
+
+  /**
+   * CB-D2 (CB2): choose the first attempt's base commit — the attempt's own
+   * frozen 40-hex tip on a retry, else the forge tip of the run's base
+   * branch. A missing base branch releases the reservation and refuses the
+   * start; an unknown or refused tip is an incomplete `worktree` step with
+   * the reservation held.
+   */
+  private async resolveWorktreeBaseTip(
+    request: StartLaneRunRequest,
+    attempt: AttemptRecord | null,
+    clonePath: string,
+    recordedHost: AttemptRunnerRecord,
+    baseBranch: BaseBranchValue,
+  ): Promise<
+    | { readonly outcome: 'tip'; readonly tip: string }
+    | { readonly outcome: 'refused'; readonly result: StartLaneRunResult }
+  > {
+    if (attempt !== null && ATTEMPT_BASE_COMMIT_PATTERN.test(attempt.baseCommit)) {
+      return { outcome: 'tip', tip: attempt.baseCommit };
+    }
+    const deps = this.deps!;
+    const resolveRequest: ResolveBaseTipRequest = {
+      clonePath,
+      baseBranch,
+      recordedHost,
+    };
+    const resolved: ResolveBaseTipResult | undefined = await deps.workspace.resolveBaseTip?.(
+      resolveRequest,
+    );
+    if (resolved === undefined) {
+      return {
+        outcome: 'refused',
+        result: incomplete(request.runId, request.attemptId, 'worktree', 'base-tip-unknown'),
+      };
+    }
+    if (resolved.outcome === 'resolved') {
+      return { outcome: 'tip', tip: resolved.tip };
+    }
+    if (resolved.outcome === 'missing') {
+      await deps.executionJournal.releaseCapacityReservation(request.attemptId, request.nowIso);
+      return {
+        outcome: 'refused',
+        result: { outcome: 'refused', reason: 'base-branch-missing' },
+      };
+    }
+    return {
+      outcome: 'refused',
+      result: incomplete(request.runId, request.attemptId, 'worktree', 'base-tip-unknown'),
+    };
   }
 
   /**

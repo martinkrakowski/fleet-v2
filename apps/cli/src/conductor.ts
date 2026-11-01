@@ -98,7 +98,7 @@ lane; a stop recorded as a keyed run-journal intent — stop is graceful by
 default, --force stops the running lane now; a resume recorded for a parked
 run. The driver obeys the records; nothing here dispatches, and the CLI
 never takes a run lease. conductor schedule is a read-only view of the live
-runs in creation order with their held slots, package keys and the admission
+runs grouped by base branch, in creation order within each, with their held slots, package keys and the admission
 count; --json prints the whole view. conductor reap --worktrees removes the clean
 worktree of every finished lane run (terminal run, terminal work order,
 every attempt cancelled or collected, no held reservation) on explicit
@@ -1056,7 +1056,13 @@ async function dryRunPassLine(
   if (result.outcome !== 'completed') {
     return { pass, ...result };
   }
-  const records = await stores.runRepo.list();
+  let records: Awaited<ReturnType<typeof stores.runRepo.list>>;
+  try {
+    records = await stores.runRepo.list();
+  } catch {
+    // The base branch is display only: a failed read never hides the completed pass.
+    return { pass, ...result };
+  }
   const recordByRunId = new Map(records.map((record) => [record.runId, record]));
   const runs = result.runs.map((run) => {
     const record = recordByRunId.get(run.runId);

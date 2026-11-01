@@ -13,6 +13,11 @@ import {
   parseWorkOrderRisk,
 } from '../../domain/execution-records.js';
 import type { WorkOrderRecord } from '../../domain/execution-records.js';
+import type { BaseBranchValue } from '../../domain/base-branch.js';
+import {
+  DEFAULT_BASE_BRANCH,
+  parseBaseBranch,
+} from '../../domain/base-branch.js';
 import type {
   RegisterWorkOrderPort,
   RegisterWorkOrderRequest,
@@ -48,6 +53,28 @@ function pathsOverlap(left: string, right: string): boolean {
   return left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
+/**
+ * The payload's base branch: `main` when the key is absent, the parsed string
+ * when it parses, and a rejection otherwise (CB1). The value is stored on the
+ * record every time, including the default.
+ */
+type RegisteredBaseBranch =
+  | { readonly accepted: true; readonly value: BaseBranchValue }
+  | { readonly accepted: false };
+
+function registeredBaseBranch(request: RegisterWorkOrderRequest): RegisteredBaseBranch {
+  // An explicit `undefined` (a CLI flag omitted via `optStr`) is absent, the
+  // same as a missing key.
+  if (request.baseBranch === undefined) {
+    return { accepted: true, value: DEFAULT_BASE_BRANCH };
+  }
+  const parsed = parseBaseBranch(request.baseBranch);
+  if (parsed === undefined) {
+    return { accepted: false };
+  }
+  return { accepted: true, value: parsed };
+}
+
 export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
   constructor(private readonly deps?: RegisterWorkOrderDependencies) {}
 
@@ -81,6 +108,13 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       request.risk === undefined ? DEFAULT_WORK_ORDER_RISK : parseWorkOrderRisk(request.risk);
     if (risk === undefined) {
       return { outcome: 'rejected', reason: "Work order risk must be 'standard' or 'high'" };
+    }
+
+    // CB1: the base branch is decided before any store access; an unparsable
+    // value is rejected with its reason code and nothing is written.
+    const baseBranchDecision = registeredBaseBranch(request);
+    if (!baseBranchDecision.accepted) {
+      return { outcome: 'rejected', reason: 'invalid-base-branch' };
     }
 
     // One trimmed id for the profile check, the conflict listing and the save.
@@ -190,6 +224,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       ownedPaths: [...request.ownedPaths],
       policyRevision: request.policyRevision,
       risk,
+      baseBranch: baseBranchDecision.value,
       prerequisiteWorkOrderIds: [...prerequisites],
       ...(request.supersedesWorkOrderId !== undefined
         ? { supersedesWorkOrderId: request.supersedesWorkOrderId.trim() }

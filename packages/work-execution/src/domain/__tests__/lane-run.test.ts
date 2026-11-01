@@ -123,6 +123,54 @@ describe('LaneRun.create', () => {
     }
   });
 
+  it('accepts a valid baseBranch beside branchName and round-trips it only when present (CB1)', () => {
+    const withBase = { ...VALID, branchName: `fleet/${RUN_ID}`, baseBranch: 'chain/example' };
+    const result = LaneRun.create(withBase);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.value.toRecord()).toEqual(withBase);
+
+    // baseBranch also round-trips on a record that has no branchName at all.
+    const legacyWithBase = { ...VALID, baseBranch: 'chain/example' };
+    const legacy = LaneRun.create(legacyWithBase);
+    expect(legacy.success).toBe(true);
+    if (!legacy.success) return;
+    expect(legacy.value.toRecord()).toEqual(legacyWithBase);
+  });
+
+  it.each(['release', null])('refuses %j as baseBranch with the fixed message (CB1)', (baseBranch) => {
+    const result = LaneRun.create({ ...VALID, baseBranch: baseBranch as never });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.message).toBe('LaneRun baseBranch must be main or chain/<lowercase-dashes>');
+  });
+
+  it('refuses hostile baseBranch key shapes like a hostile branchName (CB1)', () => {
+    const MESSAGE = 'LaneRun baseBranch must be main or chain/<lowercase-dashes>';
+    // An enumerable getter is never run: the descriptor's read value is undefined,
+    // but the key is present, so the field is refused rather than skipped. The
+    // getter returns a valid value on purpose: if the implementation ever read
+    // it, the record would round-trip and this assertion would fail.
+    const getterRecord: Record<string, unknown> = { ...VALID };
+    Object.defineProperty(getterRecord, 'baseBranch', {
+      get() {
+        return 'chain/example';
+      },
+      enumerable: true,
+    });
+    const inputs: unknown[] = [
+      { ...VALID, baseBranch: undefined },
+      { ...VALID, baseBranch: null },
+      getterRecord,
+    ];
+    for (const input of inputs) {
+      const result = LaneRun.create(input);
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      expect(result.error.message).toBe(MESSAGE);
+    }
+  });
+
   it('normalises the lease timestamp and isolates toRecord mutations', () => {
     const withLease = LaneRun.create({ ...VALID, lease: VALID_LEASE });
     expect(withLease.success).toBe(true);

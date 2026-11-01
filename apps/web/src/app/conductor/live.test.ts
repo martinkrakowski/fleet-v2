@@ -196,7 +196,7 @@ describe("loadConductor", () => {
     }
   });
 
-  it("lists the schedule with empty passes when the passes read is a fallback", async () => {
+  it("reports unreadable passes when the passes read is a 500 fallback", async () => {
     const data = await loadConductor(
       fakeClient(
         apiReply(RECORDED),
@@ -207,7 +207,26 @@ describe("loadConductor", () => {
     expect(data.view).toBe("listed");
     if (data.view === "listed") {
       expect(data.passes).toEqual({
-        store: "readable",
+        store: "unreadable",
+        passes: [],
+        total: 0,
+        truncated: false,
+      });
+    }
+  });
+
+  it("reports unreadable passes when the parser refuses the envelope", async () => {
+    const data = await loadConductor(
+      fakeClient(
+        apiReply(RECORDED),
+        apiReply({ code: "OK", result: { outcome: "listed", store: "nope" } }),
+      ),
+      now,
+    );
+    expect(data.view).toBe("listed");
+    if (data.view === "listed") {
+      expect(data.passes).toEqual({
+        store: "unreadable",
         passes: [],
         total: 0,
         truncated: false,

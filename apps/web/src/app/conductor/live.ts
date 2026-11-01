@@ -4,8 +4,9 @@
  * Reads `GET /v1/runs` and `GET /v1/runs/passes` once, server side. There is
  * no fixture: an unconfigured boundary renders a banner, and every other
  * unread renders an error view with its reason — never sample rows. The
- * schedule is authoritative; a missing or illegible pass list renders as
- * empty rather than failing the page.
+ * schedule is authoritative; a failed or illegible pass list renders as
+ * `unreadable` (never as an empty readable list, which would look like
+ * "no passes recorded yet") rather than failing the page.
  */
 
 import {
@@ -38,8 +39,8 @@ export type ConductorData = ConductorView & {
   readonly observedAtIso: string;
 };
 
-const EMPTY_PASSES: PassListView = {
-  store: "readable",
+const UNREADABLE_PASSES: PassListView = {
+  store: "unreadable",
   passes: [],
   total: 0,
   truncated: false,
@@ -64,11 +65,16 @@ function notConfigured(observedAtIso: string): ConductorData {
   };
 }
 
+/**
+ * A failed passes read is never an empty readable list: the API answers 200
+ * with an empty list when nothing is recorded (VZ6), so every fallback read
+ * or envelope the parser refuses is reported `unreadable` instead.
+ */
 function readPasses(passesEndpoint: LiveEndpointResult<unknown>): PassListView {
   if (passesEndpoint.source !== "api") {
-    return EMPTY_PASSES;
+    return UNREADABLE_PASSES;
   }
-  return parseConductorPassesEnvelope(passesEndpoint.data) ?? EMPTY_PASSES;
+  return parseConductorPassesEnvelope(passesEndpoint.data) ?? UNREADABLE_PASSES;
 }
 
 export async function loadConductor(

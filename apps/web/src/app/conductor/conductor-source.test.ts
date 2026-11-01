@@ -120,6 +120,32 @@ describe("Conductor source wiring", () => {
     expect(strip2).toContain("<Thead");
   });
 
+  it("draws the held count as a step chart with filled sample points", () => {
+    expect(strip2).toContain("buildReservationStepSegments");
+    expect(strip2).toContain("className={styles.reservationLine}");
+    expect(strip2).toContain("className={styles.reservationPoint}");
+    expect(css).toContain(".reservationPoint");
+    expect(css).not.toMatch(/\.reservationPoint\s*{[^}]*fill:\s*none/);
+  });
+
+  it("shares one time axis between the held points and the session marks", () => {
+    expect(strip2).toContain(
+      "positionSessionMarks(sessionMarks, dispatchStaggerMs, domain)",
+    );
+  });
+
+  it("keys attention badges per entry so repeats never collapse", () => {
+    expect(passes).toContain('key={`${pass.passId}-${index}`}');
+    expect(passes).not.toContain('key={`${item.runId}-${item.kind}`}');
+  });
+
+  it("wires the passes truncation and recorded stagger into the strip", () => {
+    expect(client).toContain("truncated={data.passes.truncated}");
+    expect(client).toContain(
+      "dispatchStaggerMs={schedule.caps?.dispatchStaggerMs ?? null}",
+    );
+  });
+
   it("renders the pass list as an accordion of traces", () => {
     expect(passes).toContain("Accordion");
     expect(passes).toContain("unreadable");

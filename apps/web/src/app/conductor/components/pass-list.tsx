@@ -67,8 +67,8 @@ function attentionBadges(pass: ConductorPassView) {
   }
   return (
     <p className={styles.passAttention}>
-      {pass.attention.map((item) => (
-        <span key={`${item.runId}-${item.kind}`} className={styles.badge}>
+      {pass.attention.map((item, index) => (
+        <span key={`${pass.passId}-${index}`} className={styles.badge}>
           {item.kind}
         </span>
       ))}

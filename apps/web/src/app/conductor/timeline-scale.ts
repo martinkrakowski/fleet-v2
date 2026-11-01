@@ -5,7 +5,10 @@
  * layout out, so the scale and sample derivation are unit-testable.
  */
 
-import type { ConductorPassView } from "./map-passes";
+import type {
+  ConductorPassView,
+  ConductorTraceStepView,
+} from "./map-passes";
 
 /** One reservation held-count point in the step series. */
 export interface HeldPoint {
@@ -105,6 +108,39 @@ interface NormalizedReservations {
   readonly instants: readonly number[];
 }
 
+function normalizedInterval(
+  item: ReservationInterval,
+  instants: Set<number>,
+): NormalizedInterval | null {
+  const start = Date.parse(item.reservedAtIso);
+  if (!Number.isFinite(start)) {
+    return null;
+  }
+  if (item.releasedAtIso === null) {
+    instants.add(start);
+    return { start, end: null };
+  }
+  const end = Date.parse(item.releasedAtIso);
+  if (!Number.isFinite(end) || end < start) {
+    return null;
+  }
+  instants.add(start);
+  instants.add(end);
+  return { start, end };
+}
+
+function normalizedDirectPoint(
+  item: HeldPoint,
+  instants: Set<number>,
+): { readonly at: number; readonly held: number } | null {
+  const at = Date.parse(item.atIso);
+  if (!Number.isFinite(at) || !Number.isInteger(item.held) || item.held < 0) {
+    return null;
+  }
+  instants.add(at);
+  return { at, held: item.held };
+}
+
 function normalizeReservationInput(
   input: readonly ReservationInput[],
 ): NormalizedReservations {
@@ -113,30 +149,15 @@ function normalizeReservationInput(
   const direct = new Map<number, number>();
   for (const item of input) {
     if ("reservedAtIso" in item) {
-      const start = Date.parse(item.reservedAtIso);
-      if (!Number.isFinite(start)) {
-        continue;
+      const interval = normalizedInterval(item, instants);
+      if (interval !== null) {
+        intervals.push(interval);
       }
-      let end: number | null = null;
-      if (item.releasedAtIso !== null) {
-        const parsedEnd = Date.parse(item.releasedAtIso);
-        if (!Number.isFinite(parsedEnd) || parsedEnd < start) {
-          continue;
-        }
-        end = parsedEnd;
+    } else {
+      const point = normalizedDirectPoint(item, instants);
+      if (point !== null) {
+        direct.set(point.at, point.held);
       }
-      intervals.push({ start, end });
-      instants.add(start);
-      if (end !== null) {
-        instants.add(end);
-      }
-    } else if ("atIso" in item && typeof item.held === "number") {
-      const at = Date.parse(item.atIso);
-      if (!Number.isFinite(at) || !Number.isInteger(item.held) || item.held < 0) {
-        continue;
-      }
-      direct.set(at, item.held);
-      instants.add(at);
     }
   }
   return {
@@ -183,6 +204,54 @@ export function buildReservationStepPoints(
     atIso: new Date(instant).toISOString(),
     held: heldAtInstant(instant, intervals, direct),
   }));
+}
+
+/** One drawn segment of the held-count step chart, in plot coordinates. */
+export interface StepChartSegment {
+  readonly key: string;
+  readonly x1: number;
+  readonly y1: number;
+  readonly x2: number;
+  readonly y2: number;
+}
+
+/**
+ * Turns the held-count points into the step chart's segments: for each
+ * consecutive pair, a horizontal plateau at the previous count from the
+ * previous time to the next time, then the vertical riser at the next time.
+ */
+export function buildReservationStepSegments(
+  points: readonly HeldPoint[],
+  scaleX: (ms: number) => number,
+  scaleY: (count: number) => number,
+): readonly StepChartSegment[] {
+  const segments: StepChartSegment[] = [];
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const point = points[index];
+    if (previous === undefined || point === undefined) {
+      continue;
+    }
+    const px = scaleX(Date.parse(previous.atIso));
+    const cx = scaleX(Date.parse(point.atIso));
+    const plateauY = scaleY(previous.held);
+    const riserY = scaleY(point.held);
+    segments.push({
+      key: `plateau-${previous.atIso}-${point.atIso}`,
+      x1: px,
+      y1: plateauY,
+      x2: cx,
+      y2: plateauY,
+    });
+    segments.push({
+      key: `riser-${point.atIso}`,
+      x1: cx,
+      y1: plateauY,
+      x2: cx,
+      y2: riserY,
+    });
+  }
+  return segments;
 }
 
 /**
@@ -245,28 +314,49 @@ export interface PassOverlaySample {
  * `waiting` steps whose reason is a known `LaneRunWaitReason`. Empty before
  * the first traced pass (D-VZ1); no wait is ever inferred.
  */
+function countTracedSteps(
+  steps: readonly ConductorTraceStepView[],
+  waits: Partial<Record<LaneRunWaitReason, number>>,
+): void {
+  for (const step of steps) {
+    if (step.outcome !== "waiting" || step.reason === undefined) {
+      continue;
+    }
+    if (!LANE_RUN_WAIT_REASONS.has(step.reason)) {
+      continue;
+    }
+    const reason = step.reason as LaneRunWaitReason;
+    waits[reason] = (waits[reason] ?? 0) + 1;
+  }
+}
+
+function countPassRun(pass: ConductorPassView): {
+  readonly active: number;
+  readonly waits: Partial<Record<LaneRunWaitReason, number>>;
+} {
+  let active = 0;
+  const waits: Partial<Record<LaneRunWaitReason, number>> = {};
+  for (const run of pass.runs) {
+    if (run.report.outcome !== "advanced") {
+      continue;
+    }
+    active += 1;
+    countTracedSteps(run.report.steps, waits);
+  }
+  return { active, waits };
+}
+
+/**
+ * Derives the per-pass overlay samples from recorded traces. `active` counts
+ * the runs with an `advanced` report; wait counts come only from traced
+ * `waiting` steps whose reason is a known `LaneRunWaitReason`. Empty before
+ * the first traced pass (D-VZ1); no wait is ever inferred.
+ */
 export function derivePassOverlaySamples(
   passes: readonly ConductorPassView[],
 ): readonly PassOverlaySample[] {
   return passes.map((pass) => {
-    let active = 0;
-    const waits: Partial<Record<LaneRunWaitReason, number>> = {};
-    for (const run of pass.runs) {
-      if (run.report.outcome !== "advanced") {
-        continue;
-      }
-      active += 1;
-      for (const step of run.report.steps) {
-        if (step.outcome !== "waiting" || step.reason === undefined) {
-          continue;
-        }
-        if (!LANE_RUN_WAIT_REASONS.has(step.reason)) {
-          continue;
-        }
-        const reason = step.reason as LaneRunWaitReason;
-        waits[reason] = (waits[reason] ?? 0) + 1;
-      }
-    }
+    const { active, waits } = countPassRun(pass);
     const totalWaits = Object.values(waits).reduce(
       (sum, count) => sum + (count ?? 0),
       0,
@@ -287,6 +377,8 @@ export interface SessionMarkLayoutInput {
   readonly step: string;
   readonly recordedAtIso: string;
   readonly gapMs: number | null;
+  /** The wire-recorded flag, kept as-is when present (D-VZ2). */
+  readonly underStagger?: boolean | null;
 }
 
 export interface SessionMarkLayout extends SessionMarkLayoutInput {
@@ -296,31 +388,46 @@ export interface SessionMarkLayout extends SessionMarkLayoutInput {
   readonly underStagger: boolean | null;
 }
 
+function underStaggerFlag(
+  mark: SessionMarkLayoutInput,
+  dispatchStaggerMs: number | null,
+): boolean | null {
+  if (mark.underStagger !== null && mark.underStagger !== undefined) {
+    return mark.underStagger;
+  }
+  if (mark.gapMs === null || dispatchStaggerMs === null) {
+    return null;
+  }
+  return mark.gapMs < dispatchStaggerMs;
+}
+
 /**
  * Positions session-start marks on the timeline (`dispatch`, `brief-check`,
  * `code-review`) and marks `underStagger` only when a trace supplies
- * `dispatchStaggerMs` — the 20s default is never assumed on screen.
+ * `dispatchStaggerMs` — the 20s default is never assumed on screen. A wire
+ * recorded `underStagger` flag is kept as-is. By default the domain is the
+ * marks' own span; pass `domain` to lay the marks out on the strip's shared
+ * time axis (points, samples and marks together).
  */
 export function positionSessionMarks(
   marks: readonly SessionMarkLayoutInput[],
   dispatchStaggerMs: number | null,
+  domain?: readonly [number, number] | null,
 ): readonly SessionMarkLayout[] {
-  const domain = computeTimelineDomain(
-    marks.map((mark) => ({ atIso: mark.recordedAtIso })),
-  );
-  if (domain === null) {
+  const bounds =
+    domain ??
+    computeTimelineDomain(marks.map((mark) => ({ atIso: mark.recordedAtIso })));
+  if (bounds === null) {
     return [];
   }
-  const [d0, d1] = domain;
-  const width = d1 - d0;
+  const x = scaleTimeX(bounds, [0, 1]);
   return marks.map((mark) => {
     const ms = Date.parse(mark.recordedAtIso);
-    const at = Number.isFinite(ms) ? ms : d0;
-    const x = width === 0 ? 0.5 : (at - d0) / width;
-    const underStagger =
-      mark.gapMs === null || dispatchStaggerMs === null
-        ? null
-        : mark.gapMs < dispatchStaggerMs;
-    return { ...mark, x, underStagger };
+    const at = Number.isFinite(ms) ? ms : bounds[0];
+    return {
+      ...mark,
+      x: x(at),
+      underStagger: underStaggerFlag(mark, dispatchStaggerMs),
+    };
   });
 }

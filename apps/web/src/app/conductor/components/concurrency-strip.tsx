@@ -5,6 +5,7 @@ import type { ConductorPassView } from "../map-passes";
 import type { SessionMarkView } from "../map-schedule";
 import {
   buildReservationStepPoints,
+  buildReservationStepSegments,
   computeTimelineDomain,
   derivePassOverlaySamples,
   positionSessionMarks,
@@ -26,6 +27,11 @@ export interface ConcurrencyStripProps {
   readonly passes: readonly ConductorPassView[];
   readonly sessionMarks: readonly SessionMarkView[];
   readonly truncated?: boolean;
+  /**
+   * Recorded from `schedule.caps` (as `SessionStrip` takes it), never the
+   * assumed 20s default; only fills the gap when the wire flag is missing.
+   */
+  readonly dispatchStaggerMs?: number | null;
 }
 
 function waitSummary(sample: {
@@ -64,11 +70,10 @@ export function ConcurrencyStrip({
   passes,
   sessionMarks,
   truncated = false,
+  dispatchStaggerMs = null,
 }: ConcurrencyStripProps) {
   const points = buildReservationStepPoints(reservations);
   const samples = derivePassOverlaySamples(passes);
-  const dispatchStaggerMs = passes[0]?.dispatchStaggerMs ?? null;
-  const sessionLayout = positionSessionMarks(sessionMarks, dispatchStaggerMs);
 
   const domain = computeTimelineDomain([
     ...points,
@@ -80,6 +85,9 @@ export function ConcurrencyStrip({
   }
 
   const x = scaleTimeX(domain, [STRIP_PADDING, STRIP_WIDTH - STRIP_PADDING]);
+  // The marks share the strip's time axis: they are laid out on the same
+  // domain as the reservation points and pass samples, never on their own.
+  const sessionLayout = positionSessionMarks(sessionMarks, dispatchStaggerMs, domain);
   const maxHeld = points.reduce(
     (max, point) => Math.max(max, point.held),
     1,
@@ -87,32 +95,23 @@ export function ConcurrencyStrip({
   const maxCount = Math.max(maxHeld, ...samples.map((sample) => sample.active), 1);
   const y = scaleCountY(maxCount, [PLOT_TOP, PLOT_BOTTOM]);
 
-  const stepLines = points
-    .map((point, index) => {
-      if (index === 0) {
-        return null;
-      }
-      const previous = points[index - 1];
-      const px = x(Date.parse(point.atIso));
-      const previousY = y(previous.held);
-      const py = y(point.held);
-      return (
-        <line
-          key={`step-${point.atIso}`}
-          x1={px}
-          y1={previousY}
-          x2={px}
-          y2={py}
-          className={styles.reservationLine}
-        />
-      );
-    })
-    .filter(Boolean);
+  const stepLines = buildReservationStepSegments(points, x, y).map(
+    (segment) => (
+      <line
+        key={segment.key}
+        x1={segment.x1}
+        y1={segment.y1}
+        x2={segment.x2}
+        y2={segment.y2}
+        className={styles.reservationLine}
+      />
+    ),
+  );
 
   const stepRuns = points.map((point) => {
     const px = x(Date.parse(point.atIso));
     const py = y(point.held);
-    return <circle key={`held-${point.atIso}`} cx={px} cy={py} r={2} className={styles.reservationLine} />;
+    return <circle key={`held-${point.atIso}`} cx={px} cy={py} r={2} className={styles.reservationPoint} />;
   });
 
   return (

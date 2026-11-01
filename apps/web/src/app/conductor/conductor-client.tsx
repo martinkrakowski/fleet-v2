@@ -126,6 +126,8 @@ export function ConductorClient({ data }: { data: ConductorData }) {
           ]}
           passes={data.passes.passes}
           sessionMarks={schedule.sessionStarts}
+          truncated={data.passes.truncated}
+          dispatchStaggerMs={schedule.caps?.dispatchStaggerMs ?? null}
         />
         <PassList passes={data.passes} />
       </>

@@ -165,6 +165,12 @@
   fill: none;
 }
 
+.reservationPoint {
+  fill: var(--primary);
+  stroke: var(--primary);
+  stroke-width: 1.5;
+}
+
 .overlay {
   fill: var(--blue);
   stroke: var(--text);
@@ -264,6 +270,7 @@
   .gaugeBar,
   .gaugeFill,
   .reservationLine,
+  .reservationPoint,
   .overlay {
     transition: none;
     animation: none;

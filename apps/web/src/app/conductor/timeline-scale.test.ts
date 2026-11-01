@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ConductorPassView } from "./map-passes";
 import {
   buildReservationStepPoints,
+  buildReservationStepSegments,
   computeTimelineDomain,
   derivePassOverlaySamples,
   positionSessionMarks,
@@ -144,6 +145,44 @@ describe("buildReservationStepPoints", () => {
   });
 });
 
+describe("buildReservationStepSegments", () => {
+  it("draws the plateau at the previous count, then the riser", () => {
+    const points = [
+      { atIso: "2026-10-31T13:40:00.000Z", held: 2 },
+      { atIso: "2026-10-31T13:45:00.000Z", held: 2 },
+      { atIso: "2026-10-31T13:50:00.000Z", held: 0 },
+    ];
+    const scaleX = scaleTimeX(
+      [Date.parse(points[0].atIso), Date.parse(points[2].atIso)],
+      [0, 100],
+    );
+    const scaleY = scaleCountY(2, [10, 110]);
+
+    const segments = buildReservationStepSegments(points, scaleX, scaleY);
+    expect(segments).toEqual([
+      // Plateau at held 2 from the first time to the second.
+      expect.objectContaining({ x1: 0, y1: 10, x2: 50, y2: 10 }),
+      // Riser at the second time (no change in count).
+      expect.objectContaining({ x1: 50, y1: 10, x2: 50, y2: 10 }),
+      // Plateau at held 2 from the second time to the third.
+      expect.objectContaining({ x1: 50, y1: 10, x2: 100, y2: 10 }),
+      // Riser down to held 0 at the third time.
+      expect.objectContaining({ x1: 100, y1: 10, x2: 100, y2: 110 }),
+    ]);
+  });
+
+  it("is empty for fewer than two points", () => {
+    const scale = (_value: number) => 0;
+    expect(
+      buildReservationStepSegments(
+        [{ atIso: "2026-10-31T13:40:00.000Z", held: 1 }],
+        scale,
+        scale,
+      ),
+    ).toEqual([]);
+  });
+});
+
 describe("derivePassOverlaySamples", () => {
   it("is empty before the first traced pass", () => {
     expect(derivePassOverlaySamples([])).toEqual([]);
@@ -254,5 +293,39 @@ describe("positionSessionMarks", () => {
     expect(known.map((m) => m.underStagger)).toEqual([null, true, true]);
     expect(known[0].x).toBe(0);
     expect(known[2].x).toBe(1);
+  });
+
+  it("keeps a wire-recorded underStagger flag instead of recomputing", () => {
+    const marks = [
+      {
+        runId: "run-1",
+        step: "dispatch",
+        recordedAtIso: "2026-10-31T13:40:00.000Z",
+        gapMs: 30_000,
+        underStagger: true,
+      },
+    ];
+    expect(positionSessionMarks(marks, null)[0].underStagger).toBe(true);
+  });
+
+  it("lays marks on a shared domain between the held points' positions", () => {
+    const domain: readonly [number, number] = [
+      Date.parse("2026-10-31T13:40:00.000Z"),
+      Date.parse("2026-10-31T13:50:00.000Z"),
+    ];
+    const marks = [
+      {
+        runId: "run-1",
+        step: "dispatch",
+        recordedAtIso: "2026-10-31T13:45:00.000Z",
+        gapMs: null,
+      },
+    ];
+    const x = scaleTimeX(domain, [0, 1]);
+    const laid = positionSessionMarks(marks, 20_000, domain);
+    expect(laid).toHaveLength(1);
+    expect(laid[0].x).toBeGreaterThan(x(domain[0]));
+    expect(laid[0].x).toBeLessThan(x(domain[1]));
+    expect(laid[0].x).toBe(0.5);
   });
 });

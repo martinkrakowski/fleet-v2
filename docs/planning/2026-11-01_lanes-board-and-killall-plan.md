@@ -2,7 +2,7 @@
 
 - **Date:** 2026-11-01
 - **Target repository:** `fleet-v2`
-- **Status:** rev 1, after one Grok and one Luna review (§11). Nothing built. New decisions are in §10.
+- **Status:** rev 1, after one Grok and one Luna review (§11). Nothing built. **The owner decided every §10 item as recommended on 2026-11-01** ("proceed with your recommended defaults").
 - **Owner request (2026-11-01):** the UI is "kind of useless"; the owner ends up asking the orchestrator for statuses. `/lanes` becomes a kanban board per project, with the live tail and interactive features already planned, plus a KILLALL emergency stop. Also: "The status of the lanes/briefs should be surfaced within the ui."
 - **Owner's decisions, relayed:** (1) the tail shows summaries by default, full output opt-in per installation (existing D10); (2) KILLALL has one confirmation with a typed word; (3) the real UI runs on staging; (4) scope is all projects, KILLALL included.
 - **Builds on:** `2026-10-27_web-ui-interactivity-plan.md`, `2026-10-27_work-board-plan.md`, `2026-10-31_conductor-visualizer-plan.md`, `2026-10-31_daemon-tick-plan.md`.

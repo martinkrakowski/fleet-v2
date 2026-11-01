@@ -280,6 +280,7 @@ describe('ReapOrphanSessionsUseCase', () => {
       failed: [],
       skipped: [],
       unknown: [],
+      legacyAttempts: [],
     });
     expect(runner.abortCalls).toHaveLength(0);
 
@@ -313,12 +314,12 @@ describe('ReapOrphanSessionsUseCase', () => {
   });
 
   it.each([
-    ['a live attempt on the worktree', { attempts: [attemptFixture('attempt-1', { state: 'cancelled' }), attemptFixture('attempt-2', { state: 'running' })] }, 'attempt-live'],
-    ['an attempt holding a reservation', { reservations: [heldReservation('attempt-1')] }, 'slot-held'],
-    ['an unresolved runner', { refuseHosts: ['lane-host'] }, 'no-runner'],
-    ['a missing runner-for-attempt port', { noRunnerForAttempt: true }, 'no-runner'],
-    ['no finished attempt with a recorded host', { attempts: [attemptFixture('attempt-1', { runner: { ...RECORDED_HOST, hostName: null } })] }, 'no-runner'],
-  ])('skips a worktree with %s as %s', async (_label, seed, reason) => {
+    ['a live attempt on the worktree', { attempts: [attemptFixture('attempt-1', { state: 'cancelled' }), attemptFixture('attempt-2', { state: 'running' })] }, 'attempt-live', []],
+    ['an attempt holding a reservation', { reservations: [heldReservation('attempt-1')] }, 'slot-held', []],
+    ['an unresolved runner', { refuseHosts: ['lane-host'] }, 'no-runner', []],
+    ['a missing runner-for-attempt port', { noRunnerForAttempt: true }, 'no-runner', []],
+    ['no finished attempt with a recorded host', { attempts: [attemptFixture('attempt-1', { runner: { ...RECORDED_HOST, hostName: null } })] }, 'no-runner', [{ attemptId: 'attempt-1', workOrderId: 'wo-a', worktreePath: WORKTREE, state: 'collected', sessionId: null, reason: 'alias-only' }]],
+  ])('skips a worktree with %s as %s', async (_label, seed, reason, legacyAttempts) => {
     const h = harness({
       attempts: [attemptFixture('attempt-1', { state: 'cancelled' })],
       runnersByHost: new Map([['lane-host', makeRunner({ state: 'running', sessionId: 'ses_1' })]]),
@@ -333,6 +334,7 @@ describe('ReapOrphanSessionsUseCase', () => {
       failed: [],
       skipped: [{ worktreePath: WORKTREE, reason }],
       unknown: [],
+      legacyAttempts,
     });
   });
 
@@ -384,6 +386,7 @@ describe('ReapOrphanSessionsUseCase', () => {
       failed: [],
       skipped: [],
       unknown: [],
+      legacyAttempts: [],
     });
     expect(runner.abortCalls).toHaveLength(0);
   });
@@ -413,6 +416,67 @@ describe('ReapOrphanSessionsUseCase', () => {
     expect(result.skipped).toEqual([]);
     expect(runnerA.abortCalls).toHaveLength(0);
     expect(runnerB.abortCalls).toHaveLength(0);
+  });
+
+  it('lists sorted legacy-runner attempts across states and worktrees, calling no runner for legacy worktrees', async () => {
+    const runner = makeRunner({ state: 'running', sessionId: 'ses_1' });
+    const h = harness({
+      attempts: [
+        attemptFixture('attempt-legacy-1', { worktreePath: '/tmp/wt-z', runner: null }),
+        attemptFixture('attempt-legacy-2', {
+          worktreePath: '/tmp/wt-a',
+          runner: { ...RECORDED_HOST, host: 'legacy-alias', hostName: null },
+        }),
+        attemptFixture('attempt-legacy-3', {
+          worktreePath: '/tmp/wt-m',
+          runner: { ...RECORDED_HOST, host: null, hostName: '' },
+        }),
+        attemptFixture('attempt-conducted-1', { worktreePath: '/tmp/wt-c' }),
+      ],
+      runnersByHost: new Map([['lane-host', runner]]),
+    });
+
+    const result = await reap(h, { dryRun: true });
+
+    expect(result.legacyAttempts).toEqual([
+      {
+        attemptId: 'attempt-legacy-2',
+        workOrderId: 'wo-a',
+        worktreePath: '/tmp/wt-a',
+        state: 'collected',
+        sessionId: null,
+        reason: 'alias-only',
+      },
+      {
+        attemptId: 'attempt-legacy-3',
+        workOrderId: 'wo-a',
+        worktreePath: '/tmp/wt-m',
+        state: 'collected',
+        sessionId: null,
+        reason: 'no-host-name',
+      },
+      {
+        attemptId: 'attempt-legacy-1',
+        workOrderId: 'wo-a',
+        worktreePath: '/tmp/wt-z',
+        state: 'collected',
+        sessionId: null,
+        reason: 'no-runner',
+      },
+    ]);
+    // Legacy-only worktrees are skipped as no-runner before any runner call.
+    expect(result.skipped).toEqual([
+      { worktreePath: '/tmp/wt-a', reason: 'no-runner' },
+      { worktreePath: '/tmp/wt-m', reason: 'no-runner' },
+      { worktreePath: '/tmp/wt-z', reason: 'no-runner' },
+    ]);
+    expect(result.unknown).toEqual([]);
+    // Only the conducted attempt's worktree is inspected.
+    expect(result.orphans).toEqual([
+      { worktreePath: '/tmp/wt-c', attemptId: 'attempt-conducted-1', sessionId: 'ses_1' },
+    ]);
+    expect(runner.abortCalls).toHaveLength(0);
+    expect(h.readCounts.attempts()).toBe(1);
   });
 
   it('calls the runner methods bound: a class fake whose methods read this is inspected and aborted', async () => {

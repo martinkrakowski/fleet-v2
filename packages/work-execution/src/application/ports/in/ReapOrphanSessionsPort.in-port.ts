@@ -6,6 +6,8 @@
  * and abort those by directory only with confirmation; never touches a
  * worktree with a live attempt or a held reservation; a dry run aborts
  * nothing and never deletes a session record, worktree, branch or run.
+ * A read-only scan also lists every legacy-runner attempt (a record whose
+ * runner names no installation host) the reaper will never adopt.
  */
 
 export interface ReapOrphanSessionsRequest {
@@ -40,6 +42,19 @@ export interface ReapOrphanUnknownEntry {
   readonly reason: string;
 }
 
+/** Why a legacy-runner attempt is never adopted by the reaper. */
+export type ReapOrphanLegacyRunnerReason = 'no-runner' | 'alias-only' | 'no-host-name';
+
+/** One legacy-runner attempt the reaper scans and reports, never adopts. */
+export interface ReapOrphanLegacyAttemptEntry {
+  readonly attemptId: string;
+  readonly workOrderId: string;
+  readonly worktreePath: string;
+  readonly state: string;
+  readonly sessionId: string | null;
+  readonly reason: ReapOrphanLegacyRunnerReason;
+}
+
 export type ReapOrphanSessionsResult = {
   readonly outcome: 'reaped';
   readonly dryRun: boolean;
@@ -53,6 +68,8 @@ export type ReapOrphanSessionsResult = {
   readonly skipped: readonly ReapOrphanSkippedEntry[];
   /** Worktrees whose runner state is unknown; reported, never aborted. */
   readonly unknown: readonly ReapOrphanUnknownEntry[];
+  /** Legacy-runner attempts listed read-only; the reaper never adopts them. */
+  readonly legacyAttempts: readonly ReapOrphanLegacyAttemptEntry[];
 };
 
 export interface ReapOrphanSessionsPort {

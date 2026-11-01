@@ -8,6 +8,7 @@ import {
   isValidDaemonEventKey,
   projectJobOutcomeToDaemonEvent,
   projectJournalEntryToDaemonEvent,
+  readDaemonEventHeader,
   readDaemonEventLine,
   readDaemonEventRecord,
   serializeDaemonEventHeader,
@@ -142,6 +143,25 @@ describe('daemon event header and exact 10-field records', () => {
     expect(reasonOf(readDaemonEventRecord(withoutReason))).toBe('malformed');
     expect(reasonOf(readDaemonEventRecord({ ...intentBody(), version: 2 }))).toBe('unknown-version');
     expect(reasonOf(readDaemonEventRecord({ ...intentBody(), version: 2, title: 'x' }))).toBe('malformed');
+  });
+
+  it('refuses an own __proto__ key on header and event records', () => {
+    expect(readDaemonEventLine('{"version":1,"__proto__":0}')).toEqual({
+      ok: false,
+      reason: 'malformed',
+      error: 'DaemonEvent is malformed',
+    });
+    expect(readDaemonEventHeader(JSON.parse('{"version":1,"__proto__":0}'))).toEqual({
+      ok: false,
+      reason: 'malformed',
+      error: 'DaemonEventHeader is malformed',
+    });
+    const recordWithProto = JSON.parse(JSON.stringify(intentBody()).slice(0, -1) + ',"__proto__":0}');
+    expect(readDaemonEventRecord(recordWithProto)).toEqual({
+      ok: false,
+      reason: 'malformed',
+      error: 'DaemonEvent is malformed',
+    });
   });
 
   it('serializes keys in the pinned order', () => {
@@ -363,5 +383,41 @@ describe('builders and cursor', () => {
     expect(eventsAfterCursor(records, absent)).toEqual({ ok: false, reason: 'cursor-not-found' });
     expect(eventsAfterCursor(records, 'not-a-ulid')).toEqual({ ok: false, reason: 'invalid-cursor' });
     expect(records).toHaveLength(3);
+  });
+
+  it('never throws from eventsAfterCursor on hostile or malformed input', () => {
+    const a = readDaemonEventRecord(intentBody({ eventId: EVENT_A }));
+    if (!a.ok) {
+      throw new Error('fixture');
+    }
+    expect(eventsAfterCursor([undefined] as never, null)).toEqual({
+      ok: false,
+      reason: 'cursor-not-found',
+    });
+    expect(eventsAfterCursor([undefined] as never, EVENT_A)).toEqual({
+      ok: false,
+      reason: 'cursor-not-found',
+    });
+
+    const throwingGetterRecord = {
+      ...a.record,
+      get eventId(): string {
+        throw new Error('throwing getter');
+      },
+    };
+    expect(eventsAfterCursor([throwingGetterRecord as never], null)).toEqual({
+      ok: false,
+      reason: 'cursor-not-found',
+    });
+
+    const throwingProxy = new Proxy([], {
+      get() {
+        throw new Error('throwing proxy');
+      },
+    });
+    expect(eventsAfterCursor(throwingProxy as never, null)).toEqual({
+      ok: false,
+      reason: 'cursor-not-found',
+    });
   });
 });

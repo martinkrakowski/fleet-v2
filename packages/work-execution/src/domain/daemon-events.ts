@@ -95,20 +95,24 @@ const MERGE_KEY_ONE_WAY_PATTERN =
 const MERGE_KEY_TWO_WAY_PATTERN =
   /^merge\/[0-9a-f]{12}\/[1-9]\d{0,9}\/[0-9a-f]{12}\/(?:macos-verify|veto)\/a(?:[1-9]|[12]\d|3[0-2])$/;
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
 /**
  * A descriptor-safe plain-object snapshot: a non-array object whose prototype is
  * `Object.prototype` or `null`, whose own keys are enumerable data strings, read
  * through their own property descriptors so no getter ever runs.
  */
 function readPlainSnapshot(value: unknown): Record<string, unknown> | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  if (!isPlainObject(value)) {
     return null;
   }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    return null;
-  }
-  const snapshot: Record<string, unknown> = {};
+  const snapshot: Record<string, unknown> = Object.create(null);
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== 'string') {
       return null;
@@ -469,6 +473,14 @@ export function projectJobOutcomeToDaemonEvent(params: {
   }
 }
 
+function isValidCursorEventId(cursor: unknown): boolean {
+  return typeof cursor === 'string' && REQUEST_ID_PATTERN.test(cursor);
+}
+
+function isValidEventItem(event: unknown): event is DaemonEventRecord {
+  return typeof event === 'object' && event !== null && typeof (event as DaemonEventRecord).eventId === 'string';
+}
+
 /** A cursor slice: events after the cursor row, the next cursor id, never mutating the input. */
 export function eventsAfterCursor(
   events: readonly DaemonEventRecord[],
@@ -476,23 +488,32 @@ export function eventsAfterCursor(
 ):
   | { readonly ok: true; readonly events: readonly DaemonEventRecord[]; readonly nextCursor: string | null }
   | { readonly ok: false; readonly reason: 'invalid-cursor' | 'cursor-not-found' } {
-  if (!Array.isArray(events)) {
+  try {
+    if (!Array.isArray(events)) {
+      return { ok: false, reason: 'cursor-not-found' };
+    }
+    if (cursorEventId !== null && !isValidCursorEventId(cursorEventId)) {
+      return { ok: false, reason: 'invalid-cursor' };
+    }
+    for (const event of events) {
+      if (!isValidEventItem(event)) {
+        return { ok: false, reason: 'cursor-not-found' };
+      }
+    }
+    const lastEventId = events.length > 0 ? events[events.length - 1].eventId : null;
+    if (cursorEventId === null) {
+      return { ok: true, events: Object.freeze([...events]), nextCursor: lastEventId };
+    }
+    const index = events.findIndex((event) => event.eventId === cursorEventId);
+    if (index === -1) {
+      return { ok: false, reason: 'cursor-not-found' };
+    }
+    return {
+      ok: true,
+      events: Object.freeze(events.slice(index + 1)),
+      nextCursor: lastEventId ?? cursorEventId,
+    };
+  } catch {
     return { ok: false, reason: 'cursor-not-found' };
   }
-  const lastEventId = events.length > 0 ? events[events.length - 1].eventId : null;
-  if (cursorEventId === null) {
-    return { ok: true, events: Object.freeze([...events]), nextCursor: lastEventId };
-  }
-  if (typeof cursorEventId !== 'string' || !REQUEST_ID_PATTERN.test(cursorEventId)) {
-    return { ok: false, reason: 'invalid-cursor' };
-  }
-  const index = events.findIndex((event) => event.eventId === cursorEventId);
-  if (index === -1) {
-    return { ok: false, reason: 'cursor-not-found' };
-  }
-  return {
-    ok: true,
-    events: Object.freeze(events.slice(index + 1)),
-    nextCursor: lastEventId ?? cursorEventId,
-  };
 }

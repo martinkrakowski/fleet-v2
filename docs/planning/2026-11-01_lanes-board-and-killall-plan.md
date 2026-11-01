@@ -70,6 +70,8 @@ This is a display of recorded time, not an inferred state, which reconciles it w
 
 Hand-run work reports through the existing declaration (work board §3.5, `BoardDeclarationFact`). This lane adds the kinds and steps `brief`, `train` and `pr`, and an optional typed `outcome` token. Declarations keep their rules: "declared, not observed" on screen, their TTL, and **they clear no guard**. Tokens only, no free text.
 
+The contract, fixed before LB4 and with `WORK_BOARD_SCHEMA_VERSION` bumped: `BoardDeclarationFact` gains `outcome: string | null`. Allowed outcomes by step: `brief`: `writing`, `written`, `in-review`, `changes-requested`, `reviewed`, `failed`; `train`: `queued`, `at-head`, `retrying`, `parked`, `merged`; `pr`: `opened`, `merged`, `closed`. Any other step takes `null`. An unknown step or outcome refuses the declaration with a reason code. A reader that meets an unknown value from a newer writer shows "not read", never a guess.
+
 Consequences, from review of the earlier draft:
 - A `reviewed` brief declaration is display only. The brief guard still reads the brief (work board §3.6).
 - A declaration affects a card's placement only, as work board §3.5 already allows, with a separate "declared, not observed" line. No guard, merge check or stored record reads it or its `outcome`, including the `train` and `pr` kinds.
@@ -82,7 +84,7 @@ Consequences, from review of the earlier draft:
 
 ### 5.3 Getting state to staging with one writer
 
-State stays on the host that owns it. Staging never mounts it. One publisher per section reads the owning state and pushes a **token-only snapshot of that section** to the staged API, which replaces only that section's key in a read projection and serves it with its time. A missing push makes that section stale on screen. Pushes need a narrow scope that can write snapshots and nothing else. State writers never push and publishers never write state, so the one-writer rule holds.
+State stays on the host that owns it. Staging never mounts it. One publisher per section reads the owning state and pushes a **token-only snapshot of that section** to the staged API, which replaces only that section's key in a read projection and serves it with its time. Each push carries a per-section revision, increasing from its publisher; the projection refuses a revision at or below the one it holds, so a late older snapshot cannot overwrite newer running, train or halt state. A missing push makes that section stale on screen. Pushes need a narrow scope that can write snapshots and nothing else. State writers never push and publishers never write state, so the one-writer rule holds.
 
 Because confirmed-running comes from beside the lane servers, it stays true when the orchestrator host is down.
 
@@ -100,11 +102,11 @@ Tail summaries use the allow-listed fields of interactivity §3.7. **Private and
 
 **Late starts, and what "confirmed" means.** The servers have no admission control this plan can switch on without restarting them, and restarts stay the owner's. So a client that skips the shared scripts can still start a session after a check. While halted, the agent keeps sweeping, stops any new session and lists it. "Confirmed" therefore means stopped, and no session found on two consecutive sweeps, with the time; it is not a guarantee that none can start. A late start reopens the report. Other orchestrators learn of the halt when their next dispatch is refused with the reason, and any session that slipped through is stopped.
 
-**Reporting.** Per lane, one line: stopped and confirmed; or unconfirmed, with why. Any unconfirmed lane makes the command exit non-zero and shows on the board. Gates and reviews started beside a lane are in scope (D-KA2).
+**Reporting.** Per lane, one line: stopped and confirmed; or unconfirmed, with why. The marker and the train pause report the same way. Exit codes: `0` only when the marker, the train pause and every lane sweep are confirmed; `1` for anything refused, blocked, unknown or unconfirmed, which also shows on the board; `2` for a usage error. Gates and reviews started beside a lane are in scope (D-KA2).
 
 **In-flight merges.** The train checks the pause immediately before a merge. A merge call already sent completes, and the report names any merge recorded after the marker. Chain refresh and landing steps run under the same pause.
 
-**Confirmation.** One dialog through `AlertBox` with a typed word. Body: stops every running lane in every project; pauses the merge train; refuses new dispatches until lifted (a client that skips the shared scripts is stopped by a repeating sweep instead); keeps worktrees, commits and pull requests; **cannot recall a merge that has completed**; running work in progress since the last commit is lost.
+**Confirmation.** One dialog through `AlertBox` with a typed word. Body: stops every running lane in every project; pauses the merge train; refuses new dispatches until lifted (a client that skips the shared scripts is stopped by a repeating sweep instead); keeps worktrees, commits and pull requests; **cannot recall a merge that has completed**; running work in progress since the last commit is lost. The body also states whether the live route exists: "Live route: available", or "Live route: not available" until the button's lane is complete.
 
 **The button.** It writes one parameterless request through a separate `halt` scope. The web process holds no lane credential. The scope can halt but never lift or dispatch. Lifting stays CLI-only in v1. The button ships only after T3a and T6.
 

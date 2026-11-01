@@ -4,6 +4,7 @@ export * from "./artifact-manifest.js";
 export * from "./auto-merge.js";
 export * from "./base-branch.js";
 export * from "./conductor-halt.js";
+export * from "./killall-stop.js";
 export * from "./conductor-pass-trace.js";
 export * from "./conductor-schedule.js";
 export * from "./coordination-keys.js";

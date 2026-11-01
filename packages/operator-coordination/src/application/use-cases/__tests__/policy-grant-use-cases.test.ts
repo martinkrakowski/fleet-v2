@@ -477,7 +477,11 @@ describe('IssuePolicyForgeGrantUseCase', () => {
       ],
       [
         { forgeKind: 'force-push-XYZZY' as PolicyGrantForgeKind },
-        'a policy grant forgeKind must be one of push-and-open-pr, push-to-pr, merge-pr',
+        'a policy grant forgeKind must be one of push-and-open-pr, push-to-pr, merge-pr, post-status',
+      ],
+      [
+        { forgeKind: 'post-status', source: 'autoMerge' },
+        'a policy grant for this forge kind must be authorised by its own setting',
       ],
       [
         { settingRevision: 'XYZZY' },
@@ -502,6 +506,19 @@ describe('IssuePolicyForgeGrantUseCase', () => {
       expect(reason).not.toContain('XYZZY');
     }
     expect(await repository.listRequests()).toEqual([]);
+  });
+
+  it('issues a post-status grant authorised by conductor', async () => {
+    const repository = new CoordinationRequestRepositoryAdapter();
+    const useCase = new IssuePolicyForgeGrantUseCase({
+      requestRepo: repository,
+      clock: countingClock(),
+      ids: countingIds(),
+    });
+    const result = await useCase.issuePolicyForgeGrant(
+      issueRequest({ forgeKind: 'post-status', source: 'conductor' }),
+    );
+    expect(result.outcome).toBe('issued');
   });
 
   it('refuses when a minted request id already exists', async () => {

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildLaneRunStepKey,
   head12Of,
+  laneRunPremergeKey,
   laneRunResumeKey,
   laneRunStopForceKey,
   laneRunStopKey,
@@ -141,6 +142,15 @@ describe('key builders', () => {
 
     for (const step of LANE_RUN_KEY_STEPS) {
       if (step === 'prepare' || step === 'dispatch') continue;
+      if (step === 'premerge') {
+        expect(buildLaneRunStepKey({
+          runId: RUN_ID, round: 1, step, seatIndex: 0, attemptOrdinal: 1, head12: HEAD12, retry: null,
+        })).toEqual({
+          ok: false,
+          error: 'LaneRun key step premerge has no seat index',
+        });
+        continue;
+      }
       const head12 = LANE_RUN_KEY_HEAD_RULE[step] === 'required' ? HEAD12 : null;
       const result = buildLaneRunStepKey({
         runId: RUN_ID,
@@ -167,6 +177,16 @@ describe('key builders', () => {
   });
 
   it.each(LANE_RUN_KEY_STEPS)('round-trips %s', (step) => {
+    if (step === 'premerge') {
+      const built = laneRunPremergeKey(RUN_ID, 1, HEAD12);
+      expect(built.ok).toBe(true);
+      if (!built.ok) return;
+      expect(parseLaneRunKey(built.key)).toEqual({
+        kind: 'premerge', runId: RUN_ID, round: 1, head12: HEAD12,
+      });
+      expect(laneRunPremergeKey(RUN_ID, 1, HEAD12)).toEqual(built);
+      return;
+    }
     const head12 = LANE_RUN_KEY_HEAD_RULE[step] === 'required' ? HEAD12 : null;
     const attemptOrdinal = LANE_RUN_KEY_ATTEMPT_RULE[step] === 'required' ? 1 : null;
     const parts: LaneRunStepKeyParts = {

@@ -590,6 +590,16 @@ function pendingStepIntent(
     return null;
   }
   const parsed = parseLaneRunKey(entry.key);
+  if (parsed?.kind === 'premerge') {
+    if (entryHasFinalResult(entries, entry.key)) {
+      return null;
+    }
+    return {
+      key: entry.key,
+      step: 'premerge',
+      reconciliation: entryHasAnyResult(entries, entry.key) ? 'ambiguous' : 'unread',
+    };
+  }
   if (parsed?.kind !== 'step') {
     return null;
   }

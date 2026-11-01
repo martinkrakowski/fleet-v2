@@ -118,30 +118,34 @@ function readKillallSessionResult(input: unknown): KillallSessionResultRecord | 
  * `acknowledged: true` is inconsistent and refused.
  */
 export function readKillallTrainPause(input: unknown): KillallTrainPauseRecord | null {
-  const snapshot = readExactPlainRecord(input, TRAIN_KEYS);
-  if (snapshot === null) {
-    return null;
-  }
-  if (typeof snapshot.paused !== 'boolean' || typeof snapshot.acknowledged !== 'boolean') {
-    return null;
-  }
-  if (snapshot.paused && snapshot.acknowledged) {
-    if (snapshot.unconfirmedReason !== null) {
+  try {
+    const snapshot = readExactPlainRecord(input, TRAIN_KEYS);
+    if (snapshot === null) {
       return null;
     }
-    return { paused: true, acknowledged: true, unconfirmedReason: null };
-  }
-  if (!snapshot.paused && snapshot.acknowledged) {
+    if (typeof snapshot.paused !== 'boolean' || typeof snapshot.acknowledged !== 'boolean') {
+      return null;
+    }
+    if (snapshot.paused && snapshot.acknowledged) {
+      if (snapshot.unconfirmedReason !== null) {
+        return null;
+      }
+      return { paused: true, acknowledged: true, unconfirmedReason: null };
+    }
+    if (!snapshot.paused && snapshot.acknowledged) {
+      return null;
+    }
+    if (!isKillallStopUnconfirmedReason(snapshot.unconfirmedReason)) {
+      return null;
+    }
+    return {
+      paused: snapshot.paused,
+      acknowledged: snapshot.acknowledged,
+      unconfirmedReason: snapshot.unconfirmedReason,
+    };
+  } catch {
     return null;
   }
-  if (!isKillallStopUnconfirmedReason(snapshot.unconfirmedReason)) {
-    return null;
-  }
-  return {
-    paused: snapshot.paused,
-    acknowledged: snapshot.acknowledged,
-    unconfirmedReason: snapshot.unconfirmedReason,
-  };
 }
 
 function readKillallSessionResults(input: unknown): readonly KillallSessionResultRecord[] | null {
@@ -220,29 +224,33 @@ function readUnconfirmedLaneStop(
 
 /** One lane's stop line (plan §6 "Reporting"). */
 export function readKillallLaneStop(input: unknown): KillallLaneStopRecord | null {
-  const snapshot = readExactPlainRecord(input, LANE_KEYS);
-  if (snapshot === null) {
+  try {
+    const snapshot = readExactPlainRecord(input, LANE_KEYS);
+    if (snapshot === null) {
+      return null;
+    }
+    const projectId = snapshot.projectId;
+    if (typeof projectId !== 'string' || projectId.length === 0) {
+      return null;
+    }
+    const laneId = snapshot.laneId;
+    if (typeof laneId !== 'string' || laneId.length === 0) {
+      return null;
+    }
+    if (typeof snapshot.confirmed !== 'boolean') {
+      return null;
+    }
+    const sessionResults = readKillallSessionResults(snapshot.sessionResults);
+    if (sessionResults === null) {
+      return null;
+    }
+    if (snapshot.confirmed) {
+      return readConfirmedLaneStop(projectId, laneId, snapshot, sessionResults);
+    }
+    return readUnconfirmedLaneStop(projectId, laneId, snapshot, sessionResults);
+  } catch {
     return null;
   }
-  const projectId = snapshot.projectId;
-  if (typeof projectId !== 'string' || projectId.length === 0) {
-    return null;
-  }
-  const laneId = snapshot.laneId;
-  if (typeof laneId !== 'string' || laneId.length === 0) {
-    return null;
-  }
-  if (typeof snapshot.confirmed !== 'boolean') {
-    return null;
-  }
-  const sessionResults = readKillallSessionResults(snapshot.sessionResults);
-  if (sessionResults === null) {
-    return null;
-  }
-  if (snapshot.confirmed) {
-    return readConfirmedLaneStop(projectId, laneId, snapshot, sessionResults);
-  }
-  return readUnconfirmedLaneStop(projectId, laneId, snapshot, sessionResults);
 }
 
 /** Never throws, never echoes: exact keys; version 1; zoned halt time; marker state; integer sweep count; valid lanes and train. */

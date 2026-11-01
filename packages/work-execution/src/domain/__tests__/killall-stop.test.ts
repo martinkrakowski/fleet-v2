@@ -394,3 +394,22 @@ describe('session results', () => {
     expect(readKillallLaneStop(lane({ sessionResults: [{ stopped: true }] }))).toBeNull();
   });
 });
+
+describe('revoked proxy input', () => {
+  it('refuses and does not throw when passed to each exported reader', () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+
+    expect(() => readKillallMarkerState(proxy)).not.toThrow();
+    expect(readKillallMarkerState(proxy)).toBe('unreadable');
+
+    expect(() => readKillallTrainPause(proxy)).not.toThrow();
+    expect(readKillallTrainPause(proxy)).toBeNull();
+
+    expect(() => readKillallLaneStop(proxy)).not.toThrow();
+    expect(readKillallLaneStop(proxy)).toBeNull();
+
+    expect(() => readKillallStopReportRecord(proxy)).not.toThrow();
+    expect(readKillallStopReportRecord(proxy)).toMatchObject({ ok: false });
+  });
+});

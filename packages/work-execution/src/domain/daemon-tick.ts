@@ -260,7 +260,7 @@ function readVersionedSnapshot(value: unknown, requiredKeys: readonly string[]):
       return { ok: false, reason: 'malformed' };
     }
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+    if (descriptor === undefined || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) {
       return { ok: false, reason: 'malformed' };
     }
     if (key === 'version') {
@@ -744,7 +744,7 @@ function parseJobReasonCode(value: unknown, outcome: string): string | null | un
   return containsSecretShape(value) ? undefined : value;
 }
 
-export function parseStatusJob(raw: unknown): DaemonJobStatusRecord | null {
+function parseStatusJob(raw: unknown): DaemonJobStatusRecord | null {
   const item = readExactPlainRecord(raw, STATUS_JOB_KEYS);
   if (item === null) {
     return null;

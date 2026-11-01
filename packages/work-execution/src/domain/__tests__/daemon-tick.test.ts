@@ -687,6 +687,28 @@ describe('status v1 records, versions, exit codes and health', () => {
       }
     }
   });
+
+  it('refuses an accessor property even when Object.prototype.value is polluted and never runs the getter', () => {
+    let getterRan = false;
+    const input = {
+      get paused(): boolean {
+        getterRan = true;
+        return true;
+      },
+      changedAtIso: NOW,
+    };
+    Object.defineProperty(Object.prototype, 'value', { value: true, enumerable: false, configurable: true });
+    let read: ReturnType<typeof readDaemonPauseRecord>;
+    try {
+      read = readDaemonPauseRecord(input);
+    } finally {
+      // the assertion library builds descriptors itself, so the pollution is removed before any expect runs
+      delete (Object.prototype as Record<string, unknown>).value;
+    }
+    expect(read.ok).toBe(false);
+    expect(reasonOf(read)).toBe('malformed');
+    expect(getterRan).toBe(false);
+  });
 });
 
 describe('pause and lease readers', () => {

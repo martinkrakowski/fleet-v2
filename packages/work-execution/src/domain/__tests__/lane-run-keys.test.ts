@@ -185,6 +185,9 @@ describe('key builders', () => {
         kind: 'premerge', runId: RUN_ID, round: 1, head12: HEAD12,
       });
       expect(laneRunPremergeKey(RUN_ID, 1, HEAD12)).toEqual(built);
+      // The step shape `<runId>/r<round>/premerge/0@<head12>` parses as null:
+      // premerge has no seat index and is never a step key.
+      expect(parseLaneRunKey(`${RUN_ID}/r0/premerge/0@0123456789ab`)).toBeNull();
       return;
     }
     const head12 = LANE_RUN_KEY_HEAD_RULE[step] === 'required' ? HEAD12 : null;
@@ -503,6 +506,7 @@ describe('parseLaneRunKey', () => {
     'run-1/r0/dispatch/0',
     'run-1/r0/dispatch/0/a1',
     `${RUN_ID}/r1/gate/0@0123456789ab/`,
+    `${RUN_ID}/r0/premerge/0@0123456789ab`,
     `${RUN_ID}/r1/gate/0 @0123456789ab`,
     `${RUN_ID}/stop-force@xyz`,
     `${RUN_ID}/stop@`,

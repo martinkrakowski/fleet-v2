@@ -119,6 +119,19 @@ describe('ForgeActionAdapter post-status', () => {
     },
   );
 
+  it('posts a success receipt with the tier-1 not-required description', async () => {
+    const { adapter, calls } = makeAdapter({
+      runGhResult: { exitCode: 0, stdout: '', stderr: '' },
+    });
+    const result = await adapter.performForgeAction(
+      forgeActionRequest({
+        status: { context: 'premerge', state: 'success', description: 'not required for tier 1' },
+      }),
+    );
+    expect(result).toEqual({ outcome: 'executed', headSha: HEAD_SHA });
+    expect(calls[0]).toContain('description=not required for tier 1');
+  });
+
   it.each([['findings: 00'], ['findings: 1000'], ['findings: blocker']])(
     'refuses the failure description %s without running gh',
     async (description) => {
@@ -137,7 +150,7 @@ describe('ForgeActionAdapter post-status', () => {
     },
   );
 
-  it.each([['0123456789ab'], [`${HEAD_SHA}${'abcd'}`]])(
+  it.each([['0123456789ab'], [`${HEAD_SHA}${'0123456789abcdef01234567'}`]])(
     'refuses a non-40-hex expected head sha and never verifies or runs gh',
     async (sha) => {
       const { adapter, calls, verifier } = makeAdapter({

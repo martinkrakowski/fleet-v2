@@ -219,7 +219,12 @@ function entryRunIdError(
   runId: unknown,
 ): string | null {
   if (parsedKey !== null) {
-    if (parsedKey.kind === 'step' || parsedKey.kind === 'stop' || parsedKey.kind === 'resume') {
+    if (
+      parsedKey.kind === 'step' ||
+      parsedKey.kind === 'stop' ||
+      parsedKey.kind === 'resume' ||
+      parsedKey.kind === 'premerge'
+    ) {
       if (runId !== parsedKey.runId) {
         return 'LaneRunJournal runId does not match its key';
       }

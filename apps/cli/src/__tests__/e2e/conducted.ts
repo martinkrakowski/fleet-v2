@@ -135,6 +135,8 @@ export interface ConductedFixture extends E2eFixture {
   readonly fakePidsFile: string;
   /** File the `gh` stub on PATH appends its argv to, one line per call. */
   readonly ghArgvLog: string;
+  /** KS7a-2: the PATH dir holding the `gh` stub, for status reads through the stub. */
+  readonly ghPathBin: string;
   /** Captured CLI I/O shared by every command this fixture runs. */
   readonly io: CapturedIo;
   /** `conductor start --brief-request ...` through the CLI. */
@@ -293,13 +295,45 @@ function buildConductedInstallation(
 }
 
 /** The stub `gh` binary on PATH: records one flattened argv line per call, then prints the example PR URL. */
-function ghStubScript(argvLog: string): string {
+function ghStubScript(argvLog: string, statusDir: string): string {
   return [
     '#!/bin/sh',
     // One line per call: a `--body` carries newlines, so the ARGUMENTS are
     // flattened and exactly one line terminator is written per call.
     `printf '%s' "$*" | tr '\\n' ' ' >> ${sq(argvLog)}`,
     `printf '\\n' >> ${sq(argvLog)}`,
+    // KS7a-2: a commit-status POST (`gh api -X POST .../statuses/<sha> -f
+    // state=<state> -f context=premerge ...`) is accepted: the posted state
+    // is recorded per head sha and the call exits 0 without the PR-create
+    // URL. A later status read of that sha reports the last posted state, so
+    // a status read answers what was actually posted.
+    'sha=',
+    'state=',
+    'gh_form=list',
+    'for gh_arg in "$@"; do',
+    '  case "$gh_arg" in',
+    '    */commits/*) gh_commits=${gh_arg#*/commits/}; sha=${gh_commits%/status}; gh_form=obj ;;',
+    '    */statuses/*) sha=${gh_arg#*/statuses/} ;;',
+    '    state=*) state=${gh_arg#state=} ;;',
+    '  esac',
+    'done',
+    'case " $* " in',
+    '  *" -X POST "*)',
+    '    if [ -n "$sha" ] && [ -n "$state" ]; then',
+    `      printf '%s\\n' "$state" >> ${sq(statusDir)}/status."$sha"`,
+    '    fi',
+    '    exit 0',
+    '    ;;',
+    'esac',
+    `if [ -n "$sha" ] && [ -f ${sq(statusDir)}/status."$sha" ]; then`,
+    `  gh_posted=$(tail -n 1 ${sq(statusDir)}/status."$sha")`,
+    '  if [ "$gh_form" = obj ]; then',
+    `    printf '{"state":"%s","statuses":[{"state":"%s","context":"premerge"}]}\\n' "$gh_posted" "$gh_posted"`,
+    '  else',
+    `    printf '[{"state":"%s","context":"premerge"}]\\n' "$gh_posted"`,
+    '  fi',
+    '  exit 0',
+    'fi',
     'echo "https://github.com/example-owner/example-repo/pull/7"',
     '',
   ].join('\n');
@@ -515,6 +549,9 @@ export async function startConductedFixture(
   const fakeArgvFile = path.join(dir, 'fake-opencode.argv.log');
   const fakePidsFile = path.join(dir, 'fake-opencode.pids');
   const ghArgvLog = path.join(dir, 'gh.argv.log');
+  // KS7a-2: the `gh` stub records posted commit-status states here, one file
+  // per head sha, and answers status reads of that sha from them.
+  const ghStatusDir = path.join(dir, 'gh-status');
   const laneScriptPath = path.join(dir, 'lane-commit.sh');
 
   // PATH layering: prepend ONLY this fixture's two dirs; the real PATH stays
@@ -590,12 +627,13 @@ export async function startConductedFixture(
   try {
     // --- PATH tools -----------------------------------------------------
     await fs.mkdir(pathbin, { recursive: true });
+    await fs.mkdir(ghStatusDir, { recursive: true });
     const writeTool = async (name: string, body: string): Promise<void> => {
       const target = path.join(pathbin, name);
       await fs.writeFile(target, body, 'utf8');
       await fs.chmod(target, 0o700);
     };
-    await writeTool('gh', ghStubScript(ghArgvLog));
+    await writeTool('gh', ghStubScript(ghArgvLog, ghStatusDir));
     await writeTool('ocm-run', ocmRunWrapperScript(realOcmRunBin, ocmRunArgvLog, ocmRunEnvLog, ocmRunStderrLog));
     if (options?.committingLane === true) {
       // E2E-FIX: the brief-capture directory is created before any lane runs,
@@ -1036,6 +1074,9 @@ export async function startConductedFixture(
       fakeArgvFile,
       fakePidsFile,
       ghArgvLog,
+      // KS7a-2: the PATH dir holding the `gh` stub, so a scenario can run a
+      // status read through the stub itself.
+      ghPathBin: pathbin,
       io,
       start,
       runPass,

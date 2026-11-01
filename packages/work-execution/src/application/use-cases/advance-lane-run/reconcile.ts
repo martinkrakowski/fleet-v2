@@ -12,6 +12,7 @@ import { conductDispatching } from './prepare-dispatch.js';
 import { gatePreCheck, runCollectBody, runGateBody } from './collect-gate.js';
 import { reconcileReview } from './review-fix.js';
 import { reconcileAccept, reconcileMerge, reconcilePrPush } from './merge.js';
+import { reconcilePremerge } from './premerge.js';
 
 /**
  * The `reconcile` decisions (K4-7, §3.5): an intent without a result is
@@ -44,6 +45,9 @@ export async function performReconcile(ctx: AdvanceStepContext,
   }
   if (decision.step === 'merge') {
     return reconcileMerge(ctx, record, gathered, decision, request);
+  }
+  if (decision.step === 'premerge') {
+    return reconcilePremerge(ctx, record, gathered, decision, request);
   }
   if (decision.step === 'stop') {
     return reconcileStop(ctx, record, gathered, decision, request);

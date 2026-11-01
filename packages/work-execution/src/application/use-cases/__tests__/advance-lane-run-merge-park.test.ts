@@ -15,7 +15,7 @@ import type { AttemptRecord, CollectedAttemptArtifacts, WorkOrderRecord } from '
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
-import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, laneRunPremergeKey } from '../../../domain/lane-run-keys.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import type {
   AutoMergeAttemptRequest,
@@ -213,6 +213,23 @@ function acceptKey(): string {
 
 function mergeKey(): string {
   return stepKey({ round: 0, step: 'merge', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
+}
+
+/** The premerge key at a head (no seat index, KS7a-2). */
+function premergeKey(head12: string = HEAD12): string {
+  const built = laneRunPremergeKey(RUN_ID, 0, head12);
+  expect(built.ok).toBe(true);
+  if (!built.ok) {
+    throw new Error('fixture must build a premerge key');
+  }
+  return built.key;
+}
+
+/** Append a completed premerge-success intent and result at a head (KS7a-2): the merge hold is posted. */
+async function appendPremergeSuccess(harness: Harness, head12: string = HEAD12): Promise<void> {
+  const key = premergeKey(head12);
+  await appendIntent(harness, key, 'forge-01JB00000000000000000000', NOW);
+  await appendResult(harness, key, 'completed', 'premerge-success', NOW);
 }
 
 interface Harness {
@@ -417,15 +434,50 @@ async function makeHarness(
     },
     // KF-22b: the merge act never touches the acceptance port (the merge facts
     // come from journal rows and the full assessment path). A fake that throws
-    // on either method pins that: if the merge ever called it, every merge
-    // test here would fail loudly.
+    // on assessHeadAcceptance pins that. The `premerge` post (KS7a-2) reads the
+    // receipts-only assessment for its conductor grant, so assessHeadReceipts
+    // answers a pass.
     acceptanceAssessment: {
       assessHeadAcceptance: async () => {
         throw new Error('assessHeadAcceptance must not be called during merge');
       },
-      assessHeadReceipts: async () => {
-        throw new Error('assessHeadReceipts must not be called during merge');
-      },
+      assessHeadReceipts: async (request) => ({
+        outcome: 'passed',
+        receiptsId: 'rcp-example-1',
+        assessedHeadSha: request.candidateHeadSha,
+      }),
+    },
+    // KS7a-2: the pre-merge receipt at the head; a pass releases the merging hold.
+    reviewRequest: {
+      requestReview: async () => ({ outcome: 'unknown', reason: 'delegate-failed' }),
+      findReviewReceipt: async () => ({ outcome: 'not-found' }),
+      findLatestReceiptOfKind: async (request) => ({
+        outcome: 'found',
+        receipt: {
+          receiptId: 'pm-example-1',
+          requestId: null,
+          kind: request.kind,
+          reviewerModel: 'reviewer-example-1',
+          candidateHeadSha: request.candidateHeadSha,
+          verdict: 'passed',
+          findings: [],
+        },
+      }),
+    },
+    // KS7a-2: the conductor's premerge post (only a moved head posts here; the
+    // seeded harness has already posted).
+    conductorForgeGrant: {
+      issueConductorForgeGrant: async () => ({
+        outcome: 'issued',
+        grantId: 'grant-conductor-example-1',
+        decisionRevision: 'policy:conductor@example',
+      }),
+    },
+    executeForgeAction: {
+      executeAuthorizedForgeAction: async (request) => ({
+        outcome: 'executed',
+        headSha: request.expectedHeadSha,
+      }),
     },
     newUlid: makeUlidMinter(),
     autoMergeEnabled,
@@ -624,6 +676,9 @@ async function mergingHarness(options: HarnessOptions = {}, record: LaneRunRecor
   await conduct(harness, 'merging', NOW);
   await appendIntent(harness, acceptKey(), null, NOW);
   await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
+  // KS7a-2: the merging hold is already released (premerge success posted); the
+  // merge tail is what these tests exercise.
+  await appendPremergeSuccess(harness);
   return harness;
 }
 
@@ -660,7 +715,7 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
   });
 
   it('test 2: waiting refuses merge-waiting; after the head moves and acceptance re-establishes, the next merge acts at the new head', async () => {
-    const harness = await mergingHarness();
+    const harness = await mergingHarness({}, runRecord({ branchName: 'fleet/' + RUN_ID }));
     harness.setAutoMergeAnswer({ outcome: 'waiting', reason: 'ci-pending-first-look', headSha: COMMIT, firstLookAtIso: NOW });
     expect(await advance(harness)).toEqual({
       outcome: 'acted',
@@ -699,6 +754,17 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
       headSha: MOVED_COMMIT,
       decisionRevision: AUTO_MERGE_DECISION,
     });
+    // KS7a-2: a new head has no `premerge` status yet, so the merging hold posts
+    // it first; only then is the merge tail reached.
+    const movedPremergeKey = premergeKey(MOVED_HEAD12);
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'premerge',
+      key: movedPremergeKey,
+      result: 'completed',
+      reasonCode: 'premerge-success',
+    });
+    expect(harness.autoMergeRequests).toHaveLength(1);
     const movedKey = stepKey({ round: 0, step: 'merge', seatIndex: 0, attemptOrdinal: null, head12: MOVED_HEAD12 });
     expect(await advance(harness)).toEqual({
       outcome: 'acted',

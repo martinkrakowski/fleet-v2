@@ -440,7 +440,7 @@ async function acceptedHarness(
 }
 
 describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
-  it('test 1: a passed receipts answer at the head journals accepted and the next advance enters awaiting-premerge (Tier 2); assessHeadAcceptance is never called', async () => {
+  it('test 1: a passed receipts answer at the head journals accepted and the next advance enters opening-pr (Tier 2); assessHeadAcceptance is never called', async () => {
     const harness = await acceptingHarness();
     const first = await advance(harness);
     expect(first).toEqual({
@@ -459,7 +459,7 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
       },
     ]);
     expect(harness.acceptanceRequests).toEqual([]);
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'awaiting-premerge' });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'opening-pr' });
   });
 
   it('test 1b: Tier 1 with no PR enters opening-pr', async () => {
@@ -548,7 +548,7 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey());
     expect(intents).toHaveLength(1);
     expect(entries.some((entry) => entry.kind === 'result' && entry.key === acceptKey() && entry.outcome === 'completed' && entry.reasonCode === 'accepted')).toBe(true);
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'awaiting-premerge' });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'opening-pr' });
   });
 
   it('test 6: a pending accept intent from a crash reconciles by re-running the assessment once, with no second intent', async () => {
@@ -567,7 +567,7 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey());
     expect(intents).toHaveLength(1);
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'awaiting-premerge' });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'opening-pr' });
   });
 
   it('test 7: no acceptance assessment port is not-wired with its step and writes nothing', async () => {
@@ -617,7 +617,7 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
       result: 'completed',
       reasonCode: 'accepted',
     });
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'awaiting-premerge' });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'opening-pr' });
   });
 
   it('KF-23: each resumed rejection retries the next accept at the same head (retry1 then retry2)', async () => {

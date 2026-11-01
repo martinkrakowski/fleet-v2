@@ -352,8 +352,8 @@ export function isValidDaemonLeaseScope(scope: unknown): scope is string {
     if (typeof scope !== 'string') {
       return false;
     }
-    if (scope.startsWith('merge/')) {
-      return DAEMON_REPO_DIGEST_PATTERN.test(scope.slice('merge/'.length));
+    if (scope.startsWith('merge/') && DAEMON_REPO_DIGEST_PATTERN.test(scope.slice('merge/'.length))) {
+      return true;
     }
     if (!CLOUD_SCOPE_PATTERN.test(scope)) {
       return false;
@@ -942,12 +942,16 @@ export function parseDaemonStatusStateRecord(raw: unknown): DaemonStatusRecord |
  * record the reader would refuse.
  */
 export function buildDaemonStatusRecord(input: BuildDaemonStatusInput): DaemonStatusRead {
-  const snapshot = {
-    version: DAEMON_RECORD_VERSION,
-    ...input,
-    exitCode: tickExitCodeForJobs(input.jobs),
-  };
-  return readDaemonStatusRecord(snapshot);
+  try {
+    const snapshot = {
+      ...input,
+      version: DAEMON_RECORD_VERSION,
+      exitCode: tickExitCodeForJobs(input.jobs),
+    };
+    return readDaemonStatusRecord(snapshot);
+  } catch {
+    return statusFailure('malformed');
+  }
 }
 
 /** `daemon status` health: exit 0 only with no reason at all. */

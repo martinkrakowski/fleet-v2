@@ -711,6 +711,22 @@ describe('status v1 records, versions, exit codes and health', () => {
   });
 });
 
+describe('review round 3 regressions', () => {
+  it('accepts a cloud scope whose org is merge and keeps the merge digest scope', () => {
+    expect(isValidDaemonLeaseScope('merge/widgets')).toBe(true);
+    expect(isValidDaemonLeaseScope('merge/00000000000a')).toBe(true);
+    expect(isValidDaemonLeaseScope('merge/..')).toBe(false);
+  });
+
+  it('builds status with the stamped version and refuses bad jobs without throwing', () => {
+    const stamped = buildDaemonStatusRecord(validStatusBody({ version: 2 }) as unknown as BuildDaemonStatusInput);
+    expect(stamped.ok).toBe(true);
+    const bad = buildDaemonStatusRecord(validStatusBody({ jobs: null }) as unknown as BuildDaemonStatusInput);
+    expect(bad.ok).toBe(false);
+    expect(reasonOf(bad)).toBe('malformed');
+  });
+});
+
 describe('pause and lease readers', () => {
   it('reads the pause marker with an absent version as version 1', () => {
     const read = readDaemonPauseRecord({ paused: true, changedAtIso: NOW });

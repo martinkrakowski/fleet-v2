@@ -7,6 +7,7 @@
  * displays (work-order lane ids and question titles) before rendering them.
  */
 
+import type { BaseBranchValue } from './base-branch.js';
 import type { WorkOrderStateValue } from './value-objects/WorkOrderState.vo.js';
 import type { AttemptStateValue } from './value-objects/AttemptState.vo.js';
 import type { StopReasonValue } from './value-objects/StopReason.vo.js';
@@ -108,6 +109,8 @@ export interface BoardAttemptFact {
 export interface BoardRunFact {
   readonly runId: string;
   readonly workOrderId: string;
+  /** The run's resolved base branch, when the record carried one; absent reads as `main`. */
+  readonly baseBranch?: BaseBranchValue;
   readonly state: LaneRunStateValue;
   readonly round: number;
   readonly seatRole: SeatPlanRole | null;

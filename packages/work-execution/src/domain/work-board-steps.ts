@@ -3,6 +3,8 @@
  * §3.4, §3.5, §3.7): pure, never throws, time enters only as `nowIso`.
  */
 
+import { resolveLaneRunBaseBranch } from './base-branch.js';
+import type { BaseBranchValue } from './base-branch.js';
 import { parseTimeMs } from './work-board-facts.js';
 import { isPlainText } from './work-board.js';
 import type {
@@ -69,8 +71,8 @@ export interface BoardPrStatus {
 
 export type BoardStep =
   | { readonly kind: 'run'; readonly runId: string; readonly state: LaneRunStateValue; readonly round: number;
-      readonly parkReason: LaneRunParkReason | null }
-  | { readonly kind: 'run-stopped'; readonly runId: string; readonly round: number }
+      readonly parkReason: LaneRunParkReason | null; readonly baseBranch: BaseBranchValue }
+  | { readonly kind: 'run-stopped'; readonly runId: string; readonly round: number; readonly baseBranch: BaseBranchValue }
   | { readonly kind: 'attempt-live'; readonly attemptId: string; readonly attemptKind: 'initial' | 'fix';
       readonly fixNumber: number; readonly state: AttemptStateValue }
   | { readonly kind: 'pr-closed-without-merge'; readonly pr: BoardPrStatus }
@@ -98,7 +100,7 @@ export type BoardBadge =
   | { readonly kind: 'attempt-running'; readonly attemptId: string; readonly seatRole: string | null;
       readonly model: string | null; readonly state: AttemptStateValue }
   | { readonly kind: 'run'; readonly runId: string; readonly state: LaneRunStateValue; readonly round: number;
-      readonly parkReason: LaneRunParkReason | null }
+      readonly parkReason: LaneRunParkReason | null; readonly baseBranch: BaseBranchValue }
   | { readonly kind: 'owner-item-not-recorded'; readonly runId: string }
   | { readonly kind: 'pr'; readonly pr: BoardPrStatus }
   | { readonly kind: 'owner-item'; readonly origin: 'owner-item' | 'question'; readonly id: string;
@@ -266,10 +268,11 @@ function highestUnobservedPr(pullRequests: readonly BoardPrStatus[]): BoardPrSta
 type RawBoardStep = Exclude<BoardStep, { kind: 'dropped-after-start' }>;
 
 function stepFromRun(run: BoardRunFact): RawBoardStep {
+  const baseBranch = resolveLaneRunBaseBranch(run);
   if (run.state === 'stopped') {
-    return { kind: 'run-stopped', runId: run.runId, round: run.round };
+    return { kind: 'run-stopped', runId: run.runId, round: run.round, baseBranch };
   }
-  return { kind: 'run', runId: run.runId, state: run.state, round: run.round, parkReason: run.parkReason };
+  return { kind: 'run', runId: run.runId, state: run.state, round: run.round, parkReason: run.parkReason, baseBranch };
 }
 
 function stepFromEndedOrLive(attempt: BoardAttemptFact, pullRequests: readonly BoardPrStatus[]): RawBoardStep {
@@ -362,11 +365,11 @@ function ciSuffix(pr: BoardPrStatus): string {
 export function boardStepText(step: BoardStep): string {
   switch (step.kind) {
     case 'run': {
-      if (step.state === 'parked') return 'parked: ' + (step.parkReason ?? 'unknown');
-      return step.state + ', round ' + String(step.round);
+      if (step.state === 'parked') return 'parked: ' + (step.parkReason ?? 'unknown') + ' on ' + step.baseBranch;
+      return step.state + ', round ' + String(step.round) + ' on ' + step.baseBranch;
     }
     case 'run-stopped':
-      return 'run stopped, not merged';
+      return 'run stopped, not merged on ' + step.baseBranch;
     case 'attempt-live':
       if (step.attemptKind === 'initial') return 'first pass ' + step.state;
       return 'fix round ' + String(step.fixNumber) + ' ' + step.state;
@@ -562,7 +565,14 @@ function pushRun(out: BoardBadge[], input: BoardLaneBadgeInput): void {
   const run = latestRun(input.runs);
   if (run === null) return;
   if (stepUsesRun(input.step, run.runId)) return;
-  out.push({ kind: 'run', runId: run.runId, state: run.state, round: run.round, parkReason: run.parkReason });
+  out.push({
+    kind: 'run',
+    runId: run.runId,
+    state: run.state,
+    round: run.round,
+    parkReason: run.parkReason,
+    baseBranch: resolveLaneRunBaseBranch(run),
+  });
 }
 
 function pushOwnerItemNotRecorded(out: BoardBadge[], input: BoardLaneBadgeInput): void {

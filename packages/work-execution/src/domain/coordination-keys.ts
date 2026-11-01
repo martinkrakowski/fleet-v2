@@ -3,8 +3,13 @@
  */
 
 /** Forge actions fleet may run; `push-to-pr` updates an existing PR's branch and never opens one. */
-export const FORGE_ACTION_KINDS = ['push-and-open-pr', 'push-to-pr', 'merge-pr'] as const;
+export const FORGE_ACTION_KINDS = ['push-and-open-pr', 'push-to-pr', 'merge-pr', 'post-status'] as const;
 export type ForgeActionKind = (typeof FORGE_ACTION_KINDS)[number];
+
+/** True only for the kinds that push a branch: `push-and-open-pr` and `push-to-pr`. */
+export function forgeActionPushesBranch(kind: ForgeActionKind): boolean {
+  return kind === 'push-and-open-pr' || kind === 'push-to-pr';
+}
 
 /**
  * Why the forge refused an action it was asked to run (auto-merge plan A13, §4).

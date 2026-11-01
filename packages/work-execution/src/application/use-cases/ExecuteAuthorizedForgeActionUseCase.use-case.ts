@@ -114,6 +114,12 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       return { outcome: 'refused', reason: 'branchName must be a safe branch name' };
     }
 
+    // post-status has no default branch: it posts the receipt of the run's
+    // branch, so a missing branch refuses before a grant is consumed.
+    if (request.kind === 'post-status' && request.branchName === undefined) {
+      return { outcome: 'refused', reason: 'branchName must be a safe branch name' };
+    }
+
     const attempt = await deps.attemptRepo.findAttemptById(request.attemptId);
     const workOrder = await deps.workOrderRepo.findWorkOrderById(request.workOrderId);
     if (attempt === null || workOrder === null) {
@@ -247,7 +253,9 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         kind: request.kind,
         expectedHeadSha: request.expectedHeadSha,
         // The run's recorded branch wins when the request carries one; absent
-        // keeps the manual/auto-merge default (KF-5b).
+        // keeps the manual/auto-merge default (KF-5b). post-status always
+        // carries a branch (refused above when absent), so the default never
+        // applies to it.
         branchName: request.branchName ?? `feat/${workOrder.laneId}`,
         // Title/body are forwarded only when opening a PR; push-to-pr and
         // merge never carry them (K6-2).
@@ -256,6 +264,10 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
               ...(request.title !== undefined ? { title: request.title } : {}),
               ...(request.body !== undefined ? { body: request.body } : {}),
             }
+          : {}),
+        // The status body is forwarded only for post-status.
+        ...(request.kind === 'post-status' && request.status !== undefined
+          ? { status: request.status }
           : {}),
       });
     } catch (error) {

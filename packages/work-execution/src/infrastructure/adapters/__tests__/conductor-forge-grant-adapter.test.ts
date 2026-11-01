@@ -103,6 +103,30 @@ describe('ConductorForgeGrantAdapter', () => {
     });
   });
 
+  it('issues a post-status grant with source conductor', async () => {
+    const seen: ConductorForgeGrantIssueRequest[] = [];
+    const delegate = makeDelegate({
+      issue: async (request) => {
+        seen.push(request);
+        return issued();
+      },
+    });
+    const adapter = new ConductorForgeGrantAdapter(delegate);
+
+    const result = await adapter.issueConductorForgeGrant(
+      conductorRequest({ forgeKind: 'post-status' }),
+    );
+
+    expect(result).toEqual({
+      outcome: 'issued',
+      grantId: GRANT_ID,
+      decisionRevision: EXPECTED_DECISION_REVISION,
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.forgeKind).toBe('post-status');
+    expect(seen[0]!.source).toBe('conductor');
+  });
+
   it('refuses not-configured without a delegate', async () => {
     const adapter = new ConductorForgeGrantAdapter();
     const result = await adapter.issueConductorForgeGrant(conductorRequest());

@@ -764,4 +764,70 @@ describe("createFleetWebApiClient", () => {
       expect(view.fallbackReason).toContain("/v1/projects/");
     });
   });
+
+  describe("fetchConductorPasses", () => {
+    // The composed client always provides the optional reader; the factory
+    // result is narrowed here so the optionality stays for other fakes.
+    const passesReader = (client: ReturnType<typeof createFleetWebApiClient>) =>
+      client.fetchConductorPasses!;
+
+    it("uses /v1/runs/passes with no query when none is given", async () => {
+      requestedUrls = [];
+      const client = clientWith(() =>
+        Promise.resolve(jsonResponse(200, { ok: true })),
+      );
+
+      await passesReader(client)({}, null);
+
+      expect(requestedUrls).toEqual([`${BASE_URL}/v1/runs/passes`]);
+    });
+
+    it("encodes limit into the query string", async () => {
+      requestedUrls = [];
+      const client = clientWith(() =>
+        Promise.resolve(jsonResponse(200, { ok: true })),
+      );
+
+      await passesReader(client)({ limit: 32 }, null);
+
+      expect(requestedUrls).toEqual([
+        `${BASE_URL}/v1/runs/passes?limit=32`,
+      ]);
+    });
+
+    it("requests no-store so a server render never serves a cached list", async () => {
+      let capturedInit: RequestInit | undefined;
+      const client = createFleetWebApiClient({
+        baseUrl: BASE_URL,
+        fetchImpl: async (_input, init) => {
+          capturedInit = init;
+          return jsonResponse(200, { ok: true });
+        },
+      });
+
+      await passesReader(client)({ limit: 32 }, null);
+
+      expect(capturedInit?.cache).toBe("no-store");
+    });
+
+    it("falls back to the fixture on a 501", async () => {
+      const client = clientWith(() =>
+        Promise.resolve(
+          jsonResponse(NOT_IMPLEMENTED_STATUS, {
+            operationId: "op-1",
+            code: "NOT_IMPLEMENTED",
+            result: null,
+          }),
+        ),
+      );
+
+      const result = await passesReader(client)({}, WORK_ORDER_FIXTURE);
+
+      expect(result.source).toBe("fixture-fallback");
+      expect(result.status).toBe(501);
+      expect(result.data).toBe(WORK_ORDER_FIXTURE);
+      expect(result.fallbackReason).toContain("NOT_IMPLEMENTED");
+      expect(result.fallbackReason).toContain("/v1/runs/passes");
+    });
+  });
 });

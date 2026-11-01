@@ -12,6 +12,8 @@ import {
 } from "./schedule-view";
 import { useAutoRefresh } from "../lanes/use-auto-refresh";
 import { CapGauge } from "./components/cap-gauge";
+import { ConcurrencyStrip } from "./components/concurrency-strip";
+import { PassList } from "./components/pass-list";
 import { ScheduleBoard } from "./components/schedule-board";
 import { SessionStrip } from "./components/session-strip";
 import styles from "./conductor.module.css";
@@ -26,7 +28,9 @@ function haltedBannerTitle(halt: string): string {
 function actions(data: ConductorData, liveCount: number): ReactNode {
   if (data.view === "listed") {
     return (
-      <RouteChip>live · GET /v1/runs · {liveCount} live</RouteChip>
+      <RouteChip>
+        live · GET /v1/runs · GET /v1/runs/passes · {liveCount} live
+      </RouteChip>
     );
   }
   if (data.view === "error") {
@@ -110,7 +114,20 @@ export function ConductorClient({ data }: { data: ConductorData }) {
         <SessionStrip
           marks={schedule.sessionStarts}
           truncated={schedule.truncated}
+          dispatchStaggerMs={schedule.caps?.dispatchStaggerMs ?? null}
         />
+        <ConcurrencyStrip
+          reservations={[
+            {
+              atIso: data.observedAtIso,
+              held:
+                schedule.admission.active + schedule.admission.inFlight,
+            },
+          ]}
+          passes={data.passes.passes}
+          sessionMarks={schedule.sessionStarts}
+        />
+        <PassList passes={data.passes} />
       </>
     );
   }

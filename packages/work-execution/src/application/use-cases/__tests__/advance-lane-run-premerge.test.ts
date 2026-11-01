@@ -555,6 +555,23 @@ describe('AdvanceLaneRunUseCase premerge act (KS7a-2)', () => {
     expect(JSON.stringify(entries)).not.toContain('untrusted reviewer prose');
   });
 
+  it('a failed receipt for another head or of another kind authorises no grant and no post', async () => {
+    const answers = failedReceipt([finding('other head', 0)]);
+    if (answers.outcome !== 'found') {
+      throw new Error('fixture');
+    }
+    for (const receipt of [
+      { ...answers.receipt, candidateHeadSha: 'b'.repeat(40) },
+      { ...answers.receipt, kind: 'code-review' as const },
+    ]) {
+      const harness = await mergingHarness();
+      harness.setReceiptAnswer({ outcome: 'found', receipt });
+      await advance(harness);
+      expect(harness.grantRequests).toHaveLength(0);
+      expect(harness.forgeRequests).toHaveLength(0);
+    }
+  });
+
   it('test 4: a failure count over 999 calls execute zero times and appends ambiguous review-unknown', async () => {
     const harness = await mergingHarness();
     harness.setReceiptAnswer(failedReceipt(

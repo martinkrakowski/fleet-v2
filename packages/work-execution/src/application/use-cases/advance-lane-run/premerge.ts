@@ -156,6 +156,10 @@ async function premergeVerdictOf(
       kind: 'pre-merge',
     });
     if (read.outcome === 'found') {
+      // A receipt of another kind or head never authorises a post on this head.
+      if (read.receipt.kind !== 'pre-merge' || read.receipt.candidateHeadSha !== headSha) {
+        return { receipt: null, verdict: 'unknown' };
+      }
       return { receipt: read.receipt, verdict: verdictOfReceipt(read.receipt.verdict) };
     }
     return { receipt: null, verdict: read.outcome === 'not-found' ? 'none' : 'unknown' };

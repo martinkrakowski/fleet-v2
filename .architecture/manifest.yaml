@@ -364,6 +364,9 @@ bounded_contexts:
           - CloseWorkOrderUseCase
           - ListStaleWorkOrdersUseCase
           - ReapLaneWorktreesUseCase
+          - ListLaneRunsUseCase
+          - ListConductorPassesUseCase
+          - ReapOrphanSessionsUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -387,6 +390,9 @@ bounded_contexts:
             - CloseWorkOrderPort
             - ListStaleWorkOrdersPort
             - ReapLaneWorktreesPort
+            - ListLaneRunsPort
+            - ListConductorPassesPort
+            - ReapOrphanSessionsPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -432,8 +438,9 @@ bounded_contexts:
             - RunTelemetryMarkPort
             - RunTelemetryPort
             - AcceptanceReceiptReadPort
+            - ConductorPassTracePort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
@@ -449,12 +456,15 @@ bounded_contexts:
       InspectAttemptPort: "Return the attempt record safely without invoking the runner or mutating server state."
       ListAttemptsPort: "Return recorded attempts newest first, each with its work-order summary and held capacity reservation, without invoking the runner or mutating server state; recorded state is never presented as a runner observation."
       ListAttemptJournalPort: "Return one attempt's action journal entries in recorded order, or a known absence for an unknown attempt; read-only, never contacts the runner, and carries no legality or next-action block."
+      ListLaneRunsPort: "Return, read-only, the conductor schedule: every non-terminal lane run in creation order with its projected state, round, pending step, park, package keys and held slot, the held reservations by host, the admission count of active and in-flight runs, the halt marker and whether the driver lease has lapsed; the active-run cap is reported only from a recorded pass trace, never assumed; no lease holder, ssh alias, port, transport or worktree path crosses the port."
+      ListConductorPassesPort: "Return, read-only, the most recent recorded conductor passes newest first, at most a bounded limit, each with its time, halt and progress flags, the recorded caps and each run's report in worker-take order; an unreadable or unknown-version trace store is reported unreadable, never an error and never guessed; no holder id crosses the port."
       WorkOrderRepositoryPort: "Persist work-order revisions with optimistic concurrency and retrieve orders by project and dependency identity."
       AttemptRepositoryPort: "Persist immutable dispatch identity and guarded lifecycle updates; return known absence separately from unreadable state."
       ExecutionJournalPort: "Atomically record intent, capacity and action receipts; a host has one designated dispatcher until shared arbitration is implemented."
       LaneRunRepositoryPort: "Persist lane runs: create at revision 1; save only at the stored revision plus one and only by the current, unexpired run-lease holder with its fence, never moving the lease, the run's identity or its earlier attempts; acquire the run lease by CAS on the fence, renew and release it without moving the revision; known absence is null."
       ConductorDriverLeasePort: "Hold the one conductor driver lease of a state directory: acquire by CAS on the fence over a null or lapsed lease, renew and release by its holder with its fence, check and read without writing; the fence never goes back."
       LaneRunJournalPort: "Append keyed run journal entries under the store's guard: an intent before its action, its result after, a conduct entry for an entered state; refuse a second intent with the same key, a result without its intent or after a final result, a stop whose mode does not match its key, and a stop no stronger than the strongest the run already has; list per run and per key in append order, and several runs' entries from one read."
+      ConductorPassTracePort: "Append one completed conductor pass to a bounded ring (the newest 32 passes, at most 8 steps per run, schemaVersion 1, an absent version read as 1 and any other refused) under the store's lock with an atomic replace, and list the ring; an append never throws and answers recorded or not-recorded with a reason code; a refused pass or a dry run is never written."
       BriefAuthoringPort: "Obtain a project orchestrator's brief or a hand-written file without introducing provider inference into the control plane."
       ExecutionRunnerPort: "Start, inspect and stop a matching attempt/session with explicit capabilities and strict per-lane directory isolation; a busy-worktree start is blocked and keeps its reservation until reconcile or stop resolves the worktree, and a worktree can be inspected or aborted by directory without a session id."
       RunnerSelectorPort: "Given the installation's lane-runner hosts and the attempt's seat tool, return the runner kind and host to use; a kind without an implemented adapter is refused as runner-not-available."
@@ -494,6 +504,7 @@ bounded_contexts:
       CloseWorkOrderPort: "Close one active work order as merged or stopped on the operator's explicit confirmation, releasing its owned paths; refused while any lane run naming it is not terminal, any of its attempts is outside the capacity-release states or holds a reservation, or it is already terminal; closing as merged needs a lane run naming it that ended merged; an unknown id is not-found; a stale revision is refused, never overwritten."
       ListStaleWorkOrdersPort: "List, read-only, the work orders whose state disagrees with their lane runs: active work orders whose every run is terminal, active work orders with no run, and non-terminal runs whose work order is terminal; never writes."
       ReapLaneWorktreesPort: "On the operator's explicit request, list or remove the clean worktree of every lane run that is terminal and whose work order is terminal and whose attempts are all cancelled or collected with no held reservation; never removes a dirty, locked or unlisted worktree and never deletes a branch; a dry run removes nothing."
+      ReapOrphanSessionsPort: "On the operator's explicit request, list worktrees whose latest attempt is finished (cancelled, collected or ended) but where the runner still reports a running session, and abort those by directory only with confirmation; never touches a worktree with a live attempt or a held reservation; a dry run aborts nothing."
       ProbeProjectPort: "Probe one registered project read-only: read its profile, check its repository and clones and that its gate procedures exist in the installation, and record the receipt only if the profile did not change while it was probed."
       ProjectProfileReadPort: "Read one project profile and its revision from the coordination context; known absence is null."
       ProjectProbeRecordPort: "Record a probe receipt on a profile at the revision the probe started from; a changed profile is a typed rejection, never an overwrite."
@@ -507,6 +518,7 @@ bounded_contexts:
       - { adapter: LaneRunRepositoryAdapter, implements: LaneRunRepositoryPort, integration: local-transactional-store }
       - { adapter: ConductorDriverLeaseAdapter, implements: ConductorDriverLeasePort, integration: local-transactional-store }
       - { adapter: LaneRunJournalAdapter, implements: LaneRunJournalPort, integration: local-keyed-run-journal }
+      - { adapter: ConductorPassTraceAdapter, implements: ConductorPassTracePort, integration: local-transactional-store }
       - { adapter: TelemetryDispositionAdapter, implements: TelemetryDispositionPort, integration: local-transactional-store }
       - { adapter: NoopRunTelemetryMarkAdapter, implements: RunTelemetryMarkPort, integration: in-process-noop }
       - { adapter: InMemoryRunTelemetryMarkAdapter, implements: RunTelemetryMarkPort, integration: in-process }

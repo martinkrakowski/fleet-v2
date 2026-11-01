@@ -17,6 +17,10 @@ import * as fs from "node:fs";
 
 import { createEndpointReader } from "./api/transport";
 import { createAttemptReaders, type AttemptReaders } from "./api/attempts";
+import {
+  createConductorPassReaders,
+  type ConductorPassReaders,
+} from "./api/conductor-passes";
 import { createCoordinationReaders, type CoordinationReaders } from "./api/coordination";
 import { createEvidenceReaders, type EvidenceReaders } from "./api/evidence";
 import { createProjectReaders, type ProjectReaders } from "./api/projects";
@@ -44,6 +48,7 @@ export type FleetWebApiClient = WorkOrderReaders &
   AttemptReaders &
   EvidenceReaders &
   CoordinationReaders &
+  ConductorPassReaders &
   ProjectReaders &
   RunReaders;
 
@@ -105,6 +110,7 @@ export function createFleetWebApiClient(
     ...createAttemptReaders(read),
     ...createEvidenceReaders(read),
     ...createCoordinationReaders(read),
+    ...createConductorPassReaders(read),
     ...createProjectReaders(read),
     ...createRunReaders(read),
   };

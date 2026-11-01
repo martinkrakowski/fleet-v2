@@ -48,6 +48,13 @@ export type { DecisionCallReceipt } from './decisions/receipt.js';
 export { budgetAllows } from './decisions/budget.js';
 export type { BudgetInput, BudgetDecision } from './decisions/budget.js';
 
+export { postJevDecision } from './decisions/client.js';
+export type {
+  JevDecisionClientRequest,
+  JevDecisionClientResult,
+  JevDecisionReceipt,
+} from './decisions/client.js';
+
 export { isValidHostName } from './host-name.js';
 
 export { SEAT_BILLINGS, billingOf } from './billing.js';

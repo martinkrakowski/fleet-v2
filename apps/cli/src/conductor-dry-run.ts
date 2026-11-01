@@ -367,8 +367,9 @@ export function createDryRunFakes(
     },
     findReviewReceipt: async () => ({ outcome: 'not-found' }),
     // D3: a passed pre-merge receipt at the asked head (manual, requestId
-    // null), so a Tier 2 run passes awaiting-premerge; every other kind is
-    // absent.
+    // null), so the merging hold releases and the dry-run posts `premerge`
+    // success and then merges; it does not wait in `awaiting-premerge`. Every
+    // other kind is absent.
     findLatestReceiptOfKind: async (request) => {
       recordCall('findLatestReceiptOfKind', request);
       if (request.kind !== 'pre-merge') {
@@ -480,6 +481,13 @@ export function createDryRunFakes(
   const executeForgeAction: ExecuteAuthorizedForgeActionPort = {
     executeAuthorizedForgeAction: async (request) => {
       recordCall('executeForgeAction', request);
+      // The `premerge` status post (KS7a-2) never opens or moves a PR.
+      if (request.kind === 'post-status') {
+        return {
+          outcome: 'executed',
+          headSha: request.expectedHeadSha,
+        };
+      }
       prOpened = true;
       prHeadSha = request.expectedHeadSha;
       return {

@@ -232,6 +232,7 @@ async function seedCompletedStart(runtime: FleetCliRuntime, baseBranch?: BaseBra
     lease: null,
     revision: 1,
     runPolicyRevision: 'policy-example-1',
+    branchName: 'fleet/' + RUN_ID,
     ...(baseBranch !== undefined ? { baseBranch } : {}),
   });
   expect(run.outcome).toBe('saved');
@@ -472,7 +473,7 @@ describe('conductor run --dry-run (K7-8)', () => {
     expect(result.code).toBe(0);
     const would = wouldLines(result.stdout);
     expect(would.map((line) => line.would)).toEqual([
-      'dispatch', 'collect', 'gate', 'brief-check', 'code-review', 'accept', 'open-pr', 'merge',
+      'dispatch', 'collect', 'gate', 'brief-check', 'code-review', 'accept', 'open-pr', 'premerge', 'merge',
     ]);
     expect(would[0]).toMatchObject({ key: `${RUN_ID}/r0/dispatch/0/a1`, result: 'completed', reasonCode: 'dispatch-started' });
     expect(would[1]).toMatchObject({ key: `${RUN_ID}/r0/collect/0`, result: 'completed', reasonCode: 'collected' });
@@ -480,10 +481,12 @@ describe('conductor run --dry-run (K7-8)', () => {
     expect(would[3]).toMatchObject({ key: `${RUN_ID}/r0/brief-check/0@dddddddddddd`, result: 'completed', reasonCode: 'review-passed' });
     expect(would[4]).toMatchObject({ key: `${RUN_ID}/r0/code-review/0@dddddddddddd`, result: 'completed', reasonCode: 'review-passed' });
     // K6-8: the seeded run then accepts the head, opens the PR through the
-    // conductor grant and merges it through the auto-merge fake.
+    // conductor grant, posts the premerge success (the merge hold) and merges
+    // it through the auto-merge fake.
     expect(would[5]).toMatchObject({ key: `${RUN_ID}/r0/accept/0@dddddddddddd`, result: 'completed', reasonCode: 'accepted' });
     expect(would[6]).toMatchObject({ key: `${RUN_ID}/r0/open-pr/0@dddddddddddd`, result: 'completed', reasonCode: 'pr-opened' });
-    expect(would[7]).toMatchObject({ key: `${RUN_ID}/r0/merge/0@dddddddddddd`, result: 'completed', reasonCode: 'merged' });
+    expect(would[7]).toMatchObject({ key: `${RUN_ID}/r0/premerge@dddddddddddd`, result: 'completed', reasonCode: 'premerge-success' });
+    expect(would[8]).toMatchObject({ key: `${RUN_ID}/r0/merge/0@dddddddddddd`, result: 'completed', reasonCode: 'merged' });
     // The entered states the driver would enter, in order: dispatch, run,
     // collect, gate, both reviews, then the K6 acceptance → PR → CI → merge
     // window, all the way to merged.
@@ -496,7 +499,6 @@ describe('conductor run --dry-run (K7-8)', () => {
       'brief-check',
       'code-review',
       'accepting',
-      'awaiting-premerge',
       'opening-pr',
       'watching-ci',
       'merging',
@@ -519,10 +521,10 @@ describe('conductor run --dry-run (K7-8)', () => {
     // accepted, the PR opened, the run merged.
     const acted = allSteps.filter((step) => step.outcome === 'acted');
     expect(acted.map((step) => step.step)).toEqual(
-      expect.arrayContaining(['accept', 'open-pr', 'merge']),
+      expect.arrayContaining(['accept', 'open-pr', 'premerge', 'merge']),
     );
     expect(acted.map((step) => step.reasonCode)).toEqual(
-      expect.arrayContaining(['accepted', 'pr-opened', 'merged']),
+      expect.arrayContaining(['accepted', 'pr-opened', 'premerge-success', 'merged']),
     );
 
     // Each review opened the evidence assessment and then issued its request,
@@ -552,11 +554,14 @@ describe('conductor run --dry-run (K7-8)', () => {
     expect(ports.slice(ports.lastIndexOf('reviewRequest') + 1)).toEqual([
       'acceptanceAssessment',
       'findLatestReceiptOfKind', 'ciState', 'forgeRead',
-      'findLatestReceiptOfKind', 'ciState', 'forgeRead',
       'acceptanceAssessment',
       'conductorForgeGrant', 'executeForgeAction',
       'findLatestReceiptOfKind', 'ciState', 'forgeRead',
       'findLatestReceiptOfKind', 'ciState', 'forgeRead',
+      'findLatestReceiptOfKind', 'ciState', 'forgeRead',
+      'findLatestReceiptOfKind',
+      'acceptanceAssessment',
+      'conductorForgeGrant', 'executeForgeAction',
       'findLatestReceiptOfKind', 'ciState', 'forgeRead',
       'autoMergeAttempt',
       'findLatestReceiptOfKind', 'ciState', 'forgeRead',

@@ -11,6 +11,7 @@
 
 import {
   buildLaneRunStepKey,
+  laneRunPremergeKey,
   LANE_RUN_MAX_RETRY,
 } from './lane-run-keys.js';
 import { LANE_RUN_KEY_HEAD_RULE } from './lane-run-records.js';
@@ -26,6 +27,7 @@ import {
   laneRunDrainContinues,
   laneRunHaltLiftExit,
   laneRunHeadChanged,
+  laneRunMergeHold,
   LANE_RUN_DRAIN_STEPS,
   LANE_RUN_HEAD_CHANGE_STATES,
   LANE_RUN_STEP_OF_STATE,
@@ -132,6 +134,8 @@ export interface LaneRunFacts {
   readonly codeReview: LaneRunReviewFact;
   /** Tier 2 pre-merge receipt for `head12` (D3) (K6). */
   readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
+  /** KS7a-2: the latest final `premerge` journal result at `head12` (the merging hold's post). */
+  readonly premergePost: 'none' | 'success' | 'failure' | 'refused';
   /** `AssessHeadAcceptance` at `head12` (K6). */
   readonly acceptance: 'none' | 'accepted' | 'rejected' | 'unknown';
   /**
@@ -207,6 +211,55 @@ const WAIT_FACTS_INCONSISTENT: LaneRunDecision = { kind: 'wait', reason: 'facts-
  */
 function mergedPrCarriesLaneHead(pr: NonNullable<LaneRunFacts['pr']>, laneHead12: string | null): boolean {
   return pr.head12 === laneHead12 || pr.containsLaneHead;
+}
+
+/**
+ * KS7a-2: the merging hold's decision (speed plan §3.6.2, D20; §3.3.1): post
+ * the `premerge` commit status, the merge hold, before the policy-grant /
+ * train / merge tail. Returns `null` to fall through to that tail. Total;
+ * never throws. A `wait` hold posts `pending`, a `released` hold posts
+ * `success`, a `fail` hold posts `failure` (or sends the run to a fix round
+ * when the failure is already posted); a park hold, a posted result whose
+ * side mismatches the hold, and a refused post post nothing and park.
+ */
+function laneRunPremergeDecision(record: LaneRunRecord, facts: LaneRunFacts): LaneRunDecision | null {
+  if (facts.premergePost === 'refused') {
+    return { kind: 'park', reason: 'step-refused', qualifier: 'premerge', parkedFrom: facts.state };
+  }
+  const hold = laneRunMergeHold(record.tier, facts.preMerge, record.round);
+  if (hold.kind === 'fail' && facts.premergePost === 'failure') {
+    const outcome = afterLaneRunFailure(record.round, 'pre-merge');
+    return outcome.kind === 'enter'
+      ? { kind: 'enter', to: outcome.to }
+      : { kind: 'park', reason: outcome.reason, qualifier: null, parkedFrom: facts.state };
+  }
+  if (hold.kind === 'released' && facts.premergePost === 'success') {
+    return null;
+  }
+  const post = facts.premergePost === 'none' && (hold.kind === 'wait' || hold.kind === 'released' || hold.kind === 'fail');
+  if (!post) {
+    return { kind: 'park', reason: 'ambiguous', qualifier: 'pre-merge', parkedFrom: facts.state };
+  }
+  if (facts.head12 === null) {
+    return WAIT_FACTS_INCONSISTENT;
+  }
+  const attempt = facts.attempt;
+  if (attempt === null || attempt.round !== record.round) {
+    return WAIT_FACTS_INCONSISTENT;
+  }
+  const built = laneRunPremergeKey(record.runId, record.round, facts.head12);
+  if (!built.ok) {
+    return WAIT_FACTS_INCONSISTENT;
+  }
+  return {
+    kind: 'act',
+    step: 'premerge',
+    key: built.key,
+    round: record.round,
+    seatIndex: attempt.seatIndex,
+    head12: facts.head12,
+    retry: null,
+  };
 }
 
 export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, nowIso: string): LaneRunDecision {
@@ -632,7 +685,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         }
         return park('acceptance-rejected', null);
       }
-      return enter(afterLaneRunAcceptance(record.tier, record.prNumber));
+      return enter(afterLaneRunAcceptance(record.tier, record.prNumber, 'merging'));
     };
 
     const awaitingPremergeRules = (): LaneRunDecision => {
@@ -716,6 +769,12 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (facts.merge.branchBehind) {
         return park('branch-behind', null);
       }
+      // KS7a-2 (D20): the `premerge` post is the merge hold, read before the
+      // policy-grant park and the merge tail; null falls through to them.
+      const premerge = laneRunPremergeDecision(record, facts);
+      if (premerge !== null) {
+        return premerge;
+      }
       if (!facts.merge.policyGrant) {
         return park('owner-merge', null);
       }
@@ -752,7 +811,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
     // halt rules' decision (G4b/G6) applies instead. Prepare, dispatch, stop and
     // cancel reconciles stay as they are under halt (read-only or record-only).
     if (facts.pendingIntent !== null && facts.pendingIntent.reconciliation === 'unread') {
-      if (facts.halted && (facts.pendingIntent.step === 'collect' || facts.pendingIntent.step === 'gate')) {
+      if (facts.halted && (facts.pendingIntent.step === 'collect' || facts.pendingIntent.step === 'gate' || facts.pendingIntent.step === 'premerge')) {
         if (facts.state === 'parked') {
           return wait('parked');
         }

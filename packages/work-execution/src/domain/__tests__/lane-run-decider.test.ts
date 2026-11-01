@@ -89,6 +89,7 @@ function baseFacts(overrides: Partial<LaneRunFacts> = {}): LaneRunFacts {
     briefCheck: { verdict: 'none', seatIndex: null, retries: 0 },
     codeReview: { verdict: 'none', seatIndex: null, retries: 0 },
     preMerge: 'none',
+    premergePost: 'none',
     acceptance: 'none',
     acceptanceRetry: null,
     ci: 'pending',
@@ -1073,7 +1074,7 @@ describe('accepting, premerge, PR and CI states', () => {
 
   it('A4: accepted enters the acceptance exit', () => {
     const facts = baseFacts({ state: 'accepting', acceptance: 'accepted' });
-    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'awaiting-premerge' });
+    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'opening-pr' });
     const tierOne = baseFacts({ state: 'accepting', acceptance: 'accepted' });
     const rec = record({ tier: 1 });
     assertDecision(tierOne, rec, decide(rec, tierOne), { kind: 'enter', to: 'opening-pr' });
@@ -1229,26 +1230,89 @@ describe('merging state', () => {
     });
   });
 
-  it('M6: without a policy grant parks owner-merge', () => {
+  it('M6: after the premerge success, without a policy grant parks owner-merge', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: false, trainFree: true, policyGrant: false },
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: false, trainFree: true, policyGrant: false },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'owner-merge', qualifier: null, parkedFrom: 'merging',
     });
   });
 
-  it('M7: without a free train waits merge-train', () => {
+  it('M7: after the premerge success, without a free train waits merge-train', () => {
     const facts = baseFacts({
-      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: false, trainFree: false, policyGrant: true },
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: false, trainFree: false, policyGrant: true },
     });
     expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'merge-train' });
   });
 
-  it('M8: otherwise acts merge', () => {
-    const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true }, attempt: attemptFact() });
+  it('M8: after the premerge success, otherwise acts merge', () => {
+    const facts = baseFacts({ state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'passed', premergePost: 'success', pr: { state: 'open', head12: HEAD, containsLaneHead: true }, attempt: attemptFact() });
     expect(decide(record({}), facts)).toEqual({
       kind: 'act', step: 'merge', key: `${RUN_ID}/r0/merge/0@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+    });
+  });
+
+  it('KS7a-2: a Tier 2 merging hold with no post acts premerge before the owner-merge park', () => {
+    const facts = baseFacts({
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, attempt: attemptFact(), pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: false, trainFree: true, policyGrant: false },
+    });
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: 'premerge', key: `${RUN_ID}/r0/premerge@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+    });
+  });
+
+  it('KS7a-2: an unread premerge intent reconciles first, never an act', () => {
+    const facts = baseFacts({
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true },
+      pendingIntent: { key: `${RUN_ID}/r0/premerge@${HEAD}`, step: 'premerge', reconciliation: 'unread' },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'reconcile', step: 'premerge', key: `${RUN_ID}/r0/premerge@${HEAD}`,
+    });
+  });
+
+  it('KS7a-2: a failed premerge result sends the run to fixing', () => {
+    const facts = baseFacts({
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'failed', premergePost: 'failure', pr: { state: 'open', head12: HEAD, containsLaneHead: true },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'fixing' });
+  });
+
+  it('KS7a-2: an unknown receipt parks ambiguous pre-merge, never an act', () => {
+    const facts = baseFacts({
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'unknown', premergePost: 'none', pr: { state: 'open', head12: HEAD, containsLaneHead: true },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'pre-merge', parkedFrom: 'merging',
+    });
+  });
+
+  it('KS7a-2: a success recorded while the hold is fail parks ambiguous pre-merge', () => {
+    const facts = baseFacts({
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'failed', premergePost: 'success', pr: { state: 'open', head12: HEAD, containsLaneHead: true },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'ambiguous', qualifier: 'pre-merge', parkedFrom: 'merging',
+    });
+  });
+
+  it('KS7a-2: a refused premerge posts nothing and parks step-refused premerge', () => {
+    const facts = baseFacts({
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, preMerge: 'none', premergePost: 'refused', pr: { state: 'open', head12: HEAD, containsLaneHead: true },
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'step-refused', qualifier: 'premerge', parkedFrom: 'merging',
+    });
+  });
+
+  it('KS7a-2: Tier 1 posts success on the first merging advance', () => {
+    const rec = record({ tier: 1 });
+    const facts = baseFacts({
+      state: 'merging', head12: HEAD, acceptedHead12: HEAD, attempt: attemptFact(), pr: { state: 'open', head12: HEAD, containsLaneHead: true }, merge: { oneWayDoor: false, branchBehind: false, trainFree: true, policyGrant: false },
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'premerge', key: `${RUN_ID}/r0/premerge@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
     });
   });
 });

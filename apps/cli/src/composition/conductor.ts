@@ -17,6 +17,7 @@ import {
   InspectLaneRunsUseCase,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
+  ListLaneRunsUseCase,
   ReapLaneWorktreesUseCase,
   ReapOrphanSessionsUseCase,
   RequestLaneRunStopUseCase,
@@ -106,6 +107,15 @@ export function composeConductor(input: ComposeConductorInput) {
       runJournal: laneRunJournal,
       halt: conductorHalt,
       driverLease: conductorDriverLease,
+    }),
+    listLaneRuns: new ListLaneRunsUseCase({
+      runRepo: laneRunRepository,
+      runJournal: laneRunJournal,
+      halt: conductorHalt,
+      driverLease: conductorDriverLease,
+      attemptRepo: attemptRepository,
+      executionJournal,
+      workOrderRepo: workOrderRepository,
     }),
     resumeLaneRun: new ResumeLaneRunUseCase({
       runRepo: laneRunRepository,

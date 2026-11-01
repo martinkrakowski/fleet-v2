@@ -1,7 +1,8 @@
 /**
- * `fleet-v2 conductor` (lanes K7-4 and K7-7): the four record-only
- * subcommands `status`, `halt`, `stop` and `resume`, with no driver and no
- * dispatch, plus the two driver-side subcommands `start` and `run` (K7-7).
+ * `fleet-v2 conductor` (lanes K7-4, K7-7 and VZ2): the four record-only
+ * subcommands `status`, `halt`, `stop` and `resume`, plus the read-only
+ * `schedule`, with no driver and no dispatch, and the two driver-side
+ * subcommands `start` and `run` (K7-7).
  * The record-only commands print one JSON document on stdout and map the use
  * case's outcome to an exit code (0 completed, 1
  * refused/rejected/blocked/unknown, 2 usage): the halt marker is set or
@@ -43,6 +44,8 @@ import {
   type RunConductorPassResult,
   type ConductorRunReport,
   type AdvanceLaneRunResult,
+  type ListLaneRunsResult,
+  type ConductorScheduleRow,
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
@@ -75,6 +78,7 @@ export interface ConductorCliOptions {
 }
 
 export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
+       fleet-v2 conductor schedule [--json]
        fleet-v2 conductor halt [--lift]
        fleet-v2 conductor stop <runId> [--force] [--revision <n>]
        fleet-v2 conductor resume <runId> [--revision <n>]
@@ -89,7 +93,9 @@ before any external action (halt --lift clears it); halt never stops a running
 lane; a stop recorded as a keyed run-journal intent — stop is graceful by
 default, --force stops the running lane now; a resume recorded for a parked
 run. The driver obeys the records; nothing here dispatches, and the CLI
-never takes a run lease. conductor reap --worktrees removes the clean
+never takes a run lease. conductor schedule is a read-only view of the live
+runs in creation order with their held slots, package keys and the admission
+count; --json prints the whole view. conductor reap --worktrees removes the clean
 worktree of every finished lane run (terminal run, terminal work order,
 every attempt cancelled or collected, no held reservation) on explicit
 request: --dry-run lists the candidates and removes nothing, and without it
@@ -1198,6 +1204,106 @@ async function reapCommand(
   return result.refused.length > 0 ? 1 : 0;
 }
 
+/**
+ * The text rows of a listed schedule: one line per row, space-separated,
+ * with no padding. Exported for the tests; the CLI prints them with a
+ * trailing newline each.
+ */
+export function scheduleText(result: Extract<ListLaneRunsResult, { readonly outcome: 'listed' }>): string[] {
+  const schedule = result.schedule;
+  let driver: string;
+  if (schedule.driverLeaseLapsed === null) {
+    driver = 'none';
+  } else if (schedule.driverLeaseLapsed) {
+    driver = 'lapsed';
+  } else {
+    driver = 'live';
+  }
+  const cap = schedule.caps === null ? 'cap not recorded' : `cap ${schedule.caps.maxActiveRuns}`;
+  const lines: string[] = [
+    `halt ${schedule.halt} · driver ${driver} · admission ${schedule.admission.active} active + ${schedule.admission.inFlight} in flight / ${cap}`,
+  ];
+  if (schedule.rows.length === 0) {
+    lines.push('no live runs');
+    return lines;
+  }
+  for (const row of schedule.rows) {
+    lines.push(scheduleRowText(row));
+  }
+  return lines;
+}
+
+/** One schedule row as text: `<runId> <state> r<round> <placement> <slot> <packages>` plus the optional suffixes. */
+function scheduleRowText(row: ConductorScheduleRow): string {
+  const slot = row.slot === null ? '-' : `${row.slot.hostName}#${row.slot.slotIndex}`;
+  let packages: string;
+  if (row.workOrderUnreadable) {
+    packages = 'work order unreadable';
+  } else if (row.packageKeys === null || row.packageKeys.length === 0) {
+    packages = '-';
+  } else {
+    packages = row.packageKeys.join(',');
+  }
+  let text = `${row.runId} ${row.state} r${row.round} ${row.placement} ${slot} ${packages}`;
+  if (row.pendingStep !== null) {
+    text += ` pending ${row.pendingStep.step}`;
+  }
+  if (row.park !== null) {
+    text += ` parked ${row.park.reason}`;
+  }
+  if (row.admissionWait !== null) {
+    text += ` admission wait (${row.admissionWait})`;
+  }
+  if (row.overlapsWith.length > 0) {
+    text += ` overlaps ${row.overlapsWith.join(',')}`;
+  }
+  return text;
+}
+
+/**
+ * `conductor schedule` (VZ2): the read-only schedule view. It accepts only
+ * `--json` (at most once) and needs no durable state directory — in-memory
+ * stores read empty, as `status` does. A `rejected` result prints its JSON
+ * on stdout and exits 1; `--json` prints the whole listed view and exits 0;
+ * text mode prints `scheduleText` lines and exits 0.
+ */
+async function scheduleCommand(
+  argv: readonly string[],
+  io: CliIo,
+  runtime: FleetCliRuntime,
+  options: ConductorCliOptions,
+): Promise<number> {
+  let json = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index]!;
+    if (token === '--json') {
+      if (json) {
+        io.stderr(`Repeated flag: --json\n${CONDUCTOR_HELP}\n`);
+        return 2;
+      }
+      json = true;
+      continue;
+    }
+    io.stderr(`conductor schedule takes only --json\n${CONDUCTOR_HELP}\n`);
+    return 2;
+  }
+  const result = await runtime.conductor.listLaneRuns.listLaneRuns({
+    nowIso: nowIsoOf(options),
+  });
+  if (result.outcome === 'rejected') {
+    io.stdout(`${JSON.stringify(result)}\n`);
+    return 1;
+  }
+  if (json) {
+    io.stdout(`${JSON.stringify(result)}\n`);
+    return 0;
+  }
+  for (const line of scheduleText(result)) {
+    io.stdout(`${line}\n`);
+  }
+  return 0;
+}
+
 /** `fleet-v2 conductor <subcommand>` dispatch. */
 export async function conductorCommand(
   argv: readonly string[],
@@ -1220,6 +1326,9 @@ export async function conductorCommand(
   }
   if (subcommand === 'reap') {
     return await reapCommand(argv.slice(1), io, runtime, options);
+  }
+  if (subcommand === 'schedule') {
+    return await scheduleCommand(argv.slice(1), io, runtime, options);
   }
   const parsed = readControlOptions(argv.slice(1), io);
   if (parsed === null) {

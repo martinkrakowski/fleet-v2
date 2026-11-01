@@ -288,4 +288,25 @@ describe('conductorPassTraceOf', () => {
       reason: 'malformed',
     });
   });
+
+  it('refuses limits that carry extra fields and stamps schemaVersion 1 on the record', () => {
+    const base = {
+      passId: 'pass-1',
+      nowIso: NOW,
+      holderId: 'driver-x',
+      halted: false,
+      progressed: true,
+      runs: [],
+      attention: [],
+    } as ConductorPassTraceInput;
+    expect(conductorPassTraceOf(base, { ...LIMITS, schemaVersion: 2 } as never)).toEqual({
+      ok: false,
+      reason: 'malformed',
+    });
+    const read = conductorPassTraceOf(base, LIMITS);
+    expect(read.ok).toBe(true);
+    if (read.ok) {
+      expect(read.record.schemaVersion).toBe(1);
+    }
+  });
 });

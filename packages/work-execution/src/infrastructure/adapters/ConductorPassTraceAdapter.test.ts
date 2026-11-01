@@ -153,6 +153,14 @@ describe('ConductorPassTraceAdapter', () => {
       outcome: 'not-recorded',
       reason: 'write-failed',
     });
+    await expect(colliding.list()).resolves.toMatchObject({ outcome: 'unreadable', reason: 'store-unreadable' });
+
+    const unsafe = new ConductorPassTraceAdapter({ stateDir: makeTempDir(), limits: LIMITS, fileName: '../x.json' });
+    await expect(unsafe.append(trace(1))).resolves.toMatchObject({
+      outcome: 'not-recorded',
+      reason: 'write-failed',
+    });
+    await expect(unsafe.list()).resolves.toMatchObject({ outcome: 'unreadable', reason: 'store-unreadable' });
   });
 
   it('g: a held lock times out with write-failed and creates no data file', async () => {
@@ -190,6 +198,24 @@ describe('ConductorPassTraceAdapter', () => {
     };
     expect(await adapter.append(bad)).toEqual({ outcome: 'not-recorded', reason: 'invalid-trace' });
     expect(await fs.readdir(tempDir)).toEqual([]);
+  });
+
+  it('m: a limits object carrying schemaVersion fails as invalid-trace and a valid one stamps version 1', async () => {
+    const tempDir = makeTempDir();
+    const hijacked = new ConductorPassTraceAdapter({
+      stateDir: tempDir,
+      limits: { ...LIMITS, schemaVersion: 2 } as never,
+    });
+    expect(await hijacked.append(trace(1))).toEqual({ outcome: 'not-recorded', reason: 'invalid-trace' });
+    expect(await fs.readdir(tempDir)).toEqual([]);
+
+    const adapter = new ConductorPassTraceAdapter({ stateDir: tempDir, limits: LIMITS });
+    expect(await adapter.append(trace(1))).toEqual({ outcome: 'recorded', passId: 'pass-1' });
+    const listed = await adapter.list();
+    expect(listed.outcome).toBe('listed');
+    if (listed.outcome === 'listed') {
+      expect(listed.traces[0]!.schemaVersion).toBe(1);
+    }
   });
 
   it('j: the in-memory ring bounds at 32 without a stateDir', async () => {

@@ -83,11 +83,11 @@ export class ConductorPassTraceAdapter implements ConductorPassTracePort {
   constructor(private readonly options: ConductorPassTraceAdapterOptions = {}) {}
 
   async list(): Promise<ConductorPassTraceListResult> {
-    const target = this.statePath;
-    if (target === null) {
-      return { outcome: 'listed', traces: this.inMemoryRing.map(copyTrace) };
-    }
     try {
+      const target = this.statePath;
+      if (target === null) {
+        return { outcome: 'listed', traces: this.inMemoryRing.map(copyTrace) };
+      }
       const ring = await this.readRing(target);
       return ring.ok
         ? { outcome: 'listed', traces: ring.traces }
@@ -109,7 +109,7 @@ export class ConductorPassTraceAdapter implements ConductorPassTracePort {
       if (!built.ok) {
         return {
           outcome: 'not-recorded',
-          reason: built.reason === 'unknown-schema-version' ? 'unknown-schema-version' : 'invalid-trace',
+          reason: 'invalid-trace',
         };
       }
       const target = this.statePath;

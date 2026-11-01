@@ -297,6 +297,21 @@ export interface ConductorPassTraceLimits {
   readonly dispatchStaggerMs: number;
 }
 
+const LIMIT_KEYS = ['maxActiveRuns', 'passConcurrency', 'dispatchStaggerMs'] as const;
+
+/** The limits must carry exactly the three honoured numbers, nothing else. */
+function isExactLimits(limits: ConductorPassTraceLimits): boolean {
+  if (!isPlainRecord(limits)) {
+    return false;
+  }
+  const keys = Object.keys(limits);
+  return (
+    keys.length === LIMIT_KEYS.length &&
+    keys.every((key) => (LIMIT_KEYS as readonly string[]).includes(key)) &&
+    LIMIT_KEYS.every((key) => typeof limits[key] === 'number' && Number.isFinite(limits[key]))
+  );
+}
+
 /** Structural: a RunConductorPassResult's completed fields fit it without importing application types. */
 export interface ConductorPassTraceInput {
   readonly passId: string;
@@ -317,6 +332,9 @@ export function conductorPassTraceOf(
   input: ConductorPassTraceInput,
   limits: ConductorPassTraceLimits,
 ): ConductorPassTraceRead {
+  if (!isExactLimits(limits)) {
+    return malformed();
+  }
   try {
     const runs = input.runs.map((run) => {
       if (run.outcome === 'advanced') {
@@ -331,7 +349,6 @@ export function conductorPassTraceOf(
       return { runId: run.runId, report: { outcome: run.outcome, reason: run.reason } };
     });
     return readConductorPassTrace({
-      schemaVersion: CONDUCTOR_PASS_TRACE_SCHEMA_VERSION,
       passId: input.passId,
       nowIso: input.nowIso,
       holderId: input.holderId,
@@ -340,6 +357,7 @@ export function conductorPassTraceOf(
       ...limits,
       runs,
       attention: input.attention,
+      schemaVersion: CONDUCTOR_PASS_TRACE_SCHEMA_VERSION,
     });
   } catch {
     return { ok: false, reason: 'malformed' };

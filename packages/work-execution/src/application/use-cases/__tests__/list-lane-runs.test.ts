@@ -20,11 +20,14 @@ import type {
 } from '../../../domain/execution-records.js';
 import type { ConductorDriverLeasePort } from '../../ports/out/ConductorDriverLeasePort.out-port.js';
 import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-port.js';
+import type { ConductorPassTracePort } from '../../ports/out/ConductorPassTracePort.out-port.js';
 import type { ExecutionJournalPort } from '../../ports/out/ExecutionJournalPort.out-port.js';
 import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../../ports/out/LaneRunRepositoryPort.out-port.js';
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../../ports/out/WorkOrderRepositoryPort.out-port.js';
+import { conductorPassTraceOf } from '../../../domain/conductor-pass-trace.js';
+import type { ConductorPassTraceRecord } from '../../../domain/conductor-pass-trace.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
 import { ConductorDriverLeaseAdapter } from '../../../infrastructure/adapters/ConductorDriverLeaseAdapter.adapter.js';
 import { ConductorHaltAdapter } from '../../../infrastructure/adapters/ConductorHaltAdapter.adapter.js';
@@ -102,7 +105,7 @@ const RESERVATION: CapacityReservationRecord = {
   releasedAtIso: null,
 };
 
-function makeHarness() {
+function makeHarness(passTrace?: Pick<ConductorPassTracePort, 'list'>) {
   const laneRunRepository = new LaneRunRepositoryAdapter();
   const laneRunJournal = new LaneRunJournalAdapter();
   const halt = new ConductorHaltAdapter();
@@ -118,8 +121,30 @@ function makeHarness() {
     attemptRepo,
     executionJournal,
     workOrderRepo,
+    ...(passTrace === undefined ? {} : { passTrace }),
   });
   return { laneRunRepository, laneRunJournal, halt, driverLease, attemptRepo, executionJournal, workOrderRepo, useCase };
+}
+
+/** A valid pass-trace record with the given cap, for the schedule cap reads. */
+function traceWithCap(maxActiveRuns: number): ConductorPassTraceRecord {
+  const read = conductorPassTraceOf(
+    {
+      passId: 'pass-1',
+      nowIso: NOW,
+      holderId: 'driver-secret-1',
+      halted: false,
+      progressed: true,
+      runs: [],
+      attention: [],
+    },
+    { maxActiveRuns, passConcurrency: 1, dispatchStaggerMs: 20000 },
+  );
+  expect(read.ok).toBe(true);
+  if (!read.ok) {
+    throw new Error('fixture must be a valid trace');
+  }
+  return read.record;
 }
 
 describe('ListLaneRunsUseCase (VZ2)', () => {
@@ -280,5 +305,52 @@ describe('ListLaneRunsUseCase (VZ2)', () => {
     expect(result.outcome).toBe('listed');
     expect(listForRunsCalls).toBe(1);
     expect(listForRunCalls).toBe(0);
+  });
+});
+
+describe('ListLaneRunsUseCase (VZ5b pass traces)', () => {
+  it('reads the newest pass trace cap into caps and admission', async () => {
+    const h = makeHarness({
+      list: async () => ({
+        outcome: 'listed',
+        traces: [traceWithCap(1), traceWithCap(3)],
+      }),
+    });
+    await h.laneRunRepository.create(runRecord());
+    const result = await h.useCase.listLaneRuns({ nowIso: NOW });
+    expect(result.outcome).toBe('listed');
+    if (result.outcome !== 'listed') {
+      return;
+    }
+    expect(result.schedule.trace).toBe('recorded');
+    expect(result.schedule.caps?.maxActiveRuns).toBe(3);
+    expect(result.schedule.admission.maxActiveRuns).toBe(3);
+  });
+
+  it('reports an unreadable unknown-version trace without caps', async () => {
+    const h = makeHarness({
+      list: async () => ({ outcome: 'unreadable', reason: 'unknown-schema-version' }),
+    });
+    await h.laneRunRepository.create(runRecord());
+    const result = await h.useCase.listLaneRuns({ nowIso: NOW });
+    expect(result.outcome).toBe('listed');
+    if (result.outcome !== 'listed') {
+      return;
+    }
+    expect(result.schedule.trace).toBe('unreadable');
+    expect(result.schedule.caps).toBeNull();
+    expect(result.schedule.admission.maxActiveRuns).toBeNull();
+  });
+
+  it('keeps trace none when no passTrace dependency is given', async () => {
+    const h = makeHarness();
+    await h.laneRunRepository.create(runRecord());
+    const result = await h.useCase.listLaneRuns({ nowIso: NOW });
+    expect(result.outcome).toBe('listed');
+    if (result.outcome !== 'listed') {
+      return;
+    }
+    expect(result.schedule.trace).toBe('none');
+    expect(result.schedule.caps).toBeNull();
   });
 });

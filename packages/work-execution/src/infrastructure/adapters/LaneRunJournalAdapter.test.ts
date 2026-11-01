@@ -10,6 +10,7 @@ import type {
 } from '../../domain/lane-run-journal.js';
 import {
   buildLaneRunStepKey,
+  laneRunPremergeKey,
   laneRunStopForceKey,
   laneRunStopKey,
 } from '../../domain/lane-run-keys.js';
@@ -34,6 +35,13 @@ function nextUlid(): string {
 const RUN_ID = `run-${nextUlid()}`;
 
 function stepKeyFor(step: LaneRunKeyStep): string {
+  if (step === 'premerge') {
+    const built = laneRunPremergeKey(RUN_ID, 0, '0123456789ab');
+    if (!built.ok) {
+      throw new Error(built.error);
+    }
+    return built.key;
+  }
   const parts: LaneRunStepKeyParts = {
     runId: RUN_ID,
     round: 0,

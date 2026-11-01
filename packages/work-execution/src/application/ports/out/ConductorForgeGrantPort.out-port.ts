@@ -1,7 +1,7 @@
 // @generated outbound contract scaffold — refined for K6-2.
 /**
- * ConductorForgeGrantPort: issue one push-and-open-pr or push-to-pr policy
- * grant for an accepted attempt at an exact head under
+ * ConductorForgeGrantPort: issue one push-and-open-pr, push-to-pr or
+ * post-status policy grant for an accepted attempt at an exact head under
  * `policy:conductor@<revision>` (AM3a); it never decides eligibility and
  * never issues a merge grant (those belong to `policy:autoMerge@<rev>`,
  * AM4a).
@@ -11,8 +11,8 @@ export interface ConductorForgeGrantRequest {
   readonly projectId: string;
   readonly workOrderId: string;
   readonly attemptId: string;
-  /** Only the two push kinds are conductor grants; `merge-pr` is never one. */
-  readonly forgeKind: 'push-and-open-pr' | 'push-to-pr';
+  /** The conductor grant kinds; `merge-pr` is never one. */
+  readonly forgeKind: 'push-and-open-pr' | 'push-to-pr' | 'post-status';
   readonly expectedHeadSha: string;
   /** The work order's own policy revision (A3), unrelated to the conductor setting revision. */
   readonly policyRevision: string;

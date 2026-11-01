@@ -470,6 +470,73 @@ describe('owner gate and merge (rows 15 and 17)', () => {
   });
 });
 
+describe('stays parked (row 15, fix 1)', () => {
+  const attended = makePolicy({ unattended: false, shadow: false });
+
+  it('reports owner-merge for a parked checks entry that is green and attended', () => {
+    const entry = makeReadyEntry({ state: 'parked', reason: 'checks' });
+    expectPark(decideMergeStep(entry, makeOpenFacts(), attended, NOW), 'owner-merge');
+  });
+
+  it('reports owner-merge for a parked entry with a stale checks reason', () => {
+    const entry = makeReadyEntry({ state: 'parked', reason: 'checks' });
+    expectPark(decideMergeStep(entry, makeOpenFacts(), attended, NOW), 'owner-merge');
+  });
+
+  it('reports veto-hold for a parked entry under a park-hold verdict', () => {
+    const policy = makePolicy({ unattended: false, shadow: false, veto: { mode: 'live' } });
+    const veto = { outcome: 'hold-for-human', confidence: 0.8, mode: 'live', decisionReceiptId: null };
+    const entry = makeReadyEntry({ state: 'parked', reason: 'checks' });
+    expectPark(decideMergeStep(entry, makeOpenFacts({ veto }), policy, NOW), 'veto-hold');
+  });
+
+  // A parked record without a park reason is refused by the record layer
+  // (merge-queue-records coupling check), so the decider never sees one; it
+  // fails closed instead of re-emitting `reason: null` as a park reason.
+  it('fails closed on a parked record whose reason is null', () => {
+    const entry = makeReadyEntry({ state: 'parked', reason: null });
+    expectWait(decideMergeStep(entry, makeOpenFacts(), attended, NOW), 'facts-inconsistent');
+  });
+});
+
+describe('unknown status tokens (fix 2)', () => {
+  it('decides halted for a halted entry with a bogus pr status', () => {
+    const facts = makeOpenFacts({ halted: true, pr: { status: 'bogus' } });
+    expectWait(decideMergeStep(makeEntry(), facts, makePolicy(), NOW), 'halted');
+  });
+
+  it('decides terminal for a dropped entry with a bogus pr status', () => {
+    const entry = makeEntry({ state: 'dropped', reason: 'operator-dropped' });
+    const facts = makeOpenFacts({ pr: { status: 'bogus' } });
+    expectWait(decideMergeStep(entry, facts, makePolicy(), NOW), 'terminal');
+  });
+
+  it('never acts on a live entry with a bogus pr status', () => {
+    const decision = decideMergeStep(makeEntry(), makeOpenFacts({ pr: { status: 'bogus' } }), makePolicy(), NOW);
+    expect(decision.kind).not.toBe('act');
+    expect(decision.kind === 'wait' || decision.kind === 'park').toBe(true);
+  });
+
+  it('waits facts-inconsistent on a bogus premergeCarry status on a deferred update entry', () => {
+    const entry = updateEntry({ state: 'ready', verifiedHeadOid: HEAD, verifiedBy: 'contexts', policyRevision: 'rev-1' });
+    const facts = makeOpenFacts({
+      contexts: { gate: { state: 'success' }, premerge: { state: 'missing' } },
+      premergeCarry: { status: 'bogus' },
+    });
+    const decision = decideMergeStep(entry, facts, makePolicy(), NOW);
+    expect(decision.kind).not.toBe('act');
+    expect(decision.kind === 'wait' || decision.kind === 'park').toBe(true);
+  });
+
+  it('waits facts-inconsistent on a bogus macosVerification status under a procedure', () => {
+    const policy = makePolicy({ macosProcedure: PROCEDURE });
+    const entry = makeReadyEntry({}, 'procedure');
+    const decision = decideMergeStep(entry, makeOpenFacts({ macosVerification: { status: 'bogus' } }), policy, NOW);
+    expect(decision.kind).not.toBe('act');
+    expect(decision.kind === 'wait' || decision.kind === 'park').toBe(true);
+  });
+});
+
 describe('merge-pr (row 17)', () => {
   it('acts merge-pr live at the verified head', () => {
     const decision = decideMergeStep(makeReadyEntry(), makeOpenFacts(), makePolicy(), NOW);

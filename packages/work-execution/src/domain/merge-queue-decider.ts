@@ -466,18 +466,8 @@ function validateFacts(raw: unknown): Read<MergeStepFacts> {
     ) {
       return { ok: false };
     }
-    if (!isKnownStatus(raw.pr.status, ['open', 'merged', 'closed', 'forge-error', 'unknown'])) {
-      return { ok: false };
-    }
-    if (!isKnownStatus(raw.unresolvedThreads.status, ['known', 'forge-error', 'unknown'])) {
-      return { ok: false };
-    }
-    if (!isKnownStatus(raw.premergeCarry.status, ['eligible', 'ineligible', 'unknown'])) {
-      return { ok: false };
-    }
-    if (!isKnownStatus(raw.macosVerification.status, ['none', 'passed', 'failed', 'unknown'])) {
-      return { ok: false };
-    }
+    // Status tokens are not shape: an unknown token reaches its row, which
+    // treats it as unknown and never acts.
     const updates = raw.updatesInLastHour;
     const updatesOk =
       updates === 'unknown' ||
@@ -597,6 +587,41 @@ function forgeDecision(
   );
 }
 
+/** One read-path forge-error fact, parked with backoff or dropped at the cap. */
+function forgeErrorPark(
+  entry: MergeQueueEntryRecord,
+  policy: NormalizedMergeRepoPolicy,
+  nowIso: string,
+  code: unknown,
+): MergeStepDecision {
+  return isForgeErrorCode(code)
+    ? parkOrDrop(entry, policy, nowIso, 'forge-error', 'forge-error-exhausted', code)
+    : FACTS_INCONSISTENT;
+}
+
+/** The first read-path forge error: the PR read, then contexts, then threads. */
+function readPathForgeStep(
+  entry: MergeQueueEntryRecord,
+  facts: MergeStepFacts,
+  policy: NormalizedMergeRepoPolicy,
+  nowIso: string,
+): MergeStepDecision | null {
+  const pr = facts.pr;
+  if (pr.status === 'forge-error') {
+    return forgeErrorPark(entry, policy, nowIso, pr.code);
+  }
+  const contexts = facts.contexts;
+  const container = contexts !== 'unknown' && isPlainObject(contexts) ? (contexts as Record<string, unknown>) : null;
+  if (container !== null && container.status === 'forge-error') {
+    return forgeErrorPark(entry, policy, nowIso, container.code);
+  }
+  const threads = facts.unresolvedThreads;
+  if (threads.status === 'forge-error') {
+    return forgeErrorPark(entry, policy, nowIso, threads.code);
+  }
+  return null;
+}
+
 /** Rows 6 and 7: the recorded outcome first, then the first read-path forge error. */
 function forgeOutcomeStep(
   entry: MergeQueueEntryRecord,
@@ -609,26 +634,7 @@ function forgeOutcomeStep(
     const signal = readForgeSignal(recorded);
     return signal === null ? FACTS_INCONSISTENT : forgeDecision(entry, policy, nowIso, signal);
   }
-  const pr = facts.pr;
-  if (pr.status === 'forge-error') {
-    return isForgeErrorCode(pr.code)
-      ? parkOrDrop(entry, policy, nowIso, 'forge-error', 'forge-error-exhausted', pr.code)
-      : FACTS_INCONSISTENT;
-  }
-  const contexts = facts.contexts;
-  const container = contexts !== 'unknown' && isPlainObject(contexts) ? (contexts as Record<string, unknown>) : null;
-  if (container !== null && container.status === 'forge-error') {
-    return isForgeErrorCode(container.code)
-      ? parkOrDrop(entry, policy, nowIso, 'forge-error', 'forge-error-exhausted', container.code)
-      : FACTS_INCONSISTENT;
-  }
-  const threads = facts.unresolvedThreads;
-  if (threads.status === 'forge-error') {
-    return isForgeErrorCode(threads.code)
-      ? parkOrDrop(entry, policy, nowIso, 'forge-error', 'forge-error-exhausted', threads.code)
-      : FACTS_INCONSISTENT;
-  }
-  return null;
+  return readPathForgeStep(entry, facts, policy, nowIso);
 }
 
 /** Row 8: terminal PR facts stop before the update row. */
@@ -842,7 +848,8 @@ function readyRow(
   }
   if (entry.state === 'parked') {
     if (staysParked(entry, policy, verdict)) {
-      return parkNoBackoff(entry, entry.reason as MergeParkReason, null);
+      // The reason it stays parked, not the stale reason it was parked for.
+      return parkNoBackoff(entry, verdict === 'park-hold' ? 'veto-hold' : 'owner-merge', null);
     }
     return enterReady(entry.verifiedHeadOid as string, entry.verifiedBy as MergeVerifiedBy, entry.policyRevision as string);
   }

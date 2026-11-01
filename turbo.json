@@ -30,7 +30,7 @@
     },
     "test": {
       "dependsOn": ["^build"],
-      "env": ["OCM_IT_REQUIRE", "OCM_IT_SCRIPT", "NEXT_PUBLIC_FLEET_API_URL", "FLEET_E2E_SSH"],
+      "env": ["OCM_IT_REQUIRE", "OCM_IT_SCRIPT", "NEXT_PUBLIC_FLEET_API_URL", "FLEET_E2E_SSH", "FLEET_RECORD_FIXTURES"],
       "inputs": [
         "$TURBO_DEFAULT$",
         "$TURBO_ROOT$/bin/ocm-run",

@@ -48,8 +48,11 @@ import type {
   ConductorDriverLeaseResult,
 } from '../../application/ports/out/ConductorDriverLeasePort.out-port.js';
 import {
+  StateFileUnreadableError,
+  StateFileUnreadableReadOnlyError,
+  assertStoreWritable,
   inspectRecordListBytes,
-  quarantineUnreadable,
+  rejectUnreadableStateFile,
   withFileLock,
   writeJsonAtomically,
 } from './file-store.js';
@@ -58,6 +61,8 @@ export interface ConductorDriverLeaseAdapterOptions {
   /** When set, the lease persists here and reloads on first use. */
   readonly stateDir?: string;
   readonly fileName?: string;
+  /** Read-only mode: an unreadable marker reads as `null` without quarantining or writing. */
+  readonly readOnly?: boolean;
 }
 
 const DEFAULT_FILE_NAME = 'conductor-driver-lease.json';
@@ -128,8 +133,19 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
       const current = this.inMemoryLease;
       return current === null ? null : { ...current };
     }
-    const current = currentLeaseOf(await this.readRecordsFromDisk(target));
-    return current === null ? null : { ...current };
+    try {
+      const current = currentLeaseOf(await this.readRecordsFromDisk(target));
+      return current === null ? null : { ...current };
+    } catch (error: unknown) {
+      if (
+        this.options?.readOnly === true &&
+        (error instanceof StateFileUnreadableError ||
+          error instanceof StateFileUnreadableReadOnlyError)
+      ) {
+        return null;
+      }
+      throw error;
+    }
   }
 
   acquire(request: LeaseAcquireRequest): Promise<ConductorDriverLeaseResult> {
@@ -170,6 +186,7 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
   private async mutate(
     decide: (current: ConductorDriverLeaseRecord | null) => ConductorDriverLeaseResult,
   ): Promise<ConductorDriverLeaseResult> {
+    assertStoreWritable(this.options?.readOnly === true, 'ConductorDriverLeaseAdapter');
     const target = this.statePath;
     if (target === null) {
       const result = decide(this.inMemoryLease);
@@ -221,7 +238,7 @@ export class ConductorDriverLeaseAdapter implements ConductorDriverLeasePort {
     }
     const inspection = inspectRecordListBytes(buffer, parseConductorDriverLeaseStateRecord);
     if (inspection.status === 'unreadable') {
-      return quarantineUnreadable(target, inspection.detail, buffer);
+      return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
     }
     return inspection.records;
   }

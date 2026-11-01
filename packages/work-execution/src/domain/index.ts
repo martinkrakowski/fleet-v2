@@ -25,6 +25,7 @@ export * from "./lane-run-review-facts.js";
 export * from "./lane-run-step-facts.js";
 export * from "./lane-run-transitions.js";
 export * from "./plain-record-reads.js";
+export * from "./record-schema-version.js";
 export * from "./review-finding-scope.js";
 export * from "./run-telemetry.js";
 export * from "./run-telemetry-attributes.js";

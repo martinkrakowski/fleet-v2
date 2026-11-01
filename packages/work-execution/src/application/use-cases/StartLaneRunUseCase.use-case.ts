@@ -27,6 +27,7 @@
 
 import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
+import { resolveWorkOrderBaseBranch } from '../../domain/base-branch.js';
 import { laneRunJournalState } from '../../domain/lane-run-journal.js';
 import type { SeatHistoryEntry } from '../../domain/seat-selection.js';
 import { selectSeat, seatMatchesAssignment, seatSelectionRecord } from '../../domain/seat-selection.js';
@@ -442,6 +443,7 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         revision: 1,
         runPolicyRevision: request.runPolicyRevision,
         branchName: branchForRun(request.runId),
+        baseBranch: resolveWorkOrderBaseBranch(workOrder),
       });
     } catch {
       created = { outcome: 'refused', reason: 'run-exists' };

@@ -14,10 +14,10 @@ import { parseConductorPassTraceStateRecord } from '../../domain/conductor-pass-
 import { parseConductorHaltStateRecord } from './ConductorHaltAdapter.adapter.js';
 import { ConductorPassTraceAdapter } from './ConductorPassTraceAdapter.adapter.js';
 import { WORK_EXECUTION_STATE_FILES } from './state-files.js';
-import { WorkOrderRepositoryAdapter } from './WorkOrderRepositoryAdapter.adapter.js';
+import { WorkOrderRepositoryAdapter, parseWorkOrderStateRecord } from './WorkOrderRepositoryAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from './AttemptRepositoryAdapter.adapter.js';
 import { ExecutionJournalAdapter } from './ExecutionJournalAdapter.adapter.js';
-import { LaneRunRepositoryAdapter } from './LaneRunRepositoryAdapter.adapter.js';
+import { LaneRunRepositoryAdapter, parseLaneRunStateRecord } from './LaneRunRepositoryAdapter.adapter.js';
 import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
 import { ConductorHaltAdapter } from './ConductorHaltAdapter.adapter.js';
 import { LaneRunJournalAdapter } from './LaneRunJournalAdapter.adapter.js';
@@ -305,6 +305,33 @@ describe('work-execution state file descriptors match the store readers', () => 
       expect((outcome as StateFileUnreadableError).detail).toBe(inspection.detail);
     }
     expect(expectedOk).toBe(inspection.status === 'ok');
+  });
+
+  it('a valid baseBranch stays readable and an unparsable one fails validation (CB1)', () => {
+    // The work-order store parser accepts an absent key ({ id, revision })
+    // and a present valid value, and refuses a present unparsable one.
+    const workOrderInspect = (bytes: Buffer) => inspectRecordListBytes(bytes, parseWorkOrderStateRecord);
+    expect(workOrderInspect(Buffer.from(JSON.stringify([{ id: 'wo-1', revision: 1, baseBranch: 'chain/example' }]))).status).toBe('ok');
+    expect(workOrderInspect(Buffer.from(JSON.stringify([{ id: 'wo-1', revision: 1 }]))).status).toBe('ok');
+    const badWorkOrder = workOrderInspect(
+      Buffer.from(JSON.stringify([{ id: 'wo-1', revision: 1, baseBranch: 'release' }])),
+    );
+    expect(badWorkOrder.status).toBe('unreadable');
+    expect(badWorkOrder.status === 'unreadable' ? badWorkOrder.detail : '').toBe('record 0 failed validation');
+
+    // The lane-run store parser (LaneRun.create) refuses an unparsable
+    // baseBranch the same way; a valid one and the fixture without the key stay readable.
+    const laneRunInspect = (bytes: Buffer) => inspectRecordListBytes(bytes, parseLaneRunStateRecord);
+    const withBaseBranch = VALID_FIXTURES['lane-runs.json']!.map((record) => ({
+      ...(record as Record<string, unknown>),
+      baseBranch: 'main',
+    }));
+    expect(laneRunInspect(Buffer.from(JSON.stringify(withBaseBranch))).status).toBe('ok');
+    const unparsable = VALID_FIXTURES['lane-runs.json']!.map((record) => ({
+      ...(record as Record<string, unknown>),
+      baseBranch: 'release',
+    }));
+    expect(laneRunInspect(Buffer.from(JSON.stringify(unparsable))).status).toBe('unreadable');
   });
 
   it('lists exactly the owned state files', () => {

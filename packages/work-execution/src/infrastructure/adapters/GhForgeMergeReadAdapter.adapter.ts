@@ -20,6 +20,7 @@ import type {
   ForgeMergeReadPort,
   ForgeMergeState,
   ForgePrState,
+  MergeContextSnapshot,
   ReadForgeMergeRequest,
   ReadForgeMergeResult,
 } from '../../application/ports/out/ForgeMergeReadPort.out-port.js';
@@ -60,7 +61,6 @@ const MERGE_READ_QUERY = `
                 name
                 status
                 conclusion
-                creator { login }
               }
               ... on StatusContext {
                 context
@@ -131,6 +131,10 @@ function isPullRequestNotFound(gh: GhInvocationResult): boolean {
   return text.includes('could not resolve to a pullrequest');
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 /** Navigate a GraphQL page answer to the pullRequest object, or `undefined` when unusable. */
 function readPullRequest(stdout: string): Record<string, unknown> | undefined {
   let parsed: unknown;
@@ -139,18 +143,23 @@ function readPullRequest(stdout: string): Record<string, unknown> | undefined {
   } catch {
     return undefined;
   }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+  if (!isRecord(parsed)) {
     return undefined;
   }
-  const repository = (parsed as Record<string, unknown>).repository;
-  if (repository === null || typeof repository !== 'object' || Array.isArray(repository)) {
+  if (Array.isArray(parsed.errors) && parsed.errors.length > 0) {
     return undefined;
   }
-  const pullRequest = (repository as Record<string, unknown>).pullRequest;
-  if (pullRequest === null || typeof pullRequest !== 'object' || Array.isArray(pullRequest)) {
+  if (!isRecord(parsed.data)) {
     return undefined;
   }
-  return pullRequest as Record<string, unknown>;
+  if (!isRecord(parsed.data.repository)) {
+    return undefined;
+  }
+  const pullRequest = parsed.data.repository.pullRequest;
+  if (!isRecord(pullRequest)) {
+    return undefined;
+  }
+  return pullRequest;
 }
 
 interface PageInfo {
@@ -159,23 +168,36 @@ interface PageInfo {
 }
 
 function parsePageInfo(value: unknown): PageInfo | null {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+  if (!isRecord(value)) {
     return null;
   }
-  const record = value as Record<string, unknown>;
-  const hasNextPage = record.hasNextPage;
+  const hasNextPage = value.hasNextPage;
   if (typeof hasNextPage !== 'boolean') {
     return null;
   }
-  const endCursor = record.endCursor;
+  const endCursor = value.endCursor;
   if (endCursor !== null && endCursor !== undefined && typeof endCursor !== 'string') {
     return null;
   }
   return { hasNextPage, endCursor: typeof endCursor === 'string' ? endCursor : null };
 }
 
+function extractCreatorLogin(creator: unknown): string | null | undefined {
+  if (creator === null || creator === undefined) {
+    return null;
+  }
+  if (!isRecord(creator)) {
+    return undefined;
+  }
+  const login = creator.login;
+  if (login === null || login === undefined) {
+    return null;
+  }
+  return typeof login === 'string' ? login : undefined;
+}
+
 function normalizeContextNode(node: unknown): MergeContextNode | null {
-  if (node === null || typeof node !== 'object' || Array.isArray(node)) {
+  if (!isRecord(node)) {
     return null;
   }
   const record = node as Record<string, unknown>;
@@ -197,16 +219,9 @@ function normalizeContextNode(node: unknown): MergeContextNode | null {
   if (typeof name !== 'string' || name.length === 0 || typeof state !== 'string' || state.length === 0) {
     return null;
   }
-  let creatorLogin: string | null = null;
-  if (creator !== null && creator !== undefined) {
-    if (typeof creator !== 'object' || Array.isArray(creator)) {
-      return null;
-    }
-    const login = (creator as Record<string, unknown>).login;
-    if (login !== null && login !== undefined && typeof login !== 'string') {
-      return null;
-    }
-    creatorLogin = typeof login === 'string' ? login : null;
+  const creatorLogin = extractCreatorLogin(creator);
+  if (creatorLogin === undefined) {
+    return null;
   }
   return { name, state, creatorLogin };
 }
@@ -218,19 +233,22 @@ export function parseMergeContextsPage(stdout: string): MergeContextsPageResult 
     return { kind: 'unreadable' };
   }
   const rollup = pullRequest.statusCheckRollup;
-  if (rollup !== null && (typeof rollup !== 'object' || Array.isArray(rollup))) {
+  if (rollup !== null && !isRecord(rollup)) {
     return { kind: 'unreadable' };
   }
   const contexts = rollup === null ? null : (rollup as Record<string, unknown>).contexts;
   if (contexts === null) {
     return { kind: 'page', nodes: [], hasNextPage: false, endCursor: null };
   }
-  if (typeof contexts !== 'object' || Array.isArray(contexts)) {
+  if (!isRecord(contexts)) {
     return { kind: 'unreadable' };
   }
   const pageInfo = parsePageInfo((contexts as Record<string, unknown>).pageInfo);
   if (pageInfo === null) {
     return { kind: 'unreadable' };
+  }
+  if (pageInfo.hasNextPage && pageInfo.endCursor === null) {
+    return { kind: 'unknown', reason: 'pageInfo hasNextPage is true but endCursor is null' };
   }
   const rawNodes = (contexts as Record<string, unknown>).nodes;
   if (!Array.isArray(rawNodes)) {
@@ -257,12 +275,15 @@ export function parseReviewThreadsPage(stdout: string): MergeThreadsPageResult {
   if (threads === null) {
     return { kind: 'page', unresolved: 0, hasNextPage: false, endCursor: null };
   }
-  if (typeof threads !== 'object' || Array.isArray(threads)) {
+  if (!isRecord(threads)) {
     return { kind: 'unreadable' };
   }
   const pageInfo = parsePageInfo((threads as Record<string, unknown>).pageInfo);
   if (pageInfo === null) {
     return { kind: 'unreadable' };
+  }
+  if (pageInfo.hasNextPage && pageInfo.endCursor === null) {
+    return { kind: 'unknown', reason: 'pageInfo hasNextPage is true but endCursor is null' };
   }
   const rawNodes = (threads as Record<string, unknown>).nodes;
   if (!Array.isArray(rawNodes)) {
@@ -270,7 +291,7 @@ export function parseReviewThreadsPage(stdout: string): MergeThreadsPageResult {
   }
   let unresolved = 0;
   for (const raw of rawNodes) {
-    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    if (!isRecord(raw)) {
       return { kind: 'unknown', reason: 'a review thread node is malformed' };
     }
     const isResolved = (raw as Record<string, unknown>).isResolved;
@@ -325,6 +346,85 @@ function guardRequest(
   return null;
 }
 
+interface ContextsPaginationState {
+  hasNext: boolean;
+  cursor: string | null;
+}
+
+interface ThreadsPaginationState {
+  unresolved: number;
+  hasNext: boolean;
+  cursor: string | null;
+  unknown: boolean;
+}
+
+function applyContextsPage(
+  state: ContextsPaginationState,
+  contextsByName: Map<string, MergeContextNode>,
+  page: MergeContextsPageResult & { kind: 'page' },
+): void {
+  if (!state.hasNext) {
+    return;
+  }
+  for (const node of page.nodes) {
+    contextsByName.set(node.name, node);
+  }
+  state.hasNext = page.hasNextPage;
+  state.cursor = page.hasNextPage ? page.endCursor : null;
+}
+
+function applyThreadsPage(
+  state: ThreadsPaginationState,
+  page: MergeThreadsPageResult,
+): void {
+  if (!state.hasNext) {
+    return;
+  }
+  if (page.kind !== 'page') {
+    state.unknown = true;
+    state.hasNext = false;
+    state.cursor = null;
+    return;
+  }
+  state.unresolved += page.unresolved;
+  state.hasNext = page.hasNextPage;
+  state.cursor = page.hasNextPage ? page.endCursor : null;
+}
+
+function buildContextSnapshots(
+  requiredContexts: readonly string[],
+  contextsByName: ReadonlyMap<string, MergeContextNode>,
+  posterLogin?: string,
+): MergeContextSnapshot[] {
+  return requiredContexts.map((name) => {
+    const node = contextsByName.get(name);
+    if (node === undefined) {
+      return { name, state: 'missing', isGreen: false, creatorLogin: null };
+    }
+    const isGreen =
+      node.state === 'SUCCESS' &&
+      (name !== 'premerge' || (node.creatorLogin !== null && node.creatorLogin === posterLogin));
+    return { name, state: node.state, isGreen, creatorLogin: node.creatorLogin };
+  });
+}
+
+type RunPageResult =
+  | {
+      kind: 'page';
+      meta: MergePrMetaPayload;
+      contexts: MergeContextsPageResult & { kind: 'page' };
+      threads: MergeThreadsPageResult;
+    }
+  | { kind: 'not-found' }
+  | { kind: 'unavailable'; code: 'forge-error' | 'unreadable' | 'unknown'; reason: string };
+
+function mapFetchFailure(fetched: Exclude<RunPageResult, { kind: 'page' }>): ReadForgeMergeResult {
+  if (fetched.kind === 'not-found') {
+    return { outcome: 'not-found' };
+  }
+  return { outcome: 'unavailable', code: fetched.code, reason: fetched.reason };
+}
+
 export class GhForgeMergeReadAdapter implements ForgeMergeReadPort {
   private readonly runGh?: (args: readonly string[]) => Promise<GhInvocationResult>;
   private readonly timeoutMs: number;
@@ -340,75 +440,64 @@ export class GhForgeMergeReadAdapter implements ForgeMergeReadPort {
     return this.runGh !== undefined;
   }
 
+  private checkBudget(
+    deadlineIso: string,
+  ): { ok: true; timerMs: number } | { ok: false; result: ReadForgeMergeResult } {
+    const budget = this.budget(deadlineIso);
+    if (budget === null) {
+      return {
+        ok: false,
+        result: { outcome: 'unavailable', code: 'unknown', reason: 'deadline is not a valid ISO time' },
+      };
+    }
+    if (budget.remainingToDeadline < BUDGET_MIN_REMAINING_MS) {
+      return { ok: false, result: { outcome: 'budget-exhausted' } };
+    }
+    return { ok: true, timerMs: budget.timerMs };
+  }
+
   async readForgeMerge(request: ReadForgeMergeRequest): Promise<ReadForgeMergeResult> {
     const guardReason = guardRequest(request, this.runGh);
     if (guardReason !== null) {
       return { outcome: 'unavailable', code: 'forge-error', reason: guardReason };
     }
 
-    const requiredContexts = request.requiredContexts;
     const contextsByName = new Map<string, MergeContextNode>();
-    let contextsHasNext = true;
-    let contextsCursor: string | null = null;
-    let threadsUnresolved = 0;
-    let threadsHasNext = true;
-    let threadsCursor: string | null = null;
-    let threadsUnknown = false;
+    const contexts: ContextsPaginationState = { hasNext: true, cursor: null };
+    const threads: ThreadsPaginationState = { unresolved: 0, hasNext: true, cursor: null, unknown: false };
     let meta: MergePrMetaPayload | null = null;
 
-    while (contextsHasNext || threadsHasNext) {
-      const budget = this.budget(request.deadlineIso);
-      if (budget === null) {
-        return { outcome: 'unavailable', code: 'unknown', reason: 'deadline is not a valid ISO time' };
+    while (contexts.hasNext || threads.hasNext) {
+      const budgetCheck = this.checkBudget(request.deadlineIso);
+      if (!budgetCheck.ok) {
+        return budgetCheck.result;
       }
-      if (budget.remainingToDeadline < BUDGET_MIN_REMAINING_MS) {
-        return { outcome: 'budget-exhausted' };
-      }
-      const fetched = await this.runPage(request, contextsCursor, threadsCursor, budget.timerMs);
+      const fetched = await this.runPage(request, contexts.cursor, threads.cursor, budgetCheck.timerMs);
       if (fetched.kind !== 'page') {
-        return fetched.kind === 'not-found'
-          ? { outcome: 'not-found' }
-          : { outcome: 'unavailable', code: fetched.code, reason: fetched.reason };
+        return mapFetchFailure(fetched);
       }
       if (meta === null) {
         meta = fetched.meta;
+      } else if (fetched.meta.liveHeadSha !== meta.liveHeadSha) {
+        return { outcome: 'unavailable', code: 'unknown', reason: 'the head oid changed between pages' };
       }
-      for (const node of fetched.contexts.nodes) {
-        contextsByName.set(node.name, node);
-      }
-      contextsHasNext = fetched.contexts.hasNextPage;
-      contextsCursor = fetched.contexts.hasNextPage ? fetched.contexts.endCursor : null;
-      if (fetched.threads.kind === 'page') {
-        threadsUnresolved += fetched.threads.unresolved;
-        threadsHasNext = fetched.threads.hasNextPage;
-        threadsCursor = fetched.threads.hasNextPage ? fetched.threads.endCursor : null;
-      } else {
-        threadsUnknown = true;
-        threadsHasNext = false;
-      }
+      applyContextsPage(contexts, contextsByName, fetched.contexts);
+      applyThreadsPage(threads, fetched.threads);
     }
 
     if (meta === null) {
       return { outcome: 'unavailable', code: 'unknown', reason: 'no forge page was read' };
     }
 
-    const contexts = requiredContexts.map((name) => {
-      const node = contextsByName.get(name);
-      if (node === undefined) {
-        return { name, state: 'missing', isGreen: false, creatorLogin: null };
-      }
-      const isGreen =
-        node.state === 'SUCCESS' && (name !== 'premerge' || node.creatorLogin === request.posterLogin);
-      return { name, state: node.state, isGreen, creatorLogin: node.creatorLogin };
-    });
+    const resolvedContexts = buildContextSnapshots(request.requiredContexts, contextsByName, request.posterLogin);
 
     return {
       outcome: 'ok',
       prState: meta.prState,
       liveHeadSha: meta.liveHeadSha,
       mergeState: meta.mergeState,
-      contexts,
-      unresolvedThreads: threadsUnknown ? 'unknown' : threadsUnresolved,
+      contexts: resolvedContexts,
+      unresolvedThreads: threads.unknown ? 'unknown' : threads.unresolved,
     };
   }
 
@@ -417,16 +506,7 @@ export class GhForgeMergeReadAdapter implements ForgeMergeReadPort {
     contextsCursor: string | null,
     threadsCursor: string | null,
     remaining: number,
-  ): Promise<
-    | {
-        kind: 'page';
-        meta: MergePrMetaPayload;
-        contexts: MergeContextsPageResult & { kind: 'page' };
-        threads: MergeThreadsPageResult;
-      }
-    | { kind: 'not-found' }
-    | { kind: 'unavailable'; code: 'forge-error' | 'unreadable' | 'unknown'; reason: string }
-  > {
+  ): Promise<RunPageResult> {
     const args = this.graphqlArgs(request, contextsCursor, threadsCursor);
     const raced = await this.runGhWithinTimeout(args, remaining);
     if (raced.kind === 'failed') {

@@ -39,26 +39,28 @@ interface PageOverrides {
 
 function page(overrides: PageOverrides = {}): string {
   return JSON.stringify({
-    repository: {
-      pullRequest: {
-        state: overrides.state ?? 'OPEN',
-        headRefOid: overrides.headRefOid ?? VALID_SHA,
-        mergeStateStatus: 'mergeStateStatus' in overrides ? overrides.mergeStateStatus : 'CLEAN',
-        statusCheckRollup: {
-          contexts: {
-            pageInfo: {
-              hasNextPage: overrides.contextsHasNextPage ?? false,
-              endCursor: overrides.contextsEndCursor ?? null,
+    data: {
+      repository: {
+        pullRequest: {
+          state: overrides.state ?? 'OPEN',
+          headRefOid: overrides.headRefOid ?? VALID_SHA,
+          mergeStateStatus: 'mergeStateStatus' in overrides ? overrides.mergeStateStatus : 'CLEAN',
+          statusCheckRollup: {
+            contexts: {
+              pageInfo: {
+                hasNextPage: overrides.contextsHasNextPage ?? false,
+                endCursor: overrides.contextsEndCursor ?? null,
+              },
+              nodes: overrides.contextsNodes ?? [],
             },
-            nodes: overrides.contextsNodes ?? [],
           },
-        },
-        reviewThreads: {
-          pageInfo: {
-            hasNextPage: overrides.threadsHasNextPage ?? false,
-            endCursor: overrides.threadsEndCursor ?? null,
+          reviewThreads: {
+            pageInfo: {
+              hasNextPage: overrides.threadsHasNextPage ?? false,
+              endCursor: overrides.threadsEndCursor ?? null,
+            },
+            nodes: overrides.threadsNodes ?? [],
           },
-          nodes: overrides.threadsNodes ?? [],
         },
       },
     },
@@ -136,6 +138,7 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
     expect(queryArg).toContain('statusCheckRollup');
     expect(queryArg).toContain('reviewThreads');
     expect(queryArg).toContain('creator { login }');
+    expect(queryArg).not.toMatch(/\.\.\.\s*on\s*CheckRun\s*\{[^}]*creator/);
   });
 
   it('records a required context absent from all pages as missing, not green', async () => {
@@ -486,15 +489,17 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
       contextsEndCursor: 'c1',
     });
     const broken = JSON.stringify({
-      repository: {
-        pullRequest: {
-          state: 'OPEN',
-          headRefOid: VALID_SHA,
-          mergeStateStatus: 'CLEAN',
-          statusCheckRollup: {
-            contexts: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: 'not-an-array' },
+      data: {
+        repository: {
+          pullRequest: {
+            state: 'OPEN',
+            headRefOid: VALID_SHA,
+            mergeStateStatus: 'CLEAN',
+            statusCheckRollup: {
+              contexts: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: 'not-an-array' },
+            },
+            reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
           },
-          reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
         },
       },
     });
@@ -551,6 +556,144 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
     });
     expect(calls).toEqual([]);
   });
+
+  it('fails with unreadable when a top-level errors array is present even with data', async () => {
+    const payloadWithErrors = JSON.stringify({
+      errors: [{ message: 'Field error' }],
+      data: {
+        repository: {
+          pullRequest: {
+            state: 'OPEN',
+            headRefOid: VALID_SHA,
+            mergeStateStatus: 'CLEAN',
+            statusCheckRollup: null,
+            reviewThreads: null,
+          },
+        },
+      },
+    });
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: payloadWithErrors, stderr: '' });
+    const result = await makeAdapter({ runGh }).readForgeMerge(BASE_REQUEST);
+
+    expect(result).toEqual({
+      outcome: 'unavailable',
+      code: 'unreadable',
+      reason: 'gh api graphql returned an unreadable answer',
+    });
+  });
+
+  it('does not select creator in the CheckRun fragment', async () => {
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: page(), stderr: '' });
+    await makeAdapter({ runGh }).readForgeMerge(BASE_REQUEST);
+
+    const argv = calls[0];
+    const queryArg = argv.find((arg) => arg.startsWith('query='));
+    expect(queryArg).toBeDefined();
+    expect(queryArg).not.toMatch(/\.\.\.\s*on\s*CheckRun\s*\{[^}]*creator/);
+  });
+
+  it('does not re-accumulate threads when contexts span more pages than threads', async () => {
+    const page1 = page({
+      contextsNodes: [checkRun('gate', 'SUCCESS')],
+      contextsHasNextPage: true,
+      contextsEndCursor: 'c1',
+      threadsNodes: [openThread, openThread, openThread],
+      threadsHasNextPage: false,
+      threadsEndCursor: null,
+    });
+    const page2 = page({
+      contextsNodes: [statusContext('premerge', 'SUCCESS', 'poster')],
+      contextsHasNextPage: false,
+      contextsEndCursor: null,
+      threadsNodes: [openThread, openThread, openThread],
+      threadsHasNextPage: false,
+      threadsEndCursor: null,
+    });
+    const calls: string[][] = [];
+    const responses = [page1, page2];
+    const runGh = async (args: readonly string[]) => {
+      calls.push([...args]);
+      return { exitCode: 0, stdout: responses.shift() ?? '', stderr: '' };
+    };
+
+    const result = await makeAdapter({ runGh }).readForgeMerge({
+      ...BASE_REQUEST,
+      posterLogin: 'poster',
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(result).toMatchObject({
+      outcome: 'ok',
+      unresolvedThreads: 3,
+      contexts: [
+        { name: 'gate', state: 'SUCCESS', isGreen: true },
+        { name: 'premerge', state: 'SUCCESS', isGreen: true, creatorLogin: 'poster' },
+      ],
+    });
+  });
+
+  it('fails as unknown when hasNextPage is true but endCursor is null', async () => {
+    const malformedPage = page({
+      contextsHasNextPage: true,
+      contextsEndCursor: null,
+    });
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: malformedPage, stderr: '' });
+    const result = await makeAdapter({ runGh }).readForgeMerge(BASE_REQUEST);
+
+    expect(result).toEqual({
+      outcome: 'unavailable',
+      code: 'unknown',
+      reason: 'pageInfo hasNextPage is true but endCursor is null',
+    });
+  });
+
+  it('fails as unknown when headRefOid changes between pages', async () => {
+    const OTHER_SHA = '1111111111111111111111111111111111111111';
+    const page1 = page({
+      headRefOid: VALID_SHA,
+      contextsNodes: [checkRun('gate', 'SUCCESS')],
+      contextsHasNextPage: true,
+      contextsEndCursor: 'c1',
+    });
+    const page2 = page({
+      headRefOid: OTHER_SHA,
+      contextsNodes: [statusContext('premerge', 'SUCCESS', 'poster')],
+      contextsHasNextPage: false,
+    });
+    const responses = [page1, page2];
+    const runGh = async () => ({
+      exitCode: 0,
+      stdout: responses.shift() ?? '',
+      stderr: '',
+    });
+
+    const result = await makeAdapter({ runGh }).readForgeMerge(BASE_REQUEST);
+
+    expect(result).toEqual({
+      outcome: 'unavailable',
+      code: 'unknown',
+      reason: 'the head oid changed between pages',
+    });
+  });
+
+  it('does not count a premerge SUCCESS with absent creator as green', async () => {
+    const { runGh } = makeRunGh({
+      exitCode: 0,
+      stdout: page({ contextsNodes: [statusContext('premerge', 'SUCCESS', null)] }),
+      stderr: '',
+    });
+    const result = await makeAdapter({ runGh }).readForgeMerge({
+      ...BASE_REQUEST,
+      posterLogin: 'poster',
+    });
+
+    expect(result).toMatchObject({
+      outcome: 'ok',
+      contexts: expect.arrayContaining([
+        expect.objectContaining({ name: 'premerge', state: 'SUCCESS', isGreen: false, creatorLogin: null }),
+      ]),
+    });
+  });
 });
 
 describe('GhForgeMergeReadAdapter.isConfigured', () => {
@@ -603,5 +746,15 @@ describe('pure GraphQL parsers', () => {
   it('parseMergePrMeta rejects a head oid that is not 40 hex as unknown', () => {
     const result = parseMergePrMeta(page({ headRefOid: 'short' }));
     expect(result).toEqual({ kind: 'unknown', reason: 'the head oid is not 40 hex' });
+  });
+
+  it('parseMergeContextsPage reports pageInfo with hasNextPage true and null endCursor as unknown', () => {
+    const result = parseMergeContextsPage(
+      page({ contextsHasNextPage: true, contextsEndCursor: null }),
+    );
+    expect(result).toEqual({
+      kind: 'unknown',
+      reason: 'pageInfo hasNextPage is true but endCursor is null',
+    });
   });
 });

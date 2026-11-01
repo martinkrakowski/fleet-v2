@@ -7,6 +7,9 @@
  * that a park may end `merged` (CT-2a: the owner-merge park's PR merged). Every
  * function is total: it never throws and returns a typed result for any input
  * of its declared type (fail-closed where stated). No port, no I/O, no clock.
+ * Amended by the lane-pipeline speed plan (`docs/planning/2026-10-28_lane-pipeline-speed-plan.md`
+ * §3.6.2; D19, D20, D22, D24): the rows and rules marked KS1 are data for KS6 and KS7; the decider
+ * keeps the D3 path until KS7 switches it.
  */
 
 import type {
@@ -37,7 +40,9 @@ export const LANE_RUN_EXITS = {
   'opening-pr': ['watching-ci', 'gating'],
   pushing: ['watching-ci', 'gating'],
   'watching-ci': ['merging', 'fixing', 'gating'],
-  merging: ['merged', 'gating'],
+  // KS1 (D20): a Tier 2 pre-merge finding read in `merging` goes to a fix round; (D22, D24): a forge
+  // branch update re-runs CI on the new head. The `branch-behind` park stays universal (D6, §3.3).
+  merging: ['merged', 'fixing', 'watching-ci', 'gating'],
   merged: [],
   stopped: [],
   parked: [],
@@ -54,6 +59,19 @@ export const LANE_RUN_STEP_OF_STATE = {
   accepting: 'accept', 'awaiting-premerge': 'pre-merge', 'opening-pr': 'open-pr', pushing: 'push',
   merging: 'merge',
 } as const satisfies Partial<Record<LaneRunStateValue, LaneRunKeyStep>>;
+
+/**
+ * KS1 (D19; speed plan §3.6.2 row "gating, brief-check, code-review"): a run in `gating` may hold reviews in
+ * flight. The brief-check and code-review intents keyed at the sealed head are appended while the gate runs,
+ * and the `brief-check` and `code-review` states then read the recorded receipts instead of requesting them.
+ * A receipt for a head the gate failed is kept for the fix brief and never accepts a head. The `gating` exits
+ * are unchanged. A graceful drain appends none of them (LANE_RUN_DRAIN_STEPS; plan §3.9.1). KS6 appends the
+ * intents; when inside `gating` they go out (SP-D4: after the static checks) is KS6's with KS3's facts.
+ */
+export const LANE_RUN_REVIEWS_IN_FLIGHT = {
+  from: 'gating',
+  steps: ['brief-check', 'code-review'],
+} as const satisfies { readonly from: LaneRunStateValue; readonly steps: readonly LaneRunKeyStep[] };
 
 /**
  * Whether `from → to` is a legal transition. Terminal `from` → false. `to === 'stopped'` → true.
@@ -121,18 +139,110 @@ export function afterLaneRunFailure(round: number, cause: LaneRunFailureCause): 
   };
 }
 
-/** Accepted at the head: Tier 2 waits in awaiting-premerge (D3); else opening-pr without a PR, pushing with one. */
-export function afterLaneRunAcceptance(tier: LaneRunTier, prNumber: number | null):
-  'awaiting-premerge' | 'opening-pr' | 'pushing' {
-  if (tier === 2) {
-    return 'awaiting-premerge';
-  }
+/** The PR exit after an accepted head: `opening-pr` without a PR, `pushing` with one (plan §3.2 rows opening-pr, pushing). */
+function laneRunPrExit(prNumber: number | null): 'opening-pr' | 'pushing' {
   return prNumber === null ? 'opening-pr' : 'pushing';
 }
 
-/** The pre-merge pass recorded a pass for the head. */
+/**
+ * Where a Tier 2 run awaits its pre-merge pass: in the `awaiting-premerge` state (plan §3.2, D3: the
+ * decider's path today) or as a hold read in `merging` (speed plan §3.6.2, D20: KS7 switches the decider).
+ */
+export type LaneRunPreMergeHold = 'awaiting-premerge' | 'merging';
+
+/**
+ * Accepted at the head. `hold === 'awaiting-premerge'` (the default until KS7 passes `'merging'`): Tier 2
+ * waits in `awaiting-premerge` (D3). `hold === 'merging'`: every tier takes the PR exit (D20) and Tier 2's
+ * receipt is read by `laneRunMergeHold` in `merging`. Tier 1 takes the PR exit either way.
+ */
+export function afterLaneRunAcceptance(
+  tier: LaneRunTier,
+  prNumber: number | null,
+  hold: LaneRunPreMergeHold = 'awaiting-premerge',
+): 'awaiting-premerge' | 'opening-pr' | 'pushing' {
+  if (tier === 2 && hold === 'awaiting-premerge') {
+    return 'awaiting-premerge';
+  }
+  return laneRunPrExit(prNumber);
+}
+
+/** The pre-merge pass recorded a pass for the head: the `awaiting-premerge` exit (D3). */
 export function afterLaneRunPreMergePass(prNumber: number | null): 'opening-pr' | 'pushing' {
-  return prNumber === null ? 'opening-pr' : 'pushing';
+  return laneRunPrExit(prNumber);
+}
+
+/** The pre-merge receipt at the head as the decider reads it (`LaneRunFacts.preMerge`). */
+export type LaneRunPreMergeReceipt = 'none' | 'passed' | 'failed' | 'unknown';
+
+/** The `premerge` commit status the conductor posts at the exact head (speed plan §3.3.1); KS7 posts it. */
+export type LaneRunPremergeStatus = 'success' | 'pending' | 'failure';
+
+export type LaneRunMergeHold =
+  /** Tier 1, or Tier 2 with a pass at this head: post `success`, then enable auto-merge at the head. */
+  | { readonly kind: 'released'; readonly status: 'success' }
+  /** Tier 2 without a receipt yet: post `pending`; the run waits `premerge-pending`. */
+  | { readonly kind: 'wait'; readonly status: 'pending' }
+  /** Tier 2 findings: post `failure`; `outcome` is `afterLaneRunFailure(round, 'pre-merge')` (a fix round, or the park after round 2). */
+  | { readonly kind: 'fail'; readonly status: 'failure'; readonly outcome: LaneRunFailureOutcome }
+  /** An unreadable receipt: post nothing; park `ambiguous` at `pre-merge`. */
+  | { readonly kind: 'park'; readonly status: null; readonly reason: 'ambiguous'; readonly qualifier: 'pre-merge' };
+
+/**
+ * The merge hold read in `merging` (speed plan §3.6.2 row "accepting, awaiting-premerge, opening-pr"; §3.3.1):
+ * the `awaiting-premerge` rule of the decider as data, for KS7 to wire. Total: Tier 1 is released; Tier 2 follows its receipt; a tier outside LANE_RUN_TIERS or, for Tier 2, an
+ * unknown receipt string parks (fail closed; `LaneRun.create` refuses such a tier, so the guard is for the rule's own totality).
+ */
+export function laneRunMergeHold(tier: LaneRunTier, preMerge: LaneRunPreMergeReceipt, round: number): LaneRunMergeHold {
+  if (tier !== 1 && tier !== 2) {
+    return { kind: 'park', status: null, reason: 'ambiguous', qualifier: 'pre-merge' };
+  }
+  if (tier === 1 || preMerge === 'passed') {
+    return { kind: 'released', status: 'success' };
+  }
+  if (preMerge === 'none') {
+    return { kind: 'wait', status: 'pending' };
+  }
+  if (preMerge === 'failed') {
+    return { kind: 'fail', status: 'failure', outcome: afterLaneRunFailure(round, 'pre-merge') };
+  }
+  return { kind: 'park', status: null, reason: 'ambiguous', qualifier: 'pre-merge' };
+}
+
+/**
+ * How the repository merges (speed plan §3.3): a merge queue (D21), or strict up-to-date checks with forge
+ * branch updates (D22). A-0 found no queue for fleet-v2, so the conductor runs `strict`.
+ */
+export type LaneRunMergePath = 'queue' | 'strict';
+
+export type LaneRunBranchBehindExit =
+  /** Not behind, or a queue builds the merged result itself (D24: D6's park is not reached). */
+  | { readonly kind: 'proceed' }
+  /** D22: the conductor updates the branch through the forge and CI re-runs on the new head. */
+  | { readonly kind: 'update-branch'; readonly to: 'watching-ci' }
+  /** D22 with an overlap on a file changed on main since the head's base (§3.3): D6's park stands. */
+  | { readonly kind: 'park'; readonly reason: 'branch-behind' };
+
+/**
+ * What a behind branch does in `merging` (speed plan §3.6.2 row "merge train, D6"). Order: a queue never parks;
+ * an overlap on main parks even when `branchBehind` reads false (contradictory facts fail closed); a behind
+ * branch is updated; otherwise proceed to the merge rules. Any merge path other than `queue` reads as `strict`.
+ */
+export function laneRunBranchBehindExit(input: {
+  readonly mergePath: LaneRunMergePath;
+  readonly branchBehind: boolean;
+  readonly overlapOnMain: boolean;
+}): LaneRunBranchBehindExit {
+  const { mergePath, branchBehind, overlapOnMain } = input;
+  if (mergePath === 'queue') {
+    return { kind: 'proceed' };
+  }
+  if (overlapOnMain) {
+    return { kind: 'park', reason: 'branch-behind' };
+  }
+  if (branchBehind) {
+    return { kind: 'update-branch', to: 'watching-ci' };
+  }
+  return { kind: 'proceed' };
 }
 
 /**

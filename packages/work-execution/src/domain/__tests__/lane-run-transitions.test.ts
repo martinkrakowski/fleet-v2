@@ -13,15 +13,18 @@ import {
   LANE_RUN_DRAIN_STEPS,
   LANE_RUN_EXITS,
   LANE_RUN_HEAD_CHANGE_STATES,
+  LANE_RUN_REVIEWS_IN_FLIGHT,
   afterLaneRunAcceptance,
   afterLaneRunFailure,
   afterLaneRunPreMergePass,
   canEnterLaneRunState,
   checkLaneRunResume,
   implementerRoleFor,
+  laneRunBranchBehindExit,
   laneRunDrainContinues,
   laneRunHaltLiftExit,
   laneRunHeadChanged,
+  laneRunMergeHold,
   laneRunRoundsLeft,
   laneRunStopEffect,
   strongerStopMode,
@@ -76,7 +79,7 @@ const EXPECTED_EXITS: Record<LaneRunStateValue, readonly LaneRunStateValue[]> = 
   'opening-pr': ['watching-ci', 'gating'],
   pushing: ['watching-ci', 'gating'],
   'watching-ci': ['merging', 'fixing', 'gating'],
-  merging: ['merged', 'gating'],
+  merging: ['merged', 'fixing', 'watching-ci', 'gating'],
   merged: [],
   stopped: [],
   parked: [],
@@ -97,7 +100,7 @@ const FALSE_EXIT: Record<LaneRunStateValue, LaneRunStateValue> = {
   'opening-pr': 'merging',
   pushing: 'merging',
   'watching-ci': 'pushing',
-  merging: 'fixing',
+  merging: 'running',
   merged: 'gating',
   stopped: 'gating',
   parked: 'gating',
@@ -454,5 +457,73 @@ describe('work order release at a terminal transition (KF-36a)', () => {
   it('another non-terminal run on the same work order blocks both ends', () => {
     expect(workOrderReleaseFor({ runEnds: 'merged', workOrderState: ACTIVE, slotHeld: false, otherRunActive: true })).toBe(null);
     expect(workOrderReleaseFor({ runEnds: 'stopped', workOrderState: ACTIVE, slotHeld: false, otherRunActive: true })).toBe(null);
+  });
+});
+
+describe('speed-plan rows (KS1: D19, D20, D22, D24)', () => {
+  it('merging row: a pre-merge finding enters fixing and a forge branch update enters watching-ci', () => {
+    expect(LANE_RUN_EXITS.merging).toEqual(['merged', 'fixing', 'watching-ci', 'gating']);
+    expect(canEnterLaneRunState('merging', 'fixing')).toBe(true);
+    expect(canEnterLaneRunState('merging', 'watching-ci')).toBe(true);
+    expect(canEnterLaneRunState('merging', 'parked')).toBe(true);
+    expect(canEnterLaneRunState('merging', 'running')).toBe(false);
+    expect(canEnterLaneRunState('merging', 'accepting')).toBe(false);
+  });
+
+  it('accepting row: with the hold in merging every tier takes the PR exit; the default is unchanged', () => {
+    expect(afterLaneRunAcceptance(2, null, 'merging')).toBe('opening-pr');
+    expect(afterLaneRunAcceptance(2, 7, 'merging')).toBe('pushing');
+    expect(afterLaneRunAcceptance(1, null, 'merging')).toBe('opening-pr');
+    expect(afterLaneRunAcceptance(1, 7, 'merging')).toBe('pushing');
+    expect(afterLaneRunAcceptance(2, null, 'awaiting-premerge')).toBe('awaiting-premerge');
+    expect(afterLaneRunAcceptance(2, 7)).toBe('awaiting-premerge');
+    for (const prNumber of [null, 7]) {
+      expect(canEnterLaneRunState('accepting', afterLaneRunAcceptance(2, prNumber, 'merging'))).toBe(true);
+    }
+  });
+
+  it('merge hold: Tier 1 is released at once; Tier 2 follows its receipt at the head; unknown tier or receipt parks', () => {
+    expect(laneRunMergeHold(1, 'none', 0)).toEqual({ kind: 'released', status: 'success' });
+    expect(laneRunMergeHold(2, 'passed', 0)).toEqual({ kind: 'released', status: 'success' });
+    expect(laneRunMergeHold(2, 'none', 0)).toEqual({ kind: 'wait', status: 'pending' });
+    expect(laneRunMergeHold(2, 'failed', 0)).toEqual({
+      kind: 'fail', status: 'failure', outcome: { kind: 'enter', to: 'fixing', nextRound: 1 },
+    });
+    expect(laneRunMergeHold(2, 'failed', 2)).toEqual({
+      kind: 'fail', status: 'failure', outcome: { kind: 'park', reason: 'blocker-after-round-2' },
+    });
+    const ambiguous = { kind: 'park', status: null, reason: 'ambiguous', qualifier: 'pre-merge' };
+    expect(laneRunMergeHold(2, 'unknown', 0)).toEqual(ambiguous);
+    expect(laneRunMergeHold(2, 'XYZZY' as never, 0)).toEqual(ambiguous);
+    expect(laneRunMergeHold('XYZZY' as never, 'passed', 0)).toEqual(ambiguous);
+    expect(laneRunMergeHold(1, 'failed', 0)).toEqual({ kind: 'released', status: 'success' });
+    // The hold's fix round is a legal exit of the merging row.
+    const failed = laneRunMergeHold(2, 'failed', 1);
+    if (failed.kind !== 'fail' || failed.outcome.kind !== 'enter') {
+      throw new Error('expected a fix round');
+    }
+    expect(canEnterLaneRunState('merging', failed.outcome.to)).toBe(true);
+  });
+
+  it('branch-behind exit: a queue never parks; strict updates the branch or parks on an overlap', () => {
+    expect(laneRunBranchBehindExit({ mergePath: 'queue', branchBehind: true, overlapOnMain: true })).toEqual({ kind: 'proceed' });
+    expect(laneRunBranchBehindExit({ mergePath: 'strict', branchBehind: true, overlapOnMain: false }))
+      .toEqual({ kind: 'update-branch', to: 'watching-ci' });
+    expect(laneRunBranchBehindExit({ mergePath: 'strict', branchBehind: true, overlapOnMain: true }))
+      .toEqual({ kind: 'park', reason: 'branch-behind' });
+    expect(laneRunBranchBehindExit({ mergePath: 'strict', branchBehind: false, overlapOnMain: true }))
+      .toEqual({ kind: 'park', reason: 'branch-behind' });
+    expect(laneRunBranchBehindExit({ mergePath: 'strict', branchBehind: false, overlapOnMain: false })).toEqual({ kind: 'proceed' });
+    expect(laneRunBranchBehindExit({ mergePath: 'XYZZY' as never, branchBehind: true, overlapOnMain: false }))
+      .toEqual({ kind: 'update-branch', to: 'watching-ci' });
+    expect(canEnterLaneRunState('merging', 'watching-ci')).toBe(true);
+  });
+
+  it('gating row: reviews in flight are the two review steps, and a graceful drain never starts one', () => {
+    expect(LANE_RUN_REVIEWS_IN_FLIGHT).toEqual({ from: 'gating', steps: ['brief-check', 'code-review'] });
+    expect(LANE_RUN_EXITS.gating).toEqual(['brief-check', 'fixing']);
+    for (const step of LANE_RUN_REVIEWS_IN_FLIGHT.steps) {
+      expect(LANE_RUN_DRAIN_STEPS).not.toContain(step);
+    }
   });
 });

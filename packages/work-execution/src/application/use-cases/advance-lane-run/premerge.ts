@@ -290,7 +290,11 @@ export async function performPremerge(
   }
   const read = await premergeVerdictOf(ctx, latest, headSha);
   const hold = laneRunMergeHold(record.tier, read.verdict, record.round);
-  if (hold.kind === 'park' || (hold.kind === 'fail' && (read.receipt === null || read.receipt.findings.length > 999))) {
+  if (
+    hold.kind === 'park' ||
+    read.verdict !== gathered.facts.preMerge ||
+    (hold.kind === 'fail' && (read.receipt === null || read.receipt.findings.length > 999))
+  ) {
     // Nothing is posted: an ambiguous result under a fresh intent (the next
     // tick parks); never a forge call.
     const actionId = 'forge-' + ctx.deps.newUlid();

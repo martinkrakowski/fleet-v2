@@ -31,6 +31,7 @@ import {
   attemptTraceSpans,
   laneRunSpans,
   type AttemptTraceTelemetryFacts,
+  type LaneRunSpansResult,
   type LaneRunTelemetryFacts,
   type TelemetryGateReceiptFact,
   type TelemetryReceiptFacts,
@@ -66,6 +67,8 @@ export interface ExportRunTelemetryDependencies {
   readonly hmac: TelemetryHmac;
   /** Absent means no run is dry-run or shadow (today no record marks one; plan D10). */
   readonly dryRunKindOf?: (run: LaneRunRecord) => 'dry-run' | 'shadow' | null;
+  /** Test seam: mapper override for telemetry export isolation tests. Defaults to laneRunSpans. */
+  readonly mapper?: (hmac: TelemetryHmac, facts: LaneRunTelemetryFacts) => LaneRunSpansResult;
 }
 
 const ALIAS_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
@@ -609,7 +612,8 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
         tags,
         attempts: selection.attemptsOfRun.get(run.runId) ?? [],
       };
-      const result = laneRunSpans(deps.hmac, facts);
+      const mapper = deps.mapper ?? laneRunSpans;
+      const result = mapper(deps.hmac, facts);
       mapped.push(...result.spans);
       rejectedInvalid += result.rejectedInvalid;
     }

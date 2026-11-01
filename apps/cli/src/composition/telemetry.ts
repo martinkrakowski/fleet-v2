@@ -21,6 +21,8 @@ import {
   WorkOrderRepositoryAdapter,
   createOtlpHttpRunTelemetryAdapter,
   telemetrySaltFingerprint,
+  type LaneRunSpansResult,
+  type LaneRunTelemetryFacts,
   type RunTelemetryPort,
   type TelemetryHmac,
   type TelemetryResourceInput,
@@ -42,6 +44,8 @@ export interface ComposeTelemetryOptions {
    * `FLEET_TELEMETRY_TOKEN_FILE` (plan §3.9); neither is ever logged.
    */
   readonly env: Readonly<Record<string, string | undefined>>;
+  /** Test seam: mapper override for telemetry export isolation tests. */
+  readonly mapper?: (hmac: TelemetryHmac, facts: LaneRunTelemetryFacts) => LaneRunSpansResult;
 }
 
 /** The resolved policy without its salt: what the runtime may expose (the salt never leaves the composer). */
@@ -152,7 +156,7 @@ function addWorkOrderCanaries(
   }
 }
 
-export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOptions) {
+export function composeTelemetry({ stateDir, policy, env, mapper }: ComposeTelemetryOptions) {
   const repository = new EvidenceAssessmentRepositoryAdapter({ stateDir, readOnly: true });
   const inspector = new InspectAcceptanceEvidenceUseCase({ repo: repository });
   const acceptanceReceiptRead = new AcceptanceReceiptReadAdapter({ inspector });
@@ -224,6 +228,7 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
           dispositions,
           telemetry: telemetryPort,
           hmac,
+          ...(mapper !== undefined ? { mapper } : {}),
         });
 
   // The live driver's background exporter (OT5): it marks advances and drains

@@ -36,7 +36,7 @@ function copyAllowedEnumerableKey(
   allowed: readonly string[],
   out: Record<string, unknown>,
 ): boolean {
-  if (typeof key !== 'string' || !allowed.includes(key)) {
+  if (typeof key !== 'string' || key === '__proto__' || !allowed.includes(key)) {
     return false;
   }
   const descriptor = Object.getOwnPropertyDescriptor(value, key);
@@ -98,7 +98,8 @@ export function snapshotPlainDataRecord(value: unknown): Record<string, unknown>
 
 /** Copy `key` when it is an enumerable string data property; false otherwise. */
 function copyEnumerableDataKey(value: Record<string, unknown>, key: string | symbol, out: Record<string, unknown>): boolean {
-  if (typeof key !== 'string') {
+  // An own `__proto__` key would set the copy's prototype on assignment, so it is refused.
+  if (typeof key !== 'string' || key === '__proto__') {
     return false;
   }
   const descriptor = Object.getOwnPropertyDescriptor(value, key);

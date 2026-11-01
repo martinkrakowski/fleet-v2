@@ -175,6 +175,13 @@ describe('readPlainRecordWithOptionalKeys', () => {
 });
 
 describe('snapshotPlainDataRecord', () => {
+  it('refuses an own __proto__ key instead of setting the prototype of the copy', () => {
+    const input = {};
+    Object.defineProperty(input, '__proto__', { value: { version: 1 }, enumerable: true });
+    expect(snapshotPlainDataRecord(input)).toBeNull();
+    expect(readPlainRecordWithOptionalKeys(input, ['__proto__'], [])).toBeNull();
+  });
+
   it('returns a fresh copy of a plain data object', () => {
     const value = { a: 1, b: { c: 2 } };
     const snapshot = snapshotPlainDataRecord(value);

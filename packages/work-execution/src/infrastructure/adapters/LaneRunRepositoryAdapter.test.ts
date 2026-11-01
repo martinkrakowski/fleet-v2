@@ -221,6 +221,53 @@ describe.each(['memory', 'file'] as const)('LaneRunRepositoryAdapter (%s)', (mod
     });
   });
 
+  it('save refuses a changed, added or dropped baseBranch and accepts the same one (CB1)', async () => {
+    await adapter.create(validRun({ branchName: 'fleet/run-01JB0000000000000000000000', baseBranch: 'chain/example' }));
+    const runId = validRun().runId;
+    await adapter.acquireLease(runId, ACQUIRE);
+    const base = { revision: 2, lease: LEASE };
+
+    // a changed baseBranch → identity-changed
+    expect(
+      await adapter.save(validRun({ branchName: 'fleet/run-01JB0000000000000000000000', baseBranch: 'main', ...base }), HOLD),
+    ).toEqual({ outcome: 'refused', reason: 'identity-changed' });
+    // a dropped baseBranch → identity-changed
+    expect(
+      await adapter.save(validRun({ branchName: 'fleet/run-01JB0000000000000000000000', ...base }), HOLD),
+    ).toEqual({ outcome: 'refused', reason: 'identity-changed' });
+
+    // an added baseBranch on a stored run that had none → identity-changed
+    await adapter.create(validRun({ runId: 'run-01JB0000000000000000000003' }));
+    await adapter.acquireLease('run-01JB0000000000000000000003', ACQUIRE);
+    expect(
+      await adapter.save(validRun({ runId: 'run-01JB0000000000000000000003', baseBranch: 'main', ...base }), HOLD),
+    ).toEqual({ outcome: 'refused', reason: 'identity-changed' });
+
+    // the same baseBranch saves
+    expect(
+      await adapter.save(
+        validRun({
+          branchName: 'fleet/run-01JB0000000000000000000000',
+          baseBranch: 'chain/example',
+          round: 1,
+          attemptIds: ['attempt-example-1', 'attempt-example-2'],
+          ...base,
+        }),
+        HOLD,
+      ),
+    ).toEqual({
+      outcome: 'saved',
+      record: validRun({
+        branchName: 'fleet/run-01JB0000000000000000000000',
+        baseBranch: 'chain/example',
+        round: 1,
+        attemptIds: ['attempt-example-1', 'attempt-example-2'],
+        revision: 2,
+        lease: LEASE,
+      }),
+    });
+  });
+
   it('fencing: a lapsed lease moves on; stale saves and renewals never land', async () => {
     await adapter.create(validRun());
     const runId = validRun().runId;

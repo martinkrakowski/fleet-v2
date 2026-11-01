@@ -1,6 +1,11 @@
 /** The `work-order` command group of the CLI driver; its entries moved verbatim from the command table. */
 
-import { CLOSE_WORK_ORDER_STATES, WORK_ORDER_RISKS, resolveWorkOrderRisk } from '@fleet/work-execution';
+import {
+  CLOSE_WORK_ORDER_STATES,
+  WORK_ORDER_RISKS,
+  resolveWorkOrderBaseBranch,
+  resolveWorkOrderRisk,
+} from '@fleet/work-execution';
 import { CliUsageError, str, optStr, strArr, enumOf } from './payload.js';
 import type {
   CommandHandler,
@@ -16,6 +21,14 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       ) {
         throw new CliUsageError('work-order register --supersedes-work-order-id needs a work order id');
       }
+      // A given --base-branch must carry a value the same way; a bad string
+      // (an unparsable branch name) is the use case's refusal, not a usage error.
+      if (
+        Object.hasOwn(p, 'baseBranch') &&
+        (typeof p.baseBranch !== 'string' || p.baseBranch.trim() === '')
+      ) {
+        throw new CliUsageError('work-order register --base-branch needs a branch');
+      }
       return rt.execution.registerWorkOrder.registerWorkOrder({
         workOrderId: str(p, 'workOrderId'),
         projectId: str(p, 'projectId'),
@@ -26,6 +39,7 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
         ownedPaths: strArr(p, 'ownedPaths'),
         policyRevision: str(p, 'policyRevision'),
         prerequisiteWorkOrderIds: strArr(p, 'prerequisiteWorkOrderIds'),
+        baseBranch: optStr(p, 'baseBranch'),
         risk:
           p.risk === undefined
             ? undefined
@@ -80,7 +94,7 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
       const newId = str(p, 'workOrderId');
       if (p.yes !== true) {
         throw new CliUsageError(
-          `work-order rerun needs --yes: it registers ${newId} as a new work order copying ${from}'s project, task, lane, repository, owned paths, policy revision and risk, superseding ${from}; it starts no run, changes nothing on ${from}, and the brief is frozen again by conductor start.`,
+          `work-order rerun needs --yes: it registers ${newId} as a new work order copying ${from}'s project, task, lane, repository, owned paths, policy revision, risk and base branch, superseding ${from}; it starts no run, changes nothing on ${from}, and the brief is frozen again by conductor start.`,
         );
       }
       const inspected = await rt.execution.inspectWorkOrder.inspectWorkOrder({ workOrderId: from });
@@ -100,6 +114,7 @@ export const workOrderCommands: Readonly<Record<string, CommandHandler>> = {
         ownedPaths: source.ownedPaths,
         policyRevision: source.policyRevision,
         risk: resolveWorkOrderRisk(source),
+        baseBranch: resolveWorkOrderBaseBranch(source),
         baseCommit: p.baseCommit !== undefined ? String(p.baseCommit) : source.baseCommit,
         prerequisiteWorkOrderIds: [],
         supersedesWorkOrderId: from,

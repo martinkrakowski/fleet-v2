@@ -9,6 +9,7 @@
 
 import type { SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
+import type { BaseBranchValue } from './base-branch.js';
 
 export const LANE_RUN_RECORD_VERSION = 1 as const;
 
@@ -141,4 +142,11 @@ export interface LaneRunRecord {
    * KF-5a (readers fall back to the worktree path's last segment).
    */
   readonly branchName?: string;
+  /**
+   * The run's base branch, copied from the work order at `conductor start`
+   * (lane CB1); a later work-order edit never rewrites a started run.
+   * Optional on records written before CB1 — read it through
+   * `resolveLaneRunBaseBranch`, which treats an absent value as `main`.
+   */
+  readonly baseBranch?: BaseBranchValue;
 }

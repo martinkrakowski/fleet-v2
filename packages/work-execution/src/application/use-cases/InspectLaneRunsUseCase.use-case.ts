@@ -19,6 +19,7 @@ import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLease
 import type { LaneRunLeaseRecord, LaneRunRecord } from '../../domain/lane-run-records.js';
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
 import { laneRunJournalPendingIntent, laneRunJournalState, laneRunJournalStopFacts } from '../../domain/lane-run-journal.js';
+import { resolveLaneRunBaseBranch } from '../../domain/base-branch.js';
 import { isLeaseLapsed } from '../../domain/lane-run-lease.js';
 
 export interface InspectLaneRunsDependencies {
@@ -48,6 +49,8 @@ function statusViewOf(record: LaneRunRecord, entries: readonly LaneRunJournalEnt
   return {
     runId: record.runId,
     workOrderId: record.workOrderId,
+    /** The run's base branch, copied at start (lane CB1). */
+    baseBranch: resolveLaneRunBaseBranch(record),
     tier: record.tier,
     state: laneRunJournalState(entries, record.runId),
     round: record.round,

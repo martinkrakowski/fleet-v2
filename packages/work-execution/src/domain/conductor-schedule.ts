@@ -7,6 +7,8 @@
  * store, no clock, never throws; time enters only through `nowIso`.
  */
 
+import { resolveLaneRunBaseBranch } from './base-branch.js';
+import type { BaseBranchValue } from './base-branch.js';
 import { laneRunJournalPendingIntent, laneRunJournalState } from './lane-run-journal.js';
 import type { LaneRunJournalEntryRecord } from './lane-run-journal.js';
 import { laneRunPackageKeys, laneRunPackagesOverlap } from './lane-run-packages.js';
@@ -47,6 +49,8 @@ export interface ConductorScheduleFacts {
 
 export interface ConductorScheduleRow {
   readonly runId: string;
+  /** The run's resolved base branch; absent or unparsable on the record reads as `main`. */
+  readonly baseBranch: BaseBranchValue;
   readonly workOrderId: string;
   readonly tier: LaneRunTier;
   readonly state: LaneRunStateValue;
@@ -85,6 +89,8 @@ export interface ConductorSchedule {
   /** null when no driver lease is recorded. */
   readonly driverLeaseLapsed: boolean | null;
   readonly rows: readonly ConductorScheduleRow[];
+  /** One serial queue per distinct base among live rows, sorted by code unit. */
+  readonly queues: readonly { readonly baseBranch: BaseBranchValue; readonly runIds: readonly string[] }[];
   readonly hosts: readonly ConductorScheduleHostLane[];
   readonly admission: { readonly active: number; readonly inFlight: number; readonly maxActiveRuns: number | null };
   readonly caps: ConductorScheduleCaps | null;
@@ -103,6 +109,7 @@ interface RowWithOrder {
 
 interface ScheduleRow {
   runId: string;
+  baseBranch: BaseBranchValue;
   workOrderId: string;
   tier: LaneRunTier;
   state: LaneRunStateValue;
@@ -232,6 +239,7 @@ function buildRowEntry(run: LaneRunRecord, context: BuildRowContext): RowWithOrd
   const workOrder = context.readWorkOrder(workOrderId);
   const row: ScheduleRow = {
     runId,
+    baseBranch: resolveLaneRunBaseBranch(run),
     workOrderId,
     tier,
     state,
@@ -433,6 +441,28 @@ function groupHostLanes(
     }));
 }
 
+/**
+ * Group live rows into one serial queue per distinct base branch. Rows are
+ * already ordered by run id (`buildRows`), so each queue's run ids keep that
+ * order; queues themselves sort by code unit.
+ */
+function groupQueues(
+  rows: readonly ScheduleRow[],
+): { readonly baseBranch: BaseBranchValue; readonly runIds: readonly string[] }[] {
+  const idsByBase = new Map<BaseBranchValue, string[]>();
+  for (const row of rows) {
+    let ids = idsByBase.get(row.baseBranch);
+    if (ids === undefined) {
+      ids = [];
+      idsByBase.set(row.baseBranch, ids);
+    }
+    ids.push(row.runId);
+  }
+  return [...idsByBase.entries()]
+    .sort((left, right) => byCodeUnit(left[0], right[0]))
+    .map(([baseBranch, runIds]) => ({ baseBranch, runIds }));
+}
+
 export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: string): ConductorSchedule {
   const { halt, driverLease, runs, journals, reservations, attemptWorkOrderIds, workOrders, latestTrace } = facts;
   const heldByAttempt = buildHeldByAttempt(reservations);
@@ -459,12 +489,14 @@ export function deriveConductorSchedule(facts: ConductorScheduleFacts, nowIso: s
     const { row, workOrder } = entry;
     row.admissionWait = computeAdmissionWait(row, workOrder, activeEntries, inFlightOrders, capReached);
   }
+  const queues = groupQueues(rows);
   const hosts = groupHostLanes(heldByAttempt, attemptRunIds);
   return {
     observedAtIso: nowIso,
     halt,
     driverLeaseLapsed: driverLease === null ? null : isLeaseLapsed(driverLease, nowIso),
     rows,
+    queues,
     hosts,
     admission: { active, inFlight, maxActiveRuns },
     caps,

@@ -180,6 +180,33 @@ describe('fleet-v2 conductor schedule (VZ2)', () => {
     expect(rowLine).toContain('packages/a');
   });
 
+  it('text mode groups rows into one queue per base with the base after the run id', async () => {
+    const runtime = makeRuntime(tempStateDir());
+    await seedLiveRun(runtime);
+    const second = LaneRun.create({
+      ...BASE_RECORD,
+      runId: 'run-01JB0000000000000000000001',
+      attemptIds: ['attempt-live-2'],
+      baseBranch: 'chain/example',
+    });
+    expect(second.success).toBe(true);
+    if (second.success) {
+      await runtime.conductor.laneRunRepository.create(second.value.toRecord());
+    }
+    const result = await runSchedule(runtime, []);
+    expect(result.code).toBe(0);
+    const chainIndex = result.stdout.findIndex((line) => line.startsWith('queue chain/example'));
+    const mainIndex = result.stdout.findIndex((line) => line.startsWith('queue main'));
+    expect(chainIndex).toBeGreaterThanOrEqual(0);
+    expect(mainIndex).toBeGreaterThan(chainIndex);
+    const chainRow = result.stdout.find((line) => line.startsWith('run-01JB0000000000000000000001 '));
+    expect(chainRow).toBeDefined();
+    expect(chainRow).toContain('chain/example');
+    const mainRow = result.stdout.find((line) => line.startsWith(`${RUN_ID} `));
+    expect(mainRow).toBeDefined();
+    expect(mainRow).toContain('main ');
+  });
+
   it('empty state prints no live runs and exits 0', async () => {
     const runtime = makeRuntime(tempStateDir());
     const result = await runSchedule(runtime, []);

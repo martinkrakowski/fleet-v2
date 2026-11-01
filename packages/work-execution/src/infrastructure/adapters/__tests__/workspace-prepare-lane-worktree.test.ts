@@ -7,7 +7,7 @@ import {
 import type { CommandExecutorPort } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { CommandRunResult } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { AttemptRunnerRecord } from '../../../domain/execution-records.js';
-import type { PrepareLaneWorktreeRequest } from '../../../application/ports/out/WorkspacePort.out-port.js';
+import type { PrepareLaneWorktreeRequest, ResolveBaseTipRequest } from '../../../application/ports/out/WorkspacePort.out-port.js';
 
 import { physicalPathArgv } from '../ResolvePhysicalPath.helper.js';
 
@@ -49,6 +49,23 @@ const FETCH_ARGV = [
   'git', '-C', CLONE, '-c', 'core.hooksPath=/dev/null',
   'fetch', '--quiet', 'origin',
 ];
+const LS_REMOTE_CHAIN_ARGV = [
+  'git', '-C', CLONE, '-c', 'core.hooksPath=/dev/null',
+  'ls-remote', '--exit-code', 'origin', 'refs/heads/chain/example',
+];
+const LS_REMOTE_MAIN_ARGV = [
+  'git', '-C', CLONE, '-c', 'core.hooksPath=/dev/null',
+  'ls-remote', '--exit-code', 'origin', 'refs/heads/main',
+];
+
+function resolveBaseTipRequest(overrides: Partial<ResolveBaseTipRequest> = {}): ResolveBaseTipRequest {
+  return {
+    clonePath: CLONE,
+    baseBranch: 'chain/example',
+    recordedHost: RECORDED_HOST,
+    ...overrides,
+  };
+}
 
 const ok: (stdout?: string) => CommandRunResult = (stdout = '') => ({
   exitCode: 0, signal: null, stdout, stderr: '',
@@ -274,5 +291,91 @@ describe('WorkspaceAdapter prepareLaneWorktree', () => {
       expect(printed.includes(request.clonePath)).toBe(false);
       expect(printed.includes(request.worktreePath)).toBe(false);
     }
+  });
+});
+
+describe('WorkspaceAdapter resolveBaseTip', () => {
+  it('resolves chain/example on the reserved host only, never fetching', async () => {
+    const tip = 'b'.repeat(40);
+    const answers = {
+      [LS_REMOTE_CHAIN_ARGV.join(' ')]: ok(tip + '\trefs/heads/chain/example\n'),
+    };
+    const { adapter, reservedLog, otherLog } = twoHostExecutors(answers);
+    const result = await adapter.resolveBaseTip!(resolveBaseTipRequest());
+    expect(result).toEqual({ outcome: 'resolved', tip });
+    expect(reservedLog).toEqual([LS_REMOTE_CHAIN_ARGV]);
+    expect(otherLog).toEqual([]);
+    expect(reservedLog.some((argv) => argv.includes('fetch'))).toBe(false);
+  });
+
+  it('returns missing on exit 2 (the branch does not exist on the forge)', async () => {
+    const answers = { [LS_REMOTE_CHAIN_ARGV.join(' ')]: failed(2) };
+    const { adapter, reservedLog } = twoHostExecutors(answers);
+    const result = await adapter.resolveBaseTip!(resolveBaseTipRequest());
+    expect(result).toEqual({ outcome: 'missing' });
+    expect(reservedLog).toEqual([LS_REMOTE_CHAIN_ARGV]);
+  });
+
+  it('returns the 40-hex tip of a single good main line', async () => {
+    const tip = 'b'.repeat(40);
+    const answers = {
+      [LS_REMOTE_MAIN_ARGV.join(' ')]: ok(tip + '\trefs/heads/main\n'),
+    };
+    const { adapter } = twoHostExecutors(answers);
+    const result = await adapter.resolveBaseTip!(resolveBaseTipRequest({ baseBranch: 'main' }));
+    expect(result).toEqual({ outcome: 'resolved', tip });
+  });
+
+  it('returns unknown on a 64-hex line', async () => {
+    const answers = {
+      [LS_REMOTE_CHAIN_ARGV.join(' ')]: ok('c'.repeat(64) + '\trefs/heads/chain/example\n'),
+    };
+    const { adapter } = twoHostExecutors(answers);
+    const result = await adapter.resolveBaseTip!(resolveBaseTipRequest());
+    expect(result).toEqual({ outcome: 'unknown' });
+  });
+
+  it('returns unknown on two lines', async () => {
+    const answers = {
+      [LS_REMOTE_CHAIN_ARGV.join(' ')]: ok(
+        'a'.repeat(40) + '\trefs/heads/chain/example\n' + 'b'.repeat(40) + '\trefs/heads/chain/example\n',
+      ),
+    };
+    const { adapter } = twoHostExecutors(answers);
+    const result = await adapter.resolveBaseTip!(resolveBaseTipRequest());
+    expect(result).toEqual({ outcome: 'unknown' });
+  });
+
+  it('returns unknown on exit 128', async () => {
+    const answers = { [LS_REMOTE_CHAIN_ARGV.join(' ')]: failed(128) };
+    const { adapter } = twoHostExecutors(answers);
+    const result = await adapter.resolveBaseTip!(resolveBaseTipRequest());
+    expect(result).toEqual({ outcome: 'unknown' });
+  });
+
+  it('returns unknown on a null exit and on a thrown timeout', async () => {
+    const hanging: CommandRunResult = { exitCode: null, signal: null, stdout: '', stderr: '' };
+    const answers = { [LS_REMOTE_CHAIN_ARGV.join(' ')]: hanging };
+    const hangingResult = await twoHostExecutors(answers).adapter.resolveBaseTip!(resolveBaseTipRequest());
+    expect(hangingResult).toEqual({ outcome: 'unknown' });
+
+    const throwingExecutor: CommandExecutorPort = {
+      async run() {
+        throw new Error('timed out');
+      },
+    };
+    const throwingAdapter = new WorkspaceAdapter({
+      executorForRecordedHost: () => ({ ok: true, executor: throwingExecutor }),
+    });
+    const throwingResult = await throwingAdapter.resolveBaseTip!(resolveBaseTipRequest());
+    expect(throwingResult).toEqual({ outcome: 'unknown' });
+  });
+
+  it('refuses a relative clonePath before any executor call', async () => {
+    const { adapter, reservedLog, otherLog } = twoHostExecutors(freshPathAnswers);
+    const result = await adapter.resolveBaseTip!(resolveBaseTipRequest({ clonePath: 'relative/clone' }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(reservedLog).toEqual([]);
+    expect(otherLog).toEqual([]);
   });
 });

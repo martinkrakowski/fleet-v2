@@ -567,6 +567,9 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
       authorizedBy: DECISION_REVISION,
       title: 'Fleet work order wo-example-1',
     });
+    // CB-D2: the run record has no baseBranch, so the PR base and the result
+    // detail are `main`.
+    expect(forgeRequest.baseBranch).toBe('main');
     expect(forgeRequest.body).toContain('## What');
     expect(forgeRequest.body).toContain('## Proof');
     expect(forgeRequest.body).toContain('## Hard to undo');
@@ -579,8 +582,23 @@ describe('AdvanceLaneRunUseCase open-pr act (K6-6)', () => {
     const record = await harness.runRepo.get(RUN_ID);
     expect(record?.prNumber).toBe(7);
     const entries = await harness.runJournal.listForRun(RUN_ID);
-    expect(entries.some((entry) => entry.kind === 'result' && entry.key === openPrKey() && entry.outcome === 'completed' && entry.reasonCode === 'pr-opened')).toBe(true);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.key === openPrKey() && entry.outcome === 'completed' && entry.reasonCode === 'pr-opened' && entry.detail === 'main')).toBe(true);
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'watching-ci' });
+  });
+
+  it('test 1b: an open-pr against a recorded chain base names it on the forge request and result detail', async () => {
+    const harness = await openingPrHarness({}, runRecord({ baseBranch: 'chain/example' }));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'open-pr',
+      key: openPrKey(),
+      result: 'completed',
+      reasonCode: 'pr-opened',
+    });
+    expect(harness.forgeRequests).toHaveLength(1);
+    expect(harness.forgeRequests[0]?.baseBranch).toBe('chain/example');
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.key === openPrKey() && entry.outcome === 'completed' && entry.reasonCode === 'pr-opened' && entry.detail === 'chain/example')).toBe(true);
   });
 
   it('test 1c: the push grant carries the receipts-only rcp id and assessHeadAcceptance is never called (KF-22b)', async () => {
@@ -843,10 +861,12 @@ describe('AdvanceLaneRunUseCase push act (K6-6)', () => {
     });
     expect(harness.forgeRequests[0]!.title).toBeUndefined();
     expect(harness.forgeRequests[0]!.body).toBeUndefined();
+    // CB-D2: a push act carries no base branch and its result detail stays null.
+    expect(harness.forgeRequests[0]!.baseBranch).toBeUndefined();
     const record = await harness.runRepo.get(RUN_ID);
     expect(record?.prNumber).toBeNull();
     const entries = await harness.runJournal.listForRun(RUN_ID);
-    expect(entries.some((entry) => entry.kind === 'result' && entry.key === pushKey() && entry.outcome === 'completed' && entry.reasonCode === 'pushed')).toBe(true);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.key === pushKey() && entry.outcome === 'completed' && entry.reasonCode === 'pushed' && entry.detail === null)).toBe(true);
   });
 
   it('test 10: an ambiguous push outcome leaves the intent pending and a reconcile at the head pushes once', async () => {

@@ -181,6 +181,12 @@ describe('ListLaneRunsUseCase (VZ2)', () => {
     await h.executionJournal.saveCapacityReservation(RESERVATION);
 
     const result = await h.useCase.listLaneRuns({ nowIso: NOW });
+    expect(result.outcome).toBe('listed');
+    if (result.outcome !== 'listed') {
+      return;
+    }
+    expect(result.schedule.rows).toHaveLength(1);
+    expect(result.schedule.rows[0].runId).toBe(RUN_ID);
     const serialized = JSON.stringify(result);
     for (const forbidden of ['alias-secret', '4166', '/srv/wt/run-1', 'holderId', 'sshAlias', 'transport', 'worktreePath', HOLDER]) {
       expect(serialized).not.toContain(forbidden);

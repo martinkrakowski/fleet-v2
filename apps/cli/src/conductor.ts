@@ -122,7 +122,7 @@ policy.conductor.enabled and a state directory, and dispatches nothing.
 start --abandon works while the conductor is disabled.
 
 Each subcommand prints one JSON document on stdout (conductor run prints one
-JSON line per pass).
+JSON line per pass; conductor schedule without --json prints text lines).
 
 Exit codes: 0 completed (a stop already recorded still exits 0), 1 refused,
 not found or blocked, 2 usage error.`;

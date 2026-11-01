@@ -1,0 +1,21 @@
+# The seam path list of production-quality plan §4.9 (D3). Each line names one
+# seam file that the orchestrator's PR script must watch; a PR touching any of
+# them needs the Q1 job and a review from a model family that wrote nothing on
+# the branch. A trailing "/" is a directory prefix: every path below it is a
+# seam. A new seam is added in the same PR as its test (tests/seams.test.sh).
+apps/cli/src/composition.ts
+apps/cli/src/composition/
+apps/cli/src/conductor-wiring.ts
+apps/api/server/wiring/runtime.ts
+apps/api/server/wiring/work/composition.ts
+apps/api/server/wiring/evidence/composition.ts
+apps/api/server/wiring/knowledge/composition.ts
+apps/api/server/wiring/operator/composition.ts
+apps/api/server/wiring/telemetry/composition.ts
+packages/work-execution/src/infrastructure/adapters/ExecutorForHost.helper.ts
+packages/work-execution/src/infrastructure/adapters/ConfirmRecordedHost.ts
+packages/work-execution/src/infrastructure/adapters/WorkspaceAdapter.adapter.ts
+packages/work-execution/src/infrastructure/adapters/AttemptArtifactAdapter.adapter.ts
+packages/work-execution/src/domain/lane-run-keys.ts
+packages/work-execution/src/domain/lane-run-journal.ts
+packages/work-execution/src/infrastructure/adapters/LaneRunJournalAdapter.adapter.ts

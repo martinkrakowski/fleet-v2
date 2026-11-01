@@ -1,0 +1,88 @@
+{
+  "operationId": "<operation-id>",
+  "code": "OK",
+  "result": {
+    "outcome": "listed",
+    "schedule": {
+      "observedAtIso": "<observed-at>",
+      "halt": "clear",
+      "driverLeaseLapsed": null,
+      "rows": [
+        {
+          "runId": "run-01JB0000000000000000000000",
+          "workOrderId": "wo-1",
+          "tier": 2,
+          "state": "running",
+          "round": 0,
+          "placement": "running",
+          "pendingStep": {
+            "step": "dispatch",
+            "reconciliation": "unread"
+          },
+          "park": null,
+          "leaseLapsed": false,
+          "packageKeys": [
+            "packages/a"
+          ],
+          "workOrderUnreadable": false,
+          "overlapsWith": [
+            "run-01JB0000000000000000000001"
+          ],
+          "slot": {
+            "hostName": "sol",
+            "slotIndex": 0
+          },
+          "admissionWait": null
+        },
+        {
+          "runId": "run-01JB0000000000000000000001",
+          "workOrderId": "wo-2",
+          "tier": 2,
+          "state": "ready",
+          "round": 0,
+          "placement": "waiting",
+          "pendingStep": null,
+          "park": null,
+          "leaseLapsed": null,
+          "packageKeys": [
+            "packages/a"
+          ],
+          "workOrderUnreadable": false,
+          "overlapsWith": [
+            "run-01JB0000000000000000000000"
+          ],
+          "slot": null,
+          "admissionWait": "package-overlap"
+        }
+      ],
+      "hosts": [
+        {
+          "hostName": "sol",
+          "slots": [
+            {
+              "slotIndex": 0,
+              "runId": "run-01JB0000000000000000000000"
+            }
+          ]
+        }
+      ],
+      "admission": {
+        "active": 1,
+        "inFlight": 0,
+        "maxActiveRuns": null
+      },
+      "caps": null,
+      "trace": "none"
+    },
+    "sessionStarts": [
+      {
+        "runId": "run-01JB0000000000000000000000",
+        "step": "dispatch",
+        "recordedAtIso": "2026-10-20T09:00:00.000Z",
+        "gapMs": null,
+        "underStagger": null
+      }
+    ],
+    "truncated": false
+  }
+}

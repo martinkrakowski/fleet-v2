@@ -34,7 +34,13 @@ describe("View nav P12 sample labels", () => {
   });
 
   it("leaves Lanes, Projects, Attempt and Questions unmarked", () => {
-    for (const href of ["/lanes", "/projects", "/attempt", "/questions"]) {
+    for (const href of [
+      "/lanes",
+      "/projects",
+      "/attempt",
+      "/questions",
+      "/conductor",
+    ]) {
       expect(entryText(viewNav, href)).toContain("sample: false");
     }
   });

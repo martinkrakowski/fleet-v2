@@ -8,6 +8,7 @@ import { join, resolve } from "node:path";
 
 import { ChangeFeed } from "./changes/change-feed";
 import { StateWriteWatcher } from "./changes/state-write-watcher";
+import { SnapshotProjectionStore } from "./snapshots/snapshot-projection";
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from "./gh-binary";
 import { withFileLock, writeJsonAtomically } from "./file-store";
@@ -258,6 +259,7 @@ export async function persistAuthorizationCoordinatesToState(
 let runtimeConfigured = false;
 let changeFeed: ChangeFeed | null = null;
 let watcher: StateWriteWatcher | null = null;
+let snapshotProjectionStore: SnapshotProjectionStore | null = null;
 
 /**
  * Stores whose saves emit change signals; watched so a foreign (CLI) write
@@ -280,6 +282,10 @@ export function isFleetApiRuntimeConfigured(): boolean {
 
 export function getChangeFeed(): ChangeFeed | null {
   return changeFeed;
+}
+
+export function getSnapshotProjectionStore(): SnapshotProjectionStore | null {
+  return snapshotProjectionStore;
 }
 
 /**
@@ -356,6 +362,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
 
   if (options === null) {
     runtimeConfigured = false;
+    snapshotProjectionStore = null;
     configureWorkComposition(null);
     configureEvidenceUseCases(null);
     configureKnowledgeComposition(null);
@@ -365,6 +372,7 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   }
 
   runtimeConfigured = true;
+  snapshotProjectionStore = new SnapshotProjectionStore();
 
   const stateDir = options?.stateDir;
   const ownerPublicKey = options?.ownerPublicKey;

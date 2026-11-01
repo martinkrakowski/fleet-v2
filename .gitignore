@@ -52,7 +52,6 @@ yarn-error.log*
 /.fleet/
 /.lane/
 /installation/
-/deploy/staging/staging.env
 SYNC-MIGRATION-REPORT.md
 
 # Agent briefs and lane scaffolding

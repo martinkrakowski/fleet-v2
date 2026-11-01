@@ -144,78 +144,105 @@ export function readKillallTrainPause(input: unknown): KillallTrainPauseRecord |
   };
 }
 
-/** One lane's stop line (plan §6 "Reporting"). */
-export function readKillallLaneStop(input: unknown): KillallLaneStopRecord | null {
-  const snapshot = readExactPlainRecord(input, LANE_KEYS);
-  if (snapshot === null) {
-    return null;
-  }
-  if (typeof snapshot.projectId !== 'string' || snapshot.projectId.length === 0) {
-    return null;
-  }
-  if (typeof snapshot.laneId !== 'string' || snapshot.laneId.length === 0) {
-    return null;
-  }
-  if (typeof snapshot.confirmed !== 'boolean') {
-    return null;
-  }
-  if (!Array.isArray(snapshot.sessionResults)) {
+function readKillallSessionResults(input: unknown): readonly KillallSessionResultRecord[] | null {
+  if (!Array.isArray(input)) {
     return null;
   }
   const sessionResults: KillallSessionResultRecord[] = [];
-  for (const entry of snapshot.sessionResults) {
+  for (const entry of input) {
     const sessionResult = readKillallSessionResult(entry);
     if (sessionResult === null) {
       return null;
     }
     sessionResults.push(sessionResult);
   }
-  if (snapshot.confirmed) {
-    if (snapshot.unconfirmedReason !== null) {
-      return null;
-    }
-    if (
-      typeof snapshot.cleanSweeps !== 'number' ||
-      !Number.isInteger(snapshot.cleanSweeps) ||
-      snapshot.cleanSweeps < 2
-    ) {
-      return null;
-    }
-    if (!isZonedIsoDateTime(snapshot.confirmedAtIso)) {
-      return null;
-    }
-    return {
-      projectId: snapshot.projectId,
-      laneId: snapshot.laneId,
-      confirmed: true,
-      unconfirmedReason: null,
-      cleanSweeps: snapshot.cleanSweeps,
-      confirmedAtIso: snapshot.confirmedAtIso,
-      sessionResults,
-    };
+  return sessionResults;
+}
+
+function readConfirmedLaneStop(
+  projectId: string,
+  laneId: string,
+  snapshot: Record<string, unknown>,
+  sessionResults: readonly KillallSessionResultRecord[],
+): KillallLaneStopRecord | null {
+  if (snapshot.unconfirmedReason !== null) {
+    return null;
   }
-  if (!isKillallStopUnconfirmedReason(snapshot.unconfirmedReason)) {
+  const cleanSweeps = snapshot.cleanSweeps;
+  if (typeof cleanSweeps !== 'number' || !Number.isInteger(cleanSweeps) || cleanSweeps < 2) {
+    return null;
+  }
+  const confirmedAtIso = snapshot.confirmedAtIso;
+  if (!isZonedIsoDateTime(confirmedAtIso)) {
+    return null;
+  }
+  if (sessionResults.some((session) => !session.stopped)) {
+    return null;
+  }
+  return {
+    projectId,
+    laneId,
+    confirmed: true,
+    unconfirmedReason: null,
+    cleanSweeps,
+    confirmedAtIso,
+    sessionResults,
+  };
+}
+
+function readUnconfirmedLaneStop(
+  projectId: string,
+  laneId: string,
+  snapshot: Record<string, unknown>,
+  sessionResults: readonly KillallSessionResultRecord[],
+): KillallLaneStopRecord | null {
+  const unconfirmedReason = snapshot.unconfirmedReason;
+  if (!isKillallStopUnconfirmedReason(unconfirmedReason)) {
     return null;
   }
   if (snapshot.confirmedAtIso !== null) {
     return null;
   }
-  if (
-    typeof snapshot.cleanSweeps !== 'number' ||
-    !Number.isInteger(snapshot.cleanSweeps) ||
-    snapshot.cleanSweeps < 0
-  ) {
+  const cleanSweeps = snapshot.cleanSweeps;
+  if (typeof cleanSweeps !== 'number' || !Number.isInteger(cleanSweeps) || cleanSweeps < 0) {
     return null;
   }
   return {
-    projectId: snapshot.projectId,
-    laneId: snapshot.laneId,
+    projectId,
+    laneId,
     confirmed: false,
-    unconfirmedReason: snapshot.unconfirmedReason,
-    cleanSweeps: snapshot.cleanSweeps,
+    unconfirmedReason,
+    cleanSweeps,
     confirmedAtIso: null,
     sessionResults,
   };
+}
+
+/** One lane's stop line (plan §6 "Reporting"). */
+export function readKillallLaneStop(input: unknown): KillallLaneStopRecord | null {
+  const snapshot = readExactPlainRecord(input, LANE_KEYS);
+  if (snapshot === null) {
+    return null;
+  }
+  const projectId = snapshot.projectId;
+  if (typeof projectId !== 'string' || projectId.length === 0) {
+    return null;
+  }
+  const laneId = snapshot.laneId;
+  if (typeof laneId !== 'string' || laneId.length === 0) {
+    return null;
+  }
+  if (typeof snapshot.confirmed !== 'boolean') {
+    return null;
+  }
+  const sessionResults = readKillallSessionResults(snapshot.sessionResults);
+  if (sessionResults === null) {
+    return null;
+  }
+  if (snapshot.confirmed) {
+    return readConfirmedLaneStop(projectId, laneId, snapshot, sessionResults);
+  }
+  return readUnconfirmedLaneStop(projectId, laneId, snapshot, sessionResults);
 }
 
 /** Never throws, never echoes: exact keys; version 1; zoned halt time; marker state; integer sweep count; valid lanes and train. */
@@ -282,7 +309,7 @@ export function isKillallSweepConfirmed(cleanSweeps: number, stopped: boolean): 
 /**
  * The domain side of exit code 0 (plan §6): true only when the marker is halted,
  * the train pause is confirmed, the whole sweep has at least two clean sweeps,
- * and every listed lane is confirmed.
+ * every listed lane is confirmed, and every listed session is stopped.
  */
 export function killallStopReportConfirmed(report: KillallStopReportRecord): boolean {
   if (report.marker !== 'halted') {
@@ -294,7 +321,9 @@ export function killallStopReportConfirmed(report: KillallStopReportRecord): boo
   if (!Number.isInteger(report.cleanSweeps) || report.cleanSweeps < 2) {
     return false;
   }
-  return report.lanes.every((lane) => lane.confirmed);
+  return report.lanes.every(
+    (lane) => lane.confirmed && lane.sessionResults.every((session) => session.stopped),
+  );
 }
 
 /** A late start reopens the report (plan §6): the matching confirmed lane is reopened, nothing else changes. */

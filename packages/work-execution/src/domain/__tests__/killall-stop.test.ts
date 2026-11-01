@@ -30,6 +30,16 @@ function lane(overrides: Record<string, unknown> = {}): Record<string, unknown> 
   };
 }
 
+function unconfirmedLane(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return lane({
+    confirmed: false,
+    unconfirmedReason: 'unknown',
+    cleanSweeps: 0,
+    confirmedAtIso: null,
+    ...overrides,
+  });
+}
+
 function report(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     version: KILLALL_STOP_REPORT_RECORD_VERSION,
@@ -111,19 +121,19 @@ describe('confirmed lane shape', () => {
   it('refuses a confirmed lane that carries a reason', () => {
     expect(readKillallLaneStop(lane({ unconfirmedReason: 'not-stopped' }))).toBeNull();
   });
+
+  it('refuses a confirmed lane that lists a session that did not stop', () => {
+    expect(
+      readKillallLaneStop(
+        lane({
+          sessionResults: [{ sessionRef: 'ses-1', stopped: false }],
+        }),
+      ),
+    ).toBeNull();
+  });
 });
 
 describe('unconfirmed lane shape', () => {
-  function unconfirmedLane(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-    return lane({
-      confirmed: false,
-      unconfirmedReason: 'unknown',
-      cleanSweeps: 0,
-      confirmedAtIso: null,
-      ...overrides,
-    });
-  }
-
   it('accepts a well-formed unconfirmed lane', () => {
     expect(readKillallLaneStop(unconfirmedLane())).toMatchObject({
       confirmed: false,
@@ -191,6 +201,28 @@ describe('whole-report confirmation', () => {
         ),
       ),
     ).toBe(false);
+  });
+
+  it('cannot confirm when a hand-built report has a confirmed lane with an unstopped session', () => {
+    const handBuilt: KillallStopReportRecord = {
+      version: KILLALL_STOP_REPORT_RECORD_VERSION,
+      haltedAtIso: HALTED_AT,
+      marker: 'halted',
+      cleanSweeps: 2,
+      lanes: [
+        {
+          projectId: 'project-1',
+          laneId: 'lane-1',
+          confirmed: true,
+          unconfirmedReason: null,
+          cleanSweeps: 2,
+          confirmedAtIso: CONFIRMED_AT,
+          sessionResults: [{ sessionRef: 'ses-1', stopped: false }],
+        },
+      ],
+      train: { paused: true, acknowledged: true, unconfirmedReason: null },
+    };
+    expect(killallStopReportConfirmed(handBuilt)).toBe(false);
   });
 
   it('cannot confirm with fewer than two whole clean sweeps', () => {
@@ -316,7 +348,7 @@ describe('marker rules', () => {
 describe('session results', () => {
   it('preserves non-content session references and stop outcomes', () => {
     const laneRead = readKillallLaneStop(
-      lane({
+      unconfirmedLane({
         sessionResults: [
           { sessionRef: 'ses-interactive-1', stopped: true },
           { sessionRef: 'ses-interactive-2', stopped: false },
@@ -335,6 +367,16 @@ describe('session results', () => {
         }),
       ),
     ).toMatchObject({ ok: true });
+  });
+
+  it('rejects a confirmed lane with an unstopped session in report read', () => {
+    expect(
+      readKillallStopReportRecord(
+        report({
+          lanes: [lane({ sessionResults: [{ sessionRef: 'ses-1', stopped: false }] })],
+        }),
+      ),
+    ).toMatchObject({ ok: false });
   });
 
   it('rejects malformed session-result entries', () => {

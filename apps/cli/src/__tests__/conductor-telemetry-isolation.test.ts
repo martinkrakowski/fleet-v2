@@ -71,6 +71,30 @@ const FIXTURE_PASS: RunConductorPassResult = {
   attention: [],
 };
 
+const CONDUCTOR_ENABLED_INSTALLATION: FleetInstallation = {
+  schemaVersion: 2,
+  hosts: {
+    local: {
+      transport: 'local',
+      worktreeRoot: '/tmp/fleet-k7-worktrees',
+      roles: ['orchestrator', 'lane-runner'],
+      runner: {
+        kind: 'opencode',
+        port: 46000,
+        capabilities: {
+          networkEgressRestricted: true,
+          cpuAndMemoryLimited: true,
+          processTreeTermination: true,
+          filesystemScope: 'scoped-worktree',
+        },
+        maxLanes: 2,
+      },
+    },
+  },
+  forge: { mode: 'none' },
+  policy: { conductor: { enabled: true } },
+};
+
 function throwingRunSubprocess(): never {
   throw new Error('the conductor must never dispatch a subprocess');
 }
@@ -361,7 +385,6 @@ function buildRealExportTelemetry(
     dispositions: overrides?.dispositions ?? dispositions,
     telemetry: overrides?.telemetry ?? new NoopRunTelemetryAdapter(),
     hmac: overrides?.hmac ?? hmac,
-    ...(overrides?.mapper !== undefined ? { mapper: overrides.mapper } : {}),
   });
 }
 
@@ -475,7 +498,7 @@ const ISOLATION_FAULTS: readonly IsolationFault[] = [
     name: 'a mapper that throws',
     runtime: (base, dir) => {
       const useCase = buildRealExportTelemetry(dir, {
-        mapper: () => {
+        hmac: () => {
           throw new Error('mapper fault');
         },
       });
@@ -535,12 +558,10 @@ const ISOLATION_FAULTS: readonly IsolationFault[] = [
 describe('conductor telemetry isolation (OT5, plan §3.7)', () => {
   it('the baseline run with telemetry off drives one fixture run', async () => {
     const dir = tempStateDir();
-    const runtime = runtimeOf(dir);
+    const runtime = runtimeOf(dir, CONDUCTOR_ENABLED_INSTALLATION);
     await seedConductorRunState(runtime);
-    const fake = makePassDriver(runtime, [FIXTURE_PASS]);
     const result = await runConductor(runtime, ['run', '--live', '--once'], {
       stateDir: dir,
-      buildDriver: () => fake.driver,
     });
 
     expect(result.code).toBe(0);
@@ -548,8 +569,9 @@ describe('conductor telemetry isolation (OT5, plan §3.7)', () => {
     expect(result.stdout).toHaveLength(1);
     expect(JSON.parse(result.stdout[0]!)).toMatchObject({ pass: 1, outcome: 'completed' });
     const journalEntries = await runtime.conductor.laneRunJournal.listForRun(RUN_ID);
-    expect(journalEntries).toHaveLength(2);
-    expect(journalEntries.map((e) => e.entryId)).toEqual(['entry-seed-1', 'entry-pass-1']);
+    expect(journalEntries).toHaveLength(4);
+    expect(journalEntries[0]!.entryId).toBe('entry-seed-1');
+    expect(journalEntries.map((e) => e.state)).toEqual(['running', 'collecting', 'seat-failed', 'parked']);
   });
 
   for (const fault of ISOLATION_FAULTS) {

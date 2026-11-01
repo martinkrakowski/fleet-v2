@@ -23,6 +23,7 @@ export * from "./lane-run-records.js";
 export * from "./lane-run-review-facts.js";
 export * from "./lane-run-step-facts.js";
 export * from "./lane-run-transitions.js";
+export * from "./merge-queue-records.js";
 export * from "./plain-record-reads.js";
 export * from "./review-finding-scope.js";
 export * from "./run-telemetry.js";

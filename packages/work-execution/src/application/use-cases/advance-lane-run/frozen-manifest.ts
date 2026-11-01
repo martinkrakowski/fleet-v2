@@ -1,6 +1,7 @@
 /** Frozen brief manifest readers shared by AdvanceLaneRunUseCase's acts and the class (AL-1). */
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
-import type { AttemptRecord } from '../../../domain/execution-records.js';
+import type { AttemptArtifactPort } from '../../ports/out/AttemptArtifactPort.out-port.js';
+import type { AttemptRecord, AttemptRunnerRecord } from '../../../domain/execution-records.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
@@ -29,37 +30,50 @@ export type FrozenBriefRead =
   | { readonly kind: 'absent' }
   | { readonly kind: 'unverified' };
 
+export type FrozenBriefArtifactPort = Pick<AttemptArtifactPort, 'readBriefManifest' | 'readBriefFile'>;
+
+function hasNonEmptyText(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function parseManifestObject(manifestRaw: string): Record<string, unknown> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(manifestRaw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return null;
+  }
+  return parsed as Record<string, unknown>;
+}
+
 /**
- * Reads a conducted attempt's frozen brief (prose and manifest) and verifies
- * it against the attempt's recorded `briefDigest` before anything is taken
- * from it. The digest compared is exactly the one the gate uses: `compute(prose + '\n' +
- * manifestRaw)` against `attempt.briefDigest`, the prose read at
- * `briefPackagePath` and the manifest at its `-manifest.json` sibling, both
- * through the recorded host.
+ * Reads an attempt's frozen brief (prose and `-manifest.json` sibling) through
+ * the supplied `recordedHost` and verifies `computeDigest(prose + '\n' +
+ * manifestRaw) === attempt.briefDigest` before parsing the manifest object
+ * (SEC-5b-3). Shared by conducted readers (after `conductedRunnerOf`) and
+ * `resolveImplementerSeat` (which passes `attempt.runner ?? null`).
  */
-export async function readFrozenBriefVerified(
+export async function readFrozenBriefAtHostVerified(
   attempt: AttemptRecord,
-  artifactPort: AdvanceLaneRunDependencies['artifactPort'],
+  artifactPort: FrozenBriefArtifactPort | undefined,
+  recordedHost: AttemptRunnerRecord | null,
   computeDigest: (content: string) => string = simpleDeterministicHexDigest,
 ): Promise<FrozenBriefRead> {
-  // Fail closed: a missing or empty brief path, or a port without the
-  // manifest reader, reads "absent" — there is nothing recorded to read.
+  // Fail closed: a missing or empty brief path (the exact no-trim test of
+  // today, so a whitespace-only path is attempted and fails unverified, never
+  // skipped as absent), or a port without the manifest reader, reads "absent"
+  // — there is nothing recorded to read.
   if (
     typeof attempt.briefPackagePath !== 'string' ||
     attempt.briefPackagePath.length === 0 ||
-    artifactPort.readBriefManifest === undefined
+    artifactPort?.readBriefManifest === undefined
   ) {
     return { kind: 'absent' };
   }
-  // Fail closed: a missing or empty recorded digest or a port without the
-  // brief reader reads "not verified" (never the unverified read).
-  if (typeof attempt.briefDigest !== 'string' || attempt.briefDigest.length === 0 || artifactPort.readBriefFile === undefined) {
-    return { kind: 'unverified' };
-  }
-  // Q2a-2: a conducted attempt's read goes through its recorded host or is not
-  // made; a missing host never falls back to the local executor.
-  const recordedHost = conductedRunnerOf(attempt);
-  if (recordedHost === null) {
+  if (!hasNonEmptyText(attempt.briefDigest) || artifactPort.readBriefFile === undefined) {
     return { kind: 'unverified' };
   }
   let prose: string | null;
@@ -80,15 +94,63 @@ export async function readFrozenBriefVerified(
   if (computeDigest(prose + '\n' + manifestRaw) !== attempt.briefDigest) {
     return { kind: 'unverified' };
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(manifestRaw);
-  } catch {
+  const manifest = parseManifestObject(manifestRaw);
+  if (manifest === null) {
     return { kind: 'unverified' };
   }
-  return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-    ? { kind: 'verified', prose, manifest: parsed as Record<string, unknown> }
-    : { kind: 'unverified' };
+  return { kind: 'verified', prose, manifest };
+}
+
+/**
+ * Host-parameterized sibling of `readFrozenManifestVerified` (SEC-5b-3): drops
+ * the prose on `verified` and preserves `absent` vs `unverified`.
+ */
+export async function readFrozenManifestAtHostVerified(
+  attempt: AttemptRecord,
+  artifactPort: FrozenBriefArtifactPort | undefined,
+  recordedHost: AttemptRunnerRecord | null,
+  computeDigest: (content: string) => string = simpleDeterministicHexDigest,
+): Promise<FrozenManifestRead> {
+  const read = await readFrozenBriefAtHostVerified(attempt, artifactPort, recordedHost, computeDigest);
+  return read.kind === 'verified' ? { kind: 'verified', manifest: read.manifest } : read;
+}
+
+/**
+ * Reads a conducted attempt's frozen brief (prose and manifest) and verifies
+ * it against the attempt's recorded `briefDigest` before anything is taken
+ * from it. The digest compared is exactly the one the gate uses: `compute(prose + '\n' +
+ * manifestRaw)` against `attempt.briefDigest`, the prose read at
+ * `briefPackagePath` and the manifest at its `-manifest.json` sibling, both
+ * through the recorded host.
+ */
+export async function readFrozenBriefVerified(
+  attempt: AttemptRecord,
+  artifactPort: AdvanceLaneRunDependencies['artifactPort'],
+  computeDigest: (content: string) => string = simpleDeterministicHexDigest,
+): Promise<FrozenBriefRead> {
+  // Fail closed: a missing or empty brief path (the exact no-trim test of
+  // today, so a whitespace-only path is attempted and fails unverified, never
+  // skipped as absent), or a port without the manifest reader, reads "absent"
+  // — there is nothing recorded to read.
+  if (
+    typeof attempt.briefPackagePath !== 'string' ||
+    attempt.briefPackagePath.length === 0 ||
+    artifactPort.readBriefManifest === undefined
+  ) {
+    return { kind: 'absent' };
+  }
+  // Fail closed: a missing or empty recorded digest or a port without the
+  // brief reader reads "not verified" (never the unverified read).
+  if (!hasNonEmptyText(attempt.briefDigest) || artifactPort.readBriefFile === undefined) {
+    return { kind: 'unverified' };
+  }
+  // Q2a-2: a conducted attempt's read goes through its recorded host or is not
+  // made; a missing host never falls back to the local executor.
+  const recordedHost = conductedRunnerOf(attempt);
+  if (recordedHost === null) {
+    return { kind: 'unverified' };
+  }
+  return readFrozenBriefAtHostVerified(attempt, artifactPort, recordedHost, computeDigest);
 }
 
 /**

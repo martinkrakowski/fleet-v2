@@ -38,7 +38,10 @@ import type {
   EvaluateAttemptGateRequest,
   EvaluateAttemptGateResult,
 } from '../ports/in/EvaluateAttemptGatePort.in-port.js';
-import type { AcceptanceAssessmentPort } from '../ports/out/AcceptanceAssessmentPort.out-port.js';
+import type {
+  AcceptanceAssessmentPort,
+  AcceptanceAssessmentResult,
+} from '../ports/out/AcceptanceAssessmentPort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
@@ -48,6 +51,7 @@ import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-ac
 import type { AllowedSeatPort } from '../ports/out/AllowedSeatPort.out-port.js';
 import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
+import { readFrozenManifestAtHostVerified } from './advance-lane-run/frozen-manifest.js';
 import type {
   GatePredicateKind,
   GatePredicatePort,
@@ -65,7 +69,8 @@ function isNonEmptyString(value: unknown): value is string {
  * product's frozen brief package, and is not assumed present.
  */
 export interface ImplementerSeatPorts {
-  readonly artifactPort?: Pick<AttemptArtifactPort, 'readBriefManifest'>;
+  readonly artifactPort?: Pick<AttemptArtifactPort, 'readBriefManifest' | 'readBriefFile'>;
+  readonly computeDigest?: (content: string) => string;
 }
 
 /** The seat an attempt was implemented on, and the record that established it. */
@@ -420,66 +425,29 @@ function readStoredGateOutcome(
 
 const inFlightGateRuns = new WeakMap<object, Map<string, Promise<void>>>();
 
-/**
- * Read `modelAssignment.model` from the attempt's frozen brief manifest. The
- * candidate paths are derived from the dispatch-recorded brief package path
- * only, and the manifest is read only through the artifact port, which reads
- * the product's frozen brief package: a worker-writable worktree file is
- * never a seat authority, so an attempt without a recorded runner model and
- * without a wired artifact port stays `unknown` and is refused. An unreadable
- * or non-JSON candidate is absence, not an error.
- */
-async function readFrozenManifestModel(
-  attempt: AttemptRecord,
-  ports: ImplementerSeatPorts,
-): Promise<string | null> {
-  const briefPackagePath = attempt.briefPackagePath;
-  const candidates = [
-    briefPackagePath,
-    isNonEmptyString(briefPackagePath)
-      ? briefPackagePath.replace(/\.md$/, '-manifest.json')
-      : null,
-  ].filter(isNonEmptyString);
+function noRecordedSeatReason(attemptId: string): string {
+  return `Attempt ${attemptId} records no implementer seat: neither the dispatched runner model nor the frozen brief manifest's model assignment is known`;
+}
 
-  for (const candidate of candidates) {
-    let raw: string | null = null;
-    try {
-      raw = ports.artifactPort?.readBriefManifest
-        ? await ports.artifactPort.readBriefManifest(
-            attempt.worktreePath,
-            candidate,
-            attempt.runner ?? null,
-          )
-        : null;
-    } catch {
-      continue;
-    }
-    if (!isNonEmptyString(raw)) {
-      continue;
-    }
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      if (parsed === null || typeof parsed !== 'object') {
-        continue;
-      }
-      const model = (parsed as { readonly modelAssignment?: { readonly model?: unknown } })
-        .modelAssignment?.model;
-      if (isNonEmptyString(model)) {
-        return model.trim();
-      }
-    } catch {
-      continue;
-    }
-  }
-  return null;
+function unverifiedFrozenManifestReason(attemptId: string): string {
+  return `Frozen brief manifest for attempt ${attemptId} could not be verified against the recorded briefDigest`;
+}
+
+function manifestModelOf(manifest: Record<string, unknown>): string | null {
+  const model = (manifest as { readonly modelAssignment?: { readonly model?: unknown } })
+    .modelAssignment?.model;
+  return isNonEmptyString(model) ? model.trim() : null;
 }
 
 /**
  * Bind an attempt to the seat that implemented it: the runner model dispatch
- * recorded on the attempt, otherwise the frozen brief manifest's model
- * assignment read through the artifact port. Neither known is `unknown`,
- * never an assumed default seat, and an attempt with no recorded runner model
- * and no wired artifact port is refused.
+ * recorded on the attempt, otherwise the digest-verified frozen brief
+ * manifest's model assignment read through the artifact port. The manifest
+ * fallback verifies prose + manifest against the attempt's recorded
+ * `briefDigest` (SEC-5b-3) and fails closed on `unverified`: a tampered or
+ * missing manifest, prose file or digest is never a seat authority. Neither
+ * known is `unknown`, never an assumed default seat, and an attempt with no
+ * recorded runner model and no wired artifact port is refused.
  */
 export async function resolveImplementerSeat(
   attempt: AttemptRecord,
@@ -489,14 +457,22 @@ export async function resolveImplementerSeat(
   if (isNonEmptyString(recorded)) {
     return { outcome: 'resolved', model: recorded.trim(), source: 'attempt-runner' };
   }
-  const manifestModel = await readFrozenManifestModel(attempt, ports);
-  if (manifestModel !== null) {
-    return { outcome: 'resolved', model: manifestModel, source: 'frozen-manifest' };
+  const manifestRead = await readFrozenManifestAtHostVerified(
+    attempt,
+    ports.artifactPort,
+    attempt.runner ?? null,
+    ports.computeDigest,
+  );
+  if (manifestRead.kind === 'unverified') {
+    return { outcome: 'unknown', reason: unverifiedFrozenManifestReason(attempt.id) };
   }
-  return {
-    outcome: 'unknown',
-    reason: `Attempt ${attempt.id} records no implementer seat: neither the dispatched runner model nor the frozen brief manifest's model assignment is known`,
-  };
+  if (manifestRead.kind === 'verified') {
+    const manifestModel = manifestModelOf(manifestRead.manifest);
+    if (manifestModel !== null) {
+      return { outcome: 'resolved', model: manifestModel, source: 'frozen-manifest' };
+    }
+  }
+  return { outcome: 'unknown', reason: noRecordedSeatReason(attempt.id) };
 }
 
 export interface RequestAttemptAcceptanceDependencies {
@@ -530,6 +506,76 @@ export interface RequestAttemptAcceptanceDependencies {
   readonly now?: () => string;
 }
 
+function validateCollectedHead(
+  attempt: AttemptRecord,
+  candidateHeadSha: string,
+): string | null {
+  if (attempt.state !== 'collected' && attempt.state !== 'ended') {
+    return `Attempt is not ready for acceptance: state is '${attempt.state}'`;
+  }
+  if (attempt.artifacts === null) {
+    return 'Attempt has no collected artifacts';
+  }
+  if (attempt.artifacts.headCommit !== candidateHeadSha) {
+    return `Candidate head mismatch: expected ${attempt.artifacts.headCommit}, got ${candidateHeadSha}`;
+  }
+  return null;
+}
+
+async function findSeatPlanFamilyClash(
+  attemptRepo: AttemptRepositoryPort,
+  workOrderId: string,
+  reviewerModel: string,
+): Promise<string | undefined> {
+  const lane = await attemptRepo.listAttemptsByWorkOrder(workOrderId);
+  const reviewerFamily = underlyingModelFamily(reviewerModel);
+  for (const record of lane) {
+    const model = record.runner?.model;
+    if (isNonEmptyString(model) && isSameModelFamily(underlyingModelFamily(model), reviewerFamily)) {
+      return model;
+    }
+  }
+  return undefined;
+}
+
+async function validateReviewerEligibility(
+  deps: RequestAttemptAcceptanceDependencies,
+  attempt: AttemptRecord,
+  implementerModel: string,
+  reviewerModel: string,
+): Promise<string | null> {
+  if (!isNonEmptyString(reviewerModel)) {
+    return 'reviewerModel is required';
+  }
+  if (isSameModelFamily(underlyingModelFamily(implementerModel), underlyingModelFamily(reviewerModel))) {
+    return `Reviewer model ${reviewerModel} matches implementer model ${implementerModel}; an independent reviewer is required`;
+  }
+  // S1: with a seat plan the lane may rotate implementers across families;
+  // the reviewer must be independent of every model that ran in the lane.
+  if (attempt.seatPlan) {
+    const clash = await findSeatPlanFamilyClash(deps.attemptRepo, attempt.workOrderId, reviewerModel);
+    if (clash !== undefined) {
+      return (
+        'Reviewer model ' +
+        reviewerModel +
+        ' shares a model family with implementer model ' +
+        clash +
+        ' earlier in this lane; an independent reviewer is required'
+      );
+    }
+  }
+  // Free-seat policy (plan F5): with the flag off, a reviewer model must be
+  // a catalogue seat that is not free; a free or unknown reviewer is
+  // rejected before any verification is requested.
+  if (deps.allowedSeats) {
+    const verdict = deps.allowedSeats.checkReviewerModel({ model: reviewerModel });
+    if (!verdict.allowed) {
+      return verdict.reason;
+    }
+  }
+  return null;
+}
+
 export class RequestAttemptAcceptanceUseCase
   implements RequestAttemptAcceptancePort, EvaluateAttemptGatePort
 {
@@ -547,80 +593,34 @@ export class RequestAttemptAcceptanceUseCase
     if (attempt === null) {
       return { outcome: 'rejected', reason: 'Attempt not found' };
     }
-    if (attempt.state !== 'collected' && attempt.state !== 'ended') {
-      return {
-        outcome: 'rejected',
-        reason: `Attempt is not ready for acceptance: state is '${attempt.state}'`,
-      };
-    }
-    if (attempt.artifacts === null) {
-      return { outcome: 'rejected', reason: 'Attempt has no collected artifacts' };
-    }
-
-    // Only the exact collected head is ever assessed; a moved head is stale.
-    if (attempt.artifacts.headCommit !== request.candidateHeadSha) {
-      return {
-        outcome: 'rejected',
-        reason: `Candidate head mismatch: expected ${attempt.artifacts.headCommit}, got ${request.candidateHeadSha}`,
-      };
+    const headError = validateCollectedHead(attempt, request.candidateHeadSha);
+    if (headError !== null) {
+      return { outcome: 'rejected', reason: headError };
     }
 
     // The implementer is the attempt's own seat; an unknown seat is refused
     // rather than compared against an assumed default.
     const implementerSeat = await resolveImplementerSeat(attempt, {
       artifactPort: deps.artifactPort,
+      computeDigest: deps.computeDigest,
     });
     if (implementerSeat.outcome === 'unknown') {
       return { outcome: 'rejected', reason: implementerSeat.reason };
     }
-    const implementerModel = implementerSeat.model;
-    // The reviewer seat must be named; a missing one is refused before any
-    // independence or free-seat check is evaluated.
-    if (!isNonEmptyString(request.reviewerModel)) {
-      return { outcome: 'rejected', reason: 'reviewerModel is required' };
-    }
-    // Independence is the owner-decided family rule: the same underlying model
-    // family (after the provider path and any `#`, `:` or `@` suffix are
-    // dropped) is never independence, and an empty family fails closed.
-    if (
-      isSameModelFamily(
-        underlyingModelFamily(implementerModel),
-        underlyingModelFamily(request.reviewerModel),
-      )
-    ) {
-      return {
-        outcome: 'rejected',
-        reason: `Reviewer model ${request.reviewerModel} matches implementer model ${implementerModel}; an independent reviewer is required`,
-      };
-    }
-    // S1: with a seat plan the lane may rotate implementers across families;
-    // the reviewer must be independent of every model that ran in the lane.
-    if (attempt.seatPlan) {
-      const lane = await deps.attemptRepo.listAttemptsByWorkOrder(attempt.workOrderId);
-      const laneModels = lane
-        .map((record) => record.runner?.model ?? null)
-        .filter((model): model is string => typeof model === 'string' && model.trim().length > 0);
-      const clash = laneModels.find((model) =>
-        isSameModelFamily(underlyingModelFamily(model), underlyingModelFamily(request.reviewerModel)),
-      );
-      if (clash !== undefined) {
-        return {
-          outcome: 'rejected',
-          reason:
-            'Reviewer model ' + request.reviewerModel + ' shares a model family with implementer model ' +
-            clash + ' earlier in this lane; an independent reviewer is required',
-        };
-      }
-    }
 
-    // Free-seat policy (plan F5): with the flag off, a reviewer model must be
-    // a catalogue seat that is not free; a free or unknown reviewer is
-    // rejected before any verification is requested.
-    if (deps.allowedSeats) {
-      const verdict = deps.allowedSeats.checkReviewerModel({ model: request.reviewerModel });
-      if (!verdict.allowed) {
-        return { outcome: 'rejected', reason: verdict.reason };
-      }
+    // The reviewer seat must be named; a missing one is refused before any
+    // independence or free-seat check is evaluated. Independence is the
+    // owner-decided family rule: the same underlying model family (after the
+    // provider path and any `#`, `:` or `@` suffix are dropped) is never
+    // independence, and an empty family fails closed.
+    const reviewerError = await validateReviewerEligibility(
+      deps,
+      attempt,
+      implementerSeat.model,
+      request.reviewerModel,
+    );
+    if (reviewerError !== null) {
+      return { outcome: 'rejected', reason: reviewerError };
     }
 
     const workOrder = deps.workOrderRepo
@@ -646,13 +646,21 @@ export class RequestAttemptAcceptanceUseCase
       candidateHeadSha: request.candidateHeadSha,
       policyRevision: workOrder.policyRevision,
     });
+    return this.finalizeAssessmentVerdict(deps, workOrder, request.candidateHeadSha, verdict);
+  }
 
+  /** A receipt for a different head is stale evidence, never a pass. */
+  private async finalizeAssessmentVerdict(
+    deps: RequestAttemptAcceptanceDependencies,
+    workOrder: WorkOrderRecord,
+    candidateHeadSha: string,
+    verdict: AcceptanceAssessmentResult,
+  ): Promise<RequestAttemptAcceptanceResult> {
     if (verdict.outcome === 'accepted') {
-      // A receipt for a different head is stale evidence, never a pass.
-      if (verdict.assessedHeadSha !== request.candidateHeadSha) {
+      if (verdict.assessedHeadSha !== candidateHeadSha) {
         return {
           outcome: 'rejected',
-          reason: `Stale: assessed head ${verdict.assessedHeadSha} does not match candidate head ${request.candidateHeadSha}`,
+          reason: `Stale: assessed head ${verdict.assessedHeadSha} does not match candidate head ${candidateHeadSha}`,
         };
       }
       await this.markReadyToMerge(deps, workOrder);

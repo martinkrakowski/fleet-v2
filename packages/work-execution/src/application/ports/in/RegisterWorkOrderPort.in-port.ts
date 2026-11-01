@@ -26,6 +26,12 @@ export interface RegisterWorkOrderRequest {
    * and not already superseded by another work order.
    */
   readonly supersedesWorkOrderId?: string;
+  /**
+   * Optional base branch (`main`, or a `chain/<lowercase-dashes>` name; CB1).
+   * Absent stores `main`; anything else must parse or registration is
+   * rejected with reason `invalid-base-branch`.
+   */
+  readonly baseBranch?: string;
   readonly nowIso?: string;
 }
 

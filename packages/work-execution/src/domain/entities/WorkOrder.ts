@@ -7,6 +7,8 @@
 
 import type { PlanRef, WorkOrderRecord, WorkOrderRisk } from '../execution-records.js';
 import { resolveWorkOrderRisk } from '../execution-records.js';
+import type { BaseBranchValue } from '../base-branch.js';
+import { BASE_BRANCH_INVALID_MESSAGE, parseBaseBranch, resolveWorkOrderBaseBranch } from '../base-branch.js';
 import { PLAN_ID_PATTERN, PLANNED_LANE_ID_PATTERN } from '../lane-plan-records.js';
 import type { WorkOrderStateValue } from '../value-objects/WorkOrderState.vo.js';
 import { WorkOrderState } from '../value-objects/WorkOrderState.vo.js';
@@ -55,6 +57,9 @@ export class WorkOrder {
         throw new Error('WorkOrder cannot supersede itself');
       }
     }
+    if (Object.hasOwn(record, 'baseBranch') && parseBaseBranch(record.baseBranch) === undefined) {
+      throw new Error('WorkOrder ' + BASE_BRANCH_INVALID_MESSAGE);
+    }
     return new WorkOrder(storedRecord(record));
   }
 
@@ -83,6 +88,11 @@ export class WorkOrder {
     return resolveWorkOrderRisk(this.record);
   }
 
+  /** The registered base branch; a record stored without one is `main` (lane CB1). */
+  getBaseBranch(): BaseBranchValue {
+    return resolveWorkOrderBaseBranch(this.record);
+  }
+
   /** Terminal states (merged, stopped) accept no further attempt dispatch. */
   isTerminal(): boolean {
     return this.record.state === 'merged' || this.record.state === 'stopped';
@@ -104,12 +114,13 @@ export class WorkOrder {
   }
 }
 
-/** A fresh record; `planRef` and `risk` are copied when present and omitted when absent. */
+/** A fresh record; `planRef`, `risk` and `baseBranch` are copied when present and omitted when absent. */
 function storedRecord(record: WorkOrderRecord): WorkOrderRecord {
-  const stored: Omit<WorkOrderRecord, 'planRef' | 'risk' | 'supersedesWorkOrderId'> & {
+  const stored: Omit<WorkOrderRecord, 'planRef' | 'risk' | 'supersedesWorkOrderId' | 'baseBranch'> & {
     planRef?: PlanRef;
     risk?: WorkOrderRisk;
     supersedesWorkOrderId?: string;
+    baseBranch?: BaseBranchValue;
   } = {
     id: record.id,
     projectId: record.projectId,
@@ -137,6 +148,9 @@ function storedRecord(record: WorkOrderRecord): WorkOrderRecord {
   }
   if (Object.hasOwn(record, 'supersedesWorkOrderId') && record.supersedesWorkOrderId !== undefined) {
     stored.supersedesWorkOrderId = record.supersedesWorkOrderId;
+  }
+  if (Object.hasOwn(record, 'baseBranch') && record.baseBranch !== undefined) {
+    stored.baseBranch = record.baseBranch;
   }
   return stored;
 }

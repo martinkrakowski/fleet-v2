@@ -2,18 +2,25 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildLaneRunStepKey,
+  buildMergeKey,
   head12Of,
   laneRunPremergeKey,
   laneRunResumeKey,
   laneRunStopForceKey,
   laneRunStopKey,
+  LANE_RUN_MAX_RETRY,
+  MERGE_KEY_ACTIONS,
+  MERGE_KEY_ONE_WAY_ACTIONS,
+  MERGE_KEY_TRANSIENT_REFUSAL_REASON,
+  MERGE_KEY_TWO_WAY_ACTIONS,
   parseLaneRunKey,
   reaperRepairKey,
   REAPER_FINDING_KINDS,
   requestKey,
   stopModeOfKey,
 } from '../lane-run-keys.js';
-import type { LaneRunKeyVia, LaneRunStepKeyParts, ReaperFindingKind } from '../lane-run-keys.js';
+import type { LaneRunKeyVia, LaneRunStepKeyParts, MergeKeyParts, MergeKeyRetryProof, ReaperFindingKind } from '../lane-run-keys.js';
+import { readLaneRunJournalEntry } from '../lane-run-journal.js';
 import {
   LANE_RUN_KEY_ATTEMPT_RULE,
   LANE_RUN_KEY_HEAD_RULE,
@@ -31,6 +38,7 @@ function fakeSecretShape(): string {
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const HEAD12 = '0123456789ab';
+const REPO_DIGEST = 'fedcba987654';
 
 const BASE_PARTS: LaneRunStepKeyParts = {
   runId: RUN_ID,
@@ -474,6 +482,363 @@ describe('key builders', () => {
   });
 });
 
+describe('merge keys', () => {
+  const MERGE_BASE_PARTS: MergeKeyParts = {
+    repoDigest: REPO_DIGEST,
+    pullRequest: 42,
+    head12: HEAD12,
+    action: 'merge-pr',
+    attemptOrdinal: null,
+    retry: null,
+    retryProof: null,
+  };
+  const FORGE_ERROR_PROOF: MergeKeyRetryProof = {
+    priorOutcome: 'refused',
+    priorReasonCode: MERGE_KEY_TRANSIENT_REFUSAL_REASON,
+    postconditionAbsent: true,
+  };
+
+  it('round-trips one-way base keys', () => {
+    expect(MERGE_KEY_ACTIONS).toEqual([...MERGE_KEY_ONE_WAY_ACTIONS, ...MERGE_KEY_TWO_WAY_ACTIONS]);
+    for (const action of MERGE_KEY_ONE_WAY_ACTIONS) {
+      const built = buildMergeKey({ ...MERGE_BASE_PARTS, action });
+      expect(built).toEqual({ ok: true, key: `merge/${REPO_DIGEST}/42/${HEAD12}/${action}` });
+      if (!built.ok) continue;
+      const parsed = parseLaneRunKey(built.key);
+      expect(parsed).toEqual({
+        kind: 'merge',
+        repoDigest: REPO_DIGEST,
+        pullRequest: 42,
+        head12: HEAD12,
+        action,
+        attemptOrdinal: null,
+        retry: null,
+      });
+      if (parsed === null || parsed.kind !== 'merge') continue;
+      expect(buildMergeKey(parsed)).toEqual(built);
+    }
+  });
+
+  it('mints proof-gated retry keys after refused forge-error or not-started', () => {
+    const proofs: MergeKeyRetryProof[] = [
+      FORGE_ERROR_PROOF,
+      { priorOutcome: 'not-started', priorReasonCode: null, postconditionAbsent: true },
+      { priorOutcome: 'not-started', postconditionAbsent: true },
+      { priorOutcome: 'not-started', priorReasonCode: 'update-grace-expired', postconditionAbsent: true },
+    ];
+    for (const action of MERGE_KEY_ONE_WAY_ACTIONS) {
+      for (let retry = 1; retry <= LANE_RUN_MAX_RETRY; retry += 1) {
+        for (const retryProof of proofs) {
+          const built = buildMergeKey({ ...MERGE_BASE_PARTS, action, retry, retryProof });
+          expect(built).toEqual({ ok: true, key: `merge/${REPO_DIGEST}/42/${HEAD12}/${action}/r${retry}` });
+          if (!built.ok) continue;
+          const parsed = parseLaneRunKey(built.key);
+          expect(parsed).toEqual({
+            kind: 'merge',
+            repoDigest: REPO_DIGEST,
+            pullRequest: 42,
+            head12: HEAD12,
+            action,
+            attemptOrdinal: null,
+            retry,
+          });
+          if (parsed === null || parsed.kind !== 'merge') continue;
+          expect(buildMergeKey(parsed)).toEqual({
+            ok: false,
+            error: 'LaneRun merge key retry requires a postcondition-absent proof',
+          });
+          expect(buildMergeKey({ ...parsed, retryProof })).toEqual({ ok: true, key: built.key });
+        }
+      }
+    }
+  });
+
+  it('refuses retry proofs that do not attest the postcondition absent', () => {
+    const goodProof = FORGE_ERROR_PROOF;
+    // retry set but proof omitted or null.
+    for (const retryProof of [undefined, null]) {
+      const result = buildMergeKey({ ...MERGE_BASE_PARTS, retry: 1, retryProof });
+      expect(result).toEqual({ ok: false, error: 'LaneRun merge key retry requires a postcondition-absent proof' });
+    }
+    // postconditionAbsent not exactly true.
+    for (const postconditionAbsent of [false, 'true', 1, undefined]) {
+      const result = buildMergeKey({
+        ...MERGE_BASE_PARTS,
+        retry: 1,
+        retryProof: {
+          priorOutcome: 'refused',
+          priorReasonCode: 'forge-error',
+          postconditionAbsent,
+        } as unknown as MergeKeyRetryProof,
+      });
+      expect(result).toEqual({ ok: false, error: 'LaneRun merge key retry requires postconditionAbsent to be true' });
+    }
+    // priorOutcome outside the eligible finals.
+    for (const priorOutcome of ['ambiguous', 'completed', 'reconciled', 'dry-run', 'overtaken', 'cancelled-unstarted']) {
+      const result = buildMergeKey({
+        ...MERGE_BASE_PARTS,
+        retry: 1,
+        retryProof: { priorOutcome, postconditionAbsent: true },
+      });
+      expect(result).toEqual({
+        ok: false,
+        error: 'LaneRun merge key retry is only allowed after refused forge-error or not-started',
+      });
+    }
+    // refused requires forge-error.
+    for (const priorReasonCode of ['conflict', 'protection', 'permission', null, undefined]) {
+      const result = buildMergeKey({
+        ...MERGE_BASE_PARTS,
+        retry: 1,
+        retryProof: { priorOutcome: 'refused', priorReasonCode, postconditionAbsent: true },
+      });
+      expect(result).toEqual({
+        ok: false,
+        error: 'LaneRun merge key retry after refused requires priorReasonCode forge-error',
+      });
+    }
+    // not-started requires a valid optional reason token.
+    for (const priorReasonCode of ['BAD_CODE', '']) {
+      const result = buildMergeKey({
+        ...MERGE_BASE_PARTS,
+        retry: 1,
+        retryProof: { priorOutcome: 'not-started', priorReasonCode, postconditionAbsent: true },
+      });
+      expect(result).toEqual({
+        ok: false,
+        error: 'LaneRun merge key retry priorReasonCode must be a reason token or null',
+      });
+    }
+    // retry null paired with a non-null proof.
+    const stray = buildMergeKey({ ...MERGE_BASE_PARTS, retryProof: goodProof });
+    expect(stray).toEqual({ ok: false, error: 'LaneRun merge key retryProof is only allowed when retry is set' });
+  });
+
+  it('caps retry at 1..9', () => {
+    for (const retry of [0, 10, -1, 1.5, '1']) {
+      const result = buildMergeKey({ ...MERGE_BASE_PARTS, retry: retry as number, retryProof: FORGE_ERROR_PROOF });
+      expect(result).toEqual({ ok: false, error: 'LaneRun merge key retry must be an integer from 1 to 9' });
+    }
+    for (const key of [
+      `merge/${REPO_DIGEST}/42/${HEAD12}/merge-pr/r0`,
+      `merge/${REPO_DIGEST}/42/${HEAD12}/merge-pr/r10`,
+      `merge/${REPO_DIGEST}/42/${HEAD12}/merge-pr/r01`,
+      `merge/${REPO_DIGEST}/42/${HEAD12}/merge-pr/retry1`,
+    ]) {
+      expect(parseLaneRunKey(key)).toBeNull();
+    }
+  });
+
+  it('requires /a1../a32 on two-way actions and forbids /r<n>', () => {
+    for (const action of MERGE_KEY_TWO_WAY_ACTIONS) {
+      for (const attemptOrdinal of [1, 32]) {
+        const built = buildMergeKey({ ...MERGE_BASE_PARTS, action, attemptOrdinal, retry: null });
+        expect(built).toEqual({ ok: true, key: `merge/${REPO_DIGEST}/42/${HEAD12}/${action}/a${attemptOrdinal}` });
+        if (!built.ok) continue;
+        const parsed = parseLaneRunKey(built.key);
+        expect(parsed).toEqual({
+          kind: 'merge',
+          repoDigest: REPO_DIGEST,
+          pullRequest: 42,
+          head12: HEAD12,
+          action,
+          attemptOrdinal,
+          retry: null,
+        });
+        if (parsed === null || parsed.kind !== 'merge') continue;
+        expect(buildMergeKey(parsed)).toEqual(built);
+      }
+      for (const attemptOrdinal of [null, 0, 33, 1.5, '1']) {
+        const result = buildMergeKey({ ...MERGE_BASE_PARTS, action, attemptOrdinal: attemptOrdinal as number, retry: null });
+        expect(result.ok).toBe(false);
+      }
+      const withRetry = buildMergeKey({ ...MERGE_BASE_PARTS, action, attemptOrdinal: 1, retry: 1 });
+      expect(withRetry.ok).toBe(false);
+    }
+    const oneWayAttempt = buildMergeKey({ ...MERGE_BASE_PARTS, action: 'merge-pr', attemptOrdinal: 1, retry: null });
+    expect(oneWayAttempt).toEqual({
+      ok: false,
+      error: 'LaneRun merge key attemptOrdinal is not allowed for a one-way action',
+    });
+    for (const key of [
+      `merge/${REPO_DIGEST}/42/${HEAD12}/macos-verify`,
+      `merge/${REPO_DIGEST}/42/${HEAD12}/macos-verify/a0`,
+      `merge/${REPO_DIGEST}/42/${HEAD12}/macos-verify/a01`,
+      `merge/${REPO_DIGEST}/42/${HEAD12}/macos-verify/a33`,
+      `merge/${REPO_DIGEST}/42/${HEAD12}/veto/r1`,
+      `merge/${REPO_DIGEST}/42/${HEAD12}/merge-pr/a1`,
+    ]) {
+      expect(parseLaneRunKey(key)).toBeNull();
+    }
+  });
+
+  it('rejects invalid merge fields and segments', () => {
+    for (const repoDigest of ['FEDCBA987654', 'fedcba98765', 'fedcba9876540', 'xxxxxxxxxxxx']) {
+      expect(buildMergeKey({ ...MERGE_BASE_PARTS, repoDigest }).ok).toBe(false);
+    }
+    for (const head12 of ['FEDCBA987654', 'fedcba98765', 'fedcba9876540', 'xxxxxxxxxxxx']) {
+      expect(buildMergeKey({ ...MERGE_BASE_PARTS, head12 }).ok).toBe(false);
+    }
+    for (const pullRequest of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '042']) {
+      expect(buildMergeKey({ ...MERGE_BASE_PARTS, pullRequest: pullRequest as number }).ok).toBe(false);
+    }
+    expect(buildMergeKey({ ...MERGE_BASE_PARTS, action: 'bogus' as MergeKeyParts['action'] }).ok).toBe(false);
+    for (const key of [
+      `merge/${REPO_DIGEST}`,
+      `merge/${REPO_DIGEST}/42/${HEAD12}/merge-pr/`,
+      `merge/${REPO_DIGEST}/42/${HEAD12}/merge-pr/r1/extra`,
+      `Merge/${REPO_DIGEST}/42/${HEAD12}/merge-pr`,
+      `merge/FEDCBA987654/42/${HEAD12}/merge-pr`,
+      `merge/${REPO_DIGEST}/42/FEDCBA987654/merge-pr`,
+      `merge/${REPO_DIGEST}/0/${HEAD12}/merge-pr`,
+      `merge/${REPO_DIGEST}/042/${HEAD12}/merge-pr`,
+      `merge/${REPO_DIGEST}/42/${HEAD12}/bogus`,
+    ]) {
+      expect(parseLaneRunKey(key)).toBeNull();
+    }
+  });
+
+  it('never throws and never echoes hostile merge input', () => {
+    for (const input of [null, undefined, 42, 'str', [], new Date()]) {
+      const result = buildMergeKey(input as unknown as MergeKeyParts);
+      expect(result.ok).toBe(false);
+    }
+
+    let partsGetterRan = false;
+    const hostileParts = {};
+    Object.defineProperty(hostileParts, 'repoDigest', {
+      get() {
+        partsGetterRan = true;
+        throw new Error('boom');
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    const hostilePartsResult = buildMergeKey(hostileParts as MergeKeyParts);
+    expect(partsGetterRan).toBe(false);
+    expect(hostilePartsResult.ok).toBe(false);
+    if (!hostilePartsResult.ok) {
+      expect(hostilePartsResult.error).not.toContain('boom');
+    }
+
+    let proofGetterRan = false;
+    const hostileProof = {};
+    Object.defineProperty(hostileProof, 'postconditionAbsent', {
+      get() {
+        proofGetterRan = true;
+        throw new Error('boom');
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    const hostileProofResult = buildMergeKey({
+      ...MERGE_BASE_PARTS,
+      retry: 1,
+      retryProof: hostileProof as MergeKeyRetryProof,
+    });
+    expect(proofGetterRan).toBe(false);
+    expect(hostileProofResult.ok).toBe(false);
+    if (!hostileProofResult.ok) {
+      expect(hostileProofResult.error).not.toContain('boom');
+    }
+
+    for (const trap of ['get', 'getOwnPropertyDescriptor', 'getPrototypeOf'] as const) {
+      let trapRan = false;
+      const proxy = new Proxy(
+        {},
+        {
+          [trap]() {
+            if (trap === 'get') trapRan = true;
+            throw new Error('boom');
+          },
+        },
+      );
+      const result = buildMergeKey(proxy as unknown as MergeKeyParts);
+      if (trap === 'get') {
+        expect(trapRan).toBe(false);
+      }
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).not.toContain('boom');
+      }
+    }
+
+    for (const trap of ['get', 'getOwnPropertyDescriptor', 'getPrototypeOf'] as const) {
+      let trapRan = false;
+      const proofProxy = new Proxy(
+        { priorOutcome: 'refused', priorReasonCode: 'forge-error', postconditionAbsent: true },
+        {
+          [trap]() {
+            if (trap === 'get') trapRan = true;
+            throw new Error('boom');
+          },
+        },
+      );
+      const result = buildMergeKey({
+        ...MERGE_BASE_PARTS,
+        retry: 1,
+        retryProof: proofProxy as MergeKeyRetryProof,
+      });
+      if (trap === 'get') {
+        expect(trapRan).toBe(false);
+        expect(result.ok).toBe(true);
+      } else {
+        expect(result.ok).toBe(false);
+      }
+      if (!result.ok) {
+        expect(result.error).not.toContain('boom');
+      }
+    }
+
+    const xyzzys: MergeKeyParts[] = [
+      { ...MERGE_BASE_PARTS, repoDigest: 'XYZZY' },
+      { ...MERGE_BASE_PARTS, head12: 'XYZZY' },
+      { ...MERGE_BASE_PARTS, action: 'XYZZY' as MergeKeyParts['action'] },
+      { ...MERGE_BASE_PARTS, retryProof: { priorOutcome: 'XYZZY', postconditionAbsent: true } },
+      { ...MERGE_BASE_PARTS, retry: 1, retryProof: { priorOutcome: 'XYZZY', postconditionAbsent: true } },
+      {
+        ...MERGE_BASE_PARTS,
+        retry: 1,
+        retryProof: { priorOutcome: 'refused', priorReasonCode: 'XYZZY', postconditionAbsent: true },
+      },
+    ];
+    for (const parts of xyzzys) {
+      const result = buildMergeKey(parts);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).not.toContain('XYZZY');
+      }
+    }
+  });
+
+  it('accepts merge intent entries in the run journal', () => {
+    const key = `merge/${REPO_DIGEST}/42/${HEAD12}/merge-pr`;
+    for (const runId of [null, RUN_ID]) {
+      const entry = {
+        version: 1,
+        entryId: '01JB0000000000000000000000',
+        kind: 'intent',
+        key,
+        runId,
+        recordedAtIso: '2026-10-27T10:00:00.000Z',
+        mode: null,
+        expectedRevision: null,
+        mintedId: null,
+        outcome: null,
+        reasonCode: null,
+        detail: null,
+        grantId: null,
+        state: null,
+      };
+      const read = readLaneRunJournalEntry(entry);
+      expect(read.ok).toBe(true);
+      if (read.ok) {
+        expect(read.entry).toEqual(entry);
+      }
+    }
+  });
+});
+
 describe('parseLaneRunKey', () => {
   it.each([
     '',
@@ -519,6 +884,25 @@ describe('parseLaneRunKey', () => {
     'reaper/attempt-example-1/dead-attempt',
     'reaper//dead-attempt@01JB0000000000000000000000',
     'Reaper/attempt-example-1/dead-attempt@01JB0000000000000000000000',
+    'merge/fedcba987654',
+    'merge/fedcba987654/42/0123456789ab/merge-pr/',
+    'merge/fedcba987654/42/0123456789ab/merge-pr/r1/extra',
+    'Merge/fedcba987654/42/0123456789ab/merge-pr',
+    'merge/fedcba987654/42/0123456789ab/merge-pr/r0',
+    'merge/fedcba987654/42/0123456789ab/merge-pr/r10',
+    'merge/fedcba987654/42/0123456789ab/merge-pr/r01',
+    'merge/fedcba987654/42/0123456789ab/merge-pr/retry1',
+    'merge/fedcba987654/42/0123456789ab/macos-verify',
+    'merge/fedcba987654/42/0123456789ab/macos-verify/a0',
+    'merge/fedcba987654/42/0123456789ab/macos-verify/a01',
+    'merge/fedcba987654/42/0123456789ab/macos-verify/a33',
+    'merge/fedcba987654/42/0123456789ab/veto/r1',
+    'merge/fedcba987654/42/0123456789ab/merge-pr/a1',
+    'merge/FEDCBA987654/42/0123456789ab/merge-pr',
+    'merge/fedcba987654/42/FEDCBA987654/merge-pr',
+    'merge/fedcba987654/0/0123456789ab/merge-pr',
+    'merge/fedcba987654/042/0123456789ab/merge-pr',
+    'merge/fedcba987654/42/0123456789ab/bogus',
   ])('rejects %j', (key) => {
     expect(parseLaneRunKey(key)).toBeNull();
   });

@@ -27,7 +27,9 @@ Supplier contexts do not import execution aggregates. Work execution defines
 consumer-side outbound contracts; its infrastructure adapters delegate to
 supplier-owned application contracts. The composition root constructs those
 adapters and injects them into use cases. The manifest's `adapter_bindings`
-records the intended delegation; generated stubs do not yet implement it.
+records the intended delegation; generated stubs do not yet implement it. The
+cross-context invariants these dependencies must hold, each with the test that
+enforces it, are listed in [architecture/seam-register.md](architecture/seam-register.md).
 
 ## Behavioural contract
 

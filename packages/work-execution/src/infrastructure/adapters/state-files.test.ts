@@ -10,7 +10,9 @@ import {
   type StateFileDescriptor,
   type StateFileInspection,
 } from './file-store.js';
+import { parseConductorPassTraceStateRecord } from '../../domain/conductor-pass-trace.js';
 import { parseConductorHaltStateRecord } from './ConductorHaltAdapter.adapter.js';
+import { ConductorPassTraceAdapter } from './ConductorPassTraceAdapter.adapter.js';
 import { WORK_EXECUTION_STATE_FILES } from './state-files.js';
 import { WorkOrderRepositoryAdapter } from './WorkOrderRepositoryAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from './AttemptRepositoryAdapter.adapter.js';
@@ -158,6 +160,38 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       lastExportAtIso: '2026-10-27T10:00:00.000Z',
     },
   ],
+  'conductor-passes.json': [
+    {
+      passId: 'pass-1',
+      nowIso: '2026-10-27T10:00:00.000Z',
+      holderId: 'driver-example-1',
+      halted: false,
+      progressed: true,
+      maxActiveRuns: 2,
+      passConcurrency: 1,
+      dispatchStaggerMs: 20000,
+      runs: [
+        {
+          runId: 'run-01JB0000000000000000000000',
+          report: { outcome: 'advanced', steps: [{ outcome: 'entered', state: 'running' }] },
+        },
+      ],
+      attention: [{ runId: 'run-01JB0000000000000000000000', kind: 'stop-grace-exceeded' }],
+    },
+    {
+      schemaVersion: 1,
+      passId: 'pass-2',
+      nowIso: '2026-10-27T10:01:00.000Z',
+      holderId: 'driver-example-2',
+      halted: true,
+      progressed: false,
+      maxActiveRuns: 1,
+      passConcurrency: 1,
+      dispatchStaggerMs: 10000,
+      runs: [{ runId: 'run-01JB0000000000000000000001', report: { outcome: 'skipped', reason: 'lease-held' } }],
+      attention: [],
+    },
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -195,6 +229,18 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
       return quarantineUnreadable(target, inspection.detail, buffer);
     }
     return new TelemetryDispositionAdapter({ stateDir }).read();
+  },
+  'conductor-passes.json': async (stateDir) => {
+    // The trace adapter's `list()` never throws for an unreadable ring (it
+    // reads `unreadable`), so this observes the same inspection the adapter
+    // performs, which quarantines and throws the matching detail.
+    const target = path.join(stateDir, 'conductor-passes.json');
+    const buffer = await fs.readFile(target);
+    const inspection = inspectRecordListBytes(buffer, parseConductorPassTraceStateRecord);
+    if (inspection.status === 'unreadable') {
+      return quarantineUnreadable(target, inspection.detail, buffer);
+    }
+    return new ConductorPassTraceAdapter({ stateDir }).list();
   },
 };
 
@@ -272,6 +318,7 @@ describe('work-execution state file descriptors match the store readers', () => 
       'conductor-halt.json',
       'run-journal.json',
       'telemetry-dispositions.json',
+      'conductor-passes.json',
     ]);
   });
 });

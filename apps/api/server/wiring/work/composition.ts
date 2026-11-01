@@ -11,6 +11,8 @@ import {
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
+  ConductorHaltAdapter,
+  ConductorDriverLeaseAdapter,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
   LocalExecutor,
@@ -49,6 +51,7 @@ import {
   ExecuteAuthorizedForgeActionUseCase,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
+  ListLaneRunsUseCase,
   ListAttemptsUseCase,
   ListAttemptJournalUseCase,
   ListUnregisteredProjectsUseCase,
@@ -88,6 +91,8 @@ export interface WorkComposition {
   inspectWorkOrder: InspectWorkOrderUseCase;
   inspectAttempt: InspectAttemptUseCase;
   listAttempts: ListAttemptsUseCase;
+  // GET /v1/runs: the read-only conductor schedule (A-R-1)
+  listLaneRuns: ListLaneRunsUseCase;
   listAttemptJournal: ListAttemptJournalUseCase;
   probeProject: ProbeProjectUseCase;
   /**
@@ -249,6 +254,7 @@ function unconfiguredWorkComposition(): WorkComposition {
     inspectWorkOrder: new InspectWorkOrderUseCase(),
     inspectAttempt: new InspectAttemptUseCase(),
     listAttempts: new ListAttemptsUseCase(),
+    listLaneRuns: new ListLaneRunsUseCase(),
     listAttemptJournal: new ListAttemptJournalUseCase(),
     probeProject: new ProbeProjectUseCase(),
     probeLimiter: new ProbeLimiter(),
@@ -350,6 +356,11 @@ export function createConfiguredWorkComposition(
   // route only ever reads them, so both adapters are opened read-only.
   const laneRunRepo = new LaneRunRepositoryAdapter({ stateDir, readOnly: true });
   const laneRunJournal = new LaneRunJournalAdapter({ stateDir, readOnly: true });
+  // A-R-1: the schedule read is the only caller of the halt and driver-lease
+  // `read()`; open both read-only so a malformed marker reads as unreadable
+  // / null and is never quarantined (moved) by a GET.
+  const conductorHalt = new ConductorHaltAdapter({ stateDir, readOnly: true });
+  const conductorDriverLease = new ConductorDriverLeaseAdapter({ stateDir, readOnly: true });
   const briefAuthoring = new BriefAuthoringAdapter();
   // H9b2: workspace and artifact reads for an attempt recorded on a named
   // host run through that recorded host's executor (the recorded host is the
@@ -475,6 +486,15 @@ export function createConfiguredWorkComposition(
     inspectWorkOrder: new InspectWorkOrderUseCase({ workOrderRepo, attemptRepo, journal }),
     inspectAttempt: new InspectAttemptUseCase({ attemptRepo, runnerForAttempt }),
     listAttempts: new ListAttemptsUseCase({ attemptRepo, workOrderRepo, journal }),
+    listLaneRuns: new ListLaneRunsUseCase({
+      runRepo: laneRunRepo,
+      runJournal: laneRunJournal,
+      halt: conductorHalt,
+      driverLease: conductorDriverLease,
+      attemptRepo,
+      executionJournal: journal,
+      workOrderRepo,
+    }),
     listAttemptJournal: new ListAttemptJournalUseCase({ attemptRepo, journal }),
     prepareBriefPackage: new PrepareBriefPackageUseCase({
       briefAuthoring,

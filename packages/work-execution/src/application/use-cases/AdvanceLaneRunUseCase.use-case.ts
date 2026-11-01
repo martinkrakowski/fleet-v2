@@ -96,6 +96,7 @@ import { performCollect, performGate } from './advance-lane-run/collect-gate.js'
 import { performReconcile } from './advance-lane-run/reconcile.js';
 import { performReview } from './advance-lane-run/review-fix.js';
 import { performAccept, performMerge, performOpenPr, performPush } from './advance-lane-run/merge.js';
+import { performPremerge } from './advance-lane-run/premerge.js';
 import { gatherFacts, performAdmissionWait } from './advance-lane-run/facts.js';
 import { conductedRunnerOf } from './advance-lane-run/conducted-host.js';
 
@@ -358,6 +359,9 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       }
       if (decision.step === 'merge') {
         return performMerge(this.ctx, record, gathered, decision, request);
+      }
+      if (decision.step === 'premerge') {
+        return performPremerge(this.ctx, record, gathered, decision, request);
       }
       if (decision.step === 'stop') {
         return performStop(this.ctx, record, gathered, decision, request);

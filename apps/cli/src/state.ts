@@ -44,8 +44,10 @@ export const STATE_HELP = `Usage: fleet-v2 [--state-dir <path>] state check | st
 
 Read-only check of every JSON state store under the state directory
 (--state-dir or FLEET_STATE_DIR): one line per store file (ok, missing,
-unreadable: <reason>, or invalid record <n>), then each quarantine copy kept
-for it. It never writes, locks or quarantines anything.
+unreadable: <reason>, invalid record <n>, or unsupported schemaVersion at
+record <n>), then each quarantine copy kept for it. It never writes, locks
+or quarantines anything. Readable versioned stores report their observed
+schemaVersion values, e.g. ok (2 records, schemaVersion 1).
 
 restore replaces only a missing or unreadable store file with a quarantine copy
 of the same store that validates fully; <file> is one of the store file names
@@ -55,19 +57,29 @@ dir>/quarantine (no symlinks); it shows both record counts, asks y/N unless
 quarantine copy; it never repairs.
 
 Exit codes: 0 every store file is readable or missing, 1 any store file is
-unreadable, 2 usage error (including no state directory). Exit codes for
-restore: 0 restored; 1 refused, declined or invalid candidate; 2 usage.`;
+unreadable or holds an unsupported schemaVersion, 2 usage error (including
+no state directory). Exit codes for restore: 0 restored; 1 refused, declined
+or invalid candidate; 2 usage.`;
 
 /** `record` or `records` for a count. */
 function recordWord(count: number): string {
   return count === 1 ? 'record' : 'records';
 }
 
+/** The `, schemaVersion 1` / `, schemaVersions 1, 2` suffix of an ok line. */
+function formatSchemaVersions(versions: readonly number[] | undefined): string {
+  if (versions === undefined || versions.length === 0) {
+    return '';
+  }
+  const label = versions.length === 1 ? 'schemaVersion' : 'schemaVersions';
+  return `, ${label} ${versions.join(', ')}`;
+}
+
 /** One status phrase for a store file or quarantine copy. */
 export function describeStateFileResult(result: StateFileReadResult): string {
   switch (result.status) {
     case 'ok':
-      return `ok (${result.recordCount} ${result.recordCount === 1 ? 'record' : 'records'})`;
+      return `ok (${result.recordCount} ${recordWord(result.recordCount)}${formatSchemaVersions(result.schemaVersions)})`;
     case 'missing':
       return 'missing';
     case 'read-error':
@@ -76,11 +88,17 @@ export function describeStateFileResult(result: StateFileReadResult): string {
       return result.recordIndex === null
         ? `unreadable: ${result.detail}`
         : `invalid record ${result.recordIndex}`;
+    case 'unknown-version':
+      return `unsupported schemaVersion at record ${result.recordIndex}`;
   }
 }
 
 export function isBadStateFileResult(result: StateFileReadResult): boolean {
-  return result.status === 'unreadable' || result.status === 'read-error';
+  return (
+    result.status === 'unreadable' ||
+    result.status === 'read-error' ||
+    result.status === 'unknown-version'
+  );
 }
 
 /** Check every store; Promise.all keeps the descriptors' order, so output is stable. */

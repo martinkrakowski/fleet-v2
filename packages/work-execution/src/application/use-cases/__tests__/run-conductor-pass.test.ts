@@ -61,6 +61,7 @@ const BASE_RECORD = {
   lease: null,
   revision: 1,
   runPolicyRevision: 'policy-example-1',
+  schemaVersion: 1,
 };
 
 function runRecord(overrides: Partial<LaneRunRecord> = {}): LaneRunRecord {

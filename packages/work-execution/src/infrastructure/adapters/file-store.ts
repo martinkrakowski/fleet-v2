@@ -935,6 +935,30 @@ async function readQuarantineCopyFor(
   }
 }
 
+function checkCurrentStoreRefusal(
+  basename: string,
+  current: Buffer | null,
+  inspect: (bytes: Buffer) => StateFileInspection,
+): { readonly refused: true; readonly reason: string } | { readonly refused: false } {
+  if (current === null) {
+    return { refused: false };
+  }
+  const currentInspection = inspect(current);
+  if (currentInspection.status === 'ok') {
+    return {
+      refused: true,
+      reason: `${basename} is readable; state restore replaces only a missing or unreadable store`,
+    };
+  }
+  if (currentInspection.status === 'unknown-version') {
+    return {
+      refused: true,
+      reason: `${basename} has an unsupported schemaVersion; state restore replaces only a missing or unreadable store`,
+    };
+  }
+  return { refused: false };
+}
+
 async function restoreRecordListStore(
   basename: string,
   inspect: (bytes: Buffer) => StateFileInspection,
@@ -964,8 +988,9 @@ async function restoreRecordListStore(
       if (currentSha !== request.expectedCurrentSha256) {
         return { status: 'refused', reason: 'the store changed since it was inspected; run state restore again' };
       }
-      if (current !== null && inspect(current).status === 'ok') {
-        return { status: 'refused', reason: `${basename} is readable; state restore replaces only a missing or unreadable store` };
+      const refusal = checkCurrentStoreRefusal(basename, current, inspect);
+      if (refusal.refused) {
+        return { status: 'refused', reason: refusal.reason };
       }
       let previousCopyPath: string | null = null;
       if (current !== null) {

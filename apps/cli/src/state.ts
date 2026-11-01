@@ -106,16 +106,24 @@ export async function checkStateDirectory(stateDir: string): Promise<StateFileCh
   return Promise.all(STATE_FILE_DESCRIPTORS.map((descriptor) => descriptor.check(stateDir)));
 }
 
+function errorCodeOf(error: unknown): string {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    typeof (error as { code?: unknown }).code === 'string'
+  ) {
+    return (error as { code: string }).code;
+  }
+  return 'unknown';
+}
+
 /** How the state directory looks, for the first output line. Never creates it. */
 async function describeStateDirectory(directory: string): Promise<string> {
   try {
     const stat = await fs.stat(directory);
     return stat.isDirectory() ? '' : ' (not a directory)';
   } catch (error: unknown) {
-    const code =
-      typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string'
-        ? (error as { code: string }).code
-        : 'unknown';
+    const code = errorCodeOf(error);
     return code === 'ENOENT' ? ' (does not exist yet)' : ` (cannot read: ${code})`;
   }
 }
@@ -156,13 +164,31 @@ async function stateCheck(argv: readonly string[], io: CliIo, stateDir: string):
   return 1;
 }
 
-/** `fleet-v2 state restore <file> --from <copy> [--yes]` (lane E1b-3b). */
-async function stateRestore(
+interface ParsedRestoreArgs {
+  readonly from?: string;
+  readonly yes: boolean;
+  readonly positionals: readonly string[];
+}
+
+function parseFromValue(
+  token: string,
+  argv: readonly string[],
+  index: number,
+): { readonly value: string | undefined; readonly nextIndex: number } {
+  if (token === '--from') {
+    return { value: argv[index + 1], nextIndex: index + 1 };
+  }
+  return { value: token.slice('--from='.length), nextIndex: index };
+}
+
+function isInvalidFromValue(value: string | undefined): boolean {
+  return value === undefined || value.trim() === '' || value.startsWith('--');
+}
+
+function parseRestoreArgs(
   argv: readonly string[],
   io: CliIo,
-  stateDir: string,
-  options: StateCliOptions,
-): Promise<number> {
+): ParsedRestoreArgs | null {
   let from: string | undefined;
   let yes = false;
   const positionals: string[] = [];
@@ -173,27 +199,65 @@ async function stateRestore(
       continue;
     }
     if (token === '--from' || token.startsWith('--from=')) {
-      const value = token === '--from' ? argv[index + 1] : token.slice('--from='.length);
-      if (token === '--from') {
-        index += 1;
-      }
-      if (value === undefined || value.trim() === '' || value.startsWith('--')) {
-        io.stderr(`--from requires a quarantine copy name\n${STATE_HELP}\n`);
-        return 2;
-      }
       if (from !== undefined) {
         io.stderr(`Unknown state restore option: ${token}\n${STATE_HELP}\n`);
-        return 2;
+        return null;
       }
-      from = value;
+      const parsed = parseFromValue(token, argv, index);
+      index = parsed.nextIndex;
+      if (isInvalidFromValue(parsed.value)) {
+        io.stderr(`--from requires a quarantine copy name\n${STATE_HELP}\n`);
+        return null;
+      }
+      from = parsed.value;
       continue;
     }
     if (token.startsWith('--')) {
       io.stderr(`Unknown state restore option: ${token}\n${STATE_HELP}\n`);
-      return 2;
+      return null;
     }
     positionals.push(token);
   }
+  return { from, yes, positionals };
+}
+
+async function readCurrentStoreFile(
+  filePath: string,
+): Promise<{ readonly status: 'ok'; readonly bytes: Buffer | null } | { readonly status: 'error'; readonly code: string }> {
+  try {
+    const bytes = await fs.readFile(filePath);
+    return { status: 'ok', bytes };
+  } catch (error: unknown) {
+    const code = errorCodeOf(error);
+    if (code === 'ENOENT') {
+      return { status: 'ok', bytes: null };
+    }
+    return { status: 'error', code };
+  }
+}
+
+function formatBeforeRecords(result: StateFileReadResult): string {
+  if (result.status === 'ok') {
+    return String(result.recordCount);
+  }
+  if (result.status === 'missing') {
+    return 'missing';
+  }
+  return 'unreadable';
+}
+
+/** `fleet-v2 state restore <file> --from <copy> [--yes]` (lane E1b-3b). */
+async function stateRestore(
+  argv: readonly string[],
+  io: CliIo,
+  stateDir: string,
+  options: StateCliOptions,
+): Promise<number> {
+  const parsed = parseRestoreArgs(argv, io);
+  if (parsed === null) {
+    return 2;
+  }
+  const { from, yes, positionals } = parsed;
   if (positionals.length !== 1) {
     io.stderr(`state restore requires exactly one store file\n${STATE_HELP}\n`);
     return 2;
@@ -223,33 +287,17 @@ async function stateRestore(
     return 1;
   }
   const currentPath = path.join(stateDir, file);
-  let current: Buffer | null;
-  try {
-    current = await fs.readFile(currentPath);
-  } catch (error: unknown) {
-    const code =
-      typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string'
-        ? (error as { code: string }).code
-        : 'unknown';
-    if (code === 'ENOENT') {
-      current = null;
-    } else {
-      io.stderr(`cannot read ${currentPath} (${code})\n`);
-      io.stdout('nothing changed\n');
-      return 1;
-    }
+  const currentRead = await readCurrentStoreFile(currentPath);
+  if (currentRead.status === 'error') {
+    io.stderr(`cannot read ${currentPath} (${currentRead.code})\n`);
+    io.stdout('nothing changed\n');
+    return 1;
   }
+  const current = currentRead.bytes;
   const currentResult: StateFileReadResult = current === null ? { status: 'missing' } : descriptor.inspect(current);
   const sha = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex');
   const currentSuffix = current === null ? '' : `, ${current.length} bytes, sha256 ${sha(current).slice(0, 12)}`;
-  let before: string;
-  if (currentResult.status === 'ok') {
-    before = String(currentResult.recordCount);
-  } else if (currentResult.status === 'missing') {
-    before = 'missing';
-  } else {
-    before = 'unreadable';
-  }
+  const before = formatBeforeRecords(currentResult);
   io.stdout(`restore ${currentPath}\n`);
   io.stdout(`  current:   ${describeStateFileResult(currentResult)}${currentSuffix}\n`);
   io.stdout(
@@ -259,6 +307,13 @@ async function stateRestore(
   if (currentResult.status === 'ok') {
     io.stderr(
       `${file} is readable (${currentResult.recordCount} ${recordWord(currentResult.recordCount)}); state restore replaces only a missing or unreadable store\n`,
+    );
+    io.stdout('nothing changed\n');
+    return 1;
+  }
+  if (currentResult.status === 'unknown-version') {
+    io.stderr(
+      `${file} has an unsupported schemaVersion; state restore replaces only a missing or unreadable store\n`,
     );
     io.stdout('nothing changed\n');
     return 1;

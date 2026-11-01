@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   assertValidSchemaVersionPolicy,
   describeRecordListStore,
+  describeVersionedRecordListStore,
   FileLockTimeoutError,
   inspectRecordListBytes,
   inspectVersionedRecordListBytes,
@@ -1145,6 +1146,30 @@ describe('restore', () => {
       reason: 'x.json is readable; state restore replaces only a missing or unreadable store',
     });
     expect(await snapshot()).toEqual(before);
+  });
+
+  it('refuses an unknown-version current store and leaves bytes and directory listing unchanged', async () => {
+    const versioned = describeVersionedRecordListStore('x.json', (raw) => {
+      const versionCheck = readStoreRecordSchemaVersion(raw, { writerVersion: 1, acceptedVersions: [1] });
+      if (versionCheck.status !== 'ok') {
+        return versionCheck;
+      }
+      return typeof (raw as { id?: unknown }).id === 'string'
+        ? { status: 'ok', record: raw as { id: string }, schemaVersion: versionCheck.schemaVersion }
+        : { status: 'invalid' };
+    });
+    const currentBytes = Buffer.from(JSON.stringify([{ id: 'existing', schemaVersion: 2 }]));
+    await fs.writeFile(filePath, currentBytes);
+    const before = await snapshot();
+    const dirBefore = await fs.readdir(stateDir);
+    const currentSha = createHash('sha256').update(currentBytes).digest('hex');
+    const outcome = await versioned.restore({ stateDir, candidate, expectedCurrentSha256: currentSha });
+    expect(outcome).toEqual({
+      status: 'refused',
+      reason: 'x.json has an unsupported schemaVersion; state restore replaces only a missing or unreadable store',
+    });
+    expect(await snapshot()).toEqual(before);
+    expect(await fs.readdir(stateDir)).toEqual(dirBefore);
   });
 
   it('refuses an invalid candidate', async () => {

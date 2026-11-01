@@ -28,7 +28,7 @@
 // unreadable .sonarcloud.properties).
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -82,13 +82,20 @@ for (let i = 2; i < process.argv.length; i += 1) {
     process.exit(0);
   } else if (arg === "--base") {
     if (i + 1 >= process.argv.length) usage("--base needs a revision");
-    baseArg = process.argv[(i += 1)];
+    i += 1;
+    baseArg = process.argv[i];
   } else if (arg === "--root") {
     if (i + 1 >= process.argv.length) usage("--root needs a directory");
-    rootArg = process.argv[(i += 1)];
+    i += 1;
+    rootArg = process.argv[i];
   } else usage(`unexpected argument ${arg}`);
 }
 if (!baseArg) usage("--base <rev> is required");
+// --base is a revision name only: never an option, never shell syntax. It is resolved to a
+// commit sha (with --end-of-options) before any other git command sees it.
+if (baseArg.startsWith("-") || !/^[A-Za-z0-9._/~^@{}-]{1,200}$/.test(baseArg)) {
+  usage("--base must be a revision name");
+}
 
 try {
   let root;
@@ -104,11 +111,22 @@ try {
       process.exit(2);
     }
   }
-  root = rootArg
-    ? path.resolve(rootArg)
-    : gitOrDie(["rev-parse", "--show-toplevel"]);
+  const top = gitOrDie(["rev-parse", "--show-toplevel"]);
+  if (rootArg) {
+    // --root must name the top of a git worktree, so no path outside it is ever read.
+    let real;
+    try {
+      real = realpathSync(path.resolve(rootArg));
+    } catch {
+      usage("--root must be an existing directory");
+    }
+    if (real !== realpathSync(top)) usage("--root must be the top of a git worktree");
+  }
+  root = top;
 
-  const mergeBase = gitOrDie(["merge-base", baseArg, "HEAD"]).trim();
+  const baseSha = gitOrDie(["rev-parse", "--verify", "--end-of-options", `${baseArg}^{commit}`]);
+  if (!/^[0-9a-f]{40,64}$/.test(baseSha)) usage("--base did not resolve to a commit");
+  const mergeBase = gitOrDie(["merge-base", baseSha, "HEAD"]).trim();
   const nulNames = (args) => gitOrDie(args).split("\0").filter(Boolean);
   // Added, modified and renamed files between the merge base and the working tree,
   // plus untracked non-ignored files.
@@ -227,7 +245,7 @@ try {
   }
 
   const windowHash = (list, start) =>
-    createHash("sha1")
+    createHash("sha256")
       .update(
         list
           .slice(start, start + MIN_TOKENS)
@@ -252,10 +270,19 @@ try {
   // Corpus occurrences (file, window start) whose hash is in the lookup set; each
   // one is verified token by token later — a hash match alone never reports.
   const occurrences = []; // { rel, start }
+  const occurrencesByHash = new Map(); // window hash -> [{ rel, start }]
   for (const rel of corpus) {
     const list = tokens(rel);
     for (let start = 0; start + MIN_TOKENS <= list.length; start += 1)
-      if (hashes.has(windowHash(list, start))) occurrences.push({ rel, start });
+      {
+        const hash = windowHash(list, start);
+        if (hashes.has(hash)) {
+          occurrences.push({ rel, start });
+          const bucket = occurrencesByHash.get(hash);
+          if (bucket) bucket.push({ rel, start });
+          else occurrencesByHash.set(hash, [{ rel, start }]);
+        }
+      }
   }
 
   // Added lines per changed file, from the `+start,count` of the -U0 hunk headers.
@@ -288,7 +315,7 @@ try {
     const here = new Map();
     for (let start = 0; start + MIN_TOKENS <= list.length; start += 1) {
       const hash = windowHash(list, start);
-      const valid = occurrences.filter(
+      const valid = (occurrencesByHash.get(hash) ?? []).filter(
         (o) =>
           (o.rel !== rel || Math.abs(o.start - start) >= MIN_TOKENS) &&
           equalWindows(list, start, tokens(o.rel), o.start),

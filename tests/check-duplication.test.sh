@@ -268,6 +268,10 @@ node "$SCRIPT" --root "$R" >/dev/null 2>&1
 [ $? -eq 2 ] && ok 'a missing --base exits 2' || bad 'a missing --base exits 2'
 node "$SCRIPT" --root "$R" --base "$base_h" --bogus >/dev/null 2>&1
 [ $? -eq 2 ] && ok 'an unknown flag exits 2' || bad 'an unknown flag exits 2'
+node "$SCRIPT" --root "$R" --base --upload-pack=x >/dev/null 2>&1
+[ $? -eq 2 ] && ok 'an option-shaped --base exits 2' || bad 'an option-shaped --base exits 2'
+node "$SCRIPT" --root "$R/packages" --base "$base_h" >/dev/null 2>&1
+[ $? -eq 2 ] && ok 'a --root below the worktree top exits 2' || bad 'a --root below the worktree top exits 2'
 node "$SCRIPT" --root "$R" --base not-a-rev >/dev/null 2>&1
 [ $? -eq 2 ] && ok 'an unresolvable base exits 2' || bad 'an unresolvable base exits 2'
 node "$SCRIPT" --root "$T/not-a-repo" --base HEAD >/dev/null 2>&1

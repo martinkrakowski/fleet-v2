@@ -170,8 +170,10 @@ jobs:
           key: turbo-${{ runner.os }}-${{ hashFiles('yarn.lock') }}-${{ github.sha }}
           restore-keys: |
             turbo-${{ runner.os }}-${{ hashFiles('yarn.lock') }}-
-      - name: yarn install --immutable
-        run: yarn install --immutable
+      # Lifecycle scripts are skipped at install (SonarCloud S6505); turbo builds the two packages' dependencies
+      # through the test task's ^build dependency, as the e2e job does after its skip-build install.
+      - name: yarn install --immutable --mode=skip-build
+        run: yarn install --immutable --mode=skip-build
       # The two packages with darwin branches (gh-binary candidates, BSD stat fallback, uname detection)
       # and their dependencies, built and tested on macOS.
       - name: cli and onboarding unit tests on macOS

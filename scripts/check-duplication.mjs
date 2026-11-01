@@ -131,7 +131,15 @@ try {
   const untracked = new Set(
     nulNames(["ls-files", "-z", "--others", "--exclude-standard"]),
   );
-  const corpusNames = nulNames(["ls-files", "-z", "-co", "--exclude-standard"]);
+  // Tracked files removed from the working tree are still in the index; they
+  // are not part of the code being checked.
+  const deleted = new Set(nulNames(["ls-files", "-z", "--deleted"]));
+  const corpusNames = nulNames([
+    "ls-files",
+    "-z",
+    "-co",
+    "--exclude-standard",
+  ]).filter((name) => !deleted.has(name));
 
   // Exclusions come from SonarCloud's own settings, one source of truth.
   let properties;

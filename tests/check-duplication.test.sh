@@ -400,5 +400,23 @@ finding_format "$stdout"
 clean_stderr "$stderr"
 no_zebra "$stdout"
 
+# n. a tracked file deleted from the working tree without staging: clean,
+# never a read error on the missing file.
+R=$T/n
+new_repo "$R"
+fixture base >"$R/packages/a/src/one.ts"
+other >"$R/packages/b/src/two.ts"
+git -C "$R" add -A >/dev/null && git -C "$R" commit -qm base
+base_n=$(git -C "$R" rev-parse HEAD)
+rm "$R/packages/b/src/two.ts"
+check "$R" "$base_n"
+if [ $rc -eq 0 ] && [ "$stdout" = 'check-duplication: clean' ]; then
+  ok 'a tracked file deleted without staging is clean'
+else
+  bad "a tracked file deleted without staging is clean (rc $rc: $stdout)"
+fi
+clean_stderr "$stderr"
+no_zebra "$stdout"
+
 [ "$fails" -eq 0 ] && echo 'check-duplication: all tests passed' || echo "check-duplication: $fails failure(s)"
 [ "$fails" -eq 0 ]

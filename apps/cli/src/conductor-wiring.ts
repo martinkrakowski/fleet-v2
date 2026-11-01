@@ -252,6 +252,7 @@ export function buildLiveConductorDriver(
       start,
       policy,
       runPolicyRevision: 'policy:conductor@' + conductorRevision(policy),
+      dispatchStaggerMs: LIVE_DISPATCH_STAGGER_MS,
       ...(options.passConcurrency === undefined ? {} : { passConcurrency: options.passConcurrency }),
     }),
     passTrace,

@@ -1,0 +1,73 @@
+{
+  "operationId": "00000000-0000-4000-8000-000000000000",
+  "code": "OK",
+  "result": {
+    "outcome": "listed",
+    "store": "readable",
+    "passes": [
+      {
+        "schemaVersion": 1,
+        "passId": "pass-0002",
+        "nowIso": "2026-10-31T13:52:04.000Z",
+        "halted": true,
+        "progressed": false,
+        "maxActiveRuns": 4,
+        "passConcurrency": 2,
+        "dispatchStaggerMs": 250,
+        "runs": [
+          {
+            "runId": "run-0A1B2C3D4E5F6G7H8J9K0M1N2P",
+            "report": { "outcome": "resume-refused", "reason": "halted" }
+          },
+          {
+            "runId": "run-1V2T3Z4J5K6M7N8P9A0B1C2D3E",
+            "report": { "outcome": "skipped", "reason": "halted" }
+          }
+        ],
+        "attention": [
+          { "runId": "run-0A1B2C3D4E5F6G7H8J9K0M1N2P", "kind": "resume-refused" },
+          { "runId": "run-1V2T3Z4J5K6M7N8P9A0B1C2D3E", "kind": "skipped" }
+        ]
+      },
+      {
+        "schemaVersion": 1,
+        "passId": "pass-0001",
+        "nowIso": "2026-10-31T13:41:08.000Z",
+        "halted": false,
+        "progressed": true,
+        "maxActiveRuns": 4,
+        "passConcurrency": 2,
+        "dispatchStaggerMs": 250,
+        "runs": [
+          {
+            "runId": "run-0A1B2C3D4E5F6G7H8J9K0M1N2P",
+            "report": {
+              "outcome": "advanced",
+              "steps": [
+                {
+                  "outcome": "dispatched",
+                  "step": "dispatch",
+                  "result": "started"
+                },
+                {
+                  "outcome": "prepared",
+                  "step": "prepare",
+                  "result": "ready"
+                }
+              ]
+            }
+          },
+          {
+            "runId": "run-1V2T3Z4J5K6M7N8P9A0B1C2D3E",
+            "report": { "outcome": "skipped", "reason": "halted" }
+          }
+        ],
+        "attention": [
+          { "runId": "run-1V2T3Z4J5K6M7N8P9A0B1C2D3E", "kind": "skipped" }
+        ]
+      }
+    ],
+    "total": 2,
+    "truncated": false
+  }
+}

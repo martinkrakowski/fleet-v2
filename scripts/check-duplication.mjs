@@ -25,7 +25,7 @@
 //
 // Exit codes: 0 clean, 1 at least one duplicated block, 2 usage or setup error
 // (not a git repo, unknown or unresolvable <base>, typescript not resolvable,
-// unreadable .sonarcloud.properties).
+// unreadable .sonarcloud.properties, an unreadable eligible file).
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
@@ -52,13 +52,6 @@ const SKIP_SEGMENTS = new Set([
   ".next",
   ".output",
   "coverage",
-]);
-const LITERAL_KINDS = new Set([
-  "StringLiteral",
-  "NoSubstitutionTemplateLiteral",
-  "TemplateHead",
-  "TemplateMiddle",
-  "TemplateTail",
 ]);
 const LITERAL_TEXT = "LITERAL";
 // Bytewise order, the same on every host and locale.
@@ -187,6 +180,17 @@ try {
     console.error(`${NAME}: typescript is not resolvable from ${root}`);
     process.exit(2);
   }
+  // Literal normalisation compares numeric SyntaxKind values: the reverse map
+  // ts.SyntaxKind[kind] can return an alias (NoSubstitutionTemplateLiteral is
+  // FirstTemplateToken, TemplateTail is LastTemplateToken), so string names
+  // would miss template literal tokens.
+  const literalKinds = new Set([
+    ts.SyntaxKind.StringLiteral,
+    ts.SyntaxKind.NoSubstitutionTemplateLiteral,
+    ts.SyntaxKind.TemplateHead,
+    ts.SyntaxKind.TemplateMiddle,
+    ts.SyntaxKind.TemplateTail,
+  ]);
   const scriptKind = (rel) => {
     const ext = path.extname(rel);
     if (ext === ".tsx") return ts.ScriptKind.TSX;
@@ -232,13 +236,16 @@ try {
       );
       for (const node of tokenNodes(sf, sf, []))
         found.push({
-          text: LITERAL_KINDS.has(ts.SyntaxKind[node.kind])
+          text: literalKinds.has(node.kind)
             ? LITERAL_TEXT
             : node.getText(sf),
           line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1,
         });
     } catch {
-      // An unreadable file simply has no tokens.
+      // An eligible file that cannot be read is a scan failure, never an
+      // empty token list: report it and refuse the scan.
+      console.error(`${NAME}: cannot read ${rel} under ${root}`);
+      process.exit(2);
     }
     cache.set(rel, found);
     return found;
@@ -325,73 +332,65 @@ try {
     if (here.size > 0) matchesAt.set(rel, here);
   }
 
-  // Overlapping or adjacent duplicated windows merge into blocks; a block is
-  // reported only when it covers at least MIN_LINES distinct lines and at least
-  // one of those lines is an added line. One line per block, from a deterministic
-  // representative occurrence: the other-side matches are grouped by (other file,
-  // shifted start), each group's span is its own contiguous window run — never
-  // the whole merged block, which can span several copies — and the representative
-  // is the lowest valid start, ties broken by file path.
+  // Each duplicated block is a continuous run of matched windows that all
+  // match the same counterpart file at the same constant offset; a window
+  // matching a different counterpart (or a different offset) never joins the
+  // run, so one block's line count always comes from one counterpart only. A
+  // block is reported only when it covers at least MIN_LINES distinct lines
+  // and at least one of those lines is an added line.
+  const runsOf = (sorted) => {
+    const runs = [];
+    let run = [];
+    for (const s of sorted) {
+      if (run.length > 0 && s !== run[run.length - 1] + 1) {
+        runs.push(run);
+        run = [];
+      }
+      run.push(s);
+    }
+    if (run.length > 0) runs.push(run);
+    return runs;
+  };
   const blocks = [];
   for (const [rel, windows] of matchesAt) {
-    const starts = [...windows.keys()].sort((a, b) => a - b);
-    let group = [];
-    const flush = () => {
-      if (group.length === 0) return;
-      const first = group[0];
-      const last = group[group.length - 1];
-      const list = tokens(rel);
-      const blockLines = new Set(
-        list.slice(first, last + MIN_TOKENS).map((t) => t.line),
-      );
-      let best;
-      const added = addedLines.get(rel);
-      const addedHere =
-        untracked.has(rel) || [...blockLines].some((line) => added.has(line));
-      if (blockLines.size >= MIN_LINES && addedHere) {
-        const groups = new Map(); // key -> { rel, start, lo, hi }
-        for (const start of group) {
-          for (const o of windows.get(start)) {
-            const otherStart = o.start - (start - first);
-            const key = `${o.rel}\u0000${otherStart}`;
-            let g = groups.get(key);
-            if (!g) {
-              groups.set(key, { rel: o.rel, start: otherStart, lo: start, hi: start });
-            } else {
-              if (start < g.lo) g.lo = start;
-              if (start > g.hi) g.hi = start;
-            }
-          }
-        }
-        for (const g of groups.values()) {
-          const end = g.start + (g.hi - g.lo) + MIN_TOKENS - 1;
-          const otherTokens = tokens(g.rel);
-          // A shifted span outside the other file is invalid, never clamped.
-          if (g.start < 0 || end >= otherTokens.length) continue;
-          const candidate = { rel: g.rel, start: g.start, end };
-          if (
-            !best ||
-            candidate.start < best.start ||
-            (candidate.start === best.start && candidate.rel < best.rel)
-          )
-            best = candidate;
-        }
+    const list = tokens(rel);
+    const added = addedLines.get(rel);
+    const untrackedHere = untracked.has(rel);
+    const byKey = new Map(); // "other rel\0offset" -> matched window starts
+    for (const [start, occurrences] of windows)
+      for (const o of occurrences) {
+        const key = `${o.rel}\u0000${o.start - start}`;
+        const set = byKey.get(key);
+        if (set) set.add(start);
+        else byKey.set(key, new Set([start]));
       }
-      group = [];
-      if (!best) return;
-      const other = tokens(best.rel);
-      blocks.push(
-        `${NAME}: ${rel}:${list[first].line}-${list[last + MIN_TOKENS - 1].line}` +
-          ` duplicates ${best.rel}:${other[best.start].line}-${other[best.end].line}` +
-          ` (${blockLines.size} lines)`,
-      );
-    };
-    for (const start of starts) {
-      if (group.length > 0 && start > group[group.length - 1] + MIN_TOKENS)
-        flush();
-      group.push(start);
+    for (const [key, startSet] of byKey) {
+      const sep = key.indexOf("\u0000");
+      const otherRel = key.slice(0, sep);
+      const offset = Number(key.slice(sep + 1));
+      const otherTokens = tokens(otherRel);
+      for (const run of runsOf([...startSet].sort(byCodeUnit))) {
+        const lo = run[0];
+        const hi = run[run.length - 1];
+        const otherStart = lo + offset;
+        const end = otherStart + (hi - lo) + MIN_TOKENS - 1;
+        // A shifted span outside the other file is invalid, never clamped.
+        if (otherStart < 0 || end >= otherTokens.length) continue;
+        const blockLines = new Set(
+          list.slice(lo, hi + MIN_TOKENS).map((t) => t.line),
+        );
+        if (blockLines.size < MIN_LINES) continue;
+        const addedHere =
+          untrackedHere || [...blockLines].some((line) => added.has(line));
+        if (!addedHere) continue;
+        blocks.push(
+          `${NAME}: ${rel}:${list[lo].line}-${list[hi + MIN_TOKENS - 1].line}` +
+            ` duplicates ${otherRel}:` +
+            `${otherTokens[otherStart].line}-${otherTokens[end].line}` +
+            ` (${blockLines.size} lines)`,
+        );
+      }
     }
-    flush();
   }
 
   if (blocks.length === 0) {

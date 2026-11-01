@@ -110,6 +110,57 @@ export const uvarovite = topaz + rutile;
 EOF
 }
 
+# A dense ~12-line function: eight 20-token lines on top of the declaration,
+# return and closing brace, so a full copy is one continuous duplicate.
+dense() {
+  cat <<EOF
+export function deltaW(x: number): number {
+  const a1 = x + 1; const a2 = a1 * 2; const a3 = a2 - 3;
+  const a4 = a3 + 4; const a5 = a4 * 5; const a6 = a5 - 6;
+  const a7 = a6 + 7; const a8 = a7 * 8; const a9 = a8 - 9;
+  const b1 = a9 + 10; const b2 = b1 * 11; const b3 = b2 - 12;
+  const b4 = b3 + 13; const b5 = b4 * 14; const b6 = b5 - 15;
+  const b7 = b6 + 16; const b8 = b7 * 17; const b9 = b8 - 18;
+  const c1 = b9 + 19; const c2 = c1 * 20; const c3 = c2 - 21;
+  const c4 = c3 + 22; const c5 = c4 * 23; const c6 = c5 - 24;
+  return c6 + x;
+}
+EOF
+}
+
+# A 9-line function with the same dense body but seven 20-token lines: over the
+# 100-token window threshold, under the 10-line block threshold.
+nine() { # $1 = variant letter (function name only, so variants never match)
+  cat <<EOF
+export function nine$1(x: number): number {
+  const a1 = x + 1; const a2 = a1 * 2; const a3 = a2 - 3;
+  const a4 = a3 + 4; const a5 = a4 * 5; const a6 = a5 - 6;
+  const a7 = a6 + 7; const a8 = a7 * 8; const a9 = a8 - 9;
+  const b1 = a9 + 10; const b2 = b1 * 11; const b3 = b2 - 12;
+  const b4 = b3 + 13; const b5 = b4 * 14; const b6 = b5 - 15;
+  const b7 = b6 + 16; const b8 = b7 * 17; const b9 = b8 - 18;
+  return a9 + x;
+}
+EOF
+}
+
+# The same dense body carrying one no-substitution template literal; only the
+# literal text differs between variants.
+templ() { # $1 = text inside the template literal
+  cat <<EOF
+export function echoT(x: number): number {
+  const a1 = x + 1; const a2 = a1 * 2; const a3 = a2 - 3;
+  const a4 = a3 + 4; const a5 = a4 * 5; const a6 = a5 - 6;
+  const a7 = a6 + 7; const a8 = a7 * 8; const a9 = a8 - 9;
+  const b1 = a9 + 10; const b2 = b1 * 11; const b3 = b2 - 12;
+  const b4 = b3 + 13; const b5 = b4 * 14; const b6 = b5 - 15;
+  const b7 = b6 + 16; const b8 = b7 * 17; const b9 = b8 - 18;
+  const note = \`$1\`;
+  return b9 + note.length;
+}
+EOF
+}
+
 check() { # $1 = repo, $2 = base; sets rc, stdout, stderr
   out_file=$T/check.out
   err_file=$T/check.err
@@ -284,6 +335,70 @@ else
   bad "-h prints the header and exits 0 (rc $rc)"
 fi
 no_zebra "$out"
+
+# i. a changed eligible file that is a broken symlink: the scan cannot read it,
+# so exit 2 with the path on stderr, never clean.
+R=$T/i
+new_repo "$R"
+fixture base >"$R/packages/a/src/one.ts"
+git -C "$R" add -A >/dev/null && git -C "$R" commit -qm base
+base_i=$(git -C "$R" rev-parse HEAD)
+ln -s missing-target.ts "$R/packages/b/src/broken.ts"
+check "$R" "$base_i"
+if [ $rc -eq 2 ]; then ok 'a broken-symlink eligible file exits 2'; else bad "a broken-symlink eligible file exits 2 (rc $rc: $stdout)"; fi
+case $stdout in
+*clean*) bad 'a broken-symlink eligible file does not print clean' ;;
+*) ok 'a broken-symlink eligible file does not print clean' ;;
+esac
+case $stderr in
+*packages/b/src/broken.ts*) ok 'stderr names the unreadable path' ;;
+*) bad 'stderr names the unreadable path' ;;
+esac
+
+# k. two adjacent nine-line matches against two different files: clean, because
+# neither block reaches the 10-line threshold on its own counterpart.
+R=$T/k
+new_repo "$R"
+nine x >"$R/packages/a/src/x.ts"
+nine y >"$R/packages/a/src/y.ts"
+git -C "$R" add -A >/dev/null && git -C "$R" commit -qm base
+base_k=$(git -C "$R" rev-parse HEAD)
+{ nine x; nine y; } >"$R/packages/b/src/adjacent.ts"
+check "$R" "$base_k"
+if [ $rc -eq 0 ] && [ "$stdout" = 'check-duplication: clean' ]; then
+  ok 'two adjacent nine-line matches to different files are clean'
+else
+  bad "two adjacent nine-line matches to different files are clean (rc $rc: $stdout)"
+fi
+no_zebra "$stdout"
+
+# l. a continuous twelve-line match against one file: still a finding, so the
+# per-counterpart runs do not split a genuine duplicate.
+R=$T/l
+new_repo "$R"
+dense w >"$R/packages/a/src/w.ts"
+git -C "$R" add -A >/dev/null && git -C "$R" commit -qm base
+base_l=$(git -C "$R" rev-parse HEAD)
+dense w >"$R/packages/b/src/copy.ts"
+check "$R" "$base_l"
+if [ $rc -eq 1 ]; then ok 'a continuous ten-line match to one file exits 1'; else bad "a continuous ten-line match to one file exits 1 (rc $rc: $stdout)"; fi
+finding_format "$stdout"
+clean_stderr "$stderr"
+no_zebra "$stdout"
+
+# m. two ten-line blocks that differ only in no-substitution template literal
+# text: a finding, because template literal tokens are normalised by kind.
+R=$T/m
+new_repo "$R"
+templ alpha >"$R/packages/a/src/templ-a.ts"
+git -C "$R" add -A >/dev/null && git -C "$R" commit -qm base
+base_m=$(git -C "$R" rev-parse HEAD)
+templ beta >"$R/packages/b/src/templ-b.ts"
+check "$R" "$base_m"
+if [ $rc -eq 1 ]; then ok 'template literal text is normalised'; else bad "template literal text is normalised (rc $rc: $stdout)"; fi
+finding_format "$stdout"
+clean_stderr "$stderr"
+no_zebra "$stdout"
 
 [ "$fails" -eq 0 ] && echo 'check-duplication: all tests passed' || echo "check-duplication: $fails failure(s)"
 [ "$fails" -eq 0 ]

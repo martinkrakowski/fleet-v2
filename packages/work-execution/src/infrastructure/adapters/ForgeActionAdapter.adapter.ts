@@ -228,7 +228,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
       return refusedOther('status context must be premerge');
     }
     if (status.state !== 'success' && status.state !== 'pending' && status.state !== 'failure') {
-      return refusedOther('status state must be success, pending or failure');
+      return refusedOther('status state must be success or failure');
     }
     if (!HEX_40_PATTERN.test(request.expectedHeadSha)) {
       return refusedOther(`Invalid expected head SHA: ${request.expectedHeadSha}`);
@@ -620,10 +620,9 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     }
     if (
       request.status.state !== 'success' &&
-      request.status.state !== 'pending' &&
       request.status.state !== 'failure'
     ) {
-      return this.mergeRefusedOther('status state must be success, pending or failure');
+      return this.mergeRefusedOther('status state must be success or failure');
     }
     if (!pairedDescription(request.status.state, request.status.description)) {
       return this.mergeRefusedOther('status description does not match its state');

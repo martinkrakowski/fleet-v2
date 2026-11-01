@@ -14,7 +14,8 @@
  * and the run (owner decision K7-D7); it runs no model and dispatches
  * nothing, but it writes host state, so it is guarded by
  * `policy.conductor.enabled`. `conductor run --live` is the driver: it holds
- * the state directory's driver lease, loops over passes with back-off and
+ * the state directory's driver lease, loops over passes with back-off from
+ * 30 seconds to 2 minutes, with a 10-second floor while a run waits in watching-ci or merging (D31), and
  * dispatches real lanes — it refuses unless
  * `policy.conductor.enabled` is on, needs the explicit `--live` flag and a
  * durable state directory, and may be run only with the owner's explicit
@@ -40,6 +41,8 @@ import {
   WorkOrderRepositoryAdapter,
   type LaneRunJournalEntryRecord,
   type RunConductorPassResult,
+  type ConductorRunReport,
+  type AdvanceLaneRunResult,
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
@@ -78,7 +81,7 @@ export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
        fleet-v2 conductor start --brief-request <file.json> --tier 1|2 [--run-id <id> --attempt-id <id>] [--max-active-runs <n>]
        fleet-v2 conductor start --abandon --run-id <id> --attempt-id <id>
        fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>] [--pass-concurrency <n>]
-       fleet-v2 conductor reap --worktrees [--dry-run] [--yes]
+       fleet-v2 conductor reap --worktrees|--sessions [--dry-run] [--yes]
 
 Read-only status of one lane run (or every run) with its projected state,
 the halt marker and the driver lease; a kill-switch halt the driver checks
@@ -91,7 +94,13 @@ worktree of every finished lane run (terminal run, terminal work order,
 every attempt cancelled or collected, no held reservation) on explicit
 request: --dry-run lists the candidates and removes nothing, and without it
 --yes is required; the branch fleet/<runId> is kept — no branch, run record
-or evidence is removed. --max-active-runs on conductor start is the
+or evidence is removed. conductor reap --sessions lists and, on request,
+aborts sessions with no live attempt: worktrees whose every attempt is
+finished (cancelled, collected or ended) and none holds a reservation, but
+where the runner still reports a running session; --dry-run lists them and
+aborts nothing, and without it --yes is required; it interrupts those
+sessions and does not delete session records, worktrees, branches or runs.
+--max-active-runs on conductor start is the
 active-run cap the start's admission check uses. --pass-concurrency on
 conductor run is how many live runs one pass advances concurrently
 (default 1, the serial pass), capped at 4 and at --max-active-runs.
@@ -217,16 +226,60 @@ const RUN_ID_PATTERN = /^run-[0-9A-HJKMNP-TV-Z]{26}$/;
 /** The attempt id shape `conductor start --attempt-id` accepts on a retry. */
 const ATTEMPT_ID_PATTERN = /^attempt-[0-9A-HJKMNP-TV-Z]{26}$/;
 
-/** Back-off of plan §3.1: 30 s after a pass that progressed, else doubled up to 2 min. */
+/** Back-off of plan §3.1: 30 s after a pass that progressed, else doubled up to 2 minutes, with a 10-second floor while a run waits in watching-ci or merging (D31). */
 const MIN_POLL_MS = 30_000;
 const MAX_POLL_MS = 120_000;
 
-/** Back-off of §3.1: 30 s after a pass that progressed, else doubled up to 2 min. */
+/** Back-off of §3.1: 30 s after a pass that progressed, else doubled up to 2 minutes; the sleep applies a 10-second floor while a run waits in watching-ci or merging (D31). */
 export function nextPollDelayMs(previousMs: number | null, progressed: boolean): number {
   if (progressed || previousMs === null) {
     return MIN_POLL_MS;
   }
   return Math.min(previousMs * 2, MAX_POLL_MS);
+}
+
+/** D31: a run waiting on the forge (CI or merge train) is polled no slower than every 10 s. */
+export const FORGE_WAIT_POLL_FLOOR_MS = 10_000;
+
+/** The last step of an `advanced` run's report; `null` when there is no step. */
+function lastStep(report: ConductorRunReport): AdvanceLaneRunResult | null {
+  if (report.outcome !== 'advanced') {
+    return null;
+  }
+  const steps = report.steps;
+  return steps.length > 0 ? (steps[steps.length - 1] ?? null) : null;
+}
+
+/**
+ * D31: true when any run in a completed pass ends its pass waiting on the forge —
+ * in `watching-ci` (`ci-pending`/`ci-unknown`) or in `merging` (`merge-train`).
+ * A refused pass never triggers it; `skipped` and `resume-refused` reports never do.
+ */
+export function runsWaitOnForge(result: RunConductorPassResult): boolean {
+  if (result.outcome !== 'completed') {
+    return false;
+  }
+  return result.runs.some((report) => {
+    const step = lastStep(report);
+    if (step === null) {
+      return false;
+    }
+    if (step.outcome === 'waiting') {
+      return step.reason === 'ci-pending' || step.reason === 'ci-unknown' || step.reason === 'merge-train';
+    }
+    return (
+      (step.outcome === 'entered' || step.outcome === 'repaired') &&
+      (step.state === 'watching-ci' || step.state === 'merging')
+    );
+  });
+}
+
+/** The sleep after a pass: the back-off, floored to 10 s while a run waits on the forge (D31). */
+export function pollSleepMs(backoffMs: number, result: RunConductorPassResult): number {
+  if (!runsWaitOnForge(result)) {
+    return backoffMs;
+  }
+  return Math.min(backoffMs, FORGE_WAIT_POLL_FLOOR_MS);
 }
 
 /** KF-35: the one fixed failure message; the driver exits 1 and runs no pass. */
@@ -660,8 +713,9 @@ function readRunFlags(argv: readonly string[], io: CliIo): RunFlags | null {
 
 /**
  * `conductor run --live`: the driver. One pass at a time under the state
- * directory's driver lease, polling with back-off from 30 seconds to 2
- * minutes, printing one line per pass and each grace attention item once,
+ * directory's driver lease, polling with back-off from 30 seconds to 2 minutes,
+ * with a 10-second floor while a run waits in watching-ci or merging (D31),
+ * printing one line per pass and each grace attention item once,
  * releasing its leases on SIGINT or SIGTERM. It refuses unless
  * `policy.conductor.enabled` is on, needs `--live` and a durable state
  * directory, and dispatches real lanes: it runs only with the owner's
@@ -790,7 +844,8 @@ interface PollPassOutcome {
 /**
  * The shared poll loop of `conductor run`: one pass at a time under the
  * driver lease, printing one line per pass through `eachPass`, polling with
- * back-off from 30 seconds to 2 minutes, releasing its leases on SIGINT or
+ * back-off from 30 seconds to 2 minutes, with a 10-second floor while a run
+ * waits in watching-ci or merging (D31), releasing its leases on SIGINT or
  * SIGTERM. `eachPass` returns whether the loop should stop and an exit code.
  */
 async function pollConductorPasses(options: {
@@ -839,7 +894,7 @@ async function pollConductorPasses(options: {
       if (result.outcome !== 'refused') {
         previousDelay = nextPollDelayMs(previousDelay, result.progressed);
       }
-      await options.sleep(previousDelay ?? MIN_POLL_MS, signal);
+      await options.sleep(pollSleepMs(previousDelay ?? MIN_POLL_MS, result), signal);
       if (signal.aborted) {
         break;
       }
@@ -1016,17 +1071,19 @@ async function dryRunCommand(
 
 interface ReapFlags {
   readonly worktrees: boolean;
+  readonly sessions: boolean;
   readonly dryRun: boolean;
   readonly yes: boolean;
 }
 
 /**
- * `conductor reap`'s private flag reader: `--worktrees` (required), and
- * `--dry-run`/`--yes`. An unknown flag, a repeated flag or a positional is a
- * usage error.
+ * `conductor reap`'s private flag reader: exactly one of `--worktrees` or
+ * `--sessions`, and `--dry-run`/`--yes`. An unknown flag, a repeated flag or
+ * a positional is a usage error.
  */
 function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
   let worktrees = false;
+  let sessions = false;
   let dryRun = false;
   let yes = false;
   for (let index = 0; index < argv.length; index += 1) {
@@ -1037,6 +1094,14 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
         return null;
       }
       worktrees = true;
+      continue;
+    }
+    if (token === '--sessions') {
+      if (sessions) {
+        io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
+        return null;
+      }
+      sessions = true;
       continue;
     }
     if (token === '--dry-run') {
@@ -1062,15 +1127,27 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
     io.stderr(`conductor reap takes no positional arguments\n${CONDUCTOR_HELP}\n`);
     return null;
   }
-  return { worktrees, dryRun, yes };
+  return { worktrees, sessions, dryRun, yes };
 }
 
 /**
- * `conductor reap --worktrees` (EX-2b): on explicit request (with `--yes`,
- * or `--dry-run` to only list), remove the clean worktree of every finished
- * lane run and keep the branch `fleet/<runId>`. It needs a durable state
- * directory; a dry run removes nothing and calls no `removeLaneWorktree`.
- * Exit 0 when nothing was refused or unknown, otherwise 1.
+ * `conductor reap` (EX-2b, EX-4): exactly one of `--worktrees` or
+ * `--sessions` is required.
+ *
+ * `--worktrees` (EX-2b): on explicit request (with `--yes`, or `--dry-run`
+ * to only list), remove the clean worktree of every finished lane run and
+ * keep the branch `fleet/<runId>`. It needs a durable state directory; a dry
+ * run removes nothing and calls no `removeLaneWorktree`. Exit 0 when nothing
+ * was refused or unknown, otherwise 1.
+ *
+ * `--sessions` (EX-4): on explicit request (with `--yes`, or `--dry-run` to
+ * only list), abort sessions that outlived their attempt: worktrees whose
+ * every attempt is finished (cancelled, collected or ended) and none holds a
+ * reservation, but where the runner still reports a running session. It needs
+ * a durable state directory; a dry run aborts nothing and calls no
+ * `abortWorktreeRun`. The message states it interrupts sessions with no live
+ * attempt and does not delete session records, worktrees, branches or runs.
+ * Exit 0 when nothing failed or was unknown, otherwise 1.
  */
 async function reapCommand(
   argv: readonly string[],
@@ -1082,12 +1159,20 @@ async function reapCommand(
   if (flags === null) {
     return 2;
   }
-  if (!flags.worktrees) {
-    io.stderr(`conductor reap requires --worktrees\n${CONDUCTOR_HELP}\n`);
+  if (!flags.worktrees && !flags.sessions) {
+    io.stderr(`conductor reap requires --worktrees or --sessions\n${CONDUCTOR_HELP}\n`);
+    return 2;
+  }
+  if (flags.worktrees && flags.sessions) {
+    io.stderr(`conductor reap takes only one of --worktrees or --sessions\n${CONDUCTOR_HELP}\n`);
     return 2;
   }
   if (!flags.dryRun && !flags.yes) {
-    io.stderr(`conductor reap --worktrees requires --yes unless --dry-run is given\n${CONDUCTOR_HELP}\n`);
+    io.stderr(
+      flags.worktrees
+        ? `conductor reap --worktrees requires --yes unless --dry-run is given\n${CONDUCTOR_HELP}\n`
+        : `conductor reap --sessions requires --yes unless --dry-run is given; it interrupts sessions with no live attempt and does not delete session records, worktrees, branches or runs\n${CONDUCTOR_HELP}\n`,
+    );
     return 2;
   }
   if (options.stateDir === undefined) {
@@ -1095,6 +1180,14 @@ async function reapCommand(
       `conductor reap needs a durable state directory (--state-dir or FLEET_STATE_DIR)\n${CONDUCTOR_HELP}\n`,
     );
     return 2;
+  }
+  if (flags.sessions) {
+    const result = await runtime.conductor.reapOrphanSessions.reapOrphanSessions({
+      dryRun: flags.dryRun,
+    });
+    io.stdout(`${JSON.stringify(result)}\n`);
+    // Failures and unknowns both mean the operator must look; nothing failed or unknown exits 0.
+    return result.failed.length > 0 || result.unknown.length > 0 ? 1 : 0;
   }
   const result = await runtime.conductor.reapLaneWorktrees.reapLaneWorktrees({
     dryRun: flags.dryRun,

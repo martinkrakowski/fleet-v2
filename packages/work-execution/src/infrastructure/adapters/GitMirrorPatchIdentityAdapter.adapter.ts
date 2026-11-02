@@ -83,12 +83,15 @@ export function parsePatchId(outcome: CommandRunResult): string | null {
     return null;
   }
   const [first] = trimmed.split(/\s+/);
-  return first !== undefined && first.length > 0 ? first : null;
+  return first !== undefined && isValidSha40(first) ? first : null;
 }
 
 /** A clean NUL-split `git diff --name-only -z` run, or null on failure. */
 export function parseChangedFilesNul(outcome: CommandRunResult): readonly string[] | null {
   if (outcome.exitCode !== 0 || outcome.signal !== null || outcome.error !== undefined) {
+    return null;
+  }
+  if (outcome.stdout.length > 0 && !outcome.stdout.endsWith('\0')) {
     return null;
   }
   return outcome.stdout.split('\0').filter((entry) => entry.length > 0);

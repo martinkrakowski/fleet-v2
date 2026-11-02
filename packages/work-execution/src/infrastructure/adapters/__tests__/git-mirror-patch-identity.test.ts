@@ -865,6 +865,7 @@ describe('pure decision helpers', () => {
     expect(parsePatchId({ ...twoField, signal: 'SIGTERM' })).toBeNull();
     expect(parsePatchId({ ...twoField, error: 'spawn failed' })).toBeNull();
     expect(parsePatchId({ ...twoField, stdout: '' })).toBeNull();
+    expect(parsePatchId({ ...twoField, stdout: 'garbage\n' })).toBeNull();
     expect(parsePatchId({ ...twoField, stdout: '   \t  \n' })).toBeNull();
   });
 
@@ -877,6 +878,7 @@ describe('pure decision helpers', () => {
     };
     expect(parseChangedFilesNul(clean)).toEqual(['docs/a.md', 'pkg/\nweird.ts']);
     expect(parseChangedFilesNul({ ...clean, exitCode: 128 })).toBeNull();
+    expect(parseChangedFilesNul({ ...clean, stdout: 'docs/a.md' })).toBeNull();
     expect(parseChangedFilesNul({ ...clean, signal: 'SIGTERM' })).toBeNull();
     expect(parseChangedFilesNul({ ...clean, error: 'timed out' })).toBeNull();
   });

@@ -1224,3 +1224,93 @@ describe('LaneRunAdmissionAdapter parked exclusion (KS5)', () => {
     expect(harness.reserveCalls).toHaveLength(0);
   });
 });
+
+describe('LaneRunAdmissionAdapter shared files and in-flight work order (CG2)', () => {
+  it('an in-flight reservation carrying its work order id does not block a disjoint start', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    harness.workOrders.set('wo-b', workOrderFixture({ id: 'wo-b', ownedPaths: ['packages/other/src'] }));
+    await harness.holdReservation('attempt-example-9', { workOrderId: 'wo-b' });
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toMatchObject({ outcome: 'reserved' });
+  });
+
+  it('an in-flight reservation with no work order id still blocks (fail closed)', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.holdReservation('attempt-example-9');
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('an in-flight reservation whose work order overlaps still blocks', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    harness.workOrders.set('wo-b', workOrderFixture({ id: 'wo-b', ownedPaths: ['packages/example/src'] }));
+    await harness.holdReservation('attempt-example-9', { workOrderId: 'wo-b' });
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('two work orders sharing only the manifest with disjoint packages both reserve', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    harness.workOrders.set('wo-b', workOrderFixture({
+      id: 'wo-b',
+      ownedPaths: ['.architecture/manifest.yaml', 'packages/other/src'],
+    }));
+    await harness.holdReservation('attempt-example-9', { workOrderId: 'wo-b' });
+
+    const shared = await harness.adapter.reserveFirst(
+      firstReservationRequest({
+        attemptId: 'attempt-shared-manifest',
+        workOrderId: 'wo-example-1',
+      }),
+    );
+    expect(shared).toMatchObject({ outcome: 'reserved' });
+  });
+
+  it('the same overlap on a non-shared file does not reserve', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    harness.workOrders.set('wo-c', workOrderFixture({
+      id: 'wo-c',
+      ownedPaths: ['packages/example/src/other.ts'],
+    }));
+    await harness.holdReservation('attempt-example-10', { workOrderId: 'wo-c' });
+
+    const nonShared = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(nonShared).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [], attemptIds: ['attempt-example-10'] },
+    });
+  });
+
+  it('the default cap of 1 still blocks a disjoint in-flight reservation', async () => {
+    const harness = makeHarness();
+    harness.workOrders.set('wo-b', workOrderFixture({ id: 'wo-b', ownedPaths: ['packages/other/src'] }));
+    await harness.holdReservation('attempt-example-9', { workOrderId: 'wo-b' });
+
+    const result = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('a saved reservation keeps its work order id through listActiveReservations', async () => {
+    const harness = makeHarness();
+    await harness.holdReservation('attempt-example-9', { workOrderId: 'wo-b' });
+
+    const listed = await harness.executionJournal.listActiveReservations();
+    const held = listed.find((reservation) => reservation.attemptId === 'attempt-example-9');
+    expect(held?.workOrderId).toBe('wo-b');
+  });
+});

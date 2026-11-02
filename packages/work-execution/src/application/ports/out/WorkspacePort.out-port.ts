@@ -219,6 +219,19 @@ export type ResetWorktreeToHeadResult =
     }
   | { readonly outcome: 'error'; readonly reason: string };
 
+/**
+ * GB3: the request to verify whether a preserved patch matches the worktree
+ * (`git apply --check -R <patchPath>`).
+ */
+export interface VerifySavedPatchRequest {
+  /** The attempt's recorded worktree root (absolute). */
+  readonly worktreePath: string;
+  /** Absolute path OUTSIDE the worktree where the patch file was preserved. */
+  readonly patchPath: string;
+  /** The attempt's recorded runner block: the check runs on that host's executor. */
+  readonly recordedHost?: AttemptRunnerRecord | null;
+}
+
 export interface WorkspacePort {
   /** Inspect the worktree as a typed record; part of readiness, once per prepared environment. */
   inspectWorktree(request: WorktreeInspectionRequest): Promise<WorktreeInspection>;
@@ -231,6 +244,12 @@ export interface WorkspacePort {
    * following links or overwriting files.
    */
   preserveWorktreeEdits?(request: PreserveWorktreeEditsRequest): Promise<PreserveWorktreeEditsResult>;
+
+  /**
+   * GB3: verify that one preserved patch matches the worktree
+   * (`git apply --check -R <patchPath>`).
+   */
+  verifySavedPatch?(request: VerifySavedPatchRequest): Promise<boolean>;
 
   /**
    * GB3: discard the worktree's tracked modifications back to HEAD

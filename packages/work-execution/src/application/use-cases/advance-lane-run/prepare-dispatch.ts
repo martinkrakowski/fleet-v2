@@ -1,7 +1,11 @@
 /** The `act prepare` and `act dispatch` steps of AdvanceLaneRunUseCase (AL-1). */
 import type { AdvanceLaneRunRefusal, AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
+import type {
+  PreserveWorktreeEditsResult,
+  VerifySavedPatchRequest,
+} from '../../ports/out/WorkspacePort.out-port.js';
 import { AttemptRevisionConflictError } from '../../ports/out/AttemptRepositoryPort.out-port.js';
-import { parseSeatTool, type AttemptRecord, type AttemptSeatOverrideRecord, type AttemptSeatSelectionRecord } from '../../../domain/execution-records.js';
+import { parseSeatTool, type AttemptRecord, type AttemptRunnerRecord, type AttemptSeatOverrideRecord, type AttemptSeatSelectionRecord } from '../../../domain/execution-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunCursorsRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
@@ -365,6 +369,21 @@ async function hasIncompleteWorktreeRecovery(ctx: AdvanceStepContext, attemptId:
   return sawIntent && !sawCompleted;
 }
 
+function canAttemptWorktreeRecovery(
+  recovery: AdvanceStepContext['deps']['worktreeRecovery'],
+  cancel: unknown,
+  append: unknown,
+  latest: AttemptRecord,
+): boolean {
+  if (recovery?.preserveWorktreeEdits === undefined || recovery.resetWorktreeToHead === undefined || cancel === undefined || append === undefined) {
+    return false;
+  }
+  if (latest.state !== 'intent-recorded' || latest.worktreePath === null) {
+    return false;
+  }
+  return worktreeRecoveryPatchInputsValid(latest.worktreePath, latest.id);
+}
+
 /**
  * GB3: preserve the refused attempt's uncommitted edits as a patch outside the
  * worktree, reset the worktree to its head, cancel the never-dispatched
@@ -381,19 +400,22 @@ async function recoverUncommittedWorktree(ctx: AdvanceStepContext,
   request: AdvanceLaneRunRequest,
 ): Promise<boolean> {
   const recovery = ctx.deps.worktreeRecovery;
+  const preserveWorktreeEdits = recovery?.preserveWorktreeEdits?.bind(recovery);
+  const resetWorktreeToHead = recovery?.resetWorktreeToHead?.bind(recovery);
   const cancel = ctx.deps.cancelPreparedAttempt;
   const append = ctx.deps.executionJournal.appendJournalEntry?.bind(ctx.deps.executionJournal);
-  if (recovery?.preserveWorktreeEdits === undefined || recovery.resetWorktreeToHead === undefined || cancel === undefined || append === undefined) {
-    return false;
-  }
-  if (latest.state !== 'intent-recorded' || latest.worktreePath === null) {
+  if (!canAttemptWorktreeRecovery(recovery, cancel, append, latest)) {
     return false;
   }
   const recordedHost = conductedRunnerOf(latest);
-  if (recordedHost === null) {
-    return false;
-  }
-  if (!worktreeRecoveryPatchInputsValid(latest.worktreePath, latest.id)) {
+  if (
+    recordedHost === null ||
+    latest.worktreePath === null ||
+    preserveWorktreeEdits === undefined ||
+    resetWorktreeToHead === undefined ||
+    cancel === undefined ||
+    append === undefined
+  ) {
     return false;
   }
   try {
@@ -419,11 +441,11 @@ async function recoverUncommittedWorktree(ctx: AdvanceStepContext,
       sessionId: null,
       detail: 'preserved uncommitted edits: ' + patchPath,
     });
-    const preserved = await recovery.preserveWorktreeEdits({ worktreePath: latest.worktreePath, patchPath, recordedHost });
+    const preserved = await preserveWorktreeEdits({ worktreePath: latest.worktreePath, patchPath, recordedHost });
     if (preserved.outcome !== 'preserved') {
       return false;
     }
-    const reset = await recovery.resetWorktreeToHead({ worktreePath: latest.worktreePath, recordedHost });
+    const reset = await resetWorktreeToHead({ worktreePath: latest.worktreePath, recordedHost });
     if (reset.outcome !== 'reset') {
       return false;
     }
@@ -448,6 +470,45 @@ async function recoverUncommittedWorktree(ctx: AdvanceStepContext,
   }
 }
 
+function recoveryInputsValid(
+  recovery: AdvanceStepContext['deps']['worktreeRecovery'],
+  latest: AttemptRecord,
+  append: unknown,
+): boolean {
+  if (recovery?.preserveWorktreeEdits === undefined || recovery.resetWorktreeToHead === undefined || append === undefined) {
+    return false;
+  }
+  if (latest.state !== 'cancelled' || latest.worktreePath === null) {
+    return false;
+  }
+  return worktreeRecoveryPatchInputsValid(latest.worktreePath, latest.id);
+}
+
+function hasSavedPatchVerifier(
+  candidate: object,
+): candidate is { verifySavedPatch(request: VerifySavedPatchRequest): Promise<boolean> } {
+  return 'verifySavedPatch' in candidate && typeof candidate.verifySavedPatch === 'function';
+}
+
+async function canProceedWithReconcileReset(
+  recovery: NonNullable<AdvanceStepContext['deps']['worktreeRecovery']>,
+  preserved: PreserveWorktreeEditsResult,
+  worktreePath: string,
+  patchPath: string,
+  recordedHost: AttemptRunnerRecord,
+): Promise<boolean> {
+  if (preserved.outcome === 'preserved') {
+    return true;
+  }
+  if (preserved.outcome === 'refused' && preserved.reason === 'destination-exists') {
+    if (!hasSavedPatchVerifier(recovery)) {
+      return false;
+    }
+    return recovery.verifySavedPatch({ worktreePath, patchPath, recordedHost });
+  }
+  return false;
+}
+
 /**
  * GB3: reconcile a crashed recovery whose attempt is already `cancelled` —
  * the crash landed after the cancel but before the recovery's completing
@@ -455,11 +516,8 @@ async function recoverUncommittedWorktree(ctx: AdvanceStepContext,
  * prepare the next seat over an unreconciled recovery. The preserve and reset
  * side effects may already have run, so the reconcile does not re-run them
  * blindly: a `destination-exists` preserve proves the patch survived the
- * crash (the adapter checks the destination before reading the worktree), a
- * fresh `preserved` writes a missing patch, and the idempotent reset restores
- * the head; the completing entry then closes the intent. Any other outcome —
- * in particular `nothing-to-preserve`, where a clean worktree cannot prove
- * the patch — leaves the intent open and reads false, so the run parks.
+ * crash, but reset is only repeated if the saved patch passes verification
+ * against the current worktree; otherwise keep the park.
  */
 async function reconcileCancelledWorktreeRecovery(ctx: AdvanceStepContext,
   record: LaneRunRecord,
@@ -467,31 +525,39 @@ async function reconcileCancelledWorktreeRecovery(ctx: AdvanceStepContext,
   request: AdvanceLaneRunRequest,
 ): Promise<boolean> {
   const recovery = ctx.deps.worktreeRecovery;
+  const preserveWorktreeEdits = recovery?.preserveWorktreeEdits?.bind(recovery);
+  const resetWorktreeToHead = recovery?.resetWorktreeToHead?.bind(recovery);
   const append = ctx.deps.executionJournal.appendJournalEntry?.bind(ctx.deps.executionJournal);
-  if (recovery?.preserveWorktreeEdits === undefined || recovery.resetWorktreeToHead === undefined || append === undefined) {
-    return false;
-  }
-  if (latest.state !== 'cancelled' || latest.worktreePath === null) {
-    return false;
-  }
-  if (!worktreeRecoveryPatchInputsValid(latest.worktreePath, latest.id)) {
+  if (!recoveryInputsValid(recovery, latest, append)) {
     return false;
   }
   const recordedHost = conductedRunnerOf(latest);
-  if (recordedHost === null) {
+  if (
+    recordedHost === null ||
+    latest.worktreePath === null ||
+    recovery === undefined ||
+    preserveWorktreeEdits === undefined ||
+    resetWorktreeToHead === undefined ||
+    append === undefined
+  ) {
     return false;
   }
+  const patchPath = latest.worktreePath + '.' + latest.id + '.patch';
   try {
-    const patchPath = latest.worktreePath + '.' + latest.id + '.patch';
-    const preserved = await recovery.preserveWorktreeEdits(
+    const preserved = await preserveWorktreeEdits(
       { worktreePath: latest.worktreePath, patchPath, recordedHost },
     );
-    if (preserved.outcome === 'refused' && preserved.reason === 'destination-exists') {
-      // The patch already survived the crash; nothing is re-written.
-    } else if (preserved.outcome !== 'preserved') {
+    const canReset = await canProceedWithReconcileReset(
+      recovery,
+      preserved,
+      latest.worktreePath,
+      patchPath,
+      recordedHost,
+    );
+    if (!canReset) {
       return false;
     }
-    const reset = await recovery.resetWorktreeToHead({ worktreePath: latest.worktreePath, recordedHost });
+    const reset = await resetWorktreeToHead({ worktreePath: latest.worktreePath, recordedHost });
     if (reset.outcome !== 'reset') {
       return false;
     }

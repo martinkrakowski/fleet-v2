@@ -1435,7 +1435,7 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
       await conduct(harness, 'ready', LATER);
     };
 
-    it('GB3 test 10: a crash after the cancel but before the completing entry is reconciled at the next prepare, which then advances', async () => {
+    it('GB3 test 10: a crash after the cancel whose saved patch cannot be proven keeps the park and repeats no reset', async () => {
       const harness = await makeHarness(runRecord(), [attemptFixture()], { wireRecovery: true });
       harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
       await admit(harness, 'attempt-example-1');
@@ -1448,24 +1448,13 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
 
       await restartRun(harness);
 
-      // The patch survived the crash: the adapter answers destination-exists
-      // (it checks the destination before reading the worktree). The reconcile
-      // closes the intent and the run prepares the next seat.
+      // The reset may already have run, so the saved patch cannot be proven
+      // against this worktree: the reconcile keeps the park and resets nothing
+      // more. A person recovers from the saved patch.
       harness.setPreserveAnswer(async () => ({ outcome: 'refused', reason: 'destination-exists' }));
-      const next = await advance(harness);
-      expect(next).toEqual({
-        outcome: 'acted',
-        step: 'prepare',
-        key: prepareKey(0, 1, 2),
-        result: 'completed',
-        reasonCode: 'prepared',
-      });
-      // One preserve/reset from the crashed recovery, one from the reconcile.
-      expect(harness.preserveRequests).toHaveLength(2);
-      expect(harness.resetRequests).toHaveLength(2);
-      expect(harness.resetRequests[0]).toEqual({ worktreePath: WORKTREE, recordedHost: CONDUCTED_RUNNER });
-      expect((await recoveryJournalEntries(harness)).map((entry) => entry.status)).toEqual(['intent-recorded', 'completed']);
-      // The cancelled attempt is not cancelled a second time (advance 1's cancel only).
+      expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'prepare' });
+      expect(harness.resetRequests).toHaveLength(1);
+      expect((await recoveryJournalEntries(harness)).map((entry) => entry.status)).toEqual(['intent-recorded']);
       expect(harness.cancelRequests).toHaveLength(1);
     });
 

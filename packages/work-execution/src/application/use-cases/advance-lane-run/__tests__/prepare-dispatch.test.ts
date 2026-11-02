@@ -145,6 +145,8 @@ describe('performPrepare fix-round recovery boundary (Finding 1)', () => {
       headCommit: '0'.repeat(40),
     });
 
+    const cancelPreparedAttempt = vi.fn();
+
     const ctx: AdvanceStepContext = {
       deps: {
         runRepo: {
@@ -166,6 +168,9 @@ describe('performPrepare fix-round recovery boundary (Finding 1)', () => {
           preserveWorktreeEdits,
           resetWorktreeToHead,
         },
+        cancelPreparedAttempt: {
+          cancelPreparedAttempt,
+        } as never,
         reconcileAttempt: {} as never,
         admission: {} as never,
         newUlid: () => '01JBNEWULID00000000000000',
@@ -219,6 +224,8 @@ describe('performPrepare fix-round recovery boundary (Finding 1)', () => {
       expect(result.reason).toBe('step-refused');
       expect(result.qualifier).toBe('prepare');
     }
+    expect(resetWorktreeToHead).not.toHaveBeenCalled();
+    expect(cancelPreparedAttempt).not.toHaveBeenCalled();
   });
 
   it('appends completed journal entry and prepares attempt when reconciliation succeeds', async () => {
@@ -239,6 +246,8 @@ describe('performPrepare fix-round recovery boundary (Finding 1)', () => {
       reason: 'destination-exists',
     });
 
+    const verifySavedPatch = vi.fn().mockResolvedValue(true);
+
     const resetWorktreeToHead = vi.fn().mockResolvedValue({
       outcome: 'reset',
       headCommit: '0'.repeat(40),
@@ -248,6 +257,12 @@ describe('performPrepare fix-round recovery boundary (Finding 1)', () => {
     const saveAttempt = vi.fn().mockImplementation(async (attempt) => {
       savedAttempts.push(attempt);
     });
+
+    const worktreeRecovery = {
+      preserveWorktreeEdits,
+      verifySavedPatch,
+      resetWorktreeToHead,
+    };
 
     const ctx: AdvanceStepContext = {
       deps: {
@@ -266,10 +281,7 @@ describe('performPrepare fix-round recovery boundary (Finding 1)', () => {
           listJournalEntriesForAttempt: vi.fn().mockImplementation(async () => journalEntries),
           appendJournalEntry,
         },
-        worktreeRecovery: {
-          preserveWorktreeEdits,
-          resetWorktreeToHead,
-        },
+        worktreeRecovery,
         reconcileAttempt: {} as never,
         admission: {} as never,
         newUlid: () => '01JBNEWULID00000000000000',
@@ -330,7 +342,110 @@ describe('performPrepare fix-round recovery boundary (Finding 1)', () => {
       expect(result.result).toBe('completed');
       expect(result.reasonCode).toBe('prepared');
     }
+    expect(verifySavedPatch).toHaveBeenCalled();
+    expect(resetWorktreeToHead).toHaveBeenCalled();
     expect(journalEntries.some((e) => e.status === 'completed' && e.action === 'dispatch')).toBe(true);
     expect(savedAttempts.length).toBe(1);
+  });
+
+  it('parks and does not repeat reset when destination-exists patch fails verification against current worktree', async () => {
+    const journalEntries: Array<{ action: string; status: string; detail: string | null }> = [
+      {
+        action: 'dispatch',
+        status: 'intent-recorded',
+        detail: `preserved uncommitted edits: ${WORKTREE}.${ATTEMPT_ID}.patch`,
+      },
+    ];
+
+    const appendJournalEntry = vi.fn().mockImplementation(async (entry) => {
+      journalEntries.push(entry);
+    });
+
+    const preserveWorktreeEdits = vi.fn().mockResolvedValue({
+      outcome: 'refused',
+      reason: 'destination-exists',
+    });
+
+    const verifySavedPatch = vi.fn().mockResolvedValue(false);
+
+    const resetWorktreeToHead = vi.fn().mockResolvedValue({
+      outcome: 'reset',
+      headCommit: '0'.repeat(40),
+    });
+
+    const worktreeRecovery = {
+      preserveWorktreeEdits,
+      verifySavedPatch,
+      resetWorktreeToHead,
+    };
+
+    const ctx: AdvanceStepContext = {
+      deps: {
+        runRepo: {
+          save: vi.fn().mockImplementation(async (r: LaneRunRecord) => ({ outcome: 'saved', record: r })),
+          get: vi.fn().mockResolvedValue(null),
+        } as never,
+        runJournal: {
+          append: vi.fn().mockImplementation(async (e: unknown) => ({ outcome: 'appended', entry: e })),
+          listForKey: vi.fn().mockResolvedValue([]),
+          listForRun: vi.fn().mockResolvedValue([]),
+        } as never,
+        attemptRepo: { findAttemptById: vi.fn(), saveAttempt: vi.fn() } as never,
+        executionJournal: {
+          listActiveReservations: vi.fn().mockResolvedValue([]),
+          listJournalEntriesForAttempt: vi.fn().mockImplementation(async () => journalEntries),
+          appendJournalEntry,
+        },
+        worktreeRecovery,
+        reconcileAttempt: {} as never,
+        admission: {} as never,
+        newUlid: () => '01JBNEWULID00000000000000',
+        artifactPort: {} as never,
+      },
+    };
+
+    const gathered: GatheredLaneRunFacts = {
+      facts: {
+        state: 'ready',
+        halted: false,
+        stopMode: null,
+        stopRequestedAtIso: null,
+        stopGraceMinutes: 45,
+        pendingIntent: null,
+        admission: 'admitted',
+        costCeilingReached: false,
+        implementerSeat: { ok: true, seatIndex: 0 },
+        reviewSeat: { ok: true, seatIndex: 0 },
+        roundSeatIndexes: [],
+        attempt: null,
+        head12: null,
+        acceptedHead12: null,
+        gate: 'none',
+        gateCongestion: null,
+        briefCheck: { verdict: 'none', seatIndex: null, retries: 0 },
+        codeReview: { verdict: 'none', seatIndex: null, retries: 0 },
+        preMerge: 'none',
+        premergePost: 'none',
+        acceptance: 'none',
+        acceptanceRetry: null,
+        ci: 'pending',
+        pr: null,
+        refusedStep: null,
+        merge: { oneWayDoor: false, branchBehind: false, trainFree: true, policyGrant: true },
+      },
+      deadlineUnknown: false,
+      latestAttempt: mockCancelledAttempt,
+      attemptRecords: [mockCancelledAttempt],
+    };
+
+    const result = await performPrepare(ctx, mockRecord, gathered, fixDecision, mockRequest);
+    expect(result.outcome).toBe('parked');
+    if (result.outcome === 'parked') {
+      expect(result.reason).toBe('step-refused');
+      expect(result.qualifier).toBe('prepare');
+    }
+    expect(verifySavedPatch).toHaveBeenCalled();
+    expect(resetWorktreeToHead).not.toHaveBeenCalled();
+    expect(journalEntries.some((e) => e.status === 'completed')).toBe(false);
   });
 });

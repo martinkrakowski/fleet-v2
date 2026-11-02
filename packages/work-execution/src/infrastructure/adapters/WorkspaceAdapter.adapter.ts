@@ -48,6 +48,7 @@ import type {
   RemoveLaneWorktreeResult,
   ResetWorktreeToHeadRequest,
   ResetWorktreeToHeadResult,
+  VerifySavedPatchRequest,
 } from '../../application/ports/out/WorkspacePort.out-port.js';
 import { runnerHasHostName } from '../../domain/execution-records.js';
 
@@ -379,22 +380,22 @@ function patchPathRefusal(patchPath: unknown, worktreePath: string): 'invalid-re
   return null;
 }
 
-function parseUntrackedListing(stdoutA: string, stdoutB: string): string[] {
+export function parseUntrackedListing(stdoutA: string, stdoutB: string): string[] {
   return [
     ...new Set(
-      [...stdoutA.split('\n'), ...stdoutB.split('\n')]
-        .map((line) => line.replace(/\/+$/, '').trim())
-        .filter((line) => line !== ''),
+      [...stdoutA.split('\0'), ...stdoutB.split('\0')]
+        .map((entry) => entry.replace(/\/+$/, ''))
+        .filter((entry) => entry !== ''),
     ),
   ].sort();
 }
 
-async function writeAndVerifyPatch(
+export async function writeAndVerifyPatch(
   executor: CommandExecutorPort,
   physicalParent: string,
   patchPath: string,
-  diff: string,
-): Promise<'preserved' | 'destination-exists' | 'git-refused'> {
+  worktreePath: string,
+): Promise<'preserved' | 'destination-exists' | 'nothing-to-preserve' | 'git-refused'> {
   const mkTemp = await executor.run(
     ['mktemp', path.join(physicalParent, '.fleet-patch.XXXXXX')],
     { timeoutMs: GIT_TIMEOUT_MS },
@@ -403,8 +404,20 @@ async function writeAndVerifyPatch(
     return 'git-refused';
   }
   const tempPath = mkTemp.stdout.trim();
-  const write = await executor.run(['tee', tempPath], { input: diff, timeoutMs: GIT_TIMEOUT_MS });
-  if (write.exitCode !== 0 || write.error !== undefined) {
+  const diffRun = await executor.run(
+    ['git', '-C', worktreePath, 'diff', '--binary', 'HEAD', `--output=${tempPath}`],
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
+  if (diffRun.exitCode !== 0 || diffRun.error !== undefined) {
+    await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+    return 'git-refused';
+  }
+  const sizeCheck = await executor.run(['test', '-s', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+  if (sizeCheck.exitCode === 1) {
+    await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+    return 'nothing-to-preserve';
+  }
+  if (sizeCheck.exitCode !== 0 || sizeCheck.error !== undefined) {
     await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
     return 'git-refused';
   }
@@ -418,9 +431,12 @@ async function writeAndVerifyPatch(
     await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
     return 'destination-exists';
   }
-  const verify = await executor.run(['cmp', '-', patchPath], { input: diff, timeoutMs: GIT_TIMEOUT_MS });
+  const verify = await executor.run(
+    ['git', '-C', worktreePath, 'apply', '--check', '-R', patchPath],
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
   if (verify.exitCode !== 0 || verify.error !== undefined) {
-    await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+    await executor.run(['rm', '-f', patchPath], { timeoutMs: GIT_TIMEOUT_MS });
     return 'git-refused';
   }
   return 'preserved';
@@ -970,22 +986,47 @@ export class WorkspaceAdapter implements WorkspacePort {
       return { outcome: 'refused', reason: 'destination-exists' };
     }
 
-    // 5. The preserved content: tracked edits against HEAD, binary-safe. An
-    //    empty diff contradicts the refusal that named uncommitted paths, so it
-    //    refuses, never silently succeeds.
-    const diff = await this.runGit(request.worktreePath, ['diff', '--binary', 'HEAD'], executor);
-    if (diff === '') {
-      return { outcome: 'refused', reason: 'nothing-to-preserve' };
-    }
-
-    // 6. Write atomically without following links or overwriting files: a
-    //    fresh temp file created by mktemp, the diff written into it, then a
-    //    no-clobber rename onto the destination. Any failure removes the temp.
-    const writeOutcome = await writeAndVerifyPatch(executor, physicalParent, patchPath, diff);
+    // 5-6. Write the binary-safe diff directly via git into a fresh temp file,
+    //      move it without clobbering, verify it against the worktree with
+    //      `git apply --check -R`, and read the byte count.
+    const writeOutcome = await writeAndVerifyPatch(executor, physicalParent, patchPath, request.worktreePath);
     if (writeOutcome !== 'preserved') {
       return { outcome: 'refused', reason: writeOutcome };
     }
-    return { outcome: 'preserved', patchPath, patchBytes: Buffer.byteLength(diff, 'utf8') };
+
+    const wcRun = await executor.run(['wc', '-c', patchPath], { timeoutMs: GIT_TIMEOUT_MS });
+    if (wcRun.exitCode !== 0 || wcRun.error !== undefined) {
+      await executor.run(['rm', '-f', patchPath], { timeoutMs: GIT_TIMEOUT_MS });
+      return { outcome: 'refused', reason: 'git-refused' };
+    }
+    const rawBytes = parseInt(wcRun.stdout.trim().split(/\s+/)[0] ?? '0', 10);
+    const patchBytes = Number.isNaN(rawBytes) ? 0 : rawBytes;
+
+    return { outcome: 'preserved', patchPath, patchBytes };
+  }
+
+  /**
+   * GB3: verify that one preserved patch matches the worktree
+   * (`git apply --check -R <patchPath>`).
+   */
+  async verifySavedPatch(request: VerifySavedPatchRequest): Promise<boolean> {
+    if (worktreeRootRefusal(request.worktreePath) !== null) {
+      return false;
+    }
+    if (patchPathRefusal(request.patchPath, request.worktreePath) !== null) {
+      return false;
+    }
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(request.recordedHost);
+    } catch {
+      return false;
+    }
+    const result = await executor.run(
+      ['git', '-C', request.worktreePath, 'apply', '--check', '-R', request.patchPath],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    return result.exitCode === 0 && result.error === undefined;
   }
 
   /**
@@ -1012,21 +1053,30 @@ export class WorkspaceAdapter implements WorkspacePort {
       //    restore or clear: HEAD's tree AND the index — a staged addition is
       //    not in HEAD, but `reset --hard` still removes it from index and
       //    worktree, so it must take part in the obstruction check — plus the
-      //    untracked files present.
+      //    untracked files present. Run with -z and no .trim() so quoted/special
+      //    characters are preserved faithfully.
       const head = (await this.runGit(request.worktreePath, ['rev-parse', 'HEAD'], executor)).trim();
-      const trackedRun = await this.runGit(request.worktreePath, ['ls-tree', '-r', '--name-only', 'HEAD'], executor);
-      const indexRun = await this.runGit(request.worktreePath, ['ls-files', '--cached'], executor);
+      const trackedRun = await this.runGit(
+        request.worktreePath,
+        ['ls-tree', '-r', '--name-only', '-z', 'HEAD'],
+        executor,
+      );
+      const indexRun = await this.runGit(
+        request.worktreePath,
+        ['ls-files', '--cached', '-z'],
+        executor,
+      );
       const trackedPaths = [
-        ...new Set([...trackedRun.split('\n'), ...indexRun.split('\n')].filter((line) => line !== '')),
+        ...new Set([...trackedRun.split('\0'), ...indexRun.split('\0')].filter((line) => line !== '')),
       ];
       const untrackedRun = await this.runGit(
         request.worktreePath,
-        ['ls-files', '--others'],
+        ['ls-files', '--others', '-z'],
         executor,
       );
       const untrackedDirsRun = await this.runGit(
         request.worktreePath,
-        ['ls-files', '--others', '--directory'],
+        ['ls-files', '--others', '--directory', '-z'],
         executor,
       );
       const untrackedFiles = parseUntrackedListing(untrackedRun, untrackedDirsRun);
@@ -1045,12 +1095,12 @@ export class WorkspaceAdapter implements WorkspacePort {
       // 5. Verify the untracked paths are unchanged.
       const afterRun = await this.runGit(
         request.worktreePath,
-        ['ls-files', '--others'],
+        ['ls-files', '--others', '-z'],
         executor,
       );
       const afterDirsRun = await this.runGit(
         request.worktreePath,
-        ['ls-files', '--others', '--directory'],
+        ['ls-files', '--others', '--directory', '-z'],
         executor,
       );
       const afterUntracked = parseUntrackedListing(afterRun, afterDirsRun);

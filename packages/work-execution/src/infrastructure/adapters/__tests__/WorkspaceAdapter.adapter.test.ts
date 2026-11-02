@@ -104,20 +104,20 @@ describe('WorkspaceAdapter preserveWorktreeEdits (Finding 4)', () => {
     expect(executedCommands.some((c) => c.includes('rm') && c.includes('/patch/.fleet-patch.123456'))).toBe(true);
   });
 
-  it('refuses git-refused when cmp fails to verify patchPath contents', async () => {
+  it('refuses git-refused when apply --check -R fails to verify patchPath contents', async () => {
     const executor = makeExecutor(async (argv) => {
       const cmd = argv.join(' ');
       if (cmd.includes('test -e /patch/target.patch') || cmd.includes('test -L /patch/target.patch')) {
         return { exitCode: 1, stdout: '', stderr: '' };
       }
       if (cmd.includes('diff --binary HEAD')) {
-        return { exitCode: 0, stdout: 'diff content', stderr: '' };
+        return { exitCode: 0, stdout: '', stderr: '' };
+      }
+      if (cmd.includes('test -s /patch/.fleet-patch.123456')) {
+        return { exitCode: 0, stdout: '', stderr: '' };
       }
       if (cmd.includes('mktemp')) {
         return { exitCode: 0, stdout: '/patch/.fleet-patch.123456\n', stderr: '' };
-      }
-      if (cmd.includes('tee /patch/.fleet-patch.123456')) {
-        return { exitCode: 0, stdout: '', stderr: '' };
       }
       if (cmd.includes('mv -n /patch/.fleet-patch.123456 /patch/target.patch')) {
         return { exitCode: 0, stdout: '', stderr: '' };
@@ -126,9 +126,9 @@ describe('WorkspaceAdapter preserveWorktreeEdits (Finding 4)', () => {
         // temp file no longer exists: move succeeded
         return { exitCode: 1, stdout: '', stderr: '' };
       }
-      if (cmd.includes('cmp - /patch/target.patch')) {
-        // cmp verification failed
-        return { exitCode: 1, stdout: '', stderr: 'mismatch' };
+      if (cmd.includes('apply --check -R /patch/target.patch')) {
+        // apply --check -R verification failed
+        return { exitCode: 1, stdout: '', stderr: 'error: patch does not apply' };
       }
       if (cmd.includes('pwd -P')) {
         return { exitCode: 0, stdout: `${argv[4] ?? ''}\n`, stderr: '' };
@@ -155,13 +155,13 @@ describe('WorkspaceAdapter preserveWorktreeEdits (Finding 4)', () => {
         return { exitCode: 1, stdout: '', stderr: '' };
       }
       if (cmd.includes('diff --binary HEAD')) {
-        return { exitCode: 0, stdout: 'diff content here', stderr: '' };
+        return { exitCode: 0, stdout: '', stderr: '' };
+      }
+      if (cmd.includes('test -s /patch/.fleet-patch.123456')) {
+        return { exitCode: 0, stdout: '', stderr: '' };
       }
       if (cmd.includes('mktemp')) {
         return { exitCode: 0, stdout: '/patch/.fleet-patch.123456\n', stderr: '' };
-      }
-      if (cmd.includes('tee /patch/.fleet-patch.123456')) {
-        return { exitCode: 0, stdout: '', stderr: '' };
       }
       if (cmd.includes('mv -n /patch/.fleet-patch.123456 /patch/target.patch')) {
         return { exitCode: 0, stdout: '', stderr: '' };
@@ -170,8 +170,11 @@ describe('WorkspaceAdapter preserveWorktreeEdits (Finding 4)', () => {
         // temp file no longer exists: move succeeded
         return { exitCode: 1, stdout: '', stderr: '' };
       }
-      if (cmd.includes('cmp - /patch/target.patch')) {
+      if (cmd.includes('apply --check -R /patch/target.patch')) {
         return { exitCode: 0, stdout: '', stderr: '' };
+      }
+      if (cmd.includes('wc -c /patch/target.patch')) {
+        return { exitCode: 0, stdout: '17 /patch/target.patch\n', stderr: '' };
       }
       if (cmd.includes('pwd -P')) {
         return { exitCode: 0, stdout: `${argv[4] ?? ''}\n`, stderr: '' };
@@ -188,8 +191,46 @@ describe('WorkspaceAdapter preserveWorktreeEdits (Finding 4)', () => {
     expect(result.outcome).toBe('preserved');
     if (result.outcome === 'preserved') {
       expect(result.patchPath).toBe('/patch/target.patch');
-      expect(result.patchBytes).toBe(Buffer.byteLength('diff content here', 'utf8'));
+      expect(result.patchBytes).toBe(17);
     }
+  });
+});
+
+describe('WorkspaceAdapter verifySavedPatch', () => {
+  it('returns true when git apply --check -R succeeds', async () => {
+    const executor: CommandExecutorPort = {
+      run: vi.fn().mockImplementation(async (argv: readonly string[]) => {
+        if (argv[0] === 'git' && argv.includes('apply') && argv.includes('--check') && argv.includes('-R')) {
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      }),
+    };
+
+    const adapter = new WorkspaceAdapter({ executor });
+    const result = await adapter.verifySavedPatch({
+      worktreePath: '/var/lane/wt',
+      patchPath: '/patch/target.patch',
+    });
+    expect(result).toBe(true);
+  });
+
+  it('returns false when git apply --check -R fails', async () => {
+    const executor: CommandExecutorPort = {
+      run: vi.fn().mockImplementation(async (argv: readonly string[]) => {
+        if (argv[0] === 'git' && argv.includes('apply')) {
+          return { exitCode: 1, stdout: '', stderr: 'error: patch failed' };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      }),
+    };
+
+    const adapter = new WorkspaceAdapter({ executor });
+    const result = await adapter.verifySavedPatch({
+      worktreePath: '/var/lane/wt',
+      patchPath: '/patch/target.patch',
+    });
+    expect(result).toBe(false);
   });
 });
 
@@ -206,17 +247,17 @@ describe('WorkspaceAdapter resetWorktreeToHead (Findings 3 & 5)', () => {
             return { exitCode: 0, stdout: '0123456789abcdef0123456789abcdef01234567\n', stderr: '' };
           }
           if (subcmd.startsWith('ls-tree')) {
-            return { exitCode: 0, stdout: 'tracked.txt\n', stderr: '' };
+            return { exitCode: 0, stdout: 'tracked.txt\0', stderr: '' };
           }
-          if (subcmd === 'ls-files --cached') {
-            return { exitCode: 0, stdout: 'staged_dir/file.txt\n', stderr: '' };
+          if (subcmd.startsWith('ls-files --cached')) {
+            return { exitCode: 0, stdout: 'staged_dir/file.txt\0', stderr: '' };
           }
-          if (subcmd === 'ls-files --others') {
-            return { exitCode: 0, stdout: 'unrelated.txt\n', stderr: '' };
-          }
-          if (subcmd === 'ls-files --others --directory') {
+          if (subcmd.startsWith('ls-files --others --directory')) {
             // Ignored directory obstructing staged addition!
-            return { exitCode: 0, stdout: 'staged_dir/\n', stderr: '' };
+            return { exitCode: 0, stdout: 'staged_dir/\0', stderr: '' };
+          }
+          if (subcmd.startsWith('ls-files --others')) {
+            return { exitCode: 0, stdout: 'unrelated.txt\0', stderr: '' };
           }
         }
         return { exitCode: 0, stdout: '', stderr: '' };
@@ -228,11 +269,12 @@ describe('WorkspaceAdapter resetWorktreeToHead (Findings 3 & 5)', () => {
       worktreePath: '/var/lane/wt',
     });
 
-    // Proves --exclude-standard is NOT used
+    // Proves --exclude-standard is NOT used and -z is used
     const lsFilesCalls = executedGitArgs.filter((args) => args[0] === 'ls-files' && args.includes('--others'));
     expect(lsFilesCalls.length).toBeGreaterThanOrEqual(2);
     for (const call of lsFilesCalls) {
       expect(call).not.toContain('--exclude-standard');
+      expect(call).toContain('-z');
     }
 
     // Refused because staged_dir obstructs staged addition
@@ -258,18 +300,18 @@ describe('WorkspaceAdapter resetWorktreeToHead (Findings 3 & 5)', () => {
             return { exitCode: 0, stdout: '0123456789abcdef0123456789abcdef01234567\n', stderr: '' };
           }
           if (subcmd.startsWith('ls-tree')) {
-            return { exitCode: 0, stdout: 'src/main.ts\n', stderr: '' };
+            return { exitCode: 0, stdout: 'src/main.ts\0', stderr: '' };
           }
-          if (subcmd === 'ls-files --cached') {
-            return { exitCode: 0, stdout: 'src/main.ts\n', stderr: '' };
+          if (subcmd.startsWith('ls-files --cached')) {
+            return { exitCode: 0, stdout: 'src/main.ts\0', stderr: '' };
           }
-          if (subcmd === 'ls-files --others') {
-            return { exitCode: 0, stdout: 'unrelated.txt\n', stderr: '' };
-          }
-          if (subcmd === 'ls-files --others --directory') {
+          if (subcmd.startsWith('ls-files --others --directory')) {
             return { exitCode: 0, stdout: '', stderr: '' };
           }
-          if (subcmd === 'reset --hard') {
+          if (subcmd.startsWith('ls-files --others')) {
+            return { exitCode: 0, stdout: 'unrelated.txt\0', stderr: '' };
+          }
+          if (subcmd.startsWith('reset --hard')) {
             return { exitCode: 0, stdout: '', stderr: '' };
           }
         }

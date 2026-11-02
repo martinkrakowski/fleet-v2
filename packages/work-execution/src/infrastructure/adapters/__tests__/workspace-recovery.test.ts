@@ -211,7 +211,57 @@ describe('WorkspaceAdapter GB3 recovery', () => {
     expect((await git(repoPath, ['rev-parse', 'HEAD'])).trim()).toBe(head);
   });
 
-  it('preserve refuses when a destination appears after the existence checks, and never clobbers it', { timeout: 20000 }, async () => {
+  it('preserve refuses destination-exists when mv -n skips silently on existing destination', { timeout: 20000 }, async () => {
+    const repoPath = await createGitRepo();
+    const patchesDir = await makeTempDir('fleet-patches-');
+    const patchPath = path.join(patchesDir, 'raced-skip.patch');
+    await fs.writeFile(path.join(repoPath, 'README.md'), '# changed\n', 'utf8');
+    await fs.writeFile(patchPath, 'existing destination\n', 'utf8');
+
+    const inner = new LocalExecutor();
+    const skippingExecutor: CommandExecutorPort = {
+      run: async (argv, options) => {
+        if (argv[0] === 'mv' && argv.includes('-n')) {
+          // Simulate mv -n silently skipping when destination exists (exit 0 without moving)
+          return { exitCode: 0, stdout: '', stderr: '', signal: null };
+        }
+        return inner.run(argv, options);
+      },
+    };
+    const adapter = new WorkspaceAdapter({ executor: skippingExecutor });
+    const result = await adapter.preserveWorktreeEdits({ worktreePath: repoPath, patchPath });
+    // Proves the destination-exists branch is hit when temp file remains after mv -n
+    expect(result).toEqual({ outcome: 'refused', reason: 'destination-exists' });
+    expect(await fs.readFile(patchPath, 'utf8')).toBe('existing destination\n');
+    const leftovers = (await fs.readdir(patchesDir)).filter((name) => name.startsWith('.fleet-patch.'));
+    expect(leftovers).toEqual([]);
+  });
+
+  it('preserve refuses git-refused when mv -n fails on existing destination', { timeout: 20000 }, async () => {
+    const repoPath = await createGitRepo();
+    const patchesDir = await makeTempDir('fleet-patches-');
+    const patchPath = path.join(patchesDir, 'raced-fail.patch');
+    await fs.writeFile(path.join(repoPath, 'README.md'), '# changed\n', 'utf8');
+
+    const inner = new LocalExecutor();
+    const failingExecutor: CommandExecutorPort = {
+      run: async (argv, options) => {
+        if (argv[0] === 'mv' && argv.includes('-n')) {
+          // Simulate coreutils mv -n failing with exit 1 on existing destination
+          return { exitCode: 1, stdout: '', stderr: 'mv: will not overwrite', signal: null };
+        }
+        return inner.run(argv, options);
+      },
+    };
+    const adapter = new WorkspaceAdapter({ executor: failingExecutor });
+    const result = await adapter.preserveWorktreeEdits({ worktreePath: repoPath, patchPath });
+    // Proves the git-refused branch is hit when mv -n reports a non-zero exit code
+    expect(result).toEqual({ outcome: 'refused', reason: 'git-refused' });
+    const leftovers = (await fs.readdir(patchesDir)).filter((name) => name.startsWith('.fleet-patch.'));
+    expect(leftovers).toEqual([]);
+  });
+
+  it('preserve refuses and never clobbers destination when destination appears after existence checks', { timeout: 20000 }, async () => {
     const repoPath = await createGitRepo();
     const patchesDir = await makeTempDir('fleet-patches-');
     const patchPath = path.join(patchesDir, 'raced.patch');
@@ -230,12 +280,102 @@ describe('WorkspaceAdapter GB3 recovery', () => {
     };
     const adapter = new WorkspaceAdapter({ executor: racing });
     const result = await adapter.preserveWorktreeEdits({ worktreePath: repoPath, patchPath });
-    // `mv -n` skips silently here; without the post-rename verification this
-    // reported `preserved` for a destination that never held the diff.
-    expect(result).toEqual({ outcome: 'refused', reason: 'git-refused' });
+    // Depending on coreutils version, mv -n either skips silently (destination-exists)
+    // or fails with non-zero exit (git-refused). In both cases it must refuse and not clobber.
+    expect(result.outcome).toBe('refused');
+    if (result.outcome === 'refused') {
+      expect(['destination-exists', 'git-refused']).toContain(result.reason);
+    }
     expect(await fs.readFile(patchPath, 'utf8')).toBe('raced writer\n');
     // The leftover temp file is cleaned up; no other file appeared.
     const leftovers = (await fs.readdir(patchesDir)).filter((name) => name.startsWith('.fleet-patch.'));
     expect(leftovers).toEqual([]);
+  });
+
+  it('reset refuses when a non-ASCII directory obstructs restoring a tracked path, leaving it untouched', { timeout: 20000 }, async () => {
+    const repoPath = await createGitRepo();
+    // Track a file in a non-ASCII directory 'é/a.txt'
+    await fs.mkdir(path.join(repoPath, 'é'), { recursive: true });
+    await fs.writeFile(path.join(repoPath, 'é', 'a.txt'), 'tracked in é\n', 'utf8');
+    await git(repoPath, ['add', 'é/a.txt']);
+    await git(repoPath, ['commit', '-m', 'track é/a.txt']);
+    const head = (await git(repoPath, ['rev-parse', 'HEAD'])).trim();
+
+    // In worktree: replace the tracked directory 'é' with an untracked file at the same path
+    await fs.rm(path.join(repoPath, 'é'), { recursive: true });
+    await fs.writeFile(path.join(repoPath, 'é'), 'non-ascii untracked payload\n', 'utf8');
+
+    const adapter = new WorkspaceAdapter({ executor: new LocalExecutor() });
+    const result = await adapter.resetWorktreeToHead({ worktreePath: repoPath });
+    expect(result).toEqual({ outcome: 'refused', reason: 'untracked-obstructs' });
+
+    // The non-ASCII directory and its untracked content survive; the tracked path was not restored
+    expect(await fs.readFile(path.join(repoPath, 'é'), 'utf8')).toBe('non-ascii untracked payload\n');
+    expect((await git(repoPath, ['rev-parse', 'HEAD'])).trim()).toBe(head);
+  });
+
+  it('preserve and reset handles Latin-1 edits byte-faithfully and restores exact bytes with git apply', { timeout: 20000 }, async () => {
+    const repoPath = await createGitRepo();
+    const patchesDir = await makeTempDir('fleet-patches-');
+    const patchPath = path.join(patchesDir, 'latin1.patch');
+
+    // Create a tracked file with Latin-1 bytes
+    const initialBytes = Buffer.from('latin-1 initial: \xe9\xe8\xe0\n', 'latin1');
+    await fs.writeFile(path.join(repoPath, 'latin1.txt'), initialBytes);
+    await git(repoPath, ['add', 'latin1.txt']);
+    await git(repoPath, ['commit', '-m', 'track latin1.txt']);
+    const head = (await git(repoPath, ['rev-parse', 'HEAD'])).trim();
+
+    // Edit the tracked file with different Latin-1 bytes
+    const editedBytes = Buffer.from('latin-1 edited: \xf1\xfc\xf6 \xff\xfe\n', 'latin1');
+    await fs.writeFile(path.join(repoPath, 'latin1.txt'), editedBytes);
+
+    const adapter = new WorkspaceAdapter({ executor: new LocalExecutor() });
+    const preserved = await adapter.preserveWorktreeEdits({ worktreePath: repoPath, patchPath });
+    expect(preserved.outcome).toBe('preserved');
+    if (preserved.outcome !== 'preserved') return;
+    expect(preserved.patchBytes).toBeGreaterThan(0);
+
+    const reset = await adapter.resetWorktreeToHead({ worktreePath: repoPath });
+    expect(reset.outcome).toBe('reset');
+    if (reset.outcome !== 'reset') return;
+    expect(reset.headCommit).toBe(head);
+
+    // After reset, worktree has initial content
+    const resetBytes = await fs.readFile(path.join(repoPath, 'latin1.txt'));
+    expect(Buffer.compare(resetBytes, initialBytes)).toBe(0);
+
+    // Applying the patch restores the exact edited Latin-1 bytes
+    await git(repoPath, ['apply', patchPath]);
+    const restoredBytes = await fs.readFile(path.join(repoPath, 'latin1.txt'));
+    expect(Buffer.compare(restoredBytes, editedBytes)).toBe(0);
+  });
+
+  it('reset refuses when an ignored path obstructs a tracked path and ensures ignored content survives', { timeout: 20000 }, async () => {
+    const repoPath = await createGitRepo();
+    // Track a file under dist/ in HEAD
+    await fs.mkdir(path.join(repoPath, 'dist'), { recursive: true });
+    await fs.writeFile(path.join(repoPath, 'dist', 'bundle.js'), 'tracked bundle\n', 'utf8');
+    await git(repoPath, ['add', 'dist/bundle.js']);
+    await git(repoPath, ['commit', '-m', 'track dist/bundle.js']);
+    const head = (await git(repoPath, ['rev-parse', 'HEAD'])).trim();
+
+    // Ignore dist/ in .gitignore
+    await fs.writeFile(path.join(repoPath, '.gitignore'), 'dist\n', 'utf8');
+    // Remove the tracked file from worktree and replace dist with an ignored directory containing untracked content
+    await fs.rm(path.join(repoPath, 'dist'), { recursive: true });
+    await fs.writeFile(path.join(repoPath, 'dist'), 'ignored build artifact\n', 'utf8');
+
+    // Confirm that git status sees dist/ as ignored
+    const status = await git(repoPath, ['status', '--porcelain', '--ignored']);
+    expect(status).toContain('!! dist');
+
+    const adapter = new WorkspaceAdapter({ executor: new LocalExecutor() });
+    const result = await adapter.resetWorktreeToHead({ worktreePath: repoPath });
+    expect(result).toEqual({ outcome: 'refused', reason: 'untracked-obstructs' });
+
+    // The ignored content survives and was not destroyed by reset
+    expect(await fs.readFile(path.join(repoPath, 'dist'), 'utf8')).toBe('ignored build artifact\n');
+    expect((await git(repoPath, ['rev-parse', 'HEAD'])).trim()).toBe(head);
   });
 });

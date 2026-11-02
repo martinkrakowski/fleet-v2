@@ -120,7 +120,9 @@ async function haltFlow(
     io.stdout(`${JSON.stringify(refusal('stop agent report unreadable'))}\n`);
     return 1;
   }
-  const confirmed = killallStopReportConfirmed(read.record);
+  const haltedMatches = read.record.haltedAtIso === haltedAtIso;
+  const confirmed = haltedMatches && killallStopReportConfirmed(read.record, haltedAtIso);
+  const unconfirmedReason = !haltedMatches ? 'halted-at-mismatch' : undefined;
   io.stdout(
     `${JSON.stringify({
       outcome: 'completed',
@@ -128,6 +130,9 @@ async function haltFlow(
       train: pauseSet.record,
       report: read.record,
       confirmed,
+      ...(unconfirmedReason !== undefined
+        ? { unconfirmedReason, reason: unconfirmedReason }
+        : {}),
     })}\n`,
   );
   return confirmed ? 0 : 1;

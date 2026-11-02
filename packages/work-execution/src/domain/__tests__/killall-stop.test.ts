@@ -248,6 +248,11 @@ describe('whole-report confirmation', () => {
     expect(killallStopReportConfirmed(parsed(report({ lanes: [], cleanSweeps: 1 })))).toBe(false);
     expect(killallStopReportConfirmed(parsed(report({ lanes: [], cleanSweeps: 2 })))).toBe(true);
   });
+
+  it('cannot confirm when report haltedAtIso does not match expected marker time', () => {
+    expect(killallStopReportConfirmed(parsed(report()), HALTED_AT)).toBe(true);
+    expect(killallStopReportConfirmed(parsed(report()), '2026-11-01T10:00:01.000Z')).toBe(false);
+  });
 });
 
 describe('late start reopens', () => {

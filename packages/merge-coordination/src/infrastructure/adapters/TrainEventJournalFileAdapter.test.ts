@@ -216,4 +216,116 @@ describe('TrainEventJournalFileAdapter', () => {
       expect(await adapter.list(trainId)).toEqual({ outcome: 'unreadable' });
     });
   });
+
+  describe('Finding 1: journal sequences must be contiguous and increasing', () => {
+    function makeLine(sequence: number, key: string, event: 'became-eligible' | 'batched' = 'became-eligible'): string {
+      return JSON.stringify({
+        schemaVersion: 1,
+        sequence,
+        key,
+        event,
+        atIso: nowIso,
+        fence: 1,
+      });
+    }
+
+    it('refuses a journal with decreasing sequences (e.g. 2, 1)', async () => {
+      await writeLease();
+      const dir = path.join(tempDir, 'merge-trains', trainId);
+      await fs.mkdir(dir, { recursive: true });
+      const journalFile = path.join(dir, 'journal.jsonl');
+
+      const content = `${makeLine(2, 'key-1')}\n${makeLine(1, 'key-2')}\n`;
+      await fs.writeFile(journalFile, content, 'utf8');
+
+      expect(await adapter.list(trainId)).toEqual({ outcome: 'unreadable' });
+      expect(await adapter.append(appendRequest('key-3', 'became-eligible'))).toEqual({
+        outcome: 'refused',
+        reason: 'journal-unreadable',
+      });
+      expect(await fs.readFile(journalFile, 'utf8')).toBe(content);
+    });
+
+    it('refuses a journal with duplicate sequences (e.g. 1, 1)', async () => {
+      await writeLease();
+      const dir = path.join(tempDir, 'merge-trains', trainId);
+      await fs.mkdir(dir, { recursive: true });
+      const journalFile = path.join(dir, 'journal.jsonl');
+
+      const content = `${makeLine(1, 'key-1')}\n${makeLine(1, 'key-2')}\n`;
+      await fs.writeFile(journalFile, content, 'utf8');
+
+      expect(await adapter.list(trainId)).toEqual({ outcome: 'unreadable' });
+      expect(await adapter.append(appendRequest('key-3', 'became-eligible'))).toEqual({
+        outcome: 'refused',
+        reason: 'journal-unreadable',
+      });
+      expect(await fs.readFile(journalFile, 'utf8')).toBe(content);
+    });
+
+    it('refuses a journal with a sequence gap (e.g. 1, 3)', async () => {
+      await writeLease();
+      const dir = path.join(tempDir, 'merge-trains', trainId);
+      await fs.mkdir(dir, { recursive: true });
+      const journalFile = path.join(dir, 'journal.jsonl');
+
+      const content = `${makeLine(1, 'key-1')}\n${makeLine(3, 'key-2')}\n`;
+      await fs.writeFile(journalFile, content, 'utf8');
+
+      expect(await adapter.list(trainId)).toEqual({ outcome: 'unreadable' });
+      expect(await adapter.append(appendRequest('key-3', 'became-eligible'))).toEqual({
+        outcome: 'refused',
+        reason: 'journal-unreadable',
+      });
+      expect(await fs.readFile(journalFile, 'utf8')).toBe(content);
+    });
+
+    it('refuses a journal starting with a sequence greater than 1 (e.g. 2, 3)', async () => {
+      await writeLease();
+      const dir = path.join(tempDir, 'merge-trains', trainId);
+      await fs.mkdir(dir, { recursive: true });
+      const journalFile = path.join(dir, 'journal.jsonl');
+
+      const content = `${makeLine(2, 'key-1')}\n${makeLine(3, 'key-2')}\n`;
+      await fs.writeFile(journalFile, content, 'utf8');
+
+      expect(await adapter.list(trainId)).toEqual({ outcome: 'unreadable' });
+      expect(await adapter.append(appendRequest('key-3', 'became-eligible'))).toEqual({
+        outcome: 'refused',
+        reason: 'journal-unreadable',
+      });
+      expect(await fs.readFile(journalFile, 'utf8')).toBe(content);
+    });
+
+    it('accepts a contiguous increasing sequence and appends with correct sequence', async () => {
+      await writeLease();
+      const dir = path.join(tempDir, 'merge-trains', trainId);
+      await fs.mkdir(dir, { recursive: true });
+      const journalFile = path.join(dir, 'journal.jsonl');
+
+      const content = `${makeLine(1, 'key-1')}\n${makeLine(2, 'key-2')}\n`;
+      await fs.writeFile(journalFile, content, 'utf8');
+
+      const listResult = await adapter.list(trainId);
+      expect(listResult.outcome).toBe('ok');
+      if (listResult.outcome === 'ok') {
+        expect(listResult.entries).toHaveLength(2);
+        expect(listResult.entries[0].sequence).toBe(1);
+        expect(listResult.entries[1].sequence).toBe(2);
+      }
+
+      const appendResult = await adapter.append(appendRequest('key-3', 'became-eligible'));
+      expect(appendResult).toEqual({
+        outcome: 'appended',
+        entry: {
+          schemaVersion: 1,
+          sequence: 3,
+          key: 'key-3',
+          event: 'became-eligible',
+          atIso: nowIso,
+          fence: 1,
+        },
+      });
+    });
+  });
 });

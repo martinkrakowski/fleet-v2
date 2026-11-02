@@ -68,7 +68,7 @@ export class MergeTrainStateFileAdapter implements MergeTrainStatePort {
       return { outcome: 'unreadable' };
     }
     const state = validateStateRecord(read.value);
-    if (state === null) {
+    if (state === null || state.snapshot.train.id !== trainId) {
       return { outcome: 'unreadable' };
     }
     return { outcome: 'ok', state };
@@ -104,12 +104,15 @@ export class MergeTrainStateFileAdapter implements MergeTrainStatePort {
       }
       if (stateRead.kind === 'ok') {
         const stored = validateStateRecord(stateRead.value);
-        if (stored === null) {
+        if (stored === null || stored.snapshot.train.id !== request.trainId) {
           return { outcome: 'refused', reason: 'state-unreadable' };
         }
         storedRevision = stored.revision;
       }
       if (request.expectedRevision !== storedRevision) {
+        return { outcome: 'refused', reason: 'revision-conflict' };
+      }
+      if (!Number.isSafeInteger(storedRevision + 1)) {
         return { outcome: 'refused', reason: 'revision-conflict' };
       }
       const revision = storedRevision + 1;

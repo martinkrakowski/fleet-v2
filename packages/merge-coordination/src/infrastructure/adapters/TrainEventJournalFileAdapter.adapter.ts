@@ -139,7 +139,7 @@ export class TrainEventJournalFileAdapter implements TrainEventPort {
     }
     const entries: TrainJournalEntry[] = [];
     for (const line of lines) {
-      const entry = readJournalLine(line);
+      const entry = readJournalLine(line, entries.length + 1);
       if (entry === null) {
         return { kind: 'unreadable' };
       }
@@ -150,7 +150,7 @@ export class TrainEventJournalFileAdapter implements TrainEventPort {
 }
 
 /** Read one journal line as a `TrainJournalEntry`; null when it does not match. */
-function readJournalLine(line: string): TrainJournalEntry | null {
+function readJournalLine(line: string, expectedSequence?: number): TrainJournalEntry | null {
   if (line.trim().length === 0) {
     return null;
   }
@@ -165,6 +165,7 @@ function readJournalLine(line: string): TrainJournalEntry | null {
       typeof record.sequence !== 'number' ||
       !Number.isSafeInteger(record.sequence) ||
       record.sequence < 1 ||
+      (expectedSequence !== undefined && record.sequence !== expectedSequence) ||
       typeof record.fence !== 'number' ||
       !Number.isSafeInteger(record.fence) ||
       record.fence < 1 ||

@@ -530,27 +530,51 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
     }
   }
 
+  private async settleAndFinish(
+    reservationId: string,
+    contextRef: string,
+    outcome: MergeVetoAdvice,
+    details?: {
+      readonly servedModel?: string;
+      readonly latencyMs?: number;
+      readonly reportedCost?: number;
+      readonly requestId?: string;
+    },
+  ): Promise<MergeVetoAdvice> {
+    const reportedCost = details?.reportedCost;
+    const hasReportedCost = isUsableReportedCost(reportedCost);
+    const costUsd = hasReportedCost ? reportedCost : this.assumedCostPerCallUsd;
+    const receipt: MergeVetoSettledReceipt = {
+      consumer: MERGE_VETO_CONSUMER,
+      contextRef,
+      provider: MERGE_VETO_PROVIDER,
+      model: details?.servedModel ?? this.model,
+      costUsd,
+      estimated: !hasReportedCost,
+      questionKinds: ['choice'],
+      latencyMs: details?.latencyMs ?? 0,
+      at: new Date(this.now()).toISOString(),
+      ...(details?.requestId !== undefined ? { requestId: details.requestId } : {}),
+      ...(outcome.status === 'unknown'
+        ? { unknownReason: outcome.reason }
+        : { minConfidenceObserved: outcome.confidence }),
+    };
+    const settled = await this.settleReservation(reservationId, receipt);
+    if (!settled) {
+      return { status: 'unknown', reason: 'not-configured' };
+    }
+    return outcome;
+  }
+
   /** The reservation stands: settled as estimated with the deadline reason. */
   private async finishDeadlineAfterReserve(
     reservationId: string,
     contextRef: string,
   ): Promise<MergeVetoAdvice> {
-    const settled = await this.settleReservation(reservationId, {
-      consumer: MERGE_VETO_CONSUMER,
-      contextRef,
-      provider: MERGE_VETO_PROVIDER,
-      model: this.model,
-      costUsd: this.assumedCostPerCallUsd,
-      estimated: true,
-      questionKinds: ['choice'],
-      unknownReason: 'deadline',
-      latencyMs: 0,
-      at: new Date(this.now()).toISOString(),
+    return this.settleAndFinish(reservationId, contextRef, {
+      status: 'unknown',
+      reason: 'deadline',
     });
-    if (!settled) {
-      return { status: 'unknown', reason: 'not-configured' };
-    }
-    return { status: 'unknown', reason: 'deadline' };
   }
 
   /** The reservation stands: settled as estimated with client failure reason. */
@@ -560,22 +584,12 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
     reason: MergeVetoUnknownReason,
     latencyMs: number,
   ): Promise<MergeVetoAdvice> {
-    const settled = await this.settleReservation(reservationId, {
-      consumer: MERGE_VETO_CONSUMER,
+    return this.settleAndFinish(
+      reservationId,
       contextRef,
-      provider: MERGE_VETO_PROVIDER,
-      model: this.model,
-      costUsd: this.assumedCostPerCallUsd,
-      estimated: true,
-      questionKinds: ['choice'],
-      unknownReason: reason,
-      latencyMs,
-      at: new Date(this.now()).toISOString(),
-    });
-    if (!settled) {
-      return { status: 'unknown', reason: 'not-configured' };
-    }
-    return { status: 'unknown', reason };
+      { status: 'unknown', reason },
+      { latencyMs },
+    );
   }
 
   /** The reservation stands: settled as estimated with unexpected transport error. */
@@ -585,22 +599,12 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
     callStartMs: number,
   ): Promise<MergeVetoAdvice> {
     const latencyMs = callStartMs > 0 ? Math.max(0, this.now() - callStartMs) : 0;
-    const settled = await this.settleReservation(reservationId, {
-      consumer: MERGE_VETO_CONSUMER,
+    return this.settleAndFinish(
+      reservationId,
       contextRef,
-      provider: MERGE_VETO_PROVIDER,
-      model: this.model,
-      costUsd: this.assumedCostPerCallUsd,
-      estimated: true,
-      questionKinds: ['choice'],
-      unknownReason: 'transport',
-      latencyMs,
-      at: new Date(this.now()).toISOString(),
-    });
-    if (!settled) {
-      return { status: 'unknown', reason: 'not-configured' };
-    }
-    return { status: 'unknown', reason: 'transport' };
+      { status: 'unknown', reason: 'transport' },
+      { latencyMs },
+    );
   }
 
   /** Settle after validation failure or shape violation. */
@@ -613,27 +617,12 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
     reportedCost?: number,
     requestId?: string,
   ): Promise<MergeVetoAdvice> {
-    const hasReportedCost = isUsableReportedCost(reportedCost);
-    const costUsd = hasReportedCost ? reportedCost : this.assumedCostPerCallUsd;
-    const estimated = !hasReportedCost;
-    const receipt: MergeVetoSettledReceipt = {
-      consumer: MERGE_VETO_CONSUMER,
+    return this.settleAndFinish(
+      reservationId,
       contextRef,
-      provider: MERGE_VETO_PROVIDER,
-      model: servedModel,
-      costUsd,
-      estimated,
-      questionKinds: ['choice'],
-      unknownReason: reason,
-      latencyMs,
-      at: new Date(this.now()).toISOString(),
-      ...(requestId !== undefined ? { requestId } : {}),
-    };
-    const settled = await this.settleReservation(reservationId, receipt);
-    if (!settled) {
-      return { status: 'unknown', reason: 'not-configured' };
-    }
-    return { status: 'unknown', reason };
+      { status: 'unknown', reason },
+      { servedModel, latencyMs, reportedCost, requestId },
+    );
   }
 
   /** Settle after successful choice validation. */
@@ -648,32 +637,17 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
     reportedCost?: number,
     requestId?: string,
   ): Promise<MergeVetoAdvice> {
-    const hasReportedCost = isUsableReportedCost(reportedCost);
-    const costUsd = hasReportedCost ? reportedCost : this.assumedCostPerCallUsd;
-    const estimated = !hasReportedCost;
-    const receipt: MergeVetoSettledReceipt = {
-      consumer: MERGE_VETO_CONSUMER,
+    return this.settleAndFinish(
+      reservationId,
       contextRef,
-      provider: MERGE_VETO_PROVIDER,
-      model: servedModel,
-      costUsd,
-      estimated,
-      questionKinds: ['choice'],
-      minConfidenceObserved: confidence,
-      latencyMs,
-      at: new Date(this.now()).toISOString(),
-      ...(requestId !== undefined ? { requestId } : {}),
-    };
-    const settled = await this.settleReservation(reservationId, receipt);
-    if (!settled) {
-      return { status: 'unknown', reason: 'not-configured' };
-    }
-    return {
-      status: 'answered',
-      choice,
-      confidence,
-      mode,
-      ...(requestId !== undefined ? { decisionReceiptId: requestId } : {}),
-    };
+      {
+        status: 'answered',
+        choice,
+        confidence,
+        mode,
+        ...(requestId !== undefined ? { decisionReceiptId: requestId } : {}),
+      },
+      { servedModel, latencyMs, reportedCost, requestId },
+    );
   }
 }

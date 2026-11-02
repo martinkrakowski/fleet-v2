@@ -240,19 +240,26 @@ function laneRunSettledOpenPrDecision(record: LaneRunRecord, facts: LaneRunFacts
 }
 
 /**
- * G3f (R4c, widening R4b): a merged PR that carries the lane head ends the
- * run from any waiting state — a park (any reason), `awaiting-premerge`,
- * `watching-ci` or `merging` — by itself. It runs ahead of G3a so an unread
- * `premerge` intent cannot shadow it (the conductor's own receipt never
- * appears for a head reviewed outside it), ahead of G3b/G3c so a parked
- * ambiguous intent cannot shadow it, and ahead of the stop rules: a landed
- * merge ends `merged`, never `stopped` (§3.9.1). No new intent, no result:
- * the train merged the PR while the run waited. Under a halt nothing changes
- * (the halt rules decide, as today), and a merged PR that does not carry
- * the lane head is left to the existing rules. Total; never throws.
+ * G3f (R4c, narrowed): a merged PR that carries the lane head ends the
+ * run from an eligible waiting state — a park (without owner questions or live
+ * attempts), `awaiting-premerge`, `watching-ci` or `merging` — by itself.
+ * An unread intent shadows the rule unless its step is `premerge` (so an unread
+ * `merge` intent reconciles first, as before). An ambiguous intent cannot shadow
+ * it. Under a halt nothing changes (the halt rules decide, as today), and a
+ * merged PR that does not carry the lane head is left to the existing rules.
+ * Total; never throws.
  */
-function laneRunMergedPrDecision(facts: LaneRunFacts): LaneRunDecision | null {
+function laneRunMergedPrDecision(record: LaneRunRecord, facts: LaneRunFacts): LaneRunDecision | null {
   if (facts.halted) {
+    return null;
+  }
+  // 1. An unread intent shadows the rule unless its step is premerge.
+  // An unread merge intent reconciles first, as before.
+  if (
+    facts.pendingIntent !== null &&
+    facts.pendingIntent.reconciliation === 'unread' &&
+    facts.pendingIntent.step !== 'premerge'
+  ) {
     return null;
   }
   if (facts.pr === null || facts.pr.state !== 'merged') {
@@ -260,6 +267,33 @@ function laneRunMergedPrDecision(facts: LaneRunFacts): LaneRunDecision | null {
   }
   if (!mergedPrCarriesLaneHead(facts.pr, facts.head12)) {
     return null;
+  }
+  // 2. A park with a non-null questionId returns null, and so does a one-way-door
+  // park, so no owner question is left behind. The owner-merge park is the
+  // exception: its question asks for this merge, so the merge answers it (CT-2a).
+  if (
+    record.parked !== null &&
+    record.parked.reason !== 'owner-merge' &&
+    (record.parked.questionId !== null || record.parked.reason === 'one-way-door')
+  ) {
+    return null;
+  }
+  // 3. A parked run whose latest attempt is still live returns null.
+  // `facts.attempt` exposes the latest attempt via `LaneRunAttemptFact | null`
+  // with `phase: LaneRunAttemptPhase`. An attempt is live when its phase is
+  // 'dispatching', 'running', or 'blocked' (matching GD2/G4d/lostDispatchConduct).
+  // Because facts.attempt exposes this usable phase information directly, we
+  // check attempt liveness from facts.attempt.phase (if facts had exposed
+  // nothing usable, we would fall back to returning null for parks with
+  // parkedFrom of 'running', 'collecting' or 'fixing').
+  if (facts.state === 'parked' && facts.attempt !== null) {
+    const live =
+      facts.attempt.phase === 'dispatching' ||
+      facts.attempt.phase === 'running' ||
+      facts.attempt.phase === 'blocked';
+    if (live) {
+      return null;
+    }
   }
   if (
     facts.state === 'parked' ||
@@ -864,11 +898,11 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return WAIT_FACTS_INCONSISTENT;
     }
 
-    // G3f (R4c): a merged PR carrying the lane head ends the run from any
-    // waiting state, before any unread intent, ambiguous intent or stop rule
-    // (a landed merge ends merged, never stopped; §3.9.1). Under a halt it
-    // decides nothing, so the halt rules below keep today's behaviour.
-    const mergedPr = laneRunMergedPrDecision(facts);
+    // G3f (R4c): a merged PR carrying the lane head ends the run from an
+    // eligible waiting state. An unread intent shadows it unless its step is
+    // premerge; a park with a questionId, a one-way-door park, or a parked run
+    // with a live attempt returns null. Under a halt it decides nothing.
+    const mergedPr = laneRunMergedPrDecision(record, facts);
     if (mergedPr !== null) {
       return mergedPr;
     }

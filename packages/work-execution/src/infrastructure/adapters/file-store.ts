@@ -1199,6 +1199,75 @@ async function collectLeaseFiles(dirPath: string, entries: readonly string[]): P
   return files;
 }
 
+/** Quarantine directories for lease files: the top-level and each file's / subdirectory's quarantine dir. */
+async function collectGlobQuarantineDirs(
+  dirPath: string,
+  files: readonly string[],
+  entries: readonly string[],
+): Promise<readonly string[]> {
+  const dirs = new Set<string>();
+  dirs.add(path.join(dirPath, 'quarantine'));
+  for (const relative of files) {
+    dirs.add(path.join(path.dirname(path.join(dirPath, relative)), 'quarantine'));
+  }
+  for (const entry of entries) {
+    if (entry !== 'quarantine' && !entry.endsWith('.json')) {
+      dirs.add(path.join(dirPath, entry, 'quarantine'));
+    }
+  }
+  return [...dirs].sort();
+}
+
+/** Scan quarantine copies across multiple quarantine directories. */
+async function scanAllQuarantineCopies(
+  quarantineDirs: readonly string[],
+  pattern: RegExp,
+  inspect: (bytes: Buffer) => StateFileInspection,
+): Promise<readonly QuarantineCopyCheck[]> {
+  const results: QuarantineCopyCheck[] = [];
+  for (const dir of quarantineDirs) {
+    const copies = await scanQuarantineCopies(dir, pattern, inspect);
+    results.push(...copies);
+  }
+  return results.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Resolve the quarantine directory containing `from` for a directory glob store. */
+async function resolveGlobQuarantineDir(
+  dirPath: string,
+  from: string,
+): Promise<string> {
+  const defaultDir = path.join(dirPath, 'quarantine');
+  if (path.basename(from) !== from) {
+    return defaultDir;
+  }
+  try {
+    await fs.lstat(path.join(defaultDir, from));
+    return defaultDir;
+  } catch {
+    // not in defaultDir
+  }
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dirPath);
+  } catch {
+    return defaultDir;
+  }
+  for (const entry of entries) {
+    if (entry === 'quarantine' || entry.endsWith('.json')) {
+      continue;
+    }
+    const candidateDir = path.join(dirPath, entry, 'quarantine');
+    try {
+      await fs.lstat(path.join(candidateDir, from));
+      return candidateDir;
+    } catch {
+      // not in candidateDir
+    }
+  }
+  return defaultDir;
+}
+
 /**
  * Build the descriptor of the lease glob store (`daemon/leases`): `check`
  * enumerates every `*.json` lease file (one nesting level; scopes carry at
@@ -1232,33 +1301,30 @@ export function describeRecordGlob<T>(
       }
       const files = await collectLeaseFiles(dirPath, entries);
       let total = 0;
+      let checkResult: StateFileCheck['result'] | null = null;
       for (const relative of files) {
         const filePath = path.join(dirPath, relative);
         const result = await readAndInspect(filePath, singleInspect);
         if (result.status === 'ok') {
           total += result.recordCount;
         } else if (result.status === 'unknown-version' || result.status === 'unreadable') {
-          return {
-            basename: dirRelative,
-            filePath: dirPath,
-            result: { ...result, detail: `${relative}: ${result.detail}` },
-            quarantineCopies: [],
-          };
+          checkResult = { ...result, detail: `${relative}: ${result.detail}` };
+          break;
         } else if (result.status === 'read-error') {
-          return {
-            basename: dirRelative,
-            filePath: dirPath,
-            result: { status: 'unreadable', detail: `${relative}: cannot read (${result.code})`, recordIndex: null },
-            quarantineCopies: [],
-          };
+          checkResult = { status: 'unreadable', detail: `${relative}: cannot read (${result.code})`, recordIndex: null };
+          break;
         }
       }
-      const quarantineDir = path.join(dirPath, 'quarantine');
-      const quarantineCopies = await scanQuarantineCopies(quarantineDir, pattern, singleInspect);
-      return { basename: dirRelative, filePath: dirPath, result: { status: 'ok', recordCount: total }, quarantineCopies };
+      const finalResult: StateFileCheck['result'] = checkResult ?? { status: 'ok', recordCount: total };
+      const qDirs = await collectGlobQuarantineDirs(dirPath, files, entries);
+      const quarantineCopies = await scanAllQuarantineCopies(qDirs, pattern, singleInspect);
+      return { basename: dirRelative, filePath: dirPath, result: finalResult, quarantineCopies };
     },
-    readQuarantineCopy: (stateDir, from) =>
-      readQuarantineCopyFor(dirRelative, pattern, path.join(stateDir, dirRelative, 'quarantine'), from),
+    readQuarantineCopy: async (stateDir, from) => {
+      const dirPath = path.join(stateDir, dirRelative);
+      const qDir = await resolveGlobQuarantineDir(dirPath, from);
+      return readQuarantineCopyFor(dirRelative, pattern, qDir, from);
+    },
     restore: async (_request) => ({
       status: 'refused',
       reason: `${dirRelative} is a directory store; restore a single lease file, not the directory`,

@@ -36,6 +36,7 @@ import type {
   DaemonLeaseResult,
 } from '../../application/ports/out/DaemonLeasePort.out-port.js';
 import {
+  StateFileUnknownVersionError,
   StateFileUnreadableError,
   StateFileUnreadableReadOnlyError,
   assertStoreWritable,
@@ -206,6 +207,9 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
     }
     const read = readDaemonLeaseRecord(raw);
     if (!read.ok) {
+      if (read.reason === 'unknown-version') {
+        throw new StateFileUnknownVersionError(target, 0);
+      }
       return rejectUnreadableStateFile(target, read.error, buffer, this.options?.readOnly === true);
     }
     return read.record;

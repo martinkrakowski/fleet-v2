@@ -23,6 +23,7 @@ import type {
   DaemonStatusPort,
 } from '../../application/ports/out/DaemonStatusPort.out-port.js';
 import {
+  StateFileUnknownVersionError,
   StateFileUnreadableError,
   StateFileUnreadableReadOnlyError,
   assertStoreWritable,
@@ -106,6 +107,9 @@ export class DaemonStatusFileAdapter implements DaemonStatusPort {
     }
     const read = readDaemonStatusRecord(raw);
     if (!read.ok) {
+      if (read.reason === 'unknown-version') {
+        throw new StateFileUnknownVersionError(target, 0);
+      }
       await this.rejectOrSwallow(target, read.error, buffer);
       return { status: 'unreadable' };
     }

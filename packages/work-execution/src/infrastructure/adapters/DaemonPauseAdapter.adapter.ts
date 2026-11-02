@@ -22,6 +22,7 @@ import {
 } from '../../domain/daemon-tick.js';
 import type { DaemonPausePort } from '../../application/ports/out/DaemonPausePort.out-port.js';
 import {
+  StateFileUnknownVersionError,
   StateFileUnreadableError,
   StateFileUnreadableReadOnlyError,
   assertStoreWritable,
@@ -115,6 +116,9 @@ export class DaemonPauseAdapter implements DaemonPausePort {
     }
     const read = readDaemonPauseRecord(raw);
     if (!read.ok) {
+      if (read.reason === 'unknown-version') {
+        throw new StateFileUnknownVersionError(target, 0);
+      }
       await this.rejectOrSwallow(target, read.error, buffer);
       return { status: 'unreadable' };
     }

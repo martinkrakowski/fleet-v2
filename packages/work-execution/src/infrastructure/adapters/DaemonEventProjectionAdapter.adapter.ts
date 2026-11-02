@@ -81,7 +81,7 @@ export class DaemonEventProjectionAdapter implements DaemonEventProjectionPort {
       if (newLines.length > 0) {
         const separator = existing.length === 0 || existing.endsWith('\n') ? '' : '\n';
         const content = newLines.map((line) => `${line}\n`).join('');
-        await fs.writeFile(target, `${existing}${separator}${content}`, { flag: 'a' });
+        await fs.writeFile(target, `${separator}${content}`, { flag: 'a' });
       }
       return { appended };
     });

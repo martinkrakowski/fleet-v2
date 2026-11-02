@@ -423,7 +423,7 @@ describe('global rules', () => {
     expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
   });
 
-  it('G5: a non-owner-merge park waits even when its PR merges with the lane head', () => {
+  it('G3f: a branch-behind park enters merged once its PR merges containing the lane head', () => {
     const rec = record({ parked: { reason: 'branch-behind', qualifier: null, parkedFrom: 'merging', questionId: null }, parkCount: 1 });
     const facts = baseFacts({
       state: 'parked',
@@ -431,10 +431,10 @@ describe('global rules', () => {
       acceptedHead12: HEAD,
       pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
     });
-    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
   });
 
-  it('G5: a parked ambiguous open-pr run waits even when its PR merges with the lane head (merged is R4b)', () => {
+  it('G3f: an ambiguous open-pr park enters merged once its PR merges containing the lane head', () => {
     const rec = record({ parked: { reason: 'ambiguous', qualifier: 'open-pr', parkedFrom: 'opening-pr', questionId: null }, parkCount: 1 });
     const facts = baseFacts({
       state: 'parked',
@@ -442,10 +442,10 @@ describe('global rules', () => {
       acceptedHead12: HEAD,
       pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
     });
-    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
   });
 
-  it('G3e: a stop recorded on a parked ambiguous open-pr run never reaches merged (R4b)', () => {
+  it('G3f: a stop recorded on a parked ambiguous open-pr run still ends merged, never stopped, once its PR merges (CT-2a Fable)', () => {
     const rec = record({ parked: { reason: 'ambiguous', qualifier: 'open-pr', parkedFrom: 'opening-pr', questionId: null }, parkCount: 1 });
     const facts = baseFacts({
       state: 'parked',
@@ -455,7 +455,7 @@ describe('global rules', () => {
       acceptedHead12: HEAD,
       pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
     });
-    expect(decide(rec, facts)).toEqual({ kind: 'enter', to: 'stopped' });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
   });
 
   it('G3b0: a stop recorded after the resume adopted the PR wins over watching-ci (R4a)', () => {
@@ -1971,6 +1971,80 @@ describe('G3b0 (R4a): the settled open-pr park', () => {
     });
     const facts = baseFacts({ state: 'parked', head12: HEAD, pr: openPrPath });
     expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+});
+
+describe('G3f (R4b): a merged PR with the lane head leaves branch-behind and ambiguous open-pr parks', () => {
+  const PARKED_BRANCH_BEHIND = { reason: 'branch-behind', qualifier: null, parkedFrom: 'merging', questionId: null };
+  const PARKED_AMBIGUOUS_OPEN_PR = { reason: 'ambiguous', qualifier: 'open-pr', parkedFrom: 'opening-pr', questionId: null };
+  const mergedAtHead: NonNullable<LaneRunFacts['pr']> = { state: 'merged', head12: HEAD, containsLaneHead: true };
+  const mergedOtherHeadContaining: NonNullable<LaneRunFacts['pr']> = { state: 'merged', head12: 'ffffffffffff', containsLaneHead: true };
+  const mergedOtherHeadNotContaining: NonNullable<LaneRunFacts['pr']> = { state: 'merged', head12: 'ffffffffffff', containsLaneHead: false };
+
+  it('a branch-behind park enters merged when its merged PR carries the lane head', () => {
+    const rec = record({ parked: PARKED_BRANCH_BEHIND, parkCount: 1 });
+    for (const pr of [mergedAtHead, mergedOtherHeadContaining]) {
+      const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr });
+      assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+    }
+  });
+
+  it('an ambiguous open-pr park enters merged when its merged PR carries the lane head', () => {
+    const rec = record({ parked: PARKED_AMBIGUOUS_OPEN_PR, parkCount: 1 });
+    for (const pr of [mergedAtHead, mergedOtherHeadContaining]) {
+      const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr });
+      assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+    }
+  });
+
+  it('a merged PR that does not carry the lane head keeps both parks', () => {
+    for (const parked of [PARKED_BRANCH_BEHIND, PARKED_AMBIGUOUS_OPEN_PR]) {
+      const rec = record({ parked, parkCount: 1 });
+      const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedOtherHeadNotContaining });
+      expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+    }
+  });
+
+  it('a closed or open PR keeps both parks', () => {
+    for (const parked of [PARKED_BRANCH_BEHIND, PARKED_AMBIGUOUS_OPEN_PR]) {
+      const rec = record({ parked, parkCount: 1 });
+      const closed = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'closed', head12: HEAD, containsLaneHead: false } });
+      expect(decide(rec, closed)).toEqual({ kind: 'wait', reason: 'parked' });
+      const open = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'open', head12: HEAD, containsLaneHead: true } });
+      expect(decide(rec, open)).toEqual({ kind: 'wait', reason: 'parked' });
+    }
+  });
+
+  it('no PR fact keeps both parks', () => {
+    for (const parked of [PARKED_BRANCH_BEHIND, PARKED_AMBIGUOUS_OPEN_PR]) {
+      const rec = record({ parked, parkCount: 1 });
+      const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: null });
+      expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+    }
+  });
+
+  it('an ambiguous pending intent cannot shadow the merged exit', () => {
+    const rec = record({ parked: PARKED_AMBIGUOUS_OPEN_PR, parkCount: 1 });
+    const facts = baseFacts({
+      state: 'parked',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      pr: mergedAtHead,
+      pendingIntent: { key: `${RUN_ID}/r0/open-pr/0@${HEAD}`, step: 'open-pr', reconciliation: 'ambiguous' },
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('a merged PR never leaves another park through this rule', () => {
+    for (const parked of [
+      { reason: 'ambiguous', qualifier: 'merge', parkedFrom: 'merging', questionId: null },
+      { reason: 'one-way-door', qualifier: null, parkedFrom: 'merging', questionId: null },
+      { reason: 'halted', qualifier: null, parkedFrom: 'running', questionId: null },
+    ]) {
+      const rec = record({ parked, parkCount: 1 });
+      const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });
+      expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+    }
   });
 });
 

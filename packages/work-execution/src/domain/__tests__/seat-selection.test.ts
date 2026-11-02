@@ -4,7 +4,9 @@ import type { AttemptRecord } from "../execution-records.js";
 import {
   classifyRunnerRefusal,
   historyEntryOf,
+  pickNextSeat,
   seatMatchesAssignment,
+  seatOutcomeOfStopReason,
   seatPlanFamilyConflicts,
   selectReviewSeat,
   selectSeat,
@@ -340,5 +342,127 @@ describe("classifyRunnerRefusal", () => {
     ["Runner refused the start (exit 2, usage error)", "runner-refused"],
   ])("classifies %j as %s", (input, expected) => {
     expect(classifyRunnerRefusal(input)).toBe(expected);
+  });
+});
+
+describe("pickNextSeat", () => {
+  function nextPlan(firstPass: readonly Record<string, unknown>[]): SeatPlan {
+    return SeatPlan.create({
+      version: 1,
+      "first-pass": firstPass,
+      fix: [seat("fx1", "alpha-1")],
+      review: [],
+    }).value!;
+  }
+
+  const neverBlocked = () => false;
+
+  it("rotates to the next seat after the failed index, cyclically", () => {
+    const p = nextPlan([seat("A", "alpha-1"), seat("B", "beta-1"), seat("C", "gamma-1")]);
+    const picked = pickNextSeat(p, "first-pass", 1, "provider-error", neverBlocked);
+    expect(picked).toMatchObject({ ok: true, role: "first-pass", seatIndex: 2 });
+    expect(picked.ok && picked.seat.id).toBe("C");
+    expect(pickNextSeat(p, "first-pass", 2, "rate-limited", neverBlocked)).toMatchObject({
+      ok: true,
+      seatIndex: 0,
+    });
+  });
+
+  it("skips seats the block predicate blocks", () => {
+    const p = nextPlan([seat("A", "alpha-1"), seat("B", "beta-1"), seat("C", "gamma-1")]);
+    const blocked = (s: { id: string }) => s.id === "B";
+    expect(pickNextSeat(p, "first-pass", 0, "rate-limited", blocked)).toMatchObject({
+      ok: true,
+      seatIndex: 2,
+    });
+  });
+
+  it("holds a fallback seat until the outcome maps to one of its declared triggers", () => {
+    const p = nextPlan([
+      seat("A", "alpha-1"),
+      { ...seat("F", "delta-1"), on: ["rate-limited"] },
+    ]);
+    expect(pickNextSeat(p, "first-pass", 0, "rate-limited", neverBlocked)).toMatchObject({
+      ok: true,
+      seatIndex: 1,
+    });
+    // A timeout is not a trigger the fallback declares: with the failed seat
+    // blocked, the plan is exhausted.
+    const blockFailed = (s: { id: string }) => s.id === "A";
+    expect(pickNextSeat(p, "first-pass", 0, "timeout", blockFailed)).toEqual({
+      ok: false,
+      reason: "no-seat-allowed",
+    });
+  });
+
+  it("maps every remaining trigger class to provider-error", () => {
+    const p = nextPlan([
+      seat("A", "alpha-1"),
+      { ...seat("F", "delta-1"), on: ["payment", "model-missing", "no-route", "runner-refused", "gate-failed"] },
+    ]);
+    expect(pickNextSeat(p, "first-pass", 0, "provider-error", neverBlocked)).toMatchObject({
+      ok: true,
+      seatIndex: 1,
+    });
+    // rate-limited and timeout are their own outcomes and never provider-error:
+    // with the failed seat blocked, the declared triggers never fire.
+    expect(
+      pickNextSeat(p, "first-pass", 0, "rate-limited", (s) => s.id === "A"),
+    ).toEqual({ ok: false, reason: "no-seat-allowed" });
+  });
+
+  it("returns no-seat-allowed when no seat is allowed, the role is empty or the index is out of plan", () => {
+    const blocked = () => true;
+    const p = nextPlan([seat("A", "alpha-1"), seat("B", "beta-1")]);
+    expect(pickNextSeat(p, "first-pass", 0, "rate-limited", blocked)).toEqual({
+      ok: false,
+      reason: "no-seat-allowed",
+    });
+    expect(pickNextSeat(p, "review", 0, "rate-limited", neverBlocked)).toEqual({
+      ok: false,
+      reason: "no-seat-allowed",
+    });
+    expect(pickNextSeat(p, "first-pass", 2, "rate-limited", neverBlocked)).toEqual({
+      ok: false,
+      reason: "no-seat-allowed",
+    });
+    expect(pickNextSeat(p, "first-pass", -1, "rate-limited", neverBlocked)).toEqual({
+      ok: false,
+      reason: "no-seat-allowed",
+    });
+  });
+
+  it("excludes reviewer families only through the caller's block predicate", () => {
+    const reviewSeat = seat("rv1", "beta-9", { tool: "reviewer" });
+    const p = SeatPlan.create({
+      version: 1,
+      "first-pass": [seat("A", "alpha-1"), seat("B", "beta-1")],
+      fix: [seat("fx1", "alpha-1")],
+      review: [reviewSeat],
+    }).value!;
+    const sameFamily = (a: string, b: string) => a.split("-")[0] === b.split("-")[0];
+    const reviewerModels = p.getSeats("review").map((s) => s.model);
+    const familyBlocked = (s: { model: string }) =>
+      reviewerModels.some((model) => sameFamily(s.model, model));
+    // B shares the beta family with the review seat and is skipped.
+    expect(pickNextSeat(p, "first-pass", 0, "rate-limited", familyBlocked)).toMatchObject({
+      ok: true,
+      seatIndex: 0,
+      seat: { id: "A" },
+    });
+    expect(pickNextSeat(p, "first-pass", 1, "rate-limited", familyBlocked)).toMatchObject({
+      ok: true,
+      seatIndex: 0,
+    });
+  });
+
+  it("maps stop reasons to outcomes and fails closed on none and unknown", () => {
+    expect(seatOutcomeOfStopReason("rate-limited")).toBe("rate-limited");
+    expect(seatOutcomeOfStopReason("timeout")).toBe("timeout");
+    expect(seatOutcomeOfStopReason("payment")).toBe("provider-error");
+    expect(seatOutcomeOfStopReason("no-route")).toBe("provider-error");
+    expect(seatOutcomeOfStopReason("runner-refused")).toBe("provider-error");
+    expect(seatOutcomeOfStopReason("none")).toBeNull();
+    expect(seatOutcomeOfStopReason("unknown")).toBeNull();
   });
 });

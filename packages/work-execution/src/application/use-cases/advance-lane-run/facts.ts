@@ -15,6 +15,7 @@ import {
   laneRunGateCongestion,
   laneRunGateFact,
   laneRunPremergePost,
+  laneRunRecordedSeatAdvance,
   laneRunRefusedStep,
   laneRunStopsIssued,
   laneRunTimedOut,
@@ -305,6 +306,20 @@ export function implementerSeatOf(
   if (!planResult.success || planResult.value === undefined) {
     return { ok: false };
   }
+  // G11a: a recorded advance for this round IS the next seat — the decider
+  // never re-derives a second choice over the history. `next-seat-none`
+  // (the recorded exhaustion) reads as no seat, which parks below.
+  const recorded = laneRunRecordedSeatAdvance(entries, record.runId, record.round);
+  if (recorded.kind === 'exhausted') {
+    return { ok: false };
+  }
+  const role = implementerRoleFor(record.round, state);
+  if (recorded.kind === 'seat') {
+    const inPlan = Number.isSafeInteger(recorded.seatIndex) &&
+      recorded.seatIndex >= 0 &&
+      recorded.seatIndex < planResult.value.getSeats(role).length;
+    return inPlan ? { ok: true, seatIndex: recorded.seatIndex } : { ok: false };
+  }
   const history = attemptRecords
     .filter((attempt): attempt is AttemptRecord => attempt !== null)
     .sort((left, right) => left.createdAtIso.localeCompare(right.createdAtIso))
@@ -318,7 +333,7 @@ export function implementerSeatOf(
     });
   const selected = selectSeat({
     plan: planResult.value,
-    role: implementerRoleFor(record.round, state),
+    role,
     history,
   });
   if (selected.ok) {

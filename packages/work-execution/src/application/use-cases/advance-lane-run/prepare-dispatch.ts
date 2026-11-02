@@ -6,9 +6,12 @@ import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunCursorsRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { implementerRoleFor } from '../../../domain/lane-run-transitions.js';
-import { seatMatchesAssignment, seatSelectionRecord } from '../../../domain/seat-selection.js';
-import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
+import { seatMatchesAssignment, seatSelectionRecord, pickNextSeat, seatOutcomeOfStopReason } from '../../../domain/seat-selection.js';
+import type { SeatFailureOutcome, NextSeatResult } from '../../../domain/seat-selection.js';
+import type { SeatPlanRole } from '../../../domain/value-objects/SeatPlan.vo.js';
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
+import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
+import { parseStopReason, MODEL_REFUSAL_CLASSES } from '../../../domain/value-objects/StopReason.vo.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendConduct, appendRunIntent, appendRunResult, ceilingPark, performPark, saveOrRefuse } from './step-context.js';
@@ -279,6 +282,60 @@ export function fixSeatForDispatch(
 }
 
 /**
+ * G11a: the seat-advance detail token of a failed dispatch, or null when no
+ * advance may be recorded (fail closed). The failed turn's own plan, role and
+ * seat index and its stored stop reason decide; the reviewer-family block
+ * uses the installation-configured `sameModelFamily` comparator, and an
+ * unbound comparator, a plan the attempt does not carry, a non-implementer
+ * role, an out-of-plan seat index or a stop reason that maps to no failure
+ * outcome each record nothing — the run keeps its pre-G11a behaviour.
+ * The token is a fixed `next-seat-…` code (validated by the journal's token
+ * pattern), never free text, so replay of the spent key can never record a
+ * second move.
+ */
+function seatAdvanceDetail(
+  ctx: AdvanceStepContext,
+  failed: AttemptRecord,
+  storedStopReason: unknown,
+): string | null {
+  const selection = failed.seatSelection ?? null;
+  const role: SeatPlanRole | null = selection?.role ?? null;
+  if (role !== 'first-pass' && role !== 'fix') {
+    return null;
+  }
+  const planResult = SeatPlan.create(failed.seatPlan);
+  const plan = planResult.success && planResult.value !== undefined ? planResult.value : null;
+  if (plan === null || selection === null || typeof selection.seatIndex !== 'number') {
+    return null;
+  }
+  const outcome: SeatFailureOutcome | null = seatOutcomeOfStopReason(parseStopReason(storedStopReason));
+  const sameFamily = ctx.deps.sameModelFamily;
+  if (outcome === null || sameFamily === undefined) {
+    return null;
+  }
+  // A model-refusal stop keeps the failed model out of the rest of the lane
+  // (the same rule selectSeat applies over history), so the failed seat and
+  // any seat on its model are blocked. Reviewer independence (rule 9) is
+  // composed on top: a seat sharing a model family with any review seat of
+  // the frozen plan is blocked, exactly what `seatPlanFamilyConflicts`
+  // refuses a plan for.
+  const refusedModel = MODEL_REFUSAL_CLASSES.includes(parseStopReason(storedStopReason))
+    ? (selection.model ?? '').trim()
+    : null;
+  const reviewerModels = plan.getSeats('review').map((seat) => seat.model);
+  const chosen = pickNextSeat(plan, role, selection.seatIndex, outcome, (seat) =>
+    (refusedModel !== null && seat.model.trim() === refusedModel) ||
+    reviewerModels.some((model) => sameFamily(seat.model, model)),
+  );
+  return seatAdvanceTokenOf(chosen);
+}
+
+/** The fixed detail token of a pick, or `next-seat-none` when no seat is allowed. */
+function seatAdvanceTokenOf(chosen: NextSeatResult): string {
+  return chosen.ok ? 'next-seat-' + String(chosen.seatIndex) : 'next-seat-none';
+}
+
+/**
  * The `act dispatch` decision (K4-5): start the prepared attempt through
  * `DispatchAttemptPort` with the frozen brief's limits, raising the round and
  * the seat cursor on the record before the call (§3.2, D8). The dispatch key
@@ -464,9 +521,15 @@ export async function performDispatch(ctx: AdvanceStepContext,
   }
   // KF-16: the refused result journals a fixed detail code derived from the
   // refusal text, for the dispatch-refused park and the runner-refused pivot
-  // alike.
+  // alike. G11a: a runner refusal is the provider-outcome boundary — the
+  // failure's one move (the next seat, or that no seat is allowed) is
+  // recorded on THIS key's final result, so replay of the spent key cannot
+  // select or record a second move.
+  const advanceDetail =
+    reasonCode === 'runner-refused' ? seatAdvanceDetail(ctx, latest, stored?.stopReason) : null;
   const resultRefusal = await appendRunResult(
-    ctx, request, decision.key, 'refused', reasonCode, dispatchRefusalDetail(dispatched.reason),
+    ctx, request, decision.key, 'refused', reasonCode,
+    advanceDetail ?? dispatchRefusalDetail(dispatched.reason),
   );
   if (resultRefusal !== null) {
     return { outcome: 'refused', reason: resultRefusal };

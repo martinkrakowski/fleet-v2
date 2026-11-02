@@ -305,7 +305,7 @@ export function laneRunPremergePost(
 export type LaneRunRecordedSeatAdvance =
   | { readonly kind: 'none' }
   | { readonly kind: 'seat'; readonly seatIndex: number; readonly outcome: SeatFailureOutcome }
-  | { readonly kind: 'exhausted'; readonly outcome: SeatFailureOutcome };
+  | { readonly kind: 'exhausted'; readonly outcome: SeatFailureOutcome | null };
 
 /** The failure outcomes a recorded advance may name. */
 const SEAT_ADVANCE_OUTCOMES: readonly SeatFailureOutcome[] = ['rate-limited', 'timeout', 'provider-error'];
@@ -316,6 +316,9 @@ function parseSeatAdvanceDetail(detail: string | null): LaneRunRecordedSeatAdvan
     return { kind: 'none' };
   }
   const rest = detail.slice('next-seat-'.length);
+  if (rest === 'none') {
+    return { kind: 'exhausted', outcome: null };
+  }
   for (const outcome of SEAT_ADVANCE_OUTCOMES) {
     if (!rest.startsWith(outcome + '-')) {
       continue;

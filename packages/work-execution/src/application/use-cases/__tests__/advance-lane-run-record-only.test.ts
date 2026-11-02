@@ -662,4 +662,25 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
     const parked = await advance(harness);
     expect(parked).toMatchObject({ outcome: 'parked', reason: 'seat-plan-exhausted' });
   });
+
+  it('G11a test 15: an unmapped stop reason records next-seat-none and fails closed', async () => {
+    const harness = await makeHarness(runRecord(), g11aAttempt(), { sameFamily: true });
+    harness.setFrozenBrief(G11A_PROSE, G11A_MANIFEST);
+    harness.setDispatchRefusal('unknown', 'Unknown runner refusal');
+    harness.setReservedAttemptIds(['attempt-example-1']);
+    await conduct(harness, 'seat-failed', NOW);
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', result: 'refused', reasonCode: 'runner-refused' });
+    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-none']);
+    await advance(harness);
+    const parked = await advance(harness);
+    expect(parked).toMatchObject({ outcome: 'parked', reason: 'seat-plan-exhausted' });
+  });
+
+  it('G11a test 16: an unbound family comparator fails closed when recorded advance is absent', async () => {
+    const harness = await makeHarness(runRecord(), g11aAttempt({ state: 'cancelled' }));
+    await conduct(harness, 'seat-failed', NOW);
+    const parked = await advance(harness);
+    expect(parked).toMatchObject({ outcome: 'parked', reason: 'seat-plan-exhausted' });
+  });
 });

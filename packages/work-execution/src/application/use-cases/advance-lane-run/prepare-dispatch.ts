@@ -315,7 +315,7 @@ function seatAdvanceDetail(
   const outcome: SeatFailureOutcome | null = seatOutcomeOfStopReason(parseStopReason(storedStopReason));
   const sameFamily = ctx.deps.sameModelFamily;
   if (outcome === null) {
-    return null;
+    return 'next-seat-none';
   }
   if (sameFamily === undefined) {
     // Fail closed: without the configured family comparator no seat may be

@@ -14,6 +14,7 @@ import {
   laneRunGateFact,
   laneRunIntentEntry,
   laneRunParkedConductCount,
+  laneRunRecordedSeatAdvance,
   laneRunRefusedStep,
   laneRunResultEntry,
   laneRunStopsIssued,
@@ -420,6 +421,49 @@ describe('laneRunParkedConductCount', () => {
       conduct('running'),
     ];
     expect(laneRunParkedConductCount(entries, RUN_ID)).toBe(2);
+  });
+});
+
+describe('laneRunRecordedSeatAdvance', () => {
+  const dispatchKey = keyOf({ round: 0, step: 'dispatch', seatIndex: 0, attemptOrdinal: 1 });
+
+  it('parses seat advance with outcome and seat index', () => {
+    const entries = [
+      laneRunResultEntry(nextEntryId(), RUN_ID, dispatchKey, 'refused', 'runner-refused', NOW, 'next-seat-rate-limited-1'),
+    ];
+    expect(laneRunRecordedSeatAdvance(entries, RUN_ID, 0)).toEqual({
+      kind: 'seat',
+      seatIndex: 1,
+      outcome: 'rate-limited',
+    });
+  });
+
+  it('parses exhausted advance with outcome', () => {
+    const entries = [
+      laneRunResultEntry(nextEntryId(), RUN_ID, dispatchKey, 'refused', 'runner-refused', NOW, 'next-seat-timeout-none'),
+    ];
+    expect(laneRunRecordedSeatAdvance(entries, RUN_ID, 0)).toEqual({
+      kind: 'exhausted',
+      outcome: 'timeout',
+    });
+  });
+
+  it('parses unmapped exhausted advance (next-seat-none)', () => {
+    const entries = [
+      laneRunResultEntry(nextEntryId(), RUN_ID, dispatchKey, 'refused', 'runner-refused', NOW, 'next-seat-none'),
+    ];
+    expect(laneRunRecordedSeatAdvance(entries, RUN_ID, 0)).toEqual({
+      kind: 'exhausted',
+      outcome: null,
+    });
+  });
+
+  it('returns none for non-matching or absent detail', () => {
+    expect(laneRunRecordedSeatAdvance([], RUN_ID, 0)).toEqual({ kind: 'none' });
+    const otherEntries = [
+      laneRunResultEntry(nextEntryId(), RUN_ID, dispatchKey, 'refused', 'runner-refused', NOW, 'rate-limited'),
+    ];
+    expect(laneRunRecordedSeatAdvance(otherEntries, RUN_ID, 0)).toEqual({ kind: 'none' });
   });
 });
 

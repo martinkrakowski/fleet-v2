@@ -417,6 +417,11 @@ describe("pickNextSeat", () => {
       ok: false,
       reason: "no-seat-allowed",
     });
+    // For a one-seat plan with an unblocked seat and no trigger, rate-limited also reads no-seat-allowed.
+    expect(pickNextSeat(p, "first-pass", 0, "rate-limited", neverBlocked)).toEqual({
+      ok: false,
+      reason: "no-seat-allowed",
+    });
     // A wrap-around onto the failed seat is not a move either: with the other
     // seats blocked the plan is exhausted.
     const two = nextPlan([seat("A", "alpha-1"), seat("B", "beta-1")]);

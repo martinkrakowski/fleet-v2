@@ -262,12 +262,12 @@ export function pickNextSeat(
 ): NextSeatResult {
   const seats = plan.getSeats(role);
   const validIndex =
-    Number.isSafeInteger(failedIndex) && failedIndex >= 0 && failedIndex < seats.length;
+    Number.isSafeInteger(failedIndex) && failedIndex >= 0 && failedIndex < seats.length && seats.length > 1;
   if (!validIndex) {
     return { ok: false, reason: 'no-seat-allowed' };
   }
   const triggers = SEAT_OUTCOME_TRIGGER_CLASSES[outcome];
-  for (let step = 1; step <= seats.length; step += 1) {
+  for (let step = 1; step < seats.length; step += 1) {
     const seatIndex = (failedIndex + step) % seats.length;
     if (seatIndex === failedIndex) {
       // The failed seat itself is never eligible: no wrap-around re-pick.

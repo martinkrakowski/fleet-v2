@@ -27,6 +27,7 @@ describe('classifyChangedPath — table', () => {
     { path: 'infra/branch-protection-rules.json', expected: 'alone' },
     { path: 'SECURITY.md', expected: 'alone' },
     { path: 'docs/security-notes.md', expected: 'alone' },
+    { path: 'src/security/auth.ts', expected: 'alone' },
     { path: 'scripts/release-notes.sh', expected: 'alone' },
     { path: 'build/releases/index.ts', expected: 'alone' },
     { path: 'config/.releaserc.json', expected: 'alone' },

@@ -82,7 +82,7 @@ function isAlonePath(normalized: string): boolean {
       return true;
     }
   }
-  if (segments[0] === 'security') {
+  if (segments.includes('security')) {
     return true;
   }
   const base = basenameOf(normalized);

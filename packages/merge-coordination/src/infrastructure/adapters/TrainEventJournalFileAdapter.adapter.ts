@@ -133,11 +133,12 @@ export class TrainEventJournalFileAdapter implements TrainEventPort {
       return { kind: 'unreadable' };
     }
     const text = buffer.toString('utf8');
+    const lines = text.split('\n');
+    if (lines.length > 0 && lines[lines.length - 1] === '') {
+      lines.pop();
+    }
     const entries: TrainJournalEntry[] = [];
-    for (const line of text.split('\n')) {
-      if (line.trim().length === 0) {
-        continue;
-      }
+    for (const line of lines) {
       const entry = readJournalLine(line);
       if (entry === null) {
         return { kind: 'unreadable' };
@@ -150,6 +151,9 @@ export class TrainEventJournalFileAdapter implements TrainEventPort {
 
 /** Read one journal line as a `TrainJournalEntry`; null when it does not match. */
 function readJournalLine(line: string): TrainJournalEntry | null {
+  if (line.trim().length === 0) {
+    return null;
+  }
   try {
     const value: unknown = JSON.parse(line);
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {

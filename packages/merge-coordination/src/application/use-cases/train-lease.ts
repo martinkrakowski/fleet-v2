@@ -73,7 +73,11 @@ function readExactKeys(value: unknown, keys: readonly string[]): Record<string, 
     if (own.length !== keys.length || !keys.every((key) => Object.prototype.hasOwnProperty.call(record, key))) {
       return null;
     }
-    return record;
+    const copy: Record<string, unknown> = {};
+    for (const key of keys) {
+      copy[key] = record[key];
+    }
+    return copy;
   } catch {
     return null;
   }
@@ -124,14 +128,18 @@ function readRequestSnapshot(
   keys: readonly string[],
   isoFields: readonly string[],
 ): Record<string, unknown> | null {
-  const snapshot = readExactKeys(request, keys);
-  if (snapshot === null) {
+  try {
+    const snapshot = readExactKeys(request, keys);
+    if (snapshot === null) {
+      return null;
+    }
+    if (!isValidHolderId(snapshot.holderId) || !isoFields.every((field) => isZonedIso(snapshot[field]))) {
+      return null;
+    }
+    return snapshot;
+  } catch {
     return null;
   }
-  if (!isValidHolderId(snapshot.holderId) || !isoFields.every((field) => isZonedIso(snapshot[field]))) {
-    return null;
-  }
-  return snapshot;
 }
 
 /** True when the holder and fence name the current lease (null never matches). */

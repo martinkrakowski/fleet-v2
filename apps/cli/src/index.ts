@@ -721,8 +721,8 @@ export async function runCli(
   conductorOptions?: ConductorCliOptions,
   policyOptions?: PolicyCliOptions,
   telemetryOptions?: TelemetryCliOptions,
-  killallOptions?: KillallCliOptions,
   reportOptions?: ReportCliOptions,
+  killallOptions?: KillallCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);

@@ -72,6 +72,7 @@ async function runKillall(
     undefined,
     undefined,
     undefined,
+    undefined,
     options,
   );
 }
@@ -326,6 +327,7 @@ describe('fleet-v2 killall halt flow', () => {
       const code = await runCli(
         ['killall', '--state-dir', stateDir],
         io,
+        undefined,
         undefined,
         undefined,
         undefined,

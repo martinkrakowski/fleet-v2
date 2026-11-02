@@ -152,6 +152,18 @@ describe('WorkspaceAdapter GB3 recovery', () => {
     await expect(fs.access(patchPath)).rejects.toThrow();
   });
 
+  it('preserve answers git-refused for an empty file or a symlink at the destination, never destination-exists', { timeout: 20000 }, async () => {
+    const repoPath = await createGitRepo();
+    const patchesDir = await makeTempDir('fleet-patches-');
+    const adapter = new WorkspaceAdapter({ executor: new LocalExecutor() });
+    const emptyPath = path.join(patchesDir, 'empty.patch');
+    await fs.writeFile(emptyPath, '', 'utf8');
+    expect(await adapter.preserveWorktreeEdits({ worktreePath: repoPath, patchPath: emptyPath })).toEqual({ outcome: 'refused', reason: 'git-refused' });
+    const linkPath = path.join(patchesDir, 'link.patch');
+    await fs.symlink(path.join(patchesDir, 'nowhere'), linkPath);
+    expect(await adapter.preserveWorktreeEdits({ worktreePath: repoPath, patchPath: linkPath })).toEqual({ outcome: 'refused', reason: 'git-refused' });
+  });
+
   it('preserve refuses an existing destination and never overwrites it', { timeout: 20000 }, async () => {
     const repoPath = await createGitRepo();
     const patchesDir = await makeTempDir('fleet-patches-');

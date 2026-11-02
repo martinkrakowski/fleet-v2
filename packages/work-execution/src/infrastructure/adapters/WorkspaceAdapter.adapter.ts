@@ -983,7 +983,12 @@ export class WorkspaceAdapter implements WorkspacePort {
     const existsRun = await executor.run(['test', '-e', patchPath], { timeoutMs: PROBE_TIMEOUT_MS });
     const linkRun = await executor.run(['test', '-L', patchPath], { timeoutMs: PROBE_TIMEOUT_MS });
     if (existsRun.exitCode === 0 || linkRun.exitCode === 0) {
-      return { outcome: 'refused', reason: 'destination-exists' };
+      // The reconcile reads destination-exists as a saved patch, so only a
+      // regular, non-empty file may answer it.
+      const regularRun = await executor.run(['test', '-f', patchPath], { timeoutMs: PROBE_TIMEOUT_MS });
+      const nonEmptyRun = await executor.run(['test', '-s', patchPath], { timeoutMs: PROBE_TIMEOUT_MS });
+      const savedPatch = linkRun.exitCode !== 0 && regularRun.exitCode === 0 && nonEmptyRun.exitCode === 0;
+      return { outcome: 'refused', reason: savedPatch ? 'destination-exists' : 'git-refused' };
     }
 
     // 5-6. Write the binary-safe diff directly via git into a fresh temp file,

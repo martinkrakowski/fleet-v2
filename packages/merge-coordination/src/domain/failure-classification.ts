@@ -6,7 +6,7 @@
  */
 
 import { accepted, refused, type ValidationResult } from './entities/validation.js';
-import type { BatchMemberRecord } from './entities/BatchRecord.js';
+import { validateBatchMemberRecord, type BatchMemberRecord } from './entities/BatchRecord.js';
 import type { GateReceiptResult } from './entities/GateReceiptRecord.js';
 
 /** What kind of failure one gate result was, and what that implies. */
@@ -32,13 +32,19 @@ function isNonNegativeInteger(value: unknown): value is number {
 }
 
 /**
- * Classify one gate result. Refuses empty member lists, unknown results and
- * bad retry numbers; otherwise answers with the failure kind. The retry
- * budget is a required input — no default is invented.
+ * Classify one gate result. Refuses empty member lists, malformed members,
+ * unknown results and bad retry numbers; otherwise answers with the failure
+ * kind. The retry budget is a required input — no default is invented.
  */
 export function classifyGateOutcome(input: GateOutcomeInput): ValidationResult<FailureClassification> {
   if (input.members.length < 1) {
     return refused('gate outcome needs at least one batch member');
+  }
+  for (const member of input.members) {
+    const validated = validateBatchMemberRecord(member);
+    if (!validated.ok) {
+      return validated;
+    }
   }
   if (typeof input.result !== 'string' || !KNOWN_RESULTS.includes(input.result)) {
     return refused('gate outcome result must be "passed", "failed" or "infrastructure-failure"');

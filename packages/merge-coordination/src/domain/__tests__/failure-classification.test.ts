@@ -77,6 +77,66 @@ describe('classifyGateOutcome', () => {
     expect(result.ok).toBe(false);
   });
 
+  it('refuses a malformed member such as { prNumber: 0, headSha: "" }', () => {
+    const result = classifyGateOutcome({
+      result: 'failed',
+      members: [{ prNumber: 0, headSha: '' }],
+      infrastructureRetriesUsed: 0,
+      maxInfrastructureRetries: 2,
+    });
+    expect(result).toEqual({ ok: false, reason: 'batch member prNumber must be a positive integer' });
+  });
+
+  it('refuses a member with prNumber 0', () => {
+    const result = classifyGateOutcome({
+      result: 'failed',
+      members: [{ prNumber: 0, headSha: 'a'.repeat(40) }],
+      infrastructureRetriesUsed: 0,
+      maxInfrastructureRetries: 2,
+    });
+    expect(result).toEqual({ ok: false, reason: 'batch member prNumber must be a positive integer' });
+  });
+
+  it('refuses a member with a negative prNumber', () => {
+    const result = classifyGateOutcome({
+      result: 'passed',
+      members: [{ prNumber: -1, headSha: 'a'.repeat(40) }],
+      infrastructureRetriesUsed: 0,
+      maxInfrastructureRetries: 2,
+    });
+    expect(result).toEqual({ ok: false, reason: 'batch member prNumber must be a positive integer' });
+  });
+
+  it('refuses a member with an empty headSha', () => {
+    const result = classifyGateOutcome({
+      result: 'failed',
+      members: [{ prNumber: 1, headSha: '' }],
+      infrastructureRetriesUsed: 0,
+      maxInfrastructureRetries: 2,
+    });
+    expect(result).toEqual({ ok: false, reason: 'batch member headSha must be 40 lower-case hex characters' });
+  });
+
+  it('refuses a member with an invalid headSha', () => {
+    const result = classifyGateOutcome({
+      result: 'failed',
+      members: [{ prNumber: 1, headSha: 'not-a-valid-sha' }],
+      infrastructureRetriesUsed: 0,
+      maxInfrastructureRetries: 2,
+    });
+    expect(result).toEqual({ ok: false, reason: 'batch member headSha must be 40 lower-case hex characters' });
+  });
+
+  it('refuses when one member in a multi-member batch is malformed', () => {
+    const result = classifyGateOutcome({
+      result: 'failed',
+      members: [member(1, 'a'), { prNumber: 0, headSha: 'b'.repeat(40) }],
+      infrastructureRetriesUsed: 0,
+      maxInfrastructureRetries: 2,
+    });
+    expect(result).toEqual({ ok: false, reason: 'batch member prNumber must be a positive integer' });
+  });
+
   it('refuses an unknown result string', () => {
     const result = classifyGateOutcome(outcome('exploded' as GateOutcomeInput['result']));
     expect(result).toEqual({ ok: false, reason: 'gate outcome result must be "passed", "failed" or "infrastructure-failure"' });

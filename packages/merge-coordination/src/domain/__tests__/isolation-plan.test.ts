@@ -70,6 +70,22 @@ describe('planIsolationSplit', () => {
     expect(result.ok).toBe(false);
   });
 
+  it('refuses a malformed member with prNumber 0', () => {
+    const result = planIsolationSplit([
+      { prNumber: 0, headSha: 'a'.repeat(40) },
+      member(2, 'b'),
+    ]);
+    expect(result).toEqual({ ok: false, reason: 'batch member prNumber must be a positive integer' });
+  });
+
+  it('refuses a malformed member with invalid headSha', () => {
+    const result = planIsolationSplit([
+      member(1, 'a'),
+      { prNumber: 2, headSha: '' },
+    ]);
+    expect(result).toEqual({ ok: false, reason: 'batch member headSha must be 40 lower-case hex characters' });
+  });
+
   it('accepts a frozen input', () => {
     const result = planIsolationSplit(members(2));
     expect(result.ok).toBe(true);
@@ -132,6 +148,46 @@ describe('decideIsolationStep', () => {
   it('passes a refusal through', () => {
     const result = decideIsolationStep(outcome('passed', []));
     expect(result.ok).toBe(false);
+  });
+
+  it('refuses a failed gate with a malformed member { prNumber: 0, headSha: "" } rather than blocking an invalid PR', () => {
+    const result = decideIsolationStep({
+      result: 'failed',
+      members: [{ prNumber: 0, headSha: '' }],
+      infrastructureRetriesUsed: 0,
+      maxInfrastructureRetries: 2,
+    });
+    expect(result).toEqual({ ok: false, reason: 'batch member prNumber must be a positive integer' });
+  });
+
+  it('refuses a failed gate with an invalid headSha', () => {
+    const result = decideIsolationStep({
+      result: 'failed',
+      members: [{ prNumber: 1, headSha: 'bad-sha' }],
+      infrastructureRetriesUsed: 0,
+      maxInfrastructureRetries: 2,
+    });
+    expect(result).toEqual({ ok: false, reason: 'batch member headSha must be 40 lower-case hex characters' });
+  });
+
+  it('refuses a passed gate with a malformed member', () => {
+    const result = decideIsolationStep({
+      result: 'passed',
+      members: [{ prNumber: 0, headSha: 'a'.repeat(40) }],
+      infrastructureRetriesUsed: 0,
+      maxInfrastructureRetries: 2,
+    });
+    expect(result).toEqual({ ok: false, reason: 'batch member prNumber must be a positive integer' });
+  });
+
+  it('refuses a multi-member batch containing a malformed member', () => {
+    const result = decideIsolationStep({
+      result: 'failed',
+      members: [member(1, 'a'), { prNumber: 2, headSha: '' }],
+      infrastructureRetriesUsed: 0,
+      maxInfrastructureRetries: 2,
+    });
+    expect(result).toEqual({ ok: false, reason: 'batch member headSha must be 40 lower-case hex characters' });
   });
 });
 

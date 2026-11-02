@@ -7,7 +7,7 @@
  */
 
 import { accepted, refused, type ValidationResult } from './entities/validation.js';
-import type { BatchMemberRecord } from './entities/BatchRecord.js';
+import { validateBatchMemberRecord, type BatchMemberRecord } from './entities/BatchRecord.js';
 import { classifyGateOutcome, type GateOutcomeInput } from './failure-classification.js';
 
 /** 'current-base': the base as it stands when the run starts.
@@ -30,8 +30,8 @@ export interface IsolationSplit {
  * Split an ordered member list into two halves that keep the original order.
  * The first half validates against the current base; the second half runs
  * only after the first is resolved, against that later base. Refuses fewer
- * than two members (a single member is already isolated) and any repeated
- * pull request number. Never mutates the input.
+ * than two members (a single member is already isolated), any malformed member
+ * and any repeated pull request number. Never mutates the input.
  */
 export function planIsolationSplit(members: readonly BatchMemberRecord[]): ValidationResult<IsolationSplit> {
   if (members.length < 2) {
@@ -39,6 +39,10 @@ export function planIsolationSplit(members: readonly BatchMemberRecord[]): Valid
   }
   const seenPrNumbers = new Set<number>();
   for (const member of members) {
+    const validated = validateBatchMemberRecord(member);
+    if (!validated.ok) {
+      return validated;
+    }
     if (seenPrNumbers.has(member.prNumber)) {
       return refused(`batch lists pull request ${member.prNumber} more than once and cannot be split`);
     }

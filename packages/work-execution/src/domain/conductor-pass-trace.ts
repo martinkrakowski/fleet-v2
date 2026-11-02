@@ -9,8 +9,14 @@
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { parseLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN } from './lane-run-records.js';
+import {
+  INITIAL_RECORD_SCHEMA_VERSION,
+  readRecordSchemaVersion,
+  type ReadRecordSchemaOptions,
+  type VersionedRecordRead,
+} from './record-schema-version.js';
 
-export const CONDUCTOR_PASS_TRACE_SCHEMA_VERSION = 1 as const;
+export const CONDUCTOR_PASS_TRACE_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
 export const CONDUCTOR_PASS_TRACE_RING_LENGTH = 32;
 export const CONDUCTOR_PASS_TRACE_MAX_STEPS = 8;
 
@@ -34,7 +40,7 @@ export type ConductorTraceRunReport =
   | { readonly outcome: 'resume-refused'; readonly reason: string };
 
 export interface ConductorPassTraceRecord {
-  readonly schemaVersion: typeof CONDUCTOR_PASS_TRACE_SCHEMA_VERSION;
+  readonly schemaVersion: number;
   readonly passId: string;
   readonly nowIso: string;
   readonly holderId: string; // stored, never sent
@@ -47,9 +53,7 @@ export interface ConductorPassTraceRecord {
   readonly attention: readonly { readonly runId: string; readonly kind: string }[];
 }
 
-export type ConductorPassTraceRead =
-  | { readonly ok: true; readonly record: ConductorPassTraceRecord }
-  | { readonly ok: false; readonly reason: 'unknown-schema-version' | 'malformed' };
+export type ConductorPassTraceRead = VersionedRecordRead<ConductorPassTraceRecord>;
 
 const PASS_ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
 const TOKEN_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -129,9 +133,9 @@ function readTraceStep(value: unknown): ConductorTraceStep | null {
 }
 
 
-export function readConductorPassTrace(input: unknown): ConductorPassTraceRead {
+export function readConductorPassTrace(input: unknown, options?: ReadRecordSchemaOptions): ConductorPassTraceRead {
   try {
-    return readConductorPassTraceUnchecked(input);
+    return readConductorPassTraceUnchecked(input, options?.currentVersion ?? CONDUCTOR_PASS_TRACE_SCHEMA_VERSION);
   } catch {
     return malformed();
   }
@@ -241,13 +245,13 @@ function readAttentionEntries(
   return attention;
 }
 
-function readConductorPassTraceUnchecked(input: unknown): ConductorPassTraceRead {
+function readConductorPassTraceUnchecked(input: unknown, currentVersion: number): ConductorPassTraceRead {
+  const versionRead = readRecordSchemaVersion(input, currentVersion);
+  if (!versionRead.ok) {
+    return versionRead;
+  }
   if (!isPlainRecord(input)) {
     return malformed();
-  }
-  const schemaVersion = input.schemaVersion;
-  if (schemaVersion !== undefined && schemaVersion !== CONDUCTOR_PASS_TRACE_SCHEMA_VERSION) {
-    return { ok: false, reason: 'unknown-schema-version' };
   }
   const header = readHeader(input);
   if (!header.ok) {
@@ -264,7 +268,7 @@ function readConductorPassTraceUnchecked(input: unknown): ConductorPassTraceRead
   return {
     ok: true,
     record: {
-      schemaVersion: CONDUCTOR_PASS_TRACE_SCHEMA_VERSION,
+      schemaVersion: versionRead.schemaVersion,
       passId: header.fields.get('passId') as string,
       nowIso: header.fields.get('nowIso') as string,
       holderId: header.fields.get('holderId') as string,
@@ -277,6 +281,24 @@ function readConductorPassTraceUnchecked(input: unknown): ConductorPassTraceRead
       attention,
     },
   };
+}
+
+export type VersionedConductorPassTraceParseResult =
+  | { readonly status: 'ok'; readonly record: ConductorPassTraceRecord; readonly schemaVersion: number }
+  | { readonly status: 'unknown-version' }
+  | { readonly status: 'invalid' };
+
+export function parseVersionedConductorPassTraceStateRecord(
+  raw: unknown,
+): VersionedConductorPassTraceParseResult {
+  const read = readConductorPassTrace(raw);
+  if (read.ok) {
+    return { status: 'ok', record: read.record, schemaVersion: read.record.schemaVersion };
+  }
+  if (read.reason === 'unknown-schema-version') {
+    return { status: 'unknown-version' };
+  }
+  return { status: 'invalid' };
 }
 
 /** The trace record when readable, else undefined (VZ5's adapter and `state check` use it). */

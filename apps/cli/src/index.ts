@@ -63,6 +63,7 @@ import { evidenceCommands } from './commands/evidence.js';
 import { knowledgeCommands } from './commands/knowledge.js';
 import { coordinationCommands } from './commands/coordination.js';
 import { questionsCommands } from './commands/questions.js';
+import { mergeCommands } from './merge.js';
 
 export { resolveRunnerSettings };
 
@@ -259,6 +260,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   knowledge: knowledgeCommands,
   coordination: coordinationCommands,
   questions: questionsCommands,
+  merge: mergeCommands,
 };
 
 // ---------------------------------------------------------------------------

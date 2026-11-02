@@ -906,13 +906,9 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
     const merged = await mergingHarness();
     await appendIntent(merged, mergeKey(), null, NOW);
     merged.setForgeReadAnswer(mergedPullRequestAtHead(7));
-    expect(await advance(merged)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'completed',
-      reasonCode: 'merged',
-    });
+    // R4c: the merged PR carrying the lane head ends the run before the unread
+    // merge intent is reconciled; the merge port is still never called.
+    expect(await advance(merged)).toEqual({ outcome: 'entered', state: 'merged' });
     expect(merged.autoMergeRequests).toHaveLength(0);
 
     const open = await mergingHarness();

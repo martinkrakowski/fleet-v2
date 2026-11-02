@@ -1808,7 +1808,7 @@ describe('merged before stopped (G3d)', () => {
     });
   });
 
-  it('an unread merge intent reconciles before any stop', () => {
+  it('R4c: a merged PR carrying the lane head ends the run even with an unread merge intent and a stop', () => {
     const rec = record({});
     const facts = baseFacts({
       state: 'merging',
@@ -1818,7 +1818,7 @@ describe('merged before stopped (G3d)', () => {
       pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
       pendingIntent: { key: `${RUN_ID}/r0/merge/0@${HEAD}`, step: 'merge', reconciliation: 'unread' },
     });
-    expect(decide(rec, facts)).toEqual({ kind: 'reconcile', step: 'merge', key: `${RUN_ID}/r0/merge/0@${HEAD}` });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
   });
 });
 
@@ -2035,16 +2035,88 @@ describe('G3f (R4b): a merged PR with the lane head leaves branch-behind and amb
     assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
   });
 
-  it('a merged PR never leaves another park through this rule', () => {
+  it('R4c: every park leaves once its merged PR carries the lane head, whatever the reason', () => {
     for (const parked of [
       { reason: 'ambiguous', qualifier: 'merge', parkedFrom: 'merging', questionId: null },
       { reason: 'one-way-door', qualifier: null, parkedFrom: 'merging', questionId: null },
       { reason: 'halted', qualifier: null, parkedFrom: 'running', questionId: null },
+      { reason: 'step-refused', qualifier: 'premerge', parkedFrom: 'merging', questionId: null },
+      { reason: 'fix-no-progress', qualifier: null, parkedFrom: 'fixing', questionId: null },
+      { reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating', questionId: null },
     ]) {
       const rec = record({ parked, parkCount: 1 });
       const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });
-      expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+      assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
     }
+  });
+
+  it('R4c: a halt keeps today\u2019s behaviour even with a merged PR carrying the lane head', () => {
+    const rec = record({ parked: PARKED_BLOCKER, parkCount: 1 });
+    const facts = baseFacts({ state: 'parked', halted: true, head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });
+    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+});
+
+describe('G3f (R4c): a merged PR carrying the lane head ends the run from any waiting state', () => {
+  const mergedAtHead: NonNullable<LaneRunFacts['pr']> = { state: 'merged', head12: HEAD, containsLaneHead: true };
+  const mergedOtherHeadNotContaining: NonNullable<LaneRunFacts['pr']> = { state: 'merged', head12: 'ffffffffffff', containsLaneHead: false };
+  const premergeIntent = { key: `${RUN_ID}/r0/premerge/0@${HEAD}`, step: 'premerge' as const, reconciliation: 'unread' as const };
+
+  it('merging with an unread premerge intent and a merged PR carrying the head enters merged', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'merging',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      pr: mergedAtHead,
+      pendingIntent: premergeIntent,
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('the same with a recorded stop enters merged, never stopped', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'merging',
+      stopMode: 'graceful',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      pr: mergedAtHead,
+      pendingIntent: premergeIntent,
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('awaiting-premerge and watching-ci enter merged when the PR merged with the head', () => {
+    for (const state of ['awaiting-premerge', 'watching-ci'] as const) {
+      const rec = record({});
+      const facts = baseFacts({ state, head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });
+      assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+    }
+  });
+
+  it('a merged PR not carrying the head, in merging with the pending intent, is not merged', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'merging',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      pr: mergedOtherHeadNotContaining,
+      pendingIntent: premergeIntent,
+    });
+    expect(decide(rec, facts)).toEqual({ kind: 'reconcile', step: 'premerge', key: premergeIntent.key });
+  });
+
+  it('an open PR with a pending intent is unchanged', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'merging',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      pr: { state: 'open', head12: HEAD, containsLaneHead: true },
+      pendingIntent: premergeIntent,
+    });
+    expect(decide(rec, facts)).toEqual({ kind: 'reconcile', step: 'premerge', key: premergeIntent.key });
   });
 });
 

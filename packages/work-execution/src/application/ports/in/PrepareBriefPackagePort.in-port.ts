@@ -130,7 +130,7 @@ export interface PreparedBriefPackage {
 
 export type PrepareBriefPackageResult =
   | { readonly outcome: 'prepared'; readonly prepared: PreparedBriefPackage }
-  | { readonly outcome: 'rejected'; readonly reason: string };
+  | { readonly outcome: 'rejected'; readonly reason: string; readonly reasonClass?: 'acceptance-spec-shell' };
 
 /** The acceptance spec as a preview may show it (plan §3.7): no argv element, no path. */
 export interface BriefAcceptancePreview {
@@ -155,7 +155,7 @@ export interface BriefPackagePreview {
 
 export type PreviewBriefPackageResult =
   | { readonly outcome: 'previewed'; readonly preview: BriefPackagePreview }
-  | { readonly outcome: 'rejected'; readonly reason: string };
+  | { readonly outcome: 'rejected'; readonly reason: string; readonly reasonClass?: 'acceptance-spec-shell' };
 
 export interface PrepareBriefPackagePort {
   /** Freeze one brief package and record its digest before any dispatch. */

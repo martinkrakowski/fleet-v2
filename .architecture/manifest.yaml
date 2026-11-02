@@ -344,6 +344,7 @@ bounded_contexts:
       application:
         use_cases:
           - RegisterWorkOrderUseCase
+          - ImportLanePlanUseCase
           - PrepareBriefPackageUseCase
           - ReserveExecutionCapacityUseCase
           - DispatchAttemptUseCase
@@ -370,6 +371,7 @@ bounded_contexts:
         ports:
           in:
             - RegisterWorkOrderPort
+            - ImportLanePlanPort
             - PrepareBriefPackagePort
             - ReserveExecutionCapacityPort
             - DispatchAttemptPort
@@ -398,6 +400,7 @@ bounded_contexts:
             - AttemptRepositoryPort
             - ExecutionJournalPort
             - LaneRunRepositoryPort
+            - LanePlanRepositoryPort
             - ConductorDriverLeasePort
             - LaneRunJournalPort
             - BriefAuthoringPort
@@ -440,9 +443,10 @@ bounded_contexts:
             - AcceptanceReceiptReadPort
             - ConductorPassTracePort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, LanePlanRepositoryAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
+      ImportLanePlanPort: "Import one validated plan sidecar revision per (projectId, planId): project match, greater-revision CAS with digest idempotency, the cycle check across every stored plan, dropped lanes kept; it authorizes nothing."
       PrepareBriefPackagePort: "Select applicable context, obtain a reviewed prose brief and freeze its manifest, revision references and digest before dispatch."
       ReserveExecutionCapacityPort: "Reserve configured slots and test workers atomically with attempt intent under the host's shared budget."
       DispatchAttemptPort: "Start one prepared authorised attempt after capacity and runner capabilities are verified; retain ambiguous dispatch outcomes for reconciliation."
@@ -462,6 +466,7 @@ bounded_contexts:
       AttemptRepositoryPort: "Persist immutable dispatch identity and guarded lifecycle updates; return known absence separately from unreadable state."
       ExecutionJournalPort: "Atomically record intent, capacity and action receipts; a host has one designated dispatcher until shared arbitration is implemented."
       LaneRunRepositoryPort: "Persist lane runs: create at revision 1; save only at the stored revision plus one and only by the current, unexpired run-lease holder with its fence, never moving the lease, the run's identity or its earlier attempts; acquire the run lease by CAS on the fence, renew and release it without moving the revision; known absence is null."
+      LanePlanRepositoryPort: "Persist lane-plan records keyed (projectId, planId) with revision CAS; known absence is null."
       ConductorDriverLeasePort: "Hold the one conductor driver lease of a state directory: acquire by CAS on the fence over a null or lapsed lease, renew and release by its holder with its fence, check and read without writing; the fence never goes back."
       LaneRunJournalPort: "Append keyed run journal entries under the store's guard: an intent before its action, its result after, a conduct entry for an entered state; refuse a second intent with the same key, a result without its intent or after a final result, a stop whose mode does not match its key, and a stop no stronger than the strongest the run already has; list per run and per key in append order, and several runs' entries from one read."
       ConductorPassTracePort: "Append one completed conductor pass to a bounded ring (the newest 32 passes, at most 8 steps per run, schemaVersion 1, an absent version read as 1 and any other refused) under the store's lock with an atomic replace, and list the ring; an append never throws and answers recorded or not-recorded with a reason code; a refused pass or a dry run is never written."
@@ -517,6 +522,7 @@ bounded_contexts:
       - { adapter: ExecutionJournalAdapter, implements: ExecutionJournalPort, integration: local-transactional-journal-and-capacity-arbitration }
       - { adapter: LaneRunRepositoryAdapter, implements: LaneRunRepositoryPort, integration: local-transactional-store }
       - { adapter: ConductorDriverLeaseAdapter, implements: ConductorDriverLeasePort, integration: local-transactional-store }
+      - { adapter: LanePlanRepositoryAdapter, implements: LanePlanRepositoryPort, integration: local-transactional-store }
       - { adapter: LaneRunJournalAdapter, implements: LaneRunJournalPort, integration: local-keyed-run-journal }
       - { adapter: ConductorPassTraceAdapter, implements: ConductorPassTracePort, integration: local-transactional-store }
       - { adapter: TelemetryDispositionAdapter, implements: TelemetryDispositionPort, integration: local-transactional-store }

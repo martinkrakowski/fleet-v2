@@ -3,6 +3,7 @@
  * consumer-side adapters from the shared root inputs; called by the CLI
  * composition root.
  */
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
 import { withFileLock, writeJsonAtomically } from '../file-store.js';
@@ -25,9 +26,11 @@ import {
   ExecutionObservationAdapter,
   GatePredicateAdapter,
   ProcessTreeTerminationAdapter,
+  ImportLanePlanUseCase,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
+  LanePlanRepositoryAdapter,
   ListUnregisteredProjectsUseCase,
   LocalExecutor,
   PolicyMergeGrantAdapter,
@@ -83,7 +86,7 @@ import {
 
 import type { FleetCliRuntime, FleetCliRuntimeOptions } from '../composition.js';
 import type { readJsonRecord } from '../composition.js';
-import { readAcceptanceForAttempt } from '@fleet/work-execution';
+import { canonicalLanePlanSidecarJson, readAcceptanceForAttempt } from '@fleet/work-execution';
 
 /** Grant-to-attempt binding persisted for cross-process forge execution. */
 interface AuthorizationCoordinates {
@@ -499,6 +502,11 @@ export function composeExecution(input: ComposeExecutionInput) {
   // process tree on its recorded host (a legacy record is refused by the adapter).
   const processTreeTermination = new ProcessTreeTerminationAdapter({ executorForHost });
 
+  // WB4a: the lane-plan store — one adapter is both stores (in-memory when
+  // stateDir is omitted, lane-plans.json otherwise). Its change signal
+  // defaults to a no-op, exactly as the work-order adapter's does.
+  const lanePlanRepository = new LanePlanRepositoryAdapter({ stateDir });
+
   const execution = {
     workOrderRepository,
     attemptRepository,
@@ -539,6 +547,13 @@ export function composeExecution(input: ComposeExecutionInput) {
     registerWorkOrder: new RegisterWorkOrderUseCase({
       workOrderRepo: workOrderRepository,
       profileRead,
+      lanePlanRepo: lanePlanRepository,
+    }),
+    importLanePlan: new ImportLanePlanUseCase({
+      lanePlanRepo: lanePlanRepository,
+      computeDigest: (sidecar) =>
+        createHash('sha256').update(canonicalLanePlanSidecarJson(sidecar)).digest('hex'),
+      nowIso: () => new Date().toISOString(),
     }),
     inspectWorkOrder: new InspectWorkOrderUseCase({
       workOrderRepo: workOrderRepository,

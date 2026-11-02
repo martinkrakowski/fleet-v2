@@ -196,10 +196,9 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     request: ResolveActionAuthorizationRequest,
   ): { owner: string; repo: string } | null {
     if (typeof request.repository === 'object' && request.repository !== null) {
-      const owner = request.repository.owner?.trim();
-      const repo = request.repository.repo?.trim();
-      if (owner && repo) {
-        return { owner, repo };
+      const { owner, repo } = request.repository as { owner?: unknown; repo?: unknown };
+      if (typeof owner === 'string' && typeof repo === 'string' && owner.trim() && repo.trim()) {
+        return { owner: owner.trim(), repo: repo.trim() };
       }
     } else if (typeof request.repository === 'string') {
       const parts = request.repository.trim().split('/');

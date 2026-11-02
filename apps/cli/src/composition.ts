@@ -51,6 +51,7 @@ import {
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
+  MergeGrantAdapter,
   ForgeReadAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
@@ -715,6 +716,7 @@ export interface FleetCliRuntime {
     readonly briefKnowledge: BriefKnowledgeAdapter;
     readonly executionObservation: ExecutionObservationAdapter;
     readonly forgeAction: ForgeActionAdapter;
+    readonly mergeGrant: MergeGrantAdapter;
     /** Read-only PR state (AM4b-2); bound in forge mode `github` only. */
     readonly forgeRead: ForgeReadAdapter;
     readonly registerWorkOrder: RegisterWorkOrderUseCase;

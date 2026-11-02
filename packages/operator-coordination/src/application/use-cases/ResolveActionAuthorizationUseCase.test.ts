@@ -192,4 +192,19 @@ describe('ResolveActionAuthorizationUseCase', () => {
     });
     expect(resultMismatch.outcome).toBe('blocked');
   });
+
+  it('blocks, without throwing, when the repository coordinates are not strings', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createMergeGrantRecord());
+    const useCase = new ResolveActionAuthorizationUseCase({ requestRepo });
+    const result = await useCase.resolveActionAuthorization({
+      projectId: 'proj-1',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: headSha,
+      authorizationGrantId: 'grant-1',
+      repository: { owner: 123, repo: 'repo-a' } as unknown as { owner: string; repo: string },
+      pullRequestNumber: 1,
+    });
+    expect(result.outcome).toBe('blocked');
+  });
 });

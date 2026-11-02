@@ -11,6 +11,7 @@
 
 import type { LaneRunTier } from '../../../domain/lane-run-records.js';
 import type { PrepareBriefPackageRequest } from './PrepareBriefPackagePort.in-port.js';
+import type { LaneRunAdmissionBlockers } from '../out/LaneRunAdmissionPort.out-port.js';
 
 export interface StartLaneRunRequest {
   /** 'run-' + ULID; the same id on a retry. */
@@ -45,7 +46,7 @@ export type StartLaneRunResult =
    * was written.
    */
   | { readonly outcome: 'refused'; readonly reason: StartLaneRunRefusal }
-  | { readonly outcome: 'no-capacity' }
+  | { readonly outcome: 'no-capacity'; readonly blockedBy?: LaneRunAdmissionBlockers }
   /**
    * A step after the reserve did not finish: the reservation stays held;
    * retry with the same ids, or abandon.

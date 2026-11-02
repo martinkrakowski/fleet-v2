@@ -15,8 +15,9 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AttemptRecord, CapacityReservationRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { laneRunConductEntry } from '../../../domain/lane-run-step-facts.js';
-import { laneRunPackageKeys, laneRunPackagesOverlap } from '../../../domain/lane-run-packages.js';
+import { laneRunPackageKeys, laneRunOwnedPathsOverlap, laneRunPackagesOverlap } from '../../../domain/lane-run-packages.js';
 import type { ReserveExecutionCapacityCandidateHost, ReserveExecutionCapacityPort, ReserveExecutionCapacityRequest, ReserveExecutionCapacityResult } from '../../../application/ports/in/ReserveExecutionCapacityPort.in-port.js';
+import type { ForgeReadPort, ReadPullRequestResult } from '../../../application/ports/out/ForgeReadPort.out-port.js';
 import type { LaneRunAdmissionRequest } from '../../../application/ports/out/LaneRunAdmissionPort.out-port.js';
 import { LaneRunAdmissionAdapter } from '../LaneRunAdmissionAdapter.adapter.js';
 import { ExecutionJournalAdapter } from '../ExecutionJournalAdapter.adapter.js';
@@ -74,7 +75,12 @@ function workOrderFixture(overrides: Partial<WorkOrderRecord> = {}): WorkOrderRe
   };
 }
 
-function runRecord(runId: string, attemptIds: readonly string[], workOrderId = 'wo-example-1'): LaneRunRecord {
+function runRecord(
+  runId: string,
+  attemptIds: readonly string[],
+  workOrderId = 'wo-example-1',
+  overrides: Partial<LaneRunRecord> = {},
+): LaneRunRecord {
   return {
     version: 1,
     runId,
@@ -90,6 +96,7 @@ function runRecord(runId: string, attemptIds: readonly string[], workOrderId = '
     lease: null,
     revision: 1,
     runPolicyRevision: 'policy-example-1',
+    ...overrides,
   };
 }
 
@@ -147,6 +154,10 @@ function reservationFixture(attemptId: string, overrides: Partial<CapacityReserv
 interface AdmissionHarnessOptions {
   readonly maxActiveRuns?: number;
   readonly candidateHosts?: readonly ReserveExecutionCapacityCandidateHost[] | undefined;
+  /** Wire an in-memory forge-read fake answered through `setForgeReadAnswer`. */
+  readonly wireForgeRead?: boolean;
+  /** A custom forge read (e.g. one that throws); takes precedence over the wire-in fake. */
+  readonly forgeRead?: Pick<ForgeReadPort, 'readPullRequest'>;
 }
 
 function makeHarness(options: AdmissionHarnessOptions = {}) {
@@ -182,6 +193,9 @@ function makeHarness(options: AdmissionHarnessOptions = {}) {
   };
 
   let reservationCounter = 0;
+  let forgeReadAnswer: ReadPullRequestResult = { outcome: 'not-found' };
+  const wiredForgeRead = { readPullRequest: async () => forgeReadAnswer };
+  const forgeRead = options.forgeRead ?? wiredForgeRead;
   const adapter = new LaneRunAdmissionAdapter({
     reserve,
     runRepo,
@@ -191,6 +205,7 @@ function makeHarness(options: AdmissionHarnessOptions = {}) {
     executionJournal,
     maxActiveRuns: options.maxActiveRuns ?? 1,
     ...(options.candidateHosts === undefined ? { candidateHosts: CANDIDATE_HOSTS } : { candidateHosts: options.candidateHosts }),
+    ...(options.forgeRead !== undefined || options.wireForgeRead ? { forgeRead } : {}),
     newReservationId: () => {
       reservationCounter += 1;
       return 'res-adm-' + String(reservationCounter);
@@ -210,6 +225,12 @@ function makeHarness(options: AdmissionHarnessOptions = {}) {
     );
     expect(appended.outcome).toBe('appended');
   };
+  const parkRun = async (runId: string) => {
+    const appended = await runJournal.append(
+      laneRunConductEntry('01JB0000000000000000000002', runId, 'parked', NOW),
+    );
+    expect(appended.outcome).toBe('appended');
+  };
 
   return {
     adapter,
@@ -222,9 +243,13 @@ function makeHarness(options: AdmissionHarnessOptions = {}) {
     setReserveAnswer: (answer: typeof reserveAnswer) => {
       reserveAnswer = answer;
     },
+    setForgeReadAnswer: (answer: ReadPullRequestResult) => {
+      forgeReadAnswer = answer;
+    },
     createRun,
     holdReservation,
     stopRun,
+    parkRun,
   };
 }
 
@@ -246,6 +271,23 @@ function admitRequest(overrides: Partial<LaneRunAdmissionRequest> = {}): LaneRun
     worktreePath: WORKTREE_PATH,
     nowIso: NOW,
     ...overrides,
+  };
+}
+
+function foundPullRequest(state: 'open' | 'merged' | 'closed' = 'merged'): ReadPullRequestResult {
+  return {
+    outcome: 'found',
+    pullRequest: {
+      number: 7,
+      state,
+      mergeState: 'clean',
+      headSha: COMMIT,
+      headRef: 'fleet/example',
+      baseRef: 'main',
+      mergedAtIso: state === 'merged' ? NOW : null,
+      closedAtIso: null,
+      mergeCommitSha: state === 'merged' ? COMMIT : null,
+    },
   };
 }
 
@@ -324,7 +366,10 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     await harness.holdReservation('attempt-example-2');
 
     const blocked = await harness.adapter.reserveFirst(firstReservationRequest());
-    expect(blocked).toEqual({ outcome: 'no-capacity' });
+    expect(blocked).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+    });
     expect(harness.reserveCalls).toHaveLength(0);
 
     await harness.stopRun('run-01JB0000000000000000000001');
@@ -346,11 +391,34 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
     await harness.holdReservation('attempt-example-9');
 
     const blocked = await harness.adapter.reserveFirst(firstReservationRequest());
-    expect(blocked).toEqual({ outcome: 'no-capacity' });
+    expect(blocked).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
+    });
     expect(harness.reserveCalls).toHaveLength(0);
   });
 
-  it('test 10: package-busy blocks a shared package of the same repository, not a different one', async () => {
+  it('new (test 9\'s shape): the named blockers of the cap name an active run and an in-flight reservation', async () => {
+    const harness = makeHarness({ maxActiveRuns: 1 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-example-2'));
+    harness.workOrders.set('wo-example-2', workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/other/src'] }));
+    await harness.holdReservation('attempt-example-2');
+    harness.attempts.set('attempt-example-9', attemptFixture('attempt-example-9', { workOrderId: 'wo-example-3' }));
+    await harness.holdReservation('attempt-example-9');
+    harness.workOrders.set('wo-example-3', workOrderFixture({ id: 'wo-example-3', ownedPaths: ['packages/another/src'] }));
+
+    const blocked = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(blocked).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: {
+        runIds: ['run-01JB0000000000000000000001'],
+        attemptIds: ['attempt-example-9'],
+      },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('test 10: file-level keys admit disjoint files of one package', async () => {
     const harness = makeHarness({ maxActiveRuns: 2 });
     await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-example-2'));
     harness.workOrders.set(
@@ -363,17 +431,9 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
       'wo-example-1',
       workOrderFixture({ id: 'wo-example-1', ownedPaths: ['packages/work-execution/test'] }),
     );
-    const shared = await harness.adapter.reserveFirst(
+    const distinct = await harness.adapter.reserveFirst(
       firstReservationRequest({ workOrderId: 'wo-example-1' }),
     );
-    expect(shared).toEqual({ outcome: 'no-capacity' });
-    expect(harness.reserveCalls).toHaveLength(0);
-
-    harness.workOrders.set(
-      'wo-example-1',
-      workOrderFixture({ id: 'wo-example-1', ownedPaths: ['apps/cli/src'] }),
-    );
-    const distinct = await harness.adapter.reserveFirst(firstReservationRequest());
     expect(distinct).toEqual({
       outcome: 'reserved',
       hostName: HOST_NAME,
@@ -384,6 +444,84 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
       port: null,
     });
     expect(harness.reserveCalls).toHaveLength(1);
+  });
+
+  it('new: overlapping files of one package block and name the run', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-example-2'));
+    harness.workOrders.set(
+      'wo-example-2',
+      workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/work-execution/src'] }),
+    );
+    await harness.holdReservation('attempt-example-2');
+
+    harness.workOrders.set(
+      'wo-example-1',
+      workOrderFixture({ id: 'wo-example-1', ownedPaths: ['packages/work-execution/src/adapters'] }),
+    );
+    const shared = await harness.adapter.reserveFirst(
+      firstReservationRequest({ workOrderId: 'wo-example-1' }),
+    );
+    expect(shared).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('new: a trailing glob owns its tree', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-example-2'));
+    harness.workOrders.set(
+      'wo-example-2',
+      workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/work-execution/**'] }),
+    );
+    await harness.holdReservation('attempt-example-2');
+
+    harness.workOrders.set(
+      'wo-example-1',
+      workOrderFixture({ id: 'wo-example-1', ownedPaths: ['packages/work-execution/src/x.ts'] }),
+    );
+    const blocked = await harness.adapter.reserveFirst(
+      firstReservationRequest({ workOrderId: 'wo-example-1' }),
+    );
+    expect(blocked).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('new: a brief naming no usable file root fails closed when either side has no package key', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2 });
+    await harness.createRun(runRecord('run-01JB0000000000000000000001', ['attempt-example-2'], 'wo-example-2'));
+    harness.workOrders.set(
+      'wo-example-2',
+      workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/work-execution/src'] }),
+    );
+    await harness.holdReservation('attempt-example-2');
+
+    harness.workOrders.set(
+      'wo-example-1',
+      workOrderFixture({ id: 'wo-example-1', ownedPaths: ['..'] }),
+    );
+    const realPath = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(realPath).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+
+    harness.workOrders.set(
+      'wo-example-2',
+      workOrderFixture({ id: 'wo-example-2', ownedPaths: ['..'] }),
+    );
+    const bothDotDot = await harness.adapter.reserveFirst(firstReservationRequest());
+    expect(bothDotDot).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
   });
 
   it('test 10b: an in-flight held reservation without a run blocks a shared package, not a distinct one', async () => {
@@ -400,12 +538,15 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
 
     harness.workOrders.set(
       'wo-example-1',
-      workOrderFixture({ id: 'wo-example-1', ownedPaths: ['packages/work-execution/test'] }),
+      workOrderFixture({ id: 'wo-example-1', ownedPaths: ['packages/work-execution/src/adapters'] }),
     );
     const shared = await harness.adapter.reserveFirst(
       firstReservationRequest({ workOrderId: 'wo-example-1' }),
     );
-    expect(shared).toEqual({ outcome: 'no-capacity' });
+    expect(shared).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
+    });
     expect(harness.reserveCalls).toHaveLength(0);
 
     harness.workOrders.set(
@@ -441,7 +582,10 @@ describe('LaneRunAdmissionAdapter reserveFirst (K7-D7)', () => {
 
     const result = await harness.adapter.reserveFirst(firstReservationRequest());
 
-    expect(result).toEqual({ outcome: 'no-capacity' });
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
+    });
     expect(harness.reserveCalls).toHaveLength(1);
     expect(releaseSpy).toHaveBeenCalledWith('attempt-example-1', NOW);
     expect(await heldFor(harness.executionJournal, 'attempt-example-1')).toBe(false);
@@ -562,7 +706,10 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
 
     const result = await harness.adapter.admit(admitRequest());
 
-    expect(result).toEqual({ outcome: 'no-capacity' });
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
+    });
     expect(harness.reserveCalls).toHaveLength(1);
     expect(releaseSpy).toHaveBeenCalledWith('attempt-example-2', NOW);
     expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
@@ -605,8 +752,14 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
     ]);
 
     expect([first, second].filter((outcome) => outcome.outcome === 'admitted')).toHaveLength(0);
-    expect(first).toEqual({ outcome: 'no-capacity' });
-    expect(second).toEqual({ outcome: 'no-capacity' });
+    expect(first).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [RUN_B_ID], attemptIds: [] },
+    });
+    expect(second).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
+    });
     expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
     expect(await heldFor(harness.executionJournal, 'attempt-example-4')).toBe(false);
     // Both refusing is the safe outcome: each released its own reservation and
@@ -686,7 +839,7 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
     );
     harness.workOrders.set(
       'wo-example-2',
-      workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/work-execution/test'] }),
+      workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/work-execution/src/adapters'] }),
     );
     harness.attempts.set('attempt-example-1', attemptFixture('attempt-example-1'));
     harness.attempts.set('attempt-example-3', attemptFixture('attempt-example-3'));
@@ -714,8 +867,14 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
     ]);
 
     expect([first, second].filter((outcome) => outcome.outcome === 'admitted')).toHaveLength(0);
-    expect(first).toEqual({ outcome: 'no-capacity' });
-    expect(second).toEqual({ outcome: 'no-capacity' });
+    expect(first).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [RUN_B_ID], attemptIds: [] },
+    });
+    expect(second).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
+    });
     expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
     expect(await heldFor(harness.executionJournal, 'attempt-example-4')).toBe(false);
     // Both refusing is the safe outcome: each released its own reservation and
@@ -751,8 +910,14 @@ describe('LaneRunAdmissionAdapter admit (a later attempt of a run)', () => {
       harness.adapter.admit(admitRequest()),
     ]);
 
-    expect(startResult).toEqual({ outcome: 'no-capacity' });
-    expect(admitResult).toEqual({ outcome: 'no-capacity' });
+    expect(startResult).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
+    });
+    expect(admitResult).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [], attemptIds: ['attempt-example-9'] },
+    });
     expect(await heldFor(harness.executionJournal, 'attempt-example-9')).toBe(false);
     expect(await heldFor(harness.executionJournal, 'attempt-example-2')).toBe(false);
     // Both refusing is the safe outcome: each released its own reservation and
@@ -903,5 +1068,155 @@ describe('laneRunPackageKeys (K7-D5)', () => {
   it('only exactly packages or apps (a trailing slash allowed) is a whole-tree key; packages/.. and packages//x stay skipped', () => {
     expect(laneRunPackageKeys(['packages', 'apps/'])).toEqual(['apps', 'packages']);
     expect(laneRunPackageKeys(['packages/..', 'packages//nested', 'apps/..'])).toEqual([]);
+  });
+});
+
+describe('laneRunOwnedPathsOverlap (KS5)', () => {
+  const sameRepo = { repository: 'repo-example-1' };
+
+  it('overlaps equal roots and one root nested under the other', () => {
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['packages/a/src'] }, { ...sameRepo, ownedPaths: ['packages/a/src'] })).toBe(true);
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['packages/a/src'] }, { ...sameRepo, ownedPaths: ['packages/a/src/adapters'] })).toBe(true);
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['packages/a/src/adapters'] }, { ...sameRepo, ownedPaths: ['packages/a/src'] })).toBe(true);
+  });
+
+  it('does not overlap sibling files, sibling tree roots or different repositories', () => {
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['packages/a/src/x.ts'] }, { ...sameRepo, ownedPaths: ['packages/a/src/y.ts'] })).toBe(false);
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['packages/a/src'] }, { ...sameRepo, ownedPaths: ['packages/a/test'] })).toBe(false);
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['packages/a/src'] }, { repository: 'repo-other-1', ownedPaths: ['packages/a/src'] })).toBe(false);
+  });
+
+  it('a trailing glob owns its whole tree and a bare tree root overlaps every root under it', () => {
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['packages/a/**'] }, { ...sameRepo, ownedPaths: ['packages/a/src/x.ts'] })).toBe(true);
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['packages/a/*'] }, { ...sameRepo, ownedPaths: ['packages/a/src'] })).toBe(true);
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['packages'] }, { ...sameRepo, ownedPaths: ['packages/a/src'] })).toBe(true);
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['packages/a/src'] }, { ...sameRepo, ownedPaths: ['packages'] })).toBe(true);
+  });
+
+  it('fails closed when either side has no usable root and no package key', () => {
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['..'] }, { ...sameRepo, ownedPaths: ['packages/a/src'] })).toBe(true);
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['..'] }, { ...sameRepo, ownedPaths: ['..'] })).toBe(true);
+    expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: [] }, { ...sameRepo, ownedPaths: ['packages/a/src'] })).toBe(true);
+  });
+});
+
+describe('LaneRunAdmissionAdapter parked exclusion (KS5)', () => {
+  // The parked run holds a reservation for its own attempt; the new start uses
+  // a distinct attempt id so the run counts as active (the request's own
+  // attempt is always excluded from admission).
+  const PARKED_ATTEMPT = 'attempt-example-2';
+  const NEW_START_ATTEMPT = 'attempt-example-9';
+
+  function parkedMergedRun(): LaneRunRecord {
+    return runRecord(RUN_A_ID, [PARKED_ATTEMPT], 'wo-example-2', {
+      prNumber: 7,
+      parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'running', questionId: null },
+      parkCount: 1,
+    });
+  }
+
+  const overlappingNewOrder = (id = 'wo-example-1') =>
+    workOrderFixture({ id, ownedPaths: ['packages/work-execution/src/adapters'] });
+
+  it('new: a parked run whose PR has merged does not hold admission', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2, wireForgeRead: true });
+    await harness.createRun(parkedMergedRun());
+    harness.workOrders.set('wo-example-2', workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/work-execution/src'] }));
+    harness.workOrders.set('wo-example-1', overlappingNewOrder());
+    await harness.parkRun(RUN_A_ID);
+    await harness.holdReservation(PARKED_ATTEMPT);
+    harness.setForgeReadAnswer(foundPullRequest('merged'));
+
+    const result = await harness.adapter.reserveFirst(
+      firstReservationRequest({ attemptId: NEW_START_ATTEMPT }),
+    );
+    expect(result).toEqual({
+      outcome: 'reserved',
+      hostName: HOST_NAME,
+      hostKind: 'opencode',
+      worktreePath: WORKTREE_PATH,
+      transport: 'local',
+      sshAlias: null,
+      port: null,
+    });
+    expect(harness.reserveCalls).toHaveLength(1);
+  });
+
+  it('new: a parked run with an open PR, unavailable, not-found, throwing or no forge read still blocks (fail closed)', async () => {
+    const scenarios: {
+      readonly name: string;
+      readonly options: AdmissionHarnessOptions;
+      readonly answer?: ReadPullRequestResult;
+    }[] = [
+      { name: 'open PR', options: { maxActiveRuns: 2, wireForgeRead: true }, answer: foundPullRequest('open') },
+      { name: 'unavailable read', options: { maxActiveRuns: 2, wireForgeRead: true }, answer: { outcome: 'unavailable', reason: 'forge down' } },
+      { name: 'not-found read', options: { maxActiveRuns: 2, wireForgeRead: true }, answer: { outcome: 'not-found' } },
+      {
+        name: 'throwing read',
+        options: { maxActiveRuns: 2, forgeRead: { readPullRequest: async () => { throw new Error('forge unreachable'); } } },
+      },
+      { name: 'no forge read wired', options: { maxActiveRuns: 2 } },
+    ];
+    for (const scenario of scenarios) {
+      const harness = makeHarness(scenario.options);
+      await harness.createRun(parkedMergedRun());
+      harness.workOrders.set('wo-example-2', workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/work-execution/src'] }));
+      harness.workOrders.set('wo-example-1', overlappingNewOrder());
+      await harness.parkRun(RUN_A_ID);
+      await harness.holdReservation(PARKED_ATTEMPT);
+      if (scenario.answer !== undefined) {
+        harness.setForgeReadAnswer(scenario.answer);
+      }
+      const result = await harness.adapter.reserveFirst(
+        firstReservationRequest({ attemptId: NEW_START_ATTEMPT }),
+      );
+      expect(result).toEqual({
+        outcome: 'no-capacity',
+        blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
+      });
+      expect(harness.reserveCalls).toHaveLength(0);
+    }
+  });
+
+  it('new: a parked run with prNumber null blocks (fail closed)', async () => {
+    const harness = makeHarness({ maxActiveRuns: 2, wireForgeRead: true });
+    await harness.createRun(runRecord(RUN_A_ID, [PARKED_ATTEMPT], 'wo-example-2', {
+      parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'running', questionId: null },
+      parkCount: 1,
+    }));
+    harness.workOrders.set('wo-example-2', workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/work-execution/src'] }));
+    harness.workOrders.set('wo-example-1', overlappingNewOrder());
+    await harness.parkRun(RUN_A_ID);
+    await harness.holdReservation(PARKED_ATTEMPT);
+    harness.setForgeReadAnswer(foundPullRequest('merged'));
+
+    const result = await harness.adapter.reserveFirst(
+      firstReservationRequest({ attemptId: NEW_START_ATTEMPT }),
+    );
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
+  });
+
+  it('new: the cap still counts a parked run whose PR has merged', async () => {
+    const harness = makeHarness({ maxActiveRuns: 1, wireForgeRead: true });
+    await harness.createRun(parkedMergedRun());
+    harness.workOrders.set('wo-example-2', workOrderFixture({ id: 'wo-example-2', ownedPaths: ['packages/work-execution/src'] }));
+    // The new order's files are disjoint; only the cap can block.
+    harness.workOrders.set('wo-example-1', workOrderFixture({ id: 'wo-example-1', ownedPaths: ['packages/other'] }));
+    await harness.parkRun(RUN_A_ID);
+    await harness.holdReservation(PARKED_ATTEMPT);
+    harness.setForgeReadAnswer(foundPullRequest('merged'));
+
+    const result = await harness.adapter.reserveFirst(
+      firstReservationRequest({ attemptId: NEW_START_ATTEMPT }),
+    );
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: [RUN_A_ID], attemptIds: [] },
+    });
+    expect(harness.reserveCalls).toHaveLength(0);
   });
 });

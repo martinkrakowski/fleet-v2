@@ -180,22 +180,25 @@ describe('deriveConductorSchedule', () => {
     ]);
   });
 
-  it('lists package overlaps between rows of the same repository', () => {
+  it('lists owned-file overlaps between rows of the same repository, not sibling files', () => {
     const runs = [
       runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-1' }),
       runRecord({ runId: RUN_B, attemptIds: ['a2'], workOrderId: 'wo-2' }),
       runRecord({ runId: RUN_C, attemptIds: ['a3'], workOrderId: 'wo-3' }),
+      runRecord({ runId: RUN_D, attemptIds: ['a4'], workOrderId: 'wo-4' }),
     ];
     const workOrders = new Map([
-      ['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a/x.ts'] }],
-      ['wo-2', { repository: 'acme/repo', ownedPaths: ['packages/a/y.ts'] }],
+      ['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a/src'] }],
+      ['wo-2', { repository: 'acme/repo', ownedPaths: ['packages/a/src/adapters'] }],
       ['wo-3', { repository: 'other/repo', ownedPaths: ['packages/a'] }],
+      ['wo-4', { repository: 'acme/repo', ownedPaths: ['packages/a/test'] }],
     ]);
     const schedule = deriveConductorSchedule(facts({ runs, workOrders }), NOW);
     const overlapsOf = (runId: string) => schedule.rows.find((row) => row.runId === runId)?.overlapsWith;
     expect(overlapsOf(RUN_A)).toEqual([RUN_B]);
     expect(overlapsOf(RUN_B)).toEqual([RUN_A]);
     expect(overlapsOf(RUN_C)).toEqual([]);
+    expect(overlapsOf(RUN_D)).toEqual([]);
   });
 
   it('flags an unreadable work order with a package-overlap wait', () => {
@@ -370,12 +373,12 @@ describe('deriveConductorSchedule', () => {
     expect(schedule.queues).toEqual([]);
   });
 
-  it('two runs sharing a package on different bases still overlap and wait', () => {
+  it('two runs whose owned files overlap on different bases still overlap and wait', () => {
     const active = runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-1', baseBranch: 'chain/a' });
     const waiting = runRecord({ runId: RUN_B, attemptIds: ['a2'], workOrderId: 'wo-2', baseBranch: 'main' });
     const workOrders = new Map([
-      ['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a'] }],
-      ['wo-2', { repository: 'acme/repo', ownedPaths: ['packages/a'] }],
+      ['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a/src'] }],
+      ['wo-2', { repository: 'acme/repo', ownedPaths: ['packages/a/src/adapters'] }],
     ]);
     const schedule = deriveConductorSchedule(
       facts({ runs: [active, waiting], reservations: [reservation({ attemptId: 'a1' })], workOrders }),
@@ -383,6 +386,21 @@ describe('deriveConductorSchedule', () => {
     );
     expect(schedule.rows.find((row) => row.runId === RUN_A)?.overlapsWith).toEqual([RUN_B]);
     expect(schedule.rows.find((row) => row.runId === RUN_B)?.admissionWait).toBe('package-overlap');
+  });
+
+  it('rows of one package with disjoint files do not overlap or wait', () => {
+    const active = runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-1' });
+    const waiting = runRecord({ runId: RUN_B, attemptIds: ['a2'], workOrderId: 'wo-2' });
+    const workOrders = new Map([
+      ['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a/src'] }],
+      ['wo-2', { repository: 'acme/repo', ownedPaths: ['packages/a/test'] }],
+    ]);
+    const schedule = deriveConductorSchedule(
+      facts({ runs: [active, waiting], reservations: [reservation({ attemptId: 'a1' })], workOrders }),
+      NOW,
+    );
+    expect(schedule.rows.find((row) => row.runId === RUN_A)?.overlapsWith).toEqual([]);
+    expect(schedule.rows.find((row) => row.runId === RUN_B)?.admissionWait).toBeNull();
   });
 });
 

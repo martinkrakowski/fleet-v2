@@ -1,14 +1,15 @@
 // Implemented for lane K7-5b (owner decision K7-D7, "Start reserves first").
 /**
  * LaneRunStartCapacityPort: reserve capacity for a new run's first attempt
- * after the global cap and package-busy checks (K7-D5); the reserve chooses
- * host and worktree path, and the reservation is the single authority for
- * the run's worktree path. Later attempts of a run are admitted through
+ * after the global cap and owned-file overlap checks (K7-D5); the reserve
+ * chooses host and worktree path, and the reservation is the single authority
+ * for the run's worktree path. Later attempts of a run are admitted through
  * `LaneRunAdmissionPort.admit` instead, pinned to the run's own host and
  * worktree; `LaneRunAdmissionAdapter` implements both ports.
  */
 
 import type { RunnerKind } from '../../../domain/execution-records.js';
+import type { LaneRunAdmissionBlockers } from './LaneRunAdmissionPort.out-port.js';
 
 export interface LaneRunFirstReservationRequest {
   readonly attemptId: string;
@@ -28,7 +29,7 @@ export type LaneRunFirstReservationResult =
       readonly sshAlias: string | null;
       readonly port: number | null;
     }
-  | { readonly outcome: 'no-capacity' }
+  | { readonly outcome: 'no-capacity'; readonly blockedBy?: LaneRunAdmissionBlockers }
   | {
       readonly outcome: 'refused';
       readonly reason:
@@ -38,7 +39,7 @@ export type LaneRunFirstReservationResult =
         | 'reservation-incomplete';
     };
 
-/** The first attempt of a new run: global cap and package-busy, then the reserve chooses host and worktree path (K7-D7). */
+/** The first attempt of a new run: global cap and owned-file overlap, then the reserve chooses host and worktree path (K7-D7). */
 export interface LaneRunStartCapacityPort {
   reserveFirst(request: LaneRunFirstReservationRequest): Promise<LaneRunFirstReservationResult>;
 }

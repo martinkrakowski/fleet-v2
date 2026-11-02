@@ -172,6 +172,7 @@ export function buildLiveConductorDriver(
     executionJournal: execution.executionJournal,
     maxActiveRuns: options.maxActiveRuns,
     candidateHosts: laneRunnerCandidateHosts(runtime.installation),
+    forgeRead: execution.forgeRead,
     newReservationId: () => 'res-' + conductor.newUlid(),
   });
   // One cancel use case serves the advance's G4e cancel and start's abandon.

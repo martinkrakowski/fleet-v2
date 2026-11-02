@@ -30,7 +30,6 @@ const BODY = {
   claims: ["dispatch-attempt"],
 };
 
-const SCOPE_REASON = "the presenting token lacks the orchestrate scope";
 const NOT_OWNER_REASON = "this session was registered by another token";
 
 describe("orchestrator routes", () => {
@@ -178,23 +177,21 @@ describe("orchestrator routes", () => {
 
     const refused = await post("/v1/orchestrators", BODY);
     expect(refused.status).toBe(403);
-    const refusedBody = await refused.json();
-    expect(refusedBody.code).toBe("FORBIDDEN");
-    expect(refusedBody.result.reason).toBe(SCOPE_REASON);
+    expect(await refused.json()).toEqual({ error: "Forbidden: scope required" });
 
     const listed = await get("/v1/orchestrators");
-    expect(listed.status).toBe(200);
-    expect((await listed.json()).result.sessions).toEqual([]);
+    expect(listed.status).toBe(403);
+    expect(await listed.json()).toEqual({ error: "Forbidden: scope required" });
 
     presentAs(SHARED_BEARER_TOKEN_ID, ["orchestrate"]);
     await registerSession();
     presentAs("token-example-msg", ["message"]);
     const heartbeat = await post("/v1/orchestrators/orch-example-1/heartbeat", {});
     expect(heartbeat.status).toBe(403);
-    expect((await heartbeat.json()).result.reason).toBe(SCOPE_REASON);
+    expect(await heartbeat.json()).toEqual({ error: "Forbidden: scope required" });
     const retire = await post("/v1/orchestrators/orch-example-1/retire", {});
     expect(retire.status).toBe(403);
-    expect((await retire.json()).result.reason).toBe(SCOPE_REASON);
+    expect(await retire.json()).toEqual({ error: "Forbidden: scope required" });
 
     presentAs(SHARED_BEARER_TOKEN_ID, ["orchestrate"]);
     const unchanged = await get("/v1/orchestrators");

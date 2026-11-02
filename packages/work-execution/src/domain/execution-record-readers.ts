@@ -457,12 +457,14 @@ function readAttemptUsage(value: unknown): AttemptUsageRecord | null {
   if (source !== 'opencode-db' && source !== 'opencode-api' && source !== 'unavailable') {
     malformed();
   }
+  const runnerMinutes = readOptionalRunnerMinutes(snap.runnerMinutes);
   return {
     source: source as AttemptUsageRecord['source'],
     readAtIso: requiredString(snap, 'readAtIso'),
     sessionId: requireNullableString(snap, 'sessionId'),
     steps: nullableNonNegativeSafeInt(snap, 'steps'),
     wallSeconds: nullableNonNegativeFinite(snap, 'wallSeconds'),
+    ...(runnerMinutes === undefined ? {} : { runnerMinutes }),
     tokensInput: nullableNonNegativeSafeInt(snap, 'tokensInput'),
     tokensOutput: nullableNonNegativeSafeInt(snap, 'tokensOutput'),
     tokensReasoning: nullableNonNegativeSafeInt(snap, 'tokensReasoning'),
@@ -480,6 +482,20 @@ function validateSeatRole(role: unknown): AttemptSeatSelectionRecord['role'] {
     malformed();
   }
   return role as AttemptSeatSelectionRecord['role'];
+}
+
+/** The optional usage `runnerMinutes`: absent stays absent, null is kept, otherwise a non-negative safe integer. */
+function readOptionalRunnerMinutes(value: unknown): number | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null) {
+    return null;
+  }
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    malformed();
+  }
+  return value as number;
 }
 
 function readSeatTicket(value: unknown): number | undefined {

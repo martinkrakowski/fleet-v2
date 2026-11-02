@@ -517,3 +517,72 @@ export function resolveConductorPolicy(policy: PolicySection | undefined): Resol
     reaper: reaper ?? freshDefaultConductorReaper(),
   });
 }
+
+/** Inclusive integer bounds for `policy.board` (WB6p). The first three mirror
+ * work-execution's `isValidPolicy` (work-board.ts:172-176); forgeSyncMinutes
+ * mirrors the conductor's intervalMinutes (WB7c consumes it). */
+export const BOARD_BOUNDS: Readonly<
+  Record<string, Readonly<{ min: number; max: number }>>
+> = Object.freeze({
+  forgeStaleMinutes: Object.freeze({ min: 1, max: 1440 }),
+  declarationTtlMinutes: Object.freeze({ min: 1, max: 10080 }),
+  doneWindowDays: Object.freeze({ min: 1, max: 3650 }),
+  forgeSyncMinutes: Object.freeze({ min: 1, max: 1440 }),
+});
+
+const BOARD_KEYS: readonly string[] = [
+  'forgeStaleMinutes', 'declarationTtlMinutes', 'doneWindowDays', 'forgeSyncMinutes',
+];
+
+/** The board policy for an installation without `policy.board` (WB6p):
+ * the plan's defaults (D3, D6, §3.4; forgeSyncMinutes per WB7c). Deeply frozen. */
+export const DEFAULT_BOARD_POLICY: ResolvedBoardPolicy = Object.freeze({
+  forgeStaleMinutes: 15,
+  declarationTtlMinutes: 90,
+  doneWindowDays: 14,
+  forgeSyncMinutes: 10,
+});
+
+export interface ResolvedBoardPolicy {
+  readonly forgeStaleMinutes: number;
+  readonly declarationTtlMinutes: number;
+  readonly doneWindowDays: number;
+  readonly forgeSyncMinutes: number;
+}
+
+function freshDefaultBoardPolicy(): ResolvedBoardPolicy {
+  return Object.freeze({ ...DEFAULT_BOARD_POLICY });
+}
+
+/**
+ * The effective board policy: the block's own data properties with every
+ * absent field defaulted, only when the block is a plain record with only
+ * known keys and every present field is an integer within BOARD_BOUNDS;
+ * absent or malformed anywhere is the whole default (fail closed). Always a
+ * fresh, frozen object with the keys in canonical order.
+ */
+export function resolveBoardPolicy(policy: PolicySection | undefined): ResolvedBoardPolicy {
+  if (!isPlainRecord(policy) || !Object.hasOwn(policy, 'board')) {
+    return freshDefaultBoardPolicy();
+  }
+  const block = readOwnDataProperty(policy, 'board');
+  if (!isPlainRecord(block) || hasUnknownKeys(block, BOARD_KEYS)) {
+    return freshDefaultBoardPolicy();
+  }
+  const values: Record<string, number> = {};
+  for (const key of BOARD_KEYS) {
+    const value = readBoundedInteger(readOwnDataProperty(block, key), BOARD_BOUNDS[key]);
+    if (Object.hasOwn(block, key) && value === undefined) {
+      return freshDefaultBoardPolicy();
+    }
+    if (value !== undefined) {
+      values[key] = value;
+    }
+  }
+  return Object.freeze({
+    forgeStaleMinutes: values.forgeStaleMinutes ?? DEFAULT_BOARD_POLICY.forgeStaleMinutes,
+    declarationTtlMinutes: values.declarationTtlMinutes ?? DEFAULT_BOARD_POLICY.declarationTtlMinutes,
+    doneWindowDays: values.doneWindowDays ?? DEFAULT_BOARD_POLICY.doneWindowDays,
+    forgeSyncMinutes: values.forgeSyncMinutes ?? DEFAULT_BOARD_POLICY.forgeSyncMinutes,
+  });
+}

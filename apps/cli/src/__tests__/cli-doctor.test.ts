@@ -12,7 +12,12 @@ import * as path from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { FleetInstallationModel } from '@fleet/installation';
-import type { DoctorLine, DoctorProbes, HostProbeExecutor } from '@fleet/onboarding';
+import {
+  GH_BINARY_CANDIDATES,
+  type DoctorLine,
+  type DoctorProbes,
+  type HostProbeExecutor,
+} from '@fleet/onboarding';
 
 import { runCli, type CliIo, type DoctorCliOptions } from '../index.js';
 
@@ -64,6 +69,10 @@ function passingProbes(calls?: string[]): DoctorProbes {
     worktreeRootWritable: async () => true,
     ocmRunBinary: async () => ({ path: '/repo/bin/ocm-run', sha256: 'c'.repeat(64) }),
     expectedOcmRunHash: async () => 'c'.repeat(64),
+    ghBinary: async () => ({
+      resolved: '/usr/bin/gh',
+      candidates: GH_BINARY_CANDIDATES,
+    }),
     seatProbe: async () => {
       calls?.push('seatProbe');
       return { outcome: 'pass', reason: 'answered' };
@@ -108,7 +117,7 @@ describe('fleet-v2 doctor', () => {
     expect(calls).toContain('seatProbe');
     expect(stdout.length).toBeGreaterThan(0);
     for (const text of stdout) {
-      expect(text).toMatch(/^(PASS|FAIL|UNKNOWN) (installation|host|tool|seat|credential|runner-binary) \S+ \S+ — /);
+      expect(text).toMatch(/^(PASS|FAIL|UNKNOWN) (installation|host|tool|seat|credential|runner-binary|gh-binary) \S+ \S+ — /);
     }
     expect(stdout.some((text) => text.startsWith('PASS seat seat-1 probe — '))).toBe(true);
   });
@@ -140,6 +149,29 @@ describe('fleet-v2 doctor', () => {
       doctorOptions(probes),
     );
     expect(code).toBe(1);
+  });
+
+  it('reports a missing gh binary as FAIL naming the fixed paths, and exits 1', async () => {
+    const probes = passingProbes();
+    probes.ghBinary = async () => ({
+      resolved: undefined,
+      candidates: GH_BINARY_CANDIDATES,
+    });
+    const { io, stdout } = captureIo();
+    const code = await runCli(
+      ['doctor', '--probe-seats'],
+      io,
+      undefined,
+      doctorOptions(probes),
+    );
+    expect(code).toBe(1);
+    expect(
+      stdout.some(
+        (text) =>
+          text.startsWith('FAIL gh-binary gh resolved — ') &&
+          GH_BINARY_CANDIDATES.every((candidate) => text.includes(candidate)),
+      ),
+    ).toBe(true);
   });
 
   it('prints one JSON document per line with --json', async () => {

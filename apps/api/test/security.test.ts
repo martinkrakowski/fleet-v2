@@ -19,6 +19,7 @@ import {
   setActiveApiToken,
 } from "../server/wiring/token.js";
 import { configureWorkComposition } from "../server/wiring/work/composition.js";
+import { configurePresentedTokenResolver } from "../server/wiring/presented-token.js";
 
 // Nitro auto-imports h3 utilities into the global scope at build time;
 // vitest does not, so stub them globally before loading route modules.
@@ -88,6 +89,7 @@ describe("API Security and Hardening", () => {
     configureFleetApiRuntime(null);
     setActiveApiToken(null);
     configureWorkComposition(null);
+    configurePresentedTokenResolver(null);
     delete process.env.FLEET_STATE_DIR;
     delete process.env.FLEET_API_TOKEN_FILE;
     delete process.env.FLEET_API_ALLOWED_ORIGINS;
@@ -134,6 +136,7 @@ describe("API Security and Hardening", () => {
     configureFleetApiRuntime(null);
     setActiveApiToken(null);
     configureWorkComposition(null);
+    configurePresentedTokenResolver(null);
     delete process.env.FLEET_STATE_DIR;
     delete process.env.FLEET_API_TOKEN_FILE;
     delete process.env.FLEET_API_ALLOWED_ORIGINS;
@@ -429,6 +432,150 @@ describe("API Security and Hardening", () => {
         body: "foo=bar",
       });
       expect(res.status).toBe(401);
+    });
+  });
+
+  describe("scopes", () => {
+    it("passes the shared bearer through GET and POST under /v1", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+
+      const getRes = await fetch(`${baseUrl}/v1/test`, {
+        headers: { authorization: `Bearer ${VALID_TOKEN}` },
+      });
+      expect(getRes.status).toBe(200);
+
+      const postRes = await fetch(`${baseUrl}/v1/test`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      expect(postRes.status).toBe(200);
+    });
+
+    it("refuses an unmapped POST with 403 for a non-shared token", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+      configurePresentedTokenResolver(() => ({ tokenId: "test-session", scopes: ["read"] }));
+
+      const res = await fetch(`${baseUrl}/v1/not-a-route`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: "Forbidden: unmapped route" });
+    });
+
+    it("refuses an unmapped GET with 403 for a non-shared read token", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+      configurePresentedTokenResolver(() => ({ tokenId: "test-session", scopes: ["read"] }));
+
+      const res = await fetch(`${baseUrl}/v1/not-a-route`, {
+        headers: { authorization: `Bearer ${VALID_TOKEN}` },
+      });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: "Forbidden: unmapped route" });
+    });
+
+    it("lets a read token through a mapped GET and blocks operate and orchestrate", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+      configurePresentedTokenResolver(() => ({ tokenId: "test-session", scopes: ["read"] }));
+
+      const getRes = await fetch(`${baseUrl}/v1/attempts/att-missing`, {
+        headers: { authorization: `Bearer ${VALID_TOKEN}` },
+      });
+      expect(getRes.status).toBe(200);
+
+      const stopRes = await fetch(`${baseUrl}/v1/attempts/a1/stop`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      expect(stopRes.status).toBe(403);
+      expect(await stopRes.json()).toEqual({ error: "Forbidden: scope required" });
+      expect(stopHandlerInvoked).toBe(false);
+
+      const orchRes = await fetch(`${baseUrl}/v1/orchestrators`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      expect(orchRes.status).toBe(403);
+    });
+
+    it("lets an operate token through the stop route", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+      configurePresentedTokenResolver(() => ({ tokenId: "test-session", scopes: ["operate"] }));
+
+      const res = await fetch(`${baseUrl}/v1/attempts/a1/stop`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).not.toBe(403);
+      expect(stopHandlerInvoked).toBe(true);
+    });
+
+    it("blocks operate and orchestrate for a hook token", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+      configurePresentedTokenResolver(() => ({ tokenId: "test-session", scopes: ["hook"] }));
+
+      const stopRes = await fetch(`${baseUrl}/v1/attempts/a1/stop`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      expect(stopRes.status).toBe(403);
+
+      const orchRes = await fetch(`${baseUrl}/v1/orchestrators`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      expect(orchRes.status).toBe(403);
+    });
+
+    it("does not let an encoded mutation path reach a route under a weaker scope", async () => {
+      setActiveApiToken(VALID_TOKEN);
+      configureFleetApiRuntime({ stateDir: tempDir });
+      configurePresentedTokenResolver(() => ({ tokenId: "test-session", scopes: ["read"] }));
+
+      const res = await fetch(`${baseUrl}/v1/%61ttempts/a1/stop`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${VALID_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(403);
+      expect(stopHandlerInvoked).toBe(false);
     });
   });
 

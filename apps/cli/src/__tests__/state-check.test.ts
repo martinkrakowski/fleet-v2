@@ -124,7 +124,7 @@ describe('fleet-v2 state', () => {
     const { io, stdout } = mockIo();
     const code = await runCli(['--state-dir', dir, 'state', 'check'], io);
     expect(code).toBe(0);
-    expect(stdout.join('')).toContain('attempts.json: ok (2 records)\n');
+    expect(stdout.join('')).toContain('attempts.json: ok (2 records, schemaVersion 1)\n');
   });
 
   it('uses singular record for a one-record attempts store', async () => {
@@ -133,7 +133,7 @@ describe('fleet-v2 state', () => {
     const { io, stdout } = mockIo();
     const code = await runCli(['--state-dir', dir, 'state', 'check'], io);
     expect(code).toBe(0);
-    expect(stdout.join('')).toContain('attempts.json: ok (1 record)\n');
+    expect(stdout.join('')).toContain('attempts.json: ok (1 record, schemaVersion 1)\n');
   });
 
   it('reports an unreadable journal store and exits 1', async () => {
@@ -245,7 +245,7 @@ describe('fleet-v2 state', () => {
     expect(code).toBe(0);
     const text = stdout.join('');
     expect(text).toContain(
-      `  quarantine attempts.json.20261025T101500.123Z-0.0123456789ab: ok (2 records), ${copyContent.length} bytes\n`,
+      `  quarantine attempts.json.20261025T101500.123Z-0.0123456789ab: ok (2 records, schemaVersion 1), ${copyContent.length} bytes\n`,
     );
     expect(text).not.toContain('notes.txt');
   });
@@ -268,5 +268,126 @@ describe('fleet-v2 state', () => {
     const code = await runCli(['--state-dir', filePath, 'state', 'check'], io);
     expect(code).toBe(1);
     expect(stdout[0]?.endsWith('(not a directory)\n')).toBe(true);
+  });
+
+  function laneRunFixture(runId: string): unknown {
+    return {
+      version: 1,
+      runId,
+      workOrderId: 'wo-example-1',
+      tier: 2,
+      seatPlanRef: 'a'.repeat(64),
+      cursors: { 'first-pass': 0, fix: null, review: null },
+      round: 0,
+      attemptIds: ['attempt-example-1'],
+      prNumber: null,
+      parked: null,
+      parkCount: 0,
+      lease: null,
+      revision: 1,
+      runPolicyRevision: 'policy-example-1',
+    };
+  }
+
+  function runJournalEntryFixture(entryId: string, runId: string): unknown {
+    return {
+      version: 1,
+      entryId,
+      kind: 'conduct',
+      key: null,
+      runId,
+      recordedAtIso: '2026-10-25T00:00:00.000Z',
+      mode: null,
+      expectedRevision: null,
+      mintedId: null,
+      outcome: null,
+      reasonCode: null,
+      detail: null,
+      grantId: null,
+      state: 'running',
+    };
+  }
+
+  /** Write all five versioned stores with minimal readable records; when `stamp`, carry schemaVersion 1. */
+  async function writeAllVersionedStores(dir: string, stamp: boolean): Promise<void> {
+    const stampIf = (record: Record<string, unknown>): unknown => (stamp ? { ...record, schemaVersion: 1 } : record);
+    await fs.writeFile(
+      path.join(dir, 'attempts.json'),
+      JSON.stringify([stampIf(ATTEMPT_RECORD('a1')), stampIf(ATTEMPT_RECORD('a2'))]),
+    );
+    await fs.writeFile(
+      path.join(dir, 'journal.json'),
+      JSON.stringify([stampIf({ id: 'je-1', attemptId: 'a' }), stampIf({ id: 'je-2', attemptId: 'a' })]),
+    );
+    await fs.writeFile(
+      path.join(dir, 'reservations.json'),
+      JSON.stringify([stampIf({ id: 'rs-1', attemptId: 'a' }), stampIf({ id: 'rs-2', attemptId: 'a' })]),
+    );
+    await fs.writeFile(
+      path.join(dir, 'lane-runs.json'),
+      JSON.stringify([
+        stampIf(laneRunFixture('run-01JB0000000000000000000000') as Record<string, unknown>),
+        stampIf(laneRunFixture('run-01JB0000000000000000000001') as Record<string, unknown>),
+      ]),
+    );
+    await fs.writeFile(
+      path.join(dir, 'run-journal.json'),
+      JSON.stringify([
+        stampIf(runJournalEntryFixture('01JB0000000000000000000001', 'run-01JB0000000000000000000000') as Record<string, unknown>),
+        stampIf(runJournalEntryFixture('01JB0000000000000000000002', 'run-01JB0000000000000000000000') as Record<string, unknown>),
+      ]),
+    );
+  }
+
+  it('reports schemaVersion 1 across all five versioned stores whether on-disk records omit or carry it', async () => {
+    for (const stamp of [false, true]) {
+      const dir = makeTempDir();
+      await writeAllVersionedStores(dir, stamp);
+      const { io, stdout } = mockIo();
+      const code = await runCli(['--state-dir', dir, 'state', 'check'], io);
+      expect(code).toBe(0);
+      const text = stdout.join('');
+      expect(text).toContain('attempts.json: ok (2 records, schemaVersion 1)\n');
+      expect(text).toContain('journal.json: ok (2 records, schemaVersion 1)\n');
+      expect(text).toContain('reservations.json: ok (2 records, schemaVersion 1)\n');
+      expect(text).toContain('lane-runs.json: ok (2 records, schemaVersion 1)\n');
+      expect(text).toContain('run-journal.json: ok (2 records, schemaVersion 1)\n');
+    }
+  });
+
+  it('reports ok (0 records) for an empty versioned store', async () => {
+    const dir = makeTempDir();
+    await fs.writeFile(path.join(dir, 'attempts.json'), '[]');
+    const { io, stdout } = mockIo();
+    const code = await runCli(['--state-dir', dir, 'state', 'check'], io);
+    expect(code).toBe(0);
+    expect(stdout.join('')).toContain('attempts.json: ok (0 records)\n');
+  });
+
+  it('reports unsupported schemaVersion at record <n> with exit 1 and zero writes', async () => {
+    const dir = makeTempDir();
+    await fs.writeFile(
+      path.join(dir, 'attempts.json'),
+      JSON.stringify([ATTEMPT_RECORD('a1'), { ...ATTEMPT_RECORD('a2'), schemaVersion: 2 }]),
+    );
+    const snapshot = async (): Promise<Array<{ rel: string; size: number; mtimeMs: number }>> => {
+      const entries = await fs.readdir(dir, { recursive: true });
+      const stats = await Promise.all(
+        entries.map(async (rel) => ({ rel, stat: await fs.lstat(path.join(dir, rel)) })),
+      );
+      return stats
+        .filter(({ stat }) => !stat.isDirectory())
+        .map(({ rel, stat }) => ({ rel, size: stat.size, mtimeMs: stat.mtimeMs }))
+        .sort((a, b) => a.rel.localeCompare(b.rel));
+    };
+    const before = await snapshot();
+    const { io, stdout } = mockIo();
+    const code = await runCli(['--state-dir', dir, 'state', 'check'], io);
+    expect(code).toBe(1);
+    const text = stdout.join('');
+    expect(text).toContain('attempts.json: unsupported schemaVersion at record 1\n');
+    expect(text).toContain('state check: 1 of 19 store files unreadable\n');
+    expect(await snapshot()).toEqual(before);
+    await expect(fs.stat(path.join(dir, 'quarantine'))).rejects.toThrow();
   });
 });

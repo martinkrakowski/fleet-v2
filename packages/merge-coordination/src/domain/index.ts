@@ -2,6 +2,7 @@
 
 export * from "./admission-policy.js";
 export * from "./batch-formation.js";
+export * from "./candidate-chain.js";
 export * from "./entities/index.js";
 export * from "./train-state.js";
 export * from "./value-objects/index.js";

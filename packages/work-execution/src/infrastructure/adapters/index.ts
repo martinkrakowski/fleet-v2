@@ -22,6 +22,7 @@ export * from "./ConfirmRecordedHost.js";
 export * from "./DaemonEventProjectionAdapter.adapter.js";
 export * from "./DaemonLeaseAdapter.adapter.js";
 export * from "./DaemonPauseAdapter.adapter.js";
+export * from "./DaemonSingleRecordFile.helper.js";
 export * from "./DaemonStatusFileAdapter.adapter.js";
 export * from "./ExecutionJournalAdapter.adapter.js";
 export * from "./ExecutionObservationAdapter.adapter.js";

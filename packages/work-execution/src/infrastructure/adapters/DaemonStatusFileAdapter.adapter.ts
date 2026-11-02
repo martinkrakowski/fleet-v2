@@ -8,7 +8,6 @@
  * bytes when unreadable unless the adapter was opened read-only.
  */
 
-import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -22,15 +21,12 @@ import type {
   DaemonStatusFileRead,
   DaemonStatusPort,
 } from '../../application/ports/out/DaemonStatusPort.out-port.js';
+import { assertStoreWritable } from './file-store.js';
 import {
-  StateFileUnknownVersionError,
-  StateFileUnreadableError,
-  StateFileUnreadableReadOnlyError,
-  assertStoreWritable,
-  rejectUnreadableStateFile,
-  withFileLock,
-  writeJsonAtomically,
-} from './file-store.js';
+  readSingleRecordFileState,
+  writeSingleRecordFile,
+  type SingleRecordFileState,
+} from './DaemonSingleRecordFile.helper.js';
 
 export interface DaemonStatusFileAdapterOptions {
   /** When set, the status persists at `<stateDir>/daemon/status.json`. */
@@ -38,19 +34,6 @@ export interface DaemonStatusFileAdapterOptions {
   /** Read-only mode: reads never quarantine, and every write is refused. */
   readonly readOnly?: boolean;
 }
-
-function isENOENT(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    (error as { code?: string }).code === 'ENOENT'
-  );
-}
-
-type StatusFileState =
-  | { readonly status: 'missing' }
-  | { readonly status: 'ok'; readonly record: DaemonStatusRecord }
-  | { readonly status: 'unreadable' };
 
 export class DaemonStatusFileAdapter implements DaemonStatusPort {
   private inMemoryStatus: DaemonStatusRecord | null = null;
@@ -68,9 +51,7 @@ export class DaemonStatusFileAdapter implements DaemonStatusPort {
       this.inMemoryStatus = built.record;
       return built;
     }
-    await withFileLock(`${target}.lock`, async () => {
-      await writeJsonAtomically(target, built.record);
-    });
+    await writeSingleRecordFile(target, built.record);
     return built;
   }
 
@@ -82,52 +63,13 @@ export class DaemonStatusFileAdapter implements DaemonStatusPort {
     return { status: state.status };
   }
 
-  private async readFileState(): Promise<StatusFileState> {
-    const target = this.statePath;
-    if (target === null) {
-      return this.inMemoryStatus === null
-        ? { status: 'missing' }
-        : { status: 'ok', record: { ...this.inMemoryStatus } };
-    }
-    let buffer: Buffer;
-    try {
-      buffer = await fs.readFile(target);
-    } catch (error: unknown) {
-      if (isENOENT(error)) {
-        return { status: 'missing' };
-      }
-      return { status: 'unreadable' };
-    }
-    let raw: unknown;
-    try {
-      raw = JSON.parse(buffer.toString('utf8'));
-    } catch {
-      await this.rejectOrSwallow(target, 'not valid JSON', buffer);
-      return { status: 'unreadable' };
-    }
-    const read = readDaemonStatusRecord(raw);
-    if (!read.ok) {
-      if (read.reason === 'unknown-version') {
-        throw new StateFileUnknownVersionError(target, 0);
-      }
-      await this.rejectOrSwallow(target, read.error, buffer);
-      return { status: 'unreadable' };
-    }
-    return { status: 'ok', record: read.record };
-  }
-
-  private async rejectOrSwallow(target: string, detail: string, buffer: Buffer): Promise<void> {
-    try {
-      await rejectUnreadableStateFile(target, detail, buffer, this.options?.readOnly === true);
-    } catch (error: unknown) {
-      if (
-        error instanceof StateFileUnreadableError ||
-        error instanceof StateFileUnreadableReadOnlyError
-      ) {
-        return;
-      }
-      throw error;
-    }
+  private readFileState(): Promise<SingleRecordFileState<DaemonStatusRecord>> {
+    return readSingleRecordFileState(
+      this.statePath,
+      this.inMemoryStatus,
+      readDaemonStatusRecord,
+      this.options?.readOnly === true,
+    );
   }
 
   private get statePath(): string | null {

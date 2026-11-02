@@ -910,6 +910,8 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     gh: GhInvocationResult,
     request: Extract<MergeForgeActionRequest, { kind: 'update-branch' }>,
   ): Promise<MergeForgeActionResult> {
+    // A changed head after a failed call does not say who changed it: this action or
+    // someone else's push. It is never `executed` and never a definite refusal.
     const readBudget = this.budgetCallTimeoutMs(request.deadlineIso);
     if (readBudget.ok) {
       const read = await this.mergeReadPullRequest(request, readBudget.timeoutMs);
@@ -919,7 +921,10 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
         read.outcome !== 'unavailable' &&
         read.pullRequest.headSha !== request.expectedHeadSha
       ) {
-        return { outcome: 'executed', headSha: read.pullRequest.headSha };
+        return {
+          outcome: 'ambiguous',
+          reason: `gh api update-branch failed (exit ${gh.exitCode}) and the head changed`,
+        };
       }
     }
     const refusalKind = classifyGhRefusal(gh.stderr, gh.stdout);

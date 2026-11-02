@@ -503,6 +503,41 @@ describe('ForgeActionAdapter merge-pass path (MergeForgeActionPort)', () => {
     expect(requests).toHaveLength(4);
   });
 
+  it('reports ambiguous when update-branch fails and the head changed, whatever the refusal says', async () => {
+    for (const stderr of ['HTTP 500 internal server error', 'merge conflict: cannot be cleanly created']) {
+      const { adapter } = makeAdapter({
+        runGhResult: { exitCode: 1, stdout: '', stderr },
+        reader: [foundSnapshot(), foundSnapshot({ headSha: OTHER_SHA })],
+        config: { mergeGhConfigDir: MERGE_DIR },
+      });
+      const result = await adapter.performMergeForgeAction(mergeRequest({ kind: 'update-branch' }));
+      expect(result).toEqual({
+        outcome: 'ambiguous',
+        reason: 'gh api update-branch failed (exit 1) and the head changed',
+      });
+    }
+  });
+
+  it('reports ambiguous when update-branch fails with no definite refusal and the head is unchanged', async () => {
+    const { adapter } = makeAdapter({
+      runGhResult: { exitCode: 1, stdout: '', stderr: 'HTTP 500 internal server error' },
+      reader: foundSnapshot(),
+      config: { mergeGhConfigDir: MERGE_DIR },
+    });
+    const result = await adapter.performMergeForgeAction(mergeRequest({ kind: 'update-branch' }));
+    expect(result.outcome).toBe('ambiguous');
+  });
+
+  it('reports refused when update-branch definitely refused and the head is unchanged', async () => {
+    const { adapter } = makeAdapter({
+      runGhResult: { exitCode: 1, stdout: '', stderr: 'HTTP 403: must have write access' },
+      reader: foundSnapshot(),
+      config: { mergeGhConfigDir: MERGE_DIR },
+    });
+    const result = await adapter.performMergeForgeAction(mergeRequest({ kind: 'update-branch' }));
+    expect(result.outcome).toBe('refused');
+  });
+
   it('continues update-branch re-reading after an unavailable read and reports the new head', async () => {
     const { adapter, calls, requests } = makeAdapter({
       reader: [

@@ -293,7 +293,7 @@ if [ $rc -eq 0 ]; then ok 'pre-existing copies with an unrelated change are clea
 no_zebra "$stdout"
 
 # h. two copies inside one new file: exit 1 (same-file duplication, far apart).
-R=$T/h
+R=$(mktemp -d "$T/case-h.XXXXXX") || exit 1
 new_repo "$R"
 fixture base >"$R/packages/a/src/one.ts"
 git -C "$R" add -A >/dev/null && git -C "$R" commit -qm base

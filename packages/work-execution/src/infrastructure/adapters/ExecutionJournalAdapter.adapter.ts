@@ -17,7 +17,11 @@ import type {
   ActionJournalEntryRecord,
   CapacityReservationRecord,
 } from '../../domain/execution-records.js';
-import { parseSeatTool } from '../../domain/execution-records.js';
+import {
+  ACTION_JOURNAL_ENTRY_SCHEMA_VERSION,
+  CAPACITY_RESERVATION_SCHEMA_VERSION,
+  parseSeatTool,
+} from '../../domain/execution-records.js';
 import type {
   CapacityReservationClaim,
   ExecutionJournalPort,
@@ -27,7 +31,28 @@ import type {
 } from '../../application/ports/out/ExecutionJournalPort.out-port.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
 import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
-import { inspectRecordListBytes, quarantineUnreadable, withFileLock, writeJsonAtomically } from './file-store.js';
+import {
+  assertValidSchemaVersionPolicy,
+  inspectVersionedRecordListBytes,
+  quarantineUnreadable,
+  readStoreRecordSchemaVersion,
+  StateFileUnknownVersionError,
+  withFileLock,
+  writeJsonAtomically,
+  type VersionedRecordParseResult,
+} from './file-store.js';
+
+/** The schema-version policy of `journal.json` (Q5a, D6). */
+export const JOURNAL_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy('journal.json', {
+  writerVersion: ACTION_JOURNAL_ENTRY_SCHEMA_VERSION,
+  acceptedVersions: [1],
+});
+
+/** The schema-version policy of `reservations.json` (Q5a, D6). */
+export const RESERVATION_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy('reservations.json', {
+  writerVersion: CAPACITY_RESERVATION_SCHEMA_VERSION,
+  acceptedVersions: [1],
+});
 
 export interface ExecutionJournalAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
@@ -48,21 +73,42 @@ function isCapacityReservationRecord(value: unknown): value is CapacityReservati
   return typeof candidate.id === 'string' && typeof candidate.attemptId === 'string';
 }
 
-/** The journal reader's record parser, shared with `fleet-v2 state check`. */
-export function parseJournalEntryStateRecord(raw: unknown): ActionJournalEntryRecord | undefined {
-  return isActionJournalEntryRecord(raw) ? raw : undefined;
-}
-
 function isNonEmptyStringField(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
 }
 
-/** The reservation reader's record parser, shared with `fleet-v2 state check`. */
-export function parseReservationStateRecord(raw: unknown): CapacityReservationRecord | undefined {
-  if (!isCapacityReservationRecord(raw)) return undefined;
-  const item = raw;
+/** A journal entry in canonical stored shape: every writer stamps `schemaVersion` (Q5a, D6). */
+function normalizeJournalEntry(entry: ActionJournalEntryRecord): ActionJournalEntryRecord {
+  return { ...entry, schemaVersion: JOURNAL_STORE_VERSION_POLICY.writerVersion };
+}
+
+/**
+ * The versioned journal reader's record parser, shared with
+ * `fleet-v2 state check`: the `schemaVersion` check runs first, then the
+ * body's identity check.
+ */
+export function parseVersionedJournalEntryStateRecord(raw: unknown): VersionedRecordParseResult<ActionJournalEntryRecord> {
+  const versionCheck = readStoreRecordSchemaVersion(raw, JOURNAL_STORE_VERSION_POLICY);
+  if (versionCheck.status !== 'ok') {
+    return versionCheck;
+  }
+  if (!isActionJournalEntryRecord(raw)) {
+    return { status: 'invalid' };
+  }
+  return { status: 'ok', record: normalizeJournalEntry(raw), schemaVersion: versionCheck.schemaVersion };
+}
+
+/** The journal reader's record parser, shared with `fleet-v2 state check`. */
+export function parseJournalEntryStateRecord(raw: unknown): ActionJournalEntryRecord | undefined {
+  const parsed = parseVersionedJournalEntryStateRecord(raw);
+  return parsed.status === 'ok' ? parsed.record : undefined;
+}
+
+/** A reservation in canonical stored shape: `schemaVersion` plus the host fields' null-normalizations. */
+function normalizeReservationRecord(item: CapacityReservationRecord): CapacityReservationRecord {
   return {
     ...item,
+    schemaVersion: RESERVATION_STORE_VERSION_POLICY.writerVersion,
     // A reservation stored before `seatTool` existed reads with `null`;
     // it is never defaulted to a declared kind. The host fields (H9a1)
     // read the same way: absent or malformed values read as `null`.
@@ -84,6 +130,28 @@ export function parseReservationStateRecord(raw: unknown): CapacityReservationRe
     // malformed values read as `null`.
     worktreePath: isNonEmptyStringField(item.worktreePath) ? item.worktreePath : null,
   };
+}
+
+/**
+ * The versioned reservation reader's record parser, shared with
+ * `fleet-v2 state check`: the `schemaVersion` check runs first, then the
+ * body's identity check, then the host-field normalizations.
+ */
+export function parseVersionedReservationStateRecord(raw: unknown): VersionedRecordParseResult<CapacityReservationRecord> {
+  const versionCheck = readStoreRecordSchemaVersion(raw, RESERVATION_STORE_VERSION_POLICY);
+  if (versionCheck.status !== 'ok') {
+    return versionCheck;
+  }
+  if (!isCapacityReservationRecord(raw)) {
+    return { status: 'invalid' };
+  }
+  return { status: 'ok', record: normalizeReservationRecord(raw), schemaVersion: versionCheck.schemaVersion };
+}
+
+/** The reservation reader's record parser, shared with `fleet-v2 state check`. */
+export function parseReservationStateRecord(raw: unknown): CapacityReservationRecord | undefined {
+  const parsed = parseVersionedReservationStateRecord(raw);
+  return parsed.status === 'ok' ? parsed.record : undefined;
 }
 
 /**
@@ -119,7 +187,7 @@ function arbitrateReservation(
   while (usedSlots.has(slotIndex)) {
     slotIndex += 1;
   }
-  return { outcome: 'reserved', reservation: { ...claim, slotIndex } };
+  return { outcome: 'reserved', reservation: normalizeReservationRecord({ ...claim, slotIndex }) };
 }
 
 export class ExecutionJournalAdapter implements ExecutionJournalPort {
@@ -151,7 +219,7 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       if (duplicate) {
         throw new Error(`Duplicate journal entry id: ${entry.id}`);
       }
-      this.inMemoryJournalEntries.push(entry);
+      this.inMemoryJournalEntries.push(normalizeJournalEntry(entry));
       return;
     }
 
@@ -164,7 +232,7 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       if (duplicate) {
         throw new Error(`Duplicate journal entry id: ${entry.id}`);
       }
-      entries.push(entry);
+      entries.push(normalizeJournalEntry(entry));
       await writeJsonAtomically(target, entries);
     });
   }
@@ -174,18 +242,20 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
   ): Promise<readonly ActionJournalEntryRecord[]> {
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
-      return this.inMemoryJournalEntries.filter((entry) => entry.attemptId === attemptId);
+      return this.inMemoryJournalEntries
+        .filter((entry) => entry.attemptId === attemptId)
+        .map(normalizeJournalEntry);
     }
     const target = path.join(stateDir, 'journal.json');
     const entries = await this.readJournalFromDisk(target);
-    return entries.filter((entry) => entry.attemptId === attemptId);
+    return entries.filter((entry) => entry.attemptId === attemptId).map(normalizeJournalEntry);
   }
 
   async saveCapacityReservation(reservation: CapacityReservationRecord): Promise<void> {
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
       refuseSupersedingReservation(this.inMemoryReservationsById, reservation);
-      this.inMemoryReservationsById.set(reservation.id, reservation);
+      this.inMemoryReservationsById.set(reservation.id, normalizeReservationRecord(reservation));
       this.signal({ kind: 'capacity', id: reservation.id, stateFile: null, before: null, written: null });
       return;
     }
@@ -205,7 +275,7 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       }
       const reservations = await this.readReservationsFromDisk(target);
       refuseSupersedingReservation(reservations, reservation);
-      reservations.set(reservation.id, reservation);
+      reservations.set(reservation.id, normalizeReservationRecord(reservation));
       await writeJsonAtomically(target, [...reservations.values()]);
       try {
         const stat = await fs.stat(target);
@@ -387,7 +457,7 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
         (reservation) => reservation.attemptId === attemptId && reservation.held === true,
       );
       if (held === undefined) return false;
-      this.inMemoryReservationsById.set(held.id, { ...held, held: false, releasedAtIso });
+      this.inMemoryReservationsById.set(held.id, normalizeReservationRecord({ ...held, held: false, releasedAtIso }));
       this.signal({ kind: 'capacity', id: held.id, stateFile: null, before: null, written: null });
       return true;
     }
@@ -411,7 +481,7 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
         (reservation) => reservation.attemptId === attemptId && reservation.held === true,
       );
       if (held === undefined) return false;
-      reservations.set(held.id, { ...held, held: false, releasedAtIso });
+      reservations.set(held.id, normalizeReservationRecord({ ...held, held: false, releasedAtIso }));
       await writeJsonAtomically(target, [...reservations.values()]);
       try {
         const stat = await fs.stat(target);
@@ -450,7 +520,10 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       }
       throw error;
     }
-    const inspection = inspectRecordListBytes(buffer, parseJournalEntryStateRecord);
+    const inspection = inspectVersionedRecordListBytes(buffer, parseVersionedJournalEntryStateRecord);
+    if (inspection.status === 'unknown-version') {
+      throw new StateFileUnknownVersionError(target, inspection.recordIndex);
+    }
     if (inspection.status === 'unreadable') {
       return quarantineUnreadable(target, inspection.detail, buffer);
     }
@@ -472,7 +545,10 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       }
       throw error;
     }
-    const inspection = inspectRecordListBytes(buffer, parseReservationStateRecord);
+    const inspection = inspectVersionedRecordListBytes(buffer, parseVersionedReservationStateRecord);
+    if (inspection.status === 'unknown-version') {
+      throw new StateFileUnknownVersionError(target, inspection.recordIndex);
+    }
     if (inspection.status === 'unreadable') {
       return quarantineUnreadable(target, inspection.detail, buffer);
     }

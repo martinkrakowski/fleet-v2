@@ -164,10 +164,23 @@ export function laneRunOwnedPathsOverlap(
   }
   const aRoots = usableOwnedRoots(a.ownedPaths);
   const bRoots = usableOwnedRoots(b.ownedPaths);
-  const aShared = new Set(usableOwnedRoots(a.ownedPaths.filter((path) => isSharedAppendPath(path))));
-  const bShared = new Set(usableOwnedRoots(b.ownedPaths.filter((path) => isSharedAppendPath(path))));
+  // The shared sets hold the trimmed paths themselves, not their normalized
+  // roots: a glob such as `yarn.lock*` reduces to the root `yarn.lock` but is
+  // never shared, so a root that a non-shared path also produces must not be
+  // exempt on that path's behalf.
+  const aShared = new Set(a.ownedPaths.filter((path) => isSharedAppendPath(path)).map((path) => path.trim()));
+  const bShared = new Set(b.ownedPaths.filter((path) => isSharedAppendPath(path)).map((path) => path.trim()));
+  const aNonSharedRoots = usableOwnedRoots(a.ownedPaths.filter((path) => !isSharedAppendPath(path)));
+  const bNonSharedRoots = usableOwnedRoots(b.ownedPaths.filter((path) => !isSharedAppendPath(path)));
   if (aRoots.length > 0 && bRoots.length > 0) {
-    return aRoots.some((left) => bRoots.some((right) => !(left === right && aShared.has(left) && bShared.has(right)) && ownedRootsOverlap(left, right)));
+    return aRoots.some(
+      (left) =>
+        bRoots.some(
+          (right) =>
+            !(left === right && aShared.has(left) && bShared.has(right) && !aNonSharedRoots.includes(left) && !bNonSharedRoots.includes(right)) &&
+            ownedRootsOverlap(left, right),
+        ),
+    );
   }
   const aKeys = laneRunPackageKeys(a.ownedPaths);
   const bKeys = laneRunPackageKeys(b.ownedPaths);

@@ -70,6 +70,10 @@ describe('laneRunOwnedPathsOverlap shared append exemption (CG2)', () => {
     expect(laneRunOwnedPathsOverlap(repo(['yarn.lock*']), repo(['yarn.lock']))).toBe(true);
   });
 
+  it('a shared file listed next to a glob of itself still overlaps (the glob is not exempt)', () => {
+    expect(laneRunOwnedPathsOverlap(repo(['yarn.lock', 'yarn.lock*']), repo(['yarn.lock']))).toBe(true);
+  });
+
   it('equal non-shared directories still overlap', () => {
     expect(laneRunOwnedPathsOverlap(repo(['packages/a/src']), repo(['packages/a/src']))).toBe(true);
   });

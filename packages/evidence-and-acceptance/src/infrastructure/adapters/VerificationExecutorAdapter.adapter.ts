@@ -274,6 +274,69 @@ function completedReceipt(
   return receipt(result, exitCode, summaryWithNote, completedAtIso, coverage);
 }
 
+function isDeadlineTimeout(
+  failure: NodeJS.ErrnoException,
+  deadlineIso: string | undefined,
+): boolean {
+  return failure.code === 'ETIMEDOUT' && deadlineIso !== undefined;
+}
+
+function interpretSpawnOutcome(
+  execution: SpawnedVerificationOutcome,
+  request: ExecuteVerificationCheckRequest,
+  declaration: ProcedureCoverageDeclaration | undefined,
+  completedAtIso: string,
+  sshHost?: string,
+): ExecuteVerificationCheckResult {
+  if (execution.error !== undefined) {
+    const failure = execution.error as NodeJS.ErrnoException;
+    if (isDeadlineTimeout(failure, request.deadlineIso)) {
+      return {
+        outcome: 'not-started',
+        reason: 'verification check timed out against the deadline',
+      };
+    }
+    return receipt(
+      'unknown',
+      execution.status,
+      `spawn failed: ${failure.code ?? failure.message}`,
+      completedAtIso,
+    );
+  }
+
+  if (execution.signal !== null) {
+    return receipt(
+      'unknown',
+      execution.status,
+      `verification check was terminated by signal ${execution.signal} before completing`,
+      completedAtIso,
+    );
+  }
+
+  if (execution.status === null) {
+    return receipt(
+      'unknown',
+      null,
+      'verification check ended without reporting an exit code',
+      completedAtIso,
+    );
+  }
+
+  if (sshHost !== undefined && execution.status === 255) {
+    return receipt(
+      'unknown',
+      execution.status,
+      'ssh transport failed with exit code 255 before the verification check completed',
+      completedAtIso,
+    );
+  }
+
+  const output = [execution.stdout, execution.stderr]
+    .filter((part) => part.trim().length > 0)
+    .join('\n');
+  return completedReceipt(execution.status, output, request.procedureName, declaration, completedAtIso);
+}
+
 export class VerificationExecutorAdapter implements VerificationExecutorPort {
   constructor(private readonly options: VerificationExecutorOptions = {}) {}
 
@@ -374,48 +437,7 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
     }
 
     const execution = spawn(file, argv, { timeout: boundedTimeoutMs });
-
-    if (execution.error !== undefined) {
-      const failure = execution.error as NodeJS.ErrnoException;
-      return receipt(
-        'unknown',
-        execution.status,
-        `spawn failed: ${failure.code ?? failure.message}`,
-        completedAtIso,
-      );
-    }
-
-    if (execution.signal !== null) {
-      return receipt(
-        'unknown',
-        execution.status,
-        `verification check was terminated by signal ${execution.signal} before completing`,
-        completedAtIso,
-      );
-    }
-
-    if (execution.status === null) {
-      return receipt(
-        'unknown',
-        null,
-        'verification check ended without reporting an exit code',
-        completedAtIso,
-      );
-    }
-
-    if (sshHost !== undefined && execution.status === 255) {
-      return receipt(
-        'unknown',
-        execution.status,
-        'ssh transport failed with exit code 255 before the verification check completed',
-        completedAtIso,
-      );
-    }
-
-    const output = [execution.stdout, execution.stderr]
-      .filter((part) => part.trim().length > 0)
-      .join('\n');
-    return completedReceipt(execution.status, output, request.procedureName, declaration, completedAtIso);
+    return interpretSpawnOutcome(execution, request, declaration, completedAtIso, sshHost);
   }
 
   private async executeViaCommandExecutor(

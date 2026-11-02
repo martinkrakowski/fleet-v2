@@ -829,4 +829,57 @@ describe('VerificationExecutorAdapter deadline budget', () => {
     expect(timeoutMs).toBeGreaterThan(0);
     expect(timeoutMs).toBeLessThan(6_000);
   });
+
+  it('returns not-started when a started check times out against its deadline', async () => {
+    const calls: RecordedSpawn[] = [];
+    const timeoutError = Object.assign(new Error('spawnSync /opt/verify-run.sh ETIMEDOUT'), {
+      code: 'ETIMEDOUT',
+    });
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      spawn: (file, args, options) => {
+        calls.push({ file, args, options });
+        return {
+          status: null,
+          signal: 'SIGTERM',
+          error: timeoutError,
+          stdout: 'partial stdout from timed-out check',
+          stderr: 'partial stderr from timed-out check',
+        };
+      },
+    });
+
+    const deadlineIso = new Date(Date.now() + 5_000).toISOString();
+    const result = await adapter.executeVerificationCheck(checkRequest({ deadlineIso }));
+
+    expect(result).toEqual({
+      outcome: 'not-started',
+      reason: 'verification check timed out against the deadline',
+    });
+    expect(calls).toHaveLength(1);
+    expect('outputSummary' in result).toBe(false);
+  });
+
+  it('maps a spawn timeout without a deadline to a completed unknown receipt', async () => {
+    const timeoutError = Object.assign(new Error('spawnSync /opt/verify-run.sh ETIMEDOUT'), {
+      code: 'ETIMEDOUT',
+    });
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      spawn: recordingTransport([], {
+        status: null,
+        signal: null,
+        error: timeoutError,
+        stdout: '',
+        stderr: '',
+      }),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    assertCompleted(result);
+    expect(result.result).toBe('unknown');
+    expect(result.exitCode).toBeNull();
+    expect(result.outputSummary).toBe('spawn failed: ETIMEDOUT');
+  });
 });

@@ -103,6 +103,7 @@ import {
   type ExportRunTelemetryUseCase,
   type TelemetryDispositionAdapter,
   type TelemetryResourceInput,
+  type RunTelemetryMarkPort,
 } from '@fleet/work-execution';
 
 import {
@@ -795,6 +796,24 @@ export interface FleetCliRuntime {
     readonly resource: TelemetryResourceInput;
     /** The redaction canary values of the real state directory's records (OT4b-3). */
     readonly canaryValues: () => Promise<readonly string[]>;
+    /**
+     * The driver's mark port (OT5): the no-op mark when telemetry is
+     * unconfigured, else the driver exporter's `mark`. The driver calls this
+     * after every advanced run's pass; it never throws.
+     */
+    readonly mark: RunTelemetryMarkPort;
+    /**
+     * Starts the driver's background exporter (OT5); null when telemetry is
+     * unconfigured. The driver calls it after its tunnel opens, never on the
+     * dry-run path.
+     */
+    readonly startExporter: (() => void) | null;
+    /**
+     * Stops the background exporter (OT5); null when telemetry is
+     * unconfigured. The driver awaits it in its `finally` against a 2 s
+     * unref'd timer, so the exit is delayed by at most 2 s.
+     */
+    readonly stopExporter: (() => Promise<void>) | null;
   };
 }
 

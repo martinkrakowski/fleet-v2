@@ -38,6 +38,34 @@ type MutableCoordinationRequestRecord = Omit<CoordinationRequestRecord, 'policyG
   mergeGrant?: MergeGrantRecord;
 };
 
+function readGrantProperty(
+  record: CoordinationRequestRecord,
+  propertyName: 'policyGrant' | 'mergeGrant',
+  expectedShape: string,
+): object | undefined {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(record, propertyName);
+  } catch {
+    const trapPrefix = propertyName === 'policyGrant' ? 'PolicyGrant' : 'MergeGrant';
+    throw new Error(`${trapPrefix} validation failed due to a prohibited Proxy trap execution.`);
+  }
+  if (descriptor === undefined) {
+    return undefined;
+  }
+  if (descriptor.get || descriptor.set) {
+    throw new Error(`CoordinationRequest ${propertyName} cannot be an accessor property.`);
+  }
+  const raw: unknown = descriptor.value;
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new Error(`CoordinationRequest ${propertyName} must be ${expectedShape}`);
+  }
+  return raw;
+}
+
 export class CoordinationRequest {
   private constructor(private readonly record: CoordinationRequestRecord) {
     // Invariants are validated in fromRecord.
@@ -154,32 +182,13 @@ export class CoordinationRequest {
   }
 
   private static readPolicyGrant(record: CoordinationRequestRecord): PolicyGrantRecord | undefined {
-    let descriptor: PropertyDescriptor | undefined;
-    
-    try {
-      descriptor = Object.getOwnPropertyDescriptor(record, 'policyGrant');
-    } catch {
-      throw new Error('PolicyGrant validation failed due to a prohibited Proxy trap execution.');
-    }
-    
-    if (descriptor === undefined) {
-      return undefined;
-    }
-    
-    if (descriptor.get || descriptor.set) {
-      throw new Error('CoordinationRequest policyGrant cannot be an accessor property.');
-    }
-    
-    const raw: unknown = descriptor.value;
-    
+    const raw = readGrantProperty(
+      record,
+      'policyGrant',
+      '{ workOrderId, attemptId, acceptanceReceiptId }',
+    );
     if (raw === undefined) {
       return undefined;
-    }
-    
-    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-      throw new Error(
-        'CoordinationRequest policyGrant must be { workOrderId, attemptId, acceptanceReceiptId }',
-      );
     }
 
     let proto: unknown;
@@ -266,24 +275,13 @@ export class CoordinationRequest {
   }
 
   private static readMergeGrant(record: CoordinationRequestRecord): MergeGrantRecord | undefined {
-    let descriptor: PropertyDescriptor | undefined;
-    try {
-      descriptor = Object.getOwnPropertyDescriptor(record, 'mergeGrant');
-    } catch {
-      throw new Error('MergeGrant validation failed due to a prohibited Proxy trap execution.');
-    }
-    if (descriptor === undefined) {
-      return undefined;
-    }
-    if (descriptor.get || descriptor.set) {
-      throw new Error('CoordinationRequest mergeGrant cannot be an accessor property.');
-    }
-    const raw: unknown = descriptor.value;
+    const raw = readGrantProperty(
+      record,
+      'mergeGrant',
+      '{ repository, pullRequestNumber }',
+    );
     if (raw === undefined) {
       return undefined;
-    }
-    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-      throw new Error('CoordinationRequest mergeGrant must be { repository, pullRequestNumber }');
     }
     const outer = CoordinationRequest.readMergeGrantSnapshot(raw, 'mergeGrant');
     const grantKeys = ['repository', 'pullRequestNumber'];

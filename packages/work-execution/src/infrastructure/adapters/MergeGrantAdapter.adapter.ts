@@ -82,38 +82,18 @@ export class MergeGrantAdapter implements MergeGrantPort {
     } catch {
       return { outcome: 'refused', reason: 'policy grant could not be issued' };
     }
-    switch (answer.outcome) {
-      case 'issued':
-        if (
-          answer.workOrderId !== policyRequest.workOrderId ||
-          answer.attemptId !== policyRequest.attemptId ||
-          answer.expectedHeadSha !== policyRequest.expectedHeadSha
-        ) {
-          return {
-            outcome: 'refused',
-            reason: 'policy grant coordinates do not match the request',
-          };
-        }
-        return {
-          outcome: 'issued',
-          requestId: answer.requestId,
-          grantId: answer.grantId,
-          decisionRevision: answer.decisionRevision,
-          cancelledGrantIds: answer.cancelledGrantIds,
-        };
-      case 'superseded':
-        return {
-          outcome: 'superseded',
-          requestId: answer.requestId,
-          grantId: answer.grantId,
-          cancelledGrantIds: answer.cancelledGrantIds,
-          unresolvedGrantIds: answer.unresolvedGrantIds,
-        };
-      case 'refused':
-        return { outcome: 'refused', reason: answer.reason.slice(0, 300) };
-      default:
-        return { outcome: 'refused', reason: 'unexpected policy grant answer' };
+    if (
+      answer.outcome === 'issued' &&
+      (answer.workOrderId !== policyRequest.workOrderId ||
+        answer.attemptId !== policyRequest.attemptId ||
+        answer.expectedHeadSha !== policyRequest.expectedHeadSha)
+    ) {
+      return {
+        outcome: 'refused',
+        reason: 'policy grant coordinates do not match the request',
+      };
     }
+    return this.mapGrantAnswer(answer, 'policy grant');
   }
 
   private async issueAttemptLess(request: AttemptLessRequest): Promise<MergeGrantResult> {
@@ -136,6 +116,13 @@ export class MergeGrantAdapter implements MergeGrantPort {
     } catch {
       return { outcome: 'refused', reason: 'merge grant could not be issued' };
     }
+    return this.mapGrantAnswer(answer, 'merge grant');
+  }
+
+  private mapGrantAnswer(
+    answer: IssuePolicyForgeGrantResult | IssueMergeGrantResult,
+    sourceLabel: string,
+  ): MergeGrantResult {
     switch (answer.outcome) {
       case 'issued':
         return {
@@ -156,7 +143,7 @@ export class MergeGrantAdapter implements MergeGrantPort {
       case 'refused':
         return { outcome: 'refused', reason: answer.reason.slice(0, 300) };
       default:
-        return { outcome: 'refused', reason: 'unexpected merge grant answer' };
+        return { outcome: 'refused', reason: `unexpected ${sourceLabel} answer` };
     }
   }
 }

@@ -30,7 +30,11 @@ import type {
 } from '../ports/in/IssueMergeGrantPort.in-port.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import type { ProjectProfileRepositoryPort } from '../ports/out/ProjectProfileRepositoryPort.out-port.js';
-import { cancelPolicyGrantOnce } from './policy-grant-cancel.js';
+import {
+  cancelGrantTargets,
+  mintUniqueGrantIds,
+  sweepLiveGrants,
+} from './issue-grant-shared.js';
 
 export interface IssueMergeGrantDependencies {
   readonly requestRepo: CoordinationRequestRepositoryPort;
@@ -38,9 +42,6 @@ export interface IssueMergeGrantDependencies {
   readonly ids: PolicyGrantIdSource;
   readonly profileRepo: ProjectProfileRepositoryPort;
 }
-
-/** strict: a leftover conflict refuses the whole issue; best-effort: the sweep ignores it. */
-type CancelMode = 'strict' | 'best-effort';
 
 function refused(reason: string): IssueMergeGrantResult {
   return { outcome: 'refused', reason };
@@ -82,28 +83,17 @@ export class IssueMergeGrantUseCase implements IssueMergeGrantPort {
       return refused(policyRefusal);
     }
 
-    const requestId = this.deps.ids.newRequestId();
-    const grantId = this.deps.ids.newGrantId();
-    if (
-      typeof requestId !== 'string' ||
-      requestId.trim().length === 0 ||
-      typeof grantId !== 'string' ||
-      grantId.trim().length === 0
-    ) {
-      return refused('a minted merge grant id is already recorded');
+    const minted = await mintUniqueGrantIds(this.deps.ids, this.deps.requestRepo, 'merge');
+    if ('refusal' in minted) {
+      return refused(minted.refusal);
     }
-    if (
-      (await this.deps.requestRepo.findRequestById(requestId)) !== null ||
-      (await this.deps.requestRepo.findRequestByGrantId(grantId)) !== null
-    ) {
-      return refused('a minted merge grant id is already recorded');
-    }
+    const { requestId, grantId } = minted;
     const now = this.deps.clock.nowIso();
 
     const earlier = (await this.deps.requestRepo.listRequests(projectId)).filter((record) =>
       this.isLiveMergeGrant(record, actionScope, owner, repo, pullRequestNumber),
     );
-    const cancelledEarlier = await this.cancelTargets(earlier, now, 'strict');
+    const cancelledEarlier = await cancelGrantTargets(this.deps.requestRepo, earlier, now, 'strict');
     if (cancelledEarlier.conflict) {
       return refused('an earlier merge grant moved while it was being cancelled; nothing was issued');
     }
@@ -134,47 +124,25 @@ export class IssueMergeGrantUseCase implements IssueMergeGrantPort {
     // result is superseded — a fixed outcome, never an error. A crash between
     // the save above and this sweep leaves two live grants; the next issue or
     // cancel for this pull request converges them, because the newest wins.
-    const live = (await this.deps.requestRepo.listRequests(projectId)).filter((record) =>
-      this.isLiveMergeGrant(record, actionScope, owner, repo, pullRequestNumber),
-    );
-    const ordered = [...live].sort((left, right) => {
-      if (left.createdAtIso !== right.createdAtIso) {
-        return left.createdAtIso < right.createdAtIso ? -1 : 1;
-      }
-      return left.id < right.id ? -1 : 1;
+    const sweep = await sweepLiveGrants({
+      requestRepo: this.deps.requestRepo,
+      projectId,
+      requestId,
+      grantId,
+      now,
+      isLive: (record) => this.isLiveMergeGrant(record, actionScope, owner, repo, pullRequestNumber),
+      cancelledEarlierIds: cancelledEarlier.cancelledIds,
     });
-    const newest = ordered.at(-1);
-    if (newest?.id !== requestId) {
-      // A newer live grant exists: this issue's own grant is cancelled and the
-      // newer one stays live. Superseded is a fixed outcome, never an error.
-      const mine = await this.deps.requestRepo.findRequestById(requestId);
-      const own =
-        mine !== null && this.isLiveMergeGrant(mine, actionScope, owner, repo, pullRequestNumber)
-          ? await cancelPolicyGrantOnce(this.deps.requestRepo, mine, now)
-          : 'skipped';
-      // Report only what happened: a confirmed cancel, nothing to cancel, or a cancel that may
-      // have left this grant live beside the newer one.
-      return {
-        outcome: 'superseded',
-        requestId,
-        grantId,
-        cancelledGrantIds: own === 'cancelled' ? [grantId] : [],
-        unresolvedGrantIds: own === 'conflict' ? [grantId] : [],
-      };
+    if (sweep.outcome === 'superseded') {
+      return sweep;
     }
-    const cancelledSwept = await this.cancelTargets(ordered.slice(0, -1), now, 'best-effort');
-
-    const cancelledGrantIds = [
-      ...cancelledEarlier.cancelledIds,
-      ...cancelledSwept.cancelledIds,
-    ].sort((left, right) => left.localeCompare(right));
 
     return {
       outcome: 'issued',
       requestId,
       grantId,
       decisionRevision: mergeGrantDecisionRevision(settingRevision),
-      cancelledGrantIds,
+      cancelledGrantIds: sweep.cancelledGrantIds,
     };
   }
 
@@ -274,42 +242,6 @@ export class IssueMergeGrantUseCase implements IssueMergeGrantPort {
         pullRequestNumber: input.pullRequestNumber,
       },
     };
-  }
-
-  /** Sequential cancels over a promise chain (never `for … await`). */
-  private async cancelTargets(
-    targets: readonly CoordinationRequestRecord[],
-    now: string,
-    mode: CancelMode,
-  ): Promise<{ readonly cancelledIds: string[]; readonly conflict: boolean }> {
-    const cancelledIds: string[] = [];
-    let stopped = false;
-    let conflict = false;
-    await targets.reduce(
-      (chain, record) =>
-        chain.then(async () => {
-          if (stopped) {
-            return;
-          }
-          const outcome = await cancelPolicyGrantOnce(
-            this.deps!.requestRepo,
-            record,
-            now,
-          );
-          if (outcome === 'cancelled') {
-            if (record.grantId !== null) {
-              cancelledIds.push(record.grantId);
-            }
-          } else if (outcome === 'conflict') {
-            conflict = true;
-            if (mode === 'strict') {
-              stopped = true;
-            }
-          }
-        }),
-      Promise.resolve(),
-    );
-    return { cancelledIds, conflict };
   }
 
   private async verifyPolicyRevision(

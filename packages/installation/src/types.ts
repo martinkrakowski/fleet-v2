@@ -365,6 +365,15 @@ export interface ResolvedSeatsPolicy {
   readonly observationCooldownMinutes: number;
 }
 
+/** The v2 `policy.board` section (WB6p). Every field optional; absent or
+ * malformed anywhere is the whole default (work-board plan D3, D6, §3.4). */
+export interface BoardPolicySection {
+  readonly forgeStaleMinutes?: number;
+  readonly declarationTtlMinutes?: number;
+  readonly doneWindowDays?: number;
+  readonly forgeSyncMinutes?: number;
+}
+
 /**
  * The v2 `policy` section: shape only. The rules are enforced by the loader
  * itself through `validateSeatPolicy` (lane O5) on every v2 file.
@@ -380,6 +389,8 @@ export interface PolicySection {
   readonly autoMerge?: AutoMergePolicy;
   /** Absent means off (`DEFAULT_CONDUCTOR_POLICY`); read it through `resolveConductorPolicy`. */
   readonly conductor?: ConductorPolicy;
+  /** Absent means the plan defaults (`DEFAULT_BOARD_POLICY`); read it through `resolveBoardPolicy`. */
+  readonly board?: BoardPolicySection;
   /** Absent means off (`DEFAULT_TELEMETRY_POLICY`); read it through `resolveTelemetryPolicy`. */
   readonly telemetry?: TelemetryPolicy;
   /** Absent means no rotation, 60-minute cooling, observations off (`DEFAULT_SEATS_POLICY`); read it through `resolveSeatsPolicy`. */

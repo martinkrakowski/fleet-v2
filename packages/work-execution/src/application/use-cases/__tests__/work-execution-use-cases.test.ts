@@ -3973,6 +3973,7 @@ function makeUsagePort(
         sessionId: request.attempt.sessionId,
         steps: 3,
         wallSeconds: 12.5,
+        runnerMinutes: 1,
         tokensInput: 100,
         tokensOutput: 50,
         tokensReasoning: 10,
@@ -4170,8 +4171,35 @@ describe('CollectAttemptArtifactsUseCase', () => {
     expect(saved?.usage?.source).toBe('opencode-db');
     expect(saved?.usage?.steps).toBe(3);
     expect(saved?.usage?.sessionId).toBe('session-1');
+    expect(saved?.usage?.runnerMinutes).toBe(1);
     expect(usage.calls).toHaveLength(1);
     expect(setup.journal.entries[0]?.detail).toBe('usage read');
+  });
+
+  it('stores unavailable fallback usage when the usage port throws', async () => {
+    const setup = makeCollectSetup();
+    const usage = makeUsagePort({
+      readResult: () => {
+        throw new Error('boom');
+      },
+    });
+    const useCase = new CollectAttemptArtifactsUseCase({
+      attemptRepo: setup.attemptRepo,
+      journal: setup.journal,
+      artifactPort: setup.artifacts.port,
+      usage: usage.port,
+    });
+
+    const result = await useCase.collectAttemptArtifacts(
+      validCollectRequest() as Parameters<CollectAttemptArtifactsUseCase['collectAttemptArtifacts']>[0],
+    );
+
+    expect(result.outcome).toBe('collected');
+    const saved = setup.attemptRepo.attempts.get('attempt-1');
+    expect(saved?.usage?.source).toBe('unavailable');
+    expect(saved?.usage?.reason).toBe('usage read failed');
+    expect(saved?.usage?.runnerMinutes).toBeNull();
+    expect(setup.journal.entries[0]?.detail).toBe('usage unavailable: usage read failed');
   });
 
   it('terminates the process tree with the default grace after the collected save and journals the count before the collect entry', async () => {

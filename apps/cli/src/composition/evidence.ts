@@ -54,6 +54,8 @@ export interface ComposeEvidenceInput {
   readonly runGhSubprocess: (
     args: readonly string[],
     candidates?: readonly string[],
+    env?: Record<string, string>,
+    timeoutMs?: number,
   ) => Promise<GhInvocationResult>;
 }
 
@@ -136,7 +138,8 @@ export function composeEvidence(input: ComposeEvidenceInput) {
   const ghBinaryCandidates = options?.ghBinaryCandidates ?? GH_BINARY_CANDIDATES;
   const forgeGhRunner =
     options?.forgeGhRunner ??
-    ((args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates));
+    ((args: readonly string[], timeoutMs?: number) =>
+      runGhSubprocess(args, ghBinaryCandidates, undefined, timeoutMs));
   const forgeEvidence =
     forgeMode === 'github'
       ? new ForgeEvidenceAdapter({

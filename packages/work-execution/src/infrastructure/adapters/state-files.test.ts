@@ -23,10 +23,27 @@ import { LaneRunRepositoryAdapter, parseLaneRunStateRecord } from './LaneRunRepo
 import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
 import { ConductorHaltAdapter } from './ConductorHaltAdapter.adapter.js';
 import { LaneRunJournalAdapter } from './LaneRunJournalAdapter.adapter.js';
+import { MergeQueueRepositoryAdapter } from './MergeQueueRepositoryAdapter.adapter.js';
 import {
   TelemetryDispositionAdapter,
   parseTelemetryDispositionStateRecord,
 } from './TelemetryDispositionAdapter.adapter.js';
+import {
+  buildDaemonStatusRecord,
+  type BuildDaemonStatusInput,
+  type DaemonLeaseRecord,
+  type DaemonStatusRecord,
+} from '../../domain/daemon-tick.js';
+import {
+  projectJobOutcomeToDaemonEvent,
+  serializeDaemonEventHeader,
+  serializeDaemonEventLine,
+  type DaemonEventRecord,
+} from '../../domain/daemon-events.js';
+import { DaemonStatusFileAdapter } from './DaemonStatusFileAdapter.adapter.js';
+import { DaemonPauseAdapter } from './DaemonPauseAdapter.adapter.js';
+import { DaemonLeaseAdapter } from './DaemonLeaseAdapter.adapter.js';
+import { DaemonEventProjectionAdapter } from './DaemonEventProjectionAdapter.adapter.js';
 
 const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
   'work-orders.json': [
@@ -194,6 +211,62 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       attention: [],
     },
   ],
+  'merge-queue.json': [
+    {
+      version: 1,
+      entryId: '01JB0000000000000000000000',
+      repository: { owner: 'fleet', repo: 'v2' },
+      repoDigest: '0123456789ab',
+      pullRequest: 7,
+      headOid: '0123456789abcdef0123456789abcdef01234567',
+      state: 'queued',
+      reason: null,
+      attempt: 0,
+      notBeforeIso: null,
+      enqueuedAtIso: '2026-11-01T10:00:00.000Z',
+      enqueuedBy: 'cli',
+      supersedes: null,
+      runId: null,
+      attemptId: null,
+      workOrderId: null,
+      tier: 2,
+      verifiedHeadOid: null,
+      verifiedBy: null,
+      policyRevision: null,
+      premergeReceiptHeadOid: null,
+      veto: null,
+      mergeCommitOid: null,
+      mergedAtIso: null,
+      revision: 1,
+    },
+    {
+      version: 1,
+      entryId: '01JB0000000000000000000001',
+      repository: { owner: 'fleet', repo: 'v2' },
+      repoDigest: '0123456789ab',
+      pullRequest: 8,
+      headOid: '0123456789abcdef0123456789abcdef01234568',
+      state: 'queued',
+      reason: null,
+      attempt: 0,
+      notBeforeIso: null,
+      enqueuedAtIso: '2026-11-01T11:00:00.000Z',
+      enqueuedBy: 'cli',
+      supersedes: null,
+      runId: null,
+      attemptId: null,
+      workOrderId: null,
+      tier: 1,
+      verifiedHeadOid: null,
+      verifiedBy: null,
+      policyRevision: null,
+      premergeReceiptHeadOid: null,
+      veto: null,
+      mergeCommitOid: null,
+      mergedAtIso: null,
+      revision: 1,
+    },
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -244,6 +317,10 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
     }
     return new ConductorPassTraceAdapter({ stateDir }).list();
   },
+  'merge-queue.json': (stateDir) =>
+    new MergeQueueRepositoryAdapter({ stateDir }).listMergeEntries({
+      deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+    }),
 };
 
 type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
@@ -268,6 +345,12 @@ const CASES: Array<{
 }> = [];
 
 for (const descriptor of WORK_EXECUTION_STATE_FILES) {
+  // The record-list loop below only covers the list stores (they have an array
+  // fixture and an adapter reader); the single-record, glob and projection
+  // descriptors get kind-specific tests of their own.
+  if (VALID_FIXTURES[descriptor.basename] === undefined) {
+    continue;
+  }
   const kinds: readonly FixtureKind[] = ['valid', 'not-json', 'not-list', 'bad-record'];
   for (const kind of kinds) {
     const bytes = bytesFor(descriptor.basename, kind);
@@ -348,6 +431,11 @@ describe('work-execution state file descriptors match the store readers', () => 
       'run-journal.json',
       'telemetry-dispositions.json',
       'conductor-passes.json',
+      'daemon/status.json',
+      'daemon/paused.json',
+      'daemon/leases',
+      'daemon/events.jsonl',
+      'merge-queue.json',
     ]);
   });
 });
@@ -479,5 +567,332 @@ describe('conductor-passes.json versioning and restore', () => {
     });
     expect(await fs.readFile(filePath)).toEqual(currentBytes);
     await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+  });
+});
+
+const TICK_ID = 'tick-0AAAAAAAAAAAAAAAAAAAAAAAAA';
+
+function buildStatusRecord(): DaemonStatusRecord {
+  const nowIso = new Date().toISOString();
+  const input: BuildDaemonStatusInput = {
+    tickId: TICK_ID,
+    startedAtIso: nowIso,
+    finishedAtIso: nowIso,
+    paused: false,
+    halted: false,
+    forgeReachable: null,
+    jobs: [
+      {
+        jobId: 'notifier',
+        outcome: 'completed',
+        reasonCode: null,
+        leaseFence: null,
+        durationMs: 0,
+        nextNotBeforeIso: null,
+        consecutiveBudgetExhausted: 0,
+      },
+    ],
+    repositories: [],
+    notifierCursor: null,
+  };
+  const built = buildDaemonStatusRecord(input);
+  if (!built.ok) {
+    throw new Error('invalid status fixture');
+  }
+  return built.record;
+}
+
+function buildLeaseRecord(scope: string): DaemonLeaseRecord {
+  return {
+    version: 1,
+    scope,
+    holderId: TICK_ID,
+    fence: 1,
+    leaseUntilIso: new Date(Date.now() + 60_000).toISOString(),
+  };
+}
+
+function buildEventFixture(n: number): DaemonEventRecord {
+  const read = projectJobOutcomeToDaemonEvent({
+    eventId: `01JB00000000000000000000${String(n).padStart(2, '0')}`,
+    tickId: TICK_ID,
+    jobId: 'notifier',
+    jobOutcome: { outcome: 'completed', progressed: true },
+    recordedAtIso: new Date().toISOString(),
+  });
+  if (!read.ok) {
+    throw new Error('invalid event fixture');
+  }
+  return read.record;
+}
+
+describe('daemon state file descriptors', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-daemon-state-files-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  const descriptorFor = (basename: string): StateFileDescriptor =>
+    WORK_EXECUTION_STATE_FILES.find((d) => d.basename === basename)!;
+
+  it('status.json inspects a single version 1 record and refuses a list', () => {
+    const descriptor = descriptorFor('daemon/status.json');
+    expect(descriptor.inspect(Buffer.from(JSON.stringify(buildStatusRecord())))).toEqual({
+      status: 'ok',
+      recordCount: 1,
+    });
+    expect(descriptor.inspect(Buffer.from('[{}]'))).toEqual({
+      status: 'unreadable',
+      detail: 'expects a single record',
+      recordIndex: null,
+    });
+  });
+
+  it('paused.json inspects a single version 1 record', () => {
+    const descriptor = descriptorFor('daemon/paused.json');
+    const bytes = Buffer.from(
+      JSON.stringify({ version: 1, paused: true, changedAtIso: new Date().toISOString() }),
+    );
+    expect(descriptor.inspect(bytes)).toEqual({ status: 'ok', recordCount: 1 });
+  });
+
+  it('status.json with version 2 reports unknown-version and never quarantines', async () => {
+    const descriptor = descriptorFor('daemon/status.json');
+    const bad = { ...buildStatusRecord(), version: 2 };
+    const bytes = Buffer.from(JSON.stringify(bad));
+    expect(descriptor.inspect(bytes)).toEqual({
+      status: 'unknown-version',
+      detail: 'DaemonStatus version is not supported',
+      recordIndex: 0,
+    });
+    await fs.mkdir(path.join(tempDir, 'daemon'), { recursive: true });
+    await fs.writeFile(path.join(tempDir, 'daemon', 'status.json'), bytes);
+    const check = await descriptor.check(tempDir);
+    expect(check.result.status).toBe('unknown-version');
+    await expect(fs.stat(path.join(tempDir, 'daemon', 'quarantine'))).rejects.toThrow();
+  });
+
+  it('a nested unreadable status file quarantines beside itself and reads by leaf name', async () => {
+    const descriptor = descriptorFor('daemon/status.json');
+    const garbage = Buffer.from('{ "not": json');
+    await fs.mkdir(path.join(tempDir, 'daemon'), { recursive: true });
+    await fs.writeFile(path.join(tempDir, 'daemon', 'status.json'), garbage);
+    const adapter = new DaemonStatusFileAdapter({ stateDir: tempDir });
+    await expect(adapter.read()).resolves.toEqual({ status: 'unreadable' });
+    const check = await descriptor.check(tempDir);
+    expect(check.result.status).toBe('unreadable');
+    expect(check.quarantineCopies.length).toBeGreaterThan(0);
+    const copy = check.quarantineCopies[0]!;
+    const read = await descriptor.readQuarantineCopy(tempDir, copy.name);
+    expect(read.status).toBe('read');
+    expect(read.status === 'read' ? read.bytes : null).toEqual(garbage);
+  });
+
+  it('daemon/leases aggregates lease files and names the first failing file', async () => {
+    const descriptor = descriptorFor('daemon/leases');
+    await fs.mkdir(path.join(tempDir, 'daemon', 'leases'), { recursive: true });
+    await fs.writeFile(
+      path.join(tempDir, 'daemon', 'leases', 'notifier.json'),
+      JSON.stringify(buildLeaseRecord('notifier')),
+    );
+    const one = await descriptor.check(tempDir);
+    expect(one.result).toEqual({ status: 'ok', recordCount: 1 });
+
+    await fs.mkdir(path.join(tempDir, 'daemon', 'leases', 'merge'), { recursive: true });
+    await fs.writeFile(
+      path.join(tempDir, 'daemon', 'leases', 'merge', 'abc123def456.json'),
+      JSON.stringify(buildLeaseRecord('merge/abc123def456')),
+    );
+    const two = await descriptor.check(tempDir);
+    expect(two.result).toEqual({ status: 'ok', recordCount: 2 });
+
+    await fs.writeFile(path.join(tempDir, 'daemon', 'leases', 'notifier.json'), Buffer.from('garbage'));
+    const bad = await descriptor.check(tempDir);
+    expect(bad.result.status).toBe('unreadable');
+    expect(bad.result.status === 'unreadable' ? bad.result.detail : '').toContain('notifier.json');
+  });
+
+  it('daemon/leases is missing when absent and refuses directory-wide restore', async () => {
+    const descriptor = descriptorFor('daemon/leases');
+    const missing = await descriptor.check(tempDir);
+    expect(missing.result).toEqual({ status: 'missing' });
+    const outcome = await descriptor.restore({
+      stateDir: tempDir,
+      candidate: Buffer.from(JSON.stringify(buildLeaseRecord('notifier'))),
+      expectedCurrentSha256: null,
+    });
+    expect(outcome.status).toBe('refused');
+  });
+
+  it('events.jsonl inspects ok for valid and garbage headers, never unreadable', () => {
+    const descriptor = descriptorFor('daemon/events.jsonl');
+    const header = serializeDaemonEventHeader();
+    const line1 = serializeDaemonEventLine(buildEventFixture(1))!;
+    const line2 = serializeDaemonEventLine(buildEventFixture(2))!;
+    expect(descriptor.inspect(Buffer.from(`${header}\n${line1}\n${line2}\n`))).toEqual({
+      status: 'ok',
+      recordCount: 2,
+    });
+    expect(descriptor.inspect(Buffer.from('garbage header\n'))).toEqual({
+      status: 'ok',
+      recordCount: 0,
+      detail: 'projection header missing or malformed',
+    });
+    expect(descriptor.inspect(Buffer.from(''))).toEqual({
+      status: 'ok',
+      recordCount: 0,
+      detail: 'projection header missing or malformed',
+    });
+  });
+
+  it('events.jsonl consecutive appends only append new lines without repeating existing content', async () => {
+    const adapter = new DaemonEventProjectionAdapter({ stateDir: tempDir });
+    const event1 = buildEventFixture(1);
+    const event2 = buildEventFixture(2);
+
+    const first = await adapter.append([event1]);
+    expect(first.appended).toBe(1);
+
+    const second = await adapter.append([event2]);
+    expect(second.appended).toBe(1);
+
+    const read = await adapter.readAfterCursor(null);
+    expect(read.ok).toBe(true);
+    if (!read.ok) {
+      throw new Error('expected read to be ok');
+    }
+    expect(read.events).toHaveLength(2);
+    expect(read.events[0]?.eventId).toBe(event1.eventId);
+    expect(read.events[1]?.eventId).toBe(event2.eventId);
+
+    const fileContent = await fs.readFile(path.join(tempDir, 'daemon', 'events.jsonl'), 'utf8');
+    const lines = fileContent.trim().split('\n');
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toBe(serializeDaemonEventHeader());
+  });
+
+  it('daemon adapters refuse unknown schemaVersion with StateFileUnknownVersionError without quarantining', async () => {
+    const statusDir = path.join(tempDir, 'daemon');
+    await fs.mkdir(statusDir, { recursive: true });
+    const badStatusBytes = Buffer.from(JSON.stringify({ ...buildStatusRecord(), version: 2 }));
+    const statusPath = path.join(statusDir, 'status.json');
+    await fs.writeFile(statusPath, badStatusBytes);
+
+    const statusAdapter = new DaemonStatusFileAdapter({ stateDir: tempDir });
+    await expect(statusAdapter.read()).rejects.toBeInstanceOf(StateFileUnknownVersionError);
+    expect(await fs.readFile(statusPath)).toEqual(badStatusBytes);
+    await expect(fs.stat(path.join(statusDir, 'quarantine'))).rejects.toThrow();
+
+    const badPauseBytes = Buffer.from(
+      JSON.stringify({ version: 2, paused: true, changedAtIso: '2026-10-27T10:00:00.000Z' }),
+    );
+    const pausePath = path.join(statusDir, 'paused.json');
+    await fs.writeFile(pausePath, badPauseBytes);
+
+    const pauseAdapter = new DaemonPauseAdapter({ stateDir: tempDir });
+    await expect(pauseAdapter.read()).rejects.toBeInstanceOf(StateFileUnknownVersionError);
+    expect(await fs.readFile(pausePath)).toEqual(badPauseBytes);
+    await expect(fs.stat(path.join(statusDir, 'quarantine'))).rejects.toThrow();
+
+    const leasesDir = path.join(statusDir, 'leases');
+    await fs.mkdir(leasesDir, { recursive: true });
+    const badLeaseBytes = Buffer.from(JSON.stringify({ ...buildLeaseRecord('notifier'), version: 2 }));
+    const leasePath = path.join(leasesDir, 'notifier.json');
+    await fs.writeFile(leasePath, badLeaseBytes);
+
+    const leaseAdapter = new DaemonLeaseAdapter({ stateDir: tempDir });
+    await expect(leaseAdapter.read('notifier')).rejects.toBeInstanceOf(StateFileUnknownVersionError);
+    expect(await fs.readFile(leasePath)).toEqual(badLeaseBytes);
+    await expect(fs.stat(path.join(leasesDir, 'quarantine'))).rejects.toThrow();
+  });
+
+  it('daemon/leases check scans nested lease quarantine directories even when a lease file has failed', async () => {
+    const descriptor = descriptorFor('daemon/leases');
+    const mergeDir = path.join(tempDir, 'daemon', 'leases', 'merge');
+    await fs.mkdir(mergeDir, { recursive: true });
+
+    await fs.writeFile(
+      path.join(tempDir, 'daemon', 'leases', 'notifier.json'),
+      JSON.stringify(buildLeaseRecord('notifier')),
+    );
+
+    const badLeasePath = path.join(mergeDir, '0123456789ab.json');
+    const garbageBytes = Buffer.from('{ unparseable lease content');
+    await fs.writeFile(badLeasePath, garbageBytes);
+
+    const leaseAdapter = new DaemonLeaseAdapter({ stateDir: tempDir });
+    await expect(leaseAdapter.read('merge/0123456789ab')).rejects.toBeInstanceOf(StateFileUnreadableError);
+
+    const mergeQuarantineDir = path.join(mergeDir, 'quarantine');
+    const quarantineFiles = await fs.readdir(mergeQuarantineDir);
+    expect(quarantineFiles.length).toBeGreaterThan(0);
+
+    const check = await descriptor.check(tempDir);
+    expect(check.result.status).toBe('unreadable');
+    expect(check.result.status === 'unreadable' ? check.result.detail : '').toContain('merge/0123456789ab.json');
+    expect(check.quarantineCopies).toHaveLength(1);
+    expect(check.quarantineCopies[0]!.name).toBe(quarantineFiles[0]!);
+
+    const read = await descriptor.readQuarantineCopy(tempDir, check.quarantineCopies[0]!.name);
+    expect(read.status).toBe('read');
+    if (read.status === 'read') {
+      expect(read.bytes).toEqual(garbageBytes);
+    }
+  });
+
+  it('events.jsonl append skips duplicate event ids within batch or file', async () => {
+    const adapter = new DaemonEventProjectionAdapter({ stateDir: tempDir });
+    const event1 = buildEventFixture(1);
+
+    const first = await adapter.append([event1, event1]);
+    expect(first.appended).toBe(1);
+
+    const second = await adapter.append([event1]);
+    expect(second.appended).toBe(0);
+
+    const read = await adapter.readAfterCursor(null);
+    expect(read.ok).toBe(true);
+    if (!read.ok) {
+      throw new Error('expected read to be ok');
+    }
+    expect(read.events).toHaveLength(1);
+    expect(read.events[0]?.eventId).toBe(event1.eventId);
+  });
+
+  it('DaemonLeaseAdapter refuses a lease scope with more than one slash', async () => {
+    const adapter = new DaemonLeaseAdapter({ stateDir: tempDir });
+    await expect(
+      adapter.acquire({
+        scope: 'a/b/c',
+        holderId: TICK_ID,
+        observedFence: 0,
+        leaseUntilIso: new Date(Date.now() + 60_000).toISOString(),
+        nowIso: new Date().toISOString(),
+      }),
+    ).rejects.toThrow('DaemonLeaseAdapter refuses an unsafe lease scope');
+  });
+
+  it('DaemonLeaseAdapter treats a lease whose record scope differs from its file path as unreadable', async () => {
+    const leasesDir = path.join(tempDir, 'daemon', 'leases');
+    await fs.mkdir(leasesDir, { recursive: true });
+    const leasePath = path.join(leasesDir, 'notifier.json');
+    await fs.writeFile(leasePath, JSON.stringify(buildLeaseRecord('other')));
+
+    const adapter = new DaemonLeaseAdapter({ stateDir: tempDir });
+    await expect(adapter.read('notifier')).rejects.toBeInstanceOf(StateFileUnreadableError);
+
+    const mutateResult = await adapter.acquire({
+      scope: 'notifier',
+      holderId: TICK_ID,
+      observedFence: 0,
+      leaseUntilIso: new Date(Date.now() + 60_000).toISOString(),
+      nowIso: new Date().toISOString(),
+    });
+    expect(mutateResult).toEqual({ outcome: 'refused', reason: 'lease-unreadable' });
   });
 });

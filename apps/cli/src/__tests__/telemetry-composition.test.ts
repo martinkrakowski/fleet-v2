@@ -18,6 +18,8 @@ import { telemetrySaltFingerprint, type TelemetryHmac } from '@fleet/work-execut
 
 import { createFleetCliRuntime } from '../composition.js';
 import { composeTelemetry } from '../composition/telemetry.js';
+import { DriverTelemetryExporter } from '../telemetry-exporter.js';
+import { NoopRunTelemetryMarkAdapter } from '@fleet/work-execution';
 
 const EXAMPLE_ATTEMPT = 'example-attempt-a';
 const EXAMPLE_HEAD = 'example-head-sha-1';
@@ -193,6 +195,23 @@ describe('telemetry export composition (OT4b-1)', () => {
     const composed = composeTelemetry({ policy: examplePolicy({ enabled: true, salt: SALT }), env: {} });
     expect(Object.keys(composed.telemetry.policy)).not.toContain('salt');
     expect(JSON.stringify(composed.telemetry)).not.toContain(SALT);
+    // The OT5 mark/exporter fields serialize nothing salt-shaped either.
+    expect(JSON.stringify({ mark: composed.telemetry.mark })).not.toContain(SALT);
+    expect(JSON.stringify({ stopExporter: composed.telemetry.stopExporter })).toBe('{}');
+  });
+
+  it('with a valid salt the composed mark is the driver exporter with start/stop exporters', () => {
+    const composed = composeTelemetry({ policy: examplePolicy({ enabled: true, salt: SALT }), env: {} });
+    expect(composed.telemetry.mark).toBeInstanceOf(DriverTelemetryExporter);
+    expect(composed.telemetry.startExporter).toBeTypeOf('function');
+    expect(composed.telemetry.stopExporter).toBeTypeOf('function');
+  });
+
+  it('without a salt the composed mark is the no-op and the exporters are null', () => {
+    const composed = composeTelemetry({ policy: examplePolicy(), env: {} });
+    expect(composed.telemetry.mark).toBeInstanceOf(NoopRunTelemetryMarkAdapter);
+    expect(composed.telemetry.startExporter).toBeNull();
+    expect(composed.telemetry.stopExporter).toBeNull();
   });
 
   it('reports salt-invalid for a salt the installation validator rejects, with no HMAC, export or sender', async () => {

@@ -2,7 +2,24 @@
  * The JSON state stores work-execution owns, described for `fleet-v2 state`
  * (E1b). Each parser is the one the store's reader uses.
  */
-import { describeRecordListStore, describeVersionedRecordListStore, type StateFileDescriptor } from './file-store.js';
+import {
+  describeJsonlProjection,
+  describeRecordGlob,
+  describeRecordListStore,
+  describeSingleRecordStore,
+  describeVersionedRecordListStore,
+  type SingleRecordInspection,
+  type StateFileDescriptor,
+} from './file-store.js';
+import {
+  readDaemonLeaseRecord,
+  readDaemonPauseRecord,
+  readDaemonStatusRecord,
+  type DaemonLeaseRecord,
+  type DaemonPauseRecord,
+  type DaemonStatusRecord,
+} from '../../domain/daemon-tick.js';
+import { readDaemonEventLine } from '../../domain/daemon-events.js';
 import { parseVersionedConductorPassTraceStateRecord } from '../../domain/conductor-pass-trace.js';
 import { parseVersionedAttemptStateRecord } from './AttemptRepositoryAdapter.adapter.js';
 import { parseConductorDriverLeaseStateRecord } from './ConductorDriverLeaseAdapter.adapter.js';
@@ -15,6 +32,43 @@ import { parseWorkOrderStateRecord } from './WorkOrderRepositoryAdapter.adapter.
 import { parseVersionedLaneRunStateRecord } from './LaneRunRepositoryAdapter.adapter.js';
 import { parseVersionedLaneRunJournalStateRecord } from './LaneRunJournalAdapter.adapter.js';
 import { parseTelemetryDispositionStateRecord } from './TelemetryDispositionAdapter.adapter.js';
+import {
+  duplicateMergeQueueIdentityListError,
+  parseMergeQueueStateRecord,
+} from './MergeQueueRepositoryAdapter.adapter.js';
+
+/** A single-record inspection that preserves the daemon readers' unknown-version refusal. */
+function inspectSingleDaemonStatusRecord(raw: unknown): SingleRecordInspection<DaemonStatusRecord> {
+  const read = readDaemonStatusRecord(raw);
+  if (read.ok) {
+    return { status: 'ok', record: read.record };
+  }
+  return read.reason === 'unknown-version'
+    ? { status: 'unknown-version', detail: read.error }
+    : { status: 'unreadable', detail: read.error };
+}
+
+/** A single-record inspection for the pause marker, preserving unknown-version. */
+function inspectSingleDaemonPauseRecord(raw: unknown): SingleRecordInspection<DaemonPauseRecord> {
+  const read = readDaemonPauseRecord(raw);
+  if (read.ok) {
+    return { status: 'ok', record: read.record };
+  }
+  return read.reason === 'unknown-version'
+    ? { status: 'unknown-version', detail: read.error }
+    : { status: 'unreadable', detail: read.error };
+}
+
+/** A single-record inspection for one lease file, preserving unknown-version. */
+function inspectSingleDaemonLeaseRecord(raw: unknown): SingleRecordInspection<DaemonLeaseRecord> {
+  const read = readDaemonLeaseRecord(raw);
+  if (read.ok) {
+    return { status: 'ok', record: read.record };
+  }
+  return read.reason === 'unknown-version'
+    ? { status: 'unknown-version', detail: read.error }
+    : { status: 'unreadable', detail: read.error };
+}
 
 export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('work-orders.json', parseWorkOrderStateRecord),
@@ -27,4 +81,9 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeVersionedRecordListStore('run-journal.json', parseVersionedLaneRunJournalStateRecord),
   describeRecordListStore('telemetry-dispositions.json', parseTelemetryDispositionStateRecord),
   describeVersionedRecordListStore('conductor-passes.json', parseVersionedConductorPassTraceStateRecord),
+  describeSingleRecordStore('daemon/status.json', inspectSingleDaemonStatusRecord),
+  describeSingleRecordStore('daemon/paused.json', inspectSingleDaemonPauseRecord),
+  describeRecordGlob('daemon/leases', inspectSingleDaemonLeaseRecord),
+  describeJsonlProjection('daemon/events.jsonl', readDaemonEventLine),
+  describeRecordListStore('merge-queue.json', parseMergeQueueStateRecord, duplicateMergeQueueIdentityListError),
 ];

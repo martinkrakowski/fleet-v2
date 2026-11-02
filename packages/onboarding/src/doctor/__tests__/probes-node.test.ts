@@ -5,7 +5,7 @@
  * credential file's contents — fileMode only stats.
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,6 +15,7 @@ import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
 
 import type { SeatModel } from '@fleet/installation';
 
+import { GH_BINARY_CANDIDATES } from '../gh-binary.js';
 import type {
   DoctorCommandExecutor,
   DoctorCommandRunOptions,
@@ -324,6 +325,35 @@ describe('createNodeDoctorProbes', () => {
     expect(local.calls.map((call) => call.argv)).toEqual(
       BUILT_IN_TOOLS.map((tool) => [...tool.detect.argv]),
     );
+  });
+
+  it('resolves gh from injected ghBinaryCandidates via real filesystem checks', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'gh-probes-'));
+    try {
+      const executablePath = join(tempDir, 'gh-exec');
+      writeFileSync(executablePath, '#!/bin/sh\n');
+      chmodSync(executablePath, 0o755);
+      const candidates = [executablePath, '/nonexistent/gh'];
+      const probes = createNodeDoctorProbes({ ghBinaryCandidates: candidates });
+      await expect(probes.ghBinary!()).resolves.toEqual({ resolved: executablePath, candidates });
+
+      const nonExecutablePath = join(tempDir, 'gh-noexec');
+      writeFileSync(nonExecutablePath, '#!/bin/sh\n');
+      chmodSync(nonExecutablePath, 0o644);
+      const probes2 = createNodeDoctorProbes({ ghBinaryCandidates: [nonExecutablePath] });
+      await expect(probes2.ghBinary!()).resolves.toEqual({
+        resolved: undefined,
+        candidates: [nonExecutablePath],
+      });
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('defaults gh binary candidates to the fixed reviewed list', async () => {
+    const probes = createNodeDoctorProbes();
+    const result = await probes.ghBinary!();
+    expect(result?.candidates).toEqual(GH_BINARY_CANDIDATES);
   });
 });
 

@@ -21,11 +21,19 @@ export interface RequestVerificationRequest {
   readonly implementerModel: string;
   readonly requiredChecks: readonly string[];
   readonly nowIso?: string;
+  /**
+   * Absolute ISO deadline for the verification run. When present, every
+   * executor call is bounded to `min(normal timeout, remaining budget)` and
+   * a call with under 2 seconds remaining is not started; a rejection names
+   * the exhausted budget. Callers that pass no deadline keep today's timeout.
+   */
+  readonly deadlineIso?: string;
 }
 
 export type RequestVerificationResult =
   | { readonly outcome: 'completed'; readonly assessment: EvidenceAssessmentRecord; readonly receipts: readonly VerificationReceiptRecord[] }
-  | { readonly outcome: 'rejected'; readonly reason: string };
+  | { readonly outcome: 'rejected'; readonly reason: string }
+  | { readonly outcome: 'not-started'; readonly reason: string };
 
 export interface RequestVerificationPort {
   requestVerification(request: RequestVerificationRequest): Promise<RequestVerificationResult>;

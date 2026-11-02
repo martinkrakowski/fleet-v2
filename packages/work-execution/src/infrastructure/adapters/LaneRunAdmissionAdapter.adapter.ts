@@ -308,8 +308,8 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
       return {
         blocked: true,
         blockers: {
-          runIds: [...new Set(active.map((entry) => entry.run.runId))].sort(),
-          attemptIds: [...new Set(inFlight.map((entry) => entry.attemptId))].sort(),
+          runIds: [...new Set(active.map((entry) => entry.run.runId))].sort((left, right) => left.localeCompare(right)),
+          attemptIds: [...new Set(inFlight.map((entry) => entry.attemptId))].sort((left, right) => left.localeCompare(right)),
         },
       };
     }
@@ -421,7 +421,7 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
         }
       }
     }
-    return { runIds: [...new Set(runIds)].sort(), attemptIds: [...new Set(attemptIds)].sort() };
+    return { runIds: [...new Set(runIds)].sort((left, right) => left.localeCompare(right)), attemptIds: [...new Set(attemptIds)].sort((left, right) => left.localeCompare(right)) };
   }
 
   /**

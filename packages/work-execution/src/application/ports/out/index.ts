@@ -28,6 +28,7 @@ export * from "./ForgeReadPort.out-port.js";
 export * from "./GatePredicatePort.out-port.js";
 export * from "./GateReceiptPort.out-port.js";
 export * from "./LaneDiffCheckPort.out-port.js";
+export * from "./LanePlanRepositoryPort.out-port.js";
 export * from "./LaneRunAdmissionPort.out-port.js";
 export * from "./LaneRunJournalPort.out-port.js";
 export * from "./LaneRunParkNoticePort.out-port.js";

@@ -41,6 +41,14 @@ export interface DoctorProbes {
   ocmRunBinary(): Promise<{ path: string; sha256: string } | undefined>;
   /** The expected `ocm-run` sha256 from `scripts/ocm-run-hash.txt`. */
   expectedOcmRunHash(): Promise<string | undefined>;
+  /**
+   * The reviewed `gh` binary resolution: the first fixed candidate path that
+   * is an executable regular file, plus the full candidate list. `undefined`
+   * when the probe itself could not run.
+   */
+  ghBinary(): Promise<
+    { resolved: string | undefined; candidates: readonly string[] } | undefined
+  >;
   /** The one-step probe of a seat: model, variant, agent. */
   seatProbe(seat: SeatModel): Promise<SeatProbeResult>;
 }

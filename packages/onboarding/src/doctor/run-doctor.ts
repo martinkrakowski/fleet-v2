@@ -468,6 +468,26 @@ async function runnerBinaryLines(probes: DoctorProbes): Promise<DoctorLine[]> {
   ];
 }
 
+/** The reviewed `gh` binary: first executable fixed candidate, or FAIL naming all candidates. */
+async function ghBinaryLines(probes: DoctorProbes): Promise<DoctorLine[]> {
+  const gh = await safely(() => probes.ghBinary());
+  if (gh === undefined) {
+    return [line('gh-binary', 'gh', 'resolved', 'UNKNOWN', 'gh resolution probe failed')];
+  }
+  if (gh.resolved !== undefined) {
+    return [line('gh-binary', 'gh', 'resolved', 'PASS', gh.resolved)];
+  }
+  return [
+    line(
+      'gh-binary',
+      'gh',
+      'resolved',
+      'FAIL',
+      `gh not found at ${gh.candidates.join(', ')}; conducted runs open PRs through one of these paths`,
+    ),
+  ];
+}
+
 /** Seat lines: probed, or explicitly not probed. */
 async function seatLines(
   model: FleetInstallationModel,
@@ -537,8 +557,9 @@ async function seatLines(
 /**
  * Run every doctor check over a loaded installation, in the order:
  * installation, hosts and their roles, configured tools, credential files,
- * the bundled runner binary, then seats. Each yielded line is one check;
- * the generator awaits probes sequentially so output order is stable.
+ * the bundled runner binary, the reviewed gh binary, then seats. Each
+ * yielded line is one check; the generator awaits probes sequentially so
+ * output order is stable.
  */
 export async function* runDoctor(
   result: DoctorableInstallation,
@@ -561,6 +582,9 @@ export async function* runDoctor(
     yield doctorLine;
   }
   for (const doctorLine of await runnerBinaryLines(probes)) {
+    yield doctorLine;
+  }
+  for (const doctorLine of await ghBinaryLines(probes)) {
     yield doctorLine;
   }
   for (const doctorLine of await seatLines(result.model, probes, options)) {

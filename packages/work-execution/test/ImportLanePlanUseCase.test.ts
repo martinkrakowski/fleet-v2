@@ -25,13 +25,7 @@ describe('ImportLanePlanUseCase', () => {
         scope: 'scope for lane a',
         packages: ['work-execution'],
         tier: 0,
-        after: [
-          {
-            projectId: 'proj-1',
-            planId: 'plan-b',
-            laneId: 'lane-b',
-          },
-        ],
+        after: ['proj-1/plan-b/lane-b'],
       },
     ],
   };
@@ -48,13 +42,7 @@ describe('ImportLanePlanUseCase', () => {
         scope: 'scope for lane b',
         packages: ['work-execution'],
         tier: 0,
-        after: [
-          {
-            projectId: 'proj-1',
-            planId: 'plan-a',
-            laneId: 'lane-a',
-          },
-        ],
+        after: ['proj-1/plan-a/lane-a'],
       },
     ],
   };

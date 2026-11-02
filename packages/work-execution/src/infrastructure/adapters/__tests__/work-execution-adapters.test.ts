@@ -264,7 +264,7 @@ describe('AttemptRepositoryAdapter', () => {
     const adapter = new AttemptRepositoryAdapter();
     const record = makeAttempt();
     await adapter.saveAttempt(record);
-    await expect(adapter.findAttemptById('att-1')).resolves.toEqual(record);
+    await expect(adapter.findAttemptById('att-1')).resolves.toEqual({ ...record, schemaVersion: 1 });
     await expect(adapter.findAttemptById('att-missing')).resolves.toBeNull();
   });
 

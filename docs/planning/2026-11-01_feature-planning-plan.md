@@ -366,6 +366,8 @@ Each lane is about 45 minutes. The tier follows the tier rule.
 
 ## 12. Decisions for the owner
 
+**Decided (owner, 2026-11-02: "Proceed with your recommendations"):** every default below is accepted as the owner's decision. D-FP3 opens a one-way door only when the owner allows a project by policy, because text served on staging cannot be recalled.
+
 | # | Decision | Default |
 |---|---|---|
 | D-FP1 | A new `feature-planning` context, or a part of an existing one? | New supporting context. Work execution stays free of pre-approval text. |

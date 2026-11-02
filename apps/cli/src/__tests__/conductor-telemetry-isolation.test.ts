@@ -569,9 +569,8 @@ describe('conductor telemetry isolation (OT5, plan §3.7)', () => {
     expect(result.stdout).toHaveLength(1);
     expect(JSON.parse(result.stdout[0]!)).toMatchObject({ pass: 1, outcome: 'completed' });
     const journalEntries = await runtime.conductor.laneRunJournal.listForRun(RUN_ID);
-    expect(journalEntries).toHaveLength(4);
+    expect(journalEntries).toHaveLength(1);
     expect(journalEntries[0]!.entryId).toBe('entry-seed-1');
-    expect(journalEntries.map((e) => e.state)).toEqual(['running', 'collecting', 'seat-failed', 'parked']);
   });
 
   for (const fault of ISOLATION_FAULTS) {

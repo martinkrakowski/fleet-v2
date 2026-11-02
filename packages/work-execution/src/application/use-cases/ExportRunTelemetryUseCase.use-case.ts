@@ -31,6 +31,7 @@ import {
   attemptTraceSpans,
   laneRunSpans,
   type AttemptTraceTelemetryFacts,
+  type LaneRunTelemetryFacts,
   type TelemetryGateReceiptFact,
   type TelemetryReceiptFacts,
   type TelemetryReviewReceiptFact,
@@ -601,13 +602,14 @@ export class ExportRunTelemetryUseCase implements ExportRunTelemetryPort {
       if (!journalRead.ok) {
         return refused('read-error', counts);
       }
-      const result = laneRunSpans(deps.hmac, {
+      const facts: LaneRunTelemetryFacts = {
         run,
         journal: journalRead.value,
         project,
         tags,
         attempts: selection.attemptsOfRun.get(run.runId) ?? [],
-      });
+      };
+      const result = laneRunSpans(deps.hmac, facts);
       mapped.push(...result.spans);
       rejectedInvalid += result.rejectedInvalid;
     }

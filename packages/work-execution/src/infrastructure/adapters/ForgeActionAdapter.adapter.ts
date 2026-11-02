@@ -34,6 +34,7 @@ import type {
 import type { ForgeRefusalKind } from '../../domain/coordination-keys.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
 import { classifyGhRefusal } from './gh-refusal.js';
+import { ForgeReadAdapter } from './ForgeReadAdapter.adapter.js';
 
 export {
   PERMISSION_NEEDLES,
@@ -649,6 +650,9 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     if (!Number.isFinite(Date.parse(request.deadlineIso))) {
       return this.mergeRefusedOther('unparseable deadline');
     }
+    if (!Number.isSafeInteger(request.pullRequestNumber) || request.pullRequestNumber < 1) {
+      return this.mergeRefusedOther(`Invalid pull request number: ${request.pullRequestNumber}`);
+    }
     if (!REPOSITORY_PATTERN.test(request.repository.owner) || !REPOSITORY_PATTERN.test(request.repository.repo)) {
       return this.mergeRefusedOther('Invalid repository owner or repo');
     }
@@ -703,6 +707,31 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     return dir !== undefined && dir.trim().length > 0 ? dir.trim() : null;
   }
 
+  /** The per-kind config dir for a merge-path action: premerge for post-status, merger for others. */
+  private configDirFor(request: MergeForgeActionRequest): string | null {
+    return request.kind === 'post-status' ? this.premergeConfigDir() : this.mergeConfigDir();
+  }
+
+  /**
+   * Build a reader that runs `gh pr view` with the per-kind config dir.
+   * Merger's directory for merge-pr and update-branch, poster's for post-status.
+   */
+  private mergePullRequestReader(
+    request: MergeForgeActionRequest,
+  ): Pick<ForgeReadPort, 'readPullRequest'> | null {
+    const configDir = this.configDirFor(request);
+    if (configDir === null) {
+      return null;
+    }
+    const runGh = this.delegate?.runGh;
+    if (runGh !== undefined) {
+      return new ForgeReadAdapter({
+        runGh: (args, timeoutMs) => runGh(args, configDir, timeoutMs),
+      });
+    }
+    return this.delegate?.pullRequestRead ?? null;
+  }
+
   /**
    * Read the pull request by number for the merge path, bounded by the
    * remaining budget. Returns null when the read cannot answer so the caller
@@ -712,8 +741,8 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     request: MergeForgeActionRequest,
     timeoutMs: number,
   ): Promise<ReadPullRequestResult | null> {
-    const reader = this.delegate?.pullRequestRead;
-    if (reader === undefined) {
+    const reader = this.mergePullRequestReader(request);
+    if (reader === null) {
       return null;
     }
     try {

@@ -264,7 +264,9 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
         runGhSubprocess(
           args,
           ghBinaryCandidates,
-          ghConfigDir === undefined ? undefined : buildMergeGhChildEnv(ghConfigDir),
+          ghConfigDir === undefined
+            ? undefined
+            : buildMergeGhChildEnv(ghConfigDir, (options?.env as NodeJS.ProcessEnv) ?? process.env),
           timeoutMs,
         ),
       verifyCurrentHeadSha: async (branchName, request) => {
@@ -383,8 +385,10 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     },
     forgeRead,
     {
-      premergeGhConfigDir: process.env.FLEET_GH_CONFIG_PREMERGE?.trim() || undefined,
-      mergeGhConfigDir: process.env.FLEET_GH_CONFIG_MERGE?.trim() || undefined,
+      premergeGhConfigDir:
+        (options?.env ?? process.env).FLEET_GH_CONFIG_PREMERGE?.trim() || undefined,
+      mergeGhConfigDir:
+        (options?.env ?? process.env).FLEET_GH_CONFIG_MERGE?.trim() || undefined,
     },
   );
 

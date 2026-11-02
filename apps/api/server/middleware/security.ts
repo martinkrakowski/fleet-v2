@@ -55,6 +55,7 @@ function unauthorized(event: H3Event, message: string): { error: string } {
 function authenticationFailure(
   event: H3Event,
   authHeader: string | undefined | null,
+  requestPath: string,
 ): { error: string } | undefined {
   if (!authHeader || typeof authHeader !== "string") {
     return unauthorized(event, "Unauthorized: missing Authorization header");
@@ -74,8 +75,9 @@ function authenticationFailure(
     !timingSafeEqual(activeBuf, candidateBuf)
   ) {
     // T3b: a session-minted token authenticates through the in-memory registry
-    // (memory only); it is scope-checked afterwards like any non-shared token.
-    if (resolveSessionToken(event) !== null) {
+    // (memory only); the fallback applies only to /v1 paths, so a scoped token
+    // never reaches an unscoped route. It is scope-checked afterwards like any non-shared token.
+    if (isV1Path(requestPath) && resolveSessionToken(event) !== null) {
       return undefined;
     }
     return unauthorized(event, "Unauthorized: invalid bearer token");
@@ -153,7 +155,11 @@ export default defineEventHandler((event) => {
   }
 
   // Require Authorization: Bearer <token> (constant-time compare via crypto.timingSafeEqual on equal-length buffers)
-  const authFailure = authenticationFailure(event, getRequestHeader(event, "authorization"));
+  const authFailure = authenticationFailure(
+    event,
+    getRequestHeader(event, "authorization"),
+    requestPath,
+  );
   if (authFailure) {
     return authFailure;
   }

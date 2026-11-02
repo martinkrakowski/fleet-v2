@@ -14,10 +14,17 @@ import {
   presentedToken,
 } from "../server/wiring/presented-token.js";
 import {
+  ACTOR_REFUSAL_REASON,
   configureSessionExchange,
+  dropInteractiveSession,
+  getInteractiveSession,
+  isValidActor,
+  LIVE_SESSION_LIMIT,
   registerInteractiveSession,
   SESSION_EXCHANGE_HEADER,
   SESSION_EXCHANGE_PATH,
+  TOKENS_PER_SESSION_LIMIT,
+  validateActor,
 } from "../server/wiring/session-exchange.js";
 
 // Nitro auto-imports h3 utilities into the global scope at build time;
@@ -97,6 +104,7 @@ describe("T3b session exchange", () => {
         return { ok: true };
       }),
     );
+    router.get("/unscoped", eventHandler(() => ({ ok: true })));
     app.use(router.handler);
     app.use("/health", healthGetHandler);
 
@@ -386,6 +394,8 @@ describe("T3b session exchange", () => {
       scopes: ["read", "verdict"],
     });
     expect(session).not.toBeNull();
+    expect(session?.scopes).toEqual(["read", "verdict"]);
+    expect(getInteractiveSession(session!.sessionId)?.scopes).toEqual(["read", "verdict"]);
   });
 
   it("fails closed when the exchange has no established session", async () => {
@@ -460,5 +470,197 @@ describe("T3b session exchange", () => {
     expect(await res.json()).toEqual({
       error: "Forbidden: session exchange requires the interactive session credential",
     });
+  });
+
+  it("limits an actor to at most 128 characters of [A-Za-z0-9._@-], refusing anything else with a fixed reason", () => {
+    configureFleetApiRuntime({ stateDir: tempDir });
+
+    // Valid actors
+    expect(isValidActor("owner")).toBe(true);
+    expect(isValidActor("user@domain.org")).toBe(true);
+    expect(isValidActor("agent_1.0-alpha")).toBe(true);
+    expect(isValidActor("a".repeat(128))).toBe(true);
+    expect(validateActor("owner")).toEqual({ ok: true, actor: "owner" });
+
+    // Invalid actors: length > 128
+    expect(isValidActor("a".repeat(129))).toBe(false);
+    expect(validateActor("a".repeat(129))).toEqual({ ok: false, reason: ACTOR_REFUSAL_REASON });
+
+    // Invalid actors: empty or whitespace
+    expect(isValidActor("")).toBe(false);
+    expect(isValidActor("   ")).toBe(false);
+    expect(validateActor("")).toEqual({ ok: false, reason: ACTOR_REFUSAL_REASON });
+
+    // Invalid actors: forbidden characters
+    expect(isValidActor("user name")).toBe(false);
+    expect(isValidActor("user!name")).toBe(false);
+    expect(isValidActor("user/admin")).toBe(false);
+    expect(isValidActor("user#1")).toBe(false);
+    expect(isValidActor("user$")).toBe(false);
+    expect(validateActor("user!name")).toEqual({ ok: false, reason: ACTOR_REFUSAL_REASON });
+
+    // Invalid actors: non-string
+    expect(isValidActor(null)).toBe(false);
+    expect(isValidActor(undefined)).toBe(false);
+    expect(isValidActor(123)).toBe(false);
+    expect(validateActor(null)).toEqual({ ok: false, reason: ACTOR_REFUSAL_REASON });
+
+    // registerInteractiveSession refuses invalid actors
+    expect(registerInteractiveSession({ actor: "a".repeat(129), scopes: ["read"] })).toBeNull();
+    expect(registerInteractiveSession({ actor: "owner!", scopes: ["read"] })).toBeNull();
+    expect(registerInteractiveSession({ actor: "owner/admin", scopes: ["read"] })).toBeNull();
+    expect(registerInteractiveSession({ actor: "owner name", scopes: ["read"] })).toBeNull();
+  });
+
+  it("stores sessionId on each live token", async () => {
+    configuredApi();
+    const session = registerInteractiveSession({ actor: "owner", scopes: ["read"] });
+    expect(session).not.toBeNull();
+    const minted = await mint(session!.secret, ["read"]);
+
+    const res = await fetch(`${baseUrl}/v1/questions`, {
+      headers: { authorization: `Bearer ${minted.token}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.presented.sessionId).toBe(session!.sessionId);
+  });
+
+  it("drops an interactive session and removes its tokens", async () => {
+    configuredApi();
+    const sessionA = registerInteractiveSession({ actor: "owner-a", scopes: ["read"] });
+    const sessionB = registerInteractiveSession({ actor: "owner-b", scopes: ["read"] });
+    expect(sessionA).not.toBeNull();
+    expect(sessionB).not.toBeNull();
+
+    const mintedA = await mint(sessionA!.secret, ["read"]);
+    const mintedB = await mint(sessionB!.secret, ["read"]);
+
+    // Both tokens work initially
+    const resA1 = await fetch(`${baseUrl}/v1/questions`, {
+      headers: { authorization: `Bearer ${mintedA.token}` },
+    });
+    expect(resA1.status).toBe(200);
+    const resB1 = await fetch(`${baseUrl}/v1/questions`, {
+      headers: { authorization: `Bearer ${mintedB.token}` },
+    });
+    expect(resB1.status).toBe(200);
+
+    // Drop session A
+    const dropped = dropInteractiveSession(sessionA!.sessionId);
+    expect(dropped).toBe(true);
+
+    // Session A is gone from getInteractiveSession
+    expect(getInteractiveSession(sessionA!.sessionId)).toBeNull();
+
+    // Token A is refused
+    const resA2 = await fetch(`${baseUrl}/v1/questions`, {
+      headers: { authorization: `Bearer ${mintedA.token}` },
+    });
+    expect(resA2.status).toBe(401);
+
+    // Session A secret is refused on exchange
+    const exchangeA = await fetch(exchangeUrl(), {
+      method: "POST",
+      headers: { [SESSION_EXCHANGE_HEADER]: sessionA!.secret, "content-type": "application/json" },
+      body: JSON.stringify({ scopes: ["read"] }),
+    });
+    expect(exchangeA.status).toBe(403);
+
+    // Session B and its token are unaffected
+    const resB2 = await fetch(`${baseUrl}/v1/questions`, {
+      headers: { authorization: `Bearer ${mintedB.token}` },
+    });
+    expect(resB2.status).toBe(200);
+    expect(getInteractiveSession(sessionB!.sessionId)).not.toBeNull();
+  });
+
+  it("enforces the 16-token limit per session so one session cannot lock out others", async () => {
+    configuredApi();
+    const secretA = sessionSecret(["read"], "owner-a");
+    const secretB = sessionSecret(["read"], "owner-b");
+
+    // Session A mints 16 tokens
+    for (let i = 0; i < TOKENS_PER_SESSION_LIMIT; i++) {
+      await mint(secretA, ["read"]);
+    }
+
+    // Session A cannot mint a 17th token
+    const overA = await fetch(exchangeUrl(), {
+      method: "POST",
+      headers: { [SESSION_EXCHANGE_HEADER]: secretA, "content-type": "application/json" },
+      body: JSON.stringify({ scopes: ["read"] }),
+    });
+    expect(overA.status).toBe(403);
+    expect(await overA.json()).toEqual({ error: "Forbidden: scope requested is not mintable" });
+
+    // Session B is not locked out and can mint its tokens
+    const mintedB = await mint(secretB, ["read"]);
+    expect(typeof mintedB.token).toBe("string");
+  });
+
+  it("caps live sessions at a fixed limit and refuses registration beyond it", () => {
+    configuredApi();
+    const sessionIds: string[] = [];
+    for (let i = 0; i < LIVE_SESSION_LIMIT; i++) {
+      const s = registerInteractiveSession({
+        actor: `owner-${i}`,
+        scopes: ["read"],
+      });
+      expect(s).not.toBeNull();
+      sessionIds.push(s!.sessionId);
+    }
+
+    // Beyond the cap is refused
+    const over = registerInteractiveSession({
+      actor: "owner-extra",
+      scopes: ["read"],
+    });
+    expect(over).toBeNull();
+
+    // Dropping a session allows a new session to be registered
+    expect(dropInteractiveSession(sessionIds[0])).toBe(true);
+    const replacement = registerInteractiveSession({
+      actor: "owner-replacement",
+      scopes: ["read"],
+    });
+    expect(replacement).not.toBeNull();
+  });
+
+  it("refuses a scoped read token on any path outside /v1 while allowing the shared bearer", async () => {
+    configuredApi();
+    const secret = sessionSecret(["read"]);
+    const minted = await mint(secret, ["read"]);
+
+    // Scoped token is refused on /unscoped
+    const resScoped = await fetch(`${baseUrl}/unscoped`, {
+      headers: { authorization: `Bearer ${minted.token}` },
+    });
+    expect(resScoped.status).toBe(401);
+    expect(await resScoped.json()).toEqual({ error: "Unauthorized: invalid bearer token" });
+
+    // Shared bearer is permitted on /unscoped
+    const resShared = await fetch(`${baseUrl}/unscoped`, {
+      headers: { authorization: `Bearer ${VALID_TOKEN}` },
+    });
+    expect(resShared.status).toBe(200);
+    expect(await resShared.json()).toEqual({ ok: true });
+  });
+
+  it("refuses a minted token as a bearer on the exchange", async () => {
+    configuredApi();
+    const secret = sessionSecret(["read"]);
+    const minted = await mint(secret, ["read"]);
+
+    const res = await fetch(exchangeUrl(), {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${minted.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ scopes: ["read"] }),
+    });
+    expect(res.status).toBe(403);
+    expect(res.headers.get("cache-control")).toBe("no-store");
   });
 });

@@ -10,6 +10,7 @@ export interface PresentedToken {
   readonly scopes: readonly string[];
   /** The verified actor of a session-minted token; the shared bearer has none. */
   readonly actor?: string;
+  readonly sessionId?: string;
 }
 
 /** Until T3a: the one shared bearer, presented under a fixed id that is not derived from its value. */
@@ -47,6 +48,7 @@ export function presentedToken(event: H3Event): PresentedToken {
     tokenId: resolved.tokenId,
     scopes: [...resolved.scopes],
     ...(resolved.actor !== undefined ? { actor: resolved.actor } : {}),
+    ...(resolved.sessionId !== undefined ? { sessionId: resolved.sessionId } : {}),
   };
 }
 

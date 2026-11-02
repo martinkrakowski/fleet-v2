@@ -80,9 +80,14 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
     const { scope, ...leaseRequest } = request;
     return this.mutate(scope, (current) => {
       const decision = decideLeaseAcquire(withoutVersion(current), leaseRequest);
-      return decision.ok
-        ? { outcome: 'ok', lease: withVersion(decision.lease, scope) }
-        : { outcome: 'refused', reason: decision.reason };
+      if (!decision.ok) {
+        return { outcome: 'refused', reason: decision.reason };
+      }
+      const candidate = withVersion(decision.lease, scope);
+      if (!readDaemonLeaseRecord(candidate).ok) {
+        return { outcome: 'refused', reason: 'invalid-request' };
+      }
+      return { outcome: 'ok', lease: candidate };
     });
   }
 

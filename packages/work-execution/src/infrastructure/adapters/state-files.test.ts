@@ -990,4 +990,27 @@ describe('daemon state file descriptors', () => {
     });
     expect(mutateResult).toEqual({ outcome: 'refused', reason: 'lease-unreadable' });
   });
+
+  it('DaemonLeaseAdapter refuses acquire before persisting when candidate record would not read back', async () => {
+    const adapter = new DaemonLeaseAdapter({ stateDir: tempDir });
+    const mutateResult = await adapter.acquire({
+      scope: 'notifier',
+      holderId: 'driver-example-1',
+      observedFence: 0,
+      leaseUntilIso: new Date(Date.now() + 60_000).toISOString(),
+      nowIso: new Date().toISOString(),
+    });
+    expect(mutateResult).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(await adapter.read('notifier')).toBeNull();
+  });
+
+  it('MergeQueueRepositoryAdapter refuses configured file names that collide with other stores', async () => {
+    for (const name of ['lane-plans.json', 'killall-halt.json', 'killall-train-pause.json']) {
+      await expect(
+        new MergeQueueRepositoryAdapter({ stateDir: tempDir, fileName: name }).listMergeEntries({
+          deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+        }),
+      ).rejects.toThrow('MergeQueueRepositoryAdapter refuses a fileName that collides with another store');
+    }
+  });
 });

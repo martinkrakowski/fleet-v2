@@ -1526,18 +1526,25 @@ describe('AdvanceLaneRunUseCase merged-PR leaves branch-behind and ambiguous ope
         { outcome: 'unavailable', reason: 'multiple pull requests match the branch' } as const,
       ]) {
         const harness = await parkedForgeHarness(parked, {}, 7);
+        const entriesBefore = await harness.runJournal.listForRun(RUN_ID);
         harness.setForgeReadAnswer(answer);
         expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
         const record = await harness.runRepo.get(RUN_ID);
         expect(record?.parked).not.toBeNull();
         expect(record?.prNumber).toBe(7);
+        const entriesAfter = await harness.runJournal.listForRun(RUN_ID);
+        expect(entriesAfter).toEqual(entriesBefore);
         expect(await openPrIntents(harness)).toEqual([]);
       }
       // A throwing read stays parked too.
-      const thrown = await parkedForgeHarness(parked);
+      const thrown = await parkedForgeHarness(parked, {}, 7);
+      const thrownEntriesBefore = await thrown.runJournal.listForRun(RUN_ID);
       thrown.setForgeReadAnswer('throw');
       expect(await advance(thrown)).toEqual({ outcome: 'waiting', reason: 'parked' });
-      expect((await thrown.runRepo.get(RUN_ID))?.parked).not.toBeNull();
+      const thrownRecord = await thrown.runRepo.get(RUN_ID);
+      expect(thrownRecord?.parked).not.toBeNull();
+      expect(thrownRecord?.prNumber).toBe(7);
+      expect(await thrown.runJournal.listForRun(RUN_ID)).toEqual(thrownEntriesBefore);
       expect(await openPrIntents(thrown)).toEqual([]);
     }
   });

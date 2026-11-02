@@ -209,7 +209,7 @@ describe('whole-report confirmation', () => {
       killallStopReportConfirmed(
         parsed(
           report({
-            lanes: [lane(), lane({ confirmed: false, unconfirmedReason: 'unknown', cleanSweeps: 0, confirmedAtIso: null })],
+            lanes: [lane(), unconfirmedLane()],
           }),
         ),
       ),
@@ -217,24 +217,9 @@ describe('whole-report confirmation', () => {
   });
 
   it('cannot confirm when a hand-built report has a confirmed lane with an unstopped session', () => {
-    const handBuilt: KillallStopReportRecord = {
-      version: KILLALL_STOP_REPORT_RECORD_VERSION,
-      haltedAtIso: HALTED_AT,
-      marker: 'halted',
-      cleanSweeps: 2,
-      lanes: [
-        {
-          projectId: 'project-1',
-          laneId: 'lane-1',
-          confirmed: true,
-          unconfirmedReason: null,
-          cleanSweeps: 2,
-          confirmedAtIso: CONFIRMED_AT,
-          sessionResults: [{ sessionRef: 'ses-1', stopped: false }],
-        },
-      ],
-      train: { paused: true, acknowledged: true, unconfirmedReason: null },
-    };
+    const handBuilt = report({
+      lanes: [lane({ sessionResults: [{ sessionRef: 'ses-1', stopped: false }] })],
+    }) as unknown as KillallStopReportRecord;
     expect(killallStopReportConfirmed(handBuilt)).toBe(false);
   });
 
@@ -247,6 +232,11 @@ describe('whole-report confirmation', () => {
   it('confirms an empty lanes list only after two clean sweeps', () => {
     expect(killallStopReportConfirmed(parsed(report({ lanes: [], cleanSweeps: 1 })))).toBe(false);
     expect(killallStopReportConfirmed(parsed(report({ lanes: [], cleanSweeps: 2 })))).toBe(true);
+  });
+
+  it('cannot confirm when report haltedAtIso does not match expected marker time', () => {
+    expect(killallStopReportConfirmed(parsed(report()), HALTED_AT)).toBe(true);
+    expect(killallStopReportConfirmed(parsed(report()), '2026-11-01T10:00:01.000Z')).toBe(false);
   });
 });
 
@@ -281,7 +271,7 @@ describe('late start reopens', () => {
     expect(reopenOnLateStart(original, 'project-9', 'lane-9', LATE_START_AT)).toBe(original);
     const alreadyOpen = parsed(
       report({
-        lanes: [lane({ confirmed: false, unconfirmedReason: 'unknown', cleanSweeps: 0, confirmedAtIso: null })],
+        lanes: [unconfirmedLane()],
       }),
     );
     expect(reopenOnLateStart(alreadyOpen, 'project-1', 'lane-1', LATE_START_AT)).toBe(alreadyOpen);
@@ -295,36 +285,38 @@ describe('late start reopens', () => {
 });
 
 describe('train pause read', () => {
-  it('accepts a confirmed pause with a null reason', () => {
-    expect(readKillallTrainPause({ paused: true, acknowledged: true, unconfirmedReason: null })).toEqual({
+  function pause(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
       paused: true,
       acknowledged: true,
       unconfirmedReason: null,
-    });
+      ...overrides,
+    };
+  }
+
+  it('accepts a confirmed pause with a null reason', () => {
+    expect(readKillallTrainPause(pause())).toEqual(pause());
   });
 
   it('accepts an unconfirmed pause with a bounded reason', () => {
-    expect(readKillallTrainPause({ paused: true, acknowledged: false, unconfirmedReason: 'not-stopped' })).toEqual({
-      paused: true,
-      acknowledged: false,
-      unconfirmedReason: 'not-stopped',
-    });
+    const unconfirmed = pause({ acknowledged: false, unconfirmedReason: 'not-stopped' });
+    expect(readKillallTrainPause(unconfirmed)).toEqual(unconfirmed);
   });
 
   it('rejects a missing reason', () => {
-    expect(readKillallTrainPause({ paused: true, acknowledged: false, unconfirmedReason: null })).toBeNull();
+    expect(readKillallTrainPause(pause({ acknowledged: false, unconfirmedReason: null }))).toBeNull();
     expect(readKillallTrainPause({ paused: true, acknowledged: false })).toBeNull();
   });
 
   it('rejects inconsistent paused:false with acknowledged:true', () => {
-    expect(readKillallTrainPause({ paused: false, acknowledged: true, unconfirmedReason: 'not-stopped' })).toBeNull();
-    expect(readKillallTrainPause({ paused: false, acknowledged: true, unconfirmedReason: null })).toBeNull();
+    expect(readKillallTrainPause(pause({ paused: false, unconfirmedReason: 'not-stopped' }))).toBeNull();
+    expect(readKillallTrainPause(pause({ paused: false, unconfirmedReason: null }))).toBeNull();
   });
 
   it('rejects non-boolean fields, extra keys and free-text reasons', () => {
-    expect(readKillallTrainPause({ paused: 1, acknowledged: true, unconfirmedReason: null })).toBeNull();
-    expect(readKillallTrainPause({ paused: true, acknowledged: true, unconfirmedReason: null, extra: true })).toBeNull();
-    expect(readKillallTrainPause({ paused: true, acknowledged: false, unconfirmedReason: 'because why not' })).toBeNull();
+    expect(readKillallTrainPause(pause({ paused: 1 }))).toBeNull();
+    expect(readKillallTrainPause(pause({ extra: true }))).toBeNull();
+    expect(readKillallTrainPause(pause({ acknowledged: false, unconfirmedReason: 'because why not' }))).toBeNull();
   });
 });
 
@@ -393,18 +385,19 @@ describe('session results', () => {
   });
 
   it('rejects malformed session-result entries', () => {
+    const badSession = (entry: Record<string, unknown> | string) => lane({ sessionResults: [entry] });
     // transcript, prompt and path shapes are content and are refused as extra keys
-    expect(readKillallLaneStop(lane({ sessionResults: [{ sessionRef: 's-1', stopped: true, transcript: 'secret' }] }))).toBeNull();
-    expect(readKillallLaneStop(lane({ sessionResults: [{ sessionRef: 's-1', stopped: true, prompt: 'p' }] }))).toBeNull();
-    expect(readKillallLaneStop(lane({ sessionResults: [{ sessionRef: 's-1', stopped: true, path: '/etc/config' }] }))).toBeNull();
+    expect(readKillallLaneStop(badSession({ sessionRef: 's-1', stopped: true, transcript: 'secret' }))).toBeNull();
+    expect(readKillallLaneStop(badSession({ sessionRef: 's-1', stopped: true, prompt: 'p' }))).toBeNull();
+    expect(readKillallLaneStop(badSession({ sessionRef: 's-1', stopped: true, path: '/etc/config' }))).toBeNull();
     // non-string reference
-    expect(readKillallLaneStop(lane({ sessionResults: [{ sessionRef: 12, stopped: true }] }))).toBeNull();
+    expect(readKillallLaneStop(badSession({ sessionRef: 12, stopped: true }))).toBeNull();
     // non-boolean stop status
-    expect(readKillallLaneStop(lane({ sessionResults: [{ sessionRef: 's-1', stopped: 'yes' }] }))).toBeNull();
+    expect(readKillallLaneStop(badSession({ sessionRef: 's-1', stopped: 'yes' }))).toBeNull();
     // non-object entry
-    expect(readKillallLaneStop(lane({ sessionResults: ['s-1'] }))).toBeNull();
+    expect(readKillallLaneStop(badSession('s-1'))).toBeNull();
     // missing key
-    expect(readKillallLaneStop(lane({ sessionResults: [{ stopped: true }] }))).toBeNull();
+    expect(readKillallLaneStop(badSession({ stopped: true }))).toBeNull();
   });
 });
 

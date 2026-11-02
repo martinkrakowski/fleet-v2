@@ -24,6 +24,8 @@ import { parseVersionedConductorPassTraceStateRecord } from '../../domain/conduc
 import { parseVersionedAttemptStateRecord } from './AttemptRepositoryAdapter.adapter.js';
 import { parseConductorDriverLeaseStateRecord } from './ConductorDriverLeaseAdapter.adapter.js';
 import { parseConductorHaltStateRecord } from './ConductorHaltAdapter.adapter.js';
+import { parseKillallHaltMarkerStateRecord } from './KillallHaltMarkerAdapter.adapter.js';
+import { parseKillallTrainPauseStateRecord } from './KillallTrainPauseAdapter.adapter.js';
 import {
   parseVersionedJournalEntryStateRecord,
   parseVersionedReservationStateRecord,
@@ -31,6 +33,7 @@ import {
 import { parseWorkOrderStateRecord } from './WorkOrderRepositoryAdapter.adapter.js';
 import { parseVersionedLaneRunStateRecord } from './LaneRunRepositoryAdapter.adapter.js';
 import { parseVersionedLaneRunJournalStateRecord } from './LaneRunJournalAdapter.adapter.js';
+import { parseVersionedLanePlanStateRecord } from './LanePlanRepositoryAdapter.adapter.js';
 import { parseTelemetryDispositionStateRecord } from './TelemetryDispositionAdapter.adapter.js';
 import {
   duplicateMergeQueueIdentityListError,
@@ -79,6 +82,7 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('conductor-driver-lease.json', parseConductorDriverLeaseStateRecord),
   describeRecordListStore('conductor-halt.json', parseConductorHaltStateRecord),
   describeVersionedRecordListStore('run-journal.json', parseVersionedLaneRunJournalStateRecord),
+  describeVersionedRecordListStore('lane-plans.json', parseVersionedLanePlanStateRecord),
   describeRecordListStore('telemetry-dispositions.json', parseTelemetryDispositionStateRecord),
   describeVersionedRecordListStore('conductor-passes.json', parseVersionedConductorPassTraceStateRecord),
   describeSingleRecordStore('daemon/status.json', inspectSingleDaemonStatusRecord),
@@ -86,4 +90,6 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordGlob('daemon/leases', inspectSingleDaemonLeaseRecord),
   describeJsonlProjection('daemon/events.jsonl', readDaemonEventLine),
   describeRecordListStore('merge-queue.json', parseMergeQueueStateRecord, duplicateMergeQueueIdentityListError),
+  describeRecordListStore('killall-halt.json', parseKillallHaltMarkerStateRecord),
+  describeRecordListStore('killall-train-pause.json', parseKillallTrainPauseStateRecord),
 ];

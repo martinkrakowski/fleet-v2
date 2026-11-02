@@ -12,6 +12,7 @@ export * from "./DispatchAttemptUseCase.use-case.js";
 export * from "./EnqueueMergeUseCase.use-case.js";
 export * from "./ExecuteAuthorizedForgeActionUseCase.use-case.js";
 export * from "./ExportRunTelemetryUseCase.use-case.js";
+export * from "./ImportLanePlanUseCase.use-case.js";
 export * from "./InspectAttemptUseCase.use-case.js";
 export * from "./InspectDaemonStatusUseCase.use-case.js";
 export * from "./InspectLaneRunsUseCase.use-case.js";

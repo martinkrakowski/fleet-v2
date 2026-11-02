@@ -46,6 +46,8 @@ import { projectsCommand, type ProjectsCliOptions } from './projects.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
 import { conductorCommand, type ConductorCliOptions } from './conductor.js';
 import { telemetryCommand, type TelemetryCliOptions } from './telemetry.js';
+import { killallCommand, type KillallCliOptions } from './commands/killall.js';
+import { reportCommand, type ReportCliOptions } from './report.js';
 import {
   CliUsageError,
   NON_ZERO_OUTCOMES,
@@ -662,6 +664,12 @@ The telemetry group exports run telemetry spans (a run, a work order or a
 time window) to the collector route, or prints them with a dry run, and shows
 the configuration status. Run 'fleet-v2 telemetry --help'.
 
+The killall group stops every running lane, pauses the merge train and sets the
+killall halt marker; --lift clears the pause then the marker. Run
+'fleet-v2 killall --help'.
+The report group prints the weekly run-journal service report (read-only, one
+JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
+
 Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
@@ -673,6 +681,8 @@ Commands:
   state check|restore
   conductor status|halt|stop|resume|start|run
   telemetry export|status
+  killall [--lift]
+  report weekly
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared
@@ -713,6 +723,8 @@ export async function runCli(
   conductorOptions?: ConductorCliOptions,
   policyOptions?: PolicyCliOptions,
   telemetryOptions?: TelemetryCliOptions,
+  reportOptions?: ReportCliOptions,
+  killallOptions?: KillallCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -762,6 +774,15 @@ export async function runCli(
       io.stdout(`${QUESTIONS_HELP}\n`);
       return 0;
     }
+    // `killall` halts active lane workers and pauses the train directly
+    // through its state-backed stores; it never composes the runtime or
+    // loads the installation.
+    if (group === 'killall') {
+      return await killallCommand(restArgv.slice(1), io, {
+        ...killallOptions,
+        stateDir: killallOptions?.stateDir ?? stateDir,
+      });
+    }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.
     let activeRuntime: FleetCliRuntime;
@@ -794,6 +815,9 @@ export async function runCli(
     }
     if (group === 'telemetry') {
       return await telemetryCommand(restArgv.slice(1), io, activeRuntime, telemetryOptions ?? {});
+    }
+    if (group === 'report') {
+      return await reportCommand(restArgv.slice(1), io, activeRuntime, reportOptions ?? {});
     }
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);

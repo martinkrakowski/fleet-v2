@@ -15,6 +15,8 @@ import {
 import { parseConductorPassTraceStateRecord } from '../../domain/conductor-pass-trace.js';
 import { parseConductorHaltStateRecord } from './ConductorHaltAdapter.adapter.js';
 import { ConductorPassTraceAdapter } from './ConductorPassTraceAdapter.adapter.js';
+import { KillallHaltMarkerAdapter, parseKillallHaltMarkerStateRecord } from './KillallHaltMarkerAdapter.adapter.js';
+import { KillallTrainPauseAdapter, parseKillallTrainPauseStateRecord } from './KillallTrainPauseAdapter.adapter.js';
 import { WORK_EXECUTION_STATE_FILES } from './state-files.js';
 import { WorkOrderRepositoryAdapter, parseWorkOrderStateRecord } from './WorkOrderRepositoryAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from './AttemptRepositoryAdapter.adapter.js';
@@ -23,6 +25,7 @@ import { LaneRunRepositoryAdapter, parseLaneRunStateRecord } from './LaneRunRepo
 import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
 import { ConductorHaltAdapter } from './ConductorHaltAdapter.adapter.js';
 import { LaneRunJournalAdapter } from './LaneRunJournalAdapter.adapter.js';
+import { LanePlanRepositoryAdapter } from './LanePlanRepositoryAdapter.adapter.js';
 import { MergeQueueRepositoryAdapter } from './MergeQueueRepositoryAdapter.adapter.js';
 import {
   TelemetryDispositionAdapter,
@@ -156,6 +159,60 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       state: null,
     },
   ],
+  'lane-plans.json': [
+    {
+      version: 1,
+      projectId: 'proj-1',
+      planId: 'plan-1',
+      revision: 1,
+      digest: 'a'.repeat(64),
+      doc: 'docs/plan-1.md',
+      lanes: [
+        {
+          laneId: 'L1',
+          aliases: [],
+          scope: 'wire the lane plan store',
+          packages: ['work-execution'],
+          sharedFiles: [],
+          tier: 1,
+          after: [],
+          decisions: [],
+          status: 'planned',
+          brief: null,
+          mergedPr: null,
+        },
+      ],
+      decisions: [],
+      exclusiveOrder: [],
+      importedAtIso: '2026-10-25T00:00:00.000Z',
+    },
+    {
+      version: 1,
+      projectId: 'proj-2',
+      planId: 'plan-2',
+      revision: 1,
+      digest: 'b'.repeat(64),
+      doc: 'docs/plan-2.md',
+      lanes: [
+        {
+          laneId: 'L2',
+          aliases: [],
+          scope: 'wire the lane plan store again',
+          packages: ['work-execution'],
+          sharedFiles: [],
+          tier: 0,
+          after: [],
+          decisions: [],
+          status: 'planned',
+          brief: null,
+          mergedPr: null,
+        },
+      ],
+      decisions: [],
+      exclusiveOrder: [],
+      importedAtIso: '2026-10-25T00:01:00.000Z',
+    },
+  ],
   'telemetry-dispositions.json': [
     {
       version: 1,
@@ -267,6 +324,14 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       revision: 1,
     },
   ],
+  'killall-halt.json': [
+    { version: 1, halted: true, changedAtIso: '2026-10-27T10:00:00.000Z' },
+    { version: 1, halted: false, changedAtIso: '2026-10-27T10:01:00.000Z' },
+  ],
+  'killall-train-pause.json': [
+    { version: 1, paused: true, requestedAtIso: '2026-10-27T10:00:00.000Z' },
+    { version: 1, paused: false, requestedAtIso: '2026-10-27T10:01:00.000Z' },
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -293,6 +358,8 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
   },
   'run-journal.json': (stateDir) =>
     new LaneRunJournalAdapter({ stateDir }).listForRun('run-01JB0000000000000000000000'),
+  'lane-plans.json': (stateDir) =>
+    new LanePlanRepositoryAdapter({ stateDir }).listLanePlans(),
   'telemetry-dispositions.json': async (stateDir) => {
     // The disposition port's `read()` never throws for an unreadable store
     // (it reads `unreadable`), so this observes the same inspection the
@@ -321,6 +388,30 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
     new MergeQueueRepositoryAdapter({ stateDir }).listMergeEntries({
       deadlineIso: new Date(Date.now() + 60_000).toISOString(),
     }),
+  'killall-halt.json': async (stateDir) => {
+    // The killall halt port's `read()` never throws for an unreadable marker
+    // (it reads `unreadable`), so this observes the same inspection the
+    // adapter performs, which quarantines and throws the matching detail.
+    const target = path.join(stateDir, 'killall-halt.json');
+    const buffer = await fs.readFile(target);
+    const inspection = inspectRecordListBytes(buffer, parseKillallHaltMarkerStateRecord);
+    if (inspection.status === 'unreadable') {
+      return quarantineUnreadable(target, inspection.detail, buffer);
+    }
+    return new KillallHaltMarkerAdapter({ stateDir }).read();
+  },
+  'killall-train-pause.json': async (stateDir) => {
+    // The train-pause port's `read()` never throws for an unreadable store
+    // (it reads `unreadable`), so this observes the same inspection the
+    // adapter performs, which quarantines and throws the matching detail.
+    const target = path.join(stateDir, 'killall-train-pause.json');
+    const buffer = await fs.readFile(target);
+    const inspection = inspectRecordListBytes(buffer, parseKillallTrainPauseStateRecord);
+    if (inspection.status === 'unreadable') {
+      return quarantineUnreadable(target, inspection.detail, buffer);
+    }
+    return new KillallTrainPauseAdapter({ stateDir }).read();
+  },
 };
 
 type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
@@ -429,6 +520,7 @@ describe('work-execution state file descriptors match the store readers', () => 
       'conductor-driver-lease.json',
       'conductor-halt.json',
       'run-journal.json',
+      'lane-plans.json',
       'telemetry-dispositions.json',
       'conductor-passes.json',
       'daemon/status.json',
@@ -436,6 +528,8 @@ describe('work-execution state file descriptors match the store readers', () => 
       'daemon/leases',
       'daemon/events.jsonl',
       'merge-queue.json',
+      'killall-halt.json',
+      'killall-train-pause.json',
     ]);
   });
 });
@@ -457,6 +551,7 @@ describe('versioned store descriptors', () => {
     'reservations.json',
     'lane-runs.json',
     'run-journal.json',
+    'lane-plans.json',
   ];
 
   it('reports schemaVersions [1] on valid fixtures', () => {

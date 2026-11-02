@@ -37,7 +37,7 @@ import type {
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
-import type { ForgeReadPort, ReadPullRequestResult } from '../ports/out/ForgeReadPort.out-port.js';
+import type { ForgeReadPort, PullRequestSnapshot } from '../ports/out/ForgeReadPort.out-port.js';
 
 export interface ResumeLaneRunDependencies {
   readonly runRepo: Pick<LaneRunRepositoryPort, 'get' | 'save'>;
@@ -341,70 +341,123 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
   ): Promise<ApplyPendingResumeResult> {
     // Stop-wins, matching the parkedFrom branch: nothing is read or written.
     if (stopMode !== null) {
-      if (!(await this.appendResult(request.runId, resumeKey, 'refused', 'stop-pending', request.nowIso))) {
-        return { outcome: 'refused', key: resumeKey, reason: 'journal-refused' };
-      }
-      return { outcome: 'refused', key: resumeKey, reason: 'stop-pending' };
+      return this.refuseResumeStopPending(resumeKey, request);
     }
     // The open case only applies to a run whose journal state is the parked
     // park; a stray conduct (from a pre-R4a crashed resume) fails closed.
     if (state !== 'parked') {
       return this.ambiguousOpenPrResume(resumeKey, request);
     }
-    let spentKey: string;
-    if (pending !== null) {
-      if (pending.step !== 'open-pr') {
-        return this.ambiguousOpenPrResume(resumeKey, request);
-      }
-      spentKey = pending.key;
-    } else {
-      // A crash after the spent open-pr key's result but before the resume
-      // key's result leaves laneRunJournalPendingIntent null for the now-final
-      // step key. Inspect the journal for the existing open-pr intent and
-      // continue only when it already has a reconciled/pr-opened result; the
-      // record's prNumber was saved before that result, so no second save.
-      const settled = await this.settledOpenPrKey(record.runId);
-      if (settled === null) {
-        return this.ambiguousOpenPrResume(resumeKey, request);
-      }
-      spentKey = settled;
+    const spentKey = await this.spentOpenPrKey(record.runId, pending);
+    if (spentKey === null) {
+      return this.ambiguousOpenPrResume(resumeKey, request);
     }
-    const latestId = record.attemptIds.length === 0 ? null : record.attemptIds[record.attemptIds.length - 1];
-    const latest =
-      this.deps.attemptRepo === undefined || latestId === null
-        ? null
-        : await this.deps.attemptRepo.findAttemptById(latestId);
-    const branch = latest === null ? null : branchNameOf(record, latest);
-    const headSha = latest === null || latest.artifacts === null ? null : latest.artifacts.headCommit;
-    const head12 = headSha === null ? null : head12Of(headSha);
-    let read: ReadPullRequestResult;
+    const read = await this.readOpenPrByBranch(record);
+    if (read === null) {
+      return this.ambiguousOpenPrResume(resumeKey, request);
+    }
+    if (!this.openPrAdoptable(record, read.snapshot, read.headSha, pending === null)) {
+      return this.ambiguousOpenPrResume(resumeKey, request);
+    }
+    return this.adoptOpenPr(record, resumeKey, spentKey, read.snapshot, request);
+  }
+
+  /** The stop-pending refusal of a parked resume: one refused result, then the refused answer. */
+  private async refuseResumeStopPending(
+    resumeKey: string,
+    request: ApplyPendingResumeRequest,
+  ): Promise<ApplyPendingResumeResult> {
+    if (!(await this.appendResult(request.runId, resumeKey, 'refused', 'stop-pending', request.nowIso))) {
+      return { outcome: 'refused', key: resumeKey, reason: 'journal-refused' };
+    }
+    return { outcome: 'refused', key: resumeKey, reason: 'stop-pending' };
+  }
+
+  /**
+   * The spent open-pr key of the open case (R4a): the pending step intent's
+   * key; else, for the crash-repair pass, the journalled open-pr intent
+   * whose key already holds a final result. Null when neither: a pending
+   * intent of another step, or no final open-pr key at all.
+   */
+  private async spentOpenPrKey(
+    runId: string,
+    pending: LaneRunJournalPendingIntent | null,
+  ): Promise<string | null> {
+    if (pending !== null) {
+      return pending.step === 'open-pr' ? pending.key : null;
+    }
+    // A crash after the spent open-pr key's result but before the resume
+    // key's result leaves laneRunJournalPendingIntent null for the now-final
+    // step key. Inspect the journal for the existing open-pr intent and
+    // continue only when it already has a reconciled/pr-opened result (the
+    // brief's correction 1: any other final result adopts nothing); the
+    // record's prNumber was saved before that result, so no second save.
+    return this.adoptableSettledOpenPrKey(runId);
+  }
+
+  /**
+   * The open case's PR read (R4a): the re-read is immediate and by branch —
+   * the facts read of an earlier pass is never trusted for a write. The
+   * attempt read and the head canonicalization run inside the try, so a
+   * repository error or a malformed head fails closed (null) instead of
+   * rejecting; so does every wiring gap, an unreadable read and a throw.
+   * Answers the found snapshot with the attempt's collected head it must
+   * still equal.
+   */
+  private async readOpenPrByBranch(
+    record: LaneRunRecord,
+  ): Promise<{ readonly snapshot: PullRequestSnapshot; readonly headSha: string | null } | null> {
     try {
+      const latestId = record.attemptIds.length === 0 ? null : record.attemptIds[record.attemptIds.length - 1];
+      const latest =
+        this.deps.attemptRepo === undefined || latestId === null
+          ? null
+          : await this.deps.attemptRepo.findAttemptById(latestId);
+      const branch = latest === null ? null : branchNameOf(record, latest);
+      const headSha = latest === null || latest.artifacts === null ? null : latest.artifacts.headCommit;
+      const head12 = headSha === null ? null : head12Of(headSha);
       if (this.deps.forgeRead === undefined || branch === null || head12 === null) {
         throw new Error('the forge read is not wired');
       }
-      // The re-read is immediate and by branch: the facts read of an earlier
-      // pass is never trusted for a write.
-      read = await this.deps.forgeRead.readPullRequest({ ref: { kind: 'branch', branchName: branch } });
+      const read = await this.deps.forgeRead.readPullRequest({ ref: { kind: 'branch', branchName: branch } });
+      return read.outcome === 'found' ? { snapshot: read.pullRequest, headSha } : null;
     } catch {
-      return this.ambiguousOpenPrResume(resumeKey, request);
+      return null;
     }
-    if (read.outcome !== 'found') {
-      return this.ambiguousOpenPrResume(resumeKey, request);
-    }
-    const snapshot = read.pullRequest;
+  }
+
+  /**
+   * The match check (R4a): exactly one open PR whose full validated 40-hex
+   * head and base still equal the run's, and whose number agrees with any
+   * recorded one. `alreadyRecorded` is the crash-repair pass: the adoption
+   * already landed, so the record's prNumber must equal the re-read PR and
+   * is never saved again.
+   */
+  private openPrAdoptable(
+    record: LaneRunRecord,
+    snapshot: PullRequestSnapshot,
+    headSha: string | null,
+    alreadyRecorded: boolean,
+  ): boolean {
     const matches =
       snapshot.state === 'open' &&
       sameLaneHeadSha(snapshot.headSha, headSha) &&
       snapshot.baseRef === resolveLaneRunBaseBranch(record) &&
       (record.prNumber === null || snapshot.number === record.prNumber);
     if (!matches) {
-      return this.ambiguousOpenPrResume(resumeKey, request);
+      return false;
     }
-    // Crash-repair after the spent-key result: the adoption already landed, so
-    // the record's prNumber must equal the re-read PR; never save again.
-    if (pending === null && snapshot.number !== record.prNumber) {
-      return this.ambiguousOpenPrResume(resumeKey, request);
-    }
+    return !alreadyRecorded || snapshot.number === record.prNumber;
+  }
+
+  /** The adoption writes (R4a): `prNumber` first (the park stays), then the spent key and the resume key settle reconciled. */
+  private async adoptOpenPr(
+    record: LaneRunRecord,
+    resumeKey: string,
+    spentKey: string,
+    snapshot: PullRequestSnapshot,
+    request: ApplyPendingResumeRequest,
+  ): Promise<ApplyPendingResumeResult> {
     if (snapshot.number !== record.prNumber) {
       const saved = await this.deps.runRepo.save(
         { ...record, prNumber: snapshot.number, revision: record.revision + 1 },
@@ -459,5 +512,23 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
     }
     const spent = await this.deps.runJournal.listForKey(key);
     return spent.some((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous') ? key : null;
+  }
+
+  /**
+   * R4a crash-repair, the brief's correction 1: `settledOpenPrKey` accepts
+   * any final non-`ambiguous` result, but the adoption continues only when
+   * that result says `reconciled` `pr-opened` — a `refused` or `completed`
+   * final result adopts nothing and fails closed.
+   */
+  private async adoptableSettledOpenPrKey(runId: string): Promise<string | null> {
+    const key = await this.settledOpenPrKey(runId);
+    if (key === null) {
+      return null;
+    }
+    const entries = await this.deps.runJournal.listForKey(key);
+    const prOpened = entries.some(
+      (entry) => entry.kind === 'result' && entry.outcome === 'reconciled' && entry.reasonCode === 'pr-opened',
+    );
+    return prOpened ? key : null;
   }
 }

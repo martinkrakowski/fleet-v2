@@ -434,6 +434,30 @@ describe('global rules', () => {
     expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
   });
 
+  it('G5: a parked ambiguous open-pr run waits even when its PR merges with the lane head (merged is R4b)', () => {
+    const rec = record({ parked: { reason: 'ambiguous', qualifier: 'open-pr', parkedFrom: 'opening-pr', questionId: null }, parkCount: 1 });
+    const facts = baseFacts({
+      state: 'parked',
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
+    });
+    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+
+  it('G3e: a stop recorded on a parked ambiguous open-pr run never reaches merged (R4b)', () => {
+    const rec = record({ parked: { reason: 'ambiguous', qualifier: 'open-pr', parkedFrom: 'opening-pr', questionId: null }, parkCount: 1 });
+    const facts = baseFacts({
+      state: 'parked',
+      stopMode: 'force',
+      attempt: attemptFact({ phase: 'collected' }),
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      pr: { state: 'merged', head12: HEAD, containsLaneHead: true },
+    });
+    expect(decide(rec, facts)).toEqual({ kind: 'enter', to: 'stopped' });
+  });
+
   it('G6: halted parks halted', () => {
     const facts = baseFacts({ state: 'running', halted: true, attempt: attemptFact() });
     assertDecision(facts, record({}), decide(record({}), facts), {

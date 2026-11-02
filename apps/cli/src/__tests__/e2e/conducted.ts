@@ -91,11 +91,21 @@ export interface ConductedFixtureOptions {
   readonly failPrCreateOnce?: boolean;
   /**
    * R4a: when true, the fake `pr view` read answers not-found until the first
-   * PR-create invocation has been seen, then answers the recorded open PR —
-   * the PR appears only once the create ran. Used with `failPrCreateOnce` to
-   * drive a run into the parked `ambiguous open-pr` recovery scenario.
+   * PR-create invocation has been seen, then answers unavailable for the
+   * next two reads (the degraded read right after the unreported create, so
+   * the reconcile fails closed and the run parks), then answers the recorded
+   * open PR — the PR appears only once the create ran. Used with
+   * `failPrCreateOnce` to drive a run into the parked `ambiguous open-pr`
+   * recovery scenario.
    */
   readonly prViewOpenAfterCreate?: boolean;
+  /**
+   * R4a: when true, the fake `pr checks` read answers a pending bucket, so a
+   * run that reached watching-ci rests there at a pass boundary (the
+   * scenario's CI is still running) instead of running on to the merge
+   * within one pass.
+   */
+  readonly ciChecksPending?: boolean;
 }
 
 export interface CliRunResult {
@@ -486,7 +496,13 @@ function fakeOpencodeWrapperScript(
  * pass, and zero unresolved review threads.
  * R4a: when `prViewOpenAfterCreate` is set (with `prCreateMarkerFile`), the
  * `pr view` read answers not-found until the first PR-create invocation has
- * touched the marker file, then answers the recorded open PR.
+ * touched the marker file. The two reads right after that create — the
+ * facts read and the reconcile's own read of the same pass — answer
+ * unavailable: gh is degraded just after it opened the PR without reporting
+ * its number, so `reconcilePrPush` journals `ambiguous`/`forge-ambiguous`
+ * and G3b parks `ambiguous open-pr` instead of adopting the PR at once.
+ * From the third read on (the parked facts reads and the resume's re-read)
+ * the recorded open PR answers, so the resume adopts it.
  */
 function makeForgeGhRunner(
   head: () => string,
@@ -494,10 +510,13 @@ function makeForgeGhRunner(
   options: {
     readonly prViewOpenAfterCreate?: boolean;
     readonly prCreateMarkerFile?: string;
+    /** R4a: when true, `pr checks` answers a pending bucket, so a run in watching-ci rests there. */
+    readonly ciChecksPending?: boolean;
   } = {},
 ) {
   const calls: string[][] = [];
   const flipToOpen = options.prViewOpenAfterCreate === true && options.prCreateMarkerFile !== undefined;
+  let postCreateReads = 0;
   const forgeGhRunner = async (args: readonly string[]) => {
     calls.push([...args]);
     if (args[0] === 'pr' && args[1] === 'view') {
@@ -507,6 +526,16 @@ function makeForgeGhRunner(
           stdout: '',
           stderr: `no pull requests found for branch "${branchName}"`,
         };
+      }
+      if (flipToOpen) {
+        postCreateReads += 1;
+        if (postCreateReads <= 2) {
+          return {
+            exitCode: 1,
+            stdout: '',
+            stderr: `gh pr view failed for branch "${branchName}" (transient after the unreported create)`,
+          };
+        }
       }
       return {
         exitCode: 0,
@@ -525,6 +554,12 @@ function makeForgeGhRunner(
       };
     }
     if (args[0] === 'pr' && args[1] === 'checks') {
+      // R4a: `ciChecksPending` keeps the checks running (`bucket: pending`),
+      // so a run that reached watching-ci rests there at a pass boundary
+      // instead of running on to the merge within one pass.
+      if (options.ciChecksPending === true) {
+        return { exitCode: 0, stdout: '[{"bucket":"pending"}]', stderr: '' };
+      }
       return { exitCode: 0, stdout: '[{"bucket":"pass"}]', stderr: '' };
     }
     if (args[0] === 'api' && args[1] === 'graphql') {
@@ -798,6 +833,7 @@ export async function startConductedFixture(
       ...(options?.prViewOpenAfterCreate === true
         ? { prViewOpenAfterCreate: true, prCreateMarkerFile: ghPrCreateMarker }
         : {}),
+      ...(options?.ciChecksPending === true ? { ciChecksPending: true } : {}),
     });
     const review = makeReviewSpawn(options?.reviewVerdicts ?? []);
     const buildRuntime = (installationForRuntime: FleetInstallationV2): FleetCliRuntime => {

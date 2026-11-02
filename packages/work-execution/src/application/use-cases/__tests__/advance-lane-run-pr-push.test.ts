@@ -10,6 +10,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { AttemptRecord, CollectedAttemptArtifacts, WorkOrderRecord } from '../../../domain/execution-records.js';
+import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { buildLaneRunStepKey, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
@@ -1139,13 +1140,23 @@ describe('R4a: the parked open-pr recovery', () => {
     }
   }
 
-  function resumeOf(harness: Harness, wire: { forgeRead?: boolean; attemptRepo?: boolean } = {}): ResumeLaneRunUseCase {
+  function resumeOf(
+    harness: Harness,
+    wire: { forgeRead?: boolean; attemptRepo?: boolean; attemptRepoOverride?: Pick<AttemptRepositoryPort, 'findAttemptById'> } = {},
+  ): ResumeLaneRunUseCase {
+    let attemptRepo: Pick<AttemptRepositoryPort, 'findAttemptById'> | undefined = harness.attemptRepo;
+    if (wire.attemptRepoOverride !== undefined) {
+      attemptRepo = wire.attemptRepoOverride;
+    }
+    if (wire.attemptRepo === false) {
+      attemptRepo = undefined;
+    }
     return new ResumeLaneRunUseCase({
       runRepo: harness.runRepo,
       runJournal: harness.runJournal,
       newUlid: harness.deps.newUlid,
       ...(wire.forgeRead === false ? {} : { forgeRead: harness.deps.forgeRead }),
-      ...(wire.attemptRepo === false ? {} : { attemptRepo: harness.attemptRepo }),
+      ...(attemptRepo === undefined ? {} : { attemptRepo }),
     });
   }
 
@@ -1375,6 +1386,80 @@ describe('R4a: the parked open-pr recovery', () => {
       ),
     ).toBe(true);
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'watching-ci' });
+  });
+
+  it('a crash-repair whose spent key settled refused or completed without pr-opened adopts nothing', async () => {
+    for (const [outcome, reasonCode] of [
+      ['refused', 'forge-refused'],
+      ['completed', 'accepted'],
+    ] as const) {
+      const harness = await makeHarness(parkedOpenPrRecord({ prNumber: 7 }), [collectedAttempt()], { wireForgeRead: true });
+      await conduct(harness, 'parked', NOW);
+      await appendIntent(harness, openPrKey(), null, NOW);
+      await appendResult(harness, openPrKey(), 'ambiguous', 'forge-ambiguous', NOW);
+      await appendResult(harness, openPrKey(), outcome, reasonCode, NOW);
+      const resume = resumeOf(harness);
+      await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+      harness.setForgeReadAnswer(openPullRequestAtHead(7));
+      expect(
+        await resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+      ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'forge-ambiguous' });
+      const record = await harness.runRepo.get(RUN_ID);
+      expect(record?.prNumber).toBe(7);
+      expect(record?.parked).not.toBeNull();
+      const spentResults = (await harness.runJournal.listForKey(openPrKey())).filter(
+        (entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous',
+      );
+      expect(spentResults).toHaveLength(1);
+      expect(spentResults[0]).toMatchObject({ outcome, reasonCode });
+      const resumeResults = (await harness.runJournal.listForRun(RUN_ID)).filter(
+        (entry) => entry.kind === 'result' && entry.key === RESUME_CLI_KEY,
+      );
+      expect(resumeResults).toHaveLength(1);
+      expect(resumeResults[0]).toMatchObject({ outcome: 'ambiguous', reasonCode: 'forge-ambiguous' });
+    }
+  });
+
+  it('a repository error reading the attempt fails closed with forge-ambiguous, never a rejection', async () => {
+    const harness = await makeHarness(parkedOpenPrRecord(), [collectedAttempt()], { wireForgeRead: true });
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, false);
+    const resume = resumeOf(harness, {
+      attemptRepoOverride: {
+        findAttemptById: async () => {
+          throw new Error('attempt repository unavailable');
+        },
+      },
+    });
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    await expect(
+      resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).resolves.toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'forge-ambiguous' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBeNull();
+    expect(record?.parked).not.toBeNull();
+    expect(harness.forgeReadRequests).toHaveLength(0);
+  });
+
+  it('a malformed collected head fails closed with forge-ambiguous without a forge read', async () => {
+    const harness = await makeHarness(
+      parkedOpenPrRecord(),
+      [collectedAttempt({ artifacts: { ...COLLECTED_ARTIFACTS, headCommit: 'nothex' } })],
+      { wireForgeRead: true },
+    );
+    await conduct(harness, 'parked', NOW);
+    await seedSpentOpenPrKey(harness, false);
+    const resume = resumeOf(harness);
+    await resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: RESUME_ENTRY, nowIso: NOW });
+    harness.setForgeReadAnswer(openPullRequestAtHead(7));
+    await expect(
+      resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).resolves.toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'forge-ambiguous' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.prNumber).toBeNull();
+    expect(record?.parked).not.toBeNull();
+    expect(harness.forgeReadRequests).toHaveLength(0);
   });
 
   it('a resume of the open case without a wired forge read stays parked', async () => {

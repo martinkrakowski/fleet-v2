@@ -137,6 +137,7 @@ describe.skipIf(process.env.FLEET_E2E_SSH !== '1')('conducted ambiguous open-pr 
       committingLane: true,
       failPrCreateOnce: true,
       prViewOpenAfterCreate: true,
+      ciChecksPending: true,
     });
     const startResult = await current.start(1);
     expect(startResult.code).toBe(0);

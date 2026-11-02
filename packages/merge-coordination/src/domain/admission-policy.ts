@@ -82,7 +82,7 @@ function isAlonePath(normalized: string): boolean {
       return true;
     }
   }
-  if (segments[0] === '.buildkite' || segments[0] === '.circleci' || basenameOf(normalized) === 'Jenkinsfile') {
+  if (segments[0] === '.buildkite' || segments[0] === '.circleci' || basenameOf(normalized).toLowerCase() === 'jenkinsfile') {
     return true;
   }
   if (segments.includes('security')) {

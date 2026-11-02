@@ -612,6 +612,25 @@ describe('StartLaneRunUseCase', () => {
     expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
   });
 
+  it('test 3 (extend): the use case forwards a verdict-based no-capacity with its blockers verbatim', async () => {
+    const harness = makeHarness();
+    harness.setCapacityAnswer({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+    });
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+    });
+    expect(harness.capacityCalls).toHaveLength(1);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await harness.attemptRepoStore.listAllAttempts()).toEqual([]);
+    expect(await harness.runRepoStore.list()).toEqual([]);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
+  });
+
   it('test 3e (KF-14b): the start passes the new no-review-route refusal through', async () => {
     const harness = makeHarness();
     harness.setCapacityAnswer({ outcome: 'refused', reason: 'no-review-route' });

@@ -11,7 +11,7 @@ import { resolveLaneRunBaseBranch } from './base-branch.js';
 import type { BaseBranchValue } from './base-branch.js';
 import { laneRunJournalPendingIntent, laneRunJournalState } from './lane-run-journal.js';
 import type { LaneRunJournalEntryRecord } from './lane-run-journal.js';
-import { laneRunPackageKeys, laneRunPackagesOverlap } from './lane-run-packages.js';
+import { laneRunPackageKeys, laneRunOwnedPathsOverlap } from './lane-run-packages.js';
 import { isLeaseLapsed } from './lane-run-lease.js';
 import { parseLaneRunKey } from './lane-run-keys.js';
 import type {
@@ -288,7 +288,7 @@ function collectOverlappingRunIds(
     if (otherOrder === undefined) {
       continue;
     }
-    if (laneRunPackagesOverlap(workOrder, otherOrder)) {
+    if (laneRunOwnedPathsOverlap(workOrder, otherOrder)) {
       overlaps.push(otherRunId);
     }
   }
@@ -345,7 +345,7 @@ function overlapsActiveRun(
     }
     const otherOrder = other.workOrder;
     // Fail closed like admission: an active run whose work order is unreadable blocks.
-    if (otherOrder === undefined || laneRunPackagesOverlap(rowOrder, otherOrder)) {
+    if (otherOrder === undefined || laneRunOwnedPathsOverlap(rowOrder, otherOrder)) {
       return true;
     }
   }
@@ -361,7 +361,7 @@ function overlapsInFlight(
     return true;
   }
   for (const order of inFlightOrders.orders) {
-    if (rowOrder !== undefined && laneRunPackagesOverlap(order, rowOrder)) {
+    if (rowOrder !== undefined && laneRunOwnedPathsOverlap(order, rowOrder)) {
       return true;
     }
   }

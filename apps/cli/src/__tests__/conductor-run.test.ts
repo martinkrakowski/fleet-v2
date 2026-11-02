@@ -785,16 +785,35 @@ describe('conductor start (K7-7)', () => {
     expect(parseDocument(result.stdout)).toMatchObject({ outcome: 'abandoned' });
   });
 
-  it('no-capacity exits 1', async () => {
+  it('no-capacity exits 1, naming its blockers when provided', async () => {
+    const bareDir = tempStateDir();
+    const barePath = writeBriefRequest(bareDir, briefFixture());
+    const bare = makeFakeDriver({ enabled: true, startResult: { outcome: 'no-capacity' } });
+    const bareResult = await runConductor(runtimeOf(bareDir), ['start', '--brief-request', barePath, '--tier', '2'], {
+      stateDir: bareDir,
+      buildDriver: () => bare.driver,
+    });
+    expect(bareResult.code).toBe(1);
+    expect(parseDocument(bareResult.stdout)).toEqual({ outcome: 'no-capacity' });
+
     const dir = tempStateDir();
     const briefPath = writeBriefRequest(dir, briefFixture());
-    const fake = makeFakeDriver({ enabled: true, startResult: { outcome: 'no-capacity' } });
+    const fake = makeFakeDriver({
+      enabled: true,
+      startResult: {
+        outcome: 'no-capacity',
+        blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+      },
+    });
     const result = await runConductor(runtimeOf(dir), ['start', '--brief-request', briefPath, '--tier', '2'], {
       stateDir: dir,
       buildDriver: () => fake.driver,
     });
     expect(result.code).toBe(1);
-    expect(parseDocument(result.stdout)).toEqual({ outcome: 'no-capacity' });
+    expect(parseDocument(result.stdout)).toEqual({
+      outcome: 'no-capacity',
+      blockedBy: { runIds: ['run-01JB0000000000000000000001'], attemptIds: [] },
+    });
   });
 
   it('a missing --tier, --run-id alone or a brief file with worktreePath are usage errors', async () => {

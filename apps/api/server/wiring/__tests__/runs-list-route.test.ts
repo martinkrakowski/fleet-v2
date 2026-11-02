@@ -218,7 +218,7 @@ async function seedState(stateDir: string): Promise<void> {
   const laneRunJournal = new LaneRunJournalAdapter({ stateDir });
 
   await workOrderRepo.saveWorkOrder(workOrderRecord("wo-1", ["packages/a/x.ts"]));
-  await workOrderRepo.saveWorkOrder(workOrderRecord("wo-2", ["packages/a/y.ts"]));
+  await workOrderRepo.saveWorkOrder(workOrderRecord("wo-2", ["packages/a/x.ts"]));
   await attemptRepo.saveAttempt(attemptRecord("att-1", "wo-1", "/tmp/opencode/lanes/att-1"));
   await attemptRepo.saveAttempt(attemptRecord("att-2", "wo-2", "/tmp/opencode/lanes/att-2"));
   await journal.saveCapacityReservation(RESERVATION);

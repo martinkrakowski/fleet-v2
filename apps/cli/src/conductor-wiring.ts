@@ -223,6 +223,7 @@ export function buildLiveConductorDriver(
   const start = new StartLaneRunUseCase({
     workOrderRepo: execution.workOrderRepository,
     profileRead: conductor.profileRead,
+    halt: conductor.halt,
     capacity: admission,
     executionJournal: execution.executionJournal,
     workspace: execution.workspace,

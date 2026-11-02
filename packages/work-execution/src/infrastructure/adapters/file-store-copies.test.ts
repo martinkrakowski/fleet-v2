@@ -7,8 +7,8 @@ import { describe, expect, it } from 'vitest';
 /** The repository's `packages/` directory, four levels above this test file. */
 const packagesRoot = fileURLToPath(new URL('../../../../', import.meta.url));
 
-const CONTEXTS = [
-  'work-execution',
+/** Q5b versions work-execution's file-store.ts; the peer contexts keep their own copy. */
+const PEER_CONTEXTS = [
   'evidence-and-acceptance',
   'brief-knowledge',
   'operator-coordination',
@@ -19,9 +19,9 @@ function sha256Of(bytes: Buffer): string {
 }
 
 describe('file-store.ts copies across contexts', () => {
-  it('are byte-identical (same SHA-256)', async () => {
+  it('peer contexts stay byte-identical (same SHA-256)', async () => {
     const hashes = await Promise.all(
-      CONTEXTS.map(async (ctx) => {
+      PEER_CONTEXTS.map(async (ctx) => {
         const filePath = path.join(packagesRoot, ctx, 'src/infrastructure/adapters/file-store.ts');
         return sha256Of(await fs.readFile(filePath));
       }),

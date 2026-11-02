@@ -320,9 +320,16 @@ export function isKillallSweepConfirmed(cleanSweeps: number, stopped: boolean): 
 /**
  * The domain side of exit code 0 (plan §6): true only when the marker is halted,
  * the train pause is confirmed, the whole sweep has at least two clean sweeps,
- * every listed lane is confirmed, and every listed session is stopped.
+ * every listed lane is confirmed, every listed session is stopped, and the
+ * report's haltedAtIso matches the expected marker time when supplied.
  */
-export function killallStopReportConfirmed(report: KillallStopReportRecord): boolean {
+export function killallStopReportConfirmed(
+  report: KillallStopReportRecord,
+  expectedHaltedAtIso?: string,
+): boolean {
+  if (expectedHaltedAtIso !== undefined && report.haltedAtIso !== expectedHaltedAtIso) {
+    return false;
+  }
   if (report.marker !== 'halted') {
     return false;
   }

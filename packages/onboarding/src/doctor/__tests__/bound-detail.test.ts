@@ -41,6 +41,10 @@ function seatModel(reason: string): DoctorProbes {
       sha256: 'c'.repeat(64),
     }),
     expectedOcmRunHash: async () => 'c'.repeat(64),
+    ghBinary: async () => ({
+      resolved: '/usr/bin/gh',
+      candidates: ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'],
+    }),
     seatProbe: async () => result,
   };
 }
@@ -68,10 +72,10 @@ describe('boundDoctorDetail', () => {
   });
 
   it('redacts vendor token shapes and Bearer headers', () => {
-    expect(redactSecretShapes('key sk-abcdefghijklmnop1234 done')).toBe(
+    expect(redactSecretShapes(`key sk-${'a'.repeat(16)}1234 done`)).toBe(
       'key [redacted] done',
     );
-    expect(redactSecretShapes('ghp_0123456789abcdefghij rest')).toBe(
+    expect(redactSecretShapes(`ghp_${'0123456789abcdefghij'} rest`)).toBe(
       '[redacted] rest',
     );
     expect(redactSecretShapes('ghs_zzzzzzzzzz tail')).toBe('[redacted] tail');
@@ -113,7 +117,7 @@ describe('boundDoctorDetail', () => {
 describe('runDoctor bounding', () => {
   it('bounds the seat probe reason before it reaches a line', async () => {
     const hash = 'b'.repeat(64);
-    const reason = `leak sk-abcdefghijklmnop1234\nsecond line ${hash}`;
+    const reason = `leak sk-${'a'.repeat(16)}1234\nsecond line ${hash}`;
     const probes = seatModel(reason);
     const lines = await collect(
       {

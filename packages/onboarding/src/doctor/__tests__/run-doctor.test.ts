@@ -111,6 +111,13 @@ function fakeProbes(
       calls.push('expectedOcmRunHash');
       return 'aa'.repeat(32);
     },
+    ghBinary: async () => {
+      calls.push('ghBinary');
+      return {
+        resolved: '/usr/bin/gh',
+        candidates: ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'],
+      };
+    },
     seatProbe: async (seat) => {
       calls.push(`seatProbe:${seat.id}`);
       return ALL_SEATS_PASS;
@@ -615,6 +622,9 @@ describe('runDoctor', () => {
       expectedOcmRunHash: async () => {
         throw new Error('hash exploded');
       },
+      ghBinary: async () => {
+        throw new Error('gh exploded');
+      },
       seatProbe: async () => {
         throw new Error('seat exploded');
       },
@@ -656,7 +666,57 @@ describe('runDoctor', () => {
     expect(firstIndex('host')).toBeLessThan(firstIndex('tool'));
     expect(firstIndex('tool')).toBeLessThan(firstIndex('credential'));
     expect(firstIndex('credential')).toBeLessThan(firstIndex('runner-binary'));
-    expect(firstIndex('runner-binary')).toBeLessThan(firstIndex('seat'));
+    expect(firstIndex('runner-binary')).toBeLessThan(firstIndex('gh-binary'));
+    expect(firstIndex('gh-binary')).toBeLessThan(firstIndex('seat'));
+  });
+});
+
+describe('runDoctor gh-binary check', () => {
+  const GH_CANDIDATES = ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'];
+
+  it('reports PASS naming the resolved path when a candidate resolves', async () => {
+    const { probes } = fakeProbes({
+      ghBinary: async () => ({ resolved: '/usr/bin/gh', candidates: GH_CANDIDATES }),
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(lines.filter((line) => line.scope === 'gh-binary')).toEqual([
+      {
+        scope: 'gh-binary',
+        subject: 'gh',
+        check: 'resolved',
+        status: 'PASS',
+        detail: '/usr/bin/gh',
+      },
+    ]);
+    expect(doctorExitCode(lines)).toBe(0);
+  });
+
+  it('reports FAIL naming all candidate paths when none resolves', async () => {
+    const { probes } = fakeProbes({
+      ghBinary: async () => ({ resolved: undefined, candidates: GH_CANDIDATES }),
+    });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    const ghLine = lines.find((line) => line.scope === 'gh-binary');
+    expect(ghLine).toMatchObject({ subject: 'gh', check: 'resolved', status: 'FAIL' });
+    for (const candidate of GH_CANDIDATES) {
+      expect(ghLine?.detail).toContain(candidate);
+    }
+    expect(doctorExitCode(lines)).toBe(1);
+  });
+
+  it('reports UNKNOWN when the probe fails to run', async () => {
+    const { probes } = fakeProbes({ ghBinary: async () => undefined });
+    const lines = await collect(loadedResult(sampleModel()), probes);
+    expect(lines).toContainEqual(
+      expect.objectContaining({
+        scope: 'gh-binary',
+        subject: 'gh',
+        check: 'resolved',
+        status: 'UNKNOWN',
+        detail: 'gh resolution probe failed',
+      }),
+    );
+    expect(doctorExitCode(lines)).toBe(1);
   });
 });
 

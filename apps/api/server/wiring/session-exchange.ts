@@ -1,6 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { H3Event } from "h3";
 import {
+  getMethod,
   getRequestHeader,
   setResponseHeader,
   setResponseStatus,
@@ -73,6 +74,7 @@ export function configureSessionExchange(): void {
  * exchange. Returns `{ sessionId, secret }`, or `null` when the actor or
  * scopes fail (fail closed; the reason is never echoed).
  */
+// Seam that T6's login calls; nothing calls it yet, so no session can exist until then.
 export function registerInteractiveSession(input: {
   actor: string;
   scopes: readonly string[];
@@ -125,12 +127,23 @@ function sessionBySecret(secret: string): InteractiveSession | null {
   return null;
 }
 
+function isPostMethod(event: H3Event): boolean {
+  try {
+    return getMethod(event).toUpperCase() === "POST";
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Middleware-side gate for `SESSION_EXCHANGE_PATH`. Returns `undefined` when the
  * request presents the secret of an established interactive session; otherwise a
  * 403 body that never echoes the presented value. Fail closed.
  */
 export function authenticateSessionExchange(event: H3Event): { error: string } | undefined {
+  if (!isPostMethod(event)) {
+    return exchangeForbidden(event);
+  }
   const secret = getRequestHeader(event, SESSION_EXCHANGE_HEADER);
   if (typeof secret !== "string" || secret.length === 0) {
     return exchangeForbidden(event);
@@ -143,6 +156,9 @@ export function authenticateSessionExchange(event: H3Event): { error: string } |
 
 /** The authenticated session for the current exchange request, or null. */
 export function currentExchangeSession(event: H3Event): InteractiveSession | null {
+  if (!isPostMethod(event)) {
+    return null;
+  }
   const secret = getRequestHeader(event, SESSION_EXCHANGE_HEADER);
   if (typeof secret !== "string") {
     return null;

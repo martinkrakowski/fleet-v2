@@ -410,4 +410,55 @@ describe("T3b session exchange", () => {
     });
     expect(v1.status).toBe(200);
   });
+
+  it("returns Cache-Control: no-store when rejected by the origin check", async () => {
+    configuredApi();
+    process.env.FLEET_API_ALLOWED_ORIGINS = "http://localhost:3000";
+    const secret = sessionSecret(["verdict"]);
+
+    const res = await fetch(exchangeUrl(), {
+      method: "POST",
+      headers: {
+        [SESSION_EXCHANGE_HEADER]: secret,
+        "content-type": "application/json",
+        origin: "http://evil.com",
+      },
+      body: JSON.stringify({ scopes: ["verdict"] }),
+    });
+    expect(res.status).toBe(403);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({ error: "Forbidden origin" });
+  });
+
+  it("sets Cache-Control: no-store before reading body so every response has it", async () => {
+    configuredApi();
+    const secret = sessionSecret(["verdict"]);
+
+    const res = await fetch(exchangeUrl(), {
+      method: "POST",
+      headers: {
+        [SESSION_EXCHANGE_HEADER]: secret,
+        "content-type": "application/json",
+      },
+      body: "not-json{",
+    });
+    expect(res.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("refuses GET requests on the exchange", async () => {
+    configuredApi();
+    const secret = sessionSecret(["verdict"]);
+
+    const res = await fetch(exchangeUrl(), {
+      method: "GET",
+      headers: {
+        [SESSION_EXCHANGE_HEADER]: secret,
+      },
+    });
+    expect(res.status).toBe(403);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({
+      error: "Forbidden: session exchange requires the interactive session credential",
+    });
+  });
 });

@@ -11,9 +11,9 @@ import {
 } from "../../wiring/session-exchange.js";
 
 export default defineEventHandler(async (event) => {
+  setResponseHeader(event, "cache-control", "no-store");
   const session = currentExchangeSession(event);
   if (!session) {
-    setResponseHeader(event, "cache-control", "no-store");
     setResponseStatus(event, 403);
     return { error: "Forbidden: session exchange requires the interactive session credential" };
   }
@@ -26,7 +26,6 @@ export default defineEventHandler(async (event) => {
     requested.every((s) => (MINTABLE_SESSION_SCOPES as readonly string[]).includes(s as string));
 
   const minted = valid ? mintSessionToken(session, requested) : null;
-  setResponseHeader(event, "cache-control", "no-store");
   if (!minted) {
     setResponseStatus(event, 403);
     return { error: "Forbidden: scope requested is not mintable" };

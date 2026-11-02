@@ -127,6 +127,9 @@ export default defineEventHandler((event) => {
   const originHeader = getRequestHeader(event, "origin");
   if (originHeader !== undefined && originHeader !== null && originHeader.trim().length > 0) {
     if (!isAllowedOrigin(originHeader.trim())) {
+      if (isSessionExchangePath(requestPath)) {
+        setResponseHeader(event, "cache-control", "no-store");
+      }
       return forbid(event, "Forbidden origin");
     }
   }

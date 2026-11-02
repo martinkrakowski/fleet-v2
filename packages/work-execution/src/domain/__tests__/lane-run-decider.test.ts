@@ -458,6 +458,20 @@ describe('global rules', () => {
     expect(decide(rec, facts)).toEqual({ kind: 'enter', to: 'stopped' });
   });
 
+  it('G3b0: a stop recorded after the resume adopted the PR wins over watching-ci (R4a)', () => {
+    const parked = { reason: 'ambiguous', qualifier: 'open-pr', parkedFrom: 'opening-pr', questionId: null } as const;
+    const rec = record({ parked, parkCount: 1, prNumber: 7 });
+    const facts = baseFacts({
+      state: 'parked',
+      stopMode: 'force',
+      attempt: attemptFact({ phase: 'collected' }),
+      head12: HEAD,
+      acceptedHead12: HEAD,
+      pr: { state: 'open', head12: HEAD, containsLaneHead: true },
+    });
+    expect(decide(rec, facts)).toEqual({ kind: 'enter', to: 'stopped' });
+  });
+
   it('G6: halted parks halted', () => {
     const facts = baseFacts({ state: 'running', halted: true, attempt: attemptFact() });
     assertDecision(facts, record({}), decide(record({}), facts), {

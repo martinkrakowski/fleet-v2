@@ -222,10 +222,11 @@ function mergedPrCarriesLaneHead(pr: NonNullable<LaneRunFacts['pr']>, laneHead12
  * would decide `open-pr` again on the spent key. The PR fact the parked
  * read gathered must still name an open PR at the lane head; anything
  * else — no PR fact, another head, a closed or merged PR — keeps the park.
+ * A recorded stop keeps it too, so the stop rules below decide.
  * Total; never throws.
  */
 function laneRunSettledOpenPrDecision(record: LaneRunRecord, facts: LaneRunFacts): LaneRunDecision | null {
-  if (facts.state !== 'parked' || record.parked === null || facts.pendingIntent !== null) {
+  if (facts.state !== 'parked' || record.parked === null || facts.pendingIntent !== null || facts.stopMode !== null) {
     return null;
   }
   if (record.parked.reason !== 'ambiguous' || record.parked.qualifier !== 'open-pr' || record.prNumber === null) {

@@ -22,10 +22,23 @@ function isV1Path(path: string): boolean {
   return path === "/v1" || path.startsWith("/v1/");
 }
 
-function requestPathOf(event: H3Event): string {
+function requestPathOf(event: H3Event): string | null {
   const rawPath = event.path || "/";
   const qIndex = rawPath.indexOf("?");
-  return qIndex === -1 ? rawPath : rawPath.slice(0, qIndex);
+  let pathWithoutQuery = rawPath;
+  if (qIndex !== -1) {
+    pathWithoutQuery = rawPath.slice(0, qIndex);
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURI(pathWithoutQuery);
+  } catch {
+    return null;
+  }
+  if (decoded.length > 1 && decoded.endsWith("/")) {
+    return decoded.slice(0, -1);
+  }
+  return decoded;
 }
 
 function isAllowedOrigin(origin: string): boolean {
@@ -110,6 +123,9 @@ export default defineEventHandler((event) => {
   }
 
   const requestPath = requestPathOf(event);
+  if (requestPath === null) {
+    return forbid(event, "Forbidden: unmapped route");
+  }
 
   if (ALLOWED_UNAUTHENTICATED_PATHS.has(requestPath)) {
     return;

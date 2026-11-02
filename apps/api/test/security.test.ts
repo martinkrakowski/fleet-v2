@@ -1,6 +1,6 @@
 import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { connect, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as h3 from "h3";
@@ -566,15 +566,35 @@ describe("API Security and Hardening", () => {
       configureFleetApiRuntime({ stateDir: tempDir });
       configurePresentedTokenResolver(() => ({ tokenId: "test-session", scopes: ["read"] }));
 
-      const res = await fetch(`${baseUrl}/v1/%61ttempts/a1/stop`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${VALID_TOKEN}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({}),
+      const addr = server.address() as AddressInfo;
+      const res = await new Promise<{ statusCode: number }>((resolve, reject) => {
+        const socket = connect(addr.port, "127.0.0.1", () => {
+          socket.write(
+            `POST /%76%31/attempts/a1/stop HTTP/1.1\r\n` +
+              `Host: 127.0.0.1:${addr.port}\r\n` +
+              `Authorization: Bearer ${VALID_TOKEN}\r\n` +
+              `Content-Type: application/json\r\n` +
+              `Content-Length: 2\r\n` +
+              `Connection: close\r\n\r\n{}`
+          );
+        });
+        let data = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk) => {
+          data += chunk;
+        });
+        socket.on("end", () => {
+          const match = /^HTTP\/1\.[01] (\d{3})/.exec(data);
+          let statusCode = 0;
+          if (match) {
+            statusCode = parseInt(match[1], 10);
+          }
+          resolve({ statusCode });
+        });
+        socket.on("error", reject);
       });
-      expect(res.status).toBe(403);
+
+      expect(res.statusCode).toBe(403);
       expect(stopHandlerInvoked).toBe(false);
     });
   });

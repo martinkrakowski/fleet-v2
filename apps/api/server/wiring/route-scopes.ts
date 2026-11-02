@@ -36,29 +36,64 @@ const GET_ROUTE_PATTERNS: readonly string[] = [
   "/v1/heads/:sha/evidence",
 ];
 
-/** Prefix -> scope for every mutation (non-GET) route under /v1. */
-const MUTATION_PREFIX_SCOPES: ReadonlyArray<readonly [string, string]> = [
-  ["/v1/orchestrators/", "orchestrate"],
-  ["/v1/orchestrators", "orchestrate"],
-  ["/v1/snapshots/", "orchestrate"],
-  ["/v1/questions", "message"],
-  ["/v1/relays", "message"],
-  ["/v1/reviews", "verdict"],
-  ["/v1/decisions", "verdict"],
-  ["/v1/authorizations", "hook"],
-  ["/v1/forge", "hook"],
-  ["/v1/attempts", "operate"],
-  ["/v1/verifications", "operate"],
-  ["/v1/observations", "operate"],
-  ["/v1/findings", "operate"],
-  ["/v1/work-orders", "operate"],
-  ["/v1/heads/", "operate"],
-  ["/v1/knowledge", "operate"],
-  ["/v1/projects", "operate"],
+/** Method and pattern -> scope for every mutation (non-GET) route under /v1. */
+const MUTATION_ROUTE_RULES: ReadonlyArray<readonly [string, string, string]> = [
+  ["POST", "/v1/orchestrators", "orchestrate"],
+  ["POST", "/v1/orchestrators/:id/heartbeat", "orchestrate"],
+  ["POST", "/v1/orchestrators/:id/retire", "orchestrate"],
+  ["POST", "/v1/snapshots/:section", "orchestrate"],
+  ["POST", "/v1/questions", "message"],
+  ["POST", "/v1/questions/:id/answers", "message"],
+  ["POST", "/v1/questions/:id/acknowledgement", "message"],
+  ["POST", "/v1/questions/sync", "message"],
+  ["POST", "/v1/questions/expire", "message"],
+  ["POST", "/v1/relays", "message"],
+  ["POST", "/v1/relays/:id/acknowledgement", "message"],
+  ["POST", "/v1/reviews", "verdict"],
+  ["POST", "/v1/reviews/:id/receipt", "verdict"],
+  ["POST", "/v1/decisions", "verdict"],
+  ["POST", "/v1/authorizations/resolve", "hook"],
+  ["POST", "/v1/authorizations/:id/consume", "hook"],
+  ["POST", "/v1/forge", "hook"],
+  ["POST", "/v1/attempts/:id/stop", "operate"],
+  ["POST", "/v1/attempts/:id/reconcile", "operate"],
+  ["POST", "/v1/attempts/:id/fix", "operate"],
+  ["POST", "/v1/attempts/:id/acceptance", "operate"],
+  ["POST", "/v1/attempts/:id/cancel-prepared", "operate"],
+  ["POST", "/v1/attempts/:id/artifacts", "operate"],
+  ["POST", "/v1/verifications", "operate"],
+  ["POST", "/v1/verifications/:id/receipt", "operate"],
+  ["POST", "/v1/observations", "operate"],
+  ["POST", "/v1/findings/:id/disposition", "operate"],
+  ["POST", "/v1/work-orders", "operate"],
+  ["POST", "/v1/heads/:sha/assessment", "operate"],
+  ["POST", "/v1/knowledge/checks", "operate"],
+  ["POST", "/v1/projects", "operate"],
+  ["POST", "/v1/projects/:id/retire", "operate"],
+  ["POST", "/v1/projects/:id/probe", "operate"],
+  ["PATCH", "/v1/projects/:id", "operate"],
 ];
 
 function isV1Path(path: string): boolean {
   return path === "/v1" || path.startsWith("/v1/");
+}
+
+function normalizePath(path: string): string {
+  const qIndex = path.indexOf("?");
+  let pathWithoutQuery = path;
+  if (qIndex !== -1) {
+    pathWithoutQuery = path.slice(0, qIndex);
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURI(pathWithoutQuery);
+  } catch {
+    return pathWithoutQuery;
+  }
+  if (decoded.length > 1 && decoded.endsWith("/")) {
+    return decoded.slice(0, -1);
+  }
+  return decoded;
 }
 
 function matchesSegmentPattern(path: string, pattern: string): boolean {
@@ -82,30 +117,22 @@ function matchesSegmentPattern(path: string, pattern: string): boolean {
   return true;
 }
 
-function matchesPathPrefix(path: string, prefix: string): boolean {
-  if (path === prefix) {
-    return true;
-  }
-  if (prefix.endsWith("/")) {
-    return path.startsWith(prefix);
-  }
-  return path.startsWith(`${prefix}/`);
-}
-
 export function requiredScope(method: string, requestPath: string): string | null {
-  if (!isV1Path(requestPath)) {
+  const normalized = normalizePath(requestPath);
+  if (!isV1Path(normalized)) {
     return null;
   }
-  if (method.toUpperCase() === "GET") {
+  const upperMethod = method.toUpperCase();
+  if (upperMethod === "GET") {
     for (const pattern of GET_ROUTE_PATTERNS) {
-      if (matchesSegmentPattern(requestPath, pattern)) {
+      if (matchesSegmentPattern(normalized, pattern)) {
         return "read";
       }
     }
     return null;
   }
-  for (const [prefix, scope] of MUTATION_PREFIX_SCOPES) {
-    if (matchesPathPrefix(requestPath, prefix)) {
+  for (const [m, pattern, scope] of MUTATION_ROUTE_RULES) {
+    if (m === upperMethod && matchesSegmentPattern(normalized, pattern)) {
       return scope;
     }
   }

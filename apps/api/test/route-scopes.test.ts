@@ -69,10 +69,10 @@ describe("requiredScope", () => {
 
   it("grants read only on explicit GET route patterns", () => {
     expect(requiredScope("GET", "/v1/questions")).toBe("read");
+    expect(requiredScope("GET", "/v1/questions/")).toBe("read");
     expect(requiredScope("GET", "/v1/attempts/:id/journal")).toBe("read");
     expect(requiredScope("GET", "/v1/heads/:sha/evidence")).toBe("read");
     expect(requiredScope("GET", "/v1/not-a-route")).toBeNull();
-    expect(requiredScope("GET", "/v1/%72uns")).toBeNull();
   });
 
   it("maps the orchestrate family", () => {
@@ -106,12 +106,21 @@ describe("requiredScope", () => {
 
   it("maps the operate family", () => {
     expect(requiredScope("POST", "/v1/attempts/:id/stop")).toBe("operate");
+    expect(requiredScope("POST", "/v1/attempts/:id/reconcile")).toBe("operate");
+    expect(requiredScope("POST", "/v1/attempts/:id/fix")).toBe("operate");
+    expect(requiredScope("POST", "/v1/attempts/:id/acceptance")).toBe("operate");
+    expect(requiredScope("POST", "/v1/attempts/:id/cancel-prepared")).toBe("operate");
+    expect(requiredScope("POST", "/v1/attempts/:id/artifacts")).toBe("operate");
+    expect(requiredScope("POST", "/v1/verifications")).toBe("operate");
     expect(requiredScope("POST", "/v1/verifications/:id/receipt")).toBe("operate");
     expect(requiredScope("POST", "/v1/observations")).toBe("operate");
     expect(requiredScope("POST", "/v1/findings/:id/disposition")).toBe("operate");
     expect(requiredScope("POST", "/v1/work-orders")).toBe("operate");
     expect(requiredScope("POST", "/v1/heads/:sha/assessment")).toBe("operate");
     expect(requiredScope("POST", "/v1/knowledge/checks")).toBe("operate");
+    expect(requiredScope("POST", "/v1/projects")).toBe("operate");
+    expect(requiredScope("POST", "/v1/projects/:id/retire")).toBe("operate");
+    expect(requiredScope("POST", "/v1/projects/:id/probe")).toBe("operate");
     expect(requiredScope("PATCH", "/v1/projects/:id")).toBe("operate");
   });
 
@@ -130,6 +139,7 @@ describe("requiredScope", () => {
   it("fails closed on unmapped paths", () => {
     expect(requiredScope("POST", "/v1/something-new")).toBeNull();
     expect(requiredScope("POST", "/v1/not-a-route")).toBeNull();
+    expect(requiredScope("POST", "/v1/attempts/not-a-route")).toBeNull();
     expect(requiredScope("POST", "/v1")).toBeNull();
     expect(requiredScope("POST", "/health")).toBeNull();
     expect(requiredScope("GET", "/")).toBeNull();

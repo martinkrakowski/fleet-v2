@@ -1437,3 +1437,143 @@ describe('AdvanceLaneRunUseCase work-order release at the run end (KF-36a)', () 
     });
   });
 });
+
+describe('AdvanceLaneRunUseCase merged-PR leaves branch-behind and ambiguous open-pr parks (G3f, R4b)', () => {
+  /** A parked run whose PR is read by branch while parked (R4a), journalled as parked. */
+  function parkedForgeHarness(
+    parked: NonNullable<LaneRunRecord['parked']>,
+    options: HarnessOptions = {},
+    prNumber: number | null = null,
+  ): Promise<Harness> {
+    return (async () => {
+      const parkedRecord = runRecord({ parked, parkCount: 1, prNumber });
+      const harness = await makeHarness(parkedRecord, [collectedAttempt()], {
+        wireForgeRead: true,
+        wireWorkOrder: true,
+        wireAutoMerge: false,
+        ...options,
+      });
+      await conduct(harness, 'merging', NOW);
+      await appendIntent(harness, acceptKey(), null, NOW);
+      await appendResult(harness, acceptKey(), 'completed', 'accepted', NOW);
+      await conduct(harness, 'parked', NOW);
+      return harness;
+    })();
+  }
+
+  const BRANCH_BEHIND_PARK: NonNullable<LaneRunRecord['parked']> = {
+    reason: 'branch-behind', qualifier: null, parkedFrom: 'merging', questionId: null,
+  };
+  const AMBIGUOUS_OPEN_PR_PARK: NonNullable<LaneRunRecord['parked']> = {
+    reason: 'ambiguous', qualifier: 'open-pr', parkedFrom: 'opening-pr', questionId: null,
+  };
+
+  async function openPrIntents(harness: Harness): Promise<string[]> {
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    return entries
+      .filter((entry) => entry.kind === 'intent' && entry.key !== null && entry.key.includes('/open-pr/'))
+      .map((entry) => entry.key as string);
+  }
+
+  it('test G3f-1: a branch-behind park enters merged once its PR merges with the lane head; no intent, no result appended', async () => {
+    const harness = await parkedForgeHarness(BRANCH_BEHIND_PARK);
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked).toBeNull();
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'conduct' && entry.state === 'merged')).toBe(true);
+    expect(entries.filter((entry) => entry.kind === 'intent')).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result')).toHaveLength(1);
+    expect(await openPrIntents(harness)).toEqual([]);
+    expect(harness.forgeReadRequests).toHaveLength(1);
+    expect(harness.forgeReadRequests[0]?.ref.kind).toBe('branch');
+  });
+
+  it('test G3f-2: an ambiguous open-pr park enters merged once its PR merges with the lane head; no intent, no result appended', async () => {
+    const harness = await parkedForgeHarness(AMBIGUOUS_OPEN_PR_PARK);
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked).toBeNull();
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'conduct' && entry.state === 'merged')).toBe(true);
+    expect(entries.filter((entry) => entry.kind === 'intent')).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result')).toHaveLength(1);
+    expect(await openPrIntents(harness)).toEqual([]);
+    expect(harness.forgeReadRequests).toHaveLength(1);
+    expect(harness.forgeReadRequests[0]?.ref.kind).toBe('branch');
+  });
+
+  it('test G3f-3: a merged PR at another head that does not carry the lane head keeps both parks', async () => {
+    for (const parked of [BRANCH_BEHIND_PARK, AMBIGUOUS_OPEN_PR_PARK]) {
+      const harness = await parkedForgeHarness(parked);
+      harness.setForgeReadAnswer(mergedPullRequestAtOtherHead(7));
+      harness.setAncestryAnswer({ outcome: 'answered', contains: false });
+      expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+      const record = await harness.runRepo.get(RUN_ID);
+      expect(record?.parked).not.toBeNull();
+      expect(harness.forgeReadRequests).toHaveLength(1);
+      expect(await openPrIntents(harness)).toEqual([]);
+    }
+  });
+
+  it('test G3f-4: fail-closed forge reads keep the parks with prNumber unchanged and no journal write', async () => {
+    for (const parked of [BRANCH_BEHIND_PARK, AMBIGUOUS_OPEN_PR_PARK]) {
+      // Not-found and the ambiguous two-PR read (resolves to no PR fact) stay parked.
+      for (const answer of [
+        { outcome: 'not-found' } as const,
+        { outcome: 'unavailable', reason: 'multiple pull requests match the branch' } as const,
+      ]) {
+        const harness = await parkedForgeHarness(parked, {}, 7);
+        harness.setForgeReadAnswer(answer);
+        expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+        const record = await harness.runRepo.get(RUN_ID);
+        expect(record?.parked).not.toBeNull();
+        expect(record?.prNumber).toBe(7);
+        expect(await openPrIntents(harness)).toEqual([]);
+      }
+      // A throwing read stays parked too.
+      const thrown = await parkedForgeHarness(parked);
+      thrown.setForgeReadAnswer('throw');
+      expect(await advance(thrown)).toEqual({ outcome: 'waiting', reason: 'parked' });
+      expect((await thrown.runRepo.get(RUN_ID))?.parked).not.toBeNull();
+      expect(await openPrIntents(thrown)).toEqual([]);
+    }
+  });
+
+  it('test G3f-5: no advance of a parked run ever issues open-pr; a spent-key run advancing twice emits none', async () => {
+    for (const parked of [BRANCH_BEHIND_PARK, AMBIGUOUS_OPEN_PR_PARK]) {
+      const harness = await parkedForgeHarness(parked);
+      harness.setForgeReadAnswer({ outcome: 'not-found' });
+      expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+      expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+      expect(await openPrIntents(harness)).toEqual([]);
+      const entries = await harness.runJournal.listForRun(RUN_ID);
+      expect(entries.filter((entry) => entry.kind === 'intent')).toHaveLength(1);
+      expect(entries.filter((entry) => entry.kind === 'result')).toHaveLength(1);
+      expect(harness.forgeReadRequests).toHaveLength(2);
+    }
+  });
+
+  it('test G3f-6: after entering merged the next advance is done with no port calls; a still-parked rerun re-reads and re-decides, never open-pr', async () => {
+    const harness = await parkedForgeHarness(BRANCH_BEHIND_PARK);
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    const readsAfterEnter = harness.forgeReadRequests.length;
+    const callsAfterEnter = harness.portCalls.length;
+    expect(await advance(harness)).toEqual({ outcome: 'done' });
+    expect(harness.forgeReadRequests).toHaveLength(readsAfterEnter);
+    expect(harness.portCalls).toHaveLength(callsAfterEnter);
+
+    // A pass that does not enter leaves the run parked; the next pass re-reads
+    // and re-decides, and open-pr is never emitted.
+    const again = await parkedForgeHarness(AMBIGUOUS_OPEN_PR_PARK);
+    again.setForgeReadAnswer({ outcome: 'not-found' });
+    expect(await advance(again)).toEqual({ outcome: 'waiting', reason: 'parked' });
+    again.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(again)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(again.forgeReadRequests).toHaveLength(2);
+    expect(await openPrIntents(again)).toEqual([]);
+  });
+});

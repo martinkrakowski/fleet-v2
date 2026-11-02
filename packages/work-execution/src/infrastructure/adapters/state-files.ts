@@ -15,6 +15,9 @@ import { parseWorkOrderStateRecord } from './WorkOrderRepositoryAdapter.adapter.
 import { parseVersionedLaneRunStateRecord } from './LaneRunRepositoryAdapter.adapter.js';
 import { parseVersionedLaneRunJournalStateRecord } from './LaneRunJournalAdapter.adapter.js';
 import { parseTelemetryDispositionStateRecord } from './TelemetryDispositionAdapter.adapter.js';
+import { parseMergeQueueStateRecord } from './MergeQueueRepositoryAdapter.adapter.js';
+import { isMergeQueueEntryLive } from '../../domain/merge-queue-records.js';
+import type { MergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
 
 export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('work-orders.json', parseWorkOrderStateRecord),
@@ -27,4 +30,30 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeVersionedRecordListStore('run-journal.json', parseVersionedLaneRunJournalStateRecord),
   describeRecordListStore('telemetry-dispositions.json', parseTelemetryDispositionStateRecord),
   describeVersionedRecordListStore('conductor-passes.json', parseVersionedConductorPassTraceStateRecord),
+  describeRecordListStore('merge-queue.json', parseMergeQueueStateRecord, duplicateMergeQueueIdentityListError),
 ];
+
+/** A fixed detail when two live merge-queue records share (repository, pull request, head). */
+function duplicateMergeQueueIdentityListError(records: readonly MergeQueueEntryRecord[]): string | undefined {
+  for (let leftIndex = 0; leftIndex < records.length; leftIndex += 1) {
+    const left = records[leftIndex];
+    if (!isMergeQueueEntryLive(left)) {
+      continue;
+    }
+    for (let rightIndex = leftIndex + 1; rightIndex < records.length; rightIndex += 1) {
+      const right = records[rightIndex];
+      if (!isMergeQueueEntryLive(right)) {
+        continue;
+      }
+      if (
+        left.repository.owner === right.repository.owner &&
+        left.repository.repo === right.repository.repo &&
+        left.pullRequest === right.pullRequest &&
+        left.headOid === right.headOid
+      ) {
+        return 'duplicate live merge-queue identity';
+      }
+    }
+  }
+  return undefined;
+}

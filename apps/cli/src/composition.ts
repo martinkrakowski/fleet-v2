@@ -95,6 +95,9 @@ import {
   type AttemptRecord,
   type ExecutionRunnerHost,
   type EvaluateAttemptGatePort,
+  type EnqueueMergeUseCase,
+  type ListMergeQueueUseCase,
+  type MergeQueueRepositoryAdapter,
   type ForgeActionDelegate,
   type GhInvocationResult,
   type SubprocessRunner,
@@ -694,6 +697,9 @@ export interface FleetCliRuntime {
     readonly autoMergeAttempt: AutoMergeAttemptUseCase;
     readonly probeProject: ProbeProjectUseCase;
     readonly listUnregisteredProjects: ListUnregisteredProjectsUseCase;
+    readonly mergeQueueRepository: MergeQueueRepositoryAdapter;
+    readonly enqueueMerge: EnqueueMergeUseCase;
+    readonly listMergeQueue: ListMergeQueueUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;

@@ -14,6 +14,7 @@ import type { ParsedLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN } from './lane-run-records.js';
 import type { LaneRunKeyStep } from './lane-run-records.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
+import type { SeatFailureOutcome } from './seat-selection.js';
 
 /** The conductor's result reason codes (K4); each matches LANE_RUN_JOURNAL_REASON_CODE_PATTERN. Stored data: version with the journal. */
 export const LANE_RUN_RESULT_REASON_CODES = [
@@ -294,8 +295,78 @@ export function laneRunPremergePost(
   return post;
 }
 
-/** The step of the run's latest final step-key result when its outcome is 'refused' and its round is `round`; else null. */
-export function laneRunRefusedStep(entries: readonly LaneRunJournalEntryRecord[], runId: string, round: number): LaneRunKeyStep | null {
+/**
+ * A recorded seat advance (G11a): the `next-seat-<outcome>-<index>` or
+ * `next-seat-<outcome>-none` detail token of a failed turn's final result,
+ * or `none` when the journal holds no such token for the round. The outcome
+ * is the failure outcome the result recorded (`rate-limited`, `timeout` or
+ * `provider-error`).
+ */
+export type LaneRunRecordedSeatAdvance =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'seat'; readonly seatIndex: number; readonly outcome: SeatFailureOutcome }
+  | { readonly kind: 'exhausted'; readonly outcome: SeatFailureOutcome | null };
+
+/** The failure outcomes a recorded advance may name. */
+const SEAT_ADVANCE_OUTCOMES: readonly SeatFailureOutcome[] = ['rate-limited', 'timeout', 'provider-error'];
+
+/** Parse a recorded advance's detail token; anything else reads `none`. */
+function parseSeatAdvanceDetail(detail: string | null): LaneRunRecordedSeatAdvance {
+  if (detail === null || !detail.startsWith('next-seat-')) {
+    return { kind: 'none' };
+  }
+  const rest = detail.slice('next-seat-'.length);
+  if (rest === 'none') {
+    return { kind: 'exhausted', outcome: null };
+  }
+  for (const outcome of SEAT_ADVANCE_OUTCOMES) {
+    if (!rest.startsWith(outcome + '-')) {
+      continue;
+    }
+    const tail = rest.slice(outcome.length + 1);
+    if (tail === 'none') {
+      return { kind: 'exhausted', outcome };
+    }
+    if (/^[0-9]+$/.test(tail)) {
+      return { kind: 'seat', seatIndex: Number(tail), outcome };
+    }
+  }
+  return { kind: 'none' };
+}
+
+/**
+ * The latest recorded seat advance for `round` (G11a): the LAST final
+ * `refused` result of a step key at that round whose detail is a
+ * `next-seat-` token. Journal order decides, so a later failure's advance
+ * supersedes an earlier one and no other reader may re-derive the seat
+ * independently. A run id that is not a run id, or no token, reads `none`.
+ */
+export function laneRunRecordedSeatAdvance(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  round: number,
+): LaneRunRecordedSeatAdvance {
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+    return { kind: 'none' };
+  }
+  let latest: LaneRunRecordedSeatAdvance = { kind: 'none' };
+  for (const entry of entries) {
+    if (entry.kind !== 'result' || entry.outcome !== 'refused' || entry.runId !== runId) {
+      continue;
+    }
+    const parsed = entry.key === null ? null : parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.runId !== runId || parsed.round !== round) {
+      continue;
+    }
+    const advance = parseSeatAdvanceDetail(entry.detail);
+    if (advance.kind !== 'none') {
+      latest = advance;
+    }
+  }
+  return latest;
+}
+
+/** The step of the run's latest final step-key result when its outcome is 'refused' and its round is `round`; else null. */export function laneRunRefusedStep(entries: readonly LaneRunJournalEntryRecord[], runId: string, round: number): LaneRunKeyStep | null {
   if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
     return null;
   }

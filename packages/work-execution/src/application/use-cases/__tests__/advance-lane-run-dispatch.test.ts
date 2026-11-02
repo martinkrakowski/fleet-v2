@@ -321,6 +321,9 @@ async function makeHarness(
     admission: {
       admit: async () => ({ outcome: 'admitted' }),
     },
+    // G11a: a bound family comparator is what lets a refused dispatch record
+    // its next-seat advance instead of failing closed.
+    sameModelFamily: (left, right) => left.split('-')[0] === right.split('-')[0],
     newUlid: makeUlidMinter(),
     ...(options.ceiling !== undefined ? { perLaneCostCeiling: options.ceiling } : {}),
     ...(options.wireDispatch === false

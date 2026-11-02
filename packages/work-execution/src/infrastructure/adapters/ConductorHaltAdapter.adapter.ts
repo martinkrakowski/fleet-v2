@@ -55,6 +55,8 @@ const OTHER_STORE_FILE_NAMES = [
   'run-journal.json',
   'lane-runs.json',
   'conductor-driver-lease.json',
+  'killall-halt.json',
+  'killall-train-pause.json',
 ];
 /** A configured file name may not escape the state directory it belongs to. */
 const SAFE_FILE_NAME = /^[A-Za-z0-9._-]{1,128}$/;

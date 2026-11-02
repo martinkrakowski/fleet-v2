@@ -231,8 +231,8 @@ describe('JevMergeVetoAdapter reported cost settlement', () => {
 
   it('treats negative reported cost as unusable on validation failure (low confidence)', async () => {
     const journal = new MockJournal();
-    // Confidence 0.5 is below holdConfidence 0.8 -> validation fails with low-confidence
-    const fakeFetch = (async () => createSuccessfulResponse(-1, 0.5)) as typeof fetch;
+    // Confidence 0.7 is below holdConfidence 0.8 -> validation fails with low-confidence
+    const fakeFetch = (async () => createSuccessfulResponse(-1, 0.7)) as typeof fetch;
     const adapter = new JevMergeVetoAdapter(
       makeDeps(journal, fakeFetch, { assumedCostPerCallUsd: 0.02, holdConfidence: 0.8 }),
     );

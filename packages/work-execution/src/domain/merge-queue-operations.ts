@@ -78,8 +78,13 @@ export type MergeRetryDecision =
       readonly record: MergeQueueEntryRecord;
     }
   | {
+      readonly outcome: 'duplicate';
+      readonly entries: readonly MergeQueueEntryRecord[];
+      readonly record: MergeQueueEntryRecord;
+    }
+  | {
       readonly outcome: 'refused';
-      readonly reason: 'unknown-entry' | 'not-dropped' | 'invalid-deadline';
+      readonly reason: 'unknown-entry' | 'not-dropped' | 'invalid-deadline' | 'invalid-entry';
     };
 
 function isMergeQueueTier(value: unknown): value is MergeQueueTier {
@@ -152,6 +157,68 @@ function buildSuccessorRecord(predecessor: MergeQueueEntryRecord, input: MergeEn
   };
 }
 
+function findDuplicateLiveEntry(
+  ordered: readonly MergeQueueEntryRecord[],
+  input: MergeEnqueueInput,
+): MergeQueueEntryRecord | undefined {
+  const targetIdentity = {
+    repository: input.repository,
+    pullRequest: input.pullRequest,
+    headOid: input.headOid as string,
+  };
+  return ordered.find((entry) => sameMergeQueueIdentity(entry, targetIdentity));
+}
+
+function isSupersedablePredecessor(
+  predecessor: MergeQueueEntryRecord,
+  input: MergeEnqueueInput,
+): boolean {
+  if (predecessor.headOid === input.headOid) {
+    return false;
+  }
+  if (predecessor.pullRequest !== input.pullRequest) {
+    return false;
+  }
+  return (
+    predecessor.repository.owner === input.repository.owner &&
+    predecessor.repository.repo === input.repository.repo
+  );
+}
+
+function trySupersedeEnqueue(
+  entries: readonly MergeQueueEntryRecord[],
+  ordered: readonly MergeQueueEntryRecord[],
+  input: MergeEnqueueInput,
+): MergeEnqueueDecision | null {
+  const predecessor = ordered.find((candidate) => isSupersedablePredecessor(candidate, input));
+  if (predecessor === undefined) {
+    return null;
+  }
+  const successorRead = readMergeQueueEntryRecord(buildSuccessorRecord(predecessor, input));
+  if (!successorRead.ok) {
+    return { outcome: 'refused', reason: 'invalid-entry-id' };
+  }
+  const supersededRead = readMergeQueueEntryRecord({
+    ...predecessor,
+    state: 'superseded',
+    reason: null,
+    revision: predecessor.revision + 1,
+  });
+  if (!supersededRead.ok) {
+    return { outcome: 'refused', reason: 'invalid-entry-id' };
+  }
+  const next = entries.map((entry) =>
+    entry.entryId === predecessor.entryId ? supersededRead.record : entry,
+  );
+  next.push(successorRead.record);
+  return {
+    outcome: 'supersedes',
+    entries: next,
+    record: successorRead.record,
+    supersededEntryId: predecessor.entryId,
+  };
+}
+
 export function decideMergeEnqueue(
   entries: readonly MergeQueueEntryRecord[],
   input: MergeEnqueueInput,
@@ -172,49 +239,14 @@ export function decideMergeEnqueue(
 
     const ordered = orderMergeQueue(entries.filter(isMergeQueueEntryLive));
 
-    for (const entry of ordered) {
-      if (
-        sameMergeQueueIdentity(entry, {
-          repository: input.repository,
-          pullRequest: input.pullRequest,
-          headOid: input.headOid as string,
-        })
-      ) {
-        return { outcome: 'duplicate', entries, record: entry };
-      }
+    const duplicate = findDuplicateLiveEntry(ordered, input);
+    if (duplicate !== undefined) {
+      return { outcome: 'duplicate', entries, record: duplicate };
     }
 
-    for (const predecessor of ordered) {
-      if (
-        predecessor.repository.owner === input.repository.owner &&
-        predecessor.repository.repo === input.repository.repo &&
-        predecessor.pullRequest === input.pullRequest &&
-        predecessor.headOid !== input.headOid
-      ) {
-        const successorRead = readMergeQueueEntryRecord(buildSuccessorRecord(predecessor, input));
-        if (!successorRead.ok) {
-          return { outcome: 'refused', reason: 'invalid-entry-id' };
-        }
-        const supersededRead = readMergeQueueEntryRecord({
-          ...predecessor,
-          state: 'superseded',
-          reason: null,
-          revision: predecessor.revision + 1,
-        });
-        if (!supersededRead.ok) {
-          return { outcome: 'refused', reason: 'invalid-entry-id' };
-        }
-        const next = entries.map((entry) =>
-          entry.entryId === predecessor.entryId ? supersededRead.record : entry,
-        );
-        next.push(successorRead.record);
-        return {
-          outcome: 'supersedes',
-          entries: next,
-          record: successorRead.record,
-          supersededEntryId: predecessor.entryId,
-        };
-      }
+    const supersedeResult = trySupersedeEnqueue(entries, ordered, input);
+    if (supersedeResult !== null) {
+      return supersedeResult;
     }
 
     const createdRead = readMergeQueueEntryRecord(buildCreatedRecord(input, null));
@@ -269,6 +301,12 @@ export function decideMergeRetry(
     if (target.state !== 'dropped') {
       return { outcome: 'refused', reason: 'not-dropped' };
     }
+    const duplicate = entries.find(
+      (entry) => isMergeQueueEntryLive(entry) && sameMergeQueueIdentity(entry, target),
+    );
+    if (duplicate !== undefined) {
+      return { outcome: 'duplicate', entries, record: duplicate };
+    }
     const record: MergeQueueEntryRecord = {
       version: MERGE_QUEUE_ENTRY_VERSION,
       entryId: retry.entryId as string,
@@ -298,10 +336,10 @@ export function decideMergeRetry(
     };
     const read = readMergeQueueEntryRecord(record);
     if (!read.ok) {
-      return { outcome: 'refused', reason: 'unknown-entry' };
+      return { outcome: 'refused', reason: 'invalid-entry' };
     }
     return { outcome: 'retried', entries: [...entries, read.record], record: read.record };
   } catch {
-    return { outcome: 'refused', reason: 'unknown-entry' };
+    return { outcome: 'refused', reason: 'invalid-entry' };
   }
 }

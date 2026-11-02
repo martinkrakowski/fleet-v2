@@ -60,11 +60,17 @@ export const mergeCommands: Readonly<Record<string, CommandHandler>> = {
     let tier = 2;
     const tierRaw = p['tier'];
     if (tierRaw !== undefined) {
-      const parsed = typeof tierRaw === 'number' ? tierRaw : Number(tierRaw);
-      if (!Number.isInteger(parsed) || parsed < 0 || parsed > 2) {
+      if (
+        tierRaw !== 0 &&
+        tierRaw !== 1 &&
+        tierRaw !== 2 &&
+        tierRaw !== '0' &&
+        tierRaw !== '1' &&
+        tierRaw !== '2'
+      ) {
         throw new CliUsageError('merge enqueue: --tier must be 0, 1 or 2');
       }
-      tier = parsed;
+      tier = Number(tierRaw);
     }
     return rt.execution.enqueueMerge.enqueue({
       repository,

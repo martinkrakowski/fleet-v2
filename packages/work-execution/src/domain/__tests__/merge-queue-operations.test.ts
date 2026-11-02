@@ -254,4 +254,32 @@ describe('decideMergeRetry', () => {
       expectAllValid(decision.entries);
     }
   });
+
+  it('returns duplicate when a live twin already exists', () => {
+    const dropped = makeEntry({ state: 'dropped', reason: 'operator-dropped' });
+    const liveTwin = makeEntry({
+      repository: dropped.repository,
+      pullRequest: dropped.pullRequest,
+      headOid: dropped.headOid,
+      state: 'queued',
+    });
+    const decision = decideMergeRetry([dropped, liveTwin], dropped.entryId, {
+      entryId: nextEntryId(),
+      enqueuedAtIso: '2026-11-01T12:00:00.000Z',
+    });
+    expect(decision.outcome).toBe('duplicate');
+    if (decision.outcome === 'duplicate') {
+      expect(decision.record.entryId).toBe(liveTwin.entryId);
+      expect(decision.entries).toEqual([dropped, liveTwin]);
+    }
+  });
+
+  it('refuses invalid-entry when the retry record fails validation', () => {
+    const dropped = makeEntry({ state: 'dropped', reason: 'operator-dropped', attempt: 32 });
+    const decision = decideMergeRetry([dropped], dropped.entryId, {
+      entryId: nextEntryId(),
+      enqueuedAtIso: '2026-11-01T12:00:00.000Z',
+    });
+    expect(decision).toEqual({ outcome: 'refused', reason: 'invalid-entry' });
+  });
 });

@@ -3,6 +3,7 @@ import type { MergeQueueRepositoryPort, MergeQueueListQuery } from '../ports/out
 import type { MergeQueueView, ListMergeQueuePort } from '../ports/in/ListMergeQueuePort.in-port.js';
 import {
   findMergeQueueHead,
+  isMergeQueueEntryLive,
   orderMergeQueue,
 } from '../../domain/merge-queue-records.js';
 import type { MergeQueueRepositoryRef } from '../../domain/merge-queue-records.js';
@@ -21,7 +22,8 @@ export class ListMergeQueueUseCase implements ListMergeQueuePort {
               entry.repository.owner === query.repository!.owner &&
               entry.repository.repo === query.repository!.repo,
           );
-    const ordered = orderMergeQueue(filtered);
+    const live = filtered.filter(isMergeQueueEntryLive);
+    const ordered = orderMergeQueue(live);
     const heads: { readonly repository: MergeQueueRepositoryRef; readonly headEntryId: string | null }[] = [];
     const seen = new Set<string>();
     for (const entry of ordered) {
@@ -39,6 +41,12 @@ export class ListMergeQueueUseCase implements ListMergeQueuePort {
       heads.push({
         repository: { owner: entry.repository.owner, repo: entry.repository.repo },
         headEntryId: head === null ? null : head.entryId,
+      });
+    }
+    if (query.repository !== undefined && !seen.has(`${query.repository.owner}\u0000${query.repository.repo}`)) {
+      heads.push({
+        repository: { owner: query.repository.owner, repo: query.repository.repo },
+        headEntryId: null,
       });
     }
     return { entries: ordered, heads };

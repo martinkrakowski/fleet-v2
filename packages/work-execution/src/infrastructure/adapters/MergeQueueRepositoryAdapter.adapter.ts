@@ -32,7 +32,7 @@ import {
 } from '../../domain/merge-queue-operations.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import type { MergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
-import { readMergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
+import { isMergeQueueEntryLive, readMergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
 import {
   assertStoreWritable,
   inspectRecordListBytes,
@@ -87,6 +87,31 @@ export function parseMergeQueueStateRecord(raw: unknown): MergeQueueEntryRecord 
   } catch {
     return undefined;
   }
+}
+
+/** A fixed detail when two live merge-queue records share (repository, pull request, head). */
+export function duplicateMergeQueueIdentityListError(records: readonly MergeQueueEntryRecord[]): string | undefined {
+  for (let leftIndex = 0; leftIndex < records.length; leftIndex += 1) {
+    const left = records[leftIndex];
+    if (!isMergeQueueEntryLive(left)) {
+      continue;
+    }
+    for (let rightIndex = leftIndex + 1; rightIndex < records.length; rightIndex += 1) {
+      const right = records[rightIndex];
+      if (!isMergeQueueEntryLive(right)) {
+        continue;
+      }
+      if (
+        left.repository.owner === right.repository.owner &&
+        left.repository.repo === right.repository.repo &&
+        left.pullRequest === right.pullRequest &&
+        left.headOid === right.headOid
+      ) {
+        return 'duplicate live merge-queue identity';
+      }
+    }
+  }
+  return undefined;
 }
 
 type MergeMutationDecision = MergeEnqueueDecision | MergeDropDecision | MergeRetryDecision;
@@ -230,6 +255,10 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
     const inspection = inspectRecordListBytes(buffer, parseMergeQueueStateRecord);
     if (inspection.status === 'unreadable') {
       return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
+    }
+    const listError = duplicateMergeQueueIdentityListError(inspection.records);
+    if (listError !== undefined) {
+      return rejectUnreadableStateFile(target, listError, buffer, this.options?.readOnly === true);
     }
     return inspection.records;
   }

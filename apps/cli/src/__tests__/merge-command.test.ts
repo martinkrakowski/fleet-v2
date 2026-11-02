@@ -1,5 +1,5 @@
 // DT4: the `merge` CLI group — enqueue/list/drop/retry handlers.
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, promises as fs, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
@@ -162,5 +162,131 @@ describe('merge commands (DT4)', () => {
     expect(filteredView.entries.map((entry) => entry.entryId)).toEqual([ulid(2), ulid(3)]);
     expect(filteredView.heads).toHaveLength(1);
     expect(filteredView.heads[0]?.headEntryId).toBe(ulid(2));
+  });
+
+  it.each([
+    ['bare flag', ['--tier']],
+    ['empty string', ['--tier=']],
+    ['hex literal', ['--tier', '0x1']],
+    ['explicit sign', ['--tier', '+2']],
+    ['exponential', ['--tier', '1e0']],
+  ])('refuses non-integer or malformed tier representation %s as usage error without echoing value', async (_, extraArgs) => {
+    const runtime = createFleetCliRuntime({});
+    const result = await cli(runtime, [
+      'merge',
+      'enqueue',
+      '--repository',
+      'fleet/v2',
+      '--pull-request',
+      '7',
+      '--head',
+      HEAD_A,
+      ...extraArgs,
+    ]);
+    expect(result.code).toBe(2);
+    expect(result.err).toContain('merge enqueue: --tier must be 0, 1 or 2');
+    for (const arg of extraArgs) {
+      if (arg !== '--tier' && arg !== '--tier=') {
+        expect(result.err).not.toContain(arg);
+      }
+    }
+  });
+
+  it('quarantines and refuses a merge-queue store containing duplicate live identities on read', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-merge-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+
+    const liveRecordA = {
+      version: 1,
+      entryId: ulid(1),
+      repository: { owner: 'fleet', repo: 'v2' },
+      repoDigest: '0123456789ab',
+      pullRequest: 7,
+      headOid: HEAD_A,
+      state: 'queued',
+      reason: null,
+      attempt: 0,
+      notBeforeIso: null,
+      enqueuedAtIso: '2026-11-01T10:00:00.000Z',
+      enqueuedBy: 'cli',
+      supersedes: null,
+      runId: null,
+      attemptId: null,
+      workOrderId: null,
+      tier: 2,
+      verifiedHeadOid: null,
+      verifiedBy: null,
+      policyRevision: null,
+      premergeReceiptHeadOid: null,
+      veto: null,
+      mergeCommitOid: null,
+      mergedAtIso: null,
+      revision: 1,
+    };
+    const liveRecordB = {
+      ...liveRecordA,
+      entryId: ulid(2),
+      enqueuedAtIso: '2026-11-01T11:00:00.000Z',
+    };
+
+    const target = path.join(stateDir, 'merge-queue.json');
+    await fs.writeFile(target, JSON.stringify([liveRecordA, liveRecordB]));
+
+    const result = await cli(runtime, ['merge', 'list']);
+    expect(result.code).toBe(1);
+    expect(result.err).toContain('duplicate live merge-queue identity');
+    expect(result.err).not.toContain(HEAD_A);
+    expect(result.err).not.toContain('fleet/v2');
+    expect(result.err).not.toContain(ulid(1));
+
+    const quarantineDir = path.join(stateDir, 'quarantine');
+    const files = await fs.readdir(quarantineDir);
+    expect(files.some((f) => f.startsWith('merge-queue.json.'))).toBe(true);
+  });
+
+  it('excludes merged and superseded entries from list while keeping parked entries', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-merge-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    const queue = runtime.execution.mergeQueueRepository;
+
+    const enqueue1 = await queue.enqueueMergeEntry({
+      repository: { owner: 'fleet', repo: 'v2' },
+      pullRequest: 1,
+      headOid: HEAD_A,
+      tier: 2,
+      enqueuedBy: 'cli',
+      runId: null,
+      entryId: ulid(1),
+      successorEntryId: ulid(2),
+      enqueuedAtIso: '2026-11-01T10:00:00.000Z',
+      deadlineIso: futureDeadline(),
+    });
+    expect(enqueue1.outcome).toBe('created');
+
+    const enqueue2 = await queue.enqueueMergeEntry({
+      repository: { owner: 'fleet', repo: 'v2' },
+      pullRequest: 1,
+      headOid: HEAD_B,
+      tier: 2,
+      enqueuedBy: 'cli',
+      runId: null,
+      entryId: ulid(3),
+      successorEntryId: ulid(4),
+      enqueuedAtIso: '2026-11-01T10:30:00.000Z',
+      deadlineIso: futureDeadline(),
+    });
+    expect(enqueue2.outcome).toBe('supersedes');
+
+    const result = await cli(runtime, ['merge', 'list']);
+    expect(result.code).toBe(0);
+    const view = JSON.parse(result.out) as {
+      entries: Array<{ entryId: string; state: string }>;
+      heads: Array<{ repository: { owner: string; repo: string }; headEntryId: string | null }>;
+    };
+    expect(view.entries.map((entry) => entry.entryId)).toEqual([ulid(3)]);
+    expect(view.entries.some((entry) => entry.state === 'superseded')).toBe(false);
+    expect(view.heads[0]?.headEntryId).toBe(ulid(3));
   });
 });

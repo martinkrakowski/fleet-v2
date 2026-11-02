@@ -5,10 +5,16 @@
 #
 #   sh scripts/test-bin.sh                  every test file (unchanged behaviour)
 #   sh scripts/test-bin.sh --shard <i>/<n>  only shard i of n (1 <= i <= n): the
-#                                           files sorted bytewise (LC_ALL=C), the
-#                                           file at 0-based index k runs in shard
-#                                           (k mod n) + 1, so each file runs in
-#                                           exactly one shard of the n
+#                                           files sorted bytewise (LC_ALL=C),
+#                                           then balanced across the n shards by
+#                                           the recorded per-file times in
+#                                           scripts/test-bin-timings.txt (a
+#                                           greedy split: longest first, ties
+#                                           bytewise, each file to the shard
+#                                           with the smallest total so far), so
+#                                           each file runs in exactly one shard
+#                                           of the n; a file absent from the
+#                                           timings table counts as 60 seconds
 #   sh scripts/test-bin.sh --shard <i>/<n> --list
 #                                           print that shard's files, run nothing
 #
@@ -115,12 +121,64 @@ if [ "$sharded" = 1 ]; then
   files=$(printf '%s\n' "$files" | LC_ALL=C sort)
 fi
 
+# --- shard assignment (CI1): balanced by recorded per-file times. The timings
+# --- file is data, one `path linux-seconds macos-seconds` row per test file,
+# --- with `#` comments and blank lines; FLEET_TEST_BIN_TIMINGS overrides its
+# --- path so tests can point the reader at a temp file, and a missing file
+# --- means every duration is unknown, never an error. The assignment is the
+# --- pure greedy step below: files in descending Linux duration (ties bytewise
+# --- ascending), each to the shard with the smallest total so far, ties to the
+# --- lowest shard number; an unknown file falls back to 60 seconds.
+timings_file=${FLEET_TEST_BIN_TIMINGS:-$root/scripts/test-bin-timings.txt}
+
+assign_shards() {
+  printf '%s\n' "$files" | awk -v timings="$timings_file" -v n="$shard_n" -v i_shard="$shard_i" '
+    BEGIN {
+      while ((getline line < timings) > 0) {
+        sub(/\r$/, "", line)
+        if (line ~ /^[ \t]*(#|$)/) continue
+        split(line, row, " ")
+        if (row[1] != "") linux_sec[row[1]] = row[2] + 0
+      }
+      close(timings)
+    }
+    { files[++fc] = $0 }
+    function earlier(a, b) {
+      if (ldur[a] != ldur[b]) return ldur[a] > ldur[b]
+      return files[a] < files[b]
+    }
+    END {
+      for (k = 1; k <= fc; k++) {
+        ldur[k] = (files[k] in linux_sec) ? linux_sec[files[k]] : 60
+        order[k] = k
+      }
+      for (k = 1; k <= fc; k++) {
+        for (j = k + 1; j <= fc; j++) {
+          if (earlier(order[j], order[k])) {
+            tmp = order[k]; order[k] = order[j]; order[j] = tmp
+          }
+        }
+      }
+      for (k = 1; k <= fc; k++) {
+        idx = order[k]
+        best = 1
+        for (s = 2; s <= n; s++) if (load[s] + 0 < load[best] + 0) best = s
+        load[best] += ldur[idx]
+        assign[files[idx]] = best
+      }
+      for (k = 1; k <= fc; k++) if (assign[files[k]] == i_shard) print files[k]
+    }
+  '
+}
+
 selected=""
 index=0
+if [ "$sharded" = 1 ]; then
+  selected=$(assign_shards)
+else
+  selected=$files
+fi
 for t in $files; do
-  if [ $((index % shard_n + 1)) -eq "$shard_i" ]; then
-    selected="$selected $t"
-  fi
   index=$((index + 1))
 done
 if [ -z "$selected" ]; then

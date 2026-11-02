@@ -230,6 +230,7 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     requestRepo: coordinationRequestRepository,
     clock: { nowIso: () => new Date().toISOString() },
     ids: { newRequestId: newUlid, newGrantId: newUlid },
+    profileRepo: projectProfileRepository,
   });
 
   // --- project profiles and probes (P6b) --------------------------------------

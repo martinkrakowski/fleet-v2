@@ -11,7 +11,8 @@
  */
 
 import type { PolicyMergeGrantRequest } from './PolicyMergeGrantPort.out-port.js';
-import type { MergeGrantForgeKind } from '@fleet/operator-coordination';
+export const MERGE_GRANT_FORGE_KINDS = ['merge-pr', 'update-branch', 'post-status'] as const;
+export type MergeGrantForgeKind = (typeof MERGE_GRANT_FORGE_KINDS)[number];
 
 export interface MergeGrantRepositoryRef {
   readonly owner: string;

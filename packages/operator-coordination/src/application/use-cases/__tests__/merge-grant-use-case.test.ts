@@ -12,6 +12,8 @@ import type { CoordinationRequestRecord } from '../../../domain/coordination-rec
 import { isPolicyGrantRecord, mergeGrantProposalDigest } from '../../../domain/policy-grants.js';
 import type { MergeGrantForgeKind } from '../../../domain/policy-grants.js';
 import { CoordinationRequestRepositoryAdapter } from '../../../infrastructure/adapters/CoordinationRequestRepositoryAdapter.adapter.js';
+import type { ProjectProfileRecord } from '../../../domain/coordination-records.js';
+import type { ProjectProfileRepositoryPort } from '../../ports/out/ProjectProfileRepositoryPort.out-port.js';
 import type {
   IssueMergeGrantRequest,
   PolicyGrantClock,
@@ -25,6 +27,34 @@ const NOW_ISO = '2026-11-02T10:00:00.000Z';
 const HA = 'a'.repeat(40);
 const HB = 'b'.repeat(40);
 const REPO = { owner: 'acme', repo: 'widgets' };
+const REV = '309ab8c40bf2';
+
+/** The real port the composition root injects, stubbed here for the revision. */
+class StubProfileRepository implements ProjectProfileRepositoryPort {
+  constructor(
+    private readonly revision: string | null,
+    private readonly shouldThrow = false,
+  ) {}
+
+  async saveProfile(): Promise<void> {}
+
+  async findProfileById(): Promise<ProjectProfileRecord | null> {
+    if (this.shouldThrow) {
+      throw new Error('store failure');
+    }
+    if (this.revision === null) {
+      return null;
+    }
+    return {
+      projectId: 'project-example',
+      policyRevision: this.revision,
+    } as ProjectProfileRecord;
+  }
+
+  async listProfiles(): Promise<readonly ProjectProfileRecord[]> {
+    return [];
+  }
+}
 
 /** A clock the composition root would inject; it counts its reads. */
 function countingClock(): PolicyGrantClock & { calls: number } {
@@ -163,6 +193,7 @@ describe('IssueMergeGrantUseCase', () => {
       requestRepo: repository,
       clock: countingClock(),
       ids: countingIds(),
+      profileRepo: new StubProfileRepository(REV),
     });
     const result = await useCase.issueMergeGrant(issueMergeRequest());
     expect(result).toEqual({
@@ -183,6 +214,7 @@ describe('IssueMergeGrantUseCase', () => {
       requestRepo: repository,
       clock: countingClock(),
       ids: countingIds(),
+      profileRepo: new StubProfileRepository(REV),
     });
     const first = await useCase.issueMergeGrant(issueMergeRequest());
     expect(first.outcome).toBe('issued');
@@ -217,6 +249,7 @@ describe('IssueMergeGrantUseCase', () => {
       requestRepo: wrapper,
       clock: countingClock(),
       ids: countingIds(),
+      profileRepo: new StubProfileRepository(REV),
     });
     const result = await useCase.issueMergeGrant(issueMergeRequest());
     expect(result).toEqual({
@@ -236,6 +269,7 @@ describe('IssueMergeGrantUseCase', () => {
       requestRepo: repository,
       clock: countingClock(),
       ids: countingIds(),
+      profileRepo: new StubProfileRepository(REV),
     });
     const cases: ReadonlyArray<readonly [Partial<IssueMergeGrantRequest>, string]> = [
       [{ projectId: '' }, 'a merge grant requires a non-empty projectId of at most 256 characters'],
@@ -276,6 +310,38 @@ describe('IssueMergeGrantUseCase', () => {
     expect(await repository.listRequests()).toEqual([]);
   });
 
+  it('refuses an unreadable current policy revision and writes nothing', async () => {
+    const repository = new CoordinationRequestRepositoryAdapter();
+    const useCase = new IssueMergeGrantUseCase({
+      requestRepo: repository,
+      clock: countingClock(),
+      ids: countingIds(),
+      profileRepo: new StubProfileRepository(REV, true),
+    });
+    const result = await useCase.issueMergeGrant(issueMergeRequest());
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'the current policy revision could not be read',
+    });
+    expect(await repository.listRequests()).toEqual([]);
+  });
+
+  it('refuses a differing current policy revision and writes nothing', async () => {
+    const repository = new CoordinationRequestRepositoryAdapter();
+    const useCase = new IssueMergeGrantUseCase({
+      requestRepo: repository,
+      clock: countingClock(),
+      ids: countingIds(),
+      profileRepo: new StubProfileRepository('bbbbbbbbbbbb'),
+    });
+    const result = await useCase.issueMergeGrant(issueMergeRequest());
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'the current policy revision (bbbbbbbbbbbb) differs from the supplied revision (309ab8c40bf2)',
+    });
+    expect(await repository.listRequests()).toEqual([]);
+  });
+
   it('rejects Not implemented without dependencies or with a missing request', async () => {
     await expect(new IssueMergeGrantUseCase().execute({})).rejects.toThrow(
       'Not implemented: IssueMergeGrantUseCase',
@@ -287,6 +353,7 @@ describe('IssueMergeGrantUseCase', () => {
       requestRepo: new CoordinationRequestRepositoryAdapter(),
       clock: countingClock(),
       ids: countingIds(),
+      profileRepo: new StubProfileRepository(REV),
     });
     await expect(configured.execute(undefined)).rejects.toThrow(
       'Not implemented: IssueMergeGrantUseCase',

@@ -29,12 +29,14 @@ import type {
   PolicyGrantIdSource,
 } from '../ports/in/IssueMergeGrantPort.in-port.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import type { ProjectProfileRepositoryPort } from '../ports/out/ProjectProfileRepositoryPort.out-port.js';
 import { cancelPolicyGrantOnce } from './policy-grant-cancel.js';
 
 export interface IssueMergeGrantDependencies {
   readonly requestRepo: CoordinationRequestRepositoryPort;
   readonly clock: PolicyGrantClock;
   readonly ids: PolicyGrantIdSource;
+  readonly profileRepo: ProjectProfileRepositoryPort;
 }
 
 /** strict: a leftover conflict refuses the whole issue; best-effort: the sweep ignores it. */
@@ -74,6 +76,11 @@ export class IssueMergeGrantUseCase implements IssueMergeGrantPort {
     const forgeKind = request.forgeKind;
     const settingRevision = request.settingRevision.trim();
     const actionScope = mergeGrantActionScope(forgeKind);
+
+    const policyRefusal = await this.verifyPolicyRevision(projectId, settingRevision);
+    if (policyRefusal !== null) {
+      return refused(policyRefusal);
+    }
 
     const requestId = this.deps.ids.newRequestId();
     const grantId = this.deps.ids.newGrantId();
@@ -303,5 +310,25 @@ export class IssueMergeGrantUseCase implements IssueMergeGrantPort {
       Promise.resolve(),
     );
     return { cancelledIds, conflict };
+  }
+
+  private async verifyPolicyRevision(
+    projectId: string,
+    settingRevision: string,
+  ): Promise<string | null> {
+    let currentRevision: string | null = null;
+    try {
+      const profile = await this.deps!.profileRepo.findProfileById(projectId);
+      currentRevision = profile?.policyRevision ?? null;
+    } catch {
+      return 'the current policy revision could not be read';
+    }
+    if (currentRevision === null) {
+      return 'the current policy revision could not be read';
+    }
+    if (currentRevision !== settingRevision) {
+      return `the current policy revision (${currentRevision}) differs from the supplied revision (${settingRevision})`;
+    }
+    return null;
   }
 }

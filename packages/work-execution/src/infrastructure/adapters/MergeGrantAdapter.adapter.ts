@@ -13,9 +13,11 @@ import type {
   IssueMergeGrantResult,
   IssuePolicyForgeGrantPort,
   IssuePolicyForgeGrantResult,
+  MergeGrantForgeKind as SupplierMergeGrantForgeKind,
 } from '@fleet/operator-coordination';
 
 import type {
+  MergeGrantForgeKind,
   MergeGrantPort,
   MergeGrantRequest,
   MergeGrantResult,
@@ -29,6 +31,21 @@ export interface MergeGrantDelegates {
 
 type AttemptBoundRequest = Extract<MergeGrantRequest, { kind: 'attempt-bound' }>;
 type AttemptLessRequest = Extract<MergeGrantRequest, { kind: 'attempt-less' }>;
+
+function mapMergeGrantForgeKind(kind: MergeGrantForgeKind): SupplierMergeGrantForgeKind {
+  switch (kind) {
+    case 'merge-pr':
+      return 'merge-pr';
+    case 'update-branch':
+      return 'update-branch';
+    case 'post-status':
+      return 'post-status';
+    default: {
+      const exhaustive: never = kind;
+      throw new Error(`Unsupported forge kind: ${exhaustive}`);
+    }
+  }
+}
 
 export class MergeGrantAdapter implements MergeGrantPort {
   constructor(private readonly delegate?: MergeGrantDelegates) {}
@@ -112,7 +129,7 @@ export class MergeGrantAdapter implements MergeGrantPort {
         repository: request.repository,
         pullRequestNumber: request.pullRequestNumber,
         expectedHeadSha: request.expectedHeadSha,
-        forgeKind: request.forgeKind,
+        forgeKind: mapMergeGrantForgeKind(request.forgeKind),
         settingRevision: request.settingRevision,
         deadlineIso: request.deadlineIso,
       });

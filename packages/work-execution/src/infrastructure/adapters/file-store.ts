@@ -2,6 +2,8 @@ import { createHash, randomBytes } from 'node:crypto';
 import { constants as fsConstants, promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
+import type { DaemonEventLineRead } from '../../domain/daemon-events.js';
+
 export interface FileLockOptions {
   /** Maximum wait time in milliseconds before timing out. Defaults to 10000ms. */
   readonly timeoutMs?: number;
@@ -774,6 +776,8 @@ export type StateFileInspection =
       readonly status: 'ok';
       readonly recordCount: number;
       readonly schemaVersions?: readonly number[];
+      /** A fixed note for a readable store that is not fully well-formed (a projection header). */
+      readonly detail?: string;
     }
   | {
       readonly status: 'unknown-version';
@@ -889,10 +893,9 @@ async function checkQuarantineCopy(
 async function readQuarantineCopyFor(
   basename: string,
   pattern: RegExp,
-  stateDir: string,
+  quarantineDir: string,
   from: string,
 ): Promise<QuarantineCopyRead> {
-  const quarantineDir = path.join(stateDir, 'quarantine');
   const candidatePath = path.basename(from) === from ? path.join(quarantineDir, from) : path.resolve(from);
   const name = path.basename(candidatePath);
   if (!pattern.test(name)) {
@@ -935,6 +938,25 @@ async function readQuarantineCopyFor(
   }
 }
 
+async function scanQuarantineCopies(
+  quarantineDir: string,
+  pattern: RegExp,
+  inspect: (bytes: Buffer) => StateFileInspection,
+): Promise<readonly QuarantineCopyCheck[]> {
+  let names: string[];
+  try {
+    names = await fs.readdir(quarantineDir);
+  } catch {
+    return [];
+  }
+  return Promise.all(
+    names
+      .filter((entry) => pattern.test(entry))
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => checkQuarantineCopy(quarantineDir, name, inspect)),
+  );
+}
+
 function checkCurrentStoreRefusal(
   basename: string,
   current: Buffer | null,
@@ -963,8 +985,9 @@ async function restoreRecordListStore(
   basename: string,
   inspect: (bytes: Buffer) => StateFileInspection,
   request: RestoreStateFileRequest,
+  relativePath: string = basename,
 ): Promise<RestoreStateFileOutcome> {
-  const filePath = path.join(request.stateDir, basename);
+  const filePath = path.join(request.stateDir, relativePath);
   return withFileLock<RestoreStateFileOutcome>(
     `${filePath}.lock`,
     async () => {
@@ -1010,39 +1033,39 @@ async function restoreRecordListStore(
 }
 
 /**
- * The descriptor plumbing shared by every record-list store: quarantine-name
+ * The descriptor plumbing shared by the single-file stores: quarantine-name
  * recognition, the read-only `check`, quarantine-copy reads and `restore`.
- * `inspect` is the pure parser the store's reader applies.
+ * `inspect` is the pure parser the store's reader applies. `relativePath` is
+ * the path under the state directory (defaults to `basename`); the quarantine
+ * copy name and its directory come from the leaf file name and the file's own
+ * directory, so a nested store like `daemon/status.json` quarantines beside
+ * itself.
  */
 function buildStateFileDescriptor(
   basename: string,
   inspect: (bytes: Buffer) => StateFileInspection,
+  relativePath: string = basename,
 ): StateFileDescriptor {
-  const pattern = quarantineCopyPattern(basename);
+  const pattern = quarantineCopyPattern(path.basename(relativePath));
   return {
     basename,
     inspect,
     isQuarantineCopyName: (name: string): boolean => pattern.test(name),
     check: async (stateDir: string): Promise<StateFileCheck> => {
-      const filePath = path.join(stateDir, basename);
+      const filePath = path.join(stateDir, relativePath);
       const result = await readAndInspect(filePath, inspect);
-      const quarantineDir = path.join(stateDir, 'quarantine');
-      let names: string[];
-      try {
-        names = await fs.readdir(quarantineDir);
-      } catch {
-        names = [];
-      }
-      const quarantineCopies = await Promise.all(
-        names
-          .filter((entry) => pattern.test(entry))
-          .sort((a, b) => a.localeCompare(b))
-          .map((name) => checkQuarantineCopy(quarantineDir, name, inspect)),
-      );
+      const quarantineDir = path.join(path.dirname(filePath), 'quarantine');
+      const quarantineCopies = await scanQuarantineCopies(quarantineDir, pattern, inspect);
       return { basename, filePath, result, quarantineCopies };
     },
-    readQuarantineCopy: (stateDir, from) => readQuarantineCopyFor(basename, pattern, stateDir, from),
-    restore: (request) => restoreRecordListStore(basename, inspect, request),
+    readQuarantineCopy: (stateDir, from) =>
+      readQuarantineCopyFor(
+        basename,
+        pattern,
+        path.join(stateDir, path.dirname(relativePath), 'quarantine'),
+        from,
+      ),
+    restore: (request) => restoreRecordListStore(basename, inspect, request, relativePath),
   };
 }
 
@@ -1088,6 +1111,192 @@ export function describeVersionedRecordListStore<T>(
     return listError === undefined
       ? { status: 'ok', recordCount: result.records.length, schemaVersions: result.schemaVersions }
       : { status: 'unreadable', detail: listError, recordIndex: null };
+  };
+  return buildStateFileDescriptor(basename, inspect);
+}
+
+// ---------------------------------------------------------------------------
+// Daemon state-file kinds (lane DT3): one versioned record per file, a
+// directory glob of single-record lease files, and the events.jsonl projection.
+// ---------------------------------------------------------------------------
+
+/** One record parsed from raw JSON: ok, an unsupported version, or unreadable. */
+export type SingleRecordInspection<T> =
+  | { readonly status: 'ok'; readonly record: T }
+  | { readonly status: 'unknown-version'; readonly detail: string }
+  | { readonly status: 'unreadable'; readonly detail: string };
+
+/** A quarantine copy name of any single-file store: `<name>.<stamp>-<n>.<hash>`. */
+const ANY_QUARANTINE_COPY_PATTERN =
+  /^[^/]+\.\d{8}T\d{6}\.\d{3}Z-\d+\.[0-9a-f]{12}(?:-dup\d+)?$/;
+
+const SINGLE_RECORD_NOT_JSON = 'not valid JSON';
+const SINGLE_RECORD_ARRAY = 'expects a single record';
+const JSONL_PROJECTION_HEADER_DETAIL = 'projection header missing or malformed';
+
+/** The single-record inspect shared by the single-file and glob descriptors. */
+function inspectSingleRecordBytes<T>(
+  bytes: Buffer,
+  inspectRecord: (raw: unknown) => SingleRecordInspection<T>,
+): StateFileInspection {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(bytes.toString('utf8'));
+  } catch {
+    return { status: 'unreadable', detail: SINGLE_RECORD_NOT_JSON, recordIndex: null };
+  }
+  if (Array.isArray(raw)) {
+    return { status: 'unreadable', detail: SINGLE_RECORD_ARRAY, recordIndex: null };
+  }
+  const inspected = inspectRecord(raw);
+  if (inspected.status === 'ok') {
+    return { status: 'ok', recordCount: 1 };
+  }
+  if (inspected.status === 'unknown-version') {
+    return { status: 'unknown-version', detail: inspected.detail, recordIndex: 0 };
+  }
+  return { status: 'unreadable', detail: inspected.detail, recordIndex: 0 };
+}
+
+/**
+ * Build the descriptor of one single-record store: the file holds exactly one
+ * versioned record, and the store's own reader decides whether it is ok, an
+ * unsupported version (reported as `'unknown-version'`, never quarantined) or
+ * unreadable. A JSON array, or any other shape the parser refuses, is
+ * unreadable.
+ */
+export function describeSingleRecordStore<T>(
+  basename: string,
+  inspectRecord: (raw: unknown) => SingleRecordInspection<T>,
+): StateFileDescriptor {
+  const inspect = (bytes: Buffer): StateFileInspection => inspectSingleRecordBytes(bytes, inspectRecord);
+  return buildStateFileDescriptor(basename, inspect);
+}
+
+/** The `*.json` lease files under the glob directory, one nesting level deep. */
+async function collectLeaseFiles(dirPath: string, entries: readonly string[]): Promise<string[]> {
+  const files: string[] = [];
+  for (const entry of [...entries].sort()) {
+    if (entry === 'quarantine') {
+      continue;
+    }
+    if (entry.endsWith('.json')) {
+      files.push(entry);
+      continue;
+    }
+    let inner: string[];
+    try {
+      inner = await fs.readdir(path.join(dirPath, entry));
+    } catch {
+      continue;
+    }
+    for (const name of inner.sort()) {
+      if (name.endsWith('.json')) {
+        files.push(path.join(entry, name));
+      }
+    }
+  }
+  return files;
+}
+
+/**
+ * Build the descriptor of the lease glob store (`daemon/leases`): `check`
+ * enumerates every `*.json` lease file (one nesting level; scopes carry at
+ * most one `/`), inspects each as a single record and aggregates: missing when
+ * the directory is absent, unreadable naming the first failing file, else ok
+ * with the total record count. A directory glob has no single current file to
+ * compare-and-swap, so `restore` refuses with a fixed reason.
+ */
+export function describeRecordGlob<T>(
+  dirRelative: string,
+  inspectRecord: (raw: unknown) => SingleRecordInspection<T>,
+): StateFileDescriptor {
+  const singleInspect = (bytes: Buffer): StateFileInspection =>
+    inspectSingleRecordBytes(bytes, inspectRecord);
+  const pattern = ANY_QUARANTINE_COPY_PATTERN;
+  return {
+    basename: dirRelative,
+    inspect: singleInspect,
+    isQuarantineCopyName: (name: string): boolean => pattern.test(name),
+    check: async (stateDir: string): Promise<StateFileCheck> => {
+      const dirPath = path.join(stateDir, dirRelative);
+      let entries: string[];
+      try {
+        entries = await fs.readdir(dirPath);
+      } catch (error: unknown) {
+        const code = errorCodeOf(error);
+        if (code === 'ENOENT') {
+          return { basename: dirRelative, filePath: dirPath, result: { status: 'missing' }, quarantineCopies: [] };
+        }
+        return { basename: dirRelative, filePath: dirPath, result: { status: 'read-error', code }, quarantineCopies: [] };
+      }
+      const files = await collectLeaseFiles(dirPath, entries);
+      let total = 0;
+      for (const relative of files) {
+        const filePath = path.join(dirPath, relative);
+        const result = await readAndInspect(filePath, singleInspect);
+        if (result.status === 'ok') {
+          total += result.recordCount;
+        } else if (result.status === 'unknown-version' || result.status === 'unreadable') {
+          return {
+            basename: dirRelative,
+            filePath: dirPath,
+            result: { ...result, detail: `${relative}: ${result.detail}` },
+            quarantineCopies: [],
+          };
+        } else if (result.status === 'read-error') {
+          return {
+            basename: dirRelative,
+            filePath: dirPath,
+            result: { status: 'unreadable', detail: `${relative}: cannot read (${result.code})`, recordIndex: null },
+            quarantineCopies: [],
+          };
+        }
+      }
+      const quarantineDir = path.join(dirPath, 'quarantine');
+      const quarantineCopies = await scanQuarantineCopies(quarantineDir, pattern, singleInspect);
+      return { basename: dirRelative, filePath: dirPath, result: { status: 'ok', recordCount: total }, quarantineCopies };
+    },
+    readQuarantineCopy: (stateDir, from) =>
+      readQuarantineCopyFor(dirRelative, pattern, path.join(stateDir, dirRelative, 'quarantine'), from),
+    restore: async (_request) => ({
+      status: 'refused',
+      reason: `${dirRelative} is a directory store; restore a single lease file, not the directory`,
+    }),
+  };
+}
+
+/**
+ * Build the descriptor of the events.jsonl projection: `inspect` reads the
+ * header line and every following line with the store's reader. It never
+ * reports `'unreadable'`: it reports `ok` with the count of valid event records,
+ * and when even the header is missing or malformed it reports `ok` with count
+ * 0 and a fixed detail string (no supplied value echoed).
+ */
+export function describeJsonlProjection(
+  basename: string,
+  readLine: (line: string) => DaemonEventLineRead,
+): StateFileDescriptor {
+  const inspect = (bytes: Buffer): StateFileInspection => {
+    const lines = bytes
+      .toString('utf8')
+      .split('\n')
+      .filter((line) => line.trim().length > 0);
+    if (lines.length === 0) {
+      return { status: 'ok', recordCount: 0, detail: JSONL_PROJECTION_HEADER_DETAIL };
+    }
+    const header = readLine(lines[0]!);
+    if (!header.ok || header.lineKind !== 'header') {
+      return { status: 'ok', recordCount: 0, detail: JSONL_PROJECTION_HEADER_DETAIL };
+    }
+    let count = 0;
+    for (let index = 1; index < lines.length; index += 1) {
+      const read = readLine(lines[index]!);
+      if (read.ok && read.lineKind === 'event') {
+        count += 1;
+      }
+    }
+    return { status: 'ok', recordCount: count };
   };
   return buildStateFileDescriptor(basename, inspect);
 }

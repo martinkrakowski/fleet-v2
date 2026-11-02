@@ -30,6 +30,7 @@
 
 import type { ChoiceQuestion, ScoreQuestion } from "@fleet/shared";
 import {
+  postJevDecision,
   validateChoiceAnswer,
   validateScoreAnswer,
   isValidIdOrModel,
@@ -44,11 +45,6 @@ import type { DecisionReceiptJournalPort } from "../../application/ports/out/Dec
 import { CLAIM_TRIAGE_CONSUMER } from "../../application/ports/out/DecisionReceiptJournalPort.out-port.js";
 import { buildTriageBatches, triageContextRef } from "./claim-triage-state.js";
 import { readKeyFile } from "./JevRankingAdviceAdapter.adapter.js";
-
-const JEV_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions";
-const DEFAULT_JEV_TIMEOUT_MS = 3000;
-/** Response bodies larger than this many bytes are refused as a shape failure. */
-const MAX_RESPONSE_BODY_BYTES = 65536;
 
 /** Choice criteria ids exactly as the owner-recorded K0 fixture pins them. */
 export const TRIAGE_CLASS_OPTIONS: Readonly<Record<string, string>> = {
@@ -106,10 +102,6 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === "AbortError";
-}
-
 export class JevClaimTriageAdapter implements ClaimTriagePort {
   private readonly model: string;
   private readonly keyFile: string;
@@ -122,7 +114,7 @@ export class JevClaimTriageAdapter implements ClaimTriagePort {
   private readonly fetchFn: typeof fetch;
   private readonly readKey: (path: string) => Promise<string>;
   private readonly disabledProjects: readonly string[];
-  private readonly timeoutMs: number;
+  private readonly timeoutMs: number | undefined;
 
   constructor(deps: JevClaimTriageAdapterDependencies) {
     if (!deps || typeof deps !== "object") {
@@ -154,7 +146,7 @@ export class JevClaimTriageAdapter implements ClaimTriagePort {
     this.fetchFn = deps.fetch;
     this.readKey = deps.readKey ?? readKeyFile;
     this.disabledProjects = deps.disabledProjects ?? [];
-    this.timeoutMs = deps.timeoutMs ?? DEFAULT_JEV_TIMEOUT_MS;
+    this.timeoutMs = deps.timeoutMs;
   }
 
   async triageAttempt(query: TriageAttemptQuery): Promise<ClaimTriageAdvice> {
@@ -296,6 +288,7 @@ export class JevClaimTriageAdapter implements ClaimTriagePort {
     contextRef: string,
     batch: {
       readonly stateJson: string;
+      readonly stateSha256: string;
       readonly keys: readonly string[];
       readonly idsByKey: Readonly<Record<string, string>>;
     },
@@ -318,7 +311,7 @@ export class JevClaimTriageAdapter implements ClaimTriagePort {
       }
   > {
     const startedAt = Date.now();
-    const read = await this.request(batch.stateJson);
+    const read = await this.request(batch.stateJson, batch.stateSha256);
     // One deadline covers the whole call: a clock that moved backwards never
     // records a negative latency.
     const latencyMs = Math.max(0, Date.now() - startedAt);
@@ -416,9 +409,14 @@ export class JevClaimTriageAdapter implements ClaimTriagePort {
     return { advice: { flags: flagsById, scores: scoresById } };
   }
 
-  /** The transport for one batch request, with the ranking adapter's hygiene. */
+  /**
+   * The transport for one batch request: read the key, then delegate the
+   * request to the shared Jev client. The client keeps the ranking adapter's
+   * hygiene; a key error maps to not-configured and nothing is sent.
+   */
   private async request(
     stateJson: string,
+    stateSha256: string,
   ): Promise<
     | { ok: true; parsed: unknown }
     | {
@@ -434,89 +432,19 @@ export class JevClaimTriageAdapter implements ClaimTriagePort {
       return { ok: false, reason: "not-configured" };
     }
 
-    const body = JSON.stringify({
+    const result = await postJevDecision({
+      fetch: this.fetchFn,
+      key,
       model: this.model,
-      state: stateJson,
+      stateJson,
       questions: buildTriageQuestions(stateJson),
+      stateSha256,
+      timeoutMs: this.timeoutMs,
     });
-
-    // One deadline covers the fetch AND the body read; the timer is cleared
-    // only after the body is fully read (or the attempt has already failed).
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    try {
-      const response = await this.fetchFn(JEV_DECISIONS_URL, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${key}`,
-          "content-type": "application/json",
-        },
-        body,
-        redirect: "error",
-        signal: controller.signal,
-      });
-
-      if (!(response as { ok?: boolean }).ok) {
-        // HTTP status only; never the body. Release the connection.
-        await response.body?.cancel().catch(() => undefined);
-        return { ok: false, reason: "transport" };
-      }
-
-      const contentLengthHeader = response.headers.get("content-length");
-      if (contentLengthHeader !== null) {
-        const contentLength = Number(contentLengthHeader);
-        if (
-          Number.isFinite(contentLength) &&
-          contentLength > MAX_RESPONSE_BODY_BYTES
-        ) {
-          // Refuse before reading a single byte of an oversized body.
-          await response.body?.cancel().catch(() => undefined);
-          return { ok: false, reason: "shape" };
-        }
-      }
-
-      const stream = response.body;
-      if (!stream) {
-        return { ok: false, reason: "transport" };
-      }
-      const reader = stream.getReader();
-      const decoder = new TextDecoder();
-      let received = 0;
-      let text = "";
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          received += value.byteLength;
-          if (received > MAX_RESPONSE_BODY_BYTES) {
-            await reader.cancel().catch(() => undefined);
-            return { ok: false, reason: "shape" };
-          }
-          text += decoder.decode(value, { stream: true });
-        }
-        text += decoder.decode();
-      } catch (error) {
-        return {
-          ok: false,
-          reason: isAbortError(error) ? "timeout" : "transport",
-        };
-      }
-
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(text) as unknown;
-      } catch {
-        return { ok: false, reason: "shape" };
-      }
-      return { ok: true, parsed };
-    } catch (error) {
-      if (isAbortError(error)) {
-        return { ok: false, reason: "timeout" };
-      }
-      return { ok: false, reason: "transport" };
-    } finally {
-      clearTimeout(timer);
+    if (!result.ok) {
+      return { ok: false, reason: result.reason };
     }
+    return { ok: true, parsed: result.parsed };
   }
 
   /**

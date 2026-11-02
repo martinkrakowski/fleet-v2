@@ -17,7 +17,7 @@ import { placeholderEvidenceRefusal, placeholderVerificationReceiptField } from 
 import type { EvidenceAssessmentRepositoryPort } from '../ports/out/EvidenceAssessmentRepositoryPort.out-port.js';
 import type { EvidenceArchivePort } from '../ports/out/EvidenceArchivePort.out-port.js';
 import type {
-  ExecuteVerificationCheckResult,
+  ExecuteVerificationCheckReceipt,
   VerificationExecutorPort,
 } from '../ports/out/VerificationExecutorPort.out-port.js';
 import type {
@@ -26,16 +26,100 @@ import type {
   RequestVerificationResult,
 } from '../ports/in/RequestVerificationPort.in-port.js';
 
+export type RequestVerificationClock = () => Date | number | string;
+
 export interface RequestVerificationDependencies {
   readonly repo: EvidenceAssessmentRepositoryPort;
   readonly executor: VerificationExecutorPort;
   readonly archive: EvidenceArchivePort;
+  readonly clock?: RequestVerificationClock;
 }
 
 const NOT_IMPLEMENTED = 'Not implemented: RequestVerificationUseCase';
 
 function isNonEmptyTrimmedString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+const MIN_REMAINING_BUDGET_MS = 2_000;
+
+function clockToMs(clock: RequestVerificationClock): number {
+  const value = clock();
+  if (typeof value === 'number') {
+    return value;
+  }
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  return Date.parse(value);
+}
+
+function clockToIso(clock: RequestVerificationClock): string {
+  const value = clock();
+  if (typeof value === 'string') {
+    return value;
+  }
+  return new Date(value).toISOString();
+}
+
+/** True when the deadline leaves under 2 seconds or is malformed (plan line 44). */
+function isBudgetExhausted(deadlineIso: string | undefined, nowMs: number): boolean {
+  if (deadlineIso === undefined) {
+    return false;
+  }
+  const deadlineMs = Date.parse(deadlineIso);
+  if (!Number.isFinite(deadlineMs)) {
+    return true;
+  }
+  return deadlineMs - nowMs < MIN_REMAINING_BUDGET_MS;
+}
+
+function validateRequestFields(request: RequestVerificationRequest): string | null {
+  const fields = [
+    request.assessmentId,
+    request.projectId,
+    request.attemptId,
+    request.candidateHeadSha,
+    request.policyRevision,
+    request.hostId,
+    request.implementerModel,
+  ];
+  if (fields.some((field) => !isNonEmptyTrimmedString(field))) {
+    return 'Verification requires non-empty assessmentId, projectId, attemptId, candidateHeadSha, policyRevision, hostId and implementerModel';
+  }
+  if (
+    !Array.isArray(request.requiredChecks) ||
+    request.requiredChecks.length === 0 ||
+    !request.requiredChecks.every(isNonEmptyTrimmedString)
+  ) {
+    return 'Verification requires at least one required check';
+  }
+  return null;
+}
+
+function validateExistingAssessment(
+  existing: EvidenceAssessmentRecord,
+  request: RequestVerificationRequest,
+): string | null {
+  if (AssessmentState.create(existing.state).value?.isTerminal()) {
+    return `Assessment '${existing.id}' is in terminal state '${existing.state}'`;
+  }
+  if (existing.candidateHeadSha !== request.candidateHeadSha) {
+    return `Assessment candidate head '${existing.candidateHeadSha}' does not match requested head '${request.candidateHeadSha}'`;
+  }
+  if (existing.policyRevision !== request.policyRevision) {
+    return `Assessment policy revision '${existing.policyRevision}' does not match requested policy revision '${request.policyRevision}'`;
+  }
+  if (existing.attemptId !== request.attemptId) {
+    return `Assessment attempt ID '${existing.attemptId}' does not match requested attempt ID '${request.attemptId}'`;
+  }
+  if (existing.projectId !== request.projectId) {
+    return `Assessment project ID '${existing.projectId}' does not match requested project ID '${request.projectId}'`;
+  }
+  if (existing.implementerModel !== request.implementerModel) {
+    return `Assessment records implementer seat '${existing.implementerModel}', which does not match the attempt's recorded seat '${request.implementerModel}'`;
+  }
+  return null;
 }
 
 /** Replace any earlier receipt for the same procedure, keeping one per check. */
@@ -51,7 +135,14 @@ function mergeReceiptsByProcedure(
 }
 
 export class RequestVerificationUseCase implements RequestVerificationPort {
-  constructor(private readonly deps?: RequestVerificationDependencies) {}
+  private readonly clock: RequestVerificationClock;
+
+  constructor(
+    private readonly deps?: RequestVerificationDependencies,
+    clock?: RequestVerificationClock,
+  ) {
+    this.clock = clock ?? deps?.clock ?? (() => new Date());
+  }
 
   /** Generic entry point kept for callers that hold an untyped use case. */
   async execute(input: unknown): Promise<RequestVerificationResult> {
@@ -75,67 +166,17 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
     }
     const deps = this.deps;
 
-    if (
-      !isNonEmptyTrimmedString(request.assessmentId) ||
-      !isNonEmptyTrimmedString(request.projectId) ||
-      !isNonEmptyTrimmedString(request.attemptId) ||
-      !isNonEmptyTrimmedString(request.candidateHeadSha) ||
-      !isNonEmptyTrimmedString(request.policyRevision) ||
-      !isNonEmptyTrimmedString(request.hostId) ||
-      !isNonEmptyTrimmedString(request.implementerModel)
-    ) {
-      return {
-        outcome: 'rejected',
-        reason:
-          'Verification requires non-empty assessmentId, projectId, attemptId, candidateHeadSha, policyRevision, hostId and implementerModel',
-      };
-    }
-    if (
-      !Array.isArray(request.requiredChecks) ||
-      request.requiredChecks.length === 0 ||
-      !request.requiredChecks.every(isNonEmptyTrimmedString)
-    ) {
-      return { outcome: 'rejected', reason: 'Verification requires at least one required check' };
+    const validationError = validateRequestFields(request);
+    if (validationError !== null) {
+      return { outcome: 'rejected', reason: validationError };
     }
 
-    const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
+    const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : clockToIso(this.clock);
     const existing = await deps.repo.findAssessmentById(request.assessmentId);
     if (existing !== null) {
-      if (AssessmentState.create(existing.state).value?.isTerminal()) {
-        return {
-          outcome: 'rejected',
-          reason: `Assessment '${existing.id}' is in terminal state '${existing.state}'`,
-        };
-      }
-      if (existing.candidateHeadSha !== request.candidateHeadSha) {
-        return {
-          outcome: 'rejected',
-          reason: `Assessment candidate head '${existing.candidateHeadSha}' does not match requested head '${request.candidateHeadSha}'`,
-        };
-      }
-      if (existing.policyRevision !== request.policyRevision) {
-        return {
-          outcome: 'rejected',
-          reason: `Assessment policy revision '${existing.policyRevision}' does not match requested policy revision '${request.policyRevision}'`,
-        };
-      }
-      if (existing.attemptId !== request.attemptId) {
-        return {
-          outcome: 'rejected',
-          reason: `Assessment attempt ID '${existing.attemptId}' does not match requested attempt ID '${request.attemptId}'`,
-        };
-      }
-      if (existing.projectId !== request.projectId) {
-        return {
-          outcome: 'rejected',
-          reason: `Assessment project ID '${existing.projectId}' does not match requested project ID '${request.projectId}'`,
-        };
-      }
-      if (existing.implementerModel !== request.implementerModel) {
-        return {
-          outcome: 'rejected',
-          reason: `Assessment records implementer seat '${existing.implementerModel}', which does not match the attempt's recorded seat '${request.implementerModel}'`,
-        };
+      const existingError = validateExistingAssessment(existing, request);
+      if (existingError !== null) {
+        return { outcome: 'rejected', reason: existingError };
       }
     }
     const base: EvidenceAssessmentRecord = existing ?? {
@@ -159,13 +200,26 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
     // Checks run one at a time on the verification host, as before. Every
     // execution is validated before anything is archived, so malformed
     // coverage from any check leaves no archived evidence and no receipt.
-    const executions: { procedureName: string; execution: ExecuteVerificationCheckResult }[] = [];
+    const executions: { procedureName: string; execution: ExecuteVerificationCheckReceipt }[] = [];
     for (const procedureName of request.requiredChecks) {
+      if (isBudgetExhausted(request.deadlineIso, clockToMs(this.clock))) {
+        return {
+          outcome: 'not-started',
+          reason: `Verification budget exhausted before starting check '${procedureName}'`,
+        };
+      }
       const execution = await deps.executor.executeVerificationCheck({
         hostId: request.hostId,
         candidateHeadSha: request.candidateHeadSha,
         procedureName,
+        ...(request.deadlineIso !== undefined ? { deadlineIso: request.deadlineIso } : {}),
       });
+      if (execution.outcome === 'not-started') {
+        return {
+          outcome: 'not-started',
+          reason: execution.reason,
+        };
+      }
       executions.push({ procedureName, execution });
     }
     const malformed = executions.find(

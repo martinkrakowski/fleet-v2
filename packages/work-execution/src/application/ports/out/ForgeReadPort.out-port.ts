@@ -20,6 +20,13 @@ export interface ForgeRepositoryRef {
 export interface ReadPullRequestRequest {
   readonly ref: PullRequestRef;
   readonly repository?: ForgeRepositoryRef;
+  /**
+   * Optional per-read timeout cap (ms). When set, the read is bounded to
+   * `min(adapter normal timeout, timeoutMs)` so a pass's deadline is never
+   * overrun by a re-read. The daemon merge path sets it from the remaining
+   * budget.
+   */
+  readonly timeoutMs?: number;
 }
 
 export type PullRequestState = 'open' | 'merged' | 'closed';

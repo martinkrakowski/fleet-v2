@@ -1629,7 +1629,7 @@ describe('AdvanceLaneRunUseCase carried minors in the open-pr body (GB1)', () =>
     expect(body).not.toContain('- [nit]');
   });
 
-  it('a receipt whose findings include a blocker carries nothing (display keeps to minor and nit)', async () => {
+  it('a receipt mixing a blocker with a minor carries only the minor (display keeps to minor and nit)', async () => {
     const harness = await openingPrHarness();
     await seedBriefCheckResult(harness, 'review-passed', 'minor-only-findings');
     wireReviewReceipt(harness, () => 'found', [

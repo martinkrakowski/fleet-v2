@@ -42,8 +42,12 @@ import type {
   CommitLaneOutputResult,
   PrepareLaneWorktreeRequest,
   PrepareLaneWorktreeResult,
+  PreserveWorktreeEditsRequest,
+  PreserveWorktreeEditsResult,
   RemoveLaneWorktreeRequest,
   RemoveLaneWorktreeResult,
+  ResetWorktreeToHeadRequest,
+  ResetWorktreeToHeadResult,
 } from '../../application/ports/out/WorkspacePort.out-port.js';
 import { runnerHasHostName } from '../../domain/execution-records.js';
 
@@ -96,6 +100,41 @@ export function worktreeRootRefusal(worktreePath: string): string | null {
     return 'worktree path must be an absolute path that is not the filesystem root';
   }
   return null;
+}
+
+/**
+ * GB3: true when restoring the tracked `trackedPaths` (the paths `git reset
+ * --hard` would write) could overwrite or remove an untracked path in
+ * `untrackedFiles`. The dangerous shapes are a tracked path masked by an
+ * untracked file or directory at that path or above it, and an untracked path
+ * sitting at a tracked path or below one: in both cases reset would have to
+ * replace or delete the untracked entry to restore the tracked one.
+ */
+function resetWouldDestroyUntracked(
+  trackedPaths: readonly string[],
+  untrackedFiles: readonly string[],
+): boolean {
+  const untracked = new Set(untrackedFiles);
+  for (const tracked of trackedPaths) {
+    let prefix = tracked;
+    for (;;) {
+      if (untracked.has(prefix)) return true;
+      const slash = prefix.lastIndexOf('/');
+      if (slash === -1) break;
+      prefix = prefix.slice(0, slash);
+    }
+  }
+  const trackedSet = new Set(trackedPaths);
+  for (const untrackedFile of untrackedFiles) {
+    let prefix = untrackedFile;
+    for (;;) {
+      const slash = prefix.lastIndexOf('/');
+      if (slash === -1) break;
+      prefix = prefix.slice(0, slash);
+      if (trackedSet.has(prefix)) return true;
+    }
+  }
+  return false;
 }
 
 export interface WorkspaceAdapterOptions {
@@ -817,6 +856,152 @@ export class WorkspaceAdapter implements WorkspacePort {
       return { outcome: 'resolved', tip };
     } catch {
       return { outcome: 'unknown' };
+    }
+  }
+
+  /**
+   * GB3: preserve the worktree's uncommitted tracked edits as a patch file
+   * outside it (`git diff --binary HEAD`). The worktree root and the patch
+   * destination's parent are canonicalized on the recorded host, and a
+   * destination that resolves inside the worktree (including through a symlink
+   * alias), already exists or is a symlink is refused before anything is
+   * written. The patch is written atomically via a fresh temp file and a
+   * no-clobber rename, never through a link and never over an existing file.
+   */
+  async preserveWorktreeEdits(request: PreserveWorktreeEditsRequest): Promise<PreserveWorktreeEditsResult> {
+    // 1. Validate before any command runs (no executor call on a bad request).
+    if (worktreeRootRefusal(request.worktreePath) !== null) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    const patchPath = request.patchPath;
+    if (typeof patchPath !== 'string' || !patchPath.startsWith('/') || patchPath.includes('\0')) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    const trimmedRoot = request.worktreePath.replace(/\/+$/, '');
+    if (patchPath === trimmedRoot || patchPath.startsWith(`${trimmedRoot}/`)) {
+      return { outcome: 'refused', reason: 'patch-path-inside-worktree' };
+    }
+
+    // 2. The write runs on the recorded host's executor; an unresolvable host
+    //    is a transport failure, like the other workspace writes.
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(request.recordedHost);
+    } catch {
+      return { outcome: 'error', reason: 'worktree host could not be resolved' };
+    }
+
+    // 3. Canonicalize on the recorded host: a symlink alias of the destination's
+    //    parent can place it inside the worktree even when the lexical path is
+    //    outside, so the physical root and parent decide.
+    const physicalRoot = await resolvePhysicalPath(executor, request.worktreePath, GIT_TIMEOUT_MS);
+    const physicalParent = await resolvePhysicalPath(executor, path.dirname(patchPath), GIT_TIMEOUT_MS);
+    if (physicalRoot === null || physicalParent === null) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    const physicalPatchPath = path.join(physicalParent, path.basename(patchPath));
+    if (physicalPatchPath === physicalRoot || physicalPatchPath.startsWith(`${physicalRoot}/`)) {
+      return { outcome: 'refused', reason: 'patch-path-inside-worktree' };
+    }
+
+    // 4. Refuse an existing or symlink destination before any write; refused
+    //    requests write nothing.
+    const existsRun = await executor.run(['test', '-e', patchPath], { timeoutMs: PROBE_TIMEOUT_MS });
+    const linkRun = await executor.run(['test', '-L', patchPath], { timeoutMs: PROBE_TIMEOUT_MS });
+    if (existsRun.exitCode === 0 || linkRun.exitCode === 0) {
+      return { outcome: 'refused', reason: 'destination-exists' };
+    }
+
+    // 5. The preserved content: tracked edits against HEAD, binary-safe. An
+    //    empty diff contradicts the refusal that named uncommitted paths, so it
+    //    refuses, never silently succeeds.
+    const diff = await this.runGit(request.worktreePath, ['diff', '--binary', 'HEAD'], executor);
+    if (diff === '') {
+      return { outcome: 'refused', reason: 'nothing-to-preserve' };
+    }
+
+    // 6. Write atomically without following links or overwriting files: a
+    //    fresh temp file created by mktemp, the diff written into it, then a
+    //    no-clobber rename onto the destination. Any failure removes the temp.
+    const mkTemp = await executor.run(
+      ['mktemp', path.join(physicalParent, '.fleet-patch.XXXXXX')],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (mkTemp.exitCode !== 0 || mkTemp.error !== undefined) {
+      return { outcome: 'refused', reason: 'git-refused' };
+    }
+    const tempPath = mkTemp.stdout.trim();
+    const write = await executor.run(['tee', tempPath], { input: diff, timeoutMs: GIT_TIMEOUT_MS });
+    if (write.exitCode !== 0 || write.error !== undefined) {
+      await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+      return { outcome: 'refused', reason: 'git-refused' };
+    }
+    const move = await executor.run(['mv', '-n', tempPath, patchPath], { timeoutMs: GIT_TIMEOUT_MS });
+    if (move.exitCode !== 0 || move.error !== undefined) {
+      await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+      return { outcome: 'refused', reason: 'git-refused' };
+    }
+    return { outcome: 'preserved', patchPath, patchBytes: Buffer.byteLength(diff, 'utf8') };
+  }
+
+  /**
+   * GB3: discard the worktree's tracked modifications back to its recorded head
+   * (`git reset --hard`, no ref argument — HEAD and the branch cannot move),
+   * leaving untracked files untouched. Refuses before resetting when restoring a
+   * tracked path would overwrite or remove an untracked path, and verifies after
+   * resetting that the untracked paths are unchanged.
+   */
+  async resetWorktreeToHead(request: ResetWorktreeToHeadRequest): Promise<ResetWorktreeToHeadResult> {
+    // 1. Validate before any command runs (no executor call on a bad request).
+    if (worktreeRootRefusal(request.worktreePath) !== null) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(request.recordedHost);
+    } catch {
+      return { outcome: 'error', reason: 'worktree host could not be resolved' };
+    }
+    try {
+      // 2. Read the head to report, and list the tracked paths reset would
+      //    restore (HEAD's tree) and the untracked files present.
+      const head = (await this.runGit(request.worktreePath, ['rev-parse', 'HEAD'], executor)).trim();
+      const trackedRun = await this.runGit(request.worktreePath, ['ls-tree', '-r', '--name-only', 'HEAD'], executor);
+      const trackedPaths = trackedRun.split('\n').filter((line) => line !== '');
+      const untrackedRun = await this.runGit(
+        request.worktreePath,
+        ['ls-files', '--others', '--exclude-standard'],
+        executor,
+      );
+      const untrackedFiles = untrackedRun.split('\n').filter((line) => line !== '');
+
+      // 3. Refuse BEFORE resetting when restoring a tracked path could overwrite
+      //    or remove an untracked path (for example a deleted tracked path masked
+      //    by an untracked directory or file at that path).
+      if (resetWouldDestroyUntracked(trackedPaths, untrackedFiles)) {
+        return { outcome: 'refused', reason: 'untracked-obstructs' };
+      }
+
+      // 4. Reset: `git reset --hard` with no ref argument, so HEAD and the
+      //    branch ref cannot move.
+      await this.runGit(request.worktreePath, ['reset', '--hard'], executor);
+
+      // 5. Verify the untracked paths are unchanged.
+      const afterRun = await this.runGit(
+        request.worktreePath,
+        ['ls-files', '--others', '--exclude-standard'],
+        executor,
+      );
+      const afterUntracked = afterRun.split('\n').filter((line) => line !== '');
+      const unchanged =
+        untrackedFiles.length === afterUntracked.length &&
+        untrackedFiles.every((entry, index) => entry === afterUntracked[index]);
+      if (!unchanged) {
+        return { outcome: 'error', reason: 'Untracked paths changed while resetting' };
+      }
+      return { outcome: 'reset', headCommit: head };
+    } catch {
+      return { outcome: 'refused', reason: 'git-refused' };
     }
   }
 

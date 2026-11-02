@@ -202,7 +202,8 @@ export class GitMirrorPatchIdentityAdapter implements PatchIdentityPort {
     if (oldPatchId === null) {
       return unknownResult(null, null);
     }
-    const secondParentSha = await this.resolveSecondParent(
+    const secondParentSha = await this.resolveUpdateMergeParent(
+      request.oldHeadSha,
       request.newHeadSha,
       mirror,
       request.deadlineIso,
@@ -301,22 +302,34 @@ export class GitMirrorPatchIdentityAdapter implements PatchIdentityPort {
       mirror,
       deadlineIso,
     );
-    if (outcome === null || outcome.signal !== null || outcome.error !== undefined) {
+    if (
+      outcome === null ||
+      outcome.signal !== null ||
+      outcome.error !== undefined ||
+      outcome.exitCode !== 0
+    ) {
       return 'unknown';
     }
-    if (outcome.exitCode === 0 && outcome.stdout.trim() === 'true') {
+    const answer = outcome.stdout.trim();
+    if (answer === 'true') {
       return 'bare';
     }
-    return 'not-bare';
+    return answer === 'false' ? 'not-bare' : 'unknown';
   }
 
-  private async resolveSecondParent(
+  /**
+   * The main tip a forge branch update merged in: `newHead` must be a merge
+   * whose first parent is `oldHead`, so the new patch is the lane's diff
+   * against what was merged. Anything else has no comparable patch: null.
+   */
+  private async resolveUpdateMergeParent(
+    oldHeadSha: string,
     newHeadSha: string,
     mirror: string,
     deadlineIso: string,
   ): Promise<string | null> {
     const outcome = await this.runGit(
-      ['git', 'rev-parse', `${newHeadSha}^2`],
+      ['git', 'rev-parse', `${newHeadSha}^1`, `${newHeadSha}^2`],
       mirror,
       deadlineIso,
     );
@@ -328,8 +341,11 @@ export class GitMirrorPatchIdentityAdapter implements PatchIdentityPort {
     ) {
       return null;
     }
-    const trimmed = outcome.stdout.trim();
-    return isValidSha40(trimmed) ? trimmed : null;
+    const [firstParent, secondParent, extra] = outcome.stdout.trim().split('\n');
+    if (firstParent !== oldHeadSha || secondParent === undefined || extra !== undefined) {
+      return null;
+    }
+    return isValidSha40(secondParent) ? secondParent : null;
   }
 
   private async patchId(
@@ -347,7 +363,8 @@ export class GitMirrorPatchIdentityAdapter implements PatchIdentityPort {
       diffOutcome === null ||
       diffOutcome.exitCode !== 0 ||
       diffOutcome.signal !== null ||
-      diffOutcome.error !== undefined
+      diffOutcome.error !== undefined ||
+      diffOutcome.stdout.trim() === ''
     ) {
       return null;
     }

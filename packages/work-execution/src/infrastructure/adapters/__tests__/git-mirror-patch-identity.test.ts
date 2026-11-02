@@ -5,6 +5,7 @@
 // non-empty overlap reports `carry: false` with `reason: 'patch-id-unchanged'`.
 
 import { afterEach, describe, expect, it } from 'vitest';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -66,7 +67,7 @@ const OLD_PATCH_DIFF_ARGV = [
   `${BASE}...${OLD_HEAD}`,
   '--',
 ];
-const RESOLVE_SECOND_PARENT_ARGV = ['git', 'rev-parse', `${NEW_HEAD}^2`];
+const RESOLVE_SECOND_PARENT_ARGV = ['git', 'rev-parse', `${NEW_HEAD}^1`, `${NEW_HEAD}^2`];
 const NEW_PATCH_DIFF_ARGV = [
   'git',
   'diff',
@@ -143,7 +144,7 @@ function happyAnswers(
     [RESOLVE_SECOND_PARENT_ARGV.join(' ')]: {
       exitCode: 0,
       signal: null,
-      stdout: SECOND_PARENT + '\n',
+      stdout: `${OLD_HEAD}\n${SECOND_PARENT}\n`,
       stderr: '',
     },
     [NEW_PATCH_DIFF_ARGV.join(' ')]: { exitCode: 0, signal: null, stdout: DIFF_OLD_STDOUT, stderr: '' },
@@ -518,7 +519,7 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
     expect(recorded.map((entry) => entry.argv)).toEqual([PROBE_ARGV]);
   });
 
-  it('refuses no-mirror when the bare probe itself fails', async () => {
+  it('returns unknown when the bare probe itself fails', async () => {
     const fixture = await makeStateDir();
     cleanups.push(fixture.cleanup);
     const { executor, recorded } = makeExecutor(
@@ -528,8 +529,103 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
     );
     const adapter = new GitMirrorPatchIdentityAdapter({ stateDir: fixture.stateDir, executor });
     const result = await adapter.lanePatchIdentity(request());
-    expect(result).toEqual({ ok: false, reason: 'refused', code: 'no-mirror' });
+    expect(result).toEqual({
+      ok: true,
+      carry: false,
+      reason: 'unknown',
+      oldPatchId: null,
+      newPatchId: null,
+      filesChangedByUpdate: [],
+      overlapWithLaneDiff: [],
+    });
     expect(recorded.map((entry) => entry.argv)).toEqual([PROBE_ARGV]);
+  });
+
+  it('returns unknown when the new head first parent is not the old head', async () => {
+    const fixture = await makeStateDir();
+    cleanups.push(fixture.cleanup);
+    const { executor, recorded } = makeExecutor(
+      happyAnswers({
+        [RESOLVE_SECOND_PARENT_ARGV.join(' ')]: {
+          exitCode: 0,
+          signal: null,
+          stdout: `${OBJECT_ID}\n${SECOND_PARENT}\n`,
+          stderr: '',
+        },
+      }),
+    );
+    const adapter = new GitMirrorPatchIdentityAdapter({ stateDir: fixture.stateDir, executor });
+    const result = await adapter.lanePatchIdentity(request());
+    expect(result).toMatchObject({ ok: true, carry: false, reason: 'unknown', newPatchId: null });
+    expect(recorded.map((entry) => entry.argv)).not.toContainEqual(NEW_PATCH_DIFF_ARGV);
+  });
+
+  const LANE_FILE = 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n';
+
+  it('carries over a real forge-style merge in a real bare mirror, and blocks on a lane file', async () => {
+    const fixture = await makeStateDir();
+    cleanups.push(fixture.cleanup);
+    const work = await fs.mkdtemp(path.join(os.tmpdir(), 'dt7-real-'));
+    cleanups.push(() => fs.rm(work, { recursive: true, force: true }));
+    const git = (...args: string[]): string =>
+      execFileSync(
+        'git',
+        ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', ...args],
+        { cwd: work, encoding: 'utf8' },
+      ).trim();
+    const write = (name: string, text: string) => fs.writeFile(path.join(work, name), text);
+    git('init', '-q', '-b', 'main');
+    await write('lane.ts', LANE_FILE);
+    await write('other.md', 'one\n');
+    git('add', '-A');
+    git('commit', '-qm', 'base');
+    const base = git('rev-parse', 'HEAD');
+    git('checkout', '-qb', 'lane');
+    await write('lane.ts', LANE_FILE.replace('l1', 'lane edit'));
+    git('commit', '-qam', 'lane');
+    const oldHead = git('rev-parse', 'HEAD');
+    git('checkout', '-q', 'main');
+    await write('other.md', 'two\n');
+    git('commit', '-qam', 'main moves elsewhere');
+    git('checkout', '-q', 'lane');
+    git('merge', '-q', '--no-edit', 'main');
+    const cleanHead = git('rev-parse', 'HEAD');
+    git('reset', '-q', '--hard', oldHead);
+    git('checkout', '-q', 'main');
+    await write('lane.ts', LANE_FILE.replace('l9', 'main edit'));
+    git('commit', '-qam', 'main touches the lane file');
+    git('checkout', '-q', 'lane');
+    git('merge', '-q', '--no-edit', 'main');
+    const overlapHead = git('rev-parse', 'HEAD');
+    git('branch', 'keep-clean', cleanHead);
+    await fs.rm(fixture.mirrorDir, { recursive: true, force: true });
+    git('clone', '-q', '--bare', work, fixture.mirrorDir);
+    git('--git-dir', fixture.mirrorDir, 'fetch', '-q', work, 'keep-clean', 'lane');
+    const executor: CommandExecutorPort = {
+      run: async (argv, options) => {
+        const child = spawnSync(argv[0]!, argv.slice(1), {
+          cwd: options?.cwd,
+          input: options?.input,
+          encoding: 'utf8',
+        });
+        return {
+          exitCode: child.status,
+          signal: child.signal,
+          stdout: child.stdout,
+          stderr: child.stderr,
+        };
+      },
+    };
+    const adapter = new GitMirrorPatchIdentityAdapter({ stateDir: fixture.stateDir, executor });
+    const clean = await adapter.lanePatchIdentity(
+      request({ baseSha: base, oldHeadSha: oldHead, newHeadSha: cleanHead }),
+    );
+    expect(clean).toMatchObject({ ok: true, carry: true, reason: 'patch-id-unchanged' });
+    const overlap = await adapter.lanePatchIdentity(
+      request({ baseSha: base, oldHeadSha: oldHead, newHeadSha: overlapHead }),
+    );
+    expect(overlap).toMatchObject({ ok: true, carry: false });
+    expect(overlap).toMatchObject({ overlapWithLaneDiff: ['lane.ts'] });
   });
 
   it('returns unknown with no further calls when the bare probe times out or suffers a signal', async () => {
@@ -586,7 +682,7 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
         if (entry.argv[2] === '--is-bare-repository') {
           expect(entry.argv).toEqual(['git', 'rev-parse', '--is-bare-repository']);
         } else {
-          expect(entry.argv).toEqual(['git', 'rev-parse', `${NEW_HEAD}^2`]);
+          expect(entry.argv).toEqual(RESOLVE_SECOND_PARENT_ARGV);
         }
         continue;
       }
@@ -598,7 +694,7 @@ describe('GitMirrorPatchIdentityAdapter lanePatchIdentity', () => {
       const args = entry.argv.slice(2);
       expect(args.at(-1)).toBe('--');
       const withoutEnd = args.slice(0, -1);
-      const flags = withoutEnd.slice(0, withoutEnd.length <= 3 ? 3 : 5);
+      const flags = withoutEnd.slice(0, withoutEnd[0] === '--name-only' ? 5 : 3);
       const ranges = withoutEnd.slice(flags.length);
       expect([
         ['--no-renames', '--no-ext-diff', '--no-textconv'],

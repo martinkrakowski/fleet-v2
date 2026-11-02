@@ -10,6 +10,14 @@ import type { AttemptOutcomeValue } from './value-objects/AttemptOutcome.vo.js';
 import type { StopReasonValue } from './value-objects/StopReason.vo.js';
 import type { SeatPlanProps, SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 import type { BaseBranchValue } from './base-branch.js';
+import { INITIAL_RECORD_SCHEMA_VERSION } from './record-schema-version.js';
+
+/** Record schema version for stored attempt records on disk (Q5a, D6); absent reads as 1. */
+export const ATTEMPT_RECORD_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
+/** Record schema version for stored capacity reservations on disk (Q5a, D6); absent reads as 1. */
+export const CAPACITY_RESERVATION_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
+/** Record schema version for stored action-journal entries on disk (Q5a, D6); absent reads as 1. */
+export const ACTION_JOURNAL_ENTRY_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
 
 /**
  * Completion receipt bound to the attempt and the runner session. A runner
@@ -198,6 +206,12 @@ export interface AttemptUsageRecord {
   readonly sessionId: string | null;
   readonly steps: number | null;
   readonly wallSeconds: number | null;
+  /**
+   * The lane's run time rounded up to whole minutes (`runnerMinutesOf`).
+   * Absent on usage records written before the field existed; `null` when no
+   * wall time was measured.
+   */
+  readonly runnerMinutes?: number | null;
   readonly tokensInput: number | null;
   readonly tokensOutput: number | null;
   readonly tokensReasoning: number | null;
@@ -207,6 +221,15 @@ export interface AttemptUsageRecord {
   readonly model: string | null;
   readonly agent: string | null;
   readonly reason: string | null;
+}
+
+/** The usage record's runner-minutes value: whole minutes from `wallSeconds`. */
+export function runnerMinutesOf(wallSeconds: number | null): number | null {
+  if (wallSeconds === null) {
+    return null;
+  }
+  const minutes = Math.ceil(wallSeconds / 60);
+  return Number.isSafeInteger(minutes) ? minutes : null;
 }
 
 /**
@@ -277,6 +300,8 @@ export interface SeatObservationRecord {
 
 /** Serializable record of one dispatch or one fresh fix session. */
 export interface AttemptRecord {
+  /** Record schema version on disk (Q5a, D6); absent reads as 1. */
+  readonly schemaVersion?: number;
   readonly id: string;
   readonly workOrderId: string;
   readonly kind: AttemptKind;
@@ -334,6 +359,8 @@ export interface AttemptRecord {
 
 /** One physical slot held for one attempt until the attempt ends. */
 export interface CapacityReservationRecord {
+  /** Record schema version on disk (Q5a, D6); absent reads as 1. */
+  readonly schemaVersion?: number;
   readonly id: string;
   readonly attemptId: string;
   readonly hostId: string;
@@ -368,6 +395,8 @@ export interface CapacityReservationRecord {
 
 /** Journal entry: intent is durable before the subprocess runs. */
 export interface ActionJournalEntryRecord {
+  /** Record schema version on disk (Q5a, D6); absent reads as 1. */
+  readonly schemaVersion?: number;
   readonly id: string;
   readonly attemptId: string;
   readonly workOrderId: string;

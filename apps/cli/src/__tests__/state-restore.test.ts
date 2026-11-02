@@ -166,6 +166,36 @@ describe('fleet-v2 state restore', () => {
     expect(await fs.readdir(path.join(dir, 'quarantine'))).toEqual([COPY_NAME]);
   });
 
+  it('refuses an unknown-version current store even with --yes and leaves store and quarantine unchanged', async () => {
+    const dir = makeTempDir();
+    const unknownVersionStore = JSON.stringify([
+      { ...ATTEMPT_RECORD('a1'), schemaVersion: 2 },
+      ATTEMPT_RECORD('a2'),
+    ]);
+    await fs.mkdir(path.join(dir, 'quarantine'), { recursive: true });
+    await fs.writeFile(path.join(dir, 'attempts.json'), unknownVersionStore);
+    await fs.writeFile(path.join(dir, 'quarantine', COPY_NAME), TWO_ATTEMPTS);
+    const { io, stdout, stderr } = mockIo();
+    const code = await runCli(
+      ['--state-dir', dir, 'state', 'restore', 'attempts.json', '--from', COPY_NAME, '--yes'],
+      io,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+    );
+    expect(code).toBe(1);
+    expect(stderr.join('')).toContain(
+      'attempts.json has an unsupported schemaVersion; state restore replaces only a missing or unreadable store',
+    );
+    expect(stdout.join('')).toContain('nothing changed');
+    expect(await fs.readFile(path.join(dir, 'attempts.json'), 'utf8')).toBe(unknownVersionStore);
+    expect(await fs.readdir(path.join(dir, 'quarantine'))).toEqual([COPY_NAME]);
+  });
+
   it('refuses an invalid candidate and changes nothing', async () => {
     const dir = makeTempDir();
     await fs.mkdir(path.join(dir, 'quarantine'), { recursive: true });

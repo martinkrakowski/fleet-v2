@@ -13,13 +13,30 @@ import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import type { AttemptRecord, AttemptRunnerRecord, RunnerKind } from '../../domain/execution-records.js';
+import { ATTEMPT_RECORD_SCHEMA_VERSION } from '../../domain/execution-records.js';
 import {
   AttemptRevisionConflictError,
   type AttemptRepositoryPort,
 } from '../../application/ports/out/AttemptRepositoryPort.out-port.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
 import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
-import { assertStoreWritable, inspectRecordListBytes, rejectUnreadableStateFile, withFileLock, writeJsonAtomically } from './file-store.js';
+import {
+  assertStoreWritable,
+  assertValidSchemaVersionPolicy,
+  inspectVersionedRecordListBytes,
+  readStoreRecordSchemaVersion,
+  rejectUnreadableStateFile,
+  StateFileUnknownVersionError,
+  withFileLock,
+  writeJsonAtomically,
+  type VersionedRecordParseResult,
+} from './file-store.js';
+
+/** The schema-version policy of `attempts.json` (Q5a, D6). */
+export const ATTEMPT_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy('attempts.json', {
+  writerVersion: ATTEMPT_RECORD_SCHEMA_VERSION,
+  acceptedVersions: [1],
+});
 
 export interface AttemptRepositoryAdapterOptions {
   /** Directory for file-backed JSON persistence; in-memory only when omitted. */
@@ -59,35 +76,62 @@ function isAttemptRecord(value: unknown): value is AttemptRecord {
  * same way: `hostName: null`. Those are legacy records whose ssh alias lives in
  * `host`, and after-dispatch actions apply the legacy rule to them.
  */
-function normalizeRecord(record: AttemptRecord): AttemptRecord {
-  // A missing or non-integer revision reads as 0, so every record coming out
-  // of the repository carries an integer revision.
-  const revision = Number.isInteger(record.revision) ? record.revision! : 0;
-  const runner = record.runner;
-  if (runner === undefined || runner === null) {
-    return revision === record.revision ? record : { ...record, revision };
-  }
+/**
+ * Normalize a legacy runner block to the canonical shape: absent or unknown
+ * `kind` reads as `'opencode'`, absent `remotePort` reads as `null`, and a
+ * blank or absent `hostName` reads as `null`.
+ */
+function normalizeRunner(runner: AttemptRunnerRecord): AttemptRunnerRecord {
   const raw = runner as AttemptRunnerRecord & { kind?: RunnerKind; hostName?: string | null };
   const kind: RunnerKind = raw.kind === 'agy' ? 'agy' : 'opencode';
   const hostName = typeof raw.hostName === 'string' && raw.hostName.trim() !== '' ? raw.hostName : null;
   if (kind === runner.kind && runner.remotePort !== undefined && runner.hostName === hostName) {
-    return revision === record.revision ? record : { ...record, revision };
+    return runner;
   }
   return {
-    ...record,
-    revision,
-    runner: {
-      ...runner,
-      kind,
-      remotePort: runner.remotePort ?? null,
-      hostName,
-    },
+    ...runner,
+    kind,
+    remotePort: runner.remotePort ?? null,
+    hostName,
   };
+}
+
+function normalizeRecord(record: AttemptRecord): AttemptRecord {
+  // A missing or non-integer revision reads as 0, so every record coming out
+  // of the repository carries an integer revision. Every writer stamps
+  // `schemaVersion` (Q5a, D6).
+  const revision = Number.isInteger(record.revision) ? record.revision! : 0;
+  const stamped: AttemptRecord = { ...record, schemaVersion: ATTEMPT_STORE_VERSION_POLICY.writerVersion };
+  const runner = record.runner;
+  if (runner === undefined || runner === null) {
+    return revision === record.revision ? stamped : { ...stamped, revision };
+  }
+  const normalizedRunner = normalizeRunner(runner);
+  if (normalizedRunner === runner) {
+    return revision === record.revision ? stamped : { ...stamped, revision };
+  }
+  return { ...stamped, revision, runner: normalizedRunner };
+}
+
+/**
+ * The versioned reader's record parser, shared with `fleet-v2 state check`:
+ * the `schemaVersion` check runs first, then the body's identity check.
+ */
+export function parseVersionedAttemptStateRecord(raw: unknown): VersionedRecordParseResult<AttemptRecord> {
+  const versionCheck = readStoreRecordSchemaVersion(raw, ATTEMPT_STORE_VERSION_POLICY);
+  if (versionCheck.status !== 'ok') {
+    return versionCheck;
+  }
+  if (!isAttemptRecord(raw)) {
+    return { status: 'invalid' };
+  }
+  return { status: 'ok', record: normalizeRecord(raw), schemaVersion: versionCheck.schemaVersion };
 }
 
 /** The reader's record parser, shared with `fleet-v2 state check`. */
 export function parseAttemptStateRecord(raw: unknown): AttemptRecord | undefined {
-  return isAttemptRecord(raw) ? normalizeRecord(raw) : undefined;
+  const parsed = parseVersionedAttemptStateRecord(raw);
+  return parsed.status === 'ok' ? parsed.record : undefined;
 }
 
 export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
@@ -235,7 +279,10 @@ export class AttemptRepositoryAdapter implements AttemptRepositoryPort {
       }
       throw error;
     }
-    const inspection = inspectRecordListBytes(buffer, parseAttemptStateRecord);
+    const inspection = inspectVersionedRecordListBytes(buffer, parseVersionedAttemptStateRecord);
+    if (inspection.status === 'unknown-version') {
+      throw new StateFileUnknownVersionError(target, inspection.recordIndex);
+    }
     if (inspection.status === 'unreadable') {
       return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
     }

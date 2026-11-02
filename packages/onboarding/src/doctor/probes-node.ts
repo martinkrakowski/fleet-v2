@@ -9,7 +9,7 @@
  */
 
 import { execFile as execFileCallback } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +18,7 @@ import { promisify } from 'node:util';
 import type { SeatModel } from '@fleet/installation';
 import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
 
+import { GH_BINARY_CANDIDATES } from './gh-binary.js';
 import type { DoctorProbes, SeatProbeResult } from './probes.js';
 
 const execFileAsync = promisify(execFileCallback);
@@ -136,6 +137,11 @@ export interface NodeDoctorProbesDeps {
   readonly seatTimeoutMs?: number;
   /** The worktree root `worktreeRootWritable` tests (`.` when omitted). */
   readonly worktreeRoot?: string;
+  /**
+   * Candidate absolute paths probed for the reviewed `gh` binary. Defaults
+   * to `GH_BINARY_CANDIDATES`; injectable for tests and embedders.
+   */
+  readonly ghBinaryCandidates?: readonly string[];
 }
 
 /** Walk up from this module to the repository root that owns `bin/ocm-run`. */
@@ -361,6 +367,23 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
       }
       const hash = firstField(text);
       return hash !== undefined && /^[0-9a-f]{64}$/.test(hash) ? hash : undefined;
+    },
+
+    async ghBinary() {
+      const candidates = deps.ghBinaryCandidates ?? GH_BINARY_CANDIDATES;
+      try {
+        for (const candidate of candidates) {
+          if (existsSync(candidate)) {
+            const stats = statSync(candidate);
+            if (stats.isFile() && (stats.mode & 0o111) !== 0) {
+              return { resolved: candidate, candidates };
+            }
+          }
+        }
+        return { resolved: undefined, candidates };
+      } catch {
+        return undefined;
+      }
     },
 
     async seatProbe(seat: SeatModel): Promise<SeatProbeResult> {

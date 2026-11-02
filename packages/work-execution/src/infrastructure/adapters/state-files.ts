@@ -32,6 +32,10 @@ import { parseWorkOrderStateRecord } from './WorkOrderRepositoryAdapter.adapter.
 import { parseVersionedLaneRunStateRecord } from './LaneRunRepositoryAdapter.adapter.js';
 import { parseVersionedLaneRunJournalStateRecord } from './LaneRunJournalAdapter.adapter.js';
 import { parseTelemetryDispositionStateRecord } from './TelemetryDispositionAdapter.adapter.js';
+import {
+  duplicateMergeQueueIdentityListError,
+  parseMergeQueueStateRecord,
+} from './MergeQueueRepositoryAdapter.adapter.js';
 
 /** A single-record inspection that preserves the daemon readers' unknown-version refusal. */
 function inspectSingleDaemonStatusRecord(raw: unknown): SingleRecordInspection<DaemonStatusRecord> {
@@ -81,4 +85,5 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeSingleRecordStore('daemon/paused.json', inspectSingleDaemonPauseRecord),
   describeRecordGlob('daemon/leases', inspectSingleDaemonLeaseRecord),
   describeJsonlProjection('daemon/events.jsonl', readDaemonEventLine),
+  describeRecordListStore('merge-queue.json', parseMergeQueueStateRecord, duplicateMergeQueueIdentityListError),
 ];

@@ -60,6 +60,8 @@ export interface ComposeExecutionHostsInput {
   readonly runGhSubprocess: (
     args: readonly string[],
     candidates?: readonly string[],
+    env?: Record<string, string>,
+    timeoutMs?: number,
   ) => Promise<GhInvocationResult>;
   readonly ghBinaryCandidates: readonly string[];
   readonly forgeRead: ForgeReadAdapter;
@@ -254,8 +256,20 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
   // a moved branch head is never pushed or merged on stale readiness.
   const forgeAction = new ForgeActionAdapter(
     {
-    runGh: (args: readonly string[]) => runGhSubprocess(args, ghBinaryCandidates),
-    verifyCurrentHeadSha: async (branchName, request) => {
+      // The merge-pass path routes per-kind gh identities (D-DT8): the
+      // premerge poster's config dir for post-status, the merger's for
+      // merge-pr and update-branch. Config dir values are never logged.
+      // Ambient token credentials are stripped so GH_CONFIG_DIR authenticates.
+      runGh: (args, ghConfigDir, timeoutMs) =>
+        runGhSubprocess(
+          args,
+          ghBinaryCandidates,
+          ghConfigDir === undefined
+            ? undefined
+            : buildMergeGhChildEnv(ghConfigDir, (options?.env as NodeJS.ProcessEnv) ?? process.env),
+          timeoutMs,
+        ),
+      verifyCurrentHeadSha: async (branchName, request) => {
       const attempt = await attemptRepository.findAttemptById(request.attemptId);
       if (attempt === null) {
         throw new Error(`No attempt is recorded for ${request.attemptId}`);
@@ -370,6 +384,12 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     ...forgeActionOverrides(options?.forgeActionDelegate),
     },
     forgeRead,
+    {
+      premergeGhConfigDir:
+        (options?.env ?? process.env).FLEET_GH_CONFIG_PREMERGE?.trim() || undefined,
+      mergeGhConfigDir:
+        (options?.env ?? process.env).FLEET_GH_CONFIG_MERGE?.trim() || undefined,
+    },
   );
 
   return {
@@ -388,3 +408,30 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     forgeAction,
   };
 }
+
+/**
+ * Build the child environment for a merge-path gh invocation. GH_CONFIG_DIR
+ * is set explicitly, and ambient token credentials (which gh would prefer over
+ * hosts.yml in GH_CONFIG_DIR) are stripped so the configured identity is
+ * always the one that authenticates the call.
+ */
+export function buildMergeGhChildEnv(
+  ghConfigDir: string,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const child: Record<string, string> = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (
+      value !== undefined &&
+      key !== 'GH_TOKEN' &&
+      key !== 'GITHUB_TOKEN' &&
+      key !== 'GH_ENTERPRISE_TOKEN' &&
+      key !== 'GITHUB_ENTERPRISE_TOKEN'
+    ) {
+      child[key] = value;
+    }
+  }
+  child.GH_CONFIG_DIR = ghConfigDir;
+  return child;
+}
+

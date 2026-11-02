@@ -866,7 +866,7 @@ describe('conductor start guards (K7-7)', () => {
     expect(fake.abandonCalls).toHaveLength(1);
   });
 
-  it('a present halt marker does not block start', async () => {
+  it('a present halt marker blocks start (KA4)', async () => {
     const dir = tempStateDir();
     const runtime = runtimeOf(dir, makeInstallation({ conductorEnabled: true }));
     expect(await runtime.conductor.halt.set({ halted: true, nowIso: NOW })).toMatchObject({
@@ -876,10 +876,18 @@ describe('conductor start guards (K7-7)', () => {
     const fake = makeFakeDriver({ enabled: true });
     const result = await runConductor(runtime, ['start', '--brief-request', briefPath, '--tier', '1'], {
       stateDir: dir,
-      buildDriver: () => fake.driver,
+      // The refusal comes from the real live start composition (the port the
+      // CLI wires in production), so the marker is consulted before any
+      // write; the fake's start recorder stays unconsumed, proving no start
+      // request reached a port.
+      buildDriver: (liveRuntime, _mode, driverOptions) => ({
+        ...fake.driver,
+        start: buildLiveConductorDriver(liveRuntime, driverOptions).start,
+      }),
     });
-    expect(result.code).toBe(0);
-    expect(parseDocument(result.stdout)).toMatchObject({ outcome: 'started' });
+    expect(result.code).toBe(1);
+    expect(parseDocument(result.stdout)).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(fake.startCalls).toHaveLength(0);
   });
 });
 

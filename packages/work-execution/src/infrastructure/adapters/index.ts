@@ -33,6 +33,7 @@ export * from "./ForgeActionAdapter.adapter.js";
 export * from "./ForgeReadAdapter.adapter.js";
 export * from "./GatePredicateAdapter.adapter.js";
 export * from "./GateReceiptAdapter.adapter.js";
+export * from "./gh-refusal.js";
 export * from "./GhForgeMergeReadAdapter.adapter.js";
 export * from "./GitMirrorPatchIdentityAdapter.adapter.js";
 export * from "./InMemoryRunTelemetryMarkAdapter.adapter.js";

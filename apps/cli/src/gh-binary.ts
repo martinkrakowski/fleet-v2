@@ -4,11 +4,9 @@
  * composition root resolves the binary itself from a fixed list of absolute
  * locations and only ever spawns an absolute path.
  */
-export const GH_BINARY_CANDIDATES: readonly string[] = [
-  '/opt/homebrew/bin/gh',
-  '/usr/local/bin/gh',
-  '/usr/bin/gh',
-];
+import { GH_BINARY_CANDIDATES } from '@fleet/onboarding';
+
+export { GH_BINARY_CANDIDATES };
 
 /**
  * Return the first candidate that is an executable regular file, else

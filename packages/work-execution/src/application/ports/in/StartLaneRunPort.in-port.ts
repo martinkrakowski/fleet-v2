@@ -37,7 +37,13 @@ export type StartLaneRunResult =
       readonly hostName: string;
       readonly worktreePath: string;
     }
-  /** Nothing was written: no reservation is held. */
+  /**
+   * Nothing was written: no reservation is held. This call itself acquired
+   * no reservation, though a reservation held by an earlier incomplete start
+   * may remain held and `abandonStart` releases it. The conductor's halt
+   * marker reads halted or unreadable; checked before any write, so nothing
+   * was written.
+   */
   | { readonly outcome: 'refused'; readonly reason: StartLaneRunRefusal }
   | { readonly outcome: 'no-capacity' }
   /**
@@ -66,7 +72,8 @@ export type StartLaneRunRefusal =
   | 'no-host'
   | 'no-review-route'
   | 'reserve-refused'
-  | 'base-branch-missing';
+  | 'base-branch-missing'
+  | 'halted';
 
 export interface AbandonStartRequest {
   readonly runId: string;

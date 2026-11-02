@@ -13,6 +13,7 @@ import {
   parseWorkOrderRisk,
 } from '../../domain/execution-records.js';
 import type { PlanRef, WorkOrderRecord } from '../../domain/execution-records.js';
+import { isSharedAppendPath } from '../../domain/lane-run-packages.js';
 import type { BaseBranchValue } from '../../domain/base-branch.js';
 import {
   DEFAULT_BASE_BRANCH,
@@ -55,6 +56,9 @@ function isActiveWorkOrder(state: WorkOrderRecord['state']): boolean {
 
 /** Exact match, or one path nested underneath the other. */
 function pathsOverlap(left: string, right: string): boolean {
+  if (left === right && isSharedAppendPath(left)) {
+    return false;
+  }
   if (left === right) {
     return true;
   }

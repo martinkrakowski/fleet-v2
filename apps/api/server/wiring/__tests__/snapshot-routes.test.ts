@@ -78,9 +78,9 @@ const POST_HEADERS = {
   'content-type': 'application/json',
 };
 
-function configureConfigured(scope: string): void {
+function configureConfigured(scopes: string[]): void {
   setActiveApiToken(TOKEN);
-  configurePresentedTokenResolver(() => ({ tokenId: 'test-token', scopes: [scope] }));
+  configurePresentedTokenResolver(() => ({ tokenId: 'test-token', scopes }));
 }
 
 interface SnapshotSectionWire {
@@ -117,7 +117,7 @@ describe('POST /v1/snapshots/:section', () => {
     expect(defaultScope.status).toBe(403);
     expect(((await defaultScope.json()) as { result: { reason: string } }).result.reason).toBe('scope-required');
 
-    configurePresentedTokenResolver(() => ({ tokenId: 'dispatch-only', scopes: ['dispatch'] }));
+    configurePresentedTokenResolver(() => ({ tokenId: 'dispatch-only', scopes: ['orchestrate', 'dispatch'] }));
     const dispatchOnly = await fetch(`${apiBaseUrl}/v1/snapshots/running`, {
       method: 'POST',
       headers: POST_HEADERS,
@@ -126,7 +126,7 @@ describe('POST /v1/snapshots/:section', () => {
     expect(dispatchOnly.status).toBe(403);
     expect(((await dispatchOnly.json()) as { result: { reason: string } }).result.reason).toBe('scope-required');
 
-    configureConfigured('snapshot-push');
+    configureConfigured(['orchestrate', 'snapshot-push']);
     const applied = await fetch(`${apiBaseUrl}/v1/snapshots/running`, {
       method: 'POST',
       headers: POST_HEADERS,
@@ -140,7 +140,7 @@ describe('POST /v1/snapshots/:section', () => {
   it('late-older-snapshot-refused', async () => {
     const stateDir = await makeTempDir();
     configureFleetApiRuntime({ stateDir });
-    configureConfigured('snapshot-push');
+    configureConfigured(['orchestrate', 'read', 'snapshot-push']);
     const newer = {
       revision: 5,
       tokens: ['tool:bash', 'exit:0'],
@@ -179,7 +179,7 @@ describe('POST /v1/snapshots/:section', () => {
   it('secret-shaped-push-refused', async () => {
     const stateDir = await makeTempDir();
     configureFleetApiRuntime({ stateDir });
-    configureConfigured('snapshot-push');
+    configureConfigured(['orchestrate', 'read', 'snapshot-push']);
     const secret = 'ghp_' + 'i'.repeat(30);
     const response = await fetch(`${apiBaseUrl}/v1/snapshots/running`, {
       method: 'POST',
@@ -203,7 +203,7 @@ describe('POST /v1/snapshots/:section', () => {
   it('invalid-parse-refuses-extra-fields-without-echoing', async () => {
     const stateDir = await makeTempDir();
     configureFleetApiRuntime({ stateDir });
-    configureConfigured('snapshot-push');
+    configureConfigured(['orchestrate', 'read', 'snapshot-push']);
     const pathValue = '/secret/path';
     const response = await fetch(`${apiBaseUrl}/v1/snapshots/running`, {
       method: 'POST',
@@ -245,7 +245,7 @@ describe('GET /v1/snapshots', () => {
   it('get-serves-projection-with-time', async () => {
     const stateDir = await makeTempDir();
     configureFleetApiRuntime({ stateDir });
-    configureConfigured('snapshot-push');
+    configureConfigured(['orchestrate', 'read', 'snapshot-push']);
     await fetch(`${apiBaseUrl}/v1/snapshots/halt`, {
       method: 'POST',
       headers: POST_HEADERS,
@@ -272,7 +272,7 @@ describe('GET /v1/snapshots', () => {
     const firstDir = await makeTempDir();
     const secondDir = await makeTempDir();
     configureFleetApiRuntime({ stateDir: firstDir });
-    configureConfigured('snapshot-push');
+    configureConfigured(['orchestrate', 'read', 'snapshot-push']);
     await fetch(`${apiBaseUrl}/v1/snapshots/train`, {
       method: 'POST',
       headers: POST_HEADERS,

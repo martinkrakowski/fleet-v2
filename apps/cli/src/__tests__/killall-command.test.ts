@@ -13,7 +13,6 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import type { KillallStopAgentPort, KillallStopAgentResult } from '@fleet/work-execution';
 
-import { createFleetCliRuntime } from '../composition.js';
 import { runCli, type CliIo } from '../index.js';
 
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -60,11 +59,10 @@ async function runKillall(
   io: CapturedIo,
   options: { readonly now?: () => string; readonly stateDir?: string; readonly stopAgent?: KillallStopAgentPort },
 ): Promise<number> {
-  const runtime = createFleetCliRuntime({ stateDir: options.stateDir });
   return runCli(
     ['killall', ...args],
     io,
-    runtime,
+    undefined,
     undefined,
     undefined,
     undefined,
@@ -169,11 +167,23 @@ function unavailableResponse(): KillallStopAgentResult {
 describe('fleet-v2 killall halt flow', () => {
   it('calls marker set, then pause set, then the stop agent, and exits 0 on a confirmed report (rule 3)', async () => {
     const stateDir = trackedStateDir();
+    const clockSnapshots: Array<{ readonly marker: boolean; readonly pause: boolean }> = [];
+    const now = () => {
+      clockSnapshots.push({
+        marker: existsSync(join(stateDir, 'killall-halt.json')),
+        pause: existsSync(join(stateDir, 'killall-train-pause.json')),
+      });
+      return NOW;
+    };
     const agent = new RecordingStopAgent(confirmedResponse, stateDir);
     const io = captureIo();
-    const code = await runKillall([], io, { now: () => NOW, stateDir, stopAgent: agent });
+    const code = await runKillall([], io, { now, stateDir, stopAgent: agent });
 
     expect(code).toBe(0);
+    expect(clockSnapshots).toEqual([
+      { marker: false, pause: false },
+      { marker: true, pause: false },
+    ]);
     expect(agent.calls).toHaveLength(1);
     expect(agent.sawMarker).toEqual([true]);
     expect(agent.sawPause).toEqual([true]);
@@ -272,6 +282,21 @@ describe('fleet-v2 killall halt flow', () => {
     expect(io.errLines.join('\n')).toContain('killall');
   });
 
+  it('never echoes unknown arguments or stray paths on usage error (finding 2 / rule 4)', async () => {
+    const stateDir = trackedStateDir();
+    const io = captureIo();
+    const canaryHost = 'secret-lane-host.internal';
+    const canaryPath = '/var/secrets/runner-worktree';
+    const code = await runKillall([canaryHost, canaryPath], io, { now: () => NOW, stateDir });
+
+    expect(code).toBe(2);
+    const errText = io.errLines.join('\n');
+    expect(errText).not.toContain(canaryHost);
+    expect(errText).not.toContain(canaryPath);
+    expect(errText).toContain('Usage: fleet-v2 killall [--lift]');
+    expect(io.outLines).toHaveLength(0);
+  });
+
   it('exits 2 without a durable state directory (rule 6f)', async () => {
     const saved = process.env.FLEET_STATE_DIR;
     delete process.env.FLEET_STATE_DIR;
@@ -283,6 +308,50 @@ describe('fleet-v2 killall halt flow', () => {
     } finally {
       if (saved !== undefined) {
         process.env.FLEET_STATE_DIR = saved;
+      }
+    }
+  });
+
+  it('dispatches killall without composing runtime when installation is invalid (finding 1)', async () => {
+    const stateDir = trackedStateDir();
+    const badInstallation = join(stateDir, 'corrupt-installation.json');
+    await fs.writeFile(badInstallation, '{ invalid JSON content\n', 'utf8');
+
+    const savedEnv = process.env.FLEET_INSTALLATION_FILE;
+    process.env.FLEET_INSTALLATION_FILE = badInstallation;
+
+    try {
+      const agent = new RecordingStopAgent(confirmedResponse, stateDir);
+      const io = captureIo();
+      const code = await runCli(
+        ['killall', '--state-dir', stateDir],
+        io,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { now: () => NOW, stopAgent: agent },
+      );
+
+      expect(code).toBe(0);
+      expect(agent.calls).toHaveLength(1);
+      expect(existsSync(join(stateDir, 'killall-halt.json'))).toBe(true);
+      expect(existsSync(join(stateDir, 'killall-train-pause.json'))).toBe(true);
+      const doc = parseStdoutDoc(io);
+      expect(doc.outcome).toBe('completed');
+      expect(doc.marker).toBe('halted');
+      expect(io.errLines).toHaveLength(0);
+    } finally {
+      if (savedEnv !== undefined) {
+        process.env.FLEET_INSTALLATION_FILE = savedEnv;
+      } else {
+        delete process.env.FLEET_INSTALLATION_FILE;
       }
     }
   });

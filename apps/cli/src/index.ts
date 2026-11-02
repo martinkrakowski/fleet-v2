@@ -756,6 +756,15 @@ export async function runCli(
       io.stdout(`${QUESTIONS_HELP}\n`);
       return 0;
     }
+    // `killall` halts active lane workers and pauses the train directly
+    // through its state-backed stores; it never composes the runtime or
+    // loads the installation.
+    if (group === 'killall') {
+      return await killallCommand(restArgv.slice(1), io, {
+        ...killallOptions,
+        stateDir: killallOptions?.stateDir ?? stateDir,
+      });
+    }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.
     let activeRuntime: FleetCliRuntime;
@@ -788,12 +797,6 @@ export async function runCli(
     }
     if (group === 'telemetry') {
       return await telemetryCommand(restArgv.slice(1), io, activeRuntime, telemetryOptions ?? {});
-    }
-    if (group === 'killall') {
-      return await killallCommand(restArgv.slice(1), io, {
-        ...killallOptions,
-        stateDir: killallOptions?.stateDir ?? stateDir,
-      });
     }
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);

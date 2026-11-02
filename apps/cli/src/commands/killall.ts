@@ -185,7 +185,7 @@ export async function killallCommand(
   }
   const lift = argv.length === 1 && argv[0] === '--lift';
   if (argv.length > 0 && !lift) {
-    io.stderr(`Unknown killall argument: ${argv.join(' ')}\n${KILLALL_HELP}\n`);
+    io.stderr(`${KILLALL_HELP}\n`);
     return 2;
   }
   if (options.stateDir === undefined || options.stateDir.trim() === '') {

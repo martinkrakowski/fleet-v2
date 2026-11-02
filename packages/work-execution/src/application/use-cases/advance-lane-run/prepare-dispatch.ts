@@ -1,11 +1,9 @@
 /** The `act prepare` and `act dispatch` steps of AdvanceLaneRunUseCase (AL-1). */
 import type { AdvanceLaneRunRefusal, AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import type {
-  PreserveWorktreeEditsResult,
-  VerifySavedPatchRequest,
 } from '../../ports/out/WorkspacePort.out-port.js';
 import { AttemptRevisionConflictError } from '../../ports/out/AttemptRepositoryPort.out-port.js';
-import { parseSeatTool, type AttemptRecord, type AttemptRunnerRecord, type AttemptSeatOverrideRecord, type AttemptSeatSelectionRecord } from '../../../domain/execution-records.js';
+import { parseSeatTool, type AttemptRecord, type AttemptSeatOverrideRecord, type AttemptSeatSelectionRecord } from '../../../domain/execution-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunCursorsRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
@@ -484,31 +482,6 @@ function recoveryInputsValid(
   return worktreeRecoveryPatchInputsValid(latest.worktreePath, latest.id);
 }
 
-function hasSavedPatchVerifier(
-  candidate: object,
-): candidate is { verifySavedPatch(request: VerifySavedPatchRequest): Promise<boolean> } {
-  return 'verifySavedPatch' in candidate && typeof candidate.verifySavedPatch === 'function';
-}
-
-async function canProceedWithReconcileReset(
-  recovery: NonNullable<AdvanceStepContext['deps']['worktreeRecovery']>,
-  preserved: PreserveWorktreeEditsResult,
-  worktreePath: string,
-  patchPath: string,
-  recordedHost: AttemptRunnerRecord,
-): Promise<boolean> {
-  if (preserved.outcome === 'preserved') {
-    return true;
-  }
-  if (preserved.outcome === 'refused' && preserved.reason === 'destination-exists') {
-    if (!hasSavedPatchVerifier(recovery)) {
-      return false;
-    }
-    return recovery.verifySavedPatch({ worktreePath, patchPath, recordedHost });
-  }
-  return false;
-}
-
 /**
  * GB3: reconcile a crashed recovery whose attempt is already `cancelled` —
  * the crash landed after the cancel but before the recovery's completing
@@ -516,8 +489,7 @@ async function canProceedWithReconcileReset(
  * prepare the next seat over an unreconciled recovery. The preserve and reset
  * side effects may already have run, so the reconcile does not re-run them
  * blindly: a `destination-exists` preserve proves the patch survived the
- * crash, but reset is only repeated if the saved patch passes verification
- * against the current worktree; otherwise keep the park.
+ * crash and the reset already ran, so the reconcile only closes the intent.
  */
 async function reconcileCancelledWorktreeRecovery(ctx: AdvanceStepContext,
   record: LaneRunRecord,
@@ -547,19 +519,18 @@ async function reconcileCancelledWorktreeRecovery(ctx: AdvanceStepContext,
     const preserved = await preserveWorktreeEdits(
       { worktreePath: latest.worktreePath, patchPath, recordedHost },
     );
-    const canReset = await canProceedWithReconcileReset(
-      recovery,
-      preserved,
-      latest.worktreePath,
-      patchPath,
-      recordedHost,
-    );
-    if (!canReset) {
-      return false;
-    }
-    const reset = await resetWorktreeToHead({ worktreePath: latest.worktreePath, recordedHost });
-    if (reset.outcome !== 'reset') {
-      return false;
+    // A saved patch proves the first recovery reached its reset, because the
+    // cancel only follows a successful reset. Never reset again: anything in the
+    // worktree now is newer than that patch and is in no saved file.
+    const savedEarlier = preserved.outcome === 'refused' && preserved.reason === 'destination-exists';
+    if (!savedEarlier) {
+      if (preserved.outcome !== 'preserved') {
+        return false;
+      }
+      const reset = await resetWorktreeToHead({ worktreePath: latest.worktreePath, recordedHost });
+      if (reset.outcome !== 'reset') {
+        return false;
+      }
     }
     const priorEntries = await ctx.deps.executionJournal.listJournalEntriesForAttempt(latest.id);
     await append({

@@ -1435,7 +1435,7 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
       await conduct(harness, 'ready', LATER);
     };
 
-    it('GB3 test 10: a crash after the cancel whose saved patch cannot be proven keeps the park and repeats no reset', async () => {
+    it('GB3 test 10: a crash after the cancel is reconciled at the next prepare without repeating the reset', async () => {
       const harness = await makeHarness(runRecord(), [attemptFixture()], { wireRecovery: true });
       harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
       await admit(harness, 'attempt-example-1');
@@ -1448,13 +1448,19 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
 
       await restartRun(harness);
 
-      // The reset may already have run, so the saved patch cannot be proven
-      // against this worktree: the reconcile keeps the park and resets nothing
-      // more. A person recovers from the saved patch.
+      // The patch survived the crash: the adapter answers destination-exists.
+      // The first recovery already reset, so the reconcile repeats no reset,
+      // closes the intent, and the run prepares the next seat.
       harness.setPreserveAnswer(async () => ({ outcome: 'refused', reason: 'destination-exists' }));
-      expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'prepare' });
+      expect(await advance(harness)).toEqual({
+        outcome: 'acted',
+        step: 'prepare',
+        key: prepareKey(0, 1, 2),
+        result: 'completed',
+        reasonCode: 'prepared',
+      });
       expect(harness.resetRequests).toHaveLength(1);
-      expect((await recoveryJournalEntries(harness)).map((entry) => entry.status)).toEqual(['intent-recorded']);
+      expect((await recoveryJournalEntries(harness)).map((entry) => entry.status)).toEqual(['intent-recorded', 'completed']);
       expect(harness.cancelRequests).toHaveLength(1);
     });
 

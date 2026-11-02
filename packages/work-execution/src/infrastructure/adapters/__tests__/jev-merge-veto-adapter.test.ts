@@ -143,7 +143,7 @@ function makeAdapter(overrides?: {
   timeoutMs?: number;
   now?: () => number;
   hash?: (state: string) => string;
-  readKey?: (path: string) => Promise<string>;
+  readKey?: () => Promise<string | undefined>;
   capturedRequests?: Array<{ url: unknown; init?: RequestInit }>;
 }): {
   adapter: JevMergeVetoAdapter;
@@ -154,7 +154,6 @@ function makeAdapter(overrides?: {
   const journal = overrides?.journal ?? new InMemoryJournal(events);
   const adapter = new JevMergeVetoAdapter({
     model: 'typesafe/jev-1.14',
-    keyFile: '/keys/jev.key',
     holdConfidence: overrides?.holdConfidence ?? 0.8,
     monthlyBudgetUsd: overrides?.monthlyBudgetUsd ?? 100,
     assumedCostPerCallUsd: overrides?.assumedCostPerCallUsd ?? 0.0001,
@@ -543,8 +542,8 @@ describe('JevMergeVetoAdapter', () => {
     // Normal call: request body sent to fetch must omit verifiedHeadOid, and readKey is invoked
     const captured: Array<{ url: unknown; init?: RequestInit }> = [];
     const readKeyCalls: string[] = [];
-    const trackingReadKey = async (path: string) => {
-      readKeyCalls.push(path);
+    const trackingReadKey = async () => {
+      readKeyCalls.push('readKey');
       return KEY_TEXT;
     };
     const { adapter } = makeAdapter({
@@ -565,7 +564,7 @@ describe('JevMergeVetoAdapter', () => {
     expect(sentState).not.toHaveProperty('headOid');
     expect(sentState).not.toHaveProperty('oid');
     expect(JSON.stringify(sentState)).not.toContain(REQUEST.verifiedHeadOid);
-    expect(readKeyCalls).toEqual(['/keys/jev.key']);
+    expect(readKeyCalls).toEqual(['readKey']);
 
     // Redacted call: secret in title refuses before reading key
     readKeyCalls.length = 0;

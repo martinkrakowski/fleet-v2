@@ -76,7 +76,6 @@ function makeDeps(
 ): JevMergeVetoAdapterDependencies {
   return {
     model: 'typesafe/jev-1.14',
-    keyFile: '/dev/null',
     holdConfidence: 0.8,
     monthlyBudgetUsd: 100,
     assumedCostPerCallUsd: 0.02,
@@ -265,5 +264,93 @@ describe('JevMergeVetoAdapter reported cost settlement', () => {
     expect(journal.reservations.length).toBe(1);
     expect(journal.reservations[0].assumedCostUsd).toBe(0.03);
     expect(journal.reservations[0].monthlyBudgetUsd).toBe(75);
+  });
+});
+
+describe('JevMergeVetoAdapter key reader injection', () => {
+  const journal = new MockJournal();
+  const fakeFetch = (async () => createSuccessfulResponse(0.02)) as typeof fetch;
+
+  it('answers not-configured when readKey is missing', async () => {
+    const adapter = new JevMergeVetoAdapter(
+      makeDeps(journal, fakeFetch, { readKey: undefined }),
+    );
+
+    const advice = await adapter.adviseMergeVeto(SAMPLE_REQUEST);
+    expect(advice.status).toBe('unknown');
+    if (advice.status === 'unknown') {
+      expect(advice.reason).toBe('not-configured');
+    }
+  });
+
+  it('answers not-configured when readKey throws, echoing no error', async () => {
+    const adapter = new JevMergeVetoAdapter(
+      makeDeps(journal, fakeFetch, {
+        readKey: async () => {
+          throw new Error('secret-key-file-path-failed');
+        },
+      }),
+    );
+
+    const advice = await adapter.adviseMergeVeto(SAMPLE_REQUEST);
+    expect(advice.status).toBe('unknown');
+    if (advice.status === 'unknown') {
+      expect(advice.reason).toBe('not-configured');
+    }
+  });
+
+  it('answers not-configured when readKey returns undefined', async () => {
+    const adapter = new JevMergeVetoAdapter(
+      makeDeps(journal, fakeFetch, {
+        readKey: async () => undefined,
+      }),
+    );
+
+    const advice = await adapter.adviseMergeVeto(SAMPLE_REQUEST);
+    expect(advice.status).toBe('unknown');
+    if (advice.status === 'unknown') {
+      expect(advice.reason).toBe('not-configured');
+    }
+  });
+
+  it('answers not-configured when readKey returns empty or whitespace string', async () => {
+    const adapter = new JevMergeVetoAdapter(
+      makeDeps(journal, fakeFetch, {
+        readKey: async () => '   ',
+      }),
+    );
+
+    const advice = await adapter.adviseMergeVeto(SAMPLE_REQUEST);
+    expect(advice.status).toBe('unknown');
+    if (advice.status === 'unknown') {
+      expect(advice.reason).toBe('not-configured');
+    }
+  });
+
+  it('preserves redaction-before-key-read order when state fails redaction', async () => {
+    let keyReadInvoked = false;
+    const adapter = new JevMergeVetoAdapter(
+      makeDeps(journal, fakeFetch, {
+        readKey: async () => {
+          keyReadInvoked = true;
+          return 'test-auth-key';
+        },
+      }),
+    );
+
+    const secretRequest: MergeVetoRequest = {
+      ...SAMPLE_REQUEST,
+      state: {
+        ...SAMPLE_REQUEST.state,
+        title: 'AKIAIOSFODNN7EXAMPLE',
+      },
+    };
+
+    const advice = await adapter.adviseMergeVeto(secretRequest);
+    expect(advice.status).toBe('unknown');
+    if (advice.status === 'unknown') {
+      expect(advice.reason).toBe('redaction-refused');
+    }
+    expect(keyReadInvoked).toBe(false);
   });
 });

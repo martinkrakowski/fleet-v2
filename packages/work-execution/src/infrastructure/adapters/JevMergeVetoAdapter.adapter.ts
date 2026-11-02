@@ -22,17 +22,13 @@
  * paid call is never invisible to the budget (decision-port plan :104-111).
  *
  * Transport hygiene mirrors JevRankingAdviceAdapter: the key is read by the
- * injected `readKey` (default `readKeyFile`, which requires O_NOFOLLOW, a
- * regular file and mode `& 0o077 === 0`, re-implemented here, never imported
- * across contexts). One attempt with a single AbortController deadline (default
- * 3 s), no redirects; non-2xx → `transport`; abort → `timeout`; response
- * bodies over 64 KiB or unparsable JSON → `shape`. Authorization, request
- * bodies and response bodies never appear in thrown errors or returned values.
+ * injected `readKey` (absent or throwing → `not-configured`). One attempt with
+ * a single AbortController deadline (default 3 s), no redirects; non-2xx →
+ * `transport`; abort → `timeout`; response bodies over 64 KiB or unparsable
+ * JSON → `shape`. Authorization, request bodies and response bodies never
+ * appear in thrown errors or returned values.
  */
 
-import { open } from 'node:fs/promises';
-import { constants } from 'node:fs';
-import type { FileHandle } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import type {
   ChoiceQuestion,
@@ -82,8 +78,6 @@ const MERGE_VETO_QUESTION: ChoiceQuestion = {
 export interface JevMergeVetoAdapterDependencies {
   /** Jev model id sent with every request, e.g. `typesafe/jev-1.14`. */
   readonly model: string;
-  /** Path of the mode-600 key file, read at call time by `readKey`. */
-  readonly keyFile: string;
   /** 0.8 per D-JV4; doubles as minConfidence for the choice answer. */
   readonly holdConfidence: number;
   /** Month-to-date budget the journal enforces, in USD. */
@@ -94,8 +88,8 @@ export interface JevMergeVetoAdapterDependencies {
   readonly disabledProjects?: readonly string[];
   /** Injected transport; no default network call happens without it. */
   readonly fetch: typeof fetch;
-  /** Injected key reader; defaults to `readKeyFile`. */
-  readonly readKey?: (path: string) => Promise<string>;
+  /** Injected key reader; absent or throwing → not-configured. */
+  readonly readKey?: () => Promise<string | undefined>;
   /** Durable receipt journal; absent → not-configured (invariant 5). */
   readonly journal?: MergeVetoDecisionJournal;
   readonly timeoutMs?: number;
@@ -148,57 +142,6 @@ export interface MergeVetoDecisionJournal {
    * (`unknown/not-configured`).
    */
   settle(reservationId: string, receipt: MergeVetoSettledReceipt): Promise<boolean>;
-}
-
-/**
- * Default key reader: opens with O_NOFOLLOW, requires a regular file with
- * mode `& 0o077 === 0`, trims and rejects empty. Errors never include the key
- * or any file content. Re-implemented here (never imported across contexts)
- * from the JevRankingAdviceAdapter pattern.
- */
-export async function readKeyFile(path: string): Promise<string> {
-  let handle: FileHandle;
-  try {
-    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  } catch (error) {
-    if (isEloop(error)) {
-      throw new Error(`Decision key file at ${path} must be a regular file, not a symlink`);
-    }
-    throw new Error(`Decision key file inaccessible at ${path}: ${errorMessage(error)}`);
-  }
-
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) {
-      throw new Error(`Decision key file at ${path} must be a regular file`);
-    }
-    if ((stat.mode & 0o077) !== 0) {
-      throw new Error(
-        `Decision key file at ${path} has invalid mode 0o${(stat.mode & 0o777).toString(8)}; group and other permissions must be 0`,
-      );
-    }
-    const raw = await handle.readFile('utf8');
-    const key = raw.trim();
-    if (key.length === 0) {
-      throw new Error(`Decision key file at ${path} is empty`);
-    }
-    return key;
-  } finally {
-    await handle.close();
-  }
-}
-
-function isEloop(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    (error as { code?: unknown }).code === 'ELOOP'
-  );
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -273,13 +216,12 @@ function isUsableReportedCost(cost: unknown): cost is number {
 
 export class JevMergeVetoAdapter implements MergeVetoPort {
   private readonly model: string;
-  private readonly keyFile: string;
   private readonly holdConfidence: number;
   private readonly monthlyBudgetUsd: number;
   private readonly assumedCostPerCallUsd: number;
   private readonly disabledProjects: readonly string[];
   private readonly fetchFn: typeof fetch;
-  private readonly readKey: (path: string) => Promise<string>;
+  private readonly readKey?: () => Promise<string | undefined>;
   private readonly journal: MergeVetoDecisionJournal | undefined;
   private readonly timeoutMs: number | undefined;
   private readonly now: () => number;
@@ -291,9 +233,6 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
     }
     if (typeof deps.model !== 'string' || deps.model.length === 0) {
       throw new Error('JevMergeVetoAdapter requires a model id');
-    }
-    if (typeof deps.keyFile !== 'string' || deps.keyFile.length === 0) {
-      throw new Error('JevMergeVetoAdapter requires a keyFile path');
     }
     if (!Number.isFinite(deps.holdConfidence)) {
       throw new Error('JevMergeVetoAdapter requires a finite holdConfidence');
@@ -308,13 +247,12 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
       throw new Error('JevMergeVetoAdapter requires an injected fetch');
     }
     this.model = deps.model;
-    this.keyFile = deps.keyFile;
     this.holdConfidence = deps.holdConfidence;
     this.monthlyBudgetUsd = deps.monthlyBudgetUsd;
     this.assumedCostPerCallUsd = deps.assumedCostPerCallUsd;
     this.disabledProjects = deps.disabledProjects ?? [];
     this.fetchFn = deps.fetch;
-    this.readKey = deps.readKey ?? readKeyFile;
+    this.readKey = deps.readKey;
     this.journal = deps.journal;
     this.timeoutMs = deps.timeoutMs;
     this.now = deps.now ?? (() => Date.now());
@@ -368,13 +306,22 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
       return { status: 'unknown', reason: 'redaction-refused' };
     }
 
-    let key: string;
+    if (!this.readKey) {
+      return { status: 'unknown', reason: 'not-configured' };
+    }
+
+    let rawKey: string | undefined;
     try {
-      key = await this.readKey(this.keyFile);
+      rawKey = await this.readKey();
     } catch {
       // Key errors never carry the key or file content.
       return { status: 'unknown', reason: 'not-configured' };
     }
+
+    if (typeof rawKey !== 'string' || rawKey.trim().length === 0) {
+      return { status: 'unknown', reason: 'not-configured' };
+    }
+    const key = rawKey.trim();
 
     const reserved = await this.reserve(state.stateSha256);
     if (!reserved.ok) {

@@ -49,6 +49,7 @@ export * from "./LaneRunJournalAdapter.adapter.js";
 export * from "./LaneRunParkNoticeAdapter.adapter.js";
 export * from "./LaneRunRepositoryAdapter.adapter.js";
 export * from "./LocalExecutor.adapter.js";
+export * from "./MergeGrantAdapter.adapter.js";
 export * from "./MergeNotificationAdapter.adapter.js";
 export * from "./MergeQueueRepositoryAdapter.adapter.js";
 export * from "./MergeVerificationAdapter.adapter.js";

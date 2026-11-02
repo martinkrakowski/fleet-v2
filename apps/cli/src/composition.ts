@@ -905,6 +905,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     coordination,
     coordinationRequestRepository,
     issuePolicyForgeGrantUseCase,
+    issueMergeGrantUseCase,
     profileRead,
     probeRecord,
     executorForHostName,
@@ -946,6 +947,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     opencodeUsage,
     briefAuthoring,
     forgeAction,
+    mergeGrant,
   } = composeExecutionHosts({
     stateDir,
     options,
@@ -970,6 +972,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     readGitHead,
     headRouteForExecutor,
     runGitCommand,
+    issuePolicyForgeGrantUseCase,
+    issueMergeGrantUseCase,
   });
 
   const { execution } = composeExecution({
@@ -989,6 +993,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     attemptLookup,
     forgeRead,
     issuePolicyForgeGrantUseCase,
+    mergeGrant,
     profileRead,
     probeRecord,
     executorForHostName,

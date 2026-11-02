@@ -15,6 +15,7 @@ import {
   ExecutionRunnerAdapter,
   ExecutorForHost,
   ForgeActionAdapter,
+  MergeGrantAdapter,
   OpencodeApiUsageAdapter,
   RunnerForAttemptAdapter,
   RunnerSelectorAdapter,
@@ -31,6 +32,10 @@ import {
   forgeActionPushesBranch,
 } from '@fleet/work-execution';
 import type { FleetInstallationModel } from '@fleet/installation';
+import type {
+  IssueMergeGrantUseCase,
+  IssuePolicyForgeGrantUseCase,
+} from '@fleet/operator-coordination';
 
 import type { FleetCliRuntimeOptions } from '../composition.js';
 import type {
@@ -75,6 +80,10 @@ export interface ComposeExecutionHostsInput {
   readonly readGitHead: typeof readGitHead;
   readonly headRouteForExecutor: typeof headRouteForExecutor;
   readonly runGitCommand: (args: readonly string[]) => Promise<string>;
+  /** The policy grant issuer behind the attempt-bound merge grant (DT6b). */
+  readonly issuePolicyForgeGrantUseCase?: IssuePolicyForgeGrantUseCase;
+  /** The attempt-less merge grant issuer (DT6b). */
+  readonly issueMergeGrantUseCase?: IssueMergeGrantUseCase;
 }
 
 export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
@@ -102,6 +111,8 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     readGitHead,
     headRouteForExecutor,
     runGitCommand,
+    issuePolicyForgeGrantUseCase,
+    issueMergeGrantUseCase,
   } = input;
 
   // --- work-execution ---------------------------------------------------------
@@ -392,6 +403,21 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     },
   );
 
+  // DT6b: the merge-pass grant adapter over the coordination use cases — the
+  // attempt-bound variant routes to the policy grant issuer and the attempt-less
+  // variant to the merge grant issuer. Both delegates are optional so host
+  // tests that only exercise forge adapters can omit the coordination stack; an
+  // unbound delegate answers refused with 'not-configured'. Never log a grant
+  // identifier or config value.
+  const mergeGrant = new MergeGrantAdapter({
+    ...(issuePolicyForgeGrantUseCase !== undefined
+      ? { issuePolicyForgeGrant: issuePolicyForgeGrantUseCase }
+      : {}),
+    ...(issueMergeGrantUseCase !== undefined
+      ? { issueMergeGrant: issueMergeGrantUseCase }
+      : {}),
+  });
+
   return {
     workOrderRepository,
     attemptRepository,
@@ -406,6 +432,7 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
     opencodeUsage,
     briefAuthoring,
     forgeAction,
+    mergeGrant,
   };
 }
 

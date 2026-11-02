@@ -35,6 +35,7 @@ import {
   ListMergeQueueUseCase,
   ListUnregisteredProjectsUseCase,
   LocalExecutor,
+  MergeGrantAdapter,
   MergeQueueRepositoryAdapter,
   PolicyMergeGrantAdapter,
   PrepareBriefPackageUseCase,
@@ -114,6 +115,8 @@ export interface ComposeExecutionInput {
   readonly attemptLookup: { inspectAttempt?: InspectAttemptUseCase };
   readonly forgeRead: ForgeReadAdapter;
   readonly issuePolicyForgeGrantUseCase: IssuePolicyForgeGrantUseCase;
+  /** The merge-pass grant adapter (DT6b), constructed by the host composition. */
+  readonly mergeGrant: MergeGrantAdapter;
   readonly profileRead: ProjectProfileReadPort;
   readonly probeRecord: ProjectProbeRecordAdapter;
   readonly executorForHostName: (name: string) => ExecutorForRecordedHostResult;
@@ -155,6 +158,7 @@ export function composeExecution(input: ComposeExecutionInput) {
     attemptLookup,
     forgeRead,
     issuePolicyForgeGrantUseCase,
+    mergeGrant,
     profileRead,
     probeRecord,
     executorForHostName,
@@ -534,6 +538,9 @@ export function composeExecution(input: ComposeExecutionInput) {
     briefKnowledge,
     executionObservation,
     forgeAction,
+    // DT6b: the merge-pass grant adapter sits beside forgeAction on the
+    // runtime type; the attempt-less variant grants a CLI-enqueued entry.
+    mergeGrant,
     forgeRead,
     probeProject: new ProbeProjectUseCase({
       profileRead,

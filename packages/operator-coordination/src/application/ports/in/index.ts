@@ -12,6 +12,7 @@ export * from "./HeartbeatOrchestratorSessionPort.in-port.js";
 export * from "./InspectConfiguredCapabilitiesPort.in-port.js";
 export * from "./InspectOutstandingCoordinationPort.in-port.js";
 export * from "./InspectProjectProfilePort.in-port.js";
+export * from "./IssueMergeGrantPort.in-port.js";
 export * from "./IssuePolicyForgeGrantPort.in-port.js";
 export * from "./ListAttentionItemsPort.in-port.js";
 export * from "./ListOrchestratorSessionsPort.in-port.js";

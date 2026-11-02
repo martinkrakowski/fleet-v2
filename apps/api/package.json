@@ -9,8 +9,8 @@
     "dev": "HOST=127.0.0.1 nitro dev --port 3001",
     "preview": "HOST=127.0.0.1 node .output/server/index.mjs",
     "prepare": "nitro prepare",
-    "lint": "eslint server --ext .ts",
-    "typecheck": "nitro prepare && tsc --noEmit",
+    "lint": "sh -c 'eslint server --ext .ts' lint",
+    "typecheck": "sh -c 'nitro prepare && tsc --noEmit' typecheck",
     "test": "vitest run --passWithNoTests --exclude '**/dist/**'"
   },
   "dependencies": {

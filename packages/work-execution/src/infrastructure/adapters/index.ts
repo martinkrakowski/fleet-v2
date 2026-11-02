@@ -31,6 +31,7 @@ export * from "./GatePredicateAdapter.adapter.js";
 export * from "./GateReceiptAdapter.adapter.js";
 export * from "./InMemoryRunTelemetryMarkAdapter.adapter.js";
 export * from "./LaneDiffCheckAdapter.adapter.js";
+export * from "./LanePlanRepositoryAdapter.adapter.js";
 export * from "./LaneRunAdmissionAdapter.adapter.js";
 export * from "./LaneRunJournalAdapter.adapter.js";
 export * from "./LaneRunParkNoticeAdapter.adapter.js";

@@ -80,6 +80,20 @@ interface AdmissionTimestamps {
   readonly dispatchAt: string | null;
 }
 
+function isEarlier(candidateIso: string, currentIso: string | null): boolean {
+  if (currentIso === null) {
+    return true;
+  }
+  const diff = Date.parse(candidateIso) - Date.parse(currentIso);
+  if (diff < 0) {
+    return true;
+  }
+  if (diff === 0) {
+    return candidateIso < currentIso;
+  }
+  return false;
+}
+
 function scanAdmissionTimestamps(
   entries: readonly LaneRunJournalEntryRecord[],
   weekStartMs: number,
@@ -91,10 +105,10 @@ function scanAdmissionTimestamps(
     if (step === null) {
       continue;
     }
-    if (prepareAt === null && step === 'prepare' && entry.kind === 'result' && entry.outcome !== 'ambiguous') {
+    if (step === 'prepare' && entry.kind === 'result' && entry.outcome !== 'ambiguous' && isEarlier(entry.recordedAtIso, prepareAt)) {
       prepareAt = entry.recordedAtIso;
     }
-    if (dispatchAt === null && step === 'dispatch' && entry.kind === 'intent') {
+    if (step === 'dispatch' && entry.kind === 'intent' && isEarlier(entry.recordedAtIso, dispatchAt)) {
       dispatchAt = entry.recordedAtIso;
     }
   }
@@ -154,15 +168,16 @@ function firstInWindowParkAt(
   entries: readonly LaneRunJournalEntryRecord[],
   weekStartMs: number,
 ): string | null {
+  let earliestParkAt: string | null = null;
   for (const entry of entries) {
     if (Date.parse(entry.recordedAtIso) < weekStartMs) {
       continue;
     }
-    if (entry.kind === 'conduct' && entry.state === 'parked') {
-      return entry.recordedAtIso;
+    if (entry.kind === 'conduct' && entry.state === 'parked' && isEarlier(entry.recordedAtIso, earliestParkAt)) {
+      earliestParkAt = entry.recordedAtIso;
     }
   }
-  return null;
+  return earliestParkAt;
 }
 
 /**

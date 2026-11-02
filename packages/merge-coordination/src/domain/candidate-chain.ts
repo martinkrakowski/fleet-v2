@@ -68,13 +68,17 @@ export function validateCandidateChain(value: unknown, expectedBaseSha: string):
 /**
  * Append a candidate to the end of a chain and validate the result. The base
  * sha is taken from the chain head, or from the next candidate when the chain
- * is empty. Never mutates its inputs.
+ * is empty. Never mutates its inputs. Refuses, without throwing, when the
+ * chain is not an array.
  */
 export function appendCandidate(chain: CandidateChain, next: unknown): ValidationResult<CandidateChain> {
+  if (!Array.isArray(chain)) {
+    return refused('candidate chain must be an array');
+  }
   const extended: unknown[] = [...chain, next];
   let expectedBaseSha = '';
   const head = chain[0];
-  if (head !== undefined) {
+  if (typeof head === 'object' && head !== null && 'baseSha' in head && typeof head.baseSha === 'string') {
     expectedBaseSha = head.baseSha;
   } else if (typeof next === 'object' && next !== null && !Array.isArray(next)) {
     const baseSha = (next as Record<string, unknown>).baseSha;
@@ -103,7 +107,7 @@ export function invalidateFrom(chain: CandidateChain, candidateId: string): Vali
   let index = -1;
   for (let i = 0; i < chain.length; i++) {
     const record = chain[i];
-    if (record !== undefined && record.id === candidateId) {
+    if (record !== undefined && record !== null && typeof record === 'object' && 'id' in record && record.id === candidateId) {
       index = i;
       break;
     }
@@ -135,7 +139,7 @@ export function assessChainAgainstBase(chain: CandidateChain, observedBaseSha: s
     return refused('observed base sha must be a 40-character lower-case hex string');
   }
   const head = chain[0];
-  if (head === undefined) {
+  if (head === undefined || head === null || typeof head !== 'object') {
     return refused('candidate chain must be a non-empty array');
   }
   if (observedBaseSha === head.baseSha) {
@@ -149,6 +153,14 @@ export function assessChainAgainstBase(chain: CandidateChain, observedBaseSha: s
 
 /** Whether a gate receipt proves that a candidate passed its gate. */
 export function receiptProvesCandidate(candidate: CandidateRecord, receipt: GateReceiptRecord, gateProfile: string): boolean {
+  if (
+    candidate === null ||
+    typeof candidate !== 'object' ||
+    receipt === null ||
+    typeof receipt !== 'object'
+  ) {
+    return false;
+  }
   return (
     receipt.result === 'passed' &&
     receipt.testedSha === candidate.resultSha &&
@@ -167,11 +179,11 @@ export function selectPromotable(
   observedBaseSha: string,
   gateProfile: string,
 ): CandidateRecord | null {
-  if (!Array.isArray(chain) || chain.length === 0) {
+  if (!Array.isArray(chain) || chain.length === 0 || !Array.isArray(receipts)) {
     return null;
   }
   const head = chain[0];
-  if (head === undefined || head.baseSha !== observedBaseSha) {
+  if (head === undefined || head === null || typeof head !== 'object' || head.baseSha !== observedBaseSha) {
     return null;
   }
   const proven = receipts.some((receipt) => receiptProvesCandidate(head, receipt, gateProfile));
@@ -180,5 +192,8 @@ export function selectPromotable(
 
 /** Whether promoting a sha preserves the candidate's identity. */
 export function promotionPreservesIdentity(candidate: CandidateRecord, promotedSha: string): boolean {
+  if (candidate === null || typeof candidate !== 'object') {
+    return false;
+  }
   return promotedSha === candidate.resultSha;
 }

@@ -8,6 +8,7 @@ import {
   receiptProvesCandidate,
   selectPromotable,
   validateCandidateChain,
+  type CandidateChain,
 } from '../candidate-chain.js';
 import type { CandidateRecord } from '../entities/CandidateRecord.js';
 import type { GateReceiptRecord } from '../entities/GateReceiptRecord.js';
@@ -132,6 +133,25 @@ describe('appendCandidate', () => {
       expect(result.value[0]).toEqual(c1);
     }
   });
+
+  it('refuses null, undefined and non-array chain without throwing', () => {
+    expect(() => appendCandidate(null as unknown as CandidateChain, c1)).not.toThrow();
+    expect(() => appendCandidate(undefined as unknown as CandidateChain, c1)).not.toThrow();
+    expect(() => appendCandidate(42 as unknown as CandidateChain, c1)).not.toThrow();
+    expect(() => appendCandidate('nope' as unknown as CandidateChain, c1)).not.toThrow();
+    expect(() => appendCandidate({} as unknown as CandidateChain, c1)).not.toThrow();
+    expect(appendCandidate(null as unknown as CandidateChain, c1)).toEqual({
+      ok: false,
+      reason: 'candidate chain must be an array',
+    });
+    expect(appendCandidate(undefined as unknown as CandidateChain, c1)).toEqual({
+      ok: false,
+      reason: 'candidate chain must be an array',
+    });
+    expect(appendCandidate(42 as unknown as CandidateChain, c1).ok).toBe(false);
+    expect(appendCandidate('nope' as unknown as CandidateChain, c1).ok).toBe(false);
+    expect(appendCandidate({} as unknown as CandidateChain, c1).ok).toBe(false);
+  });
 });
 
 describe('invalidateFrom', () => {
@@ -170,6 +190,25 @@ describe('invalidateFrom', () => {
     invalidateFrom(input, 'c2');
     expect(input).toEqual(copy);
   });
+
+  it('refuses null, undefined and non-array chain without throwing', () => {
+    expect(() => invalidateFrom(null as unknown as CandidateChain, 'c1')).not.toThrow();
+    expect(() => invalidateFrom(undefined as unknown as CandidateChain, 'c1')).not.toThrow();
+    expect(() => invalidateFrom(42 as unknown as CandidateChain, 'c1')).not.toThrow();
+    expect(() => invalidateFrom('nope' as unknown as CandidateChain, 'c1')).not.toThrow();
+    expect(() => invalidateFrom({} as unknown as CandidateChain, 'c1')).not.toThrow();
+    expect(invalidateFrom(null as unknown as CandidateChain, 'c1')).toEqual({
+      ok: false,
+      reason: 'candidate chain must be an array',
+    });
+    expect(invalidateFrom(undefined as unknown as CandidateChain, 'c1')).toEqual({
+      ok: false,
+      reason: 'candidate chain must be an array',
+    });
+    expect(invalidateFrom(42 as unknown as CandidateChain, 'c1').ok).toBe(false);
+    expect(invalidateFrom('nope' as unknown as CandidateChain, 'c1').ok).toBe(false);
+    expect(invalidateFrom({} as unknown as CandidateChain, 'c1').ok).toBe(false);
+  });
 });
 
 describe('assessChainAgainstBase', () => {
@@ -202,6 +241,25 @@ describe('assessChainAgainstBase', () => {
   it('refuses a bad sha', () => {
     expect(assessChainAgainstBase(goodChain, 'bad').ok).toBe(false);
   });
+
+  it('refuses null, undefined and non-array chain without throwing', () => {
+    expect(() => assessChainAgainstBase(null as unknown as CandidateChain, sha(1))).not.toThrow();
+    expect(() => assessChainAgainstBase(undefined as unknown as CandidateChain, sha(1))).not.toThrow();
+    expect(() => assessChainAgainstBase(42 as unknown as CandidateChain, sha(1))).not.toThrow();
+    expect(() => assessChainAgainstBase('nope' as unknown as CandidateChain, sha(1))).not.toThrow();
+    expect(() => assessChainAgainstBase({} as unknown as CandidateChain, sha(1))).not.toThrow();
+    expect(assessChainAgainstBase(null as unknown as CandidateChain, sha(1))).toEqual({
+      ok: false,
+      reason: 'candidate chain must be a non-empty array',
+    });
+    expect(assessChainAgainstBase(undefined as unknown as CandidateChain, sha(1))).toEqual({
+      ok: false,
+      reason: 'candidate chain must be a non-empty array',
+    });
+    expect(assessChainAgainstBase(42 as unknown as CandidateChain, sha(1)).ok).toBe(false);
+    expect(assessChainAgainstBase('nope' as unknown as CandidateChain, sha(1)).ok).toBe(false);
+    expect(assessChainAgainstBase({} as unknown as CandidateChain, sha(1)).ok).toBe(false);
+  });
 });
 
 describe('receiptProvesCandidate', () => {
@@ -225,6 +283,45 @@ describe('receiptProvesCandidate', () => {
 
   it('is false for a different profile', () => {
     expect(receiptProvesCandidate(c1, receipt('r1', sha(2), 'profile-b', 'passed'), 'profile-a')).toBe(false);
+  });
+
+  it('returns false on null, undefined and invalid input without throwing', () => {
+    expect(() =>
+      receiptProvesCandidate(
+        null as unknown as CandidateRecord,
+        receipt('r1', sha(2), 'profile-a', 'passed'),
+        'profile-a',
+      ),
+    ).not.toThrow();
+    expect(() =>
+      receiptProvesCandidate(
+        undefined as unknown as CandidateRecord,
+        receipt('r1', sha(2), 'profile-a', 'passed'),
+        'profile-a',
+      ),
+    ).not.toThrow();
+    expect(() =>
+      receiptProvesCandidate(c1, null as unknown as GateReceiptRecord, 'profile-a'),
+    ).not.toThrow();
+    expect(() =>
+      receiptProvesCandidate(c1, undefined as unknown as GateReceiptRecord, 'profile-a'),
+    ).not.toThrow();
+    expect(
+      receiptProvesCandidate(
+        null as unknown as CandidateRecord,
+        receipt('r1', sha(2), 'profile-a', 'passed'),
+        'profile-a',
+      ),
+    ).toBe(false);
+    expect(
+      receiptProvesCandidate(
+        undefined as unknown as CandidateRecord,
+        receipt('r1', sha(2), 'profile-a', 'passed'),
+        'profile-a',
+      ),
+    ).toBe(false);
+    expect(receiptProvesCandidate(c1, null as unknown as GateReceiptRecord, 'profile-a')).toBe(false);
+    expect(receiptProvesCandidate(c1, undefined as unknown as GateReceiptRecord, 'profile-a')).toBe(false);
   });
 });
 
@@ -266,6 +363,114 @@ describe('selectPromotable', () => {
     const result = selectPromotable([], [receipt('r1', sha(2), 'profile-a', 'passed')], sha(1), 'profile-a');
     expect(result).toBeNull();
   });
+
+  it('returns null on null, undefined and non-array input without throwing', () => {
+    expect(() =>
+      selectPromotable(
+        null as unknown as CandidateChain,
+        [receipt('r1', sha(2), 'profile-a', 'passed')],
+        sha(1),
+        'profile-a',
+      ),
+    ).not.toThrow();
+    expect(() =>
+      selectPromotable(
+        undefined as unknown as CandidateChain,
+        [receipt('r1', sha(2), 'profile-a', 'passed')],
+        sha(1),
+        'profile-a',
+      ),
+    ).not.toThrow();
+    expect(() =>
+      selectPromotable(
+        42 as unknown as CandidateChain,
+        [receipt('r1', sha(2), 'profile-a', 'passed')],
+        sha(1),
+        'profile-a',
+      ),
+    ).not.toThrow();
+    expect(() =>
+      selectPromotable(
+        'nope' as unknown as CandidateChain,
+        [receipt('r1', sha(2), 'profile-a', 'passed')],
+        sha(1),
+        'profile-a',
+      ),
+    ).not.toThrow();
+    expect(() =>
+      selectPromotable(
+        {} as unknown as CandidateChain,
+        [receipt('r1', sha(2), 'profile-a', 'passed')],
+        sha(1),
+        'profile-a',
+      ),
+    ).not.toThrow();
+    expect(() =>
+      selectPromotable(goodChain, null as unknown as readonly GateReceiptRecord[], sha(1), 'profile-a'),
+    ).not.toThrow();
+    expect(() =>
+      selectPromotable(goodChain, undefined as unknown as readonly GateReceiptRecord[], sha(1), 'profile-a'),
+    ).not.toThrow();
+    expect(() =>
+      selectPromotable(goodChain, 42 as unknown as readonly GateReceiptRecord[], sha(1), 'profile-a'),
+    ).not.toThrow();
+    expect(() =>
+      selectPromotable(goodChain, {} as unknown as readonly GateReceiptRecord[], sha(1), 'profile-a'),
+    ).not.toThrow();
+
+    expect(
+      selectPromotable(
+        null as unknown as CandidateChain,
+        [receipt('r1', sha(2), 'profile-a', 'passed')],
+        sha(1),
+        'profile-a',
+      ),
+    ).toBeNull();
+    expect(
+      selectPromotable(
+        undefined as unknown as CandidateChain,
+        [receipt('r1', sha(2), 'profile-a', 'passed')],
+        sha(1),
+        'profile-a',
+      ),
+    ).toBeNull();
+    expect(
+      selectPromotable(
+        42 as unknown as CandidateChain,
+        [receipt('r1', sha(2), 'profile-a', 'passed')],
+        sha(1),
+        'profile-a',
+      ),
+    ).toBeNull();
+    expect(
+      selectPromotable(
+        'nope' as unknown as CandidateChain,
+        [receipt('r1', sha(2), 'profile-a', 'passed')],
+        sha(1),
+        'profile-a',
+      ),
+    ).toBeNull();
+    expect(
+      selectPromotable(
+        {} as unknown as CandidateChain,
+        [receipt('r1', sha(2), 'profile-a', 'passed')],
+        sha(1),
+        'profile-a',
+      ),
+    ).toBeNull();
+    expect(
+      selectPromotable(goodChain, null as unknown as readonly GateReceiptRecord[], sha(1), 'profile-a'),
+    ).toBeNull();
+    expect(
+      selectPromotable(goodChain, undefined as unknown as readonly GateReceiptRecord[], sha(1), 'profile-a'),
+    ).toBeNull();
+    expect(
+      selectPromotable(goodChain, 42 as unknown as readonly GateReceiptRecord[], sha(1), 'profile-a'),
+    ).toBeNull();
+    expect(
+      selectPromotable(goodChain, {} as unknown as readonly GateReceiptRecord[], sha(1), 'profile-a'),
+    ).toBeNull();
+  });
 });
 
 describe('promotionPreservesIdentity', () => {
@@ -275,5 +480,18 @@ describe('promotionPreservesIdentity', () => {
 
   it('is false for another sha', () => {
     expect(promotionPreservesIdentity(c1, sha(9))).toBe(false);
+  });
+
+  it('returns false on null, undefined and invalid input without throwing', () => {
+    expect(() => promotionPreservesIdentity(null as unknown as CandidateRecord, sha(2))).not.toThrow();
+    expect(() => promotionPreservesIdentity(undefined as unknown as CandidateRecord, sha(2))).not.toThrow();
+    expect(() => promotionPreservesIdentity(42 as unknown as CandidateRecord, sha(2))).not.toThrow();
+    expect(() => promotionPreservesIdentity('nope' as unknown as CandidateRecord, sha(2))).not.toThrow();
+    expect(() => promotionPreservesIdentity([] as unknown as CandidateRecord, sha(2))).not.toThrow();
+    expect(promotionPreservesIdentity(null as unknown as CandidateRecord, sha(2))).toBe(false);
+    expect(promotionPreservesIdentity(undefined as unknown as CandidateRecord, sha(2))).toBe(false);
+    expect(promotionPreservesIdentity(42 as unknown as CandidateRecord, sha(2))).toBe(false);
+    expect(promotionPreservesIdentity('nope' as unknown as CandidateRecord, sha(2))).toBe(false);
+    expect(promotionPreservesIdentity([] as unknown as CandidateRecord, sha(2))).toBe(false);
   });
 });

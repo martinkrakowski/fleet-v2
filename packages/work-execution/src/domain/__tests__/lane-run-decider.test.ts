@@ -701,14 +701,27 @@ describe('seat-failed state', () => {
     });
   });
 
-  it('F3: an unavailable or already-dispatched seat parks', () => {
+  it('F3: an unavailable seat parks', () => {
     const unavailable = baseFacts({ state: 'seat-failed', implementerSeat: { ok: false } });
     assertDecision(unavailable, record({}), decide(record({}), unavailable), {
       kind: 'park', reason: 'seat-plan-exhausted', qualifier: null, parkedFrom: 'seat-failed',
     });
-    const used = baseFacts({ state: 'seat-failed', roundSeatIndexes: [0] });
-    assertDecision(used, record({}), decide(record({}), used), {
-      kind: 'park', reason: 'seat-plan-exhausted', qualifier: null, parkedFrom: 'seat-failed',
+  });
+
+  it('F3b: a chosen seat is prepared even when its index appears in roundSeatIndexes', () => {
+    const used = baseFacts({
+      state: 'seat-failed',
+      implementerSeat: { ok: true, seatIndex: 0 },
+      roundSeatIndexes: [0],
+    });
+    expect(decide(record({}), used)).toEqual({
+      kind: 'act',
+      step: 'prepare',
+      key: `${RUN_ID}/r0/prepare/0/a2`,
+      round: 0,
+      seatIndex: 0,
+      head12: null,
+      retry: null,
     });
   });
 

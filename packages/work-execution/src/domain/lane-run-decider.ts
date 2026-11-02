@@ -570,7 +570,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       ) {
         return dispatchOrPrepare(record.round, attempt, facts.implementerSeat);
       }
-      if (!facts.implementerSeat.ok || facts.roundSeatIndexes.includes(facts.implementerSeat.seatIndex)) {
+      if (!facts.implementerSeat.ok) {
         return park('seat-plan-exhausted', null);
       }
       return prepareAct(record.round, facts.implementerSeat.seatIndex);

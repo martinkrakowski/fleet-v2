@@ -470,10 +470,7 @@ async function runnerBinaryLines(probes: DoctorProbes): Promise<DoctorLine[]> {
 
 /** The reviewed `gh` binary: first executable fixed candidate, or FAIL naming all candidates. */
 async function ghBinaryLines(probes: DoctorProbes): Promise<DoctorLine[]> {
-  if (probes.ghBinary === undefined) {
-    return [line('gh-binary', 'gh', 'resolved', 'UNKNOWN', 'gh resolution probe failed')];
-  }
-  const gh = await safely(() => probes.ghBinary!());
+  const gh = await safely(() => probes.ghBinary());
   if (gh === undefined) {
     return [line('gh-binary', 'gh', 'resolved', 'UNKNOWN', 'gh resolution probe failed')];
   }

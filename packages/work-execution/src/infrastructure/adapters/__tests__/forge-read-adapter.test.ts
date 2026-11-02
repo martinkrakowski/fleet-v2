@@ -137,6 +137,43 @@ describe('ForgeReadAdapter.readPullRequest', () => {
     ]);
   });
 
+  it('a branch read parses the snapshot baseRef from a recorded payload (R4a)', async () => {
+    const payload = JSON.stringify({
+      baseRefName: 'chain/x',
+      closedAt: null,
+      headRefName: 'feat/example-chain',
+      headRefOid: '8e136fe0e0cc916b9d3485eaafe653e3143d9d63',
+      mergeCommit: null,
+      mergedAt: null,
+      mergeStateStatus: 'CLEAN',
+      number: 311,
+      state: 'OPEN',
+    });
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: payload, stderr: '' });
+    const result = await makeAdapter({ runGh }).readPullRequest({
+      ref: { kind: 'branch', branchName: 'feat/example-chain' },
+    });
+
+    expect(result).toEqual({
+      outcome: 'found',
+      pullRequest: expect.objectContaining({ baseRef: 'chain/x', number: 311, state: 'open' }),
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('a branch read with two open PRs reads unavailable from a recorded failure body (R4a)', async () => {
+    const { runGh } = makeRunGh({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'multiple pull requests match for branch "feat/example-chain"',
+    });
+    const result = await makeAdapter({ runGh }).readPullRequest({
+      ref: { kind: 'branch', branchName: 'feat/example-chain' },
+    });
+
+    expect(result.outcome).toBe('unavailable');
+  });
+
   it('reads a closed-unmerged PR with closedAt set and mergedAt null', async () => {
     const { runGh } = makeRunGh({ exitCode: 0, stdout: CLOSED_UNMERGED_FIXTURE, stderr: '' });
     const adapter = makeAdapter({ runGh });

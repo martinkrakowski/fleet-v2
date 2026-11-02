@@ -1,0 +1,20 @@
+# Per-file wall times for the shard balance, recorded the lane-pipeline way:
+# each tests/*.test.sh run alone on a fresh checkout, once, seconds.
+# Linux column: measured on this Linux host (dash as sh).
+# macOS column: the same single run under the local sh, because no Mac was
+# reachable when it was recorded; the assignment only needs consistent
+# relative weights. 0-second runs are recorded as 1.
+# <path> <linux-seconds> <macos-seconds>
+tests/agy-round.test.sh 3 3
+tests/agy-run.test.sh 17 17
+tests/check-duplication.test.sh 1 1
+tests/e2e-ssh-fixture.test.sh 1 1
+tests/fleet-host-bootstrap.test.sh 3 3
+tests/fleet-host-bootstrap-chmod.test.sh 1 1
+tests/gate-slot.test.sh 16 16
+tests/hexagen-contract.test.sh 1 1
+tests/kill-worktree-tree.test.sh 13 13
+tests/lane-diff-check.test.sh 43 43
+tests/ocm-run.test.sh 187 187
+tests/seams.test.sh 1 1
+tests/test-bin-shard.test.sh 5 5

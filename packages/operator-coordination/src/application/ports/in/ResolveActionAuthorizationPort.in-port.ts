@@ -13,7 +13,6 @@ export interface ResolveActionAuthorizationRequest {
   readonly authorizationGrantId?: string;
   readonly repository?: { readonly owner: string; readonly repo: string } | string;
   readonly pullRequestNumber?: number;
-  readonly pullRequest?: number;
 }
 
 export type ResolveActionAuthorizationResult =

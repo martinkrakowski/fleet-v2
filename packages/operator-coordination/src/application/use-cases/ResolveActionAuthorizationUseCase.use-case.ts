@@ -211,7 +211,7 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
   }
 
   private resolveTargetPullRequest(request: ResolveActionAuthorizationRequest): number | null {
-    const pr = request.pullRequestNumber ?? request.pullRequest;
+    const pr = request.pullRequestNumber;
     return typeof pr === 'number' && Number.isSafeInteger(pr) && pr > 0 ? pr : null;
   }
 

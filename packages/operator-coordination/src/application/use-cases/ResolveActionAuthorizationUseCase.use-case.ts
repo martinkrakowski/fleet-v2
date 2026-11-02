@@ -102,6 +102,22 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         }, not ${request.actionScope.trim()} at ${request.expectedHeadSha.trim()}`,
       );
     }
+    const mergeGrant = candidate.getMergeGrant();
+    if (mergeGrant !== null) {
+      const targetRepo = this.resolveTargetRepository(request);
+      const targetPr = this.resolveTargetPullRequest(request);
+      if (
+        targetRepo === null ||
+        targetPr === null ||
+        mergeGrant.repository.owner !== targetRepo.owner ||
+        mergeGrant.repository.repo !== targetRepo.repo ||
+        mergeGrant.pullRequestNumber !== targetPr
+      ) {
+        return blocked(
+          `grant ${grantId} authorizes ${mergeGrant.repository.owner}/${mergeGrant.repository.repo} pull request ${mergeGrant.pullRequestNumber}`,
+        );
+      }
+    }
     if (candidate.getConsumptions().length > 0) {
       return blocked(`grant ${grantId} is already consumed by another action`);
     }
@@ -132,7 +148,8 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         candidate.projectId === request.projectId.trim() &&
         candidate.actionScope === request.actionScope.trim() &&
         candidate.expectedHeadSha === head &&
-        !isPolicyGrantRecord(candidate),
+        !isPolicyGrantRecord(candidate) &&
+        this.matchesMergeGrantCoordinates(candidate, request),
     );
     const approved = matching.filter((candidate) => candidate.state === 'approved');
     const preferred =
@@ -173,5 +190,46 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     };
     await (this.deps?.requestRepo.saveRequest(refreshed) ?? Promise.resolve());
     return refreshed;
+  }
+
+  private resolveTargetRepository(
+    request: ResolveActionAuthorizationRequest,
+  ): { owner: string; repo: string } | null {
+    if (typeof request.repository === 'object' && request.repository !== null) {
+      const { owner, repo } = request.repository as { owner?: unknown; repo?: unknown };
+      if (typeof owner === 'string' && typeof repo === 'string' && owner.trim() && repo.trim()) {
+        return { owner: owner.trim(), repo: repo.trim() };
+      }
+    } else if (typeof request.repository === 'string') {
+      const parts = request.repository.trim().split('/');
+      if (parts.length === 2 && parts[0].trim() && parts[1].trim()) {
+        return { owner: parts[0].trim(), repo: parts[1].trim() };
+      }
+    }
+    return null;
+  }
+
+  private resolveTargetPullRequest(request: ResolveActionAuthorizationRequest): number | null {
+    const pr = request.pullRequestNumber;
+    return typeof pr === 'number' && Number.isSafeInteger(pr) && pr > 0 ? pr : null;
+  }
+
+  private matchesMergeGrantCoordinates(
+    record: CoordinationRequestRecord,
+    request: ResolveActionAuthorizationRequest,
+  ): boolean {
+    if (record.mergeGrant === undefined) {
+      return true;
+    }
+    const targetRepo = this.resolveTargetRepository(request);
+    const targetPr = this.resolveTargetPullRequest(request);
+    if (targetRepo === null || targetPr === null) {
+      return false;
+    }
+    return (
+      record.mergeGrant.repository.owner === targetRepo.owner &&
+      record.mergeGrant.repository.repo === targetRepo.repo &&
+      record.mergeGrant.pullRequestNumber === targetPr
+    );
   }
 }

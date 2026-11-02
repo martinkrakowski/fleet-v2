@@ -22,6 +22,7 @@ import {
   InspectOutstandingCoordinationUseCase,
   InspectProjectProfileUseCase,
   InstallationReferenceAdapter,
+  IssueMergeGrantUseCase,
   IssuePolicyForgeGrantUseCase,
   ListAttentionItemsUseCase,
   ListOwnerQuestionsUseCase,
@@ -221,6 +222,17 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     ids: { newRequestId: newUlid, newGrantId: newUlid },
   });
 
+  // DT6b: the attempt-less merge-grant use case over the same shared
+  // coordination request store; the merge-pass MergeGrantAdapter delegates to
+  // it through this root. The clock and ids are the root's own, as for every
+  // composition here.
+  const issueMergeGrantUseCase = new IssueMergeGrantUseCase({
+    requestRepo: coordinationRequestRepository,
+    clock: { nowIso: () => new Date().toISOString() },
+    ids: { newRequestId: newUlid, newGrantId: newUlid },
+    profileRepo: projectProfileRepository,
+  });
+
   // --- project profiles and probes (P6b) --------------------------------------
   // The execution context reads profiles and records probe receipts through
   // the operator-coordination use cases, bound here (same delegate pattern as
@@ -245,6 +257,7 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     coordination,
     coordinationRequestRepository,
     issuePolicyForgeGrantUseCase,
+    issueMergeGrantUseCase,
     profileRead,
     probeRecord,
     executorForHostName,

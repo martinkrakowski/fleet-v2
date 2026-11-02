@@ -696,6 +696,26 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
     expect(result).toMatchObject({ outcome: 'unavailable', code: 'unknown' });
   });
 
+  it('does not let a later SUCCESS hide a failure of the same context name', async () => {
+    const stdout = page({ contextsNodes: [checkRun('gate', 'FAILURE'), checkRun('gate', 'SUCCESS')] });
+    const { runGh } = makeRunGh({ exitCode: 0, stdout, stderr: '' });
+    const result = await makeAdapter({ runGh }).readForgeMerge({ ...BASE_REQUEST, requiredContexts: ['gate'] });
+    expect(result).toMatchObject({ outcome: 'ok', contexts: [{ name: 'gate', state: 'FAILURE', isGreen: false }] });
+  });
+
+  it('does not count premerge as green when two creators report it', async () => {
+    const stdout = page({
+      contextsNodes: [statusContext('premerge', 'SUCCESS', 'other'), statusContext('premerge', 'SUCCESS', 'poster')],
+    });
+    const { runGh } = makeRunGh({ exitCode: 0, stdout, stderr: '' });
+    const result = await makeAdapter({ runGh }).readForgeMerge({
+      ...BASE_REQUEST,
+      requiredContexts: ['premerge'],
+      posterLogin: 'poster',
+    });
+    expect(result).toMatchObject({ outcome: 'ok', contexts: [{ name: 'premerge', isGreen: false }] });
+  });
+
   it('fails as unknown when a finished contexts connection changes in a replay', async () => {
     const responses = [
       page({

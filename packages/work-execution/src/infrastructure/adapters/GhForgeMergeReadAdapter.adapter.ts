@@ -367,6 +367,27 @@ function threadsPageSignature(page: MergeThreadsPageResult & { kind: 'page' }): 
 }
 
 /**
+ * Two producers can report one context name. The read fails safe: any node
+ * that is not SUCCESS decides, and SUCCESS nodes by different creators lose
+ * their creator, so the premerge creator check cannot pass on a mix.
+ */
+function combineContextNodes(
+  existing: MergeContextNode | undefined,
+  node: MergeContextNode,
+): MergeContextNode {
+  if (existing === undefined) {
+    return node;
+  }
+  if (existing.state !== 'SUCCESS') {
+    return existing;
+  }
+  if (node.state !== 'SUCCESS') {
+    return node;
+  }
+  return existing.creatorLogin === node.creatorLogin ? existing : { ...existing, creatorLogin: null };
+}
+
+/**
  * One query reads both connections, so a finished connection comes back as a
  * replay of its first page. An identical replay is ignored so counts do not
  * double; a different one means the forge moved mid-read, and returns false.
@@ -382,7 +403,7 @@ function applyContextsPage(
   }
   state.firstPage ??= signature;
   for (const node of page.nodes) {
-    contextsByName.set(node.name, node);
+    contextsByName.set(node.name, combineContextNodes(contextsByName.get(node.name), node));
   }
   state.hasNext = page.hasNextPage;
   state.cursor = page.hasNextPage ? page.endCursor : null;

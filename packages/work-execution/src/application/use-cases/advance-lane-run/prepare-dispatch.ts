@@ -16,6 +16,32 @@ import { manifestExpectedArtifacts, manifestPositiveInteger, manifestTimeLimitSe
 import { performFixPrepare } from './review-fix.js';
 import { parkSpentOneWayKey } from './merge.js';
 
+function latestAttemptRecordOf(gathered: GatheredLaneRunFacts): AttemptRecord | null {
+  for (let index = gathered.attemptRecords.length - 1; index >= 0; index -= 1) {
+    const candidate = gathered.attemptRecords[index];
+    if (candidate !== null) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function reconcilePendingRecoveryOrPark(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  source: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+  state: LaneRunStateValue,
+): Promise<AdvanceLaneRunResult | null> {
+  if (await hasIncompleteWorktreeRecovery(ctx, source.id)) {
+    const reconciled = await reconcileCancelledWorktreeRecovery(ctx, record, source, request);
+    if (!reconciled) {
+      return performPark(ctx, record, 'step-refused', 'prepare', state, request);
+    }
+  }
+  return null;
+}
+
 /**
  * The `act prepare` decision (K4-5): a fresh round-0 attempt on the selected
  * first-pass seat, copying the frozen-brief fields from the run's latest
@@ -47,17 +73,7 @@ export async function performPrepare(ctx: AdvanceStepContext,
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
   };
 
-  if (decision.round !== 0) {
-    return performFixPrepare(ctx, record, gathered, decision, request, refuse);
-  }
-  let source: AttemptRecord | null = null;
-  for (let index = gathered.attemptRecords.length - 1; index >= 0; index -= 1) {
-    const candidate = gathered.attemptRecords[index];
-    if (candidate !== null) {
-      source = candidate;
-      break;
-    }
-  }
+  const source = latestAttemptRecordOf(gathered);
   if (source === null) {
     return refuse('no-frozen-brief');
   }
@@ -66,11 +82,12 @@ export async function performPrepare(ctx: AdvanceStepContext,
   // leaves the attempt `cancelled` with the intent still open. Reconcile the
   // recovery before another seat is prepared; an unreconcilable recovery
   // parks instead of advancing over unfinished side effects.
-  if (await hasIncompleteWorktreeRecovery(ctx, source.id)) {
-    const reconciled = await reconcileCancelledWorktreeRecovery(ctx, record, source, request);
-    if (!reconciled) {
-      return performPark(ctx, record, 'step-refused', 'prepare', gathered.facts.state, request);
-    }
+  const recoveryPark = await reconcilePendingRecoveryOrPark(ctx, record, source, request, gathered.facts.state);
+  if (recoveryPark !== null) {
+    return recoveryPark;
+  }
+  if (decision.round !== 0) {
+    return performFixPrepare(ctx, record, gathered, decision, request, refuse);
   }
   const planResult = SeatPlan.create(source.seatPlan);
   const seat =
@@ -289,6 +306,24 @@ export function fixSeatForDispatch(
   return { kind: 'seat', seat: selection, ...(overrideVariant !== undefined ? { overrideVariant } : {}) };
 }
 
+function isWorktreePathValid(worktreePath: unknown): worktreePath is string {
+  if (typeof worktreePath !== 'string' || !worktreePath.startsWith('/') || worktreePath === '/' || worktreePath.includes('\0')) {
+    return false;
+  }
+  if (worktreePath.includes('//') || worktreePath.endsWith('/')) {
+    return false;
+  }
+  const segments = worktreePath.split('/');
+  return !segments.includes('.') && !segments.includes('..') && segments.slice(1).every((s) => s !== '');
+}
+
+function isAttemptIdValid(attemptId: unknown): attemptId is string {
+  if (typeof attemptId !== 'string' || attemptId.includes('/') || attemptId.includes('\\') || attemptId.includes('\0') || attemptId.includes('..')) {
+    return false;
+  }
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(attemptId);
+}
+
 /**
  * GB3: the recorded worktree path and attempt id are untrusted data
  * (`AttemptRecord` stores both as plain strings), so both are validated before
@@ -297,16 +332,8 @@ export function fixSeatForDispatch(
  * the leading slash, no NUL) and an attempt id that is safe as a file-name
  * fragment. A refused pair means no patch path is ever built.
  */
-function worktreeRecoveryPatchInputsValid(worktreePath: string, attemptId: string): boolean {
-  if (!worktreePath.startsWith('/') || worktreePath.includes('\0')) {
-    return false;
-  }
-  const segments = worktreePath.split('/');
-  if (segments.includes('.') || segments.includes('..')) {
-    return false;
-  }
-  const normalized = segments.slice(1).every((segment) => segment !== '');
-  return normalized && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(attemptId);
+export function worktreeRecoveryPatchInputsValid(worktreePath: unknown, attemptId: unknown): boolean {
+  return isWorktreePathValid(worktreePath) && isAttemptIdValid(attemptId);
 }
 
 /**
@@ -374,11 +401,8 @@ async function recoverUncommittedWorktree(ctx: AdvanceStepContext,
         entry.detail !== null &&
         entry.detail.startsWith('preserved uncommitted edits:'),
     );
-    if (priorIntent !== undefined && priorIntent.status !== 'completed') {
-      return false;
-    }
     if (priorIntent !== undefined) {
-      return true;
+      return priorIntent.status === 'completed';
     }
     const patchPath = latest.worktreePath + '.' + latest.id + '.patch';
     await append({

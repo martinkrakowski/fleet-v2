@@ -102,6 +102,17 @@ export function worktreeRootRefusal(worktreePath: string): string | null {
   return null;
 }
 
+function pathOrAncestorInSet(path: string, set: ReadonlySet<string>): boolean {
+  let prefix = path;
+  for (;;) {
+    if (set.has(prefix)) return true;
+    const slash = prefix.lastIndexOf('/');
+    if (slash === -1) break;
+    prefix = prefix.slice(0, slash);
+  }
+  return false;
+}
+
 /**
  * GB3: true when restoring the tracked `trackedPaths` (the paths `git reset
  * --hard` would write) could overwrite or remove an untracked path in
@@ -110,28 +121,20 @@ export function worktreeRootRefusal(worktreePath: string): string | null {
  * sitting at a tracked path or below one: in both cases reset would have to
  * replace or delete the untracked entry to restore the tracked one.
  */
-function resetWouldDestroyUntracked(
+export function resetWouldDestroyUntracked(
   trackedPaths: readonly string[],
   untrackedFiles: readonly string[],
 ): boolean {
   const untracked = new Set(untrackedFiles);
   for (const tracked of trackedPaths) {
-    let prefix = tracked;
-    for (;;) {
-      if (untracked.has(prefix)) return true;
-      const slash = prefix.lastIndexOf('/');
-      if (slash === -1) break;
-      prefix = prefix.slice(0, slash);
+    if (pathOrAncestorInSet(tracked, untracked)) {
+      return true;
     }
   }
   const trackedSet = new Set(trackedPaths);
   for (const untrackedFile of untrackedFiles) {
-    let prefix = untrackedFile;
-    for (;;) {
-      const slash = prefix.lastIndexOf('/');
-      if (slash === -1) break;
-      prefix = prefix.slice(0, slash);
-      if (trackedSet.has(prefix)) return true;
+    if (pathOrAncestorInSet(untrackedFile, trackedSet)) {
+      return true;
     }
   }
   return false;
@@ -363,6 +366,64 @@ function parseRawDiffTree(stdout: string): { readonly dstMode: string; readonly 
     entries.push({ dstMode: meta.slice(1).split(' ')[1] ?? '', path });
   }
   return entries;
+}
+
+function patchPathRefusal(patchPath: unknown, worktreePath: string): 'invalid-request' | 'patch-path-inside-worktree' | null {
+  if (typeof patchPath !== 'string' || !patchPath.startsWith('/') || patchPath.includes('\0')) {
+    return 'invalid-request';
+  }
+  const trimmedRoot = worktreePath.replace(/\/+$/, '');
+  if (patchPath === trimmedRoot || patchPath.startsWith(`${trimmedRoot}/`)) {
+    return 'patch-path-inside-worktree';
+  }
+  return null;
+}
+
+function parseUntrackedListing(stdoutA: string, stdoutB: string): string[] {
+  return [
+    ...new Set(
+      [...stdoutA.split('\n'), ...stdoutB.split('\n')]
+        .map((line) => line.replace(/\/+$/, '').trim())
+        .filter((line) => line !== ''),
+    ),
+  ].sort();
+}
+
+async function writeAndVerifyPatch(
+  executor: CommandExecutorPort,
+  physicalParent: string,
+  patchPath: string,
+  diff: string,
+): Promise<'preserved' | 'destination-exists' | 'git-refused'> {
+  const mkTemp = await executor.run(
+    ['mktemp', path.join(physicalParent, '.fleet-patch.XXXXXX')],
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
+  if (mkTemp.exitCode !== 0 || mkTemp.error !== undefined) {
+    return 'git-refused';
+  }
+  const tempPath = mkTemp.stdout.trim();
+  const write = await executor.run(['tee', tempPath], { input: diff, timeoutMs: GIT_TIMEOUT_MS });
+  if (write.exitCode !== 0 || write.error !== undefined) {
+    await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+    return 'git-refused';
+  }
+  const move = await executor.run(['mv', '-n', tempPath, patchPath], { timeoutMs: GIT_TIMEOUT_MS });
+  if (move.exitCode !== 0 || move.error !== undefined) {
+    await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+    return 'git-refused';
+  }
+  const tempCheck = await executor.run(['test', '-e', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+  if (tempCheck.exitCode === 0) {
+    await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+    return 'destination-exists';
+  }
+  const verify = await executor.run(['cmp', '-', patchPath], { input: diff, timeoutMs: GIT_TIMEOUT_MS });
+  if (verify.exitCode !== 0 || verify.error !== undefined) {
+    await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+    return 'git-refused';
+  }
+  return 'preserved';
 }
 
 export class WorkspaceAdapter implements WorkspacePort {
@@ -874,12 +935,9 @@ export class WorkspaceAdapter implements WorkspacePort {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
     const patchPath = request.patchPath;
-    if (typeof patchPath !== 'string' || !patchPath.startsWith('/') || patchPath.includes('\0')) {
-      return { outcome: 'refused', reason: 'invalid-request' };
-    }
-    const trimmedRoot = request.worktreePath.replace(/\/+$/, '');
-    if (patchPath === trimmedRoot || patchPath.startsWith(`${trimmedRoot}/`)) {
-      return { outcome: 'refused', reason: 'patch-path-inside-worktree' };
+    const pathRefusal = patchPathRefusal(patchPath, request.worktreePath);
+    if (pathRefusal !== null) {
+      return { outcome: 'refused', reason: pathRefusal };
     }
 
     // 2. The write runs on the recorded host's executor; an unresolvable host
@@ -923,33 +981,9 @@ export class WorkspaceAdapter implements WorkspacePort {
     // 6. Write atomically without following links or overwriting files: a
     //    fresh temp file created by mktemp, the diff written into it, then a
     //    no-clobber rename onto the destination. Any failure removes the temp.
-    const mkTemp = await executor.run(
-      ['mktemp', path.join(physicalParent, '.fleet-patch.XXXXXX')],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
-    if (mkTemp.exitCode !== 0 || mkTemp.error !== undefined) {
-      return { outcome: 'refused', reason: 'git-refused' };
-    }
-    const tempPath = mkTemp.stdout.trim();
-    const write = await executor.run(['tee', tempPath], { input: diff, timeoutMs: GIT_TIMEOUT_MS });
-    if (write.exitCode !== 0 || write.error !== undefined) {
-      await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
-      return { outcome: 'refused', reason: 'git-refused' };
-    }
-    const move = await executor.run(['mv', '-n', tempPath, patchPath], { timeoutMs: GIT_TIMEOUT_MS });
-    if (move.exitCode !== 0 || move.error !== undefined) {
-      await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
-      return { outcome: 'refused', reason: 'git-refused' };
-    }
-    // A destination can appear after the existence checks; `mv -n` then skips
-    // the move while reporting success, so the rename alone proves nothing.
-    // The destination must exist and match the preserved diff byte for byte;
-    // a mismatch (including a skipped move onto a foreign file) is a refusal,
-    // and only the leftover temp file — never a foreign destination — is removed.
-    const verify = await executor.run(['cmp', '-', patchPath], { input: diff, timeoutMs: GIT_TIMEOUT_MS });
-    if (verify.exitCode !== 0 || verify.error !== undefined) {
-      await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
-      return { outcome: 'refused', reason: 'git-refused' };
+    const writeOutcome = await writeAndVerifyPatch(executor, physicalParent, patchPath, diff);
+    if (writeOutcome !== 'preserved') {
+      return { outcome: 'refused', reason: writeOutcome };
     }
     return { outcome: 'preserved', patchPath, patchBytes: Buffer.byteLength(diff, 'utf8') };
   }
@@ -987,10 +1021,15 @@ export class WorkspaceAdapter implements WorkspacePort {
       ];
       const untrackedRun = await this.runGit(
         request.worktreePath,
-        ['ls-files', '--others', '--exclude-standard'],
+        ['ls-files', '--others'],
         executor,
       );
-      const untrackedFiles = untrackedRun.split('\n').filter((line) => line !== '');
+      const untrackedDirsRun = await this.runGit(
+        request.worktreePath,
+        ['ls-files', '--others', '--directory'],
+        executor,
+      );
+      const untrackedFiles = parseUntrackedListing(untrackedRun, untrackedDirsRun);
 
       // 3. Refuse BEFORE resetting when restoring a tracked path could overwrite
       //    or remove an untracked path (for example a deleted tracked path masked
@@ -1006,10 +1045,15 @@ export class WorkspaceAdapter implements WorkspacePort {
       // 5. Verify the untracked paths are unchanged.
       const afterRun = await this.runGit(
         request.worktreePath,
-        ['ls-files', '--others', '--exclude-standard'],
+        ['ls-files', '--others'],
         executor,
       );
-      const afterUntracked = afterRun.split('\n').filter((line) => line !== '');
+      const afterDirsRun = await this.runGit(
+        request.worktreePath,
+        ['ls-files', '--others', '--directory'],
+        executor,
+      );
+      const afterUntracked = parseUntrackedListing(afterRun, afterDirsRun);
       const unchanged =
         untrackedFiles.length === afterUntracked.length &&
         untrackedFiles.every((entry, index) => entry === afterUntracked[index]);

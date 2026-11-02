@@ -34,7 +34,10 @@ import { open } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import type { ChoiceQuestion, QuestionKind } from '@fleet/shared';
+import type {
+  ChoiceQuestion,
+  DecisionCallReceipt,
+} from '@fleet/shared';
 import {
   buildDecisionState,
   postJevDecision,
@@ -45,6 +48,7 @@ import type {
   MergeVetoAdvice,
   MergeVetoPort,
   MergeVetoRequest,
+  MergeVetoUnknownReason,
 } from '../../application/ports/out/MergeVetoPort.out-port.js';
 
 /** Consumer discriminator for the receipt journal. */
@@ -118,21 +122,11 @@ export type MergeVetoReserveResult =
   | { readonly ok: false; readonly reason: 'budget' | 'not-configured' };
 
 /**
- * Fields the caller declares for a settled merge-veto receipt; the journal
- * stamps `at` and `estimated` (estimated derives from whether a cost was
- * reported, so an absent cost keeps the reservation's assumed one).
+ * Fields the caller declares for a settled merge-veto receipt; the adapter
+ * supplies costUsd (falling back to assumedCostPerCallUsd), estimated, and at.
  */
-export interface MergeVetoSettledReceipt {
+export interface MergeVetoSettledReceipt extends DecisionCallReceipt {
   readonly consumer: typeof MERGE_VETO_CONSUMER;
-  readonly contextRef: string;
-  readonly provider: string;
-  readonly model: string;
-  readonly requestId?: string;
-  readonly costUsd?: number;
-  readonly questionKinds: readonly QuestionKind[];
-  readonly minConfidenceObserved?: number;
-  readonly unknownReason?: string;
-  readonly latencyMs: number;
 }
 
 /**
@@ -241,6 +235,34 @@ function vetoContextRef(request: MergeVetoRequest): string {
   return `merge-veto:${request.repository.owner}/${request.repository.repo}#${request.pullRequestNumber}@${request.verifiedHeadOid.slice(0, 12)}`;
 }
 
+function vetoContextRefSafe(request: MergeVetoRequest): string {
+  try {
+    return vetoContextRef(request);
+  } catch {
+    const owner = request.repository?.owner ?? 'unknown';
+    const repo = request.repository?.repo ?? 'unknown';
+    const pr = request.pullRequestNumber ?? 0;
+    const oid = typeof request.verifiedHeadOid === 'string' ? request.verifiedHeadOid.slice(0, 12) : 'unknown';
+    return `merge-veto:${owner}/${repo}#${pr}@${oid}`;
+  }
+}
+
+function isDeadlineExceeded(deadlineMs: number, nowMs: number): boolean {
+  return !Number.isFinite(deadlineMs) || nowMs >= deadlineMs;
+}
+
+function isValidMergeChoice(choice: unknown): choice is 'merge-safe' | 'hold-for-human' {
+  return choice === 'merge-safe' || choice === 'hold-for-human';
+}
+
+function extractRequestId(rawId: string): string | undefined {
+  return rawId === '' ? undefined : rawId;
+}
+
+function resolveServedModel(servedModel: string, fallbackModel: string): string {
+  return servedModel !== '' ? servedModel : fallbackModel;
+}
+
 function defaultHash(state: string): string {
   return createHash('sha256').update(state, 'utf8').digest('hex');
 }
@@ -305,32 +327,35 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
     }
   }
 
-  private async adviseMergeVetoInner(request: MergeVetoRequest): Promise<MergeVetoAdvice> {
-    // A non-finite threshold is a configuration error, never a low-confidence
-    // answer: the gate would accept everything, so it is refused before the
-    // state is built and before any key is read or fetch is made.
+  private checkPreflight(
+    request: MergeVetoRequest,
+    deadlineMs: number,
+    initialNowMs: number,
+  ): MergeVetoUnknownReason | null {
     if (!Number.isFinite(this.holdConfidence)) {
-      return { status: 'unknown', reason: 'not-configured' };
+      return 'not-configured';
     }
-
-    // Fresh clock before anything else: an expired or unparsable deadline is
-    // a deadline answer with no reservation, no key read and no fetch.
-    const deadlineMs = Date.parse(request.deadlineIso);
-    const initialNowMs = this.now();
-    if (!Number.isFinite(deadlineMs) || initialNowMs >= deadlineMs) {
-      return { status: 'unknown', reason: 'deadline' };
+    if (isDeadlineExceeded(deadlineMs, initialNowMs)) {
+      return 'deadline';
     }
     if (Math.min(this.timeoutMs ?? 3000, deadlineMs - initialNowMs) <= 0) {
-      return { status: 'unknown', reason: 'deadline' };
+      return 'deadline';
     }
-
-    // fleet-v2-only enforcement stays in policy; this adapter only honours the
-    // disabled list (invariant 4/6).
     if (this.disabledProjects.includes(`${request.repository.owner}/${request.repository.repo}`)) {
-      return { status: 'unknown', reason: 'not-configured' };
+      return 'not-configured';
     }
     if (!this.journal) {
-      return { status: 'unknown', reason: 'not-configured' };
+      return 'not-configured';
+    }
+    return null;
+  }
+
+  private async adviseMergeVetoInner(request: MergeVetoRequest): Promise<MergeVetoAdvice> {
+    const deadlineMs = Date.parse(request.deadlineIso);
+    const initialNowMs = this.now();
+    const preflight = this.checkPreflight(request, deadlineMs, initialNowMs);
+    if (preflight !== null) {
+      return { status: 'unknown', reason: preflight };
     }
 
     const state = this.buildState(request);
@@ -352,107 +377,91 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
       return { status: 'unknown', reason: reserved.reason };
     }
 
-    const contextRef = vetoContextRef(request);
+    const reservationId = reserved.reservationId;
+    let callStartMs = 0;
+    try {
+      const contextRef = vetoContextRef(request);
+      const preFetchNowMs = this.now();
+      if (isDeadlineExceeded(deadlineMs, preFetchNowMs)) {
+        return await this.finishDeadlineAfterReserve(reservationId, contextRef);
+      }
+      const timeoutMs = Math.min(
+        this.timeoutMs ?? 3000,
+        deadlineMs - preFetchNowMs,
+      );
 
-    // Re-read the clock immediately before the fetch: if the deadline passed
-    // while reserving, the reservation stays counted — it is settled as
-    // estimated with the deadline reason before answering.
-    const preFetchNowMs = this.now();
-    if (!Number.isFinite(deadlineMs) || preFetchNowMs >= deadlineMs) {
-      return await this.finishDeadlineAfterReserve(reserved.reservationId, contextRef);
-    }
-    const timeoutMs = Math.min(
-      this.timeoutMs ?? 3000,
-      deadlineMs - preFetchNowMs,
-    );
-
-    const callStartMs = this.now();
-    const result = await postJevDecision({
-      fetch: this.fetchFn,
-      key,
-      model: this.model,
-      stateJson: state.stateJson,
-      questions: { merge: toJevQuestion(MERGE_VETO_QUESTION) },
-      stateSha256: state.stateSha256,
-      timeoutMs,
-    });
-    const latencyMs = Math.max(0, this.now() - callStartMs);
-
-    if (!result.ok) {
-      // Keep the client failure reason as the outcome, but never return before
-      // settlement: the reservation stays counted, settled as estimated with
-      // the assumed cost and the failure reason.
-      const settled = await this.settleReservation(reserved.reservationId, {
-        consumer: MERGE_VETO_CONSUMER,
-        contextRef,
-        provider: MERGE_VETO_PROVIDER,
+      callStartMs = this.now();
+      const result = await postJevDecision({
+        fetch: this.fetchFn,
+        key,
         model: this.model,
-        costUsd: undefined,
-        questionKinds: ['choice'],
-        unknownReason: result.reason,
-        latencyMs,
+        stateJson: state.stateJson,
+        questions: { merge: toJevQuestion(MERGE_VETO_QUESTION) },
+        stateSha256: state.stateSha256,
+        timeoutMs,
       });
-      if (!settled) {
-        return { status: 'unknown', reason: 'not-configured' };
+      const latencyMs = Math.max(0, this.now() - callStartMs);
+
+      if (!result.ok) {
+        return await this.finishClientFailureAfterReserve(
+          reservationId,
+          contextRef,
+          result.reason,
+          latencyMs,
+        );
       }
-      return { status: 'unknown', reason: result.reason };
-    }
 
-    const validated = validateChoiceAnswer(
-      readMergeAnswer(result.parsed),
-      MERGE_VETO_QUESTION,
-      this.holdConfidence,
-    );
-    // A usable id is echoed to the entry and the advice; otherwise omitted.
-    const requestId = result.receipt.requestId === '' ? undefined : result.receipt.requestId;
-    // Reported cost when usable; absent stays undefined so the journal keeps
-    // the reservation's assumed cost and marks the settlement estimated.
-    const reportedCost = result.receipt.costUsd;
-    const servedModel = result.receipt.servedModel || this.model;
+      const validated = validateChoiceAnswer(
+        readMergeAnswer(result.parsed),
+        MERGE_VETO_QUESTION,
+        this.holdConfidence,
+      );
+      const requestId = extractRequestId(result.receipt.requestId);
+      const reportedCost = result.receipt.costUsd;
+      const servedModel = resolveServedModel(result.receipt.servedModel, this.model);
 
-    if (!validated.ok) {
-      const settled = await this.settleReservation(reserved.reservationId, {
-        consumer: MERGE_VETO_CONSUMER,
+      if (!validated.ok) {
+        return await this.finishValidationFailureAfterReserve(
+          reservationId,
+          contextRef,
+          servedModel,
+          validated.reason,
+          latencyMs,
+          reportedCost,
+          requestId,
+        );
+      }
+
+      if (!isValidMergeChoice(validated.choice)) {
+        return await this.finishValidationFailureAfterReserve(
+          reservationId,
+          contextRef,
+          servedModel,
+          'shape',
+          latencyMs,
+          reportedCost,
+          requestId,
+        );
+      }
+
+      return await this.finishAnswerAfterReserve(
+        reservationId,
         contextRef,
-        provider: MERGE_VETO_PROVIDER,
-        model: servedModel,
-        ...(requestId !== undefined ? { requestId } : {}),
-        costUsd: reportedCost,
-        questionKinds: ['choice'],
-        unknownReason: validated.reason,
+        servedModel,
+        validated.choice,
+        validated.confidence,
+        request.mode,
         latencyMs,
-      });
-      if (!settled) {
-        return { status: 'unknown', reason: 'not-configured' };
-      }
-      return { status: 'unknown', reason: validated.reason };
+        reportedCost,
+        requestId,
+      );
+    } catch {
+      return await this.finishTransportErrorAfterReserve(
+        reservationId,
+        vetoContextRefSafe(request),
+        callStartMs,
+      );
     }
-
-    if (validated.choice === undefined) {
-      return { status: 'unknown', reason: 'shape' };
-    }
-    const settled = await this.settleReservation(reserved.reservationId, {
-      consumer: MERGE_VETO_CONSUMER,
-      contextRef,
-      provider: MERGE_VETO_PROVIDER,
-      model: servedModel,
-      ...(requestId !== undefined ? { requestId } : {}),
-      costUsd: reportedCost,
-      questionKinds: ['choice'],
-      minConfidenceObserved: validated.confidence,
-      latencyMs,
-    });
-    if (!settled) {
-      return { status: 'unknown', reason: 'not-configured' };
-    }
-
-    return {
-      status: 'answered',
-      choice: validated.choice as 'merge-safe' | 'hold-for-human',
-      confidence: validated.confidence,
-      mode: request.mode,
-      ...(requestId !== undefined ? { decisionReceiptId: requestId } : {}),
-    };
   }
 
   /** Declared PR metadata only; never the diff, contents, brief or head oid. */
@@ -528,14 +537,138 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
       contextRef,
       provider: MERGE_VETO_PROVIDER,
       model: this.model,
-      costUsd: undefined,
+      costUsd: this.assumedCostPerCallUsd,
+      estimated: true,
       questionKinds: ['choice'],
       unknownReason: 'deadline',
       latencyMs: 0,
+      at: new Date(this.now()).toISOString(),
     });
     if (!settled) {
       return { status: 'unknown', reason: 'not-configured' };
     }
     return { status: 'unknown', reason: 'deadline' };
+  }
+
+  /** The reservation stands: settled as estimated with client failure reason. */
+  private async finishClientFailureAfterReserve(
+    reservationId: string,
+    contextRef: string,
+    reason: MergeVetoUnknownReason,
+    latencyMs: number,
+  ): Promise<MergeVetoAdvice> {
+    const settled = await this.settleReservation(reservationId, {
+      consumer: MERGE_VETO_CONSUMER,
+      contextRef,
+      provider: MERGE_VETO_PROVIDER,
+      model: this.model,
+      costUsd: this.assumedCostPerCallUsd,
+      estimated: true,
+      questionKinds: ['choice'],
+      unknownReason: reason,
+      latencyMs,
+      at: new Date(this.now()).toISOString(),
+    });
+    if (!settled) {
+      return { status: 'unknown', reason: 'not-configured' };
+    }
+    return { status: 'unknown', reason };
+  }
+
+  /** The reservation stands: settled as estimated with unexpected transport error. */
+  private async finishTransportErrorAfterReserve(
+    reservationId: string,
+    contextRef: string,
+    callStartMs: number,
+  ): Promise<MergeVetoAdvice> {
+    const latencyMs = callStartMs > 0 ? Math.max(0, this.now() - callStartMs) : 0;
+    const settled = await this.settleReservation(reservationId, {
+      consumer: MERGE_VETO_CONSUMER,
+      contextRef,
+      provider: MERGE_VETO_PROVIDER,
+      model: this.model,
+      costUsd: this.assumedCostPerCallUsd,
+      estimated: true,
+      questionKinds: ['choice'],
+      unknownReason: 'transport',
+      latencyMs,
+      at: new Date(this.now()).toISOString(),
+    });
+    if (!settled) {
+      return { status: 'unknown', reason: 'not-configured' };
+    }
+    return { status: 'unknown', reason: 'transport' };
+  }
+
+  /** Settle after validation failure or shape violation. */
+  private async finishValidationFailureAfterReserve(
+    reservationId: string,
+    contextRef: string,
+    servedModel: string,
+    reason: MergeVetoUnknownReason,
+    latencyMs: number,
+    reportedCost?: number,
+    requestId?: string,
+  ): Promise<MergeVetoAdvice> {
+    const costUsd = reportedCost ?? this.assumedCostPerCallUsd;
+    const estimated = reportedCost === undefined;
+    const receipt: MergeVetoSettledReceipt = {
+      consumer: MERGE_VETO_CONSUMER,
+      contextRef,
+      provider: MERGE_VETO_PROVIDER,
+      model: servedModel,
+      costUsd,
+      estimated,
+      questionKinds: ['choice'],
+      unknownReason: reason,
+      latencyMs,
+      at: new Date(this.now()).toISOString(),
+      ...(requestId !== undefined ? { requestId } : {}),
+    };
+    const settled = await this.settleReservation(reservationId, receipt);
+    if (!settled) {
+      return { status: 'unknown', reason: 'not-configured' };
+    }
+    return { status: 'unknown', reason };
+  }
+
+  /** Settle after successful choice validation. */
+  private async finishAnswerAfterReserve(
+    reservationId: string,
+    contextRef: string,
+    servedModel: string,
+    choice: 'merge-safe' | 'hold-for-human',
+    confidence: number,
+    mode: 'shadow' | 'live',
+    latencyMs: number,
+    reportedCost?: number,
+    requestId?: string,
+  ): Promise<MergeVetoAdvice> {
+    const costUsd = reportedCost ?? this.assumedCostPerCallUsd;
+    const estimated = reportedCost === undefined;
+    const receipt: MergeVetoSettledReceipt = {
+      consumer: MERGE_VETO_CONSUMER,
+      contextRef,
+      provider: MERGE_VETO_PROVIDER,
+      model: servedModel,
+      costUsd,
+      estimated,
+      questionKinds: ['choice'],
+      minConfidenceObserved: confidence,
+      latencyMs,
+      at: new Date(this.now()).toISOString(),
+      ...(requestId !== undefined ? { requestId } : {}),
+    };
+    const settled = await this.settleReservation(reservationId, receipt);
+    if (!settled) {
+      return { status: 'unknown', reason: 'not-configured' };
+    }
+    return {
+      status: 'answered',
+      choice,
+      confidence,
+      mode,
+      ...(requestId !== undefined ? { decisionReceiptId: requestId } : {}),
+    };
   }
 }

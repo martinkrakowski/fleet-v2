@@ -75,10 +75,17 @@ function makeResponse(body: unknown, status = 200): Response {
 }
 
 /** Fetch spy replaying recorded bodies and recording every call in `events`. */
-function fetchAnswering(bodies: readonly unknown[], events: string[]): typeof fetch {
+function fetchAnswering(
+  bodies: readonly unknown[],
+  events: string[],
+  capturedRequests?: Array<{ url: unknown; init?: RequestInit }>,
+): typeof fetch {
   let index = 0;
-  return (async (_url: unknown, _init?: RequestInit) => {
+  return (async (url: unknown, init?: RequestInit) => {
     events.push('fetch');
+    if (capturedRequests) {
+      capturedRequests.push({ url, init });
+    }
     const body = bodies[Math.min(index, bodies.length - 1)];
     index += 1;
     return makeResponse(body);
@@ -122,6 +129,7 @@ function makeAdapter(overrides?: {
   now?: () => number;
   hash?: (state: string) => string;
   readKey?: (path: string) => Promise<string>;
+  capturedRequests?: Array<{ url: unknown; init?: RequestInit }>;
 }): {
   adapter: JevMergeVetoAdapter;
   journal: InMemoryJournal;
@@ -136,7 +144,9 @@ function makeAdapter(overrides?: {
     monthlyBudgetUsd: overrides?.monthlyBudgetUsd ?? 100,
     assumedCostPerCallUsd: overrides?.assumedCostPerCallUsd ?? 0.0001,
     disabledProjects: overrides?.disabledProjects,
-    fetch: overrides?.fetch ?? fetchAnswering([RECORDED_CHOICE_PAYLOAD], events),
+    fetch:
+      overrides?.fetch ??
+      fetchAnswering([RECORDED_CHOICE_PAYLOAD], events, overrides?.capturedRequests),
     readKey: overrides?.readKey ?? (async () => KEY_TEXT),
     journal,
     timeoutMs: overrides?.timeoutMs,
@@ -175,6 +185,8 @@ describe('JevMergeVetoAdapter', () => {
         expect(receipt.model).toBe('typesafe/jev-1.14-20261014');
         expect(receipt.requestId).toBe('gen-fixture-merge-veto');
         expect(receipt.costUsd).toBeCloseTo(0.000026376, 12);
+        expect(receipt.estimated).toBe(false);
+        expect(receipt.at).toBe(new Date(NOW_MS).toISOString());
         expect(receipt.questionKinds).toEqual(['choice']);
         expect(receipt.minConfidenceObserved).toBe(0.99);
         expect(receipt.unknownReason).toBeUndefined();
@@ -360,6 +372,9 @@ describe('JevMergeVetoAdapter', () => {
     expect(postReserve.journal.reserves).toHaveLength(1);
     expect(postReserve.journal.settles).toHaveLength(1);
     expect(postReserve.journal.settles[0].receipt.unknownReason).toBe('deadline');
+    expect(postReserve.journal.settles[0].receipt.costUsd).toBe(0.0001);
+    expect(postReserve.journal.settles[0].receipt.estimated).toBe(true);
+    expect(postReserve.journal.settles[0].receipt.at).toBe(new Date(NOW_MS + 3_600_000).toISOString());
 
     // A fresh future deadline bounds the injected timeout to the remaining ms:
     // with a 10 s adapter timeout and 200 ms left, the call must abort by the
@@ -392,5 +407,109 @@ describe('JevMergeVetoAdapter', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('settles the reservation and reports transport when an exception occurs after reserve', async () => {
+    // verifiedHeadOid is not a string (slice throws post-reserve)
+    const badOidJournal = new InMemoryJournal();
+    const badOidAdapter = makeAdapter({ journal: badOidJournal });
+    const badOidResult = await badOidAdapter.adapter.adviseMergeVeto({
+      ...REQUEST,
+      verifiedHeadOid: undefined as unknown as string,
+    });
+    expect(badOidResult).toEqual({ status: 'unknown', reason: 'transport' });
+    expect(badOidJournal.reserves).toHaveLength(1);
+    expect(badOidJournal.settles).toHaveLength(1);
+    const badOidReceipt = badOidJournal.settles[0].receipt;
+    expect(badOidReceipt.unknownReason).toBe('transport');
+    expect(badOidReceipt.costUsd).toBe(0.0001);
+    expect(badOidReceipt.estimated).toBe(true);
+    expect(badOidReceipt.at).toBe(new Date(NOW_MS).toISOString());
+
+    // If settlement fails during error recovery, caller gets not-configured
+    const failingSettleJournal = new InMemoryJournal();
+    failingSettleJournal.settleResult = false;
+    const failingSettleAdapter = makeAdapter({ journal: failingSettleJournal });
+    const failingSettleResult = await failingSettleAdapter.adapter.adviseMergeVeto({
+      ...REQUEST,
+      verifiedHeadOid: 12345 as unknown as string,
+    });
+    expect(failingSettleResult).toEqual({ status: 'unknown', reason: 'not-configured' });
+    expect(failingSettleJournal.reserves).toHaveLength(1);
+    expect(failingSettleJournal.settles).toHaveLength(1);
+  });
+
+  it('applies correction 2 cost rules on settlements: estimated true and assumed cost on failure or missing cost', async () => {
+    // Client failure (non-2xx) records assumed cost and estimated true
+    const clientFail = makeAdapter({
+      fetch: (async () => makeResponse('{"error":"fail"}', 500)) as typeof fetch,
+    });
+    const failResult = await clientFail.adapter.adviseMergeVeto(REQUEST);
+    expect(failResult).toEqual({ status: 'unknown', reason: 'transport' });
+    expect(clientFail.journal.settles).toHaveLength(1);
+    const failReceipt = clientFail.journal.settles[0].receipt;
+    expect(failReceipt.costUsd).toBe(0.0001);
+    expect(failReceipt.estimated).toBe(true);
+    expect(failReceipt.unknownReason).toBe('transport');
+    expect(failReceipt.at).toBe(new Date(NOW_MS).toISOString());
+
+    // Successful answer without costUsd records assumed cost and estimated true
+    const payloadNoCost = JSON.parse(JSON.stringify(RECORDED_CHOICE_PAYLOAD)) as {
+      usage?: { cost?: number };
+    };
+    delete payloadNoCost.usage?.cost;
+    const noCostAdapter = makeAdapter({
+      fetch: (async () => makeResponse(payloadNoCost)) as typeof fetch,
+    });
+    const noCostResult = await noCostAdapter.adapter.adviseMergeVeto(REQUEST);
+    expect(noCostResult.status).toBe('answered');
+    expect(noCostAdapter.journal.settles).toHaveLength(1);
+    const noCostReceipt = noCostAdapter.journal.settles[0].receipt;
+    expect(noCostReceipt.costUsd).toBe(0.0001);
+    expect(noCostReceipt.estimated).toBe(true);
+    expect(noCostReceipt.at).toBe(new Date(NOW_MS).toISOString());
+  });
+
+  it('asserts correction 3: omits verifiedHeadOid from provider state and avoids reading key when redaction refuses', async () => {
+    // Normal call: request body sent to fetch must omit verifiedHeadOid, and readKey is invoked
+    const captured: Array<{ url: unknown; init?: RequestInit }> = [];
+    const readKeyCalls: string[] = [];
+    const trackingReadKey = async (path: string) => {
+      readKeyCalls.push(path);
+      return KEY_TEXT;
+    };
+    const { adapter } = makeAdapter({
+      capturedRequests: captured,
+      readKey: trackingReadKey,
+    });
+    const result = await adapter.adviseMergeVeto(REQUEST);
+    expect(result.status).toBe('answered');
+    expect(captured).toHaveLength(1);
+    const sentBodyText = captured[0].init?.body as string;
+    expect(sentBodyText).toBeDefined();
+    // The verifiedHeadOid must never appear in the HTTP request body
+    expect(sentBodyText).not.toContain(REQUEST.verifiedHeadOid);
+    const sentPayload = JSON.parse(sentBodyText) as { state?: string };
+    expect(sentPayload.state).toBeDefined();
+    const sentState = JSON.parse(sentPayload.state!);
+    expect(sentState).not.toHaveProperty('verifiedHeadOid');
+    expect(sentState).not.toHaveProperty('headOid');
+    expect(sentState).not.toHaveProperty('oid');
+    expect(JSON.stringify(sentState)).not.toContain(REQUEST.verifiedHeadOid);
+    expect(readKeyCalls).toEqual(['/keys/jev.key']);
+
+    // Redacted call: secret in title refuses before reading key
+    readKeyCalls.length = 0;
+    captured.length = 0;
+    const redactionResult = await adapter.adviseMergeVeto({
+      ...REQUEST,
+      state: {
+        ...REQUEST.state,
+        title: 'rotate the token sk-abcdefghijklmnopqrstuvwx today',
+      },
+    });
+    expect(redactionResult).toEqual({ status: 'unknown', reason: 'redaction-refused' });
+    expect(readKeyCalls).toEqual([]);
+    expect(captured).toEqual([]);
   });
 });

@@ -79,7 +79,7 @@ describe("T3b session exchange", () => {
     configureFleetApiRuntime(null);
     setActiveApiToken(null);
     configurePresentedTokenResolver(null);
-    configureSessionExchange(null);
+    configureSessionExchange();
     delete process.env.FLEET_STATE_DIR;
     delete process.env.FLEET_API_TOKEN_FILE;
     delete process.env.FLEET_API_ALLOWED_ORIGINS;
@@ -114,7 +114,7 @@ describe("T3b session exchange", () => {
     configureFleetApiRuntime(null);
     setActiveApiToken(null);
     configurePresentedTokenResolver(null);
-    configureSessionExchange(null);
+    configureSessionExchange();
     delete process.env.FLEET_STATE_DIR;
     delete process.env.FLEET_API_TOKEN_FILE;
     delete process.env.FLEET_API_ALLOWED_ORIGINS;
@@ -127,7 +127,6 @@ describe("T3b session exchange", () => {
 
   function sessionSecret(scopes: string[], actor = "owner"): string {
     const session = registerInteractiveSession({
-      ownerCredential: VALID_TOKEN,
       actor,
       scopes,
     });
@@ -298,7 +297,7 @@ describe("T3b session exchange", () => {
     const secret = sessionSecret(["read"]);
     const minted = await mint(secret, ["read"]);
 
-    configureSessionExchange(null);
+    configureSessionExchange();
 
     const res = await fetch(`${baseUrl}/v1/questions`, {
       headers: { authorization: `Bearer ${minted.token}` },
@@ -329,60 +328,60 @@ describe("T3b session exchange", () => {
     expect(res.status).toBe(200);
   });
 
-  it("refuses session registration without the verified owner credential", async () => {
-    setActiveApiToken(VALID_TOKEN);
-    configureFleetApiRuntime({ stateDir: tempDir });
+  it("never treats the on-disk bearer as an interactive session", async () => {
+    configuredApi();
 
-    // No credential presented at all.
-    expect(
-      registerInteractiveSession({ ownerCredential: "", actor: "owner", scopes: ["read"] }),
-    ).toBeNull();
-    // A wrong credential (not the active API token) proves nothing.
-    expect(
-      registerInteractiveSession({
-        ownerCredential: "b".repeat(32),
-        actor: "owner",
-        scopes: ["read"],
-      }),
-    ).toBeNull();
-    // Registration without any active API credential configured fails closed.
-    setActiveApiToken(null);
-    expect(
-      registerInteractiveSession({ ownerCredential: VALID_TOKEN, actor: "owner", scopes: ["read"] }),
-    ).toBeNull();
+    // The active API bearer is the reusable on-disk token. Presenting it as the
+    // session-credential header must not mint: no session was ever established,
+    // and possession of a file-backed bearer is never owner authentication.
+    const asSessionCredential = await fetch(exchangeUrl(), {
+      method: "POST",
+      headers: {
+        [SESSION_EXCHANGE_HEADER]: VALID_TOKEN,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ scopes: ["verdict"] }),
+    });
+    expect(asSessionCredential.status).toBe(403);
+    expect(await asSessionCredential.text()).not.toContain(VALID_TOKEN);
 
-    // Nothing was registered: every exchange attempt with an invented secret 403s.
+    // Only a server-established interactive session (the login lane) can mint,
+    // and the minted token binds to the actor the login recorded.
+    const secret = sessionSecret(["verdict"], "verified-owner");
     const res = await fetch(exchangeUrl(), {
       method: "POST",
-      headers: { [SESSION_EXCHANGE_HEADER]: "c".repeat(43), "content-type": "application/json" },
-      body: JSON.stringify({ scopes: ["read"] }),
+      headers: {
+        [SESSION_EXCHANGE_HEADER]: secret,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ scopes: ["verdict"] }),
     });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.actor).toBe("verified-owner");
   });
 
   it("refuses registration of orchestrate, dispatch or unknown scopes and a blank actor", () => {
-    setActiveApiToken(VALID_TOKEN);
     configureFleetApiRuntime({ stateDir: tempDir });
 
     expect(
-      registerInteractiveSession({ ownerCredential: VALID_TOKEN, actor: "owner", scopes: ["orchestrate"] }),
+      registerInteractiveSession({ actor: "owner", scopes: ["orchestrate"] }),
     ).toBeNull();
     expect(
-      registerInteractiveSession({ ownerCredential: VALID_TOKEN, actor: "owner", scopes: ["dispatch"] }),
+      registerInteractiveSession({ actor: "owner", scopes: ["dispatch"] }),
     ).toBeNull();
     expect(
-      registerInteractiveSession({ ownerCredential: VALID_TOKEN, actor: "owner", scopes: ["not-a-scope"] }),
+      registerInteractiveSession({ actor: "owner", scopes: ["not-a-scope"] }),
     ).toBeNull();
     expect(
-      registerInteractiveSession({ ownerCredential: VALID_TOKEN, actor: "owner", scopes: [] }),
+      registerInteractiveSession({ actor: "owner", scopes: [] }),
     ).toBeNull();
     expect(
-      registerInteractiveSession({ ownerCredential: VALID_TOKEN, actor: "   ", scopes: ["read"] }),
+      registerInteractiveSession({ actor: "   ", scopes: ["read"] }),
     ).toBeNull();
 
     // Only the mintable, registered scopes ever reach a session.
     const session = registerInteractiveSession({
-      ownerCredential: VALID_TOKEN,
       actor: "owner",
       scopes: ["read", "verdict"],
     });
@@ -391,7 +390,7 @@ describe("T3b session exchange", () => {
 
   it("fails closed when the exchange has no established session", async () => {
     configuredApi();
-    configureSessionExchange(null);
+    configureSessionExchange();
 
     const res = await fetch(exchangeUrl(), {
       method: "POST",

@@ -14,7 +14,7 @@ import { readApiTokenFromFile, setActiveApiToken } from "../wiring/token";
 function refuse(): false {
   setActiveApiToken(null);
   configureFleetApiRuntime(null);
-  configureSessionExchange(null);
+  configureSessionExchange();
   return false;
 }
 

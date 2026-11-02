@@ -5,16 +5,18 @@ import {
   setResponseHeader,
   setResponseStatus,
 } from "h3";
-import { getActiveApiToken } from "./token.js";
 
 /**
- * T3b: the session exchange mints in-memory, scope-bound tokens. It does not
- * read anything from disk: possession of a reusable file-backed bearer credential
- * is never treated as proof of an interactive session. Instead, an interactive
- * session is established server-side (by the TUI or web login lanes through
- * `registerInteractiveSession`), and the exchange authenticates the request by
- * the session's per-session secret. The minted token binds to the verified
- * actor and scopes, and never holds `orchestrate` or any dispatch authority.
+ * T3b: the session exchange mints in-memory, scope-bound tokens for a
+ * server-established interactive session. It does not read anything from disk:
+ * possession of a reusable file-backed bearer credential — including the active
+ * API bearer — is never treated as proof of an interactive session. Sessions
+ * are established server-side by the login lanes (the TUI/web logins) through
+ * `registerInteractiveSession`, which records the verified actor and the
+ * permitted scopes the login granted. The exchange authenticates a request by
+ * the session's per-session secret, never by a caller-supplied actor or scope
+ * list. The minted token binds to the session's verified actor and scopes, and
+ * never holds `orchestrate` or any dispatch authority.
  */
 
 export const SESSION_EXCHANGE_PATH = "/sessions/exchange";
@@ -29,9 +31,10 @@ const LIVE_SESSION_LIMIT = 16;
 
 /**
  * A server-established interactive session: the login lane created it (in
- * memory only) and the client holds its `secret`, which the exchange verifies.
- * The actor and permitted scopes are established with the session and are never
- * supplied by the exchange caller.
+ * memory only) after authenticating the owner, and the client holds its
+ * `secret`, which the exchange verifies. The actor and permitted scopes are
+ * established with the session by the login lane; the exchange never accepts
+ * either from an HTTP caller.
  */
 export interface InteractiveSession {
   readonly sessionId: string;
@@ -51,43 +54,29 @@ const liveTokens = new Map<string, MintedToken>(); // token value -> record, mem
 
 /**
  * Reset the session exchange: forget every established session and every minted
- * token. Callers pass `null` (tests, operator reset). The exchange therefore
- * starts disabled — with no session registered every exchange request fails
- * closed. Login lanes establish sessions through `registerInteractiveSession`,
- * never from a file-backed credential.
+ * token. With no session registered every exchange request fails closed. Login
+ * lanes establish sessions through `registerInteractiveSession`, never from a
+ * file-backed credential.
  */
-export function configureSessionExchange(_credential: string | null): void {
+export function configureSessionExchange(): void {
   liveSessions.clear();
   liveTokens.clear();
 }
 
 /**
- * Establish a server-side interactive session. The actor-binding mechanism is
- * owner-authenticated registration: the caller must present the active API
- * credential (`setActiveApiToken`) — the operator's on-host authority — and it
- * is verified constant-time before any session exists. Caller-supplied actor
- * text and scopes are never proof of anything: the scopes are accepted only
- * when every one of them is mintable (never `orchestrate` or `dispatch`), and
- * the registered actor must be a non-empty verified label. Returns the
- * per-session secret the client presents to the exchange, or `null` when the
- * owner credential, actor or scopes fail (fail closed; the reason is never
- * echoed). Called by the TUI/web login lanes after authenticating the owner;
- * tests call it with the active API credential.
+ * Establish a server-side interactive session for a verified actor. Called by
+ * the login lanes (TUI/web logins) after they authenticate the owner; the actor
+ * and permitted scopes are facts of that login, never proof a caller presents to
+ * the exchange. The scopes are accepted only when every one is mintable (never
+ * `orchestrate` or `dispatch`), and the actor must be a non-empty label; the
+ * returned `secret` is the per-session credential the client presents to the
+ * exchange. Returns `{ sessionId, secret }`, or `null` when the actor or
+ * scopes fail (fail closed; the reason is never echoed).
  */
 export function registerInteractiveSession(input: {
-  ownerCredential: string;
   actor: string;
   scopes: readonly string[];
 }): { sessionId: string; secret: string } | null {
-  const active = getActiveApiToken();
-  if (
-    typeof active !== "string" ||
-    active.length === 0 ||
-    typeof input.ownerCredential !== "string" ||
-    !constantTimeMatch(active, input.ownerCredential)
-  ) {
-    return null;
-  }
   const actor = typeof input.actor === "string" ? input.actor.trim() : "";
   if (actor.length === 0) {
     return null;

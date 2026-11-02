@@ -279,13 +279,6 @@ function laneRunMergedPrDecision(record: LaneRunRecord, facts: LaneRunFacts): La
     return null;
   }
   // 3. A parked run whose latest attempt is still live returns null.
-  // `facts.attempt` exposes the latest attempt via `LaneRunAttemptFact | null`
-  // with `phase: LaneRunAttemptPhase`. An attempt is live when its phase is
-  // 'dispatching', 'running', or 'blocked' (matching GD2/G4d/lostDispatchConduct).
-  // Because facts.attempt exposes this usable phase information directly, we
-  // check attempt liveness from facts.attempt.phase (if facts had exposed
-  // nothing usable, we would fall back to returning null for parks with
-  // parkedFrom of 'running', 'collecting' or 'fixing').
   if (facts.state === 'parked' && facts.attempt !== null) {
     const live =
       facts.attempt.phase === 'dispatching' ||

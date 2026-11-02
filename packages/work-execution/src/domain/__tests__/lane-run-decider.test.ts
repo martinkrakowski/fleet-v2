@@ -397,6 +397,12 @@ describe('global rules', () => {
     assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
   });
 
+  it('R4c: an owner-merge park with its question recorded ends merged, because the merge answers it', () => {
+    const rec = record({ parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: 'q-1' }, parkCount: 1 });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: { state: 'merged', head12: HEAD, containsLaneHead: true } });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
   it('G3e: an owner-merge park with a stop recorded still ends merged, never stopped, once its PR merges (CT-2a Fable)', () => {
     const rec = record({ parked: { reason: 'owner-merge', qualifier: null, parkedFrom: 'merging', questionId: null }, parkCount: 1 });
     for (const stopMode of ['force', 'graceful'] as const) {

@@ -109,6 +109,20 @@ function makeClock(nowIso?: string) {
   return { nowIso: () => current };
 }
 
+function snapshotToStdout(pullRequest: PullRequestSnapshot): string {
+  return JSON.stringify({
+    number: pullRequest.number,
+    state: pullRequest.state.toUpperCase(),
+    headRefOid: pullRequest.headSha,
+    headRefName: pullRequest.headRef,
+    baseRefName: pullRequest.baseRef,
+    mergedAt: pullRequest.mergedAtIso,
+    closedAt: pullRequest.closedAtIso,
+    mergeCommit: pullRequest.mergeCommitSha !== null ? { oid: pullRequest.mergeCommitSha } : null,
+    mergeStateStatus: pullRequest.mergeState.toUpperCase(),
+  });
+}
+
 function makeAdapter(options: {
   readonly runGhResult?: { exitCode: number; stdout: string; stderr: string } | { throw: true };
   readonly reader?: ReadBehavior | ReadBehavior[];
@@ -119,14 +133,54 @@ function makeAdapter(options: {
     options.runGhResult ?? { exitCode: 0, stdout: '', stderr: '' },
   );
   const { requests, readPullRequest } = makeReader(options.reader ?? foundSnapshot());
+  const config = options.config ?? {
+    mergeGhConfigDir: MERGE_DIR,
+    premergeGhConfigDir: PREMERGE_DIR,
+  };
   const adapter = new ForgeActionAdapter(
     {
-      runGh,
+      runGh: async (args, ghConfigDir, timeoutMs) => {
+        if (args[0] === 'pr' && args[1] === 'view') {
+          const isNumber = /^\d+$/.test(args[2] ?? '');
+          const ref = isNumber
+            ? { kind: 'number' as const, number: parseInt(args[2]!, 10) }
+            : { kind: 'branch' as const, branchName: args[2]! };
+          let repository: { owner: string; repo: string } | undefined;
+          const rIndex = args.indexOf('-R');
+          if (rIndex !== -1 && args[rIndex + 1]) {
+            const [owner, repo] = args[rIndex + 1]!.split('/');
+            if (owner && repo) {
+              repository = { owner, repo };
+            }
+          }
+          const readResult = await readPullRequest({ ref, repository, timeoutMs });
+          if (readResult.outcome === 'found') {
+            return {
+              exitCode: 0,
+              stdout: snapshotToStdout(readResult.pullRequest),
+              stderr: '',
+            };
+          }
+          if (readResult.outcome === 'not-found') {
+            return {
+              exitCode: 1,
+              stdout: '',
+              stderr: 'no pull requests found for branch',
+            };
+          }
+          return {
+            exitCode: 1,
+            stdout: '',
+            stderr: readResult.reason,
+          };
+        }
+        return runGh(args, ghConfigDir, timeoutMs);
+      },
       pullRequestRead: { readPullRequest },
       nowIso: makeClock(options.nowIso).nowIso,
     },
     undefined,
-    options.config,
+    config,
   );
   return { adapter, calls, requests };
 }

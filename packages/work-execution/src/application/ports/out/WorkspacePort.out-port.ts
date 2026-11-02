@@ -169,9 +169,96 @@ export type RemoveLaneWorktreeResult =
   /** The executor did not answer (timeout, transport): the worktree may or may not be removed. */
   | { readonly outcome: 'unknown' };
 
+/**
+ * GB3: the request to preserve a refused dispatch's uncommitted tracked edits
+ * as a patch file outside the worktree. The worktree root and the patch
+ * destination's parent are canonicalized on the recorded host before any
+ * command runs, and a destination that resolves inside the worktree, already
+ * exists or is a symlink is refused before anything is written.
+ */
+export interface PreserveWorktreeEditsRequest {
+  /** The attempt's recorded worktree root (absolute). */
+  readonly worktreePath: string;
+  /** Absolute path OUTSIDE the worktree where the patch file is written. */
+  readonly patchPath: string;
+  /** The attempt's recorded runner block: the preserve runs on that host's executor. */
+  readonly recordedHost?: AttemptRunnerRecord | null;
+}
+
+export type PreserveWorktreeEditsResult =
+  | { readonly outcome: 'preserved'; readonly patchPath: string; readonly patchBytes: number }
+  | {
+      readonly outcome: 'refused';
+      readonly reason:
+        | 'invalid-request'
+        | 'patch-path-inside-worktree'
+        | 'nothing-to-preserve'
+        | 'destination-exists'
+        | 'git-refused';
+    }
+  | { readonly outcome: 'error'; readonly reason: string };
+
+/**
+ * GB3: the request to discard one worktree's uncommitted tracked edits back to
+ * its recorded head. The reset runs on the recorded host's executor and is
+ * refused before it runs when restoring a tracked path could overwrite or
+ * remove an untracked path; untracked files stay untouched.
+ */
+export interface ResetWorktreeToHeadRequest {
+  /** The attempt's recorded worktree root (absolute). */
+  readonly worktreePath: string;
+  /** The attempt's recorded runner block: the reset runs on that host's executor. */
+  readonly recordedHost?: AttemptRunnerRecord | null;
+}
+
+export type ResetWorktreeToHeadResult =
+  | { readonly outcome: 'reset'; readonly headCommit: string }
+  | {
+      readonly outcome: 'refused';
+      readonly reason: 'invalid-request' | 'untracked-obstructs' | 'git-refused';
+    }
+  | { readonly outcome: 'error'; readonly reason: string };
+
+/**
+ * GB3: the request to verify whether a preserved patch matches the worktree
+ * (`git apply --check -R <patchPath>`).
+ */
+export interface VerifySavedPatchRequest {
+  /** The attempt's recorded worktree root (absolute). */
+  readonly worktreePath: string;
+  /** Absolute path OUTSIDE the worktree where the patch file was preserved. */
+  readonly patchPath: string;
+  /** The attempt's recorded runner block: the check runs on that host's executor. */
+  readonly recordedHost?: AttemptRunnerRecord | null;
+}
+
 export interface WorkspacePort {
   /** Inspect the worktree as a typed record; part of readiness, once per prepared environment. */
   inspectWorktree(request: WorktreeInspectionRequest): Promise<WorktreeInspection>;
+
+  /**
+   * GB3: preserve the worktree's uncommitted tracked edits as a patch file
+   * outside it (`git diff --binary HEAD`). Refuses before any command when the
+   * patch path is not absolute, lies inside the worktree (including through a
+   * symlink alias of its parent) or already exists; writes atomically without
+   * following links or overwriting files.
+   */
+  preserveWorktreeEdits?(request: PreserveWorktreeEditsRequest): Promise<PreserveWorktreeEditsResult>;
+
+  /**
+   * GB3: verify that one preserved patch matches the worktree
+   * (`git apply --check -R <patchPath>`).
+   */
+  verifySavedPatch?(request: VerifySavedPatchRequest): Promise<boolean>;
+
+  /**
+   * GB3: discard the worktree's tracked modifications back to HEAD
+   * (`git reset --hard`, no ref argument), leaving untracked files untouched.
+   * Refuses before resetting when restoring a tracked path would overwrite or
+   * remove an untracked path; after resetting, verifies the untracked paths
+   * are unchanged.
+   */
+  resetWorktreeToHead?(request: ResetWorktreeToHeadRequest): Promise<ResetWorktreeToHeadResult>;
 
   /** Read a text file from the worktree, locally or remotely. Returns null if missing. */
   readWorktreeFile?(

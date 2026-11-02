@@ -46,6 +46,21 @@ const RECORDED_CHOICE_PAYLOAD = {
   provider: 'TypeSafe',
 };
 
+const HOLD_FOR_HUMAN_CHOICE_PAYLOAD = {
+  model: 'typesafe/jev-1.14-20261014',
+  answers: {
+    merge: {
+      type: 'choice',
+      choice: 'hold-for-human',
+      probabilities: { 'merge-safe': 0.05, 'hold-for-human': 0.95 },
+      confidence: 0.95,
+    },
+  },
+  usage: { input_tokens: 628, output_tokens: 142, cost: 0.000026376 },
+  id: 'gen-fixture-merge-veto-hold',
+  provider: 'TypeSafe',
+};
+
 const REQUEST: MergeVetoRequest = {
   repository: { owner: 'acme', repo: 'widgets' },
   pullRequestNumber: 42,
@@ -198,6 +213,40 @@ describe('JevMergeVetoAdapter', () => {
           spy.mockRestore();
         }
       }
+    }
+  });
+
+  it('answers hold-for-human on a valid hold-for-human response with matching probabilities and confidence', async () => {
+    for (const mode of ['shadow', 'live'] as const) {
+      const events: string[] = [];
+      const journal = new InMemoryJournal(events);
+      const { adapter } = makeAdapter({
+        journal,
+        fetch: fetchAnswering([HOLD_FOR_HUMAN_CHOICE_PAYLOAD], events),
+      });
+      const result = await adapter.adviseMergeVeto({ ...REQUEST, mode });
+      expect(result).toEqual({
+        status: 'answered',
+        choice: 'hold-for-human',
+        confidence: 0.95,
+        decisionReceiptId: 'gen-fixture-merge-veto-hold',
+        mode,
+      });
+      expect(events).toEqual(['reserve', 'fetch', 'settle']);
+      expect(journal.reserves).toHaveLength(1);
+      expect(journal.settles).toHaveLength(1);
+      const receipt = journal.settles[0].receipt;
+      expect(receipt.consumer).toBe(MERGE_VETO_CONSUMER);
+      expect(receipt.contextRef).toBe('merge-veto:acme/widgets#42@0123456789ab');
+      expect(receipt.provider).toBe('jev');
+      expect(receipt.model).toBe('typesafe/jev-1.14-20261014');
+      expect(receipt.requestId).toBe('gen-fixture-merge-veto-hold');
+      expect(receipt.costUsd).toBeCloseTo(0.000026376, 12);
+      expect(receipt.estimated).toBe(false);
+      expect(receipt.at).toBe(new Date(NOW_MS).toISOString());
+      expect(receipt.questionKinds).toEqual(['choice']);
+      expect(receipt.minConfidenceObserved).toBe(0.95);
+      expect(receipt.unknownReason).toBeUndefined();
     }
   });
 
@@ -369,6 +418,7 @@ describe('JevMergeVetoAdapter', () => {
     const postReserveResult = await postReserve.adapter.adviseMergeVeto(REQUEST);
     expect(postReserveResult).toEqual({ status: 'unknown', reason: 'deadline' });
     expect(postReserve.events).toEqual(['reserve', 'settle']);
+    expect(postReserve.events).not.toContain('fetch');
     expect(postReserve.journal.reserves).toHaveLength(1);
     expect(postReserve.journal.settles).toHaveLength(1);
     expect(postReserve.journal.settles[0].receipt.unknownReason).toBe('deadline');
@@ -407,6 +457,25 @@ describe('JevMergeVetoAdapter', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('does not call fetch when the deadline passes between the earlier check and the reading immediately before postJevDecision', async () => {
+    let clockCalls = 0;
+    const advancingClock = () => {
+      clockCalls += 1;
+      return clockCalls === 1 ? NOW_MS : NOW_MS + 3_600_000;
+    };
+    const { adapter, journal, events } = makeAdapter({ now: advancingClock });
+    const result = await adapter.adviseMergeVeto(REQUEST);
+    expect(result).toEqual({ status: 'unknown', reason: 'deadline' });
+    expect(events).toEqual(['reserve', 'settle']);
+    expect(events).not.toContain('fetch');
+    expect(journal.reserves).toHaveLength(1);
+    expect(journal.settles).toHaveLength(1);
+    expect(journal.settles[0].receipt.unknownReason).toBe('deadline');
+    expect(journal.settles[0].receipt.costUsd).toBe(0.0001);
+    expect(journal.settles[0].receipt.estimated).toBe(true);
+    expect(journal.settles[0].receipt.at).toBe(new Date(NOW_MS + 3_600_000).toISOString());
   });
 
   it('settles the reservation and reports transport when an exception occurs after reserve', async () => {

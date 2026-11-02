@@ -381,16 +381,15 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
     let callStartMs = 0;
     try {
       const contextRef = vetoContextRef(request);
-      const preFetchNowMs = this.now();
-      if (isDeadlineExceeded(deadlineMs, preFetchNowMs)) {
+      callStartMs = this.now();
+      if (isDeadlineExceeded(deadlineMs, callStartMs)) {
         return await this.finishDeadlineAfterReserve(reservationId, contextRef);
       }
       const timeoutMs = Math.min(
         this.timeoutMs ?? 3000,
-        deadlineMs - preFetchNowMs,
+        deadlineMs - callStartMs,
       );
 
-      callStartMs = this.now();
       const result = await postJevDecision({
         fetch: this.fetchFn,
         key,

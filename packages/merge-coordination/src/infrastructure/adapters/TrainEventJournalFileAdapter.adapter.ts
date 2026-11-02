@@ -171,6 +171,7 @@ function readJournalLine(line: string, expectedSequence?: number): TrainJournalE
       record.fence < 1 ||
       typeof record.key !== 'string' ||
       record.key.length === 0 ||
+      containsSecretShape(record.key) ||
       typeof record.event !== 'string' ||
       !TRAIN_EVENT_VALUES.includes(record.event) ||
       typeof record.atIso !== 'string' ||

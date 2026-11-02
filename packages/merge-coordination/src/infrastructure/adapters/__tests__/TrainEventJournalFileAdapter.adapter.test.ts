@@ -124,6 +124,15 @@ describe('TrainEventJournalFileAdapter', () => {
     expect(secretKey).toEqual({ outcome: 'refused', reason: 'invalid-entry' });
   });
 
+  it('reports a stored secret-shaped key as unreadable', async () => {
+    const { stateDir, leases, journal } = await makeAdapters();
+    await takeLease(leases);
+    const journalPath = path.join(stateDir, 'merge-trains', TRAIN_ID, 'journal.jsonl');
+    const line = { schemaVersion: 1, sequence: 1, fence: 1, key: 'sk-' + 'a'.repeat(24), event: 'batched', atIso: '2026-11-02T00:00:00.000Z' };
+    await fs.writeFile(journalPath, JSON.stringify(line) + '\n', 'utf8');
+    expect(await journal.list(TRAIN_ID)).toEqual({ outcome: 'unreadable' });
+  });
+
   it('reports a corrupt line as unreadable and appends nothing', async () => {
     const { stateDir, leases, journal } = await makeAdapters();
     await takeLease(leases);

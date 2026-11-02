@@ -193,6 +193,9 @@ export class MergeTrainStateFileAdapter implements MergeTrainStatePort {
 
 /** Validate a snapshot's every record with the six domain validators. */
 function isValidSnapshot(snapshot: TrainSnapshot): boolean {
+  if (snapshot === null || typeof snapshot !== 'object') {
+    return false;
+  }
   const raw = snapshot as unknown as Record<string, unknown>;
   if (!validateTrainRecord(raw.train).ok) {
     return false;

@@ -442,6 +442,19 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@fleet/merge-coordination@workspace:packages/merge-coordination":
+  version: 0.0.0-use.local
+  resolution: "@fleet/merge-coordination@workspace:packages/merge-coordination"
+  dependencies:
+    "@eslint/js": "npm:^9.0.0"
+    "@fleet/shared": "workspace:*"
+    eslint: "npm:^9.0.0"
+    typescript: "npm:^5.5.4"
+    typescript-eslint: "npm:^8.0.0"
+    vitest: "npm:^4.1.9"
+  languageName: unknown
+  linkType: soft
+
 "@fleet/onboarding@workspace:*, @fleet/onboarding@workspace:packages/onboarding":
   version: 0.0.0-use.local
   resolution: "@fleet/onboarding@workspace:packages/onboarding"

@@ -8,7 +8,7 @@
  * refused/rejected/blocked/unknown, 2 usage): the halt marker is set or
  * lifted, a stop is recorded as a keyed journal intent the driver obeys, a
  * resume is recorded for a parked run. Nothing there takes a run lease or
- * dispatches anything; stop and resume refuse while a live driver lease is
+ * dispatches anything; stop and resume refuse with `driver-lease-live` and exit 1 while a live driver lease is
  * held (a lapsed or absent lease allows the call). The lease check and the
  * record are one atomic step under the lease store's lock, so a passing
  * `conductor run --live` cannot take the lease between them.

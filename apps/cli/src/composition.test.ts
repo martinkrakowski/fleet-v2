@@ -823,4 +823,143 @@ describe('apps/cli composition', () => {
       },
     );
   });
+
+  describe('finding 2: update-branch nonzero exit re-reads head before refusal', () => {
+    const updatedHead = '2222222222222222222222222222222222222222';
+
+    it('returns executed when update-branch fails but headSha was updated', async () => {
+      const dummyRunGh = async (args: readonly string[]) => {
+        if (args[0] === 'api' && args[1]?.includes('update-branch')) {
+          return { exitCode: 1, stdout: '', stderr: 'HTTP 500 internal server error' };
+        }
+        if (args[0] === 'pr' && args[1] === 'view') {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              state: 'OPEN',
+              headRefOid: updatedHead,
+              baseRefName: 'main',
+              mergedAt: null,
+              mergeCommit: null,
+            }),
+            stderr: '',
+          };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ForgeActionAdapter(
+        { runGh: dummyRunGh },
+        undefined,
+        {
+          mergeGhConfigDir: '/state/gh/merge',
+          premergeGhConfigDir: '/state/gh/premerge',
+        },
+      );
+
+      const result = await adapter.performMergeForgeAction({
+        kind: 'update-branch',
+        actionId: 'act-update-branch-success',
+        repository: { owner: 'fleet', repo: 'fleet-v2' },
+        pullRequestNumber: 101,
+        branchName: 'feature/dt6a-fix',
+        expectedHeadSha: makeHeadH(),
+        deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+      });
+
+      expect(result.outcome).toBe('executed');
+      if (result.outcome === 'executed') {
+        expect(result.headSha).toBe(updatedHead);
+      }
+    });
+
+    it('returns ambiguous when update-branch fails without definite refusal and head is unchanged', async () => {
+      const dummyRunGh = async (args: readonly string[]) => {
+        if (args[0] === 'api' && args[1]?.includes('update-branch')) {
+          return { exitCode: 1, stdout: '', stderr: 'HTTP 500 internal server error' };
+        }
+        if (args[0] === 'pr' && args[1] === 'view') {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              state: 'OPEN',
+              headRefOid: makeHeadH(),
+              baseRefName: 'main',
+              mergedAt: null,
+              mergeCommit: null,
+            }),
+            stderr: '',
+          };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ForgeActionAdapter(
+        { runGh: dummyRunGh },
+        undefined,
+        {
+          mergeGhConfigDir: '/state/gh/merge',
+          premergeGhConfigDir: '/state/gh/premerge',
+        },
+      );
+
+      const result = await adapter.performMergeForgeAction({
+        kind: 'update-branch',
+        actionId: 'act-update-branch-ambiguous',
+        repository: { owner: 'fleet', repo: 'fleet-v2' },
+        pullRequestNumber: 101,
+        branchName: 'feature/dt6a-fix',
+        expectedHeadSha: makeHeadH(),
+        deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+      });
+
+      expect(result.outcome).toBe('ambiguous');
+    });
+
+    it('returns refused when update-branch fails with definite conflict refusal and head is unchanged', async () => {
+      const dummyRunGh = async (args: readonly string[]) => {
+        if (args[0] === 'api' && args[1]?.includes('update-branch')) {
+          return { exitCode: 1, stdout: '', stderr: 'merge conflict: cannot be cleanly created' };
+        }
+        if (args[0] === 'pr' && args[1] === 'view') {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              state: 'OPEN',
+              headRefOid: makeHeadH(),
+              baseRefName: 'main',
+              mergedAt: null,
+              mergeCommit: null,
+            }),
+            stderr: '',
+          };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      };
+
+      const adapter = new ForgeActionAdapter(
+        { runGh: dummyRunGh },
+        undefined,
+        {
+          mergeGhConfigDir: '/state/gh/merge',
+          premergeGhConfigDir: '/state/gh/premerge',
+        },
+      );
+
+      const result = await adapter.performMergeForgeAction({
+        kind: 'update-branch',
+        actionId: 'act-update-branch-refused',
+        repository: { owner: 'fleet', repo: 'fleet-v2' },
+        pullRequestNumber: 101,
+        branchName: 'feature/dt6a-fix',
+        expectedHeadSha: makeHeadH(),
+        deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+      });
+
+      expect(result.outcome).toBe('refused');
+      if (result.outcome === 'refused') {
+        expect(result.refusalKind).toBe('conflict');
+      }
+    });
+  });
 });

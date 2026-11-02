@@ -353,4 +353,40 @@ describe('JevMergeVetoAdapter key reader injection', () => {
     }
     expect(keyReadInvoked).toBe(false);
   });
+
+  it('finishes through finishDeadlineAfterReserve when key reading and reservation deplete remaining budget', async () => {
+    const testJournal = new MockJournal();
+    let fetchInvoked = false;
+    const testFetch = (async () => {
+      fetchInvoked = true;
+      return createSuccessfulResponse(0.02);
+    }) as typeof fetch;
+
+    let time = 1000;
+    const deadlineMs = 2000;
+    const adapter = new JevMergeVetoAdapter(
+      makeDeps(testJournal, testFetch, {
+        now: () => time,
+        readKey: async () => {
+          time = 2000;
+          return 'test-auth-key';
+        },
+      }),
+    );
+
+    const request: MergeVetoRequest = {
+      ...SAMPLE_REQUEST,
+      deadlineIso: new Date(deadlineMs).toISOString(),
+    };
+
+    const advice = await adapter.adviseMergeVeto(request);
+    expect(advice.status).toBe('unknown');
+    if (advice.status === 'unknown') {
+      expect(advice.reason).toBe('deadline');
+    }
+    expect(fetchInvoked).toBe(false);
+    expect(testJournal.reservations.length).toBe(1);
+    expect(testJournal.settlements.length).toBe(1);
+    expect(testJournal.settlements[0].receipt.unknownReason).toBe('deadline');
+  });
 });

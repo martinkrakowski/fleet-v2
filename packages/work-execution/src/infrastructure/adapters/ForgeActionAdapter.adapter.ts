@@ -852,7 +852,9 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     };
   }
 
-  private async runMergeUpdateBranch(request: MergeForgeActionRequest): Promise<MergeForgeActionResult> {
+  private async runMergeUpdateBranch(
+    request: Extract<MergeForgeActionRequest, { kind: 'update-branch' }>,
+  ): Promise<MergeForgeActionResult> {
     const configDir = this.mergeConfigDir();
     if (configDir === null) {
       return this.mergeRefusedOther('no merger identity is configured');
@@ -880,11 +882,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
       return { outcome: 'ambiguous', reason: 'gh api update-branch could not complete' };
     }
     if (gh.exitCode !== 0) {
-      return {
-        outcome: 'refused',
-        reason: `gh api update-branch failed (exit ${gh.exitCode})`,
-        refusalKind: classifyGhRefusal(gh.stderr, gh.stdout),
-      };
+      return this.reconcileUpdateBranchFailure(gh, request);
     }
     // The PUT is 202 async: re-read the head up to 3 times (plan §3.3).
     let observedOldHead = false;
@@ -906,6 +904,40 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
       return { outcome: 'ambiguous', reason: 'branch update accepted but the head is unchanged' };
     }
     return { outcome: 'ambiguous', reason: 'branch update accepted but the head could not be read' };
+  }
+
+  private async reconcileUpdateBranchFailure(
+    gh: GhInvocationResult,
+    request: Extract<MergeForgeActionRequest, { kind: 'update-branch' }>,
+  ): Promise<MergeForgeActionResult> {
+    const readBudget = this.budgetCallTimeoutMs(request.deadlineIso);
+    if (readBudget.ok) {
+      const read = await this.mergeReadPullRequest(request, readBudget.timeoutMs);
+      if (
+        read !== null &&
+        read.outcome !== 'not-found' &&
+        read.outcome !== 'unavailable' &&
+        read.pullRequest.headSha !== request.expectedHeadSha
+      ) {
+        return { outcome: 'executed', headSha: read.pullRequest.headSha };
+      }
+    }
+    const refusalKind = classifyGhRefusal(gh.stderr, gh.stdout);
+    if (
+      refusalKind === 'permission' ||
+      refusalKind === 'protection' ||
+      refusalKind === 'conflict'
+    ) {
+      return {
+        outcome: 'refused',
+        reason: `gh api update-branch failed (exit ${gh.exitCode})`,
+        refusalKind,
+      };
+    }
+    return {
+      outcome: 'ambiguous',
+      reason: `gh api update-branch failed (exit ${gh.exitCode})`,
+    };
   }
 
   private async runMergePostStatus(

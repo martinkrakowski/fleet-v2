@@ -72,9 +72,8 @@ function repoItem(digest: string, lastServedAtIso: string | null): DaemonReposit
   };
 }
 
-function statusRecord(overrides: Record<string, unknown> = {}): DaemonStatusRecord {
+function baseStatusFields(): Record<string, unknown> {
   return {
-    version: DAEMON_RECORD_VERSION,
     tickId: TICK_A,
     startedAtIso: '2026-10-31T11:00:00.000Z',
     finishedAtIso: '2026-10-31T12:00:00.000Z',
@@ -82,11 +81,22 @@ function statusRecord(overrides: Record<string, unknown> = {}): DaemonStatusReco
     paused: false,
     halted: false,
     forgeReachable: true,
+  };
+}
+
+function statusRecord(overrides: Record<string, unknown> = {}): DaemonStatusRecord {
+  const read = readDaemonStatusRecord({
+    version: DAEMON_RECORD_VERSION,
+    ...baseStatusFields(),
     jobs: [],
     repositories: [],
     notifierCursor: null,
     ...overrides,
-  } as DaemonStatusRecord;
+  });
+  if (!read.ok) {
+    throw new Error('fixture');
+  }
+  return read.record;
 }
 
 function previousStatus(): DaemonStatusRecord {
@@ -103,6 +113,11 @@ function previousStatus(): DaemonStatusRecord {
 function clearPause(): DaemonPauseState {
   return { state: 'clear', record: null };
 }
+
+const PAUSED_AND_UNREADABLE: readonly DaemonPauseState[] = [
+  { state: 'paused', record: { version: DAEMON_RECORD_VERSION, paused: true, changedAtIso: NOW } },
+  { state: 'unreadable' },
+];
 
 function clearHalt(): ConductorHaltState {
   return { state: 'clear', record: null };
@@ -135,13 +150,7 @@ function jobItem(overrides: Record<string, unknown> = {}): Record<string, unknow
 
 function validStatusBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    tickId: TICK_A,
-    startedAtIso: '2026-10-31T11:00:00.000Z',
-    finishedAtIso: '2026-10-31T12:00:00.000Z',
-    exitCode: 0,
-    paused: false,
-    halted: false,
-    forgeReachable: true,
+    ...baseStatusFields(),
     jobs: [jobItem()],
     repositories: [repoItem(DIGEST_A, '2026-10-31T12:00:00.000Z')],
     notifierCursor: CURSOR,
@@ -263,10 +272,7 @@ describe('deterministic tick order', () => {
 
 describe('pause and halt planning', () => {
   it('a paused or unreadable pause plans no entries and exits 0', () => {
-    for (const pause of [
-      { state: 'paused', record: { version: DAEMON_RECORD_VERSION, paused: true, changedAtIso: NOW } },
-      { state: 'unreadable' },
-    ] as readonly DaemonPauseState[]) {
+    for (const pause of PAUSED_AND_UNREADABLE) {
       const plan = planDaemonTick(planInput({
         candidates: ['notifier'],
         pause,
@@ -282,10 +288,7 @@ describe('pause and halt planning', () => {
   });
 
   it('a paused or unreadable pause with a clear halt is not halted', () => {
-    for (const pause of [
-      { state: 'paused', record: { version: DAEMON_RECORD_VERSION, paused: true, changedAtIso: NOW } },
-      { state: 'unreadable' },
-    ] as readonly DaemonPauseState[]) {
+    for (const pause of PAUSED_AND_UNREADABLE) {
       const plan = planDaemonTick(planInput({ candidates: ['notifier'], pause, halt: clearHalt() }));
       expect(plan.paused).toBe(true);
       expect(plan.halted).toBe(false);
@@ -439,23 +442,23 @@ describe('lease decision', () => {
   });
 
   it('never throws on a throwing getter in the request or in the current lease', () => {
+    const checkRefused = (decision: unknown) => {
+      expect(JSON.stringify(decision)).not.toContain('boom');
+      expect(decision).toEqual({ action: 'refuse', outcome: { outcome: 'refused', reasonCode: 'invalid-lease-request' } });
+    };
     const throwingRequest = Object.defineProperty({}, 'holderId', {
       enumerable: true,
       get() {
         throw new Error('boom');
       },
     });
-    const refused = decideDaemonJobLease(null, throwingRequest as never, 'notifier');
-    expect(JSON.stringify(refused)).not.toContain('boom');
-    expect(refused).toEqual({ action: 'refuse', outcome: { outcome: 'refused', reasonCode: 'invalid-lease-request' } });
+    checkRefused(decideDaemonJobLease(null, throwingRequest as never, 'notifier'));
     const throwingCurrent = {
       get holderId(): string {
         throw new Error('boom');
       },
     };
-    const refusedCurrent = decideDaemonJobLease(throwingCurrent as never, acquireRequest() as never, 'notifier');
-    expect(JSON.stringify(refusedCurrent)).not.toContain('boom');
-    expect(refusedCurrent).toEqual({ action: 'refuse', outcome: { outcome: 'refused', reasonCode: 'invalid-lease-request' } });
+    checkRefused(decideDaemonJobLease(throwingCurrent as never, acquireRequest() as never, 'notifier'));
   });
 });
 
@@ -610,25 +613,19 @@ describe('status v1 records, versions, exit codes and health', () => {
   });
 
   it('reports starvation, staleness, refusals and a bad clock in order', () => {
-    const near = readDaemonStatusRecord(validStatusBody({
-      jobs: [jobItem({ consecutiveBudgetExhausted: 9 })],
-    }));
-    expect(near.ok).toBe(true);
-    if (near.ok) {
-      const health = evaluateDaemonStatusHealth(near.record, NOW);
-      expect(health).toEqual({
-        healthy: true, exitCode: 0, reasons: [], refusedJobIds: [], starvedJobIds: [],
-      });
-    }
-    const starved = readDaemonStatusRecord(validStatusBody({
-      jobs: [jobItem({ consecutiveBudgetExhausted: 10 })],
-    }));
-    expect(starved.ok).toBe(true);
-    if (starved.ok) {
-      expect(evaluateDaemonStatusHealth(starved.record, NOW)).toEqual({
-        healthy: false, exitCode: 1, reasons: ['starved'], refusedJobIds: [], starvedJobIds: ['notifier'],
-      });
-    }
+    const checkExhaustion = (consecutive: number) => {
+      const read = readDaemonStatusRecord(validStatusBody({
+        jobs: [jobItem({ consecutiveBudgetExhausted: consecutive })],
+      }));
+      expect(read.ok).toBe(true);
+      return read.ok ? evaluateDaemonStatusHealth(read.record, NOW) : null;
+    };
+    expect(checkExhaustion(9)).toEqual({
+      healthy: true, exitCode: 0, reasons: [], refusedJobIds: [], starvedJobIds: [],
+    });
+    expect(checkExhaustion(10)).toEqual({
+      healthy: false, exitCode: 1, reasons: ['starved'], refusedJobIds: [], starvedJobIds: ['notifier'],
+    });
     const stale = evaluateDaemonStatusHealth(statusRecord(), '2026-10-31T13:00:00.000Z');
     expect(stale.reasons).toEqual(['stale']);
     expect(stale.exitCode).toBe(1);
@@ -778,8 +775,9 @@ describe('pause and lease readers', () => {
 
 describe('isDaemonPaused', () => {
   it('is true only for paused and unreadable', () => {
-    expect(isDaemonPaused({ state: 'paused', record: { version: DAEMON_RECORD_VERSION, paused: true, changedAtIso: NOW } })).toBe(true);
-    expect(isDaemonPaused({ state: 'unreadable' })).toBe(true);
+    for (const pause of PAUSED_AND_UNREADABLE) {
+      expect(isDaemonPaused(pause)).toBe(true);
+    }
     expect(isDaemonPaused({ state: 'clear', record: null })).toBe(false);
   });
 });

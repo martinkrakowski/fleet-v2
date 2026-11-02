@@ -185,6 +185,53 @@ describe('policy.board (WB6p)', () => {
     expect(getterRan).toBe(false);
   });
 
+  it('returns a validation error without running a throwing own getter', () => {
+    for (const field of ['forgeStaleMinutes', 'declarationTtlMinutes', 'doneWindowDays', 'forgeSyncMinutes'] as const) {
+      let getterRan = false;
+      const board: Record<string, unknown> = {};
+      Object.defineProperty(board, field, {
+        get() {
+          getterRan = true;
+          throw new Error(`getter for ${field} should not run`);
+        },
+        enumerable: true,
+        configurable: true,
+      });
+      const bounds = BOARD_BOUNDS[field];
+      let result: ReturnType<typeof parseInstallation> | undefined;
+      expect(() => {
+        result = parseInstallation(withBoard(board));
+      }).not.toThrow();
+      expect(getterRan).toBe(false);
+      expect(result).toEqual({
+        ok: false,
+        errors: [`policy.board.${field}: must be an integer ${bounds.min}..${bounds.max}`],
+      });
+      expect(resolveBoardPolicy({ board } as never)).toEqual(DEFAULT_BOARD_POLICY);
+      expect(getterRan).toBe(false);
+    }
+
+    let boardGetterRan = false;
+    const policyWithGetter: Record<string, unknown> = { ...validV2.policy };
+    Object.defineProperty(policyWithGetter, 'board', {
+      get() {
+        boardGetterRan = true;
+        throw new Error('board block getter should not run');
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    let blockResult: ReturnType<typeof parseInstallation> | undefined;
+    expect(() => {
+      blockResult = parseInstallation({ ...validV2, policy: policyWithGetter });
+    }).not.toThrow();
+    expect(boardGetterRan).toBe(false);
+    expect(blockResult).toEqual({
+      ok: false,
+      errors: ['policy.board: must be an object'],
+    });
+  });
+
   it('refuses board on a v1 file', () => {
     const result = parseInstallation({
       schemaVersion: 1,

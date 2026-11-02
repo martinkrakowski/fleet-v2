@@ -47,6 +47,7 @@ import type {
 } from './types.js';
 
 import { BOARD_BOUNDS, CONDUCTOR_MINUTE_BOUNDS, CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
+import { readOwnDataProperty } from './policy-read.js';
 import { readTelemetryPolicyBlock } from './telemetry-policy.js';
 import { readSeatsPolicyBlock } from './seats-policy.js';
 
@@ -1971,6 +1972,28 @@ function parseConductorPolicy(
   };
 }
 
+function readBoardMinutes(
+  record: JsonObject,
+  field: string,
+  bounds: Readonly<{ min: number; max: number }>,
+  errors: string[],
+): number | undefined {
+  if (!Object.hasOwn(record, field)) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(record as Record<string, unknown>, field);
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < bounds.min ||
+    value > bounds.max
+  ) {
+    errors.push(`policy.board.${field}: must be an integer ${bounds.min}..${bounds.max}`);
+    return undefined;
+  }
+  return value;
+}
+
 function parseBoardPolicy(
   section: JsonObject,
   errors: string[],
@@ -1978,38 +2001,34 @@ function parseBoardPolicy(
   if (!Object.hasOwn(section, 'board')) {
     return undefined;
   }
-  const value = section.board;
+  const value = readOwnDataProperty(section as Record<string, unknown>, 'board');
   if (!isJsonObject(value)) {
     errors.push('policy.board: must be an object');
     return undefined;
   }
   const before = errors.length;
   collectUnknownKeys(value, BOARD_KEYS, 'policy.board', errors);
-  const forgeStaleMinutes = readConductorMinutes(
+  const forgeStaleMinutes = readBoardMinutes(
     value,
     'forgeStaleMinutes',
-    'policy.board',
     BOARD_BOUNDS.forgeStaleMinutes,
     errors,
   );
-  const declarationTtlMinutes = readConductorMinutes(
+  const declarationTtlMinutes = readBoardMinutes(
     value,
     'declarationTtlMinutes',
-    'policy.board',
     BOARD_BOUNDS.declarationTtlMinutes,
     errors,
   );
-  const doneWindowDays = readConductorMinutes(
+  const doneWindowDays = readBoardMinutes(
     value,
     'doneWindowDays',
-    'policy.board',
     BOARD_BOUNDS.doneWindowDays,
     errors,
   );
-  const forgeSyncMinutes = readConductorMinutes(
+  const forgeSyncMinutes = readBoardMinutes(
     value,
     'forgeSyncMinutes',
-    'policy.board',
     BOARD_BOUNDS.forgeSyncMinutes,
     errors,
   );

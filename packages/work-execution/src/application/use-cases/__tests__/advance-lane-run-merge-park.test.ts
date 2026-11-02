@@ -292,7 +292,7 @@ function openPullRequestAtHead(number: number, mergeState: PullRequestMergeState
   };
 }
 
-function mergedPullRequestAtHead(number: number): ReadPullRequestResult {
+function mergedPullRequestAtHead(number: number, baseRef: string = 'main'): ReadPullRequestResult {
   return {
     outcome: 'found',
     pullRequest: {
@@ -301,7 +301,7 @@ function mergedPullRequestAtHead(number: number): ReadPullRequestResult {
       mergeState: 'clean',
       headSha: COMMIT,
       headRef: 'wt-example-1',
-      baseRef: 'main',
+      baseRef,
       mergedAtIso: LATER,
       closedAtIso: null,
       mergeCommitSha: COMMIT,
@@ -1510,6 +1510,18 @@ describe('AdvanceLaneRunUseCase merged-PR leaves branch-behind and ambiguous ope
       const harness = await parkedForgeHarness(parked);
       harness.setForgeReadAnswer(mergedPullRequestAtOtherHead(7));
       harness.setAncestryAnswer({ outcome: 'answered', contains: false });
+      expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
+      const record = await harness.runRepo.get(RUN_ID);
+      expect(record?.parked).not.toBeNull();
+      expect(harness.forgeReadRequests).toHaveLength(1);
+      expect(await openPrIntents(harness)).toEqual([]);
+    }
+  });
+
+  it('same head, merged, another base: stays parked', async () => {
+    for (const parked of [BRANCH_BEHIND_PARK, AMBIGUOUS_OPEN_PR_PARK]) {
+      const harness = await parkedForgeHarness(parked);
+      harness.setForgeReadAnswer(mergedPullRequestAtHead(7, 'chain/other'));
       expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
       const record = await harness.runRepo.get(RUN_ID);
       expect(record?.parked).not.toBeNull();

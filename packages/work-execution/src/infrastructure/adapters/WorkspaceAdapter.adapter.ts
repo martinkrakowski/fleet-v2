@@ -941,15 +941,26 @@ export class WorkspaceAdapter implements WorkspacePort {
       await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
       return { outcome: 'refused', reason: 'git-refused' };
     }
+    // A destination can appear after the existence checks; `mv -n` then skips
+    // the move while reporting success, so the rename alone proves nothing.
+    // The destination must exist and match the preserved diff byte for byte;
+    // a mismatch (including a skipped move onto a foreign file) is a refusal,
+    // and only the leftover temp file — never a foreign destination — is removed.
+    const verify = await executor.run(['cmp', '-', patchPath], { input: diff, timeoutMs: GIT_TIMEOUT_MS });
+    if (verify.exitCode !== 0 || verify.error !== undefined) {
+      await executor.run(['rm', '-f', tempPath], { timeoutMs: GIT_TIMEOUT_MS });
+      return { outcome: 'refused', reason: 'git-refused' };
+    }
     return { outcome: 'preserved', patchPath, patchBytes: Buffer.byteLength(diff, 'utf8') };
   }
 
   /**
    * GB3: discard the worktree's tracked modifications back to its recorded head
    * (`git reset --hard`, no ref argument — HEAD and the branch cannot move),
-   * leaving untracked files untouched. Refuses before resetting when restoring a
-   * tracked path would overwrite or remove an untracked path, and verifies after
-   * resetting that the untracked paths are unchanged.
+   * leaving untracked files untouched. Refuses before resetting when restoring
+   * or clearing a tracked path (HEAD's tree or the index) would overwrite or
+   * remove an untracked path, and verifies after resetting that the untracked
+   * paths are unchanged.
    */
   async resetWorktreeToHead(request: ResetWorktreeToHeadRequest): Promise<ResetWorktreeToHeadResult> {
     // 1. Validate before any command runs (no executor call on a bad request).
@@ -964,10 +975,16 @@ export class WorkspaceAdapter implements WorkspacePort {
     }
     try {
       // 2. Read the head to report, and list the tracked paths reset would
-      //    restore (HEAD's tree) and the untracked files present.
+      //    restore or clear: HEAD's tree AND the index — a staged addition is
+      //    not in HEAD, but `reset --hard` still removes it from index and
+      //    worktree, so it must take part in the obstruction check — plus the
+      //    untracked files present.
       const head = (await this.runGit(request.worktreePath, ['rev-parse', 'HEAD'], executor)).trim();
       const trackedRun = await this.runGit(request.worktreePath, ['ls-tree', '-r', '--name-only', 'HEAD'], executor);
-      const trackedPaths = trackedRun.split('\n').filter((line) => line !== '');
+      const indexRun = await this.runGit(request.worktreePath, ['ls-files', '--cached'], executor);
+      const trackedPaths = [
+        ...new Set([...trackedRun.split('\n'), ...indexRun.split('\n')].filter((line) => line !== '')),
+      ];
       const untrackedRun = await this.runGit(
         request.worktreePath,
         ['ls-files', '--others', '--exclude-standard'],

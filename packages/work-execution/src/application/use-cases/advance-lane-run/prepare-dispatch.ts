@@ -61,6 +61,17 @@ export async function performPrepare(ctx: AdvanceStepContext,
   if (source === null) {
     return refuse('no-frozen-brief');
   }
+  // GB3: the source attempt may carry an incomplete worktree recovery — a
+  // crash after the recovery's cancel but before its completing journal entry
+  // leaves the attempt `cancelled` with the intent still open. Reconcile the
+  // recovery before another seat is prepared; an unreconcilable recovery
+  // parks instead of advancing over unfinished side effects.
+  if (await hasIncompleteWorktreeRecovery(ctx, source.id)) {
+    const reconciled = await reconcileCancelledWorktreeRecovery(ctx, record, source, request);
+    if (!reconciled) {
+      return performPark(ctx, record, 'step-refused', 'prepare', gathered.facts.state, request);
+    }
+  }
   const planResult = SeatPlan.create(source.seatPlan);
   const seat =
     planResult.success && planResult.value !== undefined
@@ -279,6 +290,26 @@ export function fixSeatForDispatch(
 }
 
 /**
+ * GB3: the recorded worktree path and attempt id are untrusted data
+ * (`AttemptRecord` stores both as plain strings), so both are validated before
+ * the deterministic patch path is constructed from them: an absolute, already
+ * normalized worktree path (no `.` or `..` segments, no empty segments beyond
+ * the leading slash, no NUL) and an attempt id that is safe as a file-name
+ * fragment. A refused pair means no patch path is ever built.
+ */
+function worktreeRecoveryPatchInputsValid(worktreePath: string, attemptId: string): boolean {
+  if (!worktreePath.startsWith('/') || worktreePath.includes('\0')) {
+    return false;
+  }
+  const segments = worktreePath.split('/');
+  if (segments.includes('.') || segments.includes('..')) {
+    return false;
+  }
+  const normalized = segments.slice(1).every((segment) => segment !== '');
+  return normalized && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(attemptId);
+}
+
+/**
  * GB3: true when the execution journal holds a durable recovery intent for the
  * attempt that its completing entry does not close. An incomplete recovery must
  * never cancel-and-advance: the side effects (preserve, reset, cancel) may be
@@ -332,6 +363,9 @@ async function recoverUncommittedWorktree(ctx: AdvanceStepContext,
   if (recordedHost === null) {
     return false;
   }
+  if (!worktreeRecoveryPatchInputsValid(latest.worktreePath, latest.id)) {
+    return false;
+  }
   try {
     const priorEntries = await ctx.deps.executionJournal.listJournalEntriesForAttempt(latest.id);
     const priorIntent = priorEntries.find(
@@ -372,6 +406,71 @@ async function recoverUncommittedWorktree(ctx: AdvanceStepContext,
     }
     await append({
       id: latest.id + ':dispatch:' + String(priorEntries.length + 2),
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      action: 'dispatch',
+      baseCommit: latest.baseCommit,
+      recordedAtIso: request.nowIso,
+      status: 'completed',
+      sessionId: null,
+      detail: 'preserved uncommitted edits: ' + patchPath,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * GB3: reconcile a crashed recovery whose attempt is already `cancelled` —
+ * the crash landed after the cancel but before the recovery's completing
+ * journal entry, so the intent is open while the next advance would otherwise
+ * prepare the next seat over an unreconciled recovery. The preserve and reset
+ * side effects may already have run, so the reconcile does not re-run them
+ * blindly: a `destination-exists` preserve proves the patch survived the
+ * crash (the adapter checks the destination before reading the worktree), a
+ * fresh `preserved` writes a missing patch, and the idempotent reset restores
+ * the head; the completing entry then closes the intent. Any other outcome —
+ * in particular `nothing-to-preserve`, where a clean worktree cannot prove
+ * the patch — leaves the intent open and reads false, so the run parks.
+ */
+async function reconcileCancelledWorktreeRecovery(ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+): Promise<boolean> {
+  const recovery = ctx.deps.worktreeRecovery;
+  const append = ctx.deps.executionJournal.appendJournalEntry?.bind(ctx.deps.executionJournal);
+  if (recovery?.preserveWorktreeEdits === undefined || recovery.resetWorktreeToHead === undefined || append === undefined) {
+    return false;
+  }
+  if (latest.state !== 'cancelled' || latest.worktreePath === null) {
+    return false;
+  }
+  if (!worktreeRecoveryPatchInputsValid(latest.worktreePath, latest.id)) {
+    return false;
+  }
+  const recordedHost = conductedRunnerOf(latest);
+  if (recordedHost === null) {
+    return false;
+  }
+  try {
+    const patchPath = latest.worktreePath + '.' + latest.id + '.patch';
+    const preserved = await recovery.preserveWorktreeEdits(
+      { worktreePath: latest.worktreePath, patchPath, recordedHost },
+    );
+    if (preserved.outcome === 'refused' && preserved.reason === 'destination-exists') {
+      // The patch already survived the crash; nothing is re-written.
+    } else if (preserved.outcome !== 'preserved') {
+      return false;
+    }
+    const reset = await recovery.resetWorktreeToHead({ worktreePath: latest.worktreePath, recordedHost });
+    if (reset.outcome !== 'reset') {
+      return false;
+    }
+    const priorEntries = await ctx.deps.executionJournal.listJournalEntriesForAttempt(latest.id);
+    await append({
+      id: latest.id + ':dispatch:' + String(priorEntries.length + 1),
       attemptId: latest.id,
       workOrderId: record.workOrderId,
       action: 'dispatch',

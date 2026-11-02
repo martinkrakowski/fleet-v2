@@ -186,4 +186,56 @@ describe('WorkspaceAdapter GB3 recovery', () => {
     expect(status).toContain('README.md');
     expect(status).toContain('?? README.md/inside.txt');
   });
+
+  it('reset refuses when a staged addition sits at a path occupied by an untracked directory', { timeout: 20000 }, async () => {
+    const repoPath = await createGitRepo();
+    const head = (await git(repoPath, ['rev-parse', 'HEAD'])).trim();
+    // A staged addition at P (in the index, absent from HEAD) whose worktree
+    // path is now an untracked directory: only the index lists P, so a
+    // HEAD-only obstruction check would miss the collision.
+    await fs.writeFile(path.join(repoPath, 'P'), 'staged\n', 'utf8');
+    await git(repoPath, ['add', 'P']);
+    await fs.rm(path.join(repoPath, 'P'));
+    await fs.mkdir(path.join(repoPath, 'P'));
+    await fs.writeFile(path.join(repoPath, 'P', 'inner.txt'), 'untracked payload\n', 'utf8');
+
+    const adapter = new WorkspaceAdapter({ executor: new LocalExecutor() });
+    const result = await adapter.resetWorktreeToHead({ worktreePath: repoPath });
+    expect(result).toEqual({ outcome: 'refused', reason: 'untracked-obstructs' });
+    // Nothing was reset: the untracked directory and the staged addition are
+    // both untouched.
+    expect(await fs.readFile(path.join(repoPath, 'P', 'inner.txt'), 'utf8')).toBe('untracked payload\n');
+    const status = await git(repoPath, ['status', '--porcelain', '--untracked-files=all']);
+    expect(status).toContain('AD P');
+    expect(status).toContain('?? P/inner.txt');
+    expect((await git(repoPath, ['rev-parse', 'HEAD'])).trim()).toBe(head);
+  });
+
+  it('preserve refuses when a destination appears after the existence checks, and never clobbers it', { timeout: 20000 }, async () => {
+    const repoPath = await createGitRepo();
+    const patchesDir = await makeTempDir('fleet-patches-');
+    const patchPath = path.join(patchesDir, 'raced.patch');
+    await fs.writeFile(path.join(repoPath, 'README.md'), '# changed\n', 'utf8');
+    // A racing writer creates the destination between the existence checks and
+    // the rename: it hooks the git diff call, which runs after the checks.
+    const inner = new LocalExecutor();
+    const racing: CommandExecutorPort = {
+      run: async (argv, options) => {
+        const result = await inner.run(argv, options);
+        if (argv[0] === 'git' && argv.includes('diff')) {
+          await fs.writeFile(patchPath, 'raced writer\n', 'utf8');
+        }
+        return result;
+      },
+    };
+    const adapter = new WorkspaceAdapter({ executor: racing });
+    const result = await adapter.preserveWorktreeEdits({ worktreePath: repoPath, patchPath });
+    // `mv -n` skips silently here; without the post-rename verification this
+    // reported `preserved` for a destination that never held the diff.
+    expect(result).toEqual({ outcome: 'refused', reason: 'git-refused' });
+    expect(await fs.readFile(patchPath, 'utf8')).toBe('raced writer\n');
+    // The leftover temp file is cleaned up; no other file appeared.
+    const leftovers = (await fs.readdir(patchesDir)).filter((name) => name.startsWith('.fleet-patch.'));
+    expect(leftovers).toEqual([]);
+  });
 });

@@ -15,6 +15,11 @@ import {
   SHARED_BEARER_TOKEN_ID,
 } from "../wiring/presented-token.js";
 import { normalizePath, requiredScope } from "../wiring/route-scopes.js";
+import {
+  authenticateSessionExchange,
+  isSessionExchangePath,
+  resolveSessionToken,
+} from "../wiring/session-exchange.js";
 
 const ALLOWED_UNAUTHENTICATED_PATHS = new Set(["/", "/health"]);
 
@@ -68,6 +73,11 @@ function authenticationFailure(
     activeBuf.length !== candidateBuf.length ||
     !timingSafeEqual(activeBuf, candidateBuf)
   ) {
+    // T3b: a session-minted token authenticates through the in-memory registry
+    // (memory only); it is scope-checked afterwards like any non-shared token.
+    if (resolveSessionToken(event) !== null) {
+      return undefined;
+    }
     return unauthorized(event, "Unauthorized: invalid bearer token");
   }
   return undefined;
@@ -121,6 +131,24 @@ export default defineEventHandler((event) => {
     }
   }
 
+  const method = getMethod(event).toUpperCase();
+
+  // T3b: /sessions/exchange is gated by the interactive session credential
+  // (in-memory), not by the bearer token or the /v1 scope mapping.
+  if (isSessionExchangePath(requestPath)) {
+    const exchangeFailure = authenticateSessionExchange(event);
+    if (exchangeFailure) {
+      return exchangeFailure;
+    }
+    if (method !== "GET" && !hasJsonContentType(event)) {
+      setResponseStatus(event, 415);
+      setResponseHeader(event, "content-type", "application/json");
+      setResponseHeader(event, "cache-control", "no-store");
+      return { error: "Unsupported Media Type: Content-Type must be application/json" };
+    }
+    return;
+  }
+
   // Require Authorization: Bearer <token> (constant-time compare via crypto.timingSafeEqual on equal-length buffers)
   const authFailure = authenticationFailure(event, getRequestHeader(event, "authorization"));
   if (authFailure) {
@@ -128,7 +156,6 @@ export default defineEventHandler((event) => {
   }
 
   // T3a: enforce the route scope for non-shared tokens (the shared bearer keeps today's behaviour).
-  const method = getMethod(event).toUpperCase();
   if (isV1Path(requestPath)) {
     const scopeBody = scopeFailure(event, method, requestPath);
     if (scopeBody) {

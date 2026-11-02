@@ -8,11 +8,13 @@ import { loadInstallation } from "@fleet/installation";
 
 import { listenHostRefusal } from "../wiring/listen-host";
 import { configureFleetApiRuntime } from "../wiring/runtime";
+import { configureSessionExchange } from "../wiring/session-exchange";
 import { readApiTokenFromFile, setActiveApiToken } from "../wiring/token";
 
 function refuse(): false {
   setActiveApiToken(null);
   configureFleetApiRuntime(null);
+  configureSessionExchange(null);
   return false;
 }
 

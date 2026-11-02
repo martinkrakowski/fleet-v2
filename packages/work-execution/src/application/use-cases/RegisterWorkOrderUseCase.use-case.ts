@@ -12,7 +12,7 @@ import {
   DEFAULT_WORK_ORDER_RISK,
   parseWorkOrderRisk,
 } from '../../domain/execution-records.js';
-import type { WorkOrderRecord } from '../../domain/execution-records.js';
+import type { PlanRef, WorkOrderRecord } from '../../domain/execution-records.js';
 import type { BaseBranchValue } from '../../domain/base-branch.js';
 import {
   DEFAULT_BASE_BRANCH,
@@ -23,6 +23,7 @@ import type {
   RegisterWorkOrderRequest,
   RegisterWorkOrderResult,
 } from '../ports/in/RegisterWorkOrderPort.in-port.js';
+import type { LanePlanRepositoryPort } from '../ports/out/LanePlanRepositoryPort.out-port.js';
 import type { ProjectProfileReadPort } from '../ports/out/ProjectProfileReadPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 
@@ -34,6 +35,13 @@ export interface RegisterWorkOrderDependencies {
    * optional only for unit tests that exercise the work-order rules alone.
    */
   readonly profileRead?: ProjectProfileReadPort;
+  /**
+   * When present, an optional plan link is verified against the lane-plan
+   * store: the plan must exist and name the lane (current id or alias).
+   * It stays optional for unit tests that exercise the work-order rules
+   * alone.
+   */
+  readonly lanePlanRepo?: LanePlanRepositoryPort;
 }
 
 function isNonEmpty(value: unknown): value is string {
@@ -119,6 +127,16 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
 
     // One trimmed id for the profile check, the conflict listing and the save.
     const projectId = request.projectId.trim();
+
+    // The optional plan link (WB4a) is decided before any later store access:
+    // both fields or neither, the caller's planProjectId — when present — must
+    // equal the work order's own project, and a configured lane-plan repo
+    // verifies the plan and lane exist. A refusal writes nothing.
+    const planLink = await this.resolvePlanLink(request, projectId);
+    if (!planLink.ok) {
+      return { outcome: 'rejected', reason: planLink.reason };
+    }
+
     if (this.deps.profileRead) {
       const profile = await this.deps.profileRead.readProjectProfile(projectId);
       if (profile === null) {
@@ -226,6 +244,7 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
       risk,
       baseBranch: baseBranchDecision.value,
       prerequisiteWorkOrderIds: [...prerequisites],
+      ...(planLink.planRef !== undefined ? { planRef: planLink.planRef } : {}),
       ...(request.supersedesWorkOrderId !== undefined
         ? { supersedesWorkOrderId: request.supersedesWorkOrderId.trim() }
         : {}),
@@ -236,6 +255,46 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     };
     await this.deps.workOrderRepo.saveWorkOrder(record);
     return { outcome: 'registered', workOrder: record };
+  }
+
+  /**
+   * The optional plan link (WB4a): absent fields keep the record planRef-less
+   * exactly as today; both fields must be present and non-empty; `planProjectId`
+   * must equal the work order's own project; a configured lane-plan repo
+   * verifies the plan exists and names the lane (current id or alias).
+   */
+  private async resolvePlanLink(
+    request: RegisterWorkOrderRequest,
+    projectId: string,
+  ): Promise<
+    | { readonly ok: true; readonly planRef?: PlanRef }
+    | { readonly ok: false; readonly reason: string }
+  > {
+    if (request.planId === undefined && request.planLaneId === undefined) {
+      return { ok: true };
+    }
+    const planId = typeof request.planId === 'string' ? request.planId.trim() : '';
+    const laneId = typeof request.planLaneId === 'string' ? request.planLaneId.trim() : '';
+    if (planId === '' || laneId === '') {
+      return { ok: false, reason: 'plan-ref-incomplete' };
+    }
+    if (request.planProjectId !== undefined && request.planProjectId.trim() !== projectId) {
+      return { ok: false, reason: 'plan-project-mismatch' };
+    }
+    const lanePlanRepo = this.deps?.lanePlanRepo;
+    if (lanePlanRepo !== undefined) {
+      const plan = await lanePlanRepo.findLanePlan(projectId, planId);
+      if (plan === null) {
+        return { ok: false, reason: 'plan-not-found' };
+      }
+      const lane = plan.lanes.find(
+        (candidate) => candidate.laneId === laneId || candidate.aliases.includes(laneId),
+      );
+      if (lane === undefined) {
+        return { ok: false, reason: 'lane-not-found' };
+      }
+    }
+    return { ok: true, planRef: { projectId, planId, laneId } };
   }
 
   async execute(input?: unknown): Promise<RegisterWorkOrderResult> {

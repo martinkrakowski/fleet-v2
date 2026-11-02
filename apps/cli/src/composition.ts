@@ -51,6 +51,7 @@ import {
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
+  MergeGrantAdapter,
   ForgeReadAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
@@ -715,6 +716,7 @@ export interface FleetCliRuntime {
     readonly briefKnowledge: BriefKnowledgeAdapter;
     readonly executionObservation: ExecutionObservationAdapter;
     readonly forgeAction: ForgeActionAdapter;
+    readonly mergeGrant: MergeGrantAdapter;
     /** Read-only PR state (AM4b-2); bound in forge mode `github` only. */
     readonly forgeRead: ForgeReadAdapter;
     readonly registerWorkOrder: RegisterWorkOrderUseCase;
@@ -905,6 +907,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     coordination,
     coordinationRequestRepository,
     issuePolicyForgeGrantUseCase,
+    issueMergeGrantUseCase,
     profileRead,
     probeRecord,
     executorForHostName,
@@ -946,6 +949,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     opencodeUsage,
     briefAuthoring,
     forgeAction,
+    mergeGrant,
   } = composeExecutionHosts({
     stateDir,
     options,
@@ -970,6 +974,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     readGitHead,
     headRouteForExecutor,
     runGitCommand,
+    issuePolicyForgeGrantUseCase,
+    issueMergeGrantUseCase,
   });
 
   const { execution } = composeExecution({
@@ -989,6 +995,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     attemptLookup,
     forgeRead,
     issuePolicyForgeGrantUseCase,
+    mergeGrant,
     profileRead,
     probeRecord,
     executorForHostName,

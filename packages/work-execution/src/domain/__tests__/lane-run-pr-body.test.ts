@@ -156,3 +156,72 @@ describe('renderPrBody', () => {
     expect(result.body.toLowerCase()).not.toContain('co-authored-by');
   });
 });
+
+describe('renderPrBody carried minors (GB1)', () => {
+  it('renders one line per carried minor under Challenge this, using its actual severity', () => {
+    const result = renderPrBody({
+      ...baseInput(),
+      carriedMinors: [
+        { severity: 'minor', filePath: 'src/ex.ts', line: 4 },
+        { severity: 'nit', filePath: 'src/other.ts', line: 9 },
+        { severity: 'nit', filePath: null, line: 3 },
+        { severity: 'minor', filePath: 'src/no-line.ts', line: null },
+      ],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error('unreachable: expected ok');
+    }
+    const challenge = result.body.slice(result.body.indexOf('## Challenge this'));
+    expect(challenge).toContain('- [minor] src/ex.ts:4');
+    expect(challenge).toContain('- [nit] src/other.ts:9');
+    expect(challenge).toContain('- [nit] (no path)');
+    expect(challenge).toContain('- [minor] src/no-line.ts');
+    // The lines come after the frozen paragraph, in input order.
+    expect(challenge.indexOf('Revert with the lane rollback script')).toBeLessThan(challenge.indexOf('- [minor] src/ex.ts:4'));
+    expect(challenge.indexOf('- [minor] src/ex.ts:4')).toBeLessThan(challenge.indexOf('- [nit] src/other.ts:9'));
+  });
+
+  it('without carriedMinors the body is byte-identical to the pre-GB1 rendering; an empty list too', () => {
+    const plain = renderPrBody(baseInput());
+    const withEmpty = renderPrBody({ ...baseInput(), carriedMinors: [] });
+    expect(withEmpty).toEqual(plain);
+    if (!plain.ok) {
+      throw new Error('unreachable: expected ok');
+    }
+    expect(plain.body.endsWith('Revert with the lane rollback script if wrong.\n')).toBe(true);
+  });
+
+  it.each([
+    ['a blocker severity', [{ severity: 'blocker', filePath: 'src/ex.ts', line: 4 }]],
+    ['a major severity', [{ severity: 'major', filePath: 'src/ex.ts', line: 4 }]],
+    ['a non-integer line', [{ severity: 'minor', filePath: 'src/ex.ts', line: 1.5 }]],
+    ['a zero line', [{ severity: 'minor', filePath: 'src/ex.ts', line: 0 }]],
+    ['a non-string path', [{ severity: 'minor', filePath: 42, line: 4 }]],
+    ['an absolute path', [{ severity: 'minor', filePath: '/etc/passwd', line: 1 }]],
+    ['a dot-dot component', [{ severity: 'minor', filePath: 'src/../secret.ts', line: 1 }]],
+    ['an empty component', [{ severity: 'minor', filePath: 'src//ex.ts', line: 1 }]],
+    ['an empty path', [{ severity: 'minor', filePath: '', line: 1 }]],
+    ['an over-long path', [{ severity: 'minor', filePath: 'a'.repeat(301), line: 1 }]],
+    ['a path with a newline', [{ severity: 'minor', filePath: 'src/ex.ts\ninjected', line: 1 }]],
+  ])('refuses invalid-review for %s', (_label, carriedMinors) => {
+    expect(renderPrBody({ ...baseInput(), carriedMinors: carriedMinors as never }))
+      .toEqual({ ok: false, reason: 'invalid-review' });
+  });
+
+  it('refuses a secret-shaped filePath with secret-shaped', () => {
+    const secret = ['sk', 'live', '0123456789abcdef0123456789abcdef'].join('-');
+    expect(renderPrBody({ ...baseInput(), carriedMinors: [{ severity: 'minor', filePath: secret, line: 1 }] }))
+      .toEqual({ ok: false, reason: 'secret-shaped' });
+  });
+
+  it('refuses too-long when the carried lines push the body past the cap', () => {
+    const carriedMinors = Array.from({ length: 220 }, (_value, index) => ({
+      severity: 'minor' as const,
+      filePath: 'src/' + String(index).padStart(3, '0') + '/' + 'a'.repeat(291),
+      line: index + 1,
+    }));
+    expect(renderPrBody({ ...baseInput(), carriedMinors }))
+      .toEqual({ ok: false, reason: 'too-long' });
+  });
+});

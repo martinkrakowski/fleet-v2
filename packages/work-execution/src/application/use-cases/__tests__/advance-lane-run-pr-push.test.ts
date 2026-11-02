@@ -19,6 +19,7 @@ import type {
   AcceptanceAssessmentResult,
   AcceptanceReceiptsResult,
 } from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
+import type { ReviewRequestFinding } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type {
   ConductorForgeGrantRequest,
   ConductorForgeGrantResult,
@@ -1498,5 +1499,162 @@ describe('R4a: the parked open-pr recovery', () => {
     );
     expect(resumeResults).toHaveLength(1);
     expect(resumeResults[0]).toMatchObject({ outcome: 'refused', reasonCode: 'stop-pending' });
+  });
+});
+
+describe('AdvanceLaneRunUseCase carried minors in the open-pr body (GB1)', () => {
+  const MINOR_ONLY_FINDINGS = [
+    { findingId: 'f-1', severity: 'minor' as const, summary: 'a minor note', filePath: 'src/ex.ts', line: 4 },
+    { findingId: 'f-2', severity: 'nit' as const, summary: 'a nit', filePath: null, line: null },
+  ];
+
+  function briefCheckKey(): string {
+    const built = buildLaneRunStepKey({
+      runId: RUN_ID,
+      round: 0,
+      step: 'brief-check',
+      seatIndex: 0,
+      attemptOrdinal: null,
+      head12: HEAD12,
+      retry: null,
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      throw new Error('fixture must build a brief-check key');
+    }
+    return built.key;
+  }
+
+  async function appendResultWithDetail(
+    harness: Harness,
+    key: string,
+    reasonCode: Parameters<typeof laneRunResultEntry>[4],
+    detail: string | null,
+  ): Promise<void> {
+    const entry = laneRunResultEntry(harness.deps.newUlid(), RUN_ID, key, 'completed', reasonCode, NOW, detail);
+    const appended = await harness.runJournal.append(entry);
+    expect(appended.outcome).toBe('appended');
+  }
+
+  /** Seed the brief-check intent (with its minted request id) and its final result at the accepted head. */
+  async function seedBriefCheckResult(harness: Harness, reasonCode: Parameters<typeof laneRunResultEntry>[4], detail: string | null): Promise<void> {
+    await appendIntent(harness, briefCheckKey(), 'review-seeded-1', NOW);
+    await appendResultWithDetail(harness, briefCheckKey(), reasonCode, detail);
+  }
+
+  type AnyFinding = ReviewRequestFinding;
+
+  function wireReviewReceipt(
+    harness: Harness,
+    answer: (request: { requestId: string }) => 'found' | 'unavailable' | 'throw',
+    findings: readonly AnyFinding[] = MINOR_ONLY_FINDINGS,
+  ): void {
+    Object.assign(harness.deps, {
+      reviewRequest: {
+        requestReview: async () => {
+          throw new Error('never re-requested');
+        },
+        findReviewReceipt: async (request: { requestId: string }) => {
+          if (answer(request) === 'throw') {
+            throw new Error('receipt read exploded');
+          }
+          if (answer(request) === 'unavailable') {
+            return { outcome: 'unavailable', reason: 'unreadable' } as const;
+          }
+          return {
+            outcome: 'found',
+            receipt: {
+              receiptId: 'rcpt-1',
+              requestId: request.requestId,
+              kind: 'brief-check',
+              reviewerModel: 'review-model-1',
+              candidateHeadSha: COMMIT,
+              verdict: 'failed',
+              findings,
+            },
+          } as const;
+        },
+        findLatestReceiptOfKind: async () => ({ outcome: 'not-found' }) as const,
+      },
+    });
+  }
+
+  it('the matching override receipt carries its minor and nit lines into the Challenge section, and the PR opens', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', 'minor-only-findings');
+    wireReviewReceipt(harness, () => 'found');
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    expect(harness.forgeRequests).toHaveLength(1);
+    const body = harness.forgeRequests[0]!.body;
+    expect(body).toContain(CHALLENGE_THIS);
+    expect(body).toContain('- [minor] src/ex.ts:4');
+    expect(body).toContain('- [nit] (no path)');
+    // The finding summary text never reaches the body.
+    expect(body).not.toContain('a minor note');
+  });
+
+  it('a non-override brief-check result (no minor-only detail) carries no lines and the PR still opens', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', null);
+    wireReviewReceipt(harness, () => 'found');
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    const body = harness.forgeRequests[0]!.body;
+    expect(body).toContain(CHALLENGE_THIS);
+    expect(body).not.toContain('- [minor]');
+    expect(body).not.toContain('- [nit]');
+  });
+
+  it('a receipt read for another request id carries no lines and the PR still opens', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', 'minor-only-findings');
+    wireReviewReceipt(harness, (request) => (request.requestId === 'review-other' ? 'found' : 'unavailable'), [
+      { findingId: 'f-1', severity: 'minor' as const, summary: 'a minor note', filePath: 'src/ex.ts', line: 4 },
+    ]);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    expect(harness.forgeRequests[0]!.body).not.toContain('- [minor]');
+  });
+
+  it('a throwing receipt read contributes no lines and does not prevent opening the PR', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', 'minor-only-findings');
+    wireReviewReceipt(harness, () => 'throw');
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    const body = harness.forgeRequests[0]!.body;
+    expect(body).toContain(CHALLENGE_THIS);
+    expect(body).not.toContain('- [minor]');
+    expect(body).not.toContain('- [nit]');
+  });
+
+  it('a receipt mixing a blocker with a minor carries only the minor (display keeps to minor and nit)', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', 'minor-only-findings');
+    wireReviewReceipt(harness, () => 'found', [
+      { findingId: 'f-1', severity: 'minor' as const, summary: 'a minor note', filePath: 'src/ex.ts', line: 4 },
+      { findingId: 'f-2', severity: 'blocker' as const, summary: 'a blocker', filePath: 'src/bad.ts', line: 1 },
+    ]);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    const body = harness.forgeRequests[0]!.body;
+    expect(body).toContain('- [minor] src/ex.ts:4');
+    expect(body).not.toContain('src/bad.ts');
+  });
+
+  it('a receipt carries a minor whose filePath is app/[id]/page.tsx: the PR still opens and its body omits the minor', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', 'minor-only-findings');
+    wireReviewReceipt(harness, () => 'found', [
+      { findingId: 'f-1', severity: 'minor' as const, summary: 'bracket path', filePath: 'app/[id]/page.tsx', line: 12 },
+    ]);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    expect(harness.forgeRequests).toHaveLength(1);
+    const body = harness.forgeRequests[0]!.body;
+    expect(body).toContain(CHALLENGE_THIS);
+    expect(body).not.toContain('app/[id]/page.tsx');
+    expect(body).not.toContain('- [minor]');
   });
 });

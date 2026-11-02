@@ -4,11 +4,15 @@
  * setting revision that authorised it; nothing here decides eligibility.
  */
 
-import type { CoordinationRequestRecord } from './coordination-records.js';
+import type { CoordinationRequestRecord, MergeGrantRepositoryRef } from './coordination-records.js';
 
 /** Forge kinds a policy grant may authorise (A3; the conductor's forge steps). */
 export const POLICY_GRANT_FORGE_KINDS = ['push-and-open-pr', 'push-to-pr', 'merge-pr', 'post-status'] as const;
 export type PolicyGrantForgeKind = (typeof POLICY_GRANT_FORGE_KINDS)[number];
+
+/** Forge kinds the attempt-less merge grant may authorise (DT6b). */
+export const MERGE_GRANT_FORGE_KINDS = ['merge-pr', 'update-branch', 'post-status'] as const;
+export type MergeGrantForgeKind = (typeof MERGE_GRANT_FORGE_KINDS)[number];
 
 /** Installation settings that may authorise a policy grant. */
 export const POLICY_GRANT_SOURCES = ['autoMerge', 'conductor'] as const;
@@ -53,6 +57,33 @@ export function policyGrantForgeKindOf(actionScope: string): PolicyGrantForgeKin
 /** `policy:<source>@<revision>`. */
 export function policyDecisionRevision(source: PolicyGrantSource, revision: string): string {
   return `${POLICY_DECISION_REVISION_PREFIX}${source}@${revision}`;
+}
+
+/** `forge:<kind>`, the action scope of an attempt-less merge grant (DT6b). */
+export function mergeGrantActionScope(kind: MergeGrantForgeKind): string {
+  return `forge:${kind}`;
+}
+
+/** `policy:merge@<revision>`; the revision must match POLICY_SETTING_REVISION_PATTERN. */
+export function mergeGrantDecisionRevision(revision: string): string {
+  return `${POLICY_DECISION_REVISION_PREFIX}merge@${revision}`;
+}
+
+/**
+ * The canonical proposal an attempt-less merge grant binds (DT6b): `merge-grant/v1:` followed by
+ * `JSON.stringify({ owner, repo, pullRequestNumber, expectedHeadSha })` with exactly that key order.
+ */
+export function mergeGrantProposalDigest(
+  repository: MergeGrantRepositoryRef,
+  pullRequestNumber: number,
+  expectedHeadSha: string,
+): string {
+  return `merge-grant/v1:${JSON.stringify({
+    owner: repository.owner,
+    repo: repository.repo,
+    pullRequestNumber,
+    expectedHeadSha,
+  })}`;
 }
 
 /** `{ source, revision }` for a well-formed `policy:<source>@<12 hex>`, else null. Never throws. */

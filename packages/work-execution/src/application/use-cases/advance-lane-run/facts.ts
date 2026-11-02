@@ -15,6 +15,7 @@ import {
   laneRunGateCongestion,
   laneRunGateFact,
   laneRunPremergePost,
+  laneRunRecordedSeatAdvance,
   laneRunRefusedStep,
   laneRunStopsIssued,
   laneRunTimedOut,
@@ -28,7 +29,7 @@ import type {
 } from '../../../domain/lane-run-decider.js';
 import { laneRunAttemptPhaseOf } from '../../../domain/lane-run-decider.js';
 import { implementerRoleFor } from '../../../domain/lane-run-transitions.js';
-import { historyEntryOf, selectSeat, stopReasonOf } from '../../../domain/seat-selection.js';
+import { historyEntryOf, selectSeat, stopReasonOf, type SameModelFamily } from '../../../domain/seat-selection.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
@@ -254,7 +255,7 @@ export async function gatherFacts(ctx: AdvanceStepContext,
     pendingIntent: laneRunJournalPendingIntent(entries, record.runId),
     admission: admitted ? 'admitted' : 'no-capacity',
     costCeilingReached,
-    implementerSeat: implementerSeatOf(record, state, entries, attemptRecords),
+    implementerSeat: implementerSeatOf(record, state, entries, attemptRecords, ctx.deps.sameModelFamily),
     reviewSeat: review.reviewSeat,
     roundSeatIndexes,
     attempt,
@@ -296,6 +297,7 @@ export function implementerSeatOf(
   state: LaneRunStateValue,
   entries: readonly LaneRunJournalEntryRecord[],
   attemptRecords: readonly (AttemptRecord | null)[],
+  sameFamily?: SameModelFamily,
 ): LaneRunSeatFact {
   const first = attemptRecords[0] ?? null;
   if (first === null || first.seatPlan === null || first.seatPlan === undefined) {
@@ -303,6 +305,25 @@ export function implementerSeatOf(
   }
   const planResult = SeatPlan.create(first.seatPlan);
   if (!planResult.success || planResult.value === undefined) {
+    return { ok: false };
+  }
+  // G11a: a recorded advance for this round IS the next seat — the decider
+  // never re-derives a second choice over the history. An exhausted advance
+  // (a `next-seat-<outcome>-none` token, recorded for a plan with no allowed
+  // seat or fail closed without a family comparator) reads as no seat, which
+  // parks below.
+  const recorded = laneRunRecordedSeatAdvance(entries, record.runId, record.round);
+  if (recorded.kind === 'exhausted') {
+    return { ok: false };
+  }
+  const role = implementerRoleFor(record.round, state);
+  if (recorded.kind === 'seat') {
+    const inPlan = Number.isSafeInteger(recorded.seatIndex) &&
+      recorded.seatIndex >= 0 &&
+      recorded.seatIndex < planResult.value.getSeats(role).length;
+    return inPlan ? { ok: true, seatIndex: recorded.seatIndex } : { ok: false };
+  }
+  if (planResult.value.getSeats('review').length > 0 && sameFamily === undefined) {
     return { ok: false };
   }
   const history = attemptRecords
@@ -318,7 +339,7 @@ export function implementerSeatOf(
     });
   const selected = selectSeat({
     plan: planResult.value,
-    role: implementerRoleFor(record.round, state),
+    role,
     history,
   });
   if (selected.ok) {

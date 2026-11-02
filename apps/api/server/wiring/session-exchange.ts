@@ -5,6 +5,7 @@ import {
   setResponseHeader,
   setResponseStatus,
 } from "h3";
+import { getActiveApiToken } from "./token.js";
 
 /**
  * T3b: the session exchange mints in-memory, scope-bound tokens. It does not
@@ -61,22 +62,51 @@ export function configureSessionExchange(_credential: string | null): void {
 }
 
 /**
- * Establish a server-side interactive session. Called by the TUI/web login lanes
- * after authenticating the owner; tests call it directly. Returns the per-session
- * secret the client presents to the exchange.
+ * Establish a server-side interactive session. The actor-binding mechanism is
+ * owner-authenticated registration: the caller must present the active API
+ * credential (`setActiveApiToken`) — the operator's on-host authority — and it
+ * is verified constant-time before any session exists. Caller-supplied actor
+ * text and scopes are never proof of anything: the scopes are accepted only
+ * when every one of them is mintable (never `orchestrate` or `dispatch`), and
+ * the registered actor must be a non-empty verified label. Returns the
+ * per-session secret the client presents to the exchange, or `null` when the
+ * owner credential, actor or scopes fail (fail closed; the reason is never
+ * echoed). Called by the TUI/web login lanes after authenticating the owner;
+ * tests call it with the active API credential.
  */
 export function registerInteractiveSession(input: {
+  ownerCredential: string;
   actor: string;
   scopes: readonly string[];
-}): { sessionId: string; secret: string } {
-  const actor = input.actor.trim();
-  const scopes = [...input.scopes];
+}): { sessionId: string; secret: string } | null {
+  const active = getActiveApiToken();
   if (
-    actor.length === 0 ||
-    scopes.length === 0 ||
-    scopes.some((s) => typeof s !== "string" || s.length === 0)
+    typeof active !== "string" ||
+    active.length === 0 ||
+    typeof input.ownerCredential !== "string" ||
+    !constantTimeMatch(active, input.ownerCredential)
   ) {
-    throw new Error("invalid interactive session");
+    return null;
+  }
+  const actor = typeof input.actor === "string" ? input.actor.trim() : "";
+  if (actor.length === 0) {
+    return null;
+  }
+  const scopes: string[] = [];
+  for (const scope of input.scopes) {
+    if (
+      typeof scope !== "string" ||
+      scope.length === 0 ||
+      !(MINTABLE_SESSION_SCOPES as readonly string[]).includes(scope)
+    ) {
+      return null;
+    }
+    if (!scopes.includes(scope)) {
+      scopes.push(scope);
+    }
+  }
+  if (scopes.length === 0) {
+    return null;
   }
   const sessionId = randomBytes(16).toString("hex");
   const secret = randomBytes(32).toString("base64url");

@@ -126,7 +126,13 @@ describe("T3b session exchange", () => {
   }
 
   function sessionSecret(scopes: string[], actor = "owner"): string {
-    return registerInteractiveSession({ actor, scopes }).secret;
+    const session = registerInteractiveSession({
+      ownerCredential: VALID_TOKEN,
+      actor,
+      scopes,
+    });
+    expect(session).not.toBeNull();
+    return (session as { secret: string }).secret;
   }
 
   function exchangeUrl(): string {
@@ -321,6 +327,66 @@ describe("T3b session exchange", () => {
       headers: { authorization: `Bearer ${minted[0]}` },
     });
     expect(res.status).toBe(200);
+  });
+
+  it("refuses session registration without the verified owner credential", async () => {
+    setActiveApiToken(VALID_TOKEN);
+    configureFleetApiRuntime({ stateDir: tempDir });
+
+    // No credential presented at all.
+    expect(
+      registerInteractiveSession({ ownerCredential: "", actor: "owner", scopes: ["read"] }),
+    ).toBeNull();
+    // A wrong credential (not the active API token) proves nothing.
+    expect(
+      registerInteractiveSession({
+        ownerCredential: "b".repeat(32),
+        actor: "owner",
+        scopes: ["read"],
+      }),
+    ).toBeNull();
+    // Registration without any active API credential configured fails closed.
+    setActiveApiToken(null);
+    expect(
+      registerInteractiveSession({ ownerCredential: VALID_TOKEN, actor: "owner", scopes: ["read"] }),
+    ).toBeNull();
+
+    // Nothing was registered: every exchange attempt with an invented secret 403s.
+    const res = await fetch(exchangeUrl(), {
+      method: "POST",
+      headers: { [SESSION_EXCHANGE_HEADER]: "c".repeat(43), "content-type": "application/json" },
+      body: JSON.stringify({ scopes: ["read"] }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("refuses registration of orchestrate, dispatch or unknown scopes and a blank actor", () => {
+    setActiveApiToken(VALID_TOKEN);
+    configureFleetApiRuntime({ stateDir: tempDir });
+
+    expect(
+      registerInteractiveSession({ ownerCredential: VALID_TOKEN, actor: "owner", scopes: ["orchestrate"] }),
+    ).toBeNull();
+    expect(
+      registerInteractiveSession({ ownerCredential: VALID_TOKEN, actor: "owner", scopes: ["dispatch"] }),
+    ).toBeNull();
+    expect(
+      registerInteractiveSession({ ownerCredential: VALID_TOKEN, actor: "owner", scopes: ["not-a-scope"] }),
+    ).toBeNull();
+    expect(
+      registerInteractiveSession({ ownerCredential: VALID_TOKEN, actor: "owner", scopes: [] }),
+    ).toBeNull();
+    expect(
+      registerInteractiveSession({ ownerCredential: VALID_TOKEN, actor: "   ", scopes: ["read"] }),
+    ).toBeNull();
+
+    // Only the mintable, registered scopes ever reach a session.
+    const session = registerInteractiveSession({
+      ownerCredential: VALID_TOKEN,
+      actor: "owner",
+      scopes: ["read", "verdict"],
+    });
+    expect(session).not.toBeNull();
   });
 
   it("fails closed when the exchange has no established session", async () => {

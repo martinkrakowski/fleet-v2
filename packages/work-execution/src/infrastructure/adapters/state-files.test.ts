@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -5,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   StateFileUnreadableError,
+  StateFileUnknownVersionError,
   inspectRecordListBytes,
   quarantineUnreadable,
   type StateFileDescriptor,
@@ -347,5 +349,135 @@ describe('work-execution state file descriptors match the store readers', () => 
       'telemetry-dispositions.json',
       'conductor-passes.json',
     ]);
+  });
+});
+
+describe('versioned store descriptors', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-e1b-versioned-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  const VERSIONED_STORES = [
+    'attempts.json',
+    'journal.json',
+    'reservations.json',
+    'lane-runs.json',
+    'run-journal.json',
+  ];
+
+  it('reports schemaVersions [1] on valid fixtures', () => {
+    for (const basename of VERSIONED_STORES) {
+      const descriptor = WORK_EXECUTION_STATE_FILES.find((d) => d.basename === basename)!;
+      const bytes = Buffer.from(JSON.stringify(VALID_FIXTURES[basename]));
+      expect(descriptor.inspect(bytes)).toEqual({
+        status: 'ok',
+        recordCount: 2,
+        schemaVersions: [1],
+      });
+    }
+  });
+
+  it.each(VERSIONED_STORES)('refuses an unknown schemaVersion on %s without quarantine', async (basename) => {
+    const fixture = VALID_FIXTURES[basename]!;
+    const bad = [...fixture];
+    bad[1] = { ...(bad[1] as Record<string, unknown>), schemaVersion: 2 };
+    const bytes = Buffer.from(JSON.stringify(bad));
+    await fs.writeFile(path.join(tempDir, basename), bytes);
+
+    const descriptor = WORK_EXECUTION_STATE_FILES.find((d) => d.basename === basename)!;
+    expect(descriptor.inspect(bytes)).toEqual({
+      status: 'unknown-version',
+      detail: 'record 1 has an unsupported schemaVersion (unknown-schema-version)',
+      recordIndex: 1,
+    });
+
+    await expect(READS[basename]!(tempDir)).rejects.toBeInstanceOf(StateFileUnknownVersionError);
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+  });
+});
+
+describe('conductor-passes.json versioning and restore', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-conductor-passes-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('a conductor-passes.json record with schemaVersion: 2 inspects as unknown-version', () => {
+    const descriptor = WORK_EXECUTION_STATE_FILES.find((d) => d.basename === 'conductor-passes.json')!;
+    const badRecord = {
+      ...(VALID_FIXTURES['conductor-passes.json']![0] as Record<string, unknown>),
+      schemaVersion: 2,
+    };
+    const bytes = Buffer.from(JSON.stringify([badRecord]));
+    expect(descriptor.inspect(bytes)).toEqual({
+      status: 'unknown-version',
+      detail: 'record 0 has an unsupported schemaVersion (unknown-schema-version)',
+      recordIndex: 0,
+    });
+  });
+
+  it('a current record and an old record without the field still inspect ok', () => {
+    const descriptor = WORK_EXECUTION_STATE_FILES.find((d) => d.basename === 'conductor-passes.json')!;
+    const oldRecord = VALID_FIXTURES['conductor-passes.json']![0]!;
+    const currentRecord = VALID_FIXTURES['conductor-passes.json']![1]!;
+
+    const oldBytes = Buffer.from(JSON.stringify([oldRecord]));
+    expect(descriptor.inspect(oldBytes)).toEqual({
+      status: 'ok',
+      recordCount: 1,
+      schemaVersions: [1],
+    });
+
+    const currentBytes = Buffer.from(JSON.stringify([currentRecord]));
+    expect(descriptor.inspect(currentBytes)).toEqual({
+      status: 'ok',
+      recordCount: 1,
+      schemaVersions: [1],
+    });
+
+    const bothBytes = Buffer.from(JSON.stringify([oldRecord, currentRecord]));
+    expect(descriptor.inspect(bothBytes)).toEqual({
+      status: 'ok',
+      recordCount: 2,
+      schemaVersions: [1],
+    });
+  });
+
+  it('a locked restore refuses an unknown schemaVersion and leaves bytes and quarantine directory unchanged', async () => {
+    const descriptor = WORK_EXECUTION_STATE_FILES.find((d) => d.basename === 'conductor-passes.json')!;
+    const filePath = path.join(tempDir, 'conductor-passes.json');
+    const badRecord = {
+      ...(VALID_FIXTURES['conductor-passes.json']![0] as Record<string, unknown>),
+      schemaVersion: 2,
+    };
+    const currentBytes = Buffer.from(JSON.stringify([badRecord]));
+    await fs.writeFile(filePath, currentBytes);
+
+    const candidate = Buffer.from(JSON.stringify(VALID_FIXTURES['conductor-passes.json']));
+    const currentSha = createHash('sha256').update(currentBytes).digest('hex');
+
+    const outcome = await descriptor.restore({
+      stateDir: tempDir,
+      candidate,
+      expectedCurrentSha256: currentSha,
+    });
+
+    expect(outcome).toEqual({
+      status: 'refused',
+      reason: 'conductor-passes.json has an unsupported schemaVersion; state restore replaces only a missing or unreadable store',
+    });
+    expect(await fs.readFile(filePath)).toEqual(currentBytes);
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
   });
 });

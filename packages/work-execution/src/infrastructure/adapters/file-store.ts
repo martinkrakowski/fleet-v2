@@ -1176,7 +1176,7 @@ export function describeSingleRecordStore<T>(
 /** The `*.json` lease files under the glob directory, one nesting level deep. */
 async function collectLeaseFiles(dirPath: string, entries: readonly string[]): Promise<string[]> {
   const files: string[] = [];
-  for (const entry of [...entries].sort()) {
+  for (const entry of [...entries].sort((a, b) => a.localeCompare(b))) {
     if (entry === 'quarantine') {
       continue;
     }
@@ -1190,7 +1190,7 @@ async function collectLeaseFiles(dirPath: string, entries: readonly string[]): P
     } catch {
       continue;
     }
-    for (const name of inner.sort()) {
+    for (const name of inner.sort((a, b) => a.localeCompare(b))) {
       if (name.endsWith('.json')) {
         files.push(path.join(entry, name));
       }
@@ -1215,7 +1215,7 @@ async function collectGlobQuarantineDirs(
       dirs.add(path.join(dirPath, entry, 'quarantine'));
     }
   }
-  return [...dirs].sort();
+  return [...dirs].sort((a, b) => a.localeCompare(b));
 }
 
 /** Scan quarantine copies across multiple quarantine directories. */

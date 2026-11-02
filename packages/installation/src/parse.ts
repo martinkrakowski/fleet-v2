@@ -6,6 +6,7 @@ import { AGY_SECURITY_TEXT_VERSION } from './agy-security.js';
 
 import type {
   AutoMergePolicy,
+  BoardPolicySection,
   ChainStep,
   ChainTrigger,
   ChainsSection,
@@ -45,7 +46,7 @@ import type {
   WorktreeSection,
 } from './types.js';
 
-import { CONDUCTOR_MINUTE_BOUNDS, CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
+import { BOARD_BOUNDS, CONDUCTOR_MINUTE_BOUNDS, CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
 import { readTelemetryPolicyBlock } from './telemetry-policy.js';
 import { readSeatsPolicyBlock } from './seats-policy.js';
 
@@ -168,6 +169,7 @@ const POLICY_KEYS: readonly string[] = [
   'liveTail',
   'autoMerge',
   'conductor',
+  'board',
   'telemetry',
   'seats',
 ];
@@ -175,6 +177,7 @@ const FORBIDDEN_ROUTE_KEYS: readonly string[] = ['tool', 'modelPattern'];
 const LIVE_TAIL_KEYS: readonly string[] = ['content'];
 const AUTO_MERGE_KEYS: readonly string[] = ['enabled', 'allowHighRisk', 'onBlocked'];
 const CONDUCTOR_KEYS: readonly string[] = ['enabled', 'stopGraceMinutes', 'reaper'];
+const BOARD_KEYS: readonly string[] = ['forgeStaleMinutes', 'declarationTtlMinutes', 'doneWindowDays', 'forgeSyncMinutes'];
 const CONDUCTOR_REAPER_KEYS: readonly string[] = [
   'enabled',
   'intervalMinutes',
@@ -1716,6 +1719,7 @@ function parseV2Policy(
   const liveTail = parseLiveTailPolicy(section, errors);
   const autoMerge = parseAutoMergePolicy(section, errors);
   const conductor = parseConductorPolicy(section, errors);
+  const board = parseBoardPolicy(section, errors);
   const telemetry = parsePolicyBlock(section, 'telemetry', readTelemetryPolicyBlock, errors);
   const seats: SeatsPolicy | undefined = parsePolicyBlock(section, 'seats', readSeatsPolicyBlock, errors);
   return {
@@ -1725,6 +1729,7 @@ function parseV2Policy(
     ...(liveTail !== undefined ? { liveTail } : {}),
     ...(autoMerge !== undefined ? { autoMerge } : {}),
     ...(conductor !== undefined ? { conductor } : {}),
+    ...(board !== undefined ? { board } : {}),
     ...(telemetry !== undefined ? { telemetry } : {}),
     ...(seats !== undefined ? { seats } : {}),
   };
@@ -1963,6 +1968,59 @@ function parseConductorPolicy(
     enabled,
     ...(stopGraceMinutes !== undefined ? { stopGraceMinutes } : {}),
     ...(reaper !== undefined ? { reaper } : {}),
+  };
+}
+
+function parseBoardPolicy(
+  section: JsonObject,
+  errors: string[],
+): BoardPolicySection | undefined {
+  if (!Object.hasOwn(section, 'board')) {
+    return undefined;
+  }
+  const value = section.board;
+  if (!isJsonObject(value)) {
+    errors.push('policy.board: must be an object');
+    return undefined;
+  }
+  const before = errors.length;
+  collectUnknownKeys(value, BOARD_KEYS, 'policy.board', errors);
+  const forgeStaleMinutes = readConductorMinutes(
+    value,
+    'forgeStaleMinutes',
+    'policy.board',
+    BOARD_BOUNDS.forgeStaleMinutes,
+    errors,
+  );
+  const declarationTtlMinutes = readConductorMinutes(
+    value,
+    'declarationTtlMinutes',
+    'policy.board',
+    BOARD_BOUNDS.declarationTtlMinutes,
+    errors,
+  );
+  const doneWindowDays = readConductorMinutes(
+    value,
+    'doneWindowDays',
+    'policy.board',
+    BOARD_BOUNDS.doneWindowDays,
+    errors,
+  );
+  const forgeSyncMinutes = readConductorMinutes(
+    value,
+    'forgeSyncMinutes',
+    'policy.board',
+    BOARD_BOUNDS.forgeSyncMinutes,
+    errors,
+  );
+  if (errors.length !== before) {
+    return undefined;
+  }
+  return {
+    ...(forgeStaleMinutes !== undefined ? { forgeStaleMinutes } : {}),
+    ...(declarationTtlMinutes !== undefined ? { declarationTtlMinutes } : {}),
+    ...(doneWindowDays !== undefined ? { doneWindowDays } : {}),
+    ...(forgeSyncMinutes !== undefined ? { forgeSyncMinutes } : {}),
   };
 }
 

@@ -388,6 +388,117 @@ function patchPathRefusal(patchPath: unknown, worktreePath: string): 'invalid-re
   return null;
 }
 
+/**
+ * Hardening overrides for recovery git commands (plan GB3): ignore repo fsmonitor,
+ * hooks, external diff drivers, prefixes and colors.
+ */
+export const RECOVERY_GIT_CONFIG: readonly string[] = [
+  '-c', 'core.fsmonitor=false',
+  '-c', 'core.hooksPath=/dev/null',
+  '-c', 'diff.external=',
+  '-c', 'diff.noprefix=false',
+  '-c', 'diff.mnemonicPrefix=false',
+  '-c', 'color.ui=false',
+];
+
+const FILTER_DRIVER_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
+
+function filterDriverOverrides(drivers: readonly string[]): string[] {
+  const overrides: string[] = [];
+  for (const driver of drivers) {
+    overrides.push(
+      '-c', `filter.${driver}.clean=`,
+      '-c', `filter.${driver}.smudge=`,
+      '-c', `filter.${driver}.process=`,
+      '-c', `filter.${driver}.required=false`,
+    );
+  }
+  return overrides;
+}
+
+function parseFilterDrivers(stdout: string): Set<string> | null {
+  const drivers = new Set<string>(['lfs']);
+  for (const key of stdout.split('\0')) {
+    if (key === '') continue;
+    const match = /^filter\.(.+)\.(?:clean|smudge|process)$/.exec(key);
+    if (match === null) continue;
+    const driver = match[1] ?? '';
+    if (!FILTER_DRIVER_NAME_PATTERN.test(driver)) {
+      return null;
+    }
+    drivers.add(driver);
+  }
+  return drivers;
+}
+
+async function collectFilterDriverOverrides(
+  executor: CommandExecutorPort,
+  worktreePath: string,
+): Promise<string[] | null> {
+  const result = await executor.run(
+    [
+      'git',
+      '-C',
+      worktreePath,
+      ...RECOVERY_GIT_CONFIG,
+      'config',
+      '-z',
+      '--includes',
+      '--name-only',
+      '--get-regexp',
+      '^filter\\..*\\.(clean|smudge|process)$',
+    ],
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
+  if (result.exitCode === 1) {
+    return filterDriverOverrides(['lfs']);
+  }
+  if (result.exitCode !== 0 || result.error !== undefined) {
+    return null;
+  }
+  const drivers = parseFilterDrivers(result.stdout);
+  if (drivers === null) {
+    return null;
+  }
+  return filterDriverOverrides([...drivers].sort((a, b) => a.localeCompare(b)));
+}
+
+/**
+ * GB3: extracts literal pathspecs for tracked paths' top-level directories
+ * or root file paths, so `ls-files --others -z` does not walk ignored
+ * directories (like `node_modules`) that hold no tracked paths.
+ */
+export function topLevelTrackedPathspecs(trackedPaths: readonly string[]): string[] {
+  const topLevels = new Set<string>();
+  for (const p of trackedPaths) {
+    if (p === '') continue;
+    const slash = p.indexOf('/');
+    const top = slash === -1 ? p : p.slice(0, slash);
+    if (top !== '') {
+      topLevels.add(`:(literal)${top}`);
+    }
+  }
+  return [...topLevels].sort((a, b) => a.localeCompare(b));
+}
+
+async function queryUntrackedPaths(
+  runGitFn: (args: readonly string[]) => Promise<string>,
+  pathspecs: readonly string[],
+): Promise<string[]> {
+  const fullRun =
+    pathspecs.length === 0
+      ? ''
+      : await runGitFn([...RECOVERY_GIT_CONFIG, 'ls-files', '--others', '-z', '--', ...pathspecs]);
+  const dirsRun = await runGitFn([
+    ...RECOVERY_GIT_CONFIG,
+    'ls-files',
+    '--others',
+    '--directory',
+    '-z',
+  ]);
+  return parseUntrackedListing(fullRun, dirsRun);
+}
+
 export function parseUntrackedListing(stdoutA: string, stdoutB: string): string[] {
   return [
     ...new Set(
@@ -413,7 +524,19 @@ export async function writeAndVerifyPatch(
   }
   const tempPath = mkTemp.stdout.trim();
   const diffRun = await executor.run(
-    ['git', '-C', worktreePath, 'diff', '--binary', 'HEAD', `--output=${tempPath}`],
+    [
+      'git',
+      '-C',
+      worktreePath,
+      ...RECOVERY_GIT_CONFIG,
+      'diff',
+      '--binary',
+      '--no-ext-diff',
+      '--no-textconv',
+      '--no-color',
+      'HEAD',
+      `--output=${tempPath}`,
+    ],
     { timeoutMs: GIT_TIMEOUT_MS },
   );
   if (diffRun.exitCode !== 0 || diffRun.error !== undefined) {
@@ -440,7 +563,7 @@ export async function writeAndVerifyPatch(
     return 'destination-exists';
   }
   const verify = await executor.run(
-    ['git', '-C', worktreePath, 'apply', '--check', '-R', patchPath],
+    ['git', '-C', worktreePath, ...RECOVERY_GIT_CONFIG, 'apply', '--check', '-R', patchPath],
     { timeoutMs: GIT_TIMEOUT_MS },
   );
   if (verify.exitCode !== 0 || verify.error !== undefined) {
@@ -1036,7 +1159,7 @@ export class WorkspaceAdapter implements WorkspacePort {
       return false;
     }
     const result = await executor.run(
-      ['git', '-C', request.worktreePath, 'apply', '--check', '-R', request.patchPath],
+      ['git', '-C', request.worktreePath, ...RECOVERY_GIT_CONFIG, 'apply', '--check', '-R', request.patchPath],
       { timeoutMs: GIT_TIMEOUT_MS },
     );
     return result.exitCode === 0 && result.error === undefined;
@@ -1062,37 +1185,23 @@ export class WorkspaceAdapter implements WorkspacePort {
       return { outcome: 'error', reason: 'worktree host could not be resolved' };
     }
     try {
+      const runGitInWorktree = (args: readonly string[]): Promise<string> =>
+        this.runGit(request.worktreePath, args, executor);
+
       // 2. Read the head to report, and list the tracked paths reset would
       //    restore or clear: HEAD's tree AND the index — a staged addition is
       //    not in HEAD, but `reset --hard` still removes it from index and
       //    worktree, so it must take part in the obstruction check — plus the
       //    untracked files present. Run with -z and no .trim() so quoted/special
       //    characters are preserved faithfully.
-      const head = (await this.runGit(request.worktreePath, ['rev-parse', 'HEAD'], executor)).trim();
-      const trackedRun = await this.runGit(
-        request.worktreePath,
-        ['ls-tree', '-r', '--name-only', '-z', 'HEAD'],
-        executor,
-      );
-      const indexRun = await this.runGit(
-        request.worktreePath,
-        ['ls-files', '--cached', '-z'],
-        executor,
-      );
+      const head = (await runGitInWorktree(['rev-parse', 'HEAD'])).trim();
+      const trackedRun = await runGitInWorktree(['ls-tree', '-r', '--name-only', '-z', 'HEAD']);
+      const indexRun = await runGitInWorktree([...RECOVERY_GIT_CONFIG, 'ls-files', '--cached', '-z']);
       const trackedPaths = [
         ...new Set([...trackedRun.split('\0'), ...indexRun.split('\0')].filter((line) => line !== '')),
       ];
-      const untrackedRun = await this.runGit(
-        request.worktreePath,
-        ['ls-files', '--others', '-z'],
-        executor,
-      );
-      const untrackedDirsRun = await this.runGit(
-        request.worktreePath,
-        ['ls-files', '--others', '--directory', '-z'],
-        executor,
-      );
-      const untrackedFiles = parseUntrackedListing(untrackedRun, untrackedDirsRun);
+      const pathspecs = topLevelTrackedPathspecs(trackedPaths);
+      const untrackedFiles = await queryUntrackedPaths(runGitInWorktree, pathspecs);
 
       // 3. Refuse BEFORE resetting when restoring a tracked path could overwrite
       //    or remove an untracked path (for example a deleted tracked path masked
@@ -1102,21 +1211,16 @@ export class WorkspaceAdapter implements WorkspacePort {
       }
 
       // 4. Reset: `git reset --hard` with no ref argument, so HEAD and the
-      //    branch ref cannot move.
-      await this.runGit(request.worktreePath, ['reset', '--hard'], executor);
+      //    branch ref cannot move. Neutralize filter drivers so no lane-chosen
+      //    filter runs.
+      const filterOverrides = await collectFilterDriverOverrides(executor, request.worktreePath);
+      if (filterOverrides === null) {
+        return { outcome: 'refused', reason: 'git-refused' };
+      }
+      await runGitInWorktree([...RECOVERY_GIT_CONFIG, ...filterOverrides, 'reset', '--hard']);
 
       // 5. Verify the untracked paths are unchanged.
-      const afterRun = await this.runGit(
-        request.worktreePath,
-        ['ls-files', '--others', '-z'],
-        executor,
-      );
-      const afterDirsRun = await this.runGit(
-        request.worktreePath,
-        ['ls-files', '--others', '--directory', '-z'],
-        executor,
-      );
-      const afterUntracked = parseUntrackedListing(afterRun, afterDirsRun);
+      const afterUntracked = await queryUntrackedPaths(runGitInWorktree, pathspecs);
       const unchanged =
         untrackedFiles.length === afterUntracked.length &&
         untrackedFiles.every((entry, index) => entry === afterUntracked[index]);

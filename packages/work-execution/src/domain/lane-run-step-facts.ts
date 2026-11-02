@@ -14,6 +14,7 @@ import type { ParsedLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN } from './lane-run-records.js';
 import type { LaneRunKeyStep } from './lane-run-records.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
+import type { SeatFailureOutcome } from './seat-selection.js';
 
 /** The conductor's result reason codes (K4); each matches LANE_RUN_JOURNAL_REASON_CODE_PATTERN. Stored data: version with the journal. */
 export const LANE_RUN_RESULT_REASON_CODES = [
@@ -295,24 +296,36 @@ export function laneRunPremergePost(
 }
 
 /**
- * A recorded seat advance (G11a): the `next-seat-<index>` or `next-seat-none`
- * detail token of a failed turn's final result, or `none` when the journal
- * holds no such token for the round.
+ * A recorded seat advance (G11a): the `next-seat-<outcome>-<index>` or
+ * `next-seat-<outcome>-none` detail token of a failed turn's final result,
+ * or `none` when the journal holds no such token for the round. The outcome
+ * is the failure outcome the result recorded (`rate-limited`, `timeout` or
+ * `provider-error`).
  */
 export type LaneRunRecordedSeatAdvance =
   | { readonly kind: 'none' }
-  | { readonly kind: 'seat'; readonly seatIndex: number }
-  | { readonly kind: 'exhausted' };
+  | { readonly kind: 'seat'; readonly seatIndex: number; readonly outcome: SeatFailureOutcome }
+  | { readonly kind: 'exhausted'; readonly outcome: SeatFailureOutcome };
+
+/** The failure outcomes a recorded advance may name. */
+const SEAT_ADVANCE_OUTCOMES: readonly SeatFailureOutcome[] = ['rate-limited', 'timeout', 'provider-error'];
 
 /** Parse a recorded advance's detail token; anything else reads `none`. */
 function parseSeatAdvanceDetail(detail: string | null): LaneRunRecordedSeatAdvance {
-  if (detail === 'next-seat-none') {
-    return { kind: 'exhausted' };
+  if (detail === null || !detail.startsWith('next-seat-')) {
+    return { kind: 'none' };
   }
-  if (detail !== null && detail.startsWith('next-seat-')) {
-    const raw = detail.slice('next-seat-'.length);
-    if (/^[0-9]+$/.test(raw)) {
-      return { kind: 'seat', seatIndex: Number(raw) };
+  const rest = detail.slice('next-seat-'.length);
+  for (const outcome of SEAT_ADVANCE_OUTCOMES) {
+    if (!rest.startsWith(outcome + '-')) {
+      continue;
+    }
+    const tail = rest.slice(outcome.length + 1);
+    if (tail === 'none') {
+      return { kind: 'exhausted', outcome };
+    }
+    if (/^[0-9]+$/.test(tail)) {
+      return { kind: 'seat', seatIndex: Number(tail), outcome };
     }
   }
   return { kind: 'none' };

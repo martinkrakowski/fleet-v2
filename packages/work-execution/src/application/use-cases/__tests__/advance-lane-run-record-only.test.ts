@@ -599,7 +599,7 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
     });
     // One move per failure, journalled: the spent dispatch key carries the
     // advance token; no second result can ever be appended to it.
-    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-1']);
+    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-rate-limited-1']);
   });
 
   it('G11a test 12: the recorded advance, not a re-derivation, picks the next prepare seat', async () => {
@@ -621,7 +621,7 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
     expect(latest?.seatSelection?.seatIndex).toBe(1);
     expect(latest?.seatSelection?.role).toBe('first-pass');
     // Replay of the failure records no second move.
-    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-1']);
+    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-rate-limited-1']);
   });
 
   it('G11a test 13: an exhausted plan records next-seat-none and parks seat-plan-exhausted', async () => {
@@ -638,26 +638,28 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
     harness.setReservedAttemptIds(['attempt-example-1']);
     await conduct(harness, 'seat-failed', NOW);
     await advance(harness);
-    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-none']);
+    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-rate-limited-none']);
     // The exhausted round parks; no independent re-selection happens.
     await advance(harness);
     const parked = await advance(harness);
     expect(parked).toMatchObject({ outcome: 'parked', reason: 'seat-plan-exhausted' });
   });
 
-  it('G11a test 14: an unbound family comparator fails closed and records no advance', async () => {
+  it('G11a test 14: an unbound family comparator fails closed and records no next seat', async () => {
     const harness = await makeHarness(runRecord(), g11aAttempt());
     harness.setFrozenBrief(G11A_PROSE, G11A_MANIFEST);
     harness.setDispatchRefusal('rate-limited', 'HTTP 429 Too Many Requests');
     harness.setReservedAttemptIds(['attempt-example-1']);
-    // No family comparator is wired: the advance must fail closed.
+    // No family comparator is wired: the failure still records its outcome,
+    // but with no next seat — the history fallback must never derive one.
     await conduct(harness, 'seat-failed', NOW);
     const result = await advance(harness);
     expect(result).toMatchObject({ outcome: 'acted', result: 'refused', reasonCode: 'runner-refused' });
-    // Fail closed: no advance token, so the legacy history selection decides.
-    expect(await g11aAdvanceTokens(harness)).toEqual([]);
+    expect(await g11aAdvanceTokens(harness)).toEqual(['next-seat-rate-limited-none']);
+    // Fail closed: the exhausted advance parks the run; no independent
+    // re-selection happens.
     await advance(harness);
-    const prepared = await advance(harness);
-    expect(prepared).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed' });
+    const parked = await advance(harness);
+    expect(parked).toMatchObject({ outcome: 'parked', reason: 'seat-plan-exhausted' });
   });
 });

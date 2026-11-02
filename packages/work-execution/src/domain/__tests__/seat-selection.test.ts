@@ -411,6 +411,21 @@ describe("pickNextSeat", () => {
     ).toEqual({ ok: false, reason: "no-seat-allowed" });
   });
 
+  it("never returns the failed seat, so a one-seat plan reads no-seat-allowed", () => {
+    const p = nextPlan([seat("A", "alpha-1")]);
+    expect(pickNextSeat(p, "first-pass", 0, "provider-error", neverBlocked)).toEqual({
+      ok: false,
+      reason: "no-seat-allowed",
+    });
+    // A wrap-around onto the failed seat is not a move either: with the other
+    // seats blocked the plan is exhausted.
+    const two = nextPlan([seat("A", "alpha-1"), seat("B", "beta-1")]);
+    expect(pickNextSeat(two, "first-pass", 0, "rate-limited", (s) => s.id === "B")).toEqual({
+      ok: false,
+      reason: "no-seat-allowed",
+    });
+  });
+
   it("returns no-seat-allowed when no seat is allowed, the role is empty or the index is out of plan", () => {
     const blocked = () => true;
     const p = nextPlan([seat("A", "alpha-1"), seat("B", "beta-1")]);
@@ -444,11 +459,11 @@ describe("pickNextSeat", () => {
     const reviewerModels = p.getSeats("review").map((s) => s.model);
     const familyBlocked = (s: { model: string }) =>
       reviewerModels.some((model) => sameFamily(s.model, model));
-    // B shares the beta family with the review seat and is skipped.
-    expect(pickNextSeat(p, "first-pass", 0, "rate-limited", familyBlocked)).toMatchObject({
-      ok: true,
-      seatIndex: 0,
-      seat: { id: "A" },
+    // B shares the beta family with the review seat and is skipped; the failed
+    // seat A itself is never re-picked, so nothing is allowed.
+    expect(pickNextSeat(p, "first-pass", 0, "rate-limited", familyBlocked)).toEqual({
+      ok: false,
+      reason: "no-seat-allowed",
     });
     expect(pickNextSeat(p, "first-pass", 1, "rate-limited", familyBlocked)).toMatchObject({
       ok: true,

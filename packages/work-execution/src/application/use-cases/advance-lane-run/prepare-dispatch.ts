@@ -285,13 +285,17 @@ export function fixSeatForDispatch(
  * G11a: the seat-advance detail token of a failed dispatch, or null when no
  * advance may be recorded (fail closed). The failed turn's own plan, role and
  * seat index and its stored stop reason decide; the reviewer-family block
- * uses the installation-configured `sameModelFamily` comparator, and an
- * unbound comparator, a plan the attempt does not carry, a non-implementer
+ * uses the installation-configured `sameModelFamily` comparator. A plan the
+ * attempt does not carry, a non-implementer
  * role, an out-of-plan seat index or a stop reason that maps to no failure
- * outcome each record nothing — the run keeps its pre-G11a behaviour.
- * The token is a fixed `next-seat-…` code (validated by the journal's token
- * pattern), never free text, so replay of the spent key can never record a
- * second move.
+ * outcome each record nothing — the run keeps its pre-G11a behaviour. An
+ * unbound comparator fails closed: the failure records its outcome with no
+ * next seat, so the facts never re-derive one from the history.
+ * The token is a fixed `next-seat-<outcome>-<index>` code naming the failure
+ * outcome, or `next-seat-<outcome>-none` when no seat is allowed — both the
+ * failure outcome and the selected next seat in one fixed code (validated by
+ * the journal's token pattern), never free text, so replay of the spent key
+ * can never record a second move.
  */
 function seatAdvanceDetail(
   ctx: AdvanceStepContext,
@@ -310,8 +314,15 @@ function seatAdvanceDetail(
   }
   const outcome: SeatFailureOutcome | null = seatOutcomeOfStopReason(parseStopReason(storedStopReason));
   const sameFamily = ctx.deps.sameModelFamily;
-  if (outcome === null || sameFamily === undefined) {
+  if (outcome === null) {
     return null;
+  }
+  if (sameFamily === undefined) {
+    // Fail closed: without the configured family comparator no seat may be
+    // picked, and leaving the advance unrecorded would let the facts re-derive
+    // one from the history. The failure records its outcome with no next
+    // seat, so the run parks for the owner instead of moving.
+    return 'next-seat-' + outcome + '-none';
   }
   // A model-refusal stop keeps the failed model out of the rest of the lane
   // (the same rule selectSeat applies over history), so the failed seat and
@@ -327,12 +338,14 @@ function seatAdvanceDetail(
     (refusedModel !== null && seat.model.trim() === refusedModel) ||
     reviewerModels.some((model) => sameFamily(seat.model, model)),
   );
-  return seatAdvanceTokenOf(chosen);
+  return seatAdvanceTokenOf(chosen, outcome);
 }
 
-/** The fixed detail token of a pick, or `next-seat-none` when no seat is allowed. */
-function seatAdvanceTokenOf(chosen: NextSeatResult): string {
-  return chosen.ok ? 'next-seat-' + String(chosen.seatIndex) : 'next-seat-none';
+/** The fixed detail token of a pick: `next-seat-<outcome>-<index>`, or `next-seat-<outcome>-none` when no seat is allowed. */
+function seatAdvanceTokenOf(chosen: NextSeatResult, outcome: SeatFailureOutcome): string {
+  return chosen.ok
+    ? 'next-seat-' + outcome + '-' + String(chosen.seatIndex)
+    : 'next-seat-' + outcome + '-none';
 }
 
 /**

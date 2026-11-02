@@ -307,8 +307,10 @@ export function implementerSeatOf(
     return { ok: false };
   }
   // G11a: a recorded advance for this round IS the next seat — the decider
-  // never re-derives a second choice over the history. `next-seat-none`
-  // (the recorded exhaustion) reads as no seat, which parks below.
+  // never re-derives a second choice over the history. An exhausted advance
+  // (a `next-seat-<outcome>-none` token, recorded for a plan with no allowed
+  // seat or fail closed without a family comparator) reads as no seat, which
+  // parks below.
   const recorded = laneRunRecordedSeatAdvance(entries, record.runId, record.round);
   if (recorded.kind === 'exhausted') {
     return { ok: false };

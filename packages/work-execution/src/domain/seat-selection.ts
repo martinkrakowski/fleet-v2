@@ -247,6 +247,9 @@ export type NextSeatResult =
  * allows it (the caller composes reviewer-family exclusion and any outage)
  * AND its declared triggers allow the outcome: absent `on` is always
  * eligible, otherwise one of its classes must be one the outcome covers.
+ * The failed seat itself is never eligible: the rotation may not wrap
+ * around onto the seat that just failed (a one-seat plan therefore always
+ * reads no-seat-allowed).
  * A `failedIndex` outside the plan, an empty role or no eligible seat reads
  * `no-seat-allowed`: nothing is ever guessed past the plan.
  */
@@ -266,6 +269,10 @@ export function pickNextSeat(
   const triggers = SEAT_OUTCOME_TRIGGER_CLASSES[outcome];
   for (let step = 1; step <= seats.length; step += 1) {
     const seatIndex = (failedIndex + step) % seats.length;
+    if (seatIndex === failedIndex) {
+      // The failed seat itself is never eligible: no wrap-around re-pick.
+      continue;
+    }
     const seat = seats[seatIndex];
     if (isBlocked(seat)) {
       continue;

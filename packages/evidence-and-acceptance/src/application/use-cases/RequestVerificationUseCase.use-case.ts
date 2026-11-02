@@ -26,10 +26,13 @@ import type {
   RequestVerificationResult,
 } from '../ports/in/RequestVerificationPort.in-port.js';
 
+export type RequestVerificationClock = () => Date | number | string;
+
 export interface RequestVerificationDependencies {
   readonly repo: EvidenceAssessmentRepositoryPort;
   readonly executor: VerificationExecutorPort;
   readonly archive: EvidenceArchivePort;
+  readonly clock?: RequestVerificationClock;
 }
 
 const NOT_IMPLEMENTED = 'Not implemented: RequestVerificationUseCase';
@@ -40,8 +43,27 @@ function isNonEmptyTrimmedString(value: unknown): value is string {
 
 const MIN_REMAINING_BUDGET_MS = 2_000;
 
+function clockToMs(clock: RequestVerificationClock): number {
+  const value = clock();
+  if (typeof value === 'number') {
+    return value;
+  }
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  return Date.parse(value);
+}
+
+function clockToIso(clock: RequestVerificationClock): string {
+  const value = clock();
+  if (typeof value === 'string') {
+    return value;
+  }
+  return new Date(value).toISOString();
+}
+
 /** True when the deadline leaves under 2 seconds or is malformed (plan line 44). */
-function isBudgetExhausted(deadlineIso: string | undefined): boolean {
+function isBudgetExhausted(deadlineIso: string | undefined, nowMs: number): boolean {
   if (deadlineIso === undefined) {
     return false;
   }
@@ -49,7 +71,7 @@ function isBudgetExhausted(deadlineIso: string | undefined): boolean {
   if (!Number.isFinite(deadlineMs)) {
     return true;
   }
-  return deadlineMs - Date.now() < MIN_REMAINING_BUDGET_MS;
+  return deadlineMs - nowMs < MIN_REMAINING_BUDGET_MS;
 }
 
 function validateRequestFields(request: RequestVerificationRequest): string | null {
@@ -113,7 +135,14 @@ function mergeReceiptsByProcedure(
 }
 
 export class RequestVerificationUseCase implements RequestVerificationPort {
-  constructor(private readonly deps?: RequestVerificationDependencies) {}
+  private readonly clock: RequestVerificationClock;
+
+  constructor(
+    private readonly deps?: RequestVerificationDependencies,
+    clock?: RequestVerificationClock,
+  ) {
+    this.clock = clock ?? deps?.clock ?? (() => new Date());
+  }
 
   /** Generic entry point kept for callers that hold an untyped use case. */
   async execute(input: unknown): Promise<RequestVerificationResult> {
@@ -142,7 +171,7 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
       return { outcome: 'rejected', reason: validationError };
     }
 
-    const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
+    const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : clockToIso(this.clock);
     const existing = await deps.repo.findAssessmentById(request.assessmentId);
     if (existing !== null) {
       const existingError = validateExistingAssessment(existing, request);
@@ -173,7 +202,7 @@ export class RequestVerificationUseCase implements RequestVerificationPort {
     // coverage from any check leaves no archived evidence and no receipt.
     const executions: { procedureName: string; execution: ExecuteVerificationCheckReceipt }[] = [];
     for (const procedureName of request.requiredChecks) {
-      if (isBudgetExhausted(request.deadlineIso)) {
+      if (isBudgetExhausted(request.deadlineIso, clockToMs(this.clock))) {
         return {
           outcome: 'not-started',
           reason: `Verification budget exhausted before starting check '${procedureName}'`,

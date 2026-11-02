@@ -30,9 +30,20 @@ import type {
 /** Normal wall-clock budget for one evidence call; the deadline bounds it. */
 const VERIFICATION_NORMAL_TIMEOUT_MS = 30 * 60 * 1000;
 
+export type MergeVerificationClock = () => Date | number | string;
+
 export interface MergeVerificationDelegate {
   readonly inspector?: Pick<InspectAcceptanceEvidencePort, 'inspectAcceptanceEvidence'>;
   readonly requester?: Pick<RequestVerificationPort, 'requestVerification'>;
+  readonly clock?: MergeVerificationClock;
+}
+
+function clockToIso(clock: MergeVerificationClock): string {
+  const value = clock();
+  if (typeof value === 'string') {
+    return value;
+  }
+  return new Date(value).toISOString();
 }
 
 function unknownResult(reasonCode: MergeVerificationReasonCode): MergeVerificationResult {
@@ -44,7 +55,14 @@ function isNonEmptyTrimmedString(value: string): boolean {
 }
 
 export class MergeVerificationAdapter implements MergeVerificationPort {
-  constructor(private readonly delegate?: MergeVerificationDelegate) {}
+  private readonly clock: MergeVerificationClock;
+
+  constructor(
+    private readonly delegate?: MergeVerificationDelegate,
+    clock?: MergeVerificationClock,
+  ) {
+    this.clock = clock ?? delegate?.clock ?? (() => new Date());
+  }
 
   async readVerification(request: MergeVerificationReadRequest): Promise<MergeVerificationResult> {
     const inspector = this.delegate?.inspector;
@@ -158,7 +176,7 @@ export class MergeVerificationAdapter implements MergeVerificationPort {
 
   private budgetAllows(request: MergeVerificationReadRequest): boolean {
     const decision = computeCallBudget({
-      nowIso: new Date().toISOString(),
+      nowIso: clockToIso(this.clock),
       deadlineIso: request.deadlineIso,
       normalTimeoutMs: VERIFICATION_NORMAL_TIMEOUT_MS,
     });

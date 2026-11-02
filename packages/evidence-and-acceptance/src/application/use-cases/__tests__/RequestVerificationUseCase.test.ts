@@ -485,10 +485,17 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
   });
 
   it('returns not-started and archives nothing when deadline leaves under 2 seconds', async () => {
+    const fixedNow = new Date('2026-10-15T12:00:00.000Z');
+    const fixedNowMs = fixedNow.getTime();
     const repo = new InMemoryAssessmentRepo([]);
     const executor = new StubExecutor();
     const archive = new StubArchive();
-    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+    const useCase = new RequestVerificationUseCase({
+      repo,
+      executor,
+      archive,
+      clock: () => fixedNow,
+    });
 
     const result = await useCase.requestVerification({
       assessmentId: 'asm-budget-exhausted',
@@ -499,7 +506,7 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
       hostId: 'host-1',
       implementerModel: 'anthropic/claude-3-5-sonnet',
       requiredChecks: ['lint'],
-      deadlineIso: new Date(Date.now() + 500).toISOString(),
+      deadlineIso: new Date(fixedNowMs + 500).toISOString(),
     });
 
     expect(result.outcome).toBe('not-started');
@@ -539,10 +546,17 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
   });
 
   it('surfaces a not-started outcome from the executor without archiving or saving', async () => {
+    const fixedNow = new Date('2026-10-15T12:00:00.000Z');
+    const fixedNowMs = fixedNow.getTime();
     const repo = new InMemoryAssessmentRepo([]);
     const executor = new NotStartedStubExecutor();
     const archive = new StubArchive();
-    const useCase = new RequestVerificationUseCase({ repo, executor, archive });
+    const useCase = new RequestVerificationUseCase({
+      repo,
+      executor,
+      archive,
+      clock: () => fixedNow,
+    });
 
     const result = await useCase.requestVerification({
       assessmentId: 'asm-executor-not-started',
@@ -553,7 +567,7 @@ describe('RequestVerificationUseCase identity comparison (M13)', () => {
       hostId: 'host-1',
       implementerModel: 'anthropic/claude-3-5-sonnet',
       requiredChecks: ['lint'],
-      deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+      deadlineIso: new Date(fixedNowMs + 60_000).toISOString(),
     });
 
     expect(result.outcome).toBe('not-started');

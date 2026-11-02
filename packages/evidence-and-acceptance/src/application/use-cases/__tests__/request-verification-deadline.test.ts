@@ -79,7 +79,12 @@ function verificationRequest(overrides: Record<string, unknown> = {}): Record<st
 describe('RequestVerificationUseCase deadline budget', () => {
   it('forwards the deadline to every executor call when one is supplied', async () => {
     const executor = new RecordingExecutor();
-    const useCase = new RequestVerificationUseCase({ repo: emptyRepo, executor, archive });
+    const useCase = new RequestVerificationUseCase({
+      repo: emptyRepo,
+      executor,
+      archive,
+      clock: () => new Date(NOW),
+    });
 
     const result: RequestVerificationResult = await useCase.requestVerification(
       verificationRequest({ deadlineIso: DEADLINE }) as never,
@@ -92,14 +97,19 @@ describe('RequestVerificationUseCase deadline budget', () => {
 
   it('does not start an executor call with under 2 seconds remaining', async () => {
     const executor = new RecordingExecutor();
-    const useCase = new RequestVerificationUseCase({ repo: emptyRepo, executor, archive });
+    const useCase = new RequestVerificationUseCase({
+      repo: emptyRepo,
+      executor,
+      archive,
+      clock: () => new Date(NOW),
+    });
 
     const result = await useCase.requestVerification(
       verificationRequest({ deadlineIso: '2026-10-15T00:00:01.000Z' }) as never,
     );
 
     expect(result).toEqual({
-      outcome: 'rejected',
+      outcome: 'not-started',
       reason: expect.stringContaining('budget exhausted'),
     });
     expect(executor.calls).toEqual([]);
@@ -107,11 +117,52 @@ describe('RequestVerificationUseCase deadline budget', () => {
 
   it('keeps today\'s timeout when no deadline is supplied', async () => {
     const executor = new RecordingExecutor();
-    const useCase = new RequestVerificationUseCase({ repo: emptyRepo, executor, archive });
+    const useCase = new RequestVerificationUseCase({
+      repo: emptyRepo,
+      executor,
+      archive,
+      clock: () => new Date(NOW),
+    });
 
     const result = await useCase.requestVerification(verificationRequest() as never);
 
     expect(result.outcome).toBe('completed');
     expect('deadlineIso' in (executor.calls[0] ?? {})).toBe(false);
+  });
+
+  it('exhausts budget mid-sequence when the injected clock advances past the deadline before a subsequent check', async () => {
+    const executor = new RecordingExecutor();
+    let tick = 0;
+    const timestamps = [
+      '2026-10-15T00:00:00.000Z',
+      '2026-10-15T00:00:02.100Z',
+    ];
+    const clock = () => timestamps[Math.min(tick++, timestamps.length - 1)]!;
+
+    const useCase = new RequestVerificationUseCase({
+      repo: emptyRepo,
+      executor,
+      archive,
+      clock,
+    });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'ea-multi-deadline',
+      projectId: 'fleet-core-worker',
+      attemptId: 'att-20261015-multi',
+      candidateHeadSha: '9f8e7d6c5b4a3928170123456789abcdef012345',
+      policyRevision: 'pol-rev-42',
+      hostId: 'verify-host-lin-01',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      requiredChecks: ['lint', 'acceptance'],
+      deadlineIso: '2026-10-15T00:00:03.000Z',
+    });
+
+    expect(result).toEqual({
+      outcome: 'not-started',
+      reason: "Verification budget exhausted before starting check 'acceptance'",
+    });
+    expect(executor.calls).toHaveLength(1);
+    expect(executor.calls[0]?.procedureName).toBe('lint');
   });
 });

@@ -5,7 +5,7 @@
 // failure is unknown, not a throw. Fake delegates only — no subprocess, no
 // live host.
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import type {
   EvidenceAssessmentRecord,
@@ -379,153 +379,220 @@ describe('MergeVerificationAdapter', () => {
 
   it('composes the use case with the adapter: a check that cannot start returns budget-exhausted, archives and saves nothing, and a later read is not receipt-failed', async () => {
     const baseNow = 1_700_000_000_000;
-    let callCount = 0;
-    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
-      callCount += 1;
-      return callCount === 1 ? baseNow : baseNow + 1_500;
+    const repoRecords = new Map<string, EvidenceAssessmentRecord>();
+    const repo = {
+      async saveAssessment(record: EvidenceAssessmentRecord): Promise<void> {
+        repoRecords.set(record.id, { ...record });
+      },
+      async findAssessmentById(id: string): Promise<EvidenceAssessmentRecord | null> {
+        const found = repoRecords.get(id);
+        return found ? { ...found } : null;
+      },
+      async findAssessmentByHead(sha: string): Promise<EvidenceAssessmentRecord | null> {
+        for (const record of repoRecords.values()) {
+          if (record.candidateHeadSha === sha) return { ...record };
+        }
+        return null;
+      },
+    };
+
+    const archiveCalls: unknown[] = [];
+    const archive = {
+      async archiveEvidence(req: { artifactId: string; candidateHeadSha: string; content: string }) {
+        archiveCalls.push(req);
+        return { evidenceRef: `ref-${req.artifactId}`, digest: 'digest-1' };
+      },
+      async readArchivedEvidence(_ref: string) {
+        return 'content';
+      },
+    };
+
+    const spawnCalls: unknown[] = [];
+    const executor = new VerificationExecutorAdapter({
+      allowListedCommands: { [MACOS_PROCEDURE]: '/opt/verify-run.sh' },
+      spawn: (file, args, options) => {
+        spawnCalls.push({ file, args, options });
+        return { status: 0, signal: null, stdout: 'ok', stderr: '' };
+      },
     });
 
-    try {
-      const repoRecords = new Map<string, EvidenceAssessmentRecord>();
-      const repo = {
-        async saveAssessment(record: EvidenceAssessmentRecord): Promise<void> {
-          repoRecords.set(record.id, { ...record });
-        },
-        async findAssessmentById(id: string): Promise<EvidenceAssessmentRecord | null> {
-          const found = repoRecords.get(id);
-          return found ? { ...found } : null;
-        },
-        async findAssessmentByHead(sha: string): Promise<EvidenceAssessmentRecord | null> {
-          for (const record of repoRecords.values()) {
-            if (record.candidateHeadSha === sha) return { ...record };
-          }
-          return null;
-        },
-      };
+    const useCase = new RequestVerificationUseCase({
+      repo,
+      executor,
+      archive,
+      clock: () => new Date(baseNow + 1_500),
+    });
+    const inspector = new InspectAcceptanceEvidenceUseCase({ repo });
+    const adapter = new MergeVerificationAdapter({
+      requester: useCase,
+      inspector,
+      clock: () => new Date(baseNow),
+    });
 
-      const archiveCalls: unknown[] = [];
-      const archive = {
-        async archiveEvidence(req: { artifactId: string; candidateHeadSha: string; content: string }) {
-          archiveCalls.push(req);
-          return { evidenceRef: `ref-${req.artifactId}`, digest: 'digest-1' };
-        },
-        async readArchivedEvidence(_ref: string) {
-          return 'content';
-        },
-      };
+    const deadlineIso = new Date(baseNow + 2_500).toISOString();
+    const triggerResult = await adapter.runVerification(triggerRequest({ deadlineIso }));
 
-      const spawnCalls: unknown[] = [];
-      const executor = new VerificationExecutorAdapter({
-        allowListedCommands: { [MACOS_PROCEDURE]: '/opt/verify-run.sh' },
-        spawn: (file, args, options) => {
-          spawnCalls.push({ file, args, options });
-          return { status: 0, signal: null, stdout: 'ok', stderr: '' };
-        },
-      });
+    expect(triggerResult).toEqual({
+      outcome: 'unknown',
+      reasonCode: 'budget-exhausted',
+    });
+    expect(archiveCalls).toHaveLength(0);
+    expect(spawnCalls).toHaveLength(0);
+    expect(repoRecords.size).toBe(0);
 
-      const useCase = new RequestVerificationUseCase({ repo, executor, archive });
-      const inspector = new InspectAcceptanceEvidenceUseCase({ repo });
-      const adapter = new MergeVerificationAdapter({ requester: useCase, inspector });
-
-      const deadlineIso = new Date(baseNow + 2_500).toISOString();
-      const triggerResult = await adapter.runVerification(triggerRequest({ deadlineIso }));
-
-      expect(triggerResult).toEqual({
-        outcome: 'unknown',
-        reasonCode: 'budget-exhausted',
-      });
-      expect(archiveCalls).toHaveLength(0);
-      expect(spawnCalls).toHaveLength(0);
-      expect(repoRecords.size).toBe(0);
-
-      const readResult = await adapter.readVerification(
-        readRequest({ deadlineIso: new Date(baseNow + 60_000).toISOString() }),
-      );
-      assertUnknown(readResult);
-      expect(readResult).toEqual({
-        outcome: 'unknown',
-        reasonCode: 'no-receipt',
-      });
-      expect(readResult.reasonCode).not.toBe('receipt-failed');
-    } finally {
-      nowSpy.mockRestore();
-    }
+    const readResult = await adapter.readVerification(
+      readRequest({ deadlineIso: new Date(baseNow + 60_000).toISOString() }),
+    );
+    assertUnknown(readResult);
+    expect(readResult).toEqual({
+      outcome: 'unknown',
+      reasonCode: 'no-receipt',
+    });
+    expect(readResult.reasonCode).not.toBe('receipt-failed');
   });
 
   it('composes the use case with the adapter when the executor path deadline check returns not-started: returns budget-exhausted, archives and saves nothing, and a later read is not receipt-failed', async () => {
     const baseNow = 1_700_000_000_000;
-    let callCount = 0;
-    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
-      callCount += 1;
-      if (callCount === 1) return baseNow;
-      if (callCount === 2) return baseNow + 400;
-      return baseNow + 700;
+    const repoRecords = new Map<string, EvidenceAssessmentRecord>();
+    const repo = {
+      async saveAssessment(record: EvidenceAssessmentRecord): Promise<void> {
+        repoRecords.set(record.id, { ...record });
+      },
+      async findAssessmentById(id: string): Promise<EvidenceAssessmentRecord | null> {
+        const found = repoRecords.get(id);
+        return found ? { ...found } : null;
+      },
+      async findAssessmentByHead(sha: string): Promise<EvidenceAssessmentRecord | null> {
+        for (const record of repoRecords.values()) {
+          if (record.candidateHeadSha === sha) return { ...record };
+        }
+        return null;
+      },
+    };
+
+    const archiveCalls: unknown[] = [];
+    const archive = {
+      async archiveEvidence(req: { artifactId: string; candidateHeadSha: string; content: string }) {
+        archiveCalls.push(req);
+        return { evidenceRef: `ref-${req.artifactId}`, digest: 'digest-1' };
+      },
+      async readArchivedEvidence(_ref: string) {
+        return 'content';
+      },
+    };
+
+    const spawnCalls: unknown[] = [];
+    const executor = new VerificationExecutorAdapter({
+      allowListedCommands: { [MACOS_PROCEDURE]: '/opt/verify-run.sh' },
+      runCheck: async () => ({
+        outcome: 'not-started',
+        reason: 'verification check did not start: the remaining budget is under 2 seconds',
+      }),
+      spawn: (file, args, options) => {
+        spawnCalls.push({ file, args, options });
+        return { status: 0, signal: null, stdout: 'ok', stderr: '' };
+      },
     });
 
-    try {
-      const repoRecords = new Map<string, EvidenceAssessmentRecord>();
-      const repo = {
-        async saveAssessment(record: EvidenceAssessmentRecord): Promise<void> {
-          repoRecords.set(record.id, { ...record });
-        },
-        async findAssessmentById(id: string): Promise<EvidenceAssessmentRecord | null> {
-          const found = repoRecords.get(id);
-          return found ? { ...found } : null;
-        },
-        async findAssessmentByHead(sha: string): Promise<EvidenceAssessmentRecord | null> {
-          for (const record of repoRecords.values()) {
-            if (record.candidateHeadSha === sha) return { ...record };
-          }
-          return null;
-        },
-      };
+    const useCase = new RequestVerificationUseCase({
+      repo,
+      executor,
+      archive,
+      clock: () => new Date(baseNow + 400),
+    });
+    const inspector = new InspectAcceptanceEvidenceUseCase({ repo });
+    const adapter = new MergeVerificationAdapter({
+      requester: useCase,
+      inspector,
+      clock: () => new Date(baseNow),
+    });
 
-      const archiveCalls: unknown[] = [];
-      const archive = {
-        async archiveEvidence(req: { artifactId: string; candidateHeadSha: string; content: string }) {
-          archiveCalls.push(req);
-          return { evidenceRef: `ref-${req.artifactId}`, digest: 'digest-1' };
-        },
-        async readArchivedEvidence(_ref: string) {
-          return 'content';
-        },
-      };
+    const deadlineIso = new Date(baseNow + 2_500).toISOString();
+    const triggerResult = await adapter.runVerification(triggerRequest({ deadlineIso }));
 
-      const spawnCalls: unknown[] = [];
-      const executor = new VerificationExecutorAdapter({
-        allowListedCommands: { [MACOS_PROCEDURE]: '/opt/verify-run.sh' },
-        spawn: (file, args, options) => {
-          spawnCalls.push({ file, args, options });
-          return { status: 0, signal: null, stdout: 'ok', stderr: '' };
-        },
-      });
+    expect(triggerResult).toEqual({
+      outcome: 'unknown',
+      reasonCode: 'budget-exhausted',
+    });
+    expect(archiveCalls).toHaveLength(0);
+    expect(spawnCalls).toHaveLength(0);
+    expect(repoRecords.size).toBe(0);
 
-      const useCase = new RequestVerificationUseCase({ repo, executor, archive });
-      const inspector = new InspectAcceptanceEvidenceUseCase({ repo });
-      const adapter = new MergeVerificationAdapter({ requester: useCase, inspector });
+    const readResult = await adapter.readVerification(
+      readRequest({ deadlineIso: new Date(baseNow + 60_000).toISOString() }),
+    );
+    assertUnknown(readResult);
+    expect(readResult).toEqual({
+      outcome: 'unknown',
+      reasonCode: 'no-receipt',
+    });
+    expect(readResult.reasonCode).not.toBe('receipt-failed');
+  });
 
-      const deadlineIso = new Date(baseNow + 2_500).toISOString();
-      const triggerResult = await adapter.runVerification(triggerRequest({ deadlineIso }));
+  it('reads and verifies a valid passing receipt when configured with an injected clock before an earlier deadline', async () => {
+    const fixedNow = new Date('2026-06-01T10:00:00.000Z');
+    const deadlineIso = '2026-06-01T10:15:00.000Z';
+    const prodHead = 'b3f5c7d9e1a20485769201948572019485720194';
+    const prodProcedure = 'integration-tests';
+    const prodAttempt = 'attempt-run-482';
+    const prodProject = 'project-infra';
+    const prodAssessmentId = assessmentIdForAttempt(prodAttempt);
 
-      expect(triggerResult).toEqual({
-        outcome: 'unknown',
-        reasonCode: 'budget-exhausted',
-      });
-      expect(archiveCalls).toHaveLength(0);
-      expect(spawnCalls).toHaveLength(0);
-      expect(repoRecords.size).toBe(0);
+    const receipt: VerificationReceiptRecord = {
+      id: 'vr-integration-482',
+      assessmentId: prodAssessmentId,
+      projectId: prodProject,
+      attemptId: prodAttempt,
+      candidateHeadSha: prodHead,
+      hostId: 'verify-host-mac-arm-02',
+      procedureName: prodProcedure,
+      result: 'pass',
+      exitCode: 0,
+      evidenceRef: 'evidence://assessment-482/integration-tests',
+      policyRevision: 'policy-prod-v3',
+      completedAtIso: '2026-06-01T10:05:00.000Z',
+    };
 
-      const readResult = await adapter.readVerification(
-        readRequest({ deadlineIso: new Date(baseNow + 60_000).toISOString() }),
-      );
-      assertUnknown(readResult);
-      expect(readResult).toEqual({
-        outcome: 'unknown',
-        reasonCode: 'no-receipt',
-      });
-      expect(readResult.reasonCode).not.toBe('receipt-failed');
-    } finally {
-      nowSpy.mockRestore();
-    }
+    const assessment: EvidenceAssessmentRecord = {
+      id: prodAssessmentId,
+      projectId: prodProject,
+      attemptId: prodAttempt,
+      candidateHeadSha: prodHead,
+      policyRevision: 'policy-prod-v3',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      requiredChecks: [prodProcedure],
+      state: 'pending',
+      verificationReceipts: [receipt],
+      reviewReceipts: [],
+      findingDispositions: [],
+      acceptanceReceiptId: null,
+      blockers: [],
+      revision: 1,
+      updatedAtIso: '2026-06-01T10:06:00.000Z',
+    };
+
+    const inspector = new RecordingInspector([{ outcome: 'found', assessment }]);
+    const adapter = new MergeVerificationAdapter({
+      inspector,
+      clock: () => fixedNow,
+    });
+
+    const result = await adapter.readVerification({
+      repoDigest: 'deadbeef1234',
+      headOid: prodHead,
+      macosProcedure: prodProcedure,
+      policyRevision: 'policy-prod-v3',
+      projectId: prodProject,
+      attemptId: prodAttempt,
+      deadlineIso,
+    });
+
+    expect(result).toEqual({
+      outcome: 'verified',
+      receiptHeadOid: prodHead,
+      receiptId: receipt.id,
+      verifiedBy: 'procedure',
+    });
+    expect(inspector.requests).toEqual([{ assessmentId: prodAssessmentId, candidateHeadSha: prodHead }]);
   });
 });

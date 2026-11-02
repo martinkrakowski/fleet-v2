@@ -13,8 +13,8 @@ function member(prNumber: number, hex: string): BatchMemberRecord {
 
 /** Members 1..count in order, frozen so no planner can mutate them. */
 function members(count: number): readonly BatchMemberRecord[] {
-  const hex = 'abcdefghij';
-  return Object.freeze(Array.from({ length: count }, (_, index) => member(index + 1, hex[index])));
+  const hex = 'abcdef0123456789';
+  return Object.freeze(Array.from({ length: count }, (_, index) => member(index + 1, hex[index % hex.length])));
 }
 
 /** A gate outcome over the given members. */

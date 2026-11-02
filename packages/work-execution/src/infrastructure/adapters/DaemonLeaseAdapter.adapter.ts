@@ -119,7 +119,7 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
       return current === undefined ? null : { ...current };
     }
     try {
-      return await this.readRecord(target);
+      return await this.readRecord(target, scope);
     } catch (error: unknown) {
       if (
         this.options?.readOnly === true &&
@@ -154,7 +154,7 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
     return withFileLock(`${target}.lock`, async () => {
       let current: DaemonLeaseRecord | null;
       try {
-        current = await this.readRecord(target);
+        current = await this.readRecord(target, scope);
       } catch (error: unknown) {
         if (
           error instanceof StateFileUnreadableError ||
@@ -181,6 +181,9 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
       throw new Error('DaemonLeaseAdapter refuses an empty lease scope');
     }
     const components = scope.split('/');
+    if (components.length > 2) {
+      throw new Error('DaemonLeaseAdapter refuses an unsafe lease scope');
+    }
     for (const component of components) {
       if (!isSafeScopeComponent(component)) {
         throw new Error('DaemonLeaseAdapter refuses an unsafe lease scope');
@@ -189,7 +192,7 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
     return join(stateDir, 'daemon', 'leases', ...components) + '.json';
   }
 
-  private async readRecord(target: string): Promise<DaemonLeaseRecord | null> {
+  private async readRecord(target: string, expectedScope: string): Promise<DaemonLeaseRecord | null> {
     let buffer: Buffer;
     try {
       buffer = await fs.readFile(target);
@@ -211,6 +214,14 @@ export class DaemonLeaseAdapter implements DaemonLeasePort {
         throw new StateFileUnknownVersionError(target, 0);
       }
       return rejectUnreadableStateFile(target, read.error, buffer, this.options?.readOnly === true);
+    }
+    if (read.record.scope !== expectedScope) {
+      return rejectUnreadableStateFile(
+        target,
+        'DaemonLease record scope does not match file path',
+        buffer,
+        this.options?.readOnly === true,
+      );
     }
     return read.record;
   }

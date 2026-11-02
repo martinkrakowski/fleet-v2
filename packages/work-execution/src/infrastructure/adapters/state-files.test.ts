@@ -782,4 +782,55 @@ describe('daemon state file descriptors', () => {
       expect(read.bytes).toEqual(garbageBytes);
     }
   });
+
+  it('events.jsonl append skips duplicate event ids within batch or file', async () => {
+    const adapter = new DaemonEventProjectionAdapter({ stateDir: tempDir });
+    const event1 = buildEventFixture(1);
+
+    const first = await adapter.append([event1, event1]);
+    expect(first.appended).toBe(1);
+
+    const second = await adapter.append([event1]);
+    expect(second.appended).toBe(0);
+
+    const read = await adapter.readAfterCursor(null);
+    expect(read.ok).toBe(true);
+    if (!read.ok) {
+      throw new Error('expected read to be ok');
+    }
+    expect(read.events).toHaveLength(1);
+    expect(read.events[0]?.eventId).toBe(event1.eventId);
+  });
+
+  it('DaemonLeaseAdapter refuses a lease scope with more than one slash', async () => {
+    const adapter = new DaemonLeaseAdapter({ stateDir: tempDir });
+    await expect(
+      adapter.acquire({
+        scope: 'a/b/c',
+        holderId: TICK_ID,
+        observedFence: 0,
+        leaseUntilIso: new Date(Date.now() + 60_000).toISOString(),
+        nowIso: new Date().toISOString(),
+      }),
+    ).rejects.toThrow('DaemonLeaseAdapter refuses an unsafe lease scope');
+  });
+
+  it('DaemonLeaseAdapter treats a lease whose record scope differs from its file path as unreadable', async () => {
+    const leasesDir = path.join(tempDir, 'daemon', 'leases');
+    await fs.mkdir(leasesDir, { recursive: true });
+    const leasePath = path.join(leasesDir, 'notifier.json');
+    await fs.writeFile(leasePath, JSON.stringify(buildLeaseRecord('other')));
+
+    const adapter = new DaemonLeaseAdapter({ stateDir: tempDir });
+    await expect(adapter.read('notifier')).rejects.toBeInstanceOf(StateFileUnreadableError);
+
+    const mutateResult = await adapter.acquire({
+      scope: 'notifier',
+      holderId: TICK_ID,
+      observedFence: 0,
+      leaseUntilIso: new Date(Date.now() + 60_000).toISOString(),
+      nowIso: new Date().toISOString(),
+    });
+    expect(mutateResult).toEqual({ outcome: 'refused', reason: 'lease-unreadable' });
+  });
 });

@@ -38,6 +38,20 @@ function isENOENT(error: unknown): boolean {
   );
 }
 
+function collectExistingEventIds(text: string): Set<string> {
+  const ids = new Set<string>();
+  for (const line of text.split('\n')) {
+    if (line.trim().length === 0) {
+      continue;
+    }
+    const read = readDaemonEventLine(line);
+    if (read.ok && read.lineKind === 'event') {
+      ids.add(read.record.eventId);
+    }
+  }
+  return ids;
+}
+
 export class DaemonEventProjectionAdapter implements DaemonEventProjectionPort {
   private readonly inMemoryEvents: DaemonEventRecord[] = [];
 
@@ -46,9 +60,14 @@ export class DaemonEventProjectionAdapter implements DaemonEventProjectionPort {
   async append(events: readonly DaemonEventRecord[]): Promise<{ readonly appended: number }> {
     const target = this.statePath;
     if (target === null) {
+      const seenIds = new Set<string>(this.inMemoryEvents.map((e) => e.eventId));
       let appended = 0;
       for (const event of events) {
+        if (seenIds.has(event.eventId)) {
+          continue;
+        }
         if (serializeDaemonEventLine(event) !== null) {
+          seenIds.add(event.eventId);
           this.inMemoryEvents.push(event);
           appended += 1;
         }
@@ -66,14 +85,19 @@ export class DaemonEventProjectionAdapter implements DaemonEventProjectionPort {
           throw error;
         }
       }
+      const seenIds = collectExistingEventIds(existing);
       const newLines: string[] = [];
       if (existing.trim().length === 0) {
         newLines.push(serializeDaemonEventHeader());
       }
       let appended = 0;
       for (const event of events) {
+        if (seenIds.has(event.eventId)) {
+          continue;
+        }
         const line = serializeDaemonEventLine(event);
         if (line !== null) {
+          seenIds.add(event.eventId);
           newLines.push(line);
           appended += 1;
         }

@@ -50,6 +50,7 @@ import {
   type ConductorScheduleRow,
   type ConductorPassTraceInput,
   type ConductorPassTracePort,
+  type RunTelemetryMarkPort,
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
@@ -723,6 +724,42 @@ function readRunFlags(argv: readonly string[], io: CliIo): RunFlags | null {
 }
 
 /**
+ * OT5: marks one advanced run for telemetry export. Telemetry is off the
+ * lane's critical path: a throwing mark adapter never fails a pass, and a
+ * lost mark only delays the next export.
+ */
+function markRunQuietly(mark: RunTelemetryMarkPort | undefined, runId: string): void {
+  try {
+    mark?.mark({ kind: 'run', runId });
+  } catch {
+    // a lost mark delays only the next export (plan §3.3)
+  }
+}
+
+/**
+ * OT5: stops the driver's background exporter within the 2 s stop race of plan
+ * §3.5 (line 202). The timer is unref()'d and cleared when the exporter's own
+ * stop settles first; synchronous throws and rejected stop promises are
+ * absorbed, so the driver's exit is delayed by at most 2 s.
+ */
+async function stopTelemetryExporter(runtime: FleetCliRuntime): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(() => resolve(), 2_000);
+    timer.unref();
+  });
+  try {
+    await Promise.race([runtime.telemetry.stopExporter?.() ?? Promise.resolve(), timeout]);
+  } catch {
+    // absorbed: telemetry never changes an exit code
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
  * `conductor run --live`: the driver. One pass at a time under the state
  * directory's driver lease, polling with back-off from 30 seconds to 2 minutes,
  * with a 10-second floor while a run waits in watching-ci or merging (D31),
@@ -809,6 +846,14 @@ async function runCommand(
       io.stderr(`${RUNNER_TUNNEL_FAILED_MESSAGE}\n`);
       return 1;
     }
+    // OT5: start the background exporter once the tunnel is up; it drains
+    // marks off the critical path. Never throws, but the isolation test proves
+    // a throwing start cannot affect the run.
+    try {
+      runtime.telemetry.startExporter?.();
+    } catch {
+      // a lost exporter delays only the next export
+    }
     const holderId = 'driver-' + runtime.conductor.newUlid();
     const seenAttention = new Set<string>();
     return await pollConductorPasses({
@@ -833,6 +878,14 @@ async function runCommand(
           runs: result.runs,
           attention: result.attention,
         });
+        // OT5: mark every advanced run after its pass has journalled its result
+        // (only advanced passes journalled results; the exporter re-reads the
+        // records, so the root is emitted whenever the run is already terminal).
+        for (const report of result.runs) {
+          if (report.outcome === 'advanced') {
+            markRunQuietly(runtime.telemetry.mark, report.runId);
+          }
+        }
         for (const item of result.attention) {
           const key = `${item.runId}:${item.kind}`;
           if (seenAttention.has(key)) {
@@ -852,6 +905,8 @@ async function runCommand(
       process.removeListener('SIGINT', onSignal);
       process.removeListener('SIGTERM', onSignal);
     }
+    // OT5: stop the background exporter within the 2 s stop race (plan §3.5).
+    await stopTelemetryExporter(runtime);
   }
 }
 

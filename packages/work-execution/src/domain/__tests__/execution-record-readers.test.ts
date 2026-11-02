@@ -70,6 +70,7 @@ const validAttempt = {
     sessionId: 'ses_1',
     steps: 42,
     wallSeconds: 0.25,
+    runnerMinutes: 1,
     tokensInput: 100,
     tokensOutput: 200,
     tokensReasoning: 10,
@@ -445,6 +446,39 @@ describe('execution-record-readers: attempt tightening (D6)', () => {
       if (nullResult.ok) {
         expect(nullResult.record.seatSelection?.[field]).toBeNull();
       }
+    }
+  });
+
+  it('reads an old usage record without runnerMinutes, keeping the key absent', () => {
+    const oldAttempt = clone(validAttempt);
+    const usageCopy = { ...oldAttempt.usage };
+    delete (usageCopy as Record<string, unknown>).runnerMinutes;
+    oldAttempt.usage = usageCopy as typeof validAttempt.usage;
+    const result = readAttemptRecord(oldAttempt);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(Object.hasOwn(result.record.usage!, 'runnerMinutes')).toBe(false);
+    }
+  });
+
+  it('keeps an explicit null runnerMinutes as null', () => {
+    const nullAttempt = clone(validAttempt);
+    nullAttempt.usage = { ...nullAttempt.usage, runnerMinutes: null } as unknown as typeof validAttempt.usage;
+    const result = readAttemptRecord(nullAttempt);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.record.usage?.runnerMinutes).toBeNull();
+    }
+  });
+
+  it('refuses a malformed runnerMinutes', () => {
+    for (const value of ['2', 1.5, -1, NaN]) {
+      const malformedAttempt = clone(validAttempt);
+      malformedAttempt.usage = { ...malformedAttempt.usage, runnerMinutes: value } as unknown as typeof validAttempt.usage;
+      expect(readAttemptRecord(malformedAttempt)).toEqual({
+        ok: false,
+        reason: 'malformed',
+      });
     }
   });
 });

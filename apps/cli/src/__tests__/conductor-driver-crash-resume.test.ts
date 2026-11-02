@@ -24,6 +24,7 @@ import type {
   AdvanceLaneRunResult,
   AttemptRecord,
   BaseBranchValue,
+  DispatchAttemptPort,
   LaneRunStateValue,
 } from '@fleet/work-execution';
 import {
@@ -200,8 +201,12 @@ const HOLDER_CONTROL = 'driver-control-1';
 const HOLDER_CRASH = 'driver-crash-1';
 const HOLDER_RESUME = 'driver-resume-2';
 
+interface StartScenarioOptions {
+  readonly wrapDispatchAttempt?: (dispatchAttempt: DispatchAttemptPort, fakes: DryRunFakes) => DispatchAttemptPort;
+}
+
 /** Build one isolated world: a temp state dir, a seeded run, and the dry-run advance over the real file stores. */
-async function startScenario(): Promise<Scenario> {
+async function startScenario(options?: StartScenarioOptions): Promise<Scenario> {
   const dir = tempStateDir();
   const runSubprocess = vi.fn(throwingRunSubprocess);
   const runtime = createFleetCliRuntime({ stateDir: dir, runSubprocess });
@@ -211,6 +216,9 @@ async function startScenario(): Promise<Scenario> {
     { attemptRepo: runtime.execution.attemptRepository, executionJournal: runtime.execution.executionJournal },
     clock.now,
   );
+  const dispatchAttempt = options?.wrapDispatchAttempt
+    ? options.wrapDispatchAttempt(fakes.dispatchAttempt, fakes)
+    : fakes.dispatchAttempt;
   const advance = new AdvanceLaneRunUseCase({
     runRepo: runtime.conductor.laneRunRepository,
     runJournal: runtime.conductor.laneRunJournal,
@@ -222,7 +230,7 @@ async function startScenario(): Promise<Scenario> {
     admission: fakes.admission,
     newUlid: runtime.conductor.newUlid,
     stopGraceMinutes: resolveConductorPolicy(undefined).stopGraceMinutes,
-    dispatchAttempt: fakes.dispatchAttempt,
+    dispatchAttempt,
     cancelPreparedAttempt: new CancelPreparedAttemptUseCase({
       attemptRepo: runtime.execution.attemptRepository,
       journal: runtime.execution.executionJournal,
@@ -508,6 +516,75 @@ describe('conductor driver crash and resume at every step boundary', () => {
       await runPasses(scenario, resumePass, HOLDER_RESUME);
       expect(await isTerminal(scenario)).toBe(true);
       expect(resumeCounting.calls).toHaveLength(0);
+    } finally {
+      rmSync(scenario.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('T6: crash inside dispatch step records started attempt, reconciles on resume, and dispatches once', async () => {
+    let dispatchCallCount = 0;
+    const scenario = await startScenario({
+      wrapDispatchAttempt: (inner) => ({
+        dispatchAttempt: async (request) => {
+          dispatchCallCount += 1;
+          await inner.dispatchAttempt(request);
+          throw new Error('injected crash inside dispatch step');
+        },
+      }),
+    });
+    try {
+      const crashPass = driverFor(scenario, scenario.advance);
+      let rejection: unknown = null;
+      try {
+        await crashPass.runPass({ holderId: HOLDER_CRASH, nowIso: scenario.clock.now() });
+      } catch (error) {
+        rejection = error;
+      }
+      expect(rejection).toBeInstanceOf(Error);
+      expect((rejection as Error).message).toBe('injected crash inside dispatch step');
+
+      // The acting fake recorded that dispatch started and exposed the known reconciliation state
+      const attemptAfterCrash = await scenario.runtime.execution.attemptRepository.findAttemptById(ATTEMPT_ID);
+      expect(attemptAfterCrash?.state).toBe('running');
+      expect(attemptAfterCrash?.sessionId).toBe('dry-run-session-1');
+
+      // The dispatch intent was journalled, but the crash happened before the result was recorded
+      const journalAfterCrash = await scenario.runtime.conductor.laneRunJournal.listForRun(RUN_ID);
+      const intentBefore = journalAfterCrash.find(
+        (entry) => entry.kind === 'intent' && entry.key !== null && entry.key.includes('/dispatch'),
+      );
+      const resultBefore = journalAfterCrash.find(
+        (entry) => entry.kind === 'result' && entry.key !== null && entry.key.includes('/dispatch'),
+      );
+      expect(intentBefore).toBeDefined();
+      expect(resultBefore).toBeUndefined();
+
+      // Lapse the crashed holder's leases
+      scenario.clock.advanceMs(CONDUCTOR_LEASE_MS + 60_000);
+
+      // On resume, a fresh driver takes over and drives to terminal
+      const resumePass = driverFor(scenario, scenario.advance);
+      await runPasses(scenario, resumePass, HOLDER_RESUME);
+
+      // Assert that reconciliation recorded the result for the dispatch step
+      const journalAfterResume = await scenario.runtime.conductor.laneRunJournal.listForRun(RUN_ID);
+      const dispatchResult = journalAfterResume.find(
+        (entry) => entry.kind === 'result' && entry.key !== null && entry.key.includes('/dispatch'),
+      );
+      expect(dispatchResult).toBeDefined();
+      expect(dispatchResult?.outcome).toBe('reconciled');
+      expect(dispatchResult?.reasonCode).toBe('dispatch-started');
+
+      // Assert that dispatchAttempt was called exactly once across the whole drive
+      expect(dispatchCallCount).toBe(1);
+      const recordedDispatchCalls = scenario.fakes.recorder.calls.filter((call) => call.port === 'dispatch');
+      expect(recordedDispatchCalls).toHaveLength(1);
+
+      // The run reaches terminal state merged with expected counts
+      const metrics = await deriveMetrics(scenario);
+      expect(metrics.terminalState).toBe('merged');
+      expect(metrics.parkIsNull).toBe(true);
+      expectExplicitCounts(metrics.tally);
     } finally {
       rmSync(scenario.dir, { recursive: true, force: true });
     }

@@ -11,15 +11,31 @@ export interface ExecuteVerificationCheckRequest {
   readonly hostId: string;
   readonly candidateHeadSha: string;
   readonly procedureName: string;
+  /**
+   * Absolute ISO deadline bounding this check: a started call takes
+   * `min(normal timeout, remaining budget)`, and a call with under 2 seconds
+   * remaining is not started. Absent means today's normal timeout.
+   */
+  readonly deadlineIso?: string;
 }
 
-export interface ExecuteVerificationCheckResult {
+export interface ExecuteVerificationCheckReceipt {
+  readonly outcome?: 'completed';
   readonly result: EvidenceResultValue;
   readonly exitCode: number | null;
   readonly coverage?: CheckCoverage;
   readonly outputSummary: string;
   readonly completedAtIso: string;
 }
+
+export interface ExecuteVerificationCheckNotStarted {
+  readonly outcome: 'not-started';
+  readonly reason: string;
+}
+
+export type ExecuteVerificationCheckResult =
+  | ExecuteVerificationCheckReceipt
+  | ExecuteVerificationCheckNotStarted;
 
 export interface VerificationExecutorPort {
   executeVerificationCheck(request: ExecuteVerificationCheckRequest): Promise<ExecuteVerificationCheckResult>;

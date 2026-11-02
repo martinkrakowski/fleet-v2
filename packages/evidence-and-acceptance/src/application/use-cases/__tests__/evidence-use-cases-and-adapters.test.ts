@@ -25,7 +25,11 @@ import type {
   IndependentReviewPort,
   RunIndependentReviewRequest,
 } from '../../ports/out/IndependentReviewPort.out-port.js';
-import type { VerificationExecutorPort } from '../../ports/out/VerificationExecutorPort.out-port.js';
+import type {
+  ExecuteVerificationCheckReceipt,
+  ExecuteVerificationCheckResult,
+  VerificationExecutorPort,
+} from '../../ports/out/VerificationExecutorPort.out-port.js';
 import type {
   AssessHeadAcceptanceRequest,
   AssessHeadAcceptanceResult,
@@ -1477,6 +1481,15 @@ describe('EvidenceArchiveAdapter', () => {
   });
 });
 
+function assertCompleted(
+  result: ExecuteVerificationCheckResult,
+): asserts result is ExecuteVerificationCheckReceipt {
+  expect(result.outcome).toBe('completed');
+  if (result.outcome !== 'completed') {
+    throw new Error(`expected completed check, got ${result.outcome}`);
+  }
+}
+
 describe('VerificationExecutorAdapter', () => {
   it('delegates to the configured check transport', async () => {
     const adapter = new VerificationExecutorAdapter({
@@ -1513,6 +1526,7 @@ describe('VerificationExecutorAdapter', () => {
       procedureName: 'unit-tests',
     });
 
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(result.exitCode).toBeNull();
     expect(result.outputSummary).toContain('no allow-listed verification command');
@@ -1539,9 +1553,11 @@ describe('VerificationExecutorAdapter', () => {
       procedureName: 'unit-tests',
     });
 
+    assertCompleted(passed);
     expect(passed.result).toBe('pass');
     expect(passed.exitCode).toBe(0);
     expect(passed.outputSummary).toContain('all good');
+    assertCompleted(failed);
     expect(failed.result).toBe('fail');
     expect(failed.exitCode).toBe(2);
     expect(failed.outputSummary).toContain('boom');

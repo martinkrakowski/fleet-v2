@@ -139,6 +139,7 @@ describe('OpencodeApiUsageAdapter', () => {
         sessionId: 'ses_test_123',
         steps: 17,
         wallSeconds: 70.7,
+        runnerMinutes: 2,
         tokensInput: 25563,
         tokensOutput: 3775,
         tokensReasoning: 4494,
@@ -232,6 +233,7 @@ describe('OpencodeApiUsageAdapter', () => {
       expect(result.usage.model).toBeNull();
       expect(result.usage.agent).toBeNull();
       expect(result.usage.wallSeconds).toBeNull();
+      expect(result.usage.runnerMinutes).toBeNull();
       expect(result.usage.steps).toBe(17);
     }
   });
@@ -274,6 +276,7 @@ describe('OpencodeApiUsageAdapter', () => {
     if (result.outcome === 'unavailable') {
       expect(result.usage.source).toBe('unavailable');
       expect(result.usage.reason).toBe('no-session');
+      expect(result.usage.runnerMinutes).toBeNull();
     }
   });
 

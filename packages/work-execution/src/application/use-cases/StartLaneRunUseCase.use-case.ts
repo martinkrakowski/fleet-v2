@@ -29,6 +29,7 @@ import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
 import { resolveWorkOrderBaseBranch } from '../../domain/base-branch.js';
 import type { BaseBranchValue } from '../../domain/base-branch.js';
+import { isConductorHalted } from '../../domain/conductor-halt.js';
 import { laneRunJournalState } from '../../domain/lane-run-journal.js';
 import type { SeatHistoryEntry } from '../../domain/seat-selection.js';
 import { selectSeat, seatMatchesAssignment, seatSelectionRecord } from '../../domain/seat-selection.js';
@@ -52,6 +53,7 @@ import type { CancelPreparedAttemptPort } from '../ports/in/CancelPreparedAttemp
 import type { PrepareBriefPackagePort } from '../ports/in/PrepareBriefPackagePort.in-port.js';
 import type { PrepareBriefPackageUseCaseRequest } from './PrepareBriefPackageUseCase.use-case.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
@@ -70,6 +72,8 @@ import type {
 export interface StartLaneRunDependencies {
   readonly workOrderRepo: Pick<WorkOrderRepositoryPort, 'findWorkOrderById'>;
   readonly profileRead: ProjectProfileReadPort;
+  /** The conductor's halt marker; read before any write or external action. */
+  readonly halt: Pick<ConductorHaltPort, 'read'>;
   readonly capacity: LaneRunStartCapacityPort;
   readonly executionJournal: Pick<
     ExecutionJournalPort,
@@ -224,6 +228,19 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     const shapeError = attemptShapeError(request);
     if (shapeError !== null) {
       return { outcome: 'refused', reason: shapeError };
+    }
+    // KA4: the conductor refuses to start a lane run while halted. The marker
+    // is read before any write or external action; `unreadable` counts as
+    // halted (fail closed) and a read that throws fails closed too. The
+    // refusal carries only the fixed token.
+    let halted: boolean;
+    try {
+      halted = isConductorHalted(await deps.halt.read());
+    } catch {
+      halted = true;
+    }
+    if (halted) {
+      return { outcome: 'refused', reason: 'halted' };
     }
     const existingRun = await deps.runRepo.get(request.runId);
     if (existingRun !== null) {

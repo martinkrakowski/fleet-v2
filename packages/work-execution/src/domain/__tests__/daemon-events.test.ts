@@ -15,7 +15,8 @@ import {
   serializeDaemonEventLine,
 } from '../daemon-events.js';
 import { mergePassJobId } from '../daemon-tick.js';
-import type { DaemonEventRead } from '../daemon-events.js';
+import type { DaemonEventRead, DaemonEventRecord } from '../daemon-events.js';
+import type { DaemonJobOutcome } from '../daemon-tick.js';
 
 const NOW = '2026-10-31T12:00:00.000Z';
 const SHIFTED = '2026-10-31T14:00:00.000+02:00';
@@ -78,6 +79,37 @@ function queueBody(overrides: Record<string, unknown> = {}): Record<string, unkn
 
 function statusBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return recordBody({ kind: 'status', jobId: DAEMON_STATUS_EVENT_JOB_ID, key: null, entryId: null, outcome: 'paused', reasonCode: null, ...overrides });
+}
+
+function validIntentEvent(eventId: string = EVENT_A): DaemonEventRecord {
+  const read = readDaemonEventRecord(intentBody({ eventId }));
+  if (!read.ok) {
+    throw new Error('fixture');
+  }
+  return read.record;
+}
+
+function projectJournal(
+  journalEntry: Parameters<typeof projectJournalEntryToDaemonEvent>[0]['journalEntry'],
+  queueEntryId?: string | null,
+) {
+  return projectJournalEntryToDaemonEvent({
+    eventId: EVENT_A,
+    tickId: TICK,
+    jobId: 'notifier',
+    journalEntry,
+    ...(queueEntryId !== undefined ? { queueEntryId } : {}),
+  });
+}
+
+function projectJob(jobOutcome: DaemonJobOutcome) {
+  return projectJobOutcomeToDaemonEvent({
+    eventId: EVENT_A,
+    tickId: TICK,
+    jobId: 'notifier',
+    jobOutcome,
+    recordedAtIso: NOW,
+  });
 }
 
 describe('daemon event header and exact 10-field records', () => {
@@ -165,11 +197,8 @@ describe('daemon event header and exact 10-field records', () => {
   });
 
   it('serializes keys in the pinned order', () => {
-    const record = readDaemonEventRecord(intentBody());
-    if (!record.ok) {
-      throw new Error('fixture');
-    }
-    const line = serializeDaemonEventLine(record.record);
+    const record = validIntentEvent(EVENT_A);
+    const line = serializeDaemonEventLine(record);
     expect(line).not.toBeNull();
     expect(Object.keys(JSON.parse(line as string))).toEqual([...DAEMON_EVENT_KEYS]);
   });
@@ -274,20 +303,10 @@ describe('merge keys, code and secret rules', () => {
 
 describe('builders and cursor', () => {
   it('rejects conduct entries and projects intent entries', () => {
-    const conduct = projectJournalEntryToDaemonEvent({
-      eventId: EVENT_A,
-      tickId: TICK,
-      jobId: 'notifier',
-      journalEntry: { kind: 'conduct', key: null, outcome: null, reasonCode: null, recordedAtIso: NOW },
-    });
+    const conduct = projectJournal({ kind: 'conduct', key: null, outcome: null, reasonCode: null, recordedAtIso: NOW });
     expect(conduct).toEqual({ ok: false, reason: 'malformed', error: 'DaemonEvent is malformed' });
 
-    const intent = projectJournalEntryToDaemonEvent({
-      eventId: EVENT_A,
-      tickId: TICK,
-      jobId: 'notifier',
-      journalEntry: { kind: 'intent', key: ONE_WAY_KEY, outcome: null, reasonCode: null, recordedAtIso: NOW },
-    });
+    const intent = projectJournal({ kind: 'intent', key: ONE_WAY_KEY, outcome: null, reasonCode: null, recordedAtIso: NOW });
     expect(intent.ok).toBe(true);
     if (intent.ok) {
       expect(intent.record.kind).toBe('intent');
@@ -296,13 +315,10 @@ describe('builders and cursor', () => {
       expect(intent.record.key).toBe(ONE_WAY_KEY);
     }
 
-    const intentWithNumberQueue = projectJournalEntryToDaemonEvent({
-      eventId: EVENT_A,
-      tickId: TICK,
-      jobId: 'notifier',
-      journalEntry: { kind: 'intent', key: ONE_WAY_KEY, outcome: null, reasonCode: null, recordedAtIso: NOW },
-      queueEntryId: 42 as never,
-    });
+    const intentWithNumberQueue = projectJournal(
+      { kind: 'intent', key: ONE_WAY_KEY, outcome: null, reasonCode: null, recordedAtIso: NOW },
+      42 as never,
+    );
     expect(intentWithNumberQueue.ok).toBe(true);
     if (intentWithNumberQueue.ok) {
       expect(intentWithNumberQueue.record.entryId).toBeNull();
@@ -310,12 +326,7 @@ describe('builders and cursor', () => {
   });
 
   it('projects result entries with their outcome', () => {
-    const result = projectJournalEntryToDaemonEvent({
-      eventId: EVENT_A,
-      tickId: TICK,
-      jobId: 'notifier',
-      journalEntry: { kind: 'result', key: ONE_WAY_KEY, outcome: 'completed', reasonCode: null, recordedAtIso: NOW },
-    });
+    const result = projectJournal({ kind: 'result', key: ONE_WAY_KEY, outcome: 'completed', reasonCode: null, recordedAtIso: NOW });
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.record.kind).toBe('result');
@@ -324,51 +335,27 @@ describe('builders and cursor', () => {
   });
 
   it('projects job outcomes into job lines', () => {
-    const skipped = projectJobOutcomeToDaemonEvent({
-      eventId: EVENT_A,
-      tickId: TICK,
-      jobId: 'notifier',
-      jobOutcome: { outcome: 'skipped', reasonCode: 'lease-held' },
-      recordedAtIso: NOW,
-    });
+    const skipped = projectJob({ outcome: 'skipped', reasonCode: 'lease-held' });
     expect(skipped.ok).toBe(true);
     if (skipped.ok) {
       expect(skipped.record.kind).toBe('job');
       expect(skipped.record.reasonCode).toBe('lease-held');
     }
 
-    const exhausted = projectJobOutcomeToDaemonEvent({
-      eventId: EVENT_A,
-      tickId: TICK,
-      jobId: 'notifier',
-      jobOutcome: { outcome: 'budget-exhausted', progressed: false },
-      recordedAtIso: NOW,
-    });
+    const exhausted = projectJob({ outcome: 'budget-exhausted', progressed: false });
     expect(exhausted.ok).toBe(true);
     if (exhausted.ok) {
       expect(exhausted.record.outcome).toBe('budget-exhausted');
       expect(exhausted.record.reasonCode).toBeNull();
     }
 
-    const refused = projectJobOutcomeToDaemonEvent({
-      eventId: EVENT_A,
-      tickId: TICK,
-      jobId: 'notifier',
-      jobOutcome: { outcome: 'refused', reasonCode: '' },
-      recordedAtIso: NOW,
-    });
+    const refused = projectJob({ outcome: 'refused', reasonCode: '' });
     expect(refused.ok).toBe(false);
     expect(reasonOf(refused)).toBe('malformed');
   });
 
   it('slices events after a cursor without mutating the input', () => {
-    const a = readDaemonEventRecord(intentBody({ eventId: EVENT_A }));
-    const b = readDaemonEventRecord(intentBody({ eventId: EVENT_B }));
-    const c = readDaemonEventRecord(intentBody({ eventId: EVENT_C }));
-    if (!a.ok || !b.ok || !c.ok) {
-      throw new Error('fixture');
-    }
-    const records = [a.record, b.record, c.record];
+    const records = [validIntentEvent(EVENT_A), validIntentEvent(EVENT_B), validIntentEvent(EVENT_C)];
 
     const all = eventsAfterCursor(records, null);
     expect(all.ok).toBe(true);
@@ -377,19 +364,16 @@ describe('builders and cursor', () => {
       expect(all.nextCursor).toBe(EVENT_C);
     }
 
-    const afterA = eventsAfterCursor(records, EVENT_A);
-    expect(afterA.ok).toBe(true);
-    if (afterA.ok) {
-      expect(afterA.events.map((event) => event.eventId)).toEqual([EVENT_B, EVENT_C]);
-      expect(afterA.nextCursor).toBe(EVENT_C);
-    }
-
-    const afterC = eventsAfterCursor(records, EVENT_C);
-    expect(afterC.ok).toBe(true);
-    if (afterC.ok) {
-      expect(afterC.events).toEqual([]);
-      expect(afterC.nextCursor).toBe(EVENT_C);
-    }
+    const checkAfter = (cursor: string, expectedEvents: string[]) => {
+      const slice = eventsAfterCursor(records, cursor);
+      expect(slice.ok).toBe(true);
+      if (slice.ok) {
+        expect(slice.events.map((event) => event.eventId)).toEqual(expectedEvents);
+        expect(slice.nextCursor).toBe(EVENT_C);
+      }
+    };
+    checkAfter(EVENT_A, [EVENT_B, EVENT_C]);
+    checkAfter(EVENT_C, []);
 
     const absent = `0${'9'.repeat(25)}`;
     expect(eventsAfterCursor(records, absent)).toEqual({ ok: false, reason: 'cursor-not-found' });
@@ -398,47 +382,35 @@ describe('builders and cursor', () => {
   });
 
   it('never throws from eventsAfterCursor on hostile or malformed input', () => {
-    const a = readDaemonEventRecord(intentBody({ eventId: EVENT_A }));
-    if (!a.ok) {
-      throw new Error('fixture');
-    }
-    expect(eventsAfterCursor([undefined] as never, null)).toEqual({
-      ok: false,
-      reason: 'cursor-not-found',
-    });
-    expect(eventsAfterCursor([undefined] as never, EVENT_A)).toEqual({
-      ok: false,
-      reason: 'cursor-not-found',
-    });
+    const a = validIntentEvent(EVENT_A);
+    const expectCursorNotFound = (input: unknown, cursor: string | null) => {
+      expect(eventsAfterCursor(input as never, cursor)).toEqual({
+        ok: false,
+        reason: 'cursor-not-found',
+      });
+    };
+    expectCursorNotFound([undefined], null);
+    expectCursorNotFound([undefined], EVENT_A);
 
     const throwingGetterRecord = {
-      ...a.record,
+      ...a,
       get eventId(): string {
         throw new Error('throwing getter');
       },
     };
-    expect(eventsAfterCursor([throwingGetterRecord as never], null)).toEqual({
-      ok: false,
-      reason: 'cursor-not-found',
-    });
+    expectCursorNotFound([throwingGetterRecord], null);
 
     const throwingProxy = new Proxy([], {
       get() {
         throw new Error('throwing proxy');
       },
     });
-    expect(eventsAfterCursor(throwingProxy as never, null)).toEqual({
-      ok: false,
-      reason: 'cursor-not-found',
-    });
+    expectCursorNotFound(throwingProxy, null);
   });
 
   it('never advances past unreturned events when array iterator is empty', () => {
-    const a = readDaemonEventRecord(intentBody({ eventId: EVENT_A }));
-    if (!a.ok) {
-      throw new Error('fixture');
-    }
-    const hostile = [a.record];
+    const a = validIntentEvent(EVENT_A);
+    const hostile = [a];
     Object.defineProperty(hostile, Symbol.iterator, {
       value: function* () {
         // yields nothing
@@ -446,15 +418,15 @@ describe('builders and cursor', () => {
     });
     const result = eventsAfterCursor(hostile, null);
     if (result.ok) {
-      expect(result.events).toContainEqual(a.record);
-      expect(result.nextCursor).toBe(a.record.eventId);
+      expect(result.events).toContainEqual(a);
+      expect(result.nextCursor).toBe(a.eventId);
     } else {
       expect(result.reason).toBe('cursor-not-found');
     }
     expect(result).toEqual({
       ok: true,
-      events: [a.record],
-      nextCursor: a.record.eventId,
+      events: [a],
+      nextCursor: a.eventId,
     });
   });
 });

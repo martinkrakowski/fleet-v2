@@ -22,7 +22,7 @@ import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateAllowedPathPrefix } from '../../domain/lane-diff-check.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isPlanSecretShaped } from '../../domain/lane-plan-sidecar.js';
-import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
+import { AcceptanceSpec, isAcceptanceSpecShellError } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import type {
   BriefContextDecision,
   PrepareBriefPackagePort,
@@ -235,7 +235,7 @@ function validateBriefFields(request: PrepareBriefPackageRequest): string | null
  */
 function validatePathsAndSpec(
   request: PrepareBriefPackageRequest,
-): { readonly reason: string } | {
+): { readonly reason: string; readonly reasonClass?: 'acceptance-spec-shell' } | {
   readonly allowedPathPrefixes: readonly string[];
   readonly acceptanceSpec: AcceptanceSpec;
 } {
@@ -265,7 +265,11 @@ function validatePathsAndSpec(
   }
   const acceptanceSpec = AcceptanceSpec.create(request.acceptanceSpec);
   if (!acceptanceSpec.success || acceptanceSpec.value === undefined) {
-    return { reason: acceptanceSpec.error?.message ?? 'acceptanceSpec is invalid' };
+    const message = acceptanceSpec.error?.message ?? 'acceptanceSpec is invalid';
+    if (isAcceptanceSpecShellError(message)) {
+      return { reason: message, reasonClass: 'acceptance-spec-shell' };
+    }
+    return { reason: message };
   }
   if (allowedPathPrefixes.length === 0) {
     return {
@@ -385,7 +389,7 @@ function validateReviewerAndPlan(
 
 /** Everything a prepare would write or freeze, or the reason it would refuse. */
 type BuiltBriefPackage =
-  | { readonly reason: string }
+  | { readonly reason: string; readonly reasonClass?: 'acceptance-spec-shell' }
   | {
       readonly authored: Extract<AuthoredBriefResult, { readonly outcome: 'authored' }>;
       readonly attemptId: string;
@@ -446,7 +450,10 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     }
     const pathsCheck = validatePathsAndSpec(request);
     if ('reason' in pathsCheck) {
-      return { reason: pathsCheck.reason };
+      return {
+        reason: pathsCheck.reason,
+        ...(pathsCheck.reasonClass !== undefined ? { reasonClass: pathsCheck.reasonClass } : {}),
+      };
     }
     const placementCheck = validatePlacement(request, deps.worktreePath, forPreview);
     if ('reason' in placementCheck) {
@@ -569,7 +576,11 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
 
     const built = await this.build(request, this.deps);
     if ('reason' in built) {
-      return { outcome: 'rejected', reason: built.reason };
+      return {
+        outcome: 'rejected',
+        reason: built.reason,
+        ...(built.reasonClass !== undefined ? { reasonClass: built.reasonClass } : {}),
+      };
     }
 
     const placed = await this.deps.artifactPort.placeFrozenBrief({
@@ -621,7 +632,11 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     // fixed reasons when forPreview is set.
     const built = await this.build(request, this.deps, true);
     if ('reason' in built) {
-      return { outcome: 'rejected', reason: redactRequestPaths(built.reason, request, this.deps) };
+      return {
+        outcome: 'rejected',
+        reason: redactRequestPaths(built.reason, request, this.deps),
+        ...(built.reasonClass !== undefined ? { reasonClass: built.reasonClass } : {}),
+      };
     }
 
     const compute = this.deps.computeDigest ?? simpleDeterministicHexDigest;

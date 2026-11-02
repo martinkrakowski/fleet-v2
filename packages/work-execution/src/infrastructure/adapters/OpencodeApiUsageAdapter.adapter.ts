@@ -11,7 +11,7 @@
  * stderr line. It never throws.
  */
 
-import type { AttemptRecord, AttemptUsageRecord } from '../../domain/execution-records.js';
+import { runnerMinutesOf, type AttemptRecord, type AttemptUsageRecord } from '../../domain/execution-records.js';
 import type {
   ReadUsageRequest,
   ReadUsageResult,
@@ -227,6 +227,7 @@ export class OpencodeApiUsageAdapter implements UsagePort {
       sessionId: attempt.sessionId,
       steps: stepsFrom(stdout),
       wallSeconds,
+      runnerMinutes: runnerMinutesOf(wallSeconds),
       tokensInput: numberOrNull(tokens.input),
       tokensOutput: numberOrNull(tokens.output),
       tokensReasoning: numberOrNull(tokens.reasoning),
@@ -248,6 +249,7 @@ export class OpencodeApiUsageAdapter implements UsagePort {
         sessionId: attempt.sessionId,
         steps: null,
         wallSeconds: null,
+        runnerMinutes: null,
         tokensInput: null,
         tokensOutput: null,
         tokensReasoning: null,

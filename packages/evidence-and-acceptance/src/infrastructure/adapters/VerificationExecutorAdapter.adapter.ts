@@ -17,6 +17,7 @@ import { COVERAGE_READER_UNIT_KINDS, isCoverageReaderName, readCheckCoverage } f
 import type { CoverageReaderName } from './coverage-readers.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type {
+  ExecuteVerificationCheckReceipt,
   ExecuteVerificationCheckRequest,
   ExecuteVerificationCheckResult,
   VerificationExecutorPort,
@@ -54,6 +55,7 @@ export type SpawnVerificationTransport = (
 ) => SpawnedVerificationOutcome;
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+const MIN_REMAINING_BUDGET_MS = 2_000;
 const OUTPUT_SUMMARY_LIMIT = 4000;
 const SHA_PATTERN = /^[0-9a-f]{7,40}$/;
 
@@ -195,8 +197,9 @@ function receipt(
   outputSummary: string,
   completedAtIso: string,
   coverage?: CheckCoverage,
-): ExecuteVerificationCheckResult {
+): ExecuteVerificationCheckReceipt {
   return {
+    outcome: 'completed',
     result,
     exitCode,
     outputSummary: outputSummary.slice(-OUTPUT_SUMMARY_LIMIT),
@@ -235,13 +238,26 @@ function coverageNote(
   return 'coverage: not read (' + coverage.reason + ')';
 }
 
+/**
+ * `min(normalTimeoutMs, remaining budget)` for a check that may start, or
+ * `null` when under 2 seconds remain (the call is not started). A malformed
+ * deadline never starts a call.
+ */
+function boundedByDeadline(normalTimeoutMs: number, deadlineIso: string): number | null {
+  const remainingMs = Date.parse(deadlineIso) - Date.now();
+  if (!Number.isFinite(remainingMs) || remainingMs < MIN_REMAINING_BUDGET_MS) {
+    return null;
+  }
+  return Math.min(normalTimeoutMs, remainingMs);
+}
+
 function completedReceipt(
   exitCode: number,
   output: string,
   procedureName: string,
   declaration: ProcedureCoverageDeclaration | undefined,
   completedAtIso: string,
-): ExecuteVerificationCheckResult {
+): ExecuteVerificationCheckReceipt {
   const raw: EvidenceResultValue = exitCode === 0 ? 'pass' : 'fail';
   const summary =
     output.length > 0 ? output : `'${procedureName}' produced no output`;
@@ -256,6 +272,69 @@ function completedReceipt(
   const result = applyCoverage(raw, coverage, expectation);
   const summaryWithNote = summary + '\n' + coverageNote(declaration, coverage);
   return receipt(result, exitCode, summaryWithNote, completedAtIso, coverage);
+}
+
+function isDeadlineTimeout(
+  failure: NodeJS.ErrnoException,
+  deadlineIso: string | undefined,
+): boolean {
+  return failure.code === 'ETIMEDOUT' && deadlineIso !== undefined;
+}
+
+function interpretSpawnOutcome(
+  execution: SpawnedVerificationOutcome,
+  request: ExecuteVerificationCheckRequest,
+  declaration: ProcedureCoverageDeclaration | undefined,
+  completedAtIso: string,
+  sshHost?: string,
+): ExecuteVerificationCheckResult {
+  if (execution.error !== undefined) {
+    const failure = execution.error as NodeJS.ErrnoException;
+    if (isDeadlineTimeout(failure, request.deadlineIso)) {
+      return {
+        outcome: 'not-started',
+        reason: 'verification check timed out against the deadline',
+      };
+    }
+    return receipt(
+      'unknown',
+      execution.status,
+      `spawn failed: ${failure.code ?? failure.message}`,
+      completedAtIso,
+    );
+  }
+
+  if (execution.signal !== null) {
+    return receipt(
+      'unknown',
+      execution.status,
+      `verification check was terminated by signal ${execution.signal} before completing`,
+      completedAtIso,
+    );
+  }
+
+  if (execution.status === null) {
+    return receipt(
+      'unknown',
+      null,
+      'verification check ended without reporting an exit code',
+      completedAtIso,
+    );
+  }
+
+  if (sshHost !== undefined && execution.status === 255) {
+    return receipt(
+      'unknown',
+      execution.status,
+      'ssh transport failed with exit code 255 before the verification check completed',
+      completedAtIso,
+    );
+  }
+
+  const output = [execution.stdout, execution.stderr]
+    .filter((part) => part.trim().length > 0)
+    .join('\n');
+  return completedReceipt(execution.status, output, request.procedureName, declaration, completedAtIso);
 }
 
 export class VerificationExecutorAdapter implements VerificationExecutorPort {
@@ -304,45 +383,26 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
     }
 
     const timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const deadlineIso = request.deadlineIso;
+    const boundedTimeoutMs =
+      deadlineIso === undefined ? timeoutMs : boundedByDeadline(timeoutMs, deadlineIso);
+    if (boundedTimeoutMs === null) {
+      return {
+        outcome: 'not-started',
+        reason: 'verification check did not start: the remaining budget is under 2 seconds',
+      };
+    }
 
     const executor = this.options.executor;
     if (executor !== undefined) {
-      const executed = await executor.run([resolved.command, ...resolved.args, request.candidateHeadSha], {
-        timeoutMs,
-      });
-      const output = [executed.stdout, executed.stderr]
-        .filter((part) => part.trim().length > 0)
-        .join('\n');
-      if (executed.error !== undefined) {
-        return receipt('unknown', executed.exitCode, `spawn failed: ${executed.error}`, completedAtIso);
-      }
-      if (executed.signal !== null) {
-        return receipt(
-          'unknown',
-          executed.exitCode,
-          `verification check was terminated by signal ${executed.signal} before completing`,
-          completedAtIso,
-        );
-      }
-      if (executed.exitCode === null) {
-        return receipt(
-          'unknown',
-          null,
-          'verification check ended without reporting an exit code',
-          completedAtIso,
-        );
-      }
-      if (executed.exitCode === 255) {
-        // Through an ssh executor exit 255 means the transport itself
-        // failed before the check ran; the check's own outcome is unknown.
-        return receipt(
-          'unknown',
-          executed.exitCode,
-          'verification check exited 255; through an ssh executor this means the transport failed before the check completed',
-          completedAtIso,
-        );
-      }
-      return completedReceipt(executed.exitCode, output, request.procedureName, declaration, completedAtIso);
+      return this.executeViaCommandExecutor(
+        executor,
+        resolved,
+        request,
+        declaration,
+        boundedTimeoutMs,
+        completedAtIso,
+      );
     }
 
     const sshHost = this.options.sshHost;
@@ -376,28 +436,36 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
       argv = [...resolved.args, request.candidateHeadSha];
     }
 
-    const execution = spawn(file, argv, { timeout: timeoutMs });
+    const execution = spawn(file, argv, { timeout: boundedTimeoutMs });
+    return interpretSpawnOutcome(execution, request, declaration, completedAtIso, sshHost);
+  }
 
-    if (execution.error !== undefined) {
-      const failure = execution.error as NodeJS.ErrnoException;
+  private async executeViaCommandExecutor(
+    executor: CommandExecutorPort,
+    resolved: { readonly command: string; readonly args: readonly string[] },
+    request: ExecuteVerificationCheckRequest,
+    declaration: ProcedureCoverageDeclaration | undefined,
+    timeoutMs: number,
+    completedAtIso: string,
+  ): Promise<ExecuteVerificationCheckReceipt> {
+    const executed = await executor.run([resolved.command, ...resolved.args, request.candidateHeadSha], {
+      timeoutMs,
+    });
+    const output = [executed.stdout, executed.stderr]
+      .filter((part) => part.trim().length > 0)
+      .join('\n');
+    if (executed.error !== undefined) {
+      return receipt('unknown', executed.exitCode, `spawn failed: ${executed.error}`, completedAtIso);
+    }
+    if (executed.signal !== null) {
       return receipt(
         'unknown',
-        execution.status,
-        `spawn failed: ${failure.code ?? failure.message}`,
+        executed.exitCode,
+        `verification check was terminated by signal ${executed.signal} before completing`,
         completedAtIso,
       );
     }
-
-    if (execution.signal !== null) {
-      return receipt(
-        'unknown',
-        execution.status,
-        `verification check was terminated by signal ${execution.signal} before completing`,
-        completedAtIso,
-      );
-    }
-
-    if (execution.status === null) {
+    if (executed.exitCode === null) {
       return receipt(
         'unknown',
         null,
@@ -405,19 +473,16 @@ export class VerificationExecutorAdapter implements VerificationExecutorPort {
         completedAtIso,
       );
     }
-
-    if (sshHost !== undefined && execution.status === 255) {
+    if (executed.exitCode === 255) {
+      // Through an ssh executor exit 255 means the transport itself
+      // failed before the check ran; the check's own outcome is unknown.
       return receipt(
         'unknown',
-        execution.status,
-        'ssh transport failed with exit code 255 before the verification check completed',
+        executed.exitCode,
+        'verification check exited 255; through an ssh executor this means the transport failed before the check completed',
         completedAtIso,
       );
     }
-
-    const output = [execution.stdout, execution.stderr]
-      .filter((part) => part.trim().length > 0)
-      .join('\n');
-    return completedReceipt(execution.status, output, request.procedureName, declaration, completedAtIso);
+    return completedReceipt(executed.exitCode, output, request.procedureName, declaration, completedAtIso);
   }
 }

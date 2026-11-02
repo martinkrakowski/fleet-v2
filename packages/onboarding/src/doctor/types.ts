@@ -13,6 +13,7 @@ export type DoctorScope =
   | 'seat'
   | 'credential'
   | 'runner-binary'
+  | 'gh-binary'
   | 'state';
 
 /** Outcome of one doctor check. `UNKNOWN` means the check could not tell. */

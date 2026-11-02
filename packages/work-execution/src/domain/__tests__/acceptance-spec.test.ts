@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   AcceptanceSpec,
   GATE_COVERAGE_READER_UNIT_KINDS,
+  isAcceptanceSpecShellError,
 } from '../value-objects/AcceptanceSpec.vo.js';
 import { BriefPackage, type BriefPackageProps } from '../value-objects/BriefPackage.vo.js';
 
@@ -234,6 +235,22 @@ describe('AcceptanceSpec', () => {
       'hexagen-lint-json': 'files',
       'eslint-json': 'files',
     });
+  });
+});
+
+describe('isAcceptanceSpecShellError', () => {
+  it('is true for the two fixed command-level shell rejections', () => {
+    expect(
+      isAcceptanceSpecShellError(
+        'AcceptanceSpec command 1 looks like a shell string; give each argument its own argv entry',
+      ),
+    ).toBe(true);
+    expect(isAcceptanceSpecShellError('AcceptanceSpec command 3 must not run a shell')).toBe(true);
+  });
+
+  it('is false for other acceptance-spec rejections', () => {
+    expect(isAcceptanceSpecShellError('AcceptanceSpec command 1 argv[0] must name a program')).toBe(false);
+    expect(isAcceptanceSpecShellError('AcceptanceSpec requires commitRequired: true')).toBe(false);
   });
 });
 

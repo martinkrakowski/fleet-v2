@@ -16,6 +16,7 @@ import {
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
   NoopRunTelemetryAdapter,
+  NoopRunTelemetryMarkAdapter,
   TelemetryDispositionAdapter,
   WorkOrderRepositoryAdapter,
   createOtlpHttpRunTelemetryAdapter,
@@ -25,6 +26,7 @@ import {
   type TelemetryResourceInput,
 } from '@fleet/work-execution';
 import { TELEMETRY_SALT_MIN_DISTINCT, TELEMETRY_SALT_PATTERN, type ResolvedTelemetryPolicy } from '@fleet/installation';
+import { DriverTelemetryExporter } from '../telemetry-exporter.js';
 
 /** The CLI package version, a build-time constant (plan §3.2). */
 const SERVICE_VERSION = createRequire(import.meta.url)('../../package.json').version;
@@ -179,6 +181,11 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
   const endpoint = env.FLEET_TELEMETRY_ENDPOINT;
   const tokenFile = env.FLEET_TELEMETRY_TOKEN_FILE;
 
+  // The driver's one stop controller (OT5): its signal is wired to the OTLP
+  // adapter and to the background exporter, so the exporter's stop aborts an
+  // in-flight HTTP send and the driver's exit obeys the 2 s stop race.
+  const stopController = new AbortController();
+
   let telemetryPort: RunTelemetryPort = new NoopRunTelemetryAdapter();
   let configured: TelemetryConfiguredState;
   if (!policy.enabled) {
@@ -195,6 +202,7 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
       tokenFile,
       route: policy.route,
       resource: { serviceVersion: SERVICE_VERSION, projectName: policy.projectName },
+      stopSignal: stopController.signal,
     });
     if (built.ok) {
       telemetryPort = built.adapter;
@@ -216,6 +224,18 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
           dispositions,
           telemetry: telemetryPort,
           hmac,
+        });
+
+  // The live driver's background exporter (OT5): it marks advances and drains
+  // them in the background, off the lane's critical path. Only a valid salt
+  // builds it; the no-op mark adapter is the default.
+  const exporter =
+    hmac === null || exportTelemetry === null
+      ? null
+      : new DriverTelemetryExporter({
+          exportTelemetry,
+          policy: policyView(policy),
+          stopSignal: stopController.signal,
         });
 
   /**
@@ -278,6 +298,19 @@ export function composeTelemetry({ stateDir, policy, env }: ComposeTelemetryOpti
       policy: policyView(policy),
       resource,
       canaryValues,
+      // OT5: the driver's mark port and the background exporter's lifetime. The
+      // no-op mark is the default; `startExporter`/`stopExporter` are null
+      // without a salt, and `stopExporter` aborts the stop controller before
+      // awaiting the exporter's `stop()` so an in-flight HTTP send ends.
+      mark: exporter ?? new NoopRunTelemetryMarkAdapter(),
+      startExporter: exporter === null ? null : () => exporter.start(),
+      stopExporter:
+        exporter === null
+          ? null
+          : () => {
+              stopController.abort();
+              return exporter.stop();
+            },
     },
   };
 }

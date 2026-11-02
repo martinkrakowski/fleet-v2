@@ -206,6 +206,12 @@ export interface AttemptUsageRecord {
   readonly sessionId: string | null;
   readonly steps: number | null;
   readonly wallSeconds: number | null;
+  /**
+   * The lane's run time rounded up to whole minutes (`runnerMinutesOf`).
+   * Absent on usage records written before the field existed; `null` when no
+   * wall time was measured.
+   */
+  readonly runnerMinutes?: number | null;
   readonly tokensInput: number | null;
   readonly tokensOutput: number | null;
   readonly tokensReasoning: number | null;
@@ -215,6 +221,15 @@ export interface AttemptUsageRecord {
   readonly model: string | null;
   readonly agent: string | null;
   readonly reason: string | null;
+}
+
+/** The usage record's runner-minutes value: whole minutes from `wallSeconds`. */
+export function runnerMinutesOf(wallSeconds: number | null): number | null {
+  if (wallSeconds === null) {
+    return null;
+  }
+  const minutes = Math.ceil(wallSeconds / 60);
+  return Number.isSafeInteger(minutes) ? minutes : null;
 }
 
 /**

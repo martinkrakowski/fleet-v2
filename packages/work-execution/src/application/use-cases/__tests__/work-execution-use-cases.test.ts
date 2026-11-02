@@ -754,6 +754,7 @@ describe('ReserveExecutionCapacityUseCase', () => {
         transport: null,
         sshAlias: null,
         port: null,
+        workOrderId: 'wo-1',
         worktreePath: '/lanes/attempt-9',
         reservedAtIso: '2026-10-15T08:00:00.000Z',
         releasedAtIso: null,

@@ -958,11 +958,11 @@ bounded_contexts:
     plane: supporting
     status: active
     description: >-
-      Own the merge train's coordination records and its pure train state
-      machine: queue entries with eligibility, ordered batches, candidate
-      lineage, gate receipts and promotion receipts. This station holds only
-      pure domain records, validators and the transition function; ports,
-      adapters and I/O belong to later stations.
+      Own the merge train's pure records and state machine, and the ports that
+      persist one train's state under a per-train lease with a fencing token
+      and append the train's event journal. Promotion, forge, git and gate
+      adapters belong to later stations; the outbound port stubs here are
+      contracts, not implemented guarantees.
     depends_on: []
     layers:
       domain:
@@ -972,9 +972,15 @@ bounded_contexts:
         use_cases: []
         ports:
           in: []
-          out: []
+          out: [MergeTrainStatePort, TrainEventPort]
       infrastructure:
-        adapters: []
+        adapters: [MergeTrainStateFileAdapter, TrainEventJournalFileAdapter]
+    contracts:
+      MergeTrainStatePort: "Persist one train's records (train, queue entries, batches, candidates, gate receipts, promotion receipts) as a snapshot with a revision; save only at the stored revision plus one and only by the current, unexpired lease holder with its fence, so a stale writer never writes after takeover; acquire the lease by CAS on the fence over a null or lapsed lease, renew and release by the holder with its fence, check and read without writing; the fence never goes back and a lease change never moves the revision; known absence is separate from unreadable state."
+      TrainEventPort: "Append keyed, ordered train events to one train's journal only under the current, unexpired lease holder's fence; a repeated key with the same event is a duplicate that writes nothing, the same key with another event is refused; list in append order; an unreadable journal is reported, never repaired or guessed."
+    adapter_bindings:
+      - { adapter: MergeTrainStateFileAdapter, implements: MergeTrainStatePort, integration: local-transactional-store }
+      - { adapter: TrainEventJournalFileAdapter, implements: TrainEventPort, integration: local-keyed-run-journal }
 
 context_mappings:
   - { upstream: evidence-and-acceptance, downstream: work-execution, pattern: OHS, mechanism: in-process-application-contract, notes: "AcceptanceAssessmentAdapter delegates to supplier-owned application ports; AcceptanceReceiptReadAdapter (telemetry, OT2b) reads receipts through its own read-only InspectAcceptanceEvidenceUseCase instance; dependency is declared on work-execution." }

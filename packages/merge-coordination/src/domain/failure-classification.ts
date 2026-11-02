@@ -32,19 +32,31 @@ function isNonNegativeInteger(value: unknown): value is number {
 }
 
 /**
- * Classify one gate result. Refuses empty member lists, malformed members,
+ * Classify one gate result. Refuses non-object input, non-array member
+ * lists, empty member lists, repeated pull requests, malformed members,
  * unknown results and bad retry numbers; otherwise answers with the failure
  * kind. The retry budget is a required input — no default is invented.
  */
 export function classifyGateOutcome(input: GateOutcomeInput): ValidationResult<FailureClassification> {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    return refused('gate outcome must be a plain object');
+  }
+  if (!Array.isArray(input.members)) {
+    return refused('gate outcome members must be an array');
+  }
   if (input.members.length < 1) {
     return refused('gate outcome needs at least one batch member');
   }
+  const seenPrNumbers = new Set<number>();
   for (const member of input.members) {
     const validated = validateBatchMemberRecord(member);
     if (!validated.ok) {
       return validated;
     }
+    if (seenPrNumbers.has(validated.value.prNumber)) {
+      return refused(`gate outcome lists pull request ${validated.value.prNumber} more than once`);
+    }
+    seenPrNumbers.add(validated.value.prNumber);
   }
   if (typeof input.result !== 'string' || !KNOWN_RESULTS.includes(input.result)) {
     return refused('gate outcome result must be "passed", "failed" or "infrastructure-failure"');

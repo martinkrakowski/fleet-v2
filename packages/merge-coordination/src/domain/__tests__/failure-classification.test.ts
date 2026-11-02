@@ -162,4 +162,49 @@ describe('classifyGateOutcome', () => {
     expect(FOUR).toHaveLength(4);
     expect(Object.isFrozen(FOUR)).toBe(true);
   });
+
+  it('refuses a repeated pull request on a passed outcome', () => {
+    const result = classifyGateOutcome({
+      result: 'passed',
+      members: [member(1, 'a'), member(1, 'b')],
+      infrastructureRetriesUsed: 0,
+      maxInfrastructureRetries: 2,
+    });
+    expect(result).toEqual({ ok: false, reason: 'gate outcome lists pull request 1 more than once' });
+  });
+
+  it('refuses a repeated pull request on a failed outcome', () => {
+    const result = classifyGateOutcome({
+      result: 'failed',
+      members: [member(1, 'a'), member(1, 'b')],
+      infrastructureRetriesUsed: 0,
+      maxInfrastructureRetries: 2,
+    });
+    expect(result).toEqual({ ok: false, reason: 'gate outcome lists pull request 1 more than once' });
+  });
+
+  it('refuses null input without throwing', () => {
+    const result = classifyGateOutcome(null as unknown as GateOutcomeInput);
+    expect(result).toEqual({ ok: false, reason: 'gate outcome must be a plain object' });
+  });
+
+  it('refuses undefined input without throwing', () => {
+    const result = classifyGateOutcome(undefined as unknown as GateOutcomeInput);
+    expect(result).toEqual({ ok: false, reason: 'gate outcome must be a plain object' });
+  });
+
+  it('refuses members null', () => {
+    const result = classifyGateOutcome({ members: null } as unknown as GateOutcomeInput);
+    expect(result).toEqual({ ok: false, reason: 'gate outcome members must be an array' });
+  });
+
+  it('refuses members undefined', () => {
+    const result = classifyGateOutcome({} as unknown as GateOutcomeInput);
+    expect(result).toEqual({ ok: false, reason: 'gate outcome members must be an array' });
+  });
+
+  it('refuses members a string', () => {
+    const result = classifyGateOutcome({ members: 'x' } as unknown as GateOutcomeInput);
+    expect(result).toEqual({ ok: false, reason: 'gate outcome members must be an array' });
+  });
 });

@@ -347,6 +347,7 @@ function guardRequest(
 interface ContextsPaginationState {
   hasNext: boolean;
   cursor: string | null;
+  firstPage: string | null;
 }
 
 interface ThreadsPaginationState {
@@ -354,39 +355,58 @@ interface ThreadsPaginationState {
   hasNext: boolean;
   cursor: string | null;
   unknown: boolean;
+  firstPage: string | null;
 }
 
+function contextsPageSignature(page: MergeContextsPageResult & { kind: 'page' }): string {
+  return JSON.stringify([page.nodes, page.hasNextPage, page.endCursor]);
+}
+
+function threadsPageSignature(page: MergeThreadsPageResult & { kind: 'page' }): string {
+  return JSON.stringify([page.unresolved, page.hasNextPage, page.endCursor]);
+}
+
+/**
+ * One query reads both connections, so a finished connection comes back as a
+ * replay of its first page. An identical replay is ignored so counts do not
+ * double; a different one means the forge moved mid-read, and returns false.
+ */
 function applyContextsPage(
   state: ContextsPaginationState,
   contextsByName: Map<string, MergeContextNode>,
   page: MergeContextsPageResult & { kind: 'page' },
-): void {
+): boolean {
+  const signature = contextsPageSignature(page);
   if (!state.hasNext) {
-    return;
+    return signature === state.firstPage;
   }
+  state.firstPage ??= signature;
   for (const node of page.nodes) {
     contextsByName.set(node.name, node);
   }
   state.hasNext = page.hasNextPage;
   state.cursor = page.hasNextPage ? page.endCursor : null;
+  return true;
 }
 
 function applyThreadsPage(
   state: ThreadsPaginationState,
   page: MergeThreadsPageResult,
-): void {
+): boolean {
   if (!state.hasNext) {
-    return;
+    return state.unknown || (page.kind === 'page' && threadsPageSignature(page) === state.firstPage);
   }
   if (page.kind !== 'page') {
     state.unknown = true;
     state.hasNext = false;
     state.cursor = null;
-    return;
+    return true;
   }
+  state.firstPage ??= threadsPageSignature(page);
   state.unresolved += page.unresolved;
   state.hasNext = page.hasNextPage;
   state.cursor = page.hasNextPage ? page.endCursor : null;
+  return true;
 }
 
 function buildContextSnapshots(
@@ -461,8 +481,14 @@ export class GhForgeMergeReadAdapter implements ForgeMergeReadPort {
     }
 
     const contextsByName = new Map<string, MergeContextNode>();
-    const contexts: ContextsPaginationState = { hasNext: true, cursor: null };
-    const threads: ThreadsPaginationState = { unresolved: 0, hasNext: true, cursor: null, unknown: false };
+    const contexts: ContextsPaginationState = { hasNext: true, cursor: null, firstPage: null };
+    const threads: ThreadsPaginationState = {
+      unresolved: 0,
+      hasNext: true,
+      cursor: null,
+      unknown: false,
+      firstPage: null,
+    };
     let meta: MergePrMetaPayload | null = null;
 
     while (contexts.hasNext || threads.hasNext) {
@@ -478,8 +504,11 @@ export class GhForgeMergeReadAdapter implements ForgeMergeReadPort {
         return { outcome: 'unavailable', code: 'unknown', reason: 'the head oid changed between pages' };
       }
       meta = fetched.meta;
-      applyContextsPage(contexts, contextsByName, fetched.contexts);
-      applyThreadsPage(threads, fetched.threads);
+      const contextsSteady = applyContextsPage(contexts, contextsByName, fetched.contexts);
+      const threadsSteady = applyThreadsPage(threads, fetched.threads);
+      if (!contextsSteady || !threadsSteady) {
+        return { outcome: 'unavailable', code: 'unknown', reason: 'a finished connection changed between pages' };
+      }
     }
 
     if (meta === null) {

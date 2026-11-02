@@ -207,6 +207,7 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
       threadsEndCursor: 't1',
     });
     const page2 = page({
+      contextsNodes: [checkRun('gate', 'SUCCESS')],
       threadsNodes: Array.from({ length: 50 }, () => openThread),
     });
     const calls: string[][] = [];
@@ -235,11 +236,12 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
       threadsEndCursor: 't1',
     });
     const page2 = page({
+      contextsNodes: [checkRun('gate', 'SUCCESS')],
       threadsNodes: Array.from({ length: 50 }, () => openThread),
       threadsHasNextPage: true,
       threadsEndCursor: 't2',
     });
-    const page3 = page({ threadsNodes: [null] });
+    const page3 = page({ contextsNodes: [checkRun('gate', 'SUCCESS')], threadsNodes: [null] });
     const responses = [page1, page2, page3];
     const runGh = async (_args: readonly string[]) => ({
       exitCode: 0,
@@ -674,6 +676,42 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
       code: 'unknown',
       reason: 'the head oid changed between pages',
     });
+  });
+
+  it('fails as unknown when a finished threads connection changes in a replay (150-thread shape)', async () => {
+    const responses = [
+      page({
+        contextsNodes: [checkRun('gate', 'SUCCESS')],
+        contextsHasNextPage: true,
+        contextsEndCursor: 'c1',
+        threadsNodes: Array.from({ length: 150 }, () => resolvedThread),
+      }),
+      page({
+        contextsNodes: [checkRun('other', 'SUCCESS')],
+        threadsNodes: [...Array.from({ length: 149 }, () => resolvedThread), openThread],
+      }),
+    ];
+    const runGh = async () => ({ exitCode: 0, stdout: responses.shift() ?? '', stderr: '' });
+    const result = await makeAdapter({ runGh }).readForgeMerge({ ...BASE_REQUEST, requiredContexts: ['gate'] });
+    expect(result).toMatchObject({ outcome: 'unavailable', code: 'unknown' });
+  });
+
+  it('fails as unknown when a finished contexts connection changes in a replay', async () => {
+    const responses = [
+      page({
+        contextsNodes: [checkRun('gate', 'SUCCESS')],
+        threadsNodes: Array.from({ length: 100 }, () => openThread),
+        threadsHasNextPage: true,
+        threadsEndCursor: 't1',
+      }),
+      page({
+        contextsNodes: [checkRun('gate', 'FAILURE')],
+        threadsNodes: Array.from({ length: 50 }, () => openThread),
+      }),
+    ];
+    const runGh = async () => ({ exitCode: 0, stdout: responses.shift() ?? '', stderr: '' });
+    const result = await makeAdapter({ runGh }).readForgeMerge({ ...BASE_REQUEST, requiredContexts: ['gate'] });
+    expect(result).toMatchObject({ outcome: 'unavailable', code: 'unknown' });
   });
 
   it('does not count a premerge SUCCESS with absent creator as green', async () => {

@@ -36,10 +36,14 @@ export const LANE_RUN_EXITS = {
   'code-review': ['accepting', 'fixing'],
   fixing: ['dispatching'],
   accepting: ['awaiting-premerge', 'opening-pr', 'pushing'],
-  'awaiting-premerge': ['opening-pr', 'pushing', 'fixing', 'gating'],
+  // R4c: a merged PR carrying the lane head ends the run from `awaiting-premerge`
+  // by itself (the decider's G3f), even though the pre-merge pass never ran.
+  'awaiting-premerge': ['opening-pr', 'pushing', 'fixing', 'gating', 'merged'],
   'opening-pr': ['watching-ci', 'gating'],
   pushing: ['watching-ci', 'gating'],
-  'watching-ci': ['merging', 'fixing', 'gating'],
+  // R4c: a merged PR carrying the lane head ends the run from `watching-ci`
+  // by itself (the decider's G3f) without passing through `merging`.
+  'watching-ci': ['merging', 'fixing', 'gating', 'merged'],
   // KS1 (D20): a Tier 2 pre-merge finding read in `merging` goes to a fix round; (D22, D24): a forge
   // branch update re-runs CI on the new head. The `branch-behind` park stays universal (D6, §3.3).
   merging: ['merged', 'fixing', 'watching-ci', 'gating'],

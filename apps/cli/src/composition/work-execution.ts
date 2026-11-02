@@ -23,6 +23,7 @@ import {
   CommitEditOnlyAttemptUseCase,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
+  EnqueueMergeUseCase,
   ExecutionObservationAdapter,
   GatePredicateAdapter,
   ProcessTreeTerminationAdapter,
@@ -31,8 +32,10 @@ import {
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
   LanePlanRepositoryAdapter,
+  ListMergeQueueUseCase,
   ListUnregisteredProjectsUseCase,
   LocalExecutor,
+  MergeQueueRepositoryAdapter,
   PolicyMergeGrantAdapter,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
@@ -502,6 +505,10 @@ export function composeExecution(input: ComposeExecutionInput) {
   // process tree on its recorded host (a legacy record is refused by the adapter).
   const processTreeTermination = new ProcessTreeTerminationAdapter({ executorForHost });
 
+  const mergeQueueRepository = new MergeQueueRepositoryAdapter({ stateDir });
+  const enqueueMerge = new EnqueueMergeUseCase({ queue: mergeQueueRepository });
+  const listMergeQueue = new ListMergeQueueUseCase({ queue: mergeQueueRepository });
+
   // WB4a: the lane-plan store — one adapter is both stores (in-memory when
   // stateDir is omitted, lane-plans.json otherwise). Its change signal
   // defaults to a no-op, exactly as the work-order adapter's does.
@@ -627,6 +634,9 @@ export function composeExecution(input: ComposeExecutionInput) {
       attemptRepo: attemptRepository,
       journal: executionJournal,
     }),
+    mergeQueueRepository,
+    enqueueMerge,
+    listMergeQueue,
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({
       attemptRepo: attemptRepository,
       workOrderRepo: workOrderRepository,

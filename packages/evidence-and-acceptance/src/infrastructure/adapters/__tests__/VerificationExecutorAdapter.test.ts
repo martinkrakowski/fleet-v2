@@ -14,7 +14,11 @@ import type {
   SpawnVerificationTransport,
   VerificationExecutorOptions,
 } from '../VerificationExecutorAdapter.adapter.js';
-import type { ExecuteVerificationCheckRequest } from '../../../application/ports/out/VerificationExecutorPort.out-port.js';
+import type {
+  ExecuteVerificationCheckReceipt,
+  ExecuteVerificationCheckRequest,
+  ExecuteVerificationCheckResult,
+} from '../../../application/ports/out/VerificationExecutorPort.out-port.js';
 
 const HEAD = '1111111111111111111111111111111111111111';
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
@@ -60,6 +64,15 @@ function completed(status: number, stdout = '', stderr = ''): SpawnedVerificatio
   return { status, signal: null, stdout, stderr };
 }
 
+function assertCompleted(
+  result: ExecuteVerificationCheckResult,
+): asserts result is ExecuteVerificationCheckReceipt {
+  expect(result.outcome).toBe('completed');
+  if (result.outcome !== 'completed') {
+    throw new Error(`expected completed check, got ${result.outcome}`);
+  }
+}
+
 describe('VerificationExecutorAdapter', () => {
   it('never spawns when the procedure has no allow-listed command', async () => {
     const calls: RecordedSpawn[] = [];
@@ -69,6 +82,7 @@ describe('VerificationExecutorAdapter', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(result.exitCode).toBeNull();
     expect(result.outputSummary).toContain('no allow-listed verification command');
@@ -84,6 +98,7 @@ describe('VerificationExecutorAdapter', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result).toMatchObject({ result: 'pass', exitCode: 0 });
     expect(result.outputSummary).toContain('all good');
     expect(calls).toEqual([
@@ -124,6 +139,7 @@ describe('VerificationExecutorAdapter', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('pass');
     expect(calls).toEqual([
       {
@@ -152,6 +168,7 @@ describe('VerificationExecutorAdapter', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('fail');
     expect(result.exitCode).toBe(1);
     expect(result.outputSummary).toContain('checks ran');
@@ -167,6 +184,7 @@ describe('VerificationExecutorAdapter', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(result.exitCode).toBe(255);
     expect(result.outputSummary).toContain('ssh transport failed with exit code 255');
@@ -180,6 +198,7 @@ describe('VerificationExecutorAdapter', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('fail');
     expect(result.exitCode).toBe(255);
   });
@@ -200,6 +219,7 @@ describe('VerificationExecutorAdapter', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(result.exitCode).toBeNull();
     expect(result.outputSummary).toBe('spawn failed: ENOENT');
@@ -213,6 +233,7 @@ describe('VerificationExecutorAdapter', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(result.exitCode).toBeNull();
     expect(result.outputSummary).toContain('SIGTERM');
@@ -226,6 +247,7 @@ describe('VerificationExecutorAdapter', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(result.exitCode).toBeNull();
     expect(result.outputSummary).toContain('without reporting an exit code');
@@ -248,6 +270,9 @@ describe('VerificationExecutorAdapter', () => {
       checkRequest({ candidateHeadSha: '123456' }),
     );
 
+    assertCompleted(notHex);
+    assertCompleted(uppercase);
+    assertCompleted(tooShort);
     expect(notHex.result).toBe('unknown');
     expect(uppercase.result).toBe('unknown');
     expect(tooShort.result).toBe('unknown');
@@ -266,6 +291,7 @@ describe('VerificationExecutorAdapter', () => {
       checkRequest({ candidateHeadSha: '1234567' }),
     );
 
+    assertCompleted(result);
     expect(result.result).toBe('pass');
     expect(calls).toEqual([
       { file: '/opt/verify-run.sh', args: ['1234567'], options: { timeout: DEFAULT_TIMEOUT_MS } },
@@ -286,6 +312,8 @@ describe('VerificationExecutorAdapter', () => {
       spawn: recordingTransport(calls, completed(0)),
     }).executeVerificationCheck(checkRequest());
 
+    assertCompleted(optionInjection);
+    assertCompleted(splitWords);
     expect(optionInjection.result).toBe('unknown');
     expect(splitWords.result).toBe('unknown');
     expect(optionInjection.exitCode).toBeNull();
@@ -303,6 +331,8 @@ describe('VerificationExecutorAdapter', () => {
       spawn: recordingTransport([], completed(1, 'B'.repeat(3999) + 'Z')),
     }).executeVerificationCheck(checkRequest());
 
+    assertCompleted(truncated);
+    assertCompleted(exactLimit);
     expect(truncated.outputSummary).toBe('A'.repeat(3997) + 'END');
     expect(truncated.outputSummary).toHaveLength(OUTPUT_SUMMARY_LIMIT);
     expect(exactLimit.outputSummary).toBe('B'.repeat(3999) + 'Z');
@@ -316,6 +346,7 @@ describe('VerificationExecutorAdapter', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('fail');
     expect(result.exitCode).toBe(3);
     expect(result.outputSummary).toBe(`'ci' produced no output`);
@@ -364,6 +395,7 @@ describe('VerificationExecutorAdapter with a CommandExecutorPort', () => {
       allowListedCommands: allowList,
     });
     const result = await adapter.executeVerificationCheck(checkRequest());
+    assertCompleted(result);
     expect(result.result).toBe('pass');
     expect(result.exitCode).toBe(0);
     expect(result.outputSummary).toBe('ok\n');
@@ -372,17 +404,21 @@ describe('VerificationExecutorAdapter with a CommandExecutorPort', () => {
     expect(fake.calls[0].options?.timeoutMs).toBe(DEFAULT_TIMEOUT_MS);
   });
 
-  it('maps a failing exit code to fail and a signal or spawn error to unknown', async () => {    const failing = new VerificationExecutorAdapter({
+  it('maps a failing exit code to fail and a signal or spawn error to unknown', async () => {
+    const failing = new VerificationExecutorAdapter({
       executor: fakeExecutor({ exitCode: 2, stderr: 'boom\n' }),
       allowListedCommands: allowList,
     });
-    expect((await failing.executeVerificationCheck(checkRequest())).result).toBe('fail');
+    const failingResult = await failing.executeVerificationCheck(checkRequest());
+    assertCompleted(failingResult);
+    expect(failingResult.result).toBe('fail');
 
     const signalled = new VerificationExecutorAdapter({
       executor: fakeExecutor({ exitCode: null, signal: 'SIGTERM' }),
       allowListedCommands: allowList,
     });
     const signalledResult = await signalled.executeVerificationCheck(checkRequest());
+    assertCompleted(signalledResult);
     expect(signalledResult.result).toBe('unknown');
     expect(signalledResult.outputSummary).toContain('SIGTERM');
 
@@ -391,6 +427,7 @@ describe('VerificationExecutorAdapter with a CommandExecutorPort', () => {
       allowListedCommands: allowList,
     });
     const failedResult = await spawnFailed.executeVerificationCheck(checkRequest());
+    assertCompleted(failedResult);
     expect(failedResult.result).toBe('unknown');
     expect(failedResult.outputSummary).toContain('spawn failed');
   });
@@ -399,6 +436,7 @@ describe('VerificationExecutorAdapter with a CommandExecutorPort', () => {
     const fake = fakeExecutor({});
     const adapter = new VerificationExecutorAdapter({ executor: fake });
     const result = await adapter.executeVerificationCheck(checkRequest());
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(fake.calls).toHaveLength(0);
   });
@@ -410,6 +448,7 @@ describe('VerificationExecutorAdapter with a CommandExecutorPort', () => {
       allowListedCommands: allowList,
     });
     const result = await adapter.executeVerificationCheck(checkRequest());
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(result.exitCode).toBe(255);
     expect(result.outputSummary).toContain('255');
@@ -425,6 +464,7 @@ describe('VerificationExecutorAdapter with a CommandExecutorPort', () => {
       timeoutMs: 400,
     });
     const result = await adapter.executeVerificationCheck(checkRequest());
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(result.exitCode).toBeNull();
     expect(result.outputSummary).toContain('timeout');
@@ -440,6 +480,7 @@ describe('VerificationExecutorAdapter with a CommandExecutorPort', () => {
       timeoutMs: 10_000,
     });
     const result = await adapter.executeVerificationCheck(checkRequest());
+    assertCompleted(result);
     expect(result.result).toBe('pass');
     expect(result.exitCode).toBe(0);
     expect(result.outputSummary).toContain('verified');
@@ -510,6 +551,7 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('pass');
     expect(result.coverage).toEqual({ ran: true, unitKind: 'tests', units: 36 });
     expect(result.outputSummary.endsWith('coverage: 36 tests (at least 1 tests expected)')).toBe(true);
@@ -523,6 +565,7 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(result.coverage).toEqual({ ran: true, unitKind: 'tests', units: 0 });
   });
@@ -535,6 +578,7 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(result.coverage).toEqual({ ran: false, reason: 'no count in output' });
   });
@@ -547,6 +591,7 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
   });
 
@@ -558,6 +603,7 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('fail');
     expect(result.coverage).toEqual({ ran: true, unitKind: 'tests', units: 33 });
   });
@@ -570,6 +616,7 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('pass');
     expect(result.coverage).toEqual({ ran: true, unitKind: 'tests', units: 36 });
     expect(result.outputSummary.length).toBeLessThanOrEqual(4000);
@@ -590,6 +637,7 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect(result.coverage).toEqual({ ran: true, unitKind: 'files', units: 0 });
   });
@@ -602,6 +650,7 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('pass');
     expect('coverage' in result).toBe(false);
   });
@@ -615,6 +664,7 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('pass');
     expect('coverage' in result).toBe(false);
     expect(calls).toHaveLength(1);
@@ -644,6 +694,7 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
     );
 
     for (const { calls, result } of outcomes) {
+      assertCompleted(result);
       expect(result.result).toBe('unknown');
       expect(result.exitCode).toBeNull();
       expect(result.outputSummary).toContain('coverage declaration');
@@ -657,6 +708,7 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
       allowListedCommands: declared,
     });
     const skippedResult = await skipped.executeVerificationCheck(checkRequest());
+    assertCompleted(skippedResult);
     expect(skippedResult.result).toBe('unknown');
 
     const passed = new VerificationExecutorAdapter({
@@ -664,6 +716,7 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
       allowListedCommands: declared,
     });
     const passedResult = await passed.executeVerificationCheck(checkRequest());
+    assertCompleted(passedResult);
     expect(passedResult.result).toBe('pass');
     expect(passedResult.coverage).toEqual({ ran: true, unitKind: 'tests', units: 36 });
   });
@@ -676,7 +729,157 @@ describe('VerificationExecutorAdapter coverage declarations', () => {
 
     const result = await adapter.executeVerificationCheck(checkRequest());
 
+    assertCompleted(result);
     expect(result.result).toBe('unknown');
     expect('coverage' in result).toBe(false);
+  });
+});
+
+describe('VerificationExecutorAdapter deadline budget', () => {
+  it('does not start a check when the deadline leaves under 2 seconds', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    const result = await adapter.executeVerificationCheck(
+      checkRequest({ deadlineIso: new Date(Date.now() - 60_000).toISOString() }),
+    );
+
+    expect(result).toEqual({
+      outcome: 'not-started',
+      reason: 'verification check did not start: the remaining budget is under 2 seconds',
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it('does not start a check when the deadline is malformed', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    const result = await adapter.executeVerificationCheck(
+      checkRequest({ deadlineIso: 'malformed-deadline' }),
+    );
+
+    expect(result).toEqual({
+      outcome: 'not-started',
+      reason: 'verification check did not start: the remaining budget is under 2 seconds',
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it('bounds a started check by the remaining budget', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    const deadlineIso = new Date(Date.now() + 5_000).toISOString();
+    const result = await adapter.executeVerificationCheck(checkRequest({ deadlineIso }));
+
+    assertCompleted(result);
+    expect(result.result).toBe('pass');
+    expect(calls).toHaveLength(1);
+    const timeout = calls[0]?.options.timeout ?? 0;
+    expect(timeout).toBeGreaterThan(0);
+    expect(timeout).toBeLessThan(6_000);
+  });
+
+  it('keeps the configured normal timeout when the deadline is further away', async () => {
+    const calls: RecordedSpawn[] = [];
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      timeoutMs: 1_000,
+      spawn: recordingTransport(calls, completed(0)),
+    });
+
+    const deadlineIso = new Date(Date.now() + 60_000).toISOString();
+    await adapter.executeVerificationCheck(checkRequest({ deadlineIso }));
+
+    expect(calls).toEqual([
+      { file: '/opt/verify-run.sh', args: [HEAD], options: { timeout: 1_000 } },
+    ]);
+  });
+
+  it('bounds the command-executor path by the remaining budget too', async () => {
+    const recorded: Array<{ argv: readonly string[]; options?: { timeoutMs?: number } }> = [];
+    const fake = {
+      async run(argv: readonly string[], options?: { timeoutMs?: number }) {
+        recorded.push({ argv, options });
+        return { exitCode: 0, signal: null, stdout: 'ok\n', stderr: '' };
+      },
+    };
+    const adapter = new VerificationExecutorAdapter({
+      executor: fake,
+      allowListedCommands: { ci: { command: '/opt/verify-run.sh', args: ['--strict'] } },
+    });
+
+    const deadlineIso = new Date(Date.now() + 5_000).toISOString();
+    const result = await adapter.executeVerificationCheck(checkRequest({ deadlineIso }));
+
+    assertCompleted(result);
+    expect(result.result).toBe('pass');
+    expect(recorded).toHaveLength(1);
+    const timeoutMs = recorded[0]?.options?.timeoutMs ?? 0;
+    expect(timeoutMs).toBeGreaterThan(0);
+    expect(timeoutMs).toBeLessThan(6_000);
+  });
+
+  it('returns not-started when a started check times out against its deadline', async () => {
+    const calls: RecordedSpawn[] = [];
+    const timeoutError = Object.assign(new Error('spawnSync /opt/verify-run.sh ETIMEDOUT'), {
+      code: 'ETIMEDOUT',
+    });
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      spawn: (file, args, options) => {
+        calls.push({ file, args, options });
+        return {
+          status: null,
+          signal: 'SIGTERM',
+          error: timeoutError,
+          stdout: 'partial stdout from timed-out check',
+          stderr: 'partial stderr from timed-out check',
+        };
+      },
+    });
+
+    const deadlineIso = new Date(Date.now() + 5_000).toISOString();
+    const result = await adapter.executeVerificationCheck(checkRequest({ deadlineIso }));
+
+    expect(result).toEqual({
+      outcome: 'not-started',
+      reason: 'verification check timed out against the deadline',
+    });
+    expect(calls).toHaveLength(1);
+    expect('outputSummary' in result).toBe(false);
+  });
+
+  it('maps a spawn timeout without a deadline to a completed unknown receipt', async () => {
+    const timeoutError = Object.assign(new Error('spawnSync /opt/verify-run.sh ETIMEDOUT'), {
+      code: 'ETIMEDOUT',
+    });
+    const adapter = new VerificationExecutorAdapter({
+      allowListedCommands: { ci: '/opt/verify-run.sh' },
+      spawn: recordingTransport([], {
+        status: null,
+        signal: null,
+        error: timeoutError,
+        stdout: '',
+        stderr: '',
+      }),
+    });
+
+    const result = await adapter.executeVerificationCheck(checkRequest());
+
+    assertCompleted(result);
+    expect(result.result).toBe('unknown');
+    expect(result.exitCode).toBeNull();
+    expect(result.outputSummary).toBe('spawn failed: ETIMEDOUT');
   });
 });

@@ -132,6 +132,28 @@ describe('ForgeActionAdapter post-status', () => {
     expect(calls[0]).toContain('description=not required for tier 1');
   });
 
+  it('refuses an invalid status state without running gh', async () => {
+    const { adapter, calls, verifier } = makeAdapter({
+      runGhResult: { exitCode: 0, stdout: '', stderr: '' },
+    });
+    const result = await adapter.performForgeAction(
+      forgeActionRequest({
+        status: {
+          context: 'premerge',
+          state: 'error' as unknown as 'success',
+          description: 'waiting for the pre-merge review',
+        },
+      }),
+    );
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'status state must be success, pending or failure',
+      refusalKind: 'other',
+    });
+    expect(calls).toEqual([]);
+    expect(verifier.state.calls).toBe(0);
+  });
+
   it.each([['findings: 00'], ['findings: 1000'], ['findings: blocker']])(
     'refuses the failure description %s without running gh',
     async (description) => {

@@ -23,7 +23,7 @@ import { isSafeBranchName } from './ForgeActionAdapter.adapter.js';
 export interface ForgeReadAdapterOptions {
   readonly owner?: string;
   readonly repo?: string;
-  readonly runGh?: (args: readonly string[]) => Promise<GhInvocationResult>;
+  readonly runGh?: (args: readonly string[], timeoutMs?: number) => Promise<GhInvocationResult>;
   /** Test hook: overrides the read deadline (READ_TIMEOUT_MS). */
   readonly timeoutMs?: number;
 }
@@ -196,7 +196,7 @@ export function parseCompareStatus(stdout: string): ContainsCommitResult {
 export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
   private readonly owner?: string;
   private readonly repo?: string;
-  private readonly runGh?: (args: readonly string[]) => Promise<GhInvocationResult>;
+  private readonly runGh?: (args: readonly string[], timeoutMs?: number) => Promise<GhInvocationResult>;
   private readonly timeoutMs: number;
 
   constructor(options: ForgeReadAdapterOptions = {}) {
@@ -243,7 +243,7 @@ export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
       '--json',
       PULL_REQUEST_VIEW_FIELDS,
     ];
-    const raced = await this.runGhWithinDeadline(args);
+    const raced = await this.runGhWithinDeadline(args, request.timeoutMs);
     if (raced.kind === 'timed-out') {
       return { outcome: 'unavailable', reason: 'gh pr view timed out' };
     }
@@ -264,11 +264,16 @@ export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
   }
 
   /**
-   * One gh invocation raced against the shared read deadline: a read that
-   * settles after the deadline won must not become an unhandled rejection.
-   * The caller maps the three outcomes onto its own reason strings.
+   * One gh invocation raced against the read deadline: a read that settles
+   * after the deadline won must not become an unhandled rejection. An
+   * optional per-read cap bounds the call to `min(adapter normal timeout,
+   * timeoutMs)` (the daemon merge path passes the remaining budget). The
+   * caller maps the three outcomes onto its own reason strings.
    */
-  private async runGhWithinDeadline(args: readonly string[]): Promise<
+  private async runGhWithinDeadline(
+    args: readonly string[],
+    timeoutMs?: number,
+  ): Promise<
     | { kind: 'ok'; gh: GhInvocationResult }
     | { kind: 'timed-out' }
     | { kind: 'failed' }
@@ -277,14 +282,16 @@ export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
     if (runGh === undefined) {
       return { kind: 'failed' };
     }
+    const effectiveTimeoutMs =
+      timeoutMs === undefined ? this.timeoutMs : Math.min(this.timeoutMs, timeoutMs);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const pending = runGh(args);
+      const pending = runGh(args, effectiveTimeoutMs);
       pending.catch(() => undefined);
       const gh = await Promise.race([
         pending,
         new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error(READ_TIMED_OUT)), this.timeoutMs);
+          timer = setTimeout(() => reject(new Error(READ_TIMED_OUT)), effectiveTimeoutMs);
         }),
       ]);
       return { kind: 'ok', gh };

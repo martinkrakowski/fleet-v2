@@ -8,7 +8,8 @@
  * refused/rejected/blocked/unknown, 2 usage): the halt marker is set or
  * lifted, a stop is recorded as a keyed journal intent the driver obeys, a
  * resume is recorded for a parked run. Nothing there takes a run lease or
- * dispatches anything.
+ * dispatches anything; stop and resume refuse while a live driver lease is
+ * held (a lapsed or absent lease allows the call).
  *
  * `conductor start` reserves capacity, prepares the run's worktree at the
  * reserved path and places the brief there, then records the first attempt
@@ -42,7 +43,9 @@ import {
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
   WorkOrderRepositoryAdapter,
+  isLeaseLapsed,
   type LaneRunJournalEntryRecord,
+  type ConductorDriverLeaseRecord,
   type RunConductorPassResult,
   type ConductorRunReport,
   type AdvanceLaneRunResult,
@@ -98,8 +101,11 @@ before any external action (halt --lift clears it); halt never stops a running
 lane; a stop recorded as a keyed run-journal intent — stop is graceful by
 default, --force stops the running lane now; a resume recorded for a parked
 run. The driver obeys the records; nothing here dispatches, and the CLI
-never takes a run lease. conductor schedule is a read-only view of the live
-runs grouped by base branch, in creation order within each, with their held slots, package keys and the admission
+never takes a run lease. stop and resume refuse with reason
+driver-lease-live (exit 1) while another process holds a live driver
+lease; a lapsed or absent lease allows the call. conductor schedule is a
+read-only view of the live runs grouped by base branch, in creation order
+within each, with their held slots, package keys and the admission
 count; --json prints the whole view. conductor reap --worktrees removes the clean
 worktree of every finished lane run (terminal run, terminal work order,
 every attempt cancelled or collected, no held reservation) on explicit
@@ -226,6 +232,21 @@ function exitFor(result: { readonly outcome: string }): number {
     return 1;
   }
   return 0;
+}
+
+/**
+ * True when a live driver lease is held: a lease record exists and is not
+ * lapsed at `nowIso`. Read-only — the CLI never takes the lease. An
+ * unreadable lease fails closed: the driver may hold it.
+ */
+async function liveDriverLeaseHeld(runtime: FleetCliRuntime, nowIso: string): Promise<boolean> {
+  let lease: ConductorDriverLeaseRecord | null = null;
+  try {
+    lease = await runtime.conductor.driverLease.read();
+  } catch {
+    return true;
+  }
+  return lease !== null && !isLeaseLapsed(lease, nowIso);
 }
 
 // ---------------------------------------------------------------------------
@@ -1572,6 +1593,10 @@ export async function conductorCommand(
         io.stderr(`conductor stop requires a run id\n${CONDUCTOR_HELP}\n`);
         return 2;
       }
+      if (await liveDriverLeaseHeld(runtime, nowIso)) {
+        io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'driver-lease-live' })}\n`);
+        return 1;
+      }
       const result = await conductor.requestLaneRunStop.requestLaneRunStop({
         runId,
         mode: force ? 'force' : 'graceful',
@@ -1588,6 +1613,10 @@ export async function conductorCommand(
       if (runId === undefined) {
         io.stderr(`conductor resume requires a run id\n${CONDUCTOR_HELP}\n`);
         return 2;
+      }
+      if (await liveDriverLeaseHeld(runtime, nowIso)) {
+        io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'driver-lease-live' })}\n`);
+        return 1;
       }
       const result = await conductor.resumeLaneRun.requestResume({
         runId,

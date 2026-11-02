@@ -7,7 +7,7 @@
  * runtime is built with a `runSubprocess` spy that throws if called.
  */
 
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -325,5 +325,105 @@ describe('fleet-v2 conductor (K7-4)', () => {
     expect((await runConductor(runtime, ['stop', RUN_ID, '--force'])).code).toBe(0);
     expect((await runConductor(runtime, ['resume', RUN_ID])).code).toBe(1);
     expect((await runConductor(runtime, ['resume', RUN_ID, '--revision', '2'])).code).toBe(1);
+  });
+});
+
+describe('fleet-v2 conductor stop/resume vs the driver lease (R0b)', () => {
+  /**
+   * The fixed refusal document of a live (or unreadable) driver lease: the
+   * reason only — no run id, no holder id, no fence, no path.
+   */
+  const LEASE_REFUSAL = `${JSON.stringify({ outcome: 'refused', reason: 'driver-lease-live' })}\n`;
+
+  /**
+   * Seed a driver lease in the runtime's state directory (holder
+   * `driver-other`). `nowIso` defaults to NOW; the lapsed tests acquire
+   * earlier (the window is checked at acquire time) while the deadline stays
+   * derived from the clock the command reads.
+   */
+  async function seedDriverLease(
+    runtime: FleetCliRuntime,
+    leaseUntilIso: string,
+    nowIso: string = NOW,
+  ): Promise<void> {
+    expect(
+      await runtime.conductor.driverLease.acquire({
+        holderId: 'driver-other',
+        observedFence: 0,
+        leaseUntilIso,
+        nowIso,
+      }),
+    ).toMatchObject({ outcome: 'ok' });
+  }
+
+  it('stop refuses while a live driver lease is held, echoing no supplied value', async () => {
+    const runtime = makeRuntime(tempStateDir());
+    await seedPlainRun(runtime);
+    await seedDriverLease(runtime, LEASE_UNTIL);
+    const result = await runConductor(runtime, ['stop', RUN_ID]);
+    expect(result.code).toBe(1);
+    expect(result.stdout).toEqual([LEASE_REFUSAL]);
+    expect(result.stderr).toEqual([]);
+  });
+
+  it('resume refuses while a live driver lease is held, echoing no supplied value', async () => {
+    const runtime = makeRuntime(tempStateDir());
+    await seedParkedRun(runtime);
+    await seedDriverLease(runtime, LEASE_UNTIL);
+    const result = await runConductor(runtime, ['resume', RUN_ID]);
+    expect(result.code).toBe(1);
+    expect(result.stdout).toEqual([LEASE_REFUSAL]);
+    expect(result.stderr).toEqual([]);
+  });
+
+  it('a lapsed driver lease allows stop, and the run journal shows the recorded intent', async () => {
+    const runtime = makeRuntime(tempStateDir());
+    await seedPlainRun(runtime);
+    await seedDriverLease(runtime, NOW, new Date(Date.parse(NOW) - 5 * 60 * 1000).toISOString());
+    const result = await runConductor(runtime, ['stop', RUN_ID]);
+    expect(result.code).toBe(0);
+    expect(parseDocument(result.stdout)).toMatchObject({ outcome: 'stop-recorded', mode: 'graceful' });
+    const entries = await runtime.conductor.laneRunJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'intent' && entry.mode === 'graceful')).toBe(true);
+  });
+
+  it('a lapsed driver lease allows resume, and the run journal shows the recorded intent', async () => {
+    const runtime = makeRuntime(tempStateDir());
+    await seedParkedRun(runtime);
+    await seedDriverLease(runtime, NOW, new Date(Date.parse(NOW) - 5 * 60 * 1000).toISOString());
+    const result = await runConductor(runtime, ['resume', RUN_ID]);
+    expect(result.code).toBe(0);
+    expect(parseDocument(result.stdout)).toMatchObject({
+      outcome: 'resume-recorded',
+      runId: RUN_ID,
+      to: 'gating',
+    });
+    const entries = await runtime.conductor.laneRunJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind === 'intent')).toBe(true);
+  });
+
+  it('an absent driver lease lets stop and resume behave exactly as before this lane', async () => {
+    const runtime = makeRuntime(tempStateDir());
+    await seedPlainRun(runtime);
+    const stop = await runConductor(runtime, ['stop', RUN_ID]);
+    expect(stop.code).toBe(0);
+    expect(parseDocument(stop.stdout)).toMatchObject({ outcome: 'stop-recorded', mode: 'graceful' });
+
+    const parked = makeRuntime(tempStateDir());
+    await seedParkedRun(parked);
+    const resume = await runConductor(parked, ['resume', RUN_ID]);
+    expect(resume.code).toBe(0);
+    expect(parseDocument(resume.stdout)).toMatchObject({ outcome: 'resume-recorded', runId: RUN_ID, to: 'gating' });
+  });
+
+  it('an unreadable lease file fails closed: stop refuses with the fixed document only', async () => {
+    const stateDir = tempStateDir();
+    const runtime = makeRuntime(stateDir);
+    await seedPlainRun(runtime);
+    writeFileSync(join(stateDir, 'conductor-driver-lease.json'), 'not valid json bytes');
+    const result = await runConductor(runtime, ['stop', RUN_ID]);
+    expect(result.code).toBe(1);
+    expect(result.stdout).toEqual([LEASE_REFUSAL]);
+    expect(result.stderr).toEqual([]);
   });
 });

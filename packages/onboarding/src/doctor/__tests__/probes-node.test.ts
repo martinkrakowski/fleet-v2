@@ -335,13 +335,13 @@ describe('createNodeDoctorProbes', () => {
       chmodSync(executablePath, 0o755);
       const candidates = [executablePath, '/nonexistent/gh'];
       const probes = createNodeDoctorProbes({ ghBinaryCandidates: candidates });
-      await expect(probes.ghBinary()).resolves.toEqual({ resolved: executablePath, candidates });
+      await expect(probes.ghBinary!()).resolves.toEqual({ resolved: executablePath, candidates });
 
       const nonExecutablePath = join(tempDir, 'gh-noexec');
       writeFileSync(nonExecutablePath, '#!/bin/sh\n');
       chmodSync(nonExecutablePath, 0o644);
       const probes2 = createNodeDoctorProbes({ ghBinaryCandidates: [nonExecutablePath] });
-      await expect(probes2.ghBinary()).resolves.toEqual({
+      await expect(probes2.ghBinary!()).resolves.toEqual({
         resolved: undefined,
         candidates: [nonExecutablePath],
       });
@@ -352,7 +352,7 @@ describe('createNodeDoctorProbes', () => {
 
   it('defaults gh binary candidates to the fixed reviewed list', async () => {
     const probes = createNodeDoctorProbes();
-    const result = await probes.ghBinary();
+    const result = await probes.ghBinary!();
     expect(result?.candidates).toEqual(GH_BINARY_CANDIDATES);
   });
 });

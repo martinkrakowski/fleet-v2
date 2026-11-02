@@ -44,9 +44,11 @@ export interface DoctorProbes {
   /**
    * The reviewed `gh` binary resolution: the first fixed candidate path that
    * is an executable regular file, plus the full candidate list. `undefined`
-   * when the probe itself could not run.
+   * when the probe itself could not run. Optional so probe implementations
+   * that do not exercise the doctor's gh check (e.g. CLI test doubles) do
+   * not have to grow a member; the engine reports `UNKNOWN` when absent.
    */
-  ghBinary(): Promise<
+  ghBinary?(): Promise<
     { resolved: string | undefined; candidates: readonly string[] } | undefined
   >;
   /** The one-step probe of a seat: model, variant, agent. */

@@ -135,6 +135,7 @@ describe('RequestVerificationUseCase deadline budget', () => {
     let tick = 0;
     const timestamps = [
       '2026-10-15T00:00:00.000Z',
+      '2026-10-15T00:00:00.000Z',
       '2026-10-15T00:00:02.100Z',
     ];
     const clock = () => timestamps[Math.min(tick++, timestamps.length - 1)]!;
@@ -155,6 +156,43 @@ describe('RequestVerificationUseCase deadline budget', () => {
       hostId: 'verify-host-lin-01',
       implementerModel: 'anthropic/claude-3-5-sonnet',
       requiredChecks: ['lint', 'acceptance'],
+      deadlineIso: '2026-10-15T00:00:03.000Z',
+    });
+
+    expect(result).toEqual({
+      outcome: 'not-started',
+      reason: "Verification budget exhausted before starting check 'acceptance'",
+    });
+    expect(executor.calls).toHaveLength(1);
+    expect(executor.calls[0]?.procedureName).toBe('lint');
+  });
+
+  it('exhausts budget mid-sequence when nowIso is supplied and the injected clock advances past the deadline before a subsequent check', async () => {
+    const executor = new RecordingExecutor();
+    let tick = 0;
+    const timestamps = [
+      '2026-10-15T00:00:00.000Z',
+      '2026-10-15T00:00:02.100Z',
+    ];
+    const clock = () => timestamps[Math.min(tick++, timestamps.length - 1)]!;
+
+    const useCase = new RequestVerificationUseCase({
+      repo: emptyRepo,
+      executor,
+      archive,
+      clock,
+    });
+
+    const result = await useCase.requestVerification({
+      assessmentId: 'ea-multi-deadline-now',
+      projectId: 'fleet-core-worker',
+      attemptId: 'att-20261015-multi-now',
+      candidateHeadSha: '9f8e7d6c5b4a3928170123456789abcdef012345',
+      policyRevision: 'pol-rev-42',
+      hostId: 'verify-host-lin-01',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      requiredChecks: ['lint', 'acceptance'],
+      nowIso: '2026-10-15T00:00:00.000Z',
       deadlineIso: '2026-10-15T00:00:03.000Z',
     });
 

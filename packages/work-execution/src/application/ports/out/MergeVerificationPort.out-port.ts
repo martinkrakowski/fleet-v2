@@ -17,7 +17,7 @@ export interface MergeVerificationReadRequest {
   readonly macosProcedure: string;
   readonly policyRevision: string;
   readonly projectId: string;
-  readonly attemptId: string;
+  readonly attemptId: string | null;
   readonly deadlineIso: string;
 }
 

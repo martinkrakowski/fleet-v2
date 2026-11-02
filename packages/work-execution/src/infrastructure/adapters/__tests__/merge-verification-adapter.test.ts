@@ -366,6 +366,23 @@ describe('MergeVerificationAdapter', () => {
     expect(requester.calls).toEqual([]);
   });
 
+  it('returns no-attempt-identity for a null attempt id without calling any delegate', async () => {
+    const inspector = new RecordingInspector();
+    const requester = new RecordingRequester();
+    const adapter = new MergeVerificationAdapter({ inspector, requester });
+
+    expect(await adapter.readVerification(readRequest({ attemptId: null }))).toEqual({
+      outcome: 'unknown',
+      reasonCode: 'no-attempt-identity',
+    });
+    expect(await adapter.runVerification(triggerRequest({ attemptId: null }))).toEqual({
+      outcome: 'unknown',
+      reasonCode: 'no-attempt-identity',
+    });
+    expect(inspector.requests).toEqual([]);
+    expect(requester.calls).toEqual([]);
+  });
+
   it('trigger path maps a not-started outcome from the requester to budget-exhausted', async () => {
     const requester = new RecordingRequester([
       { outcome: 'not-started', reason: 'Verification budget exhausted before starting check' },

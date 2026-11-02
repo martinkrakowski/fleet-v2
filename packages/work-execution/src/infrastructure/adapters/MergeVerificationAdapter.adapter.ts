@@ -50,8 +50,8 @@ function unknownResult(reasonCode: MergeVerificationReasonCode): MergeVerificati
   return { outcome: 'unknown', reasonCode };
 }
 
-function isNonEmptyTrimmedString(value: string): boolean {
-  return value.trim().length > 0;
+function isNonEmptyTrimmedString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 export class MergeVerificationAdapter implements MergeVerificationPort {
@@ -69,7 +69,8 @@ export class MergeVerificationAdapter implements MergeVerificationPort {
     if (inspector === undefined) {
       throw new Error('Not implemented: MergeVerificationAdapter.readVerification');
     }
-    if (!isNonEmptyTrimmedString(request.attemptId)) {
+    const attemptId = request.attemptId;
+    if (!isNonEmptyTrimmedString(attemptId)) {
       return unknownResult('no-attempt-identity');
     }
     if (!this.budgetAllows(request)) {
@@ -78,7 +79,7 @@ export class MergeVerificationAdapter implements MergeVerificationPort {
     let inspected: InspectAcceptanceEvidenceResult;
     try {
       inspected = await inspector.inspectAcceptanceEvidence({
-        assessmentId: assessmentIdForAttempt(request.attemptId),
+        assessmentId: assessmentIdForAttempt(attemptId),
         candidateHeadSha: request.headOid,
       });
     } catch {
@@ -95,7 +96,8 @@ export class MergeVerificationAdapter implements MergeVerificationPort {
     if (requester === undefined) {
       throw new Error('Not implemented: MergeVerificationAdapter.runVerification');
     }
-    if (!isNonEmptyTrimmedString(request.attemptId)) {
+    const attemptId = request.attemptId;
+    if (!isNonEmptyTrimmedString(attemptId)) {
       return unknownResult('no-attempt-identity');
     }
     if (!this.budgetAllows(request)) {
@@ -104,9 +106,9 @@ export class MergeVerificationAdapter implements MergeVerificationPort {
     let result: RequestVerificationResult;
     try {
       result = await requester.requestVerification({
-        assessmentId: assessmentIdForAttempt(request.attemptId),
+        assessmentId: assessmentIdForAttempt(attemptId),
         projectId: request.projectId,
-        attemptId: request.attemptId,
+        attemptId,
         candidateHeadSha: request.headOid,
         policyRevision: request.policyRevision,
         hostId: request.hostId,
@@ -130,10 +132,14 @@ export class MergeVerificationAdapter implements MergeVerificationPort {
     assessment: EvidenceAssessmentRecord,
     request: MergeVerificationReadRequest,
   ): MergeVerificationResult {
-    const expectedAssessmentId = assessmentIdForAttempt(request.attemptId);
+    const attemptId = request.attemptId;
+    if (!isNonEmptyTrimmedString(attemptId)) {
+      return unknownResult('no-attempt-identity');
+    }
+    const expectedAssessmentId = assessmentIdForAttempt(attemptId);
     if (
       assessment.id !== expectedAssessmentId ||
-      assessment.attemptId !== request.attemptId ||
+      assessment.attemptId !== attemptId ||
       assessment.projectId !== request.projectId
     ) {
       return unknownResult('evidence-unreadable');
@@ -153,7 +159,7 @@ export class MergeVerificationAdapter implements MergeVerificationPort {
     if (
       receipt.assessmentId !== expectedAssessmentId ||
       receipt.projectId !== request.projectId ||
-      receipt.attemptId !== request.attemptId
+      receipt.attemptId !== attemptId
     ) {
       return unknownResult('evidence-unreadable');
     }

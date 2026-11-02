@@ -267,6 +267,10 @@ function defaultHash(state: string): string {
   return createHash('sha256').update(state, 'utf8').digest('hex');
 }
 
+function isUsableReportedCost(cost: unknown): cost is number {
+  return typeof cost === 'number' && Number.isFinite(cost) && cost >= 0;
+}
+
 export class JevMergeVetoAdapter implements MergeVetoPort {
   private readonly model: string;
   private readonly keyFile: string;
@@ -294,11 +298,11 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
     if (!Number.isFinite(deps.holdConfidence)) {
       throw new Error('JevMergeVetoAdapter requires a finite holdConfidence');
     }
-    if (!Number.isFinite(deps.monthlyBudgetUsd)) {
-      throw new Error('JevMergeVetoAdapter requires a finite monthlyBudgetUsd');
+    if (!Number.isFinite(deps.monthlyBudgetUsd) || deps.monthlyBudgetUsd < 0) {
+      throw new Error('JevMergeVetoAdapter requires a finite non-negative monthlyBudgetUsd');
     }
-    if (!Number.isFinite(deps.assumedCostPerCallUsd)) {
-      throw new Error('JevMergeVetoAdapter requires a finite assumedCostPerCallUsd');
+    if (!Number.isFinite(deps.assumedCostPerCallUsd) || deps.assumedCostPerCallUsd < 0) {
+      throw new Error('JevMergeVetoAdapter requires a finite non-negative assumedCostPerCallUsd');
     }
     if (typeof deps.fetch !== 'function') {
       throw new Error('JevMergeVetoAdapter requires an injected fetch');
@@ -609,8 +613,9 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
     reportedCost?: number,
     requestId?: string,
   ): Promise<MergeVetoAdvice> {
-    const costUsd = reportedCost ?? this.assumedCostPerCallUsd;
-    const estimated = reportedCost === undefined;
+    const hasReportedCost = isUsableReportedCost(reportedCost);
+    const costUsd = hasReportedCost ? reportedCost : this.assumedCostPerCallUsd;
+    const estimated = !hasReportedCost;
     const receipt: MergeVetoSettledReceipt = {
       consumer: MERGE_VETO_CONSUMER,
       contextRef,
@@ -643,8 +648,9 @@ export class JevMergeVetoAdapter implements MergeVetoPort {
     reportedCost?: number,
     requestId?: string,
   ): Promise<MergeVetoAdvice> {
-    const costUsd = reportedCost ?? this.assumedCostPerCallUsd;
-    const estimated = reportedCost === undefined;
+    const hasReportedCost = isUsableReportedCost(reportedCost);
+    const costUsd = hasReportedCost ? reportedCost : this.assumedCostPerCallUsd;
+    const estimated = !hasReportedCost;
     const receipt: MergeVetoSettledReceipt = {
       consumer: MERGE_VETO_CONSUMER,
       contextRef,

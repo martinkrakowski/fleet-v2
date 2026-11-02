@@ -7,6 +7,10 @@
  * against a fake-acting `AdvanceLaneRunUseCase`.
  */
 
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
@@ -33,9 +37,11 @@ import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import { CancelPreparedAttemptUseCase } from '../CancelPreparedAttemptUseCase.use-case.js';
 import { StartLaneRunUseCase } from '../StartLaneRunUseCase.use-case.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
+import { ConductorHaltAdapter } from '../../../infrastructure/adapters/ConductorHaltAdapter.adapter.js';
 import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/ExecutionJournalAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
+import type { ConductorHaltPort } from '../../ports/out/ConductorHaltPort.out-port.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const ATTEMPT_ID = 'attempt-example-1';
@@ -133,6 +139,8 @@ interface HarnessOptions {
   readonly workOrder?: WorkOrderRecord | null;
   readonly profileStatus?: 'active' | 'retired';
   readonly withProfile?: boolean;
+  /** The conductor's halt port; defaults to a fresh in-memory ConductorHaltAdapter. */
+  readonly halt?: ConductorHaltPort;
 }
 
 function makeHarness(options: HarnessOptions = {}) {
@@ -246,24 +254,36 @@ function makeHarness(options: HarnessOptions = {}) {
   };
 
   const briefCalls: PrepareBriefPackageUseCaseRequest[] = [];
-  let briefAnswers: ('prepared' | 'rejected')[] = [];
+  type BriefAnswer =
+    | 'prepared'
+    | 'rejected'
+    | { readonly outcome: 'rejected'; readonly reason: string; readonly reasonClass?: 'acceptance-spec-shell' };
+  let briefAnswers: BriefAnswer[] = [];
   const prepareBrief: PrepareBriefPackagePort = {
     async prepareBriefPackage(request) {
       briefCalls.push(request);
-      const answer = briefAnswers.length > 0 ? (briefAnswers.shift() as 'prepared' | 'rejected') : 'prepared';
+      const answer = briefAnswers.length > 0 ? (briefAnswers.shift() as BriefAnswer) : 'prepared';
       const placed = request as PrepareBriefPackageUseCaseRequest;
-      return answer === 'prepared'
-        ? {
-            outcome: 'prepared' as const,
-            prepared: {
-              attemptId: placed.attemptId ?? ATTEMPT_ID,
-              briefDigest: DIGEST,
-              prosePath: (placed.worktreePath ?? WORKTREE_PATH) + '/.lane/brief.md',
-              manifestPath: (placed.worktreePath ?? WORKTREE_PATH) + '/.lane/brief-manifest.json',
-              selectedKnowledgeVersions: [],
-            },
-          }
-        : { outcome: 'rejected' as const, reason: 'example brief rejection' };
+      if (answer === 'prepared') {
+        return {
+          outcome: 'prepared' as const,
+          prepared: {
+            attemptId: placed.attemptId ?? ATTEMPT_ID,
+            briefDigest: DIGEST,
+            prosePath: (placed.worktreePath ?? WORKTREE_PATH) + '/.lane/brief.md',
+            manifestPath: (placed.worktreePath ?? WORKTREE_PATH) + '/.lane/brief-manifest.json',
+            selectedKnowledgeVersions: [],
+          },
+        };
+      }
+      if (answer === 'rejected') {
+        return { outcome: 'rejected' as const, reason: 'example brief rejection' };
+      }
+      return {
+        outcome: 'rejected' as const,
+        reason: answer.reason,
+        ...(answer.reasonClass !== undefined ? { reasonClass: answer.reasonClass } : {}),
+      };
     },
     async previewBriefPackage() {
       throw new Error('not used in this test');
@@ -272,9 +292,12 @@ function makeHarness(options: HarnessOptions = {}) {
 
   const cancelPreparedAttempt = new CancelPreparedAttemptUseCase({ attemptRepo, journal: executionJournal });
 
+  const halt = options.halt ?? new ConductorHaltAdapter();
+
   const useCase = new StartLaneRunUseCase({
     workOrderRepo,
     profileRead,
+    halt,
     capacity,
     executionJournal,
     workspace,
@@ -290,6 +313,7 @@ function makeHarness(options: HarnessOptions = {}) {
     useCase,
     attemptRepoStore,
     executionJournal,
+    halt,
     runRepoStore,
     runRepo,
     runJournal,
@@ -309,7 +333,7 @@ function makeHarness(options: HarnessOptions = {}) {
       resolveTipAnswer = answer;
     },
     briefCalls,
-    setBriefAnswers: (answers: ('prepared' | 'rejected')[]) => {
+    setBriefAnswers: (answers: BriefAnswer[]) => {
       briefAnswers = answers;
     },
     failNextAttemptSave: () => {
@@ -974,6 +998,36 @@ describe('StartLaneRunUseCase', () => {
     expect(attempts[0]?.state).toBe('intent-recorded');
   });
 
+  it('test 4c: a brief rejection classified acceptance-spec-shell maps to brief-acceptance-spec-shell', async () => {
+    const harness = makeHarness();
+    harness.setBriefAnswers([
+      { outcome: 'rejected', reason: '<redacted>', reasonClass: 'acceptance-spec-shell' },
+    ]);
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'brief',
+      reason: 'brief-acceptance-spec-shell',
+    });
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
+  });
+
+  it('test 4d: a brief rejection without reasonClass still maps to brief-rejected', async () => {
+    const harness = makeHarness();
+    harness.setBriefAnswers([{ outcome: 'rejected', reason: 'example brief rejection' }]);
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'brief',
+      reason: 'brief-rejected',
+    });
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
+  });
+
   it('test 5: a retry after completion returns started and calls no fake again', async () => {
     const harness = makeHarness();
     expect(await harness.useCase.startLaneRun(requestFixture())).toMatchObject({ outcome: 'started' });
@@ -1442,5 +1496,107 @@ describe('StartLaneRunUseCase', () => {
     const retry = await harness.useCase.startLaneRun(requestFixture());
     expect(retry).toMatchObject({ outcome: 'started' });
     expect(await harness.runRepoStore.get(RUN_ID)).toEqual(before);
+  });
+
+  it('test 10: a halted marker refuses before any write or port call (KA4)', async () => {
+    const harness = makeHarness();
+    expect(await harness.halt.set({ halted: true, nowIso: NOW })).toMatchObject({ outcome: 'changed' });
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    // Echo nothing: the refusal deep-equals exactly the fixed token, no other key.
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(harness.capacityCalls).toHaveLength(0);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await harness.executionJournal.listActiveReservations()).toEqual([]);
+    expect(await harness.attemptRepoStore.listAllAttempts()).toEqual([]);
+    expect(await harness.runRepoStore.list()).toEqual([]);
+  });
+
+  it('test 11: an unreadable halt marker refuses fail closed before any write (KA4)', async () => {
+    // The real adapter over a real temp state directory whose marker bytes no
+    // record parses (the state-files.test.ts unreadable pattern): read()
+    // never throws, it reads `unreadable`, which is a halt.
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-v2-start-lane-run-test-'));
+    writeFileSync(join(dir, 'conductor-halt.json'), '{ not json', 'utf8');
+    const harness = makeHarness({ halt: new ConductorHaltAdapter({ stateDir: dir }) });
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(harness.capacityCalls).toHaveLength(0);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await harness.executionJournal.listActiveReservations()).toEqual([]);
+    expect(await harness.attemptRepoStore.listAllAttempts()).toEqual([]);
+    expect(await harness.runRepoStore.list()).toEqual([]);
+  });
+
+  it('test 12: a halt read that throws refuses fail closed before any write (KA4)', async () => {
+    // The only hand-written stub this lane adds: it stubs the port contract
+    // (a `read` that rejects), not a command.
+    const harness = makeHarness({
+      halt: {
+        read: async () => {
+          throw new Error('example halt read failure');
+        },
+        set: async () => ({ outcome: 'refused', reason: 'invalid-request' }),
+      },
+    });
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(harness.capacityCalls).toHaveLength(0);
+    expect(harness.worktreeCalls).toHaveLength(0);
+    expect(harness.briefCalls).toHaveLength(0);
+    expect(await harness.executionJournal.listActiveReservations()).toEqual([]);
+    expect(await harness.attemptRepoStore.listAllAttempts()).toEqual([]);
+    expect(await harness.runRepoStore.list()).toEqual([]);
+  });
+
+  it('test 13: a clear halt marker (absent file) lets a start complete end to end (KA4)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-v2-start-lane-run-test-'));
+    const harness = makeHarness({ halt: new ConductorHaltAdapter({ stateDir: dir }) });
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'started',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      hostName: HOST_NAME,
+      worktreePath: WORKTREE_PATH,
+    });
+    expect(harness.capacityCalls).toHaveLength(1);
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
+  });
+
+  it('test 14: a halted retry of an incomplete start refuses without changing the existing reservation (KA4)', async () => {
+    const harness = makeHarness();
+    // An earlier incomplete start leaves a held reservation.
+    harness.setWorktreeAnswers([{ outcome: 'unknown' }]);
+    expect(await harness.useCase.startLaneRun(requestFixture())).toMatchObject({
+      outcome: 'incomplete',
+      step: 'worktree',
+    });
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
+    expect(harness.capacityCalls).toHaveLength(1);
+    // Now halted: the retry refuses and leaves that reservation untouched.
+    expect(await harness.halt.set({ halted: true, nowIso: NOW })).toMatchObject({ outcome: 'changed' });
+    const retry = await harness.useCase.startLaneRun(requestFixture({ nowIso: LATER }));
+    expect(retry).toEqual({ outcome: 'refused', reason: 'halted' });
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
+    expect(harness.capacityCalls).toHaveLength(1);
+    expect(harness.worktreeCalls).toHaveLength(1);
+    expect(harness.briefCalls).toHaveLength(0);
+  });
+
+  it('test 15: abandonStart stays available while halted and releases the held reservation (KA4)', async () => {
+    const harness = makeHarness();
+    harness.setWorktreeAnswers([{ outcome: 'unknown' }]);
+    expect(await harness.useCase.startLaneRun(requestFixture())).toMatchObject({
+      outcome: 'incomplete',
+      step: 'worktree',
+    });
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
+    expect(await harness.halt.set({ halted: true, nowIso: NOW })).toMatchObject({ outcome: 'changed' });
+    expect(
+      await harness.useCase.abandonStart({ runId: RUN_ID, attemptId: ATTEMPT_ID, nowIso: LATER }),
+    ).toEqual({ outcome: 'abandoned', capacity: 'released', attemptCancelled: false });
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(false);
   });
 });

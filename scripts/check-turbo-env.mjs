@@ -49,6 +49,8 @@ const EXTENSIONS = new Set([
 // is a review decision: if a task's result can depend on the variable, declare it in turbo.json
 // `env` instead.
 const RUNTIME_ONLY = new Set([
+  // Set per gh call by the merge path, and read back only by tests; never a build input.
+  "GH_CONFIG_DIR",
   // Fleet installation and routing, read by the CLI/API composition roots at runtime.
   "FLEET_STATE_DIR",
   "FLEET_INSTALLATION_FILE",
@@ -94,6 +96,8 @@ const RUNTIME_ONLY = new Set([
 // Credential-shaped names (or their file paths and sockets): never declared in turbo.json, never
 // hashed and never passed into a task. Code reads them only at runtime; tests plant fakes.
 const CREDENTIAL = new Set([
+  "GH_ENTERPRISE_TOKEN",
+  "GITHUB_ENTERPRISE_TOKEN",
   "GH_TOKEN",
   "GITHUB_TOKEN",
   "XAI_API_KEY",

@@ -12,6 +12,7 @@ export * from "./HeartbeatOrchestratorSessionUseCase.use-case.js";
 export * from "./InspectConfiguredCapabilitiesUseCase.use-case.js";
 export * from "./InspectOutstandingCoordinationUseCase.use-case.js";
 export * from "./InspectProjectProfileUseCase.use-case.js";
+export * from "./issue-grant-shared.js";
 export * from "./IssueMergeGrantUseCase.use-case.js";
 export * from "./IssuePolicyForgeGrantUseCase.use-case.js";
 export * from "./ListAttentionItemsUseCase.use-case.js";

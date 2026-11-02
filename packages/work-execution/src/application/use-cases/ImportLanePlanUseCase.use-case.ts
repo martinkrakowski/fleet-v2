@@ -58,20 +58,6 @@ function lanePlanGraphPlanFromRecord(record: LanePlanRecord): LanePlanGraphPlan 
   };
 }
 
-/** The graph plan of the incoming sidecar: sidecar lanes carry renamedFrom. */
-function lanePlanGraphPlanFromSidecar(sidecar: LanePlanSidecar): LanePlanGraphPlan {
-  return {
-    projectId: sidecar.projectId,
-    planId: sidecar.planId,
-    lanes: sidecar.lanes.map((lane) => ({
-      laneId: lane.laneId,
-      renamedFrom: lane.renamedFrom,
-      after: lane.after,
-    })),
-    exclusiveOrder: sidecar.exclusiveOrder,
-  };
-}
-
 /** Stored lanes no incoming lane names (neither laneId nor renamedFrom), re-stamped dropped, sorted by laneId. */
 function droppedLanesFrom(stored: LanePlanRecord, sidecar: LanePlanSidecar): PlannedLaneRecord[] {
   const incomingNames = new Set<string>();
@@ -87,81 +73,120 @@ function droppedLanesFrom(stored: LanePlanRecord, sidecar: LanePlanSidecar): Pla
     .sort((a, b) => a.laneId.localeCompare(b.laneId));
 }
 
+function validateRequest(
+  request: ImportLanePlanRequest,
+): { ok: true; sidecar: LanePlanSidecar } | { ok: false; result: ImportLanePlanResult } {
+  const requestedProject = request.requestedProjectId;
+  if (typeof requestedProject !== 'string' || requestedProject.trim().length === 0) {
+    return { ok: false, result: refusal('request', 'requestedProjectId must be a non-empty string') };
+  }
+  const parsed = parseLanePlanSidecar(request.sidecar);
+  if (!parsed.ok) {
+    return { ok: false, result: refusal('sidecar-invalid', parsed.errors.join('; ')) };
+  }
+  const sidecar = parsed.sidecar;
+  if (sidecar.projectId !== requestedProject.trim()) {
+    return { ok: false, result: refusal('project-mismatch', 'requested project does not match the sidecar project') };
+  }
+  return { ok: true, sidecar };
+}
+
+function checkRevision(
+  sidecar: LanePlanSidecar,
+  stored: LanePlanRecord | null,
+  digest: string,
+): ImportLanePlanResult | null {
+  if (stored === null) {
+    return null;
+  }
+  if (sidecar.revision < stored.revision) {
+    return staleRevision();
+  }
+  if (sidecar.revision === stored.revision) {
+    if (digest === stored.digest) {
+      return { outcome: 'unchanged', plan: stored };
+    }
+    return staleRevision();
+  }
+  return null;
+}
+
+function buildCandidateRecord(
+  sidecar: LanePlanSidecar,
+  stored: LanePlanRecord | null,
+  meta: { digest: string; importedAtIso: string },
+): { ok: true; record: LanePlanRecord } | { ok: false; result: ImportLanePlanResult } {
+  const built = LanePlan.fromSidecar(sidecar, meta);
+  if (!built.success) {
+    return { ok: false, result: refusal('sidecar-invalid', 'sidecar could not be built into a plan record') };
+  }
+  const baseRecord = built.value.toRecord();
+  if (stored === null || sidecar.revision <= stored.revision) {
+    return { ok: true, record: baseRecord };
+  }
+  const merged: LanePlanRecord = {
+    ...baseRecord,
+    lanes: [...baseRecord.lanes, ...droppedLanesFrom(stored, sidecar)],
+  };
+  const revalidated = LanePlan.create(merged);
+  if (!revalidated.success) {
+    return { ok: false, result: refusal('sidecar-invalid', 'merged plan record failed validation') };
+  }
+  return { ok: true, record: revalidated.value.toRecord() };
+}
+
 export class ImportLanePlanUseCase implements ImportLanePlanPort {
   constructor(private readonly deps: ImportLanePlanDependencies) {}
 
   async importLanePlan(request: ImportLanePlanRequest): Promise<ImportLanePlanResult> {
-    const requestedProject = request.requestedProjectId;
-    if (typeof requestedProject !== 'string' || requestedProject.trim().length === 0) {
-      return refusal('request', 'requestedProjectId must be a non-empty string');
+    const validated = validateRequest(request);
+    if (!validated.ok) {
+      return validated.result;
     }
-    const parsed = parseLanePlanSidecar(request.sidecar);
-    if (!parsed.ok) {
-      return refusal('sidecar-invalid', parsed.errors.join('; '));
-    }
-    const sidecar = parsed.sidecar;
-    if (sidecar.projectId !== requestedProject.trim()) {
-      return refusal('project-mismatch', 'requested project does not match the sidecar project');
-    }
-
+    const sidecar = validated.sidecar;
     const { projectId, planId } = sidecar;
     const stored = await this.deps.lanePlanRepo.findLanePlan(projectId, planId);
     const digest = this.deps.computeDigest(sidecar);
-    if (stored !== null && sidecar.revision < stored.revision) {
-      return staleRevision();
-    }
-    if (stored !== null && sidecar.revision === stored.revision) {
-      return digest === stored.digest
-        ? { outcome: 'unchanged', plan: stored }
-        : staleRevision();
+
+    const revisionCheck = checkRevision(sidecar, stored, digest);
+    if (revisionCheck !== null) {
+      return revisionCheck;
     }
 
-    const cycle = await this.findCycle(sidecar, projectId, planId);
+    const candidate = buildCandidateRecord(sidecar, stored, {
+      digest,
+      importedAtIso: this.deps.nowIso(),
+    });
+    if (!candidate.ok) {
+      return candidate.result;
+    }
+
+    const cycle = await this.findCycle(candidate.record);
     if (cycle !== null) {
       return refusal('plan-cycle', formatLanePlanCycle(cycle));
     }
 
-    const importedAtIso = this.deps.nowIso();
-    const built = LanePlan.fromSidecar(sidecar, { digest, importedAtIso });
-    if (!built.success) {
-      return refusal('sidecar-invalid', 'sidecar could not be built into a plan record');
-    }
-    let record = built.value.toRecord();
-    if (stored !== null && sidecar.revision > stored.revision) {
-      const merged: LanePlanRecord = {
-        ...record,
-        lanes: [...record.lanes, ...droppedLanesFrom(stored, sidecar)],
-      };
-      const revalidated = LanePlan.create(merged);
-      if (!revalidated.success) {
-        return refusal('sidecar-invalid', 'merged plan record failed validation');
-      }
-      record = revalidated.value.toRecord();
-    }
-
     try {
-      await this.deps.lanePlanRepo.saveLanePlan(record);
+      await this.deps.lanePlanRepo.saveLanePlan(candidate.record);
     } catch {
       return refusal('store', 'the store refused the save');
     }
-    return { outcome: 'imported', plan: record, digest };
+    return { outcome: 'imported', plan: candidate.record, digest };
   }
 
-  /** Every stored plan plus the incoming sidecar, excluding the stored self being replaced. */
+  /** Every stored plan plus the incoming candidate record, excluding the stored self being replaced. */
   private async findCycle(
-    sidecar: LanePlanSidecar,
-    projectId: string,
-    planId: string,
+    candidate: LanePlanRecord,
   ): Promise<readonly PlannedLaneRef[] | null> {
     const plans: LanePlanGraphPlan[] = [];
     const storedPlans = await this.deps.lanePlanRepo.listLanePlans();
     for (const storedPlan of storedPlans) {
-      if (storedPlan.projectId === projectId && storedPlan.planId === planId) {
+      if (storedPlan.projectId === candidate.projectId && storedPlan.planId === candidate.planId) {
         continue;
       }
       plans.push(lanePlanGraphPlanFromRecord(storedPlan));
     }
-    plans.push(lanePlanGraphPlanFromSidecar(sidecar));
+    plans.push(lanePlanGraphPlanFromRecord(candidate));
     return findLanePlanCycle(plans);
   }
 }

@@ -279,6 +279,60 @@ describe('ImportLanePlanUseCase', () => {
     expect(result.outcome).toBe('imported');
   });
 
+  it('refuses an import whose dropped lane closes a cross-plan cycle', async () => {
+    // Plan A revision 1 has L1 and L2 (after plan-A/L1).
+    const storedPlanA = storedPlan({
+      projectId: 'proj-1',
+      planId: 'plan-A',
+      revision: 1,
+      lanes: [
+        storedLane('L1'),
+        storedLane('L2', {
+          after: [{ projectId: 'proj-1', planId: 'plan-A', laneId: 'L1' }],
+        }),
+      ],
+    });
+    // Plan C revision 1 has L1 (after plan-A/L2).
+    const storedPlanC = storedPlan({
+      projectId: 'proj-1',
+      planId: 'plan-C',
+      revision: 1,
+      lanes: [
+        storedLane('L1', {
+          after: [{ projectId: 'proj-1', planId: 'plan-A', laneId: 'L2' }],
+        }),
+      ],
+    });
+    const { repo, useCase } = makeHarness({
+      lanePlanRepo: new FakeLanePlanRepo([storedPlanA, storedPlanC]),
+    });
+
+    // Plan A revision 2 keeps only L1 with after plan-C/L1, omitting L2.
+    // L2 is reattached as dropped with after plan-A/L1.
+    // The resulting graph is plan-A/L1 -> plan-C/L1 -> plan-A/L2 -> plan-A/L1 (cycle!).
+    const incomingA = sidecar({
+      projectId: 'proj-1',
+      planId: 'plan-A',
+      revision: 2,
+      lanes: [
+        lane('L1', { after: ['plan-C/L1'] }),
+      ],
+    });
+
+    const result = await useCase.importLanePlan({
+      sidecar: incomingA,
+      requestedProjectId: 'proj-1',
+    });
+
+    expect(result.outcome).toBe('refused');
+    expect(result.outcome === 'refused' ? result.code : '').toBe('plan-cycle');
+    const reason = result.outcome === 'refused' ? result.reason : '';
+    expect(reason).toContain('plan-A/L1');
+    expect(reason).toContain('plan-C/L1');
+    expect(reason).toContain('plan-A/L2');
+    expect(repo.saved).toHaveLength(0);
+  });
+
   it('keeps a removed lane as dropped with its fields intact, sorted by laneId', async () => {
     const stored = storedPlan({
       lanes: [

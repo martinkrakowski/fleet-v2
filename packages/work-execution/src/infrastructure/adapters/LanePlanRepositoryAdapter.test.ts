@@ -104,6 +104,40 @@ describe('LanePlanRepositoryAdapter file store', () => {
     await expect(adapter.saveLanePlan(lanePlan())).rejects.toThrow('Stale lane plan revision');
   });
 
+  it('saving a second plan preserves schemaVersion on previously stored plans', async () => {
+    const adapter = new LanePlanRepositoryAdapter({ stateDir: tempDir });
+    await adapter.saveLanePlan(lanePlan({ planId: 'plan-1' }));
+    await adapter.saveLanePlan(
+      lanePlan({
+        planId: 'plan-2',
+        lanes: [
+          {
+            laneId: 'L2',
+            aliases: [],
+            scope: 'second plan lane',
+            packages: ['pkg-b'],
+            sharedFiles: [],
+            tier: 0,
+            after: [],
+            decisions: [],
+            status: 'planned',
+            brief: null,
+            mergedPr: null,
+          },
+        ],
+      }),
+    );
+
+    const onDisk = JSON.parse(
+      await fs.readFile(path.join(tempDir, 'lane-plans.json'), 'utf8'),
+    ) as Array<Record<string, unknown>>;
+    expect(onDisk).toHaveLength(2);
+    expect(onDisk[0]!.schemaVersion).toBe(1);
+    expect(onDisk[1]!.schemaVersion).toBe(1);
+    expect(onDisk[0]!.planId).toBe('plan-1');
+    expect(onDisk[1]!.planId).toBe('plan-2');
+  });
+
   it('the change signal fires with kind plan and a non-null stateFile', async () => {
     const target = path.resolve(path.join(tempDir, 'lane-plans.json'));
     const signals = new RecordingChangeSignalPort();

@@ -149,11 +149,12 @@ export class LanePlanRepositoryAdapter implements LanePlanRepositoryPort {
       if (existing !== undefined && existing.revision >= record.revision) {
         throwStale(existing);
       }
-      records.set(
-        key,
-        { ...record, schemaVersion: LANE_PLAN_STORE_VERSION_POLICY.writerVersion } as LanePlanRecord,
-      );
-      await writeJsonAtomically(target, [...records.values()]);
+      records.set(key, record);
+      const payload = [...records.values()].map((r) => ({
+        ...r,
+        schemaVersion: LANE_PLAN_STORE_VERSION_POLICY.writerVersion,
+      }));
+      await writeJsonAtomically(target, payload);
       try {
         const stat = await fs.stat(target);
         written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };

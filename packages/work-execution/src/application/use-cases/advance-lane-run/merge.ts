@@ -277,6 +277,7 @@ async function prFactOf(
   laneHead12: string | null,
   laneHeadSha: string | null,
   ancestry: ForgeAncestryPort | undefined,
+  expectedBaseBranch: string,
 ): Promise<PrReadResult> {
   try {
     const read = await port.readPullRequest({ ref });
@@ -285,6 +286,9 @@ async function prFactOf(
     }
     const head12 = head12Of(read.pullRequest.headSha);
     if (head12 === null) {
+      return { pr: null, mergeState: null };
+    }
+    if (read.pullRequest.state === 'merged' && read.pullRequest.baseRef !== expectedBaseBranch) {
       return { pr: null, mergeState: null };
     }
     let containsLaneHead = head12 === laneHead12;
@@ -356,7 +360,14 @@ export async function acceptanceFactsOf(
       parkedPrRead);
   if (canReadPr && ctx.deps.forgeRead !== undefined) {
     const ref = parkedPrRead ? branchRefOf(record, latest) : pullRequestRefOf(record, latest);
-    const prRead = await prFactOf(ctx.deps.forgeRead, ref, head12, latest.artifacts.headCommit, ctx.deps.forgeAncestry);
+    const prRead = await prFactOf(
+      ctx.deps.forgeRead,
+      ref,
+      head12,
+      latest.artifacts.headCommit,
+      ctx.deps.forgeAncestry,
+      resolveLaneRunBaseBranch(record),
+    );
     pr = prRead.pr;
     mergeState = prRead.mergeState;
   }

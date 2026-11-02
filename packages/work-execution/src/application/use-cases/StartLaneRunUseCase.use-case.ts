@@ -363,7 +363,10 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
         nowIso: request.nowIso,
       });
       if (reserved.outcome === 'no-capacity') {
-        return { outcome: 'no-capacity' };
+        return {
+          outcome: 'no-capacity',
+          ...(reserved.blockedBy === undefined ? {} : { blockedBy: reserved.blockedBy }),
+        };
       }
       if (reserved.outcome === 'refused') {
         // `reservation-incomplete` never reaches the caller as a start

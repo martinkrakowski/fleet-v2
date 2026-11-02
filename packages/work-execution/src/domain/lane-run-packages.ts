@@ -72,3 +72,76 @@ export function laneRunPackagesOverlap(
   const bKeys = laneRunPackageKeys(b.ownedPaths);
   return laneRunPackageKeys(a.ownedPaths).some((key) => bKeys.some((other) => packageKeysOverlap(key, other)));
 }
+
+/** The literal tree root an owned path names: a trailing glob segment (`/**`, `/*`, `*`)
+ *  and any trailing `/` are stripped; blank and `..` entries and a stripped-empty
+ *  result yield null. Pure; never throws. */
+function ownedRootOf(ownedPath: string): string | null {
+  if (typeof ownedPath !== 'string') {
+    return null;
+  }
+  const trimmed = ownedPath.trim();
+  if (trimmed === '' || trimmed === '..') {
+    return null;
+  }
+  let root = trimmed.replace(/\/+$/u, '');
+  root = root.replace(/\/\*\*$|\/\*$|\*$/u, '');
+  if (root === '') {
+    return null;
+  }
+  return root;
+}
+
+/** The non-null owned roots of a work order, in order. */
+function usableOwnedRoots(ownedPaths: readonly string[]): string[] {
+  const roots: string[] = [];
+  for (const ownedPath of ownedPaths) {
+    const root = ownedRootOf(ownedPath);
+    if (root !== null) {
+      roots.push(root);
+    }
+  }
+  return roots;
+}
+
+/** Whether two owned roots overlap: equal, or one a `/`-boundary directory prefix of the other. */
+function ownedRootsOverlap(left: string, right: string): boolean {
+  return left === right || right.startsWith(left + '/') || left.startsWith(right + '/');
+}
+
+/** Whether an owned path has a `.` or `..` segment, so its literal text does not say which tree it names. */
+function hasDotSegment(ownedPath: string): boolean {
+  return typeof ownedPath === 'string' && ownedPath.trim().split('/').some((segment) => segment === '.' || segment === '..');
+}
+
+/**
+ * The file-level admission overlap (KS5, D30): same repository, and at least one
+ * pair of owned roots equal or one a `/`-boundary directory prefix of the other.
+ * When either brief names no usable root (empty or all-skipped ownedPaths),
+ * fall back to the package-level rule only when both sides still name at least
+ * one package key; a side with no package key fails closed (overlaps) for the
+ * same repository. An owned path with a `.` or `..` segment on either side also
+ * fails closed, whatever its other paths say. Pure; never throws.
+ */
+export function laneRunOwnedPathsOverlap(
+  a: { readonly repository: string; readonly ownedPaths: readonly string[] },
+  b: { readonly repository: string; readonly ownedPaths: readonly string[] },
+): boolean {
+  if (a.repository !== b.repository) {
+    return false;
+  }
+  if (a.ownedPaths.some(hasDotSegment) || b.ownedPaths.some(hasDotSegment)) {
+    return true;
+  }
+  const aRoots = usableOwnedRoots(a.ownedPaths);
+  const bRoots = usableOwnedRoots(b.ownedPaths);
+  if (aRoots.length > 0 && bRoots.length > 0) {
+    return aRoots.some((left) => bRoots.some((right) => ownedRootsOverlap(left, right)));
+  }
+  const aKeys = laneRunPackageKeys(a.ownedPaths);
+  const bKeys = laneRunPackageKeys(b.ownedPaths);
+  if (aKeys.length > 0 && bKeys.length > 0) {
+    return laneRunPackagesOverlap(a, b);
+  }
+  return true;
+}

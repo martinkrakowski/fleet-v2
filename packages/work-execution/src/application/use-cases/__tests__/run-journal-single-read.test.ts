@@ -191,6 +191,7 @@ describe('EX-3a: scans read the run journal once', () => {
           },
           runJournal,
           profileRead: { readProjectProfile: async () => null },
+          halt: new ConductorHaltAdapter(),
         }) as unknown as StartLaneRunDependencies;
 
       const groupedResult = await new StartLaneRunUseCase(deps(counting)).startLaneRun(request);

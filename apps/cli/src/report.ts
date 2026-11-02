@@ -52,6 +52,70 @@ function p95Ms(msValues: readonly number[]): number | null {
   return sorted[rank - 1]!;
 }
 
+/** Non-negative interval in milliseconds between two ISO timestamps, or null if negative (clock skew). */
+function nonNegativeIntervalMs(startIso: string, endIso: string): number | null {
+  const ms = Date.parse(endIso) - Date.parse(startIso);
+  if (ms < 0) {
+    return null;
+  }
+  return ms;
+}
+
+function stepForEntry(entry: LaneRunJournalEntryRecord, weekStartMs: number): string | null {
+  if (entry.key === null) {
+    return null;
+  }
+  if (Date.parse(entry.recordedAtIso) < weekStartMs) {
+    return null;
+  }
+  const parsed = parseLaneRunKey(entry.key);
+  if (parsed === null || parsed.kind !== 'step') {
+    return null;
+  }
+  return parsed.step;
+}
+
+interface AdmissionTimestamps {
+  readonly prepareAt: string | null;
+  readonly dispatchAt: string | null;
+}
+
+function scanAdmissionTimestamps(
+  entries: readonly LaneRunJournalEntryRecord[],
+  weekStartMs: number,
+): AdmissionTimestamps {
+  let prepareAt: string | null = null;
+  let dispatchAt: string | null = null;
+  for (const entry of entries) {
+    const step = stepForEntry(entry, weekStartMs);
+    if (step === null) {
+      continue;
+    }
+    if (prepareAt === null && step === 'prepare' && entry.kind === 'result' && entry.outcome !== 'ambiguous') {
+      prepareAt = entry.recordedAtIso;
+    }
+    if (dispatchAt === null && step === 'dispatch' && entry.kind === 'intent') {
+      dispatchAt = entry.recordedAtIso;
+    }
+  }
+  return { prepareAt, dispatchAt };
+}
+
+function admissionSampleForRun(
+  entries: readonly LaneRunJournalEntryRecord[],
+  weekStartMs: number,
+): Sample | null {
+  const { prepareAt, dispatchAt } = scanAdmissionTimestamps(entries, weekStartMs);
+  if (prepareAt === null || dispatchAt === null) {
+    return null;
+  }
+  const ms = nonNegativeIntervalMs(prepareAt, dispatchAt);
+  if (ms === null) {
+    return null;
+  }
+  return { ms };
+}
+
 /**
  * Admission-wait samples: one per run that, in the window, has a prepare
  * result (the earliest non-ambiguous `prepare` result) and a dispatch intent
@@ -64,27 +128,9 @@ function admissionWaitSamples(
 ): Sample[] {
   const samples: Sample[] = [];
   for (const entries of entriesByRun.values()) {
-    let prepareAt: string | null = null;
-    let dispatchAt: string | null = null;
-    for (const entry of entries) {
-      if (Date.parse(entry.recordedAtIso) < weekStartMs || entry.key === null) {
-        continue;
-      }
-      const parsed = parseLaneRunKey(entry.key);
-      if (parsed === null || parsed.kind !== 'step') {
-        continue;
-      }
-      if (entry.kind === 'result' && parsed.step === 'prepare' && entry.outcome !== 'ambiguous' && prepareAt === null) {
-        prepareAt = entry.recordedAtIso;
-      } else if (entry.kind === 'intent' && parsed.step === 'dispatch' && dispatchAt === null) {
-        dispatchAt = entry.recordedAtIso;
-      }
-    }
-    if (prepareAt !== null && dispatchAt !== null) {
-      const ms = Date.parse(dispatchAt) - Date.parse(prepareAt);
-      if (ms >= 0) {
-        samples.push({ ms });
-      }
+    const sample = admissionSampleForRun(entries, weekStartMs);
+    if (sample !== null) {
+      samples.push(sample);
     }
   }
   return samples;
@@ -93,6 +139,31 @@ function admissionWaitSamples(
 type AttentionItemEntry = Awaited<
   ReturnType<FleetCliRuntime['coordination']['listAttentionItems']['listAttentionItems']>
 >['items'][number];
+
+function parkNoticeIndex(items: readonly AttentionItemEntry[]): Map<string, string> {
+  const noticedAt = new Map<string, string>();
+  for (const entry of items) {
+    if (entry.item.kind === 'conductor-park' && entry.item.subject.kind === 'run') {
+      noticedAt.set(entry.item.subject.ref, entry.item.firstRaisedAtIso);
+    }
+  }
+  return noticedAt;
+}
+
+function firstInWindowParkAt(
+  entries: readonly LaneRunJournalEntryRecord[],
+  weekStartMs: number,
+): string | null {
+  for (const entry of entries) {
+    if (Date.parse(entry.recordedAtIso) < weekStartMs) {
+      continue;
+    }
+    if (entry.kind === 'conduct' && entry.state === 'parked') {
+      return entry.recordedAtIso;
+    }
+  }
+  return null;
+}
 
 /**
  * Park-to-notify samples: one per run that, in the window, has a `parked`
@@ -105,33 +176,20 @@ function parkToNotifySamples(
   items: readonly AttentionItemEntry[],
   weekStartMs: number,
 ): Sample[] {
-  const noticedAt = new Map<string, string>();
-  for (const entry of items) {
-    if (entry.item.kind === 'conductor-park' && entry.item.subject.kind === 'run') {
-      noticedAt.set(entry.item.subject.ref, entry.item.firstRaisedAtIso);
-    }
-  }
+  const noticedAt = parkNoticeIndex(items);
   const samples: Sample[] = [];
   for (const [runId, entries] of entriesByRun) {
     const firstRaisedAtIso = noticedAt.get(runId);
     if (firstRaisedAtIso === undefined) {
       continue;
     }
-    let parkAt: string | null = null;
-    for (const entry of entries) {
-      if (Date.parse(entry.recordedAtIso) < weekStartMs) {
-        continue;
-      }
-      if (entry.kind === 'conduct' && entry.state === 'parked') {
-        parkAt = entry.recordedAtIso;
-        break;
-      }
+    const parkAt = firstInWindowParkAt(entries, weekStartMs);
+    if (parkAt === null) {
+      continue;
     }
-    if (parkAt !== null) {
-      const ms = Date.parse(firstRaisedAtIso) - Date.parse(parkAt);
-      if (ms >= 0) {
-        samples.push({ ms });
-      }
+    const ms = nonNegativeIntervalMs(parkAt, firstRaisedAtIso);
+    if (ms !== null) {
+      samples.push({ ms });
     }
   }
   return samples;

@@ -267,4 +267,118 @@ describe('fleet-v2 report weekly', () => {
     expect(groupHelp.code).toBe(0);
     expect(groupHelp.stdout.join('')).toContain('report weekly');
   });
+
+  it('T7 admission wait skips ambiguous prepare results and drops negative intervals', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+
+    const runIdValid = 'run-01JB0000000000000000000003';
+    const runIdSkew = 'run-01JB0000000000000000000004';
+    await runtime.conductor.laneRunRepository.create(runRecord(runIdValid));
+    await runtime.conductor.laneRunRepository.create(runRecord(runIdSkew));
+
+    const nowMs = Date.now();
+    const prepareKeyValid = stepKey(runIdValid, 'prepare');
+    const dispatchKeyValid = stepKey(runIdValid, 'dispatch');
+
+    const ambiguousPrepareAt = new Date(nowMs - 2 * 60 * 60 * 1000);
+    const finalPrepareAt = new Date(nowMs - 60 * 60 * 1000);
+    const dispatchAt = new Date(nowMs - 40 * 60 * 1000);
+
+    await runtime.conductor.laneRunJournal.append(
+      laneRunIntentEntry(nextEntryId(), runIdValid, prepareKeyValid, ATTEMPT_ID, ambiguousPrepareAt.toISOString()),
+    );
+    await runtime.conductor.laneRunJournal.append(
+      laneRunResultEntry(nextEntryId(), runIdValid, prepareKeyValid, 'ambiguous', null, ambiguousPrepareAt.toISOString()),
+    );
+    await runtime.conductor.laneRunJournal.append(
+      laneRunResultEntry(nextEntryId(), runIdValid, prepareKeyValid, 'completed', 'prepared', finalPrepareAt.toISOString()),
+    );
+    await runtime.conductor.laneRunJournal.append(
+      laneRunIntentEntry(nextEntryId(), runIdValid, dispatchKeyValid, ATTEMPT_ID, dispatchAt.toISOString()),
+    );
+
+    const skewPrepareAt = new Date(nowMs - 30 * 60 * 1000);
+    const skewDispatchAt = new Date(skewPrepareAt.getTime() - 50 * 1000);
+    await seedAdmissionPair(runtime, runIdSkew, skewPrepareAt, skewDispatchAt);
+
+    const result = await runReport(runtime, ['weekly']);
+    expect(result.code).toBe(0);
+    const doc = parseDocument(result.stdout);
+    expect(doc.outcome).toBe('completed');
+    expect(doc.admissionWait).toEqual({ status: 'measured', p95Ms: 1200000, samples: 1 });
+  });
+
+  it('T8 park-to-notify uses first in-window parked conduct and drops negative intervals', async () => {
+    const stateDir = tempStateDir();
+    const runtime = createFleetCliRuntime({ stateDir });
+
+    const runIdValid = 'run-01JB0000000000000000000005';
+    const runIdSkew = 'run-01JB0000000000000000000006';
+    await runtime.conductor.laneRunRepository.create(runRecord(runIdValid));
+    await runtime.conductor.laneRunRepository.create(runRecord(runIdSkew));
+
+    await runtime.coordination.recordAttentionItem.recordAttentionItem(
+      {
+        projectId: 'example-project',
+        kind: 'conductor-park',
+        subject: { kind: 'work-order', ref: WO_ID },
+        workOrderId: WO_ID,
+        summary: `Work order park attention item.`,
+      },
+      'conductor',
+    );
+
+    const noticeValid = await runtime.coordination.recordAttentionItem.recordAttentionItem(
+      {
+        projectId: 'example-project',
+        kind: 'conductor-park',
+        subject: { kind: 'run', ref: runIdValid },
+        workOrderId: WO_ID,
+        summary: `The conductor parked ${runIdValid}.`,
+      },
+      'conductor',
+    );
+    expect(noticeValid.outcome).toBe('raised');
+    if (noticeValid.outcome !== 'raised') {
+      return;
+    }
+    const noticeValidRaisedAt = Date.parse(noticeValid.item.firstRaisedAtIso);
+
+    const firstParkAt = new Date(noticeValidRaisedAt - 300);
+    const secondParkAt = new Date(noticeValidRaisedAt - 100);
+    await runtime.conductor.laneRunJournal.append(
+      laneRunConductEntry(nextEntryId(), runIdValid, 'parked', firstParkAt.toISOString()),
+    );
+    await runtime.conductor.laneRunJournal.append(
+      laneRunConductEntry(nextEntryId(), runIdValid, 'parked', secondParkAt.toISOString()),
+    );
+
+    const noticeSkew = await runtime.coordination.recordAttentionItem.recordAttentionItem(
+      {
+        projectId: 'example-project',
+        kind: 'conductor-park',
+        subject: { kind: 'run', ref: runIdSkew },
+        workOrderId: WO_ID,
+        summary: `The conductor parked ${runIdSkew}.`,
+      },
+      'conductor',
+    );
+    expect(noticeSkew.outcome).toBe('raised');
+    if (noticeSkew.outcome !== 'raised') {
+      return;
+    }
+    const noticeSkewRaisedAt = Date.parse(noticeSkew.item.firstRaisedAtIso);
+
+    const skewParkAt = new Date(noticeSkewRaisedAt + 200);
+    await runtime.conductor.laneRunJournal.append(
+      laneRunConductEntry(nextEntryId(), runIdSkew, 'parked', skewParkAt.toISOString()),
+    );
+
+    const result = await runReport(runtime, ['weekly']);
+    expect(result.code).toBe(0);
+    const doc = parseDocument(result.stdout);
+    expect(doc.outcome).toBe('completed');
+    expect(doc.parkToNotify).toEqual({ status: 'measured', p95Ms: 300, samples: 1 });
+  });
 });

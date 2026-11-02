@@ -1019,6 +1019,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     installation: options?.installation,
     workOrderRepository,
     attemptRepository,
+    forgeRead,
     executionJournal,
     workspace,
     runnerForAttempt,

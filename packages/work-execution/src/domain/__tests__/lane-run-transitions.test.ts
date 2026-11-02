@@ -138,6 +138,14 @@ describe('LaneRun exits', () => {
     expect(canEnterLaneRunState('parked', 'stopped')).toBe(true);
   });
 
+  it('a settled open-pr park may enter watching-ci (R4a)', () => {
+    expect(canEnterLaneRunState('parked', 'watching-ci', 'opening-pr', true)).toBe(true);
+    expect(canEnterLaneRunState('parked', 'watching-ci', 'opening-pr')).toBe(false);
+    expect(canEnterLaneRunState('parked', 'gating', 'opening-pr', true)).toBe(false);
+    expect(canEnterLaneRunState('parked', 'opening-pr', 'opening-pr', true)).toBe(true);
+    expect(canEnterLaneRunState('parked', 'merged', 'opening-pr')).toBe(true);
+  });
+
   it('the owner-merge park enters merged by itself (CT-2a)', () => {
     expect(canEnterLaneRunState('parked', 'merged', 'merging')).toBe(true);
     expect(canEnterLaneRunState('parked', 'merged')).toBe(true);

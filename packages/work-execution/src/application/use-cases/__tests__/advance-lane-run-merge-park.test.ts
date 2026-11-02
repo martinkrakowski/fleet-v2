@@ -1237,8 +1237,10 @@ describe('AdvanceLaneRunUseCase park notice re-raise (KF-4)', () => {
     expect(harness.recordParkAttentionCalls).toHaveLength(2);
     expect(harness.recordParkAttentionCalls[1].key).toBe(RUN_ID + '/park@1');
     expect(harness.askParkQuestionCalls).toHaveLength(0);
-    // A park other than owner-merge reads no PR while parked (CT-2a).
-    expect(harness.forgeReadRequests).toHaveLength(1);
+    // R4a: a parked `branch-behind` park now also reads its PR by branch while
+    // parked (the facts read for the decider); it still never asks a question.
+    expect(harness.forgeReadRequests).toHaveLength(2);
+    expect(harness.forgeReadRequests[1]?.ref.kind).toBe('branch');
   });
 
   it('test 17: no parkNotice wired means no raise and the parked wait is unchanged', async () => {

@@ -323,7 +323,7 @@ export function implementerSeatOf(
       recorded.seatIndex < planResult.value.getSeats(role).length;
     return inPlan ? { ok: true, seatIndex: recorded.seatIndex } : { ok: false };
   }
-  if (sameFamily === undefined) {
+  if (planResult.value.getSeats('review').length > 0 && sameFamily === undefined) {
     return { ok: false };
   }
   const history = attemptRecords

@@ -677,10 +677,21 @@ describe('AdvanceLaneRunUseCase (K4-4a, record-only)', () => {
     expect(parked).toMatchObject({ outcome: 'parked', reason: 'seat-plan-exhausted' });
   });
 
-  it('G11a test 16: an unbound family comparator fails closed when recorded advance is absent', async () => {
-    const harness = await makeHarness(runRecord(), g11aAttempt({ state: 'cancelled' }));
+  it('G11a test 16: an unbound family comparator fails closed when recorded advance is absent and reviewer seats exist', async () => {
+    const withReview = {
+      ...SEAT_PLAN,
+      review: [{ id: 'rev-1', model: 'model-reviewer-1', tool: 'opencode' }],
+    };
+    const harness = await makeHarness(runRecord(), g11aAttempt({ state: 'cancelled', seatPlan: withReview }));
     await conduct(harness, 'seat-failed', NOW);
     const parked = await advance(harness);
     expect(parked).toMatchObject({ outcome: 'parked', reason: 'seat-plan-exhausted' });
+  });
+
+  it('G11a test 17: a cancelled attempt with no reviewer seats moves to the next seat without a family comparator', async () => {
+    const harness = await makeHarness(runRecord(), g11aAttempt({ state: 'cancelled' }));
+    await conduct(harness, 'seat-failed', NOW);
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared' });
   });
 });

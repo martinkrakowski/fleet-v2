@@ -1642,4 +1642,19 @@ describe('AdvanceLaneRunUseCase carried minors in the open-pr body (GB1)', () =>
     expect(body).toContain('- [minor] src/ex.ts:4');
     expect(body).not.toContain('src/bad.ts');
   });
+
+  it('a receipt carries a minor whose filePath is app/[id]/page.tsx: the PR still opens and its body omits the minor', async () => {
+    const harness = await openingPrHarness();
+    await seedBriefCheckResult(harness, 'review-passed', 'minor-only-findings');
+    wireReviewReceipt(harness, () => 'found', [
+      { findingId: 'f-1', severity: 'minor' as const, summary: 'bracket path', filePath: 'app/[id]/page.tsx', line: 12 },
+    ]);
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'acted', step: 'open-pr', key: openPrKey(), result: 'completed', reasonCode: 'pr-opened' });
+    expect(harness.forgeRequests).toHaveLength(1);
+    const body = harness.forgeRequests[0]!.body;
+    expect(body).toContain(CHALLENGE_THIS);
+    expect(body).not.toContain('app/[id]/page.tsx');
+    expect(body).not.toContain('- [minor]');
+  });
 });

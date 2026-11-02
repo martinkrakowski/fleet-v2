@@ -785,6 +785,21 @@ async function runPrPushBody(
       frozen,
       ...(carriedMinors.length > 0 ? { carriedMinors } : {}),
     });
+    // Carried minors are display only and must never block an open-pr:
+    // when the render with carried minors is not ok, render again without
+    // carriedMinors and refuse only if that second render also fails.
+    if (frozen !== null && carriedMinors.length > 0 && (rendered === null || !rendered.ok)) {
+      rendered = renderPrBody({
+        workOrderId: record.workOrderId,
+        title,
+        tier: record.tier,
+        runId: record.runId,
+        rounds: record.round,
+        gate: 'passed',
+        reviews: [],
+        frozen,
+      });
+    }
     if (rendered === null || !rendered.ok) {
       return refuseKeyed(ctx, request, decision, 'forge-refused', baseBranch);
     }

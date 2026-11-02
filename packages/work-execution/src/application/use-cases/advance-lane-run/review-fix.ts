@@ -307,22 +307,6 @@ function minorOnlyOverrideOf(
 }
 
 /**
- * GB1: the reconcile's answer mapping with the minors-only brief-check
- * override applied. The detail stays null unless the override applies, so the
- * fixed token only ever marks a minors-only override receipt.
- */
-function reconciledReviewOf(
-  step: ReviewKind,
-  receipt: { readonly verdict: ReviewVerdict; readonly findings: readonly ReviewRequestFinding[] },
-  mapped: { readonly result: 'completed'; readonly reasonCode: LaneRunResultReasonCode },
-): { readonly result: 'completed'; readonly reasonCode: LaneRunResultReasonCode; readonly detail: string | null } {
-  if (mapped.reasonCode === 'review-failed' && step === 'brief-check' && isMinorOnlyBriefCheckReceipt(step, receipt)) {
-    return { ...MINOR_ONLY_OVERRIDE };
-  }
-  return { ...mapped, detail: null };
-}
-
-/**
  * KF-33b2: a failed receipt with findings is checked against the lane's
  * changed set before it fails the run. An unknown changed set or no
  * out-of-scope finding leaves the mapping unchanged. With out-of-scope
@@ -529,9 +513,10 @@ export async function reconcileReview(
   if (latest === null || latest.artifacts === null) {
     return { outcome: 'waiting', reason: 'facts-inconsistent' };
   }
+  const head = latest.artifacts.headCommit;
   // The review key's head must be the latest attempt's collected head; else the facts are inconsistent.
   const parsed = parseLaneRunKey(decision.key);
-  if (parsed === null || parsed.kind !== 'step' || parsed.head12 !== head12Of(latest.artifacts.headCommit)) {
+  if (parsed === null || parsed.kind !== 'step' || parsed.head12 !== head12Of(head)) {
     return { outcome: 'waiting', reason: 'facts-inconsistent' };
   }
   const requestId = await intentMintedIdOf(ctx, decision.key);
@@ -547,21 +532,28 @@ export async function reconcileReview(
     found = await ctx.deps.reviewRequest.findReviewReceipt({
       attemptId: latest.id,
       requestId,
-      candidateHeadSha: latest.artifacts.headCommit,
+      candidateHeadSha: head,
     });
   } catch {
     found = { outcome: 'unavailable', reason: 'unreadable' };
   }
   if (found.outcome === 'found') {
-    const mapped = reviewResultOfVerdict(found.receipt.verdict);
-    // GB1: a minors-only failed brief-check receipt reconciles review-passed
-    // with the fixed detail, before the result entry is appended.
-    const resolved = reconciledReviewOf(parsed.step as ReviewKind, found.receipt, mapped);
-    const resultRefusal = await appendRunResult(ctx, request, decision.key, resolved.result, resolved.reasonCode, resolved.detail);
+    const outcome: ReviewRequestResult = { outcome: 'receipt', receipt: found.receipt };
+    const mapped = reviewResultOf(outcome)!;
+    // KF-33b2: a failed receipt with findings is scoped before it fails the
+    // run; everything else keeps its plain mapping.
+    const resolved =
+      found.receipt.verdict === 'failed' && found.receipt.findings.length > 0
+        ? await reviewScopeDispositionOf(ctx, gathered, latest, head, found.receipt.findings, mapped)
+        : mapped;
+    // GB1: after the scope disposition, a still-failed minors-only brief-check
+    // receipt journals `review-passed` with the fixed detail instead.
+    const override = minorOnlyOverrideOf(parsed.step as ReviewKind, outcome, resolved);
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, override.result, override.reasonCode, override.detail);
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
-    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode: resolved.reasonCode };
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode: override.reasonCode };
   }
   const ambiguous = found.outcome === 'unavailable';
   const reasonCode = ambiguous ? 'review-unknown' : 'review-no-receipt';

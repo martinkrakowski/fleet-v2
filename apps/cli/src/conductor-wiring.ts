@@ -194,6 +194,7 @@ export function buildLiveConductorDriver(
     perLaneCostCeiling: runtime.installation?.policy?.perLaneCostCeiling,
     dispatchAttempt: execution.dispatchAttempt,
     cancelPreparedAttempt,
+    worktreeRecovery: execution.workspace,
     installationSchemaVersion: runtime.installation?.schemaVersion,
     stopAttempt: execution.stopAttempt,
     collectAttemptArtifacts: execution.collectAttemptArtifacts,

@@ -47,6 +47,7 @@ import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.o
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
+import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
 import type { AttemptArtifactPort } from '../ports/out/AttemptArtifactPort.out-port.js';
 import type { ReconcileAttemptPort } from '../ports/in/ReconcileAttemptPort.in-port.js';
 import type { DispatchAttemptPort } from '../ports/in/DispatchAttemptPort.in-port.js';
@@ -104,7 +105,15 @@ export interface AdvanceLaneRunDependencies {
   readonly runRepo: LaneRunRepositoryPort;
   readonly runJournal: LaneRunJournalPort;
   readonly attemptRepo: AttemptRepositoryPort;
-  readonly executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJournalEntriesForAttempt'>;
+  readonly executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJournalEntriesForAttempt'> &
+    {
+      /**
+       * GB3: the recovery intent and its completing entry are journaled through
+       * this method. Absent (a fake without it), recovery is unwired and keeps
+       * today's park.
+       */
+      readonly appendJournalEntry?: ExecutionJournalPort['appendJournalEntry'];
+    };
   readonly artifactPort: Pick<AttemptArtifactPort, 'readBriefManifest' | 'verifyArtifactManifest' | 'readBriefFile' | 'readChangedPaths'>;
   /**
    * Digest used to verify a prior attempt's frozen brief prose against its
@@ -124,6 +133,12 @@ export interface AdvanceLaneRunDependencies {
   readonly dispatchAttempt?: DispatchAttemptPort;
   /** The record-only cancel of a never-dispatched attempt (K4-1, K4-5); absent → `not-wired stop`. */
   readonly cancelPreparedAttempt?: CancelPreparedAttemptPort;
+  /**
+   * GB3: preserve a refused dispatch's uncommitted worktree edits as a patch
+   * outside the worktree and reset the worktree to its head; absent → today's
+   * park (the recovery is never attempted).
+   */
+  readonly worktreeRecovery?: Pick<WorkspacePort, 'preserveWorktreeEdits' | 'resetWorktreeToHead'>;
   /** Stop a running attempt (K4-6); absent → `not-wired stop`. */
   readonly stopAttempt?: StopAttemptPort;
   /** Collect an ended attempt's artifacts (K4-6); absent → `not-wired collect`. */

@@ -145,7 +145,14 @@ export class ImportLanePlanUseCase implements ImportLanePlanPort {
     }
     const sidecar = validated.sidecar;
     const { projectId, planId } = sidecar;
-    const stored = await this.deps.lanePlanRepo.findLanePlan(projectId, planId);
+
+    let stored: LanePlanRecord | null;
+    try {
+      stored = await this.deps.lanePlanRepo.findLanePlan(projectId, planId);
+    } catch {
+      return refusal('store', 'the store could not be read');
+    }
+
     const digest = this.deps.computeDigest(sidecar);
 
     const revisionCheck = checkRevision(sidecar, stored, digest);
@@ -161,17 +168,30 @@ export class ImportLanePlanUseCase implements ImportLanePlanPort {
       return candidate.result;
     }
 
-    const cycle = await this.findCycle(candidate.record);
-    if (cycle !== null) {
-      return refusal('plan-cycle', formatLanePlanCycle(cycle));
-    }
+    return this.persistCandidate(candidate.record, digest);
+  }
 
+  private async persistCandidate(
+    candidate: LanePlanRecord,
+    digest: string,
+  ): Promise<ImportLanePlanResult> {
     try {
-      await this.deps.lanePlanRepo.saveLanePlan(candidate.record);
+      if (typeof this.deps.lanePlanRepo.saveLanePlanIfAcyclic === 'function') {
+        const saveResult = await this.deps.lanePlanRepo.saveLanePlanIfAcyclic(candidate);
+        if (saveResult.outcome === 'cycle') {
+          return refusal('plan-cycle', formatLanePlanCycle(saveResult.cycle));
+        }
+      } else {
+        const cycle = await this.findCycle(candidate);
+        if (cycle !== null) {
+          return refusal('plan-cycle', formatLanePlanCycle(cycle));
+        }
+        await this.deps.lanePlanRepo.saveLanePlan(candidate);
+      }
     } catch {
       return refusal('store', 'the store refused the save');
     }
-    return { outcome: 'imported', plan: candidate.record, digest };
+    return { outcome: 'imported', plan: candidate, digest };
   }
 
   /** Every stored plan plus the incoming candidate record, excluding the stored self being replaced. */

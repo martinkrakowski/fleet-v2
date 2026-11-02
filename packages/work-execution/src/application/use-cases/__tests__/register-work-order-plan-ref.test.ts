@@ -7,7 +7,10 @@ import { describe, expect, it } from 'vitest';
 
 import type { WorkOrderRecord } from '../../../domain/execution-records.js';
 import type { LanePlanRecord } from '../../../domain/lane-plan-records.js';
-import type { LanePlanRepositoryPort } from '../../ports/out/LanePlanRepositoryPort.out-port.js';
+import type {
+  LanePlanRepositoryPort,
+  SaveLanePlanResult,
+} from '../../ports/out/LanePlanRepositoryPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../../ports/out/WorkOrderRepositoryPort.out-port.js';
 import { RegisterWorkOrderUseCase } from '../RegisterWorkOrderUseCase.use-case.js';
 
@@ -35,6 +38,10 @@ class FakeLanePlanRepo implements LanePlanRepositoryPort {
   }
 
   async saveLanePlan(): Promise<void> {
+    throw new Error('not used');
+  }
+
+  async saveLanePlanIfAcyclic(): Promise<SaveLanePlanResult> {
     throw new Error('not used');
   }
 
@@ -178,5 +185,24 @@ describe('RegisterWorkOrderUseCase plan link', () => {
     if (result.outcome === 'registered') {
       expect(result.workOrder.planRef).toBeUndefined();
     }
+  });
+
+  it('rejects a non-string or padded planProjectId as plan-project-mismatch, writing nothing', async () => {
+    const workOrderRepo = new FakeWorkOrderRepo();
+    const useCase = new RegisterWorkOrderUseCase({ workOrderRepo });
+
+    const nonString = await useCase.execute({
+      ...validRequest({ planId: 'plan-1', planLaneId: 'L1' }),
+      planProjectId: 7,
+    });
+    expect(nonString.outcome).toBe('rejected');
+    expect(nonString.outcome === 'rejected' ? nonString.reason : '').toBe('plan-project-mismatch');
+
+    const padded = await useCase.registerWorkOrder(
+      validRequest({ planId: 'plan-1', planLaneId: 'L1', planProjectId: ' proj-1 ' }),
+    );
+    expect(padded.outcome).toBe('rejected');
+    expect(padded.outcome === 'rejected' ? padded.reason : '').toBe('plan-project-mismatch');
+    expect(workOrderRepo.orders.size).toBe(0);
   });
 });

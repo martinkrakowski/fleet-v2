@@ -17,10 +17,14 @@
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
-import type { LanePlanRecord } from '../../domain/lane-plan-records.js';
+import type { LanePlanRecord, PlannedLaneRef } from '../../domain/lane-plan-records.js';
 import { LANE_PLAN_RECORD_VERSION } from '../../domain/lane-plan-records.js';
 import { LanePlan } from '../../domain/entities/LanePlan.js';
-import type { LanePlanRepositoryPort } from '../../application/ports/out/LanePlanRepositoryPort.out-port.js';
+import { findLanePlanCycle, type LanePlanGraphPlan } from '../../domain/lane-plan-graph.js';
+import type {
+  LanePlanRepositoryPort,
+  SaveLanePlanResult,
+} from '../../application/ports/out/LanePlanRepositoryPort.out-port.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
 import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
 import {
@@ -91,6 +95,35 @@ export function parseLanePlanStateRecord(raw: unknown): LanePlanRecord | undefin
   return parsed.status === 'ok' ? parsed.record : undefined;
 }
 
+/** The graph plan of a stored record: stored lanes carry their aliases. */
+function lanePlanGraphPlanFromRecord(record: LanePlanRecord): LanePlanGraphPlan {
+  return {
+    projectId: record.projectId,
+    planId: record.planId,
+    lanes: record.lanes.map((lane) => ({
+      laneId: lane.laneId,
+      aliases: lane.aliases,
+      after: lane.after,
+    })),
+    exclusiveOrder: record.exclusiveOrder,
+  };
+}
+
+function findCycleAcrossPlans(
+  records: Iterable<LanePlanRecord>,
+  candidate: LanePlanRecord,
+): readonly PlannedLaneRef[] | null {
+  const plans: LanePlanGraphPlan[] = [];
+  for (const storedPlan of records) {
+    if (storedPlan.projectId === candidate.projectId && storedPlan.planId === candidate.planId) {
+      continue;
+    }
+    plans.push(lanePlanGraphPlanFromRecord(storedPlan));
+  }
+  plans.push(lanePlanGraphPlanFromRecord(candidate));
+  return findLanePlanCycle(plans);
+}
+
 export class LanePlanRepositoryAdapter implements LanePlanRepositoryPort {
   private readonly inMemoryRecords = new Map<string, LanePlanRecord>();
   private readonly changeSignal: ChangeSignalPort;
@@ -112,42 +145,75 @@ export class LanePlanRepositoryAdapter implements LanePlanRepositoryPort {
     }
   }
 
-  async saveLanePlan(record: LanePlanRecord): Promise<void> {
-    assertStoreWritable(this.options?.readOnly === true, 'LanePlanRepositoryAdapter');
-    const stateDir = this.options?.stateDir;
-    const key = `${record.projectId}/${record.planId}`;
-    const throwStale = (existing: LanePlanRecord): never => {
-      throw new Error(
-        `Stale lane plan revision for ${key}: expected > ${existing.revision}, got ${record.revision}`,
-      );
-    };
-    if (stateDir === undefined) {
-      const existing = this.inMemoryRecords.get(key);
-      if (existing !== undefined && existing.revision >= record.revision) {
-        throwStale(existing);
-      }
-      this.inMemoryRecords.set(key, record);
-      this.signal({ kind: 'plan', id: key, stateFile: null, before: null, written: null });
-      return;
-    }
+  private throwStaleRevision(key: string, existingRevision: number, newRevision: number): never {
+    throw new Error(
+      `Stale lane plan revision for ${key}: expected > ${existingRevision}, got ${newRevision}`,
+    );
+  }
 
+  private async safeStat(target: string): Promise<ChangeSignal['before']> {
+    try {
+      const stat = await fs.stat(target);
+      return { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+    } catch {
+      return null;
+    }
+  }
+
+  async saveLanePlan(record: LanePlanRecord): Promise<void> {
+    const result = await this.saveLanePlanIfAcyclic(record);
+    if (result.outcome === 'cycle') {
+      throw new Error(`Lane plan cycle detected for ${record.projectId}/${record.planId}`);
+    }
+  }
+
+  async saveLanePlanIfAcyclic(record: LanePlanRecord): Promise<SaveLanePlanResult> {
+    assertStoreWritable(this.options?.readOnly === true, 'LanePlanRepositoryAdapter');
+    const key = `${record.projectId}/${record.planId}`;
+    const stateDir = this.options?.stateDir;
+    if (stateDir === undefined) {
+      return this.saveInMemoryIfAcyclic(record, key);
+    }
+    return this.saveFileIfAcyclic(record, key, stateDir);
+  }
+
+  private saveInMemoryIfAcyclic(record: LanePlanRecord, key: string): SaveLanePlanResult {
+    const existing = this.inMemoryRecords.get(key);
+    if (existing !== undefined && existing.revision >= record.revision) {
+      this.throwStaleRevision(key, existing.revision, record.revision);
+    }
+    const cycle = findCycleAcrossPlans(this.inMemoryRecords.values(), record);
+    if (cycle !== null) {
+      return { outcome: 'cycle', cycle };
+    }
+    this.inMemoryRecords.set(key, record);
+    this.signal({ kind: 'plan', id: key, stateFile: null, before: null, written: null });
+    return { outcome: 'saved' };
+  }
+
+  private async saveFileIfAcyclic(
+    record: LanePlanRecord,
+    key: string,
+    stateDir: string,
+  ): Promise<SaveLanePlanResult> {
     const target = path.join(stateDir, 'lane-plans.json');
     const lockPath = path.join(stateDir, 'lane-plans.json.lock');
 
     let before: ChangeSignal['before'] = null;
     let written: ChangeSignal['written'] = null;
+    let cycleResult: readonly PlannedLaneRef[] | null = null;
 
     await withFileLock(lockPath, async () => {
-      try {
-        const stat = await fs.stat(target);
-        before = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
-      } catch {
-        before = null;
-      }
+      before = await this.safeStat(target);
       const records = await this.readRecordsFromDisk(target);
       const existing = records.get(key);
       if (existing !== undefined && existing.revision >= record.revision) {
-        throwStale(existing);
+        this.throwStaleRevision(key, existing.revision, record.revision);
+      }
+      const cycle = findCycleAcrossPlans(records.values(), record);
+      if (cycle !== null) {
+        cycleResult = cycle;
+        return;
       }
       records.set(key, record);
       const payload = [...records.values()].map((r) => ({
@@ -155,13 +221,12 @@ export class LanePlanRepositoryAdapter implements LanePlanRepositoryPort {
         schemaVersion: LANE_PLAN_STORE_VERSION_POLICY.writerVersion,
       }));
       await writeJsonAtomically(target, payload);
-      try {
-        const stat = await fs.stat(target);
-        written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
-      } catch {
-        written = null;
-      }
+      written = await this.safeStat(target);
     });
+
+    if (cycleResult !== null) {
+      return { outcome: 'cycle', cycle: cycleResult };
+    }
 
     this.signal({
       kind: 'plan',
@@ -170,6 +235,7 @@ export class LanePlanRepositoryAdapter implements LanePlanRepositoryPort {
       before,
       written,
     });
+    return { outcome: 'saved' };
   }
 
   async findLanePlan(projectId: string, planId: string): Promise<LanePlanRecord | null> {

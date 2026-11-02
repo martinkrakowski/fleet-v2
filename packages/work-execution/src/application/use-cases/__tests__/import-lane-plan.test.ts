@@ -13,11 +13,28 @@ import type {
   PlannedLaneRecord,
 } from '../../../domain/lane-plan-records.js';
 import { canonicalLanePlanSidecarJson } from '../../../domain/lane-plan-sidecar.js';
-import type { LanePlanRepositoryPort } from '../../ports/out/LanePlanRepositoryPort.out-port.js';
+import { findLanePlanCycle, type LanePlanGraphPlan } from '../../../domain/lane-plan-graph.js';
+import type {
+  LanePlanRepositoryPort,
+  SaveLanePlanResult,
+} from '../../ports/out/LanePlanRepositoryPort.out-port.js';
 import {
   ImportLanePlanUseCase,
   type ImportLanePlanDependencies,
 } from '../ImportLanePlanUseCase.use-case.js';
+
+function lanePlanGraphPlanFromRecord(record: LanePlanRecord): LanePlanGraphPlan {
+  return {
+    projectId: record.projectId,
+    planId: record.planId,
+    lanes: record.lanes.map((l) => ({
+      laneId: l.laneId,
+      aliases: l.aliases,
+      after: l.after,
+    })),
+    exclusiveOrder: record.exclusiveOrder,
+  };
+}
 
 class FakeLanePlanRepo implements LanePlanRepositoryPort {
   readonly store = new Map<string, LanePlanRecord>();
@@ -32,6 +49,23 @@ class FakeLanePlanRepo implements LanePlanRepositoryPort {
   async saveLanePlan(record: LanePlanRecord): Promise<void> {
     this.saved.push(record);
     this.store.set(`${record.projectId}/${record.planId}`, record);
+  }
+
+  async saveLanePlanIfAcyclic(record: LanePlanRecord): Promise<SaveLanePlanResult> {
+    const plans: LanePlanGraphPlan[] = [];
+    for (const storedPlan of this.store.values()) {
+      if (storedPlan.projectId === record.projectId && storedPlan.planId === record.planId) {
+        continue;
+      }
+      plans.push(lanePlanGraphPlanFromRecord(storedPlan));
+    }
+    plans.push(lanePlanGraphPlanFromRecord(record));
+    const cycle = findLanePlanCycle(plans);
+    if (cycle !== null) {
+      return { outcome: 'cycle', cycle };
+    }
+    await this.saveLanePlan(record);
+    return { outcome: 'saved' };
   }
 
   async findLanePlan(projectId: string, planId: string): Promise<LanePlanRecord | null> {
@@ -425,6 +459,54 @@ describe('ImportLanePlanUseCase', () => {
     expect(nowIso).toHaveBeenCalledTimes(1);
     if (result.outcome === 'imported') {
       expect(result.plan.importedAtIso).toBe('2026-10-26T00:00:00.000Z');
+    }
+  });
+
+  it('concurrently importing two mutually dependent plans results in exactly one succeeding', async () => {
+    const { repo, useCase } = makeHarness();
+    const incomingA = sidecar({
+      planId: 'plan-A',
+      lanes: [lane('L1', { after: ['plan-B/L1'] })],
+    });
+    const incomingB = sidecar({
+      planId: 'plan-B',
+      lanes: [lane('L1', { after: ['plan-A/L1'] })],
+    });
+
+    const [resA, resB] = await Promise.all([
+      useCase.importLanePlan({ sidecar: incomingA, requestedProjectId: 'proj-1' }),
+      useCase.importLanePlan({ sidecar: incomingB, requestedProjectId: 'proj-1' }),
+    ]);
+
+    const outcomes = [resA.outcome, resB.outcome];
+    expect(outcomes).toContain('imported');
+    expect(outcomes).toContain('refused');
+
+    const refused = resA.outcome === 'refused' ? resA : resB;
+    if (refused.outcome === 'refused') {
+      expect(refused.code).toBe('plan-cycle');
+      expect(refused.reason).toContain('plan-A/L1');
+      expect(refused.reason).toContain('plan-B/L1');
+    }
+
+    expect(repo.saved).toHaveLength(1);
+    expect(repo.store.size).toBe(1);
+  });
+
+  it('returns a store refusal when findLanePlan throws on store read failure', async () => {
+    const repo = new FakeLanePlanRepo();
+    repo.findLanePlan = async () => {
+      throw new Error('unreadable store file');
+    };
+    const { useCase } = makeHarness({ lanePlanRepo: repo });
+    const result = await useCase.importLanePlan({
+      sidecar: sidecar(),
+      requestedProjectId: 'proj-1',
+    });
+    expect(result.outcome).toBe('refused');
+    if (result.outcome === 'refused') {
+      expect(result.code).toBe('store');
+      expect(result.reason).toBe('the store could not be read');
     }
   });
 });

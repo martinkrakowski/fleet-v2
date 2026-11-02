@@ -270,16 +270,23 @@ export class RegisterWorkOrderUseCase implements RegisterWorkOrderPort {
     | { readonly ok: true; readonly planRef?: PlanRef }
     | { readonly ok: false; readonly reason: string }
   > {
-    if (request.planId === undefined && request.planLaneId === undefined) {
+    if (
+      request.planId === undefined &&
+      request.planLaneId === undefined &&
+      request.planProjectId === undefined
+    ) {
       return { ok: true };
+    }
+    if (
+      request.planProjectId !== undefined &&
+      (typeof request.planProjectId !== 'string' || request.planProjectId !== projectId)
+    ) {
+      return { ok: false, reason: 'plan-project-mismatch' };
     }
     const planId = typeof request.planId === 'string' ? request.planId.trim() : '';
     const laneId = typeof request.planLaneId === 'string' ? request.planLaneId.trim() : '';
     if (planId === '' || laneId === '') {
       return { ok: false, reason: 'plan-ref-incomplete' };
-    }
-    if (request.planProjectId !== undefined && request.planProjectId.trim() !== projectId) {
-      return { ok: false, reason: 'plan-project-mismatch' };
     }
     const lanePlanRepo = this.deps?.lanePlanRepo;
     if (lanePlanRepo !== undefined) {

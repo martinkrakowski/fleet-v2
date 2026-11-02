@@ -285,8 +285,8 @@ describe('merge commands (DT4)', () => {
       entries: Array<{ entryId: string; state: string }>;
       heads: Array<{ repository: { owner: string; repo: string }; headEntryId: string | null }>;
     };
-    expect(view.entries.map((entry) => entry.entryId)).toEqual([ulid(3)]);
+    expect(view.entries.map((entry) => entry.entryId)).toEqual([ulid(4)]);
     expect(view.entries.some((entry) => entry.state === 'superseded')).toBe(false);
-    expect(view.heads[0]?.headEntryId).toBe(ulid(3));
+    expect(view.heads[0]?.headEntryId).toBe(ulid(4));
   });
 });

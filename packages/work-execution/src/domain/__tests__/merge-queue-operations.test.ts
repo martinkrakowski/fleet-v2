@@ -180,6 +180,38 @@ describe('decideMergeEnqueue', () => {
       expectAllValid(second.entries);
     }
   });
+
+  it('uses successorEntryId on supersede avoiding collision when entryId matches a terminal record', () => {
+    const terminalRecord = makeEntry({ state: 'dropped', reason: 'operator-dropped' });
+    const liveRecord = makeEntry({ headOid: HEAD_A });
+    const successorId = nextEntryId();
+
+    const decision = decideMergeEnqueue(
+      [terminalRecord, liveRecord],
+      input({
+        entryId: terminalRecord.entryId,
+        successorEntryId: successorId,
+        headOid: HEAD_B,
+      }),
+    );
+
+    expect(decision.outcome).toBe('supersedes');
+    if (decision.outcome === 'supersedes') {
+      expect(decision.record.entryId).toBe(successorId);
+      expect(decision.record.entryId).not.toBe(terminalRecord.entryId);
+      const recordsWithTerminalId = decision.entries.filter(
+        (entry) => entry.entryId === terminalRecord.entryId,
+      );
+      expect(recordsWithTerminalId).toHaveLength(1);
+      expect(recordsWithTerminalId[0].state).toBe('dropped');
+      const recordsWithSuccessorId = decision.entries.filter(
+        (entry) => entry.entryId === successorId,
+      );
+      expect(recordsWithSuccessorId).toHaveLength(1);
+      expect(recordsWithSuccessorId[0].state).toBe('queued');
+      expectAllValid(decision.entries);
+    }
+  });
 });
 
 describe('decideMergeDrop', () => {

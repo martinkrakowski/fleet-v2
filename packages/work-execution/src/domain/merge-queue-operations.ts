@@ -130,7 +130,7 @@ function buildCreatedRecord(input: MergeEnqueueInput, supersedes: string | null)
 function buildSuccessorRecord(predecessor: MergeQueueEntryRecord, input: MergeEnqueueInput): MergeQueueEntryRecord {
   return {
     version: MERGE_QUEUE_ENTRY_VERSION,
-    entryId: input.entryId as string,
+    entryId: input.successorEntryId as string,
     repository: predecessor.repository,
     repoDigest: predecessor.repoDigest,
     pullRequest: predecessor.pullRequest,

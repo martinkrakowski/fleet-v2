@@ -276,6 +276,11 @@ export interface DoctorCliOptions {
   /** Probe implementation; the node probes compose one when omitted. */
   readonly probes?: DoctorProbes;
   /**
+   * Candidate absolute paths probed for the reviewed `gh` binary when
+   * node probes are composed (tests only).
+   */
+  readonly ghBinaryCandidates?: readonly string[];
+  /**
    * Argv executor for `doctor --host` (the host probe subset and the
    * leftover-forward check); the node doctor executor composes when omitted.
    */
@@ -537,7 +542,13 @@ export async function doctorCommand(
     const executor = options.hostProbeExecutor ?? createNodeDoctorExecutor();
     return doctorHostCommand(host, loadResult, io, json, executor);
   }
-  const probes = options.probes ?? createNodeDoctorProbes();
+  const probes =
+    options.probes ??
+    createNodeDoctorProbes(
+      options.ghBinaryCandidates !== undefined
+        ? { ghBinaryCandidates: options.ghBinaryCandidates }
+        : undefined,
+    );
   const lines: DoctorLine[] = [];
   for await (const doctorLine of runDoctor(loadResult, probes, {
     probeSeats,

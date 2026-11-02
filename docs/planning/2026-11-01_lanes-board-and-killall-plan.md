@@ -183,6 +183,8 @@ The audit keeps the proposed order. Slice 2 is the thin path: the board tolerate
 
 ## 10. New decisions for the owner
 
+**Decided (owner, 2026-11-02: "Proceed with your recommendations"):** D-KA7, D-KA8, D-KA9 and D-LB4 are accepted as the defaults below. D-KA9 needs a notification path on the orchestrator host, which does not exist yet: until it does, the report goes to the owner in the session and the gap stays open.
+
 | Id | Question | Default |
 |---|---|---|
 | D-KA1 | Separate `halt` scope, beyond `operate`? | Yes: it can halt and nothing else |

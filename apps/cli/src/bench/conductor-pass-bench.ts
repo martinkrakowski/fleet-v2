@@ -124,7 +124,7 @@ export async function seedRuns(stateDir: string, n: number): Promise<void> {
       kind: 'initial',
       fixNumber: 0,
       priorAttemptId: null,
-      worktreePath: '/tmp/fleet-bench/wt/' + runId,
+      worktreePath: '/srv/fleet-bench/wt/' + runId,
       baseCommit: 'a'.repeat(40),
       state: 'intent-recorded',
       outcome: null,

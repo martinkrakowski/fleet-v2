@@ -46,6 +46,7 @@ import { projectsCommand, type ProjectsCliOptions } from './projects.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
 import { conductorCommand, type ConductorCliOptions } from './conductor.js';
 import { telemetryCommand, type TelemetryCliOptions } from './telemetry.js';
+import { killallCommand, type KillallCliOptions } from './commands/killall.js';
 import {
   CliUsageError,
   NON_ZERO_OUTCOMES,
@@ -649,6 +650,10 @@ The telemetry group exports run telemetry spans (a run, a work order or a
 time window) to the collector route, or prints them with a dry run, and shows
 the configuration status. Run 'fleet-v2 telemetry --help'.
 
+The killall group stops every running lane, pauses the merge train and sets the
+killall halt marker; --lift clears the pause then the marker. Run
+'fleet-v2 killall --help'.
+
 Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
@@ -660,6 +665,7 @@ Commands:
   state check|restore
   conductor status|halt|stop|resume|start|run
   telemetry export|status
+  killall [--lift]
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared
@@ -700,6 +706,7 @@ export async function runCli(
   conductorOptions?: ConductorCliOptions,
   policyOptions?: PolicyCliOptions,
   telemetryOptions?: TelemetryCliOptions,
+  killallOptions?: KillallCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -781,6 +788,12 @@ export async function runCli(
     }
     if (group === 'telemetry') {
       return await telemetryCommand(restArgv.slice(1), io, activeRuntime, telemetryOptions ?? {});
+    }
+    if (group === 'killall') {
+      return await killallCommand(restArgv.slice(1), io, {
+        ...killallOptions,
+        stateDir: killallOptions?.stateDir ?? stateDir,
+      });
     }
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);

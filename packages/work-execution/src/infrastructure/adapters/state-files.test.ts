@@ -15,6 +15,8 @@ import {
 import { parseConductorPassTraceStateRecord } from '../../domain/conductor-pass-trace.js';
 import { parseConductorHaltStateRecord } from './ConductorHaltAdapter.adapter.js';
 import { ConductorPassTraceAdapter } from './ConductorPassTraceAdapter.adapter.js';
+import { KillallHaltMarkerAdapter, parseKillallHaltMarkerStateRecord } from './KillallHaltMarkerAdapter.adapter.js';
+import { KillallTrainPauseAdapter, parseKillallTrainPauseStateRecord } from './KillallTrainPauseAdapter.adapter.js';
 import { WORK_EXECUTION_STATE_FILES } from './state-files.js';
 import { WorkOrderRepositoryAdapter, parseWorkOrderStateRecord } from './WorkOrderRepositoryAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from './AttemptRepositoryAdapter.adapter.js';
@@ -194,6 +196,14 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       attention: [],
     },
   ],
+  'killall-halt.json': [
+    { version: 1, halted: true, changedAtIso: '2026-10-27T10:00:00.000Z' },
+    { version: 1, halted: false, changedAtIso: '2026-10-27T10:01:00.000Z' },
+  ],
+  'killall-train-pause.json': [
+    { version: 1, paused: true, requestedAtIso: '2026-10-27T10:00:00.000Z' },
+    { version: 1, paused: false, requestedAtIso: '2026-10-27T10:01:00.000Z' },
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -243,6 +253,30 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
       return quarantineUnreadable(target, inspection.detail, buffer);
     }
     return new ConductorPassTraceAdapter({ stateDir }).list();
+  },
+  'killall-halt.json': async (stateDir) => {
+    // The killall halt port's `read()` never throws for an unreadable marker
+    // (it reads `unreadable`), so this observes the same inspection the
+    // adapter performs, which quarantines and throws the matching detail.
+    const target = path.join(stateDir, 'killall-halt.json');
+    const buffer = await fs.readFile(target);
+    const inspection = inspectRecordListBytes(buffer, parseKillallHaltMarkerStateRecord);
+    if (inspection.status === 'unreadable') {
+      return quarantineUnreadable(target, inspection.detail, buffer);
+    }
+    return new KillallHaltMarkerAdapter({ stateDir }).read();
+  },
+  'killall-train-pause.json': async (stateDir) => {
+    // The train-pause port's `read()` never throws for an unreadable store
+    // (it reads `unreadable`), so this observes the same inspection the
+    // adapter performs, which quarantines and throws the matching detail.
+    const target = path.join(stateDir, 'killall-train-pause.json');
+    const buffer = await fs.readFile(target);
+    const inspection = inspectRecordListBytes(buffer, parseKillallTrainPauseStateRecord);
+    if (inspection.status === 'unreadable') {
+      return quarantineUnreadable(target, inspection.detail, buffer);
+    }
+    return new KillallTrainPauseAdapter({ stateDir }).read();
   },
 };
 
@@ -348,6 +382,8 @@ describe('work-execution state file descriptors match the store readers', () => 
       'run-journal.json',
       'telemetry-dispositions.json',
       'conductor-passes.json',
+      'killall-halt.json',
+      'killall-train-pause.json',
     ]);
   });
 });

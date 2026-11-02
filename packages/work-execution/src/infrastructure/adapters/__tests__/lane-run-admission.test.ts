@@ -1096,6 +1096,10 @@ describe('laneRunOwnedPathsOverlap (KS5)', () => {
   it('fails closed when either side has no usable root and no package key', () => {
     expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['..'] }, { ...sameRepo, ownedPaths: ['packages/a/src'] })).toBe(true);
     expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['..'] }, { ...sameRepo, ownedPaths: ['..'] })).toBe(true);
+    for (const dotted of ['packages/..', './packages/b', 'packages/../apps', 'packages/.']) {
+      expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: [dotted] }, { ...sameRepo, ownedPaths: ['packages/a/src'] })).toBe(true);
+      expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: ['apps/z', dotted] }, { ...sameRepo, ownedPaths: ['packages/a/src'] })).toBe(true);
+    }
     expect(laneRunOwnedPathsOverlap({ ...sameRepo, ownedPaths: [] }, { ...sameRepo, ownedPaths: ['packages/a/src'] })).toBe(true);
   });
 });

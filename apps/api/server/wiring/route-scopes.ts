@@ -69,6 +69,7 @@ const MUTATION_ROUTE_RULES: ReadonlyArray<readonly [string, string, string]> = [
   ["POST", "/v1/work-orders", "operate"],
   ["POST", "/v1/heads/:sha/assessment", "operate"],
   ["POST", "/v1/knowledge/checks", "operate"],
+  ["POST", "/v1/knowledge/:id/disposition", "operate"],
   ["POST", "/v1/projects", "operate"],
   ["POST", "/v1/projects/:id/retire", "operate"],
   ["POST", "/v1/projects/:id/probe", "operate"],

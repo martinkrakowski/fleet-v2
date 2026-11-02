@@ -70,6 +70,7 @@ function unavailableUsage(
     sessionId: attempt.sessionId,
     steps: null,
     wallSeconds: null,
+    runnerMinutes: null,
     tokensInput: null,
     tokensOutput: null,
     tokensReasoning: null,

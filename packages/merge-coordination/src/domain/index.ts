@@ -2,4 +2,5 @@
 
 export * from "./entities/index.js";
 export * from "./train-state.js";
+export * from "./batch-formation.js";
 export * from "./value-objects/index.js";

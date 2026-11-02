@@ -46,6 +46,7 @@ import { projectsCommand, type ProjectsCliOptions } from './projects.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
 import { conductorCommand, type ConductorCliOptions } from './conductor.js';
 import { telemetryCommand, type TelemetryCliOptions } from './telemetry.js';
+import { reportCommand, type ReportCliOptions } from './report.js';
 import {
   CliUsageError,
   NON_ZERO_OUTCOMES,
@@ -660,6 +661,9 @@ The telemetry group exports run telemetry spans (a run, a work order or a
 time window) to the collector route, or prints them with a dry run, and shows
 the configuration status. Run 'fleet-v2 telemetry --help'.
 
+The report group prints the weekly run-journal service report (read-only, one
+JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
+
 Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
@@ -671,6 +675,7 @@ Commands:
   state check|restore
   conductor status|halt|stop|resume|start|run
   telemetry export|status
+  report weekly
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared
@@ -711,6 +716,7 @@ export async function runCli(
   conductorOptions?: ConductorCliOptions,
   policyOptions?: PolicyCliOptions,
   telemetryOptions?: TelemetryCliOptions,
+  reportOptions?: ReportCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -792,6 +798,9 @@ export async function runCli(
     }
     if (group === 'telemetry') {
       return await telemetryCommand(restArgv.slice(1), io, activeRuntime, telemetryOptions ?? {});
+    }
+    if (group === 'report') {
+      return await reportCommand(restArgv.slice(1), io, activeRuntime, reportOptions ?? {});
     }
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);

@@ -572,6 +572,7 @@ describe('apps/cli composition', () => {
     it('buildMergeGhChildEnv removes ambient tokens and sets GH_CONFIG_DIR', () => {
       const parentEnv: NodeJS.ProcessEnv = {
         PATH: '/usr/local/bin:/usr/bin',
+        GH_CONFIG_DIR: '/inherited/config',
         GH_TOKEN: 'ambient-tok-a',
         GITHUB_TOKEN: 'ambient-tok-b',
         GH_ENTERPRISE_TOKEN: 'ambient-tok-c',
@@ -581,6 +582,7 @@ describe('apps/cli composition', () => {
       const child = buildMergeGhChildEnv('/state/gh/merge', parentEnv);
 
       expect(child.GH_CONFIG_DIR).toBe('/state/gh/merge');
+      expect(child.GH_CONFIG_DIR).not.toBe(parentEnv.GH_CONFIG_DIR);
       expect(child.GH_TOKEN).toBeUndefined();
       expect(child.GITHUB_TOKEN).toBeUndefined();
       expect(child.GH_ENTERPRISE_TOKEN).toBeUndefined();
@@ -592,6 +594,7 @@ describe('apps/cli composition', () => {
     it('buildGhChildEnvironment strips ambient tokens when GH_CONFIG_DIR is present', () => {
       const parentEnv: NodeJS.ProcessEnv = {
         PATH: '/usr/bin',
+        GH_CONFIG_DIR: '/inherited/config',
         GH_TOKEN: 'ambient-token-1',
         GITHUB_TOKEN: 'ambient-token-2',
         GH_ENTERPRISE_TOKEN: 'ambient-token-3',
@@ -601,6 +604,7 @@ describe('apps/cli composition', () => {
 
       expect(child).toBeDefined();
       expect(child?.GH_CONFIG_DIR).toBe('/state/gh/premerge');
+      expect(child?.GH_CONFIG_DIR).not.toBe(parentEnv.GH_CONFIG_DIR);
       expect(child?.GH_TOKEN).toBeUndefined();
       expect(child?.GITHUB_TOKEN).toBeUndefined();
       expect(child?.GH_ENTERPRISE_TOKEN).toBeUndefined();

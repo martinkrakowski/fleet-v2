@@ -228,7 +228,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
       return refusedOther('status context must be premerge');
     }
     if (status.state !== 'success' && status.state !== 'pending' && status.state !== 'failure') {
-      return refusedOther('status state must be success or failure');
+      return refusedOther('status state must be success, pending or failure');
     }
     if (!HEX_40_PATTERN.test(request.expectedHeadSha)) {
       return refusedOther(`Invalid expected head SHA: ${request.expectedHeadSha}`);
@@ -683,11 +683,8 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
       return { ok: false, reason: 'unparseable deadline' };
     }
     const remainingMs = deadlineMs - Date.parse(this.nowIso());
-    if (remainingMs <= 0) {
-      return { ok: false, reason: 'the deadline passed before the forge action could start' };
-    }
     if (remainingMs < MIN_REMAINING_TO_START_MS) {
-      return { ok: false, reason: 'less than 2 seconds remained before the deadline' };
+      return { ok: false, reason: 'budget-exhausted' };
     }
     return { ok: true, timeoutMs: Math.min(NORMAL_FORGE_TIMEOUT_MS, remainingMs) };
   }
@@ -748,6 +745,9 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     if (read.pullRequest.headSha !== request.expectedHeadSha) {
       return this.mergeRefusedOther('the pull request head moved since verification');
     }
+    if (read.pullRequest.headRef !== request.branchName) {
+      return this.mergeRefusedOther('the pull request head branch does not match the request');
+    }
     return null;
   }
 
@@ -769,7 +769,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
       'merge',
       '-R',
       `${request.repository.owner}/${request.repository.repo}`,
-      request.branchName,
+      String(request.pullRequestNumber),
       '--match-head-commit',
       request.expectedHeadSha,
       '--merge',

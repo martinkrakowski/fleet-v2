@@ -82,7 +82,11 @@ function makeReader(behavior: ReadBehavior | ReadBehavior[]) {
 }
 
 function foundSnapshot(
-  overrides: { readonly state?: PullRequestSnapshot['state']; readonly headSha?: string } = {},
+  overrides: {
+    readonly state?: PullRequestSnapshot['state'];
+    readonly headSha?: string;
+    readonly headRef?: string;
+  } = {},
 ): ReadPullRequestResult {
   return {
     outcome: 'found',
@@ -91,7 +95,7 @@ function foundSnapshot(
       state: overrides.state ?? 'open',
       mergeState: 'clean',
       headSha: overrides.headSha ?? HEAD_SHA,
-      headRef: BRANCH,
+      headRef: overrides.headRef ?? BRANCH,
       baseRef: 'main',
       mergedAtIso: overrides.state === 'merged' ? '2026-11-01T12:00:05.000Z' : null,
       closedAtIso: null,
@@ -143,6 +147,21 @@ describe('ForgeActionAdapter merge-pass path (MergeForgeActionPort)', () => {
     expect(requests).toHaveLength(1);
   });
 
+  it('refuses when the pull request head branch does not match the request branch', async () => {
+    const { adapter, calls, requests } = makeAdapter({
+      reader: foundSnapshot({ headRef: 'feat/other-branch' }),
+      config: { mergeGhConfigDir: MERGE_DIR },
+    });
+    const result = await adapter.performMergeForgeAction(mergeRequest());
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'the pull request head branch does not match the request',
+      refusalKind: 'other',
+    });
+    expect(calls).toHaveLength(0);
+    expect(requests).toHaveLength(1);
+  });
+
   it('merges pinned to the repo and the expected head with the merger config dir', async () => {
     const { adapter, calls } = makeAdapter({
       config: { mergeGhConfigDir: MERGE_DIR },
@@ -155,7 +174,7 @@ describe('ForgeActionAdapter merge-pass path (MergeForgeActionPort)', () => {
       'merge',
       '-R',
       `${OWNER}/${REPO}`,
-      BRANCH,
+      String(PR_NUMBER),
       '--match-head-commit',
       HEAD_SHA,
       '--merge',
@@ -451,7 +470,11 @@ describe('ForgeActionAdapter merge-pass path (MergeForgeActionPort)', () => {
       config: { mergeGhConfigDir: MERGE_DIR },
     });
     const result = await adapter.performMergeForgeAction(mergeRequest());
-    expect(result.outcome).toBe('refused');
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'budget-exhausted',
+      refusalKind: 'other',
+    });
     expect(calls).toHaveLength(0);
     expect(requests).toHaveLength(0);
   });
@@ -462,7 +485,11 @@ describe('ForgeActionAdapter merge-pass path (MergeForgeActionPort)', () => {
       config: { mergeGhConfigDir: MERGE_DIR },
     });
     const result = await adapter.performMergeForgeAction(mergeRequest());
-    expect(result.outcome).toBe('refused');
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'budget-exhausted',
+      refusalKind: 'other',
+    });
     expect(calls).toHaveLength(0);
     expect(requests).toHaveLength(0);
   });

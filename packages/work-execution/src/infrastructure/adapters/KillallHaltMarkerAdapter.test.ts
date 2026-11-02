@@ -9,6 +9,26 @@ const NOW = '2026-10-27T10:00:00.000Z';
 const HALTED_RECORD = { version: 1, halted: true, changedAtIso: NOW };
 const CLEAR_RECORD = { version: 1, halted: false, changedAtIso: NOW };
 
+async function createTempStateDir(prefix: string): Promise<string> {
+  return fs.mkdtemp(path.join(os.tmpdir(), prefix));
+}
+
+async function removeTempDir(dir: string | undefined): Promise<void> {
+  if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+}
+
+async function readMarkerFile(dir: string) {
+  const file = path.join(dir, 'killall-halt.json');
+  return {
+    bytes: await fs.readFile(file, 'utf8'),
+    mtimeMs: (await fs.stat(file)).mtimeMs,
+  };
+}
+
+function makeFileAdapter(dir: string, fileName?: string) {
+  return new KillallHaltMarkerAdapter({ stateDir: dir, ...(fileName ? { fileName } : {}) });
+}
+
 describe.each(['memory', 'file'] as const)('KillallHaltMarkerAdapter (%s)', (mode) => {
   const isFile = mode === 'file';
   let tempDir: string;
@@ -16,8 +36,8 @@ describe.each(['memory', 'file'] as const)('KillallHaltMarkerAdapter (%s)', (mod
 
   beforeEach(async () => {
     if (isFile) {
-      tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-killall-halt-test-'));
-      adapter = new KillallHaltMarkerAdapter({ stateDir: tempDir });
+      tempDir = await createTempStateDir('fleet-killall-halt-test-');
+      adapter = makeFileAdapter(tempDir);
     } else {
       adapter = new KillallHaltMarkerAdapter();
     }
@@ -25,7 +45,7 @@ describe.each(['memory', 'file'] as const)('KillallHaltMarkerAdapter (%s)', (mod
 
   afterEach(async () => {
     if (isFile) {
-      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      await removeTempDir(tempDir);
     }
   });
 
@@ -42,11 +62,7 @@ describe.each(['memory', 'file'] as const)('KillallHaltMarkerAdapter (%s)', (mod
 
     let before: { bytes: string; mtimeMs: number } | null = null;
     if (isFile) {
-      const file = path.join(tempDir, 'killall-halt.json');
-      before = {
-        bytes: await fs.readFile(file, 'utf8'),
-        mtimeMs: (await fs.stat(file)).mtimeMs,
-      };
+      before = await readMarkerFile(tempDir);
     }
 
     expect(await adapter.set({ halted: true, nowIso: NOW })).toEqual({
@@ -91,15 +107,15 @@ describe('KillallHaltMarkerAdapter file shape, unreadable marker and file names'
   let tempDir: string;
 
   beforeEach(async () => {
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-killall-halt-file-'));
+    tempDir = await createTempStateDir('fleet-killall-halt-file-');
   });
 
   afterEach(async () => {
-    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    await removeTempDir(tempDir);
   });
 
   it('always writes exactly one record; a fresh adapter reads back what the first wrote', async () => {
-    const writer = new KillallHaltMarkerAdapter({ stateDir: tempDir });
+    const writer = makeFileAdapter(tempDir);
     await writer.set({ halted: true, nowIso: NOW });
 
     const raw = JSON.parse(await fs.readFile(path.join(tempDir, 'killall-halt.json'), 'utf8'));
@@ -107,15 +123,15 @@ describe('KillallHaltMarkerAdapter file shape, unreadable marker and file names'
     expect(raw).toHaveLength(1);
     expect(raw[0]).toEqual(HALTED_RECORD);
 
-    const reader = new KillallHaltMarkerAdapter({ stateDir: tempDir });
+    const reader = makeFileAdapter(tempDir);
     expect(await reader.read()).toEqual({ state: 'halted' });
   });
 
   it('an unreadable marker reads as halted, keeps a quarantine copy and refuses a lift; halting over it writes', async () => {
     const garbage = '{ not json';
-    const file = path.join(tempDir, 'killall-halt.json');
-    await fs.writeFile(file, garbage, 'utf8');
-    const adapter = new KillallHaltMarkerAdapter({ stateDir: tempDir });
+    const markerFile = path.join(tempDir, 'killall-halt.json');
+    await fs.writeFile(markerFile, garbage, 'utf8');
+    const adapter = makeFileAdapter(tempDir);
 
     const state = await adapter.read();
     expect(state).toEqual({ state: 'unreadable' });
@@ -140,13 +156,13 @@ describe('KillallHaltMarkerAdapter file shape, unreadable marker and file names'
   });
 
   it('refuses file names that collide with another store or are unsafe', async () => {
-    const colliding = new KillallHaltMarkerAdapter({ stateDir: tempDir, fileName: 'conductor-halt.json' });
+    const colliding = makeFileAdapter(tempDir, 'conductor-halt.json');
     await expect(colliding.read()).rejects.toThrow(/collides with another store/);
 
-    const pauseColliding = new KillallHaltMarkerAdapter({ stateDir: tempDir, fileName: 'killall-train-pause.json' });
+    const pauseColliding = makeFileAdapter(tempDir, 'killall-train-pause.json');
     await expect(pauseColliding.read()).rejects.toThrow(/collides with another store/);
 
-    const escaping = new KillallHaltMarkerAdapter({ stateDir: tempDir, fileName: '../x' });
+    const escaping = makeFileAdapter(tempDir, '../x');
     await expect(escaping.read()).rejects.toThrow(/unsafe state file name/);
   });
 });

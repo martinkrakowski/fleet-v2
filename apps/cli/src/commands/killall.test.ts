@@ -9,7 +9,7 @@ import {
   type KillallStopReportRecord,
 } from '@fleet/work-execution';
 
-import { killallCommand } from './killall.js';
+import { killallCommand, type KillallCliOptions } from './killall.js';
 import type { CliIo } from '../index.js';
 
 describe('killall command', () => {
@@ -27,14 +27,7 @@ describe('killall command', () => {
     const stdout: string[] = [];
     const stderr: string[] = [];
     return {
-      io: {
-        stdout: (text: string) => {
-          stdout.push(text);
-        },
-        stderr: (text: string) => {
-          stderr.push(text);
-        },
-      },
+      io: { stdout: (text) => stdout.push(text), stderr: (text) => stderr.push(text) },
       stdout,
       stderr,
     };
@@ -44,22 +37,21 @@ describe('killall command', () => {
   const DIFFERENT_TIME = '2026-11-01T10:00:01.000Z';
 
   function createConfirmedReport(haltedAtIso: string): KillallStopReportRecord {
+    const lane = {
+      projectId: 'project-1',
+      laneId: 'lane-1',
+      confirmed: true,
+      unconfirmedReason: null,
+      cleanSweeps: 2,
+      confirmedAtIso: '2026-11-01T10:05:00.000Z',
+      sessionResults: [],
+    };
     return {
       version: KILLALL_STOP_REPORT_RECORD_VERSION,
       haltedAtIso,
       marker: 'halted',
       cleanSweeps: 2,
-      lanes: [
-        {
-          projectId: 'project-1',
-          laneId: 'lane-1',
-          confirmed: true,
-          unconfirmedReason: null,
-          cleanSweeps: 2,
-          confirmedAtIso: '2026-11-01T10:05:00.000Z',
-          sessionResults: [],
-        },
-      ],
+      lanes: [lane],
       train: {
         paused: true,
         acknowledged: true,
@@ -68,20 +60,28 @@ describe('killall command', () => {
     };
   }
 
-  it('refuses an otherwise confirmed report whose haltedAtIso differs from the marker changedAtIso and exits 1', async () => {
+  async function runKillall(argv: readonly string[] = [], extraOptions: KillallCliOptions = {}) {
+    const { io, stdout, stderr } = createMockIo();
+    const exitCode = await killallCommand(argv, io, {
+      stateDir: tempDir,
+      now: () => MARKER_TIME,
+      ...extraOptions,
+    });
+    return { exitCode, stdout, stderr };
+  }
+
+  async function runHaltWithAgent(payload: KillallStopReportRecord) {
     const fakeAgent: KillallStopAgentPort = {
       stop: async () => ({
         ok: true,
-        payload: createConfirmedReport(DIFFERENT_TIME),
+        payload,
       }),
     };
+    return runKillall([], { stopAgent: fakeAgent });
+  }
 
-    const { io, stdout } = createMockIo();
-    const exitCode = await killallCommand([], io, {
-      stateDir: tempDir,
-      now: () => MARKER_TIME,
-      stopAgent: fakeAgent,
-    });
+  it('refuses an otherwise confirmed report whose haltedAtIso differs from the marker changedAtIso and exits 1', async () => {
+    const { exitCode, stdout } = await runHaltWithAgent(createConfirmedReport(DIFFERENT_TIME));
 
     expect(exitCode).toBe(1);
     const parsed = JSON.parse(stdout.join(''));
@@ -91,19 +91,7 @@ describe('killall command', () => {
   });
 
   it('completes with exit 0 when haltedAtIso matches the marker changedAtIso', async () => {
-    const fakeAgent: KillallStopAgentPort = {
-      stop: async () => ({
-        ok: true,
-        payload: createConfirmedReport(MARKER_TIME),
-      }),
-    };
-
-    const { io, stdout } = createMockIo();
-    const exitCode = await killallCommand([], io, {
-      stateDir: tempDir,
-      now: () => MARKER_TIME,
-      stopAgent: fakeAgent,
-    });
+    const { exitCode, stdout } = await runHaltWithAgent(createConfirmedReport(MARKER_TIME));
 
     expect(exitCode).toBe(0);
     const parsed = JSON.parse(stdout.join(''));
@@ -126,17 +114,8 @@ describe('killall command', () => {
   });
 
   it('lifts a halt and train pause with exit 0', async () => {
-    const { io: haltIo } = createMockIo();
-    await killallCommand([], haltIo, {
-      stateDir: tempDir,
-      now: () => MARKER_TIME,
-    });
-
-    const { io: liftIo, stdout } = createMockIo();
-    const exitCode = await killallCommand(['--lift'], liftIo, {
-      stateDir: tempDir,
-      now: () => MARKER_TIME,
-    });
+    await runKillall();
+    const { exitCode, stdout } = await runKillall(['--lift']);
 
     expect(exitCode).toBe(0);
     const parsed = JSON.parse(stdout.join(''));

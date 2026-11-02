@@ -113,6 +113,7 @@ export type StartLaneRunIncompleteReason =
   | 'base-tip-unknown'
   | 'no-clone-on-host'
   | 'brief-rejected'
+  | 'brief-acceptance-spec-shell'
   | 'attempt-differs'
   | 'attempt-save-failed'
   | 'run-exists'
@@ -451,7 +452,14 @@ export class StartLaneRunUseCase implements StartLaneRunPort {
     };
     const briefResult = await deps.prepareBrief.prepareBriefPackage(briefRequest);
     if (briefResult.outcome === 'rejected') {
-      return incomplete(request.runId, request.attemptId, 'brief', 'brief-rejected');
+      return incomplete(
+        request.runId,
+        request.attemptId,
+        'brief',
+        briefResult.reasonClass === 'acceptance-spec-shell'
+          ? 'brief-acceptance-spec-shell'
+          : 'brief-rejected',
+      );
     }
     const briefDigest = briefResult.prepared.briefDigest;
     const briefPackagePath = briefResult.prepared.prosePath;

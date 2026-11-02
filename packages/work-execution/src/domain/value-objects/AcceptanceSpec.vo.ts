@@ -40,6 +40,14 @@ export const MAX_GATE_ARG_CHARACTERS = 4096;
 /** Guards against a pasted shell string (word splitting), not a sandbox: env, interpreters with -c/-e and package scripts still reach a shell. */
 const SHELL_BASENAMES: readonly string[] = ['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh'];
 
+export const ACCEPTANCE_SHELL_STRING_TAIL = 'looks like a shell string; give each argument its own argv entry';
+export const ACCEPTANCE_SHELL_RUN_TAIL = 'must not run a shell';
+
+/** True exactly for the two fixed, value-free shell rejections of a command. */
+export function isAcceptanceSpecShellError(message: string): boolean {
+  return message.endsWith(ACCEPTANCE_SHELL_STRING_TAIL) || message.endsWith(ACCEPTANCE_SHELL_RUN_TAIL);
+}
+
 function coverageError(value: unknown, n: number): string | null {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return `AcceptanceSpec command ${n} coverage must be { reader, unitKind, minUnits }`;
@@ -97,11 +105,11 @@ function commandError(value: unknown, n: number): string | null {
     return `AcceptanceSpec command ${n} argv[0] must name a program`;
   }
   if (argv.length === 1 && program.includes(' ')) {
-    return `AcceptanceSpec command ${n} looks like a shell string; give each argument its own argv entry`;
+    return `AcceptanceSpec command ${n} ${ACCEPTANCE_SHELL_STRING_TAIL}`;
   }
   const lastSegment = program.slice(program.lastIndexOf('/') + 1);
   if (SHELL_BASENAMES.indexOf(lastSegment) !== -1) {
-    return `AcceptanceSpec command ${n} must not run a shell`;
+    return `AcceptanceSpec command ${n} ${ACCEPTANCE_SHELL_RUN_TAIL}`;
   }
   if (record.coverage !== undefined) {
     return coverageError(record.coverage, n);

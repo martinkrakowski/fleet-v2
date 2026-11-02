@@ -642,7 +642,12 @@ async function carriedMinorsOf(
   if (key === null || !hasMinorOnlyOverrideResult(entries, key)) {
     return [];
   }
-  const requestId = await intentMintedIdOf(ctx, key);
+  let requestId: string | null;
+  try {
+    requestId = await intentMintedIdOf(ctx, key);
+  } catch {
+    return [];
+  }
   if (requestId === null) {
     return [];
   }

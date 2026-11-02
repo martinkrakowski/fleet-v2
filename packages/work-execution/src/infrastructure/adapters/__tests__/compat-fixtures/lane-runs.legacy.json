@@ -1,0 +1,82 @@
+[
+  {
+    "version": 1,
+    "runId": "run-01JB0000000000000000000000",
+    "workOrderId": "wo-example-1",
+    "tier": 2,
+    "seatPlanRef": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cursors": {
+      "first-pass": 0,
+      "fix": null,
+      "review": null
+    },
+    "round": 0,
+    "attemptIds": ["attempt-example-1"],
+    "prNumber": null,
+    "parked": null,
+    "parkCount": 0,
+    "lease": null,
+    "revision": 1,
+    "runPolicyRevision": "policy-example-1"
+  },
+  {
+    "version": 1,
+    "runId": "run-01JB0000000000000000000001",
+    "workOrderId": "wo-example-1",
+    "tier": 2,
+    "seatPlanRef": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cursors": {
+      "first-pass": 0,
+      "fix": null,
+      "review": null
+    },
+    "round": 1,
+    "attemptIds": ["attempt-example-1", "attempt-example-2"],
+    "prNumber": null,
+    "parked": null,
+    "parkCount": 0,
+    "lease": null,
+    "revision": 1,
+    "runPolicyRevision": "policy-example-1"
+  },
+  {
+    "version": 1,
+    "runId": "run-01JB0000000000000000000002",
+    "workOrderId": "wo-example-1",
+    "tier": 2,
+    "seatPlanRef": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cursors": {
+      "first-pass": 0,
+      "fix": null,
+      "review": null
+    },
+    "round": 0,
+    "attemptIds": ["attempt-example-3"],
+    "prNumber": null,
+    "parked": null,
+    "parkCount": 0,
+    "lease": null,
+    "revision": 1,
+    "runPolicyRevision": "policy-example-1"
+  },
+  {
+    "version": 1,
+    "runId": "run-01JB0000000000000000000003",
+    "workOrderId": "wo-example-1",
+    "tier": 2,
+    "seatPlanRef": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cursors": {
+      "first-pass": 0,
+      "fix": null,
+      "review": null
+    },
+    "round": 1,
+    "attemptIds": ["attempt-example-3", "attempt-example-4"],
+    "prNumber": null,
+    "parked": null,
+    "parkCount": 0,
+    "lease": null,
+    "revision": 1,
+    "runPolicyRevision": "policy-example-1"
+  }
+]

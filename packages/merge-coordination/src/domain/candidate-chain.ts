@@ -11,16 +11,7 @@ import { accepted, isSha40, refused, type ValidationResult } from './entities/va
 /** A candidate chain: index 0 is the head, closest to the base. */
 export type CandidateChain = readonly CandidateRecord[];
 
-/**
- * Validate unknown input as a candidate chain. Refuses, with a reason and
- * without throwing, when the base sha is malformed, the value is not a
- * non-empty array, any entry is not a valid candidate record, any id is
- * duplicated, or the lineage links do not line up.
- */
-export function validateCandidateChain(value: unknown, expectedBaseSha: string): ValidationResult<CandidateChain> {
-  if (!isSha40(expectedBaseSha)) {
-    return refused('expected base sha must be a 40-character lower-case hex string');
-  }
+function parseChainRecords(value: unknown): ValidationResult<CandidateRecord[]> {
   if (!Array.isArray(value) || value.length === 0) {
     return refused('candidate chain must be a non-empty array');
   }
@@ -32,6 +23,10 @@ export function validateCandidateChain(value: unknown, expectedBaseSha: string):
     }
     records.push(result.value);
   }
+  return accepted(records);
+}
+
+function checkDuplicateIds(records: readonly CandidateRecord[]): ValidationResult<void> {
   const seen = new Set<string>();
   for (const record of records) {
     if (seen.has(record.id)) {
@@ -39,6 +34,10 @@ export function validateCandidateChain(value: unknown, expectedBaseSha: string):
     }
     seen.add(record.id);
   }
+  return accepted(undefined);
+}
+
+function validateChainHead(records: readonly CandidateRecord[], expectedBaseSha: string): ValidationResult<void> {
   const head = records[0];
   if (head === undefined) {
     return refused('candidate chain must be a non-empty array');
@@ -49,18 +48,60 @@ export function validateCandidateChain(value: unknown, expectedBaseSha: string):
   if (head.baseSha !== expectedBaseSha) {
     return refused(`head candidate ${head.id} baseSha must equal the expected base sha`);
   }
+  return accepted(undefined);
+}
+
+function validateCandidateLink(record: CandidateRecord, previous: CandidateRecord): ValidationResult<void> {
+  if (record.parentCandidateId !== previous.id) {
+    return refused(`candidate ${record.id} parentCandidateId must match the previous candidate id`);
+  }
+  if (record.baseSha !== previous.resultSha) {
+    return refused(`candidate ${record.id} baseSha must equal the previous candidate resultSha`);
+  }
+  return accepted(undefined);
+}
+
+function validateChainLineage(records: readonly CandidateRecord[]): ValidationResult<void> {
   for (let i = 1; i < records.length; i++) {
     const previous = records[i - 1];
     const record = records[i];
     if (previous === undefined || record === undefined) {
       return refused('candidate chain must be a non-empty array');
     }
-    if (record.parentCandidateId !== previous.id) {
-      return refused(`candidate ${record.id} parentCandidateId must match the previous candidate id`);
+    const linkResult = validateCandidateLink(record, previous);
+    if (!linkResult.ok) {
+      return linkResult;
     }
-    if (record.baseSha !== previous.resultSha) {
-      return refused(`candidate ${record.id} baseSha must equal the previous candidate resultSha`);
-    }
+  }
+  return accepted(undefined);
+}
+
+/**
+ * Validate unknown input as a candidate chain. Refuses, with a reason and
+ * without throwing, when the base sha is malformed, the value is not a
+ * non-empty array, any entry is not a valid candidate record, any id is
+ * duplicated, or the lineage links do not line up.
+ */
+export function validateCandidateChain(value: unknown, expectedBaseSha: string): ValidationResult<CandidateChain> {
+  if (!isSha40(expectedBaseSha)) {
+    return refused('expected base sha must be a 40-character lower-case hex string');
+  }
+  const recordsResult = parseChainRecords(value);
+  if (!recordsResult.ok) {
+    return recordsResult;
+  }
+  const records = recordsResult.value;
+  const duplicateResult = checkDuplicateIds(records);
+  if (!duplicateResult.ok) {
+    return duplicateResult;
+  }
+  const headResult = validateChainHead(records, expectedBaseSha);
+  if (!headResult.ok) {
+    return headResult;
+  }
+  const lineageResult = validateChainLineage(records);
+  if (!lineageResult.ok) {
+    return lineageResult;
   }
   return accepted(records);
 }

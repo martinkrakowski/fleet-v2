@@ -4,6 +4,7 @@ import {
   PrepareBriefPackageUseCase,
   type PrepareBriefPackageUseCaseRequest,
 } from '../PrepareBriefPackageUseCase.use-case.js';
+import type { GateCoverageReader } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 import type { BriefAuthoringPort } from '../../ports/out/BriefAuthoringPort.out-port.js';
 import type { AttemptArtifactPort } from '../../ports/out/AttemptArtifactPort.out-port.js';
 
@@ -286,6 +287,7 @@ describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
     expect(result).toEqual({
       outcome: 'rejected',
       reason: 'AcceptanceSpec command 1 looks like a shell string; give each argument its own argv entry',
+      reasonClass: 'acceptance-spec-shell',
     });
   });
 
@@ -397,6 +399,64 @@ describe('PrepareBriefPackageUseCase acceptance spec (S2a)', () => {
     await useCase.prepareBriefPackage(validRequest({ allowedPathPrefixes: [] }));
 
     expect(authorBrief).not.toHaveBeenCalled();
+  });
+});
+
+describe('PrepareBriefPackageUseCase rejection reason class', () => {
+  it('rejects a shell argv with reasonClass acceptance-spec-shell', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.prepareBriefPackage(
+      validRequest({
+        acceptanceSpec: { commitRequired: true, diffCheck: true, commands: [{ argv: ['bash', 'run.sh'] }] },
+      }),
+    );
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'AcceptanceSpec command 1 must not run a shell',
+      reasonClass: 'acceptance-spec-shell',
+    });
+  });
+
+  it('carries no reasonClass for a non-shell rejection', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.prepareBriefPackage(
+      validRequest({
+        acceptanceSpec: {
+          commitRequired: true,
+          diffCheck: true,
+          commands: [
+            {
+              argv: ['x'],
+              coverage: { reader: 'jest' as GateCoverageReader, unitKind: 'tests', minUnits: 1 },
+            },
+          ],
+        },
+      }),
+    );
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'AcceptanceSpec command 1 names an unknown coverage reader',
+    });
+    expect(result).not.toHaveProperty('reasonClass');
+  });
+
+  it('keeps reasonClass on a preview rejection while redacting a path-bearing reason', async () => {
+    const useCase = makeUseCase();
+    const result = await useCase.previewBriefPackage(
+      validRequest({
+        ownedPaths: ['shell'],
+        acceptanceSpec: {
+          commitRequired: true,
+          diffCheck: true,
+          commands: [{ argv: ['yarn build'] }],
+        },
+      }),
+    );
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason: 'the brief request was refused: a supplied path or path prefix is invalid or unavailable',
+      reasonClass: 'acceptance-spec-shell',
+    });
   });
 });
 

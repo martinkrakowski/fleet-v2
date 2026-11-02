@@ -34,6 +34,7 @@ export * from "./KillallHaltMarkerAdapter.adapter.js";
 export * from "./KillallStopAgentUnavailableAdapter.adapter.js";
 export * from "./KillallTrainPauseAdapter.adapter.js";
 export * from "./LaneDiffCheckAdapter.adapter.js";
+export * from "./LanePlanRepositoryAdapter.adapter.js";
 export * from "./LaneRunAdmissionAdapter.adapter.js";
 export * from "./LaneRunJournalAdapter.adapter.js";
 export * from "./LaneRunParkNoticeAdapter.adapter.js";

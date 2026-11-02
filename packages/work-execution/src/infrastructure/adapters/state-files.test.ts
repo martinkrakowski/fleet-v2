@@ -25,6 +25,7 @@ import { LaneRunRepositoryAdapter, parseLaneRunStateRecord } from './LaneRunRepo
 import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
 import { ConductorHaltAdapter } from './ConductorHaltAdapter.adapter.js';
 import { LaneRunJournalAdapter } from './LaneRunJournalAdapter.adapter.js';
+import { LanePlanRepositoryAdapter } from './LanePlanRepositoryAdapter.adapter.js';
 import {
   TelemetryDispositionAdapter,
   parseTelemetryDispositionStateRecord,
@@ -141,6 +142,60 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       state: null,
     },
   ],
+  'lane-plans.json': [
+    {
+      version: 1,
+      projectId: 'proj-1',
+      planId: 'plan-1',
+      revision: 1,
+      digest: 'a'.repeat(64),
+      doc: 'docs/plan-1.md',
+      lanes: [
+        {
+          laneId: 'L1',
+          aliases: [],
+          scope: 'wire the lane plan store',
+          packages: ['work-execution'],
+          sharedFiles: [],
+          tier: 1,
+          after: [],
+          decisions: [],
+          status: 'planned',
+          brief: null,
+          mergedPr: null,
+        },
+      ],
+      decisions: [],
+      exclusiveOrder: [],
+      importedAtIso: '2026-10-25T00:00:00.000Z',
+    },
+    {
+      version: 1,
+      projectId: 'proj-2',
+      planId: 'plan-2',
+      revision: 1,
+      digest: 'b'.repeat(64),
+      doc: 'docs/plan-2.md',
+      lanes: [
+        {
+          laneId: 'L2',
+          aliases: [],
+          scope: 'wire the lane plan store again',
+          packages: ['work-execution'],
+          sharedFiles: [],
+          tier: 0,
+          after: [],
+          decisions: [],
+          status: 'planned',
+          brief: null,
+          mergedPr: null,
+        },
+      ],
+      decisions: [],
+      exclusiveOrder: [],
+      importedAtIso: '2026-10-25T00:01:00.000Z',
+    },
+  ],
   'telemetry-dispositions.json': [
     {
       version: 1,
@@ -230,6 +285,8 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
   },
   'run-journal.json': (stateDir) =>
     new LaneRunJournalAdapter({ stateDir }).listForRun('run-01JB0000000000000000000000'),
+  'lane-plans.json': (stateDir) =>
+    new LanePlanRepositoryAdapter({ stateDir }).listLanePlans(),
   'telemetry-dispositions.json': async (stateDir) => {
     // The disposition port's `read()` never throws for an unreadable store
     // (it reads `unreadable`), so this observes the same inspection the
@@ -380,6 +437,7 @@ describe('work-execution state file descriptors match the store readers', () => 
       'conductor-driver-lease.json',
       'conductor-halt.json',
       'run-journal.json',
+      'lane-plans.json',
       'telemetry-dispositions.json',
       'conductor-passes.json',
       'killall-halt.json',
@@ -405,6 +463,7 @@ describe('versioned store descriptors', () => {
     'reservations.json',
     'lane-runs.json',
     'run-journal.json',
+    'lane-plans.json',
   ];
 
   it('reports schemaVersions [1] on valid fixtures', () => {

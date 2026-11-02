@@ -32,6 +32,13 @@ export interface RegisterWorkOrderRequest {
    * rejected with reason `invalid-base-branch`.
    */
   readonly baseBranch?: string;
+  /** Optional plan link (`--plan`/`--lane`, CLI in WB7a). The stored planRef's
+   *  projectId is always the work order's own projectId; `planProjectId`, when
+   *  the caller supplies it, must equal it or registration is rejected
+   *  `plan-project-mismatch`. */
+  readonly planId?: string;
+  readonly planLaneId?: string;
+  readonly planProjectId?: string;
   readonly nowIso?: string;
 }
 

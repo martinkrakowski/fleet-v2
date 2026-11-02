@@ -31,6 +31,11 @@ describe('nextTrainState — legal edges', () => {
 });
 
 describe('nextTrainState — illegal pairs', () => {
+  it('refuses an inherited property name as a state or an event', () => {
+    expect(nextTrainState('validating', 'toString' as TrainEventValue).ok).toBe(false);
+    expect(nextTrainState('toString' as TrainStateValue, TRAIN_EVENTS[0] as TrainEventValue).ok).toBe(false);
+  });
+
   const legal = new Set(LEGAL_EDGES.map((edge) => `${edge.from}|${edge.event}`));
 
   for (const from of TRAIN_STATES) {

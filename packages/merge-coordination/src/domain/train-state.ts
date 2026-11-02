@@ -53,11 +53,11 @@ const TRANSITIONS: TrainTransitionTable = Object.freeze({
  * event. It never throws and never mutates its arguments.
  */
 export function nextTrainState(state: TrainStateValue, event: TrainEventValue): TrainTransitionResult {
-  const edges = TRANSITIONS[state];
+  const edges = Object.hasOwn(TRANSITIONS, state) ? TRANSITIONS[state] : undefined;
   if (edges === undefined) {
     return { ok: false, reason: `unknown train state: ${String(state)}` };
   }
-  const next = edges[event];
+  const next = Object.hasOwn(edges, event) ? edges[event] : undefined;
   if (next === undefined) {
     return { ok: false, reason: `no transition from ${String(state)} on ${String(event)}` };
   }

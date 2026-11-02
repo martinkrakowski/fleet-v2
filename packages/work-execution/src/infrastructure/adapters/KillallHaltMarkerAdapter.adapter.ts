@@ -12,7 +12,6 @@
  * The file joins `fleet-v2 state check` and `state restore`.
  */
 
-import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -26,15 +25,11 @@ import type {
   KillallHaltMarkerRead,
   KillallHaltMarkerSetResult,
 } from '../../application/ports/out/KillallHaltMarkerPort.out-port.js';
+import { assertStoreWritable } from './file-store.js';
 import {
-  StateFileUnreadableError,
-  StateFileUnreadableReadOnlyError,
-  assertStoreWritable,
-  inspectRecordListBytes,
-  rejectUnreadableStateFile,
-  withFileLock,
-  writeJsonAtomically,
-} from './file-store.js';
+  mutateSingleRecordOnDisk,
+  readCurrentSingleRecord,
+} from './SingleRecordStore.helper.js';
 
 export interface KillallHaltMarkerAdapterOptions {
   /** When set, the halt marker persists here and reloads on first use. */
@@ -77,14 +72,6 @@ export function parseKillallHaltMarkerStateRecord(raw: unknown): ConductorHaltRe
   }
 }
 
-/** The current marker of a list: the last record; an empty list is none. */
-function currentRecordOf(records: readonly ConductorHaltRecord[]): ConductorHaltRecord | null {
-  if (records.length === 0) {
-    return null;
-  }
-  return records[records.length - 1];
-}
-
 /** The stored record's state: a halted record is a halt, any other is clear. */
 function stateOfRecord(record: ConductorHaltRecord | null): KillallHaltMarkerRead {
   if (record === null) {
@@ -103,17 +90,15 @@ export class KillallHaltMarkerAdapter implements KillallHaltMarkerPort {
     if (target === null) {
       return stateOfRecord(this.inMemoryRecord);
     }
-    try {
-      return stateOfRecord(currentRecordOf(await this.readRecordsFromDisk(target)));
-    } catch (error: unknown) {
-      if (
-        error instanceof StateFileUnreadableError ||
-        error instanceof StateFileUnreadableReadOnlyError
-      ) {
-        return { state: 'unreadable' };
-      }
-      throw error;
+    const outcome = await readCurrentSingleRecord(
+      target,
+      parseKillallHaltMarkerStateRecord,
+      this.options?.readOnly === true,
+    );
+    if (outcome.unreadable) {
+      return { state: 'unreadable' };
     }
+    return stateOfRecord(outcome.record);
   }
 
   async set(request: { readonly halted: boolean; readonly nowIso: string }): Promise<KillallHaltMarkerSetResult> {
@@ -125,7 +110,15 @@ export class KillallHaltMarkerAdapter implements KillallHaltMarkerPort {
     if (target === null) {
       return this.mutateInMemory(request);
     }
-    return this.mutateOnDisk(target, request);
+    return mutateSingleRecordOnDisk({
+      target,
+      parseRecord: parseKillallHaltMarkerStateRecord,
+      isActivating: request.halted,
+      unreadableReason: 'marker-unreadable',
+      isUnchanged: (current) => current.halted === request.halted,
+      record: recordFor(request),
+      readOnly: this.options?.readOnly === true,
+    });
   }
 
   /** Memory mode: one field; nothing stored and `halted: false` still writes the record. */
@@ -137,36 +130,6 @@ export class KillallHaltMarkerAdapter implements KillallHaltMarkerPort {
     const record = recordFor(request);
     this.inMemoryRecord = record;
     return { outcome: 'changed', record };
-  }
-
-  /**
-   * File mode: under the store's lock. An unreadable file is quarantined by
-   * the read; halting over it writes anyway, lifting refuses it.
-   */
-  private async mutateOnDisk(
-    target: string,
-    request: { readonly halted: boolean; readonly nowIso: string },
-  ): Promise<KillallHaltMarkerSetResult> {
-    return withFileLock(`${target}.lock`, async () => {
-      let current: ConductorHaltRecord | null;
-      try {
-        current = currentRecordOf(await this.readRecordsFromDisk(target));
-      } catch (error: unknown) {
-        if (!(error instanceof StateFileUnreadableError)) {
-          throw error;
-        }
-        if (!request.halted) {
-          return { outcome: 'refused', reason: 'marker-unreadable' };
-        }
-        current = null;
-      }
-      if (current !== null && current.halted === request.halted) {
-        return { outcome: 'unchanged', record: current };
-      }
-      const record = recordFor(request);
-      await writeJsonAtomically(target, [record]);
-      return { outcome: 'changed', record };
-    });
   }
 
   private get statePath(): string | null {
@@ -182,27 +145,6 @@ export class KillallHaltMarkerAdapter implements KillallHaltMarkerPort {
       throw new Error('KillallHaltMarkerAdapter refuses unsafe state file name');
     }
     return join(stateDir, name);
-  }
-
-  private async readRecordsFromDisk(target: string): Promise<readonly ConductorHaltRecord[]> {
-    let buffer: Buffer;
-    try {
-      buffer = await fs.readFile(target);
-    } catch (error: unknown) {
-      if (
-        typeof error === 'object' &&
-        error !== null &&
-        (error as { code?: string }).code === 'ENOENT'
-      ) {
-        return [];
-      }
-      throw error;
-    }
-    const inspection = inspectRecordListBytes(buffer, parseKillallHaltMarkerStateRecord);
-    if (inspection.status === 'unreadable') {
-      return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
-    }
-    return inspection.records;
   }
 }
 

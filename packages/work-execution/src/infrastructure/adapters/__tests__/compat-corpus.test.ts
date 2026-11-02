@@ -54,6 +54,9 @@ const FIXTURE_FILENAMES = [
 
 const RUN_0 = "run-01JB0000000000000000000000";
 
+/** The `attemptId` every `journal.legacy.json` entry carries. */
+const JOURNAL_ATTEMPT_ID = "attempt-example-1";
+
 interface StoreCorpusSpec {
   readonly basename: string;
   readonly read: (stateDir: string) => Promise<readonly unknown[]>;
@@ -86,7 +89,7 @@ const STORE_SPECS: readonly StoreCorpusSpec[] = [
     read: (dir) =>
       new ExecutionJournalAdapter({
         stateDir: dir,
-      }).listJournalEntriesForAttempt("a"),
+      }).listJournalEntriesForAttempt(JOURNAL_ATTEMPT_ID),
     policy: JOURNAL_STORE_VERSION_POLICY,
   },
   {
@@ -147,7 +150,10 @@ function leafStrings(value: unknown, out: string[] = []): string[] {
 /**
  * Distinctive string field values of a fixture record, used to assert the
  * refusal error echoes none of them. Tokens shorter than 4 characters are not
- * distinctive enough (e.g. an `attemptId` of `a`) and are skipped.
+ * distinctive enough (a short value can be a substring of an innocuous
+ * message), so the corpus keeps every fixture field value at that length or
+ * longer and the shape test below fails loudly if one ever falls short —
+ * the filter therefore never silently skips a fixture field value.
  */
 function fixtureFieldValues(record: unknown): string[] {
   return [...new Set(leafStrings(record).filter((value) => value.length >= 4))];
@@ -231,6 +237,23 @@ describe("legacy fixtures keep their pre-schemaVersion shape", () => {
         expect(typeof record).toBe("object");
         expect(record).not.toBeNull();
         expect(Object.hasOwn(record as object, "schemaVersion")).toBe(false);
+      }
+    },
+  );
+
+  it.each(FIXTURE_FILENAMES)(
+    "%s has a distinctive (length >= 4) value on every string field",
+    async (basename) => {
+      const parsed = JSON.parse(
+        await fs.readFile(fixturePath(basename), "utf8"),
+      ) as unknown;
+      for (const value of leafStrings(parsed)) {
+        // The unknown-version refusal test asserts the error echoes none of
+        // the fixture's field values. A shorter token cannot be asserted
+        // against (it matches innocuous message text), so the corpus must
+        // not contain one: if it did, a field value would be silently
+        // skipped instead of checked.
+        expect(value.length).toBeGreaterThanOrEqual(4);
       }
     },
   );

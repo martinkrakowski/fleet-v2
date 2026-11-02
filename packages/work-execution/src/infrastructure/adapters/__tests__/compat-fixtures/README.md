@@ -15,6 +15,13 @@ those helper shapes never carry, is absent by construction. Values are generic
 (`wo-1`, `attempt-example-1`, synthetic ULID-style ids) and each fixture stays
 well under ~20 records.
 
+Every string field value in every fixture is at least 4 characters long: the
+unknown-version refusal test asserts the error echoes none of the fixture's
+field values, and a shorter token could not be asserted against (it matches
+innocuous message text), so it would be silently skipped. The shape test in
+`compat-corpus.test.ts` fails loudly if a fixture ever carries a shorter
+value.
+
 ## Files
 
 | File                       | Adapter                    | State file          |

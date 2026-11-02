@@ -1,8 +1,8 @@
 [
   {
     "id": "rs-1",
-    "attemptId": "a",
-    "hostId": "h",
+    "attemptId": "attempt-example-1",
+    "hostId": "host-example-1",
     "slotIndex": 0,
     "held": true,
     "seatTool": null,
@@ -17,8 +17,8 @@
   },
   {
     "id": "rs-2",
-    "attemptId": "b",
-    "hostId": "h",
+    "attemptId": "attempt-example-2",
+    "hostId": "host-example-1",
     "slotIndex": 1,
     "held": true,
     "seatTool": null,
@@ -33,8 +33,8 @@
   },
   {
     "id": "rs-3",
-    "attemptId": "c",
-    "hostId": "h",
+    "attemptId": "attempt-example-3",
+    "hostId": "host-example-1",
     "slotIndex": 2,
     "held": true,
     "seatTool": null,
@@ -49,8 +49,8 @@
   },
   {
     "id": "rs-4",
-    "attemptId": "d",
-    "hostId": "h",
+    "attemptId": "attempt-example-4",
+    "hostId": "host-example-1",
     "slotIndex": 3,
     "held": true,
     "seatTool": null,

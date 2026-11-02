@@ -448,6 +448,17 @@ describe('ForgeReadAdapter.readPullRequest', () => {
       PULL_REQUEST_VIEW_FIELDS,
     ]);
   });
+
+  it('passes effectiveTimeoutMs to runGh when timeoutMs is provided on the request', async () => {
+    const timeouts: Array<number | undefined> = [];
+    const runGh = async (_args: readonly string[], timeoutMs?: number) => {
+      timeouts.push(timeoutMs);
+      return { exitCode: 0, stdout: OPEN_FIXTURE, stderr: '' };
+    };
+    const adapter = makeAdapter({ runGh, timeoutMs: 30000 });
+    await adapter.readPullRequest({ ref: { kind: 'number', number: 259 }, timeoutMs: 5000 });
+    expect(timeouts).toEqual([5000]);
+  });
 });
 
 describe('ForgeReadAdapter.isConfigured', () => {

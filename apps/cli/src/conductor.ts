@@ -9,7 +9,9 @@
  * lifted, a stop is recorded as a keyed journal intent the driver obeys, a
  * resume is recorded for a parked run. Nothing there takes a run lease or
  * dispatches anything; stop and resume refuse while a live driver lease is
- * held (a lapsed or absent lease allows the call).
+ * held (a lapsed or absent lease allows the call). The lease check and the
+ * record are one atomic step under the lease store's lock, so a passing
+ * `conductor run --live` cannot take the lease between them.
  *
  * `conductor start` reserves capacity, prepares the run's worktree at the
  * reserved path and places the brief there, then records the first attempt
@@ -57,8 +59,9 @@ import {
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
-import type { CliIo } from './index.js';
 import { buildLiveConductorDriver, buildDryRunConductorDriver, type ConductorDriver, type DryRunStores } from './conductor-wiring.js';
+import { withFileLock } from './file-store.js';
+import type { CliIo } from './index.js';
 import type { RunnerTunnelPort } from './runner-tunnel.js';
 
 export interface ConductorCliOptions {
@@ -103,7 +106,8 @@ default, --force stops the running lane now; a resume recorded for a parked
 run. The driver obeys the records; nothing here dispatches, and the CLI
 never takes a run lease. stop and resume refuse with reason
 driver-lease-live (exit 1) while another process holds a live driver
-lease; a lapsed or absent lease allows the call. conductor schedule is a
+lease; a lapsed or absent lease allows the call; the check and the record
+are one atomic step under the lease store's lock. conductor schedule is a
 read-only view of the live runs grouped by base branch, in creation order
 within each, with their held slots, package keys and the admission
 count; --json prints the whole view. conductor reap --worktrees removes the clean
@@ -234,6 +238,9 @@ function exitFor(result: { readonly outcome: string }): number {
   return 0;
 }
 
+/** The driver lease store's file name (`ConductorDriverLeaseAdapter` default); its lock is `<stateDir>/<fileName>.lock`. */
+const DRIVER_LEASE_FILE_NAME = 'conductor-driver-lease.json';
+
 /**
  * True when a live driver lease is held: a lease record exists and is not
  * lapsed at `nowIso`. Read-only — the CLI never takes the lease. An
@@ -247,6 +254,32 @@ async function liveDriverLeaseHeld(runtime: FleetCliRuntime, nowIso: string): Pr
     return true;
   }
   return lease !== null && !isLeaseLapsed(lease, nowIso);
+}
+
+/**
+ * Record a control intent under the driver lease store's exclusive lock,
+ * refusing when a live driver lease is held at `nowIso`. The check and the
+ * record run under the same lock the driver's acquire/renew/release run
+ * under, so `conductor run --live` cannot take the lease between them: a
+ * stop or resume never lands while a live lease is held. An unreadable lease
+ * or an un-lockable store fails closed.
+ */
+async function recordUnderDriverLeaseGuard<T>(
+  runtime: FleetCliRuntime,
+  stateDir: string,
+  nowIso: string,
+  record: () => Promise<T>,
+): Promise<{ readonly refused: true } | { readonly refused: false; readonly result: T }> {
+  try {
+    return await withFileLock(join(stateDir, `${DRIVER_LEASE_FILE_NAME}.lock`), async () => {
+      if (await liveDriverLeaseHeld(runtime, nowIso)) {
+        return { refused: true } as const;
+      }
+      return { refused: false, result: await record() };
+    });
+  } catch {
+    return { refused: true } as const;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1591,26 +1624,35 @@ async function conductorStopExit(
   runtime: FleetCliRuntime,
   nowIso: string,
   parsed: ControlOptions,
+  stateDir: string | undefined,
 ): Promise<number> {
   const runId = parsed.positionals[0];
   if (runId === undefined) {
     io.stderr(`conductor stop requires a run id\n${CONDUCTOR_HELP}\n`);
     return 2;
   }
-  if (await liveDriverLeaseHeld(runtime, nowIso)) {
+  // `controlUsageExit` already demanded a durable state directory above; the
+  // guard re-checks so the lease lock path is never built from `undefined`.
+  if (stateDir === undefined) {
     io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'driver-lease-live' })}\n`);
     return 1;
   }
-  const result = await conductor.requestLaneRunStop.requestLaneRunStop({
-    runId,
-    mode: parsed.force ? 'force' : 'graceful',
-    via: 'cli',
-    entryId: conductor.newUlid(),
-    nowIso,
-    ...(parsed.revision !== undefined ? { expectedRevision: parsed.revision } : {}),
-  });
-  io.stdout(`${JSON.stringify(result)}\n`);
-  return exitFor(result);
+  const guarded = await recordUnderDriverLeaseGuard(runtime, stateDir, nowIso, async () =>
+    conductor.requestLaneRunStop.requestLaneRunStop({
+      runId,
+      mode: parsed.force ? 'force' : 'graceful',
+      via: 'cli',
+      entryId: conductor.newUlid(),
+      nowIso,
+      ...(parsed.revision !== undefined ? { expectedRevision: parsed.revision } : {}),
+    }),
+  );
+  if (guarded.refused) {
+    io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'driver-lease-live' })}\n`);
+    return 1;
+  }
+  io.stdout(`${JSON.stringify(guarded.result)}\n`);
+  return exitFor(guarded.result);
 }
 
 /** `conductor resume`: records a resume request for a run, refusing while a live driver lease is held. */
@@ -1620,25 +1662,34 @@ async function conductorResumeExit(
   runtime: FleetCliRuntime,
   nowIso: string,
   parsed: ControlOptions,
+  stateDir: string | undefined,
 ): Promise<number> {
   const runId = parsed.positionals[0];
   if (runId === undefined) {
     io.stderr(`conductor resume requires a run id\n${CONDUCTOR_HELP}\n`);
     return 2;
   }
-  if (await liveDriverLeaseHeld(runtime, nowIso)) {
+  // `controlUsageExit` already demanded a durable state directory above; the
+  // guard re-checks so the lease lock path is never built from `undefined`.
+  if (stateDir === undefined) {
     io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'driver-lease-live' })}\n`);
     return 1;
   }
-  const result = await conductor.resumeLaneRun.requestResume({
-    runId,
-    via: 'cli',
-    entryId: conductor.newUlid(),
-    nowIso,
-    ...(parsed.revision !== undefined ? { expectedRevision: parsed.revision } : {}),
-  });
-  io.stdout(`${JSON.stringify(result)}\n`);
-  return exitFor(result);
+  const guarded = await recordUnderDriverLeaseGuard(runtime, stateDir, nowIso, async () =>
+    conductor.resumeLaneRun.requestResume({
+      runId,
+      via: 'cli',
+      entryId: conductor.newUlid(),
+      nowIso,
+      ...(parsed.revision !== undefined ? { expectedRevision: parsed.revision } : {}),
+    }),
+  );
+  if (guarded.refused) {
+    io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'driver-lease-live' })}\n`);
+    return 1;
+  }
+  io.stdout(`${JSON.stringify(guarded.result)}\n`);
+  return exitFor(guarded.result);
 }
 
 /** `fleet-v2 conductor <subcommand>` dispatch. */
@@ -1687,9 +1738,9 @@ export async function conductorCommand(
     case 'halt':
       return await conductorHaltExit(conductor, io, nowIso, parsed.lift);
     case 'stop':
-      return await conductorStopExit(conductor, io, runtime, nowIso, parsed);
+      return await conductorStopExit(conductor, io, runtime, nowIso, parsed, options.stateDir);
     case 'resume':
-      return await conductorResumeExit(conductor, io, runtime, nowIso, parsed);
+      return await conductorResumeExit(conductor, io, runtime, nowIso, parsed, options.stateDir);
     default:
       io.stderr(`Unknown conductor subcommand: ${subcommand === '' ? '(none)' : subcommand}\n${CONDUCTOR_HELP}\n`);
       return 2;

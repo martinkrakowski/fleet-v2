@@ -16,6 +16,7 @@ import { describe, expect, it } from 'vitest';
 import {
   LaneRun,
   laneRunConductEntry,
+  withFileLock,
   type LaneRunParkRecord,
   type LaneRunRecord,
   type LaneRunJournalEntryRecord,
@@ -206,26 +207,28 @@ describe('fleet-v2 conductor (K7-4)', () => {
   });
 
   it('stop records graceful, then force; a graceful stop after a force is refused', async () => {
-    const runtime = makeRuntime(tempStateDir());
+    const stateDir = tempStateDir();
+    const runtime = makeRuntime(stateDir);
     await seedPlainRun(runtime);
-    const first = await runConductor(runtime, ['stop', RUN_ID]);
+    const first = await runConductor(runtime, ['stop', RUN_ID], stateDir);
     expect(first.code).toBe(0);
     expect(parseDocument(first.stdout)).toMatchObject({ outcome: 'stop-recorded', mode: 'graceful' });
-    const again = await runConductor(runtime, ['stop', RUN_ID]);
+    const again = await runConductor(runtime, ['stop', RUN_ID], stateDir);
     expect(again.code).toBe(0);
     expect(parseDocument(again.stdout)).toMatchObject({ outcome: 'already-requested', mode: 'graceful' });
-    const forced = await runConductor(runtime, ['stop', RUN_ID, '--force']);
+    const forced = await runConductor(runtime, ['stop', RUN_ID, '--force'], stateDir);
     expect(forced.code).toBe(0);
     expect(parseDocument(forced.stdout)).toMatchObject({ outcome: 'stop-recorded', mode: 'force' });
-    const afterForce = await runConductor(runtime, ['stop', RUN_ID]);
+    const afterForce = await runConductor(runtime, ['stop', RUN_ID], stateDir);
     expect(afterForce.code).toBe(1);
     expect(parseDocument(afterForce.stdout)).toMatchObject({ outcome: 'refused', reason: 'stop-already-forced' });
   });
 
   it('stop refuses a stale revision, a missing run id, a bad revision and an unknown run', async () => {
-    const runtime = makeRuntime(tempStateDir());
+    const stateDir = tempStateDir();
+    const runtime = makeRuntime(stateDir);
     await seedPlainRun(runtime);
-    const stale = await runConductor(runtime, ['stop', RUN_ID, '--revision', '99']);
+    const stale = await runConductor(runtime, ['stop', RUN_ID, '--revision', '99'], stateDir);
     expect(stale.code).toBe(1);
     expect(parseDocument(stale.stdout)).toMatchObject({ outcome: 'refused', reason: 'stale-revision' });
     const noId = await runConductor(runtime, ['stop']);
@@ -234,21 +237,23 @@ describe('fleet-v2 conductor (K7-4)', () => {
     const badRevision = await runConductor(runtime, ['stop', RUN_ID, '--revision', 'abc']);
     expect(badRevision.code).toBe(2);
     expect(badRevision.stderr[0]).toContain('--revision');
-    const unknown = await runConductor(runtime, ['stop', RUN_ID_UNKNOWN]);
+    const unknown = await runConductor(runtime, ['stop', RUN_ID_UNKNOWN], stateDir);
     expect(unknown.code).toBe(1);
     expect(parseDocument(unknown.stdout)).toMatchObject({ outcome: 'not-found', runId: RUN_ID_UNKNOWN });
   });
 
   it('resume refuses a non-parked run and records a parked run', async () => {
-    const plain = makeRuntime(tempStateDir());
+    const plainDir = tempStateDir();
+    const plain = makeRuntime(plainDir);
     await seedPlainRun(plain);
-    const notParked = await runConductor(plain, ['resume', RUN_ID]);
+    const notParked = await runConductor(plain, ['resume', RUN_ID], plainDir);
     expect(notParked.code).toBe(1);
     expect(parseDocument(notParked.stdout)).toMatchObject({ outcome: 'refused', reason: 'not-parked' });
 
-    const parked = makeRuntime(tempStateDir());
+    const parkedDir = tempStateDir();
+    const parked = makeRuntime(parkedDir);
     await seedParkedRun(parked);
-    const resumed = await runConductor(parked, ['resume', RUN_ID]);
+    const resumed = await runConductor(parked, ['resume', RUN_ID], parkedDir);
     expect(resumed.code).toBe(0);
     expect(parseDocument(resumed.stdout)).toMatchObject({
       outcome: 'resume-recorded',
@@ -306,7 +311,7 @@ describe('fleet-v2 conductor (K7-4)', () => {
     const first = makeRuntime(stateDir);
     await seedPlainRun(first);
     expect((await runConductor(first, ['halt'])).code).toBe(0);
-    expect((await runConductor(first, ['stop', RUN_ID])).code).toBe(0);
+    expect((await runConductor(first, ['stop', RUN_ID], stateDir)).code).toBe(0);
     const second = makeRuntime(stateDir);
     const status = await runConductor(second, ['status']);
     expect(status.code).toBe(0);
@@ -317,14 +322,15 @@ describe('fleet-v2 conductor (K7-4)', () => {
   });
 
   it('dispatches nothing: the runSubprocess spy never throws across the controls', async () => {
-    const runtime = makeRuntime(tempStateDir());
+    const stateDir = tempStateDir();
+    const runtime = makeRuntime(stateDir);
     await seedPlainRun(runtime);
     expect((await runConductor(runtime, ['status'])).code).toBe(0);
     expect((await runConductor(runtime, ['halt'])).code).toBe(0);
     expect((await runConductor(runtime, ['halt', '--lift'])).code).toBe(0);
-    expect((await runConductor(runtime, ['stop', RUN_ID, '--force'])).code).toBe(0);
-    expect((await runConductor(runtime, ['resume', RUN_ID])).code).toBe(1);
-    expect((await runConductor(runtime, ['resume', RUN_ID, '--revision', '2'])).code).toBe(1);
+    expect((await runConductor(runtime, ['stop', RUN_ID, '--force'], stateDir)).code).toBe(0);
+    expect((await runConductor(runtime, ['resume', RUN_ID], stateDir)).code).toBe(1);
+    expect((await runConductor(runtime, ['resume', RUN_ID, '--revision', '2'], stateDir)).code).toBe(1);
   });
 });
 
@@ -357,30 +363,33 @@ describe('fleet-v2 conductor stop/resume vs the driver lease (R0b)', () => {
   }
 
   it('stop refuses while a live driver lease is held, echoing no supplied value', async () => {
-    const runtime = makeRuntime(tempStateDir());
+    const stateDir = tempStateDir();
+    const runtime = makeRuntime(stateDir);
     await seedPlainRun(runtime);
     await seedDriverLease(runtime, LEASE_UNTIL);
-    const result = await runConductor(runtime, ['stop', RUN_ID]);
+    const result = await runConductor(runtime, ['stop', RUN_ID], stateDir);
     expect(result.code).toBe(1);
     expect(result.stdout).toEqual([LEASE_REFUSAL]);
     expect(result.stderr).toEqual([]);
   });
 
   it('resume refuses while a live driver lease is held, echoing no supplied value', async () => {
-    const runtime = makeRuntime(tempStateDir());
+    const stateDir = tempStateDir();
+    const runtime = makeRuntime(stateDir);
     await seedParkedRun(runtime);
     await seedDriverLease(runtime, LEASE_UNTIL);
-    const result = await runConductor(runtime, ['resume', RUN_ID]);
+    const result = await runConductor(runtime, ['resume', RUN_ID], stateDir);
     expect(result.code).toBe(1);
     expect(result.stdout).toEqual([LEASE_REFUSAL]);
     expect(result.stderr).toEqual([]);
   });
 
   it('a lapsed driver lease allows stop, and the run journal shows the recorded intent', async () => {
-    const runtime = makeRuntime(tempStateDir());
+    const stateDir = tempStateDir();
+    const runtime = makeRuntime(stateDir);
     await seedPlainRun(runtime);
     await seedDriverLease(runtime, NOW, new Date(Date.parse(NOW) - 5 * 60 * 1000).toISOString());
-    const result = await runConductor(runtime, ['stop', RUN_ID]);
+    const result = await runConductor(runtime, ['stop', RUN_ID], stateDir);
     expect(result.code).toBe(0);
     expect(parseDocument(result.stdout)).toMatchObject({ outcome: 'stop-recorded', mode: 'graceful' });
     const entries = await runtime.conductor.laneRunJournal.listForRun(RUN_ID);
@@ -388,10 +397,11 @@ describe('fleet-v2 conductor stop/resume vs the driver lease (R0b)', () => {
   });
 
   it('a lapsed driver lease allows resume, and the run journal shows the recorded intent', async () => {
-    const runtime = makeRuntime(tempStateDir());
+    const stateDir = tempStateDir();
+    const runtime = makeRuntime(stateDir);
     await seedParkedRun(runtime);
     await seedDriverLease(runtime, NOW, new Date(Date.parse(NOW) - 5 * 60 * 1000).toISOString());
-    const result = await runConductor(runtime, ['resume', RUN_ID]);
+    const result = await runConductor(runtime, ['resume', RUN_ID], stateDir);
     expect(result.code).toBe(0);
     expect(parseDocument(result.stdout)).toMatchObject({
       outcome: 'resume-recorded',
@@ -403,15 +413,17 @@ describe('fleet-v2 conductor stop/resume vs the driver lease (R0b)', () => {
   });
 
   it('an absent driver lease lets stop and resume behave exactly as before this lane', async () => {
-    const runtime = makeRuntime(tempStateDir());
+    const stateDir = tempStateDir();
+    const runtime = makeRuntime(stateDir);
     await seedPlainRun(runtime);
-    const stop = await runConductor(runtime, ['stop', RUN_ID]);
+    const stop = await runConductor(runtime, ['stop', RUN_ID], stateDir);
     expect(stop.code).toBe(0);
     expect(parseDocument(stop.stdout)).toMatchObject({ outcome: 'stop-recorded', mode: 'graceful' });
 
-    const parked = makeRuntime(tempStateDir());
+    const parkedDir = tempStateDir();
+    const parked = makeRuntime(parkedDir);
     await seedParkedRun(parked);
-    const resume = await runConductor(parked, ['resume', RUN_ID]);
+    const resume = await runConductor(parked, ['resume', RUN_ID], parkedDir);
     expect(resume.code).toBe(0);
     expect(parseDocument(resume.stdout)).toMatchObject({ outcome: 'resume-recorded', runId: RUN_ID, to: 'gating' });
   });
@@ -421,9 +433,79 @@ describe('fleet-v2 conductor stop/resume vs the driver lease (R0b)', () => {
     const runtime = makeRuntime(stateDir);
     await seedPlainRun(runtime);
     writeFileSync(join(stateDir, 'conductor-driver-lease.json'), 'not valid json bytes');
-    const result = await runConductor(runtime, ['stop', RUN_ID]);
+    const result = await runConductor(runtime, ['stop', RUN_ID], stateDir);
     expect(result.code).toBe(1);
     expect(result.stdout).toEqual([LEASE_REFUSAL]);
     expect(result.stderr).toEqual([]);
+  });
+
+  it('records stop under the driver lease lock, so a lease change cannot slip between the check and the record', async () => {
+    const stateDir = tempStateDir();
+    const runtime = makeRuntime(stateDir);
+    await seedPlainRun(runtime);
+    let releaseLock!: () => void;
+    const released = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    let lockHeld!: () => void;
+    const held = new Promise<void>((resolve) => {
+      lockHeld = resolve;
+    });
+    const locker = withFileLock(join(stateDir, 'conductor-driver-lease.json.lock'), async () => {
+      lockHeld();
+      await released;
+    });
+    await held;
+    let stopDone = false;
+    const stopPromise = runConductor(runtime, ['stop', RUN_ID], stateDir).then((result) => {
+      stopDone = true;
+      return result;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(stopDone).toBe(false);
+    const entriesWhileLocked = await runtime.conductor.laneRunJournal.listForRun(RUN_ID);
+    expect(entriesWhileLocked.some((entry) => entry.kind === 'intent')).toBe(false);
+    releaseLock();
+    await locker;
+    const result = await stopPromise;
+    expect(result.code).toBe(0);
+    expect(parseDocument(result.stdout)).toMatchObject({ outcome: 'stop-recorded', mode: 'graceful' });
+  });
+
+  it('records resume under the driver lease lock, so a lease change cannot slip between the check and the record', async () => {
+    const stateDir = tempStateDir();
+    const runtime = makeRuntime(stateDir);
+    await seedParkedRun(runtime);
+    let releaseLock!: () => void;
+    const released = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    let lockHeld!: () => void;
+    const held = new Promise<void>((resolve) => {
+      lockHeld = resolve;
+    });
+    const locker = withFileLock(join(stateDir, 'conductor-driver-lease.json.lock'), async () => {
+      lockHeld();
+      await released;
+    });
+    await held;
+    let resumeDone = false;
+    const resumePromise = runConductor(runtime, ['resume', RUN_ID], stateDir).then((result) => {
+      resumeDone = true;
+      return result;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(resumeDone).toBe(false);
+    const entriesWhileLocked = await runtime.conductor.laneRunJournal.listForRun(RUN_ID);
+    expect(entriesWhileLocked.some((entry) => entry.kind === 'intent')).toBe(false);
+    releaseLock();
+    await locker;
+    const result = await resumePromise;
+    expect(result.code).toBe(0);
+    expect(parseDocument(result.stdout)).toMatchObject({
+      outcome: 'resume-recorded',
+      runId: RUN_ID,
+      to: 'gating',
+    });
   });
 });

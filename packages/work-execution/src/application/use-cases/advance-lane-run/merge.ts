@@ -6,20 +6,20 @@ import type { CiStatePort } from '../../ports/out/CiStatePort.out-port.js';
 import type { ConductorForgeGrantResult } from '../../ports/out/ConductorForgeGrantPort.out-port.js';
 import type { ForgeReadPort, PullRequestMergeState, PullRequestRef, ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
 import type { ForgeAncestryPort } from '../../ports/out/ForgeAncestryPort.out-port.js';
-import type { ReviewRequestPort } from '../../ports/out/ReviewRequestPort.out-port.js';
+import type { ReviewRequestPort, FindReviewReceiptResult } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { laneRunJournalState } from '../../../domain/lane-run-journal.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
 import { resolveLaneRunBaseBranch } from '../../../domain/base-branch.js';
 import { head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
-import type { LaneRunPrBodyFrozen, RenderPrBodyResult } from '../../../domain/lane-run-pr-body.js';
+import type { LaneRunPrBodyFrozen, LaneRunCarriedMinor, RenderPrBodyResult } from '../../../domain/lane-run-pr-body.js';
 import { renderPrBody } from '../../../domain/lane-run-pr-body.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendRunIntent, appendRunResult, performPark, saveOrRefuse } from './step-context.js';
+import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, saveOrRefuse } from './step-context.js';
 import { readVerifiedFrozenManifest } from './frozen-manifest.js';
 
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
@@ -568,6 +568,100 @@ function frozenPrNotesOf(manifest: Record<string, unknown> | null): LaneRunPrBod
   return { hardToUndo, assumptions, challengeThis };
 }
 
+/**
+ * GB1: the run's latest brief-check intent key at the accepted head, or null.
+ * Read from the journal entries in reverse; only step keys of `brief-check`
+ * whose head12 matches the accepted head count.
+ */
+function latestBriefCheckIntentKeyOf(entries: readonly LaneRunJournalEntryRecord[], headSha: string): string | null {
+  const head12 = head12Of(headSha);
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index]!;
+    if (entry.kind !== 'intent') {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.step !== 'brief-check' || parsed.head12 !== head12) {
+      continue;
+    }
+    return entry.key;
+  }
+  return null;
+}
+
+/**
+ * GB1 (correction 3): the key carries minors only when its final journal
+ * result is the minor-only override itself — `review-passed` with the fixed
+ * detail `minor-only-findings`. Any other result, or none, carries nothing.
+ */
+function hasMinorOnlyOverrideResult(entries: readonly LaneRunJournalEntryRecord[], key: string): boolean {
+  return entries.some(
+    (entry) =>
+      entry.kind === 'result' &&
+      entry.key === key &&
+      entry.outcome !== 'ambiguous' &&
+      entry.reasonCode === 'review-passed' &&
+      entry.detail === 'minor-only-findings',
+  );
+}
+
+/** Receipt findings map onto the carried shape; only `minor` and `nit` are carried. */
+function carriedMinorsOfReceipt(receipt: {
+  readonly findings: readonly { readonly severity: 'blocker' | 'major' | 'minor' | 'nit';
+    readonly filePath: string | null; readonly line: number | null }[];
+}): LaneRunCarriedMinor[] {
+  return receipt.findings
+    .filter((finding): finding is typeof finding & { severity: 'minor' | 'nit' } =>
+      finding.severity === 'minor' || finding.severity === 'nit')
+    .map((finding) => ({ severity: finding.severity, filePath: finding.filePath, line: finding.line }));
+}
+
+/**
+ * GB1: the minors the open-PR body carries from the minors-only brief-check
+ * override receipt at the accepted head. Display only: a missing read, no
+ * intent, no override result, no request id, an absent dep, a non-found or
+ * throwing receipt read contributes no lines — the PR still opens.
+ */
+async function carriedMinorsOf(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  headSha: string,
+): Promise<LaneRunCarriedMinor[]> {
+  const port = ctx.deps.reviewRequest;
+  if (port === undefined) {
+    return [];
+  }
+  let entries: readonly LaneRunJournalEntryRecord[];
+  try {
+    entries = await ctx.deps.runJournal.listForRun(record.runId);
+  } catch {
+    return [];
+  }
+  const key = latestBriefCheckIntentKeyOf(entries, headSha);
+  if (key === null || !hasMinorOnlyOverrideResult(entries, key)) {
+    return [];
+  }
+  const requestId = await intentMintedIdOf(ctx, key);
+  if (requestId === null) {
+    return [];
+  }
+  let found: FindReviewReceiptResult;
+  try {
+    found = await port.findReviewReceipt({
+      attemptId: latest.id,
+      requestId,
+      candidateHeadSha: headSha,
+    });
+  } catch {
+    return [];
+  }
+  if (found.outcome !== 'found') {
+    return [];
+  }
+  return carriedMinorsOfReceipt(found.receipt);
+}
+
 /** The open-pr/push act pre-checks (K6-6): the wiring and the collected head. */
 function prPushPreCheck(
   ctx: AdvanceStepContext,
@@ -670,6 +764,10 @@ async function runPrPushBody(
   if (kind === 'push-and-open-pr') {
     const manifest = await readVerifiedFrozenManifest(latest, ctx.deps.artifactPort, ctx.deps.computeDigest);
     const frozen = frozenPrNotesOf(manifest);
+    // GB1: the minors-only brief-check override receipt's findings join the
+    // Challenge section. Display only — an unavailable receipt contributes
+    // no lines and never blocks the open-pr.
+    const carriedMinors = await carriedMinorsOf(ctx, record, latest, headSha);
     const title = 'Fleet work order ' + record.workOrderId;
     rendered = frozen === null ? null : renderPrBody({
       workOrderId: record.workOrderId,
@@ -680,6 +778,7 @@ async function runPrPushBody(
       gate: 'passed',
       reviews: [],
       frozen,
+      ...(carriedMinors.length > 0 ? { carriedMinors } : {}),
     });
     if (rendered === null || !rendered.ok) {
       return refuseKeyed(ctx, request, decision, 'forge-refused', baseBranch);

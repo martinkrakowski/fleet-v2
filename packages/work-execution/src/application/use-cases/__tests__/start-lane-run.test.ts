@@ -246,24 +246,36 @@ function makeHarness(options: HarnessOptions = {}) {
   };
 
   const briefCalls: PrepareBriefPackageUseCaseRequest[] = [];
-  let briefAnswers: ('prepared' | 'rejected')[] = [];
+  type BriefAnswer =
+    | 'prepared'
+    | 'rejected'
+    | { readonly outcome: 'rejected'; readonly reason: string; readonly reasonClass?: 'acceptance-spec-shell' };
+  let briefAnswers: BriefAnswer[] = [];
   const prepareBrief: PrepareBriefPackagePort = {
     async prepareBriefPackage(request) {
       briefCalls.push(request);
-      const answer = briefAnswers.length > 0 ? (briefAnswers.shift() as 'prepared' | 'rejected') : 'prepared';
+      const answer = briefAnswers.length > 0 ? (briefAnswers.shift() as BriefAnswer) : 'prepared';
       const placed = request as PrepareBriefPackageUseCaseRequest;
-      return answer === 'prepared'
-        ? {
-            outcome: 'prepared' as const,
-            prepared: {
-              attemptId: placed.attemptId ?? ATTEMPT_ID,
-              briefDigest: DIGEST,
-              prosePath: (placed.worktreePath ?? WORKTREE_PATH) + '/.lane/brief.md',
-              manifestPath: (placed.worktreePath ?? WORKTREE_PATH) + '/.lane/brief-manifest.json',
-              selectedKnowledgeVersions: [],
-            },
-          }
-        : { outcome: 'rejected' as const, reason: 'example brief rejection' };
+      if (answer === 'prepared') {
+        return {
+          outcome: 'prepared' as const,
+          prepared: {
+            attemptId: placed.attemptId ?? ATTEMPT_ID,
+            briefDigest: DIGEST,
+            prosePath: (placed.worktreePath ?? WORKTREE_PATH) + '/.lane/brief.md',
+            manifestPath: (placed.worktreePath ?? WORKTREE_PATH) + '/.lane/brief-manifest.json',
+            selectedKnowledgeVersions: [],
+          },
+        };
+      }
+      if (answer === 'rejected') {
+        return { outcome: 'rejected' as const, reason: 'example brief rejection' };
+      }
+      return {
+        outcome: 'rejected' as const,
+        reason: answer.reason,
+        ...(answer.reasonClass !== undefined ? { reasonClass: answer.reasonClass } : {}),
+      };
     },
     async previewBriefPackage() {
       throw new Error('not used in this test');
@@ -309,7 +321,7 @@ function makeHarness(options: HarnessOptions = {}) {
       resolveTipAnswer = answer;
     },
     briefCalls,
-    setBriefAnswers: (answers: ('prepared' | 'rejected')[]) => {
+    setBriefAnswers: (answers: BriefAnswer[]) => {
       briefAnswers = answers;
     },
     failNextAttemptSave: () => {
@@ -972,6 +984,36 @@ describe('StartLaneRunUseCase', () => {
     const attempts = await harness.attemptRepoStore.listAllAttempts();
     expect(attempts).toHaveLength(1);
     expect(attempts[0]?.state).toBe('intent-recorded');
+  });
+
+  it('test 4c: a brief rejection classified acceptance-spec-shell maps to brief-acceptance-spec-shell', async () => {
+    const harness = makeHarness();
+    harness.setBriefAnswers([
+      { outcome: 'rejected', reason: '<redacted>', reasonClass: 'acceptance-spec-shell' },
+    ]);
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'brief',
+      reason: 'brief-acceptance-spec-shell',
+    });
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
+  });
+
+  it('test 4d: a brief rejection without reasonClass still maps to brief-rejected', async () => {
+    const harness = makeHarness();
+    harness.setBriefAnswers([{ outcome: 'rejected', reason: 'example brief rejection' }]);
+    const result = await harness.useCase.startLaneRun(requestFixture());
+    expect(result).toEqual({
+      outcome: 'incomplete',
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+      step: 'brief',
+      reason: 'brief-rejected',
+    });
+    expect(await heldFor(harness.executionJournal, ATTEMPT_ID)).toBe(true);
   });
 
   it('test 5: a retry after completion returns started and calls no fake again', async () => {

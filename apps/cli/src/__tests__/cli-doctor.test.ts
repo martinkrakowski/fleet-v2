@@ -64,6 +64,10 @@ function passingProbes(calls?: string[]): DoctorProbes {
     worktreeRootWritable: async () => true,
     ocmRunBinary: async () => ({ path: '/repo/bin/ocm-run', sha256: 'c'.repeat(64) }),
     expectedOcmRunHash: async () => 'c'.repeat(64),
+    ghBinary: async () => ({
+      resolved: '/usr/bin/gh',
+      candidates: ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'],
+    }),
     seatProbe: async () => {
       calls?.push('seatProbe');
       return { outcome: 'pass', reason: 'answered' };
@@ -108,7 +112,7 @@ describe('fleet-v2 doctor', () => {
     expect(calls).toContain('seatProbe');
     expect(stdout.length).toBeGreaterThan(0);
     for (const text of stdout) {
-      expect(text).toMatch(/^(PASS|FAIL|UNKNOWN) (installation|host|tool|seat|credential|runner-binary) \S+ \S+ — /);
+      expect(text).toMatch(/^(PASS|FAIL|UNKNOWN) (installation|host|tool|seat|credential|runner-binary|gh-binary) \S+ \S+ — /);
     }
     expect(stdout.some((text) => text.startsWith('PASS seat seat-1 probe — '))).toBe(true);
   });

@@ -112,6 +112,10 @@ function passingDoctorProbes(): DoctorProbes {
       sha256: "c".repeat(64),
     }),
     expectedOcmRunHash: async () => "c".repeat(64),
+    ghBinary: async () => ({
+      resolved: "/usr/bin/gh",
+      candidates: ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"],
+    }),
     seatProbe: async () => ({ outcome: "pass", reason: "answered" }),
   };
 }

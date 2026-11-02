@@ -28,6 +28,7 @@ import {
   ReviewRequestAdapter,
   WorkspaceAdapter,
   WorkOrderRepositoryAdapter,
+  type ForgeReadAdapter,
   type ProjectProfileReadPort,
   type RunnerForAttemptPort,
 } from '@fleet/work-execution';
@@ -57,6 +58,8 @@ export interface ComposeConductorInput {
   /** The execution stores the worktree reap reads (EX-2b). */
   readonly workOrderRepository: WorkOrderRepositoryAdapter;
   readonly attemptRepository: AttemptRepositoryAdapter;
+  /** R4a: the read-only forge read the settled open-pr park's resume re-checks. */
+  readonly forgeRead: ForgeReadAdapter;
   readonly executionJournal: ExecutionJournalAdapter;
   readonly workspace: WorkspaceAdapter;
   /** H9b1: resolves the runner addressed by an attempt's recorded host (EX-4). */
@@ -74,6 +77,7 @@ export function composeConductor(input: ComposeConductorInput) {
     installation,
     workOrderRepository,
     attemptRepository,
+    forgeRead,
     executionJournal,
     workspace,
     runnerForAttempt,
@@ -128,6 +132,8 @@ export function composeConductor(input: ComposeConductorInput) {
       runRepo: laneRunRepository,
       runJournal: laneRunJournal,
       newUlid: conductorNewUlid,
+      forgeRead,
+      attemptRepo: attemptRepository,
     }),
     // EX-2b: the operator-opt-in worktree reap, built beside the lane-run
     // stores it scans and the execution stores it journals to.

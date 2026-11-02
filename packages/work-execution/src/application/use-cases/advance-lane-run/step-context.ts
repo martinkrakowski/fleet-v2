@@ -41,7 +41,12 @@ export async function performEnter(ctx: AdvanceStepContext,
   to: LaneRunStateValue,
   request: AdvanceLaneRunRequest,
 ): Promise<AdvanceLaneRunResult> {
-  if (!canEnterLaneRunState(from, to, record.parked?.parkedFrom ?? null)) {
+  const settledOpenPr =
+    record.parked !== null &&
+    record.parked.reason === 'ambiguous' &&
+    record.parked.qualifier === 'open-pr' &&
+    record.prNumber !== null;
+  if (!canEnterLaneRunState(from, to, record.parked?.parkedFrom ?? null, settledOpenPr)) {
     return { outcome: 'refused', reason: 'illegal-transition' };
   }
   if (to === 'merged' || to === 'stopped') {

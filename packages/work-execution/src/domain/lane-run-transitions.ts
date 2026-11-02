@@ -76,10 +76,17 @@ export const LANE_RUN_REVIEWS_IN_FLIGHT = {
 /**
  * Whether `from → to` is a legal transition. Terminal `from` → false. `to === 'stopped'` → true.
  * `to === 'parked'` → true unless `from` is `parked`. `from === 'parked'` → true only when `to` equals
- * `parkedFrom` (pass the record's `parked.parkedFrom`; `null`/absent → false) or when `to` is `merged`
- * (CT-2a). Otherwise the table. Unknown strings → false.
+ * `parkedFrom` (pass the record's `parked.parkedFrom`; `null`/absent → false), when `to` is `merged`
+ * (CT-2a), or when `to` is `watching-ci` and `settledOpenPrPark` is true (R4a / G3b0: an `ambiguous`
+ * `open-pr` park whose spent key the resume adopted leaves by itself; the `opening-pr` parkedFrom exit
+ * would decide `open-pr` again on its spent key). Otherwise the table. Unknown strings → false.
  */
-export function canEnterLaneRunState(from: string, to: string, parkedFrom?: string | null): boolean {
+export function canEnterLaneRunState(
+  from: string,
+  to: string,
+  parkedFrom?: string | null,
+  settledOpenPrPark?: boolean,
+): boolean {
   if (!(LANE_RUN_STATES as readonly string[]).includes(from)) {
     return false;
   }
@@ -98,6 +105,13 @@ export function canEnterLaneRunState(from: string, to: string, parkedFrom?: stri
     // its PR merges with the lane head (the decider's G5), even though `merged`
     // is not the park's recorded `parkedFrom`.
     if (to === 'merged') {
+      return true;
+    }
+    // R4a (G3b0): the settled open-pr park (an `ambiguous open-pr` park whose
+    // spent key the resume adopted) enters `watching-ci` directly — the PR is
+    // already open, so the `opening-pr` parkedFrom exit would decide
+    // `open-pr` again on its spent key.
+    if (to === 'watching-ci' && settledOpenPrPark === true) {
       return true;
     }
     return parkedFrom !== null && parkedFrom !== undefined && to === parkedFrom;

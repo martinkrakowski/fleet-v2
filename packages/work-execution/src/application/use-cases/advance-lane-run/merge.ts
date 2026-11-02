@@ -202,6 +202,18 @@ function acceptedHead12Of(
 }
 
 /**
+ * The run's PR head branch: its recorded `branchName`, else the latest
+ * attempt's worktreePath last segment (the same decision K5-5 takes).
+ */
+function branchRefOf(record: LaneRunRecord, latest: AttemptRecord): PullRequestRef {
+  if (record.branchName !== undefined) {
+    return { kind: 'branch', branchName: record.branchName };
+  }
+  const segments = latest.worktreePath.split('/');
+  return { kind: 'branch', branchName: segments[segments.length - 1] };
+}
+
+/**
  * The PR is read by number when `record.prNumber` is set, else by the run's
  * recorded branch (`record.branchName`, KF-5b); old records without the field
  * fall back to the last path segment of the latest attempt's worktreePath
@@ -211,11 +223,7 @@ function pullRequestRefOf(record: LaneRunRecord, latest: AttemptRecord): PullReq
   if (record.prNumber !== null) {
     return { kind: 'number', number: record.prNumber };
   }
-  if (record.branchName !== undefined) {
-    return { kind: 'branch', branchName: record.branchName };
-  }
-  const segments = latest.worktreePath.split('/');
-  return { kind: 'branch', branchName: segments[segments.length - 1] };
+  return branchRefOf(record, latest);
 }
 
 /** The pre-merge receipt fact (D3): the receipt's verdict; unreadable → unknown, absent → none. */
@@ -265,14 +273,13 @@ async function containsLaneHeadOf(ancestry: ForgeAncestryPort, ancestorSha: stri
 /** The PR read: the snapshot's state and head plus its merge state; anything but a found snapshot reads null. */
 async function prFactOf(
   port: ForgeReadPort,
-  record: LaneRunRecord,
-  latest: AttemptRecord,
+  ref: PullRequestRef,
   laneHead12: string | null,
   laneHeadSha: string | null,
   ancestry: ForgeAncestryPort | undefined,
 ): Promise<PrReadResult> {
   try {
-    const read = await port.readPullRequest({ ref: pullRequestRefOf(record, latest) });
+    const read = await port.readPullRequest({ ref });
     if (read.outcome !== 'found') {
       return { pr: null, mergeState: null };
     }
@@ -332,15 +339,24 @@ export async function acceptanceFactsOf(
     }
   }
   // CT-2a: an owner-merge park reads the PR so G5 can leave once the PR merges
-  // with the lane head; every other park keeps reading nothing.
+  // with the lane head; R4a adds the parked `branch-behind` and `ambiguous`/`open-pr`
+  // reads (by branch, even when `prNumber` is set) so the decider's G3b0 can leave
+  // the settled open-pr park; every other park keeps reading nothing.
+  const parkedPrRead =
+    state === 'parked' &&
+    record.parked !== null &&
+    (record.parked.reason === 'branch-behind' ||
+      (record.parked.reason === 'ambiguous' && record.parked.qualifier === 'open-pr'));
   const canReadPr =
     !halted &&
     latest !== null &&
     latest.artifacts !== null &&
     (FACT_READ_STATES.includes(state) ||
-      (state === 'parked' && record.parked?.reason === 'owner-merge'));
+      (state === 'parked' && record.parked?.reason === 'owner-merge') ||
+      parkedPrRead);
   if (canReadPr && ctx.deps.forgeRead !== undefined) {
-    const prRead = await prFactOf(ctx.deps.forgeRead, record, latest, head12, latest.artifacts.headCommit, ctx.deps.forgeAncestry);
+    const ref = parkedPrRead ? branchRefOf(record, latest) : pullRequestRefOf(record, latest);
+    const prRead = await prFactOf(ctx.deps.forgeRead, ref, head12, latest.artifacts.headCommit, ctx.deps.forgeAncestry);
     pr = prRead.pr;
     mergeState = prRead.mergeState;
   }

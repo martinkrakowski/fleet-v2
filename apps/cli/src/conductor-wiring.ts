@@ -295,6 +295,8 @@ export function buildDryRunConductorDriver(
     runRepo: stores.runRepo,
     runJournal: stores.runJournal,
     newUlid,
+    forgeRead: fakes.forgeRead,
+    attemptRepo: stores.attemptRepo,
   });
   const advance = new AdvanceLaneRunUseCase({
     runRepo: stores.runRepo,

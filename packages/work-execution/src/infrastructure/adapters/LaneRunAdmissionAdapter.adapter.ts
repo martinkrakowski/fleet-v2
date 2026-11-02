@@ -308,8 +308,8 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
       return {
         blocked: true,
         blockers: {
-          runIds: active.map((entry) => entry.run.runId),
-          attemptIds: inFlight.map((entry) => entry.attemptId),
+          runIds: [...new Set(active.map((entry) => entry.run.runId))].sort(),
+          attemptIds: [...new Set(inFlight.map((entry) => entry.attemptId))].sort(),
         },
       };
     }

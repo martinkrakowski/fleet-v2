@@ -111,6 +111,7 @@ describe("requiredScope", () => {
     expect(requiredScope("POST", "/v1/attempts/:id/acceptance")).toBe("operate");
     expect(requiredScope("POST", "/v1/attempts/:id/cancel-prepared")).toBe("operate");
     expect(requiredScope("POST", "/v1/attempts/:id/artifacts")).toBe("operate");
+    expect(requiredScope("POST", "/v1/attempts/:id/notes")).toBe("operate");
     expect(requiredScope("POST", "/v1/verifications")).toBe("operate");
     expect(requiredScope("POST", "/v1/verifications/:id/receipt")).toBe("operate");
     expect(requiredScope("POST", "/v1/observations")).toBe("operate");

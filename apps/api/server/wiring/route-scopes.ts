@@ -61,6 +61,7 @@ const MUTATION_ROUTE_RULES: ReadonlyArray<readonly [string, string, string]> = [
   ["POST", "/v1/attempts/:id/acceptance", "operate"],
   ["POST", "/v1/attempts/:id/cancel-prepared", "operate"],
   ["POST", "/v1/attempts/:id/artifacts", "operate"],
+  ["POST", "/v1/attempts/:id/notes", "operate"],
   ["POST", "/v1/verifications", "operate"],
   ["POST", "/v1/verifications/:id/receipt", "operate"],
   ["POST", "/v1/observations", "operate"],
@@ -78,18 +79,22 @@ function isV1Path(path: string): boolean {
   return path === "/v1" || path.startsWith("/v1/");
 }
 
-function normalizePath(path: string): string {
+function decodeSegment(segment: string): string {
+  try {
+    return decodeURI(segment);
+  } catch {
+    return segment;
+  }
+}
+
+export function normalizePath(path: string): string {
   const qIndex = path.indexOf("?");
   let pathWithoutQuery = path;
   if (qIndex !== -1) {
     pathWithoutQuery = path.slice(0, qIndex);
   }
-  let decoded: string;
-  try {
-    decoded = decodeURI(pathWithoutQuery);
-  } catch {
-    return pathWithoutQuery;
-  }
+  const segments = pathWithoutQuery.split("/");
+  const decoded = segments.map(decodeSegment).join("/");
   if (decoded.length > 1 && decoded.endsWith("/")) {
     return decoded.slice(0, -1);
   }

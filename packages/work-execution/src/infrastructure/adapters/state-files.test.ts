@@ -23,6 +23,7 @@ import { LaneRunRepositoryAdapter, parseLaneRunStateRecord } from './LaneRunRepo
 import { ConductorDriverLeaseAdapter } from './ConductorDriverLeaseAdapter.adapter.js';
 import { ConductorHaltAdapter } from './ConductorHaltAdapter.adapter.js';
 import { LaneRunJournalAdapter } from './LaneRunJournalAdapter.adapter.js';
+import { MergeQueueRepositoryAdapter } from './MergeQueueRepositoryAdapter.adapter.js';
 import {
   TelemetryDispositionAdapter,
   parseTelemetryDispositionStateRecord,
@@ -194,6 +195,62 @@ const VALID_FIXTURES: Readonly<Record<string, readonly unknown[]>> = {
       attention: [],
     },
   ],
+  'merge-queue.json': [
+    {
+      version: 1,
+      entryId: '01JB0000000000000000000000',
+      repository: { owner: 'fleet', repo: 'v2' },
+      repoDigest: '0123456789ab',
+      pullRequest: 7,
+      headOid: '0123456789abcdef0123456789abcdef01234567',
+      state: 'queued',
+      reason: null,
+      attempt: 0,
+      notBeforeIso: null,
+      enqueuedAtIso: '2026-11-01T10:00:00.000Z',
+      enqueuedBy: 'cli',
+      supersedes: null,
+      runId: null,
+      attemptId: null,
+      workOrderId: null,
+      tier: 2,
+      verifiedHeadOid: null,
+      verifiedBy: null,
+      policyRevision: null,
+      premergeReceiptHeadOid: null,
+      veto: null,
+      mergeCommitOid: null,
+      mergedAtIso: null,
+      revision: 1,
+    },
+    {
+      version: 1,
+      entryId: '01JB0000000000000000000001',
+      repository: { owner: 'fleet', repo: 'v2' },
+      repoDigest: '0123456789ab',
+      pullRequest: 8,
+      headOid: '0123456789abcdef0123456789abcdef01234568',
+      state: 'queued',
+      reason: null,
+      attempt: 0,
+      notBeforeIso: null,
+      enqueuedAtIso: '2026-11-01T11:00:00.000Z',
+      enqueuedBy: 'cli',
+      supersedes: null,
+      runId: null,
+      attemptId: null,
+      workOrderId: null,
+      tier: 1,
+      verifiedHeadOid: null,
+      verifiedBy: null,
+      policyRevision: null,
+      premergeReceiptHeadOid: null,
+      veto: null,
+      mergeCommitOid: null,
+      mergedAtIso: null,
+      revision: 1,
+    },
+  ],
 };
 
 const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = {
@@ -244,6 +301,10 @@ const READS: Readonly<Record<string, (stateDir: string) => Promise<unknown>>> = 
     }
     return new ConductorPassTraceAdapter({ stateDir }).list();
   },
+  'merge-queue.json': (stateDir) =>
+    new MergeQueueRepositoryAdapter({ stateDir }).listMergeEntries({
+      deadlineIso: new Date(Date.now() + 60_000).toISOString(),
+    }),
 };
 
 type FixtureKind = 'valid' | 'not-json' | 'not-list' | 'bad-record';
@@ -348,6 +409,7 @@ describe('work-execution state file descriptors match the store readers', () => 
       'run-journal.json',
       'telemetry-dispositions.json',
       'conductor-passes.json',
+      'merge-queue.json',
     ]);
   });
 });

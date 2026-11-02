@@ -15,6 +15,10 @@ import { parseWorkOrderStateRecord } from './WorkOrderRepositoryAdapter.adapter.
 import { parseVersionedLaneRunStateRecord } from './LaneRunRepositoryAdapter.adapter.js';
 import { parseVersionedLaneRunJournalStateRecord } from './LaneRunJournalAdapter.adapter.js';
 import { parseTelemetryDispositionStateRecord } from './TelemetryDispositionAdapter.adapter.js';
+import {
+  duplicateMergeQueueIdentityListError,
+  parseMergeQueueStateRecord,
+} from './MergeQueueRepositoryAdapter.adapter.js';
 
 export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('work-orders.json', parseWorkOrderStateRecord),
@@ -27,4 +31,5 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeVersionedRecordListStore('run-journal.json', parseVersionedLaneRunJournalStateRecord),
   describeRecordListStore('telemetry-dispositions.json', parseTelemetryDispositionStateRecord),
   describeVersionedRecordListStore('conductor-passes.json', parseVersionedConductorPassTraceStateRecord),
+  describeRecordListStore('merge-queue.json', parseMergeQueueStateRecord, duplicateMergeQueueIdentityListError),
 ];

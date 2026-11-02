@@ -22,14 +22,17 @@ import {
   CommitEditOnlyAttemptUseCase,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
+  EnqueueMergeUseCase,
   ExecutionObservationAdapter,
   GatePredicateAdapter,
   ProcessTreeTerminationAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
+  ListMergeQueueUseCase,
   ListUnregisteredProjectsUseCase,
   LocalExecutor,
+  MergeQueueRepositoryAdapter,
   PolicyMergeGrantAdapter,
   PrepareBriefPackageUseCase,
   PrepareFixAttemptUseCase,
@@ -499,6 +502,10 @@ export function composeExecution(input: ComposeExecutionInput) {
   // process tree on its recorded host (a legacy record is refused by the adapter).
   const processTreeTermination = new ProcessTreeTerminationAdapter({ executorForHost });
 
+  const mergeQueueRepository = new MergeQueueRepositoryAdapter({ stateDir });
+  const enqueueMerge = new EnqueueMergeUseCase({ queue: mergeQueueRepository });
+  const listMergeQueue = new ListMergeQueueUseCase({ queue: mergeQueueRepository });
+
   const execution = {
     workOrderRepository,
     attemptRepository,
@@ -612,6 +619,9 @@ export function composeExecution(input: ComposeExecutionInput) {
       attemptRepo: attemptRepository,
       journal: executionJournal,
     }),
+    mergeQueueRepository,
+    enqueueMerge,
+    listMergeQueue,
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({
       attemptRepo: attemptRepository,
       workOrderRepo: workOrderRepository,

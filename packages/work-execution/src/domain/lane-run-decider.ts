@@ -214,6 +214,31 @@ function mergedPrCarriesLaneHead(pr: NonNullable<LaneRunFacts['pr']>, laneHead12
 }
 
 /**
+ * G3b0 (R4a): a settled open-pr park leaves to `watching-ci` by itself.
+ * A run parked `ambiguous open-pr` whose resume adopted exactly one open PR
+ * (the resume saved `record.prNumber` and settled the spent key, so no
+ * intent is pending) is only waiting on CI for an already-open PR: G3b
+ * below would wait on it forever, and the `opening-pr` parkedFrom exit
+ * would decide `open-pr` again on the spent key. The PR fact the parked
+ * read gathered must still name an open PR at the lane head; anything
+ * else — no PR fact, another head, a closed or merged PR — keeps the park.
+ * Total; never throws.
+ */
+function laneRunSettledOpenPrDecision(record: LaneRunRecord, facts: LaneRunFacts): LaneRunDecision | null {
+  if (facts.state !== 'parked' || record.parked === null || facts.pendingIntent !== null) {
+    return null;
+  }
+  if (record.parked.reason !== 'ambiguous' || record.parked.qualifier !== 'open-pr' || record.prNumber === null) {
+    return null;
+  }
+  const pr = facts.pr;
+  if (pr === null || pr.state !== 'open' || pr.head12 !== facts.head12) {
+    return null;
+  }
+  return { kind: 'enter', to: 'watching-ci' };
+}
+
+/**
  * KS7a-2: the merging hold's decision (speed plan §3.6.2, D20; §3.3.1): post
  * the `premerge` commit status, the merge hold, before the policy-grant /
  * train / merge tail. Returns `null` to fall through to that tail. Total;
@@ -818,6 +843,13 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         return park('halted', null);
       }
       return { kind: 'reconcile', step: facts.pendingIntent.step, key: facts.pendingIntent.key };
+    }
+
+    // G3b0 (R4a): a settled open-pr park leaves by itself; G3b below would
+    // wait on it forever.
+    const settledOpenPr = laneRunSettledOpenPrDecision(record, facts);
+    if (settledOpenPr !== null) {
+      return settledOpenPr;
     }
 
     // G3b / G3c: an ambiguous intent parks (or waits, when already parked).

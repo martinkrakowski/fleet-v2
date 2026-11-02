@@ -119,7 +119,12 @@ function reviewFacts(
 }
 
 /** Every `enter` decision produced by the rule tests must be a legal transition (§3.2). */
-const enterDecisions: Array<{ from: LaneRunStateValue; to: LaneRunStateValue; parkedFrom: string | null }> = [];
+const enterDecisions: Array<{
+  from: LaneRunStateValue;
+  to: LaneRunStateValue;
+  parkedFrom: string | null;
+  settledOpenPr: boolean;
+}> = [];
 
 function assertDecision(facts: LaneRunFacts, rec: LaneRunRecord, decision: LaneRunDecision, expected: LaneRunDecision): void {
   expect(decision).toEqual(expected);
@@ -128,6 +133,11 @@ function assertDecision(facts: LaneRunFacts, rec: LaneRunRecord, decision: LaneR
       from: facts.state,
       to: expected.to,
       parkedFrom: rec.parked === null ? null : rec.parked.parkedFrom,
+      settledOpenPr:
+        rec.parked !== null &&
+        rec.parked.reason === 'ambiguous' &&
+        rec.parked.qualifier === 'open-pr' &&
+        rec.prNumber !== null,
     });
   }
 }
@@ -1852,11 +1862,72 @@ describe('KF-1: halt blocks the collect and gate reconcile (G3a under halt)', ()
   });
 });
 
+describe('G3b0 (R4a): the settled open-pr park', () => {
+  const PARKED_AMBIGUOUS_OPEN_PR = {
+    reason: 'ambiguous',
+    qualifier: 'open-pr',
+    parkedFrom: 'opening-pr',
+    questionId: null,
+  };
+  const openPrPath: NonNullable<LaneRunFacts['pr']> = { state: 'open', head12: HEAD, containsLaneHead: false };
+
+  it('a settled open-pr park enters watching-ci', () => {
+    const rec = record({ parked: PARKED_AMBIGUOUS_OPEN_PR, parkCount: 1, prNumber: 7 });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, pr: openPrPath });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'watching-ci' });
+  });
+
+  it('the park waits while record.prNumber is null', () => {
+    const rec = record({ parked: PARKED_AMBIGUOUS_OPEN_PR, parkCount: 1 });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, pr: openPrPath });
+    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+
+  it('the park waits while the spent key is unsettled', () => {
+    const rec = record({ parked: PARKED_AMBIGUOUS_OPEN_PR, parkCount: 1, prNumber: 7 });
+    const facts = baseFacts({
+      state: 'parked',
+      head12: HEAD,
+      pr: openPrPath,
+      pendingIntent: { key: `${RUN_ID}/r0/open-pr/0@${HEAD}`, step: 'open-pr', reconciliation: 'ambiguous' },
+    });
+    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+
+  it('a changed PR head keeps the park', () => {
+    const rec = record({ parked: PARKED_AMBIGUOUS_OPEN_PR, parkCount: 1, prNumber: 7 });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, pr: { state: 'open', head12: '000000000000', containsLaneHead: false } });
+    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+
+  it('no PR fact keeps the park', () => {
+    const rec = record({ parked: PARKED_AMBIGUOUS_OPEN_PR, parkCount: 1, prNumber: 7 });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, pr: null });
+    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+
+  it('a closed PR keeps the park', () => {
+    const rec = record({ parked: PARKED_AMBIGUOUS_OPEN_PR, parkCount: 1, prNumber: 7 });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, pr: { state: 'closed', head12: HEAD, containsLaneHead: false } });
+    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+
+  it('another ambiguous step keeps the park', () => {
+    const rec = record({
+      parked: { reason: 'ambiguous', qualifier: 'merge', parkedFrom: 'merging', questionId: null },
+      parkCount: 1,
+      prNumber: 7,
+    });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, pr: openPrPath });
+    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
+  });
+});
+
 describe('decision legality', () => {
   it('every enter decision produced above is a legal transition', () => {
     expect(enterDecisions.length).toBeGreaterThan(0);
     for (const entry of enterDecisions) {
-      expect(canEnterLaneRunState(entry.from, entry.to, entry.parkedFrom)).toBe(true);
+      expect(canEnterLaneRunState(entry.from, entry.to, entry.parkedFrom, entry.settledOpenPr)).toBe(true);
     }
   });
 });

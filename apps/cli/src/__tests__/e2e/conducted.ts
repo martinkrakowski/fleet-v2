@@ -10,7 +10,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
@@ -81,6 +81,21 @@ export interface ConductedFixtureOptions {
    * `maxConcurrentLanes` to 2. Default: false — today's single-run shape.
    */
   readonly secondRun?: boolean;
+  /**
+   * R4a: when true, the gh stub makes the FIRST `gh pr create` invocation
+   * return without a parseable pull-request number (exit 0, "Created pull
+   * request!"), so the conductor journals `forge-ambiguous` and the run parks
+   * `ambiguous open-pr` — the real-world case where gh opened the PR but its
+   * response did not report a number. Later PR-creates answer normally.
+   */
+  readonly failPrCreateOnce?: boolean;
+  /**
+   * R4a: when true, the fake `pr view` read answers not-found until the first
+   * PR-create invocation has been seen, then answers the recorded open PR —
+   * the PR appears only once the create ran. Used with `failPrCreateOnce` to
+   * drive a run into the parked `ambiguous open-pr` recovery scenario.
+   */
+  readonly prViewOpenAfterCreate?: boolean;
 }
 
 export interface CliRunResult {
@@ -295,7 +310,20 @@ function buildConductedInstallation(
 }
 
 /** The stub `gh` binary on PATH: records one flattened argv line per call, then prints the example PR URL. */
-function ghStubScript(argvLog: string, statusDir: string): string {
+function ghStubScript(
+  argvLog: string,
+  statusDir: string,
+  options: {
+    /** R4a: the first PR-create answers without a number (ambiguous), later ones normally. */
+    readonly failPrCreateOnce?: boolean;
+    /** R4a: touched by every PR-create, so the fake `pr view` can flip to the open PR. */
+    readonly prCreateMarkerFile?: string;
+    /** R4a: the "already failed" marker for the once-only ambiguous create. */
+    readonly prCreateCountFile?: string;
+  } = {},
+): string {
+  const failOnce = options.failPrCreateOnce === true && options.prCreateCountFile !== undefined;
+  const marker = options.prCreateMarkerFile === undefined ? null : options.prCreateMarkerFile;
   return [
     '#!/bin/sh',
     // One line per call: a `--body` carries newlines, so the ARGUMENTS are
@@ -323,6 +351,25 @@ function ghStubScript(argvLog: string, statusDir: string): string {
     `      printf '%s\\n' "$state" >> ${sq(statusDir)}/status."$sha"`,
     '    fi',
     '    exit 0',
+    '    ;;',
+    'esac',
+    // R4a: a PR-create that reports no pull-request number (the gh stub's
+    // "Created pull request!" with no URL) makes the conductor journal
+    // `forge-ambiguous`; the marker file tells the fake `pr view` read that
+    // the PR now exists (touched before the ambiguous branch, so the once-only
+    // failure still records that a create ran).
+    'case " $* " in',
+    '  *" pr create "*)',
+    ...(marker === null ? [] : [`    : > ${sq(marker)}`]),
+    ...(failOnce
+      ? [
+          `    if [ ! -f ${sq(options.prCreateCountFile!)} ]; then`,
+          `      printf '%s\\n' '1' > ${sq(options.prCreateCountFile!)}`,
+          '      printf \'%s\\n\' \'Created pull request!\'',
+          '      exit 0',
+          '    fi',
+        ]
+      : []),
     '    ;;',
     'esac',
     `if [ -n "$sha" ] && [ -f ${sq(statusDir)}/status."$sha" ]; then`,
@@ -437,12 +484,30 @@ function fakeOpencodeWrapperScript(
  * (PC-4's stub plus the `pr view` snapshot and the compare read): an open PR
  * number 7 at the worktree head whose merge state is clean, CI buckets that
  * pass, and zero unresolved review threads.
+ * R4a: when `prViewOpenAfterCreate` is set (with `prCreateMarkerFile`), the
+ * `pr view` read answers not-found until the first PR-create invocation has
+ * touched the marker file, then answers the recorded open PR.
  */
-function makeForgeGhRunner(head: () => string, branchName: string) {
+function makeForgeGhRunner(
+  head: () => string,
+  branchName: string,
+  options: {
+    readonly prViewOpenAfterCreate?: boolean;
+    readonly prCreateMarkerFile?: string;
+  } = {},
+) {
   const calls: string[][] = [];
+  const flipToOpen = options.prViewOpenAfterCreate === true && options.prCreateMarkerFile !== undefined;
   const forgeGhRunner = async (args: readonly string[]) => {
     calls.push([...args]);
     if (args[0] === 'pr' && args[1] === 'view') {
+      if (flipToOpen && !existsSync(options.prCreateMarkerFile!)) {
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr: `no pull requests found for branch "${branchName}"`,
+        };
+      }
       return {
         exitCode: 0,
         stdout: JSON.stringify({
@@ -552,6 +617,11 @@ export async function startConductedFixture(
   // KS7a-2: the `gh` stub records posted commit-status states here, one file
   // per head sha, and answers status reads of that sha from them.
   const ghStatusDir = path.join(dir, 'gh-status');
+  // R4a: the gh stub touches this marker after the first PR-create (so the
+  // fake `pr view` flips to the open PR) and uses the count file to make the
+  // ambiguous create happen exactly once.
+  const ghPrCreateMarker = path.join(dir, 'pr-created.marker');
+  const ghPrCreateCount = path.join(dir, 'pr-create.count');
   const laneScriptPath = path.join(dir, 'lane-commit.sh');
 
   // PATH layering: prepend ONLY this fixture's two dirs; the real PATH stays
@@ -633,7 +703,11 @@ export async function startConductedFixture(
       await fs.writeFile(target, body, 'utf8');
       await fs.chmod(target, 0o700);
     };
-    await writeTool('gh', ghStubScript(ghArgvLog, ghStatusDir));
+    await writeTool('gh', ghStubScript(ghArgvLog, ghStatusDir, {
+      ...(options?.failPrCreateOnce === true
+        ? { failPrCreateOnce: true, prCreateMarkerFile: ghPrCreateMarker, prCreateCountFile: ghPrCreateCount }
+        : {}),
+    }));
     await writeTool('ocm-run', ocmRunWrapperScript(realOcmRunBin, ocmRunArgvLog, ocmRunEnvLog, ocmRunStderrLog));
     if (options?.committingLane === true) {
       // E2E-FIX: the brief-capture directory is created before any lane runs,
@@ -720,7 +794,11 @@ export async function startConductedFixture(
     const attemptId2 = 'attempt-' + idChars(97202611, 26);
 
     // --- runtime ----------------------------------------------------------
-    const gh = makeForgeGhRunner(() => readWorktreeHead(worktreeRoot, baseCommit), `fleet/${runId}`);
+    const gh = makeForgeGhRunner(() => readWorktreeHead(worktreeRoot, baseCommit), `fleet/${runId}`, {
+      ...(options?.prViewOpenAfterCreate === true
+        ? { prViewOpenAfterCreate: true, prCreateMarkerFile: ghPrCreateMarker }
+        : {}),
+    });
     const review = makeReviewSpawn(options?.reviewVerdicts ?? []);
     const buildRuntime = (installationForRuntime: FleetInstallationV2): FleetCliRuntime => {
       return createFleetCliRuntime({

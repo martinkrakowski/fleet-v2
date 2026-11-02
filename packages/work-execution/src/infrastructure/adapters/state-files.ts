@@ -7,6 +7,8 @@ import { parseVersionedConductorPassTraceStateRecord } from '../../domain/conduc
 import { parseVersionedAttemptStateRecord } from './AttemptRepositoryAdapter.adapter.js';
 import { parseConductorDriverLeaseStateRecord } from './ConductorDriverLeaseAdapter.adapter.js';
 import { parseConductorHaltStateRecord } from './ConductorHaltAdapter.adapter.js';
+import { parseKillallHaltMarkerStateRecord } from './KillallHaltMarkerAdapter.adapter.js';
+import { parseKillallTrainPauseStateRecord } from './KillallTrainPauseAdapter.adapter.js';
 import {
   parseVersionedJournalEntryStateRecord,
   parseVersionedReservationStateRecord,
@@ -29,4 +31,6 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeVersionedRecordListStore('lane-plans.json', parseVersionedLanePlanStateRecord),
   describeRecordListStore('telemetry-dispositions.json', parseTelemetryDispositionStateRecord),
   describeVersionedRecordListStore('conductor-passes.json', parseVersionedConductorPassTraceStateRecord),
+  describeRecordListStore('killall-halt.json', parseKillallHaltMarkerStateRecord),
+  describeRecordListStore('killall-train-pause.json', parseKillallTrainPauseStateRecord),
 ];

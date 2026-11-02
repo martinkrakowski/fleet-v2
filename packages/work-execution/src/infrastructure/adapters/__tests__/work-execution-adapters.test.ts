@@ -10,6 +10,7 @@ import type {
   ActionJournalEntryRecord,
   AttemptRecord,
   AttemptRunnerRecord,
+  AttemptUsageRecord,
   CapacityReservationRecord,
   CommandCompletionReceipt,
   WorkOrderRecord,
@@ -333,11 +334,43 @@ describe('AttemptRepositoryAdapter', () => {
   it('persists attempts to stateDir and reloads them for a new instance', async () => {
     const stateDir = await makeTempDir('fleet-state-');
     const writer = new AttemptRepositoryAdapter({ stateDir });
-    await writer.saveAttempt(makeAttempt({ state: 'running' }));
+    const usageWithRunnerMinutes: AttemptUsageRecord = {
+      source: 'opencode-db',
+      readAtIso: '2026-10-23T12:00:00.000Z',
+      sessionId: 'ses_1',
+      steps: 5,
+      wallSeconds: 75,
+      runnerMinutes: 2,
+      tokensInput: 100,
+      tokensOutput: 50,
+      tokensReasoning: 10,
+      tokensCacheRead: 20,
+      tokensCacheWrite: 5,
+      costUsd: 0.02,
+      model: 'model-y',
+      agent: 'lane',
+      reason: null,
+    };
+    await writer.saveAttempt(makeAttempt({ state: 'running', usage: usageWithRunnerMinutes }));
+    // An old record predates the field: its usage block carries no runnerMinutes key.
+    await writer.saveAttempt(
+      makeAttempt({
+        id: 'att-2',
+        state: 'running',
+        usage: { ...usageWithRunnerMinutes, runnerMinutes: undefined },
+      }),
+    );
     const reader = new AttemptRepositoryAdapter({ stateDir });
     const found = await reader.findAttemptById('att-1');
     expect(found?.state).toBe('running');
-    expect((await reader.listAllAttempts()).map((record) => record.id)).toEqual(['att-1']);
+    expect(found?.usage?.runnerMinutes).toBe(2);
+    expect(found?.schemaVersion).toBe(1);
+    const second = await reader.findAttemptById('att-2');
+    expect(second?.usage ? Object.hasOwn(second.usage, 'runnerMinutes') : true).toBe(false);
+    expect((await reader.listAllAttempts()).map((record) => record.id).sort()).toEqual([
+      'att-1',
+      'att-2',
+    ]);
   });
 });
 

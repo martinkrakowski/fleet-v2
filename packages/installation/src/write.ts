@@ -224,6 +224,22 @@ function serializePolicy(policy: PolicySection): Record<string, unknown> {
     }
     out.conductor = conductor;
   }
+  if (policy.board !== undefined) {
+    const board: Record<string, unknown> = {};
+    if (policy.board.forgeStaleMinutes !== undefined) {
+      board.forgeStaleMinutes = policy.board.forgeStaleMinutes;
+    }
+    if (policy.board.declarationTtlMinutes !== undefined) {
+      board.declarationTtlMinutes = policy.board.declarationTtlMinutes;
+    }
+    if (policy.board.doneWindowDays !== undefined) {
+      board.doneWindowDays = policy.board.doneWindowDays;
+    }
+    if (policy.board.forgeSyncMinutes !== undefined) {
+      board.forgeSyncMinutes = policy.board.forgeSyncMinutes;
+    }
+    out.board = board;
+  }
   if (policy.telemetry !== undefined) {
     out.telemetry = serializePolicyBlock(policy.telemetry, TELEMETRY_POLICY_KEYS);
   }

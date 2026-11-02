@@ -103,6 +103,14 @@ export function worktreeRootRefusal(worktreePath: string): string | null {
   return null;
 }
 
+function stripTrailingSlashes(entry: string): string {
+  let end = entry.length;
+  while (end > 0 && entry[end - 1] === '/') {
+    end -= 1;
+  }
+  return entry.slice(0, end);
+}
+
 function pathOrAncestorInSet(path: string, set: ReadonlySet<string>): boolean {
   let prefix = path;
   for (;;) {
@@ -384,10 +392,10 @@ export function parseUntrackedListing(stdoutA: string, stdoutB: string): string[
   return [
     ...new Set(
       [...stdoutA.split('\0'), ...stdoutB.split('\0')]
-        .map((entry) => entry.replace(/\/+$/, ''))
+        .map((entry) => stripTrailingSlashes(entry))
         .filter((entry) => entry !== ''),
     ),
-  ].sort();
+  ].sort((a, b) => a.localeCompare(b));
 }
 
 export async function writeAndVerifyPatch(
@@ -1004,7 +1012,7 @@ export class WorkspaceAdapter implements WorkspacePort {
       await executor.run(['rm', '-f', patchPath], { timeoutMs: GIT_TIMEOUT_MS });
       return { outcome: 'refused', reason: 'git-refused' };
     }
-    const rawBytes = parseInt(wcRun.stdout.trim().split(/\s+/)[0] ?? '0', 10);
+    const rawBytes = Number.parseInt(wcRun.stdout.trim().split(/\s+/)[0] ?? '0', 10);
     const patchBytes = Number.isNaN(rawBytes) ? 0 : rawBytes;
 
     return { outcome: 'preserved', patchPath, patchBytes };

@@ -1,7 +1,5 @@
 /** The `act prepare` and `act dispatch` steps of AdvanceLaneRunUseCase (AL-1). */
 import type { AdvanceLaneRunRefusal, AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
-import type {
-} from '../../ports/out/WorkspacePort.out-port.js';
 import { AttemptRevisionConflictError } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import { parseSeatTool, type AttemptRecord, type AttemptSeatOverrideRecord, type AttemptSeatSelectionRecord } from '../../../domain/execution-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';

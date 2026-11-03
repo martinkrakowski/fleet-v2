@@ -178,6 +178,49 @@ describe('RecordAttentionItemUseCase conductor-park occurrence idempotence', () 
     expect(reopenedOk.item.raisedCount).toBe(firstOk.item.raisedCount + 1);
   });
 
+  it('writes nothing for an out-of-order re-raise of an older park', async () => {
+    const { useCase, repo, signal } = makeUseCase();
+    await useCase.recordAttentionItem(parkBody(), 'conductor');
+    const second = await useCase.recordAttentionItem(parkBody({ summary: PARK_2_SUMMARY }), 'conductor');
+    expect(second.outcome).toBe('refreshed');
+    expect(second).toMatchObject({ revision: 2, item: { raisedCount: 2 } });
+    const signals = signal.emitted.length;
+
+    const bytes = await readStateBytes(stateDir);
+    const stale = await useCase.recordAttentionItem(parkBody(), 'conductor');
+    expect(stale.outcome).toBe('refreshed');
+    expect(mustOk(stale).item.summary).toBe(PARK_2_SUMMARY);
+    expect(mustOk(stale).revision).toBe(2);
+    expect(await readStateBytes(stateDir)).toEqual(bytes);
+    expect(signal.emitted).toHaveLength(signals);
+
+    const stored = await repo.findByKey(KEY);
+    expect(stored?.item.raisedCount).toBe(2);
+  });
+
+  it('keeps a cleared item cleared when an older park is re-raised out of order', async () => {
+    const { useCase, repo, clock } = makeUseCase();
+    await useCase.recordAttentionItem(parkBody(), 'conductor');
+    const second = await useCase.recordAttentionItem(parkBody({ summary: PARK_2_SUMMARY }), 'conductor');
+    expect(second.outcome).toBe('refreshed');
+    const secondOk = mustOk(second);
+
+    const cleared = mustSucceed(mustSucceed(AttentionItem.create(secondOk.item)).clear({ reason: 'dismissed', via: 'cli', by: 'example-owner' }, clock.current()));
+    const saved = await repo.save(cleared.toRecord(), secondOk.revision);
+
+    const bytes = await readStateBytes(stateDir);
+    const stale = await useCase.recordAttentionItem(parkBody(), 'conductor');
+    expect(stale.outcome).toBe('refreshed');
+    expect(mustOk(stale).item.state).toBe('cleared');
+    expect(mustOk(stale).revision).toBe(saved.revision);
+    expect(await readStateBytes(stateDir)).toEqual(bytes);
+
+    // A newer park than the stored one still reopens the cleared item.
+    const third = await useCase.recordAttentionItem(parkBody({ summary: `The conductor parked ${RUN_REF} with reason owner-merge (park 3).` }), 'conductor');
+    expect(third.outcome).toBe('reopened');
+    expect(mustOk(third).item.state).toBe('open');
+  });
+
   it('keeps other kinds refreshing on every repeat', async () => {
     const { useCase } = makeUseCase();
     const body = parkBody({ kind: 'needs-owner', subject: { kind: 'work-order', ref: 'wo-example-1' }, summary: 'example notice' });

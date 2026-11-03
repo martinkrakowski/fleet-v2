@@ -8,11 +8,16 @@
  * (`reopened`). A repeat never creates a second item; a lost race is re-read
  * once, never piled up. For occurrence-naming kinds (`conductor-park`), a
  * raise repeating the stored summary writes nothing and returns the stored
- * item. A recorded attention item grants nothing.
+ * item. A raise naming an occurrence the stored summary already supersedes
+ * writes nothing either, so an old park never refreshes or reopens the item.
+ * A recorded attention item grants nothing.
  */
 
 import { AttentionItem, attentionItemKey } from '../../domain/entities/AttentionItem.js';
-import { ATTENTION_ITEM_OCCURRENCE_KINDS } from '../../domain/attention-item-records.js';
+import {
+  ATTENTION_ITEM_OCCURRENCE_KINDS,
+  attentionItemSummaryParkOrdinal,
+} from '../../domain/attention-item-records.js';
 import { readPlainObject } from '../../domain/record-input.js';
 import {
   AttentionItemKeyConflictError,
@@ -180,6 +185,21 @@ export class RecordAttentionItemUseCase implements RecordAttentionItemPort {
       holder.item.summary === record.summary &&
       holder.item.workOrderId === record.workOrderId &&
       holder.item.raisedBy === record.raisedBy
+    ) {
+      return { outcome: 'refreshed', item: holder.item, revision: holder.revision };
+    }
+    // An out-of-order raise of an occurrence the stored summary already
+    // supersedes (e.g. park 1 re-raised after park 2 was stored) is stale: it
+    // writes nothing and never refreshes or reopens the item with its older
+    // summary, whatever the stored state. When either summary names no
+    // ordinal (legacy), the raise behaves as today.
+    const raiseOrdinal = attentionItemSummaryParkOrdinal(record.summary);
+    const storedOrdinal = attentionItemSummaryParkOrdinal(holder.item.summary);
+    if (
+      ATTENTION_ITEM_OCCURRENCE_KINDS.includes(record.kind) &&
+      raiseOrdinal !== null &&
+      storedOrdinal !== null &&
+      raiseOrdinal <= storedOrdinal
     ) {
       return { outcome: 'refreshed', item: holder.item, revision: holder.revision };
     }

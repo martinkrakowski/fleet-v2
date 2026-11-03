@@ -129,13 +129,6 @@ export interface LaneRunFacts {
    * is not a congestion. Non-null only when `gate === 'congested'`.
    */
   readonly gateCongestion: { readonly retry: number; readonly atIso: string } | null;
-  /**
-   * F62: the retry ordinal of the ONE gate re-run a resume from an
-   * `ambiguous gate` park may mint at `head12`; null when no re-run is allowed
-   * (the unknown read was not parked yet, the budget of one is spent, or a
-   * later gate run at the head already decided).
-   */
-  readonly gateRetry: number | null;
   /** Receipts per (reviewer, kind) at `head12` (RW1) (PC/K5). */
   readonly briefCheck: LaneRunReviewFact;
   readonly codeReview: LaneRunReviewFact;
@@ -652,23 +645,6 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
     };
 
     const gatingRules = (): LaneRunDecision => {
-      // F62: the gate's unknown read is re-run once under a retry key at the
-      // same head after a resume from the `ambiguous gate` park. The re-run's
-      // own unknown result parks for good: the budget of one.
-      if (facts.gateRetry !== null) {
-        const attempt = facts.attempt;
-        if (attempt === null) {
-          return WAIT_FACTS_INCONSISTENT;
-        }
-        return act({
-          step: 'gate',
-          round: attempt.round,
-          seatIndex: attempt.seatIndex,
-          head12: facts.head12,
-          retry: facts.gateRetry,
-          attemptOrdinal: null,
-        });
-      }
       if (facts.gate === 'none') {
         const attempt = facts.attempt;
         if (attempt === null) {
@@ -952,16 +928,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (facts.state === 'parked') {
         return wait('parked');
       }
-      // F62: an ambiguous gate intent is not a park when the gate at the head
-      // is already decided by a later run (`facts.gate !== 'pending'`) or when
-      // the gate's unknown read may be re-run once (`facts.gateRetry`). Every
-      // other ambiguous intent parks exactly as before.
-      const gateAmbiguous =
-        facts.pendingIntent.step === 'gate' &&
-        (facts.gate !== 'pending' || facts.gateRetry !== null);
-      if (!gateAmbiguous) {
-        return park('ambiguous', facts.pendingIntent.step);
-      }
+      return park('ambiguous', facts.pendingIntent.step);
     }
 
     // G3d: a merge that landed ends `merged`, never `stopped` (§3.9.1).

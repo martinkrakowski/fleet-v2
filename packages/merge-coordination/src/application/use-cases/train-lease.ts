@@ -3,7 +3,7 @@
  * acquire, renew, release and check held over a current train lease
  * (`TrainLeaseRecord | null`) and a request read from `unknown`. Each
  * decision returns a typed result and never throws, never echoes a value,
- * and never reads a clock (time arrives as `nowIso`).
+ * and reads the trusted clock time passed as `nowIso`, never a request time.
  *
  * Two design rules carried over from the work-execution lease:
  * 1. A lease change never moves the train's revision. The lease is guarded
@@ -22,6 +22,7 @@ export const TRAIN_LEASE_MAX_MS = 10 * 60 * 1000;
 
 export const TRAIN_LEASE_REFUSALS = [
   'invalid-request', 'lease-held', 'lease-moved', 'lease-not-held', 'lease-expired',
+  'clock-unreadable',
 ] as const;
 export type TrainLeaseRefusal = (typeof TRAIN_LEASE_REFUSALS)[number];
 
@@ -37,12 +38,10 @@ export interface TrainLeaseAcquireRequest {
   /** The fence the caller read (0 when the lease was null): the CAS value. */
   readonly observedFence: number;
   readonly leaseUntilIso: string;
-  readonly nowIso: string;
 }
 export interface TrainLeaseHoldRequest {
   readonly holderId: string;
   readonly fence: number;
-  readonly nowIso: string;
 }
 export interface TrainLeaseRenewRequest extends TrainLeaseHoldRequest {
   readonly leaseUntilIso: string;
@@ -55,9 +54,9 @@ export type TrainLeaseDecision =
 const ID_MAX_BYTES = 256;
 const LEASE_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 
-const ACQUIRE_KEYS: readonly string[] = ['holderId', 'observedFence', 'leaseUntilIso', 'nowIso'];
-const RENEW_KEYS: readonly string[] = ['holderId', 'fence', 'leaseUntilIso', 'nowIso'];
-const HOLD_KEYS: readonly string[] = ['holderId', 'fence', 'nowIso'];
+const ACQUIRE_KEYS: readonly string[] = ['holderId', 'observedFence', 'leaseUntilIso'];
+const RENEW_KEYS: readonly string[] = ['holderId', 'fence', 'leaseUntilIso'];
+const HOLD_KEYS: readonly string[] = ['holderId', 'fence'];
 
 /**
  * Read `value` as a non-null, non-array plain object whose own keys are
@@ -90,6 +89,21 @@ function isZonedIso(value: unknown): value is string {
     LEASE_ISO_PATTERN.test(value) &&
     !Number.isNaN(Date.parse(value))
   );
+}
+
+/**
+ * Read a trusted clock reading as a canonical zoned ISO-8601 string; null
+ * when it is not a zoned ISO time. Never throws.
+ */
+export function readClockIso(value: unknown): string | null {
+  try {
+    if (!isZonedIso(value)) {
+      return null;
+    }
+    return new Date(value).toISOString();
+  } catch {
+    return null;
+  }
 }
 
 /** The train lease field rules for an id: non-empty, at most 256 UTF-8 bytes, never secret-shaped. */
@@ -152,7 +166,7 @@ function holdsCurrentLease(
 }
 
 function readAcquireRequest(request: unknown): TrainLeaseAcquireRequest | null {
-  const snapshot = readRequestSnapshot(request, ACQUIRE_KEYS, ['leaseUntilIso', 'nowIso']);
+  const snapshot = readRequestSnapshot(request, ACQUIRE_KEYS, ['leaseUntilIso']);
   if (snapshot === null || !isFence(snapshot.observedFence, 0)) {
     return null;
   }
@@ -160,12 +174,11 @@ function readAcquireRequest(request: unknown): TrainLeaseAcquireRequest | null {
     holderId: snapshot.holderId as string,
     observedFence: snapshot.observedFence as number,
     leaseUntilIso: snapshot.leaseUntilIso as string,
-    nowIso: snapshot.nowIso as string,
   };
 }
 
 function readRenewRequest(request: unknown): TrainLeaseRenewRequest | null {
-  const snapshot = readRequestSnapshot(request, RENEW_KEYS, ['leaseUntilIso', 'nowIso']);
+  const snapshot = readRequestSnapshot(request, RENEW_KEYS, ['leaseUntilIso']);
   if (snapshot === null || !isFence(snapshot.fence, 1)) {
     return null;
   }
@@ -173,32 +186,38 @@ function readRenewRequest(request: unknown): TrainLeaseRenewRequest | null {
     holderId: snapshot.holderId as string,
     fence: snapshot.fence as number,
     leaseUntilIso: snapshot.leaseUntilIso as string,
-    nowIso: snapshot.nowIso as string,
   };
 }
 
 function readHoldRequest(request: unknown): TrainLeaseHoldRequest | null {
-  const snapshot = readRequestSnapshot(request, HOLD_KEYS, ['nowIso']);
+  const snapshot = readRequestSnapshot(request, HOLD_KEYS, []);
   if (snapshot === null || !isFence(snapshot.fence, 1)) {
     return null;
   }
   return {
     holderId: snapshot.holderId as string,
     fence: snapshot.fence as number,
-    nowIso: snapshot.nowIso as string,
   };
 }
 
 /** Acquire one train's lease by CAS on the fence over a null or lapsed lease. */
-export function decideTrainLeaseAcquire(current: TrainLeaseRecord | null, request: unknown): TrainLeaseDecision {
+export function decideTrainLeaseAcquire(
+  current: TrainLeaseRecord | null,
+  request: unknown,
+  nowIso: string,
+): TrainLeaseDecision {
+  const clockIso = readClockIso(nowIso);
+  if (clockIso === null) {
+    return { ok: false, reason: 'clock-unreadable' };
+  }
   const parsed = readAcquireRequest(request);
   if (parsed === null) {
     return { ok: false, reason: 'invalid-request' };
   }
-  if (!withinLeaseWindow(parsed.leaseUntilIso, parsed.nowIso)) {
+  if (!withinLeaseWindow(parsed.leaseUntilIso, clockIso)) {
     return { ok: false, reason: 'invalid-request' };
   }
-  if (current !== null && !isExpired(current, parsed.nowIso)) {
+  if (current !== null && !isExpired(current, clockIso)) {
     return { ok: false, reason: 'lease-held' };
   }
   const currentFence = current?.fence ?? 0;
@@ -220,18 +239,26 @@ export function decideTrainLeaseAcquire(current: TrainLeaseRecord | null, reques
 }
 
 /** Renew one train's lease: the current holder with its fence keeps the fence. */
-export function decideTrainLeaseRenew(current: TrainLeaseRecord | null, request: unknown): TrainLeaseDecision {
+export function decideTrainLeaseRenew(
+  current: TrainLeaseRecord | null,
+  request: unknown,
+  nowIso: string,
+): TrainLeaseDecision {
+  const clockIso = readClockIso(nowIso);
+  if (clockIso === null) {
+    return { ok: false, reason: 'clock-unreadable' };
+  }
   const parsed = readRenewRequest(request);
   if (parsed === null) {
     return { ok: false, reason: 'invalid-request' };
   }
-  if (!withinLeaseWindow(parsed.leaseUntilIso, parsed.nowIso)) {
+  if (!withinLeaseWindow(parsed.leaseUntilIso, clockIso)) {
     return { ok: false, reason: 'invalid-request' };
   }
   if (!holdsCurrentLease(current, parsed.holderId, parsed.fence)) {
     return { ok: false, reason: 'lease-not-held' };
   }
-  if (isExpired(current, parsed.nowIso)) {
+  if (isExpired(current, clockIso)) {
     return { ok: false, reason: 'lease-expired' };
   }
   return {
@@ -245,7 +272,15 @@ export function decideTrainLeaseRenew(current: TrainLeaseRecord | null, request:
 }
 
 /** Release one train's lease: holder and fence are kept, the lease ends now. */
-export function decideTrainLeaseRelease(current: TrainLeaseRecord | null, request: unknown): TrainLeaseDecision {
+export function decideTrainLeaseRelease(
+  current: TrainLeaseRecord | null,
+  request: unknown,
+  nowIso: string,
+): TrainLeaseDecision {
+  const clockIso = readClockIso(nowIso);
+  if (clockIso === null) {
+    return { ok: false, reason: 'clock-unreadable' };
+  }
   const parsed = readHoldRequest(request);
   if (parsed === null) {
     return { ok: false, reason: 'invalid-request' };
@@ -253,7 +288,7 @@ export function decideTrainLeaseRelease(current: TrainLeaseRecord | null, reques
   if (!holdsCurrentLease(current, parsed.holderId, parsed.fence)) {
     return { ok: false, reason: 'lease-not-held' };
   }
-  if (isExpired(current, parsed.nowIso)) {
+  if (isExpired(current, clockIso)) {
     return {
       ok: true,
       lease: Object.freeze({
@@ -268,13 +303,21 @@ export function decideTrainLeaseRelease(current: TrainLeaseRecord | null, reques
     lease: Object.freeze({
       holderId: current.holderId,
       fence: current.fence,
-      leaseUntilIso: new Date(parsed.nowIso).toISOString(),
+      leaseUntilIso: clockIso,
     }),
   };
 }
 
 /** null when `request` names the current, unexpired lease; else why not. */
-export function checkTrainLeaseHeld(current: TrainLeaseRecord | null, request: unknown): TrainLeaseRefusal | null {
+export function checkTrainLeaseHeld(
+  current: TrainLeaseRecord | null,
+  request: unknown,
+  nowIso: string,
+): TrainLeaseRefusal | null {
+  const clockIso = readClockIso(nowIso);
+  if (clockIso === null) {
+    return 'clock-unreadable';
+  }
   const parsed = readHoldRequest(request);
   if (parsed === null) {
     return 'invalid-request';
@@ -282,7 +325,7 @@ export function checkTrainLeaseHeld(current: TrainLeaseRecord | null, request: u
   if (!holdsCurrentLease(current, parsed.holderId, parsed.fence)) {
     return 'lease-not-held';
   }
-  if (isExpired(current, parsed.nowIso)) {
+  if (isExpired(current, clockIso)) {
     return 'lease-expired';
   }
   return null;

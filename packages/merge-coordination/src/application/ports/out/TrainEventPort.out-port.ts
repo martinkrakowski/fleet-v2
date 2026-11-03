@@ -27,7 +27,6 @@ export interface TrainJournalAppendRequest {
   readonly trainId: string;
   readonly holderId: string;
   readonly fence: number;
-  readonly nowIso: string;
   readonly entry: TrainJournalEntryInput;
 }
 

@@ -49,7 +49,6 @@ export interface TrainStateSaveRequest {
   readonly expectedRevision: number;
   readonly holderId: string;
   readonly fence: number;
-  readonly nowIso: string;
   readonly snapshot: TrainSnapshot;
 }
 

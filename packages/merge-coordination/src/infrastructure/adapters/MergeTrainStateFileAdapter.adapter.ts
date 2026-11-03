@@ -19,6 +19,7 @@ import type {
   TrainStateSaveRequest,
   TrainStateSaveResult,
 } from '../../application/ports/out/MergeTrainStatePort.out-port.js';
+import type { ClockPort } from '../../application/ports/out/ClockPort.out-port.js';
 import type {
   TrainLeaseAcquireRequest,
   TrainLeaseHoldRequest,
@@ -30,8 +31,10 @@ import {
   decideTrainLeaseAcquire,
   decideTrainLeaseRelease,
   decideTrainLeaseRenew,
+  readClockIso,
   type TrainLeaseRecord,
 } from '../../application/use-cases/train-lease.js';
+import { SystemClockAdapter } from './SystemClockAdapter.adapter.js';
 import { validateTrainRecord } from '../../domain/entities/TrainRecord.js';
 import { validateQueueEntryRecord } from '../../domain/entities/QueueEntryRecord.js';
 import { validateBatchRecord } from '../../domain/entities/BatchRecord.js';
@@ -48,9 +51,20 @@ import {
 
 export class MergeTrainStateFileAdapter implements MergeTrainStatePort {
   private readonly stateDir: string;
+  private readonly clock: ClockPort;
 
-  constructor(options: { stateDir: string }) {
+  constructor(options: { stateDir: string; clock?: ClockPort }) {
     this.stateDir = options.stateDir;
+    this.clock = options.clock ?? new SystemClockAdapter();
+  }
+
+  /** Read the clock once; null when it throws or is malformed. */
+  private readClockNow(): string | null {
+    try {
+      return readClockIso(this.clock.nowIso());
+    } catch {
+      return null;
+    }
   }
 
   async readState(trainId: string): Promise<TrainStateRead> {
@@ -82,6 +96,10 @@ export class MergeTrainStateFileAdapter implements MergeTrainStatePort {
       return { outcome: 'refused', reason: 'invalid-snapshot' };
     }
     return withTrainLock(dir, async () => {
+      const nowIso = this.readClockNow();
+      if (nowIso === null) {
+        return { outcome: 'refused', reason: 'clock-unreadable' };
+      }
       const leaseRead = await readLeaseFile(dir);
       if (leaseRead.kind === 'unreadable') {
         return { outcome: 'refused', reason: 'lease-unreadable' };
@@ -89,8 +107,7 @@ export class MergeTrainStateFileAdapter implements MergeTrainStatePort {
       const hold = checkTrainLeaseHeld(leaseRead.lease, {
         holderId: request.holderId,
         fence: request.fence,
-        nowIso: request.nowIso,
-      });
+      }, nowIso);
       if (hold !== null) {
         return { outcome: 'refused', reason: hold };
       }
@@ -126,15 +143,15 @@ export class MergeTrainStateFileAdapter implements MergeTrainStatePort {
   }
 
   async acquireLease(trainId: string, request: TrainLeaseAcquireRequest): Promise<TrainLeaseResult> {
-    return this.mutateLease(trainId, (current) => decideTrainLeaseAcquire(current, request));
+    return this.mutateLease(trainId, (current, nowIso) => decideTrainLeaseAcquire(current, request, nowIso));
   }
 
   async renewLease(trainId: string, request: TrainLeaseRenewRequest): Promise<TrainLeaseResult> {
-    return this.mutateLease(trainId, (current) => decideTrainLeaseRenew(current, request));
+    return this.mutateLease(trainId, (current, nowIso) => decideTrainLeaseRenew(current, request, nowIso));
   }
 
   async releaseLease(trainId: string, request: TrainLeaseHoldRequest): Promise<TrainLeaseResult> {
-    return this.mutateLease(trainId, (current) => decideTrainLeaseRelease(current, request));
+    return this.mutateLease(trainId, (current, nowIso) => decideTrainLeaseRelease(current, request, nowIso));
   }
 
   async checkLease(trainId: string, request: TrainLeaseHoldRequest): Promise<TrainLeaseRefusal | 'lease-unreadable' | null> {
@@ -144,11 +161,15 @@ export class MergeTrainStateFileAdapter implements MergeTrainStatePort {
     } catch {
       return 'lease-unreadable';
     }
+    const nowIso = this.readClockNow();
+    if (nowIso === null) {
+      return 'clock-unreadable';
+    }
     const leaseRead = await readLeaseFile(dir);
     if (leaseRead.kind === 'unreadable') {
       return 'lease-unreadable';
     }
-    return checkTrainLeaseHeld(leaseRead.lease, request);
+    return checkTrainLeaseHeld(leaseRead.lease, request, nowIso);
   }
 
   async readLease(trainId: string): Promise<TrainLeaseRead> {
@@ -165,10 +186,10 @@ export class MergeTrainStateFileAdapter implements MergeTrainStatePort {
     return { outcome: 'ok', lease: leaseRead.lease };
   }
 
-  /** One lease change under the lock: read, decide, write only on `ok`. */
+  /** One lease change under the lock: read the clock, decide, write only on `ok`. */
   private async mutateLease(
     trainId: string,
-    decide: (current: TrainLeaseRecord | null) => { ok: true; lease: TrainLeaseRecord } | { ok: false; reason: TrainLeaseRefusal },
+    decide: (current: TrainLeaseRecord | null, nowIso: string) => { ok: true; lease: TrainLeaseRecord } | { ok: false; reason: TrainLeaseRefusal },
   ): Promise<TrainLeaseResult> {
     let dir: string;
     try {
@@ -177,11 +198,15 @@ export class MergeTrainStateFileAdapter implements MergeTrainStatePort {
       return { outcome: 'refused', reason: 'lease-unreadable' };
     }
     return withTrainLock(dir, async () => {
+      const nowIso = this.readClockNow();
+      if (nowIso === null) {
+        return { outcome: 'refused', reason: 'clock-unreadable' };
+      }
       const leaseRead = await readLeaseFile(dir);
       if (leaseRead.kind === 'unreadable') {
         return { outcome: 'refused', reason: 'lease-unreadable' };
       }
-      const decision = decide(leaseRead.lease);
+      const decision = decide(leaseRead.lease, nowIso);
       if (!decision.ok) {
         return { outcome: 'refused', reason: decision.reason };
       }

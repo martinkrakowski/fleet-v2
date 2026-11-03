@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -15,7 +15,14 @@ const NOW = '2026-11-02T12:00:00.000Z';
 const UNTIL = '2026-11-02T12:05:00.000Z';
 const TRAIN_ID = 'train-main';
 
+let now = NOW;
+const clock = { nowIso: () => now };
+
 let tmpRoots: string[] = [];
+
+beforeEach(() => {
+  now = NOW;
+});
 
 afterEach(async () => {
   await Promise.all(tmpRoots.map((root) => fs.rm(root, { recursive: true, force: true })));
@@ -66,7 +73,7 @@ function snapshot(trainId = TRAIN_ID): TrainSnapshot {
 
 async function makeAdapter() {
   const stateDir = await makeStateDir();
-  const adapter = new MergeTrainStateFileAdapter({ stateDir });
+  const adapter = new MergeTrainStateFileAdapter({ stateDir, clock });
   return { stateDir, adapter };
 }
 
@@ -79,7 +86,7 @@ describe('MergeTrainStateFileAdapter', () => {
 
   it('saves twice with rising revisions', async () => {
     const { adapter } = await makeAdapter();
-    const acquired = await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL, nowIso: NOW });
+    const acquired = await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL });
     expect(acquired.outcome).toBe('ok');
 
     const first = await adapter.saveState({
@@ -87,7 +94,6 @@ describe('MergeTrainStateFileAdapter', () => {
       expectedRevision: 0,
       holderId: 'worker-1',
       fence: 1,
-      nowIso: NOW,
       snapshot: snapshot(),
     });
     expect(first).toEqual({ outcome: 'saved', revision: 1 });
@@ -97,7 +103,6 @@ describe('MergeTrainStateFileAdapter', () => {
       expectedRevision: 1,
       holderId: 'worker-1',
       fence: 1,
-      nowIso: NOW,
       snapshot: snapshot(),
     });
     expect(second).toEqual({ outcome: 'saved', revision: 2 });
@@ -105,18 +110,18 @@ describe('MergeTrainStateFileAdapter', () => {
 
   it('refuses a save at a stale expected revision', async () => {
     const { adapter } = await makeAdapter();
-    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL, nowIso: NOW });
-    await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, nowIso: NOW, snapshot: snapshot() });
+    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL });
+    await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, snapshot: snapshot() });
 
-    const refused = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, nowIso: NOW, snapshot: snapshot() });
+    const refused = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, snapshot: snapshot() });
     expect(refused).toEqual({ outcome: 'refused', reason: 'revision-conflict' });
   });
 
   it('keeps exactly one winner out of two concurrent saves at the same revision', async () => {
     const { adapter } = await makeAdapter();
-    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL, nowIso: NOW });
+    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL });
     const save = () =>
-      adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, nowIso: NOW, snapshot: snapshot() });
+      adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, snapshot: snapshot() });
     const results = await Promise.all([save(), save()]);
     const saved = results.filter((result) => result.outcome === 'saved');
     const conflicts = results.filter((result) => result.outcome === 'refused' && result.reason === 'revision-conflict');
@@ -126,45 +131,46 @@ describe('MergeTrainStateFileAdapter', () => {
 
   it('refuses a save without a lease', async () => {
     const { adapter } = await makeAdapter();
-    const refused = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, nowIso: NOW, snapshot: snapshot() });
+    const refused = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, snapshot: snapshot() });
     expect(refused).toEqual({ outcome: 'refused', reason: 'lease-not-held' });
   });
 
   it('refuses a stale writer after a takeover', async () => {
     const { adapter } = await makeAdapter();
-    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-a', observedFence: 0, leaseUntilIso: UNTIL, nowIso: NOW });
-    await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-a', fence: 1, nowIso: NOW, snapshot: snapshot() });
+    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-a', observedFence: 0, leaseUntilIso: UNTIL });
+    await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-a', fence: 1, snapshot: snapshot() });
 
     const afterExpiry = '2026-11-02T12:06:00.000Z';
-    const acquired = await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-b', observedFence: 1, leaseUntilIso: '2026-11-02T12:11:00.000Z', nowIso: afterExpiry });
+    now = afterExpiry;
+    const acquired = await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-b', observedFence: 1, leaseUntilIso: '2026-11-02T12:11:00.000Z' });
     expect(acquired.outcome).toBe('ok');
 
-    const stale = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 1, holderId: 'worker-a', fence: 1, nowIso: afterExpiry, snapshot: snapshot() });
+    const stale = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 1, holderId: 'worker-a', fence: 1, snapshot: snapshot() });
     expect(stale).toEqual({ outcome: 'refused', reason: 'lease-not-held' });
 
-    const fresh = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 1, holderId: 'worker-b', fence: 2, nowIso: afterExpiry, snapshot: snapshot() });
+    const fresh = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 1, holderId: 'worker-b', fence: 2, snapshot: snapshot() });
     expect(fresh).toEqual({ outcome: 'saved', revision: 2 });
   });
 
   it('refuses a snapshot with a bad sha or a mismatching train id', async () => {
     const { adapter } = await makeAdapter();
-    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL, nowIso: NOW });
+    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL });
 
     const badSha = snapshot();
     const badSnapshot = {
       ...badSha,
       train: { ...badSha.train, currentBaseSha: 'not-a-sha' },
     } as TrainSnapshot;
-    const refusedSha = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, nowIso: NOW, snapshot: badSnapshot });
+    const refusedSha = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, snapshot: badSnapshot });
     expect(refusedSha).toEqual({ outcome: 'refused', reason: 'invalid-snapshot' });
 
-    const refusedId = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, nowIso: NOW, snapshot: snapshot('train-other') });
+    const refusedId = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, snapshot: snapshot('train-other') });
     expect(refusedId).toEqual({ outcome: 'refused', reason: 'invalid-snapshot' });
   });
 
   it('reports garbage state as unreadable without changing its bytes', async () => {
     const { stateDir, adapter } = await makeAdapter();
-    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL, nowIso: NOW });
+    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL });
     const statePath = path.join(stateDir, 'merge-trains', TRAIN_ID, 'state.json');
     await fs.writeFile(statePath, 'not json at all', 'utf8');
     const before = await fs.readFile(statePath, 'utf8');
@@ -172,7 +178,7 @@ describe('MergeTrainStateFileAdapter', () => {
     const read = await adapter.readState(TRAIN_ID);
     expect(read).toEqual({ outcome: 'unreadable' });
 
-    const refused = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, nowIso: NOW, snapshot: snapshot() });
+    const refused = await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, snapshot: snapshot() });
     expect(refused).toEqual({ outcome: 'refused', reason: 'state-unreadable' });
 
     expect(await fs.readFile(statePath, 'utf8')).toBe(before);
@@ -180,10 +186,10 @@ describe('MergeTrainStateFileAdapter', () => {
 
   it('lets a fresh adapter instance on the same directory see the lease and state', async () => {
     const { stateDir, adapter } = await makeAdapter();
-    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL, nowIso: NOW });
-    await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, nowIso: NOW, snapshot: snapshot() });
+    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL });
+    await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, snapshot: snapshot() });
 
-    const second = new MergeTrainStateFileAdapter({ stateDir });
+    const second = new MergeTrainStateFileAdapter({ stateDir, clock });
     const lease = await second.readLease(TRAIN_ID);
     expect(lease).toEqual({ outcome: 'ok', lease: { holderId: 'worker-1', fence: 1, leaseUntilIso: UNTIL } });
     const state = await second.readState(TRAIN_ID);
@@ -195,10 +201,10 @@ describe('MergeTrainStateFileAdapter', () => {
 
   it('leaves the revision unchanged after a lease renew', async () => {
     const { adapter } = await makeAdapter();
-    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL, nowIso: NOW });
-    await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, nowIso: NOW, snapshot: snapshot() });
+    await adapter.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL });
+    await adapter.saveState({ trainId: TRAIN_ID, expectedRevision: 0, holderId: 'worker-1', fence: 1, snapshot: snapshot() });
 
-    const renewed = await adapter.renewLease(TRAIN_ID, { holderId: 'worker-1', fence: 1, leaseUntilIso: UNTIL, nowIso: NOW });
+    const renewed = await adapter.renewLease(TRAIN_ID, { holderId: 'worker-1', fence: 1, leaseUntilIso: UNTIL });
     expect(renewed.outcome).toBe('ok');
 
     const state = await adapter.readState(TRAIN_ID);
@@ -212,7 +218,7 @@ describe('MergeTrainStateFileAdapter', () => {
     const { adapter } = await makeAdapter();
     expect(() => trainDirectory('.', '../x')).toThrow();
     await expect(adapter.readState('../x')).resolves.toEqual({ outcome: 'unreadable' });
-    await expect(adapter.acquireLease('../x', { holderId: 'w', observedFence: 0, leaseUntilIso: UNTIL, nowIso: NOW })).resolves.toEqual({
+    await expect(adapter.acquireLease('../x', { holderId: 'w', observedFence: 0, leaseUntilIso: UNTIL })).resolves.toEqual({
       outcome: 'refused',
       reason: 'lease-unreadable',
     });

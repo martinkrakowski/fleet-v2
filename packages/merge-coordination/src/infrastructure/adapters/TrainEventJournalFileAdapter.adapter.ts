@@ -17,7 +17,9 @@ import type {
   TrainJournalEntry,
   TrainJournalRead,
 } from '../../application/ports/out/TrainEventPort.out-port.js';
-import { checkTrainLeaseHeld } from '../../application/use-cases/train-lease.js';
+import type { ClockPort } from '../../application/ports/out/ClockPort.out-port.js';
+import { checkTrainLeaseHeld, readClockIso } from '../../application/use-cases/train-lease.js';
+import { SystemClockAdapter } from './SystemClockAdapter.adapter.js';
 import { containsSecretShape } from '@fleet/shared';
 import { TRAIN_EVENTS } from '../../domain/value-objects/TrainEvent.vo.js';
 import {
@@ -33,9 +35,20 @@ const TRAIN_EVENT_VALUES: readonly string[] = TRAIN_EVENTS;
 
 export class TrainEventJournalFileAdapter implements TrainEventPort {
   private readonly stateDir: string;
+  private readonly clock: ClockPort;
 
-  constructor(options: { stateDir: string }) {
+  constructor(options: { stateDir: string; clock?: ClockPort }) {
     this.stateDir = options.stateDir;
+    this.clock = options.clock ?? new SystemClockAdapter();
+  }
+
+  /** Read the clock once; null when it throws or is malformed. */
+  private readClockNow(): string | null {
+    try {
+      return readClockIso(this.clock.nowIso());
+    } catch {
+      return null;
+    }
   }
 
   async append(request: TrainJournalAppendRequest): Promise<TrainJournalAppendResult> {
@@ -46,6 +59,10 @@ export class TrainEventJournalFileAdapter implements TrainEventPort {
       return { outcome: 'refused', reason: 'invalid-entry' };
     }
     return withTrainLock(dir, async () => {
+      const nowIso = this.readClockNow();
+      if (nowIso === null) {
+        return { outcome: 'refused', reason: 'clock-unreadable' };
+      }
       const leaseRead = await readLeaseFile(dir);
       if (leaseRead.kind === 'unreadable') {
         return { outcome: 'refused', reason: 'lease-unreadable' };
@@ -53,8 +70,7 @@ export class TrainEventJournalFileAdapter implements TrainEventPort {
       const hold = checkTrainLeaseHeld(leaseRead.lease, {
         holderId: request.holderId,
         fence: request.fence,
-        nowIso: request.nowIso,
-      });
+      }, nowIso);
       if (hold !== null) {
         return { outcome: 'refused', reason: hold };
       }

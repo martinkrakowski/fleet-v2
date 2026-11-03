@@ -13,12 +13,13 @@ describe('TrainEventJournalFileAdapter', () => {
   const trainId = 'train-1';
   const holderId = 'holder-1';
   const fence = 1;
-  const nowIso = '2026-11-02T20:00:00.000Z';
+  const now = '2026-11-02T20:00:00.000Z';
+  const clock = { nowIso: () => now };
   const leaseUntilIso = '2026-11-02T21:00:00.000Z';
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-journal-test-'));
-    adapter = new TrainEventJournalFileAdapter({ stateDir: tempDir });
+    adapter = new TrainEventJournalFileAdapter({ stateDir: tempDir, clock });
   });
 
   afterEach(async () => {
@@ -41,11 +42,10 @@ describe('TrainEventJournalFileAdapter', () => {
       trainId,
       holderId,
       fence,
-      nowIso,
       entry: {
         key,
         event,
-        atIso: nowIso,
+        atIso: now,
       },
     };
   }
@@ -75,7 +75,7 @@ describe('TrainEventJournalFileAdapter', () => {
         sequence: 1,
         key: 'key-1',
         event: 'became-eligible',
-        atIso: nowIso,
+        atIso: now,
         fence: 1,
       },
     });
@@ -89,7 +89,7 @@ describe('TrainEventJournalFileAdapter', () => {
           sequence: 1,
           key: 'key-1',
           event: 'became-eligible',
-          atIso: nowIso,
+          atIso: now,
           fence: 1,
         },
       ],
@@ -136,7 +136,7 @@ describe('TrainEventJournalFileAdapter', () => {
       sequence: 1,
       key: 'key-1',
       event: 'became-eligible',
-      atIso: nowIso,
+      atIso: now,
       fence: 1,
     });
 
@@ -145,7 +145,7 @@ describe('TrainEventJournalFileAdapter', () => {
       sequence: 2,
       key: 'key-2',
       event: 'batched',
-      atIso: nowIso,
+      atIso: now,
       fence: 1,
     });
 
@@ -224,7 +224,7 @@ describe('TrainEventJournalFileAdapter', () => {
         sequence,
         key,
         event,
-        atIso: nowIso,
+        atIso: now,
         fence: 1,
       });
     }
@@ -322,10 +322,81 @@ describe('TrainEventJournalFileAdapter', () => {
           sequence: 3,
           key: 'key-3',
           event: 'became-eligible',
-          atIso: nowIso,
+          atIso: now,
           fence: 1,
         },
       });
+    });
+  });
+
+  describe('clock-decided expiry', () => {
+    async function journalBytes(): Promise<Buffer | null> {
+      try {
+        return await fs.readFile(path.join(tempDir, 'merge-trains', trainId, 'journal.jsonl'));
+      } catch {
+        return null;
+      }
+    }
+
+    it('append refuses an expired lease and creates no journal', async () => {
+      await writeLease(holderId, fence, '2026-11-02T19:00:00.000Z');
+      const result = await adapter.append(appendRequest('key-1'));
+      expect(result).toEqual({ outcome: 'refused', reason: 'lease-expired' });
+      expect(await journalBytes()).toBeNull();
+    });
+
+    it('append ignores a request nowIso: an expired lease with a stale request time is still refused', async () => {
+      await writeLease(holderId, fence, '2026-11-02T19:00:00.000Z');
+      const request = {
+        ...appendRequest('key-1'),
+        nowIso: '2026-11-01T00:00:00.000Z',
+      } as TrainJournalAppendRequest;
+      const result = await adapter.append(request);
+      expect(result).toEqual({ outcome: 'refused', reason: 'lease-expired' });
+      expect(await journalBytes()).toBeNull();
+    });
+
+    it('append by a foreign holder is refused lease-not-held and writes nothing', async () => {
+      await writeLease();
+      const result = await adapter.append({ ...appendRequest('key-1'), holderId: 'holder-2' });
+      expect(result).toEqual({ outcome: 'refused', reason: 'lease-not-held' });
+      expect(await journalBytes()).toBeNull();
+    });
+
+    it('append with the wrong fence is refused lease-not-held and writes nothing', async () => {
+      await writeLease();
+      const result = await adapter.append({ ...appendRequest('key-1'), fence: 2 });
+      expect(result).toEqual({ outcome: 'refused', reason: 'lease-not-held' });
+      expect(await journalBytes()).toBeNull();
+    });
+
+    const BAD_CLOCK_VALUES: readonly unknown[] = ['', 'garbage', '2026-11-02 20:00:00', '2026-13-45T00:00:00Z', 42, undefined];
+    const BAD_CLOCKS: Array<[string, { nowIso: () => string }]> = [
+      ...BAD_CLOCK_VALUES.map((v): [string, { nowIso: () => string }] => [
+        typeof v === 'string' ? v : String(v),
+        { nowIso: () => v as string },
+      ]),
+      ['throwing', { nowIso: () => { throw new Error('clock failure'); } }],
+    ];
+
+    it.each(BAD_CLOCKS)(
+      'append with a malformed or throwing clock (%s) is refused clock-unreadable and the journal is unchanged',
+      async (_label: string, badClock: { nowIso: () => string }) => {
+        const badAdapter = new TrainEventJournalFileAdapter({ stateDir: tempDir, clock: badClock });
+        await writeLease();
+        const before = await journalBytes();
+        const result = await badAdapter.append(appendRequest('key-1'));
+        expect(result).toEqual({ outcome: 'refused', reason: 'clock-unreadable' });
+        expect(await journalBytes()).toEqual(before);
+      },
+    );
+
+    it('append defaults to the system clock', async () => {
+      const systemAdapter = new TrainEventJournalFileAdapter({ stateDir: tempDir });
+      await writeLease(holderId, fence, '2999-01-01T00:00:00.000Z');
+      expect((await systemAdapter.append(appendRequest('key-1'))).outcome).toBe('appended');
+      await writeLease(holderId, fence, '2000-01-01T00:00:00.000Z');
+      expect(await systemAdapter.append(appendRequest('key-2'))).toEqual({ outcome: 'refused', reason: 'lease-expired' });
     });
   });
 });

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -12,7 +12,14 @@ const NOW = '2026-11-02T12:00:00.000Z';
 const UNTIL = '2026-11-02T12:05:00.000Z';
 const TRAIN_ID = 'train-main';
 
+let now = NOW;
+const clock = { nowIso: () => now };
+
 let tmpRoots: string[] = [];
+
+beforeEach(() => {
+  now = NOW;
+});
 
 afterEach(async () => {
   await Promise.all(tmpRoots.map((root) => fs.rm(root, { recursive: true, force: true })));
@@ -22,14 +29,14 @@ afterEach(async () => {
 async function makeAdapters() {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), 'train-journal-'));
   tmpRoots.push(stateDir);
-  const leases = new MergeTrainStateFileAdapter({ stateDir });
-  const journal = new TrainEventJournalFileAdapter({ stateDir });
+  const leases = new MergeTrainStateFileAdapter({ stateDir, clock });
+  const journal = new TrainEventJournalFileAdapter({ stateDir, clock });
   return { stateDir, leases, journal };
 }
 
 /** Take a lease for holder-1 at fence 1. */
 async function takeLease(leases: MergeTrainStateFileAdapter): Promise<void> {
-  const acquired = await leases.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL, nowIso: NOW });
+  const acquired = await leases.acquireLease(TRAIN_ID, { holderId: 'worker-1', observedFence: 0, leaseUntilIso: UNTIL });
   expect(acquired.outcome).toBe('ok');
 }
 
@@ -40,7 +47,6 @@ describe('TrainEventJournalFileAdapter', () => {
       trainId: TRAIN_ID,
       holderId: 'worker-1',
       fence: 1,
-      nowIso: NOW,
       entry: { key: 'k1', event: 'batched', atIso: NOW },
     });
     expect(refused).toEqual({ outcome: 'refused', reason: 'lease-not-held' });
@@ -49,12 +55,12 @@ describe('TrainEventJournalFileAdapter', () => {
   it('appends two entries with rising sequences and lists them in order', async () => {
     const { leases, journal } = await makeAdapters();
     await takeLease(leases);
-    const first = await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, nowIso: NOW, entry: { key: 'k1', event: 'batched', atIso: NOW } });
+    const first = await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, entry: { key: 'k1', event: 'batched', atIso: NOW } });
     expect(first.outcome).toBe('appended');
     if (first.outcome === 'appended') {
       expect(first.entry.sequence).toBe(1);
     }
-    const second = await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, nowIso: NOW, entry: { key: 'k2', event: 'candidate-built', atIso: NOW } });
+    const second = await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, entry: { key: 'k2', event: 'candidate-built', atIso: NOW } });
     if (second.outcome === 'appended') {
       expect(second.entry.sequence).toBe(2);
     }
@@ -71,8 +77,8 @@ describe('TrainEventJournalFileAdapter', () => {
   it('answers duplicate for a repeated key with the same event and writes nothing', async () => {
     const { leases, journal } = await makeAdapters();
     await takeLease(leases);
-    await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, nowIso: NOW, entry: { key: 'k1', event: 'batched', atIso: NOW } });
-    const repeated = await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, nowIso: NOW, entry: { key: 'k1', event: 'batched', atIso: NOW } });
+    await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, entry: { key: 'k1', event: 'batched', atIso: NOW } });
+    const repeated = await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, entry: { key: 'k1', event: 'batched', atIso: NOW } });
     expect(repeated).toEqual({
       outcome: 'duplicate',
       entry: { schemaVersion: 1, sequence: 1, key: 'k1', event: 'batched', atIso: NOW, fence: 1 },
@@ -87,8 +93,8 @@ describe('TrainEventJournalFileAdapter', () => {
   it('refuses the same key with another event as a key conflict', async () => {
     const { leases, journal } = await makeAdapters();
     await takeLease(leases);
-    await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, nowIso: NOW, entry: { key: 'k1', event: 'batched', atIso: NOW } });
-    const refused = await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, nowIso: NOW, entry: { key: 'k1', event: 'gate-passed', atIso: NOW } });
+    await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, entry: { key: 'k1', event: 'batched', atIso: NOW } });
+    const refused = await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, entry: { key: 'k1', event: 'gate-passed', atIso: NOW } });
     expect(refused).toEqual({ outcome: 'refused', reason: 'key-conflict' });
   });
 
@@ -96,9 +102,10 @@ describe('TrainEventJournalFileAdapter', () => {
     const { leases, journal } = await makeAdapters();
     await takeLease(leases);
     const afterExpiry = '2026-11-02T12:06:00.000Z';
-    const acquired = await leases.acquireLease(TRAIN_ID, { holderId: 'worker-2', observedFence: 1, leaseUntilIso: '2026-11-02T12:11:00.000Z', nowIso: afterExpiry });
+    now = afterExpiry;
+    const acquired = await leases.acquireLease(TRAIN_ID, { holderId: 'worker-2', observedFence: 1, leaseUntilIso: '2026-11-02T12:11:00.000Z' });
     expect(acquired.outcome).toBe('ok');
-    const refused = await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, nowIso: afterExpiry, entry: { key: 'k1', event: 'batched', atIso: NOW } });
+    const refused = await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, entry: { key: 'k1', event: 'batched', atIso: NOW } });
     expect(refused).toEqual({ outcome: 'refused', reason: 'lease-not-held' });
   });
 
@@ -109,7 +116,6 @@ describe('TrainEventJournalFileAdapter', () => {
       trainId: TRAIN_ID,
       holderId: 'worker-1',
       fence: 1,
-      nowIso: NOW,
       entry: { key: 'k1', event: 'exploded' as TrainEventValue, atIso: NOW },
     });
     expect(unknownEvent).toEqual({ outcome: 'refused', reason: 'invalid-entry' });
@@ -118,7 +124,6 @@ describe('TrainEventJournalFileAdapter', () => {
       trainId: TRAIN_ID,
       holderId: 'worker-1',
       fence: 1,
-      nowIso: NOW,
       entry: { key: `sk-${'x'.repeat(24)}`, event: 'batched', atIso: NOW },
     });
     expect(secretKey).toEqual({ outcome: 'refused', reason: 'invalid-entry' });
@@ -143,7 +148,7 @@ describe('TrainEventJournalFileAdapter', () => {
     const list = await journal.list(TRAIN_ID);
     expect(list).toEqual({ outcome: 'unreadable' });
 
-    const refused = await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, nowIso: NOW, entry: { key: 'k1', event: 'batched', atIso: NOW } });
+    const refused = await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, entry: { key: 'k1', event: 'batched', atIso: NOW } });
     expect(refused).toEqual({ outcome: 'refused', reason: 'journal-unreadable' });
 
     expect(await fs.readFile(journalPath, 'utf8')).toBe(before);
@@ -157,9 +162,9 @@ describe('TrainEventJournalFileAdapter', () => {
   it('lets a fresh adapter instance on the same directory see the entries', async () => {
     const { stateDir, leases, journal } = await makeAdapters();
     await takeLease(leases);
-    await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, nowIso: NOW, entry: { key: 'k1', event: 'batched', atIso: NOW } });
+    await journal.append({ trainId: TRAIN_ID, holderId: 'worker-1', fence: 1, entry: { key: 'k1', event: 'batched', atIso: NOW } });
 
-    const second = new TrainEventJournalFileAdapter({ stateDir });
+    const second = new TrainEventJournalFileAdapter({ stateDir, clock });
     const list = await second.list(TRAIN_ID);
     expect(list.outcome).toBe('ok');
     if (list.outcome === 'ok') {

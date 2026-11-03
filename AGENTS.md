@@ -9,6 +9,11 @@ This project is a generated, CLI-first hexagonal scaffold. Read
 - Refine typed contracts before implementing a station. Generated empty ports and
   stubs do not establish an implemented guarantee.
 - Use the existing Fleet scripts behind adapters before replacing their behaviour.
+  (Amended 2026-11-03, owner decision on the cutover plan: every behaviour of the
+  fleet-repo shell scripts moves into fleet-v2 as rewritten platform code, never as
+  shell carried in — "no shell style for scripts in v2, everything should be
+  properly rewritten for the platform". The scripts stay frozen, bug fixes only,
+  until each behaviour's replacement is proved.)
 - Workers are disposable and isolated. Context enters through frozen briefs;
   candidate notes never become instructions or authority automatically.
 - Never read, print, copy or commit credentials, tokens, secrets or client content.

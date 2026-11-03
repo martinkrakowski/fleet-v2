@@ -317,4 +317,43 @@ describe("projectConductorStatus", () => {
     }
     expect(projected.liveRuns).toBe(1);
   });
+
+  it("has exactly the declared keys and no truncated", () => {
+    const projected = projectConductorStatus({
+      outcome: "listed",
+      truncated: true,
+      schedule: {
+        observedAtIso: "2026-11-02T00:00:00Z",
+        halt: "clear",
+        driverLeaseLapsed: false,
+        admission: { active: 1, inFlight: 0, maxActiveRuns: 4 },
+        caps: {
+          maxActiveRuns: 4,
+          passConcurrency: 2,
+          dispatchStaggerMs: 500,
+          recordedAtIso: "2026-11-01T00:00:00Z",
+        },
+        trace: "none",
+        rows: [],
+      },
+    });
+    if (!("liveRuns" in projected)) {
+      throw new Error("expected listed");
+    }
+    expect(Object.keys(projected).sort()).toEqual([
+      "admission",
+      "byAdmissionWait",
+      "byPark",
+      "byPlacement",
+      "byState",
+      "caps",
+      "driverLeaseLapsed",
+      "halt",
+      "liveRuns",
+      "observedAtIso",
+      "outcome",
+      "trace",
+    ]);
+    expect("truncated" in projected).toBe(false);
+  });
 });

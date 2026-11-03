@@ -828,7 +828,6 @@ function tally(keys: string[]): Record<string, number> {
 export type ConductorStatusProjection =
   | (ConductorSummaryProjection & {
       readonly outcome: "listed";
-      readonly truncated: boolean | null;
       readonly liveRuns: number;
       readonly byState: Record<string, number>;
       readonly byPlacement: Record<string, number>;
@@ -874,7 +873,6 @@ export function projectConductorStatus(
         }
       : null,
     trace: asString(schedule?.trace),
-    truncated: asBoolean(record.truncated),
     liveRuns: liveRows.length,
     byState: tally(liveRows.map((row) => asString(row.state) ?? "unknown")),
     byPlacement: tally(

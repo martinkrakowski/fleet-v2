@@ -63,12 +63,21 @@ export function useChangeSignals(): void {
         return;
       }
       const next = new EventSource(CHANGE_SIGNAL_PATH);
-      next.onmessage = (event: MessageEvent<string>) => {
+      // The relay writes every frame with a custom `event: change` field, so
+      // signals arrive as named `change` events — `onmessage` only fires for
+      // unnamed frames and stays as the fallback. One handler for both, so a
+      // frame can never schedule two refreshes.
+      const onSignal = (event: Event): void => {
+        if (!(event instanceof MessageEvent)) {
+          return;
+        }
         const signal = parseSignalData(event.data);
         if (signal !== null) {
           scheduleRefresh(refreshDelayMs(signal.kind));
         }
       };
+      next.addEventListener("change", onSignal);
+      next.onmessage = onSignal;
       next.onerror = () => {
         closeSource();
         if (document.visibilityState === "visible" && retryTimer === null) {

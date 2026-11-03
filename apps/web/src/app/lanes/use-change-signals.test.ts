@@ -41,6 +41,9 @@ describe("change-signal source wiring", () => {
 
   it("subscribes to the same-origin relay and refreshes debounced", () => {
     expect(hook).toContain("new EventSource(CHANGE_SIGNAL_PATH)");
+    // The relay frames carry `event: change`; named SSE events never fire
+    // `onmessage`, so the hook must listen for the named event as well.
+    expect(hook).toContain('addEventListener("change", onSignal)');
     expect(hook).toContain("router.refresh()");
     expect(hook).toContain("document.visibilityState");
     expect(hook).toContain("CHANGE_SIGNAL_RETRY_MS");

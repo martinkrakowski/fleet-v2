@@ -71,7 +71,7 @@ function stepKey(step: 'prepare' | 'dispatch', seatIndex: number, attemptOrdinal
 function resultPair(
   index: number,
   key: string,
-  outcome: 'refused' | 'completed',
+  outcome: 'refused' | 'completed' | 'ambiguous',
   reasonCode: LaneRunResultReasonCode,
   detail: string | null = null,
 ): [LaneRunJournalEntryRecord, LaneRunJournalEntryRecord] {
@@ -122,6 +122,33 @@ function gb2Pairs(detail: string): readonly [LaneRunJournalEntryRecord, LaneRunJ
   ];
 }
 
+/** The F62-shaped park: ambiguous at the gate, parked from gating. */
+function gateAmbiguousRecord(): LaneRunRecord {
+  return runRecord({
+    parked: { reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating', questionId: null },
+    parkCount: 1,
+  });
+}
+
+const HEAD12 = '0123456789ab';
+
+function gateKey(): string {
+  const built = buildLaneRunStepKey({
+    runId: RUN_ID,
+    round: 0,
+    step: 'gate',
+    seatIndex: 0,
+    attemptOrdinal: null,
+    head12: HEAD12,
+    retry: null,
+  });
+  expect(built.ok).toBe(true);
+  if (!built.ok) {
+    throw new Error('fixture must build a gate key');
+  }
+  return built.key;
+}
+
 describe('InspectLaneRunsUseCase parkDetail (GB3c)', () => {
   it('7. a GB2-shaped dispatch park shows the refusal detail (worktree-uncommitted)', async () => {
     const view = await inspectView(gb2Record(), gb2Pairs('worktree-uncommitted'));
@@ -147,5 +174,12 @@ describe('InspectLaneRunsUseCase parkDetail (GB3c)', () => {
       resultPair(3, stepKey('dispatch', 2, 3), 'refused', 'dispatch-inputs-unreadable'),
     ]);
     expect(view.parkDetail).toBe('worktree-uncommitted');
+  });
+
+  it('9. an ambiguous gate park shows the fixed unknown-read detail token', async () => {
+    const view = await inspectView(gateAmbiguousRecord(), [
+      resultPair(0, gateKey(), 'ambiguous', 'gate-unknown', 'gate-output-unreadable'),
+    ]);
+    expect(view.parkDetail).toBe('gate-output-unreadable');
   });
 });

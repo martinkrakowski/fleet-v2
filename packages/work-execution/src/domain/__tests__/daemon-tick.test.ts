@@ -20,6 +20,7 @@ import {
   resolveRepoLastServedAtIso,
   buildDaemonStatusRecord,
   isValidDaemonLeaseScope,
+  mergeQueueLeaseScope,
   tickExitCodeForJobs,
 } from '../daemon-tick.js';
 import type {
@@ -202,6 +203,31 @@ describe('job ids and lease scopes', () => {
     expect(isValidDaemonLeaseScope('replan-digest')).toBe(true);
     expect(isValidDaemonLeaseScope(`merge/${DIGEST_A}`)).toBe(true);
     expect(isValidDaemonLeaseScope('acme/widgets')).toBe(true);
+  });
+
+  it('builds merge-queue lease scopes for main and chain bases', () => {
+    expect(mergeQueueLeaseScope(DIGEST_A, 'main')).toBe(`merge/${DIGEST_A}`);
+    expect(mergeQueueLeaseScope(DIGEST_A, 'chain/dt')).toBe(`merge/${DIGEST_A}--chain-dt`);
+  });
+
+  it('refuses bad digests and unparsable bases for lease scopes', () => {
+    expect(mergeQueueLeaseScope('00000000000A', 'main')).toBeNull();
+    expect(mergeQueueLeaseScope('short', 'main')).toBeNull();
+    expect(mergeQueueLeaseScope(DIGEST_A, 'release')).toBeNull();
+    expect(mergeQueueLeaseScope(DIGEST_A, undefined)).toBeNull();
+    expect(mergeQueueLeaseScope(DIGEST_A, 42)).toBeNull();
+  });
+
+  it('returns null for a chain lease scope whose component exceeds the safe length', () => {
+    const longChain = `chain/${'a'.repeat(194)}`;
+    expect(longChain).toHaveLength(200);
+    expect(mergeQueueLeaseScope(DIGEST_A, longChain)).toBeNull();
+  });
+
+  it('accepts merge digest scopes and chain lease scopes and rejects --main', () => {
+    expect(isValidDaemonLeaseScope(`merge/${DIGEST_A}`)).toBe(true);
+    expect(isValidDaemonLeaseScope(`merge/${DIGEST_A}--chain-dt`)).toBe(true);
+    expect(isValidDaemonLeaseScope(`merge/${DIGEST_A}--main`)).toBe(false);
   });
 
   it('rejects traversal, dot segments and secret-shaped scopes', () => {

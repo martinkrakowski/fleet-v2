@@ -523,6 +523,15 @@ export type DecisionsSectionV2 =
   | JevDecisionsSection
   | AnswerFileDecisionsSection;
 
+/** The optional v2 `daemon` section: paths for the user-scope scheduler units. */
+export interface DaemonSection {
+  readonly nodePath: string;
+  readonly cliPath: string;
+  readonly stateDir: string;
+  readonly unitDir: string;
+  readonly installationFile: string;
+}
+
 /** The v2 file shape (plan section 1). */
 export interface FleetInstallationV2 {
   readonly schemaVersion: 2;
@@ -541,6 +550,7 @@ export interface FleetInstallationV2 {
   readonly verification?: VerificationProceduresSection;
   readonly waves?: WavesSection;
   readonly decisions?: DecisionsSectionV2;
+  readonly daemon?: DaemonSection;
 }
 
 // ---------------------------------------------------------------------------
@@ -632,6 +642,7 @@ export interface FleetInstallationModel {
   readonly verification?: VerificationProceduresSection;
   readonly waves?: WavesSection;
   readonly decisions?: DecisionsSectionV2;
+  readonly daemon?: DaemonSection;
 }
 
 // ---------------------------------------------------------------------------
@@ -675,4 +686,6 @@ export interface FleetInstallation {
   readonly policy?: PolicySection;
   /** v2: decision provider configuration (D3). Never set in v1. */
   readonly decisions?: DecisionsSectionV2;
+  /** v2: the daemon tick's user-scope scheduler unit paths. Never set in v1. */
+  readonly daemon?: DaemonSection;
 }

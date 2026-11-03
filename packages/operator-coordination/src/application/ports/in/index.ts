@@ -19,6 +19,7 @@ export * from "./ListOrchestratorSessionsPort.in-port.js";
 export * from "./ListOwnerItemsPort.in-port.js";
 export * from "./ListOwnerQuestionsPort.in-port.js";
 export * from "./ListProjectProfilesPort.in-port.js";
+export * from "./OwnerNotificationPort.in-port.js";
 export * from "./PublishProjectObservationPort.in-port.js";
 export * from "./ReadOwnerQuestionPort.in-port.js";
 export * from "./ReadProjectAttentionPort.in-port.js";

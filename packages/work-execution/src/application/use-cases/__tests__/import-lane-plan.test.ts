@@ -11,12 +11,15 @@ import type {
   LanePlanRecord,
   LanePlanSidecar,
   PlannedLaneRecord,
+  PullRequestLinkRecord,
 } from '../../../domain/lane-plan-records.js';
 import { canonicalLanePlanSidecarJson } from '../../../domain/lane-plan-sidecar.js';
 import { findLanePlanCycle, type LanePlanGraphPlan } from '../../../domain/lane-plan-graph.js';
+import { decidePullRequestLink, pullRequestLinkKey } from '../../../domain/entities/PullRequestLink.js';
 import type {
   LanePlanRepositoryPort,
   SaveLanePlanResult,
+  SavePullRequestLinkResult,
 } from '../../ports/out/LanePlanRepositoryPort.out-port.js';
 import {
   ImportLanePlanUseCase,
@@ -39,6 +42,7 @@ function lanePlanGraphPlanFromRecord(record: LanePlanRecord): LanePlanGraphPlan 
 class FakeLanePlanRepo implements LanePlanRepositoryPort {
   readonly store = new Map<string, LanePlanRecord>();
   readonly saved: LanePlanRecord[] = [];
+  readonly links = new Map<string, PullRequestLinkRecord>();
 
   constructor(seed: readonly LanePlanRecord[] = []) {
     for (const record of seed) {
@@ -74,6 +78,29 @@ class FakeLanePlanRepo implements LanePlanRepositoryPort {
 
   async listLanePlans(): Promise<readonly LanePlanRecord[]> {
     return [...this.store.values()];
+  }
+
+  async savePullRequestLink(record: PullRequestLinkRecord): Promise<SavePullRequestLinkResult> {
+    const key = pullRequestLinkKey({ repository: record.repository, number: record.number });
+    const existing = this.links.get(key) ?? null;
+    const decision = decidePullRequestLink(existing, record);
+    if (decision === 'create') {
+      this.links.set(key, record);
+      return { outcome: 'saved', link: record };
+    }
+    if (decision === 'no-op') {
+      return { outcome: 'unchanged', link: existing as PullRequestLinkRecord };
+    }
+    return { outcome: 'refused', code: 'pr-already-linked', linkedLaneId: existing!.laneId };
+  }
+
+  async findPullRequestLink(repository: string, number: number): Promise<PullRequestLinkRecord | null> {
+    return this.links.get(pullRequestLinkKey({ repository, number })) ?? null;
+  }
+
+  async listPullRequestLinks(projectId?: string): Promise<readonly PullRequestLinkRecord[]> {
+    const records = [...this.links.values()];
+    return projectId === undefined ? records : records.filter((link) => link.projectId === projectId);
   }
 }
 

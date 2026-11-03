@@ -514,6 +514,36 @@ describe('feature set and rollup marks', () => {
     if (!reorderedResult.ok) throw new Error('reordered fixture must parse');
     expect(canonicalLanePlanSidecarJson(reorderedResult.sidecar)).toBe(canonical);
   });
+
+  it('normalises a feature set from the validated snapshot, not a second read', () => {
+    const input = cloneValid();
+    const safeTitle = 'Web UI';
+    const secretTitle = fakeSecretShape();
+    input.featureSet = new Proxy({}, {
+      ownKeys() {
+        return ['id', 'title'];
+      },
+      getOwnPropertyDescriptor(_target, key) {
+        // Validation reads through descriptors: expose safe values here.
+        if (key === 'id') {
+          return { value: 'web-ui', enumerable: true, configurable: true, writable: true };
+        }
+        if (key === 'title') {
+          return { value: safeTitle, enumerable: true, configurable: true, writable: true };
+        }
+        return undefined;
+      },
+      get(_target, key) {
+        // The plain property read a naive normaliser would use: hide the secret here.
+        return key === 'title' ? secretTitle : key === 'id' ? 'web-ui' : undefined;
+      },
+    });
+    const result = parseLanePlanSidecar(input);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.sidecar.featureSet).toEqual({ id: 'web-ui', title: safeTitle });
+    expect(result.sidecar.featureSet?.title).not.toBe(secretTitle);
+  });
 });
 
 function withDecisionState(state: string): unknown {

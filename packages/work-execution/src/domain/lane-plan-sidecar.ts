@@ -203,16 +203,32 @@ export function pullRequestRefError(path: string, value: unknown): string | null
  * the id a machine key and the title a human label. Never throws; the message
  * names the path, never the value.
  */
-export function planFeatureSetError(path: string, value: unknown): string | null {
+/**
+ * Validate a feature set against a fresh descriptor snapshot and return that
+ * snapshot. Callers must normalise from the returned snapshot, never from the
+ * original object: a hostile object (a proxy) can expose safe values here and
+ * different, unvalidated values on a later property read.
+ */
+function planFeatureSetSnapshot(
+  path: string,
+  value: unknown,
+): { readonly error: string | null; readonly snapshot: Record<string, unknown> | null } {
   const snapshot = readExactPlainRecord(value, ['id', 'title']);
   if (snapshot === null) {
-    return `${path}: must be an object with id and title`;
+    return { error: `${path}: must be an object with id and title`, snapshot: null };
   }
   const idError = planIdError(`${path}.id`, snapshot.id, PLAN_FEATURE_SET_ID_PATTERN, 'feature set id');
   if (idError !== null) {
-    return idError;
+    return { error: idError, snapshot };
   }
-  return planTextError(`${path}.title`, snapshot.title, LANE_PLAN_LIMITS.featureSetTitleBytes);
+  return {
+    error: planTextError(`${path}.title`, snapshot.title, LANE_PLAN_LIMITS.featureSetTitleBytes),
+    snapshot,
+  };
+}
+
+export function planFeatureSetError(path: string, value: unknown): string | null {
+  return planFeatureSetSnapshot(path, value).error;
 }
 
 const ROOT_REQUIRED_KEYS = ['schemaVersion', 'projectId', 'planId', 'revision', 'doc', 'lanes'];
@@ -252,11 +268,13 @@ function parseLanePlanSidecarUnchecked(input: unknown): LanePlanSidecarResult {
   if (hasOwn(root, 'exclusiveOrder')) {
     checkRootExclusiveOrder(root, errors);
   }
+  let featureSetSnapshot: Record<string, unknown> | null = null;
   if (hasOwn(root, 'featureSet')) {
-    const featureSetError = planFeatureSetError('sidecar.featureSet', root.featureSet);
-    if (featureSetError !== null) {
-      errors.push(featureSetError);
+    const featureSetResult = planFeatureSetSnapshot('sidecar.featureSet', root.featureSet);
+    if (featureSetResult.error !== null) {
+      errors.push(featureSetResult.error);
     }
+    featureSetSnapshot = featureSetResult.snapshot;
   }
   if (errors.length > 0) {
     return cappedErrors(errors);
@@ -265,7 +283,7 @@ function parseLanePlanSidecarUnchecked(input: unknown): LanePlanSidecarResult {
   if (errors.length > 0) {
     return cappedErrors(errors);
   }
-  return { ok: true, sidecar: buildNormalizedSidecar(root) };
+  return { ok: true, sidecar: buildNormalizedSidecar(root, featureSetSnapshot) };
 }
 
 function checkRootLanes(root: Record<string, unknown>, errors: string[]): void {
@@ -735,7 +753,10 @@ function collectDecisionIds(root: Record<string, unknown>): Set<string> {
   return ids;
 }
 
-function buildNormalizedSidecar(root: Record<string, unknown>): LanePlanSidecar {
+function buildNormalizedSidecar(
+  root: Record<string, unknown>,
+  featureSetSnapshot: Record<string, unknown> | null,
+): LanePlanSidecar {
   const projectId = root.projectId as string;
   const planId = root.planId as string;
   const lanes = (plainArrayCopy(root.lanes) as unknown[]).map((raw) =>
@@ -747,12 +768,9 @@ function buildNormalizedSidecar(root: Record<string, unknown>): LanePlanSidecar 
   const exclusiveOrder = hasOwn(root, 'exclusiveOrder')
     ? (plainArrayCopy(root.exclusiveOrder) as unknown[]).map((raw) => buildNormalizedExclusiveOrder(raw))
     : [];
-  const featureSet: PlanFeatureSet | null = hasOwn(root, 'featureSet')
-    ? {
-        id: (root.featureSet as Record<string, unknown>).id as string,
-        title: (root.featureSet as Record<string, unknown>).title as string,
-      }
-    : null;
+  const featureSet: PlanFeatureSet | null = featureSetSnapshot === null
+    ? null
+    : { id: featureSetSnapshot.id as string, title: featureSetSnapshot.title as string };
   return {
     schemaVersion: LANE_PLAN_SIDECAR_SCHEMA_VERSION,
     projectId,

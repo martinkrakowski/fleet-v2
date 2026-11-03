@@ -13,12 +13,17 @@
 import { containsSecretShape } from '@fleet/shared';
 import type {
   KnowledgeCheckRecord,
+  KnowledgeClaimKind,
   KnowledgeEntryRecord,
   KnowledgeReuseRecord,
 } from '../knowledge-records.js';
 import {
+  DEFAULT_KNOWLEDGE_CLAIM_KIND,
+  KNOWLEDGE_CLAIM_KINDS,
   KNOWLEDGE_TRIAGE_FLAGS,
+  MAX_FAILED_CLAIM_TEXT_CHARS,
   MAX_OVERRIDE_REASON_CHARS,
+  isKnowledgeClaimKind,
   isKnowledgeTriageFlag,
 } from '../knowledge-records.js';
 import type { KnowledgeDispositionValue } from '../value-objects/KnowledgeDisposition.vo.js';
@@ -51,6 +56,17 @@ export class KnowledgeEntry {
     }
     if (typeof record.claimText !== 'string' || record.claimText.trim().length === 0) {
       throw new Error('KnowledgeEntry requires a non-empty claimText');
+    }
+    if (record.claimKind !== undefined && !isKnowledgeClaimKind(record.claimKind)) {
+      throw new Error(
+        `KnowledgeEntry claimKind must be one of ${KNOWLEDGE_CLAIM_KINDS.join(', ')}`,
+      );
+    }
+    const claimKind = record.claimKind ?? DEFAULT_KNOWLEDGE_CLAIM_KIND;
+    if (claimKind === 'failed' && record.claimText.length > MAX_FAILED_CLAIM_TEXT_CHARS) {
+      throw new Error(
+        `KnowledgeEntry claimText must be at most ${MAX_FAILED_CLAIM_TEXT_CHARS} characters for a failed claim`,
+      );
     }
     if (!Array.isArray(record.pathPrefixes) || !record.pathPrefixes.every((entry) => typeof entry === 'string')) {
       throw new Error('KnowledgeEntry requires string pathPrefixes');
@@ -159,6 +175,16 @@ export class KnowledgeEntry {
 
   getCheckerId(): string | null {
     return this.record.checkerId;
+  }
+
+  /** The kind this claim asserts; an entry written before kinds existed reads as `fact`. */
+  getClaimKind(): KnowledgeClaimKind {
+    return this.record.claimKind ?? DEFAULT_KNOWLEDGE_CLAIM_KIND;
+  }
+
+  /** True for an approach that was tried and disproved. */
+  isFailedClaim(): boolean {
+    return this.getClaimKind() === 'failed';
   }
 
   getChecks(): readonly KnowledgeCheckRecord[] {

@@ -11,6 +11,7 @@ import type { SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { BaseBranchValue } from './base-branch.js';
 import { INITIAL_RECORD_SCHEMA_VERSION } from './record-schema-version.js';
+import type { LaneRunParkFindingView } from './park-findings-view.js';
 
 export const LANE_RUN_RECORD_VERSION = 1 as const;
 
@@ -106,6 +107,13 @@ export interface LaneRunParkRecord {
   readonly parkedFrom: LaneRunStateValue;
   /** The keyed owner question, once asked; null when none is (e.g. stop-unconfirmed, halted). */
   readonly questionId: string | null;
+  /**
+   * The bounded findings snapshot of the failed code review at the parked head,
+   * frozen when the park is raised so repair and every retry reuse the same
+   * snapshot (GB2 correction 2); absent on records written before GB2 and for
+   * non-blocker parks.
+   */
+  readonly findings?: readonly LaneRunParkFindingView[] | null;
 }
 
 /** The driver's lease on this run (K3 takes and renews it by CAS with a fencing revision). */

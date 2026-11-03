@@ -102,6 +102,20 @@ export function composeConductor(input: ComposeConductorInput) {
   } catch {
     autoMergeEnabled = false;
   }
+  // The review request adapter, shared by the review step and the status view's
+  // read-only findings projection (GB2). Hoisted above the conductor literal so
+  // today the inspect use case can read the parked head's latest receipt.
+  const reviewRequest = new ReviewRequestAdapter({
+    requestIndependentReview: (request) =>
+      evidence.requestIndependentReview.requestIndependentReview(request),
+    inspectAcceptanceEvidence: (request) =>
+      evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence(request),
+    // KF-33b2: the review step's out-of-scope dispositions through the
+    // evidence context's existing disposition use case, one id per call.
+    recordFindingDisposition: (request) =>
+      evidence.recordFindingDisposition.recordFindingDisposition(request),
+  });
+
   const conductor = {
     laneRunRepository,
     laneRunJournal,
@@ -116,6 +130,8 @@ export function composeConductor(input: ComposeConductorInput) {
       runJournal: laneRunJournal,
       halt: conductorHalt,
       driverLease: conductorDriverLease,
+      attemptRepo: attemptRepository,
+      reviewReceipts: reviewRequest,
     }),
     listLaneRuns: new ListLaneRunsUseCase({
       runRepo: laneRunRepository,
@@ -157,16 +173,7 @@ export function composeConductor(input: ComposeConductorInput) {
     profileRead,
     // Delegates are bound as arrow functions: the use cases read `this.deps`,
     // so an unbound method call would fail every request.
-    reviewRequest: new ReviewRequestAdapter({
-      requestIndependentReview: (request) =>
-        evidence.requestIndependentReview.requestIndependentReview(request),
-      inspectAcceptanceEvidence: (request) =>
-        evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence(request),
-      // KF-33b2: the review step's out-of-scope dispositions through the
-      // evidence context's existing disposition use case, one id per call.
-      recordFindingDisposition: (request) =>
-        evidence.recordFindingDisposition.recordFindingDisposition(request),
-    }),
+    reviewRequest,
     reviewAssessment: new ReviewAssessmentAdapter({
       openEvidenceAssessment: (request) =>
         evidence.openEvidenceAssessment.openEvidenceAssessment(request),

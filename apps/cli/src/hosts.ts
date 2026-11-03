@@ -51,7 +51,10 @@ import {
   AttemptRepositoryAdapter,
   CAPACITY_RELEASE_STATES,
   ExecutionJournalAdapter,
+  ManageDaemonSchedulerUseCase,
   resolveInstallationHostForRole,
+  SystemdUserSchedulerAdapter,
+  type DaemonSchedulerPort,
 } from "@fleet/work-execution";
 
 import { formatDoctorLine, type CliIo } from "./index.js";
@@ -74,6 +77,8 @@ export interface HostsCliOptions {
    * refuses the write.
    */
   readonly confirm?: (question: string) => Promise<boolean>;
+  /** Daemon scheduler port; the systemd user adapter composes when omitted. */
+  readonly scheduler?: DaemonSchedulerPort;
 }
 
 const HOSTS_HELP = `Usage: fleet-v2 hosts <subcommand> [flags]
@@ -95,6 +100,11 @@ A schema version 1 file is converted to v2 on the first write.
                                the entry's current values
   remove <name> [--yes]        remove a host; refuses the orchestrator host,
                                the last lane-runner and a host with live work
+  daemon install|show|uninstall --scheduler systemd [--apply]
+                               render the daemon tick's user-scope scheduler
+                               units (systemd service and timer); install
+                               prints the enable and linger commands, and
+                               --apply writes or removes the unit files
 
 Roles: orchestrator, lane-runner, verifier. hosts add/edit keep one
 lane-runner role: adding or editing a host with the lane-runner role moves that
@@ -835,12 +845,169 @@ async function listHosts(file: string, io: CliIo): Promise<number> {
   return 0;
 }
 
+type DaemonAction = "install" | "show" | "uninstall";
+
+interface DaemonCommandArgs {
+  readonly action: DaemonAction;
+  readonly apply: boolean;
+}
+
+type ParsedDaemonArgs =
+  | { readonly ok: true; readonly help: true }
+  | { readonly ok: true; readonly help: false; readonly args: DaemonCommandArgs }
+  | { readonly ok: false; readonly error: string };
+
+/**
+ * Parse one `hosts daemon` invocation. `--scheduler` is required and must be
+ * `systemd`; `--apply` is refused on show. Every problem is a usage message.
+ */
+function parseDaemonArgs(tokens: readonly string[]): ParsedDaemonArgs {
+  if (isHelpToken(tokens[0] ?? "")) {
+    return { ok: true, help: true };
+  }
+  const action = tokens[0];
+  if (action !== "install" && action !== "show" && action !== "uninstall") {
+    return {
+      ok: false,
+      error: `Unknown hosts daemon action: ${action === undefined ? "(none)" : action}\n${HOSTS_HELP}`,
+    };
+  }
+  let scheduler: string | undefined;
+  let apply = false;
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (isHelpToken(token)) {
+      return { ok: true, help: true };
+    }
+    const body = token.startsWith("--") ? token.slice(2) : "";
+    const separator = body.indexOf("=");
+    const flag = separator === -1 ? body : body.slice(0, separator);
+    const inlineValue =
+      separator === -1 ? undefined : body.slice(separator + 1);
+    if (flag === "apply") {
+      if (inlineValue !== undefined) {
+        return { ok: false, error: `--apply takes no value\n${HOSTS_HELP}` };
+      }
+      apply = true;
+      continue;
+    }
+    if (flag === "scheduler") {
+      let value = inlineValue;
+      if (value === undefined) {
+        const next = tokens[index + 1];
+        if (next === undefined || next.startsWith("--")) {
+          return {
+            ok: false,
+            error: `--scheduler requires a value\n${HOSTS_HELP}`,
+          };
+        }
+        value = next;
+        index += 1;
+      }
+      scheduler = value;
+      continue;
+    }
+    return {
+      ok: false,
+      error: `Unknown hosts daemon option: --${flag}\n${HOSTS_HELP}`,
+    };
+  }
+  if (scheduler === undefined) {
+    return {
+      ok: false,
+      error: `hosts daemon requires --scheduler <name>\n${HOSTS_HELP}`,
+    };
+  }
+  if (scheduler !== "systemd") {
+    return {
+      ok: false,
+      error: `hosts daemon --scheduler must be systemd\n${HOSTS_HELP}`,
+    };
+  }
+  if (action === "show" && apply) {
+    return {
+      ok: false,
+      error: `hosts daemon show does not take --apply\n${HOSTS_HELP}`,
+    };
+  }
+  return { ok: true, help: false, args: { action, apply } };
+}
+
+/**
+ * `fleet-v2 hosts daemon <action>`: install/show/uninstall the daemon tick's
+ * user-scope scheduler units. The installation file resolves exactly as the
+ * other hosts commands; its path is never printed. A missing, unreadable,
+ * invalid, v1 or daemon-less file is exit 1; usage problems are exit 2.
+ */
+async function daemonCommand(
+  argv: readonly string[],
+  io: CliIo,
+  options: HostsCliOptions,
+): Promise<number> {
+  const parsed = parseDaemonArgs(argv);
+  if (!parsed.ok) {
+    io.stderr(`${parsed.error}\n`);
+    return 2;
+  }
+  if (parsed.help) {
+    io.stdout(`${HOSTS_HELP}\n`);
+    return 0;
+  }
+  const args = parsed.args;
+  const file =
+    options.installationFile ??
+    resolveInstallationFile(undefined, process.env, process.cwd());
+  const state = await readInstallationState(file);
+  if (state.status === "absent") {
+    io.stderr("installation: absent\n");
+    return 1;
+  }
+  if (state.status === "unreadable") {
+    io.stderr("installation: unreadable\n");
+    return 1;
+  }
+  if (state.status === "invalid") {
+    printErrors(io, state.errors);
+    return 1;
+  }
+  if (state.status === "v1") {
+    io.stderr("installation.daemon: schema version 1 has no daemon section\n");
+    return 1;
+  }
+  const daemon = state.installation.daemon;
+  if (daemon === undefined) {
+    io.stderr("installation.daemon: absent\n");
+    return 1;
+  }
+  const scheduler =
+    options.scheduler ??
+    new SystemdUserSchedulerAdapter({ unitDir: daemon.unitDir });
+  const useCase = new ManageDaemonSchedulerUseCase({ scheduler });
+  const result = await useCase.execute({
+    action: args.action,
+    apply: args.apply,
+    daemon,
+  });
+  for (const unit of result.units) {
+    io.stdout(`${unit.key} ${unit.code}\n`);
+  }
+  if (result.operatorLines !== null) {
+    for (const line of result.operatorLines) {
+      io.stdout(`${line}\n`);
+    }
+  }
+  return result.units.some((unit) => unit.code === "unreadable") ? 1 : 0;
+}
+
 /** `fleet-v2 hosts <subcommand>`; exit codes: 0 written/listed, 1 refused, 2 usage. */
 export async function hostsCommand(
   argv: readonly string[],
   io: CliIo,
   options: HostsCliOptions = {},
 ): Promise<number> {
+  if (argv[0] === "daemon") {
+    return daemonCommand(argv.slice(1), io, options);
+  }
   const parsed = parseHostsArgs(argv);
   if (!parsed.ok) {
     io.stderr(`${parsed.error}\n`);

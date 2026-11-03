@@ -510,7 +510,7 @@ export function composeExecution(input: ComposeExecutionInput) {
   const processTreeTermination = new ProcessTreeTerminationAdapter({ executorForHost });
 
   const mergeQueueRepository = new MergeQueueRepositoryAdapter({ stateDir });
-  const enqueueMerge = new EnqueueMergeUseCase({ queue: mergeQueueRepository, forge: forgeRead });
+  const enqueueMerge = new EnqueueMergeUseCase({ queue: mergeQueueRepository });
   const listMergeQueue = new ListMergeQueueUseCase({ queue: mergeQueueRepository });
 
   // WB4a: the lane-plan store — one adapter is both stores (in-memory when

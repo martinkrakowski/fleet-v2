@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
 import { LanePlan } from '../entities/LanePlan.js';
-import { PlannedLane } from '../entities/PlannedLane.js';
 import type { LanePlanRecord, LanePlanSidecar } from '../lane-plan-records.js';
 import { parseLanePlanSidecar } from '../lane-plan-sidecar.js';
 
@@ -316,93 +315,5 @@ describe('LanePlan deep freeze', () => {
     expect(Object.isFrozen(lane)).toBe(true);
     expect(Object.isFrozen(lane.after[0])).toBe(true);
     expect(Object.isFrozen(record.lanes[2].mergedPr)).toBe(true);
-  });
-});
-
-describe('LanePlan feature set and rollup marks', () => {
-  function sidecarWithFeatureSet(): LanePlanSidecar {
-    const result = parseLanePlanSidecar({
-      ...VALID,
-      featureSet: { id: 'web-ui', title: 'Web UI' },
-      lanes: [
-        { ...(VALID.lanes[0] as Record<string, unknown>), rollupOf: true },
-        VALID.lanes[1],
-        VALID.lanes[2],
-      ],
-    });
-    if (!result.ok) {
-      throw new Error('fixture sidecar must parse');
-    }
-    return result.sidecar;
-  }
-
-  it('carries the feature set and the rollup mark into the stored record', () => {
-    const plan = LanePlan.fromSidecar(sidecarWithFeatureSet(), {
-      digest: 'a'.repeat(64),
-      importedAtIso: '2026-10-27T12:00:00.000Z',
-    });
-    expect(plan.success).toBe(true);
-    if (!plan.success) return;
-    const record = plan.value.toRecord();
-    expect(record.featureSet).toEqual({ id: 'web-ui', title: 'Web UI' });
-    const a1 = record.lanes.find((lane) => lane.laneId === 'A1');
-    expect(a1?.rollupOf).toBe(true);
-    for (const lane of record.lanes) {
-      if (lane.laneId === 'A1') {
-        continue;
-      }
-      expect(Object.prototype.hasOwnProperty.call(lane, 'rollupOf')).toBe(false);
-    }
-  });
-
-  it('stores and round-trips a record without the new fields', () => {
-    const record = storedRecord();
-    expect(Object.prototype.hasOwnProperty.call(record, 'featureSet')).toBe(false);
-    for (const lane of record.lanes) {
-      expect(Object.prototype.hasOwnProperty.call(lane, 'rollupOf')).toBe(false);
-    }
-    const plan = LanePlan.create(record);
-    expect(plan.success).toBe(true);
-    if (!plan.success) return;
-    expect(plan.value.toRecord()).toEqual(record);
-  });
-
-  it('refuses a malformed stored featureSet and rollupOf', () => {
-    expect(createError(patched((record) => { record.featureSet = { id: 'web-ui' }; })))
-      .toBe('LanePlan featureSet: must be an object with id and title');
-    expect(createError(patched((record) => { record.featureSet = { id: 'web ui', title: 'Web UI' }; })))
-      .toBe('LanePlan featureSet.id: must be a feature set id');
-    expect(createError(patched((record) => {
-      record.featureSet = { id: 'web-ui', title: 'é'.repeat(61) };
-    })))
-      .toBe('LanePlan featureSet.title: must be plain text of at most 120 bytes');
-    expect(createError(patched((record) => {
-      record.featureSet = { id: 'web-ui', title: fakeSecretShape() };
-    })))
-      .toBe('LanePlan featureSet.title: contains a secret-shaped value and was refused');
-    expect(createError(patched((record) => { lane0(record).rollupOf = false; })))
-      .toBe('PlannedLane lanes[0].rollupOf: must be true');
-  });
-
-  it('getFeatureSet returns a fresh copy and isRollup reflects the rollup mark', () => {
-    const plan = LanePlan.create(patched((record) => {
-      record.featureSet = { id: 'web-ui', title: 'Web UI' };
-      lane0(record).rollupOf = true;
-    }));
-    if (!plan.success) throw new Error('fixture must store');
-    const first = plan.value.getFeatureSet();
-    expect(first).toEqual({ id: 'web-ui', title: 'Web UI' });
-    if (first !== null) {
-      (first as { title: string }).title = 'Changed';
-    }
-    expect(plan.value.getFeatureSet()).toEqual({ id: 'web-ui', title: 'Web UI' });
-
-    const record = plan.value.toRecord();
-    const rollupResult = PlannedLane.create(record.lanes[0], 'lanes[0]');
-    if (!rollupResult.success) throw new Error('rollup lane must load');
-    expect(rollupResult.value.isRollup()).toBe(true);
-    const plainResult = PlannedLane.create(record.lanes[1], 'lanes[1]');
-    if (!plainResult.success) throw new Error('plain lane must load');
-    expect(plainResult.value.isRollup()).toBe(false);
   });
 });

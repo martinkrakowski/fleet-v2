@@ -64,6 +64,15 @@ export function writeInstallationV2(installation: FleetInstallationV2): string {
   if (installation.decisions !== undefined) {
     document.decisions = serializeDecisions(installation.decisions);
   }
+  if (installation.daemon !== undefined) {
+    document.daemon = {
+      nodePath: installation.daemon.nodePath,
+      cliPath: installation.daemon.cliPath,
+      stateDir: installation.daemon.stateDir,
+      unitDir: installation.daemon.unitDir,
+      installationFile: installation.daemon.installationFile,
+    };
+  }
   return `${JSON.stringify(document, null, 2)}\n`;
 }
 

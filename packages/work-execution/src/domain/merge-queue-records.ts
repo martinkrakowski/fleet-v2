@@ -4,18 +4,13 @@
  */
 
 import { containsSecretShape } from '@fleet/shared';
-import { DEFAULT_BASE_BRANCH, parseBaseBranch } from './base-branch.js';
-import type { BaseBranchValue } from './base-branch.js';
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from './lane-run-journal.js';
 import { REQUEST_ID_PATTERN } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN } from './lane-run-records.js';
 import { readExactPlainRecord } from './plain-record-reads.js';
 
-export const MERGE_QUEUE_ENTRY_VERSION = 2 as const;
-
-/** The stored record schema versions the reader accepts: 1 (legacy) and 2 (current). */
-export type MergeQueueEntryVersion = 1 | 2;
+export const MERGE_QUEUE_ENTRY_VERSION = 1 as const;
 
 export const MERGE_QUEUE_TIERS = [0, 1, 2] as const;
 export type MergeQueueTier = (typeof MERGE_QUEUE_TIERS)[number];
@@ -74,12 +69,10 @@ export interface MergeQueueVetoRecord {
 }
 
 export interface MergeQueueEntryRecord {
-  readonly version: MergeQueueEntryVersion;
+  readonly version: typeof MERGE_QUEUE_ENTRY_VERSION;
   readonly entryId: string;
   readonly repository: MergeQueueRepositoryRef;
   readonly repoDigest: string;
-  /** Own enumerable base on version-2 records; never present on version 1. */
-  readonly baseBranch?: BaseBranchValue;
   readonly pullRequest: number;
   readonly headOid: string;
   readonly state: MergeQueueEntryState;
@@ -199,9 +192,6 @@ const ENTRY_KEYS: readonly string[] = [
 
 const LEGACY_ENTRY_KEYS: readonly string[] = ENTRY_KEYS.filter((key) => key !== 'version');
 
-/** Version-2 records add one own enumerable `baseBranch` to the v1 keys. */
-const V2_ENTRY_KEYS: readonly string[] = [...ENTRY_KEYS, 'baseBranch'];
-
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 const ATTEMPT_CAP = 32;
 
@@ -220,25 +210,19 @@ export function readMergeQueueEntryRecord(input: unknown): MergeQueueEntryRead {
       if (!versionDescriptor.enumerable) {
         return refusal('malformed', 'MergeQueueEntry version must be enumerable');
       }
-      if (versionDescriptor.value === 1) {
-        snapshot = readExactPlainRecord(input, ENTRY_KEYS);
-        if (snapshot === null) {
-          return refusal('malformed', 'MergeQueueEntry must have exactly the v1 entry keys');
-        }
-      } else if (versionDescriptor.value === MERGE_QUEUE_ENTRY_VERSION) {
-        snapshot = readExactPlainRecord(input, V2_ENTRY_KEYS);
-        if (snapshot === null) {
-          return refusal('malformed', 'MergeQueueEntry must have exactly the v2 entry keys');
-        }
-      } else {
-        return refusal('unknown-version', 'MergeQueueEntry version must be 1 or 2');
+      if (versionDescriptor.value !== MERGE_QUEUE_ENTRY_VERSION) {
+        return refusal('unknown-version', 'MergeQueueEntry version must be 1');
+      }
+      snapshot = readExactPlainRecord(input, ENTRY_KEYS);
+      if (snapshot === null) {
+        return refusal('malformed', 'MergeQueueEntry must have exactly the v1 entry keys');
       }
     } else {
       snapshot = readExactPlainRecord(input, LEGACY_ENTRY_KEYS);
       if (snapshot === null) {
         return refusal('malformed', 'MergeQueueEntry must have exactly the v1 entry keys');
       }
-      snapshot = { ...snapshot, version: 1 };
+      snapshot = { ...snapshot, version: MERGE_QUEUE_ENTRY_VERSION };
     }
     return readValidatedSnapshot(snapshot);
   } catch {
@@ -277,15 +261,6 @@ function readValidatedSnapshot(snapshot: Record<string, unknown>): MergeQueueEnt
     return refusal('malformed', 'MergeQueueEntry repository must have valid owner and repo');
   }
 
-  let baseBranch: BaseBranchValue | undefined;
-  if (snapshot.version === MERGE_QUEUE_ENTRY_VERSION) {
-    const parsed = parseBaseBranch(snapshot.baseBranch);
-    if (parsed === undefined) {
-      return refusal('malformed', 'MergeQueueEntry baseBranch must be main or chain/<lowercase-dashes>');
-    }
-    baseBranch = parsed;
-  }
-
   let veto: MergeQueueVetoRecord | null = null;
   if (snapshot.veto !== null) {
     const vetoRead = readMergeVetoRecord(snapshot.veto);
@@ -310,12 +285,11 @@ function readValidatedSnapshot(snapshot: Record<string, unknown>): MergeQueueEnt
   }
 
   const record: MergeQueueEntryRecord = Object.freeze({
-    version: snapshot.version as MergeQueueEntryVersion,
+    version: MERGE_QUEUE_ENTRY_VERSION,
     entryId: snapshot.entryId as string,
     repository: repository.ref,
     repoDigest: snapshot.repoDigest as string,
     pullRequest: snapshot.pullRequest as number,
-    ...(baseBranch !== undefined ? { baseBranch } : {}),
     headOid: snapshot.headOid as string,
     state: snapshot.state as MergeQueueEntryState,
     reason: snapshot.reason as string | null,
@@ -464,15 +438,6 @@ function pairsError(snapshot: Record<string, unknown>): string | null {
   return null;
 }
 
-/**
- * The resolved base of a stored record: its own `baseBranch` when it parses,
- * `main` otherwise. Version-2 records always carry a parsed base; version-1
- * records never carry the key, so they resolve to `main`.
- */
-export function resolveMergeQueueEntryBase(entry: { readonly baseBranch?: unknown }): BaseBranchValue {
-  return parseBaseBranch(entry.baseBranch) ?? DEFAULT_BASE_BRANCH;
-}
-
 export function isMergeQueueEntryLive(entry: Pick<MergeQueueEntryRecord, 'state'>): boolean {
   try {
     return !MERGE_QUEUE_TERMINAL_STATES.includes(entry.state as MergeQueueTerminalState);
@@ -550,32 +515,9 @@ export function orderMergeQueue(
 export function findMergeQueueHead(
   entries: readonly MergeQueueEntryRecord[],
   repoDigest?: string,
-  base?: BaseBranchValue,
 ): MergeQueueEntryRecord | null {
   try {
     const ordered = orderMergeQueue(entries, repoDigest);
-    if (base !== undefined) {
-      let digest: string | null = null;
-      for (const entry of ordered) {
-        if (resolveMergeQueueEntryBase(entry) !== base) {
-          continue;
-        }
-        if (digest === null) {
-          digest = entry.repoDigest;
-        } else if (entry.repoDigest !== digest) {
-          return null;
-        }
-      }
-      for (const entry of ordered) {
-        if (resolveMergeQueueEntryBase(entry) !== base) {
-          continue;
-        }
-        if (entry.state !== 'parked') {
-          return entry;
-        }
-      }
-      return null;
-    }
     if (repoDigest === undefined) {
       let digest: string | null = null;
       for (const entry of ordered) {
@@ -584,15 +526,6 @@ export function findMergeQueueHead(
         } else if (entry.repoDigest !== digest) {
           return null;
         }
-      }
-    }
-    let resolvedBase: BaseBranchValue | null = null;
-    for (const entry of ordered) {
-      const baseOf = resolveMergeQueueEntryBase(entry);
-      if (resolvedBase === null) {
-        resolvedBase = baseOf;
-      } else if (baseOf !== resolvedBase) {
-        return null;
       }
     }
     for (const entry of ordered) {
@@ -636,7 +569,6 @@ export function createUpdateSuccessorEntry(
       entryId: inputEntryId as string,
       repository: previous.repository,
       repoDigest: previous.repoDigest,
-      baseBranch: resolveMergeQueueEntryBase(previous),
       pullRequest: previous.pullRequest,
       headOid: inputHeadOid,
       state: 'awaiting-checks',

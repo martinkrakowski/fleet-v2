@@ -1,4 +1,4 @@
-- **Status:** rev 0, a draft from Sonnet 5.5 (agy), read-only against the plans in this repo, 2026-11-03. Owner decisions D-CO1 to D-CO10 are open; no lane is dispatched from it.
+- **Status:** rev 1, the rev 0 draft from Sonnet 5.5 (agy) revised by lane CO1, 2026-11-03. Owner decisions D-CO1 to D-CO10 are decided (2026-11-03) as recommended; lanes may be dispatched from it.
 
 I'll start by reading the core documents.
 The read tool only accepts absolute paths. I'll use the repository's absolute root, `/home/martin/Projects/fleet-v2/`, followed by the relative path. That keeps every read inside the repository.
@@ -331,18 +331,18 @@ Goal: stop every running lane and relaunch it on fleet-v2's rails without losing
 
 ### Decisions needed from the owner
 
-| # | Question | Recommended |
-|---|---|---|
-| D-CO1 | Which merge model: the daemon plan's merge pass in `work-execution`, or the `merge-coordination` context? Four contexts (`AGENTS.md`) against five (manifest) | DT merge pass is the cutover vehicle; MC2–MC8 follow after cutover as batching. Settle four against five in CO1 |
-| D-CO2 | Does "no shell style" cover fleet-v2's own `bin/*`, `scripts/*`, `tests/*.test.sh` and the planned `hosts/` programs? | Cutover scope is the fleet-repo scripts. In-repo `gate-slot`, `agy-round` and lane-diff-check go to TypeScript (CO34). Host programs (`ocm-run`, `agy-run`, bootstrap, `hosts/`) stay pinned until the owner rules |
-| D-CO3 | `batch.sh` and TR2–TR4 | Retire unported if no base had batches on at switch day; cancel TR2–TR4; MC2–MC8 follow. If batches were on, port first |
-| D-CO4 | Review shape: Grok off, combined Luna pass, premerge given by the code-review seat. Also S3 (static first) against D19 (review beside the gate) | Confirm as installation data; reconcile S3 and D19. The premerge seat conflicts with T2S SP-D1 and SPD D34 |
-| D-CO5 | Gate timeout retest against SP-D2 (no automatic retries) | Keep SP-D2; drop CO23 |
-| D-CO6 | Local merges in `merge-main.sh`, `lane-rebase.sh`, `push-fix.sh` and `land-mc.sh` are retired under D22/D24 | Confirm |
-| D-CO7 | Keep chains (CO7–CO11) or retire them in favour of MC batches and KS5 | Keep until MC batching is proven |
-| D-CO8 | Switch scope | Staged: switch gate then retirement gate |
-| D-CO9 | Shadow length and rollback window | 3 days and 20 merges; 14 days |
-| D-CO10 | Relaunch conducted runs by driver swap, not stop | Yes |
+| # | Question | Recommended | Decision |
+|---|---|---|---|
+| D-CO1 | Which merge model: the daemon plan's merge pass in `work-execution`, or the `merge-coordination` context? Four contexts (`AGENTS.md`) against five (manifest) | DT merge pass is the cutover vehicle; MC2–MC8 follow after cutover as batching. Settle four against five in CO1 | Decided 2026-11-03: as recommended |
+| D-CO2 | Does "no shell style" cover fleet-v2's own `bin/*`, `scripts/*`, `tests/*.test.sh` and the planned `hosts/` programs? | Cutover scope is the fleet-repo scripts. In-repo `gate-slot`, `agy-round` and lane-diff-check go to TypeScript (CO34). Host programs (`ocm-run`, `agy-run`, bootstrap, `hosts/`) stay pinned until the owner rules | Decided 2026-11-03: as recommended |
+| D-CO3 | `batch.sh` and TR2–TR4 | Retire unported if no base had batches on at switch day; cancel TR2–TR4; MC2–MC8 follow. If batches were on, port first | Decided 2026-11-03: as recommended |
+| D-CO4 | Review shape: Grok off, combined Luna pass, premerge given by the code-review seat. Also S3 (static first) against D19 (review beside the gate) | Confirm as installation data; reconcile S3 and D19. The premerge seat conflicts with T2S SP-D1 and SPD D34 | Decided 2026-11-03: as recommended |
+| D-CO5 | Gate timeout retest against SP-D2 (no automatic retries) | Keep SP-D2; drop CO23 | Decided 2026-11-03: as recommended |
+| D-CO6 | Local merges in `merge-main.sh`, `lane-rebase.sh`, `push-fix.sh` and `land-mc.sh` are retired under D22/D24 | Confirm | Decided 2026-11-03: as recommended |
+| D-CO7 | Keep chains (CO7–CO11) or retire them in favour of MC batches and KS5 | Keep until MC batching is proven | Decided 2026-11-03: as recommended |
+| D-CO8 | Switch scope | Staged: switch gate then retirement gate | Decided 2026-11-03: as recommended |
+| D-CO9 | Shadow length and rollback window | 3 days and 20 merges; 14 days | Decided 2026-11-03: as recommended |
+| D-CO10 | Relaunch conducted runs by driver swap, not stop | Yes | Decided 2026-11-03: as recommended |
 
 ### Hard to undo
 
@@ -385,3 +385,83 @@ Goal: stop every running lane and relaunch it on fleet-v2's rails without losing
 - **Adoption changes the transition table** (CO28). S1 review is mandatory, and it is stored data.
 - **Relaunch loses in-session context** (no resumed sessions); handover is from the diff and the brief.
 - **Rollback state divergence:** merged PRs live on the forge, so the shell re-reads them; only the queue needs the legacy export.
+
+---
+
+## 6. Status audit of the DT, KS, MC and CB lanes (CO1, 2026-11-03)
+
+For each lane id those plans list, the code — not the manifest — was searched for
+the use case, port, adapter or artefact the lane would add. "Not found" means no
+code artefact. Generated empty stubs count as not built: a declared symbol
+establishes nothing. Built declarations were read enough to see implementation
+(bodies, tests or composition wiring), never only the export line.
+
+### DT (daemon-tick plan, 2026-10-31)
+
+| Lane | Looked for | Found at | Status |
+|---|---|---|---|
+| DT0 | Plan revision and decision record (docs lane, no code artefact) | `docs/planning/2026-10-31_daemon-tick-plan.md` — rev 1.1, D-DT1–D-DT9 and D-JV1–D-JV5 recorded as accepted | built |
+| DT1 | `merge-queue-records.ts`, `merge-queue-decider.ts` | `packages/work-execution/src/domain/merge-queue-records.ts`, `merge-queue-decider.ts` (with domain tests) | built |
+| DT2 | `daemon-tick.ts`, `daemon-events.ts` | `packages/work-execution/src/domain/daemon-tick.ts`, `daemon-events.ts` (with domain tests) | built |
+| DTK | `merge/` key family in `lane-run-keys.ts` | `packages/work-execution/src/domain/lane-run-keys.ts` (one-way/two-way actions, `/r<n>`, `/a<n>`, with tests) | built |
+| DTM | Manifest-owned symbols present as code | The DT ports, use cases and adapters exist across `work-execution`, `operator-coordination` and `@fleet/shared` (see the rows below) | built |
+| DT3 | `file-store.ts` descriptor kinds and the daemon and queue stores in `state-files.ts` | `packages/work-execution/src/infrastructure/adapters/file-store.ts` (`describeSingleRecordStore`, `describeRecordGlob`, `describeJsonlProjection`); `state-files.ts` registers `daemon/status.json`, `daemon/paused.json`, `daemon/leases`, `daemon/events.jsonl`, `merge-queue.json` | built |
+| DT4 | `MergeQueueRepositoryAdapter`, `EnqueueMerge`, `ListMergeQueue`, `merge enqueue\|list\|drop\|retry` | `.../adapters/MergeQueueRepositoryAdapter.adapter.ts`; `EnqueueMergeUseCase`, `ListMergeQueueUseCase`; `apps/cli/src/merge.ts` with enqueue, list, drop and retry, wired in `composition/work-execution.ts` | built |
+| DT5 | `GhForgeMergeReadAdapter` | `.../adapters/GhForgeMergeReadAdapter.adapter.ts` (implemented for lane DT5) | built |
+| DT6 | `MergeForgeActionPort`, `MergeGrantPort`, the attempt-less grant | `ForgeActionAdapter` implements `MergeForgeActionPort` with the DT6 refusals; `MergeGrantAdapter`; `IssueMergeGrantUseCase` in `operator-coordination` | built |
+| DT7 | `GitMirrorPatchIdentityAdapter` | `.../adapters/GitMirrorPatchIdentityAdapter.adapter.ts` (refined for lane DT7) | built |
+| DT8 | `MergeVerificationAdapter` | `.../adapters/MergeVerificationAdapter.adapter.ts` (delegates to the evidence context) | built |
+| DT-V1 | Shared Jev decision-port types and client | `packages/shared/src/decisions/client.ts` | built |
+| DT-V2 | `MergeVetoPort`, `JevMergeVetoAdapter` | `.../adapters/JevMergeVetoAdapter.adapter.ts` (implemented for DT-V2) | built |
+| DT9 | `RunMergePassUseCase` | `.../use-cases/RunMergePassUseCase.use-case.ts` — a generated stub whose body throws `Not implemented` | not built |
+| DT10 | `RunDaemonTickUseCase`, `InspectDaemonStatusUseCase`, `daemon tick\|status\|pause\|resume` | Both use cases are generated stubs that throw `Not implemented`; no `daemon` command in `apps/cli` | not built |
+| DT11 | `hosts daemon install\|show\|uninstall`, launchd template | Not found — `apps/cli/src/hosts.ts` has no daemon section and no launchd template exists | not found — not built |
+| DT12 | `MergeNotificationAdapter` and a notifier job | `MergeNotificationPort` declares no members and `MergeNotificationAdapter.adapter.ts` is an empty generated stub | not built |
+| DT13 | `replan-digest` job in the daemon registry | Only the job id exists in the domain order (`daemon-tick.ts`); no registry job runs it | not built |
+| DT14 | Merge-pass e2e over `tests/e2e` | Not found — `tests/e2e` holds only the fake-opencode fixtures | not found — not built |
+| KS7b | `merge-enqueue` step and key in `advance-lane-run` | Not found — no `merge-enqueue` step or key in `advance-lane-run/` | not found — not built |
+
+### KS (lane-pipeline-speed plan, 2026-10-28)
+
+| Lane | Looked for | Found at | Status |
+|---|---|---|---|
+| KS0 | Amendment markers in the conductor plan (docs lane, no code artefact) | `docs/planning/2026-10-28_lane-pipeline-speed-plan.md` §4.4 carries the amendment notes the code cites (for example `lane-run-transitions.ts` refers to the KS1 rows) | built |
+| KM | Manifest commit behind KS2's receipt-key port change and KS4a's `WorktreePoolPort` | Not found — neither symbol exists anywhere in code | not found — not built |
+| KS1 | Transition-table rows: `awaiting-premerge`, Tier 2 `accepting` → `opening-pr`, the `premerge` hold in `merging` | `packages/work-execution/src/domain/lane-run-transitions.ts` (`LaneRunPreMergeHold`, `awaiting-premerge`, with tests) | built |
+| KS2 | Gate receipts keyed by predicate, tree, definition digest, toolchain and declared environment, with reuse | `GateReceiptAdapter` records verification receipts per acceptance check (KF-13a) but no predicate-keyed reuse exists | not built |
+| KS3 | Concurrent predicates under the slot budget | Not found — `advance-lane-run/collect-gate.ts` records checks in order, no concurrency or budget | not found — not built |
+| KS4a | `WorktreePoolPort` and its domain record | Not found | not found — not built |
+| KS4b | Pool adapter through the recorded host's executor | Not found | not found — not built |
+| KS5 | File-level admission: touch list, disjointness, per-file locks | Not found | not found — not built |
+| KS6 | Reviews in flight from `gating`; fix brief from review deltas and re-review on the delta | Not found — `lane-run-transitions.ts` names KS6 only as future data | not found — not built |
+| KS7a | The `post-status` forge action kind and the `premerge` post | `lane-run-keys.ts` lists `post-status` among the one-way merge actions; `advance-lane-run/premerge.ts` posts it | built |
+| KS7b | The `merge-enqueue` step (see the DT table) | Not found | not found — not built |
+| KS8 | 10 s poll floor in `watching-ci` and `merging` | `apps/cli/src/conductor.ts` (the D31 poll floor) with the `poll floor (KS8)` test | built |
+
+### MC (merge-acceleration plan, 2026-11-02)
+
+| Lane | Looked for | Found at | Status |
+|---|---|---|---|
+| MC1 | `merge-coordination` scaffold, records and pure state machine | `packages/merge-coordination/src/domain` — `TrainRecord`, `QueueEntryRecord`, `BatchRecord`, `CandidateRecord`, `GateReceiptRecord`, `PromotionReceiptRecord`, `TrainState.vo`, `TrainEvent.vo`, `train-state.ts`, all with validator and behaviour tests | built |
+| MC2 | Batch formation and admission policy, pure | `packages/merge-coordination/src/domain/batch-formation.ts`, `admission-policy.ts` | built |
+| MC3 | Candidate chain and invalidation, pure | `packages/merge-coordination/src/domain/candidate-chain.ts` | built |
+| MC4 | Failure classification and isolation plan, pure | `packages/merge-coordination/src/domain/failure-classification.ts`, `isolation-plan.ts`, `failure-isolation.ts` | built |
+| MC5 | Ports, file state, lease and fencing, event journal | Not found — `merge-coordination` has no `application/` or `infrastructure/` tree | not found — not built |
+| MC6 | Promotion use case | Not found | not found — not built |
+| MC7 | Forge, git and gate adapters | Not found | not found — not built |
+| MC8 | `fleet-v2 train` commands | Not found — no `train` command group in `apps/cli` | not found — not built |
+| MC9 | Metrics of §7 | Not found | not found — not built |
+| MC10 | Scheduler integration: per-project slot budgets | Not found | not found — not built |
+
+### CB (conductor plan §3.12)
+
+| Lane | Looked for | Found at | Status |
+|---|---|---|---|
+| CB1 | `baseBranch` on the work order | `packages/work-execution/src/domain/base-branch.ts`; `RegisterWorkOrderUseCase` stores and refuses malformed values (tests); `apps/cli/src/commands/work-order.ts` carries the payload and flag | built |
+| CB2 | Worktree and PR against `baseBranch`; the forge-side base existence guard | `WorkspaceAdapter.adapter.ts` verifies `refs/heads/<baseBranch>` on the forge (`ls-remote`) and refuses a missing base; `advance-lane-run/merge.ts` resolves the run's `baseBranch` for `push-and-open-pr` | built |
+| CB3 | Schedule and status read model showing each run's base | `apps/cli/src/conductor.ts` — `resolveLaneRunBaseBranch`, per-run rows and per-base queue grouping | built |
+
+**Summary.** Built: DT0–DT8, DT-V1, DT-V2, DTK, DTM, KS0, KS1, KS7a, KS8, MC1–MC4, CB1–CB3.
+Not built: DT9–DT14, KS7b, KM, KS2–KS6, MC5–MC10. The merge pass (DT9) and the
+tick (DT10) are the blockers every cutover stream item waits on; the pure domain
+beneath them is in place.

@@ -70,6 +70,28 @@ describe('BriefReadRepositoryAdapter', () => {
     expect(afterRefusal).toEqual('}{ broken');
   });
 
+  it('a genuine interleaved write between read and write is refused by the CAS, leaving the file intact', async () => {
+    const target = path.join(tempDir, 'brief-reads.json');
+    const rogue = JSON.stringify([record('2026-10-27T09:00:00.000Z', { lane: OTHER_LANE })], null, 2);
+    const first = new BriefReadRepositoryAdapter({ stateDir: tempDir });
+    await first.put(record('2026-10-27T10:00:00.000Z'));
+
+    // A writer that bypasses the lock replaces the file exactly between the
+    // adapter's list read and its compare-and-swap re-read.
+    const raced = new BriefReadRepositoryAdapter({
+      stateDir: tempDir,
+      onLockMidWrite: async () => {
+        await fs.writeFile(target, rogue, 'utf8');
+      },
+    });
+    const result = await raced.put(record('2026-10-27T10:05:00.000Z'));
+    expect(result).toEqual({ outcome: 'refused', reason: 'the brief-read store changed during the write; no write was made' });
+    expect(await fs.readFile(target, 'utf8')).toEqual(rogue);
+    const reader = new BriefReadRepositoryAdapter({ stateDir: tempDir });
+    expect((await reader.latest(OTHER_LANE))!.readAtIso).toBe('2026-10-27T09:00:00.000Z');
+    expect(await reader.latest(LANE)).toBeNull();
+  });
+
   it('an unparsable file quarantines and reads as null', async () => {
     await fs.writeFile(path.join(tempDir, 'brief-reads.json'), 'nope', 'utf8');
     const adapter = new BriefReadRepositoryAdapter({ stateDir: tempDir });

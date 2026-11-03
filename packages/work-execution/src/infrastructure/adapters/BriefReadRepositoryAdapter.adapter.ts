@@ -2,7 +2,8 @@
 /**
  * BriefReadRepositoryAdapter implements BriefReadRepositoryPort. Records
  * live in an in-memory list by default; with `stateDir` each put rewrites
- * `<stateDir>/brief-reads.json` atomically under an exclusive lock — one
+ * `<stateDir>/brief-reads.json` atomically under an exclusive lock with a
+ * byte compare-and-swap between the locked read and the write — one
  * latest read per lane, the older read of the same lane replaced. Reads
  * validate every record and quarantine an unparsable file (fail closed:
  * reads return null and writes are refused until the store is repaired).
@@ -62,11 +63,21 @@ function latestOf(records: readonly BriefReadRecord[], lane: LaneRef): BriefRead
   return latest;
 }
 
+export interface BriefReadRepositoryAdapterOptions {
+  readonly stateDir?: string;
+  /**
+   * Test seam only: runs inside the lock after the current list is read and
+   * before the compare-and-swap re-read, so a test can interleave a writer
+   * that bypasses the lock. Undefined in production.
+   */
+  readonly onLockMidWrite?: () => Promise<void>;
+}
+
 export class BriefReadRepositoryAdapter implements BriefReadRepositoryPort {
   private readonly inMemoryRecords: BriefReadRecord[] = [];
   private quarantined = false;
 
-  constructor(private readonly options?: { readonly stateDir?: string }) {}
+  constructor(private readonly options?: BriefReadRepositoryAdapterOptions) {}
 
   async latest(lane: LaneRef): Promise<BriefReadRecord | null> {
     const stateDir = this.options?.stateDir;
@@ -74,7 +85,10 @@ export class BriefReadRepositoryAdapter implements BriefReadRepositoryPort {
       return latestOf(this.inMemoryRecords, lane);
     }
     try {
-      return latestOf(await this.readRecords(path.join(stateDir, BRIEF_READS_FILE)), lane);
+      return latestOf(
+        await this.parseBytes(path.join(stateDir, BRIEF_READS_FILE), await this.readBytes(path.join(stateDir, BRIEF_READS_FILE))),
+        lane,
+      );
     } catch {
       return null;
     }
@@ -98,7 +112,13 @@ export class BriefReadRepositoryAdapter implements BriefReadRepositoryPort {
     const target = path.join(stateDir, BRIEF_READS_FILE);
     try {
       return await withFileLock(`${target}.lock`, async () => {
-        const records = replaceLaneRead(await this.readRecords(target), record);
+        const before = await this.readBytes(target);
+        const records = replaceLaneRead(await this.parseBytes(target, before), record);
+        await this.options?.onLockMidWrite?.();
+        const after = await this.readBytes(target);
+        if (!sameBytes(after, before)) {
+          return refusal('the brief-read store changed during the write; no write was made');
+        }
         await writeJsonAtomically(target, records);
         return { outcome: 'saved' as const, revision: records.length };
       });
@@ -111,25 +131,38 @@ export class BriefReadRepositoryAdapter implements BriefReadRepositoryPort {
     }
   }
 
-  /** Throws `StateFileUnreadableError` (after quarantining) on an unparsable file. */
-  private async readRecords(target: string): Promise<readonly BriefReadRecord[]> {
-    let buffer: Buffer;
+  /** The store's current bytes, or null when it does not exist yet. */
+  private async readBytes(target: string): Promise<Buffer | null> {
     try {
-      buffer = await fs.readFile(target);
+      return await fs.readFile(target);
     } catch (error: unknown) {
       if (
         typeof error === 'object' &&
         error !== null &&
         (error as { code?: string }).code === 'ENOENT'
       ) {
-        return [];
+        return null;
       }
       throw error;
     }
-    const inspection = inspectRecordListBytes(buffer, parseBriefReadStateRecord);
+  }
+
+  /** Throws `StateFileUnreadableError` (after quarantining) on an unparsable file. */
+  private async parseBytes(target: string, bytes: Buffer | null): Promise<readonly BriefReadRecord[]> {
+    if (bytes === null) {
+      return [];
+    }
+    const inspection = inspectRecordListBytes(bytes, parseBriefReadStateRecord);
     if (inspection.status !== 'ok') {
-      return rejectUnreadableStateFile(target, inspection.detail, buffer, false);
+      return rejectUnreadableStateFile(target, inspection.detail, bytes, false);
     }
     return [...inspection.records];
   }
+}
+
+function sameBytes(left: Buffer | null, right: Buffer | null): boolean {
+  if (left === null || right === null) {
+    return left === right;
+  }
+  return left.equals(right);
 }

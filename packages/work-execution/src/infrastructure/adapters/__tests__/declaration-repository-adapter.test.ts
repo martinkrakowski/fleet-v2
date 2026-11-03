@@ -74,6 +74,29 @@ describe('DeclarationRepositoryAdapter', () => {
     expect((await adapter.append(record('2026-10-27T10:00:00.000Z'))).outcome).toBe('refused');
   });
 
+  it('a genuine interleaved write between read and write is refused by the CAS, leaving the file intact', async () => {
+    const target = path.join(tempDir, 'lane-declarations.json');
+    const first = new DeclarationRepositoryAdapter({ stateDir: tempDir });
+    await first.append(record('2026-10-27T10:00:00.000Z'));
+    const rogue = JSON.stringify([record('2026-10-27T09:00:00.000Z')], null, 2);
+
+    // A writer that bypasses the lock replaces the file exactly between the
+    // adapter's list read and its compare-and-swap re-read.
+    const raced = new DeclarationRepositoryAdapter({
+      stateDir: tempDir,
+      onLockMidWrite: async () => {
+        await fs.writeFile(target, rogue, 'utf8');
+      },
+    });
+    const result = await raced.append(record('2026-10-27T10:05:00.000Z'));
+    expect(result).toEqual({ outcome: 'refused', reason: 'the declaration store changed during the write; no write was made' });
+    expect(await fs.readFile(target, 'utf8')).toEqual(rogue);
+    const reader = new DeclarationRepositoryAdapter({ stateDir: tempDir });
+    const listed = await reader.list();
+    expect(listed).toHaveLength(1);
+    expect(listed[0]!.declaredAtIso).toBe('2026-10-27T09:00:00.000Z');
+  });
+
   it('the in-memory variant keeps its own list', async () => {
     const adapter = new DeclarationRepositoryAdapter();
     await adapter.append(record('2026-10-27T10:00:00.000Z'));

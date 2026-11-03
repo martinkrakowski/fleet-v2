@@ -73,6 +73,13 @@ function hasExactlyKeys(
   if (!isRecordObject(value)) {
     return false;
   }
+  return hasExactlyKeysOf(value, keys);
+}
+
+function hasExactlyKeysOf(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
   const own = Object.keys(value);
   return own.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
 }
@@ -86,28 +93,54 @@ function isBoundedPlain(value: unknown, limit: number): value is string {
 }
 
 function isCanonicalIso(value: unknown): value is string {
-  return typeof value === 'string' && CANONICAL_ISO_PATTERN.test(value);
+  return (
+    typeof value === 'string' &&
+    CANONICAL_ISO_PATTERN.test(value) &&
+    Number.isFinite(Date.parse(value))
+  );
 }
+
+const LAN_REF_PLAN_KEYS = ['kind', 'projectId', 'planId', 'laneId'] as const;
+const LAN_REF_WORK_ORDER_KEYS = ['kind', 'projectId', 'workOrderId'] as const;
 
 function isLaneRef(value: unknown): value is LaneRef {
   if (!isRecordObject(value)) {
     return false;
   }
-  if (value.kind === 'plan') {
+  if (hasExactlyKeysOf(value, LAN_REF_PLAN_KEYS)) {
     return (
+      value.kind === 'plan' &&
       typeof value.projectId === 'string' && PLAN_PROJECT_ID_PATTERN.test(value.projectId) &&
       typeof value.planId === 'string' && PLAN_ID_PATTERN.test(value.planId) &&
       typeof value.laneId === 'string' && PLANNED_LANE_ID_PATTERN.test(value.laneId)
     );
   }
-  if (value.kind === 'work-order') {
+  if (hasExactlyKeysOf(value, LAN_REF_WORK_ORDER_KEYS)) {
     return (
+      value.kind === 'work-order' &&
       typeof value.projectId === 'string' && PLAN_PROJECT_ID_PATTERN.test(value.projectId) &&
       typeof value.workOrderId === 'string' && value.workOrderId.length > 0 &&
       isBoundedPlain(value.workOrderId, BRIEF_READ_PATH_LIMIT)
     );
   }
   return false;
+}
+
+/** A fresh lane reference holding exactly the validated fields, never the body's own object. */
+function laneRefOf(record: Record<string, unknown>): LaneRef {
+  if (record.kind === 'plan') {
+    return {
+      kind: 'plan',
+      projectId: record.projectId as string,
+      planId: record.planId as string,
+      laneId: record.laneId as string,
+    };
+  }
+  return {
+    kind: 'work-order',
+    projectId: record.projectId as string,
+    workOrderId: record.workOrderId as string,
+  };
 }
 
 function isDeclarationStep(value: unknown): value is BoardDeclarationStep {
@@ -122,8 +155,16 @@ function isTtlMinutes(value: number): boolean {
   return Number.isInteger(value) && value >= 1;
 }
 
-function isoAfter(iso: string, milliseconds: number): string {
-  return new Date(Date.parse(iso) + milliseconds).toISOString();
+/** The maximum date value `toISOString` accepts (±100 million days in ms). */
+const MAX_DATE_MS = 8.64e15;
+
+function isoAfter(iso: string, milliseconds: number): string | null {
+  const base = Date.parse(iso);
+  const target = base + milliseconds;
+  if (!Number.isFinite(base) || !Number.isFinite(target) || Math.abs(target) > MAX_DATE_MS) {
+    return null;
+  }
+  return new Date(target).toISOString();
 }
 
 /**
@@ -159,11 +200,14 @@ export function parseLaneDeclarationBody(
     return { ok: false, error: 'invalid model' };
   }
   const lapsesAtIso = isoAfter(nowIso, ttlMinutes * 60_000);
+  if (lapsesAtIso === null) {
+    return { ok: false, error: 'invalid ttlMinutes' };
+  }
   return {
     ok: true,
     record: {
       version: LANE_DECLARATION_RECORD_VERSION,
-      lane: record.lane,
+      lane: laneRefOf(record.lane as Record<string, unknown>),
       step: record.step,
       seatRole: record.seatRole,
       model: record.model,
@@ -206,7 +250,7 @@ export function parseBriefReadBody(body: unknown, nowIso: string): BriefReadPars
       ok: true,
       record: {
         version: LANE_BRIEF_READ_RECORD_VERSION,
-        lane: record.lane,
+        lane: laneRefOf(record.lane as Record<string, unknown>),
         path: record.path,
         outcome: 'read',
         sha256: record.sha256,
@@ -219,7 +263,7 @@ export function parseBriefReadBody(body: unknown, nowIso: string): BriefReadPars
     ok: true,
     record: {
       version: LANE_BRIEF_READ_RECORD_VERSION,
-      lane: record.lane,
+      lane: laneRefOf(record.lane as Record<string, unknown>),
       path: record.path,
       outcome: 'failed',
       sha256: null,
@@ -255,7 +299,13 @@ export function isBriefReadRecord(value: unknown): value is BriefReadRecord {
   if (value.outcome !== 'read' && value.outcome !== 'failed') {
     return false;
   }
-  const sha256Ok = value.sha256 === null || (typeof value.sha256 === 'string' && SHA256_HEX_PATTERN.test(value.sha256));
-  const bytesOk = value.bytes === null || isNonNegativeInteger(value.bytes);
-  return sha256Ok && bytesOk && isCanonicalIso(value.readAtIso);
+  if (value.outcome === 'read') {
+    // A `read` carries both the digest and the byte count, always.
+    if (typeof value.sha256 !== 'string' || !SHA256_HEX_PATTERN.test(value.sha256)) {
+      return false;
+    }
+    return isNonNegativeInteger(value.bytes) && isCanonicalIso(value.readAtIso);
+  }
+  // A `failed` read carries neither, forced null at parse time.
+  return value.sha256 === null && value.bytes === null && isCanonicalIso(value.readAtIso);
 }

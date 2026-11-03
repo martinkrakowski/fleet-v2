@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import type { FleetInstallationV2 } from '../types.js';
+import type { FleetInstallationV2, ResolvedConductorPolicy } from '../types.js';
 import { canonicalConductorJson, conductorRevision } from '../conductor-revision.js';
 import { requireValidInstallationModel } from '../load.js';
 import { parseInstallation } from '../parse.js';
@@ -474,30 +474,51 @@ describe('policy.conductor (K2)', () => {
   });
 
   it('computes the revision from the canonical JSON', () => {
-    expect(conductorRevision(DEFAULT_CONDUCTOR_POLICY)).toBe('78cc1fdb1b30');
-    expect(
-      conductorRevision(resolveConductorPolicy({ conductor: { enabled: true } } as never)),
-    ).toBe('ed656a35e15c');
-    expect(
-      conductorRevision(
-        resolveConductorPolicy({
-          conductor: { enabled: true, reaper: { enabled: true, repairs: RECORD_ONLY } },
-        } as never),
-      ),
-    ).toBe('b47b30195765');
-    expect(
-      conductorRevision(
-        resolveConductorPolicy({
-          conductor: { enabled: true, reaper: { enabled: true, repairs: { 'orphan-session': true } } },
-        } as never),
-      ),
-    ).toBe('4e739224b097');
-    for (const revision of ['78cc1fdb1b30', 'ed656a35e15c', 'b47b30195765', '4e739224b097']) {
+    const defaultPolicy = DEFAULT_CONDUCTOR_POLICY;
+    const enabledPolicy = resolveConductorPolicy({ conductor: { enabled: true } } as never);
+    const recordOnlyPolicy = resolveConductorPolicy({
+      conductor: { enabled: true, reaper: { enabled: true, repairs: RECORD_ONLY } },
+    } as never);
+    const orphanSessionPolicy = resolveConductorPolicy({
+      conductor: { enabled: true, reaper: { enabled: true, repairs: { 'orphan-session': true } } },
+    } as never);
+    // Each pinned revision hashes exactly the canonical JSON carrying the new reaper keys
+    // (the `merged-worktree` repair plus the `worktrees` / `disk` blocks).
+    const pinned: Array<{
+      policy: ResolvedConductorPolicy;
+      canonical: string;
+      revision: string;
+    }> = [
+      {
+        policy: defaultPolicy,
+        canonical:
+          '{"enabled":false,"stopGraceMinutes":45,"reaper":{"enabled":true,"intervalMinutes":10,"graceMinutes":5,"staleStopMinutes":30,"repairs":{"dead-attempt":false,"leaked-slot":false,"stale-stop":false,"stale-attention":false,"merged-worktree":false,"orphan-session":false},"worktrees":{"retentionHours":24,"maxRemovalsPerPass":10,"passBudgetSeconds":120},"disk":{"minFreePercent":15,"clearFreePercent":20}}}',
+        revision: '78cc1fdb1b30',
+      },
+      {
+        policy: enabledPolicy,
+        canonical:
+          '{"enabled":true,"stopGraceMinutes":45,"reaper":{"enabled":true,"intervalMinutes":10,"graceMinutes":5,"staleStopMinutes":30,"repairs":{"dead-attempt":false,"leaked-slot":false,"stale-stop":false,"stale-attention":false,"merged-worktree":false,"orphan-session":false},"worktrees":{"retentionHours":24,"maxRemovalsPerPass":10,"passBudgetSeconds":120},"disk":{"minFreePercent":15,"clearFreePercent":20}}}',
+        revision: 'ed656a35e15c',
+      },
+      {
+        policy: recordOnlyPolicy,
+        canonical:
+          '{"enabled":true,"stopGraceMinutes":45,"reaper":{"enabled":true,"intervalMinutes":10,"graceMinutes":5,"staleStopMinutes":30,"repairs":{"dead-attempt":true,"leaked-slot":true,"stale-stop":true,"stale-attention":true,"merged-worktree":false,"orphan-session":false},"worktrees":{"retentionHours":24,"maxRemovalsPerPass":10,"passBudgetSeconds":120},"disk":{"minFreePercent":15,"clearFreePercent":20}}}',
+        revision: 'b47b30195765',
+      },
+      {
+        policy: orphanSessionPolicy,
+        canonical:
+          '{"enabled":true,"stopGraceMinutes":45,"reaper":{"enabled":true,"intervalMinutes":10,"graceMinutes":5,"staleStopMinutes":30,"repairs":{"dead-attempt":false,"leaked-slot":false,"stale-stop":false,"stale-attention":false,"merged-worktree":false,"orphan-session":true},"worktrees":{"retentionHours":24,"maxRemovalsPerPass":10,"passBudgetSeconds":120},"disk":{"minFreePercent":15,"clearFreePercent":20}}}',
+        revision: '4e739224b097',
+      },
+    ];
+    for (const { policy, canonical, revision } of pinned) {
+      expect(canonicalConductorJson(policy)).toBe(canonical);
+      expect(conductorRevision(policy)).toBe(revision);
       expect(revision).toMatch(/^[0-9a-f]{12}$/);
     }
-    expect(canonicalConductorJson(DEFAULT_CONDUCTOR_POLICY)).toBe(
-      '{"enabled":false,"stopGraceMinutes":45,"reaper":{"enabled":true,"intervalMinutes":10,"graceMinutes":5,"staleStopMinutes":30,"repairs":{"dead-attempt":false,"leaked-slot":false,"stale-stop":false,"stale-attention":false,"merged-worktree":false,"orphan-session":false},"worktrees":{"retentionHours":24,"maxRemovalsPerPass":10,"passBudgetSeconds":120},"disk":{"minFreePercent":15,"clearFreePercent":20}}}',
-    );
   });
 
   it('is stable across key order', () => {

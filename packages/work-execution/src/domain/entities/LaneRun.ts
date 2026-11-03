@@ -42,6 +42,7 @@ import type {
   RunStopRefusalKind,
 } from '../lane-run-records.js';
 import type { LaneRunParkFindingView } from '../park-findings-view.js';
+import { parkFindingsSnapshotOf } from '../park-findings-view.js';
 import { LANE_RUN_RESUMABLE_STATES } from '../value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../value-objects/LaneRunState.vo.js';
 import { SEAT_PLAN_ROLES } from '../value-objects/SeatPlan.vo.js';
@@ -583,37 +584,19 @@ function parkedSnapshotError(snapshot: Record<string, unknown> | null): string |
   return null;
 }
 
-/** The bounded findings view's four severity codes, in the contract's order. */
-const FINDINGS_SEVERITIES: readonly string[] = ['blocker', 'major', 'minor', 'nit'];
-
-/** Findings must be null or an array of bounded findings-view objects (GB2). */
+/**
+ * Findings must be null or an array of at most `PARK_FINDINGS_MAX_COUNT`
+ * bounded findings-view objects (GB2): the stored snapshot is validated with
+ * the domain's own exported snapshot reader, so malformed ids, oversized,
+ * control-carrying or secret-shaped summaries, unsafe paths, bad lines and
+ * extra fields are all refused here exactly as at the boundary.
+ */
 function findingsArrayError(findings: unknown): string | null {
   if (findings === null) {
     return null;
   }
-  if (!Array.isArray(findings)) {
-    return 'LaneRun parked findings must be null or an array';
-  }
-  for (const finding of findings) {
-    if (!isPlainRecordObject(finding)) {
-      return 'LaneRun parked findings must be an array of bounded finding objects';
-    }
-    const entry = finding as Record<string, unknown>;
-    if (typeof entry.findingId !== 'string' || entry.findingId.length === 0 || entry.findingId.length > 128) {
-      return 'LaneRun parked findings must be an array of bounded finding objects';
-    }
-    if (typeof entry.severity !== 'string' || !FINDINGS_SEVERITIES.includes(entry.severity)) {
-      return 'LaneRun parked findings must be an array of bounded finding objects';
-    }
-    if (typeof entry.summary !== 'string') {
-      return 'LaneRun parked findings must be an array of bounded finding objects';
-    }
-    if (entry.filePath !== null && typeof entry.filePath !== 'string') {
-      return 'LaneRun parked findings must be an array of bounded finding objects';
-    }
-    if (entry.line !== null && (typeof entry.line !== 'number' || !Number.isSafeInteger(entry.line) || (entry.line as number) < 0)) {
-      return 'LaneRun parked findings must be an array of bounded finding objects';
-    }
+  if (parkFindingsSnapshotOf(findings) === null) {
+    return 'LaneRun parked findings must be null or an array of bounded finding objects';
   }
   return null;
 }

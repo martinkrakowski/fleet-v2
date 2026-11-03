@@ -126,12 +126,20 @@ describe('boundedFindingsView', () => {
   });
 
   it('never surfaces bidi, format or zero-width controls in the summary', () => {
-    const hostile = 'a\u200Bb\u200Cc\u200Dd\u2060e\uFEFFf\u00ADg\uFFF9h\u2066i\u2069j';
+    const hostile = 'a\u200Bb\u200Cc\u200Dd\u2060e\uFEFFf\u00ADg\uFFF9h\u2066i\u2069j\u180Ek';
     const view = boundedFindingsView([finding({ summary: hostile, filePath: null, line: null })]);
-    expect(view[0]!.summary).toBe('a b c d e f g h i j');
+    expect(view[0]!.summary).toBe('a b c d e f g h i j k');
     // The control characters are exactly what must never survive sanitization.
     // eslint-disable-next-line no-control-regex
-    expect(view[0]!.summary).not.toMatch(/[\u0000-\u001F\u007F-\u009F\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/);
+    expect(view[0]!.summary).not.toMatch(/[\u0000-\u001F\u007F-\u009F\u00AD\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/);
+  });
+
+  it('flattens the Unicode format control U+180E like every other format control', () => {
+    const view = boundedFindingsView([finding({ summary: 'a\u180Eb', filePath: null, line: null })]);
+    expect(view[0]!.summary).toBe('a b');
+    const snapshot = [{ ...finding(), summary: 'a\u180Eb' }];
+    expect(parkFindingsSnapshotOf(snapshot)).toBeNull();
+    expect(isParkFindingView(snapshot[0])).toBe(false);
   });
 
   it('drops a summary that flattens to whitespace only', () => {

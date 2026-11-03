@@ -28,6 +28,14 @@ const VALID_PARKED = {
   questionId: null,
 };
 
+const VALID_FINDING = {
+  findingId: 'finding-1',
+  severity: 'blocker',
+  summary: 'a bounded summary',
+  filePath: 'src/a.ts',
+  line: 3,
+};
+
 const VALID_LEASE = { holderId: 'lease-example-1', fence: 1, leaseUntilIso: '2026-10-27T10:00:00Z' };
 
 const VALID_WITHOUT_LEASE: Record<string, unknown> = { ...VALID };
@@ -265,6 +273,20 @@ describe('LaneRun.create', () => {
   it.each([
     [{ ...VALID, parkCount: LANE_RUN_MAX_PARK_ORDINAL }],
     [{ ...VALID, parked: { ...VALID_PARKED, questionId: 'question-example-1' }, parkCount: 1 }],
+    [
+      {
+        ...VALID,
+        parked: { ...VALID_PARKED, findings: null },
+        parkCount: 1,
+      },
+    ],
+    [
+      {
+        ...VALID,
+        parked: { ...VALID_PARKED, findings: [VALID_FINDING, { ...VALID_FINDING, findingId: 'finding-2' }] },
+        parkCount: 1,
+      },
+    ],
   ])('accepts valid boundary record %j', (input) => {
     const result = LaneRun.create(input);
     expect(result.success).toBe(true);
@@ -354,6 +376,62 @@ describe('LaneRun.create', () => {
     ],
     [{ ...VALID, revision: 0 }, 'LaneRun revision must be a positive integer'],
     [{ ...VALID, runPolicyRevision: '  ' }, 'LaneRun runPolicyRevision must be a non-empty id of at most 256 bytes'],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: 'nope' }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      {
+        ...VALID,
+        parked: { ...VALID_PARKED, findings: [VALID_FINDING, VALID_FINDING, VALID_FINDING, VALID_FINDING, VALID_FINDING, VALID_FINDING] },
+        parkCount: 1,
+      },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, findingId: 'bad/id' }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, findingId: 'f'.repeat(129) }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, summary: 's'.repeat(161) }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, summary: fakeSecretShape() }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, summary: 'bad\u180E' }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, filePath: '/etc/passwd' }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, filePath: '../outside.ts' }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, filePath: 'src\\a.ts' }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, severity: 'critical' }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, line: -1 }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
+    [
+      { ...VALID, parked: { ...VALID_PARKED, findings: [{ ...VALID_FINDING, extra: true }] }, parkCount: 1 },
+      'LaneRun parked findings must be null or an array of bounded finding objects',
+    ],
   ])('refuses with the fixed message %j', (input, message) => {
     const result = LaneRun.create(input);
     expect(result.success).toBe(false);

@@ -33,7 +33,7 @@ const FILE_PATH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
  * is refused.
  */
 // eslint-disable-next-line no-control-regex
-const FORBIDDEN_SUMMARY_PATTERN = /[\u0000-\u001F\u007F-\u009F\u00AD\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/;
+const FORBIDDEN_SUMMARY_PATTERN = /[\u0000-\u001F\u007F-\u009F\u00AD\u180E\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/;
 
 /** The global form used to flatten forbidden summaries to spaces. */
 const FORBIDDEN_SUMMARY_FLATTEN = new RegExp(FORBIDDEN_SUMMARY_PATTERN.source, 'g');
@@ -117,6 +117,9 @@ export function isParkFindingView(value: unknown): value is LaneRunParkFindingVi
     return false;
   }
   if (typeof value.summary !== 'string' || FORBIDDEN_SUMMARY_PATTERN.test(value.summary)) {
+    return false;
+  }
+  if (Array.from(value.summary).length > PARK_FINDING_SUMMARY_MAX) {
     return false;
   }
   if (summaryOf(value.summary) === null) {

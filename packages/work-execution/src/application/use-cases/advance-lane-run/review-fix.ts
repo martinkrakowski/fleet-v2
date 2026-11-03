@@ -574,11 +574,46 @@ export async function reconcileReview(
 }
 
 /**
+ * AR1: the review key whose findings drove a review-blocked acceptance
+ * rejection at `head12`. Scans entries backwards for the latest final result of
+ * this run whose key is a `brief-check`/`code-review` step at that head whose
+ * result is either `review-failed`, or `review-passed` with the GB1
+ * `minor-only-findings` detail. Null without one (`performFixPrepare` then
+ * refuses `prepare-refused`).
+ */
+function failedReviewKeyAtHead(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  head12: string,
+): string | null {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index]!;
+    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.head12 !== head12) {
+      continue;
+    }
+    if (parsed.step !== 'brief-check' && parsed.step !== 'code-review') {
+      continue;
+    }
+    if (entry.reasonCode === 'review-failed' || (entry.reasonCode === 'review-passed' && entry.detail === 'minor-only-findings')) {
+      return entry.key;
+    }
+  }
+  return null;
+}
+
+/**
  * Why the run is `fixing`: the LATEST final result entry of this run whose
  * key's step sent it there — a `brief-check`/`code-review` result with reason
  * `review-failed` (a review source), a `gate` result with reason `gate-failed`
  * (a gate source), or a K6 `ci`/`pre-merge` failure (a gate-shaped source with
  * its reason code). `ci` has no key step yet, so only `pre-merge` counts here.
+ * AR1 adds the review-blocked acceptance rejection: an `accept` result with
+ * reason `acceptance-rejected` and detail `review-findings` hands the failed
+ * review key at that head to the fix round.
  */
 function fixingFailureSourceOf(
   entries: readonly LaneRunJournalEntryRecord[],
@@ -604,6 +639,13 @@ function fixingFailureSourceOf(
     }
     if (parsed.step === 'pre-merge' && entry.reasonCode !== null) {
       return { key: entry.key, source: 'gate', reasonCode: entry.reasonCode };
+    }
+    if (parsed.step === 'accept' && entry.reasonCode === 'acceptance-rejected' && entry.detail === 'review-findings') {
+      const reviewKey = parsed.head12 === null ? null : failedReviewKeyAtHead(entries, runId, parsed.head12);
+      if (reviewKey !== null) {
+        return { key: reviewKey, source: 'review', reasonCode: 'review-failed' };
+      }
+      return null;
     }
   }
   return null;

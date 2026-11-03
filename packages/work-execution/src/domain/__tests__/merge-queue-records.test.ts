@@ -8,10 +8,8 @@ import {
   findMergeQueueHead,
   orderMergeQueue,
   readMergeQueueEntryRecord,
-  resolveMergeQueueEntryBase,
 } from '../merge-queue-records.js';
 import type { MergeQueueEntryRecord } from '../merge-queue-records.js';
-import { parseBaseBranch } from '../base-branch.js';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const HEAD_2 = '0123456789abcdef0123456789abcdef01234568';
@@ -36,7 +34,6 @@ function makeEntry(overrides: Partial<MergeQueueEntryRecord> = {}): MergeQueueEn
     entryId: nextEntryId(),
     repository: { owner: 'fleet', repo: 'v2' },
     repoDigest: DIGEST,
-    baseBranch: 'main',
     pullRequest: 1,
     headOid: HEAD,
     state: 'queued',
@@ -79,12 +76,11 @@ function expectMalformed(input: unknown, error: string, secret?: string): void {
 }
 
 describe('round-trip', () => {
-  it('reads a valid v2 record', () => {
+  it('reads a valid v1 record', () => {
     const result = readMergeQueueEntryRecord(makeEntry());
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.record.version).toBe(MERGE_QUEUE_ENTRY_VERSION);
-      expect(result.record.baseBranch).toBe('main');
     }
   });
 
@@ -125,65 +121,16 @@ describe('D-R8 version handling', () => {
   it('reads a legacy record without version as version 1', () => {
     const legacy = rawEntry();
     delete legacy.version;
-    delete legacy.baseBranch;
     const result = readMergeQueueEntryRecord(legacy);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.record.version).toBe(1);
-      expect(Object.hasOwn(result.record, 'baseBranch')).toBe(false);
-      expect(resolveMergeQueueEntryBase(result.record)).toBe('main');
     }
   });
 
-  it('reads an explicitly declared version 1 record with no baseBranch', () => {
-    const input = rawEntry({ version: 1 });
-    delete input.baseBranch;
-    const result = readMergeQueueEntryRecord(input);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.record.version).toBe(1);
-      expect(Object.hasOwn(result.record, 'baseBranch')).toBe(false);
-      expect(resolveMergeQueueEntryBase(result.record)).toBe('main');
-    }
-  });
-
-  it.each([0, 3, '1'])('refuses version %p', (version) => {
+  it.each([2, 0, '1'])('refuses version %p', (version) => {
     const result = readMergeQueueEntryRecord(rawEntry({ version }));
-    expect(result).toEqual({ ok: false, reason: 'unknown-version', error: 'MergeQueueEntry version must be 1 or 2' });
-  });
-
-  it('round-trips a version 2 record with a chain base and freezes it', () => {
-    const result = readMergeQueueEntryRecord(rawEntry({ baseBranch: 'chain/dt' }));
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.record.version).toBe(2);
-      expect(result.record.baseBranch).toBe('chain/dt');
-      expect(Object.isFrozen(result.record)).toBe(true);
-      expect(resolveMergeQueueEntryBase(result.record)).toBe('chain/dt');
-    }
-  });
-
-  it('refuses a version 2 record with a bad, missing or secret-shaped baseBranch without echoing it', () => {
-    const secret = fakeSecret();
-    expectMalformed(
-      rawEntry({ baseBranch: 'release' }),
-      'MergeQueueEntry baseBranch must be main or chain/<lowercase-dashes>',
-    );
-    const missing = rawEntry();
-    delete missing.baseBranch;
-    expectMalformed(missing, 'MergeQueueEntry must have exactly the v2 entry keys');
-    expectMalformed(
-      rawEntry({ baseBranch: secret }),
-      'MergeQueueEntry baseBranch must be main or chain/<lowercase-dashes>',
-      secret,
-    );
-  });
-
-  it('refuses a version 1 record that also carries baseBranch', () => {
-    expectMalformed(
-      rawEntry({ version: 1, baseBranch: 'main' }),
-      'MergeQueueEntry must have exactly the v1 entry keys',
-    );
+    expect(result).toEqual({ ok: false, reason: 'unknown-version', error: 'MergeQueueEntry version must be 1' });
   });
 
   it('refuses a non-enumerable version', () => {
@@ -191,12 +138,6 @@ describe('D-R8 version handling', () => {
     Object.defineProperty(input, 'version', { value: 1, enumerable: false });
     const result = readMergeQueueEntryRecord(input);
     expect(result).toEqual({ ok: false, reason: 'malformed', error: 'MergeQueueEntry version must be enumerable' });
-  });
-
-  it('parses a 200-character chain base', () => {
-    const longChain = `chain/${'a'.repeat(194)}`;
-    expect(longChain).toHaveLength(200);
-    expect(parseBaseBranch(longChain)).toBe(longChain);
   });
 });
 
@@ -280,10 +221,10 @@ describe('malformed refusals', () => {
   });
 
   it('refuses an extra key and a missing key', () => {
-    expectMalformed(rawEntry({ extra: 'x' }), 'MergeQueueEntry must have exactly the v2 entry keys');
+    expectMalformed(rawEntry({ extra: 'x' }), 'MergeQueueEntry must have exactly the v1 entry keys');
     const missingState = rawEntry();
     delete missingState.state;
-    expectMalformed(missingState, 'MergeQueueEntry must have exactly the v2 entry keys');
+    expectMalformed(missingState, 'MergeQueueEntry must have exactly the v1 entry keys');
   });
 });
 
@@ -491,25 +432,6 @@ describe('findMergeQueueHead', () => {
     const a = makeEntry();
     const b = makeEntry({ repoDigest: DIGEST_2 });
     expect(findMergeQueueHead([a, b], DIGEST)?.entryId).toBe(a.entryId);
-  });
-
-  it('returns null when live entries span two resolved bases and no base is given', () => {
-    const a = makeEntry();
-    const b = makeEntry({ baseBranch: 'chain/dt' });
-    expect(findMergeQueueHead([a, b])).toBeNull();
-  });
-
-  it('returns null when entries on the given base span two digests', () => {
-    const a = makeEntry();
-    const b = makeEntry({ repoDigest: DIGEST_2, enqueuedAtIso: '2026-11-01T11:00:00.000Z' });
-    expect(findMergeQueueHead([a, b], undefined, 'main')).toBeNull();
-  });
-
-  it('returns the head of one base; another base parked entry does not block it', () => {
-    const parkedMain = makeEntry({ state: 'parked', reason: 'checks', enqueuedAtIso: '2026-11-01T10:00:00.000Z' });
-    const chain = makeEntry({ baseBranch: 'chain/dt', enqueuedAtIso: '2026-11-01T11:00:00.000Z' });
-    expect(findMergeQueueHead([parkedMain, chain], undefined, 'main')).toBeNull();
-    expect(findMergeQueueHead([parkedMain, chain], undefined, 'chain/dt')?.entryId).toBe(chain.entryId);
   });
 });
 

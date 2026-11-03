@@ -2231,9 +2231,18 @@ describe('G3f (R4c): a merged PR carrying the lane head ends the run from any wa
     expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
   });
 
-  it('a one-way-door park returns null and stays parked', () => {
+  it('a one-way-door park with a merged PR at the lane head enters merged', () => {
     const rec = record({
       parked: { reason: 'one-way-door', qualifier: null, parkedFrom: 'merging', questionId: null },
+      parkCount: 1,
+    });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('a one-way-door park with an owner question returns null and stays parked', () => {
+    const rec = record({
+      parked: { reason: 'one-way-door', qualifier: null, parkedFrom: 'merging', questionId: 'question-example-1' },
       parkCount: 1,
     });
     const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });

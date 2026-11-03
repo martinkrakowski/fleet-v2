@@ -163,6 +163,37 @@ async function seedParkedRun(runtime: FleetCliRuntime): Promise<void> {
   expect(await runtime.conductor.laneRunJournal.append(entry)).toMatchObject({ outcome: 'appended' });
 }
 
+/** A blocker-after-round-2 park seeded with no review receipt, so `reviewFindings` is `[]`. */
+async function seedBlockerParkedRun(runtime: FleetCliRuntime): Promise<void> {
+  await seedPlainRun(runtime);
+  expect(
+    await runtime.conductor.laneRunRepository.acquireLease(RUN_ID, {
+      holderId: HOLDER,
+      observedFence: 0,
+      leaseUntilIso: LEASE_UNTIL,
+      nowIso: NOW,
+    }),
+  ).toMatchObject({ outcome: 'saved' });
+  expect(
+    await runtime.conductor.laneRunRepository.save(
+      runRecord({
+        parked: {
+          reason: 'blocker-after-round-2',
+          qualifier: null,
+          parkedFrom: 'gating',
+          questionId: null,
+        },
+        parkCount: 1,
+        revision: 2,
+        lease: { holderId: HOLDER, fence: 1, leaseUntilIso: LEASE_UNTIL },
+      }),
+      { holderId: HOLDER, fence: 1, nowIso: NOW },
+    ),
+  ).toMatchObject({ outcome: 'saved' });
+  const entry: LaneRunJournalEntryRecord = laneRunConductEntry(ENTRY_1, RUN_ID, 'parked', NOW);
+  expect(await runtime.conductor.laneRunJournal.append(entry)).toMatchObject({ outcome: 'appended' });
+}
+
 describe('fleet-v2 conductor (K7-4)', () => {
   it('status lists the seeded run with the halt marker clear', async () => {
     const runtime = makeRuntime(tempStateDir());
@@ -190,6 +221,19 @@ describe('fleet-v2 conductor (K7-4)', () => {
     expect(plain.code).toBe(0);
     const plainRuns = (parseDocument(plain.stdout).runs as readonly Record<string, unknown>[])[0];
     expect(plainRuns).toMatchObject({ runId: RUN_ID, baseBranch: 'main' });
+  });
+
+  it('status carries reviewFindings on a parked run (GB2)', async () => {
+    const runtime = makeRuntime(tempStateDir());
+    await seedBlockerParkedRun(runtime);
+    const result = await runConductor(runtime, ['status', RUN_ID]);
+    expect(result.code).toBe(0);
+    const document = parseDocument(result.stdout);
+    expect(document).toMatchObject({ outcome: 'listed' });
+    const runs = document.runs as readonly Record<string, unknown>[];
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toHaveProperty('reviewFindings');
+    expect(runs[0].reviewFindings).toEqual([]);
   });
 
   it('halt sets and lifts the kill switch; status shows it', async () => {

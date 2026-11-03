@@ -8,6 +8,8 @@ import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-fact
 import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
 import type { LaneRunParkReason, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.out-port.js';
+import { boundedFindingsView } from '../../../domain/park-findings-view.js';
+import type { LaneRunParkFindingView } from '../../../domain/park-findings-view.js';
 import { canEnterLaneRunState, workOrderReleaseFor } from '../../../domain/lane-run-transitions.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { workOrderHoldFacts } from '../work-order-hold-facts.js';
@@ -112,6 +114,7 @@ export async function raiseParkNotice(
     if (workOrder === null) {
       return;
     }
+    const parkedFindings = record.parked?.findings;
     const parkRequest: LaneRunParkRequest = {
       key,
       projectId: workOrder.projectId,
@@ -119,6 +122,9 @@ export async function raiseParkNotice(
       runId: record.runId,
       reason,
       ...(qualifier === null ? {} : { qualifier }),
+      ...(reason === 'blocker-after-round-2' && parkedFindings !== undefined && parkedFindings !== null
+        ? { findings: parkedFindings }
+        : {}),
     };
     await parkNotice.recordParkAttention(parkRequest);
     if (OWNER_QUESTION_REASONS.includes(reason)) {
@@ -219,6 +225,46 @@ export async function releaseWorkOrderAtEnd(ctx: AdvanceStepContext,
   }
 }
 
+/**
+ * The bounded findings snapshot of a blocker-after-round-2 park, read once at
+ * park time and frozen on the parked record so repair and every retry reuse it
+ * (GB2 correction 2). `null` means the decision that findings are absent
+ * (unwired deps, a missing attempt or head, or a non-found/non-failed receipt);
+ * every failure falls through to `null`, never throws.
+ */
+async function blockerFindingsFor(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+): Promise<readonly LaneRunParkFindingView[] | null> {
+  const reviewRequest = ctx.deps.reviewRequest;
+  const attemptRepo = ctx.deps.attemptRepo;
+  if (reviewRequest === undefined || attemptRepo === undefined) {
+    return null;
+  }
+  const attemptId = record.attemptIds[record.attemptIds.length - 1];
+  if (attemptId === undefined) {
+    return null;
+  }
+  try {
+    const attempt = await attemptRepo.findAttemptById(attemptId);
+    const head = attempt?.artifacts?.headCommit;
+    if (attempt === null || head === undefined) {
+      return null;
+    }
+    const found = await reviewRequest.findLatestReceiptOfKind({
+      attemptId,
+      candidateHeadSha: head,
+      kind: 'code-review',
+    });
+    if (found.outcome !== 'found' || found.receipt.verdict !== 'failed') {
+      return null;
+    }
+    return boundedFindingsView(found.receipt.findings);
+  } catch {
+    return null;
+  }
+}
+
 export async function performPark(ctx: AdvanceStepContext,
   record: LaneRunRecord,
   reason: LaneRunParkReason,
@@ -226,9 +272,16 @@ export async function performPark(ctx: AdvanceStepContext,
   parkedFrom: LaneRunStateValue,
   request: AdvanceLaneRunRequest,
 ): Promise<AdvanceLaneRunResult> {
+  const findings = reason === 'blocker-after-round-2' ? await blockerFindingsFor(ctx, record) : undefined;
   const parkedRecord: LaneRunRecord = {
     ...record,
-    parked: { reason, qualifier, parkedFrom, questionId: null },
+    parked: {
+      reason,
+      qualifier,
+      parkedFrom,
+      questionId: null,
+      ...(findings !== undefined ? { findings } : {}),
+    },
     parkCount: record.parkCount + 1,
     revision: record.revision + 1,
   };

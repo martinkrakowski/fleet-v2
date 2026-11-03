@@ -41,6 +41,9 @@ import type {
   LaneRunTier,
   RunStopRefusalKind,
 } from '../lane-run-records.js';
+import { copyParkRecord } from '../lane-run-records.js';
+import type { LaneRunParkFindingView } from '../park-findings-view.js';
+import { copyParkFindings, parkFindingsSnapshotOf } from '../park-findings-view.js';
 import { LANE_RUN_RESUMABLE_STATES } from '../value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../value-objects/LaneRunState.vo.js';
 import { SEAT_PLAN_ROLES } from '../value-objects/SeatPlan.vo.js';
@@ -78,7 +81,8 @@ const REQUIRED_RECORD_KEYS: readonly string[] = [
  */
 const OPTIONAL_RECORD_KEYS: readonly string[] = ['branchName', 'baseBranch', 'schemaVersion'];
 
-const PARKED_KEYS: readonly string[] = ['reason', 'qualifier', 'parkedFrom', 'questionId'];
+const PARKED_REQUIRED_KEYS: readonly string[] = ['reason', 'qualifier', 'parkedFrom', 'questionId'];
+const PARKED_OPTIONAL_KEYS: readonly string[] = ['findings'];
 const LEASE_KEYS: readonly string[] = ['holderId', 'fence', 'leaseUntilIso'];
 
 export class LaneRun {
@@ -203,7 +207,7 @@ export class LaneRun {
       round: this.record.round,
       attemptIds: [...this.record.attemptIds],
       prNumber: this.record.prNumber,
-      parked: this.record.parked === null ? null : { ...this.record.parked },
+      parked: copyParkRecord(this.record.parked),
       parkCount: this.record.parkCount,
       lease: this.record.lease === null ? null : { ...this.record.lease },
       revision: this.record.revision,
@@ -235,7 +239,7 @@ export class LaneRun {
   }
 
   getParked(): LaneRunParkRecord | null {
-    return this.record.parked === null ? null : { ...this.record.parked };
+    return copyParkRecord(this.record.parked);
   }
 
   isParked(): boolean {
@@ -349,7 +353,11 @@ function readValidatedPark(recordInput: Record<string, unknown>): {
 } | { ok: false; error: string } {
   let parked: LaneRunParkRecord | null = null;
   if (recordInput.parked !== null) {
-    const parkedSnapshot = readExactPlainRecord(recordInput.parked, PARKED_KEYS);
+    const parkedSnapshot = readPlainRecordWithOptionalKeys(
+      recordInput.parked,
+      PARKED_REQUIRED_KEYS,
+      PARKED_OPTIONAL_KEYS,
+    );
     const parkedError = parkedSnapshotError(parkedSnapshot);
     if (parkedError !== null) {
       return { ok: false, error: parkedError };
@@ -541,6 +549,12 @@ function parkedSnapshotError(snapshot: Record<string, unknown> | null): string |
   if (snapshot === null) {
     return 'LaneRun parked must be null or { reason, qualifier, parkedFrom, questionId }';
   }
+  if (snapshot.findings !== undefined) {
+    const findingsError = findingsArrayError(snapshot.findings);
+    if (findingsError !== null) {
+      return findingsError;
+    }
+  }
   const reason = snapshot.reason;
   if (typeof reason !== 'string' || !LANE_RUN_PARK_REASONS.includes(reason as LaneRunParkReason)) {
     return 'LaneRun parked reason is not a known park reason';
@@ -571,12 +585,35 @@ function parkedSnapshotError(snapshot: Record<string, unknown> | null): string |
   return null;
 }
 
+/**
+ * Findings must be null or an array of at most `PARK_FINDINGS_MAX_COUNT`
+ * bounded findings-view objects (GB2): the stored snapshot is validated with
+ * the domain's own exported snapshot reader, so malformed ids, oversized,
+ * control-carrying or secret-shaped summaries, unsafe paths, bad lines and
+ * extra fields are all refused here exactly as at the boundary.
+ */
+function findingsArrayError(findings: unknown): string | null {
+  if (findings === null) {
+    return null;
+  }
+  if (parkFindingsSnapshotOf(findings) === null) {
+    return 'LaneRun parked findings must be null or an array of bounded finding objects';
+  }
+  return null;
+}
+
 function buildParkedRecord(snapshot: Record<string, unknown>): LaneRunParkRecord {
+  let findings: readonly LaneRunParkFindingView[] | null | undefined;
+  if (snapshot.findings !== undefined) {
+    const copied = copyParkFindings(snapshot.findings as readonly LaneRunParkFindingView[] | null);
+    findings = copied === null ? null : Object.freeze(copied);
+  }
   return Object.freeze({
     reason: snapshot.reason as LaneRunParkReason,
     qualifier: snapshot.qualifier as string | null,
     parkedFrom: snapshot.parkedFrom as LaneRunStateValue,
     questionId: snapshot.questionId as string | null,
+    ...(findings !== undefined ? { findings } : {}),
   });
 }
 

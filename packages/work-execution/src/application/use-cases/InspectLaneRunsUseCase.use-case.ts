@@ -16,7 +16,11 @@ import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.o
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLeasePort.out-port.js';
+import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+import type { ReviewRequestPort } from '../ports/out/ReviewRequestPort.out-port.js';
 import type { LaneRunLeaseRecord, LaneRunRecord } from '../../domain/lane-run-records.js';
+import type { LaneRunParkFindingView } from '../../domain/park-findings-view.js';
+import { boundedFindingsView } from '../../domain/park-findings-view.js';
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
 import { laneRunJournalPendingIntent, laneRunJournalState, laneRunJournalStopFacts } from '../../domain/lane-run-journal.js';
 import { parseLaneRunKey } from '../../domain/lane-run-keys.js';
@@ -28,6 +32,9 @@ export interface InspectLaneRunsDependencies {
   readonly runJournal: Pick<LaneRunJournalPort, 'listForRun'>;
   readonly halt: Pick<ConductorHaltPort, 'read'>;
   readonly driverLease: Pick<ConductorDriverLeasePort, 'read'>;
+  /** Read the parked head's latest code-review receipt (GB2); optional so unwired callers keep today's shape. */
+  readonly attemptRepo?: Pick<AttemptRepositoryPort, 'findAttemptById'>;
+  readonly reviewReceipts?: Pick<ReviewRequestPort, 'findLatestReceiptOfKind'>;
 }
 
 /** A run lease record with its lapsed flag; null stays null. */
@@ -41,6 +48,58 @@ function leaseView(lease: LaneRunLeaseRecord | null, nowIso: string): LaneRunSta
     leaseUntilIso: lease.leaseUntilIso,
     lapsed: isLeaseLapsed(lease, nowIso),
   };
+}
+
+/** Fallback receipt read when the parked record does not carry a saved snapshot. */
+async function fallbackReviewFindings(
+  deps: InspectLaneRunsDependencies,
+  record: LaneRunRecord,
+): Promise<readonly LaneRunParkFindingView[]> {
+  const attemptRepo = deps.attemptRepo;
+  const reviewReceipts = deps.reviewReceipts;
+  if (attemptRepo === undefined || reviewReceipts === undefined) {
+    return [];
+  }
+  const attemptId = record.attemptIds.length === 0 ? null : record.attemptIds[record.attemptIds.length - 1];
+  if (attemptId === null) {
+    return [];
+  }
+  try {
+    const attempt = await attemptRepo.findAttemptById(attemptId);
+    const head = attempt?.artifacts?.headCommit;
+    if (attempt === null || head === undefined) {
+      return [];
+    }
+    const found = await reviewReceipts.findLatestReceiptOfKind({
+      attemptId,
+      candidateHeadSha: head,
+      kind: 'code-review',
+    });
+    if (found.outcome !== 'found' || found.receipt.verdict !== 'failed') {
+      return [];
+    }
+    return boundedFindingsView(found.receipt.findings);
+  } catch {
+    return [];
+  }
+}
+
+/** The bounded findings of the parked head's failed code review; `null` when not a blocker park. */
+async function blockedReviewFindings(
+  deps: InspectLaneRunsDependencies,
+  record: LaneRunRecord,
+): Promise<readonly LaneRunParkFindingView[] | null> {
+  const parked = record.parked;
+  if (parked === null || parked.reason !== 'blocker-after-round-2') {
+    return null;
+  }
+  if (parked.findings === undefined) {
+    return fallbackReviewFindings(deps, record);
+  }
+  if (parked.findings === null) {
+    return [];
+  }
+  return boundedFindingsView(parked.findings);
 }
 
 /**
@@ -74,9 +133,15 @@ function parkRefusalDetailOf(record: LaneRunRecord, entries: readonly LaneRunJou
 }
 
 /** The status view of one run from its record and journal. */
-function statusViewOf(record: LaneRunRecord, entries: readonly LaneRunJournalEntryRecord[], nowIso: string): LaneRunStatusView {
+async function statusViewOf(
+  deps: InspectLaneRunsDependencies,
+  record: LaneRunRecord,
+  entries: readonly LaneRunJournalEntryRecord[],
+  nowIso: string,
+): Promise<LaneRunStatusView> {
   const stopFacts = laneRunJournalStopFacts(entries, record.runId);
   const pendingIntent = laneRunJournalPendingIntent(entries, record.runId);
+  const reviewFindings = await blockedReviewFindings(deps, record);
   const parkDetail = parkRefusalDetailOf(record, entries);
   return {
     runId: record.runId,
@@ -88,6 +153,7 @@ function statusViewOf(record: LaneRunRecord, entries: readonly LaneRunJournalEnt
     round: record.round,
     revision: record.revision,
     parked: record.parked,
+    reviewFindings,
     ...(parkDetail !== null ? { parkDetail } : {}),
     parkCount: record.parkCount,
     stopMode: stopFacts.stopMode,
@@ -130,11 +196,15 @@ export class InspectLaneRunsUseCase implements InspectLaneRunsPort {
       lapsed: isLeaseLapsed(driver, request.nowIso),
     };
 
+    const runs = await Promise.all(
+      known.map((record, index) => statusViewOf(this.deps, record, journals[index], request.nowIso)),
+    );
+
     return {
       outcome: 'listed',
       halt: halt.state,
       driver: driverLease,
-      runs: known.map((record, index) => statusViewOf(record, journals[index], request.nowIso)),
+      runs,
     };
   }
 }

@@ -132,34 +132,6 @@ function parkRefusalDetailOf(record: LaneRunRecord, entries: readonly LaneRunJou
   return null;
 }
 
-/**
- * F62: the detail of the run's last gate result for a run parked `ambiguous`
- * at the gate — the fixed token that says why the gate read was unknown. The
- * gate's result is `ambiguous`, so it is not a final result and the
- * step-refused scan never sees it.
- */
-function parkGateDetailOf(record: LaneRunRecord, entries: readonly LaneRunJournalEntryRecord[]): string | null {
-  const parked = record.parked;
-  if (parked === null || parked.reason !== 'ambiguous' || parked.qualifier !== 'gate') {
-    return null;
-  }
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const entry = entries[index];
-    if (entry.kind !== 'result' || entry.runId !== record.runId || entry.key === null) {
-      continue;
-    }
-    if (entry.reasonCode !== 'gate-unknown') {
-      continue;
-    }
-    const parsed = parseLaneRunKey(entry.key);
-    if (parsed === null || parsed.kind !== 'step' || parsed.step !== 'gate') {
-      continue;
-    }
-    return entry.detail;
-  }
-  return null;
-}
-
 /** The status view of one run from its record and journal. */
 async function statusViewOf(
   deps: InspectLaneRunsDependencies,
@@ -170,7 +142,7 @@ async function statusViewOf(
   const stopFacts = laneRunJournalStopFacts(entries, record.runId);
   const pendingIntent = laneRunJournalPendingIntent(entries, record.runId);
   const reviewFindings = await blockedReviewFindings(deps, record);
-  const parkDetail = parkRefusalDetailOf(record, entries) ?? parkGateDetailOf(record, entries);
+  const parkDetail = parkRefusalDetailOf(record, entries);
   return {
     runId: record.runId,
     workOrderId: record.workOrderId,

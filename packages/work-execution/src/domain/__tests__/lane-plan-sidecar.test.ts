@@ -95,7 +95,6 @@ describe('parseLanePlanSidecar', () => {
           status: 'planned',
           brief: null,
           mergedPr: null,
-          rollupOf: false,
         },
         {
           laneId: 'A2',
@@ -113,7 +112,6 @@ describe('parseLanePlanSidecar', () => {
           status: 'planned',
           brief: '.lane/brief-a2.md',
           mergedPr: null,
-          rollupOf: false,
         },
         {
           laneId: 'A3',
@@ -127,12 +125,10 @@ describe('parseLanePlanSidecar', () => {
           status: 'dropped',
           brief: null,
           mergedPr: { repository: 'example-org/example-repo', number: 251 },
-          rollupOf: false,
         },
       ],
       decisions: [{ id: 'D1', question: 'Which store?', default: 'A file store', state: 'open' }],
       exclusiveOrder: [{ file: '.architecture/manifest.yaml', lanes: ['A1', 'A2'] }],
-      featureSet: null,
     });
   });
 
@@ -432,120 +428,6 @@ describe('parseLanePlanSidecar', () => {
   });
 });
 
-describe('feature set and rollup marks', () => {
-  it('parses a feature set and rollup marks and fills defaults', () => {
-    const input = cloneValid();
-    input.featureSet = { id: 'web-ui', title: 'Web UI' };
-    (input.lanes as Record<string, unknown>[])[0].rollupOf = true;
-    const result = parseLanePlanSidecar(input);
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(result.sidecar.featureSet).toEqual({ id: 'web-ui', title: 'Web UI' });
-    expect(result.sidecar.lanes[0].rollupOf).toBe(true);
-    expect(result.sidecar.lanes[1].rollupOf).toBe(false);
-    expect(result.sidecar.lanes[2].rollupOf).toBe(false);
-
-    const plain = parseLanePlanSidecar(VALID);
-    expect(plain.ok).toBe(true);
-    if (!plain.ok) return;
-    expect(plain.sidecar.featureSet).toBeNull();
-  });
-
-  it('refuses a feature set that is not exactly an object with id and title', () => {
-    expect(refusedErrors({ ...VALID, featureSet: 'not-an-object' })).toEqual([
-      'sidecar.featureSet: must be an object with id and title',
-    ]);
-    const missingTitle = cloneValid();
-    missingTitle.featureSet = { id: 'web-ui' };
-    expect(refusedErrors(missingTitle)).toEqual([
-      'sidecar.featureSet: must be an object with id and title',
-    ]);
-    const extraKey = cloneValid();
-    extraKey.featureSet = { id: 'web-ui', title: 'Web UI', extra: 1 };
-    expect(refusedErrors(extraKey)).toEqual([
-      'sidecar.featureSet: must be an object with id and title',
-    ]);
-  });
-
-  it('refuses feature set ids and titles outside their rules', () => {
-    for (const id of ['web ui', 'web/ui']) {
-      expect(refusedErrors({ ...VALID, featureSet: { id, title: 'Web UI' } })).toEqual([
-        'sidecar.featureSet.id: must be a feature set id',
-      ]);
-    }
-    expect(refusedErrors({ ...VALID, featureSet: { id: 'web-ui', title: '' } })).toEqual([
-      'sidecar.featureSet.title: must be plain text of at most 120 bytes',
-    ]);
-    expect(refusedErrors({ ...VALID, featureSet: { id: 'web-ui', title: 'é'.repeat(61) } })).toEqual([
-      'sidecar.featureSet.title: must be plain text of at most 120 bytes',
-    ]);
-    const secret = cloneValid();
-    secret.featureSet = { id: 'web-ui', title: fakeSecretShape() };
-    const secretErrors = refusedErrors(secret);
-    expect(secretErrors).toEqual(['sidecar.featureSet.title: contains a secret-shaped value and was refused']);
-    expect(secretErrors.join('\n')).not.toContain(fakeSecretShape());
-  });
-
-  it('refuses a rollupOf that is not true', () => {
-    for (const rollupOf of [false, 'true', 1, null]) {
-      expect(refusedErrors(withLane(0, { rollupOf }))).toEqual([
-        'lanes[0].rollupOf: must be true',
-      ]);
-    }
-  });
-
-  it('keeps canonical JSON stable without the fields and includes them when used', () => {
-    const plain = parseLanePlanSidecar(VALID);
-    if (!plain.ok) throw new Error('fixture must parse');
-    const plainCanonical = canonicalLanePlanSidecarJson(plain.sidecar);
-    expect(plainCanonical).not.toContain('featureSet');
-    expect(plainCanonical).not.toContain('rollupOf');
-
-    const input = cloneValid();
-    input.featureSet = { id: 'web-ui', title: 'Web UI' };
-    (input.lanes as Record<string, unknown>[])[0].rollupOf = true;
-    const result = parseLanePlanSidecar(input);
-    if (!result.ok) throw new Error('fixture must parse');
-    const canonical = canonicalLanePlanSidecarJson(result.sidecar);
-    expect(canonical).toContain('"featureSet":{"id":"web-ui","title":"Web UI"}');
-    expect(canonical).toContain('"rollupOf":true');
-
-    const reorderedResult = parseLanePlanSidecar(reversedFeatureSpelledOut());
-    if (!reorderedResult.ok) throw new Error('reordered fixture must parse');
-    expect(canonicalLanePlanSidecarJson(reorderedResult.sidecar)).toBe(canonical);
-  });
-
-  it('normalises a feature set from the validated snapshot, not a second read', () => {
-    const input = cloneValid();
-    const safeTitle = 'Web UI';
-    const secretTitle = fakeSecretShape();
-    input.featureSet = new Proxy({}, {
-      ownKeys() {
-        return ['id', 'title'];
-      },
-      getOwnPropertyDescriptor(_target, key) {
-        // Validation reads through descriptors: expose safe values here.
-        if (key === 'id') {
-          return { value: 'web-ui', enumerable: true, configurable: true, writable: true };
-        }
-        if (key === 'title') {
-          return { value: safeTitle, enumerable: true, configurable: true, writable: true };
-        }
-        return undefined;
-      },
-      get(_target, key) {
-        // The plain property read a naive normaliser would use: hide the secret here.
-        return key === 'title' ? secretTitle : key === 'id' ? 'web-ui' : undefined;
-      },
-    });
-    const result = parseLanePlanSidecar(input);
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(result.sidecar.featureSet).toEqual({ id: 'web-ui', title: safeTitle });
-    expect(result.sidecar.featureSet?.title).not.toBe(secretTitle);
-  });
-});
-
 function withDecisionState(state: string): unknown {
   const copy = cloneValid();
   const decisions = copy.decisions as Record<string, unknown>[];
@@ -559,61 +441,6 @@ function reversedSpelledOut(): unknown {
     decisions: [{ state: 'open', default: 'A file store', question: 'Which store?', id: 'D1' }],
     lanes: [
       {
-        mergedPr: null,
-        brief: null,
-        status: 'planned',
-        decisions: ['D1'],
-        after: [],
-        tier: 2,
-        sharedFiles: ['.architecture/manifest.yaml'],
-        packages: ['work-execution'],
-        scope: 'Records',
-        renamedFrom: null,
-        laneId: 'A1',
-      },
-      {
-        mergedPr: null,
-        brief: '.lane/brief-a2.md',
-        status: 'planned',
-        decisions: [],
-        after: ['A1', 'other-plan/B1', 'other-project/third-plan/C1'],
-        tier: 2,
-        sharedFiles: [],
-        packages: ['work-execution'],
-        scope: 'Stores',
-        renamedFrom: 'A-two',
-        laneId: 'A2',
-      },
-      {
-        mergedPr: { number: 251, repository: 'example-org/example-repo' },
-        brief: null,
-        status: 'dropped',
-        decisions: [],
-        after: [],
-        tier: 0,
-        sharedFiles: [],
-        packages: ['docs'],
-        scope: 'Docs',
-        renamedFrom: null,
-        laneId: 'A3',
-      },
-    ],
-    doc: 'docs/planning/2026-10-27_example-plan.md',
-    revision: 3,
-    planId: '2026-10-27_example',
-    projectId: 'example-project',
-    schemaVersion: 1,
-  };
-}
-
-function reversedFeatureSpelledOut(): unknown {
-  return {
-    featureSet: { title: 'Web UI', id: 'web-ui' },
-    exclusiveOrder: [{ lanes: ['A1', 'A2'], file: '.architecture/manifest.yaml' }],
-    decisions: [{ state: 'open', default: 'A file store', question: 'Which store?', id: 'D1' }],
-    lanes: [
-      {
-        rollupOf: true,
         mergedPr: null,
         brief: null,
         status: 'planned',

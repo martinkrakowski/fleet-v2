@@ -9,6 +9,7 @@
  */
 
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
+import { isCanonicalIso } from './lane-activity-records.js';
 import { REAPER_SUBJECT_ID_PATTERN } from './lane-run-keys.js';
 import type { ReaperFindingKind } from './lane-run-keys.js';
 
@@ -50,8 +51,8 @@ export interface ReaperFinding {
   readonly kind: ReaperFindingKind;
   readonly subject: string;
   readonly action: ReaperFindingAction;
-  readonly firstSightingIso: string;
-  readonly lastSightingIso: string;
+  readonly firstSightingIso?: string | null;
+  readonly lastSightingIso?: string | null;
   readonly sightings: number;
 }
 
@@ -231,7 +232,8 @@ function kindVerdict(
 
 /** Prior sighting state resolved from open findings. */
 interface SightingInfo {
-  readonly firstSightingIso: string;
+  readonly firstSightingIso: string | null;
+  readonly lastSightingIso: string | null;
   readonly sightings: number;
   readonly previousSightingMs: number | null;
   readonly hasPrior: boolean;
@@ -255,19 +257,37 @@ function findPriorFinding(
 function resolveSighting(
   prior: ReaperFinding | null,
   nowIso: string,
+  nowCanonical: boolean,
 ): SightingInfo {
+  if (!nowCanonical) {
+    return {
+      firstSightingIso: null,
+      lastSightingIso: null,
+      sightings: prior === null ? 1 : prior.sightings + 1,
+      previousSightingMs: null,
+      hasPrior: prior !== null,
+    };
+  }
   if (prior === null) {
     return {
       firstSightingIso: nowIso,
+      lastSightingIso: nowIso,
       sightings: 1,
       previousSightingMs: null,
       hasPrior: false,
     };
   }
+  const firstSightingIso = isCanonicalIso(prior.firstSightingIso)
+    ? prior.firstSightingIso
+    : nowIso;
+  const previousSightingMs = isCanonicalIso(prior.lastSightingIso)
+    ? msOf(prior.lastSightingIso)
+    : null;
   return {
-    firstSightingIso: prior.firstSightingIso,
+    firstSightingIso,
+    lastSightingIso: nowIso,
     sightings: prior.sightings + 1,
-    previousSightingMs: msOf(prior.lastSightingIso),
+    previousSightingMs,
     hasPrior: true,
   };
 }
@@ -320,6 +340,7 @@ function classifyObservation(
   openFindings: readonly ReaperFinding[],
   nowIso: string,
   nowMs: number | null,
+  nowCanonical: boolean,
   graceMs: number,
   staleStopMinutes: number,
   minFreePercent: number,
@@ -345,14 +366,16 @@ function classifyObservation(
   }
 
   const prior = findPriorFinding(openFindings, kind, subject);
-  const sighting = resolveSighting(prior, nowIso);
-  const action = resolveAction(
-    observation.youngActivity === true,
-    sighting,
-    nowMs,
-    graceMs,
-    verdict.repairEligible,
-  );
+  const sighting = resolveSighting(prior, nowIso, nowCanonical);
+  const action = nowCanonical
+    ? resolveAction(
+        observation.youngActivity === true,
+        sighting,
+        nowMs,
+        graceMs,
+        verdict.repairEligible,
+      )
+    : 'wait';
 
   return {
     schemaVersion: REAPER_FINDING_SCHEMA_VERSION,
@@ -360,7 +383,7 @@ function classifyObservation(
     subject,
     action,
     firstSightingIso: sighting.firstSightingIso,
-    lastSightingIso: nowIso,
+    lastSightingIso: sighting.lastSightingIso,
     sightings: sighting.sightings,
   };
 }
@@ -405,7 +428,8 @@ export function classifyZombies(
     const staleStopMinutes = minutesOf(policy.staleStopMinutes, DEFAULT_STALE_STOP_MINUTES);
     const minFreePercent = minutesOf(policy.minFreePercent, DEFAULT_MIN_FREE_PERCENT);
     const graceMs = graceMinutes * MINUTE_MS;
-    const nowMs = msOf(nowIso);
+    const nowCanonical = isCanonicalIso(nowIso);
+    const nowMs = nowCanonical ? msOf(nowIso) : null;
     const computed: ReaperFinding[] = [];
     const mergedSubjects = new Set<string>();
 
@@ -415,6 +439,7 @@ export function classifyZombies(
         openFindings,
         nowIso,
         nowMs,
+        nowCanonical,
         graceMs,
         staleStopMinutes,
         minFreePercent,

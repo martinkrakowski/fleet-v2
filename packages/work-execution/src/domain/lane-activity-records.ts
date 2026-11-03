@@ -106,7 +106,7 @@ function isBoundedPlainBytes(value: unknown, limitBytes: number): value is strin
   return bytes >= 1 && bytes <= limitBytes;
 }
 
-function isCanonicalIso(value: unknown): value is string {
+export function isCanonicalIso(value: unknown): value is string {
   if (typeof value !== 'string' || !CANONICAL_ISO_PATTERN.test(value)) {
     return false;
   }

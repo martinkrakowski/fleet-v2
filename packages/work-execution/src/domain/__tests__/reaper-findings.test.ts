@@ -419,6 +419,95 @@ describe('classifyZombies — the sighting bookkeeping', () => {
   });
 });
 
+describe('classifyZombies — canonical timestamp guard', () => {
+  const observation = {
+    kind: 'orphan-session' as const,
+    subject: 'attempt-canonical',
+    youngActivity: false,
+    attemptsTerminalOrAbsent: true,
+    commitsNotOnRemote: false,
+  };
+
+  it('a secret-shaped nowIso never appears in any returned field', () => {
+    const secretNowTimes = [
+      'AIza' + 'A'.repeat(30),
+      'ghp_' + 'B'.repeat(36),
+      'sk-' + 'C'.repeat(40),
+    ];
+    for (const secretNow of secretNowTimes) {
+      const findings = classifyZombies(
+        { observations: [observation], openFindings: [] },
+        secretNow,
+        {},
+      );
+      expect(findings).toHaveLength(1);
+      const res = findings[0]!;
+      expect(res.action).toBe('wait');
+      expect(res.firstSightingIso).toBeNull();
+      expect(res.lastSightingIso).toBeNull();
+      for (const value of Object.values(res)) {
+        if (typeof value === 'string') {
+          expect(value).not.toContain(secretNow);
+        }
+      }
+      expect(JSON.stringify(res)).not.toContain(secretNow);
+    }
+  });
+
+  it('a secret-shaped prior firstSightingIso never appears', () => {
+    const secretFirstSightings = [
+      'AIza' + 'A'.repeat(30),
+      'ghp_' + 'B'.repeat(36),
+      'sk-' + 'C'.repeat(40),
+    ];
+    for (const secretPrior of secretFirstSightings) {
+      const prior = finding(
+        'orphan-session',
+        'attempt-canonical',
+        secretPrior,
+        '2026-10-27T09:50:00.000Z',
+        1,
+      );
+      const findings = classifyZombies(
+        { observations: [observation], openFindings: [prior] },
+        NOW,
+        {},
+      );
+      expect(findings).toHaveLength(1);
+      const res = findings[0]!;
+      expect(res.firstSightingIso).toBe(NOW);
+      expect(res.lastSightingIso).toBe(NOW);
+      for (const value of Object.values(res)) {
+        if (typeof value === 'string') {
+          expect(value).not.toContain(secretPrior);
+        }
+      }
+      expect(JSON.stringify(res)).not.toContain(secretPrior);
+    }
+  });
+
+  it('a canonical prior firstSightingIso is kept', () => {
+    const canonicalPriorIso = '2026-10-27T09:15:30.123Z';
+    const prior = finding(
+      'orphan-session',
+      'attempt-canonical',
+      canonicalPriorIso,
+      '2026-10-27T09:50:00.000Z',
+      2,
+    );
+    const findings = classifyZombies(
+      { observations: [observation], openFindings: [prior] },
+      NOW,
+      {},
+    );
+    expect(findings).toHaveLength(1);
+    const res = findings[0]!;
+    expect(res.sightings).toBe(3);
+    expect(res.firstSightingIso).toBe(canonicalPriorIso);
+    expect(res.lastSightingIso).toBe(NOW);
+  });
+});
+
 describe('classifyZombies — young activity', () => {
   it('is wait and never report or repair while the activity is young', () => {
     const observation = {
@@ -566,6 +655,8 @@ describe('classifyZombies — never throws', () => {
     const seen = { ...observation, stopRetriesSpent: true };
     const findings = classifyZombies({ observations: [seen], openFindings: [] }, 'not-a-time', {});
     expect(findings[0]?.action).toBe('wait');
+    expect(findings[0]?.firstSightingIso).toBeNull();
+    expect(findings[0]?.lastSightingIso).toBeNull();
   });
 
   it('returns without throwing on a negative graceMinutes', () => {

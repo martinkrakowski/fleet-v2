@@ -34,6 +34,24 @@ export const ATTENTION_ITEM_PR_REF_PATTERN = /^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9
 
 export const ATTENTION_ITEM_LIMITS = Object.freeze({ summaryChars: 1024, recordJsonChars: 16384 });
 
+/** Kinds whose summary names one occurrence, so a raise repeating the stored summary is idempotent. */
+export const ATTENTION_ITEM_OCCURRENCE_KINDS: readonly string[] = ['conductor-park'];
+
+/**
+ * The park ordinal a summary names, from the ` (park N).` suffix the park
+ * notice adapter writes, or null when the summary names no occurrence. An
+ * ordinal orders the occurrences of one park item so an older raise can be
+ * recognised as stale.
+ */
+export function attentionItemSummaryParkOrdinal(summary: string): number | null {
+  const match = / \(park (\d+)\)\.$/.exec(summary);
+  if (match === null) {
+    return null;
+  }
+  const ordinal = Number.parseInt(match[1], 10);
+  return ordinal >= 1 ? ordinal : null;
+}
+
 export interface AttentionItemSubjectRecord {
   readonly kind: AttentionItemSubjectKind;
   readonly ref: string;

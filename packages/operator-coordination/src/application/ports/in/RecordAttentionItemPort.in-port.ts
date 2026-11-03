@@ -4,7 +4,10 @@
  * body with the injected clock and id source; the raiser is the caller's
  * actor, never the body. One item per project, subject and kind: a repeat
  * refreshes the open item or reopens a cleared one, so notices replace rather
- * than pile up. An attention item grants and blocks nothing.
+ * than pile up. For occurrence-naming kinds (`conductor-park`), a raise
+ * repeating the stored summary writes nothing and returns the stored item; so
+ * does a raise naming an occurrence the stored summary already supersedes.
+ * An attention item grants and blocks nothing.
  */
 
 import type { AttentionItemRecord } from '../../../domain/attention-item-records.js';

@@ -121,6 +121,7 @@ export async function raiseParkNotice(
       workOrderId: record.workOrderId,
       runId: record.runId,
       reason,
+      parkCount: record.parkCount,
       ...(qualifier === null ? {} : { qualifier }),
       ...(reason === 'blocker-after-round-2' && parkedFindings !== undefined && parkedFindings !== null
         ? { findings: parkedFindings }

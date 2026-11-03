@@ -802,6 +802,7 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
       workOrderId: WORK_ORDER_ID,
       runId: RUN_ID,
       reason: 'owner-merge',
+      parkCount: 1,
     });
     expect(harness.askParkQuestionCalls).toHaveLength(1);
     const record = await harness.runRepo.get(RUN_ID);

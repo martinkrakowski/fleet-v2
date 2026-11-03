@@ -11,8 +11,10 @@ import type {
   ChainTrigger,
   ChainsSection,
   ConductorPolicy,
+  ConductorReaperDiskPolicy,
   ConductorReaperPolicy,
   ConductorReaperRepairs,
+  ConductorReaperWorktreePolicy,
   CostClass,
   CoverageReaderName,
   CoverageUnitKind,
@@ -47,7 +49,13 @@ import type {
   WorktreeSection,
 } from './types.js';
 
-import { BOARD_BOUNDS, CONDUCTOR_MINUTE_BOUNDS, CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
+import {
+  BOARD_BOUNDS,
+  CONDUCTOR_MINUTE_BOUNDS,
+  CONDUCTOR_REAPER_DISK_BOUNDS,
+  CONDUCTOR_REAPER_REPAIR_KINDS,
+  CONDUCTOR_REAPER_WORKTREE_BOUNDS,
+} from './policy.js';
 import { readOwnDataProperty } from './policy-read.js';
 import { readTelemetryPolicyBlock } from './telemetry-policy.js';
 import { readSeatsPolicyBlock } from './seats-policy.js';
@@ -187,6 +195,17 @@ const CONDUCTOR_REAPER_KEYS: readonly string[] = [
   'graceMinutes',
   'staleStopMinutes',
   'repairs',
+  'worktrees',
+  'disk',
+];
+const CONDUCTOR_REAPER_WORKTREE_KEYS: readonly string[] = [
+  'retentionHours',
+  'maxRemovalsPerPass',
+  'passBudgetSeconds',
+];
+const CONDUCTOR_REAPER_DISK_KEYS: readonly string[] = [
+  'minFreePercent',
+  'clearFreePercent',
 ];
 const GIT_SHELF_KEYS: readonly string[] = [
   'provider',
@@ -1925,7 +1944,7 @@ function parseConductorRepairs(
     if (!Object.hasOwn(value, kind)) {
       continue;
     }
-    const flag = value[kind];
+    const flag = readOwnDataProperty(value, kind);
     if (typeof flag !== 'boolean') {
       errors.push(`policy.conductor.reaper.repairs.${kind}: must be a boolean`);
       continue;
@@ -1933,6 +1952,116 @@ function parseConductorRepairs(
     repairs[kind] = flag;
   }
   return repairs;
+}
+
+function readConductorReaperNumber(
+  record: JsonObject,
+  field: string,
+  path: string,
+  bounds: Readonly<{ min: number; max: number }>,
+  errors: string[],
+): number | undefined {
+  if (!Object.hasOwn(record, field)) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(record as Record<string, unknown>, field);
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < bounds.min ||
+    value > bounds.max
+  ) {
+    errors.push(`${path}.${field}: must be an integer ${bounds.min}..${bounds.max}`);
+    return undefined;
+  }
+  return value;
+}
+
+function parseConductorWorktrees(
+  reaper: JsonObject,
+  errors: string[],
+): ConductorReaperWorktreePolicy | undefined {
+  if (!Object.hasOwn(reaper, 'worktrees')) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(reaper as Record<string, unknown>, 'worktrees');
+  if (!isJsonObject(value)) {
+    errors.push('policy.conductor.reaper.worktrees: must be an object');
+    return undefined;
+  }
+  collectUnknownKeys(
+    value,
+    CONDUCTOR_REAPER_WORKTREE_KEYS,
+    'policy.conductor.reaper.worktrees',
+    errors,
+  );
+  const retentionHours = readConductorReaperNumber(
+    value,
+    'retentionHours',
+    'policy.conductor.reaper.worktrees',
+    CONDUCTOR_REAPER_WORKTREE_BOUNDS.retentionHours,
+    errors,
+  );
+  const maxRemovalsPerPass = readConductorReaperNumber(
+    value,
+    'maxRemovalsPerPass',
+    'policy.conductor.reaper.worktrees',
+    CONDUCTOR_REAPER_WORKTREE_BOUNDS.maxRemovalsPerPass,
+    errors,
+  );
+  const passBudgetSeconds = readConductorReaperNumber(
+    value,
+    'passBudgetSeconds',
+    'policy.conductor.reaper.worktrees',
+    CONDUCTOR_REAPER_WORKTREE_BOUNDS.passBudgetSeconds,
+    errors,
+  );
+  return {
+    ...(retentionHours !== undefined ? { retentionHours } : {}),
+    ...(maxRemovalsPerPass !== undefined ? { maxRemovalsPerPass } : {}),
+    ...(passBudgetSeconds !== undefined ? { passBudgetSeconds } : {}),
+  };
+}
+
+function parseConductorDisk(
+  reaper: JsonObject,
+  errors: string[],
+): ConductorReaperDiskPolicy | undefined {
+  if (!Object.hasOwn(reaper, 'disk')) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(reaper as Record<string, unknown>, 'disk');
+  if (!isJsonObject(value)) {
+    errors.push('policy.conductor.reaper.disk: must be an object');
+    return undefined;
+  }
+  collectUnknownKeys(
+    value,
+    CONDUCTOR_REAPER_DISK_KEYS,
+    'policy.conductor.reaper.disk',
+    errors,
+  );
+  const minFreePercent = readConductorReaperNumber(
+    value,
+    'minFreePercent',
+    'policy.conductor.reaper.disk',
+    CONDUCTOR_REAPER_DISK_BOUNDS.minFreePercent,
+    errors,
+  );
+  const clearFreePercent = readConductorReaperNumber(
+    value,
+    'clearFreePercent',
+    'policy.conductor.reaper.disk',
+    CONDUCTOR_REAPER_DISK_BOUNDS.clearFreePercent,
+    errors,
+  );
+  if ((minFreePercent ?? 15) >= (clearFreePercent ?? 20)) {
+    errors.push('policy.conductor.reaper.disk: minFreePercent must be less than clearFreePercent');
+  }
+  return {
+    ...(minFreePercent !== undefined ? { minFreePercent } : {}),
+    ...(clearFreePercent !== undefined ? { clearFreePercent } : {}),
+  };
 }
 
 function parseConductorReaper(
@@ -1972,6 +2101,8 @@ function parseConductorReaper(
     errors,
   );
   const repairs = parseConductorRepairs(value, errors);
+  const worktrees = parseConductorWorktrees(value, errors);
+  const disk = parseConductorDisk(value, errors);
   if (errors.length !== before || enabled === undefined) {
     return undefined;
   }
@@ -1981,6 +2112,8 @@ function parseConductorReaper(
     ...(graceMinutes !== undefined ? { graceMinutes } : {}),
     ...(staleStopMinutes !== undefined ? { staleStopMinutes } : {}),
     ...(repairs !== undefined ? { repairs } : {}),
+    ...(worktrees !== undefined ? { worktrees } : {}),
+    ...(disk !== undefined ? { disk } : {}),
   };
 }
 

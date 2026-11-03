@@ -18,12 +18,15 @@
  * runner is never silently undeclared.
  */
 
+import { readFile } from "node:fs/promises";
+
 import {
   createNodeDoctorExecutor,
   diffInstallationText,
   draftHost,
   hostProbeSpecFromDraft,
   hostProbesHaveFailure,
+  parseHostDescriptor,
   probeHost,
   readHashOf,
   readInstallationFile,
@@ -33,6 +36,7 @@ import {
   writeInstallation,
   type HostDraftCandidate,
   type HostDraftInput,
+  type HostDescriptor,
   type HostProbeExecutor,
   type HostRunnerDraft,
   type InstallationFileRead,
@@ -90,10 +94,11 @@ A schema version 1 file is converted to v2 on the first write.
 
   list                         print one line per configured host
   add <name> [--ssh <alias>] [--port <n>] [--worktree-root <path>]
-                               [--role <role>]... [--yes]
+                               [--from-descriptor <file>] [--role <role>]... [--yes]
                                draft a new host; the default role is
                                lane-runner, and without --ssh the host is
-                               local
+                               local. With --from-descriptor the file carries
+                               the port, worktree root, tool and capabilities.
   edit <name> [--ssh <alias>] [--port <n>] [--worktree-root <path>]
                                [--role <role>]... [--yes]
                                change an existing host; flags left out keep
@@ -136,7 +141,7 @@ const CONVERSION_ISOLATION_FLOOR: RunnerCapabilityDeclaration = {
 /** Which flags each subcommand accepts; anything else is a usage error. */
 const SUBCOMMAND_FLAGS: Readonly<Record<string, ReadonlySet<string>>> = {
   list: new Set([]),
-  add: new Set(["ssh", "port", "worktree-root", "role", "yes"]),
+  add: new Set(["ssh", "port", "worktree-root", "from-descriptor", "role", "yes"]),
   edit: new Set(["ssh", "port", "worktree-root", "role", "yes"]),
   remove: new Set(["yes"]),
 };
@@ -147,6 +152,7 @@ interface HostsArgs {
   readonly sshAlias?: string;
   readonly port?: number;
   readonly worktreeRoot?: string;
+  readonly fromDescriptor?: string;
   readonly roles: readonly HostRole[];
   readonly yes: boolean;
 }
@@ -179,6 +185,7 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
     sshAlias?: string;
     port?: number;
     worktreeRoot?: string;
+    fromDescriptor?: string;
     roles: HostRole[];
     yes: boolean;
   } = { subcommand, roles: [], yes: false };
@@ -242,6 +249,8 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
         };
       }
       args.port = Number(value);
+    } else if (flag === "from-descriptor") {
+      args.fromDescriptor = value;
     } else {
       const segments = value.split(",");
       const roles: HostRole[] = [];
@@ -556,8 +565,50 @@ async function writeHost(
     );
     return 2;
   }
-  if (mode === "add" && args.worktreeRoot === undefined) {
-    io.stderr(`hosts add requires --worktree-root <path>\n${HOSTS_HELP}\n`);
+  // The descriptor path: the file carries the port, worktree root, runner
+  // and capabilities; the operator still supplies the alias and the roles.
+  let descriptor: HostDescriptor | undefined;
+  if (args.fromDescriptor !== undefined) {
+    if (args.port !== undefined || args.worktreeRoot !== undefined) {
+      io.stderr(
+        `hosts add --from-descriptor: the descriptor carries the worktree root and the port; --worktree-root and --port cannot be given with it\n${HOSTS_HELP}\n`,
+      );
+      return 2;
+    }
+    let text: string;
+    try {
+      text = await readFile(args.fromDescriptor, "utf8");
+    } catch {
+      io.stderr(
+        `hosts add --from-descriptor: the descriptor file could not be read (${args.fromDescriptor})\n`,
+      );
+      return 1;
+    }
+    let descriptorValue: unknown;
+    try {
+      descriptorValue = JSON.parse(text);
+    } catch {
+      io.stderr(
+        "hosts add --from-descriptor: the descriptor file is not JSON\n",
+      );
+      return 1;
+    }
+    const parsed = parseHostDescriptor(descriptorValue);
+    if (!parsed.ok) {
+      io.stderr("the descriptor is refused:\n");
+      printErrors(io, parsed.errors);
+      return 1;
+    }
+    descriptor = parsed.descriptor;
+  }
+  if (
+    mode === "add" &&
+    args.worktreeRoot === undefined &&
+    descriptor === undefined
+  ) {
+    io.stderr(
+      `hosts add requires --worktree-root <path> or --from-descriptor <file>\n${HOSTS_HELP}\n`,
+    );
     return 2;
   }
   const state = await readInstallationState(file);
@@ -599,11 +650,18 @@ async function writeHost(
   }
 
   const roles = args.roles.length > 0 ? args.roles : undefined;
-  const runner = runnerDraftFor(
-    existing,
-    args.port,
-    converting && mode === "add",
-  );
+  const runner: HostRunnerDraft | undefined =
+    descriptor !== undefined
+      ? {
+          kind: "opencode",
+          port: descriptor.port,
+          ...(descriptor.capabilities !== undefined
+            ? { capabilities: descriptor.capabilities }
+            : converting && mode === "add"
+              ? { capabilities: CONVERSION_ISOLATION_FLOOR }
+              : {}),
+        }
+      : runnerDraftFor(existing, args.port, converting && mode === "add");
   const input: HostDraftInput = {
     name,
     transport:
@@ -613,7 +671,8 @@ async function writeHost(
       : existing?.transport === "ssh" && existing.sshAlias !== undefined
         ? { sshAlias: existing.sshAlias }
         : {}),
-    worktreeRoot: args.worktreeRoot ?? existing?.worktreeRoot ?? "",
+    worktreeRoot:
+      descriptor?.worktreeRoot ?? args.worktreeRoot ?? existing?.worktreeRoot ?? "",
     ...(existing?.tmpDir !== undefined ? { tmpDir: existing.tmpDir } : {}),
     roles: roles ?? [...(existing?.roles ?? ["lane-runner"])],
     ...(runner !== undefined ? { runner } : {}),
@@ -684,6 +743,31 @@ async function writeHost(
   if (hostProbesHaveFailure(lines)) {
     io.stderr("refused: a probe reported FAIL; nothing was written\n");
     return 1;
+  }
+  // The probe beats the descriptor's claim: the only claim the probe can
+  // measure is the runner tool's version, and the file carries no version
+  // field, so the claim is never written. Neither value is printed — the
+  // descriptor's value is untrusted file content, the measured one already
+  // sits on the probe line above.
+  if (descriptor !== undefined) {
+    const versionLine = lines.find((line) => line.check === "version-opencode");
+    if (versionLine !== undefined) {
+      if (versionLine.status === "UNKNOWN") {
+        io.stdout(
+          "the descriptor's claimed opencode version could not be measured; the claim is not written\n",
+        );
+      } else if (versionLine.status === "PASS") {
+        const prefix = "opencode: version ";
+        if (versionLine.detail.startsWith(prefix)) {
+          const measured = versionLine.detail.slice(prefix.length);
+          if (measured !== descriptor.tools[0].version) {
+            io.stdout(
+              "the descriptor's claimed opencode version does not match the measured one; the measured version stands\n",
+            );
+          }
+        }
+      }
+    }
   }
   if (movedFrom.length > 0) {
     io.stdout(

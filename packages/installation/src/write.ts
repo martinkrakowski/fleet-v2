@@ -229,6 +229,29 @@ function serializePolicy(policy: PolicySection): Record<string, unknown> {
         }
         reaper.repairs = repairs;
       }
+      if (policy.conductor.reaper.worktrees !== undefined) {
+        const worktrees: Record<string, unknown> = {};
+        if (policy.conductor.reaper.worktrees.retentionHours !== undefined) {
+          worktrees.retentionHours = policy.conductor.reaper.worktrees.retentionHours;
+        }
+        if (policy.conductor.reaper.worktrees.maxRemovalsPerPass !== undefined) {
+          worktrees.maxRemovalsPerPass = policy.conductor.reaper.worktrees.maxRemovalsPerPass;
+        }
+        if (policy.conductor.reaper.worktrees.passBudgetSeconds !== undefined) {
+          worktrees.passBudgetSeconds = policy.conductor.reaper.worktrees.passBudgetSeconds;
+        }
+        reaper.worktrees = worktrees;
+      }
+      if (policy.conductor.reaper.disk !== undefined) {
+        const disk: Record<string, unknown> = {};
+        if (policy.conductor.reaper.disk.minFreePercent !== undefined) {
+          disk.minFreePercent = policy.conductor.reaper.disk.minFreePercent;
+        }
+        if (policy.conductor.reaper.disk.clearFreePercent !== undefined) {
+          disk.clearFreePercent = policy.conductor.reaper.disk.clearFreePercent;
+        }
+        reaper.disk = disk;
+      }
       conductor.reaper = reaper;
     }
     out.conductor = conductor;

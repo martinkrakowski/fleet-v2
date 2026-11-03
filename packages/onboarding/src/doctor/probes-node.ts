@@ -422,6 +422,8 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
           '-sS',
           '--max-time',
           '5',
+          '--noproxy',
+          '*',
           '-o',
           '/dev/null',
           '-w',
@@ -456,7 +458,15 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
       const listed = await runOnHost(
         executors,
         host,
-        ['curl', '-sS', '--max-time', '5', `http://127.0.0.1:${port}/api/model`],
+        [
+          'curl',
+          '-sS',
+          '--max-time',
+          '5',
+          '--noproxy',
+          '*',
+          `http://127.0.0.1:${port}/api/model`,
+        ],
       );
       const reason = `the opencode server on 127.0.0.1:${port} answered`;
       if (listed.error !== undefined || listed.exitCode !== 0) {

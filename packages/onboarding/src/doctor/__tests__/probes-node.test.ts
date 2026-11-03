@@ -379,14 +379,33 @@ describe('createNodeDoctorProbes', () => {
         '-sS',
         '--max-time',
         '5',
+        '--noproxy',
+        '*',
         '-o',
         '/dev/null',
         '-w',
         '%{http_code}',
         'http://127.0.0.1:4096/api/info',
       ],
-      ['curl', '-sS', '--max-time', '5', 'http://127.0.0.1:4096/api/model'],
+      ['curl', '-sS', '--max-time', '5', '--noproxy', '*', 'http://127.0.0.1:4096/api/model'],
     ]);
+  });
+
+  it('bypasses any proxy by passing --noproxy * in every loopback curl probe', async () => {
+    const local = fakeExecutor(({ argv }) =>
+      argv.some((arg) => arg.endsWith('/api/model'))
+        ? { exitCode: 0, signal: null, stdout: '{"data":{"models":{}}}', stderr: '' }
+        : { exitCode: 0, signal: null, stdout: '200', stderr: '' },
+    );
+    const probes = createNodeDoctorProbes({ localExecutor: local.executor });
+    await probes.serverProbe('local', 4096);
+
+    expect(local.calls).toHaveLength(2);
+    for (const call of local.calls) {
+      const noproxyIndex = call.argv.indexOf('--noproxy');
+      expect(noproxyIndex).toBeGreaterThan(-1);
+      expect(call.argv[noproxyIndex + 1]).toBe('*');
+    }
   });
 
   it('sends the server probe argv over ssh without a tunnel or credential', async () => {
@@ -412,6 +431,8 @@ describe('createNodeDoctorProbes', () => {
       '-sS',
       '--max-time',
       '5',
+      '--noproxy',
+      '*',
       '-o',
       '/dev/null',
       '-w',

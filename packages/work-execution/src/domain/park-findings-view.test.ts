@@ -158,6 +158,29 @@ describe('boundedFindingsView', () => {
   it('drops a summary that flattens to whitespace only', () => {
     expect(boundedFindingsView([finding({ summary: '\n\n\t' })])).toEqual([]);
   });
+
+  it('drops a summary whose first 160 code points are whitespace with visible text past the cap', () => {
+    const summary = ' '.repeat(PARK_FINDING_SUMMARY_MAX) + 'real finding';
+    const view = boundedFindingsView([finding({ summary, filePath: null, line: null })]);
+    expect(view).toEqual([]);
+  });
+
+  it('drops a summary whose first 160 code points are format controls with visible text past the cap', () => {
+    const summary = '\u061C'.repeat(PARK_FINDING_SUMMARY_MAX) + 'real finding';
+    const view = boundedFindingsView([finding({ summary, filePath: null, line: null })]);
+    expect(view).toEqual([]);
+  });
+
+  it('drops a secret split by a format control instead of keeping the spaced token', () => {
+    const split = 'sk-\u061C' + 'A'.repeat(24);
+    const view = boundedFindingsView([finding({ summary: split, filePath: null, line: null })]);
+    expect(view).toEqual([]);
+    // The control is still flattened for a benign summary.
+    const benign = boundedFindingsView([
+      finding({ summary: 'a\u061Cb', filePath: null, line: null }),
+    ]);
+    expect(benign[0]!.summary).toBe('a b');
+  });
 });
 
 describe('parkFindingsSnapshotOf and isParkFindingView', () => {

@@ -53,14 +53,33 @@ function summaryOf(value: unknown): string | null {
   if (typeof value !== 'string') {
     return null;
   }
-  const flattened = value.replace(FORBIDDEN_SUMMARY_FLATTEN, ' ');
-  if (flattened.trim().length === 0) {
+  // Secret detection runs before any character replacement, on the raw text
+  // and on a copy with every forbidden character removed: a format control
+  // inside a secret must not break the contiguous shape the patterns look
+  // for, and the space-flattened form is checked too for secrets the raw
+  // text hides with the controls it carries.
+  if (containsSecretShape(value)) {
     return null;
   }
+  const controlStripped = value.replace(FORBIDDEN_SUMMARY_FLATTEN, '');
+  if (containsSecretShape(controlStripped)) {
+    return null;
+  }
+  const flattened = value.replace(FORBIDDEN_SUMMARY_FLATTEN, ' ');
   if (containsSecretShape(flattened)) {
     return null;
   }
-  return Array.from(flattened).slice(0, PARK_FINDING_SUMMARY_MAX).join('');
+  if (flattened.trim().length === 0) {
+    return null;
+  }
+  const bounded = Array.from(flattened).slice(0, PARK_FINDING_SUMMARY_MAX).join('');
+  // A summary whose first cap code points are whitespace (or controls
+  // flattened to spaces) has no owner-visible text inside the cap and is
+  // dropped rather than returned as a whitespace-only string.
+  if (bounded.trim().length === 0) {
+    return null;
+  }
+  return bounded;
 }
 
 /** A plain worktree-relative path, or null when the finding's path is dropped. */

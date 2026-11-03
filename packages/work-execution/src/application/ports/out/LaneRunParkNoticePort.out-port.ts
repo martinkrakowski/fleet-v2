@@ -16,6 +16,8 @@ export interface LaneRunParkRequest {
   readonly workOrderId: string;
   readonly runId: string;
   readonly reason: string;
+  /** The run's park ordinal; names the park occurrence in the item summary. */
+  readonly parkCount?: number;
   readonly qualifier?: string;
   /** Bounded, sanitized by the caller; the adapter re-checks the caps. */
   readonly findings?: readonly LaneRunParkFindingView[];
@@ -35,7 +37,7 @@ export type LaneRunParkFindResult =
   | { readonly outcome: 'unavailable' };
 
 export interface LaneRunParkNoticePort {
-  /** Raise the run's attention item; a repeat refreshes it, never piling up. */
+  /** Raise the run's attention item; a repeat of the same park occurrence writes nothing; a new park of the run refreshes or reopens it. */
   recordParkAttention(request: LaneRunParkRequest): Promise<LaneRunParkNoticeResult>;
   /** Ask the keyed owner question for reasons the owner must decide; a repeat returns the stored question. */
   askParkQuestion(request: LaneRunParkRequest): Promise<LaneRunParkNoticeResult>;

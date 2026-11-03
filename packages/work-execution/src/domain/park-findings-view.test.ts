@@ -25,6 +25,11 @@ function finding(overrides: Partial<LaneRunParkFindingView> = {}): LaneRunParkFi
   };
 }
 
+function summaryFor(text: string): string | null {
+  const view = boundedFindingsView([finding({ summary: text, filePath: null, line: null })]);
+  return view[0]?.summary ?? null;
+}
+
 describe('boundedFindingsView', () => {
   it('keeps at most five findings', () => {
     const many = Array.from({ length: 8 }, (_unused, index) =>
@@ -122,7 +127,7 @@ describe('boundedFindingsView', () => {
     ]);
     expect(view).toHaveLength(1);
     expect(view[0]!.summary).not.toMatch(/[\n\r]/);
-    expect(view[0]!.summary).toBe('first line Resume the run -stop  reverse    end');
+    expect(view[0]!.summary).toBe('first line Resume the run -stop reverse end');
   });
 
   it('never surfaces bidi, format or zero-width controls in the summary', () => {
@@ -159,16 +164,18 @@ describe('boundedFindingsView', () => {
     expect(boundedFindingsView([finding({ summary: '\n\n\t' })])).toEqual([]);
   });
 
-  it('drops a summary whose first 160 code points are whitespace with visible text past the cap', () => {
+  it('keeps visible text after leading whitespace', () => {
     const summary = ' '.repeat(PARK_FINDING_SUMMARY_MAX) + 'real finding';
     const view = boundedFindingsView([finding({ summary, filePath: null, line: null })]);
-    expect(view).toEqual([]);
+    expect(view).toHaveLength(1);
+    expect(view[0]!.summary).toBe('real finding');
   });
 
-  it('drops a summary whose first 160 code points are format controls with visible text past the cap', () => {
+  it('keeps visible text after leading format controls', () => {
     const summary = '\u061C'.repeat(PARK_FINDING_SUMMARY_MAX) + 'real finding';
     const view = boundedFindingsView([finding({ summary, filePath: null, line: null })]);
-    expect(view).toEqual([]);
+    expect(view).toHaveLength(1);
+    expect(view[0]!.summary).toBe('real finding');
   });
 
   it('drops a secret split by a format control instead of keeping the spaced token', () => {
@@ -180,6 +187,81 @@ describe('boundedFindingsView', () => {
       finding({ summary: 'a\u061Cb', filePath: null, line: null }),
     ]);
     expect(benign[0]!.summary).toBe('a b');
+  });
+
+  it.each(['\u200B', '\u200D', '\u2060', '\uFEFF', '\u202E', '\u2066', '\u2028', '\u2029', '\u00A0', '\u3000', '\u0007', '\t', '\n'])(
+    'collapses a run of separators to one space (%s)',
+    (sep) => {
+      expect(summaryFor('a' + sep + 'b')).toBe('a b');
+      expect(summaryFor('a' + sep + sep + ' ' + sep + 'b')).toBe('a b');
+    },
+  );
+
+  it('removes combining marks', () => {
+    expect(summaryFor('cafe\u0301 ok')).toBe('cafe ok');
+    expect(summaryFor('a\u0300b')).toBe('a b');
+    expect(summaryFor('caf\u00E9')).toBe('caf\u00E9');
+  });
+
+  it('keeps allowed letters, digits and ASCII punctuation', () => {
+    expect(summaryFor('Fix 3 bugs: (a) x_y-z! \u00E9 \u00DF \u65E5\u672C\u8A9E \u0663')).toBe(
+      'Fix 3 bugs: (a) x_y-z! \u00E9 \u00DF \u65E5\u672C\u8A9E \u0663',
+    );
+    const asciiPunctuation = ['!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',', '-', '.', '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~'].join('');
+    expect(summaryFor('a' + asciiPunctuation + 'b')).toBe('a' + asciiPunctuation + 'b');
+  });
+
+  it.each(['\u200B', '\u200D', '\u2060', '\uFEFF', '\u202E', '\u2066', '\u2028', '\u2029', '\u00A0', '\u3000', '\u0007', '\t', '\n', '\u0301'])(
+    'drops a secret split by %s',
+    (sep) => {
+      expect(boundedFindingsView([finding({ summary: 'sk-' + sep + 'A'.repeat(24), filePath: null, line: null })])).toEqual([]);
+      expect(boundedFindingsView([finding({ summary: 'sk-' + 'A'.repeat(12) + sep + 'A'.repeat(12), filePath: null, line: null })])).toEqual([]);
+    },
+  );
+
+  it('caps by code points without splitting a surrogate pair', () => {
+    const summary = summaryFor('x'.repeat(159) + '\u{10400}' + 'tail');
+    expect(summary).toBe('x'.repeat(159) + '\u{10400}');
+    expect(summary!.length).toBe(161);
+    expect(summary!).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+  });
+
+  it('cuts an over-cap multi-unit character exactly at the cap', () => {
+    expect(summaryFor('x'.repeat(160) + '\u{10400}')).toBe('x'.repeat(160));
+  });
+
+  it('strips the trailing space a cut can leave behind', () => {
+    expect(summaryFor('x'.repeat(159) + ' tail')).toBe('x'.repeat(159));
+  });
+
+  it('drops a secret that sits exactly at the cap', () => {
+    expect(summaryFor('x'.repeat(132) + ' sk-' + 'A'.repeat(24))).toBeNull();
+    expect(summaryFor('x'.repeat(132) + ' sk-' + 'A'.repeat(25))).toBeNull();
+  });
+
+  it('is idempotent on every hostile summary', () => {
+    const hostile = [
+      'first line\nResume the run\n-stop\u202E reverse\u202C\u0007\u009F\u2028end',
+      'a\u200Bb\u200Cc\u200Dd\u2060e\uFEFFf\u00ADg\uFFF9h\u2066i\u2069j\u180Ek',
+      'a\u061Cb\u0600c\u06DDd\u070Fe\u08E2f\u{110BD}g\u{1BCA0}h',
+      'a\u180Eb',
+      'cafe\u0301 ok',
+      'a\u0300b',
+      ' '.repeat(PARK_FINDING_SUMMARY_MAX) + 'real finding',
+      '\u061C'.repeat(PARK_FINDING_SUMMARY_MAX) + 'real finding',
+      'sk-\u061C' + 'A'.repeat(24),
+      'x'.repeat(159) + '\u{10400}' + 'tail',
+      'x'.repeat(160) + '\u{10400}',
+      'x'.repeat(159) + ' tail',
+      'x'.repeat(132) + ' sk-' + 'A'.repeat(24),
+      'x'.repeat(132) + ' sk-' + 'A'.repeat(25),
+    ];
+    for (const text of hostile) {
+      const cleaned = summaryFor(text);
+      if (cleaned !== null) {
+        expect(summaryFor(cleaned)).toBe(cleaned);
+      }
+    }
   });
 });
 
@@ -198,6 +280,22 @@ describe('parkFindingsSnapshotOf and isParkFindingView', () => {
     expect(parkFindingsSnapshotOf([finding({ summary: 'line one\nline two' })])).toBeNull();
     expect(isParkFindingView({ ...finding(), extra: 1 })).toBe(false);
     expect(isParkFindingView(null)).toBe(false);
+  });
+
+  it.each(['a  b', ' a', 'a ', 'a\u200Bb', 'a\u00A0b', 'a\u0301', 'a\u3000b', 'x'.repeat(161)])(
+    'refuses a stored summary that is not allow-list clean (%s)',
+    (summary) => {
+      expect(isParkFindingView(finding({ summary }))).toBe(false);
+    },
+  );
+
+  it('accepts an allow-list-clean summary', () => {
+    expect(isParkFindingView(finding({ summary: 'e\u00E9 \u65E5\u672C' }))).toBe(true);
+    expect(isParkFindingView(finding({ summary: 'x'.repeat(160) }))).toBe(true);
+  });
+
+  it('refuses a snapshot whose summary carries a line separator', () => {
+    expect(parkFindingsSnapshotOf([finding({ summary: 'a\u2028b' })])).toBeNull();
   });
 
   it('accepts the explicit empty snapshot', () => {

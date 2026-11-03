@@ -26,16 +26,13 @@ const FINDING_ID_PATTERN = /^[0-9A-Za-z-]{1,128}$/;
 const FILE_PATH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 
 /**
- * Characters a summary may never carry into an owner surface: C0/C1 controls,
- * all Unicode format controls (including bidi controls, zero-width marks,
- * soft hyphens, U+180E, U+061C and every other Cf character), and line and
- * paragraph separators. In the bounded view these are flattened to spaces; a
- * stored snapshot carrying any of them is refused.
+ * Any run of characters that is not a Unicode letter, a Unicode digit or
+ * ASCII punctuation (`\x21-\x7E` also covers ASCII letters and digits): the
+ * ASCII space, all other whitespace, controls, Unicode format characters,
+ * line and paragraph separators, combining marks and lone surrogates. Every
+ * such run is collapsed to a single space in the bounded view.
  */
-const FORBIDDEN_SUMMARY_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
-
-/** The global form used to flatten forbidden summaries to spaces. */
-const FORBIDDEN_SUMMARY_FLATTEN = new RegExp(FORBIDDEN_SUMMARY_PATTERN.source, 'gu');
+const NON_ALLOWED_SUMMARY_RUN = /[^\p{L}\p{N}\x21-\x7E]+/gu;
 
 const SEVERITIES = ['blocker', 'major', 'minor', 'nit'] as const;
 
@@ -53,33 +50,22 @@ function summaryOf(value: unknown): string | null {
   if (typeof value !== 'string') {
     return null;
   }
-  // Secret detection runs before any character replacement, on the raw text
-  // and on a copy with every forbidden character removed: a format control
-  // inside a secret must not break the contiguous shape the patterns look
-  // for, and the space-flattened form is checked too for secrets the raw
-  // text hides with the controls it carries.
-  if (containsSecretShape(value)) {
+  // Allow-list cleaning: every run of characters that is not a Unicode letter,
+  // a Unicode digit or ASCII punctuation collapses to a single space, and
+  // leading/trailing spaces are trimmed. The secret check runs last, on the
+  // final string only, never on the raw input.
+  const flattened = value.replace(NON_ALLOWED_SUMMARY_RUN, ' ');
+  const stripped = flattened.replace(/^ +| +$/g, '');
+  const bounded = Array.from(stripped).slice(0, PARK_FINDING_SUMMARY_MAX).join('');
+  // The code-point cap can leave a trailing space behind; trim it again.
+  const final = bounded.replace(/ +$/, '');
+  if (final.length === 0) {
     return null;
   }
-  const controlStripped = value.replace(FORBIDDEN_SUMMARY_FLATTEN, '');
-  if (containsSecretShape(controlStripped)) {
+  if (containsSecretShape(final) || containsSecretShape(final.replace(/ /g, ''))) {
     return null;
   }
-  const flattened = value.replace(FORBIDDEN_SUMMARY_FLATTEN, ' ');
-  if (containsSecretShape(flattened)) {
-    return null;
-  }
-  if (flattened.trim().length === 0) {
-    return null;
-  }
-  const bounded = Array.from(flattened).slice(0, PARK_FINDING_SUMMARY_MAX).join('');
-  // A summary whose first cap code points are whitespace (or controls
-  // flattened to spaces) has no owner-visible text inside the cap and is
-  // dropped rather than returned as a whitespace-only string.
-  if (bounded.trim().length === 0) {
-    return null;
-  }
-  return bounded;
+  return final;
 }
 
 /** A plain worktree-relative path, or null when the finding's path is dropped. */
@@ -118,8 +104,8 @@ function findingIdOf(value: unknown): string | null {
 
 /**
  * True when `value` is exactly a bounded findings-view object: the five fields
- * present with the contract's types, a clean bounded summary, and no extra
- * keys. Used to validate a stored snapshot.
+ * present with the contract's types, an allow-list-cleaned bounded summary,
+ * and no extra keys. Used to validate a stored snapshot.
  */
 export function isParkFindingView(value: unknown): value is LaneRunParkFindingView {
   if (!isPlainRecordObject(value)) {
@@ -134,13 +120,13 @@ export function isParkFindingView(value: unknown): value is LaneRunParkFindingVi
   if (severityOf(value.severity) === null) {
     return false;
   }
-  if (typeof value.summary !== 'string' || FORBIDDEN_SUMMARY_PATTERN.test(value.summary)) {
+  if (typeof value.summary !== 'string') {
     return false;
   }
   if (Array.from(value.summary).length > PARK_FINDING_SUMMARY_MAX) {
     return false;
   }
-  if (summaryOf(value.summary) === null) {
+  if (summaryOf(value.summary) !== value.summary) {
     return false;
   }
   if (value.filePath !== null && filePathOf(value.filePath) === null) {
@@ -174,7 +160,7 @@ export function parkFindingsSnapshotOf(snapshot: unknown): readonly LaneRunParkF
 
 /**
  * The bounded view of one receipt's findings: at most `PARK_FINDINGS_MAX_COUNT`
- * findings, each with a truncated, control-flattened and secret-free summary, a
+ * findings, each with a truncated, allow-list-cleaned and secret-free summary, a
  * kept (or null) worktree-relative file path and a non-negative line. Anything
  * that is not an array (including null) yields `[]`. Unknown shapes are dropped,
  * never guessed.

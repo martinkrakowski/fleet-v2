@@ -2041,6 +2041,24 @@ describe('G3f (R4b): a merged PR with the lane head leaves branch-behind and amb
     assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
   });
 
+  it('G3f: a step-refused open-pr park enters merged once its PR merges containing the lane head', () => {
+    const rec = record({ parked: { reason: 'step-refused', qualifier: 'open-pr', parkedFrom: 'opening-pr', questionId: null }, parkCount: 1 });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('G3f: a stop-unconfirmed park enters merged once its PR merges containing the lane head', () => {
+    const rec = record({ parked: PARKED_UNCONFIRMED, parkCount: 1 });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('G3f: a parked run with an open owner question is not decided by the merged-PR rule', () => {
+    const rec = record({ parked: { reason: 'seat-plan-exhausted', qualifier: null, parkedFrom: 'running', questionId: 'question-example-1' }, parkCount: 1 });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });
+    expect(decide(rec, facts)).not.toEqual({ kind: 'enter', to: 'merged' });
+  });
+
   it('R4c: eligible parks without questions leave once their merged PR carries the lane head', () => {
     for (const parked of [
       { reason: 'ambiguous', qualifier: 'merge', parkedFrom: 'merging', questionId: null },

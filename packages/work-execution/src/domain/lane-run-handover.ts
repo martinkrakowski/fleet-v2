@@ -40,6 +40,8 @@ export interface RenderHandoverBriefInput {
   readonly gatePredicates: readonly { readonly name: string; readonly verdict: 'fail' | 'unknown'; readonly exitCode: number | null }[];
   readonly proofCommands: readonly (readonly string[])[];
   readonly originalBrief: string | null;
+  /** GB3a: the previous fix seat left uncommitted work; prepend the handover note. */
+  readonly uncommittedHandover?: boolean;
 }
 
 export type RenderHandoverBriefResult =
@@ -165,6 +167,9 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
     }
   } else {
     return { ok: false, reason: 'nothing-to-fix' };
+  }
+  if (input.uncommittedHandover === true) {
+    rawLines.unshift({ text: '[handover] The previous seat left uncommitted work in this worktree; finish that work and commit it. Do not discard it.' });
   }
 
   const numbered = rawLines.slice(0, MAX_NUMBERED_FIXES);

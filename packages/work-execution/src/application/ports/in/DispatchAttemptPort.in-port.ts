@@ -24,6 +24,10 @@ export interface DispatchAttemptRequest {
   readonly seatOverride?: AttemptSeatOverrideRecord;
   readonly reviewerSeat?: string;
   /**
+   * GB3a: the previous fix seat left uncommitted work; the worktree is handed over unchanged.
+   */
+  readonly allowUncommittedHandover?: boolean;
+  /**
    * The installation schema version the dispatching root runs under (H9a2).
    * A v2 installation never defaults the seat tool: a frozen manifest whose
    * model assignment carries no `seatTool` refuses. A v1 or absent

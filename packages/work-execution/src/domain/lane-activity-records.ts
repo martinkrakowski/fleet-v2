@@ -20,9 +20,9 @@ import {
 export const LANE_DECLARATION_RECORD_VERSION = 1 as const;
 export const LANE_BRIEF_READ_RECORD_VERSION = 1 as const;
 
-/** seatRole and model are single-line plain text, 1–120 code points. */
+/** seatRole and model are single-line plain text, 1–120 code points; all single-line fields refuse C0, DEL, C1, U+2028 and U+2029. */
 export const LANE_DECLARATION_TEXT_LIMIT = 120;
-/** The brief path cap, the same `pathBytes` bound lane-plan-records uses. */
+/** The brief path cap, 256 UTF-8 bytes, the same `pathBytes` bound lane-plan-records uses. */
 export const BRIEF_READ_PATH_LIMIT = 256;
 
 /** One `plan declare` record. The store keeps every declaration; the board applies lapse. */
@@ -58,9 +58,9 @@ export type BriefReadParseResult =
 const DECLARATION_KEYS = ['lane', 'step', 'seatRole', 'model'] as const;
 const BRIEF_READ_KEYS = ['lane', 'path', 'outcome', 'sha256', 'bytes'] as const;
 
-/** No control character, no line break: single-line plain text or refused. */
+/** Refuses C0, DEL, C1, U+2028 and U+2029: single-line plain text or refused. */
 // eslint-disable-next-line no-control-regex
-const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 function isRecordObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -84,12 +84,26 @@ function hasExactlyKeysOf(
   return own.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
 }
 
+const UTF8_ENCODER = new TextEncoder();
+
+function utf8ByteLength(value: string): number {
+  return UTF8_ENCODER.encode(value).length;
+}
+
 function isBoundedPlain(value: unknown, limit: number): value is string {
   if (typeof value !== 'string' || CONTROL_CHARACTER_PATTERN.test(value)) {
     return false;
   }
   const codePoints = [...value].length;
   return codePoints >= 1 && codePoints <= limit;
+}
+
+function isBoundedPlainBytes(value: unknown, limitBytes: number): value is string {
+  if (typeof value !== 'string' || CONTROL_CHARACTER_PATTERN.test(value)) {
+    return false;
+  }
+  const bytes = utf8ByteLength(value);
+  return bytes >= 1 && bytes <= limitBytes;
 }
 
 function isCanonicalIso(value: unknown): value is string {
@@ -123,7 +137,7 @@ function isLaneRef(value: unknown): value is LaneRef {
       value.kind === 'work-order' &&
       typeof value.projectId === 'string' && PLAN_PROJECT_ID_PATTERN.test(value.projectId) &&
       typeof value.workOrderId === 'string' && value.workOrderId.length > 0 &&
-      isBoundedPlain(value.workOrderId, BRIEF_READ_PATH_LIMIT)
+      isBoundedPlainBytes(value.workOrderId, BRIEF_READ_PATH_LIMIT)
     );
   }
   return false;
@@ -240,7 +254,7 @@ export function parseBriefReadBody(body: unknown, nowIso: string): BriefReadPars
   if (!isLaneRef(record.lane)) {
     return { ok: false, error: 'invalid lane' };
   }
-  if (!isBoundedPlain(record.path, BRIEF_READ_PATH_LIMIT)) {
+  if (!isBoundedPlainBytes(record.path, BRIEF_READ_PATH_LIMIT)) {
     return { ok: false, error: 'invalid path' };
   }
   if (record.outcome !== 'read' && record.outcome !== 'failed') {
@@ -300,7 +314,7 @@ export function isBriefReadRecord(value: unknown): value is BriefReadRecord {
   if (!isRecordObject(value) || value.version !== LANE_BRIEF_READ_RECORD_VERSION) {
     return false;
   }
-  if (!isLaneRef(value.lane) || !isBoundedPlain(value.path, BRIEF_READ_PATH_LIMIT)) {
+  if (!isLaneRef(value.lane) || !isBoundedPlainBytes(value.path, BRIEF_READ_PATH_LIMIT)) {
     return false;
   }
   if (value.outcome !== 'read' && value.outcome !== 'failed') {

@@ -8,6 +8,7 @@
  * `nextLaneRunAction`: no I/O, no clock — time enters only through `nowIso`.
  */
 
+import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { REAPER_SUBJECT_ID_PATTERN } from './lane-run-keys.js';
 import type { ReaperFindingKind } from './lane-run-keys.js';
 
@@ -19,6 +20,23 @@ import type { ReaperFindingKind } from './lane-run-keys.js';
  */
 const SECRET_SHAPED_SUBJECT_PATTERN =
   /^(?:gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9_-]+|sk-(?:ant-)?[A-Za-z0-9_-]+|xox[bpas]-[A-Za-z0-9-]+|AKIA[0-9A-Z]{16}|npm_[A-Za-z0-9]+)$/;
+
+/**
+ * True when `text` matches the repository's secret detectors: `containsSecretShape`
+ * from `@fleet/shared`, the `LANE_DIFF_SECRET_PATTERNS` registry, or the token
+ * pattern. A credential never reaches a finding. Pure, no I/O.
+ */
+function isSecretShaped(text: string): boolean {
+  if (containsSecretShape(text) || containsSecretShape(text.replace(/ /g, ''))) {
+    return true;
+  }
+  for (const pattern of LANE_DIFF_SECRET_PATTERNS) {
+    if (pattern.regex.test(text)) {
+      return true;
+    }
+  }
+  return SECRET_SHAPED_SUBJECT_PATTERN.test(text);
+}
 
 /** The stored finding record's schema version (D6, D-R8): the first version, 1. */
 export const REAPER_FINDING_SCHEMA_VERSION = 1;
@@ -211,6 +229,158 @@ function kindVerdict(
   }
 }
 
+/** Prior sighting state resolved from open findings. */
+interface SightingInfo {
+  readonly firstSightingIso: string;
+  readonly sightings: number;
+  readonly previousSightingMs: number | null;
+  readonly hasPrior: boolean;
+}
+
+/** Finds the prior open finding for the given (kind, subject) pair. */
+function findPriorFinding(
+  openFindings: readonly ReaperFinding[],
+  kind: ReaperFindingKind,
+  subject: string,
+): ReaperFinding | null {
+  for (const open of openFindings) {
+    if (open !== null && typeof open === 'object' && open.kind === kind && open.subject === subject) {
+      return open;
+    }
+  }
+  return null;
+}
+
+/** Computes the sighting counters and timestamps from the prior finding. */
+function resolveSighting(
+  prior: ReaperFinding | null,
+  nowIso: string,
+): SightingInfo {
+  if (prior === null) {
+    return {
+      firstSightingIso: nowIso,
+      sightings: 1,
+      previousSightingMs: null,
+      hasPrior: false,
+    };
+  }
+  return {
+    firstSightingIso: prior.firstSightingIso,
+    sightings: prior.sightings + 1,
+    previousSightingMs: msOf(prior.lastSightingIso),
+    hasPrior: true,
+  };
+}
+
+/**
+ * Resolves the action for one finding: wait on young activity or until two
+ * sightings separated by at least the grace interval have elapsed; then
+ * repair when eligible under policy, otherwise report.
+ */
+function resolveAction(
+  young: boolean,
+  sighting: SightingInfo,
+  nowMs: number | null,
+  graceMs: number,
+  repairEligible: boolean,
+): ReaperFindingAction {
+  if (young) {
+    return 'wait';
+  }
+  const gapElapsed =
+    sighting.previousSightingMs !== null &&
+    nowMs !== null &&
+    nowMs - sighting.previousSightingMs >= graceMs;
+  const acts = sighting.hasPrior && sighting.sightings >= 2 && gapElapsed;
+  if (!acts) {
+    return 'wait';
+  }
+  if (repairEligible) {
+    return 'repair';
+  }
+  return 'report';
+}
+
+/**
+ * True when `subject` is a valid identifier that does not match any credential shape.
+ */
+function isValidSubject(subject: unknown): subject is string {
+  return typeof subject === 'string' &&
+    REAPER_SUBJECT_ID_PATTERN.test(subject) &&
+    !isSecretShaped(subject);
+}
+
+/**
+ * Classifies one observation against prior sightings and policy. Answers null
+ * when the observation is malformed, its subject is rejected or the kind's
+ * seen condition is not met.
+ */
+function classifyObservation(
+  observation: ReaperObservation,
+  openFindings: readonly ReaperFinding[],
+  nowIso: string,
+  nowMs: number | null,
+  graceMs: number,
+  staleStopMinutes: number,
+  minFreePercent: number,
+  repairs: ReaperPolicy['repairs'],
+): ReaperFinding | null {
+  if (observation === null || typeof observation !== 'object') {
+    return null;
+  }
+  const kind = observation.kind;
+  const subject = observation.subject;
+  if (!isValidSubject(subject)) {
+    return null;
+  }
+  const verdict = kindVerdict(
+    observation,
+    staleStopMinutes,
+    minFreePercent,
+    nowMs,
+    repairEnabled(repairs, kind),
+  );
+  if (!verdict.seen) {
+    return null;
+  }
+
+  const prior = findPriorFinding(openFindings, kind, subject);
+  const sighting = resolveSighting(prior, nowIso);
+  const action = resolveAction(
+    observation.youngActivity === true,
+    sighting,
+    nowMs,
+    graceMs,
+    verdict.repairEligible,
+  );
+
+  return {
+    schemaVersion: REAPER_FINDING_SCHEMA_VERSION,
+    kind,
+    subject,
+    action,
+    firstSightingIso: sighting.firstSightingIso,
+    lastSightingIso: nowIso,
+    sightings: sighting.sightings,
+  };
+}
+
+/**
+ * Precedence (KW1, §3.10.2): a subject under `merged-worktree` is not
+ * reported as `orphan-worktree` as well.
+ */
+function applyPrecedence(
+  findings: readonly ReaperFinding[],
+  mergedSubjects: ReadonlySet<string>,
+): readonly ReaperFinding[] {
+  if (mergedSubjects.size === 0) {
+    return findings;
+  }
+  return findings.filter(
+    (finding) => finding.kind !== 'orphan-worktree' || !mergedSubjects.has(finding.subject),
+  );
+}
+
 /**
  * The one classification of this pass (§3.9.2): per observation at most one
  * finding, in the observations' order. A finding exists only when the kind's
@@ -235,69 +405,31 @@ export function classifyZombies(
     const staleStopMinutes = minutesOf(policy.staleStopMinutes, DEFAULT_STALE_STOP_MINUTES);
     const minFreePercent = minutesOf(policy.minFreePercent, DEFAULT_MIN_FREE_PERCENT);
     const graceMs = graceMinutes * MINUTE_MS;
-    const now = msOf(nowIso);
+    const nowMs = msOf(nowIso);
     const computed: ReaperFinding[] = [];
     const mergedSubjects = new Set<string>();
 
     for (const observation of observations) {
-      if (observation === null || typeof observation !== 'object') {
+      const finding = classifyObservation(
+        observation,
+        openFindings,
+        nowIso,
+        nowMs,
+        graceMs,
+        staleStopMinutes,
+        minFreePercent,
+        policy.repairs,
+      );
+      if (finding === null) {
         continue;
       }
-      const kind = observation.kind;
-      const subject = observation.subject;
-      if (typeof subject !== 'string' || !REAPER_SUBJECT_ID_PATTERN.test(subject)
-        || SECRET_SHAPED_SUBJECT_PATTERN.test(subject)) {
-        continue;
-      }
-      const verdict = kindVerdict(observation, staleStopMinutes, minFreePercent, now, repairEnabled(policy.repairs, kind));
-      if (!verdict.seen) {
-        continue;
-      }
-
-      // Sighting bookkeeping: the prior open finding of the same (kind, subject).
-      let prior: ReaperFinding | null = null;
-      for (const open of openFindings) {
-        if (open !== null && typeof open === 'object' && open.kind === kind && open.subject === subject) {
-          prior = open;
-          break;
-        }
-      }
-      const firstSightingIso = prior === null ? nowIso : prior.firstSightingIso;
-      const sightings = prior === null ? 1 : prior.sightings + 1;
-      const previousSightingMs = prior === null ? null : msOf(prior.lastSightingIso);
-
-      // Young activity (§3.9.2): the reaper never acts inside the grace.
-      const young = observation.youngActivity === true;
-      // Two sightings and the grace: a first sighting is always `wait`; a
-      // finding acts only when seen on two passes at least G apart.
-      const gapElapsed = previousSightingMs !== null && now !== null && now - previousSightingMs >= graceMs;
-      const acts = prior !== null && sightings >= 2 && gapElapsed;
-      const action: ReaperFindingAction = young || !acts
-        ? 'wait'
-        : verdict.repairEligible
-          ? 'repair'
-          : 'report';
-
-      computed.push({
-        schemaVersion: REAPER_FINDING_SCHEMA_VERSION,
-        kind,
-        subject,
-        action,
-        firstSightingIso,
-        lastSightingIso: nowIso,
-        sightings,
-      });
-      if (kind === 'merged-worktree') {
-        mergedSubjects.add(subject);
+      computed.push(finding);
+      if (finding.kind === 'merged-worktree') {
+        mergedSubjects.add(finding.subject);
       }
     }
 
-    // Precedence (KW1, §3.10.2): a subject under `merged-worktree` is not
-    // reported as `orphan-worktree` as well.
-    if (mergedSubjects.size > 0) {
-      return computed.filter((finding) => finding.kind !== 'orphan-worktree' || !mergedSubjects.has(finding.subject));
-    }
-    return computed;
+    return applyPrecedence(computed, mergedSubjects);
   } catch {
     return [];
   }

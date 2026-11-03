@@ -476,6 +476,39 @@ describe('classifyZombies — the subject guard', () => {
     expect(classifyZombies({ observations, openFindings: [] }, NOW, {})).toEqual([]);
   });
 
+  it('an AIza… key, a ghp_… token and a sk-… key in a subject each do not appear in any returned finding', () => {
+    const validSubject = 'wt-valid000000';
+    const secretSubjects = [
+      'AIza' + 'A'.repeat(30),
+      'ghp_' + 'B'.repeat(36),
+      'sk-' + 'C'.repeat(40),
+    ];
+    for (const subject of secretSubjects) {
+      const secretObservation: ReaperObservation = {
+        kind: 'orphan-worktree',
+        subject,
+        youngActivity: false,
+        noLiveRecord: true,
+        branchPrMerged: false,
+      };
+      const validObservation: ReaperObservation = {
+        kind: 'orphan-worktree',
+        subject: validSubject,
+        youngActivity: false,
+        noLiveRecord: true,
+        branchPrMerged: false,
+      };
+      const findings = classifyZombies(
+        { observations: [secretObservation, validObservation], openFindings: [] },
+        NOW,
+        {},
+      );
+      expect(findings.some((finding) => finding.subject === subject)).toBe(false);
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.subject).toBe(validSubject);
+    }
+  });
+
   it('still accepts ordinary ids alongside rejected secret-shaped subjects', () => {
     const tokenObservation: ReaperObservation = {
       kind: 'orphan-worktree',

@@ -23,6 +23,7 @@ import type { LaneRunParkFindingView } from '../../domain/park-findings-view.js'
 import { boundedFindingsView } from '../../domain/park-findings-view.js';
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
 import { laneRunJournalPendingIntent, laneRunJournalState, laneRunJournalStopFacts } from '../../domain/lane-run-journal.js';
+import { parseLaneRunKey } from '../../domain/lane-run-keys.js';
 import { resolveLaneRunBaseBranch } from '../../domain/base-branch.js';
 import { isLeaseLapsed } from '../../domain/lane-run-lease.js';
 
@@ -87,6 +88,36 @@ async function blockedReviewFindings(
   }
 }
 
+/**
+ * The fixed refusal detail of a `step-refused` park (GB3a): the detail of the
+ * run's last final result on the park's qualifier step, or null when there is
+ * none. The park's qualifier is never matched against a result of another step.
+ */
+function parkRefusalDetailOf(record: LaneRunRecord, entries: readonly LaneRunJournalEntryRecord[]): string | null {
+  const parked = record.parked;
+  if (parked === null || parked.reason !== 'step-refused' || parked.qualifier === null) {
+    return null;
+  }
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.kind !== 'result' || entry.runId !== record.runId || entry.outcome === 'ambiguous') {
+      continue;
+    }
+    const parsed = entry.key === null ? null : parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.step !== parked.qualifier) {
+      continue;
+    }
+    // GB3c: a later result of the qualifier step whose detail is null or a
+    // `next-seat-` seat-advance token does not express the refusal that
+    // parked the run — keep scanning back for the refusal detail.
+    if (entry.detail === null || entry.detail.startsWith('next-seat-')) {
+      continue;
+    }
+    return entry.detail;
+  }
+  return null;
+}
+
 /** The status view of one run from its record and journal. */
 async function statusViewOf(
   deps: InspectLaneRunsDependencies,
@@ -97,6 +128,7 @@ async function statusViewOf(
   const stopFacts = laneRunJournalStopFacts(entries, record.runId);
   const pendingIntent = laneRunJournalPendingIntent(entries, record.runId);
   const reviewFindings = await blockedReviewFindings(deps, record);
+  const parkDetail = parkRefusalDetailOf(record, entries);
   return {
     runId: record.runId,
     workOrderId: record.workOrderId,
@@ -108,6 +140,7 @@ async function statusViewOf(
     revision: record.revision,
     parked: record.parked,
     reviewFindings,
+    ...(parkDetail !== null ? { parkDetail } : {}),
     parkCount: record.parkCount,
     stopMode: stopFacts.stopMode,
     stopRequestedAtIso: stopFacts.stopRequestedAtIso,

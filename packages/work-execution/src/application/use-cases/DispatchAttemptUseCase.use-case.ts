@@ -356,17 +356,22 @@ export class DispatchAttemptUseCase implements DispatchAttemptPort {
           : `Worktree ${request.worktreePath} does not match the base commit (checked out ${inspection.checkedOutCommit})`,
       };
     }
-    if (inspection.uncommittedPaths.length > 0) {
-      return {
-        outcome: 'refused',
-        reason: `Worktree ${request.worktreePath} has uncommitted changes: ${inspection.uncommittedPaths.join(', ')}`,
-      };
-    }
-    if (inspection.untrackedPaths.length > 0) {
-      return {
-        outcome: 'refused',
-        reason: `Worktree ${request.worktreePath} has untracked files: ${inspection.untrackedPaths.join(', ')}`,
-      };
+    // GB3a: a handed-over worktree is accepted as-is — the previous fix seat's
+    // uncommitted or untracked work is intended, not a refusal. The head-match
+    // check above and the residue check below stay unconditional.
+    if (request.allowUncommittedHandover !== true) {
+      if (inspection.uncommittedPaths.length > 0) {
+        return {
+          outcome: 'refused',
+          reason: `Worktree ${request.worktreePath} has uncommitted changes: ${inspection.uncommittedPaths.join(', ')}`,
+        };
+      }
+      if (inspection.untrackedPaths.length > 0) {
+        return {
+          outcome: 'refused',
+          reason: `Worktree ${request.worktreePath} has untracked files: ${inspection.untrackedPaths.join(', ')}`,
+        };
+      }
     }
     const preparedBriefInWorktree =
       request.briefPackagePath === '.lane/brief.md' ||

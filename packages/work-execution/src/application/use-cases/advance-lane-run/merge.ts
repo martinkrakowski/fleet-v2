@@ -205,7 +205,7 @@ function acceptedHead12Of(
  * The run's PR head branch: its recorded `branchName`, else the latest
  * attempt's worktreePath last segment (the same decision K5-5 takes).
  */
-function branchRefOf(record: LaneRunRecord, latest: AttemptRecord): PullRequestRef {
+function branchRefOf(record: LaneRunRecord, latest: AttemptRecord): Extract<PullRequestRef, { readonly kind: 'branch' }> {
   if (record.branchName !== undefined) {
     return { kind: 'branch', branchName: record.branchName };
   }
@@ -278,6 +278,7 @@ async function prFactOf(
   laneHeadSha: string | null,
   ancestry: ForgeAncestryPort | undefined,
   expectedBaseBranch: string,
+  expectedHeadRef: string | null = null,
 ): Promise<PrReadResult> {
   try {
     const read = await port.readPullRequest({ ref });
@@ -286,6 +287,9 @@ async function prFactOf(
     }
     const head12 = head12Of(read.pullRequest.headSha);
     if (head12 === null) {
+      return { pr: null, mergeState: null };
+    }
+    if (expectedHeadRef !== null && read.pullRequest.headRef !== expectedHeadRef) {
       return { pr: null, mergeState: null };
     }
     if (read.pullRequest.state === 'merged' && read.pullRequest.baseRef !== expectedBaseBranch) {
@@ -314,7 +318,9 @@ async function prFactOf(
  * run only past acceptance — a state inside the PR/CI window, a collected head
  * to read at, a bound port, and never while halted — otherwise the hard-coded
  * defaults stand (`preMerge: 'none'`, `ci: 'unknown'`, `pr: null`). The PR is
- * read once; its snapshot's merge state feeds the merge facts.
+ * read once; its snapshot's merge state feeds the merge facts. CG1: a parked
+ * run with no recorded PR number additionally reads its PR by branch, keeping
+ * only a merged PR, for the merged-PR rule only.
  */
 export async function acceptanceFactsOf(
   ctx: AdvanceStepContext,
@@ -370,6 +376,34 @@ export async function acceptanceFactsOf(
     );
     pr = prRead.pr;
     mergeState = prRead.mergeState;
+  }
+  // CG1: for a parked run with no recorded PR number (the PR was opened by
+  // hand), look the PR up by the run's own branch; the lookup keeps only a
+  // merged PR — never an open one — and is for the merged-PR rule only. It
+  // does not write the record, save a prNumber, or feed the merge facts.
+  if (
+    !halted &&
+    !canReadPr &&
+    state === 'parked' &&
+    record.parked !== null &&
+    record.prNumber === null &&
+    latest !== null &&
+    latest.artifacts !== null &&
+    ctx.deps.forgeRead !== undefined
+  ) {
+    const ref = branchRefOf(record, latest);
+    const lookup = await prFactOf(
+      ctx.deps.forgeRead,
+      ref,
+      head12,
+      latest.artifacts.headCommit,
+      ctx.deps.forgeAncestry,
+      resolveLaneRunBaseBranch(record),
+      ref.branchName,
+    );
+    if (lookup.pr !== null && lookup.pr.state === 'merged') {
+      pr = lookup.pr;
+    }
   }
   const merge = await mergeFactsOf(ctx, record, state, halted, acceptance, mergeState);
   return { acceptance, acceptanceRetry, acceptedHead12, preMerge, ci, pr, merge };

@@ -25,6 +25,10 @@ export interface LaneRunStatusView {
   readonly parked: LaneRunParkRecord | null;
   /** Bounded findings of the failed code review at the parked head; null unless parked blocker-after-round-2. */
   readonly reviewFindings: readonly LaneRunParkFindingView[] | null;
+  /**
+   * The fixed refusal detail of a `step-refused` park (e.g. `worktree-uncommitted`); absent when none.
+   */
+  readonly parkDetail?: string;
   readonly parkCount: number;
   /** The strongest stop intent's mode (laneRunJournalStopFacts); null when none. */
   readonly stopMode: RunStopMode | null;

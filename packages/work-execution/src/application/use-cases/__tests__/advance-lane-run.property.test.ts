@@ -13,6 +13,7 @@ import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
 import {
+  FakePortThrowError,
   RUN_ID,
   makeLaneRunScenario,
   portOutcomeSequenceArb,
@@ -25,19 +26,27 @@ describe('Q4a: the lane-run journal settles every intent within one pass', () =>
       fc.asyncProperty(portOutcomeSequenceArb, async (outcomes) => {
         const scenario = await makeLaneRunScenario(outcomes);
         for (let pass = 0; pass < 4; pass += 1) {
-          let threw = false;
+          let portThrew = false;
           try {
             await scenario.advance();
-          } catch {
-            threw = true;
+          } catch (error) {
+            // Only the fake ports' throws are exempted from P1(a): such a throw
+            // comes from the dispatch or reconcile port and leaves the act's
+            // intent open for the next pass to settle. Any other exception is an
+            // application-code defect — it must fail the test loudly instead of
+            // being mistaken for a port throw and silently skipping P1(a).
+            if (!(error instanceof FakePortThrowError)) {
+              throw error;
+            }
+            portThrew = true;
           }
           const entries = await scenario.journal();
           const record = await scenario.record();
           const unsettled = stepIntentKeysWithoutResult(entries, RUN_ID);
-          if (!threw) {
+          if (!portThrew) {
             // P1 (a): every step-key intent has a result, or the run is parked.
-            // A pass that threw left its intent open; this non-throwing pass
-            // settles it, so the deferred check lands here.
+            // A prior pass whose port threw left its intent open; this
+            // non-throwing pass settles it, so the deferred check lands here.
             expect(unsettled.length === 0 || (record?.parked ?? null) !== null).toBe(true);
           }
           // P1 (b): the record's parked flag and the last conduct state agree —

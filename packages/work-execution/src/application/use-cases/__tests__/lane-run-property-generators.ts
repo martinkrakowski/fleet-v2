@@ -45,6 +45,16 @@ export const portOutcomeArb = fc.constantFrom(...PORT_OUTCOMES);
 export const portOutcomeSequenceArb = fc.array(portOutcomeArb, { minLength: 1, maxLength: 8 });
 
 export const RUN_ID = 'run-01JB0000000000000000000000';
+
+/**
+ * The error the fake dispatch and reconcile ports throw on a `thrown`
+ * outcome. The Q4a property exempts exactly these throws from P1(a): a
+ * port throw leaves the act's intent open, and the next pass settles it.
+ * Any other exception from `advanceLaneRun` is an application-code defect
+ * and must fail the test instead of being treated as a port throw.
+ */
+export class FakePortThrowError extends Error {}
+
 const NOW = '2026-10-27T10:00:00.000Z';
 const LATER = '2026-10-27T10:01:00.000Z';
 const LEASE_UNTIL = '2026-10-27T10:05:00.000Z';
@@ -212,7 +222,7 @@ export async function makeLaneRunScenario(outcomes: readonly PortOutcome[]): Pro
     dispatchAttempt: async (): Promise<DispatchAttemptResult> => {
       const outcome = nextOutcome();
       if (outcome === 'thrown') {
-        throw new Error('runner threw');
+        throw new FakePortThrowError('runner threw');
       }
       if (outcome === 'refused') {
         return { outcome: 'refused', reason: 'runner refused' };
@@ -236,7 +246,7 @@ export async function makeLaneRunScenario(outcomes: readonly PortOutcome[]): Pro
     reconcileAttempt: async (): Promise<ReconcileAttemptResult> => {
       const outcome = nextOutcome();
       if (outcome === 'thrown') {
-        throw new Error('reconcile threw');
+        throw new FakePortThrowError('reconcile threw');
       }
       if (outcome === 'refused') {
         return { outcome: 'refused', reason: 'runner refused' };

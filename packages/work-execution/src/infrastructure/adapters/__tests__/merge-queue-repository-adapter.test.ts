@@ -36,7 +36,6 @@ function command(headOid: string) {
     successorEntryId: nextEntryId(),
     enqueuedAtIso: new Date().toISOString(),
     deadlineIso: futureDeadline(),
-    baseBranch: 'main',
   };
 }
 
@@ -59,15 +58,6 @@ describe('MergeQueueRepositoryAdapter', () => {
     expect(decision).toEqual({ outcome: 'refused', reason: 'invalid-head' });
     await expect(fs.stat(path.join(stateDir, 'merge-queue.json'))).rejects.toThrow();
     expect(JSON.stringify(decision)).not.toContain('not-a-real-head');
-  });
-
-  it('refuses an enqueue without a base without creating the file', async () => {
-    const adapter = new MergeQueueRepositoryAdapter({ stateDir });
-    const noBase = command(HEAD_A) as unknown as Record<string, unknown>;
-    delete noBase.baseBranch;
-    const decision = await adapter.enqueueMergeEntry(noBase as unknown as Parameters<MergeQueueRepositoryAdapter['enqueueMergeEntry']>[0]);
-    expect(decision).toEqual({ outcome: 'refused', reason: 'base-unavailable' });
-    await expect(fs.stat(path.join(stateDir, 'merge-queue.json'))).rejects.toThrow();
   });
 
   it('returns the first live entry on a duplicate and writes nothing', async () => {

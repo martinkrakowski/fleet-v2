@@ -35,7 +35,8 @@ export const LANE_RUN_EXITS = {
   'brief-check': ['code-review', 'fixing'],
   'code-review': ['accepting', 'fixing'],
   fixing: ['dispatching'],
-  accepting: ['awaiting-premerge', 'opening-pr', 'pushing'],
+  // AR1: the review-blocked acceptance rejection goes to a fix round.
+  accepting: ['awaiting-premerge', 'opening-pr', 'pushing', 'fixing'],
   // R4c: a merged PR carrying the lane head ends the run from `awaiting-premerge`
   // by itself (the decider's G3f), even though the pre-merge pass never ran.
   'awaiting-premerge': ['opening-pr', 'pushing', 'fixing', 'gating', 'merged'],

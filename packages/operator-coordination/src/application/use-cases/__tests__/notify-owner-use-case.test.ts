@@ -157,6 +157,18 @@ describe('NotifyOwnerUseCase', () => {
     });
     expect(first).toEqual({ outcome: 'suppressed', reason: 'delivery-unavailable' });
     expect(unavailable.messages).toHaveLength(0);
+    // The same instance, with the channel now healthy: the key was not
+    // remembered by the failed delivery, so this notifies.
+    unavailable.reportUnavailable = null;
+    const recoveredAfterUnavailable = await unavailableCase.notifyOwner({
+      trigger: 'attempt-ended',
+      id: 'attempt-a1',
+    });
+    expect(recoveredAfterUnavailable).toEqual({
+      outcome: 'notified',
+      text: ownerNotificationText('attempt-ended', 'attempt-a1'),
+    });
+    expect(unavailable.messages).toHaveLength(1);
 
     const throwing = new FakeDelivery();
     throwing.throwOnDeliver = true;
@@ -167,17 +179,26 @@ describe('NotifyOwnerUseCase', () => {
     });
     expect(second).toEqual({ outcome: 'suppressed', reason: 'delivery-unavailable' });
     expect(throwing.messages).toHaveLength(0);
-
-    // Neither key was remembered: a later successful delivery notifies.
-    const recovered = new FakeDelivery();
-    const recoveredCase = useCaseWith(recovered);
-    await recoveredCase.notifyOwner({ trigger: 'attempt-ended', id: 'attempt-a1' });
-    const third = await recoveredCase.notifyOwner({
+    // The same throwing instance, now healthy: the key was not remembered.
+    throwing.throwOnDeliver = false;
+    const recoveredAfterThrow = await throwingCase.notifyOwner({
       trigger: 'attempt-ended',
       id: 'attempt-a1',
     });
-    expect(third).toEqual({ outcome: 'suppressed', reason: 'rate-limited' });
-    expect(recovered.messages).toHaveLength(1);
+    expect(recoveredAfterThrow).toEqual({
+      outcome: 'notified',
+      text: ownerNotificationText('attempt-ended', 'attempt-a1'),
+    });
+    expect(throwing.messages).toHaveLength(1);
+
+    // For contrast, a key that was delivered is remembered on that same
+    // instance: the follow-up call is rate-limited.
+    const rateLimitedFollowUp = await unavailableCase.notifyOwner({
+      trigger: 'attempt-ended',
+      id: 'attempt-a1',
+    });
+    expect(rateLimitedFollowUp).toEqual({ outcome: 'suppressed', reason: 'rate-limited' });
+    expect(unavailable.messages).toHaveLength(1);
   });
 
   it('throws the fixed not-implemented error when unconfigured', async () => {

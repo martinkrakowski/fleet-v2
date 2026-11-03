@@ -1091,3 +1091,42 @@ export function describeVersionedRecordListStore<T>(
   };
   return buildStateFileDescriptor(basename, inspect);
 }
+
+/** A record-list store's current bytes, or null when the file does not exist yet. */
+export async function readStoreBytes(target: string): Promise<Buffer | null> {
+  try {
+    return await fs.readFile(target);
+  } catch (error: unknown) {
+    if (typeof error === 'object' && error !== null && (error as { code?: string }).code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/**
+ * The records in a record-list store's bytes; a missing file (null) is an empty list. An unparsable file is
+ * quarantined and `StateFileUnreadableError` is thrown, through `rejectUnreadableStateFile`.
+ */
+export async function parseRecordListOrQuarantine<T>(
+  target: string,
+  bytes: Buffer | null,
+  parse: (raw: unknown) => T | undefined,
+): Promise<readonly T[]> {
+  if (bytes === null) {
+    return [];
+  }
+  const inspection = inspectRecordListBytes(bytes, parse);
+  if (inspection.status !== 'ok') {
+    return rejectUnreadableStateFile(target, inspection.detail, bytes, false);
+  }
+  return [...inspection.records];
+}
+
+/** Byte equality of two store reads, where null (no file) equals only null: the compare-and-swap check. */
+export function sameStoreBytes(left: Buffer | null, right: Buffer | null): boolean {
+  if (left === null || right === null) {
+    return left === right;
+  }
+  return left.equals(right);
+}

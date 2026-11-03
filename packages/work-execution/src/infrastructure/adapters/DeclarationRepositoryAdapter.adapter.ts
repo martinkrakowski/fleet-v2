@@ -11,7 +11,6 @@
  * already valid.
  */
 
-import { promises as fs } from "node:fs";
 import * as path from "node:path";
 
 import type { LaneDeclarationRecord } from "../../domain/lane-activity-records.js";
@@ -21,11 +20,12 @@ import type {
   DeclarationRepositoryPort,
 } from "../../application/ports/out/DeclarationRepositoryPort.out-port.js";
 import {
-  inspectRecordListBytes,
-  rejectUnreadableStateFile,
   StateFileUnreadableError,
   withFileLock,
   writeJsonAtomically,
+  parseRecordListOrQuarantine,
+  readStoreBytes,
+  sameStoreBytes,
 } from "./file-store.js";
 
 export const LANE_DECLARATIONS_FILE = "lane-declarations.json";
@@ -66,9 +66,10 @@ export class DeclarationRepositoryAdapter implements DeclarationRepositoryPort {
       return [...this.inMemoryRecords];
     }
     try {
-      return await this.parseBytes(
+      return await parseRecordListOrQuarantine(
         path.join(stateDir, LANE_DECLARATIONS_FILE),
-        await this.readBytes(path.join(stateDir, LANE_DECLARATIONS_FILE)),
+        await readStoreBytes(path.join(stateDir, LANE_DECLARATIONS_FILE)),
+        parseLaneDeclarationStateRecord,
       );
     } catch (error: unknown) {
       if (error instanceof StateFileUnreadableError) {
@@ -101,11 +102,18 @@ export class DeclarationRepositoryAdapter implements DeclarationRepositoryPort {
     const target = path.join(stateDir, LANE_DECLARATIONS_FILE);
     try {
       return await withFileLock(`${target}.lock`, async () => {
-        const before = await this.readBytes(target);
-        const records = [...(await this.parseBytes(target, before)), record];
+        const before = await readStoreBytes(target);
+        const records = [
+          ...(await parseRecordListOrQuarantine(
+            target,
+            before,
+            parseLaneDeclarationStateRecord,
+          )),
+          record,
+        ];
         await this.options?.onLockMidWrite?.();
-        const after = await this.readBytes(target);
-        if (!sameBytes(after, before)) {
+        const after = await readStoreBytes(target);
+        if (!sameStoreBytes(after, before)) {
           return refusal(
             "the declaration store changed during the write; no write was made",
           );
@@ -123,45 +131,4 @@ export class DeclarationRepositoryAdapter implements DeclarationRepositoryPort {
       return refusal("the declaration store refused the write");
     }
   }
-
-  /** The store's current bytes, or null when it does not exist yet. */
-  private async readBytes(target: string): Promise<Buffer | null> {
-    try {
-      return await fs.readFile(target);
-    } catch (error: unknown) {
-      if (
-        typeof error === "object" &&
-        error !== null &&
-        (error as { code?: string }).code === "ENOENT"
-      ) {
-        return null;
-      }
-      throw error;
-    }
-  }
-
-  /** Throws `StateFileUnreadableError` (after quarantining) on an unparsable file. */
-  private async parseBytes(
-    target: string,
-    bytes: Buffer | null,
-  ): Promise<readonly LaneDeclarationRecord[]> {
-    if (bytes === null) {
-      return [];
-    }
-    const inspection = inspectRecordListBytes(
-      bytes,
-      parseLaneDeclarationStateRecord,
-    );
-    if (inspection.status !== "ok") {
-      return rejectUnreadableStateFile(target, inspection.detail, bytes, false);
-    }
-    return [...inspection.records];
-  }
-}
-
-function sameBytes(left: Buffer | null, right: Buffer | null): boolean {
-  if (left === null || right === null) {
-    return left === right;
-  }
-  return left.equals(right);
 }

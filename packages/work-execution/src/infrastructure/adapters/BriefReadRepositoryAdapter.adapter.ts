@@ -10,7 +10,6 @@
  * Records arrive already valid.
  */
 
-import { promises as fs } from "node:fs";
 import * as path from "node:path";
 
 import type { BriefReadRecord } from "../../domain/lane-activity-records.js";
@@ -21,11 +20,12 @@ import type {
   PutBriefReadResult,
 } from "../../application/ports/out/BriefReadRepositoryPort.out-port.js";
 import {
-  inspectRecordListBytes,
-  rejectUnreadableStateFile,
   StateFileUnreadableError,
   withFileLock,
   writeJsonAtomically,
+  parseRecordListOrQuarantine,
+  readStoreBytes,
+  sameStoreBytes,
 } from "./file-store.js";
 
 export const BRIEF_READS_FILE = "brief-reads.json";
@@ -104,9 +104,10 @@ export class BriefReadRepositoryAdapter implements BriefReadRepositoryPort {
     }
     try {
       return latestOf(
-        await this.parseBytes(
+        await parseRecordListOrQuarantine(
           path.join(stateDir, BRIEF_READS_FILE),
-          await this.readBytes(path.join(stateDir, BRIEF_READS_FILE)),
+          await readStoreBytes(path.join(stateDir, BRIEF_READS_FILE)),
+          parseBriefReadStateRecord,
         ),
         lane,
       );
@@ -141,14 +142,18 @@ export class BriefReadRepositoryAdapter implements BriefReadRepositoryPort {
     const target = path.join(stateDir, BRIEF_READS_FILE);
     try {
       return await withFileLock(`${target}.lock`, async () => {
-        const before = await this.readBytes(target);
+        const before = await readStoreBytes(target);
         const records = replaceLaneRead(
-          await this.parseBytes(target, before),
+          await parseRecordListOrQuarantine(
+            target,
+            before,
+            parseBriefReadStateRecord,
+          ),
           record,
         );
         await this.options?.onLockMidWrite?.();
-        const after = await this.readBytes(target);
-        if (!sameBytes(after, before)) {
+        const after = await readStoreBytes(target);
+        if (!sameStoreBytes(after, before)) {
           return refusal(
             "the brief-read store changed during the write; no write was made",
           );
@@ -166,42 +171,4 @@ export class BriefReadRepositoryAdapter implements BriefReadRepositoryPort {
       return refusal("the brief-read store refused the write");
     }
   }
-
-  /** The store's current bytes, or null when it does not exist yet. */
-  private async readBytes(target: string): Promise<Buffer | null> {
-    try {
-      return await fs.readFile(target);
-    } catch (error: unknown) {
-      if (
-        typeof error === "object" &&
-        error !== null &&
-        (error as { code?: string }).code === "ENOENT"
-      ) {
-        return null;
-      }
-      throw error;
-    }
-  }
-
-  /** Throws `StateFileUnreadableError` (after quarantining) on an unparsable file. */
-  private async parseBytes(
-    target: string,
-    bytes: Buffer | null,
-  ): Promise<readonly BriefReadRecord[]> {
-    if (bytes === null) {
-      return [];
-    }
-    const inspection = inspectRecordListBytes(bytes, parseBriefReadStateRecord);
-    if (inspection.status !== "ok") {
-      return rejectUnreadableStateFile(target, inspection.detail, bytes, false);
-    }
-    return [...inspection.records];
-  }
-}
-
-function sameBytes(left: Buffer | null, right: Buffer | null): boolean {
-  if (left === null || right === null) {
-    return left === right;
-  }
-  return left.equals(right);
 }

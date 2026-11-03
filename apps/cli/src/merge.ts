@@ -3,7 +3,7 @@
  * driver mints ULIDs and computes fresh deadlines, never the store.
  */
 
-import { str, optNum, CliUsageError, type Payload } from './commands/payload.js';
+import { str, optNum, optStr, CliUsageError, type Payload } from './commands/payload.js';
 import type { CommandHandler } from './commands/payload.js';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
@@ -109,5 +109,21 @@ export const mergeCommands: Readonly<Record<string, CommandHandler>> = {
       enqueuedAtIso: nowIso,
       deadlineIso,
     });
+  },
+  import: async (p, rt) => {
+    const repository = repositoryFromPayload(p);
+    if (repository === undefined) {
+      throw new CliUsageError('merge import requires --repository owner/repo');
+    }
+    const stateDir = str(p, 'legacyStateDir').trim();
+    if (stateDir === '') {
+      throw new CliUsageError('merge import requires --legacy-state-dir');
+    }
+    const apply = p['apply'] === true || p['apply'] === 'true';
+    const authority = optStr(p, 'authority') ?? null;
+    if (apply && authority === null) {
+      throw new CliUsageError('merge import --apply requires --authority');
+    }
+    return rt.execution.importTrainState.importTrainState({ repository, stateDir, apply, authority });
   },
 };

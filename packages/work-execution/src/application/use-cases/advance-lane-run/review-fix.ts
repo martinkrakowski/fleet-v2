@@ -574,18 +574,19 @@ export async function reconcileReview(
 }
 
 /**
- * AR1: the review key whose findings drove a review-blocked acceptance
- * rejection at `head12`. Scans entries backwards for the latest final result of
- * this run whose key is a `brief-check`/`code-review` step at that head whose
- * result is either `review-failed`, or `review-passed` with the GB1
- * `minor-only-findings` detail. Null without one (`performFixPrepare` then
- * refuses `prepare-refused`).
+ * AR1/MX7: every final `brief-check`/`code-review` result key of this run at
+ * `head12`, latest first (journal order) — any final reason code, so both a
+ * `review-failed` result and a GB1 `review-passed` with the
+ * `minor-only-findings` detail are candidates. Which candidate actually
+ * carries the unresolved findings is decided by its receipt, not by the
+ * journal result alone.
  */
-function failedReviewKeyAtHead(
+function reviewResultKeysAtHead(
   entries: readonly LaneRunJournalEntryRecord[],
   runId: string,
   head12: string,
-): string | null {
+): { readonly key: string; readonly step: ReviewKind }[] {
+  const candidates: { key: string; step: ReviewKind }[] = [];
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index]!;
     if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
@@ -598,11 +599,9 @@ function failedReviewKeyAtHead(
     if (parsed.step !== 'brief-check' && parsed.step !== 'code-review') {
       continue;
     }
-    if (entry.reasonCode === 'review-failed' || (entry.reasonCode === 'review-passed' && entry.detail === 'minor-only-findings')) {
-      return entry.key;
-    }
+    candidates.push({ key: entry.key, step: parsed.step });
   }
-  return null;
+  return candidates;
 }
 
 /**
@@ -614,12 +613,18 @@ function failedReviewKeyAtHead(
  * AR1/F61 add the review-blocked acceptance rejection: an `accept` result with
  * reason `acceptance-rejected` and detail `review-findings` (AR1), or a null
  * detail (F61, a pre-AR1 rejection classified from the assessment), hands the
- * failed review key at that head to the fix round.
+ * review results at that head to the fix round; `performFixPrepare` then picks
+ * the candidate whose receipt carries unresolved findings (MX7).
  */
 function fixingFailureSourceOf(
   entries: readonly LaneRunJournalEntryRecord[],
   runId: string,
-): { readonly key: string; readonly source: 'review' | 'gate'; readonly reasonCode: string } | null {
+): {
+  readonly key: string | null;
+  readonly acceptHead12: string | null;
+  readonly source: 'review' | 'gate';
+  readonly reasonCode: string;
+} | null {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index]!;
     if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
@@ -633,24 +638,26 @@ function fixingFailureSourceOf(
       (parsed.step === 'brief-check' || parsed.step === 'code-review') &&
       entry.reasonCode === 'review-failed'
     ) {
-      return { key: entry.key, source: 'review', reasonCode: entry.reasonCode };
+      return { key: entry.key, acceptHead12: null, source: 'review', reasonCode: entry.reasonCode };
     }
     if (parsed.step === 'gate' && entry.reasonCode === 'gate-failed') {
-      return { key: entry.key, source: 'gate', reasonCode: entry.reasonCode };
+      return { key: entry.key, acceptHead12: null, source: 'gate', reasonCode: entry.reasonCode };
     }
     if (parsed.step === 'pre-merge' && entry.reasonCode !== null) {
-      return { key: entry.key, source: 'gate', reasonCode: entry.reasonCode };
+      return { key: entry.key, acceptHead12: null, source: 'gate', reasonCode: entry.reasonCode };
     }
     if (
       parsed.step === 'accept' &&
       entry.reasonCode === 'acceptance-rejected' &&
       (entry.detail === 'review-findings' || entry.detail === null)
     ) {
-      const reviewKey = parsed.head12 === null ? null : failedReviewKeyAtHead(entries, runId, parsed.head12);
-      if (reviewKey !== null) {
-        return { key: reviewKey, source: 'review', reasonCode: 'review-failed' };
+      // AR1/MX7: the review source of an accept rejection is receipt-driven.
+      // No key is picked from the journal result alone: `performFixPrepare`
+      // lists the review results at this head and walks their receipts.
+      if (parsed.head12 === null) {
+        return null;
       }
-      return null;
+      return { key: null, acceptHead12: parsed.head12, source: 'review', reasonCode: 'review-failed' };
     }
   }
   return null;
@@ -668,6 +675,50 @@ function handoverFindingsOf(receipt: {
     filePath: finding.filePath,
     line: finding.line,
   }));
+}
+
+/**
+ * AR1/MX7: the receipt behind one candidate review result — by the intent's
+ * minted request id first, and when that yields nothing, by kind at the
+ * prior's collected head. Null without a receipt; the walk continues.
+ */
+async function candidateReceiptOf(
+  ctx: AdvanceStepContext,
+  prior: AttemptRecord,
+  candidate: { readonly key: string; readonly step: ReviewKind },
+): Promise<{ readonly findings: readonly ReviewRequestFinding[] } | null> {
+  const reviewRequest = ctx.deps.reviewRequest;
+  if (reviewRequest === undefined || prior.artifacts === null) {
+    return null;
+  }
+  const requestId = await intentMintedIdOf(ctx, candidate.key);
+  if (requestId !== null) {
+    try {
+      const found = await reviewRequest.findReviewReceipt({
+        attemptId: prior.id,
+        requestId,
+        candidateHeadSha: prior.artifacts.headCommit,
+      });
+      if (found.outcome === 'found') {
+        return found.receipt;
+      }
+    } catch {
+      // Fall through to the kind lookup at the head.
+    }
+  }
+  try {
+    const latest = await reviewRequest.findLatestReceiptOfKind({
+      attemptId: prior.id,
+      candidateHeadSha: prior.artifacts.headCommit,
+      kind: candidate.step,
+    });
+    if (latest.outcome === 'found') {
+      return latest.receipt;
+    }
+  } catch {
+    // Skip this candidate; the walk continues.
+  }
+  return null;
 }
 
 /**
@@ -759,7 +810,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   gathered: GatheredLaneRunFacts,
   decision: ActDecision,
   request: AdvanceLaneRunRequest,
-  refuse: (reasonCode: LaneRunResultReasonCode) => Promise<AdvanceLaneRunResult>,
+  refuse: (reasonCode: LaneRunResultReasonCode, detail?: string | null) => Promise<AdvanceLaneRunResult>,
 ): Promise<AdvanceLaneRunResult> {
   const fixPort = ctx.deps.prepareFixAttempt;
   const prepareBrief = ctx.deps.prepareBrief;
@@ -777,7 +828,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     return performPark(ctx, record, 'step-refused', 'prepare', gathered.facts.state, request);
   }
   if (decision.round !== 1 && decision.round !== 2) {
-    return refuse('prepare-refused');
+    return refuse('prepare-refused', 'prepare-round-out-of-range');
   }
   const round: 1 | 2 = decision.round === 1 ? 1 : 2;
   // The prior is the latest attempt WITH artifacts: a cancelled fix attempt
@@ -797,33 +848,54 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   }
   const head = head12Of(prior.artifacts.headCommit);
   if (head === null) {
-    return refuse('prepare-refused');
+    return refuse('prepare-refused', 'prepare-no-head');
   }
   const entries = await ctx.deps.runJournal.listForRun(record.runId);
   const failure = fixingFailureSourceOf(entries, record.runId);
   if (failure === null) {
-    return refuse('prepare-refused');
+    return refuse('prepare-refused', 'prepare-no-failure-source');
   }
   let findings: readonly HandoverFinding[] = [];
   if (failure.source === 'review') {
-    const requestId = await intentMintedIdOf(ctx, failure.key);
-    if (requestId === null) {
-      return refuse('prepare-refused');
+    if (failure.acceptHead12 !== null) {
+      // AR1/MX7: the rejection's review source is receipt-driven. Walk the
+      // run's final review results at the rejected head, latest first, and
+      // take the first whose receipt has at least one unresolved finding —
+      // a GB1 `review-passed` with `minor-only-findings` included.
+      let receipt: { readonly findings: readonly ReviewRequestFinding[] } | null = null;
+      for (const candidate of reviewResultKeysAtHead(entries, record.runId, failure.acceptHead12)) {
+        const found = await candidateReceiptOf(ctx, prior, candidate);
+        if (found !== null && found.findings.length > 0) {
+          receipt = found;
+          break;
+        }
+      }
+      if (receipt === null) {
+        return refuse('prepare-refused', 'prepare-no-review-findings');
+      }
+      findings = handoverFindingsOf(receipt);
+    } else if (failure.key !== null) {
+      const requestId = await intentMintedIdOf(ctx, failure.key);
+      if (requestId === null) {
+        return refuse('prepare-refused', 'prepare-no-review-request');
+      }
+      let found: FindReviewReceiptResult;
+      try {
+        found = await ctx.deps.reviewRequest.findReviewReceipt({
+          attemptId: prior.id,
+          requestId,
+          candidateHeadSha: prior.artifacts.headCommit,
+        });
+      } catch {
+        found = { outcome: 'unavailable', reason: 'unreadable' };
+      }
+      if (found.outcome !== 'found') {
+        return refuse('prepare-refused', 'prepare-review-receipt-unavailable');
+      }
+      findings = handoverFindingsOf(found.receipt);
+    } else {
+      return refuse('prepare-refused', 'prepare-no-failure-source');
     }
-    let found: FindReviewReceiptResult;
-    try {
-      found = await ctx.deps.reviewRequest.findReviewReceipt({
-        attemptId: prior.id,
-        requestId,
-        candidateHeadSha: prior.artifacts.headCommit,
-      });
-    } catch {
-      found = { outcome: 'unavailable', reason: 'unreadable' };
-    }
-    if (found.outcome !== 'found') {
-      return refuse('prepare-refused');
-    }
-    findings = handoverFindingsOf(found.receipt);
     // KF-33a: only findings on files the lane changed — between the run's
     // original base and the prior's collected head, read through the prior's
     // recorded host — drive the fix round; the read is the shared
@@ -850,11 +922,11 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   // `prepare-refused`: a lane edit to `.lane/brief.md` or its manifest is
   // refused, never trusted.
   if (prior.briefPackagePath === null) {
-    return refuse('prepare-refused');
+    return refuse('prepare-refused', 'prepare-no-brief-package');
   }
   const recordedHost = conductedRunnerOf(prior);
   if (recordedHost === null) {
-    return refuse('prepare-refused');
+    return refuse('prepare-refused', 'prepare-no-recorded-host');
   }
   let prose: string | null | undefined;
   let manifestRaw: string | null | undefined;
@@ -866,10 +938,10 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
       recordedHost,
     );
   } catch {
-    return refuse('prepare-refused');
+    return refuse('prepare-refused', 'prepare-brief-read-failed');
   }
   if (typeof prose !== 'string' || typeof manifestRaw !== 'string') {
-    return refuse('prepare-refused');
+    return refuse('prepare-refused', 'prepare-brief-unreadable');
   }
   const compute = ctx.deps.computeDigest ?? simpleDeterministicHexDigest;
   // KF-28: the disk may hold a cancelled fix attempt's handover rather than
@@ -896,18 +968,18 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
       }
     }
     if (trustedHandover === null) {
-      return refuse('prepare-refused');
+      return refuse('prepare-refused', 'prepare-brief-digest-mismatch');
     }
   }
   let manifest: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse(manifestRaw);
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      return refuse('prepare-refused');
+      return refuse('prepare-refused', 'prepare-manifest-unreadable');
     }
     manifest = parsed as Record<string, unknown>;
   } catch {
-    return refuse('prepare-refused');
+    return refuse('prepare-refused', 'prepare-manifest-unreadable');
   }
 
   // Failed gate checks: the stored predicate results of the prior's gate, in
@@ -920,7 +992,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     try {
       journalEntries = await ctx.deps.executionJournal.listJournalEntriesForAttempt(prior.id);
     } catch {
-      return refuse('prepare-refused');
+      return refuse('prepare-refused', 'prepare-gate-journal-unreadable');
     }
     gatePredicates.push(
       ...nonPassingGatePredicatesOf(journalEntries, prior.id, prior.artifacts.headCommit).map(
@@ -928,7 +1000,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
       ),
     );
     if (failure.reasonCode === 'gate-failed' && gatePredicates.length === 0) {
-      return refuse('prepare-refused');
+      return refuse('prepare-refused', 'prepare-no-gate-checks');
     }
   }
 
@@ -936,7 +1008,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   // the value object; an invalid spec refuses the prepare.
   const spec = AcceptanceSpec.create(manifest.acceptanceSpec);
   if (!spec.success || spec.value === undefined) {
-    return refuse('prepare-refused');
+    return refuse('prepare-refused', 'prepare-acceptance-spec-invalid');
   }
   const proofCommands: readonly (readonly string[])[] = spec.value.getCommands().map((command) => command.argv);
   // Round 1 carries the prose verbatim; round 2 extracts the previous
@@ -946,7 +1018,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   // attempt.
   const originalBrief = trustedHandover === null && prior.kind !== 'fix' ? prose : originalBriefOf(prose);
   if (originalBrief === null) {
-    return refuse('prepare-refused');
+    return refuse('prepare-refused', 'prepare-no-original-brief');
   }
 
   // GB3a: when the previous FIX seat left the worktree dirty (its last
@@ -973,7 +1045,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     ...(handover ? { uncommittedHandover: true } : {}),
   } satisfies RenderHandoverBriefInput);
   if (!brief.ok || brief.numberedFixes.length === 0) {
-    return refuse('prepare-refused');
+    return refuse('prepare-refused', 'prepare-nothing-to-fix');
   }
   const numberedFixes: readonly string[] = brief.numberedFixes;
   const briefFixRequest: PrepareFixAttemptRequest = {
@@ -1000,15 +1072,15 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     // attempt, never on the default executor (Q2a-2): checked above.
     recordedHost,
   });
-  const refusePrepared = async (): Promise<AdvanceLaneRunResult> => {
-    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'prepare-refused');
+  const refusePrepared = async (detail: string): Promise<AdvanceLaneRunResult> => {
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'prepare-refused', detail);
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
-    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'prepare-refused' };
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'prepare-refused', detail };
   };
   if (briefRequest === null) {
-    return refusePrepared();
+    return refusePrepared('prepare-brief-request-incomplete');
   }
   let briefResult: PrepareBriefPackageResult;
   try {
@@ -1017,7 +1089,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     briefResult = { outcome: 'rejected', reason: 'prepare-refused' };
   }
   if (briefResult.outcome !== 'prepared') {
-    return refusePrepared();
+    return refusePrepared('prepare-brief-rejected');
   }
   const fixRequest: PrepareFixAttemptRequest = {
     ...briefFixRequest,
@@ -1032,7 +1104,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     prepared = { outcome: 'refused', reason: 'prepare-refused' };
   }
   if (prepared.outcome !== 'prepared' || prepared.attempt.id !== fixRequest.fixAttemptId) {
-    return refusePrepared();
+    return refusePrepared('prepare-fix-refused');
   }
   const saved = await saveOrRefuse(ctx,
     { ...record, attemptIds: [...record.attemptIds, prepared.attempt.id], revision: record.revision + 1 },

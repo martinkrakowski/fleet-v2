@@ -121,6 +121,7 @@ function passingDoctorProbes(): DoctorProbes {
       candidates: GH_BINARY_CANDIDATES,
     }),
     seatProbe: async () => ({ outcome: "pass", reason: "answered" }),
+    serverProbe: async () => ({ outcome: "pass", reason: "the opencode server answered" }),
   };
 }
 

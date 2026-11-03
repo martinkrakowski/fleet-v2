@@ -4,7 +4,9 @@
  * performs no side effect itself — every observation enters through the
  * injected `DoctorProbes` — and a probe that throws becomes an `UNKNOWN`
  * line, never a crash. Details carry paths, modes, versions and reasons
- * only; never file contents, keys or tokens.
+ * only; never file contents, keys or tokens. The sweep also probes the
+ * opencode server each host runs (`server-answers`) and reports whether the
+ * servers list every opencode seat the installation names (`model-listed`).
  */
 
 import type {
@@ -488,6 +490,112 @@ async function ghBinaryLines(probes: DoctorProbes): Promise<DoctorLine[]> {
   ];
 }
 
+/**
+ * The opencode servers the installation names: one entry per host with an
+ * opencode runner that declares its port. A host with no runner, an `agy`
+ * runner or no port contributes nothing.
+ */
+interface DoctorServer {
+  readonly name: string;
+  readonly probeHost: string;
+  readonly port: number;
+}
+
+function opencodeServers(model: FleetInstallationModel): DoctorServer[] {
+  const servers: DoctorServer[] = [];
+  for (const [name, host] of Object.entries(model.hosts)) {
+    const runner = host.runner;
+    if (runner === undefined || runner.kind !== 'opencode' || runner.port === undefined) {
+      continue;
+    }
+    servers.push({ name, probeHost: probeHostOf(name, host), port: runner.port });
+  }
+  return servers;
+}
+
+/**
+ * One `server-answers` line per opencode server, probed on the host that
+ * runs it, plus the union of the model ids the servers list.
+ */
+async function serverLines(
+  model: FleetInstallationModel,
+  probes: DoctorProbes,
+): Promise<{ lines: DoctorLine[]; models: readonly string[] }> {
+  const lines: DoctorLine[] = [];
+  const models = new Set<string>();
+  for (const server of opencodeServers(model)) {
+    const outcome = await safely(() =>
+      probes.serverProbe(server.probeHost, server.port),
+    );
+    if (outcome === undefined) {
+      lines.push(
+        line('host', server.name, 'server-answers', 'UNKNOWN', 'the server probe failed'),
+      );
+      continue;
+    }
+    lines.push(
+      line(
+        'host',
+        server.name,
+        'server-answers',
+        outcome.outcome === 'pass' ? 'PASS' : outcome.outcome === 'fail' ? 'FAIL' : 'UNKNOWN',
+        outcome.reason,
+      ),
+    );
+    for (const modelId of outcome.models ?? []) {
+      models.add(modelId);
+    }
+  }
+  return { lines, models: [...models] };
+}
+
+/**
+ * One installation line about the opencode seats the installation names:
+ * does some server the installation runs actually list each seat's model?
+ * No opencode seat means no line at all.
+ */
+function seatModelLine(
+  model: FleetInstallationModel,
+  listedModels: readonly string[],
+): DoctorLine | undefined {
+  const freeOff = model.policy?.useFreeSeats === false;
+  const seats = (model.seats ?? []).filter(
+    (seat) => seat.tool === 'opencode' && !(freeOff && seat.costClass === 'free'),
+  );
+  if (seats.length === 0) {
+    return undefined;
+  }
+  const listed = (seat: SeatModel): boolean =>
+    listedModels.includes(seat.model) ||
+    (seat.variant !== undefined && listedModels.includes(`${seat.model}#${seat.variant}`));
+  const missingModels = seats.filter((seat) => !listed(seat)).map((seat) => seat.model);
+  if (listedModels.length === 0) {
+    return line(
+      'installation',
+      'seats',
+      'model-listed',
+      'UNKNOWN',
+      'no opencode server listed its models; the seats could not be checked',
+    );
+  }
+  if (missingModels.length === 0) {
+    return line(
+      'installation',
+      'seats',
+      'model-listed',
+      'PASS',
+      `the opencode server lists all ${seats.length} opencode seat(s)`,
+    );
+  }
+  return line(
+    'installation',
+    'seats',
+    'model-listed',
+    'FAIL',
+    `the opencode server does not list ${missingModels.join(', ')}`,
+  );
+}
+
 /** Seat lines: probed, or explicitly not probed. */
 async function seatLines(
   model: FleetInstallationModel,
@@ -556,23 +664,35 @@ async function seatLines(
 
 /**
  * Run every doctor check over a loaded installation, in the order:
- * installation, hosts and their roles, configured tools, credential files,
- * the bundled runner binary, the reviewed gh binary, then seats. Each
- * yielded line is one check; the generator awaits probes sequentially so
- * output order is stable.
+ * installation, routing, the seat model list, hosts and their roles, the
+ * servers' answers, configured tools, credential files, the bundled runner
+ * binary, the reviewed gh binary, then seats. Each yielded line is one
+ * check; the generator awaits probes sequentially so output order is
+ * stable. The server answers are computed before the `model-listed` line is
+ * yielded (that line needs the union of the servers' model ids), but the
+ * host lines are yielded before the server lines so every `host` line stays
+ * together.
  */
 export async function* runDoctor(
   result: DoctorableInstallation,
   probes: DoctorProbes,
   options: RunDoctorOptions,
 ): AsyncGenerator<DoctorLine> {
+  const serverAnswers = await serverLines(result.model, probes);
+  const seatModelCheck = seatModelLine(result.model, serverAnswers.models);
   for (const doctorLine of await installationLines(result)) {
     yield doctorLine;
   }
   for (const doctorLine of routingEnvLines(result, options.env)) {
     yield doctorLine;
   }
+  if (seatModelCheck !== undefined) {
+    yield seatModelCheck;
+  }
   for (const doctorLine of await hostLines(result.model, probes)) {
+    yield doctorLine;
+  }
+  for (const doctorLine of serverAnswers.lines) {
     yield doctorLine;
   }
   for (const doctorLine of await toolLines(result.model, probes)) {

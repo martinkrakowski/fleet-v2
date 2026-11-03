@@ -19,7 +19,7 @@ import type { SeatModel } from '@fleet/installation';
 import { BUILT_IN_TOOLS, type ToolId } from '@fleet/tooling';
 
 import { GH_BINARY_CANDIDATES } from './gh-binary.js';
-import type { DoctorProbes, SeatProbeResult } from './probes.js';
+import type { DoctorProbes, SeatProbeResult, ServerProbeResult } from './probes.js';
 
 const execFileAsync = promisify(execFileCallback);
 
@@ -251,6 +251,33 @@ export function seatProbeArgv(seat: SeatModel, template: readonly string[]): str
 }
 
 /**
+ * The model ids an opencode server lists: `id` for each model and
+ * `id#variant` for each of its variants. `undefined` when the answer is not
+ * a readable model list.
+ */
+export function serverModelIds(stdout: string): readonly string[] | undefined {
+  const opencode = BUILT_IN_TOOLS.find((tool) => tool.id === 'opencode');
+  if (opencode?.models === undefined) {
+    return undefined;
+  }
+  const parsed = opencode.models.parse(stdout);
+  if (parsed === 'unknown' || 'source' in parsed) {
+    return undefined;
+  }
+  if (parsed.length === 0) {
+    return undefined;
+  }
+  const ids: string[] = [];
+  for (const model of parsed) {
+    ids.push(model.id);
+    for (const variant of model.variants ?? []) {
+      ids.push(`${model.id}#${variant}`);
+    }
+  }
+  return ids;
+}
+
+/**
  * The node doctor probes. Local hosts run argv arrays through the local
  * executor; every other host name is an ssh alias and the same argv travels
  * through `ssh <alias> --` with `BatchMode=yes`. Nothing here reads a
@@ -384,6 +411,59 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
       } catch {
         return undefined;
       }
+    },
+
+    async serverProbe(host, port): Promise<ServerProbeResult> {
+      const info = await runOnHost(
+        executors,
+        host,
+        [
+          'curl',
+          '-sS',
+          '--max-time',
+          '5',
+          '-o',
+          '/dev/null',
+          '-w',
+          '%{http_code}',
+          `http://127.0.0.1:${port}/api/info`,
+        ],
+      );
+      if (info.error !== undefined) {
+        return { outcome: 'unknown', reason: 'the server probe could not be run' };
+      }
+      if (info.exitCode !== 0) {
+        return {
+          outcome: 'unknown',
+          reason: `the opencode server on 127.0.0.1:${port} did not answer`,
+        };
+      }
+      const code = info.stdout.trim();
+      if (code === '401' || code === '403') {
+        // The doctor never reads a credential; an authenticated server is
+        // unknown, never a pass.
+        return {
+          outcome: 'unknown',
+          reason: `the opencode server on 127.0.0.1:${port} requires authentication`,
+        };
+      }
+      if (code !== '200') {
+        return {
+          outcome: 'fail',
+          reason: `the opencode server on 127.0.0.1:${port} answered HTTP ${code}`,
+        };
+      }
+      const listed = await runOnHost(
+        executors,
+        host,
+        ['curl', '-sS', '--max-time', '5', `http://127.0.0.1:${port}/api/model`],
+      );
+      const reason = `the opencode server on 127.0.0.1:${port} answered`;
+      if (listed.error !== undefined || listed.exitCode !== 0) {
+        return { outcome: 'pass', reason };
+      }
+      const models = serverModelIds(listed.stdout);
+      return models === undefined ? { outcome: 'pass', reason } : { outcome: 'pass', reason, models };
     },
 
     async seatProbe(seat: SeatModel): Promise<SeatProbeResult> {

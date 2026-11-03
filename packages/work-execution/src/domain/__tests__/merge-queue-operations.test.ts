@@ -29,7 +29,6 @@ function makeEntry(overrides: Partial<MergeQueueEntryRecord> = {}): MergeQueueEn
     entryId: nextEntryId(),
     repository: { owner: 'fleet', repo: 'v2' },
     repoDigest: DIGEST,
-    baseBranch: 'main',
     pullRequest: 7,
     headOid: HEAD_A,
     state: 'queued',
@@ -67,7 +66,6 @@ function input(overrides: Partial<MergeEnqueueInput> = {}): MergeEnqueueInput {
     successorEntryId: nextEntryId(),
     enqueuedAtIso: '2026-11-01T11:00:00.000Z',
     repoDigest: DIGEST,
-    baseBranch: 'main',
     ...overrides,
   };
 }
@@ -122,65 +120,8 @@ describe('decideMergeEnqueue', () => {
       expect(decision.record.supersedes).toBeNull();
       expect(decision.record.enqueuedBy).toBe('cli');
       expect(decision.record.revision).toBe(1);
-      expect(decision.record.version).toBe(2);
-      expect(decision.record.baseBranch).toBe('main');
       expect(decision.entries).toEqual([decision.record]);
       expectAllValid(decision.entries);
-    }
-  });
-
-  it('writes version 2 with the resolved chain base on create', () => {
-    const decision = decideMergeEnqueue([], input({ baseBranch: 'chain/dt' }));
-    expect(decision.outcome).toBe('created');
-    if (decision.outcome === 'created') {
-      expect(decision.record.version).toBe(2);
-      expect(decision.record.baseBranch).toBe('chain/dt');
-    }
-  });
-
-  it('refuses an input without a base as base-unavailable', () => {
-    const noBase = input() as unknown as Record<string, unknown>;
-    delete noBase.baseBranch;
-    expect(decideMergeEnqueue([], noBase as unknown as MergeEnqueueInput)).toEqual({
-      outcome: 'refused',
-      reason: 'base-unavailable',
-    });
-  });
-
-  it('refuses an unparsable base as invalid-base without echoing it', () => {
-    const decision = decideMergeEnqueue([], input({ baseBranch: 'release' }));
-    expect(decision).toEqual({ outcome: 'refused', reason: 'invalid-base' });
-    expect(JSON.stringify(decision)).not.toContain('release');
-  });
-
-  it('creates rather than supersedes when a same-PR head lands on another base', () => {
-    const first = decideMergeEnqueue([], input());
-    expect(first.outcome).toBe('created');
-    if (first.outcome !== 'created') {
-      return;
-    }
-    const second = decideMergeEnqueue(
-      first.entries,
-      input({ headOid: HEAD_B, baseBranch: 'chain/dt', successorEntryId: nextEntryId() }),
-    );
-    expect(second.outcome).toBe('created');
-    if (second.outcome === 'created') {
-      expect(second.entries).toHaveLength(2);
-      expectAllValid(second.entries);
-    }
-  });
-
-  it('creates rather than duplicates when the same head lands on another base', () => {
-    const first = decideMergeEnqueue([], input());
-    expect(first.outcome).toBe('created');
-    if (first.outcome !== 'created') {
-      return;
-    }
-    const second = decideMergeEnqueue(first.entries, input({ baseBranch: 'chain/dt' }));
-    expect(second.outcome).toBe('created');
-    if (second.outcome === 'created') {
-      expect(second.entries).toHaveLength(2);
-      expectAllValid(second.entries);
     }
   });
 
@@ -228,8 +169,6 @@ describe('decideMergeEnqueue', () => {
       expect(successor.enqueuedAtIso).toBe(first.record.enqueuedAtIso);
       expect(successor.enqueuedBy).toBe('cli');
       expect(successor.headOid).toBe(HEAD_B);
-      expect(successor.version).toBe(2);
-      expect(successor.baseBranch).toBe(first.record.baseBranch);
       expect(successor.revision).toBe(1);
       expect(successor.attempt).toBe(0);
       expect(successor.runId).toBeNull();
@@ -335,8 +274,6 @@ describe('decideMergeRetry', () => {
       expect(decision.record.enqueuedBy).toBe('cli');
       expect(decision.record.supersedes).toBeNull();
       expect(decision.record.revision).toBe(1);
-      expect(decision.record.version).toBe(2);
-      expect(decision.record.baseBranch).toBe(dropped.baseBranch);
       expect(decision.record.headOid).toBe(dropped.headOid);
       expect(decision.record.tier).toBe(dropped.tier);
       expect(decision.record.runId).toBeNull();

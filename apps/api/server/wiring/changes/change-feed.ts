@@ -11,6 +11,10 @@ export type FeedKind =
   | "question"
   | "profile"
   | "orchestrator"
+  | "owner-item"
+  | "plan"
+  | "merge"
+  | "forge-observation"
   | "resync";
 
 export interface FeedEntry {
@@ -43,8 +47,10 @@ export type FeedRead =
     }
   | { readonly kind: "resync"; readonly cursor: string };
 
-// heartbeat signals (a lease-only orchestrator save, plan F7) are deliberately not a feed kind: they
-// record file stamps and append nothing.
+// The owner-item, lane-plan, merge-record and forge-observation store saves are
+// feed kinds because the board and to-do surfaces read them. heartbeat signals (a
+// lease-only orchestrator save, plan F7) stay out: they record a lease and carry
+// no record change.
 const DATA_KINDS: ReadonlySet<FeedKind> = new Set([
   "attempt",
   "capacity",
@@ -52,6 +58,10 @@ const DATA_KINDS: ReadonlySet<FeedKind> = new Set([
   "question",
   "profile",
   "orchestrator",
+  "owner-item",
+  "plan",
+  "merge",
+  "forge-observation",
 ]);
 
 const DEFAULT_CAPACITY = 1024;

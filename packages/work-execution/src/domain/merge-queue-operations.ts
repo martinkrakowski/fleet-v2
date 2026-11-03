@@ -5,8 +5,6 @@
  * `readMergeQueueEntryRecord`; a non-ok read refuses without writing.
  */
 
-import { parseBaseBranch } from './base-branch.js';
-import type { BaseBranchValue } from './base-branch.js';
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { REQUEST_ID_PATTERN } from './lane-run-keys.js';
 import {
@@ -16,7 +14,6 @@ import {
   isMergeQueueEntryLive,
   orderMergeQueue,
   readMergeQueueEntryRecord,
-  resolveMergeQueueEntryBase,
   sameMergeQueueIdentity,
 } from './merge-queue-records.js';
 import type {
@@ -32,9 +29,7 @@ export type MergeEnqueueRefusal =
   | 'invalid-entry-id'
   | 'invalid-tier'
   | 'invalid-enqueued-at'
-  | 'invalid-deadline'
-  | 'base-unavailable'
-  | 'invalid-base';
+  | 'invalid-deadline';
 
 export interface MergeEnqueueInput {
   readonly repository: MergeQueueRepositoryRef;
@@ -47,8 +42,6 @@ export interface MergeEnqueueInput {
   readonly successorEntryId: unknown;
   readonly enqueuedAtIso: string;
   readonly repoDigest: string;
-  /** The resolved base; absent is `base-unavailable`, unparsable is `invalid-base`. */
-  readonly baseBranch?: unknown;
 }
 
 export type MergeEnqueueDecision =
@@ -103,13 +96,12 @@ function isUlid(value: unknown): value is string {
 }
 
 /** The fresh record shape a created or superseding enqueue writes. */
-function buildCreatedRecord(input: MergeEnqueueInput, supersedes: string | null, base: BaseBranchValue): MergeQueueEntryRecord {
+function buildCreatedRecord(input: MergeEnqueueInput, supersedes: string | null): MergeQueueEntryRecord {
   return {
     version: MERGE_QUEUE_ENTRY_VERSION,
     entryId: input.entryId as string,
     repository: input.repository,
     repoDigest: input.repoDigest,
-    baseBranch: base,
     pullRequest: input.pullRequest,
     headOid: input.headOid as string,
     state: 'queued',
@@ -134,14 +126,13 @@ function buildCreatedRecord(input: MergeEnqueueInput, supersedes: string | null,
   };
 }
 
-/** The successor of a superseded entry: inherits the predecessor's position and base. */
+/** The successor of a superseded entry: inherits the predecessor's position. */
 function buildSuccessorRecord(predecessor: MergeQueueEntryRecord, input: MergeEnqueueInput): MergeQueueEntryRecord {
   return {
     version: MERGE_QUEUE_ENTRY_VERSION,
     entryId: input.successorEntryId as string,
     repository: predecessor.repository,
     repoDigest: predecessor.repoDigest,
-    baseBranch: resolveMergeQueueEntryBase(predecessor),
     pullRequest: predecessor.pullRequest,
     headOid: input.headOid as string,
     state: 'queued',
@@ -169,22 +160,18 @@ function buildSuccessorRecord(predecessor: MergeQueueEntryRecord, input: MergeEn
 function findDuplicateLiveEntry(
   ordered: readonly MergeQueueEntryRecord[],
   input: MergeEnqueueInput,
-  base: BaseBranchValue,
 ): MergeQueueEntryRecord | undefined {
   const targetIdentity = {
     repository: input.repository,
     pullRequest: input.pullRequest,
     headOid: input.headOid as string,
   };
-  return ordered.find(
-    (entry) => sameMergeQueueIdentity(entry, targetIdentity) && resolveMergeQueueEntryBase(entry) === base,
-  );
+  return ordered.find((entry) => sameMergeQueueIdentity(entry, targetIdentity));
 }
 
 function isSupersedablePredecessor(
   predecessor: MergeQueueEntryRecord,
   input: MergeEnqueueInput,
-  base: BaseBranchValue,
 ): boolean {
   if (predecessor.headOid === input.headOid) {
     return false;
@@ -192,22 +179,18 @@ function isSupersedablePredecessor(
   if (predecessor.pullRequest !== input.pullRequest) {
     return false;
   }
-  if (
-    predecessor.repository.owner !== input.repository.owner ||
-    predecessor.repository.repo !== input.repository.repo
-  ) {
-    return false;
-  }
-  return resolveMergeQueueEntryBase(predecessor) === base;
+  return (
+    predecessor.repository.owner === input.repository.owner &&
+    predecessor.repository.repo === input.repository.repo
+  );
 }
 
 function trySupersedeEnqueue(
   entries: readonly MergeQueueEntryRecord[],
   ordered: readonly MergeQueueEntryRecord[],
   input: MergeEnqueueInput,
-  base: BaseBranchValue,
 ): MergeEnqueueDecision | null {
-  const predecessor = ordered.find((candidate) => isSupersedablePredecessor(candidate, input, base));
+  const predecessor = ordered.find((candidate) => isSupersedablePredecessor(candidate, input));
   if (predecessor === undefined) {
     return null;
   }
@@ -253,27 +236,20 @@ export function decideMergeEnqueue(
     if (!isZonedIsoDateTime(input.enqueuedAtIso)) {
       return { outcome: 'refused', reason: 'invalid-enqueued-at' };
     }
-    if (input.baseBranch === undefined) {
-      return { outcome: 'refused', reason: 'base-unavailable' };
-    }
-    const base = parseBaseBranch(input.baseBranch);
-    if (base === undefined) {
-      return { outcome: 'refused', reason: 'invalid-base' };
-    }
 
     const ordered = orderMergeQueue(entries.filter(isMergeQueueEntryLive));
 
-    const duplicate = findDuplicateLiveEntry(ordered, input, base);
+    const duplicate = findDuplicateLiveEntry(ordered, input);
     if (duplicate !== undefined) {
       return { outcome: 'duplicate', entries, record: duplicate };
     }
 
-    const supersedeResult = trySupersedeEnqueue(entries, ordered, input, base);
+    const supersedeResult = trySupersedeEnqueue(entries, ordered, input);
     if (supersedeResult !== null) {
       return supersedeResult;
     }
 
-    const createdRead = readMergeQueueEntryRecord(buildCreatedRecord(input, null, base));
+    const createdRead = readMergeQueueEntryRecord(buildCreatedRecord(input, null));
     if (!createdRead.ok) {
       return { outcome: 'refused', reason: 'invalid-entry-id' };
     }
@@ -336,7 +312,6 @@ export function decideMergeRetry(
       entryId: retry.entryId as string,
       repository: target.repository,
       repoDigest: target.repoDigest,
-      baseBranch: resolveMergeQueueEntryBase(target),
       pullRequest: target.pullRequest,
       headOid: target.headOid,
       state: 'queued',

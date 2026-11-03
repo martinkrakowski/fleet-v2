@@ -27,9 +27,6 @@ export const PLAN_DECISION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 /** A workspace name (`work-execution` for packages/work-execution/, `cli` for apps/cli/) or `docs`. */
 export const PLAN_PACKAGE_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
-/** A feature set id is a machine key like a plan id: no spaces, 1–64 characters. */
-export const PLAN_FEATURE_SET_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-
 export const LANE_PLAN_LIMITS = Object.freeze({
   lanes: 300,
   after: 32,
@@ -45,7 +42,6 @@ export const LANE_PLAN_LIMITS = Object.freeze({
   defaultBytes: 300,
   pathBytes: 256,
   repositoryBytes: 200,
-  featureSetTitleBytes: 120,
 });
 
 /** A lane anywhere: every `after` form resolves to this full reference. */
@@ -54,12 +50,6 @@ export type PlannedLaneRef = PlanRef;
 export interface PlanPullRequestRef {
   readonly repository: string;
   readonly number: number;
-}
-
-/** The group a plan's lanes are reported under (feature progress plan §3). */
-export interface PlanFeatureSet {
-  readonly id: string;
-  readonly title: string;
 }
 
 export interface PlannedLaneSidecar {
@@ -74,7 +64,6 @@ export interface PlannedLaneSidecar {
   readonly status: PlannedLaneStatus;
   readonly brief: string | null;
   readonly mergedPr: PlanPullRequestRef | null;
-  readonly rollupOf: boolean;
 }
 
 export interface PlanDecisionSidecar {
@@ -99,7 +88,6 @@ export interface LanePlanSidecar {
   readonly lanes: readonly PlannedLaneSidecar[];
   readonly decisions: readonly PlanDecisionSidecar[];
   readonly exclusiveOrder: readonly ExclusiveOrderSidecar[];
-  readonly featureSet: PlanFeatureSet | null;
 }
 
 export const LANE_PLAN_RECORD_VERSION = 1 as const;
@@ -125,11 +113,6 @@ export interface PlannedLaneRecord {
   readonly status: PlannedLaneStatus;
   readonly brief: string | null;
   readonly mergedPr: PlanPullRequestRef | null;
-  /**
-   * True when the lane is a rollup heading. Absent on every other lane and on
-   * every record written before the field existed (PV1).
-   */
-  readonly rollupOf?: true;
 }
 
 /** A plan's machine workbook as imported, keyed (projectId, planId). Version 1. */
@@ -145,11 +128,6 @@ export interface LanePlanRecord {
   readonly lanes: readonly PlannedLaneRecord[];
   readonly decisions: readonly PlanDecisionSidecar[];
   readonly exclusiveOrder: readonly ExclusiveOrderSidecar[];
-  /**
-   * The plan's feature set. Absent on a plan with no feature set and on every
-   * record written before the field existed (PV1).
-   */
-  readonly featureSet?: PlanFeatureSet;
   readonly importedAtIso: string;
 }
 

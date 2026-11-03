@@ -93,10 +93,13 @@ async function blockedReviewFindings(
   if (parked === null || parked.reason !== 'blocker-after-round-2') {
     return null;
   }
-  if (parked.findings !== undefined && parked.findings !== null) {
-    return boundedFindingsView(parked.findings);
+  if (parked.findings === undefined) {
+    return fallbackReviewFindings(deps, record);
   }
-  return fallbackReviewFindings(deps, record);
+  if (parked.findings === null) {
+    return [];
+  }
+  return boundedFindingsView(parked.findings);
 }
 
 /**

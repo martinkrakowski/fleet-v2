@@ -7,7 +7,7 @@
  * reads only; a read failure yields `[]`, never a throw.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunParkReason, LaneRunRecord } from '../../../domain/lane-run-records.js';
@@ -331,5 +331,49 @@ describe('InspectLaneRunsUseCase (GB2)', () => {
     await seedParkedRun(harness, 'blocker-after-round-2', 1, [ATTEMPT_ID], [FINDING]);
     const [run] = await statusRuns(harness);
     expect(run.reviewFindings).toEqual([FINDING]);
+  });
+
+  it('returns [] and does not call receipt store when parked findings is explicitly null even with receipt available', async () => {
+    const findLatestReceiptOfKind = vi.fn(async (request: { candidateHeadSha: string }) => ({
+      outcome: 'found' as const,
+      receipt: {
+        receiptId: 'rcpt-1',
+        requestId: null,
+        kind: 'code-review' as const,
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: request.candidateHeadSha,
+        verdict: 'failed' as const,
+        findings: [FINDING],
+      },
+    }));
+    const harness = makeHarness({
+      reviewReceipts: { findLatestReceiptOfKind },
+    });
+    await seedParkedRun(harness, 'blocker-after-round-2', 1, [ATTEMPT_ID], null);
+    const [run] = await statusRuns(harness);
+    expect(run.reviewFindings).toEqual([]);
+    expect(findLatestReceiptOfKind).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the receipt when parked record has no findings field (undefined)', async () => {
+    const findLatestReceiptOfKind = vi.fn(async (request: { candidateHeadSha: string }) => ({
+      outcome: 'found' as const,
+      receipt: {
+        receiptId: 'rcpt-1',
+        requestId: null,
+        kind: 'code-review' as const,
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: request.candidateHeadSha,
+        verdict: 'failed' as const,
+        findings: [FINDING],
+      },
+    }));
+    const harness = makeHarness({
+      reviewReceipts: { findLatestReceiptOfKind },
+    });
+    await seedParkedRun(harness, 'blocker-after-round-2');
+    const [run] = await statusRuns(harness);
+    expect(run.reviewFindings).toEqual([FINDING]);
+    expect(findLatestReceiptOfKind).toHaveBeenCalled();
   });
 });

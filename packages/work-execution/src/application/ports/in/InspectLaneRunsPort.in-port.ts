@@ -7,6 +7,7 @@
 
 import type { LaneRunKeyStep, LaneRunTier } from '../../../domain/lane-run-records.js';
 import type { LaneRunParkRecord } from '../../../domain/lane-run-records.js';
+import type { LaneRunParkFindingView } from '../../../domain/park-findings-view.js';
 import type { RunStopMode } from '../../../domain/lane-run-transitions.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { BaseBranchValue } from '../../../domain/base-branch.js';
@@ -22,6 +23,8 @@ export interface LaneRunStatusView {
   readonly round: number;
   readonly revision: number;
   readonly parked: LaneRunParkRecord | null;
+  /** Bounded findings of the failed code review at the parked head; null unless parked blocker-after-round-2. */
+  readonly reviewFindings: readonly LaneRunParkFindingView[] | null;
   /**
    * The fixed refusal detail of a `step-refused` park (e.g. `worktree-uncommitted`); absent when none.
    */

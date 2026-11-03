@@ -440,17 +440,9 @@ describe('classifyZombies — canonical timestamp guard', () => {
         secretNow,
         {},
       );
-      expect(findings).toHaveLength(1);
-      const res = findings[0]!;
-      expect(res.action).toBe('wait');
-      expect(res.firstSightingIso).toBeNull();
-      expect(res.lastSightingIso).toBeNull();
-      for (const value of Object.values(res)) {
-        if (typeof value === 'string') {
-          expect(value).not.toContain(secretNow);
-        }
-      }
-      expect(JSON.stringify(res)).not.toContain(secretNow);
+      // An unreadable clock emits no finding: no stored record ever carries a non-canonical sighting time.
+      expect(findings).toEqual([]);
+      expect(JSON.stringify(findings)).not.toContain(secretNow);
     }
   });
 
@@ -654,9 +646,8 @@ describe('classifyZombies — never throws', () => {
   it('returns without throwing on an unparsable nowIso', () => {
     const seen = { ...observation, stopRetriesSpent: true };
     const findings = classifyZombies({ observations: [seen], openFindings: [] }, 'not-a-time', {});
-    expect(findings[0]?.action).toBe('wait');
-    expect(findings[0]?.firstSightingIso).toBeNull();
-    expect(findings[0]?.lastSightingIso).toBeNull();
+    // No finding without a canonical clock value, so no stored record holds a null or invalid sighting time.
+    expect(findings).toEqual([]);
   });
 
   it('returns without throwing on a negative graceMinutes', () => {

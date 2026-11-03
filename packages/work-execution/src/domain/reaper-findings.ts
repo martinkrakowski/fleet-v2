@@ -429,7 +429,12 @@ export function classifyZombies(
     const minFreePercent = minutesOf(policy.minFreePercent, DEFAULT_MIN_FREE_PERCENT);
     const graceMs = graceMinutes * MINUTE_MS;
     const nowCanonical = isCanonicalIso(nowIso);
-    const nowMs = nowCanonical ? msOf(nowIso) : null;
+    // Without a canonical clock value no finding is emitted: a stored finding needs real sighting times, and a clock
+    // that cannot be read (or carries a secret shape) must never reach one. The next pass with a good clock reports.
+    if (!nowCanonical) {
+      return [];
+    }
+    const nowMs = msOf(nowIso);
     const computed: ReaperFinding[] = [];
     const mergedSubjects = new Set<string>();
 

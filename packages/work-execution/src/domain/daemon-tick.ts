@@ -7,7 +7,6 @@
  */
 
 import { containsSecretShape } from '@fleet/shared';
-import { parseBaseBranch } from './base-branch.js';
 import { isConductorHalted, isZonedIsoDateTime } from './conductor-halt.js';
 import { readExactPlainRecord } from './plain-record-reads.js';
 import type { ConductorHaltState } from './conductor-halt.js';
@@ -340,40 +339,10 @@ export function parseDaemonJobId(jobId: unknown): ParsedDaemonJobId | null {
   });
 }
 
-/** The lease path component pattern the daemon lease adapter enforces (safe component). */
-const MERGE_LEASE_SAFE_COMPONENT = /^[A-Za-z0-9._-]{1,128}$/;
-
 /**
- * The daemon lease scope of one merge-queue (repository, base) pair: `main`
- * keeps the digest scope, a chain base becomes `merge/<digest>--chain-<name>`.
- * A bad digest, an unparsable base, or a second component that would not survive
- * the adapter's safe-component rule returns `null`; never shortened, hashed or
- * fallen back to the `main` scope.
- */
-export function mergeQueueLeaseScope(repoDigest: string, baseBranch: unknown): string | null {
-  if (!DAEMON_REPO_DIGEST_PATTERN.test(repoDigest)) {
-    return null;
-  }
-  const base = parseBaseBranch(baseBranch);
-  if (base === undefined) {
-    return null;
-  }
-  if (base === 'main') {
-    return `merge/${repoDigest}`;
-  }
-  const chainName = base.slice('chain/'.length);
-  const second = `${repoDigest}--chain-${chainName}`;
-  if (!MERGE_LEASE_SAFE_COMPONENT.test(second)) {
-    return null;
-  }
-  return `merge/${second}`;
-}
-
-/**
- * True for `notifier`, `replan-digest`, `merge/<12 lowercase hex>`, a merge
- * chain lease `merge/<12 hex>--chain-<name>` whose chain suffix parses back,
- * or a cloud `<org>/<repo>` scope whose segments are not `.` or `..` and which
- * carries no secret-shaped text. Never throws.
+ * True for `notifier`, `replan-digest`, `merge/<12 lowercase hex>`, or a cloud
+ * `<org>/<repo>` scope whose segments are not `.` or `..` and which carries no
+ * secret-shaped text. Never throws.
  */
 export function isValidDaemonLeaseScope(scope: unknown): scope is string {
   try {
@@ -383,20 +352,8 @@ export function isValidDaemonLeaseScope(scope: unknown): scope is string {
     if (typeof scope !== 'string') {
       return false;
     }
-    if (scope.startsWith('merge/')) {
-      const rest = scope.slice('merge/'.length);
-      if (DAEMON_REPO_DIGEST_PATTERN.test(rest)) {
-        return true;
-      }
-      const chainAt = rest.indexOf('--chain-');
-      if (chainAt > 0 && DAEMON_REPO_DIGEST_PATTERN.test(rest.slice(0, chainAt))) {
-        const chain = rest.slice(chainAt + '--chain-'.length);
-        return parseBaseBranch(`chain/${chain}`) !== undefined;
-      }
-      const dashAt = rest.indexOf('--');
-      if (dashAt > 0 && DAEMON_REPO_DIGEST_PATTERN.test(rest.slice(0, dashAt))) {
-        return false;
-      }
+    if (scope.startsWith('merge/') && DAEMON_REPO_DIGEST_PATTERN.test(scope.slice('merge/'.length))) {
+      return true;
     }
     if (!CLOUD_SCOPE_PATTERN.test(scope)) {
       return false;

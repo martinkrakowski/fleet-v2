@@ -8,9 +8,10 @@ export const CONDUCTOR_REVISION_LENGTH = 12;
 
 /**
  * The canonical JSON the revision hashes: `enabled`, `stopGraceMinutes`, then `reaper` with
- * `enabled`, `intervalMinutes`, `graceMinutes`, `staleStopMinutes` and `repairs` (every kind, in
- * CONDUCTOR_REAPER_REPAIR_KINDS order), no whitespace. Pass a resolved policy
- * (`resolveConductorPolicy`) so an absent block hashes as the default.
+ * `enabled`, `intervalMinutes`, `graceMinutes`, `staleStopMinutes`, `repairs` (every kind, in
+ * CONDUCTOR_REAPER_REPAIR_KINDS order), `worktrees` (`retentionHours`, `maxRemovalsPerPass`,
+ * `passBudgetSeconds`) and `disk` (`minFreePercent`, `clearFreePercent`), no whitespace. Pass a
+ * resolved policy (`resolveConductorPolicy`) so an absent block hashes as the default.
  */
 export function canonicalConductorJson(policy: ResolvedConductorPolicy): string {
   const repairs: Record<string, boolean> = {};
@@ -26,6 +27,15 @@ export function canonicalConductorJson(policy: ResolvedConductorPolicy): string 
       graceMinutes: policy.reaper.graceMinutes,
       staleStopMinutes: policy.reaper.staleStopMinutes,
       repairs,
+      worktrees: {
+        retentionHours: policy.reaper.worktrees.retentionHours,
+        maxRemovalsPerPass: policy.reaper.worktrees.maxRemovalsPerPass,
+        passBudgetSeconds: policy.reaper.worktrees.passBudgetSeconds,
+      },
+      disk: {
+        minFreePercent: policy.reaper.disk.minFreePercent,
+        clearFreePercent: policy.reaper.disk.clearFreePercent,
+      },
     },
   });
 }

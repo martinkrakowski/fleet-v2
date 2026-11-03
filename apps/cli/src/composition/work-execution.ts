@@ -23,6 +23,7 @@ import {
   CommitEditOnlyAttemptUseCase,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
+  ExplainAttemptUseCase,
   EnqueueMergeUseCase,
   ExecutionObservationAdapter,
   GatePredicateAdapter,
@@ -577,6 +578,11 @@ export function composeExecution(input: ComposeExecutionInput) {
     inspectAttempt: new InspectAttemptUseCase({
       attemptRepo: attemptRepository,
       runnerForAttempt,
+    }),
+    explainAttempt: new ExplainAttemptUseCase({
+      attemptRepo: attemptRepository,
+      journal: executionJournal,
+      acceptanceEvidence,
     }),
     prepareBriefPackage: new PrepareBriefPackageUseCase({
       briefAuthoring,

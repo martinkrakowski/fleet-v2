@@ -260,19 +260,34 @@ export interface AutoMergePolicy {
 }
 
 /**
- * Reaper finding kinds that have a repair (conductor plan §3.9.2, D14). The first four are
- * record-only; `orphan-session` aborts a session and is destructive. `driverless-run` and
- * `orphan-worktree` are report-only and have no repair (D15: no worktree removal).
+ * Reaper finding kinds that have a repair (conductor plan §3.9.2, D14, §3.10.4). The first four
+ * are record-only; `merged-worktree` removes a merged worktree and `orphan-session` aborts a
+ * session — both destructive and opt-in (D17, D14). `driverless-run` and `orphan-worktree` are
+ * report-only and have no repair (D15: no worktree removal).
  */
 export type ConductorReaperRepairKind =
   | 'dead-attempt'
   | 'leaked-slot'
   | 'stale-stop'
   | 'stale-attention'
+  | 'merged-worktree'
   | 'orphan-session';
 
 /** Per-kind repair opt-ins as written in the file; an absent kind is off. */
 export type ConductorReaperRepairs = Readonly<Partial<Record<ConductorReaperRepairKind, boolean>>>;
+
+/** The v2 `policy.conductor.reaper.worktrees` block as written (§3.10.4); absent fields default. */
+export interface ConductorReaperWorktreePolicy {
+  readonly retentionHours?: number;
+  readonly maxRemovalsPerPass?: number;
+  readonly passBudgetSeconds?: number;
+}
+
+/** The v2 `policy.conductor.reaper.disk` block as written (§3.10.4, §3.10.6); absent fields default. */
+export interface ConductorReaperDiskPolicy {
+  readonly minFreePercent?: number;
+  readonly clearFreePercent?: number;
+}
 
 /** The v2 `policy.conductor.reaper` section as written; only `enabled` is required. */
 export interface ConductorReaperPolicy {
@@ -281,6 +296,8 @@ export interface ConductorReaperPolicy {
   readonly graceMinutes?: number;
   readonly staleStopMinutes?: number;
   readonly repairs?: ConductorReaperRepairs;
+  readonly worktrees?: ConductorReaperWorktreePolicy;
+  readonly disk?: ConductorReaperDiskPolicy;
 }
 
 /**
@@ -327,6 +344,19 @@ export interface ResolvedTelemetryPolicy {
   readonly salt: string | null;
 }
 
+/** The effective `policy.conductor.reaper.worktrees` block: every field present (§3.10.4). */
+export interface ResolvedConductorReaperWorktreePolicy {
+  readonly retentionHours: number;
+  readonly maxRemovalsPerPass: number;
+  readonly passBudgetSeconds: number;
+}
+
+/** The effective `policy.conductor.reaper.disk` block: every field present (§3.10.4). */
+export interface ResolvedConductorReaperDiskPolicy {
+  readonly minFreePercent: number;
+  readonly clearFreePercent: number;
+}
+
 /** The effective reaper policy: every field present. */
 export interface ResolvedConductorReaperPolicy {
   readonly enabled: boolean;
@@ -334,6 +364,8 @@ export interface ResolvedConductorReaperPolicy {
   readonly graceMinutes: number;
   readonly staleStopMinutes: number;
   readonly repairs: Readonly<Record<ConductorReaperRepairKind, boolean>>;
+  readonly worktrees: ResolvedConductorReaperWorktreePolicy;
+  readonly disk: ResolvedConductorReaperDiskPolicy;
 }
 
 /** The effective conductor policy: every field present (`resolveConductorPolicy`). */

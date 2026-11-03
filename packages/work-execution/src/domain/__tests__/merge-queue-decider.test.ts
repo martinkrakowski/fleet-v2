@@ -29,6 +29,7 @@ function makeEntry(overrides: Partial<MergeQueueEntryRecord> = {}): MergeQueueEn
     entryId: nextEntryId(),
     repository: { owner: 'fleet', repo: 'v2' },
     repoDigest: DIGEST,
+    baseBranch: 'main',
     pullRequest: 1,
     headOid: HEAD,
     state: 'queued',
@@ -73,6 +74,7 @@ function makeOpenFacts(overrides: Record<string, unknown> = {}): MergeStepFacts 
     paused: false,
     isQueueHead: true,
     pr: { status: 'open', headOid: HEAD, mergeStateStatus: 'CLEAN' },
+    prBaseRef: 'main',
     reReadHeadOid: HEAD,
     headObservedAtIso: NOW,
     contexts: {
@@ -211,6 +213,57 @@ describe('update row (row 9)', () => {
   it('parks update-refused from the recorded forge outcome even when CLEAN', () => {
     const decision = decideMergeStep(makeEntry(), makeOpenFacts({ lastForgeOutcome: { outcome: 'update-refused' } }), makePolicy(), NOW);
     expectPark(decision, 'update-refused');
+  });
+});
+
+describe('base-unknown guard (CO3)', () => {
+  it('waits base-unknown on BEHIND when the pr base differs from the entry base', () => {
+    const entry = makeEntry({ baseBranch: 'chain/dt' });
+    const facts = makeOpenFacts({
+      prBaseRef: 'main',
+      pr: { status: 'open', headOid: HEAD, mergeStateStatus: 'BEHIND' },
+    });
+    const decision = decideMergeStep(entry, facts, makePolicy(), NOW);
+    expectWait(decision, 'base-unknown');
+    expect(decision.kind).not.toBe('act');
+  });
+
+  it('acts update-branch on BEHIND when the pr base matches the entry base', () => {
+    const entry = makeEntry({ baseBranch: 'chain/dt' });
+    const facts = makeOpenFacts({
+      prBaseRef: 'chain/dt',
+      pr: { status: 'open', headOid: HEAD, mergeStateStatus: 'BEHIND' },
+    });
+    const decision = decideMergeStep(entry, facts, makePolicy(), NOW);
+    expect(decision.kind).toBe('act');
+    if (decision.kind === 'act') {
+      expect(decision.action).toBe('update-branch');
+    }
+  });
+
+  it('proceeds from CLEAN when the pr base matches the entry base', () => {
+    const entry = makeReadyEntry({ baseBranch: 'chain/dt' });
+    const decision = decideMergeStep(entry, makeOpenFacts({ prBaseRef: 'chain/dt' }), makePolicy(), NOW);
+    expect(decision.kind).toBe('act');
+  });
+
+  it('waits base-unknown on CLEAN when the bases differ', () => {
+    const entry = makeReadyEntry({ baseBranch: 'chain/dt' });
+    const decision = decideMergeStep(entry, makeOpenFacts({ prBaseRef: 'main' }), makePolicy(), NOW);
+    expectWait(decision, 'base-unknown');
+  });
+
+  it('waits base-unknown when prBaseRef is omitted', () => {
+    const facts = makeOpenFacts();
+    delete (facts as unknown as Record<string, unknown>).prBaseRef;
+    const decision = decideMergeStep(makeReadyEntry(), facts, makePolicy(), NOW);
+    expectWait(decision, 'base-unknown');
+  });
+
+  it('waits base-unknown for an unparsable prBaseRef without echoing it', () => {
+    const decision = decideMergeStep(makeReadyEntry(), makeOpenFacts({ prBaseRef: 'release' }), makePolicy(), NOW);
+    expectWait(decision, 'base-unknown');
+    expect(JSON.stringify(decision)).not.toContain('release');
   });
 });
 

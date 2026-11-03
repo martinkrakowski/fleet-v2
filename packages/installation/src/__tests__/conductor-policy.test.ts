@@ -141,6 +141,7 @@ describe('policy.conductor (K2)', () => {
       'leaked-slot': false,
       'stale-stop': false,
       'stale-attention': false,
+      'merged-worktree': false,
       'orphan-session': false,
     });
     expect(Object.isFrozen(off)).toBe(true);
@@ -473,41 +474,41 @@ describe('policy.conductor (K2)', () => {
   });
 
   it('computes the revision from the canonical JSON', () => {
-    expect(conductorRevision(DEFAULT_CONDUCTOR_POLICY)).toBe('4f455a6c4093');
+    expect(conductorRevision(DEFAULT_CONDUCTOR_POLICY)).toBe('78cc1fdb1b30');
     expect(
       conductorRevision(resolveConductorPolicy({ conductor: { enabled: true } } as never)),
-    ).toBe('7844746b0277');
+    ).toBe('ed656a35e15c');
     expect(
       conductorRevision(
         resolveConductorPolicy({
           conductor: { enabled: true, reaper: { enabled: true, repairs: RECORD_ONLY } },
         } as never),
       ),
-    ).toBe('82afb846ea78');
+    ).toBe('b47b30195765');
     expect(
       conductorRevision(
         resolveConductorPolicy({
           conductor: { enabled: true, reaper: { enabled: true, repairs: { 'orphan-session': true } } },
         } as never),
       ),
-    ).toBe('5bb8328117df');
-    for (const revision of ['4f455a6c4093', '7844746b0277', '82afb846ea78', '5bb8328117df']) {
+    ).toBe('4e739224b097');
+    for (const revision of ['78cc1fdb1b30', 'ed656a35e15c', 'b47b30195765', '4e739224b097']) {
       expect(revision).toMatch(/^[0-9a-f]{12}$/);
     }
     expect(canonicalConductorJson(DEFAULT_CONDUCTOR_POLICY)).toBe(
-      '{"enabled":false,"stopGraceMinutes":45,"reaper":{"enabled":true,"intervalMinutes":10,"graceMinutes":5,"staleStopMinutes":30,"repairs":{"dead-attempt":false,"leaked-slot":false,"stale-stop":false,"stale-attention":false,"orphan-session":false}}}',
+      '{"enabled":false,"stopGraceMinutes":45,"reaper":{"enabled":true,"intervalMinutes":10,"graceMinutes":5,"staleStopMinutes":30,"repairs":{"dead-attempt":false,"leaked-slot":false,"stale-stop":false,"stale-attention":false,"merged-worktree":false,"orphan-session":false},"worktrees":{"retentionHours":24,"maxRemovalsPerPass":10,"passBudgetSeconds":120},"disk":{"minFreePercent":15,"clearFreePercent":20}}}',
     );
   });
 
   it('is stable across key order', () => {
     const canonical = parseV2Fixture(withConductor({ enabled: true }));
     const reversed = parseV2Fixture(withConductor(REVERSED_DEFAULT_ON));
-    expect(conductorRevision(resolveConductorPolicy(canonical.policy))).toBe('7844746b0277');
-    expect(conductorRevision(resolveConductorPolicy(reversed.policy))).toBe('7844746b0277');
+    expect(conductorRevision(resolveConductorPolicy(canonical.policy))).toBe('ed656a35e15c');
+    expect(conductorRevision(resolveConductorPolicy(reversed.policy))).toBe('ed656a35e15c');
   });
 
   it('changes the revision when any field changes', () => {
-    const base = '7844746b0277';
+    const base = 'ed656a35e15c';
     expect(
       conductorRevision(resolveConductorPolicy({ conductor: { enabled: false } } as never)),
     ).not.toBe(base);

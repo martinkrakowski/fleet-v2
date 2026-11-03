@@ -86,7 +86,6 @@ function baseFacts(overrides: Partial<LaneRunFacts> = {}): LaneRunFacts {
     acceptedHead12: null,
     gate: 'none',
     gateCongestion: null,
-    gateRetry: null,
     briefCheck: { verdict: 'none', seatIndex: null, retries: 0 },
     codeReview: { verdict: 'none', seatIndex: null, retries: 0 },
     preMerge: 'none',
@@ -180,7 +179,6 @@ describe('global rules', () => {
     const facts = baseFacts({
       state: 'running',
       attempt: attemptFact(),
-      gate: 'pending',
       pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
@@ -894,46 +892,6 @@ describe('gating state', () => {
       });
       expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
     }
-  });
-
-  it('T7: an ambiguous gate park\'s resume re-runs the gate once under /retry1', () => {
-    const facts = baseFacts({
-      state: 'gating',
-      head12: HEAD,
-      attempt: attemptFact(),
-      gate: 'pending',
-      gateRetry: 1,
-      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
-    });
-    expect(decide(record({}), facts)).toEqual({
-      kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
-    });
-  });
-
-  it('T7b: the same ambiguous gate intent with no retry fact still parks ambiguous gate', () => {
-    const facts = baseFacts({
-      state: 'gating',
-      head12: HEAD,
-      attempt: attemptFact(),
-      gate: 'pending',
-      gateRetry: null,
-      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
-    });
-    assertDecision(facts, record({}), decide(record({}), facts), {
-      kind: 'park', reason: 'ambiguous', qualifier: 'gate', parkedFrom: 'gating',
-    });
-  });
-
-  it('T7c: a later gate run that decided the head means the ambiguous intent does not park', () => {
-    const facts = baseFacts({
-      state: 'gating',
-      head12: HEAD,
-      attempt: attemptFact(),
-      gate: 'passed',
-      gateRetry: null,
-      pendingIntent: { key: `${RUN_ID}/r0/gate/0@${HEAD}`, step: 'gate', reconciliation: 'ambiguous' },
-    });
-    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'brief-check' });
   });
 });
 

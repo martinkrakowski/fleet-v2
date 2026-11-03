@@ -36,6 +36,7 @@ export * from "./merge-queue-records.js";
 export * from "./owner-entries.js";
 export * from "./park-findings-view.js";
 export * from "./plain-record-reads.js";
+export * from "./reaper-findings.js";
 export * from "./record-schema-version.js";
 export * from "./review-finding-scope.js";
 export * from "./run-telemetry.js";

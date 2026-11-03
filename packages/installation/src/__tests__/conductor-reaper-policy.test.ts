@@ -375,6 +375,35 @@ describe('policy.conductor.reaper worktrees/disk (KWp)', () => {
       expect(getterRan).toBe(false);
     }
 
+    for (const kind of CONDUCTOR_REAPER_REPAIR_KINDS) {
+      let repairGetterRan = false;
+      const repairs: Record<string, unknown> = {};
+      Object.defineProperty(repairs, kind, {
+        get() {
+          repairGetterRan = true;
+          throw new Error(`getter for repairs.${kind} should not run`);
+        },
+        enumerable: true,
+        configurable: true,
+      });
+      const reaperWithRepairGetter = { enabled: true, repairs };
+      let repairResult: ReturnType<typeof parseInstallation> | undefined;
+      expect(() => {
+        repairResult = parseInstallation(withReaper(reaperWithRepairGetter));
+      }).not.toThrow();
+      expect(repairGetterRan).toBe(false);
+      expect(repairResult).toEqual({
+        ok: false,
+        errors: [`policy.conductor.reaper.repairs.${kind}: must be a boolean`],
+      });
+      expect(
+        resolveConductorPolicy({
+          conductor: { enabled: true, reaper: reaperWithRepairGetter },
+        } as never),
+      ).toEqual(DEFAULT_CONDUCTOR_POLICY);
+      expect(repairGetterRan).toBe(false);
+    }
+
     for (const parent of ['worktrees', 'disk'] as const) {
       let blockGetterRan = false;
       const reaperWithGetter: Record<string, unknown> = { enabled: true };

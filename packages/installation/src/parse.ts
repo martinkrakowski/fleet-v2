@@ -1899,7 +1899,7 @@ function parseConductorRepairs(
     if (!Object.hasOwn(value, kind)) {
       continue;
     }
-    const flag = value[kind];
+    const flag = readOwnDataProperty(value, kind);
     if (typeof flag !== 'boolean') {
       errors.push(`policy.conductor.reaper.repairs.${kind}: must be a boolean`);
       continue;

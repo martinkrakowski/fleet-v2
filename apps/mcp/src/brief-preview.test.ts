@@ -38,8 +38,8 @@ const MARKER_INPUT = {
     model: "example-provider/glm-5.3",
     variant: "default",
     fallbackModel: "example-provider/grok-4.7",
+    seatTool: "opencode",
   },
-  seatTool: "opencode",
   proseMarkdown: "prose mentioning MARK-NOTE-1",
   prNotes: {
     hardToUndo: "hard to undo MARK-NOTE-1",

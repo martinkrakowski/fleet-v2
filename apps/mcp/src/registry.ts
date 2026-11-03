@@ -187,9 +187,9 @@ const BRIEF_PREVIEW_INPUT = z.strictObject({
     model: z.string().max(256),
     variant: z.string().max(256),
     fallbackModel: z.string().max(256),
+    seatTool: z.enum(["opencode", "agy"]),
+    agent: z.string().max(64).optional(),
   }),
-  seatTool: z.enum(["opencode", "agy"]),
-  agent: z.string().max(64).optional(),
   proseMarkdown: z.string().max(16000).optional(),
   prNotes: z
     .strictObject({

@@ -109,6 +109,35 @@ function ownedRootsOverlap(left: string, right: string): boolean {
   return left === right || right.startsWith(left + '/') || left.startsWith(right + '/');
 }
 
+/**
+ * Shared append-style files (CG2): files a lane only ever appends to, so two
+ * lanes listing the exact same path do not conflict. Pure: never throws, exact
+ * match only; no directory is ever shared, and no glob is ever shared.
+ */
+export const SHARED_APPEND_PATHS: readonly string[] = ['.architecture/manifest.yaml', 'yarn.lock'];
+
+/**
+ * Whether an owned path is a shared append-style file: a non-empty, glob-free,
+ * dot-segment-free path that names one of `SHARED_APPEND_PATHS` exactly, or a
+ * file named exactly `index.ts` (a barrel). A directory such as `packages/a/src`
+ * is never shared, and a trailing glob (`yarn.lock*`) is never shared. Pure;
+ * never throws; exact match only.
+ */
+export function isSharedAppendPath(ownedPath: string): boolean {
+  if (typeof ownedPath !== 'string') {
+    return false;
+  }
+  const trimmed = ownedPath.trim();
+  if (trimmed === '' || trimmed.includes('*')) {
+    return false;
+  }
+  const segments = trimmed.split('/');
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
+    return false;
+  }
+  return SHARED_APPEND_PATHS.includes(trimmed) || segments[segments.length - 1] === 'index.ts';
+}
+
 /** Whether an owned path has a `.` or `..` segment, so its literal text does not say which tree it names. */
 function hasDotSegment(ownedPath: string): boolean {
   return typeof ownedPath === 'string' && ownedPath.trim().split('/').some((segment) => segment === '.' || segment === '..');
@@ -135,8 +164,23 @@ export function laneRunOwnedPathsOverlap(
   }
   const aRoots = usableOwnedRoots(a.ownedPaths);
   const bRoots = usableOwnedRoots(b.ownedPaths);
+  // The shared sets hold the trimmed paths themselves, not their normalized
+  // roots: a glob such as `yarn.lock*` reduces to the root `yarn.lock` but is
+  // never shared, so a root that a non-shared path also produces must not be
+  // exempt on that path's behalf.
+  const aShared = new Set(a.ownedPaths.filter((path) => isSharedAppendPath(path)).map((path) => path.trim()));
+  const bShared = new Set(b.ownedPaths.filter((path) => isSharedAppendPath(path)).map((path) => path.trim()));
+  const aNonSharedRoots = usableOwnedRoots(a.ownedPaths.filter((path) => !isSharedAppendPath(path)));
+  const bNonSharedRoots = usableOwnedRoots(b.ownedPaths.filter((path) => !isSharedAppendPath(path)));
   if (aRoots.length > 0 && bRoots.length > 0) {
-    return aRoots.some((left) => bRoots.some((right) => ownedRootsOverlap(left, right)));
+    return aRoots.some(
+      (left) =>
+        bRoots.some(
+          (right) =>
+            !(left === right && aShared.has(left) && bShared.has(right) && !aNonSharedRoots.includes(left) && !bNonSharedRoots.includes(right)) &&
+            ownedRootsOverlap(left, right),
+        ),
+    );
   }
   const aKeys = laneRunPackageKeys(a.ownedPaths);
   const bKeys = laneRunPackageKeys(b.ownedPaths);

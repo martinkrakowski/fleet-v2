@@ -29,6 +29,7 @@ import { readFrozenBriefVerified } from './frozen-manifest.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, saveOrRefuse } from './step-context.js';
+import { lastDispatchLeftDirtyWorktree } from './dirty-handover.js';
 import { nonPassingGatePredicatesOf } from '../RequestAttemptAcceptanceUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
@@ -901,6 +902,16 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     return refuse('prepare-refused');
   }
 
+  // GB3a: when the previous FIX seat left the worktree dirty (its last
+  // dispatch refused with a dirty detail and the attempt was cancelled), the
+  // next fix brief opens with the handover note: finish the work and commit.
+  const latestAttempt = gathered.latestAttempt;
+  const handover =
+    lastDispatchLeftDirtyWorktree(entries, record.runId) &&
+    latestAttempt !== null &&
+    latestAttempt.kind === 'fix' &&
+    latestAttempt.state === 'cancelled' &&
+    latestAttempt.priorAttemptId === prior.id;
   const brief = renderHandoverBrief({
     runId: record.runId,
     round,
@@ -912,6 +923,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     gatePredicates,
     proofCommands,
     originalBrief,
+    ...(handover ? { uncommittedHandover: true } : {}),
   } satisfies RenderHandoverBriefInput);
   if (!brief.ok || brief.numberedFixes.length === 0) {
     return refuse('prepare-refused');

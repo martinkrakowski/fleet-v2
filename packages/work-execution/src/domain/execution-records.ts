@@ -389,6 +389,12 @@ export interface CapacityReservationRecord {
    * busy-worktree check.
    */
   readonly worktreePath?: string | null;
+  /**
+   * The work order the reservation was made for (CG2). Records persisted
+   * before the field existed read as absent, and absent still fails closed
+   * in admission: the attempt's own record is the other source.
+   */
+  readonly workOrderId?: string | null;
   readonly reservedAtIso: string;
   readonly releasedAtIso: string | null;
 }

@@ -7,10 +7,10 @@
  */
 
 import {
-  BOARD_GATING_OWNER_ITEM_KINDS,
   BOARD_SOURCES,
   DEFAULT_BOARD_POLICY,
   formatLaneRef,
+  isPlainText,
   parseTimeMs,
   WORK_BOARD_SCHEMA_VERSION,
 } from './work-board-facts.js';
@@ -20,20 +20,18 @@ import type {
   BoardFacts,
   BoardMergeFact,
   BoardOptions,
-  BoardOwnerItemFact,
-  BoardOwnerItemKind,
   BoardPlanFact,
   BoardPlannedLaneStatus,
   BoardPolicy,
   BoardPullRequestLinkFact,
-  BoardQuestionFact,
   BoardRunFact,
   BoardSource,
   BoardWorkOrderFact,
   LaneRef,
   SourceReading,
 } from './work-board-facts.js';
-import { planTextError } from './lane-plan-sidecar.js';
+import { deriveOwnerEntries } from './owner-entries.js';
+import type { BoardOwnerEntry } from './owner-entries.js';
 import {
   boardStepText,
   laneBadges,
@@ -99,21 +97,6 @@ export interface BoardLaneCard {
   readonly pullRequests: readonly BoardPrStatus[];
   readonly reviewCounts: BoardReviewCounts | null;
   readonly badges: readonly BoardBadge[];
-}
-
-/** One entry of the deduplicated owner-items list (plan §3.1 identity rule). */
-export interface BoardOwnerEntry {
-  readonly origin: 'owner-item' | 'question';
-  readonly id: string;
-  readonly projectId: string | null;          // null for a question
-  readonly kind: BoardOwnerItemKind;
-  readonly subject: string | null;            // an item's subject, a question's title
-  readonly sinceIso: string;
-  readonly gating: boolean;                   // a gating kind (a question is a decision)
-  readonly gatesLanes: readonly string[];     // card keys where it is the Waiting reason; sorted
-  readonly namesLanes: readonly string[];     // card keys named in blocks or refs; sorted
-  readonly placement: 'lane-reason' | 'own-card';
-  readonly questionIds: readonly string[];    // questions folded into this item; sorted
 }
 
 export type BoardDoneEntry =
@@ -256,18 +239,8 @@ function resolveLaneRef(ref: LaneRef, facts: BoardFacts): LaneRef {
   return ref;
 }
 
-/**
- * The plain-text rule the board applies to its own display text: a work-order
- * lane id becomes a card label, and a question title becomes a subject, only
- * when it passes the plan sidecar's plain-text rule (`planTextError`).
- */
-const BOARD_TEXT_MAX_BYTES = 1024;
 /** The label of a plan-lane card whose lane id, matched to no imported lane, is not plain text. */
 const UNNAMED_PLAN_LANE_LABEL = 'Unnamed plan lane';
-
-export function isPlainText(text: string): boolean {
-  return planTextError('text', text, BOARD_TEXT_MAX_BYTES) === null;
-}
 
 function makeCard(ref: LaneRef, facts: BoardFacts): Card {
   const isPlan = ref.kind === 'plan';
@@ -450,166 +423,6 @@ function buildCards(facts: BoardFacts): Card[] {
   }
 
   return cards;
-}
-
-interface EntryDraft {
-  origin: 'owner-item' | 'question';
-  id: string;
-  projectId: string | null;
-  kind: BoardOwnerItemKind;
-  subject: string | null;
-  sinceIso: string;
-  gating: boolean;
-  namesLanes: Set<string>;
-  gatesLanes: Set<string>;
-  questionIds: Set<string>;
-}
-
-function parseLaneBlockRef(text: string, projectId: string): LaneRef | null {
-  const parts = text.split('/');
-  if (parts.length === 2) {
-    return { kind: 'plan', projectId, planId: parts[0], laneId: parts[1] };
-  }
-  if (parts.length === 3) {
-    return { kind: 'plan', projectId: parts[0], planId: parts[1], laneId: parts[2] };
-  }
-  return null;
-}
-
-function isClosedQuestion(question: BoardQuestionFact): boolean {
-  if (question.state !== 'answered' && question.state !== 'acknowledged') return false;
-  const answer = question.answer;
-  if (!answer) return false;
-  if (answer.shape === 'accept') return true;
-  if (answer.shape === 'answer' && (answer.hasOption || answer.hasText)) return true;
-  return false;
-}
-
-function draftForItem(item: BoardOwnerItemFact, cardByKey: Map<string, Card>, facts: BoardFacts): EntryDraft {
-  const gating = (BOARD_GATING_OWNER_ITEM_KINDS as readonly BoardOwnerItemKind[]).includes(item.kind);
-  const names = new Set<string>();
-  const gates = new Set<string>();
-  const addLane = (ref: LaneRef, fromBlock: boolean): void => {
-    const key = formatLaneRef(resolveLaneRef(ref, facts));
-    if (!cardByKey.has(key)) return;
-    names.add(key);
-    if (fromBlock && gating) gates.add(key);
-  };
-
-  for (const ref of item.refs) {
-    if (ref.kind === 'lane') {
-      addLane({ kind: 'plan', projectId: item.projectId, planId: ref.planId, laneId: ref.laneId }, false);
-    } else if (ref.kind === 'work-order') {
-      addLane({ kind: 'work-order', projectId: item.projectId, workOrderId: ref.id }, false);
-    }
-  }
-  for (const block of item.blocks) {
-    if (block.kind === 'lane') {
-      const parsed = parseLaneBlockRef(block.ref, item.projectId);
-      if (parsed) addLane(parsed, true);
-    } else if (block.kind === 'work-order') {
-      addLane({ kind: 'work-order', projectId: item.projectId, workOrderId: block.ref }, true);
-    }
-  }
-
-  const questionIds = new Set<string>();
-  for (const ref of item.refs) {
-    if (ref.kind === 'question') questionIds.add(ref.id);
-  }
-
-  return {
-    origin: 'owner-item',
-    id: item.itemId,
-    projectId: item.projectId,
-    kind: item.kind,
-    subject: item.subject,
-    sinceIso: item.createdAtIso,
-    gating,
-    namesLanes: names,
-    gatesLanes: gates,
-    questionIds,
-  };
-}
-
-function draftForQuestion(question: BoardQuestionFact, cardByKey: Map<string, Card>, facts: BoardFacts): EntryDraft {
-  const names = new Set<string>();
-  const gates = new Set<string>();
-  const addLane = (ref: LaneRef): void => {
-    const key = formatLaneRef(resolveLaneRef(ref, facts));
-    if (!cardByKey.has(key)) return;
-    names.add(key);
-    gates.add(key);
-  };
-  for (const block of question.blocks) {
-    if (block.kind === 'lane') {
-      const parts = block.ref.split('/');
-      if (parts.length === 3) {
-        addLane({ kind: 'plan', projectId: parts[0], planId: parts[1], laneId: parts[2] });
-      }
-    } else if (block.kind === 'work-order') {
-      addLane({ kind: 'work-order', projectId: '', workOrderId: block.ref });
-    }
-  }
-  return {
-    origin: 'question',
-    id: question.questionId,
-    projectId: null,
-    kind: 'decision',
-    subject: isPlainText(question.title) ? question.title : 'Owner question',
-    sinceIso: question.askedAtIso,
-    gating: true,
-    namesLanes: names,
-    gatesLanes: gates,
-    questionIds: new Set<string>(),
-  };
-}
-
-function buildEntries(facts: BoardFacts, cardByKey: Map<string, Card>): EntryDraft[] {
-  const referenced = new Set<string>();
-  for (const item of facts.ownerItems) {
-    for (const ref of item.refs) {
-      if (ref.kind === 'question') referenced.add(ref.id);
-    }
-  }
-
-  const drafts: EntryDraft[] = [];
-  const seen = new Set<string>();
-  for (const item of facts.ownerItems) {
-    if (seen.has(item.itemId)) continue;
-    seen.add(item.itemId);
-    if (item.state !== 'open') continue;
-    drafts.push(draftForItem(item, cardByKey, facts));
-  }
-  for (const question of facts.questions) {
-    if (referenced.has(question.questionId)) continue;
-    if (isClosedQuestion(question)) continue;
-    drafts.push(draftForQuestion(question, cardByKey, facts));
-  }
-  return drafts;
-}
-
-function finalizeEntry(draft: EntryDraft, cardByKey: Map<string, Card>): BoardOwnerEntry {
-  const gatesLanes = [...draft.gatesLanes]
-    .filter((key) => {
-      const card = cardByKey.get(key);
-      return card !== undefined && card.done === null;
-    })
-    .sort(stringAsc);
-  const namesLanes = [...draft.namesLanes].sort(stringAsc);
-  const questionIds = [...draft.questionIds].sort(stringAsc);
-  return {
-    origin: draft.origin,
-    id: draft.id,
-    projectId: draft.projectId,
-    kind: draft.kind,
-    subject: draft.subject,
-    sinceIso: draft.sinceIso,
-    gating: draft.gating,
-    gatesLanes,
-    namesLanes,
-    placement: gatesLanes.length > 0 ? 'lane-reason' : 'own-card',
-    questionIds,
-  };
 }
 
 function reasonKindOf(entry: BoardOwnerEntry): 'merge' | 'decision' | 'secret' {
@@ -875,7 +688,6 @@ function entryOrderCompare(a: BoardOwnerEntry, b: BoardOwnerEntry): number {
 
 function computeBoard(facts: BoardFacts, readAtIso: string, sinceIso: string | null, policy: BoardPolicy): WorkBoard {
   const cards = buildCards(facts);
-  const cardByKey = new Map(cards.map((c) => [c.key, c]));
 
   const forgeRepos: string[] = [];
   {
@@ -891,8 +703,12 @@ function computeBoard(facts: BoardFacts, readAtIso: string, sinceIso: string | n
   }
   const readings = gatherReadings(facts, forgeRepos);
 
-  const drafts = buildEntries(facts, cardByKey);
-  const entries = drafts.map((d) => finalizeEntry(d, cardByKey));
+  const entries: BoardOwnerEntry[] = [...deriveOwnerEntries(
+    facts.ownerItems,
+    facts.questions,
+    cards.map((c) => ({ key: c.key, done: c.done !== null })),
+    (ref) => formatLaneRef(resolveLaneRef(ref, facts)),
+  )];
   const reasonsByKey = collectReasons(entries);
 
   const conflictLikes: BoardLinkConflictLike[] = facts.linkConflicts.map((conflict) => ({

@@ -37,6 +37,8 @@ export interface NotifyOwnerDependencies {
 export class NotifyOwnerUseCase implements OwnerNotificationPort {
   /** In-memory rate-limit keys in insertion order; the oldest drops first. */
   private readonly notifiedKeys = new Set<string>();
+  /** In-memory keys currently awaiting delivery. */
+  private readonly inFlightKeys = new Set<string>();
 
   constructor(private readonly deps?: NotifyOwnerDependencies) {}
 
@@ -68,12 +70,13 @@ export class NotifyOwnerUseCase implements OwnerNotificationPort {
       return { outcome: 'suppressed', reason: 'notifications-disabled' };
     }
     const key = ownerNotificationRateLimitKey(request.trigger, request.id);
-    if (this.notifiedKeys.has(key)) {
+    if (this.notifiedKeys.has(key) || this.inFlightKeys.has(key)) {
       return { outcome: 'suppressed', reason: 'rate-limited' };
     }
     // The text is rendered from the fixed template; nothing from the caller
     // reaches the message.
     const text = ownerNotificationText(request.trigger, request.id);
+    this.inFlightKeys.add(key);
     try {
       const receipt = await this.deps.delivery.deliverOwnerNotification({
         title: OWNER_NOTIFICATION_TITLE,
@@ -83,11 +86,13 @@ export class NotifyOwnerUseCase implements OwnerNotificationPort {
         // An unavailable delivery is remembered by nothing.
         return { outcome: 'suppressed', reason: 'delivery-unavailable' };
       }
+      this.remember(key);
+      return { outcome: 'notified', text };
     } catch {
       return { outcome: 'suppressed', reason: 'delivery-unavailable' };
+    } finally {
+      this.inFlightKeys.delete(key);
     }
-    this.remember(key);
-    return { outcome: 'notified', text };
   }
 
   /** Record the key, dropping the oldest first once the set is at capacity. */

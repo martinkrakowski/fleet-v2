@@ -22,10 +22,14 @@ class FakeDelivery implements OwnerNotificationDeliveryPort {
   readonly messages: { title: string; body: string }[] = [];
   reportUnavailable: string | null = null;
   throwOnDeliver = false;
+  deliverHook?: () => Promise<void>;
 
   async deliverOwnerNotification(
     message: { title: string; body: string },
   ): Promise<{ outcome: 'delivered' } | { outcome: 'unavailable'; reason: string }> {
+    if (this.deliverHook) {
+      await this.deliverHook();
+    }
     if (this.throwOnDeliver) {
       throw new Error('the injected runner exploded');
     }
@@ -199,6 +203,59 @@ describe('NotifyOwnerUseCase', () => {
     });
     expect(rateLimitedFollowUp).toEqual({ outcome: 'suppressed', reason: 'rate-limited' });
     expect(unavailable.messages).toHaveLength(1);
+  });
+
+  it('handles two concurrent calls with one key, where the delivery port resolves after a deferred promise: exactly one delivery, and the other call returns rate-limited', async () => {
+    const delivery = new FakeDelivery();
+    let resolveDeferred!: () => void;
+    const deferred = new Promise<void>((resolve) => {
+      resolveDeferred = resolve;
+    });
+    delivery.deliverHook = () => deferred;
+    const useCase = useCaseWith(delivery);
+
+    const call1 = useCase.notifyOwner({ trigger: 'attempt-ended', id: 'attempt-a1' });
+    const call2 = useCase.notifyOwner({ trigger: 'attempt-ended', id: 'attempt-a1' });
+
+    // The second call arrives while the first is in flight, so it is rate-limited.
+    expect(await call2).toEqual({ outcome: 'suppressed', reason: 'rate-limited' });
+    expect(delivery.messages).toHaveLength(0);
+
+    // After the deferred promise resolves, the first call completes delivery.
+    resolveDeferred();
+    expect(await call1).toEqual({
+      outcome: 'notified',
+      text: ownerNotificationText('attempt-ended', 'attempt-a1'),
+    });
+    expect(delivery.messages).toHaveLength(1);
+    expect(delivery.messages[0]).toEqual({
+      title: 'Fleet',
+      body: ownerNotificationText('attempt-ended', 'attempt-a1'),
+    });
+  });
+
+  it('a failed delivery, then a retry on the same instance, delivers once', async () => {
+    const delivery = new FakeDelivery();
+    delivery.reportUnavailable = 'the notification daemon is not running';
+    const useCase = useCaseWith(delivery);
+
+    const failed = await useCase.notifyOwner({
+      trigger: 'attempt-ended',
+      id: 'attempt-a1',
+    });
+    expect(failed).toEqual({ outcome: 'suppressed', reason: 'delivery-unavailable' });
+    expect(delivery.messages).toHaveLength(0);
+
+    delivery.reportUnavailable = null;
+    const retry = await useCase.notifyOwner({
+      trigger: 'attempt-ended',
+      id: 'attempt-a1',
+    });
+    expect(retry).toEqual({
+      outcome: 'notified',
+      text: ownerNotificationText('attempt-ended', 'attempt-a1'),
+    });
+    expect(delivery.messages).toHaveLength(1);
   });
 
   it('throws the fixed not-implemented error when unconfigured', async () => {

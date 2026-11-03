@@ -53,6 +53,7 @@ export type TrainLeaseDecision =
 
 const ID_MAX_BYTES = 256;
 const LEASE_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+const CLOCK_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 
 const ACQUIRE_KEYS: readonly string[] = ['holderId', 'observedFence', 'leaseUntilIso'];
 const RENEW_KEYS: readonly string[] = ['holderId', 'fence', 'leaseUntilIso'];
@@ -92,15 +93,24 @@ function isZonedIso(value: unknown): value is string {
 }
 
 /**
- * Read a trusted clock reading as a canonical zoned ISO-8601 string; null
- * when it is not a zoned ISO time. Never throws.
+ * Read a trusted clock reading as a canonical UTC ISO-8601 string; null
+ * when it is not a canonical UTC ISO time or does not name a real calendar instant. Never throws.
  */
 export function readClockIso(value: unknown): string | null {
   try {
-    if (!isZonedIso(value)) {
+    if (typeof value !== 'string' || !CLOCK_ISO_PATTERN.test(value)) {
       return null;
     }
-    return new Date(value).toISOString();
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      return null;
+    }
+    const iso = date.toISOString();
+    const expectedIso = value.includes('.') ? value : `${value.slice(0, 19)}.000Z`;
+    if (iso !== expectedIso) {
+      return null;
+    }
+    return iso;
   } catch {
     return null;
   }

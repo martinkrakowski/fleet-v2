@@ -79,6 +79,8 @@ const MUTATION_ROUTE_RULES: ReadonlyArray<readonly [string, string, string]> = [
   ["POST", "/v1/projects/:id/retire", "operate"],
   ["POST", "/v1/projects/:id/probe", "operate"],
   ["PATCH", "/v1/projects/:id", "operate"],
+  // The brief preview is a dry run: it computes and stores nothing.
+  ["POST", "/v1/briefs/preview", "read"],
 ];
 
 function isV1Path(path: string): boolean {

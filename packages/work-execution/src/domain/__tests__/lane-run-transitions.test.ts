@@ -74,7 +74,7 @@ const EXPECTED_EXITS: Record<LaneRunStateValue, readonly LaneRunStateValue[]> = 
   'brief-check': ['code-review', 'fixing'],
   'code-review': ['accepting', 'fixing'],
   fixing: ['dispatching'],
-  accepting: ['awaiting-premerge', 'opening-pr', 'pushing'],
+  accepting: ['awaiting-premerge', 'opening-pr', 'pushing', 'fixing'],
   'awaiting-premerge': ['opening-pr', 'pushing', 'fixing', 'gating', 'merged'],
   'opening-pr': ['watching-ci', 'gating'],
   pushing: ['watching-ci', 'gating'],
@@ -488,6 +488,11 @@ describe('speed-plan rows (KS1: D19, D20, D22, D24)', () => {
     for (const prNumber of [null, 7]) {
       expect(canEnterLaneRunState('accepting', afterLaneRunAcceptance(2, prNumber, 'merging'))).toBe(true);
     }
+  });
+
+  it('AR1: the review-blocked acceptance rejection leaves accepting into fixing', () => {
+    expect(LANE_RUN_EXITS.accepting).toContain('fixing');
+    expect(canEnterLaneRunState('accepting', 'fixing')).toBe(true);
   });
 
   it('merge hold: Tier 1 is released at once; Tier 2 follows its receipt at the head; unknown tier or receipt parks', () => {

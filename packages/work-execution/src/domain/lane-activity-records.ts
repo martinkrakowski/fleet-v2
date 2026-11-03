@@ -167,7 +167,11 @@ function isoAfter(iso: string, milliseconds: number): string | null {
   if (!Number.isFinite(base) || !Number.isFinite(target) || Math.abs(target) > MAX_DATE_MS) {
     return null;
   }
-  return new Date(target).toISOString();
+  const result = new Date(target).toISOString();
+  if (!CANONICAL_ISO_PATTERN.test(result)) {
+    return null;
+  }
+  return result;
 }
 
 /**

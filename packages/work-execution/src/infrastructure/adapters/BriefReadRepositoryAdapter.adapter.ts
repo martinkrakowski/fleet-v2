@@ -16,7 +16,6 @@ import * as path from 'node:path';
 import type { BriefReadRecord } from '../../domain/lane-activity-records.js';
 import { isBriefReadRecord } from '../../domain/lane-activity-records.js';
 import type { LaneRef } from '../../domain/work-board-facts.js';
-import { formatLaneRef } from '../../domain/work-board-facts.js';
 import type {
   BriefReadRepositoryPort,
   PutBriefReadResult,
@@ -37,7 +36,10 @@ export function parseBriefReadStateRecord(raw: unknown): BriefReadRecord | undef
 }
 
 function laneKeyOf(lane: LaneRef): string {
-  return formatLaneRef(lane);
+  if (lane.kind === 'plan') {
+    return JSON.stringify([lane.kind, lane.projectId, lane.planId, lane.laneId]);
+  }
+  return JSON.stringify([lane.kind, lane.projectId, lane.workOrderId]);
 }
 
 function refusal(reason: string): PutBriefReadResult {

@@ -222,4 +222,28 @@ describe('SyncPlanDecisionsUseCase', () => {
       decisions: [{ decisionId: 'd1', outcome: 'refused', code: 'not-configured' }],
     });
   });
+
+  it('a nowIso that throws gives outcome refused and code clock, and execute resolves without rejecting', async () => {
+    const ownerItems = new FakeOwnerItems();
+    const useCase = new SyncPlanDecisionsUseCase({
+      plans: new FakePlans(planRecord(), false),
+      ownerItems,
+      nowIso: () => {
+        throw new Error('clock unreadable');
+      },
+    });
+    const result = await useCase.execute({
+      projectId: 'example-project',
+      planId: 'plan-1',
+      previousDecisionIds: null,
+    });
+    expect(result).toEqual({
+      outcome: 'refused',
+      code: 'clock',
+      reason: 'the clock could not be read',
+      decisions: [],
+    });
+    expect(ownerItems.calls.opened).toHaveLength(0);
+    expect(ownerItems.calls.resolved).toHaveLength(0);
+  });
 });

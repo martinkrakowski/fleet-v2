@@ -105,7 +105,11 @@ export class SyncPlanDecisionsUseCase implements SyncPlanDecisionsPort {
   constructor(private readonly deps: SyncPlanDecisionsDependencies) {}
 
   async execute(request: SyncPlanDecisionsRequest): Promise<SyncPlanDecisionsResult> {
-    this.deps.nowIso();
+    try {
+      this.deps.nowIso();
+    } catch {
+      return { outcome: 'refused', code: 'clock', reason: 'the clock could not be read', decisions: [] };
+    }
     let record: LanePlanRecord | null;
     try {
       record = await this.deps.plans.findLanePlan(request.projectId, request.planId);

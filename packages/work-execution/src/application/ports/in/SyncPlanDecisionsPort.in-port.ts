@@ -22,7 +22,7 @@ export type SyncPlanDecisionsDecisionResult =
   | { readonly decisionId: string; readonly outcome: Exclude<SyncPlanDecisionsDecisionOutcome, 'refused'> }
   | { readonly decisionId: string; readonly outcome: 'refused'; readonly code: string };
 
-export type SyncPlanDecisionsRefusalCode = 'plan-unread' | 'all-refused';
+export type SyncPlanDecisionsRefusalCode = 'plan-unread' | 'all-refused' | 'clock';
 
 export type SyncPlanDecisionsResult =
   | { readonly outcome: 'synced' | 'partial'; readonly decisions: readonly SyncPlanDecisionsDecisionResult[] }

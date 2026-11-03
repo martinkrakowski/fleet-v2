@@ -109,4 +109,16 @@ describe('BriefReadRepositoryAdapter', () => {
     expect((await adapter.latest(LANE))!.readAtIso).toBe('2026-10-27T10:05:00.000Z');
     expect((await adapter.latest(OTHER_LANE))!.readAtIso).toBe('2026-10-27T10:06:00.000Z');
   });
+
+  it('two lanes with the same work-order id in different projects keep separate reads', async () => {
+    const adapter = new BriefReadRepositoryAdapter({ stateDir: tempDir });
+    const laneA = { kind: 'work-order', projectId: 'project-a', workOrderId: 'wo-1' } as const;
+    const laneB = { kind: 'work-order', projectId: 'project-b', workOrderId: 'wo-1' } as const;
+
+    await adapter.put(record('2026-10-27T10:00:00.000Z', { lane: laneA }));
+    await adapter.put(record('2026-10-27T10:05:00.000Z', { lane: laneB }));
+
+    expect((await adapter.latest(laneA))!.readAtIso).toBe('2026-10-27T10:00:00.000Z');
+    expect((await adapter.latest(laneB))!.readAtIso).toBe('2026-10-27T10:05:00.000Z');
+  });
 });

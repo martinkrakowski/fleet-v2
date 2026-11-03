@@ -99,6 +99,13 @@ describe('parseLaneDeclarationBody', () => {
     });
   });
 
+  it('refuses a TTL that puts the lapse past 9999-12-31', () => {
+    expect(parseLaneDeclarationBody(declarationBody(), NOW, 5_000_000_000)).toEqual({
+      ok: false,
+      error: 'invalid ttlMinutes',
+    });
+  });
+
   it('refuses a lane ref with extra properties and stores a fresh ref', () => {
     const extraLane = { ...LANE, surprise: 'x' };
     const parsed = parseLaneDeclarationBody(declarationBody({ lane: extraLane }), NOW, 90);

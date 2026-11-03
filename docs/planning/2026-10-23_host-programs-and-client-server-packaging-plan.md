@@ -25,7 +25,13 @@ the programs that run on the lane host and inside its containers. Each program k
 POSIX shell script, pinned by hash, tested by `yarn test:bin`) and gains one delivery path: fleet-v2
 copies it to where it runs and verifies the hash there, the way `fleet-host-bootstrap` already does.
 
-**Non-goals.** No rewrite of a host script into TypeScript. No resident agent on any host. No
+**Non-goals.** No rewrite of a host script into TypeScript. (Amended 2026-11-03,
+owner decision on the cutover plan: this non-goal no longer covers the fleet-repo
+shell scripts — every behaviour of those scripts moves into fleet-v2 as rewritten
+platform code, never as shell carried in, "no shell style for scripts in v2,
+everything should be properly rewritten for the platform". The host programs this
+plan is about — `ocm-run`, `agy-run`, bootstrap, `hosts/` — stay pinned until the
+owner rules on them, per D-CO2.) No resident agent on any host. No
 change to the four contexts. The host's own administration (storage, GPU, backups, the Mac mini's
 clean-up scripts) is not fleet-v2's concern (§2, class D).
 

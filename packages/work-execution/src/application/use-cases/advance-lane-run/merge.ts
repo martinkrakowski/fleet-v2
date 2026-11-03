@@ -44,6 +44,8 @@ export interface AcceptanceFacts {
   readonly acceptedHead12: string | null;
   /** KF-23: the accept retry ordinal at `head12`, or null when no retry is due. */
   readonly acceptanceRetry: number | null;
+  /** AR1: why the head's acceptance was rejected; `review-findings` only for the review-blocked rejection. */
+  readonly acceptanceRejection: 'review-findings' | 'other';
   readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
   readonly ci: 'pending' | 'passed' | 'failed' | 'unknown';
   readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
@@ -174,6 +176,40 @@ function acceptanceRetryOf(
     }
   }
   return null;
+}
+
+/**
+ * Why the latest accept result at `head12` rejected (AR1): `'review-findings'`
+ * only when that final result is `acceptance-rejected` with detail
+ * `review-findings`; every other case, including a missing head, is `'other'`.
+ */
+function acceptanceRejectionOf(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  head12: string | null,
+): AcceptanceFacts['acceptanceRejection'] {
+  if (head12 === null) {
+    return 'other';
+  }
+  let latestIntentKey: string | null = null;
+  for (const entry of entries) {
+    if (entry.kind !== 'intent' || entry.runId !== runId || entry.key === null) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.step !== 'accept' || parsed.head12 !== head12) {
+      continue;
+    }
+    latestIntentKey = entry.key;
+  }
+  if (latestIntentKey === null) {
+    return 'other';
+  }
+  const final = finalResultOfKey(entries, latestIntentKey);
+  if (final !== null && final.reasonCode === 'acceptance-rejected' && final.detail === 'review-findings') {
+    return 'review-findings';
+  }
+  return 'other';
 }
 
 /** The head12 of the LATEST `accepted` accept result's key over all heads; null without one. */
@@ -318,8 +354,8 @@ async function prFactOf(
  * run only past acceptance — a state inside the PR/CI window, a collected head
  * to read at, a bound port, and never while halted — otherwise the hard-coded
  * defaults stand (`preMerge: 'none'`, `ci: 'unknown'`, `pr: null`). The PR is
- * read once; its snapshot's merge state feeds the merge facts. CG1: a parked
- * run with no recorded PR number additionally reads its PR by branch, keeping
+ * read once; its snapshot's merge state feeds the merge facts. CG1: any parked
+ * run reads its PR — by number when one is recorded, else by branch — keeping
  * only a merged PR, for the merged-PR rule only.
  */
 export async function acceptanceFactsOf(
@@ -333,6 +369,7 @@ export async function acceptanceFactsOf(
 ): Promise<AcceptanceFacts> {
   const acceptance = acceptanceOf(entries, record.runId, head12);
   const acceptanceRetry = acceptanceRetryOf(entries, record.runId, head12);
+  const acceptanceRejection = acceptanceRejectionOf(entries, record.runId, head12);
   const acceptedHead12 = acceptedHead12Of(entries, record.runId);
   let preMerge: AcceptanceFacts['preMerge'] = 'none';
   let ci: AcceptanceFacts['ci'] = 'unknown';
@@ -377,21 +414,20 @@ export async function acceptanceFactsOf(
     pr = prRead.pr;
     mergeState = prRead.mergeState;
   }
-  // CG1: for a parked run with no recorded PR number (the PR was opened by
-  // hand), look the PR up by the run's own branch; the lookup keeps only a
-  // merged PR — never an open one — and is for the merged-PR rule only. It
-  // does not write the record, save a prNumber, or feed the merge facts.
+  // CG1: any parked run, with or without a recorded PR number, reads its PR —
+  // by number when one is recorded, else by the run's own branch; the lookup
+  // keeps only a merged PR — never an open one — and is for the merged-PR rule
+  // only. It does not write the record, save a prNumber, or feed the merge facts.
   if (
     !halted &&
     !canReadPr &&
     state === 'parked' &&
     record.parked !== null &&
-    record.prNumber === null &&
     latest !== null &&
     latest.artifacts !== null &&
     ctx.deps.forgeRead !== undefined
   ) {
-    const ref = branchRefOf(record, latest);
+    const ref = pullRequestRefOf(record, latest);
     const lookup = await prFactOf(
       ctx.deps.forgeRead,
       ref,
@@ -399,14 +435,14 @@ export async function acceptanceFactsOf(
       latest.artifacts.headCommit,
       ctx.deps.forgeAncestry,
       resolveLaneRunBaseBranch(record),
-      ref.branchName,
+      branchRefOf(record, latest).branchName,
     );
     if (lookup.pr !== null && lookup.pr.state === 'merged') {
       pr = lookup.pr;
     }
   }
   const merge = await mergeFactsOf(ctx, record, state, halted, acceptance, mergeState);
-  return { acceptance, acceptanceRetry, acceptedHead12, preMerge, ci, pr, merge };
+  return { acceptance, acceptanceRetry, acceptanceRejection, acceptedHead12, preMerge, ci, pr, merge };
 }
 
 /**
@@ -466,6 +502,38 @@ async function mergeFactsOf(
   return { oneWayDoor, branchBehind, trainFree, policyGrant };
 }
 
+/**
+ * AR1: the journalled accept result's detail token for a rejected assessment.
+ * `'review-findings'` only when every blocker is kind `other` AND a
+ * `brief-check` or `code-review` receipt at the exact head failed with at
+ * least one finding. Never reads or journals any blocker or finding text.
+ */
+async function reviewFindingsDetailOf(
+  ctx: AdvanceStepContext,
+  attemptId: string,
+  headSha: string,
+  blockers: readonly { readonly kind: string }[] | undefined,
+): Promise<'review-findings' | null> {
+  if (blockers === undefined || blockers.length === 0 || blockers.some((blocker) => blocker.kind !== 'other')) {
+    return null;
+  }
+  const reviewRequest = ctx.deps.reviewRequest;
+  if (reviewRequest === undefined) {
+    return null;
+  }
+  for (const kind of ['brief-check', 'code-review'] as const) {
+    try {
+      const found = await reviewRequest.findLatestReceiptOfKind({ attemptId, candidateHeadSha: headSha, kind });
+      if (found.outcome === 'found' && found.receipt.verdict === 'failed' && found.receipt.findings.length > 0) {
+        return 'review-findings';
+      }
+    } catch {
+      // An unreadable receipt lookup skips that kind; it never fails the accept.
+    }
+  }
+  return null;
+}
+
 /** The accept body after its intent (K6-5): one assessment at the exact head, mapped by reason code only. */
 async function runAcceptBody(
   ctx: AdvanceStepContext,
@@ -486,6 +554,7 @@ async function runAcceptBody(
   const headSha = latest.artifacts.headCommit;
   let result: 'completed' | 'ambiguous';
   let reasonCode: LaneRunResultReasonCode;
+  let detail: string | null = null;
   try {
     // The conductor's pre-PR accept uses the receipts-only assessment: no
     // acceptance is stored, but a `passed` answer at the exact head accepts.
@@ -506,6 +575,7 @@ async function runAcceptBody(
     } else if (outcome.outcome === 'rejected') {
       result = 'completed';
       reasonCode = 'acceptance-rejected';
+      detail = await reviewFindingsDetailOf(ctx, latest.id, headSha, outcome.blockerDetails);
     } else {
       result = 'ambiguous';
       reasonCode = 'acceptance-unknown';
@@ -517,11 +587,11 @@ async function runAcceptBody(
     // OUTCOME from the port (not a throw) keeps the ambiguous result below.
     return { outcome: 'acted', step: decision.step, key, result: 'ambiguous', reasonCode: 'acceptance-unknown' };
   }
-  const resultRefusal = await appendRunResult(ctx, request, key, result, reasonCode);
+  const resultRefusal = await appendRunResult(ctx, request, key, result, reasonCode, detail);
   if (resultRefusal !== null) {
     return { outcome: 'refused', reason: resultRefusal };
   }
-  return { outcome: 'acted', step: decision.step, key, result, reasonCode };
+  return { outcome: 'acted', step: decision.step, key, result, reasonCode, ...(detail !== null ? { detail } : {}) };
 }
 
 /**

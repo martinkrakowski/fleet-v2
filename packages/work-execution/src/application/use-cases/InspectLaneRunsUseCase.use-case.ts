@@ -62,6 +62,12 @@ function parkRefusalDetailOf(record: LaneRunRecord, entries: readonly LaneRunJou
     if (parsed === null || parsed.kind !== 'step' || parsed.step !== parked.qualifier) {
       continue;
     }
+    // GB3c: a later result of the qualifier step whose detail is null or a
+    // `next-seat-` seat-advance token does not express the refusal that
+    // parked the run — keep scanning back for the refusal detail.
+    if (entry.detail === null || entry.detail.startsWith('next-seat-')) {
+      continue;
+    }
     return entry.detail;
   }
   return null;

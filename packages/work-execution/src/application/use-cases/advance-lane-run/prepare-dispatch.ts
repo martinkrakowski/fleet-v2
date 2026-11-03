@@ -639,6 +639,16 @@ async function handOverDirtyWorktree(ctx: AdvanceStepContext,
 }
 
 /**
+ * True when a refused dispatch's attempt hands a dirty worktree over to the
+ * next seat unchanged: a fix attempt, or a round-0 pivot seat (an initial
+ * attempt with a prior — a seat pivot prepared after an earlier seat failed).
+ * The very first attempt (`priorAttemptId === null`) keeps GB3 recovery.
+ */
+function handsOverDirtyWorktree(latest: AttemptRecord): boolean {
+  return latest.kind === 'fix' || (latest.kind === 'initial' && latest.priorAttemptId !== null);
+}
+
+/**
  * The `act dispatch` decision (K4-5): start the prepared attempt through
  * `DispatchAttemptPort` with the frozen brief's limits, raising the round and
  * the seat cursor on the record before the call (§3.2, D8). The dispatch key
@@ -781,11 +791,11 @@ export async function performDispatch(ctx: AdvanceStepContext,
           setBy: 'conductor',
           expiresAtIso: new Date(Date.parse(nowIso) + timeLimitSeconds * 1000).toISOString(),
         };
-  // GB3a: a fix dispatch following a dirty-worktree refusal carries the
-  // handed-over worktree as-is, so the next seat's uncommitted work is
-  // accepted instead of refused again.
+  // GB3a/GB3c: a fix dispatch or a round-0 pivot dispatch following a
+  // dirty-worktree refusal carries the handed-over worktree as-is, so the
+  // next seat's uncommitted work is accepted instead of refused again.
   const handover =
-    latest.kind === 'fix' &&
+    handsOverDirtyWorktree(latest) &&
     lastDispatchLeftDirtyWorktree(await ctx.deps.runJournal.listForRun(record.runId), record.runId);
   const dispatched = await dispatch.dispatchAttempt({
     attemptId: latest.id,
@@ -851,24 +861,27 @@ export async function performDispatch(ctx: AdvanceStepContext,
   if (resultRefusal !== null) {
     return { outcome: 'refused', reason: resultRefusal };
   }
-  // GB3a: a refused FIX dispatch whose detail is a dirty-worktree detail cancels
-  // the attempt and hands the worktree UNCHANGED to the next fix seat — nothing
-  // is preserved, reset or deleted. If the cancel does not land (unwired,
-  // refused or throwing) the run parks at the bottom; a fix attempt never
-  // reaches `recoverUncommittedWorktree`. First-pass attempts keep today's GB3
+  // GB3a/GB3c: a refused dispatch whose attempt is a fix seat or a round-0
+  // pivot seat and whose detail is a dirty-worktree detail cancels the attempt
+  // and hands the worktree UNCHANGED to the next seat — nothing is preserved,
+  // reset or deleted. If the cancel does not land (unwired, refused or
+  // throwing) the run parks at the bottom; such an attempt never reaches
+  // `recoverUncommittedWorktree`. First-pass attempts keep today's GB3
   // recovery exactly: preserve the edits as a patch outside the worktree, reset
   // the worktree to its head, cancel the attempt, and journal the patch path.
   // The spent refusal key is already recorded above. Success returns acted
   // without parking so the next advance prepares the next seat.
   const detail = dispatchRefusalDetail(dispatched.reason);
-  if (reasonCode === 'dispatch-refused' && latest.kind === 'fix' && isDirtyWorktreeDetail(detail)) {
-    if (await handOverDirtyWorktree(ctx, latest, request)) {
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
-    }
-  } else if (reasonCode === 'dispatch-refused' && latest.kind !== 'fix' && detail === 'worktree-uncommitted') {
-    const recovered = await recoverUncommittedWorktree(ctx, record, latest, request);
-    if (recovered) {
-      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
+  if (reasonCode === 'dispatch-refused') {
+    if (handsOverDirtyWorktree(latest)) {
+      if (isDirtyWorktreeDetail(detail) && (await handOverDirtyWorktree(ctx, latest, request))) {
+        return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
+      }
+    } else if (detail === 'worktree-uncommitted') {
+      const recovered = await recoverUncommittedWorktree(ctx, record, latest, request);
+      if (recovered) {
+        return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
+      }
     }
   }
   if (reasonCode === 'runner-refused') {

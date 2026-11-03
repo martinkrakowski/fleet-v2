@@ -88,6 +88,40 @@ describe('parseLaneDeclarationBody', () => {
     });
   });
 
+  it('refuses C1 controls and line separators in seatRole', () => {
+    for (const seatRole of ['build\u0080er', 'build\u0085er', 'build\u009fer', 'build\u2028er', 'build\u2029er', 'build\u007fer']) {
+      expect(parseLaneDeclarationBody(declarationBody({ seatRole }), NOW, 90)).toEqual({
+        ok: false,
+        error: 'invalid seatRole',
+      });
+    }
+  });
+
+  it('refuses C1 controls and line separators in model', () => {
+    for (const model of ['build\u0080er', 'build\u0085er', 'build\u009fer', 'build\u2028er', 'build\u2029er', 'build\u007fer']) {
+      expect(parseLaneDeclarationBody(declarationBody({ model }), NOW, 90)).toEqual({
+        ok: false,
+        error: 'invalid model',
+      });
+    }
+  });
+
+  it('accepts non-control neighbours in seatRole', () => {
+    expect(parseLaneDeclarationBody(declarationBody({ seatRole: 'build\u00a0er' }), NOW, 90).ok).toBe(true);
+    expect(parseLaneDeclarationBody(declarationBody({ seatRole: 'builder-\u00e9' }), NOW, 90).ok).toBe(true);
+  });
+
+  it('bounds a work-order lane workOrderId by UTF-8 bytes', () => {
+    const workOrderLane = (workOrderId: string): LaneRef => ({ kind: 'work-order', projectId: 'example-project', workOrderId });
+    expect(parseLaneDeclarationBody(declarationBody({ lane: workOrderLane('\u00e9'.repeat(128)) }), NOW, 90).ok).toBe(true);
+    for (const workOrderId of ['\u00e9'.repeat(129), 'a' + '\u00e9'.repeat(128), 'a\u0085b']) {
+      expect(parseLaneDeclarationBody(declarationBody({ lane: workOrderLane(workOrderId) }), NOW, 90)).toEqual({
+        ok: false,
+        error: 'invalid lane',
+      });
+    }
+  });
+
   it('refuses an invalid ttlMinutes', () => {
     expect(parseLaneDeclarationBody(declarationBody(), NOW, 0)).toEqual({
       ok: false,
@@ -195,6 +229,54 @@ describe('parseBriefReadBody', () => {
       error: 'invalid nowIso',
     });
   });
+
+  it('bounds path length by UTF-8 bytes', () => {
+    const acceptedPaths = [
+      'x'.repeat(256),
+      '\u00e9'.repeat(128),
+      'aa' + '\u00e9'.repeat(127),
+      '\u20ac'.repeat(85) + 'a',
+      '\ud83d\ude00'.repeat(64),
+    ];
+    for (const path of acceptedPaths) {
+      expect(parseBriefReadBody(briefReadBody({ path }), NOW).ok).toBe(true);
+    }
+    const refusedPaths = [
+      '\u00e9'.repeat(129),
+      'a' + '\u00e9'.repeat(128),
+      '\u20ac'.repeat(85) + 'aa',
+      '\ud83d\ude00'.repeat(64) + 'a',
+    ];
+    for (const path of refusedPaths) {
+      expect(parseBriefReadBody(briefReadBody({ path }), NOW)).toEqual({
+        ok: false,
+        error: 'invalid path',
+      });
+    }
+  });
+
+  it('refuses C1 controls and line separators in path', () => {
+    const paths = ['docs/a\u0080b', 'docs/a\u0085b', 'docs/a\u009fb', 'docs/a\u2028b', 'docs/a\u2029b', 'docs/a\u007fb', 'docs/a\u0000b', 'docs/a\nb'];
+    for (const path of paths) {
+      expect(parseBriefReadBody(briefReadBody({ path }), NOW)).toEqual({
+        ok: false,
+        error: 'invalid path',
+      });
+    }
+  });
+
+  it('accepts NBSP and other non-control unicode in path', () => {
+    expect(parseBriefReadBody(briefReadBody({ path: 'docs/a\u00a0b' }), NOW).ok).toBe(true);
+  });
+
+  it('refuses a failed read whose path has controls or exceeds the byte bound', () => {
+    for (const path of ['docs/a\u0085b', '\u00e9'.repeat(129)]) {
+      expect(parseBriefReadBody(briefReadBody({ path, outcome: 'failed', sha256: null, bytes: null }), NOW)).toEqual({
+        ok: false,
+        error: 'invalid path',
+      });
+    }
+  });
 });
 
 describe('isBriefReadRecord', () => {
@@ -227,5 +309,13 @@ describe('isBriefReadRecord', () => {
         bytes: 42,
       }),
     ).toBe(false);
+  });
+
+  it('bounds path by UTF-8 bytes and refuses C1 controls', () => {
+    expect(isBriefReadRecord({ ...base, path: '\u00e9'.repeat(128), outcome: 'read', sha256: 'a'.repeat(64), bytes: 42 })).toBe(true);
+    expect(isBriefReadRecord({ ...base, path: '\u00e9'.repeat(129), outcome: 'read', sha256: 'a'.repeat(64), bytes: 42 })).toBe(false);
+    expect(isBriefReadRecord({ ...base, path: 'a' + '\u00e9'.repeat(128), outcome: 'read', sha256: 'a'.repeat(64), bytes: 42 })).toBe(false);
+    expect(isBriefReadRecord({ ...base, path: 'docs/a\u0085b', outcome: 'read', sha256: 'a'.repeat(64), bytes: 42 })).toBe(false);
+    expect(isBriefReadRecord({ ...base, path: 'docs/a\u2028b', outcome: 'read', sha256: 'a'.repeat(64), bytes: 42 })).toBe(false);
   });
 });

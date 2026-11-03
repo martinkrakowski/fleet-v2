@@ -1,17 +1,19 @@
 /**
- * Unit tests for CG1: a parked run with no recorded PR number (the PR was
- * opened by hand) reads its PR by the run's own branch, keeping only a merged
- * PR, for the merged-PR rule only. No PR-number write, no journal entry, no
- * non-parked-state lookup. Every store is in-memory; no forge, no CI, no
- * subprocess, no network.
+ * Unit tests for CG1 and CX2: any parked run reads its PR — by number when one
+ * is recorded, else by the run's own branch — keeping only a merged PR, for the
+ * merged-PR rule only. No PR-number write, no journal entry, no non-parked-state
+ * lookup. Every store is in-memory; no forge, no CI, no subprocess, no network.
  */
 
 import { describe, expect, it } from 'vitest';
 
 import type { AttemptRecord, CollectedAttemptArtifacts } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
-import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
+import { laneRunJournalState } from '../../../domain/lane-run-journal.js';
+import { LANE_RUN_PARK_REASONS } from '../../../domain/lane-run-records.js';
+import type { LaneRunParkReason, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import { laneRunConductEntry } from '../../../domain/lane-run-step-facts.js';
+import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { ReadPullRequestRequest, ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
@@ -376,13 +378,104 @@ describe('CG1: a parked run with no recorded PR number reads its PR by branch, k
     expect(result).toEqual({ outcome: 'waiting', reason: 'parked' });
   });
 
-  it('a recorded prNumber means the lookup by branch never runs', async () => {
+  it('a recorded prNumber reads the PR by number and an open PR keeps the run parked', async () => {
     const { record, attempts } = parkedFixture();
     const numberedRecord = runRecord({ ...record, prNumber: 7 });
     const harness = await makeHarness(numberedRecord, attempts);
     await conduct(harness, 'parked', NOW);
     const result = await advance(harness);
     expect(result).toEqual({ outcome: 'waiting', reason: 'parked' });
-    expect(harness.forgeRequests).toHaveLength(0);
+    expect(harness.forgeRequests[0]?.ref).toEqual({ kind: 'number', number: 7 });
+  });
+});
+
+describe('CX2: a parked run whose PR merged with the lane head goes to merged, for every park reason', () => {
+  const REASON_CASES: Record<LaneRunParkReason, { qualifier: string | null; parkedFrom: LaneRunStateValue }> = {
+    'one-way-door': { qualifier: null, parkedFrom: 'fixing' },
+    'seat-plan-exhausted': { qualifier: null, parkedFrom: 'fixing' },
+    'blocker-after-round-2': { qualifier: null, parkedFrom: 'fixing' },
+    ambiguous: { qualifier: 'merge', parkedFrom: 'merging' },
+    'artifacts-unsealed': { qualifier: null, parkedFrom: 'fixing' },
+    'cost-ceiling': { qualifier: null, parkedFrom: 'fixing' },
+    'ci-failed-no-rounds': { qualifier: null, parkedFrom: 'fixing' },
+    'branch-behind': { qualifier: null, parkedFrom: 'merging' },
+    'review-seat-unavailable': { qualifier: null, parkedFrom: 'fixing' },
+    halted: { qualifier: null, parkedFrom: 'fixing' },
+    'stop-unconfirmed': { qualifier: null, parkedFrom: 'fixing' },
+    'stop-refused': { qualifier: 'runner-refused', parkedFrom: 'fixing' },
+    'acceptance-rejected': { qualifier: null, parkedFrom: 'accepting' },
+    'step-refused': { qualifier: 'prepare', parkedFrom: 'fixing' },
+    'owner-merge': { qualifier: null, parkedFrom: 'merging' },
+    'fix-no-progress': { qualifier: null, parkedFrom: 'fixing' },
+  };
+
+  it('REASON_CASES covers exactly LANE_RUN_PARK_REASONS', () => {
+    expect(Object.keys(REASON_CASES).sort()).toEqual([...LANE_RUN_PARK_REASONS].sort());
+  });
+
+  it.each(LANE_RUN_PARK_REASONS)('%s enters merged when its PR merged with the lane head', async (reason) => {
+    const { qualifier, parkedFrom } = REASON_CASES[reason];
+    const record = runRecord({
+      prNumber: 9,
+      parked: { reason, qualifier, parkedFrom, questionId: null },
+      parkCount: 1,
+    });
+    const harness = await makeHarness(record, [collectedAttempt()]);
+    await conduct(harness, 'parked', NOW);
+    harness.setForgeAnswer(mergedPullRequest());
+    const result = await advance(harness);
+    expect(result.outcome).toBe('entered');
+    if (result.outcome !== 'entered') {
+      throw new Error('expected entered');
+    }
+    expect(result.state).toBe('merged');
+    expect(laneRunJournalState(await harness.runJournal.listForRun(RUN_ID), RUN_ID)).toBe('merged');
+    const stored = await harness.runRepo.get(RUN_ID);
+    expect(stored?.prNumber).toBe(9);
+  });
+
+  it('CG1 sequence by name: step-refused prepare fixing with PR 638 enters merged by number', async () => {
+    const record = runRecord({
+      prNumber: 638,
+      parked: { reason: 'step-refused', qualifier: 'prepare', parkedFrom: 'fixing', questionId: null },
+      parkCount: 1,
+    });
+    const harness = await makeHarness(record, [collectedAttempt()]);
+    await conduct(harness, 'parked', NOW);
+    harness.setForgeAnswer(mergedPullRequest({ number: 638 }));
+    const result = await advance(harness);
+    expect(result.outcome).toBe('entered');
+    if (result.outcome !== 'entered') {
+      throw new Error('expected entered');
+    }
+    expect(result.state).toBe('merged');
+    expect(harness.forgeRequests[0]?.ref).toEqual({ kind: 'number', number: 638 });
+  });
+
+  it('a merged PR without the lane head keeps the run parked', async () => {
+    const record = runRecord({
+      prNumber: 9,
+      parked: { reason: 'step-refused', qualifier: 'prepare', parkedFrom: 'fixing', questionId: null },
+      parkCount: 1,
+    });
+    const harness = await makeHarness(record, [collectedAttempt()]);
+    await conduct(harness, 'parked', NOW);
+    harness.setForgeAnswer(mergedPullRequest({ headSha: MOVED_COMMIT }));
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'waiting', reason: 'parked' });
+    expect(laneRunJournalState(await harness.runJournal.listForRun(RUN_ID), RUN_ID)).not.toBe('merged');
+  });
+
+  it('a one-way-door park with an owner question stays parked even when the PR merged', async () => {
+    const record = runRecord({
+      prNumber: 9,
+      parked: { reason: 'one-way-door', qualifier: null, parkedFrom: 'fixing', questionId: 'question-example-1' },
+      parkCount: 1,
+    });
+    const harness = await makeHarness(record, [collectedAttempt()]);
+    await conduct(harness, 'parked', NOW);
+    harness.setForgeAnswer(mergedPullRequest());
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'waiting', reason: 'parked' });
   });
 });

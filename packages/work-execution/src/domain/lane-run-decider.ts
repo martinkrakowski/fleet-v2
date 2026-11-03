@@ -246,14 +246,14 @@ function laneRunSettledOpenPrDecision(record: LaneRunRecord, facts: LaneRunFacts
 }
 
 /**
- * G3f (R4c, narrowed): a merged PR that carries the lane head ends the
- * run from an eligible waiting state — a park (without owner questions or live
- * attempts), `awaiting-premerge`, `watching-ci` or `merging` — by itself.
- * An unread intent shadows the rule unless its step is `premerge` (so an unread
- * `merge` intent reconciles first, as before). An ambiguous intent cannot shadow
- * it. Under a halt nothing changes (the halt rules decide, as today), and a
- * merged PR that does not carry the lane head is left to the existing rules.
- * Total; never throws.
+ * G3f (R4c): a merged PR that carries the lane head ends the run from an
+ * eligible waiting state — a park (for every reason, without an open owner
+ * question or a live attempt), `awaiting-premerge`, `watching-ci` or
+ * `merging` — by itself. An unread intent shadows the rule unless its step is
+ * `premerge` (so an unread `merge` intent reconciles first, as before). An
+ * ambiguous intent cannot shadow it. Under a halt nothing changes (the halt
+ * rules decide, as today), and a merged PR that does not carry the lane head
+ * is left to the existing rules. Total; never throws.
  */
 function laneRunMergedPrDecision(record: LaneRunRecord, facts: LaneRunFacts): LaneRunDecision | null {
   if (facts.halted) {
@@ -274,13 +274,14 @@ function laneRunMergedPrDecision(record: LaneRunRecord, facts: LaneRunFacts): La
   if (!mergedPrCarriesLaneHead(facts.pr, facts.head12)) {
     return null;
   }
-  // 2. A park with a non-null questionId returns null, and so does a one-way-door
-  // park, so no owner question is left behind. The owner-merge park is the
-  // exception: its question asks for this merge, so the merge answers it (CT-2a).
+  // 2. A park with an open owner question (non-null questionId) returns null, so
+  // no owner question is left behind. The owner-merge park is the exception:
+  // its question asks for this merge, so the merge answers it (CT-2a). A merged
+  // PR that carries the lane head answers any other park reason.
   if (
     record.parked !== null &&
     record.parked.reason !== 'owner-merge' &&
-    (record.parked.questionId !== null || record.parked.reason === 'one-way-door')
+    record.parked.questionId !== null
   ) {
     return null;
   }
@@ -893,8 +894,8 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
 
     // G3f (R4c): a merged PR carrying the lane head ends the run from an
     // eligible waiting state. An unread intent shadows it unless its step is
-    // premerge; a park with a questionId, a one-way-door park, or a parked run
-    // with a live attempt returns null. Under a halt it decides nothing.
+    // premerge; a park with an open owner question, or a parked run with a live
+    // attempt returns null. Under a halt it decides nothing.
     const mergedPr = laneRunMergedPrDecision(record, facts);
     if (mergedPr !== null) {
       return mergedPr;

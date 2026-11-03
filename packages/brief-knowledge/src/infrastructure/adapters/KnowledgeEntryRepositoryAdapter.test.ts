@@ -3,6 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { KnowledgeEntry } from '../../domain/entities/KnowledgeEntry.js';
 import type { KnowledgeEntryRecord } from '../../domain/knowledge-records.js';
 import type { ContextSelectionProps } from '../../domain/value-objects/ContextSelection.vo.js';
 import { KnowledgeEntryRepositoryAdapter } from './KnowledgeEntryRepositoryAdapter.adapter.js';
@@ -219,5 +220,82 @@ describe('KnowledgeEntryRepositoryAdapter setTriageFlag write-once', () => {
       // anything else arriving through an untyped boundary.
       adapter.setTriageFlag('ke-1', 'unknown' as 'policy-like'),
     ).rejects.toThrow('policy-like');
+  });
+});
+
+describe('KnowledgeEntryRepositoryAdapter claimKind parity', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-knowledge-test-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('loads a stored record written before claim kinds existed as a fact', async () => {
+    const legacyRecord = {
+      id: 'ke-legacy',
+      version: 'v1',
+      projectId: 'proj-1',
+      sourceAttemptId: 'att-1',
+      sourceCommitSha: 'sha-1',
+      claimText: 'A candidate claim worth checking',
+      pathPrefixes: ['src/'],
+      sharedAcrossProjects: false,
+      disposition: 'candidate',
+      verification: 'unverified',
+      checkerId: null,
+      dispositionReason: null,
+      supersededById: null,
+      checks: [],
+      reuses: [],
+      revision: 1,
+      createdAtIso: '2026-10-15T10:00:00.000Z',
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+    const filePath = path.join(tempDir, 'knowledge-entries.json');
+    await fs.writeFile(filePath, JSON.stringify([legacyRecord]), 'utf8');
+
+    const adapter = new KnowledgeEntryRepositoryAdapter({ stateDir: tempDir });
+    const found = await adapter.findEntryById('ke-legacy');
+    expect(found).not.toBeNull();
+    expect(found?.claimKind).toBeUndefined();
+    expect(KnowledgeEntry.fromRecord(found as KnowledgeEntryRecord).getClaimKind()).toBe('fact');
+  });
+
+  it('keeps a failed claim kind through the store', async () => {
+    const failedRecord: KnowledgeEntryRecord = {
+      id: 'ke-failed',
+      version: 'v1',
+      projectId: 'proj-1',
+      sourceAttemptId: 'att-1',
+      sourceCommitSha: 'sha-1',
+      claimText: 'x'.repeat(300),
+      claimKind: 'failed',
+      pathPrefixes: ['src/'],
+      sharedAcrossProjects: false,
+      disposition: 'candidate',
+      verification: 'unverified',
+      checkerId: null,
+      dispositionReason: null,
+      supersededById: null,
+      checks: [],
+      reuses: [],
+      revision: 1,
+      createdAtIso: '2026-10-15T10:00:00.000Z',
+      updatedAtIso: '2026-10-15T10:00:00.000Z',
+    };
+
+    const adapter = new KnowledgeEntryRepositoryAdapter({ stateDir: tempDir });
+    await adapter.saveEntry(failedRecord);
+
+    const raw = await fs.readFile(path.join(tempDir, 'knowledge-entries.json'), 'utf8');
+    expect(raw).toContain('"claimKind": "failed"');
+
+    const found = await adapter.findEntryById('ke-failed');
+    expect(found?.claimKind).toBe('failed');
+    expect(found?.claimText).toBe('x'.repeat(300));
   });
 });

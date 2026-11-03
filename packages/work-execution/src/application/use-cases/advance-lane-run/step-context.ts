@@ -118,6 +118,7 @@ export async function raiseParkNotice(
       workOrderId: record.workOrderId,
       runId: record.runId,
       reason,
+      parkCount: record.parkCount,
       ...(qualifier === null ? {} : { qualifier }),
     };
     await parkNotice.recordParkAttention(parkRequest);

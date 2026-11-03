@@ -34,6 +34,9 @@ export const ATTENTION_ITEM_PR_REF_PATTERN = /^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9
 
 export const ATTENTION_ITEM_LIMITS = Object.freeze({ summaryChars: 1024, recordJsonChars: 16384 });
 
+/** Kinds whose summary names one occurrence, so a raise repeating the stored summary is idempotent. */
+export const ATTENTION_ITEM_OCCURRENCE_KINDS: readonly string[] = ['conductor-park'];
+
 export interface AttentionItemSubjectRecord {
   readonly kind: AttentionItemSubjectKind;
   readonly ref: string;

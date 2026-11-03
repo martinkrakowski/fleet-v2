@@ -157,6 +157,9 @@ export class LaneRunParkNoticeAdapter implements LaneRunParkNoticePort {
     if (request.qualifier !== undefined && !QUALIFIER_CODE.test(request.qualifier)) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
+    if (request.parkCount !== undefined && !(Number.isSafeInteger(request.parkCount) && request.parkCount >= 1)) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
     // Every park reason raises its attention item (K6-3); only the four owner
     // reasons also ask the keyed owner question, so the question texts stay
     // out of this path and an unknown reason code is still refused.
@@ -164,12 +167,13 @@ export class LaneRunParkNoticeAdapter implements LaneRunParkNoticePort {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
     const qualifier = request.qualifier === undefined ? '' : `, qualifier ${request.qualifier}`;
+    const occurrence = request.parkCount === undefined ? '' : ` (park ${request.parkCount})`;
     const body = {
       projectId: request.projectId,
       kind: PARK_ATTENTION_KIND,
       subject: { kind: 'run', ref: request.runId },
       workOrderId: request.workOrderId,
-      summary: `The conductor parked ${request.runId} with reason ${request.reason}${qualifier}.`,
+      summary: `The conductor parked ${request.runId} with reason ${request.reason}${qualifier}${occurrence}.`,
     };
     try {
       const answer = await recordAttentionItem(body, PARK_ACTOR);

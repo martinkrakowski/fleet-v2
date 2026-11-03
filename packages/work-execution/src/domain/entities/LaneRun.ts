@@ -41,8 +41,9 @@ import type {
   LaneRunTier,
   RunStopRefusalKind,
 } from '../lane-run-records.js';
+import { copyParkRecord } from '../lane-run-records.js';
 import type { LaneRunParkFindingView } from '../park-findings-view.js';
-import { parkFindingsSnapshotOf } from '../park-findings-view.js';
+import { copyParkFindings, parkFindingsSnapshotOf } from '../park-findings-view.js';
 import { LANE_RUN_RESUMABLE_STATES } from '../value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../value-objects/LaneRunState.vo.js';
 import { SEAT_PLAN_ROLES } from '../value-objects/SeatPlan.vo.js';
@@ -206,7 +207,7 @@ export class LaneRun {
       round: this.record.round,
       attemptIds: [...this.record.attemptIds],
       prNumber: this.record.prNumber,
-      parked: this.record.parked === null ? null : { ...this.record.parked },
+      parked: copyParkRecord(this.record.parked),
       parkCount: this.record.parkCount,
       lease: this.record.lease === null ? null : { ...this.record.lease },
       revision: this.record.revision,
@@ -238,7 +239,7 @@ export class LaneRun {
   }
 
   getParked(): LaneRunParkRecord | null {
-    return this.record.parked === null ? null : { ...this.record.parked };
+    return copyParkRecord(this.record.parked);
   }
 
   isParked(): boolean {
@@ -602,14 +603,17 @@ function findingsArrayError(findings: unknown): string | null {
 }
 
 function buildParkedRecord(snapshot: Record<string, unknown>): LaneRunParkRecord {
+  let findings: readonly LaneRunParkFindingView[] | null | undefined;
+  if (snapshot.findings !== undefined) {
+    const copied = copyParkFindings(snapshot.findings as readonly LaneRunParkFindingView[] | null);
+    findings = copied === null ? null : Object.freeze(copied);
+  }
   return Object.freeze({
     reason: snapshot.reason as LaneRunParkReason,
     qualifier: snapshot.qualifier as string | null,
     parkedFrom: snapshot.parkedFrom as LaneRunStateValue,
     questionId: snapshot.questionId as string | null,
-    ...(snapshot.findings !== undefined
-      ? { findings: snapshot.findings as readonly LaneRunParkFindingView[] | null }
-      : {}),
+    ...(findings !== undefined ? { findings } : {}),
   });
 }
 

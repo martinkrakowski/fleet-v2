@@ -50,15 +50,11 @@ function leaseView(lease: LaneRunLeaseRecord | null, nowIso: string): LaneRunSta
   };
 }
 
-/** The bounded findings of the parked head's failed code review; `null` when not a blocker park. */
-async function blockedReviewFindings(
+/** Fallback receipt read when the parked record does not carry a saved snapshot. */
+async function fallbackReviewFindings(
   deps: InspectLaneRunsDependencies,
   record: LaneRunRecord,
-): Promise<readonly LaneRunParkFindingView[] | null> {
-  const parked = record.parked;
-  if (parked === null || parked.reason !== 'blocker-after-round-2') {
-    return null;
-  }
+): Promise<readonly LaneRunParkFindingView[]> {
   const attemptRepo = deps.attemptRepo;
   const reviewReceipts = deps.reviewReceipts;
   if (attemptRepo === undefined || reviewReceipts === undefined) {
@@ -86,6 +82,21 @@ async function blockedReviewFindings(
   } catch {
     return [];
   }
+}
+
+/** The bounded findings of the parked head's failed code review; `null` when not a blocker park. */
+async function blockedReviewFindings(
+  deps: InspectLaneRunsDependencies,
+  record: LaneRunRecord,
+): Promise<readonly LaneRunParkFindingView[] | null> {
+  const parked = record.parked;
+  if (parked === null || parked.reason !== 'blocker-after-round-2') {
+    return null;
+  }
+  if (parked.findings !== undefined && parked.findings !== null) {
+    return boundedFindingsView(parked.findings);
+  }
+  return fallbackReviewFindings(deps, record);
 }
 
 /**

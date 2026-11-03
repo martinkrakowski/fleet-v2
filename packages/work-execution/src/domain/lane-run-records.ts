@@ -12,6 +12,7 @@ import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import type { BaseBranchValue } from './base-branch.js';
 import { INITIAL_RECORD_SCHEMA_VERSION } from './record-schema-version.js';
 import type { LaneRunParkFindingView } from './park-findings-view.js';
+import { copyParkFindings } from './park-findings-view.js';
 
 export const LANE_RUN_RECORD_VERSION = 1 as const;
 
@@ -114,6 +115,23 @@ export interface LaneRunParkRecord {
    * non-blocker parks.
    */
   readonly findings?: readonly LaneRunParkFindingView[] | null;
+}
+
+/**
+ * Fresh plain park record; findings (when present) is a fresh array of fresh,
+ * frozen finding objects.
+ */
+export function copyParkRecord(parked: LaneRunParkRecord | null): LaneRunParkRecord | null {
+  if (parked === null) {
+    return null;
+  }
+  if (parked.findings === undefined) {
+    return { ...parked };
+  }
+  return {
+    ...parked,
+    findings: copyParkFindings(parked.findings),
+  };
 }
 
 /** The driver's lease on this run (K3 takes and renews it by CAS with a fencing revision). */

@@ -4,6 +4,7 @@ import { LaneRun } from '../entities/LaneRun.js';
 import { LANE_RUN_MAX_PARK_ORDINAL } from '../lane-run-keys.js';
 import { LANE_RUN_PARK_REASONS, LANE_RUN_SCHEMA_VERSION } from '../lane-run-records.js';
 import { readLaneRunRecord } from '../entities/LaneRun.js';
+import type { LaneRunParkFindingView } from '../park-findings-view.js';
 import {
   LANE_RUN_RESUMABLE_STATES,
   LANE_RUN_STATES,
@@ -268,6 +269,61 @@ describe('LaneRun.create', () => {
     (first.cursors as Record<string, number | null>)['first-pass'] = 7;
     expect(second.attemptIds).toEqual(['attempt-example-1']);
     expect(second.cursors).toEqual({ 'first-pass': 0, fix: null, review: null });
+  });
+
+  it('stores a deep copy of parked findings and entries so mutating input leaves stored findings unchanged', () => {
+    const inputFinding = {
+      findingId: 'finding-1',
+      severity: 'blocker' as LaneRunParkFindingView['severity'],
+      summary: 'clean and bounded summary',
+      filePath: 'src/a.ts',
+      line: 12,
+    };
+    const inputFindings: LaneRunParkFindingView[] = [inputFinding];
+    const created = LaneRun.create({
+      ...VALID,
+      parked: {
+        reason: 'blocker-after-round-2',
+        qualifier: null,
+        parkedFrom: 'gating',
+        questionId: null,
+        findings: inputFindings,
+      },
+      parkCount: 1,
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    inputFindings.push({
+      findingId: 'finding-2',
+      severity: 'major',
+      summary: 'second finding',
+      filePath: 'src/b.ts',
+      line: 20,
+    });
+    inputFinding.summary += '\u2028';
+
+    const stored = created.value.toRecord();
+    expect(stored.parked?.findings).toEqual([
+      {
+        findingId: 'finding-1',
+        severity: 'blocker',
+        summary: 'clean and bounded summary',
+        filePath: 'src/a.ts',
+        line: 12,
+      },
+    ]);
+    expect(created.value.getParked()?.findings).toEqual([
+      {
+        findingId: 'finding-1',
+        severity: 'blocker',
+        summary: 'clean and bounded summary',
+        filePath: 'src/a.ts',
+        line: 12,
+      },
+    ]);
+    expect(Object.isFrozen(stored.parked?.findings?.[0])).toBe(true);
+    expect(Object.isFrozen(created.value.getParked()?.findings?.[0])).toBe(true);
   });
 
   it.each([

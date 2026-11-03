@@ -204,3 +204,37 @@ export function boundedFindingsView(
   }
   return out;
 }
+
+/**
+ * A deep copy of one bounded finding entry: a fresh, frozen object with the
+ * five bounded fields.
+ */
+export function copyParkFinding(entry: LaneRunParkFindingView): LaneRunParkFindingView {
+  return Object.freeze({
+    findingId: entry.findingId,
+    severity: entry.severity,
+    summary: entry.summary,
+    filePath: entry.filePath,
+    line: entry.line,
+  });
+}
+
+/**
+ * A deep copy of a park findings array: null when null, else a fresh array of
+ * fresh, frozen finding objects.
+ */
+export function copyParkFindings(
+  findings: readonly LaneRunParkFindingView[] | null,
+): readonly LaneRunParkFindingView[] | null;
+export function copyParkFindings(
+  findings: readonly LaneRunParkFindingView[] | null | undefined,
+): readonly LaneRunParkFindingView[] | null | undefined;
+export function copyParkFindings(
+  findings: readonly LaneRunParkFindingView[] | null | undefined,
+): readonly LaneRunParkFindingView[] | null | undefined {
+  if (findings === undefined || findings === null) {
+    return findings;
+  }
+  return findings.map(copyParkFinding);
+}
+

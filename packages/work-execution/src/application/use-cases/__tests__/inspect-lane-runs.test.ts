@@ -158,6 +158,7 @@ async function seedParkedRun(
   reason: LaneRunParkReason,
   parkCount = 1,
   attemptIds: readonly string[] = [ATTEMPT_ID],
+  findings?: readonly LaneRunParkFindingView[] | null,
 ): Promise<void> {
   const record = runRecord({
     attemptIds,
@@ -166,6 +167,7 @@ async function seedParkedRun(
       qualifier: null,
       parkedFrom: 'gating',
       questionId: null,
+      ...(findings !== undefined ? { findings } : {}),
     },
     parkCount,
   });
@@ -284,5 +286,50 @@ describe('InspectLaneRunsUseCase (GB2)', () => {
     // negative line are not present; the view never carries raw receipt fields.
     expect(findings.some((finding) => finding.findingId === 'finding-secret')).toBe(false);
     expect(findings.every((finding) => finding.filePath === null || !finding.filePath.startsWith('/'))).toBe(true);
+  });
+
+  it('returns saved findings for a blocker park with no attemptRepo or reviewReceipts', async () => {
+    const harness = makeHarness({ withAttemptRepo: false });
+    await seedParkedRun(harness, 'blocker-after-round-2', 1, [ATTEMPT_ID], [FINDING]);
+    const [run] = await statusRuns(harness);
+    expect(run.reviewFindings).toEqual([FINDING]);
+  });
+
+  it('returns saved findings for a blocker park with an attempt with no head', async () => {
+    const harness = makeHarness({
+      reviewReceipts: reviewPort(async () => ({ outcome: 'not-found' })),
+    });
+    const record = runRecord({
+      attemptIds: [ATTEMPT_ID],
+      parked: {
+        reason: 'blocker-after-round-2',
+        qualifier: null,
+        parkedFrom: 'gating',
+        questionId: null,
+        findings: [FINDING],
+      },
+      parkCount: 1,
+    });
+    expect(await harness.runRepo.create(record)).toMatchObject({ outcome: 'saved' });
+    const entry: LaneRunJournalEntryRecord = laneRunConductEntry(ENTRY_1, RUN_ID, 'parked', NOW);
+    expect(await harness.runJournal.append(entry)).toMatchObject({ outcome: 'appended' });
+    const attemptWithoutHead: AttemptRecord = {
+      ...collectedAttempt(),
+      artifacts: null,
+    };
+    await harness.attemptRepo.saveAttempt(attemptWithoutHead);
+    const [run] = await statusRuns(harness);
+    expect(run.reviewFindings).toEqual([FINDING]);
+  });
+
+  it('returns saved findings for a blocker park when receipt lookup throws', async () => {
+    const harness = makeHarness({
+      reviewReceipts: reviewPort(async () => {
+        throw new Error('store down');
+      }),
+    });
+    await seedParkedRun(harness, 'blocker-after-round-2', 1, [ATTEMPT_ID], [FINDING]);
+    const [run] = await statusRuns(harness);
+    expect(run.reviewFindings).toEqual([FINDING]);
   });
 });

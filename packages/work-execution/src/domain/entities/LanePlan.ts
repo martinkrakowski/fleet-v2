@@ -144,12 +144,21 @@ export class LanePlan {
     let normalizedFeatureSet: PlanFeatureSet | undefined;
     const featureSet = recordInput.featureSet;
     if (featureSet !== undefined) {
-      const featureSetError = planFeatureSetError('featureSet', featureSet);
+      // Snapshot first, then validate and store only the snapshot: the original
+      // object may be a proxy that yields valid values during validation and
+      // different ones on a second read.
+      const featureSetSnapshot = readExactPlainRecord(featureSet, ['id', 'title']);
+      if (featureSetSnapshot === null) {
+        return invalid('LanePlan featureSet: must be an object with id and title');
+      }
+      const featureSetError = planFeatureSetError('featureSet', featureSetSnapshot);
       if (featureSetError !== null) {
         return invalid(`LanePlan ${featureSetError}`);
       }
-      const snapshot = featureSet as { id: string; title: string };
-      normalizedFeatureSet = { id: snapshot.id, title: snapshot.title };
+      normalizedFeatureSet = {
+        id: featureSetSnapshot.id as string,
+        title: featureSetSnapshot.title as string,
+      };
     }
 
     const lanesRaw = plainArrayCopy(recordInput.lanes);

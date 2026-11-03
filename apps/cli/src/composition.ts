@@ -98,6 +98,7 @@ import {
   type EvaluateAttemptGatePort,
   type EnqueueMergeUseCase,
   type ListMergeQueueUseCase,
+  type ImportTrainStateUseCase,
   type MergeQueueRepositoryAdapter,
   type ForgeActionDelegate,
   type GhInvocationResult,
@@ -746,6 +747,7 @@ export interface FleetCliRuntime {
     readonly mergeQueueRepository: MergeQueueRepositoryAdapter;
     readonly enqueueMerge: EnqueueMergeUseCase;
     readonly listMergeQueue: ListMergeQueueUseCase;
+    readonly importTrainState: ImportTrainStateUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;

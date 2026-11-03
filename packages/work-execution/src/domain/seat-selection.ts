@@ -14,6 +14,7 @@ import {
 } from './value-objects/SeatPlan.vo.js';
 import {
   MODEL_REFUSAL_CLASSES,
+  SEAT_TRIGGER_CLASSES,
   parseStopReason,
   type StopReasonValue,
 } from './value-objects/StopReason.vo.js';
@@ -198,6 +199,90 @@ export function selectSeat(input: {
     ok: false,
     reason: 'Seat plan exhausted for role ' + input.role + ': ' + blocks.join('; '),
   };
+}
+
+/**
+ * How an attempt's seat turn ended. `ok` succeeded; the failure outcomes map
+ * onto the stop-reason classes a fallback seat's `on` may name:
+ * `rate-limited` and `timeout` are their own classes, and every other trigger
+ * class reads as `provider-error`. `none` and `unknown` map to no outcome at
+ * all: an ended-normally turn is not a failure, and an undeclared one never
+ * triggers a fallback (fail closed).
+ */
+export type SeatOutcome = 'ok' | 'rate-limited' | 'timeout' | 'provider-error';
+
+/** The failure outcomes: the ones a failed turn can record. */
+export type SeatFailureOutcome = Exclude<SeatOutcome, 'ok'>;
+
+/** The stop-reason trigger classes each failure outcome covers (total over SEAT_TRIGGER_CLASSES). */
+export const SEAT_OUTCOME_TRIGGER_CLASSES: Readonly<Record<SeatFailureOutcome, readonly StopReasonValue[]>> = {
+  'rate-limited': ['rate-limited'],
+  timeout: ['timeout'],
+  'provider-error': SEAT_TRIGGER_CLASSES.filter(
+    (trigger) => trigger !== 'rate-limited' && trigger !== 'timeout',
+  ),
+};
+
+/** The failure outcome of a failed turn's stop reason, or null when it maps to none (fail closed). */
+export function seatOutcomeOfStopReason(reason: StopReasonValue): SeatFailureOutcome | null {
+  if (reason === 'rate-limited') {
+    return 'rate-limited';
+  }
+  if (reason === 'timeout') {
+    return 'timeout';
+  }
+  if (SEAT_TRIGGER_CLASSES.includes(reason)) {
+    return 'provider-error';
+  }
+  return null;
+}
+
+export type NextSeatResult =
+  | { readonly ok: true; readonly role: SeatPlanRole; readonly seatIndex: number; readonly seat: SeatPlanSeat }
+  | { readonly ok: false; readonly reason: 'no-seat-allowed' };
+
+/**
+ * The next seat for `role` after the failed turn at `failedIndex`, in
+ * rotation order. A seat is eligible only when the supplied block predicate
+ * allows it (the caller composes reviewer-family exclusion and any outage)
+ * AND its declared triggers allow the outcome: absent `on` is always
+ * eligible, otherwise one of its classes must be one the outcome covers.
+ * The failed seat itself is never eligible: the rotation may not wrap
+ * around onto the seat that just failed (a one-seat plan therefore always
+ * reads no-seat-allowed).
+ * A `failedIndex` outside the plan, an empty role or no eligible seat reads
+ * `no-seat-allowed`: nothing is ever guessed past the plan.
+ */
+export function pickNextSeat(
+  plan: SeatPlan,
+  role: SeatPlanRole,
+  failedIndex: number,
+  outcome: SeatFailureOutcome,
+  isBlocked: (seat: SeatPlanSeat) => boolean,
+): NextSeatResult {
+  const seats = plan.getSeats(role);
+  const validIndex =
+    Number.isSafeInteger(failedIndex) && failedIndex >= 0 && failedIndex < seats.length && seats.length > 1;
+  if (!validIndex) {
+    return { ok: false, reason: 'no-seat-allowed' };
+  }
+  const triggers = SEAT_OUTCOME_TRIGGER_CLASSES[outcome];
+  for (let step = 1; step < seats.length; step += 1) {
+    const seatIndex = (failedIndex + step) % seats.length;
+    if (seatIndex === failedIndex) {
+      // The failed seat itself is never eligible: no wrap-around re-pick.
+      continue;
+    }
+    const seat = seats[seatIndex];
+    if (isBlocked(seat)) {
+      continue;
+    }
+    if (seat.on !== undefined && !seat.on.some((trigger) => triggers.includes(trigger))) {
+      continue;
+    }
+    return { ok: true, role, seatIndex, seat };
+  }
+  return { ok: false, reason: 'no-seat-allowed' };
 }
 
 /**

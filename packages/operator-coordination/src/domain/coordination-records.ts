@@ -128,6 +128,22 @@ export interface PolicyGrantRecord {
   readonly acceptanceReceiptId: string;
 }
 
+/** The repository coordinates of an attempt-less merge grant (DT6b). */
+export interface MergeGrantRepositoryRef {
+  readonly owner: string;
+  readonly repo: string;
+}
+
+/**
+ * The coordinates of an attempt-less merge grant (DT6b): the repository and pull
+ * request it serves. Present only on a merge grant issued from the merge setting;
+ * a policy grant (A3) and every other request never carries it.
+ */
+export interface MergeGrantRecord {
+  readonly repository: MergeGrantRepositoryRef;
+  readonly pullRequestNumber: number;
+}
+
 /** Serializable snapshot of the CoordinationRequest aggregate. */
 export interface CoordinationRequestRecord {
   readonly id: string;
@@ -149,6 +165,8 @@ export interface CoordinationRequestRecord {
   readonly updatedAtIso: string;
   /** Present only on a policy grant (A3); absent on every owner grant and every other request. */
   readonly policyGrant?: PolicyGrantRecord;
+  /** Present only on an attempt-less merge grant (DT6b); absent everywhere else. */
+  readonly mergeGrant?: MergeGrantRecord;
 }
 
 /** Bounded attention and staleness summary; reading it rewrites nothing. */

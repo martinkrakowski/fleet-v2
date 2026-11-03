@@ -39,6 +39,12 @@ import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import type { SessionStartGate } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
+import type {
+  PreserveWorktreeEditsRequest,
+  PreserveWorktreeEditsResult,
+  ResetWorktreeToHeadRequest,
+  ResetWorktreeToHeadResult,
+} from '../../ports/out/WorkspacePort.out-port.js';
 
 function denyingStartGate(): SessionStartGate {
   return { tryStart: () => ({ ok: false, retryAfterMs: 12_345 }) };
@@ -237,11 +243,15 @@ interface Harness {
   readonly dispatchRequests: readonly DispatchAttemptRequest[];
   readonly manifestReads: readonly (AttemptRunnerRecord | null)[];
   readonly cancelRequests: readonly CancelPreparedAttemptRequest[];
+  readonly preserveRequests: readonly PreserveWorktreeEditsRequest[];
+  readonly resetRequests: readonly ResetWorktreeToHeadRequest[];
   readonly deps: AdvanceLaneRunDependencies;
   setManifest(json: string | null): Promise<void>;
   setChangedManifestOnDisk(json: string | null): void;
   setDispatchAnswer(answer: (request: DispatchAttemptRequest) => Promise<DispatchAttemptResult>): void;
   setCancelAnswer(answer: CancelPreparedAttemptResult): void;
+  setPreserveAnswer(answer: (request: PreserveWorktreeEditsRequest) => Promise<PreserveWorktreeEditsResult>): void;
+  setResetAnswer(answer: (request: ResetWorktreeToHeadRequest) => Promise<ResetWorktreeToHeadResult>): void;
   markAttemptCancelled(attemptId: string, stopReason: AttemptRecord['stopReason']): Promise<void>;
 }
 
@@ -249,6 +259,8 @@ interface HarnessOptions {
   readonly ceiling?: number;
   /** When false, no `dispatchAttempt` port is wired (`not-wired dispatch`). */
   readonly wireDispatch?: boolean;
+  /** When true, the GB3 worktree recovery port is wired (preserve/reset fakes). */
+  readonly wireRecovery?: boolean;
   /** A run repository whose `save` refuses or throws (save-order tests). */
   readonly runSave?: 'ok' | 'refuse' | 'throw';
 }
@@ -289,6 +301,17 @@ async function makeHarness(
   });
   const cancelRequests: CancelPreparedAttemptRequest[] = [];
   let cancelAnswer: CancelPreparedAttemptResult = { outcome: 'cancelled', attempt: attemptFixture(), capacity: 'released' };
+  const preserveRequests: PreserveWorktreeEditsRequest[] = [];
+  const resetRequests: ResetWorktreeToHeadRequest[] = [];
+  let preserveAnswer: (request: PreserveWorktreeEditsRequest) => Promise<PreserveWorktreeEditsResult> = async (request) => ({
+    outcome: 'preserved',
+    patchPath: request.patchPath,
+    patchBytes: 42,
+  });
+  let resetAnswer: (request: ResetWorktreeToHeadRequest) => Promise<ResetWorktreeToHeadResult> = async () => ({
+    outcome: 'reset',
+    headCommit: COMMIT,
+  });
   let manifestJson: string | null = DEFAULT_MANIFEST_JSON;
   const created = await runRepoPort.create(record);
   expect(created.outcome).toBe('saved');
@@ -321,6 +344,9 @@ async function makeHarness(
     admission: {
       admit: async () => ({ outcome: 'admitted' }),
     },
+    // G11a: a bound family comparator is what lets a refused dispatch record
+    // its next-seat advance instead of failing closed.
+    sameModelFamily: (left, right) => left.split('-')[0] === right.split('-')[0],
     newUlid: makeUlidMinter(),
     ...(options.ceiling !== undefined ? { perLaneCostCeiling: options.ceiling } : {}),
     ...(options.wireDispatch === false
@@ -353,6 +379,20 @@ async function makeHarness(
         return cancelAnswer;
       },
     },
+    ...(options.wireRecovery
+      ? {
+          worktreeRecovery: {
+            preserveWorktreeEdits: async (request) => {
+              preserveRequests.push(request);
+              return preserveAnswer(request);
+            },
+            resetWorktreeToHead: async (request) => {
+              resetRequests.push(request);
+              return resetAnswer(request);
+            },
+          },
+        }
+      : {}),
   };
   return {
     runRepo,
@@ -362,6 +402,8 @@ async function makeHarness(
     dispatchRequests,
     manifestReads,
     cancelRequests,
+    preserveRequests,
+    resetRequests,
     deps,
     setManifest: async (json) => {
       manifestJson = json;
@@ -390,6 +432,12 @@ async function makeHarness(
     },
     setCancelAnswer: (answer) => {
       cancelAnswer = answer;
+    },
+    setPreserveAnswer: (answer) => {
+      preserveAnswer = answer;
+    },
+    setResetAnswer: (answer) => {
+      resetAnswer = answer;
     },
     markAttemptCancelled: async (attemptId, stopReason) => {
       const existing = await attemptRepo.findAttemptById(attemptId);
@@ -1178,5 +1226,302 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(harness.dispatchRequests).toHaveLength(1);
     const entries = await harness.runJournal.listForRun(RUN_ID);
     expect(entries.some((entry) => entry.kind === 'intent' && entry.key === dispatchKey(0, 1, 2))).toBe(false);
+  });
+
+  describe('GB3: worktree-uncommitted dispatch recovery', () => {
+    const WORKTREE_REFUSAL = 'Worktree ' + WORKTREE + ' has uncommitted changes: src/ex.ts';
+    const PATCH_PATH = WORKTREE + '.attempt-example-1.patch';
+    const recoveryJournalEntries = async (harness: Harness) =>
+      (await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1')).filter(
+        (entry) =>
+          entry.action === 'dispatch' &&
+          entry.detail !== null &&
+          entry.detail.startsWith('preserved uncommitted edits:'),
+      );
+
+    it('GB3 test 1: a worktree-uncommitted refusal preserves edits, resets, cancels, journals the patch path and does not park', async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture()], { wireRecovery: true });
+      harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
+      await admit(harness, 'attempt-example-1');
+      const result = await advance(harness);
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'dispatch',
+        key: dispatchKey(0, 0, 1),
+        result: 'refused',
+        reasonCode: 'dispatch-refused',
+      });
+      const stored = await harness.attemptRepo.findAttemptById('attempt-example-1');
+      expect(stored?.state).toBe('cancelled');
+      const after = await harness.runRepo.get(RUN_ID);
+      expect(after?.parked).toBeNull();
+      const entries = await harness.runJournal.listForRun(RUN_ID);
+      expect(entries).toContainEqual(
+        expect.objectContaining({
+          kind: 'result',
+          outcome: 'refused',
+          reasonCode: 'dispatch-refused',
+          detail: 'worktree-uncommitted',
+        }),
+      );
+      expect(entries.some((entry) => entry.kind === 'conduct' && entry.state === 'parked')).toBe(false);
+      const preserved = await recoveryJournalEntries(harness);
+      expect(preserved.map((entry) => entry.status)).toEqual(['intent-recorded', 'completed']);
+      for (const entry of preserved) {
+        expect(entry.detail).toBe('preserved uncommitted edits: ' + PATCH_PATH);
+      }
+      // The next advance prepares the next seat: no park.
+      const next = await advance(harness);
+      expect(next).toEqual({
+        outcome: 'acted',
+        step: 'prepare',
+        key: prepareKey(0, 1, 2),
+        result: 'completed',
+        reasonCode: 'prepared',
+      });
+    });
+
+    it('GB3 test 2: preserve runs before reset before cancel, each on the recorded host with the exact paths', async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture()], { wireRecovery: true });
+      harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
+      await admit(harness, 'attempt-example-1');
+      await advance(harness);
+      expect(harness.preserveRequests).toEqual([{ worktreePath: WORKTREE, patchPath: PATCH_PATH, recordedHost: CONDUCTED_RUNNER }]);
+      expect(harness.resetRequests).toEqual([{ worktreePath: WORKTREE, recordedHost: CONDUCTED_RUNNER }]);
+      expect(harness.cancelRequests).toEqual([{ attemptId: 'attempt-example-1', nowIso: LATER }]);
+    });
+
+    it('GB3 test 3: a refused preserve keeps the park and calls neither reset nor cancel', async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture()], { wireRecovery: true });
+      harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
+      harness.setPreserveAnswer(async () => ({ outcome: 'refused', reason: 'git-refused' }));
+      await admit(harness, 'attempt-example-1');
+      const result = await advance(harness);
+      expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+      const stored = await harness.attemptRepo.findAttemptById('attempt-example-1');
+      expect(stored?.state).toBe('intent-recorded');
+      expect(harness.resetRequests).toEqual([]);
+      expect(harness.cancelRequests).toEqual([]);
+      expect((await recoveryJournalEntries(harness)).map((entry) => entry.status)).toEqual(['intent-recorded']);
+    });
+
+    it('GB3 test 4: a failed reset keeps the park and never cancels', async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture()], { wireRecovery: true });
+      harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
+      harness.setResetAnswer(async () => ({ outcome: 'error', reason: 'git died' }));
+      await admit(harness, 'attempt-example-1');
+      const result = await advance(harness);
+      expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+      expect(harness.preserveRequests).toHaveLength(1);
+      expect(harness.cancelRequests).toEqual([]);
+      expect((await recoveryJournalEntries(harness)).map((entry) => entry.status)).toEqual(['intent-recorded']);
+    });
+
+    it('GB3 test 5: a refused cancel keeps the park and leaves the recovery intent unclosed', async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture()], { wireRecovery: true });
+      harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
+      harness.setCancelAnswer({ outcome: 'refused', reason: 'changed' });
+      await admit(harness, 'attempt-example-1');
+      const result = await advance(harness);
+      expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+      expect((await recoveryJournalEntries(harness)).map((entry) => entry.status)).toEqual(['intent-recorded']);
+    });
+
+    it('GB3 test 6: without wired recovery a worktree-uncommitted refusal parks as today', async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture()]);
+      harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
+      await admit(harness, 'attempt-example-1');
+      const result = await advance(harness);
+      expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+      expect(harness.preserveRequests).toEqual([]);
+      expect(harness.resetRequests).toEqual([]);
+      expect(harness.cancelRequests).toEqual([]);
+    });
+
+    it('GB3 test 7: only worktree-uncommitted recovers; worktree-untracked parks and calls nothing', async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture()], { wireRecovery: true });
+      harness.setDispatchAnswer(async () => ({
+        outcome: 'refused',
+        reason: 'Worktree ' + WORKTREE + ' has untracked files: notes.txt',
+      }));
+      await admit(harness, 'attempt-example-1');
+      const result = await advance(harness);
+      expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+      expect(harness.preserveRequests).toEqual([]);
+      expect(harness.resetRequests).toEqual([]);
+      expect(harness.cancelRequests).toEqual([]);
+    });
+
+    it('GB3 test 8: a crash after the durable intent parks; the patch path stays discoverable and reset/cancel never run', async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture()], { wireRecovery: true });
+      harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
+      harness.setPreserveAnswer(async () => ({ outcome: 'error', reason: 'simulated crash after intent' }));
+      await admit(harness, 'attempt-example-1');
+      const result = await advance(harness);
+      expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+      expect(harness.preserveRequests).toHaveLength(1);
+      expect(harness.resetRequests).toEqual([]);
+      expect(harness.cancelRequests).toEqual([]);
+      const preserved = await recoveryJournalEntries(harness);
+      expect(preserved.map((entry) => entry.status)).toEqual(['intent-recorded']);
+      expect(preserved[0]?.detail).toBe('preserved uncommitted edits: ' + PATCH_PATH);
+    });
+
+    it('GB3 test 9: an incomplete recovery blocks advance after restart: the run parks again and nothing re-runs', async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture()], { wireRecovery: true });
+      harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
+      harness.setResetAnswer(async () => ({ outcome: 'error', reason: 'simulated crash after preserve' }));
+      await admit(harness, 'attempt-example-1');
+      expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+      expect(harness.preserveRequests).toHaveLength(1);
+      expect(harness.resetRequests).toHaveLength(1);
+      expect(harness.cancelRequests).toEqual([]);
+
+      // Restart: clear the park and re-conduct `ready`.
+      const parked = await harness.runRepo.get(RUN_ID);
+      if (parked === null || parked.parked === null) {
+        throw new Error('fixture must end parked');
+      }
+      const saved = await harness.deps.runRepo.save(
+        { ...parked, parked: null, revision: parked.revision + 1 },
+        { holderId: HOLDER, fence: 1, nowIso: LATER },
+      );
+      expect(saved.outcome).toBe('saved');
+      await conduct(harness, 'ready', LATER);
+
+      // The resumed run still parks (incomplete recovery must not advance) and
+      // the recovery steps are not re-run.
+      harness.setResetAnswer(async () => ({ outcome: 'reset', headCommit: COMMIT }));
+      const again = await advance(harness);
+      expect(again).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+      expect(harness.preserveRequests).toHaveLength(1);
+      expect(harness.resetRequests).toHaveLength(1);
+      expect(harness.cancelRequests).toEqual([]);
+      const preserved = await recoveryJournalEntries(harness);
+      expect(preserved.map((entry) => entry.status)).toEqual(['intent-recorded']);
+      expect((await harness.attemptRepo.findAttemptById('attempt-example-1'))?.state).toBe('intent-recorded');
+    });
+
+    /** Crash injection: the nth execution-journal append throws after delegating. */
+    const crashOnAppend = (harness: Harness, nth: number): void => {
+      const base = harness.executionJournal;
+      let appends = 0;
+      const injected: AdvanceLaneRunDependencies['executionJournal'] = {
+        listActiveReservations: (hostId) => base.listActiveReservations(hostId),
+        listJournalEntriesForAttempt: (attemptId) => base.listJournalEntriesForAttempt(attemptId),
+        appendJournalEntry: async (entry) => {
+          appends += 1;
+          if (appends === nth) {
+            throw new Error('simulated crash between journal appends');
+          }
+          await base.appendJournalEntry(entry);
+        },
+      };
+      (harness.deps as { executionJournal: AdvanceLaneRunDependencies['executionJournal'] }).executionJournal =
+        injected;
+    };
+
+    /** Restarts the harness's parked run (clears the park, re-conducts `ready`). */
+    const restartRun = async (harness: Harness): Promise<void> => {
+      const parked = await harness.runRepo.get(RUN_ID);
+      if (parked === null || parked.parked === null) {
+        throw new Error('fixture must end parked');
+      }
+      const saved = await harness.deps.runRepo.save(
+        { ...parked, parked: null, revision: parked.revision + 1 },
+        { holderId: HOLDER, fence: 1, nowIso: LATER },
+      );
+      expect(saved.outcome).toBe('saved');
+      await conduct(harness, 'ready', LATER);
+    };
+
+    it('GB3 test 10: a crash after the cancel is reconciled at the next prepare without repeating the reset', async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture()], { wireRecovery: true });
+      harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
+      await admit(harness, 'attempt-example-1');
+      // The second execution-journal append is the recovery's completing
+      // entry; it throws after the cancel already persisted.
+      crashOnAppend(harness, 2);
+      expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+      expect((await harness.attemptRepo.findAttemptById('attempt-example-1'))?.state).toBe('cancelled');
+      expect((await recoveryJournalEntries(harness)).map((entry) => entry.status)).toEqual(['intent-recorded']);
+
+      await restartRun(harness);
+
+      // The patch survived the crash: the adapter answers destination-exists.
+      // The first recovery already reset, so the reconcile repeats no reset,
+      // closes the intent, and the run prepares the next seat.
+      harness.setPreserveAnswer(async () => ({ outcome: 'refused', reason: 'destination-exists' }));
+      expect(await advance(harness)).toEqual({
+        outcome: 'acted',
+        step: 'prepare',
+        key: prepareKey(0, 1, 2),
+        result: 'completed',
+        reasonCode: 'prepared',
+      });
+      expect(harness.resetRequests).toHaveLength(1);
+      expect((await recoveryJournalEntries(harness)).map((entry) => entry.status)).toEqual(['intent-recorded', 'completed']);
+      expect(harness.cancelRequests).toHaveLength(1);
+    });
+
+    it('GB3 test 11: a crash after the cancel whose patch cannot be proven parks at prepare and calls nothing further', async () => {
+      const harness = await makeHarness(runRecord(), [attemptFixture()], { wireRecovery: true });
+      harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
+      await admit(harness, 'attempt-example-1');
+      crashOnAppend(harness, 2);
+      expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+
+      await restartRun(harness);
+
+      // A clean worktree without a provable patch (nothing-to-preserve) cannot
+      // close the recovery: the run parks at prepare and the reset never runs.
+      harness.setPreserveAnswer(async () => ({ outcome: 'refused', reason: 'nothing-to-preserve' }));
+      const next = await advance(harness);
+      expect(next).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'prepare' });
+      // The crashed recovery's reset ran once; the reconcile added none.
+      expect(harness.resetRequests).toHaveLength(1);
+      expect((await recoveryJournalEntries(harness)).map((entry) => entry.status)).toEqual(['intent-recorded']);
+    });
+
+    it('GB3 test 12: a non-normalized recorded worktree path never builds a patch path — recovery and reconcile both refuse', async () => {
+      // Dispatch recovery: the double slash means the recorded path was never
+      // normalized, so no patch path is built and the refusal parks.
+      const harness = await makeHarness(
+        runRecord(),
+        [attemptFixture({ worktreePath: '/tmp/opencode/wo-example-1//wt-example-1' })],
+        { wireRecovery: true },
+      );
+      harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: WORKTREE_REFUSAL }));
+      await admit(harness, 'attempt-example-1');
+      const result = await advance(harness);
+      expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+      expect(harness.preserveRequests).toEqual([]);
+      expect(harness.resetRequests).toEqual([]);
+      expect(harness.cancelRequests).toEqual([]);
+      expect((await recoveryJournalEntries(harness)).map((entry) => entry.status)).toEqual([]);
+
+      // Reconcile: a cancelled attempt with an open intent and a `..`-shaped
+      // worktree path parks at prepare without touching the recovery port.
+      const harness2 = await makeHarness(
+        runRecord(),
+        [attemptFixture({ worktreePath: WORKTREE + '/../wt-example-1', state: 'cancelled', outcome: 'stopped' })],
+        { wireRecovery: true },
+      );
+      await harness2.executionJournal.appendJournalEntry({
+        id: 'attempt-example-1:dispatch:1',
+        attemptId: 'attempt-example-1',
+        workOrderId: 'wo-example-1',
+        action: 'dispatch',
+        baseCommit: COMMIT,
+        recordedAtIso: NOW,
+        status: 'intent-recorded',
+        sessionId: null,
+        detail: 'preserved uncommitted edits: ' + WORKTREE + '/../wt-example-1.attempt-example-1.patch',
+      });
+      const prepared = await advance(harness2);
+      expect(prepared).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'prepare' });
+      expect(harness2.preserveRequests).toEqual([]);
+      expect(harness2.resetRequests).toEqual([]);
+    });
   });
 });

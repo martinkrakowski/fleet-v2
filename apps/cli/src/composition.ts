@@ -51,6 +51,7 @@ import {
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
+  MergeGrantAdapter,
   ForgeReadAdapter,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
@@ -95,6 +96,9 @@ import {
   type AttemptRecord,
   type ExecutionRunnerHost,
   type EvaluateAttemptGatePort,
+  type EnqueueMergeUseCase,
+  type ListMergeQueueUseCase,
+  type MergeQueueRepositoryAdapter,
   type ForgeActionDelegate,
   type GhInvocationResult,
   type SubprocessRunner,
@@ -227,7 +231,10 @@ export interface FleetCliRuntimeOptions {
    * reviewed subprocess runner shared with the forge action adapter; tests
    * inject a stub transport here.
    */
-  readonly forgeGhRunner?: (args: readonly string[]) => Promise<GhInvocationResult>;
+  readonly forgeGhRunner?: (
+    args: readonly string[],
+    timeoutMs?: number,
+  ) => Promise<GhInvocationResult>;
   /**
    * Absolute gh locations overriding the fixed defaults (tests only).
    * Production always resolves the reviewed GitHub CLI from
@@ -446,6 +453,31 @@ function isExecutableRegularFile(path: string): boolean {
   }
 }
 
+/** Normal one-call timeout for a `gh` subprocess; the subprocess is killed on expiry. */
+const GH_SUBPROCESS_TIMEOUT_MS = 30_000;
+
+/**
+ * Build the child environment for a GitHub CLI subprocess. When `env` sets
+ * `GH_CONFIG_DIR`, ambient token credentials (which gh prefers over hosts.yml)
+ * are stripped so the configured identity authenticates the child.
+ */
+export function buildGhChildEnvironment(
+  ambient: NodeJS.ProcessEnv = process.env,
+  env?: Record<string, string>,
+): NodeJS.ProcessEnv | undefined {
+  if (env === undefined) {
+    return undefined;
+  }
+  const child: NodeJS.ProcessEnv = { ...ambient, ...env };
+  if ('GH_CONFIG_DIR' in env) {
+    delete child.GH_TOKEN;
+    delete child.GITHUB_TOKEN;
+    delete child.GH_ENTERPRISE_TOKEN;
+    delete child.GITHUB_ENTERPRISE_TOKEN;
+  }
+  return child;
+}
+
 /**
  * Run the reviewed GitHub CLI subprocess for the forge adapter. The binary is
  * resolved from fixed absolute locations (S4036), never through PATH; when
@@ -453,18 +485,33 @@ function isExecutableRegularFile(path: string): boolean {
  * unreadable (fail closed, as a missing binary does today). A completed
  * invocation resolves with its exit code and captured output; a spawn failure
  * rejects so the adapter reports the outcome as ambiguous for reconciliation
- * instead of guessing.
+ * instead of guessing. `env` (when provided) is merged over the inherited
+ * environment, with ambient tokens stripped when `GH_CONFIG_DIR` is set; the
+ * value is never logged. A timeout that kills the subprocess also rejects: an
+ * expired write may have reached the forge, so the adapters report it ambiguous,
+ * never as proof of success.
  */
-function runGhSubprocess(
+export function runGhSubprocess(
   args: readonly string[],
   candidates: readonly string[] = GH_BINARY_CANDIDATES,
+  env?: Record<string, string>,
+  timeoutMs?: number,
 ): Promise<GhInvocationResult> {
   const ghBinary = resolveGhBinary(candidates, isExecutableRegularFile);
   if (ghBinary === undefined) {
     return Promise.reject(new Error('gh not found in fixed locations'));
   }
+  const executionOptions: {
+    encoding: 'utf8';
+    env?: NodeJS.ProcessEnv;
+    timeout?: number;
+  } = { encoding: 'utf8', timeout: timeoutMs ?? GH_SUBPROCESS_TIMEOUT_MS };
+  const childEnv = buildGhChildEnvironment(process.env, env);
+  if (childEnv !== undefined) {
+    executionOptions.env = childEnv;
+  }
   return new Promise((resolve, reject) => {
-    execFile(ghBinary, [...applyGhEnvironmentOverrides(args)], { encoding: 'utf8' }, (error, stdout, stderr) => {
+    execFile(ghBinary, [...applyGhEnvironmentOverrides(args)], executionOptions, (error, stdout, stderr) => {
       if (error === null) {
         resolve({ exitCode: 0, stdout: String(stdout), stderr: String(stderr) });
         return;
@@ -669,6 +716,7 @@ export interface FleetCliRuntime {
     readonly briefKnowledge: BriefKnowledgeAdapter;
     readonly executionObservation: ExecutionObservationAdapter;
     readonly forgeAction: ForgeActionAdapter;
+    readonly mergeGrant: MergeGrantAdapter;
     /** Read-only PR state (AM4b-2); bound in forge mode `github` only. */
     readonly forgeRead: ForgeReadAdapter;
     readonly registerWorkOrder: RegisterWorkOrderUseCase;
@@ -695,6 +743,9 @@ export interface FleetCliRuntime {
     readonly autoMergeAttempt: AutoMergeAttemptUseCase;
     readonly probeProject: ProbeProjectUseCase;
     readonly listUnregisteredProjects: ListUnregisteredProjectsUseCase;
+    readonly mergeQueueRepository: MergeQueueRepositoryAdapter;
+    readonly enqueueMerge: EnqueueMergeUseCase;
+    readonly listMergeQueue: ListMergeQueueUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -856,6 +907,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     coordination,
     coordinationRequestRepository,
     issuePolicyForgeGrantUseCase,
+    issueMergeGrantUseCase,
     profileRead,
     probeRecord,
     executorForHostName,
@@ -897,6 +949,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     opencodeUsage,
     briefAuthoring,
     forgeAction,
+    mergeGrant,
   } = composeExecutionHosts({
     stateDir,
     options,
@@ -921,6 +974,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     readGitHead,
     headRouteForExecutor,
     runGitCommand,
+    issuePolicyForgeGrantUseCase,
+    issueMergeGrantUseCase,
   });
 
   const { execution } = composeExecution({
@@ -940,6 +995,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     attemptLookup,
     forgeRead,
     issuePolicyForgeGrantUseCase,
+    mergeGrant,
     profileRead,
     probeRecord,
     executorForHostName,

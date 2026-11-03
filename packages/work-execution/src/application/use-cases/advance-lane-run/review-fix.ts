@@ -29,6 +29,7 @@ import { readFrozenBriefVerified } from './frozen-manifest.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
 import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, saveOrRefuse } from './step-context.js';
+import { lastDispatchLeftDirtyWorktree } from './dirty-handover.js';
 import { nonPassingGatePredicatesOf } from '../RequestAttemptAcceptanceUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 
@@ -260,6 +261,68 @@ async function recordOutOfScopeFindings(
   }
 }
 
+const MINOR_ONLY_SEVERITIES: readonly string[] = ['minor', 'nit'];
+
+/**
+ * GB1: a minors-only failed brief-check receipt does not block the run. True
+ * exactly when the kind is `brief-check`, the receipt verdict is `failed`, the
+ * receipt has at least one finding, and every finding's severity is `minor`
+ * or `nit`. Any blocker or major finding, zero findings, or another kind keeps
+ * the plain `review-failed` mapping (fail closed).
+ */
+function isMinorOnlyBriefCheckReceipt(
+  kind: ReviewKind,
+  receipt: { readonly verdict: ReviewVerdict; readonly findings: readonly ReviewRequestFinding[] },
+): boolean {
+  if (kind !== 'brief-check' || receipt.verdict !== 'failed' || receipt.findings.length === 0) {
+    return false;
+  }
+  return receipt.findings.every((finding) => MINOR_ONLY_SEVERITIES.includes(finding.severity));
+}
+
+/** The minor-only override: the same shape the plain mapping carries, with the fixed detail token. */
+const MINOR_ONLY_OVERRIDE = {
+  result: 'completed',
+  reasonCode: 'review-passed',
+  detail: 'minor-only-findings',
+} as const;
+
+/**
+ * GB1: when the resolved mapping is still `review-failed` for a receipt, the
+ * minors-only brief-check override applies on top of it. The scope disposition
+ * runs first: an `out-of-scope-findings` result is never touched, and neither
+ * is any non-`review-failed` mapping.
+ */
+function minorOnlyOverrideOf(
+  step: ReviewKind,
+  outcome: ReviewRequestResult,
+  resolved: { readonly result: 'completed' | 'refused'; readonly reasonCode: LaneRunResultReasonCode; readonly detail: string | null },
+): typeof resolved {
+  if (resolved.reasonCode !== 'review-failed' || outcome.outcome !== 'receipt') {
+    return resolved;
+  }
+  if (!isMinorOnlyBriefCheckReceipt(step, outcome.receipt)) {
+    return resolved;
+  }
+  return { ...MINOR_ONLY_OVERRIDE };
+}
+
+/**
+ * GB1: the reconcile's answer mapping with the minors-only brief-check
+ * override applied. The detail stays null unless the override applies, so the
+ * fixed token only ever marks a minors-only override receipt.
+ */
+function reconciledReviewOf(
+  step: ReviewKind,
+  receipt: { readonly verdict: ReviewVerdict; readonly findings: readonly ReviewRequestFinding[] },
+  mapped: { readonly result: 'completed'; readonly reasonCode: LaneRunResultReasonCode },
+): { readonly result: 'completed'; readonly reasonCode: LaneRunResultReasonCode; readonly detail: string | null } {
+  if (mapped.reasonCode === 'review-failed' && step === 'brief-check' && isMinorOnlyBriefCheckReceipt(step, receipt)) {
+    return { ...MINOR_ONLY_OVERRIDE };
+  }
+  return { ...mapped, detail: null };
+}
+
 /**
  * KF-33b2: a failed receipt with findings is checked against the lane's
  * changed set before it fails the run. An unknown changed set or no
@@ -439,7 +502,10 @@ export async function performReview(
     outcome.outcome === 'receipt' && outcome.receipt.verdict === 'failed' && outcome.receipt.findings.length > 0
       ? await reviewScopeDispositionOf(ctx, gathered, latest, head, outcome.receipt.findings, mapped)
       : mapped;
-  return finishReview(ctx, request, decision, resolved.result, resolved.reasonCode, resolved.detail);
+  // GB1: after the scope disposition, a still-failed minors-only brief-check
+  // receipt journals `review-passed` with the fixed detail instead.
+  const override = minorOnlyOverrideOf(decision.step as ReviewKind, outcome, resolved);
+  return finishReview(ctx, request, decision, override.result, override.reasonCode, override.detail);
 }
 
 /**
@@ -489,11 +555,14 @@ export async function reconcileReview(
   }
   if (found.outcome === 'found') {
     const mapped = reviewResultOfVerdict(found.receipt.verdict);
-    const resultRefusal = await appendRunResult(ctx, request, decision.key, mapped.result, mapped.reasonCode);
+    // GB1: a minors-only failed brief-check receipt reconciles review-passed
+    // with the fixed detail, before the result entry is appended.
+    const resolved = reconciledReviewOf(parsed.step as ReviewKind, found.receipt, mapped);
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, resolved.result, resolved.reasonCode, resolved.detail);
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
-    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode: mapped.reasonCode };
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode: resolved.reasonCode };
   }
   const ambiguous = found.outcome === 'unavailable';
   const reasonCode = ambiguous ? 'review-unknown' : 'review-no-receipt';
@@ -833,6 +902,16 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     return refuse('prepare-refused');
   }
 
+  // GB3a: when the previous FIX seat left the worktree dirty (its last
+  // dispatch refused with a dirty detail and the attempt was cancelled), the
+  // next fix brief opens with the handover note: finish the work and commit.
+  const latestAttempt = gathered.latestAttempt;
+  const handover =
+    lastDispatchLeftDirtyWorktree(entries, record.runId) &&
+    latestAttempt !== null &&
+    latestAttempt.kind === 'fix' &&
+    latestAttempt.state === 'cancelled' &&
+    latestAttempt.priorAttemptId === prior.id;
   const brief = renderHandoverBrief({
     runId: record.runId,
     round,
@@ -844,6 +923,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     gatePredicates,
     proofCommands,
     originalBrief,
+    ...(handover ? { uncommittedHandover: true } : {}),
   } satisfies RenderHandoverBriefInput);
   if (!brief.ok || brief.numberedFixes.length === 0) {
     return refuse('prepare-refused');

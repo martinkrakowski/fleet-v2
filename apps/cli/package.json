@@ -11,7 +11,8 @@
     "build": "tsc",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",
-    "test": "../../node_modules/.bin/vitest run --passWithNoTests --exclude '**/dist/**'"
+    "test": "../../node_modules/.bin/vitest run --passWithNoTests --exclude '**/dist/**'",
+    "bench:conductor-pass": "node dist/bench/conductor-pass-bench.js"
   },
   "dependencies": {
     "@fleet/brief-knowledge": "workspace:*",

@@ -138,14 +138,38 @@ describe('detectTools', () => {
   });
 });
 
+/** Runner for opencode's version and auth probes, used by HTTP model listing tests. */
+function opencodeHttpRunner(): CommandRunner {
+  return fakeRunner({
+    'opencode --version': RECORDED_SWEEP['opencode --version'],
+    'opencode auth': RECORDED_SWEEP['opencode auth'],
+  }).run;
+}
+
+/** Runner overriding one argv command with a specific result or thrown error. */
+function runnerWithOverride(
+  matchedKey: string,
+  outcome: CommandRunResult | Error,
+  fallbackKey?: string,
+): CommandRunner {
+  return async (argv) => {
+    if (argv.join(' ') === matchedKey) {
+      if (outcome instanceof Error) {
+        throw outcome;
+      }
+      return outcome;
+    }
+    return (fallbackKey !== undefined ? RECORDED_SWEEP[fallbackKey] : undefined) ?? { exitCode: 0, stdout: '' };
+  };
+}
+
 describe('detectTool', () => {
   it('fails closed as not installed when the runner throws on detect', async () => {
-    const run: CommandRunner = async (argv) => {
-      if (argv.join(' ') === 'claude --version') {
-        throw new Error('spawn ENOENT');
-      }
-      return RECORDED_SWEEP['claude auth status'] ?? { exitCode: 0, stdout: '' };
-    };
+    const run = runnerWithOverride(
+      'claude --version',
+      new Error('spawn ENOENT'),
+      'claude auth status',
+    );
     const detection = await detectTool(CLAUDE_CODE_TOOL, run);
     expect(detection).toEqual({
       id: 'claude-code',
@@ -157,32 +181,25 @@ describe('detectTool', () => {
   });
 
   it('keeps the tool installed but reports unknown sign-in when the probe throws', async () => {
-    const run: CommandRunner = async (argv) => {
-      if (argv.join(' ') === 'claude auth status') {
-        throw new Error('probe crashed');
-      }
-      return RECORDED_SWEEP['claude --version'] ?? { exitCode: 0, stdout: '' };
-    };
+    const run = runnerWithOverride(
+      'claude auth status',
+      new Error('probe crashed'),
+      'claude --version',
+    );
     const detection = await detectTool(CLAUDE_CODE_TOOL, run);
     expect(detection.installed).toBe(true);
     expect(detection.signIn).toBe('unknown');
   });
 
   it('reports an HTTP model list as unknown without an injected HTTP prober', async () => {
-    const { run } = fakeRunner({
-      'opencode --version': RECORDED_SWEEP['opencode --version'],
-      'opencode auth': RECORDED_SWEEP['opencode auth'],
-    });
+    const run = opencodeHttpRunner();
     const detection = await detectTool(OPENCODE_TOOL, run);
     expect(detection.installed).toBe(true);
     expect(detection.models).toBe('unknown');
   });
 
   it('reports an HTTP model list as unknown on a non-2xx answer or a throwing prober', async () => {
-    const { run } = fakeRunner({
-      'opencode --version': RECORDED_SWEEP['opencode --version'],
-      'opencode auth': RECORDED_SWEEP['opencode auth'],
-    });
+    const run = opencodeHttpRunner();
     const failing = await detectTool(OPENCODE_TOOL, run, {
       httpGet: async () => ({ exitCode: 404, stdout: '' }),
     });
@@ -197,10 +214,7 @@ describe('detectTool', () => {
   });
 
   it('parses an HTTP model list through the injected prober', async () => {
-    const { run } = fakeRunner({
-      'opencode --version': RECORDED_SWEEP['opencode --version'],
-      'opencode auth': RECORDED_SWEEP['opencode auth'],
-    });
+    const run = opencodeHttpRunner();
     const detection = await detectTool(OPENCODE_TOOL, run, {
       httpGet: async (path) => {
         expect(path).toBe('/api/model');
@@ -214,12 +228,11 @@ describe('detectTool', () => {
   });
 
   it('reports models as unknown when the listing exits non-zero, whatever its stdout says', async () => {
-    const run: CommandRunner = async (argv) => {
-      if (argv.join(' ') === 'grok models') {
-        return { exitCode: 1, stdout: 'Available models:\n  grok-4.7\n' };
-      }
-      return RECORDED_SWEEP['grok --version'] ?? { exitCode: 0, stdout: '' };
-    };
+    const run = runnerWithOverride(
+      'grok models',
+      { exitCode: 1, stdout: 'Available models:\n  grok-4.7\n' },
+      'grok --version',
+    );
     const detection = await detectTool(GROK_TOOL, run);
     expect(detection.installed).toBe(true);
     expect(detection.models).toBe('unknown');
@@ -230,12 +243,10 @@ describe('detectTool', () => {
       ...CLAUDE_CODE_TOOL,
       models: { parse: () => [] },
     };
-    const run: CommandRunner = async (argv) => {
-      if (argv.join(' ') === 'claude --version') {
-        return RECORDED_SWEEP['claude --version'] ?? { exitCode: 0, stdout: '' };
-      }
-      return { exitCode: 0, stdout: '' };
-    };
+    const run = runnerWithOverride(
+      'claude --version',
+      RECORDED_SWEEP['claude --version'] ?? { exitCode: 0, stdout: '' },
+    );
     const detection = await detectTool(emptyListTool, run);
     expect(detection.models).toBe('unknown');
   });
@@ -260,12 +271,11 @@ describe('detectTool', () => {
   });
 
   it('reports models as unknown when the argv listing probe throws', async () => {
-    const run: CommandRunner = async (argv) => {
-      if (argv.join(' ') === 'agy models') {
-        throw new Error('probe crashed');
-      }
-      return RECORDED_SWEEP['agy --version'] ?? { exitCode: 0, stdout: '' };
-    };
+    const run = runnerWithOverride(
+      'agy models',
+      new Error('probe crashed'),
+      'agy --version',
+    );
     const detection = await detectTool(AGY_TOOL, run);
     expect(detection.installed).toBe(true);
     expect(detection.models).toBe('unknown');

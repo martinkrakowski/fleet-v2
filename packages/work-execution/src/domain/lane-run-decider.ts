@@ -240,6 +240,66 @@ function laneRunSettledOpenPrDecision(record: LaneRunRecord, facts: LaneRunFacts
 }
 
 /**
+ * G3f (R4c, narrowed): a merged PR that carries the lane head ends the
+ * run from an eligible waiting state — a park (without owner questions or live
+ * attempts), `awaiting-premerge`, `watching-ci` or `merging` — by itself.
+ * An unread intent shadows the rule unless its step is `premerge` (so an unread
+ * `merge` intent reconciles first, as before). An ambiguous intent cannot shadow
+ * it. Under a halt nothing changes (the halt rules decide, as today), and a
+ * merged PR that does not carry the lane head is left to the existing rules.
+ * Total; never throws.
+ */
+function laneRunMergedPrDecision(record: LaneRunRecord, facts: LaneRunFacts): LaneRunDecision | null {
+  if (facts.halted) {
+    return null;
+  }
+  // 1. An unread intent shadows the rule unless its step is premerge.
+  // An unread merge intent reconciles first, as before.
+  if (
+    facts.pendingIntent !== null &&
+    facts.pendingIntent.reconciliation === 'unread' &&
+    facts.pendingIntent.step !== 'premerge'
+  ) {
+    return null;
+  }
+  if (facts.pr === null || facts.pr.state !== 'merged') {
+    return null;
+  }
+  if (!mergedPrCarriesLaneHead(facts.pr, facts.head12)) {
+    return null;
+  }
+  // 2. A park with a non-null questionId returns null, and so does a one-way-door
+  // park, so no owner question is left behind. The owner-merge park is the
+  // exception: its question asks for this merge, so the merge answers it (CT-2a).
+  if (
+    record.parked !== null &&
+    record.parked.reason !== 'owner-merge' &&
+    (record.parked.questionId !== null || record.parked.reason === 'one-way-door')
+  ) {
+    return null;
+  }
+  // 3. A parked run whose latest attempt is still live returns null.
+  if (facts.state === 'parked' && facts.attempt !== null) {
+    const live =
+      facts.attempt.phase === 'dispatching' ||
+      facts.attempt.phase === 'running' ||
+      facts.attempt.phase === 'blocked';
+    if (live) {
+      return null;
+    }
+  }
+  if (
+    facts.state === 'parked' ||
+    facts.state === 'awaiting-premerge' ||
+    facts.state === 'watching-ci' ||
+    facts.state === 'merging'
+  ) {
+    return { kind: 'enter', to: 'merged' };
+  }
+  return null;
+}
+
+/**
  * KS7a-2: the merging hold's decision (speed plan §3.6.2, D20; §3.3.1): post
  * the `premerge` commit status, the merge hold, before the policy-grant /
  * train / merge tail. Returns `null` to fall through to that tail. Total;
@@ -544,7 +604,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       ) {
         return dispatchOrPrepare(record.round, attempt, facts.implementerSeat);
       }
-      if (!facts.implementerSeat.ok || facts.roundSeatIndexes.includes(facts.implementerSeat.seatIndex)) {
+      if (!facts.implementerSeat.ok) {
         return park('seat-plan-exhausted', null);
       }
       return prepareAct(record.round, facts.implementerSeat.seatIndex);
@@ -831,6 +891,15 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return WAIT_FACTS_INCONSISTENT;
     }
 
+    // G3f (R4c): a merged PR carrying the lane head ends the run from an
+    // eligible waiting state. An unread intent shadows it unless its step is
+    // premerge; a park with a questionId, a one-way-door park, or a parked run
+    // with a live attempt returns null. Under a halt it decides nothing.
+    const mergedPr = laneRunMergedPrDecision(record, facts);
+    if (mergedPr !== null) {
+      return mergedPr;
+    }
+
     // G3a: an unread intent without a result is reconciled first, in any state —
     // except under a halt, where a collect or gate reconcile would re-run its act
     // body (an edit-only commit, a collect, a gate on the lane host; §3.7): the
@@ -867,22 +936,6 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
         return enter('merged');
       }
       return park('ambiguous', 'merge');
-    }
-
-    // G3e: the owner-merge park leaves by itself once its PR merges with the
-    // lane head (CT-2a). It sits here, ahead of the stop rules G4a and GD1, so
-    // a landed merge ends `merged` and never `stopped` even with a stop
-    // recorded on the park (§3.9.1). A merged PR that neither equals nor
-    // contains the lane head keeps the park for the owner (no park → park).
-    if (
-      facts.state === 'parked' &&
-      record.parked !== null &&
-      record.parked.reason === 'owner-merge' &&
-      facts.pr !== null &&
-      facts.pr.state === 'merged' &&
-      mergedPrCarriesLaneHead(facts.pr, facts.head12)
-    ) {
-      return enter('merged');
     }
 
     // G4a: a force stop with nothing to stop ends the run.

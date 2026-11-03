@@ -33,6 +33,17 @@ export interface LaneRunPrBodyFrozen {
   readonly challengeThis: string;
 }
 
+/**
+ * GB1: one carried minor from a minors-only brief-check override receipt.
+ * Severity, file path and line only — never a finding summary or reviewer
+ * prose.
+ */
+export interface LaneRunCarriedMinor {
+  readonly severity: 'minor' | 'nit';
+  readonly filePath: string | null;
+  readonly line: number | null;
+}
+
 export interface RenderPrBodyInput {
   readonly workOrderId: string;
   readonly title: string;
@@ -42,6 +53,8 @@ export interface RenderPrBodyInput {
   readonly gate: 'passed';
   readonly reviews: readonly LaneRunPrBodyReview[];
   readonly frozen: LaneRunPrBodyFrozen;
+  /** GB1: the minors carried into the Challenge section; absent or empty renders the body unchanged. */
+  readonly carriedMinors?: readonly LaneRunCarriedMinor[];
 }
 
 /** The PR body refusals: the D7 note refusal, the secret-shape refusal, the size refusal. */
@@ -85,6 +98,60 @@ function findingCountsLine(counts: LaneRunPrBodyReview['findingCounts']): string
   return parts.length === 0 ? 'no findings' : parts.join(', ');
 }
 
+/** GB1: a carried minor's `filePath` is null or a repository-relative path: 1–300 chars, no empty, `.` or `..` components. */
+const CARRIED_PATH_PATTERN = /^[A-Za-z0-9._@+/-]+$/;
+
+function isCarriedFilePath(filePath: unknown): filePath is string | null {
+  if (filePath === null) {
+    return true;
+  }
+  if (typeof filePath !== 'string' || filePath.length < 1 || filePath.length > 300) {
+    return false;
+  }
+  if (!CARRIED_PATH_PATTERN.test(filePath)) {
+    return false;
+  }
+  return filePath.split('/').every((component) => component.length > 0 && component !== '.' && component !== '..');
+}
+
+function isCarriedLine(line: unknown): line is number | null {
+  return line === null || (typeof line === 'number' && Number.isSafeInteger(line) && line >= 1);
+}
+
+/** A carried minor renders only when its severity, path and line are all in shape; anything else refuses. */
+function isCarriedMinor(entry: unknown): entry is LaneRunCarriedMinor {
+  if (typeof entry !== 'object' || entry === null) {
+    return false;
+  }
+  const record = entry as Record<string, unknown>;
+  return (
+    (record.severity === 'minor' || record.severity === 'nit') &&
+    isCarriedFilePath(record.filePath) &&
+    isCarriedLine(record.line)
+  );
+}
+
+/**
+ * GB1: one Challenge-section line per carried minor, in input order, using the
+ * entry's actual severity. A null path renders `(no path)`; a null line omits
+ * the `:<line>` suffix.
+ */
+function carriedMinorLines(minors: readonly LaneRunCarriedMinor[]): string[] {
+  const lines: string[] = [];
+  for (const minor of minors) {
+    if (minor.filePath === null) {
+      lines.push(`- [${minor.severity}] (no path)`);
+      continue;
+    }
+    if (minor.line === null) {
+      lines.push(`- [${minor.severity}] ${minor.filePath}`);
+      continue;
+    }
+    lines.push(`- [${minor.severity}] ${minor.filePath}:${minor.line}`);
+  }
+  return lines;
+}
+
 export function renderPrBody(input: RenderPrBodyInput): RenderPrBodyResult {
   const hardToUndo = typeof input.frozen?.hardToUndo === 'string' ? input.frozen.hardToUndo : '';
   const assumptions = typeof input.frozen?.assumptions === 'string' ? input.frozen.assumptions : '';
@@ -99,6 +166,11 @@ export function renderPrBody(input: RenderPrBodyInput): RenderPrBodyResult {
     return { ok: false, reason: 'invalid-review' };
   }
 
+  // GB1: every carried minor must be in shape; an invalid entry refuses.
+  if (input.carriedMinors !== undefined && !input.carriedMinors.every(isCarriedMinor)) {
+    return { ok: false, reason: 'invalid-review' };
+  }
+
   // Every string the caller declares is checked for secret shape (§5: records only).
   const declared: string[] = [
     input.workOrderId, input.title, input.runId,
@@ -106,6 +178,12 @@ export function renderPrBody(input: RenderPrBodyInput): RenderPrBodyResult {
   ];
   for (const review of input.reviews) {
     declared.push(review.reviewerModel);
+  }
+  // GB1: a carried path is reviewer-shaped data and is secret-scanned too.
+  for (const minor of input.carriedMinors ?? []) {
+    if (typeof minor.filePath === 'string') {
+      declared.push(minor.filePath);
+    }
   }
   for (const value of declared) {
     if (typeof value === 'string' && containsSecretShape(value)) {
@@ -133,6 +211,10 @@ export function renderPrBody(input: RenderPrBodyInput): RenderPrBodyResult {
     );
   }
 
+  // GB1: the carried minors join the Challenge section after its paragraph;
+  // without them the body is byte-identical to the pre-GB1 rendering.
+  const challengeTail: string[] = carriedMinorLines(input.carriedMinors ?? []);
+
   const body = [
     ...whatLines,
     '',
@@ -149,6 +231,7 @@ export function renderPrBody(input: RenderPrBodyInput): RenderPrBodyResult {
     '## Challenge this',
     '',
     challengeThis,
+    ...challengeTail,
     '',
   ].join('\n');
 

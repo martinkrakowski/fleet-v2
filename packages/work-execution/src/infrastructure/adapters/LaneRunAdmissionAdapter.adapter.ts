@@ -374,7 +374,7 @@ export class LaneRunAdmissionAdapter implements LaneRunAdmissionPort, LaneRunSta
         continue;
       }
       const attempt = await this.options.attemptRepo.findAttemptById(reservation.attemptId);
-      inFlight.push({ attemptId: reservation.attemptId, workOrderId: attempt?.workOrderId ?? null });
+      inFlight.push({ attemptId: reservation.attemptId, workOrderId: attempt?.workOrderId ?? reservation.workOrderId ?? null });
     }
     return inFlight;
   }

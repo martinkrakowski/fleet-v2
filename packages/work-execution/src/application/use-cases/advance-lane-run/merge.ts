@@ -354,8 +354,8 @@ async function prFactOf(
  * run only past acceptance — a state inside the PR/CI window, a collected head
  * to read at, a bound port, and never while halted — otherwise the hard-coded
  * defaults stand (`preMerge: 'none'`, `ci: 'unknown'`, `pr: null`). The PR is
- * read once; its snapshot's merge state feeds the merge facts. CG1: a parked
- * run with no recorded PR number additionally reads its PR by branch, keeping
+ * read once; its snapshot's merge state feeds the merge facts. CG1: any parked
+ * run reads its PR — by number when one is recorded, else by branch — keeping
  * only a merged PR, for the merged-PR rule only.
  */
 export async function acceptanceFactsOf(
@@ -414,21 +414,20 @@ export async function acceptanceFactsOf(
     pr = prRead.pr;
     mergeState = prRead.mergeState;
   }
-  // CG1: for a parked run with no recorded PR number (the PR was opened by
-  // hand), look the PR up by the run's own branch; the lookup keeps only a
-  // merged PR — never an open one — and is for the merged-PR rule only. It
-  // does not write the record, save a prNumber, or feed the merge facts.
+  // CG1: any parked run, with or without a recorded PR number, reads its PR —
+  // by number when one is recorded, else by the run's own branch; the lookup
+  // keeps only a merged PR — never an open one — and is for the merged-PR rule
+  // only. It does not write the record, save a prNumber, or feed the merge facts.
   if (
     !halted &&
     !canReadPr &&
     state === 'parked' &&
     record.parked !== null &&
-    record.prNumber === null &&
     latest !== null &&
     latest.artifacts !== null &&
     ctx.deps.forgeRead !== undefined
   ) {
-    const ref = branchRefOf(record, latest);
+    const ref = pullRequestRefOf(record, latest);
     const lookup = await prFactOf(
       ctx.deps.forgeRead,
       ref,
@@ -436,7 +435,7 @@ export async function acceptanceFactsOf(
       latest.artifacts.headCommit,
       ctx.deps.forgeAncestry,
       resolveLaneRunBaseBranch(record),
-      ref.branchName,
+      branchRefOf(record, latest).branchName,
     );
     if (lookup.pr !== null && lookup.pr.state === 'merged') {
       pr = lookup.pr;

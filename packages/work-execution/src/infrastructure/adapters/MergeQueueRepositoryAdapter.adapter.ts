@@ -142,6 +142,7 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
       successorEntryId,
       enqueuedAtIso,
       repoDigest,
+      baseBranch: command.baseBranch,
     };
     return this.mutate((current) => decideMergeEnqueue(current, input));
   }

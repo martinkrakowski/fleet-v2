@@ -27,16 +27,15 @@ const FILE_PATH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 
 /**
  * Characters a summary may never carry into an owner surface: C0/C1 controls,
- * bidi controls, Unicode format/zero-width controls, soft hyphens, line and
- * paragraph separators, and interlinear annotation controls. In the bounded
- * view these are flattened to spaces; a stored snapshot carrying any of them
- * is refused.
+ * all Unicode format controls (including bidi controls, zero-width marks,
+ * soft hyphens, U+180E, U+061C and every other Cf character), and line and
+ * paragraph separators. In the bounded view these are flattened to spaces; a
+ * stored snapshot carrying any of them is refused.
  */
-// eslint-disable-next-line no-control-regex
-const FORBIDDEN_SUMMARY_PATTERN = /[\u0000-\u001F\u007F-\u009F\u00AD\u180E\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/;
+const FORBIDDEN_SUMMARY_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 
 /** The global form used to flatten forbidden summaries to spaces. */
-const FORBIDDEN_SUMMARY_FLATTEN = new RegExp(FORBIDDEN_SUMMARY_PATTERN.source, 'g');
+const FORBIDDEN_SUMMARY_FLATTEN = new RegExp(FORBIDDEN_SUMMARY_PATTERN.source, 'gu');
 
 const SEVERITIES = ['blocker', 'major', 'minor', 'nit'] as const;
 

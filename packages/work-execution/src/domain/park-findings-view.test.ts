@@ -130,8 +130,21 @@ describe('boundedFindingsView', () => {
     const view = boundedFindingsView([finding({ summary: hostile, filePath: null, line: null })]);
     expect(view[0]!.summary).toBe('a b c d e f g h i j k');
     // The control characters are exactly what must never survive sanitization.
-    // eslint-disable-next-line no-control-regex
-    expect(view[0]!.summary).not.toMatch(/[\u0000-\u001F\u007F-\u009F\u00AD\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/);
+    expect(view[0]!.summary).not.toMatch(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
+  });
+
+  it('flattens every Unicode format control, including U+061C and the rest of Cf', () => {
+    // U+061C ARABIC LETTER MARK, U+0600 ARABIC NUMBER SIGN, U+06DD ARABIC END OF
+    // AYAH, U+070F SYRIAC ABBREVIATION MARK, U+08E2 ARABIC DISPUTED END OF
+    // AYAH, U+110BD KAITHI NUMBER SIGN, U+1BCA0 SHORTHAND FORMAT LETTER OVERLAP:
+    // all are Cf format controls outside the original explicit ranges.
+    const hostile = 'a\u061Cb\u0600c\u06DDd\u070Fe\u08E2f\u{110BD}g\u{1BCA0}h';
+    const view = boundedFindingsView([finding({ summary: hostile, filePath: null, line: null })]);
+    expect(view[0]!.summary).toBe('a b c d e f g h');
+    expect(view[0]!.summary).not.toMatch(/[\p{Cf}]/u);
+    const snapshot = [{ ...finding(), summary: hostile }];
+    expect(parkFindingsSnapshotOf(snapshot)).toBeNull();
+    expect(isParkFindingView(snapshot[0])).toBe(false);
   });
 
   it('flattens the Unicode format control U+180E like every other format control', () => {

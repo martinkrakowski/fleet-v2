@@ -18,6 +18,7 @@ import { appendConduct, appendRunIntent, appendRunResult, ceilingPark, performPa
 import { manifestExpectedArtifacts, manifestPositiveInteger, manifestTimeLimitSeconds, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { performFixPrepare } from './review-fix.js';
 import { parkSpentOneWayKey } from './merge.js';
+import { isDirtyWorktreeDetail, lastDispatchLeftDirtyWorktree } from './dirty-handover.js';
 
 function latestAttemptRecordOf(gathered: GatheredLaneRunFacts): AttemptRecord | null {
   for (let index = gathered.attemptRecords.length - 1; index >= 0; index -= 1) {
@@ -616,6 +617,28 @@ function seatAdvanceTokenOf(chosen: NextSeatResult, outcome: SeatFailureOutcome)
 }
 
 /**
+ * GB3a: cancel a refused fix attempt so the dirty worktree is handed over to
+ * the next fix seat unchanged. Cancelling is the ONLY side effect; the
+ * worktree is never preserved, reset or deleted. True only when the cancel
+ * landed; any other outcome (unwired, refused or throwing) is false.
+ */
+async function handOverDirtyWorktree(ctx: AdvanceStepContext,
+  latest: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+): Promise<boolean> {
+  const cancel = ctx.deps.cancelPreparedAttempt;
+  if (cancel === undefined) {
+    return false;
+  }
+  try {
+    const cancelled = await cancel.cancelPreparedAttempt({ attemptId: latest.id, nowIso: request.nowIso });
+    return cancelled.outcome === 'cancelled';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The `act dispatch` decision (K4-5): start the prepared attempt through
  * `DispatchAttemptPort` with the frozen brief's limits, raising the round and
  * the seat cursor on the record before the call (§3.2, D8). The dispatch key
@@ -758,6 +781,12 @@ export async function performDispatch(ctx: AdvanceStepContext,
           setBy: 'conductor',
           expiresAtIso: new Date(Date.parse(nowIso) + timeLimitSeconds * 1000).toISOString(),
         };
+  // GB3a: a fix dispatch following a dirty-worktree refusal carries the
+  // handed-over worktree as-is, so the next seat's uncommitted work is
+  // accepted instead of refused again.
+  const handover =
+    latest.kind === 'fix' &&
+    lastDispatchLeftDirtyWorktree(await ctx.deps.runJournal.listForRun(record.runId), record.runId);
   const dispatched = await dispatch.dispatchAttempt({
     attemptId: latest.id,
     workOrderId: record.workOrderId,
@@ -770,6 +799,7 @@ export async function performDispatch(ctx: AdvanceStepContext,
     expectedArtifacts,
     nowIso,
     ...(seatOverride !== null ? { seatOverride } : {}),
+    ...(handover ? { allowUncommittedHandover: true } : {}),
     ...(ctx.deps.installationSchemaVersion !== undefined
       ? { installationSchemaVersion: ctx.deps.installationSchemaVersion }
       : {}),
@@ -821,13 +851,21 @@ export async function performDispatch(ctx: AdvanceStepContext,
   if (resultRefusal !== null) {
     return { outcome: 'refused', reason: resultRefusal };
   }
-  // GB3: for a refused dispatch whose detail is `worktree-uncommitted`, preserve
-  // the never-dispatched attempt's uncommitted edits as a patch outside the
-  // worktree, reset the worktree to its head, cancel the attempt, and journal
-  // the patch path. The spent refusal key is already recorded above. Success
-  // returns acted without parking so the next advance prepares the next seat;
-  // any failure (or unwired recovery) keeps today's park exactly.
-  if (reasonCode === 'dispatch-refused' && dispatchRefusalDetail(dispatched.reason) === 'worktree-uncommitted') {
+  // GB3a: a refused FIX dispatch whose detail is a dirty-worktree detail cancels
+  // the attempt and hands the worktree UNCHANGED to the next fix seat — nothing
+  // is preserved, reset or deleted. If the cancel does not land (unwired,
+  // refused or throwing) the run parks at the bottom; a fix attempt never
+  // reaches `recoverUncommittedWorktree`. First-pass attempts keep today's GB3
+  // recovery exactly: preserve the edits as a patch outside the worktree, reset
+  // the worktree to its head, cancel the attempt, and journal the patch path.
+  // The spent refusal key is already recorded above. Success returns acted
+  // without parking so the next advance prepares the next seat.
+  const detail = dispatchRefusalDetail(dispatched.reason);
+  if (reasonCode === 'dispatch-refused' && latest.kind === 'fix' && isDirtyWorktreeDetail(detail)) {
+    if (await handOverDirtyWorktree(ctx, latest, request)) {
+      return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
+    }
+  } else if (reasonCode === 'dispatch-refused' && latest.kind !== 'fix' && detail === 'worktree-uncommitted') {
     const recovered = await recoverUncommittedWorktree(ctx, record, latest, request);
     if (recovered) {
       return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };

@@ -22,6 +22,10 @@ export interface LaneRunStatusView {
   readonly round: number;
   readonly revision: number;
   readonly parked: LaneRunParkRecord | null;
+  /**
+   * The fixed refusal detail of a `step-refused` park (e.g. `worktree-uncommitted`); absent when none.
+   */
+  readonly parkDetail?: string;
   readonly parkCount: number;
   /** The strongest stop intent's mode (laneRunJournalStopFacts); null when none. */
   readonly stopMode: RunStopMode | null;

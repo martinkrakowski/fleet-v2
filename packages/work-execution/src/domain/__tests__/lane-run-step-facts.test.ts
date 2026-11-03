@@ -12,6 +12,7 @@ import {
   laneRunDispatchedAtIso,
   laneRunGateCongestion,
   laneRunGateFact,
+  laneRunGateRetryFact,
   laneRunIntentEntry,
   laneRunParkedConductCount,
   laneRunRecordedSeatAdvance,
@@ -366,6 +367,71 @@ describe('laneRunGateCongestion', () => {
   it('returns null with no gate intent or a null head', () => {
     expect(laneRunGateCongestion([], RUN_ID, HEAD)).toBeNull();
     expect(laneRunGateCongestion([], RUN_ID, null)).toBeNull();
+  });
+});
+
+describe('laneRunGateRetryFact', () => {
+  const run0 = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD });
+  const run1 = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD, retry: 1 });
+
+  it('returns null with no gate intent at the head', () => {
+    expect(laneRunGateRetryFact([], RUN_ID, HEAD)).toBeNull();
+  });
+
+  it('returns null for another head and for a null head', () => {
+    const entries = [intent(run0)];
+    expect(laneRunGateRetryFact(entries, RUN_ID, OTHER_HEAD)).toBeNull();
+    expect(laneRunGateRetryFact(entries, RUN_ID, null)).toBeNull();
+  });
+
+  it('returns null while the ambiguous read is not parked yet', () => {
+    const entries = [
+      intent(run0),
+      result(run0, 'ambiguous', 'gate-unknown'),
+    ];
+    expect(laneRunGateRetryFact(entries, RUN_ID, HEAD)).toBeNull();
+  });
+
+  it('returns { retry: 1 } when the ambiguous gate-unknown read is followed by a parked conduct of this run', () => {
+    const entries = [
+      intent(run0),
+      result(run0, 'ambiguous', 'gate-unknown'),
+      conduct('parked'),
+    ];
+    expect(laneRunGateRetryFact(entries, RUN_ID, HEAD)).toEqual({ retry: 1 });
+  });
+
+  it('returns null when the latest gate run at the head holds a final gate-passed result', () => {
+    const entries = [
+      intent(run0),
+      result(run0, 'ambiguous', 'gate-unknown'),
+      conduct('parked'),
+      intent(run1),
+      result(run1, 'completed', 'gate-passed'),
+    ];
+    expect(laneRunGateRetryFact(entries, RUN_ID, HEAD)).toBeNull();
+  });
+
+  it('returns null when a second gate run at the head is also an ambiguous gate-unknown read', () => {
+    const entries = [
+      intent(run0),
+      result(run0, 'ambiguous', 'gate-unknown'),
+      conduct('parked'),
+      intent(run1),
+      result(run1, 'ambiguous', 'gate-unknown'),
+    ];
+    expect(laneRunGateRetryFact(entries, RUN_ID, HEAD)).toBeNull();
+  });
+
+  it('returns { retry: 2 } when a gate-congested run 0 is followed by an ambiguous run 1 that was parked', () => {
+    const entries = [
+      intent(run0),
+      result(run0, 'completed', 'gate-congested'),
+      intent(run1),
+      result(run1, 'ambiguous', 'gate-unknown'),
+      conduct('parked'),
+    ];
+    expect(laneRunGateRetryFact(entries, RUN_ID, HEAD)).toEqual({ retry: 2 });
   });
 });
 

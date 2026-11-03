@@ -6,6 +6,7 @@
  * tick, reaching `act merge-pr` only when every earlier row is false.
  */
 
+import { parseBaseBranch } from './base-branch.js';
 import { isZonedIsoDateTime } from './conductor-halt.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from './lane-run-journal.js';
 import { LANE_RUN_MAX_RETRY } from './lane-run-keys.js';
@@ -18,6 +19,7 @@ import {
   MERGE_VETO_MODES,
   readMergeQueueEntryRecord,
   readMergeVetoRecord,
+  resolveMergeQueueEntryBase,
 } from './merge-queue-records.js';
 import type {
   MergeDropReason,
@@ -98,6 +100,8 @@ export interface MergeStepFacts {
   readonly paused: boolean | 'unreadable';
   readonly isQueueHead: boolean;
   readonly pr: MergePrFact;
+  /** The pull request's forge base branch; required to update or enter ready. */
+  readonly prBaseRef?: string | null;
   readonly reReadHeadOid?: string | 'unknown' | null;
   readonly headObservedAtIso: string;
   readonly contexts:
@@ -137,7 +141,7 @@ export type MergeStepWaitReason =
   | 'threads-unknown' | 'not-queue-head' | 'already-merged' | 'pr-unknown'
   | 'checks-unknown' | 'updates-unknown' | 'premerge-carry-unknown' | 'disjointness-unknown'
   | 'merge-state-unknown' | 'merge-state-blocked' | 'macos-unknown' | 'head-reread-unknown'
-  | 'unverified-head' | 'facts-inconsistent';
+  | 'unverified-head' | 'base-unknown' | 'facts-inconsistent';
 
 export type MergeStepDecision =
   | {
@@ -842,6 +846,9 @@ function readyRow(
   if (pr.mergeStateStatus !== 'CLEAN') {
     return waitDecision('merge-state-blocked');
   }
+  if (!matchesEntryBase(facts, entry)) {
+    return waitDecision('base-unknown');
+  }
   const recorded = entry.verifiedHeadOid === entry.headOid && entry.verifiedBy !== null && entry.policyRevision === policy.policyRevision;
   if (!recorded) {
     return enterReady(entry.headOid, 'contexts', policy.policyRevision);
@@ -1000,9 +1007,14 @@ function decideRows(
   return disjoint !== null ? disjoint : readyRowsStep(entry, facts, policy, nowIso, verdict);
 }
 
+/** The PR's awaited base must equal the entry's own resolved base to update or merge. */
+function matchesEntryBase(facts: MergeStepFacts, entry: MergeQueueEntryRecord): boolean {
+  return parseBaseBranch(facts.prBaseRef) === resolveMergeQueueEntryBase(entry);
+}
+
 /**
  * Row 9: the update row on an open PR. `DIRTY` drops here; only `BEHIND`
- * with room under the hourly cap acts.
+ * with a matching base and room under the hourly cap acts.
  */
 function updateRowStep(
   entry: MergeQueueEntryRecord,
@@ -1031,6 +1043,9 @@ function updateRowStep(
   }
   if (pr.mergeStateStatus !== 'BEHIND') {
     return null;
+  }
+  if (!matchesEntryBase(facts, entry)) {
+    return waitDecision('base-unknown');
   }
   if (!policy.updateBranch) {
     return parkNoBackoff(entry, 'update-refused', null);

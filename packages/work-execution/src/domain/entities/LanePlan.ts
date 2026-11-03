@@ -10,7 +10,7 @@
  * secret-shaped input is refused with a fixed message, never echoed.
  */
 
-import { readExactPlainRecord } from '../plain-record-reads.js';
+import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from '../plain-record-reads.js';
 import {
   CANONICAL_ISO_PATTERN,
   LANE_PLAN_LIMITS,
@@ -32,10 +32,12 @@ import type {
   PlannedLaneTier,
   PlanDecisionSidecar,
   PlanDecisionState,
+  PlanFeatureSet,
   PlanPullRequestRef,
 } from '../lane-plan-records.js';
 import {
   planDecisionAndOrderRecords,
+  planFeatureSetError,
   planIdError,
   planPathError,
   planTextError,
@@ -93,6 +95,9 @@ export class LanePlan {
         revision: sidecar.revision,
         digest: meta.digest,
         doc: sidecar.doc,
+        ...(sidecar.featureSet === null
+          ? {}
+          : { featureSet: { id: sidecar.featureSet.id, title: sidecar.featureSet.title } }),
         lanes: sidecar.lanes.map((lane) => freshLaneRecord({
           laneId: lane.laneId,
           aliases: lane.renamedFrom === null ? [] : [lane.renamedFrom],
@@ -105,6 +110,7 @@ export class LanePlan {
           status: lane.status,
           brief: lane.brief,
           mergedPr: lane.mergedPr,
+          rollupOf: lane.rollupOf ? true : undefined,
         })),
         ...planDecisionAndOrderRecords(sidecar.decisions, sidecar.exclusiveOrder),
         importedAtIso: meta.importedAtIso,
@@ -134,6 +140,17 @@ export class LanePlan {
       return invalid(headError);
     }
     const revision = recordInput.revision as number;
+
+    let normalizedFeatureSet: PlanFeatureSet | undefined;
+    const featureSet = recordInput.featureSet;
+    if (featureSet !== undefined) {
+      const featureSetError = planFeatureSetError('featureSet', featureSet);
+      if (featureSetError !== null) {
+        return invalid(`LanePlan ${featureSetError}`);
+      }
+      const snapshot = featureSet as { id: string; title: string };
+      normalizedFeatureSet = { id: snapshot.id, title: snapshot.title };
+    }
 
     const lanesRaw = plainArrayCopy(recordInput.lanes);
     const lanesListError = lanesListShapeError(lanesRaw);
@@ -186,6 +203,7 @@ export class LanePlan {
       revision,
       digest: recordInput.digest as string,
       doc: recordInput.doc as string,
+      ...(normalizedFeatureSet === undefined ? {} : { featureSet: normalizedFeatureSet }),
       lanes: Object.freeze(lanes.map((lane) => {
         const laneRecord = lane.toRecord();
         deepFreezeValue(laneRecord);
@@ -209,6 +227,9 @@ export class LanePlan {
       doc: this.record.doc,
       lanes: this.record.lanes.map(freshLaneRecord),
       ...planDecisionAndOrderRecords(this.record.decisions, this.record.exclusiveOrder),
+      ...(this.record.featureSet === undefined
+        ? {}
+        : { featureSet: { id: this.record.featureSet.id, title: this.record.featureSet.title } }),
       importedAtIso: this.record.importedAtIso,
     };
   }
@@ -223,6 +244,15 @@ export class LanePlan {
 
   getRevision(): number {
     return this.record.revision;
+  }
+
+  /** The plan's feature set, or null when it has none; a fresh copy. */
+  getFeatureSet(): PlanFeatureSet | null {
+    const featureSet = this.record.featureSet;
+    if (featureSet === undefined) {
+      return null;
+    }
+    return { id: featureSet.id, title: featureSet.title };
   }
 
   getDigest(): string {
@@ -262,7 +292,7 @@ function lanePlanRecordSnapshot(input: unknown): Record<string, unknown> | strin
   if (inputPrototype !== Object.prototype && inputPrototype !== null) {
     return 'LanePlan requires a record';
   }
-  const recordInput = readExactPlainRecord(input, RECORD_KEYS);
+  const recordInput = readPlainRecordWithOptionalKeys(input, RECORD_KEYS, ['featureSet']);
   if (recordInput === null) {
     return 'LanePlan must have exactly its record fields';
   }
@@ -322,6 +352,7 @@ interface LaneRecordSource {
   readonly status: PlannedLaneStatus;
   readonly brief: string | null;
   readonly mergedPr: PlanPullRequestRef | null;
+  readonly rollupOf?: true;
 }
 
 /** One fresh lane record; nested lists and references are fresh copies. */
@@ -344,6 +375,7 @@ function freshLaneRecord(lane: LaneRecordSource): PlannedLaneRecord {
     mergedPr: lane.mergedPr === null
       ? null
       : { repository: lane.mergedPr.repository, number: lane.mergedPr.number },
+    ...(lane.rollupOf === true ? { rollupOf: true } : {}),
   };
 }
 

@@ -452,6 +452,53 @@ describe('classifyZombies — the subject guard', () => {
     };
     expect(classifyZombies({ observations: [pathObservation, emptyObservation], openFindings: [] }, NOW, {})).toEqual([]);
   });
+
+  it('produces no finding for a secret-shaped subject such as a GitHub token', () => {
+    const tokenSubjects = [
+      'ghp_' + 'A'.repeat(36),
+      'gho_' + 'B'.repeat(36),
+      'ghs_' + 'C'.repeat(36),
+      'github_pat_' + 'D'.repeat(40),
+      'glpat-' + 'E'.repeat(20),
+      'sk-' + 'F'.repeat(40),
+      'sk-ant-' + 'G'.repeat(40),
+      'xoxb-' + 'H'.repeat(24),
+      'AKIA' + 'I'.repeat(16),
+      'npm_' + 'J'.repeat(30),
+    ];
+    const observations: ReaperObservation[] = tokenSubjects.map((subject) => ({
+      kind: 'orphan-worktree',
+      subject,
+      youngActivity: false,
+      noLiveRecord: true,
+      branchPrMerged: false,
+    }));
+    expect(classifyZombies({ observations, openFindings: [] }, NOW, {})).toEqual([]);
+  });
+
+  it('still accepts ordinary ids alongside rejected secret-shaped subjects', () => {
+    const tokenObservation: ReaperObservation = {
+      kind: 'orphan-worktree',
+      subject: 'ghp_' + 'A'.repeat(36),
+      youngActivity: false,
+      noLiveRecord: true,
+      branchPrMerged: false,
+    };
+    const idObservation: ReaperObservation = {
+      kind: 'orphan-worktree',
+      subject: 'wt-' + 'a'.repeat(12),
+      youngActivity: false,
+      noLiveRecord: true,
+      branchPrMerged: false,
+    };
+    const findings = classifyZombies(
+      { observations: [tokenObservation, idObservation], openFindings: [] },
+      NOW,
+      {},
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.subject).toBe('wt-' + 'a'.repeat(12));
+  });
 });
 
 describe('classifyZombies — the schema version', () => {

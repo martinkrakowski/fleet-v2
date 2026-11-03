@@ -11,6 +11,15 @@
 import { REAPER_SUBJECT_ID_PATTERN } from './lane-run-keys.js';
 import type { ReaperFindingKind } from './lane-run-keys.js';
 
+/**
+ * A subject that is not an identifier but a credential-shaped string (a token
+ * pasted where an id belongs). The broad printable-ASCII subject pattern cannot
+ * tell them apart, so the classifier rejects these shapes explicitly: a secret
+ * never reaches a finding.
+ */
+const SECRET_SHAPED_SUBJECT_PATTERN =
+  /^(?:gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9_-]+|sk-(?:ant-)?[A-Za-z0-9_-]+|xox[bpas]-[A-Za-z0-9-]+|AKIA[0-9A-Z]{16}|npm_[A-Za-z0-9]+)$/;
+
 /** The stored finding record's schema version (D6, D-R8): the first version, 1. */
 export const REAPER_FINDING_SCHEMA_VERSION = 1;
 
@@ -236,7 +245,8 @@ export function classifyZombies(
       }
       const kind = observation.kind;
       const subject = observation.subject;
-      if (typeof subject !== 'string' || !REAPER_SUBJECT_ID_PATTERN.test(subject)) {
+      if (typeof subject !== 'string' || !REAPER_SUBJECT_ID_PATTERN.test(subject)
+        || SECRET_SHAPED_SUBJECT_PATTERN.test(subject)) {
         continue;
       }
       const verdict = kindVerdict(observation, staleStopMinutes, minFreePercent, now, repairEnabled(policy.repairs, kind));

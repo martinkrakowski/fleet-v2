@@ -223,8 +223,11 @@ export async function makeLaneRunScenario(outcomes: readonly PortOutcome[]): Pro
         return { outcome: 'unknown', attempt, reason: 'runner unknown' };
       }
       // `completed`: the runner started — save the attempt `running` with its
-      // session, like the real adapter.
-      await attemptRepo.saveAttempt({ ...attempt, state: 'running', sessionId: 'session-example-1', revision: 1 });
+      // session like the real adapter: one read, then a save at the stored
+      // revision + 1 (`AttemptRepositoryAdapter` refuses a save that does not
+      // increment the stored revision, so a hard-coded revision would throw
+      // instead of simulating the started runner).
+      await saveAnswered({ ...attempt, state: 'running', sessionId: 'session-example-1' });
       return { outcome: 'started', attempt, sessionId: 'session-example-1' };
     },
   };

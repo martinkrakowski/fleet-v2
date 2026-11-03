@@ -117,6 +117,23 @@ describe('parseLaneDeclarationBody', () => {
       error: 'invalid nowIso',
     });
   });
+
+  it('refuses an impossible calendar date that Date.parse would normalize', () => {
+    // 2026-02-30 and 2026-02-29 (not a leap year) parse to a finite value but
+    // normalize to a different instant, so they are not canonical.
+    expect(parseLaneDeclarationBody(declarationBody(), '2026-02-30T00:00:00.000Z', 90)).toEqual({
+      ok: false,
+      error: 'invalid nowIso',
+    });
+    expect(parseBriefReadBody(briefReadBody(), '2026-02-30T00:00:00.000Z')).toEqual({
+      ok: false,
+      error: 'invalid nowIso',
+    });
+    expect(parseLaneDeclarationBody(declarationBody(), '2026-02-29T00:00:00.000Z', 90)).toEqual({
+      ok: false,
+      error: 'invalid nowIso',
+    });
+  });
 });
 
 describe('parseBriefReadBody', () => {

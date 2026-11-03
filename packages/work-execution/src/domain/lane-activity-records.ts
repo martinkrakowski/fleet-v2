@@ -93,11 +93,14 @@ function isBoundedPlain(value: unknown, limit: number): value is string {
 }
 
 function isCanonicalIso(value: unknown): value is string {
-  return (
-    typeof value === 'string' &&
-    CANONICAL_ISO_PATTERN.test(value) &&
-    Number.isFinite(Date.parse(value))
-  );
+  if (typeof value !== 'string' || !CANONICAL_ISO_PATTERN.test(value)) {
+    return false;
+  }
+  const parsed = Date.parse(value);
+  // Date.parse rolls some impossible calendar dates (for example, an
+  // out-of-range day) over into a later instant instead of refusing them,
+  // so only a timestamp that round-trips exactly is canonical.
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
 }
 
 const LAN_REF_PLAN_KEYS = ['kind', 'projectId', 'planId', 'laneId'] as const;

@@ -40,15 +40,22 @@ import { isValidAgyModel } from './AgyRunnerAdapter.adapter.js';
 import type {
   CommitLaneOutputRequest,
   CommitLaneOutputResult,
+  InspectWorktreeForRemovalRequest,
+  InspectWorktreeForRemovalResult,
+  ListWorktreesRequest,
+  ListWorktreesResult,
   PrepareLaneWorktreeRequest,
   PrepareLaneWorktreeResult,
   PreserveWorktreeEditsRequest,
   PreserveWorktreeEditsResult,
+  ReadFilesystemSpaceRequest,
+  ReadFilesystemSpaceResult,
   RemoveLaneWorktreeRequest,
   RemoveLaneWorktreeResult,
   ResetWorktreeToHeadRequest,
   ResetWorktreeToHeadResult,
   VerifySavedPatchRequest,
+  WorktreeLastActivity,
 } from '../../application/ports/out/WorkspacePort.out-port.js';
 import { runnerHasHostName } from '../../domain/execution-records.js';
 
@@ -184,6 +191,19 @@ const PROBE_TIMEOUT_MS = 60 * 1000;
 /** Wall-clock budget for one file read (`cat`). */
 const CAT_TIMEOUT_MS = 60 * 1000;
 
+/** Porcelain status pairs that mean a path is in a merge state, never counted as tracked. */
+const UNMERGED_STATUS_PAIRS = new Set(['UU', 'AA', 'DD', 'AU', 'UA', 'DU', 'UD']);
+
+/** The in-progress operation files probed in a worktree's git directory, in probe order. */
+const IN_PROGRESS_OPERATION_FILES = [
+  'rebase-merge',
+  'rebase-apply',
+  'MERGE_HEAD',
+  'CHERRY_PICK_HEAD',
+  'REVERT_HEAD',
+  'BISECT_LOG',
+];
+
 /** The commit's argv hardening (2026-10-16 plan, step 4): no hooks, no signing, no fsmonitor. */
 const COMMIT_GIT_CONFIG: readonly string[] = [
   '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false', '-c', 'core.fsmonitor=false',
@@ -269,6 +289,8 @@ interface ListedWorktreeEntry {
   /** The checked-out branch without `refs/heads/`, or null when detached. */
   readonly branch: string | null;
   readonly locked: boolean;
+  /** The administrative entry is stale (`prunable <reason>`); never pruned here. */
+  readonly prunable: boolean;
 }
 
 /**
@@ -291,6 +313,7 @@ export function parseWorktreeList(stdout: string): ListedWorktreeEntry[] {
         head: null,
         branch: null,
         locked: false,
+        prunable: false,
       };
       entries.push(current);
       continue;
@@ -307,6 +330,9 @@ export function parseWorktreeList(stdout: string): ListedWorktreeEntry[] {
       entries[entries.length - 1] = current;
     } else if (line === 'locked' || line.startsWith('locked ')) {
       current = { ...current, locked: true };
+      entries[entries.length - 1] = current;
+    } else if (line === 'prunable' || line.startsWith('prunable ')) {
+      current = { ...current, prunable: true };
       entries[entries.length - 1] = current;
     }
   }
@@ -1354,6 +1380,341 @@ export class WorkspaceAdapter implements WorkspacePort {
     } catch {
       return { outcome: 'unknown' };
     }
+  }
+
+  /**
+   * KW2 (D18): list one registered clone's worktrees. Read-only: it never
+   * prunes, removes, locks or fetches anything, and it never scans a host.
+   */
+  async listWorktrees(request: ListWorktreesRequest): Promise<ListWorktreesResult> {
+    if (!isAbsoluteNormalisedPath(request.repositoryRoot)) {
+      return { outcome: 'unknown', reason: 'invalid-request' };
+    }
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(request.recordedHost);
+    } catch {
+      return { outcome: 'unknown', reason: 'no executor for the read' };
+    }
+    const run = await executor.run(
+      ['git', '-C', request.repositoryRoot, 'worktree', 'list', '--porcelain'],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (run.exitCode === null || run.error !== undefined) {
+      return { outcome: 'unknown', reason: 'git worktree list did not report an exit code' };
+    }
+    if (run.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'git worktree list failed' };
+    }
+    return { outcome: 'listed', worktrees: parseWorktreeList(run.stdout) };
+  }
+
+  /**
+   * KW2 (D18): read one worktree's removal facts — HEAD, branch or detached,
+   * the ancestor answer against the default branch, the porcelain status
+   * counts, the lock, the in-progress operations, the last activity and the
+   * budgeted size. Every refusal happens before any command runs; a command
+   * that never reports an exit code is unknown, never a guess.
+   */
+  async inspectWorktreeForRemoval(
+    request: InspectWorktreeForRemovalRequest,
+  ): Promise<InspectWorktreeForRemovalResult> {
+    // 1. Validate before any command runs (no executor call on a bad request).
+    const { repositoryRoot, worktreePath, defaultRef } = request;
+    if (
+      !isAbsoluteNormalisedPath(repositoryRoot) ||
+      !isAbsoluteNormalisedPath(worktreePath) ||
+      typeof defaultRef !== 'string' ||
+      defaultRef === '' ||
+      /\s/.test(defaultRef) ||
+      defaultRef.includes('\0')
+    ) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+
+    // 2. The read runs on the recorded host's executor; an unresolvable host
+    //    is unknown — nothing is known to have been read.
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(request.recordedHost);
+    } catch {
+      return { outcome: 'unknown', reason: 'no executor for the read' };
+    }
+
+    // 3. List the clone's worktrees.
+    const listRun = await executor.run(
+      ['git', '-C', repositoryRoot, 'worktree', 'list', '--porcelain'],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (listRun.exitCode === null || listRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'git worktree list did not report an exit code' };
+    }
+    if (listRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'git worktree list failed' };
+    }
+    const listed = parseWorktreeList(listRun.stdout);
+
+    // 4. Find the entry by the given path, then by its physical form (a
+    //    symlinked worktree is listed under its physical path).
+    let entry = listedWorktreeAt(listed, worktreePath);
+    if (entry === null) {
+      const physicalWorktreePath = await resolvePhysicalPath(executor, worktreePath, GIT_TIMEOUT_MS);
+      if (physicalWorktreePath !== null && physicalWorktreePath !== worktreePath) {
+        entry = listedWorktreeAt(listed, physicalWorktreePath);
+      }
+    }
+    if (entry === null) {
+      return { outcome: 'refused', reason: 'not-a-linked-worktree' };
+    }
+
+    // 5. The main checkout is never inspected.
+    if (entry.path === repositoryRoot) {
+      return { outcome: 'refused', reason: 'not-a-linked-worktree' };
+    }
+    const physicalRepositoryRoot = await resolvePhysicalPath(executor, repositoryRoot, GIT_TIMEOUT_MS);
+    if (physicalRepositoryRoot !== null && entry.path === physicalRepositoryRoot) {
+      return { outcome: 'refused', reason: 'not-a-linked-worktree' };
+    }
+
+    // 6. Facts from the entry.
+    const head = entry.head;
+    const branch = entry.branch;
+    const detached = branch === null;
+    const locked = entry.locked;
+
+    // 7. Ancestor answer against the default branch.
+    let headOnDefault: boolean | null = null;
+    if (head !== null) {
+      const mergeBaseRun = await executor.run(
+        ['git', '-C', worktreePath, 'merge-base', '--is-ancestor', head, defaultRef],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (mergeBaseRun.exitCode === 0) {
+        headOnDefault = true;
+      } else if (mergeBaseRun.exitCode === 1) {
+        headOnDefault = false;
+      }
+      // Any other exit (null/absent or other) stays null: unknown, never false.
+    }
+
+    // 8. Status counts.
+    const statusRun = await executor.run(
+      ['git', '-C', worktreePath, 'status', '--porcelain', '--untracked-files=all'],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (statusRun.exitCode === null || statusRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'git status did not report an exit code' };
+    }
+    if (statusRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'git status failed' };
+    }
+    let tracked = 0;
+    let untracked = 0;
+    let unmerged = 0;
+    for (const line of statusRun.stdout.split('\n')) {
+      if (line === '') continue;
+      if (line.startsWith('?? ')) {
+        untracked += 1;
+      } else if (UNMERGED_STATUS_PAIRS.has(line.slice(0, 2))) {
+        unmerged += 1;
+      } else {
+        tracked += 1;
+      }
+    }
+
+    // 9. In-progress operations.
+    const gitDirRun = await executor.run(
+      ['git', '-C', worktreePath, 'rev-parse', '--git-dir'],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (gitDirRun.exitCode === null || gitDirRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'git rev-parse --git-dir did not report an exit code' };
+    }
+    if (gitDirRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'git rev-parse --git-dir failed' };
+    }
+    let gitDir = gitDirRun.stdout.trim();
+    if (!gitDir.startsWith('/')) {
+      gitDir = path.join(worktreePath, gitDir);
+    }
+    const inProgressOperations: string[] = [];
+    for (const name of IN_PROGRESS_OPERATION_FILES) {
+      const probeRun = await executor.run(['test', '-e', path.join(gitDir, name)], {
+        timeoutMs: PROBE_TIMEOUT_MS,
+      });
+      if (probeRun.exitCode === null || probeRun.error !== undefined) {
+        return { outcome: 'unknown', reason: 'operation file probe did not report an exit code' };
+      }
+      if (probeRun.exitCode === 0) {
+        inProgressOperations.push(name);
+      }
+    }
+
+    // 10. Last activity.
+    const lastActivity = await this.readLastActivity(executor, worktreePath);
+
+    // 11. Size (budgeted; a failure is null, never a guess).
+    let sizeBytes: number | null = null;
+    const sizeRun = await executor.run(['du', '-sk', worktreePath], { timeoutMs: GIT_TIMEOUT_MS });
+    if (sizeRun.exitCode !== null && sizeRun.error === undefined && sizeRun.exitCode === 0) {
+      const lines = sizeRun.stdout.split('\n').filter((line) => line.trim() !== '');
+      const lastLine = lines[lines.length - 1];
+      if (lastLine !== undefined) {
+        const kilobytes = Number.parseInt(lastLine.trim().split(/\s+/)[0] ?? '', 10);
+        if (Number.isSafeInteger(kilobytes) && kilobytes >= 0) {
+          sizeBytes = kilobytes * 1024;
+        }
+      }
+    }
+
+    return {
+      outcome: 'inspected',
+      facts: {
+        path: worktreePath,
+        head,
+        branch,
+        detached,
+        headOnDefault,
+        status: { tracked, untracked, unmerged },
+        locked,
+        inProgressOperations,
+        lastActivity,
+        sizeBytes,
+      },
+    };
+  }
+
+  /**
+   * KW2: read the free and total bytes of the filesystem holding a path.
+   */
+  async readFilesystemSpace(request: ReadFilesystemSpaceRequest): Promise<ReadFilesystemSpaceResult> {
+    if (!isAbsoluteNormalisedPath(request.path)) {
+      return { outcome: 'unknown', reason: 'invalid-request' };
+    }
+    let executor: CommandExecutorPort;
+    try {
+      executor = this.executorFor(request.recordedHost);
+    } catch {
+      return { outcome: 'unknown', reason: 'no executor for the read' };
+    }
+    const run = await executor.run(['df', '-k', request.path], { timeoutMs: GIT_TIMEOUT_MS });
+    if (run.exitCode === null || run.error !== undefined) {
+      return { outcome: 'unknown', reason: 'df did not report an exit code' };
+    }
+    if (run.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'df failed' };
+    }
+    const lines = run.stdout.split('\n').filter((line) => line.trim() !== '');
+    const last = lines[lines.length - 1];
+    if (last === undefined) {
+      return { outcome: 'unknown', reason: 'df printed no line' };
+    }
+    const fields = last.trim().split(/\s+/);
+    const total = Number.parseInt(fields[1] ?? '', 10);
+    const available = Number.parseInt(fields[3] ?? '', 10);
+    if (!Number.isSafeInteger(total) || !Number.isSafeInteger(available)) {
+      return { outcome: 'unknown', reason: 'df output could not be parsed' };
+    }
+    return { outcome: 'read', freeBytes: available * 1024, totalBytes: total * 1024 };
+  }
+
+  /**
+   * KW2: the newest activity of one worktree — the reflog date, the index
+   * mtime and the bounded tree walk, whichever is newest. `unknown` is true
+   * when the tree walk did not finish (or could not be asked), never when the
+   * answer is known.
+   */
+  private async readLastActivity(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+  ): Promise<WorktreeLastActivity> {
+    // reflog: the newest reflog entry's commit date; a non-zero exit or empty
+    // stdout contributes nothing.
+    let newestMs: number | null = null;
+    const reflogRun = await executor.run(
+      ['git', '-C', worktreePath, 'reflog', 'show', '-1', '--date=iso-strict', '--format=%cd', 'HEAD'],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (reflogRun.exitCode === 0 && reflogRun.error === undefined) {
+      const reflogIso = reflogRun.stdout.trim();
+      if (reflogIso !== '') {
+        const ms = Date.parse(reflogIso);
+        if (!Number.isNaN(ms)) {
+          newestMs = ms;
+        }
+      }
+    }
+
+    // Detect the `stat` flavour once: GNU (`-c %Y`) or BSD (`-f %m`).
+    const gnuStatRun = await executor.run(['stat', '-c', '%Y', worktreePath], {
+      timeoutMs: GIT_TIMEOUT_MS,
+    });
+    let flavour: 'gnu' | 'bsd' | null = null;
+    if (gnuStatRun.exitCode === 0 && gnuStatRun.error === undefined) {
+      flavour = 'gnu';
+    } else {
+      const bsdStatRun = await executor.run(['stat', '-f', '%m', worktreePath], {
+        timeoutMs: GIT_TIMEOUT_MS,
+      });
+      if (bsdStatRun.exitCode === 0 && bsdStatRun.error === undefined) {
+        flavour = 'bsd';
+      }
+    }
+
+    let unknown = false;
+    if (flavour === null) {
+      // Neither stat answered: the index mtime and the walk are unknown.
+      unknown = true;
+    } else {
+      // Index mtime: resolve the index path, then stat it with the detected flavour.
+      const indexPathRun = await executor.run(
+        ['git', '-C', worktreePath, 'rev-parse', '--git-path', 'index'],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      if (indexPathRun.exitCode === 0 && indexPathRun.error === undefined) {
+        let indexPath = indexPathRun.stdout.trim();
+        if (!indexPath.startsWith('/')) {
+          indexPath = path.join(worktreePath, indexPath);
+        }
+        const indexStatRun = await executor.run(
+          flavour === 'gnu' ? ['stat', '-c', '%Y', indexPath] : ['stat', '-f', '%m', indexPath],
+          { timeoutMs: GIT_TIMEOUT_MS },
+        );
+        if (
+          indexStatRun.exitCode === 0 &&
+          indexStatRun.error === undefined &&
+          indexStatRun.stdout.trim() !== ''
+        ) {
+          const seconds = Number.parseInt(indexStatRun.stdout.trim(), 10);
+          if (Number.isSafeInteger(seconds) && (newestMs === null || seconds * 1000 > newestMs)) {
+            newestMs = seconds * 1000;
+          }
+        }
+      }
+
+      // Bounded tree walk: newest file mtime under the worktree, skipping .git.
+      const walkArgv =
+        flavour === 'gnu'
+          ? ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y', '{}', '+']
+          : ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-f', '%m', '{}', '+'];
+      const walkRun = await executor.run(walkArgv, { timeoutMs: GIT_TIMEOUT_MS });
+      for (const line of walkRun.stdout.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed === '') continue;
+        const seconds = Number.parseInt(trimmed, 10);
+        if (Number.isSafeInteger(seconds) && (newestMs === null || seconds * 1000 > newestMs)) {
+          newestMs = seconds * 1000;
+        }
+      }
+      if (walkRun.exitCode === null || walkRun.error !== undefined || walkRun.exitCode !== 0) {
+        unknown = true;
+      }
+    }
+
+    if (newestMs === null) {
+      return { iso: null, unknown: true };
+    }
+    return { iso: new Date(newestMs).toISOString(), unknown };
   }
 
   /**

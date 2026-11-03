@@ -501,7 +501,7 @@ describe('train-lease pure rules', () => {
       ['garbage', 'garbage'],
       ['no zone', '2026-11-02 20:00:00'],
       ['bad calendar date', '2026-13-45T00:00:00Z'],
-      ['non-UTC offset', '2026-11-02T21:00:00+01:00'],
+      ['rollover non-leap year', '2026-02-29T23:30:00-01:00'],
       ['number', 42],
       ['undefined', undefined],
     ])('a malformed clock value %s gives clock-unreadable from every decision', (_label, badClock) => {
@@ -516,9 +516,9 @@ describe('train-lease pure rules', () => {
       expect(checkTrainLeaseHeld(current, { holderId: 'holder-1', fence: 1 }, badClock as string)).toBe('clock-unreadable');
     });
 
-    it('readClockIso returns the canonical ISO string for a canonical UTC ISO time and null otherwise', () => {
+    it('readClockIso returns the canonical ISO string for a zoned time and null otherwise', () => {
       expect(readClockIso('2026-11-02T20:00:00.000Z')).toBe('2026-11-02T20:00:00.000Z');
-      expect(readClockIso('2026-11-02T21:00:00+01:00')).toBeNull();
+      expect(readClockIso('2026-11-02T21:00:00+01:00')).toBe('2026-11-02T20:00:00.000Z');
       expect(readClockIso('')).toBeNull();
       expect(readClockIso('garbage')).toBeNull();
       expect(readClockIso('2026-11-02 20:00:00')).toBeNull();

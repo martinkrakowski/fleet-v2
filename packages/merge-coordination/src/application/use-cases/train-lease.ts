@@ -53,7 +53,6 @@ export type TrainLeaseDecision =
 
 const ID_MAX_BYTES = 256;
 const LEASE_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
-const CLOCK_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 
 const ACQUIRE_KEYS: readonly string[] = ['holderId', 'observedFence', 'leaseUntilIso'];
 const RENEW_KEYS: readonly string[] = ['holderId', 'fence', 'leaseUntilIso'];
@@ -83,34 +82,49 @@ function readExactKeys(value: unknown, keys: readonly string[]): Record<string, 
   }
 }
 
+/**
+ * True when the date and time fields of an ISO-8601 string name a real calendar instant
+ * in the string's own offset (no calendar rollover). Date.parse rolls an impossible date
+ * such as 02-30 over into March instead of refusing it, so the fields are checked here.
+ */
+function isCalendarDateTime(iso: string): boolean {
+  const year = Number(iso.slice(0, 4));
+  const month = Number(iso.slice(5, 7));
+  const day = Number(iso.slice(8, 10));
+  const hour = Number(iso.slice(11, 13));
+  const minute = Number(iso.slice(14, 16));
+  const second = Number(iso.slice(17, 19));
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) {
+    return false;
+  }
+  const isLeapYear = (year % 4 === 0 && year % 100 !== 0) || (year % 400 === 0);
+  const daysInMonth =
+    month === 2
+      ? (isLeapYear ? 29 : 28)
+      : [31, -1, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  return day >= 1 && day <= daysInMonth;
+}
+
 /** A zoned ISO-8601 time string that also parses as a calendar date. */
 function isZonedIso(value: unknown): value is string {
   return (
     typeof value === 'string' &&
     LEASE_ISO_PATTERN.test(value) &&
+    isCalendarDateTime(value) &&
     !Number.isNaN(Date.parse(value))
   );
 }
 
 /**
  * Read a trusted clock reading as a canonical UTC ISO-8601 string; null
- * when it is not a canonical UTC ISO time or does not name a real calendar instant. Never throws.
+ * when it is not a zoned ISO time or does not name a real calendar instant. Never throws.
  */
 export function readClockIso(value: unknown): string | null {
   try {
-    if (typeof value !== 'string' || !CLOCK_ISO_PATTERN.test(value)) {
+    if (!isZonedIso(value)) {
       return null;
     }
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) {
-      return null;
-    }
-    const iso = date.toISOString();
-    const expectedIso = value.includes('.') ? value : `${value.slice(0, 19)}.000Z`;
-    if (iso !== expectedIso) {
-      return null;
-    }
-    return iso;
+    return new Date(value).toISOString();
   } catch {
     return null;
   }

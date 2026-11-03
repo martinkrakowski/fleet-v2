@@ -129,7 +129,7 @@ describe('clock validation', () => {
     ['2026-13-01T00:00:00Z', 'invalid month (month 13)'],
     ['2026-04-31T00:00:00Z', 'invalid calendar date (April 31)'],
     ['2026-02-29T00:00:00Z', 'not a leap year (February 29, 2026)'],
-    ['2026-11-02T21:00:00+01:00', 'non-UTC offset'],
+    ['2026-02-29T23:30:00-01:00', 'not a leap year in string offset (February 29, 2026)'],
   ];
 
   it.each(BAD_CLOCKS)(
@@ -162,6 +162,90 @@ describe('clock validation', () => {
       expect(current).toEqual(original);
     },
   );
+
+  it('accepts 2026-11-02T21:00:00+01:00, which equals 2026-11-02T20:00:00.000Z in a lease decision', () => {
+    const zonedClock = '2026-11-02T21:00:00+01:00';
+    const canonicalUtc = '2026-11-02T20:00:00.000Z';
+    const until = '2026-11-02T20:05:00.000Z';
+
+    expect(readClockIso(zonedClock)).toBe(canonicalUtc);
+
+    const acquireDecision = decideTrainLeaseAcquire(
+      null,
+      { holderId: 'worker-1', observedFence: 0, leaseUntilIso: until },
+      zonedClock,
+    );
+    expect(acquireDecision).toEqual({
+      ok: true,
+      lease: { holderId: 'worker-1', fence: 1, leaseUntilIso: until },
+    });
+
+    const currentLease = (acquireDecision as { ok: true; lease: TrainLeaseRecord }).lease;
+    const renewUntil = '2026-11-02T20:08:00.000Z';
+    const renewDecision = decideTrainLeaseRenew(
+      currentLease,
+      { holderId: 'worker-1', fence: 1, leaseUntilIso: renewUntil },
+      zonedClock,
+    );
+    expect(renewDecision).toEqual({
+      ok: true,
+      lease: { holderId: 'worker-1', fence: 1, leaseUntilIso: renewUntil },
+    });
+
+    expect(checkTrainLeaseHeld(currentLease, { holderId: 'worker-1', fence: 1 }, zonedClock)).toBeNull();
+
+    const releaseDecision = decideTrainLeaseRelease(
+      currentLease,
+      { holderId: 'worker-1', fence: 1 },
+      zonedClock,
+    );
+    expect(releaseDecision).toEqual({
+      ok: true,
+      lease: { holderId: 'worker-1', fence: 1, leaseUntilIso: canonicalUtc },
+    });
+  });
+
+  it('accepts 2026-11-02T20:00:00.123456Z', () => {
+    const fractionalClock = '2026-11-02T20:00:00.123456Z';
+    const canonicalUtc = '2026-11-02T20:00:00.123Z';
+    const until = '2026-11-02T20:05:00.000Z';
+
+    expect(readClockIso(fractionalClock)).toBe(canonicalUtc);
+
+    const acquireDecision = decideTrainLeaseAcquire(
+      null,
+      { holderId: 'worker-1', observedFence: 0, leaseUntilIso: until },
+      fractionalClock,
+    );
+    expect(acquireDecision).toEqual({
+      ok: true,
+      lease: { holderId: 'worker-1', fence: 1, leaseUntilIso: until },
+    });
+
+    const currentLease = (acquireDecision as { ok: true; lease: TrainLeaseRecord }).lease;
+    expect(checkTrainLeaseHeld(currentLease, { holderId: 'worker-1', fence: 1 }, fractionalClock)).toBeNull();
+  });
+
+  it('accepts 2028-02-29T00:00:00-05:00', () => {
+    const leapOffsetClock = '2028-02-29T00:00:00-05:00';
+    const canonicalUtc = '2028-02-29T05:00:00.000Z';
+    const until = '2028-02-29T05:05:00.000Z';
+
+    expect(readClockIso(leapOffsetClock)).toBe(canonicalUtc);
+
+    const acquireDecision = decideTrainLeaseAcquire(
+      null,
+      { holderId: 'worker-1', observedFence: 0, leaseUntilIso: until },
+      leapOffsetClock,
+    );
+    expect(acquireDecision).toEqual({
+      ok: true,
+      lease: { holderId: 'worker-1', fence: 1, leaseUntilIso: until },
+    });
+
+    const currentLease = (acquireDecision as { ok: true; lease: TrainLeaseRecord }).lease;
+    expect(checkTrainLeaseHeld(currentLease, { holderId: 'worker-1', fence: 1 }, leapOffsetClock)).toBeNull();
+  });
 
   it('accepts 2028-02-29T00:00:00Z (a leap year)', () => {
     const leapClock = '2028-02-29T00:00:00Z';

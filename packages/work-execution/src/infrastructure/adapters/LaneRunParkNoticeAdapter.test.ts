@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { LaneRunParkNoticeAdapter } from './LaneRunParkNoticeAdapter.adapter.js';
+import type { LaneRunParkFindingView } from '../../domain/park-findings-view.js';
 
 const REQUEST = {
   key: 'park:proj-1:wo-7:one-way-door',
@@ -9,6 +10,31 @@ const REQUEST = {
   runId: 'run-42',
   reason: 'one-way-door',
 } as const;
+
+const BLOCKER_REQUEST = {
+  key: 'park:proj-1:wo-7:blocker-after-round-2',
+  projectId: 'proj-1',
+  workOrderId: 'wo-7',
+  runId: 'run-42',
+  reason: 'blocker-after-round-2',
+} as const;
+
+const FINDINGS: readonly LaneRunParkFindingView[] = [
+  {
+    findingId: 'finding-1',
+    severity: 'blocker',
+    summary: 'blocks the acceptance check',
+    filePath: 'src/ex.ts',
+    line: 4,
+  },
+  {
+    findingId: 'finding-2',
+    severity: 'major',
+    summary: 'second finding',
+    filePath: null,
+    line: null,
+  },
+];
 
 function attentionDelegate() {
   return vi.fn(async (_body: unknown, _actor: string) => ({
@@ -42,6 +68,25 @@ describe('LaneRunParkNoticeAdapter', () => {
         },
         'conductor',
       );
+    });
+
+    it('keeps the attention body byte-identical when findings are present (GB2 correction 1)', async () => {
+      // The attention item contract is closed; the bounded findings reach only
+      // the keyed owner question, never the attention body.
+      const recordAttentionItem = attentionDelegate();
+      const adapter = new LaneRunParkNoticeAdapter({ recordAttentionItem });
+      await adapter.recordParkAttention({ ...BLOCKER_REQUEST, findings: FINDINGS });
+      expect(recordAttentionItem).toHaveBeenCalledWith(
+        {
+          projectId: 'proj-1',
+          kind: 'conductor-park',
+          subject: { kind: 'run', ref: 'run-42' },
+          workOrderId: 'wo-7',
+          summary: 'The conductor parked run-42 with reason blocker-after-round-2.',
+        },
+        'conductor',
+      );
+      expect(recordAttentionItem.mock.calls[0]?.[0]).not.toHaveProperty('findings');
     });
 
     it('records an attention item for a non-owner park reason such as step-refused (Q1c)', async () => {
@@ -211,6 +256,44 @@ describe('LaneRunParkNoticeAdapter', () => {
       }));
       const adapter = new LaneRunParkNoticeAdapter({ askOwnerQuestion });
       expect(await adapter.askParkQuestion(REQUEST)).toEqual({ outcome: 'exists', questionId: 'q-stored' });
+    });
+
+    it('appends one severity-labelled findings line per finding to the blocker question body (GB2 correction 4)', async () => {
+      const askOwnerQuestion = vi.fn(async (_request: unknown) => ({ outcome: 'asked', question: { questionId: 'q-1' } }));
+      const adapter = new LaneRunParkNoticeAdapter({ askOwnerQuestion });
+      await adapter.askParkQuestion({ ...BLOCKER_REQUEST, findings: FINDINGS });
+      const ask = askOwnerQuestion.mock.calls[0]?.[0] as { body: string };
+      expect(ask.body).toContain('- [blocker] blocks the acceptance check (src/ex.ts:4)');
+      expect(ask.body).toContain('- [major] second finding');
+      // The location suffix is omitted when filePath and line are both null.
+      expect(ask.body).not.toContain('second finding (');
+    });
+
+    it('leaves the blocker question body byte-identical when no findings are present', async () => {
+      const askOwnerQuestion = vi.fn(async (_request: unknown) => ({ outcome: 'asked', question: { questionId: 'q-1' } }));
+      const adapter = new LaneRunParkNoticeAdapter({ askOwnerQuestion });
+      await adapter.askParkQuestion(BLOCKER_REQUEST);
+      const ask = askOwnerQuestion.mock.calls[0]?.[0] as { body: string };
+      expect(ask.body).toBe(
+        'The conductor parked run run-42 of work order wo-7 in project proj-1 with reason blocker-after-round-2. The run still carries a blocker after its second fix round. Choose resume or stop.',
+      );
+    });
+
+    it('re-caps findings beyond the cap even when the caller bypassed the domain helper', async () => {
+      const many = Array.from({ length: 8 }, (_unused, index) => ({
+        findingId: 'finding-' + String(index),
+        severity: 'blocker' as const,
+        summary: 'finding ' + String(index),
+        filePath: null as string | null,
+        line: null as number | null,
+      }));
+      const askOwnerQuestion = vi.fn(async (_request: unknown) => ({ outcome: 'asked', question: { questionId: 'q-1' } }));
+      const adapter = new LaneRunParkNoticeAdapter({ askOwnerQuestion });
+      await adapter.askParkQuestion({ ...BLOCKER_REQUEST, findings: many });
+      const bodyLines = (askOwnerQuestion.mock.calls[0]?.[0] as { body: string }).body
+        .split('\n')
+        .filter((line) => line.startsWith('- ['));
+      expect(bodyLines).toHaveLength(5);
     });
 
     it('maps a refused delegate answer and a throw to refused unreadable', async () => {

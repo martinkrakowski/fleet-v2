@@ -32,12 +32,15 @@ import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { SessionStartGate } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import type {
+  FindLatestReceiptOfKindRequest,
+  FindLatestReceiptOfKindResult,
   FindReviewReceiptRequest,
   FindReviewReceiptResult,
   ReviewRequest,
   ReviewRequestFinding,
   ReviewRequestResult,
 } from '../../ports/out/ReviewRequestPort.out-port.js';
+import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.out-port.js';
 import type {
   PrepareFixAttemptRequest,
   PrepareFixAttemptResult,
@@ -286,6 +289,23 @@ function reviewKey(step: 'brief-check' | 'code-review', seatIndex: number, head1
   return built.key;
 }
 
+function acceptKeyAt(head12: string): string {
+  const built = buildLaneRunStepKey({
+    runId: RUN_ID,
+    round: 0,
+    step: 'accept',
+    seatIndex: 0,
+    attemptOrdinal: null,
+    head12,
+    retry: null,
+  });
+  expect(built.ok).toBe(true);
+  if (!built.ok) {
+    throw new Error('fixture must build an accept key');
+  }
+  return built.key;
+}
+
 function attemptStepKey(step: 'prepare' | 'dispatch', round: number, seatIndex: number, attemptOrdinal: number): string {
   const built = buildLaneRunStepKey({
     runId: RUN_ID,
@@ -338,6 +358,8 @@ interface Harness {
   readonly briefRequests: PrepareBriefPackageUseCaseRequest[];
   readonly dispatchRequests: DispatchAttemptRequest[];
   readonly cancelRequests: CancelPreparedAttemptRequest[];
+  /** Every park notice request sent through the recording parkNotice fake, in order. */
+  readonly parkNoticeRequests: LaneRunParkRequest[];
   readonly gateRequests: readonly EvaluateAttemptGateRequest[];
   readonly reviewOpenRequests: readonly OpenReviewAssessmentRequest[];
   readonly gateReceiptRequests: readonly RecordGateReceiptsRequest[];
@@ -356,6 +378,7 @@ interface Harness {
   setChangedPaths(paths: readonly string[] | null): void;
   setChangedPathsError(message: string | null): void;
   setFindReceiptAnswer(answer: (request: FindReviewReceiptRequest) => Promise<FindReviewReceiptResult>): void;
+  setFindLatestReceiptAnswer(answer: (request: FindLatestReceiptOfKindRequest) => Promise<FindLatestReceiptOfKindResult>): void;
   setFixAnswer(answer: (request: PrepareFixAttemptRequest) => Promise<PrepareFixAttemptResult>): void;
   setBriefAnswer(answer: (request: PrepareBriefPackageUseCaseRequest) => Promise<PrepareBriefPackageResult>): void;
   setDispatchAnswer(answer: (request: DispatchAttemptRequest) => Promise<DispatchAttemptResult>): void;
@@ -373,6 +396,7 @@ interface HarnessOptions {
   readonly wireGate?: boolean;
   readonly wireReviewAssessment?: boolean;
   readonly wireGateReceipts?: boolean;
+  readonly wireParkNotice?: boolean;
 }
 
 async function makeHarness(
@@ -389,6 +413,7 @@ async function makeHarness(
   const briefRequests: PrepareBriefPackageUseCaseRequest[] = [];
   const dispatchRequests: DispatchAttemptRequest[] = [];
   const cancelRequests: CancelPreparedAttemptRequest[] = [];
+  const parkNoticeRequests: LaneRunParkRequest[] = [];
   const gateRequests: EvaluateAttemptGateRequest[] = [];
   const reviewOpenRequests: OpenReviewAssessmentRequest[] = [];
   const gateReceiptRequests: RecordGateReceiptsRequest[] = [];
@@ -418,6 +443,9 @@ async function makeHarness(
     },
   });
   let findReceiptAnswer: (request: FindReviewReceiptRequest) => Promise<FindReviewReceiptResult> = async () => ({
+    outcome: 'not-found',
+  });
+  let findLatestReceiptAnswer: (request: FindLatestReceiptOfKindRequest) => Promise<FindLatestReceiptOfKindResult> = async () => ({
     outcome: 'not-found',
   });
   let prepareAnswer: (request: PrepareFixAttemptRequest) => Promise<PrepareFixAttemptResult> = async (request) => ({
@@ -540,7 +568,7 @@ async function makeHarness(
               return reviewAnswer(request);
             },
             findReviewReceipt: async (request) => findReceiptAnswer(request),
-            findLatestReceiptOfKind: async () => ({ outcome: 'not-found' }),
+            findLatestReceiptOfKind: async (request) => findLatestReceiptAnswer(request),
           },
         }),
     ...(options.wirePrepareFix === false
@@ -630,6 +658,21 @@ async function makeHarness(
           },
         }
       : {}),
+    ...(options.wireParkNotice === true
+      ? {
+          parkNotice: {
+            recordParkAttention: async (request) => {
+              parkNoticeRequests.push(request);
+              return { outcome: 'recorded', item: {}, revision: 1 };
+            },
+            askParkQuestion: async (request) => {
+              parkNoticeRequests.push(request);
+              return { outcome: 'recorded', question: { questionId: 'q-park' } };
+            },
+            findParkQuestion: async () => ({ outcome: 'not-found' }),
+          },
+        }
+      : {}),
   };
 
   return {
@@ -642,6 +685,7 @@ async function makeHarness(
     briefRequests,
     dispatchRequests,
     cancelRequests,
+    parkNoticeRequests,
     gateRequests,
     reviewOpenRequests,
     gateReceiptRequests,
@@ -669,6 +713,9 @@ async function makeHarness(
     },
     setFindReceiptAnswer: (answer) => {
       findReceiptAnswer = answer;
+    },
+    setFindLatestReceiptAnswer: (answer) => {
+      findLatestReceiptAnswer = answer;
     },
     setFixAnswer: (answer) => {
       prepareAnswer = answer;
@@ -740,8 +787,9 @@ async function appendResult(
   outcome: LaneRunJournalOutcome,
   reasonCode: LaneRunResultReasonCode,
   recordedAtIso: string,
+  detail: string | null = null,
 ): Promise<void> {
-  const entry = laneRunResultEntry(harness.deps.newUlid(), RUN_ID, key, outcome, reasonCode, recordedAtIso);
+  const entry = laneRunResultEntry(harness.deps.newUlid(), RUN_ID, key, outcome, reasonCode, recordedAtIso, detail);
   const appended = await harness.runJournal.append(entry);
   expect(appended.outcome).toBe('appended');
 }
@@ -877,6 +925,50 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(intents[0]?.mintedId).toBe(fixRequest.fixAttemptId);
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({ outcome: 'completed', reasonCode: 'prepared' });
+  });
+
+  it('AR1 MX5a: a review-blocked acceptance rejection enters fixing and the fix prepare carries the finding summary', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    // The GB1 minor-only brief-check pass, then the code-review pass, then the
+    // rejected accept with the review-findings detail (the run MX5a journal).
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-passed', NOW, 'minor-only-findings');
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    await appendIntent(harness, codeKey, null, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-passed', NOW);
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+    // The brief-check receipt, read by the brief-check intent's minted request
+    // id, is failed with one minor finding.
+    harness.setFindReceiptAnswer(async (request) => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-' + request.requestId,
+        requestId: request.requestId,
+        kind: 'brief-check',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [
+          { findingId: 'finding-1', severity: 'minor', summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+        ],
+      },
+    }));
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared' });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[minor] src/ex.ts:4 — tighten the guard']);
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const acceptIntents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey);
+    expect(acceptIntents).toHaveLength(1);
   });
 
   it('b) a gate-failed with no recorded failed check refuses prepare-refused rather than a bare reason code (KF-21b)', async () => {
@@ -1032,6 +1124,63 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(record?.parked?.reason).toBe('blocker-after-round-2');
     expect(record?.round).toBe(2);
     expect(harness.fixRequests).toHaveLength(0);
+  });
+
+  it('f2) a blocker-after-round-2 park carries the bounded findings in the notice request', async () => {
+    const latestAttempt = { ...collectedAttempt(), id: 'attempt-example-3' };
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, latestAttempt],
+      { wireParkNotice: true },
+    );
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setFindLatestReceiptAnswer(async () => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-latest',
+        requestId: null,
+        kind: 'code-review',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [blockerFinding(), blockerFinding(), blockerFinding()],
+      },
+    }));
+
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+    const parkRequest = harness.parkNoticeRequests.find((request) => request.reason === 'blocker-after-round-2');
+    expect(parkRequest?.findings).toHaveLength(3);
+    expect(parkRequest?.findings?.[0]).toEqual({
+      findingId: 'finding-1',
+      severity: 'blocker',
+      summary: 'blocks the acceptance check',
+      filePath: 'src/ex.ts',
+      line: 4,
+    });
+  });
+
+  it('f3) a blocker-after-round-2 park carries no findings when the receipt is not-found or reviewRequest is unwired', async () => {
+    const latestAttempt = { ...collectedAttempt(), id: 'attempt-example-3' };
+    const notFound = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, latestAttempt],
+      { wireParkNotice: true },
+    );
+    await seedReviewFailure(notFound, [blockerFinding()]);
+    await advance(notFound);
+    const notFoundRequest = notFound.parkNoticeRequests.find((request) => request.reason === 'blocker-after-round-2');
+    expect(notFoundRequest?.findings).toBeUndefined();
+
+    const unwired = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, latestAttempt],
+      { wireParkNotice: true, wireReviewRequest: false },
+    );
+    await seedReviewFailure(unwired, [blockerFinding()]);
+    await advance(unwired);
+    const unwiredRequest = unwired.parkNoticeRequests.find((request) => request.reason === 'blocker-after-round-2');
+    expect(unwiredRequest?.findings).toBeUndefined();
   });
 
   it('g) journals the prepare intent before the port call', async () => {

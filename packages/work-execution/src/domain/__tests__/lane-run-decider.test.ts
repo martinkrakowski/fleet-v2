@@ -1147,20 +1147,74 @@ describe('accepting, premerge, PR and CI states', () => {
     assertDecision(tierOne, rec, decide(rec, tierOne), { kind: 'enter', to: 'opening-pr' });
   });
 
-  it('KF-23: a rejected acceptance with a retry at the head acts accept under retry1', () => {
+  it('AR1: a rejected acceptance with retry facts never retries accept and parks', () => {
     const facts = baseFacts({
       state: 'accepting', head12: HEAD, attempt: attemptFact(), acceptance: 'rejected', acceptanceRetry: 1,
     });
-    expect(decide(record({}), facts)).toEqual({
-      kind: 'act', step: 'accept', key: `${RUN_ID}/r0/accept/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'acceptance-rejected', qualifier: null, parkedFrom: 'accepting',
     });
   });
 
-  it('KF-23: a rejected acceptance above the retry cap parks acceptance-rejected', () => {
+  it('AR1: a rejected acceptance above the retry cap parks acceptance-rejected', () => {
     const facts = baseFacts({
       state: 'accepting', acceptance: 'rejected', acceptanceRetry: LANE_RUN_MAX_RETRY + 1,
     });
     assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'acceptance-rejected', qualifier: null, parkedFrom: 'accepting',
+    });
+  });
+
+  it('AR1: a review-blocked rejection at round 0 enters fixing', () => {
+    const facts = baseFacts({
+      state: 'accepting', acceptance: 'rejected', acceptanceRejection: 'review-findings',
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'fixing' });
+  });
+
+  it('AR1: a review-blocked rejection at round 1 enters fixing', () => {
+    const facts = baseFacts({
+      state: 'accepting', acceptance: 'rejected', acceptanceRejection: 'review-findings',
+    });
+    const rec = record({ round: 1, attemptIds: ['attempt-example-0', 'attempt-example-1'] });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'fixing' });
+  });
+
+  it('AR1: a review-blocked rejection at round 2 parks acceptance-rejected', () => {
+    const facts = baseFacts({
+      state: 'accepting', acceptance: 'rejected', acceptanceRejection: 'review-findings',
+    });
+    const rec = record({ round: 2, attemptIds: ['attempt-example-0', 'attempt-example-0a', 'attempt-example-1'] });
+    assertDecision(facts, rec, decide(rec, facts), {
+      kind: 'park', reason: 'acceptance-rejected', qualifier: null, parkedFrom: 'accepting',
+    });
+  });
+
+  it('AR1: a rejection classified other parks acceptance-rejected', () => {
+    const facts = baseFacts({
+      state: 'accepting', acceptance: 'rejected', acceptanceRejection: 'other',
+    });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'acceptance-rejected', qualifier: null, parkedFrom: 'accepting',
+    });
+  });
+
+  it('AR1: a rejection with the classification absent parks acceptance-rejected', () => {
+    const facts = baseFacts({ state: 'accepting', acceptance: 'rejected' });
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'acceptance-rejected', qualifier: null, parkedFrom: 'accepting',
+    });
+  });
+
+  it('AR1: a rejection with no retry ordinal at round 2 parks without an accept act', () => {
+    const facts = baseFacts({
+      state: 'accepting', head12: HEAD, attempt: attemptFact(), acceptance: 'rejected',
+      acceptanceRetry: null,
+    });
+    const rec = record({ round: 2, attemptIds: ['attempt-example-0', 'attempt-example-0a', 'attempt-example-1'] });
+    const decision = decide(rec, facts);
+    expect(decision).not.toEqual(expect.objectContaining({ kind: 'act' }));
+    assertDecision(facts, rec, decision, {
       kind: 'park', reason: 'acceptance-rejected', qualifier: null, parkedFrom: 'accepting',
     });
   });
@@ -2041,6 +2095,24 @@ describe('G3f (R4b): a merged PR with the lane head leaves branch-behind and amb
     assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
   });
 
+  it('G3f: a step-refused open-pr park enters merged once its PR merges containing the lane head', () => {
+    const rec = record({ parked: { reason: 'step-refused', qualifier: 'open-pr', parkedFrom: 'opening-pr', questionId: null }, parkCount: 1 });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('G3f: a stop-unconfirmed park enters merged once its PR merges containing the lane head', () => {
+    const rec = record({ parked: PARKED_UNCONFIRMED, parkCount: 1 });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('G3f: a parked run with an open owner question is not decided by the merged-PR rule', () => {
+    const rec = record({ parked: { reason: 'seat-plan-exhausted', qualifier: null, parkedFrom: 'running', questionId: 'question-example-1' }, parkCount: 1 });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });
+    expect(decide(rec, facts)).not.toEqual({ kind: 'enter', to: 'merged' });
+  });
+
   it('R4c: eligible parks without questions leave once their merged PR carries the lane head', () => {
     for (const parked of [
       { reason: 'ambiguous', qualifier: 'merge', parkedFrom: 'merging', questionId: null },
@@ -2159,9 +2231,18 @@ describe('G3f (R4c): a merged PR carrying the lane head ends the run from any wa
     expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'parked' });
   });
 
-  it('a one-way-door park returns null and stays parked', () => {
+  it('a one-way-door park with a merged PR at the lane head enters merged', () => {
     const rec = record({
       parked: { reason: 'one-way-door', qualifier: null, parkedFrom: 'merging', questionId: null },
+      parkCount: 1,
+    });
+    const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'merged' });
+  });
+
+  it('a one-way-door park with an owner question returns null and stays parked', () => {
+    const rec = record({
+      parked: { reason: 'one-way-door', qualifier: null, parkedFrom: 'merging', questionId: 'question-example-1' },
       parkCount: 1,
     });
     const facts = baseFacts({ state: 'parked', head12: HEAD, acceptedHead12: HEAD, pr: mergedAtHead });

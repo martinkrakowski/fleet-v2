@@ -32,7 +32,7 @@ import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
-import { LANE_RUN_SCHEMA_VERSION } from '../../domain/lane-run-records.js';
+import { copyParkRecord, LANE_RUN_SCHEMA_VERSION } from '../../domain/lane-run-records.js';
 import { LaneRun } from '../../domain/entities/LaneRun.js';
 import type {
   LeaseAcquireRequest,
@@ -102,7 +102,7 @@ function copy(record: LaneRunRecord): LaneRunRecord {
     round: record.round,
     attemptIds: [...record.attemptIds],
     prNumber: record.prNumber,
-    parked: record.parked === null ? null : { ...record.parked },
+    parked: copyParkRecord(record.parked),
     parkCount: record.parkCount,
     lease: record.lease === null ? null : { ...record.lease },
     revision: record.revision,

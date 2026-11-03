@@ -97,7 +97,10 @@ operator configuration, not script policy.
 
 Every action control in `@fleet/web` confirms through `@fleet/ui`'s `AlertBox`
 before it runs, and states on screen whether a live route backs it. No script is
-replaced solely to change language. Keep private hosts, paths, project
+replaced solely to change language. (Amended 2026-11-03, owner decision on the
+cutover plan: every behaviour of the fleet-repo shell scripts moves into fleet-v2
+as rewritten platform code, never as shell carried in — "no shell style for
+scripts in v2, everything should be properly rewritten for the platform".) Keep private hosts, paths, project
 registries, seat choices and operational history outside reusable product code.
 
 ## Acceptance for the scaffold

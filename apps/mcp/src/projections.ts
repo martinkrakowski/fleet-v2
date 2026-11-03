@@ -302,7 +302,9 @@ export function projectWorkOrder(result: unknown): WorkOrderResultProjection {
           risk: asString(workOrder.risk),
           state: asString(workOrder.state),
           revision: asNumber(workOrder.revision),
-          prerequisiteWorkOrderIds: stringList(workOrder.prerequisiteWorkOrderIds),
+          prerequisiteWorkOrderIds: stringList(
+            workOrder.prerequisiteWorkOrderIds,
+          ),
           createdAtIso: asString(workOrder.createdAtIso),
           updatedAtIso: asString(workOrder.updatedAtIso),
         }
@@ -389,10 +391,15 @@ export interface HeadEvidenceAssessmentProjection {
 }
 
 export type HeadEvidenceProjection =
-  | { readonly outcome: "found"; readonly assessment: HeadEvidenceAssessmentProjection }
+  | {
+      readonly outcome: "found";
+      readonly assessment: HeadEvidenceAssessmentProjection;
+    }
   | { readonly outcome: string; readonly assessment: null };
 
-function projectVerificationReceipt(value: unknown): HeadVerificationProjection {
+function projectVerificationReceipt(
+  value: unknown,
+): HeadVerificationProjection {
   const receipt = asRecord(value);
   return {
     id: asString(receipt?.id),
@@ -452,7 +459,10 @@ function projectReviewReceipt(value: unknown): HeadReviewProjection {
 export function projectHeadEvidence(result: unknown): HeadEvidenceProjection {
   const record = asRecord(result);
   if (record?.outcome !== "found") {
-    return { outcome: asString(record?.outcome) ?? "unknown", assessment: null };
+    return {
+      outcome: asString(record?.outcome) ?? "unknown",
+      assessment: null,
+    };
   }
   const assessment = asRecord(record.assessment);
   const verification = Array.isArray(assessment?.verificationReceipts)
@@ -584,7 +594,9 @@ export function projectQuestion(value: unknown): QuestionProjection {
 }
 
 /** Project the question-list result: `{ questions: [projectQuestion(…)] }`. */
-export function projectQuestionList(result: unknown): { questions: QuestionProjection[] } {
+export function projectQuestionList(result: unknown): {
+  questions: QuestionProjection[];
+} {
   const record = asRecord(result);
   const questions = Array.isArray(record?.questions) ? record.questions : [];
   return { questions: questions.map(projectQuestion) };
@@ -595,7 +607,9 @@ export type QuestionResultProjection =
   | { readonly outcome: string; readonly question: null };
 
 /** Project the single-question result. Non-found outcomes carry no question text. */
-export function projectQuestionResult(result: unknown): QuestionResultProjection {
+export function projectQuestionResult(
+  result: unknown,
+): QuestionResultProjection {
   const record = asRecord(result);
   if (record?.outcome !== "found") {
     return { outcome: asString(record?.outcome) ?? "unknown", question: null };
@@ -619,9 +633,10 @@ export interface ProjectProfileSummaryProjection {
  * `designatedDispatcherHost`, `clones`, `gateProcedures`,
  * `defaultAllowedPathPrefixes`, `runnerCapabilities` and `lastProbe`.
  */
-export function projectProjectList(
-  result: unknown,
-): { outcome: string | null; profiles: ProjectProfileSummaryProjection[] } {
+export function projectProjectList(result: unknown): {
+  outcome: string | null;
+  profiles: ProjectProfileSummaryProjection[];
+} {
   const record = asRecord(result);
   const profiles = Array.isArray(record?.profiles) ? record.profiles : [];
   return {
@@ -644,5 +659,240 @@ export function projectProjectList(
         },
       ];
     }),
+  };
+}
+
+export interface LaneRunRowProjection {
+  readonly runId: string | null;
+  readonly baseBranch: string | null;
+  readonly workOrderId: string | null;
+  readonly tier: string | null;
+  readonly state: string | null;
+  readonly round: number | null;
+  readonly placement: string | null;
+  readonly pendingStep: {
+    readonly step: string | null;
+    readonly reconciliation: string | null;
+  } | null;
+  readonly park: { readonly reason: string | null } | null;
+  readonly leaseLapsed: boolean | null;
+  readonly workOrderUnreadable: boolean | null;
+  readonly overlapsWith: string[];
+  readonly slot: { readonly slotIndex: number | null } | null;
+  readonly admissionWait: string | null;
+}
+
+export interface LaneRunQueueProjection {
+  readonly baseBranch: string | null;
+  readonly runIds: string[];
+}
+
+export interface SessionStartMarkProjection {
+  readonly runId: string | null;
+  readonly step: string | null;
+  readonly recordedAtIso: string | null;
+  readonly gapMs: number | null;
+  readonly underStagger: boolean | null;
+}
+
+export interface ConductorSummaryProjection {
+  readonly observedAtIso: string | null;
+  readonly halt: string | null;
+  readonly driverLeaseLapsed: boolean | null;
+  readonly admission: {
+    readonly active: number | null;
+    readonly inFlight: number | null;
+    readonly maxActiveRuns: number | null;
+  } | null;
+  readonly caps: {
+    readonly maxActiveRuns: number | null;
+    readonly passConcurrency: number | null;
+    readonly dispatchStaggerMs: number | null;
+    readonly recordedAtIso: string | null;
+  } | null;
+  readonly trace: string | null;
+}
+
+export type LaneRunListProjection =
+  | {
+      readonly outcome: "listed";
+      readonly observedAtIso: string | null;
+      readonly halt: string | null;
+      readonly driverLeaseLapsed: boolean | null;
+      readonly admission: ConductorSummaryProjection["admission"];
+      readonly caps: ConductorSummaryProjection["caps"];
+      readonly trace: string | null;
+      readonly truncated: boolean | null;
+      readonly rows: LaneRunRowProjection[];
+      readonly queues: LaneRunQueueProjection[];
+      readonly sessionStarts: SessionStartMarkProjection[];
+    }
+  | { readonly outcome: string };
+
+/** Project one conductor-schedule row. Dropped: hostName, packageKeys, park qualifier, any other field. */
+function projectLaneRunRow(value: unknown): LaneRunRowProjection | null {
+  const row = asRecord(value);
+  if (!row) {
+    return null;
+  }
+  const pendingStep = asRecord(row.pendingStep);
+  const park = asRecord(row.park);
+  const slot = asRecord(row.slot);
+  return {
+    runId: asString(row.runId),
+    baseBranch: asString(row.baseBranch),
+    workOrderId: asString(row.workOrderId),
+    tier: asString(row.tier),
+    state: asString(row.state),
+    round: asNumber(row.round),
+    placement: asString(row.placement),
+    pendingStep: pendingStep
+      ? {
+          step: asString(pendingStep.step),
+          reconciliation: asString(pendingStep.reconciliation),
+        }
+      : null,
+    park: park ? { reason: asString(park.reason) } : null,
+    leaseLapsed: asBoolean(row.leaseLapsed),
+    workOrderUnreadable: asBoolean(row.workOrderUnreadable),
+    overlapsWith: stringList(row.overlapsWith),
+    slot: slot ? { slotIndex: asNumber(slot.slotIndex) } : null,
+    admissionWait: asString(row.admissionWait),
+  };
+}
+
+/** The schedule summary both the lane-run list and the conductor status carry. */
+function projectConductorSummary(
+  schedule: Record<string, unknown> | null | undefined,
+): ConductorSummaryProjection {
+  const admission = asRecord(schedule?.admission);
+  const caps = asRecord(schedule?.caps);
+  return {
+    observedAtIso: asString(schedule?.observedAtIso),
+    halt: asString(schedule?.halt),
+    driverLeaseLapsed: asBoolean(schedule?.driverLeaseLapsed),
+    admission: admission
+      ? {
+          active: asNumber(admission.active),
+          inFlight: asNumber(admission.inFlight),
+          maxActiveRuns: asNumber(admission.maxActiveRuns),
+        }
+      : null,
+    caps: caps
+      ? {
+          maxActiveRuns: asNumber(caps.maxActiveRuns),
+          passConcurrency: asNumber(caps.passConcurrency),
+          dispatchStaggerMs: asNumber(caps.dispatchStaggerMs),
+          recordedAtIso: asString(caps.recordedAtIso),
+        }
+      : null,
+    trace: asString(schedule?.trace),
+  };
+}
+
+/** Project the lane-run-list result. Dropped: hostName (rows and hosts), packageKeys, park qualifier, any other field. */
+export function projectLaneRunList(result: unknown): LaneRunListProjection {
+  const record = asRecord(result);
+  if (record?.outcome !== "listed") {
+    return { outcome: asString(record?.outcome) ?? "unknown" };
+  }
+  const schedule = asRecord(record.schedule);
+  const rows = Array.isArray(schedule?.rows) ? schedule.rows : [];
+  const queues = Array.isArray(schedule?.queues) ? schedule.queues : [];
+  const sessionStarts = Array.isArray(schedule?.sessionStarts)
+    ? schedule.sessionStarts
+    : [];
+  return {
+    outcome: "listed",
+    ...projectConductorSummary(schedule),
+    truncated: asBoolean(record.truncated),
+    rows: rows.flatMap((raw) => {
+      const projected = projectLaneRunRow(raw);
+      return projected ? [projected] : [];
+    }),
+    queues: queues.flatMap((raw) => {
+      const queue = asRecord(raw);
+      if (!queue) {
+        return [];
+      }
+      return [
+        {
+          baseBranch: asString(queue.baseBranch),
+          runIds: stringList(queue.runIds),
+        },
+      ];
+    }),
+    sessionStarts: sessionStarts.flatMap((raw) => {
+      const mark = asRecord(raw);
+      if (!mark) {
+        return [];
+      }
+      return [
+        {
+          runId: asString(mark.runId),
+          step: asString(mark.step),
+          recordedAtIso: asString(mark.recordedAtIso),
+          gapMs: asNumber(mark.gapMs),
+          underStagger: asBoolean(mark.underStagger),
+        },
+      ];
+    }),
+  };
+}
+
+/** Count occurrences of non-empty keys: `["a", "a", "b"]` → `{ a: 2, b: 1 }`. */
+function tally(keys: string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const key of keys) {
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  return counts;
+}
+
+export type ConductorStatusProjection =
+  | (ConductorSummaryProjection & {
+      readonly outcome: "listed";
+      readonly liveRuns: number;
+      readonly byState: Record<string, number>;
+      readonly byPlacement: Record<string, number>;
+      readonly byPark: Record<string, number>;
+      readonly byAdmissionWait: Record<string, number>;
+    })
+  | { readonly outcome: string };
+
+/** Project the conductor-status result. Dropped: hostName (rows and hosts), packageKeys, park qualifier, any other field. */
+export function projectConductorStatus(
+  result: unknown,
+): ConductorStatusProjection {
+  const record = asRecord(result);
+  if (record?.outcome !== "listed") {
+    return { outcome: asString(record?.outcome) ?? "unknown" };
+  }
+  const schedule = asRecord(record.schedule);
+  const rows = Array.isArray(schedule?.rows) ? schedule.rows : [];
+  const liveRows = rows.flatMap((raw) => {
+    const row = asRecord(raw);
+    return row ? [row] : [];
+  });
+  return {
+    outcome: "listed",
+    ...projectConductorSummary(schedule),
+    liveRuns: liveRows.length,
+    byState: tally(liveRows.map((row) => asString(row.state) ?? "unknown")),
+    byPlacement: tally(
+      liveRows.map((row) => asString(row.placement) ?? "unknown"),
+    ),
+    byPark: tally(
+      liveRows.flatMap((row) => {
+        const reason = asString(asRecord(row.park)?.reason);
+        return reason === null ? [] : [reason];
+      }),
+    ),
+    byAdmissionWait: tally(
+      liveRows.flatMap((row) => {
+        const wait = asString(row.admissionWait);
+        return wait === null ? [] : [wait];
+      }),
+    ),
   };
 }

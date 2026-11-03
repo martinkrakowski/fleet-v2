@@ -19,6 +19,8 @@ import type {
 } from '@fleet/operator-coordination';
 
 import { LANE_RUN_PARK_REASONS } from '../../domain/lane-run-records.js';
+import { boundedFindingsView, PARK_FINDINGS_MAX_COUNT } from '../../domain/park-findings-view.js';
+import type { LaneRunParkFindingView } from '../../domain/park-findings-view.js';
 
 import type {
   LaneRunParkFindResult,
@@ -146,6 +148,28 @@ function questionIdOf(answer: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * The fixed-format findings block appended to the blocker-after-round-2 owner
+ * question body, one line per bounded finding: `- [<severity>] <summary>`,
+ * with ` (<filePath>:<line>)` appended only when both are non-null (GB2
+ * correction 4). Re-applies the bounded view's caps defensively; empty when
+ * there is nothing to show.
+ */
+function findingsBodyBlock(findings: readonly LaneRunParkFindingView[] | undefined): string {
+  const bounded = boundedFindingsView(findings).slice(0, PARK_FINDINGS_MAX_COUNT);
+  if (bounded.length === 0) {
+    return '';
+  }
+  const lines = bounded.map((finding) => {
+    const location =
+      finding.filePath !== null && finding.line !== null
+        ? ` (${finding.filePath}:${finding.line})`
+        : '';
+    return `- [${finding.severity}] ${finding.summary}${location}`;
+  });
+  return '\n' + lines.join('\n');
+}
+
 export class LaneRunParkNoticeAdapter implements LaneRunParkNoticePort {
   constructor(private readonly delegate?: LaneRunParkNoticeDelegate) {}
 
@@ -157,6 +181,9 @@ export class LaneRunParkNoticeAdapter implements LaneRunParkNoticePort {
     if (request.qualifier !== undefined && !QUALIFIER_CODE.test(request.qualifier)) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
+    if (request.parkCount !== undefined && !(Number.isSafeInteger(request.parkCount) && request.parkCount >= 1)) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
     // Every park reason raises its attention item (K6-3); only the four owner
     // reasons also ask the keyed owner question, so the question texts stay
     // out of this path and an unknown reason code is still refused.
@@ -164,12 +191,13 @@ export class LaneRunParkNoticeAdapter implements LaneRunParkNoticePort {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
     const qualifier = request.qualifier === undefined ? '' : `, qualifier ${request.qualifier}`;
+    const occurrence = request.parkCount === undefined ? '' : ` (park ${request.parkCount})`;
     const body = {
       projectId: request.projectId,
       kind: PARK_ATTENTION_KIND,
       subject: { kind: 'run', ref: request.runId },
       workOrderId: request.workOrderId,
-      summary: `The conductor parked ${request.runId} with reason ${request.reason}${qualifier}.`,
+      summary: `The conductor parked ${request.runId} with reason ${request.reason}${qualifier}${occurrence}.`,
     };
     try {
       const answer = await recordAttentionItem(body, PARK_ACTOR);
@@ -196,6 +224,7 @@ export class LaneRunParkNoticeAdapter implements LaneRunParkNoticePort {
     } catch {
       return { outcome: 'refused', reason: 'unknown-reason' };
     }
+    const findingsBlock = request.reason === 'blocker-after-round-2' ? findingsBodyBlock(request.findings) : '';
     const blocks: readonly OwnerQuestionBlockRecord[] = [
       { kind: 'lane', ref: request.runId },
     ];
@@ -203,7 +232,7 @@ export class LaneRunParkNoticeAdapter implements LaneRunParkNoticePort {
       questionId: `park-question:${request.key}`,
       askedBy: PARK_ACTOR,
       title: texts.title,
-      body: texts.body,
+      body: texts.body + findingsBlock,
       options: request.reason === 'fix-no-progress' ? STOP_ONLY_OPTIONS : PARK_OPTIONS,
       recommendation: request.reason === 'fix-no-progress' ? STOP_RECOMMENDATION : PARK_RECOMMENDATION,
       doorKind: doorKindFor(request.reason),

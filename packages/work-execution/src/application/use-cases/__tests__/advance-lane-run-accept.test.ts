@@ -171,6 +171,22 @@ function acceptKey(): string {
   return stepKey({ round: 0, step: 'accept', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
 }
 
+/** A failed brief-check receipt at the collected head with one minor finding. */
+const FAILED_BRIEF_CHECK_RECEIPT: FindLatestReceiptOfKindResult = {
+  outcome: 'found',
+  receipt: {
+    receiptId: 'receipt-example-1',
+    requestId: null,
+    kind: 'brief-check',
+    reviewerModel: 'reviewer-example-1',
+    candidateHeadSha: COMMIT,
+    verdict: 'failed',
+    findings: [
+      { findingId: 'finding-1', severity: 'minor', summary: 'minor review finding', filePath: 'src/ex.ts', line: 4 },
+    ],
+  },
+};
+
 interface Harness {
   readonly runRepo: LaneRunRepositoryAdapter;
   readonly runJournal: LaneRunJournalAdapter;
@@ -398,8 +414,9 @@ async function appendResult(
   outcome: Parameters<typeof laneRunResultEntry>[3],
   reasonCode: Parameters<typeof laneRunResultEntry>[4],
   recordedAtIso: string,
+  detail: string | null = null,
 ): Promise<void> {
-  const entry = laneRunResultEntry(harness.deps.newUlid(), RUN_ID, key, outcome, reasonCode, recordedAtIso);
+  const entry = laneRunResultEntry(harness.deps.newUlid(), RUN_ID, key, outcome, reasonCode, recordedAtIso, detail);
   const appended = await harness.runJournal.append(entry);
   expect(appended.outcome).toBe('appended');
 }
@@ -597,30 +614,74 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     expect(entries.some((entry) => JSON.stringify(entry).includes('rcp-example-1'))).toBe(false);
   });
 
-  it('KF-23: a rejected acceptance parks, resumes, and retries the assessment under /retry1 at the same head', async () => {
+  it('AR1: a rejection with other blockers and a failed review receipt journals the review-findings detail', async () => {
     const harness = await acceptingHarness();
-    harness.setReceiptsAnswer({ outcome: 'rejected', reason: BLOCKER_TEXT });
+    harness.setReceiptsAnswer({
+      outcome: 'rejected',
+      reason: BLOCKER_TEXT,
+      blockerDetails: [
+        { kind: 'other', text: BLOCKER_TEXT },
+        { kind: 'other', text: 'second blocker text example' },
+      ],
+    });
+    harness.setReceiptAnswer(FAILED_BRIEF_CHECK_RECEIPT);
     expect(await advance(harness)).toEqual({
       outcome: 'acted',
       step: 'accept',
       key: acceptKey(),
       result: 'completed',
       reasonCode: 'acceptance-rejected',
+      detail: 'review-findings',
     });
-    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'acceptance-rejected', qualifier: null });
-    await resumeAccepting(harness, LATER);
-    harness.setReceiptsAnswer({ outcome: 'passed', receiptsId: 'rcp-example-1', assessedHeadSha: COMMIT });
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'accept',
-      key: acceptKey() + '/retry1',
-      result: 'completed',
-      reasonCode: 'accepted',
-    });
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'opening-pr' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const result = entries.find((entry) => entry.kind === 'result' && entry.key === acceptKey());
+    expect(result).toMatchObject({ outcome: 'completed', reasonCode: 'acceptance-rejected', detail: 'review-findings' });
+    expect(harness.receiptRequests).toEqual([
+      { attemptId: 'attempt-example-1', candidateHeadSha: COMMIT, kind: 'brief-check' },
+    ]);
   });
 
-  it('KF-23: each resumed rejection retries the next accept at the same head (retry1 then retry2)', async () => {
+  it('AR1: a rejection with a door blocker never carries the review-findings detail', async () => {
+    const harness = await acceptingHarness();
+    harness.setReceiptsAnswer({
+      outcome: 'rejected',
+      reason: BLOCKER_TEXT,
+      blockerDetails: [{ kind: 'door', text: BLOCKER_TEXT }],
+    });
+    harness.setReceiptAnswer(FAILED_BRIEF_CHECK_RECEIPT);
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'accept',
+      key: acceptKey(),
+      result: 'completed',
+      reasonCode: 'acceptance-rejected',
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const result = entries.find((entry) => entry.kind === 'result' && entry.key === acceptKey());
+    expect(result).toMatchObject({ outcome: 'completed', reasonCode: 'acceptance-rejected', detail: null });
+    expect(harness.receiptRequests).toEqual([]);
+  });
+
+  it('AR1: a rejection whose receipts passed carries no review-findings detail', async () => {
+    const harness = await acceptingHarness();
+    harness.setReceiptsAnswer({
+      outcome: 'rejected',
+      reason: BLOCKER_TEXT,
+      blockerDetails: [{ kind: 'other', text: BLOCKER_TEXT }],
+    });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'accept',
+      key: acceptKey(),
+      result: 'completed',
+      reasonCode: 'acceptance-rejected',
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const result = entries.find((entry) => entry.kind === 'result' && entry.key === acceptKey());
+    expect(result).toMatchObject({ outcome: 'completed', reasonCode: 'acceptance-rejected', detail: null });
+  });
+
+  it('AR1: a rejected acceptance parks, resumes, and parks at once with no new accept intent', async () => {
     const harness = await acceptingHarness();
     harness.setReceiptsAnswer({ outcome: 'rejected', reason: BLOCKER_TEXT });
     expect(await advance(harness)).toEqual({
@@ -632,22 +693,39 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     });
     expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'acceptance-rejected', qualifier: null });
     await resumeAccepting(harness, LATER);
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'accept',
-      key: acceptKey() + '/retry1',
-      result: 'completed',
-      reasonCode: 'acceptance-rejected',
-    });
+    const receiptsBefore = harness.receiptsRequests.length;
     expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'acceptance-rejected', qualifier: null });
+    expect(harness.receiptsRequests).toHaveLength(receiptsBefore);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey());
+    expect(intents).toHaveLength(1);
+  });
+
+  it('AR1: a review-blocked rejection in accepting enters fixing with no new accept intent', async () => {
+    const harness = await acceptingHarness();
+    await appendIntent(harness, acceptKey(), null, NOW);
+    await appendResult(harness, acceptKey(), 'completed', 'acceptance-rejected', NOW, 'review-findings');
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey());
+    expect(intents).toHaveLength(1);
+  });
+
+  it('AR1: a review-blocked rejection at round 2 parks with the accept intents unchanged', async () => {
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-0', 'attempt-example-0a', 'attempt-example-1'] }),
+      [collectedAttempt()],
+    );
+    await conduct(harness, 'accepting', NOW);
+    await appendIntent(harness, acceptKey(), null, NOW);
+    await appendResult(harness, acceptKey(), 'completed', 'acceptance-rejected', NOW, 'review-findings');
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'acceptance-rejected', qualifier: null });
+    // A resumed run parks again instead of blocking-after-round-2, and never retries accept.
     await resumeAccepting(harness, LATER);
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'accept',
-      key: acceptKey() + '/retry2',
-      result: 'completed',
-      reasonCode: 'acceptance-rejected',
-    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'acceptance-rejected', qualifier: null });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey());
+    expect(intents).toHaveLength(1);
   });
 
   it('KF-23: a journal whose rejected result has no park after it still parks (no retry)', async () => {

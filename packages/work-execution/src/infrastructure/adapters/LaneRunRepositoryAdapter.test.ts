@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
+import type { LaneRunParkFindingView } from '../../domain/park-findings-view.js';
 import { StateFileUnreadableError } from './file-store.js';
 import { LaneRunRepositoryAdapter } from './LaneRunRepositoryAdapter.adapter.js';
 
@@ -446,6 +447,51 @@ describe.each(['memory', 'file'] as const)('LaneRunRepositoryAdapter (%s)', (mod
     expect(saves.map((result) => result.outcome).sort()).toEqual(['refused', 'saved']);
     const refusedSave = saves.find((result) => result.outcome === 'refused');
     expect(refusedSave?.outcome === 'refused' && refusedSave.reason).toBe('stale-revision');
+  });
+
+  it('save and get deep copy parked findings so mutations do not affect stored state', async () => {
+    const finding: LaneRunParkFindingView = {
+      findingId: 'finding-1',
+      severity: 'blocker',
+      summary: 'clean and bounded summary',
+      filePath: 'src/a.ts',
+      line: 12,
+    };
+    const findings: LaneRunParkFindingView[] = [finding];
+    const run = validRun({
+      parked: {
+        reason: 'blocker-after-round-2',
+        qualifier: null,
+        parkedFrom: 'gating',
+        questionId: null,
+        findings,
+      },
+      parkCount: 1,
+    });
+    await adapter.create(run);
+
+    findings.push({
+      findingId: 'finding-2',
+      severity: 'major',
+      summary: 'second finding',
+      filePath: 'src/b.ts',
+      line: 20,
+    });
+    (finding as { summary: string }).summary += '\u2028';
+
+    const fetched = await adapter.get(run.runId);
+    expect(fetched?.parked?.findings).toHaveLength(1);
+    expect(fetched?.parked?.findings?.[0].summary).toBe('clean and bounded summary');
+
+    (fetched?.parked?.findings as unknown[]).push({
+      findingId: 'finding-3',
+      severity: 'minor',
+      summary: 'third',
+      filePath: null,
+      line: null,
+    });
+    const fetchedAgain = await adapter.get(run.runId);
+    expect(fetchedAgain?.parked?.findings).toHaveLength(1);
   });
 });
 

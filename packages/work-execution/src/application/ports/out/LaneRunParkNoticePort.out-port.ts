@@ -2,8 +2,11 @@
 /**
  * LaneRunParkNoticePort: raise one attention item per parked run and reason,
  * and ask one keyed owner question where the owner must choose; ids and
- * reason codes only; a repeat returns the existing notice.
+ * reason codes, plus, for the blocker park, the bounded findings view; a
+ * repeat returns the existing notice.
  */
+
+import type { LaneRunParkFindingView } from '../../../domain/park-findings-view.js';
 
 /** One parked run's coordinates. `reason` and `qualifier` are codes, never free text. */
 export interface LaneRunParkRequest {
@@ -13,7 +16,11 @@ export interface LaneRunParkRequest {
   readonly workOrderId: string;
   readonly runId: string;
   readonly reason: string;
+  /** The run's park ordinal; names the park occurrence in the item summary. */
+  readonly parkCount?: number;
   readonly qualifier?: string;
+  /** Bounded, sanitized by the caller; the adapter re-checks the caps. */
+  readonly findings?: readonly LaneRunParkFindingView[];
 }
 
 export type LaneRunParkNoticeResult =
@@ -30,7 +37,7 @@ export type LaneRunParkFindResult =
   | { readonly outcome: 'unavailable' };
 
 export interface LaneRunParkNoticePort {
-  /** Raise the run's attention item; a repeat refreshes it, never piling up. */
+  /** Raise the run's attention item; a repeat of the same park occurrence writes nothing; a new park of the run refreshes or reopens it. */
   recordParkAttention(request: LaneRunParkRequest): Promise<LaneRunParkNoticeResult>;
   /** Ask the keyed owner question for reasons the owner must decide; a repeat returns the stored question. */
   askParkQuestion(request: LaneRunParkRequest): Promise<LaneRunParkNoticeResult>;

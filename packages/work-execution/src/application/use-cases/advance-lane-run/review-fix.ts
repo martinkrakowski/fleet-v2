@@ -611,9 +611,10 @@ function failedReviewKeyAtHead(
  * `review-failed` (a review source), a `gate` result with reason `gate-failed`
  * (a gate source), or a K6 `ci`/`pre-merge` failure (a gate-shaped source with
  * its reason code). `ci` has no key step yet, so only `pre-merge` counts here.
- * AR1 adds the review-blocked acceptance rejection: an `accept` result with
- * reason `acceptance-rejected` and detail `review-findings` hands the failed
- * review key at that head to the fix round.
+ * AR1/F61 add the review-blocked acceptance rejection: an `accept` result with
+ * reason `acceptance-rejected` and detail `review-findings` (AR1), or a null
+ * detail (F61, a pre-AR1 rejection classified from the assessment), hands the
+ * failed review key at that head to the fix round.
  */
 function fixingFailureSourceOf(
   entries: readonly LaneRunJournalEntryRecord[],
@@ -640,7 +641,11 @@ function fixingFailureSourceOf(
     if (parsed.step === 'pre-merge' && entry.reasonCode !== null) {
       return { key: entry.key, source: 'gate', reasonCode: entry.reasonCode };
     }
-    if (parsed.step === 'accept' && entry.reasonCode === 'acceptance-rejected' && entry.detail === 'review-findings') {
+    if (
+      parsed.step === 'accept' &&
+      entry.reasonCode === 'acceptance-rejected' &&
+      (entry.detail === 'review-findings' || entry.detail === null)
+    ) {
       const reviewKey = parsed.head12 === null ? null : failedReviewKeyAtHead(entries, runId, parsed.head12);
       if (reviewKey !== null) {
         return { key: reviewKey, source: 'review', reasonCode: 'review-failed' };

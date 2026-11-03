@@ -971,6 +971,84 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(acceptIntents).toHaveLength(1);
   });
 
+  it('F61: a pre-AR1 null-detail acceptance rejection enters fixing and the fix prepare carries the finding summary', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    // The MX5a journal with a null detail on the accept result (pre-AR1).
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-passed', NOW, 'minor-only-findings');
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    await appendIntent(harness, codeKey, null, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-passed', NOW);
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW);
+    // F61: the classification wires the receipts-only assessment; the full
+    // acceptance read is never used by the accept step.
+    Object.assign(harness.deps, {
+      acceptanceAssessment: {
+        assessHeadAcceptance: async () => {
+          throw new Error('assessHeadAcceptance is not used by the accept step');
+        },
+        assessHeadReceipts: async () =>
+          ({
+            outcome: 'rejected' as const,
+            reason: 'blocked',
+            blockerDetails: [{ kind: 'other' as const, text: 'blocked' }],
+          }),
+      },
+    });
+    // The review evidence at the head, for both receipt kinds: the brief-check
+    // receipt is failed with one minor finding; code-review has none.
+    harness.setFindLatestReceiptAnswer(async (request) =>
+      request.kind === 'brief-check'
+        ? {
+            outcome: 'found' as const,
+            receipt: {
+              receiptId: 'rcpt-brief-1',
+              requestId: null,
+              kind: 'brief-check' as const,
+              reviewerModel: 'review-model-1',
+              candidateHeadSha: COMMIT_A,
+              verdict: 'failed' as const,
+              findings: [
+                { findingId: 'finding-1', severity: 'minor' as const, summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+              ],
+            },
+          }
+        : { outcome: 'not-found' as const },
+    );
+    // The handover reads the failed brief-check receipt by the intent's minted
+    // request id.
+    harness.setFindReceiptAnswer(async (request) => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-' + request.requestId,
+        requestId: request.requestId,
+        kind: 'brief-check',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [
+          { findingId: 'finding-1', severity: 'minor', summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+        ],
+      },
+    }));
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+
+    const result = await advance(harness);
+    expect(result).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed', reasonCode: 'prepared' });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[minor] src/ex.ts:4 — tighten the guard']);
+
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const acceptIntents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey);
+    expect(acceptIntents).toHaveLength(1);
+  });
+
   it('b) a gate-failed with no recorded failed check refuses prepare-refused rather than a bare reason code (KF-21b)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await seedGateFailure(harness);

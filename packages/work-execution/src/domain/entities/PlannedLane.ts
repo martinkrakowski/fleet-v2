@@ -32,7 +32,7 @@ import {
   planTextError,
   pullRequestRefError,
 } from '../lane-plan-sidecar.js';
-import { readExactPlainRecord } from '../plain-record-reads.js';
+import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from '../plain-record-reads.js';
 
 export type PlannedLaneResult =
   | { readonly success: true; readonly value: PlannedLane }
@@ -134,6 +134,11 @@ export class PlannedLane {
     }
     const mergedPr = mergedPrOrError;
 
+    const rollupOf = recordInput.rollupOf;
+    if (rollupOf !== undefined && rollupOf !== true) {
+      return invalid(`PlannedLane ${path}.rollupOf: must be true`);
+    }
+
     const record: PlannedLaneRecord = Object.freeze({
       laneId,
       aliases: Object.freeze([...aliases]),
@@ -146,6 +151,7 @@ export class PlannedLane {
       status,
       brief,
       mergedPr: mergedPr === null ? null : Object.freeze(mergedPr),
+      ...(rollupOf === true ? { rollupOf: true } : {}),
     });
     return { success: true, value: new PlannedLane(record) };
   }
@@ -170,6 +176,7 @@ export class PlannedLane {
       mergedPr: this.record.mergedPr === null
         ? null
         : { repository: this.record.mergedPr.repository, number: this.record.mergedPr.number },
+      ...(this.record.rollupOf === true ? { rollupOf: true } : {}),
     };
   }
 
@@ -184,6 +191,11 @@ export class PlannedLane {
 
   getStatus(): PlannedLaneStatus {
     return this.record.status;
+  }
+
+  /** True when the lane is a rollup heading (PV1). */
+  isRollup(): boolean {
+    return this.record.rollupOf === true;
   }
 
   /** True for the lane's current id or any of its aliases. */
@@ -209,7 +221,7 @@ function laneRecordSnapshot(input: unknown, path: string): Record<string, unknow
   if (inputPrototype !== Object.prototype && inputPrototype !== null) {
     return `PlannedLane ${path}: must be an object`;
   }
-  const recordInput = readExactPlainRecord(input, RECORD_KEYS);
+  const recordInput = readPlainRecordWithOptionalKeys(input, RECORD_KEYS, ['rollupOf']);
   if (recordInput === null) {
     return `PlannedLane ${path}: must have exactly its record fields`;
   }

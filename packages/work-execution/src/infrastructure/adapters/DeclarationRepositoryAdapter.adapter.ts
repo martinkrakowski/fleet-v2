@@ -11,32 +11,34 @@
  * already valid.
  */
 
-import { promises as fs } from 'node:fs';
-import * as path from 'node:path';
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
 
-import type { LaneDeclarationRecord } from '../../domain/lane-activity-records.js';
-import { isLaneDeclarationRecord } from '../../domain/lane-activity-records.js';
+import type { LaneDeclarationRecord } from "../../domain/lane-activity-records.js";
+import { isLaneDeclarationRecord } from "../../domain/lane-activity-records.js";
 import type {
   AppendDeclarationResult,
   DeclarationRepositoryPort,
-} from '../../application/ports/out/DeclarationRepositoryPort.out-port.js';
+} from "../../application/ports/out/DeclarationRepositoryPort.out-port.js";
 import {
   inspectRecordListBytes,
   rejectUnreadableStateFile,
   StateFileUnreadableError,
   withFileLock,
   writeJsonAtomically,
-} from './file-store.js';
+} from "./file-store.js";
 
-export const LANE_DECLARATIONS_FILE = 'lane-declarations.json';
+export const LANE_DECLARATIONS_FILE = "lane-declarations.json";
 
 /** The reader's record parser, shared with `fleet-v2 state check`. */
-export function parseLaneDeclarationStateRecord(raw: unknown): LaneDeclarationRecord | undefined {
+export function parseLaneDeclarationStateRecord(
+  raw: unknown,
+): LaneDeclarationRecord | undefined {
   return isLaneDeclarationRecord(raw) ? raw : undefined;
 }
 
 function refusal(reason: string): AppendDeclarationResult {
-  return { outcome: 'refused', reason };
+  return { outcome: "refused", reason };
 }
 
 export interface DeclarationRepositoryAdapterOptions {
@@ -56,6 +58,9 @@ export class DeclarationRepositoryAdapter implements DeclarationRepositoryPort {
   constructor(private readonly options?: DeclarationRepositoryAdapterOptions) {}
 
   async list(): Promise<readonly LaneDeclarationRecord[]> {
+    if (this.quarantined) {
+      return [];
+    }
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
       return [...this.inMemoryRecords];
@@ -65,23 +70,33 @@ export class DeclarationRepositoryAdapter implements DeclarationRepositoryPort {
         path.join(stateDir, LANE_DECLARATIONS_FILE),
         await this.readBytes(path.join(stateDir, LANE_DECLARATIONS_FILE)),
       );
-    } catch {
+    } catch (error: unknown) {
+      if (error instanceof StateFileUnreadableError) {
+        this.quarantined = true;
+      }
       return [];
     }
   }
 
-  async append(record: LaneDeclarationRecord): Promise<AppendDeclarationResult> {
+  async append(
+    record: LaneDeclarationRecord,
+  ): Promise<AppendDeclarationResult> {
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
       this.inMemoryRecords.push(record);
-      return { outcome: 'saved', revision: this.inMemoryRecords.length };
+      return { outcome: "saved", revision: this.inMemoryRecords.length };
     }
     return this.appendToFile(record, stateDir);
   }
 
-  private async appendToFile(record: LaneDeclarationRecord, stateDir: string): Promise<AppendDeclarationResult> {
+  private async appendToFile(
+    record: LaneDeclarationRecord,
+    stateDir: string,
+  ): Promise<AppendDeclarationResult> {
     if (this.quarantined) {
-      return refusal('the declaration store is quarantined; no write until it is repaired');
+      return refusal(
+        "the declaration store is quarantined; no write until it is repaired",
+      );
     }
     const target = path.join(stateDir, LANE_DECLARATIONS_FILE);
     try {
@@ -91,17 +106,21 @@ export class DeclarationRepositoryAdapter implements DeclarationRepositoryPort {
         await this.options?.onLockMidWrite?.();
         const after = await this.readBytes(target);
         if (!sameBytes(after, before)) {
-          return refusal('the declaration store changed during the write; no write was made');
+          return refusal(
+            "the declaration store changed during the write; no write was made",
+          );
         }
         await writeJsonAtomically(target, records);
-        return { outcome: 'saved' as const, revision: records.length };
+        return { outcome: "saved" as const, revision: records.length };
       });
     } catch (error: unknown) {
       if (error instanceof StateFileUnreadableError) {
         this.quarantined = true;
-        return refusal('the declaration store file is unreadable and was quarantined');
+        return refusal(
+          "the declaration store file is unreadable and was quarantined",
+        );
       }
-      return refusal('the declaration store refused the write');
+      return refusal("the declaration store refused the write");
     }
   }
 
@@ -111,9 +130,9 @@ export class DeclarationRepositoryAdapter implements DeclarationRepositoryPort {
       return await fs.readFile(target);
     } catch (error: unknown) {
       if (
-        typeof error === 'object' &&
+        typeof error === "object" &&
         error !== null &&
-        (error as { code?: string }).code === 'ENOENT'
+        (error as { code?: string }).code === "ENOENT"
       ) {
         return null;
       }
@@ -122,12 +141,18 @@ export class DeclarationRepositoryAdapter implements DeclarationRepositoryPort {
   }
 
   /** Throws `StateFileUnreadableError` (after quarantining) on an unparsable file. */
-  private async parseBytes(target: string, bytes: Buffer | null): Promise<readonly LaneDeclarationRecord[]> {
+  private async parseBytes(
+    target: string,
+    bytes: Buffer | null,
+  ): Promise<readonly LaneDeclarationRecord[]> {
     if (bytes === null) {
       return [];
     }
-    const inspection = inspectRecordListBytes(bytes, parseLaneDeclarationStateRecord);
-    if (inspection.status !== 'ok') {
+    const inspection = inspectRecordListBytes(
+      bytes,
+      parseLaneDeclarationStateRecord,
+    );
+    if (inspection.status !== "ok") {
       return rejectUnreadableStateFile(target, inspection.detail, bytes, false);
     }
     return [...inspection.records];

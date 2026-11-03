@@ -10,40 +10,47 @@
  * Records arrive already valid.
  */
 
-import { promises as fs } from 'node:fs';
-import * as path from 'node:path';
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
 
-import type { BriefReadRecord } from '../../domain/lane-activity-records.js';
-import { isBriefReadRecord } from '../../domain/lane-activity-records.js';
-import type { LaneRef } from '../../domain/work-board-facts.js';
+import type { BriefReadRecord } from "../../domain/lane-activity-records.js";
+import { isBriefReadRecord } from "../../domain/lane-activity-records.js";
+import type { LaneRef } from "../../domain/work-board-facts.js";
 import type {
   BriefReadRepositoryPort,
   PutBriefReadResult,
-} from '../../application/ports/out/BriefReadRepositoryPort.out-port.js';
+} from "../../application/ports/out/BriefReadRepositoryPort.out-port.js";
 import {
   inspectRecordListBytes,
   rejectUnreadableStateFile,
   StateFileUnreadableError,
   withFileLock,
   writeJsonAtomically,
-} from './file-store.js';
+} from "./file-store.js";
 
-export const BRIEF_READS_FILE = 'brief-reads.json';
+export const BRIEF_READS_FILE = "brief-reads.json";
 
 /** The reader's record parser, shared with `fleet-v2 state check`. */
-export function parseBriefReadStateRecord(raw: unknown): BriefReadRecord | undefined {
+export function parseBriefReadStateRecord(
+  raw: unknown,
+): BriefReadRecord | undefined {
   return isBriefReadRecord(raw) ? raw : undefined;
 }
 
 function laneKeyOf(lane: LaneRef): string {
-  if (lane.kind === 'plan') {
-    return JSON.stringify([lane.kind, lane.projectId, lane.planId, lane.laneId]);
+  if (lane.kind === "plan") {
+    return JSON.stringify([
+      lane.kind,
+      lane.projectId,
+      lane.planId,
+      lane.laneId,
+    ]);
   }
   return JSON.stringify([lane.kind, lane.projectId, lane.workOrderId]);
 }
 
 function refusal(reason: string): PutBriefReadResult {
-  return { outcome: 'refused', reason };
+  return { outcome: "refused", reason };
 }
 
 function replaceLaneRead(
@@ -51,10 +58,16 @@ function replaceLaneRead(
   record: BriefReadRecord,
 ): BriefReadRecord[] {
   const key = laneKeyOf(record.lane);
-  return [...records.filter((existing) => laneKeyOf(existing.lane) !== key), record];
+  return [
+    ...records.filter((existing) => laneKeyOf(existing.lane) !== key),
+    record,
+  ];
 }
 
-function latestOf(records: readonly BriefReadRecord[], lane: LaneRef): BriefReadRecord | null {
+function latestOf(
+  records: readonly BriefReadRecord[],
+  lane: LaneRef,
+): BriefReadRecord | null {
   const key = laneKeyOf(lane);
   let latest: BriefReadRecord | null = null;
   for (const existing of records) {
@@ -82,16 +95,25 @@ export class BriefReadRepositoryAdapter implements BriefReadRepositoryPort {
   constructor(private readonly options?: BriefReadRepositoryAdapterOptions) {}
 
   async latest(lane: LaneRef): Promise<BriefReadRecord | null> {
+    if (this.quarantined) {
+      return null;
+    }
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
       return latestOf(this.inMemoryRecords, lane);
     }
     try {
       return latestOf(
-        await this.parseBytes(path.join(stateDir, BRIEF_READS_FILE), await this.readBytes(path.join(stateDir, BRIEF_READS_FILE))),
+        await this.parseBytes(
+          path.join(stateDir, BRIEF_READS_FILE),
+          await this.readBytes(path.join(stateDir, BRIEF_READS_FILE)),
+        ),
         lane,
       );
-    } catch {
+    } catch (error: unknown) {
+      if (error instanceof StateFileUnreadableError) {
+        this.quarantined = true;
+      }
       return null;
     }
   }
@@ -102,34 +124,46 @@ export class BriefReadRepositoryAdapter implements BriefReadRepositoryPort {
       const updated = replaceLaneRead(this.inMemoryRecords, record);
       this.inMemoryRecords.length = 0;
       this.inMemoryRecords.push(...updated);
-      return { outcome: 'saved', revision: updated.length };
+      return { outcome: "saved", revision: updated.length };
     }
     return this.putToFile(record, stateDir);
   }
 
-  private async putToFile(record: BriefReadRecord, stateDir: string): Promise<PutBriefReadResult> {
+  private async putToFile(
+    record: BriefReadRecord,
+    stateDir: string,
+  ): Promise<PutBriefReadResult> {
     if (this.quarantined) {
-      return refusal('the brief-read store is quarantined; no write until it is repaired');
+      return refusal(
+        "the brief-read store is quarantined; no write until it is repaired",
+      );
     }
     const target = path.join(stateDir, BRIEF_READS_FILE);
     try {
       return await withFileLock(`${target}.lock`, async () => {
         const before = await this.readBytes(target);
-        const records = replaceLaneRead(await this.parseBytes(target, before), record);
+        const records = replaceLaneRead(
+          await this.parseBytes(target, before),
+          record,
+        );
         await this.options?.onLockMidWrite?.();
         const after = await this.readBytes(target);
         if (!sameBytes(after, before)) {
-          return refusal('the brief-read store changed during the write; no write was made');
+          return refusal(
+            "the brief-read store changed during the write; no write was made",
+          );
         }
         await writeJsonAtomically(target, records);
-        return { outcome: 'saved' as const, revision: records.length };
+        return { outcome: "saved" as const, revision: records.length };
       });
     } catch (error: unknown) {
       if (error instanceof StateFileUnreadableError) {
         this.quarantined = true;
-        return refusal('the brief-read store file is unreadable and was quarantined');
+        return refusal(
+          "the brief-read store file is unreadable and was quarantined",
+        );
       }
-      return refusal('the brief-read store refused the write');
+      return refusal("the brief-read store refused the write");
     }
   }
 
@@ -139,9 +173,9 @@ export class BriefReadRepositoryAdapter implements BriefReadRepositoryPort {
       return await fs.readFile(target);
     } catch (error: unknown) {
       if (
-        typeof error === 'object' &&
+        typeof error === "object" &&
         error !== null &&
-        (error as { code?: string }).code === 'ENOENT'
+        (error as { code?: string }).code === "ENOENT"
       ) {
         return null;
       }
@@ -150,12 +184,15 @@ export class BriefReadRepositoryAdapter implements BriefReadRepositoryPort {
   }
 
   /** Throws `StateFileUnreadableError` (after quarantining) on an unparsable file. */
-  private async parseBytes(target: string, bytes: Buffer | null): Promise<readonly BriefReadRecord[]> {
+  private async parseBytes(
+    target: string,
+    bytes: Buffer | null,
+  ): Promise<readonly BriefReadRecord[]> {
     if (bytes === null) {
       return [];
     }
     const inspection = inspectRecordListBytes(bytes, parseBriefReadStateRecord);
-    if (inspection.status !== 'ok') {
+    if (inspection.status !== "ok") {
       return rejectUnreadableStateFile(target, inspection.detail, bytes, false);
     }
     return [...inspection.records];

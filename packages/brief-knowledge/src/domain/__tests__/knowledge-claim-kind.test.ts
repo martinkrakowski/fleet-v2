@@ -89,11 +89,7 @@ describe('KnowledgeEntry claimKind', () => {
   });
 
   it('keeps the attribution and the keeper path of a failed claim', () => {
-    const record = makeEntryRecord({
-      claimKind: 'failed',
-      claimText: 'x'.repeat(300),
-      verification: 'supported',
-    });
+    const record = makeEntryRecord({ claimKind: 'failed', claimText: 'x'.repeat(300) });
     const entry = KnowledgeEntry.fromRecord(record);
 
     // Attribution survives the round-trip unchanged.
@@ -103,9 +99,8 @@ describe('KnowledgeEntry claimKind', () => {
     expect(entry.toRecord().checkerId).toBeNull();
 
     // An unverified failed claim cannot become accepted.
-    const unverified = KnowledgeEntry.fromRecord(makeEntryRecord({ claimKind: 'failed' }));
     expect(() =>
-      unverified.decideDisposition({
+      entry.decideDisposition({
         disposition: 'accepted',
         checkerId: 'orchestrator-1',
         reason: 'looks right',
@@ -113,7 +108,20 @@ describe('KnowledgeEntry claimKind', () => {
       }),
     ).toThrow(/unverified claim cannot become accepted/);
 
-    // A supported failed claim becomes a retrievable keeper with a checker identity.
+    // A supported check moves the unverified failed claim to supported…
+    entry.applyCheck({
+      id: 'check-1',
+      entryId: record.id,
+      checkerId: 'orchestrator-1',
+      procedureName: 'yarn typecheck',
+      verification: 'supported',
+      evidenceRef: 'evidence/typecheck.log',
+      checkedAtIso: '2026-10-15T02:00:00.000Z',
+    });
+    expect(entry.getVerification()).toBe('supported');
+    expect(entry.getChecks()).toHaveLength(1);
+
+    // …and with a checker identity it becomes a retrievable keeper.
     const decided = entry.decideDisposition({
       disposition: 'accepted',
       checkerId: 'orchestrator-1',

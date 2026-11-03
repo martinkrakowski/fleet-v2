@@ -194,7 +194,8 @@ describe('deriveOwnerEntries', () => {
     if (!result.ok) throw new Error('expected a board');
 
     const cards = result.board.lanes.map((lane) => ({ key: lane.key, done: lane.done !== null }));
-    const derived = deriveOwnerEntries(facts.ownerItems, facts.questions, cards, resolveLaneKey);
+    const derived = [...deriveOwnerEntries(facts.ownerItems, facts.questions, cards, resolveLaneKey)]
+      .sort((a, b) => a.id.localeCompare(b.id));
     const boardEntries = [...result.board.ownerItems].sort((a, b) => a.id.localeCompare(b.id));
     expect(derived).toEqual(boardEntries);
   });

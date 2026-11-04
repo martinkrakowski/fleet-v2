@@ -1082,12 +1082,12 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const mergeForgeRead =
     forgeMode === 'github'
       ? new GhForgeMergeReadAdapter({
-          runGh: (args) =>
+          runGh: (args, timeoutMs) =>
             (
               options?.forgeGhRunner ??
-              ((ghArgs: readonly string[], timeoutMs?: number) =>
-                runGhSubprocess(ghArgs, ghBinaryCandidates, undefined, timeoutMs))
-            )(args),
+              ((ghArgs: readonly string[], ghTimeoutMs?: number) =>
+                runGhSubprocess(ghArgs, ghBinaryCandidates, undefined, ghTimeoutMs))
+            )(args, timeoutMs),
         })
       : new GhForgeMergeReadAdapter();
   const inspectMergeReadiness = new InspectMergeReadinessUseCase({

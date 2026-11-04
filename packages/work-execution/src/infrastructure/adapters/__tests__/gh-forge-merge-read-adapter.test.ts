@@ -141,6 +141,18 @@ describe('GhForgeMergeReadAdapter.readForgeMerge', () => {
     expect(queryArg).not.toMatch(/\.\.\.\s*on\s*CheckRun\s*\{[^}]*creator/);
   });
 
+  it('passes the raced per-call deadline to the gh runner, so the subprocess never outlives it', async () => {
+    const seen: (number | undefined)[] = [];
+    const runGh = async (_args: readonly string[], timeoutMs?: number) => {
+      seen.push(timeoutMs);
+      return { exitCode: 0, stdout: page(), stderr: '' };
+    };
+    await makeAdapter({ runGh }).readForgeMerge(BASE_REQUEST);
+    expect(seen).toHaveLength(1);
+    expect(typeof seen[0]).toBe('number');
+    expect(seen[0]).toBeGreaterThan(0);
+  });
+
   it('records a required context absent from all pages as missing, not green', async () => {
     const { calls, runGh } = makeRunGh({
       exitCode: 0,

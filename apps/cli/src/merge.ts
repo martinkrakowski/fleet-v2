@@ -226,9 +226,14 @@ type MergeWaitResult =
   | InspectMergeReadinessResult
   | { outcome: 'still-waiting'; reason: 'wait-timeout'; lastReason: string };
 
-/** The answer a spent budget reports: the typed wait-timeout for a waiting read, the answer itself otherwise. */
+/**
+ * The answer a spent budget reports: the typed wait-timeout for a read that was
+ * still waiting or could not decide (unknown, for example a deadline under the
+ * adapter's budget floor or a forge read cut short), the settled answer itself
+ * otherwise.
+ */
 function budgetSpentResult(answer: InspectMergeReadinessResult): MergeWaitResult {
-  if (answer.outcome === 'still-waiting') {
+  if (answer.outcome === 'still-waiting' || answer.outcome === 'unknown') {
     return { outcome: 'still-waiting', reason: 'wait-timeout', lastReason: answer.reason };
   }
   return answer;

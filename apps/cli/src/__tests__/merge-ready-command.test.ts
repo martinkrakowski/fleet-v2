@@ -246,10 +246,11 @@ describe('merge wait', () => {
 
     expect(code).toBe(1);
     // A read deadline under the forge adapter's 2 s budget floor answers
-    // budget-exhausted; either way the whole wait stays inside --max.
+    // budget-exhausted; a spent --max reports the typed wait-timeout with it.
     expect(JSON.parse(out.join(''))).toEqual({
-      outcome: 'unknown',
-      reason: 'budget-exhausted',
+      outcome: 'still-waiting',
+      reason: 'wait-timeout',
+      lastReason: 'budget-exhausted',
     });
   });
 

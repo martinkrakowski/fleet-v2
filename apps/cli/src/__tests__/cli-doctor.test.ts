@@ -77,6 +77,7 @@ function passingProbes(calls?: string[]): DoctorProbes {
       calls?.push('seatProbe');
       return { outcome: 'pass', reason: 'answered' };
     },
+    serverProbe: async () => ({ outcome: 'pass', reason: 'the opencode server answered' }),
   };
 }
 

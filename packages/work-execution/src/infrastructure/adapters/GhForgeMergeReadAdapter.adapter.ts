@@ -27,7 +27,7 @@ import type {
 
 export interface GhForgeMergeReadAdapterOptions {
   /** Host-side delegate; the composition root binds the reviewed subprocess. */
-  readonly runGh?: (args: readonly string[]) => Promise<GhInvocationResult>;
+  readonly runGh?: (args: readonly string[], timeoutMs?: number) => Promise<GhInvocationResult>;
   /** Normal timeout for one graphql call; min(≤ this, deadlineIso − now) bounds each call. */
   readonly timeoutMs?: number; // default 30_000, ForgeReadAdapter.adapter.ts:40 precedent
   /** Test hook: wall clock (epoch ms) for the budget rule; default Date.now. */
@@ -330,7 +330,7 @@ export function parseMergePrMeta(stdout: string): MergePrMetaResult {
 
 function guardRequest(
   request: ReadForgeMergeRequest,
-  runGh: ((args: readonly string[]) => Promise<GhInvocationResult>) | undefined,
+  runGh: ((args: readonly string[], timeoutMs?: number) => Promise<GhInvocationResult>) | undefined,
 ): string | null {
   if (runGh === undefined) {
     return 'merge read is not configured';
@@ -465,7 +465,7 @@ function mapFetchFailure(fetched: Exclude<RunPageResult, { kind: 'page' }>): Rea
 }
 
 export class GhForgeMergeReadAdapter implements ForgeMergeReadPort {
-  private readonly runGh?: (args: readonly string[]) => Promise<GhInvocationResult>;
+  private readonly runGh?: (args: readonly string[], timeoutMs?: number) => Promise<GhInvocationResult>;
   private readonly timeoutMs: number;
   private readonly now: () => number;
 
@@ -652,7 +652,9 @@ export class GhForgeMergeReadAdapter implements ForgeMergeReadPort {
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const pending = runGh(args);
+      // The subprocess gets the same deadline the race uses, so a hung gh
+      // never outlives the caller's budget (CO25: merge wait --max).
+      const pending = runGh(args, timeoutMs);
       pending.catch(() => undefined);
       const gh = await Promise.race([
         pending,

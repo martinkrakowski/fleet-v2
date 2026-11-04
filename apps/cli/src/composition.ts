@@ -47,13 +47,16 @@ import {
   ConductorForgeGrantAdapter,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
+  ExplainAttemptUseCase,
   ExecutionJournalAdapter,
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
   MergeGrantAdapter,
   ForgeReadAdapter,
+  GhForgeMergeReadAdapter,
   InspectAttemptUseCase,
+  InspectMergeReadinessUseCase,
   InspectWorkOrderUseCase,
   LaneRunParkNoticeAdapter,
   ListUnregisteredProjectsUseCase,
@@ -98,6 +101,7 @@ import {
   type EvaluateAttemptGatePort,
   type EnqueueMergeUseCase,
   type ListMergeQueueUseCase,
+  type ImportTrainStateUseCase,
   type MergeQueueRepositoryAdapter,
   type ForgeActionDelegate,
   type GhInvocationResult,
@@ -726,6 +730,7 @@ export interface FleetCliRuntime {
     /** KF-36b-2: the read-only stale work-order listing; built beside closeWorkOrder from the same stores. */
     readonly listStaleWorkOrders: ListStaleWorkOrdersUseCase;
     readonly inspectAttempt: InspectAttemptUseCase;
+    readonly explainAttempt: ExplainAttemptUseCase;
     readonly prepareBriefPackage: PrepareBriefPackageUseCase;
     readonly reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
     readonly dispatchAttempt: DispatchAttemptUseCase;
@@ -746,6 +751,9 @@ export interface FleetCliRuntime {
     readonly mergeQueueRepository: MergeQueueRepositoryAdapter;
     readonly enqueueMerge: EnqueueMergeUseCase;
     readonly listMergeQueue: ListMergeQueueUseCase;
+    readonly importTrainState: ImportTrainStateUseCase;
+    /** CO25: the read-only merge readiness check for one pull request. */
+    readonly inspectMergeReadiness: InspectMergeReadinessUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -1067,12 +1075,32 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const tunnelTarget = resolveRunnerTunnelTarget(runnerHost, { runnerRemoteHost, runnerRemotePort });
   const runnerTunnel = new RunnerTunnelAdapter(tunnelTarget);
 
+  // CO25: the merge-readiness forge read (DT5) behind the same reviewed gh
+  // subprocess as the other forge reads. Without forge mode github the
+  // adapter stays unconfigured, so a readiness check answers unknown instead
+  // of reaching for a forge the installation forbids.
+  const mergeForgeRead =
+    forgeMode === 'github'
+      ? new GhForgeMergeReadAdapter({
+          runGh: (args, timeoutMs) =>
+            (
+              options?.forgeGhRunner ??
+              ((ghArgs: readonly string[], ghTimeoutMs?: number) =>
+                runGhSubprocess(ghArgs, ghBinaryCandidates, undefined, ghTimeoutMs))
+            )(args, timeoutMs),
+        })
+      : new GhForgeMergeReadAdapter();
+  const inspectMergeReadiness = new InspectMergeReadinessUseCase({
+    mergeRead: mergeForgeRead,
+    nowIso: () => new Date().toISOString(),
+  });
+
   return {
     installation: options?.installation,
     coordination,
     knowledge,
     evidence,
-    execution: { ...execution, closeWorkOrder, listStaleWorkOrders },
+    execution: { ...execution, closeWorkOrder, listStaleWorkOrders, inspectMergeReadiness },
     conductor,
     runnerTunnel,
     telemetry,

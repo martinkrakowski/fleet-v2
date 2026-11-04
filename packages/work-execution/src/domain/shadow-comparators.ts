@@ -82,7 +82,12 @@ function isRecordObject(value: unknown): value is Record<string, unknown> {
  * as an invalid item and never run.
  */
 function ownFields(item: Record<string, unknown>, names: readonly string[]): unknown[] {
-  return names.map((name) => (Object.hasOwn(item, name) ? item[name] : undefined));
+  // The value comes from the own data descriptor itself, never from a property
+  // read, so neither a getter nor a Proxy get trap supplies it.
+  return names.map((name) => {
+    const descriptor = Object.getOwnPropertyDescriptor(item, name);
+    return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+  });
 }
 
 /**

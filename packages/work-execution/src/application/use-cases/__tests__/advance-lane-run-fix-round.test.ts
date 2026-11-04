@@ -2323,6 +2323,128 @@ describe('AdvanceLaneRunUseCase fix-round prepare refusal details (MX7)', () => 
     expect(await refusedPrepareDetailOf(harness)).toBe('prepare-no-review-findings');
   });
 
+  it('the newest failed receipt is all out of scope and an older one has an in-scope finding: the handover carries the older one\'s finding', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-passed', NOW, 'minor-only-findings');
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    const codeRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, codeKey, codeRequestId, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-failed', NOW);
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+
+    harness.setChangedPaths(['src/ex.ts']);
+    harness.setFindReceiptAnswer(async (request) => {
+      if (request.requestId === codeRequestId) {
+        return {
+          outcome: 'found',
+          receipt: {
+            receiptId: 'rcpt-' + codeRequestId,
+            requestId: codeRequestId,
+            kind: 'code-review',
+            reviewerModel: 'review-model-1',
+            candidateHeadSha: COMMIT_A,
+            verdict: 'failed',
+            findings: [
+              { findingId: 'finding-out-1', severity: 'blocker', summary: 'already marked out of scope', filePath: 'src/ex.ts', line: 4, state: 'out-of-scope' },
+              { findingId: 'finding-out-2', severity: 'major', summary: 'path not changed', filePath: 'src/other.ts', line: 10 },
+            ],
+          },
+        };
+      }
+      if (request.requestId === briefRequestId) {
+        return {
+          outcome: 'found',
+          receipt: {
+            receiptId: 'rcpt-' + briefRequestId,
+            requestId: briefRequestId,
+            kind: 'brief-check',
+            reviewerModel: 'review-model-1',
+            candidateHeadSha: COMMIT_A,
+            verdict: 'failed',
+            findings: [
+              { findingId: 'finding-in-1', severity: 'minor', summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+            ],
+          },
+        };
+      }
+      return { outcome: 'not-found' };
+    });
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[minor] src/ex.ts:4 — tighten the guard']);
+  });
+
+  it('no failed receipt has an in-scope finding: the prepare refuses prepare-no-review-findings', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-passed', NOW, 'minor-only-findings');
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    const codeRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, codeKey, codeRequestId, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-failed', NOW);
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+
+    harness.setChangedPaths(['src/ex.ts']);
+    harness.setFindReceiptAnswer(async (request) => {
+      if (request.requestId === codeRequestId) {
+        return {
+          outcome: 'found',
+          receipt: {
+            receiptId: 'rcpt-' + codeRequestId,
+            requestId: codeRequestId,
+            kind: 'code-review',
+            reviewerModel: 'review-model-1',
+            candidateHeadSha: COMMIT_A,
+            verdict: 'failed',
+            findings: [
+              { findingId: 'finding-code-out', severity: 'blocker', summary: 'path not changed', filePath: 'src/other.ts', line: 10 },
+            ],
+          },
+        };
+      }
+      if (request.requestId === briefRequestId) {
+        return {
+          outcome: 'found',
+          receipt: {
+            receiptId: 'rcpt-' + briefRequestId,
+            requestId: briefRequestId,
+            kind: 'brief-check',
+            reviewerModel: 'review-model-1',
+            candidateHeadSha: COMMIT_A,
+            verdict: 'failed',
+            findings: [
+              { findingId: 'finding-brief-out', severity: 'minor', summary: 'already out of scope', filePath: 'src/ex.ts', line: 4, state: 'out-of-scope' },
+            ],
+          },
+        };
+      }
+      return { outcome: 'not-found' };
+    });
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-no-review-findings');
+  });
+
   it('prepare-no-review-request: a review failure whose intent has no minted request id refuses with its own token', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     const key = reviewKey('code-review', 0, HEAD12_A);

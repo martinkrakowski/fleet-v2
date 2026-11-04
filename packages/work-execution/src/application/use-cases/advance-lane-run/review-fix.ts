@@ -678,6 +678,20 @@ function handoverFindingsOf(receipt: {
 }
 
 /**
+ * Filter findings by finding state and lane changed-path scope. Drops any
+ * finding whose state is `out-of-scope`, and delegates the rest to the
+ * domain scope partition.
+ */
+function inScopeFindingsOf<T extends ReviewRequestFinding>(
+  findings: readonly T[],
+  changedPaths: readonly string[] | null,
+  worktreePath: string | null = null,
+): readonly T[] {
+  const active = findings.filter((finding) => finding.state !== 'out-of-scope');
+  return partitionFindingsByScope(active, changedPaths, worktreePath).inScope;
+}
+
+/**
  * AR1/MX7: the receipt behind one candidate review result — by the intent's
  * minted request id first, and when that yields nothing, by kind at the
  * prior's collected head. Null without a receipt; the walk continues.
@@ -857,23 +871,33 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   }
   let findings: readonly HandoverFinding[] = [];
   if (failure.source === 'review') {
+    // KF-33a: only findings on files the lane changed — between the run's
+    // original base and the prior's collected head, read through the prior's
+    // recorded host — drive the fix round; the read is the shared
+    // `changedPathsOf` helper (KF-33b2) and any unknown answer fails closed
+    // (changed stays null and every finding stays in scope, as before).
+    const changed = await changedPathsOf(ctx, gathered, prior, prior.artifacts.headCommit);
     if (failure.acceptHead12 !== null) {
       // AR1/MX7: the rejection's review source is receipt-driven. Walk the
       // run's final review results at the rejected head, latest first, and
-      // take the first whose receipt has at least one unresolved finding —
-      // a GB1 `review-passed` with `minor-only-findings` included.
-      let receipt: { readonly findings: readonly ReviewRequestFinding[] } | null = null;
+      // take the newest whose receipt has at least one in-scope finding —
+      // a GB1 `review-passed` with `minor-only-findings` included. Keep
+      // walking past failed receipts that have no in-scope finding.
+      let inScope: readonly ReviewRequestFinding[] | null = null;
       for (const candidate of reviewResultKeysAtHead(entries, record.runId, failure.acceptHead12)) {
         const found = await candidateReceiptOf(ctx, prior, candidate);
-        if (found !== null && found.findings.length > 0) {
-          receipt = found;
-          break;
+        if (found !== null) {
+          const candidateInScope = inScopeFindingsOf(found.findings, changed, prior.worktreePath);
+          if (candidateInScope.length > 0) {
+            inScope = candidateInScope;
+            break;
+          }
         }
       }
-      if (receipt === null) {
+      if (inScope === null) {
         return refuse('prepare-refused', 'prepare-no-review-findings');
       }
-      findings = handoverFindingsOf(receipt);
+      findings = handoverFindingsOf({ findings: inScope });
     } else if (failure.key !== null) {
       const requestId = await intentMintedIdOf(ctx, failure.key);
       if (requestId === null) {
@@ -892,22 +916,13 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
       if (found.outcome !== 'found') {
         return refuse('prepare-refused', 'prepare-review-receipt-unavailable');
       }
-      findings = handoverFindingsOf(found.receipt);
+      const inScope = inScopeFindingsOf(found.receipt.findings, changed, prior.worktreePath);
+      if (found.receipt.findings.length > 0 && inScope.length === 0) {
+        return refuse('no-in-scope-findings');
+      }
+      findings = handoverFindingsOf({ findings: inScope });
     } else {
       return refuse('prepare-refused', 'prepare-no-failure-source');
-    }
-    // KF-33a: only findings on files the lane changed — between the run's
-    // original base and the prior's collected head, read through the prior's
-    // recorded host — drive the fix round; the read is the shared
-    // `changedPathsOf` helper (KF-33b2) and any unknown answer fails closed
-    // (changed stays null and every finding stays in scope, as before). When
-    // the receipt had findings and none is in scope, the round is refused:
-    // the existing refused-prepare handling parks it for the orchestrator.
-    const changed = await changedPathsOf(ctx, gathered, prior, prior.artifacts.headCommit);
-    const receiptFindingCount = findings.length;
-    findings = partitionFindingsByScope(findings, changed, prior.worktreePath).inScope;
-    if (receiptFindingCount > 0 && findings.length === 0) {
-      return refuse('no-in-scope-findings');
     }
   }
   // The run's recorded branch wins (KF-5b); old records without it fall back

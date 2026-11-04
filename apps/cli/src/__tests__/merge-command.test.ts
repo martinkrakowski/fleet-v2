@@ -122,7 +122,6 @@ describe('merge commands (DT4)', () => {
         successorEntryId: ulid(9),
         enqueuedAtIso,
         deadlineIso: futureDeadline(),
-        baseBranch: 'main',
       });
       expect(result.outcome).toBe('created');
     };
@@ -141,7 +140,7 @@ describe('merge commands (DT4)', () => {
     expect(result.code).toBe(0);
     const view = JSON.parse(result.out) as {
       entries: Array<{ entryId: string; state: string }>;
-      heads: Array<{ repository: { owner: string; repo: string }; baseBranch: string; headEntryId: string | null }>;
+      heads: Array<{ repository: { owner: string; repo: string }; headEntryId: string | null }>;
     };
     expect(view.entries.map((entry) => entry.entryId)).toEqual([ulid(1), ulid(2), ulid(3)]);
     expect(view.entries.some((entry) => entry.state === 'dropped')).toBe(false);
@@ -152,20 +151,17 @@ describe('merge commands (DT4)', () => {
       (head) => head.repository.owner === 'acme' && head.repository.repo === 'widget',
     );
     expect(repoAHead?.headEntryId).toBe(ulid(2));
-    expect(repoAHead?.baseBranch).toBe('main');
     expect(repoBHead?.headEntryId).toBe(ulid(1));
-    expect(repoBHead?.baseBranch).toBe('main');
 
     const filtered = await cli(runtime, ['merge', 'list', '--repository', 'fleet/v2']);
     expect(filtered.code).toBe(0);
     const filteredView = JSON.parse(filtered.out) as {
       entries: Array<{ entryId: string }>;
-      heads: Array<{ repository: { owner: string; repo: string }; baseBranch: string; headEntryId: string | null }>;
+      heads: Array<{ repository: { owner: string; repo: string }; headEntryId: string | null }>;
     };
     expect(filteredView.entries.map((entry) => entry.entryId)).toEqual([ulid(2), ulid(3)]);
     expect(filteredView.heads).toHaveLength(1);
     expect(filteredView.heads[0]?.headEntryId).toBe(ulid(2));
-    expect(filteredView.heads[0]?.baseBranch).toBe('main');
   });
 
   it.each([
@@ -266,7 +262,6 @@ describe('merge commands (DT4)', () => {
       successorEntryId: ulid(2),
       enqueuedAtIso: '2026-11-01T10:00:00.000Z',
       deadlineIso: futureDeadline(),
-      baseBranch: 'main',
     });
     expect(enqueue1.outcome).toBe('created');
 
@@ -281,7 +276,6 @@ describe('merge commands (DT4)', () => {
       successorEntryId: ulid(4),
       enqueuedAtIso: '2026-11-01T10:30:00.000Z',
       deadlineIso: futureDeadline(),
-      baseBranch: 'main',
     });
     expect(enqueue2.outcome).toBe('supersedes');
 
@@ -289,11 +283,10 @@ describe('merge commands (DT4)', () => {
     expect(result.code).toBe(0);
     const view = JSON.parse(result.out) as {
       entries: Array<{ entryId: string; state: string }>;
-      heads: Array<{ repository: { owner: string; repo: string }; baseBranch: string; headEntryId: string | null }>;
+      heads: Array<{ repository: { owner: string; repo: string }; headEntryId: string | null }>;
     };
     expect(view.entries.map((entry) => entry.entryId)).toEqual([ulid(4)]);
     expect(view.entries.some((entry) => entry.state === 'superseded')).toBe(false);
     expect(view.heads[0]?.headEntryId).toBe(ulid(4));
-    expect(view.heads[0]?.baseBranch).toBe('main');
   });
 });

@@ -5,12 +5,10 @@ import {
   findMergeQueueHead,
   isMergeQueueEntryLive,
   orderMergeQueue,
-  resolveMergeQueueEntryBase,
 } from '../../domain/merge-queue-records.js';
 import type { MergeQueueRepositoryRef } from '../../domain/merge-queue-records.js';
-import type { BaseBranchValue } from '../../domain/base-branch.js';
 
-/** List merge-queue entries live-first in queue order with a head per (repository, base). */
+/** List merge-queue entries live-first in queue order with a head per repository. */
 export class ListMergeQueueUseCase implements ListMergeQueuePort {
   constructor(private readonly deps: { readonly queue: MergeQueueRepositoryPort }) {}
 
@@ -26,15 +24,10 @@ export class ListMergeQueueUseCase implements ListMergeQueuePort {
           );
     const live = filtered.filter(isMergeQueueEntryLive);
     const ordered = orderMergeQueue(live);
-    const heads: {
-      readonly repository: MergeQueueRepositoryRef;
-      readonly baseBranch: BaseBranchValue;
-      readonly headEntryId: string | null;
-    }[] = [];
+    const heads: { readonly repository: MergeQueueRepositoryRef; readonly headEntryId: string | null }[] = [];
     const seen = new Set<string>();
     for (const entry of ordered) {
-      const base = resolveMergeQueueEntryBase(entry);
-      const key = `${entry.repository.owner}\u0000${entry.repository.repo}\u0000${base}`;
+      const key = `${entry.repository.owner}\u0000${entry.repository.repo}`;
       if (seen.has(key)) {
         continue;
       }
@@ -42,26 +35,19 @@ export class ListMergeQueueUseCase implements ListMergeQueuePort {
       const group = ordered.filter(
         (candidate) =>
           candidate.repository.owner === entry.repository.owner &&
-          candidate.repository.repo === entry.repository.repo &&
-          resolveMergeQueueEntryBase(candidate) === base,
+          candidate.repository.repo === entry.repository.repo,
       );
-      const head = findMergeQueueHead(group, undefined, base);
+      const head = findMergeQueueHead(group);
       heads.push({
         repository: { owner: entry.repository.owner, repo: entry.repository.repo },
-        baseBranch: base,
         headEntryId: head === null ? null : head.entryId,
       });
     }
-    if (query.repository !== undefined) {
-      const repoKey = `${query.repository.owner}\u0000${query.repository.repo}`;
-      const matched = [...seen].some((key) => key.startsWith(`${repoKey}\u0000`));
-      if (!matched) {
-        heads.push({
-          repository: { owner: query.repository.owner, repo: query.repository.repo },
-          baseBranch: 'main',
-          headEntryId: null,
-        });
-      }
+    if (query.repository !== undefined && !seen.has(`${query.repository.owner}\u0000${query.repository.repo}`)) {
+      heads.push({
+        repository: { owner: query.repository.owner, repo: query.repository.repo },
+        headEntryId: null,
+      });
     }
     return { entries: ordered, heads };
   }

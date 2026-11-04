@@ -180,6 +180,7 @@ export const NON_ZERO_OUTCOMES: ReadonlySet<string> = new Set([
   'no-capacity',
   'busy-worktree',
   'still-running',
+  'still-waiting',
   'not-merged',
   'unknown',
 ]);

@@ -433,6 +433,11 @@ export async function reconcileCollect(ctx: AdvanceStepContext,
  * current facts is overtaken, never journalled as a CI failure. The stale
  * key takes an `overtaken` result, the pending intent resolves, and the
  * decider issues a fresh `ci` act at the current head.
+ *
+ * Fix round 2: a pending key whose head still matches but whose CI has
+ * since passed is overtaken too — the failure no longer holds, so the
+ * intent resolves without entering fixing and the run reaches the normal
+ * transition to `merging`.
  */
 export async function reconcileCi(ctx: AdvanceStepContext,
   record: LaneRunRecord,
@@ -455,10 +460,21 @@ export async function reconcileCi(ctx: AdvanceStepContext,
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'overtaken', reasonCode: 'ci-overtaken' };
   }
   const ci = gathered.facts.ci;
-  if (ci !== 'failed') {
-    return { outcome: 'waiting', reason: ci === 'pending' ? 'ci-pending' : 'ci-unknown' };
+  if (ci === 'failed') {
+    return recordCiFailure(ctx, record, gathered, decision, request);
   }
-  return recordCiFailure(ctx, record, gathered, decision, request);
+  if (ci === 'passed') {
+    // GB4 fix round 2: the failure was superseded by a pass at the same
+    // head — the pending intent is overtaken, never journalled as a CI
+    // failure, so the decider's next decision is the normal transition to
+    // `merging`.
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'overtaken', 'ci-overtaken');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'overtaken', reasonCode: 'ci-overtaken' };
+  }
+  return { outcome: 'waiting', reason: ci === 'pending' ? 'ci-pending' : 'ci-unknown' };
 }
 
 /**

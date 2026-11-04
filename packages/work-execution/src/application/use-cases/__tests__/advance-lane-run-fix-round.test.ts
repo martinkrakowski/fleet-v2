@@ -3329,6 +3329,33 @@ describe('AdvanceLaneRunUseCase CI-red fix round (GB4)', () => {
     expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
   });
 
+  it('a crash after the ci intent followed by a CI pass resolves the pending intent and reaches merging', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    const accept = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, accept, null, NOW);
+    await appendResult(harness, accept, 'completed', 'accepted', NOW);
+    await appendIntent(harness, ciKey(), null, NOW);
+    harness.setCiAnswer({ headSha: COMMIT_A, state: 'passed', reason: 'read' });
+    await conduct(harness, 'watching-ci', NOW);
+
+    // The reconcile resolves the pending intent as overtaken — never ci-failed.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'ci',
+      key: ciKey(),
+      result: 'overtaken',
+      reasonCode: 'ci-overtaken',
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'ci-failed')).toBe(false);
+    expect(harness.parkNoticeRequests).toHaveLength(0);
+
+    // With the intent resolved, the normal watching-ci → merging transition proceeds.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merging' });
+  });
+
   it('a crash after the ci result resumes only the transition to fixing', async () => {
     const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
     const accept = acceptKeyAt(HEAD12_A);

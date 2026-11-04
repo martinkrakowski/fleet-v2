@@ -47,6 +47,7 @@ import {
   ConductorForgeGrantAdapter,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
+  ExplainAttemptUseCase,
   ExecutionJournalAdapter,
   ExecutionObservationAdapter,
   ExecutionRunnerAdapter,
@@ -727,6 +728,7 @@ export interface FleetCliRuntime {
     /** KF-36b-2: the read-only stale work-order listing; built beside closeWorkOrder from the same stores. */
     readonly listStaleWorkOrders: ListStaleWorkOrdersUseCase;
     readonly inspectAttempt: InspectAttemptUseCase;
+    readonly explainAttempt: ExplainAttemptUseCase;
     readonly prepareBriefPackage: PrepareBriefPackageUseCase;
     readonly reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
     readonly dispatchAttempt: DispatchAttemptUseCase;

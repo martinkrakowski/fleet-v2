@@ -114,6 +114,16 @@ describe("createChangeRelay", () => {
     expect("body" in relay).toBe(false);
   });
 
+  it("joins a base URL with a trailing slash without doubling it", async () => {
+    const calls: FetchCall[] = [];
+    await createChangeRelay({
+      url: "https://api.example/",
+      token: TOKEN,
+      fetchImpl: fakeFetch(502, null, calls),
+    });
+    expect(String(calls[0]?.url)).toBe("https://api.example/v1/changes");
+  });
+
   it("cancels the upstream body and aborts when the upstream answers non-200", async () => {
     const cancelSpy = vi.fn();
     const body = new ReadableStream<Uint8Array>({

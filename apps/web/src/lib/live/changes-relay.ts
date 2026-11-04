@@ -82,7 +82,7 @@ export async function createChangeRelay(
 
   let upstream: Response;
   try {
-    upstream = await fetchImpl(`${url}/v1/changes`, {
+    upstream = await fetchImpl(`${url.replace(/\/+$/, "")}/v1/changes`, {
       headers,
       cache: "no-store",
       signal: abort.signal,

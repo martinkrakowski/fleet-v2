@@ -353,14 +353,14 @@ function gateKey(): string {
   return built.key;
 }
 
-function ciKey(): string {
+function ciKey(head12: string = HEAD12_A): string {
   const built = buildLaneRunStepKey({
     runId: RUN_ID,
     round: 0,
     step: 'ci',
     seatIndex: 0,
     attemptOrdinal: null,
-    head12: HEAD12_A,
+    head12,
     retry: null,
   });
   expect(built.ok).toBe(true);
@@ -3293,6 +3293,40 @@ describe('AdvanceLaneRunUseCase CI-red fix round (GB4)', () => {
     expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
     expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
     expect(harness.parkNoticeRequests).toHaveLength(0);
+  });
+
+  it('a pending ci intent whose head no longer matches the facts is overtaken, never journalled ci-failed', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    const HEAD12_STALE = 'b'.repeat(12);
+    const staleKey = ciKey(HEAD12_STALE);
+    await appendIntent(harness, staleKey, null, NOW);
+    await seedCiRed(harness);
+
+    // The stale intent is reconciled as overtaken under its own key — no ci-failed under it.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'ci',
+      key: staleKey,
+      result: 'overtaken',
+      reasonCode: 'ci-overtaken',
+    });
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === staleKey)).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === staleKey)).toHaveLength(1);
+    expect(entries.some((entry) => entry.kind === 'result' && entry.reasonCode === 'ci-failed')).toBe(false);
+    expect(harness.parkNoticeRequests).toHaveLength(0);
+
+    // The resolved pending intent lets the decider issue a fresh ci act at the current head.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'ci',
+      key: ciKey(),
+      result: 'refused',
+      reasonCode: 'ci-failed',
+    });
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
   });
 
   it('a crash after the ci result resumes only the transition to fixing', async () => {

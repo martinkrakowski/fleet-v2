@@ -35,6 +35,7 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'gate-congested', // KF-30c2: a gate run that exhausted the gate-slot wait limit; the conductor may retry it
   'premerge-success', 'premerge-failure', 'premerge-overtaken', // KS7a-2: the merge hold's `premerge` commit status
   'ci-failed', // GB4: the keyed `ci` step's refusal of the exact head's CI read
+  'ci-overtaken', // GB4 fix round 1: a pending `ci` intent whose head or round no longer matches the facts
 ] as const;
 export type LaneRunResultReasonCode = (typeof LANE_RUN_RESULT_REASON_CODES)[number];
 

@@ -428,6 +428,11 @@ export async function reconcileCollect(ctx: AdvanceStepContext,
  * unknown, a moved head or a pending check is never a CI failure. The
  * result is appended under the pending key — no second intent — and the
  * run enters `fixing`.
+ *
+ * Fix round 1: a pending key whose head or round no longer matches the
+ * current facts is overtaken, never journalled as a CI failure. The stale
+ * key takes an `overtaken` result, the pending intent resolves, and the
+ * decider issues a fresh `ci` act at the current head.
  */
 export async function reconcileCi(ctx: AdvanceStepContext,
   record: LaneRunRecord,
@@ -435,6 +440,20 @@ export async function reconcileCi(ctx: AdvanceStepContext,
   decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
   request: AdvanceLaneRunRequest,
 ): Promise<AdvanceLaneRunResult> {
+  const parsed = parseLaneRunKey(decision.key);
+  const stale = parsed === null
+    || parsed.kind !== 'step'
+    || parsed.step !== 'ci'
+    || parsed.runId !== record.runId
+    || parsed.round !== record.round
+    || parsed.head12 !== gathered.facts.head12;
+  if (stale) {
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'overtaken', 'ci-overtaken');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'overtaken', reasonCode: 'ci-overtaken' };
+  }
   const ci = gathered.facts.ci;
   if (ci !== 'failed') {
     return { outcome: 'waiting', reason: ci === 'pending' ? 'ci-pending' : 'ci-unknown' };

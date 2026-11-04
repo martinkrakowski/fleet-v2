@@ -18,7 +18,7 @@ import type { ReviewReceiptOfKind } from '../../ports/out/ReviewRequestPort.out-
 import type { WorkOrderRecord } from '../../../domain/execution-records.js';
 import { laneRunMergeHold } from '../../../domain/lane-run-transitions.js';
 import type { LaneRunMergeHold } from '../../../domain/lane-run-transitions.js';
-import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, parseLaneRunKey, LANE_RUN_MAX_RETRY } from '../../../domain/lane-run-keys.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
@@ -323,10 +323,64 @@ export async function performPremerge(
   );
 }
 
-/** The `ci` key's final (non-ambiguous) result, or null when it has none. */
+/**
+ * True when `key` already carries a recorded CI failure result (`ci-failed`).
+ * An overtaken (`ci-overtaken`) final result never counts as a recorded CI failure.
+ */
 async function ciFinalResultOf(ctx: AdvanceStepContext, key: string): Promise<boolean> {
   const entries = await ctx.deps.runJournal.listForKey(key);
-  return entries.some((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous');
+  return entries.some((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous' && entry.reasonCode === 'ci-failed');
+}
+
+/**
+ * Resolves the key under which a CI failure should be acted / recorded.
+ *
+ * If `initialKey` already has a recorded `ci-failed` result, returns `already-recorded`
+ * so only the missing transition to `fixing` is performed.
+ * If `initialKey` has no intent yet, returns `fresh`.
+ * If `initialKey` is already spent without a CI failure (e.g. overtaken because CI
+ * previously passed), walks the key family's retry suffixes (`/retry1`..`/retry9`)
+ * to find the first candidate that is either already recorded with `ci-failed` or
+ * completely fresh.
+ */
+async function resolveCiFailureKey(
+  ctx: AdvanceStepContext,
+  initialKey: string,
+): Promise<{ readonly kind: 'already-recorded'; readonly key: string } | { readonly kind: 'fresh'; readonly key: string } | null> {
+  if (await ciFinalResultOf(ctx, initialKey)) {
+    return { kind: 'already-recorded', key: initialKey };
+  }
+  const initialEntries = await ctx.deps.runJournal.listForKey(initialKey);
+  if (!initialEntries.some((entry) => entry.kind === 'intent')) {
+    return { kind: 'fresh', key: initialKey };
+  }
+  const parsed = parseLaneRunKey(initialKey);
+  if (parsed === null || parsed.kind !== 'step') {
+    return null;
+  }
+  for (let retry = (parsed.retry ?? 0) + 1; retry <= LANE_RUN_MAX_RETRY; retry += 1) {
+    const built = buildLaneRunStepKey({
+      runId: parsed.runId,
+      round: parsed.round,
+      step: parsed.step,
+      seatIndex: parsed.seatIndex,
+      attemptOrdinal: parsed.attemptOrdinal,
+      head12: parsed.head12,
+      retry,
+    });
+    if (!built.ok) {
+      continue;
+    }
+    const candidateKey = built.key;
+    if (await ciFinalResultOf(ctx, candidateKey)) {
+      return { kind: 'already-recorded', key: candidateKey };
+    }
+    const candidateEntries = await ctx.deps.runJournal.listForKey(candidateKey);
+    if (!candidateEntries.some((entry) => entry.kind === 'intent')) {
+      return { kind: 'fresh', key: candidateKey };
+    }
+  }
+  return null;
 }
 
 /**
@@ -369,6 +423,11 @@ async function enterFixingAfterCi(ctx: AdvanceStepContext,
  * keyed `refused` / `ci-failed` result and the run enters `fixing`. A key
  * that already carries its final result is never written again: only the
  * missing transition is performed.
+ *
+ * When a prior pending CI intent at the same head was reconciled as
+ * overtaken (e.g. CI passed before a subsequent rerun failed), the spent
+ * key is never reused for a new intent: a fresh retry key (`/retry<n>`)
+ * is journalled instead, and the run enters fixing with that failure source.
  */
 export async function performCiFailure(ctx: AdvanceStepContext,
   record: LaneRunRecord,
@@ -376,14 +435,19 @@ export async function performCiFailure(ctx: AdvanceStepContext,
   decision: ActDecision,
   request: AdvanceLaneRunRequest,
 ): Promise<AdvanceLaneRunResult> {
-  if (await ciFinalResultOf(ctx, decision.key)) {
-    return enterFixingAfterCi(ctx, record, gathered, decision, request);
+  const resolved = await resolveCiFailureKey(ctx, decision.key);
+  if (resolved === null) {
+    return { outcome: 'waiting', reason: 'facts-inconsistent' };
   }
-  const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
+  const keyDecision = { ...decision, key: resolved.key };
+  if (resolved.kind === 'already-recorded') {
+    return enterFixingAfterCi(ctx, record, gathered, keyDecision, request);
+  }
+  const intentRefusal = await appendRunIntent(ctx, request, resolved.key, null);
   if (intentRefusal !== null) {
     return { outcome: 'refused', reason: intentRefusal };
   }
-  return recordCiFailure(ctx, record, gathered, decision, request);
+  return recordCiFailure(ctx, record, gathered, keyDecision, request);
 }
 
 /**

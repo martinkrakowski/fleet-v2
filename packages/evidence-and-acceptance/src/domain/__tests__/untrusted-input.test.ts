@@ -197,3 +197,84 @@ describe('overlapping forged markers (RV1 fix 1)', () => {
     expect(defanged).not.toMatch(/<<<[\p{Cf}\s]*(?:untrusted|enduntrusted)/iu);
   });
 });
+
+describe('git conflict markers must never be matched or produced (RV1 fix 2)', () => {
+  it('ensures neither generated marker line matches /^(<{7}|={7}|>{7}|\\|{7})( |$)/', () => {
+    const gitConflictPattern = /^(<{7}|={7}|>{7}|\|{7})( |$)/;
+    const output = wrapUntrusted({ label: LABEL, text: 'sample diff', nonce: NONCE });
+    const lines = output.split('\n');
+    const openingMarker = lines[0]!;
+    const closingMarker = lines[lines.length - 1]!;
+
+    expect(openingMarker.startsWith('<<<UNTRUSTED')).toBe(true);
+    expect(openingMarker.endsWith('>>>')).toBe(true);
+    expect(openingMarker.startsWith('<<<<')).toBe(false);
+
+    expect(closingMarker.startsWith('<<<END UNTRUSTED')).toBe(true);
+    expect(closingMarker.endsWith('>>>')).toBe(true);
+    expect(closingMarker.startsWith('<<<<')).toBe(false);
+
+    expect(openingMarker).not.toMatch(gitConflictPattern);
+    expect(closingMarker).not.toMatch(gitConflictPattern);
+  });
+
+  it('ensures defang never creates a run of seven < unless the input line did, and real conflict lines stay byte-identical', () => {
+    const realConflictLine = '<'.repeat(7) + ' HEAD';
+    const inputs = [
+      '<<<<END UNTRUSTED',
+      '<'.repeat(7) + 'UNTRUSTED',
+      realConflictLine,
+    ];
+
+    for (const input of inputs) {
+      const inputStartsWithSeven = /^<{7}/.test(input);
+      const defanged = defangMarkerLikeTokens(input);
+      for (const line of defanged.split('\n')) {
+        if (/^<{7}/.test(line)) {
+          expect(inputStartsWithSeven).toBe(true);
+        }
+      }
+
+      const wrapped = wrapUntrusted({ label: 'diff', text: input, nonce: NONCE });
+      for (const line of wrapped.split('\n')) {
+        if (/^<{7}/.test(line)) {
+          expect(inputStartsWithSeven).toBe(true);
+        }
+      }
+    }
+
+    // A real conflict line in a wrapped diff is data and stays byte-identical
+    expect(defangMarkerLikeTokens(realConflictLine)).toBe(realConflictLine);
+
+    const wrappedDiff = wrapUntrusted({ label: 'diff', text: realConflictLine, nonce: NONCE });
+    const innerDiff = wrappedDiff.split('\n').slice(1, -1).join('\n');
+    expect(innerDiff).toBe(realConflictLine);
+  });
+
+  it('preserves a full git conflict block in wrapped diff data byte-identically', () => {
+    const conflictDiff = [
+      '<'.repeat(7) + ' HEAD',
+      'const value = "ours";',
+      '='.repeat(7),
+      'const value = "theirs";',
+      '>'.repeat(7) + ' branch',
+    ].join('\n');
+
+    expect(defangMarkerLikeTokens(conflictDiff)).toBe(conflictDiff);
+
+    const wrapped = wrapUntrusted({ label: 'diff', text: conflictDiff, nonce: NONCE });
+    const inner = wrapped.split('\n').slice(1, -1).join('\n');
+    expect(inner).toBe(conflictDiff);
+
+    const inputLines = conflictDiff.split('\n');
+    const outputLines = wrapped.split('\n').slice(1, -1);
+    for (let index = 0; index < outputLines.length; index += 1) {
+      const outputLine = outputLines[index]!;
+      const inputLine = inputLines[index]!;
+      if (/^<{7}/.test(outputLine)) {
+        expect(/^<{7}/.test(inputLine)).toBe(true);
+      }
+    }
+  });
+});
+

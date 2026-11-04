@@ -233,6 +233,59 @@ describe('lintBrief', () => {
     expect(result.findings).toEqual([]);
   });
 
+  it('does not let prose ending in the label word satisfy the commit item', () => {
+    const brief = [
+      '# File list',
+      '- packages/a.ts',
+      '# Commands',
+      'yarn build',
+      '# Tier',
+      '1',
+      '# Size',
+      'about 45 minutes',
+      'Avoid commit.',
+      '# Validity',
+      'base branch: main',
+      '## Hard to undo',
+      'None',
+      '## Assumptions',
+      'Assume X',
+      '## Challenge this',
+      'Challenge Y',
+    ].join('\n');
+    const result = lintBrief(brief);
+    expect(result.ok).toBe(false);
+    expect(result.findings).toEqual([{ rule: 'missing-commit-line', label: 'Commit' }]);
+  });
+
+  it('does not let imperative prose satisfy the commit item', () => {
+    for (const prose of ['Please commit.', 'Don\'t commit.', 'Never commit.']) {
+      const brief = [
+        '# File list',
+        '- packages/a.ts',
+        '# Commands',
+        'yarn build',
+        '# Tier',
+        '1',
+        '# Size',
+        'about 45 minutes',
+        prose,
+        '# Validity',
+        'base branch: main',
+        '## Hard to undo',
+        'None',
+        '## Assumptions',
+        'Assume X',
+        '## Challenge this',
+        'Challenge Y',
+      ].join('\n');
+      expect(lintBrief(brief).findings).toContainEqual({
+        rule: 'missing-commit-line',
+        label: 'Commit',
+      });
+    }
+  });
+
   it('accepts the compact tier/size/commit authoring line', () => {
     const brief = [
       '# File list',

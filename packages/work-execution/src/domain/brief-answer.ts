@@ -200,8 +200,9 @@ function sectionHasBody(headings: readonly Heading[], lines: readonly string[], 
  * label (case-insensitive) followed by a colon or whitespace and a value, as
  * in `Tier: 1`, `Size: about 45 minutes`, or the compact authoring line
  * `Tier 1. Size: about 45 minutes, one commit.` — where the commit item
- * appears as a phrase ending in the label word. A bare label with no value
- * does not count.
+ * appears as a phrase ending in the label word and carrying a quantity value
+ * (a number or a quantifier word), so bare prose like `Avoid commit.` never
+ * satisfies the item. A bare label with no value does not count.
  */
 function lineIsInlineItem(rawLine: string, label: string): boolean {
   const content = rawLine.replace(/^#{0,6}\s*/, '').trim();
@@ -217,8 +218,10 @@ function lineIsInlineItem(rawLine: string, label: string): boolean {
   if (new RegExp(`(^|\\s)${word}\\s+\\S`, 'i').test(content)) {
     return true;
   }
-  // `one commit.` — a phrase ending in the label word.
-  return new RegExp(`(^|\\s)\\S+\\s+${word}[.!?]*\\s*$`, 'i').test(content);
+  // `one commit.` — a phrase ending in the label word whose value is a
+  // quantity (a number or a quantifier word), never a bare prose mention
+  // like `Avoid commit.`.
+  return new RegExp(`(^|\\s)(?:one|single|an|a|\\d+)\\s+${word}[.!?]*\\s*$`, 'i').test(content);
 }
 
 /**

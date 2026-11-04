@@ -46,6 +46,7 @@ function seatModel(reason: string): DoctorProbes {
       candidates: ['/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/usr/bin/gh'],
     }),
     seatProbe: async () => result,
+    serverProbe: async () => ({ outcome: 'pass', reason: 'the opencode server answered' }),
   };
 }
 

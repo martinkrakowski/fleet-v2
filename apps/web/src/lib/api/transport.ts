@@ -5,6 +5,8 @@
  * never read here.
  */
 
+import { describeFailure } from "./describe-failure";
+
 /** Status the API boundary returns for a use case that is not implemented. */
 export const NOT_IMPLEMENTED_STATUS = 501;
 
@@ -20,10 +22,7 @@ export interface LiveEndpointResult<T> {
   readonly fallbackReason: string | null;
 }
 
-function apiResult<T>(
-  status: number,
-  data: T,
-): LiveEndpointResult<T> {
+function apiResult<T>(status: number, data: T): LiveEndpointResult<T> {
   return { source: "api", status, data, fallbackReason: null };
 }
 
@@ -38,28 +37,6 @@ function fixtureFallback<T>(
 /** Trailing slashes on `baseUrl` must not double up with the path slash. */
 function endpointUrl(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
-}
-
-const PLAIN_WORDS = /^[A-Za-z ]{1,80}$/;
-const ERROR_CODE = /^[A-Z][A-Z0-9_]{1,40}$/;
-
-/**
- * A host-free reason for a failed request: the raw message can name the API host (an ENOTFOUND
- * message, a URL), and this text reaches the page. Keep only a plain-words message ("fetch failed")
- * and the system error code (ENOTFOUND, ECONNREFUSED), never the original text.
- */
-function describeFailure(error: unknown): string {
-  if (!(error instanceof Error)) {
-    return "unknown error";
-  }
-  const words = PLAIN_WORDS.test(error.message) ? error.message : "request failed";
-  const cause = (error as { readonly cause?: unknown }).cause;
-  const code =
-    typeof cause === "object" && cause !== null ? (cause as { readonly code?: unknown }).code : undefined;
-  if (typeof code === "string" && ERROR_CODE.test(code)) {
-    return words + " (" + code + ")";
-  }
-  return words;
 }
 
 function isAbortError(error: unknown): boolean {
@@ -135,11 +112,7 @@ export function createEndpointReader(
     fallback: T,
   ): Promise<LiveEndpointResult<T>> {
     if (baseUrl.length === 0) {
-      return fixtureFallback(
-        null,
-        fallback,
-        "api boundary is not configured",
-      );
+      return fixtureFallback(null, fallback, "api boundary is not configured");
     }
 
     const url = endpointUrl(baseUrl, path);

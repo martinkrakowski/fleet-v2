@@ -498,6 +498,7 @@ function fakeProbes(
       calls?.push("seatProbe");
       return outcome;
     },
+    serverProbe: async () => ({ outcome: "pass", reason: "the opencode server answered" }),
   };
 }
 

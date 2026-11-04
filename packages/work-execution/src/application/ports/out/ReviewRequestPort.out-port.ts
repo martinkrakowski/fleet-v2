@@ -28,6 +28,7 @@ export interface ReviewRequestFinding {
   readonly summary: string;
   readonly filePath: string | null;
   readonly line: number | null;
+  readonly state?: string;
 }
 
 export interface ReviewReceiptSummary {

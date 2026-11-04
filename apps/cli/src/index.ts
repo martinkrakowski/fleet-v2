@@ -99,7 +99,10 @@ function isPerLineResult(result: unknown): result is CliPerLineResult {
   return (
     typeof result === 'object' &&
     result !== null &&
-    Array.isArray((result as { lines?: unknown }).lines)
+    Array.isArray((result as { lines?: unknown }).lines) &&
+    (result as { lines: readonly unknown[] }).lines.every(
+      (line) => typeof line === 'string',
+    )
   );
 }
 
@@ -686,7 +689,7 @@ Commands:
   report weekly
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
-  attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared
+  attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared|explain
   forge execute
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede

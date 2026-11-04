@@ -608,8 +608,8 @@ function reviewResultKeysAtHead(
  * Why the run is `fixing`: the LATEST final result entry of this run whose
  * key's step sent it there — a `brief-check`/`code-review` result with reason
  * `review-failed` (a review source), a `gate` result with reason `gate-failed`
- * (a gate source), or a K6 `ci`/`pre-merge` failure (a gate-shaped source with
- * its reason code). `ci` has no key step yet, so only `pre-merge` counts here.
+ * (a gate source), a K6 `pre-merge` failure or the GB4 keyed `ci` failure (a
+ * gate-shaped source with its reason code).
  * AR1/F61 add the review-blocked acceptance rejection: an `accept` result with
  * reason `acceptance-rejected` and detail `review-findings` (AR1), or a null
  * detail (F61, a pre-AR1 rejection classified from the assessment), hands the
@@ -641,6 +641,11 @@ function fixingFailureSourceOf(
       return { key: entry.key, acceptHead12: null, source: 'review', reasonCode: entry.reasonCode };
     }
     if (parsed.step === 'gate' && entry.reasonCode === 'gate-failed') {
+      return { key: entry.key, acceptHead12: null, source: 'gate', reasonCode: entry.reasonCode };
+    }
+    if (parsed.step === 'ci' && entry.reasonCode === 'ci-failed') {
+      // GB4: a CI failure is a gate-shaped source with its bare reason code;
+      // the gate-predicate refusal (gate-failed only) never fires for it.
       return { key: entry.key, acceptHead12: null, source: 'gate', reasonCode: entry.reasonCode };
     }
     if (parsed.step === 'pre-merge' && entry.reasonCode !== null) {

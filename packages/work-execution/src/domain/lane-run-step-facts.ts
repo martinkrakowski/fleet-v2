@@ -34,6 +34,8 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'merge-off', 'notice-recorded', 'notice-refused', 'no-in-scope-findings',
   'gate-congested', // KF-30c2: a gate run that exhausted the gate-slot wait limit; the conductor may retry it
   'premerge-success', 'premerge-failure', 'premerge-overtaken', // KS7a-2: the merge hold's `premerge` commit status
+  'ci-failed', // GB4: the keyed `ci` step's refusal of the exact head's CI read
+  'ci-overtaken', // GB4 fix rounds 1-2: a pending `ci` intent whose head/round moved, or whose CI has since passed
 ] as const;
 export type LaneRunResultReasonCode = (typeof LANE_RUN_RESULT_REASON_CODES)[number];
 
@@ -389,6 +391,36 @@ export function laneRunRecordedSeatAdvance(
     return null;
   }
   return parsed.step;
+}
+
+/**
+ * GB4: true when this run has a final `ci` result with reason `ci-failed`
+ * at `head12` in `round` — the CI failure is already journalled and only the
+ * transition to `fixing` is left. Pure; never throws.
+ */
+export function laneRunCiFailureRecorded(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  round: number,
+  head12: string | null,
+): boolean {
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId) || head12 === null) {
+    return false;
+  }
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index]!;
+    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.runId !== runId) {
+      continue;
+    }
+    if (parsed.step === 'ci' && entry.reasonCode === 'ci-failed' && parsed.round === round && parsed.head12 === head12) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** The dispatch intent time of an attempt (its recordedAtIso), or null. */

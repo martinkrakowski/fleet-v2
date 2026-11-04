@@ -251,6 +251,10 @@ function runOpencode(
     ...(seat.variant !== undefined ? { variant: seat.variant } : {}),
     resolveReviewDir: () => location.worktreePath,
     readHead: () => location.readHead(),
+    // F68: a kind review judges the change, so the location supplies the
+    // base..head diff; an unreadable or over-cap diff refuses the review.
+    baseCommit: location.baseCommit,
+    readDiff: (fromSha: string, toSha: string) => location.readDiff(fromSha, toSha),
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     ...(options.ocmSpawn !== undefined ? { spawn: options.ocmSpawn } : {}),
     ...(options.makeNonce !== undefined ? { makeNonce: options.makeNonce } : {}),

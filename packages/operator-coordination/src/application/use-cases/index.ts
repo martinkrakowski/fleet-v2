@@ -20,6 +20,7 @@ export * from "./ListOrchestratorSessionsUseCase.use-case.js";
 export * from "./ListOwnerItemsUseCase.use-case.js";
 export * from "./ListOwnerQuestionsUseCase.use-case.js";
 export * from "./ListProjectProfilesUseCase.use-case.js";
+export * from "./NotifyOwnerUseCase.use-case.js";
 export * from "./policy-grant-cancel.js";
 export * from "./profile-write-checks.js";
 export * from "./PublishProjectObservationUseCase.use-case.js";

@@ -2,7 +2,8 @@
  * The idempotency keys of plan §3.2 and §3.8: step keys
  * `<runId>/r<round>/<step>/<seatIndex>[/a<n>][@<head12>][/retry<n>]` (including
  * `reconcile`; `collect` now always carries `/a<n>`, the collected attempt's
- * ordinal, and its legacy ordinal-less form `<runId>/r<round>/collect/<seatIndex>`
+ * ordinal, and may also carry `/retry<n>` after it (collect is not a one-way
+ * step), while its legacy ordinal-less form `<runId>/r<round>/collect/<seatIndex>`
  * is still read but no longer buildable), the control keys `<runId>/stop@<via>` (graceful) and
  * `<runId>/stop-force@<via>` (force), with via web or cli and the mode read from
  * the key, `<runId>/park/<n>/resume@<via>` (with via web or cli), the request channel's
@@ -520,7 +521,10 @@ function parseStepKeySegments(segments: string[], key: string): ParsedLaneRunKey
   if (step === 'collect') {
     // The collect step's own branch, before the generic attempt-rule branches:
     // since F87 collect keys carry `/a<n>`, but the legacy ordinal-less form
-    // (and its legacy `retry<n>` tail) is still read for older journals.
+    // (and its legacy `retry<n>` tail) is still read for older journals. Collect
+    // is not a one-way step, so the builder also forms a key carrying both
+    // `/a<n>` and `/retry<m>`; the parser must read that combined form too, or a
+    // built key could never be journaled.
     if (!SEAT_INDEX_TEXT_PATTERN.test(segments[3])) {
       return null;
     }
@@ -539,6 +543,14 @@ function parseStepKeySegments(segments: string[], key: string): ParsedLaneRunKey
       } else {
         return null;
       }
+    } else if (segments.length === 6) {
+      const attemptTail = segments[4];
+      const retryTail = segments[5];
+      if (!ATTEMPT_SEGMENT_PATTERN.test(attemptTail) || !RETRY_SEGMENT_PATTERN.test(retryTail)) {
+        return null;
+      }
+      attemptOrdinal = Number(attemptTail.slice(1));
+      retry = Number(retryTail.slice(5));
     } else {
       return null;
     }
@@ -765,7 +777,7 @@ export function parseLaneRunKey(key: unknown): ParsedLaneRunKey | null {
   if (segments.length === 4 && segments[1] === 'park') {
     return parseResumeKeySegments(segments, key);
   }
-  if (segments.length === 4 || segments.length === 5) {
+  if (segments.length === 4 || segments.length === 5 || segments.length === 6) {
     return parseStepKeySegments(segments, key);
   }
   return null;

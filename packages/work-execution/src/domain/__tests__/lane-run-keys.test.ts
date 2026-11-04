@@ -860,6 +860,9 @@ describe('parseLaneRunKey', () => {
     `${RUN_ID}/r1/park/0@0123456789ab`,
     `${RUN_ID}/r1/merge/0@0123456789ab/retry1`,
     `${RUN_ID}/r1/gate/0@0123456789ab/retry0`,
+    `${RUN_ID}/r1/collect/0/a1/retry0`,
+    `${RUN_ID}/r1/collect/0/a0/retry1`,
+    `${RUN_ID}/r1/collect/0/a1/extra`,
     `${RUN_ID}/park/0/resume@web`,
     `${RUN_ID}/park/01/resume@web`,
     `${RUN_ID}/park/1/extra/resume@web`,
@@ -916,6 +919,19 @@ describe('parseLaneRunKey', () => {
     expect(parseLaneRunKey(`${RUN_ID}/r1/collect/0/a1`)).toEqual({
       kind: 'step', runId: RUN_ID, round: 1, step: 'collect', seatIndex: 0, attemptOrdinal: 1, head12: null, retry: null,
     });
+  });
+
+  it('parses a collect key that carries both the attempt ordinal and a retry', () => {
+    const parts: LaneRunStepKeyParts = {
+      runId: RUN_ID, round: 1, step: 'collect', seatIndex: 0, attemptOrdinal: 1, head12: null, retry: 1,
+    };
+    const built = buildLaneRunStepKey(parts);
+    expect(built).toEqual({ ok: true, key: `${RUN_ID}/r1/collect/0/a1/retry1` });
+    if (!built.ok) throw new Error('unreachable: collect retry key must build');
+    expect(parseLaneRunKey(built.key)).toEqual({ kind: 'step', ...parts });
+    const parsed = parseLaneRunKey(built.key);
+    if (parsed === null || parsed.kind !== 'step') throw new Error('unreachable: parsed collect retry key');
+    expect(buildLaneRunStepKey(parsed)).toEqual(built);
   });
 });
 

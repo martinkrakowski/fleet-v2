@@ -111,55 +111,75 @@ export async function createChangeRelay(
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
 
-  const body = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const enqueueSignal = (signal: ChangeSignal | null) => {
-        if (signal !== null) {
-          controller.enqueue(encoder.encode(toServerSentEvent(signal)));
+  let buffer = "";
+  let finished = false;
+  // Every complete line in the buffer becomes a frame; returns whether any frame was enqueued.
+  const drainLines = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+  ): boolean => {
+    let enqueued = false;
+    let newline = buffer.indexOf("\n");
+    while (newline >= 0) {
+      const signal = parseChangeSignal(buffer.slice(0, newline));
+      buffer = buffer.slice(newline + 1);
+      if (signal !== null) {
+        controller.enqueue(encoder.encode(toServerSentEvent(signal)));
+        enqueued = true;
+      }
+      newline = buffer.indexOf("\n");
+    }
+    return enqueued;
+  };
+  const closeQuietly = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+  ) => {
+    try {
+      controller.close();
+    } catch {
+      // Already closed by a downstream cancel; nothing to report.
+    }
+  };
+
+  // Pull-based: the upstream is read only when the consumer asks for more, so a slow or stalled browser applies
+  // backpressure to the API stream instead of growing an unbounded queue of frames.
+  const body = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        if (finished) {
+          closeQuietly(controller);
+          return;
         }
-      };
-      const closeQuietly = () => {
-        try {
-          controller.close();
-        } catch {
-          // Already closed by a downstream cancel; nothing to report.
-        }
-      };
-      const readUpstream = async (): Promise<void> => {
-        let buffer = "";
         try {
           for (;;) {
             const { done, value } = await reader.read();
             if (done) {
-              break;
+              buffer += decoder.decode() + "\n";
+              drainLines(controller);
+              finished = true;
+              closeQuietly(controller);
+              return;
             }
             buffer += decoder.decode(value, { stream: true });
-            let newline = buffer.indexOf("\n");
-            while (newline >= 0) {
-              const line = buffer.slice(0, newline);
-              buffer = buffer.slice(newline + 1);
-              enqueueSignal(parseChangeSignal(line));
-              newline = buffer.indexOf("\n");
+            if (drainLines(controller)) {
+              return;
             }
           }
-          buffer += decoder.decode();
-          enqueueSignal(parseChangeSignal(buffer));
-          closeQuietly();
         } catch {
-          // The upstream ended or errored: close, never error. The browser
-          // reconnects and re-reads.
-          closeQuietly();
+          // The upstream ended or errored: close, never error. The browser reconnects and re-reads.
+          finished = true;
+          closeQuietly(controller);
         }
-      };
-      void readUpstream();
+      },
+      cancel() {
+        finished = true;
+        abort.abort();
+        void reader.cancel().catch(() => {
+          // The upstream is going away either way; nothing to report.
+        });
+      },
     },
-    cancel() {
-      abort.abort();
-      void reader.cancel().catch(() => {
-        // The upstream is going away either way; nothing to report.
-      });
-    },
-  });
+    { highWaterMark: 1 },
+  );
 
   return { status: "streaming", body };
 }

@@ -41,9 +41,7 @@ function fakeFetch(
   }) as typeof fetch;
 }
 
-async function readFrames(
-  body: ReadableStream<Uint8Array>,
-): Promise<string[]> {
+async function readFrames(body: ReadableStream<Uint8Array>): Promise<string[]> {
   const text = await new Response(body).text();
   return text.split("\n\n").filter((frame) => frame.length > 0);
 }
@@ -91,12 +89,16 @@ describe("createChangeRelay", () => {
     }
     const frames = await readFrames(relay.body);
     expect(frames).toHaveLength(2);
-    expect(frames[0]).toContain('data: {"seq":12,"kind":"attempt","id":"att_1"}');
-    expect(frames[1]).toContain('data: {"seq":12,"kind":"attempt","id":"att_1"}');
-    expect(calls[0]?.url.endsWith("/v1/changes")).toBe(true);
-    expect((calls[0]?.init?.headers as Record<string, string>)?.authorization).toBe(
-      `Bearer ${TOKEN}`,
+    expect(frames[0]).toContain(
+      'data: {"seq":12,"kind":"attempt","id":"att_1"}',
     );
+    expect(frames[1]).toContain(
+      'data: {"seq":12,"kind":"attempt","id":"att_1"}',
+    );
+    expect(calls[0]?.url.endsWith("/v1/changes")).toBe(true);
+    expect(
+      (calls[0]?.init?.headers as Record<string, string>)?.authorization,
+    ).toBe(`Bearer ${TOKEN}`);
   });
 
   it("answers unavailable with the status named for a non-200 answer", async () => {
@@ -112,6 +114,42 @@ describe("createChangeRelay", () => {
     }
     expect(relay.reason).toContain("501");
     expect("body" in relay).toBe(false);
+  });
+
+  it("reads the upstream only as fast as the consumer pulls (backpressure)", async () => {
+    let pulls = 0;
+    const line = new TextEncoder().encode(
+      JSON.stringify({ seq: 1, kind: "run", id: "run-a" }) + "\n",
+    );
+    const upstreamBody = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          pulls += 1;
+          if (pulls > 100) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(line);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const calls: FetchCall[] = [];
+    const relay = await createChangeRelay({
+      url: "http://127.0.0.1:3001",
+      token: TOKEN,
+      fetchImpl: fakeFetch(200, upstreamBody, calls),
+    });
+    expect(relay.status).toBe("streaming");
+    if (relay.status !== "streaming") {
+      throw new Error("relay did not stream");
+    }
+    const reader = relay.body.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(pulls).toBeLessThan(5);
+    await reader.cancel();
   });
 
   it("joins a base URL with a trailing slash without doubling it", async () => {

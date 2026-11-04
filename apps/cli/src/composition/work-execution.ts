@@ -29,10 +29,12 @@ import {
   GatePredicateAdapter,
   ProcessTreeTerminationAdapter,
   ImportLanePlanUseCase,
+  ImportTrainStateUseCase,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
   LanePlanRepositoryAdapter,
+  LegacyTrainStateReadAdapter,
   ListMergeQueueUseCase,
   ListUnregisteredProjectsUseCase,
   LocalExecutor,
@@ -513,6 +515,12 @@ export function composeExecution(input: ComposeExecutionInput) {
   const mergeQueueRepository = new MergeQueueRepositoryAdapter({ stateDir });
   const enqueueMerge = new EnqueueMergeUseCase({ queue: mergeQueueRepository });
   const listMergeQueue = new ListMergeQueueUseCase({ queue: mergeQueueRepository });
+  const importTrainState = new ImportTrainStateUseCase({
+    legacyState: new LegacyTrainStateReadAdapter(),
+    queue: mergeQueueRepository,
+    mintUlid: () => newUlid(),
+    nowIso: () => new Date().toISOString(),
+  });
 
   // WB4a: the lane-plan store — one adapter is both stores (in-memory when
   // stateDir is omitted, lane-plans.json otherwise). Its change signal
@@ -650,6 +658,7 @@ export function composeExecution(input: ComposeExecutionInput) {
     mergeQueueRepository,
     enqueueMerge,
     listMergeQueue,
+    importTrainState,
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({
       attemptRepo: attemptRepository,
       workOrderRepo: workOrderRepository,

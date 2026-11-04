@@ -179,17 +179,19 @@ function acceptanceRetryOf(
 }
 
 /**
- * Why the latest accept result at `head12` rejected (AR1): `'review-findings'`
- * only when that final result is `acceptance-rejected` with detail
- * `review-findings`; every other case, including a missing head, is `'other'`.
+ * Why the latest accept result at `head12` rejected, read from the journal only
+ * (F61): `'review-findings'` when that final result is `acceptance-rejected`
+ * with detail `review-findings` (AR1), `'unclassified'` when it is
+ * `acceptance-rejected` with any other detail (`null` for a pre-AR1 result),
+ * and `'none'` when there is no final `acceptance-rejected` result at the head.
  */
 function acceptanceRejectionOf(
   entries: readonly LaneRunJournalEntryRecord[],
   runId: string,
   head12: string | null,
-): AcceptanceFacts['acceptanceRejection'] {
+): 'none' | 'review-findings' | 'unclassified' {
   if (head12 === null) {
-    return 'other';
+    return 'none';
   }
   let latestIntentKey: string | null = null;
   for (const entry of entries) {
@@ -203,13 +205,83 @@ function acceptanceRejectionOf(
     latestIntentKey = entry.key;
   }
   if (latestIntentKey === null) {
-    return 'other';
+    return 'none';
   }
   const final = finalResultOfKey(entries, latestIntentKey);
-  if (final !== null && final.reasonCode === 'acceptance-rejected' && final.detail === 'review-findings') {
-    return 'review-findings';
+  if (final === null || final.reasonCode !== 'acceptance-rejected') {
+    return 'none';
   }
-  return 'other';
+  return final.detail === 'review-findings' ? 'review-findings' : 'unclassified';
+}
+
+/**
+ * F61: whether the review evidence at the exact head names review work — a
+ * found `brief-check` or `code-review` receipt whose verdict is `failed`, or
+ * that carries at least one finding (an unresolved review finding). A missing
+ * port, a `not-found`/`unavailable` receipt or a throwing lookup contributes
+ * nothing; a throwing lookup skips that kind, like `reviewFindingsDetailOf`.
+ */
+async function reviewFindingsAtHead(
+  ctx: AdvanceStepContext,
+  attemptId: string,
+  headSha: string,
+): Promise<boolean> {
+  const reviewRequest = ctx.deps.reviewRequest;
+  if (reviewRequest === undefined) {
+    return false;
+  }
+  for (const kind of ['brief-check', 'code-review'] as const) {
+    try {
+      const found = await reviewRequest.findLatestReceiptOfKind({ attemptId, candidateHeadSha: headSha, kind });
+      if (found.outcome === 'found' && (found.receipt.verdict === 'failed' || found.receipt.findings.length > 0)) {
+        return true;
+      }
+    } catch {
+      // An unreadable receipt lookup skips that kind; it never fails the read.
+    }
+  }
+  return false;
+}
+
+/**
+ * F61: classify a pre-AR1 (null-detail) acceptance rejection from the
+ * assessment at the head. The receipts-only assessment is read again at the
+ * exact head (it never stores acceptance and never reads the forge); every
+ * failure path — absent port, a throw, any outcome other than `rejected`,
+ * absent or empty blockers, any blocker kind other than `other` — fails closed
+ * to `'other'`. Only when every blocker is `other` does the review evidence at
+ * the head decide: review work there makes the rejection `review-findings`.
+ * Blocker and finding texts are never read or compared.
+ */
+async function classifyRejectionFromAssessment(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+): Promise<AcceptanceFacts['acceptanceRejection']> {
+  const assessment = ctx.deps.acceptanceAssessment;
+  if (assessment === undefined || latest.artifacts === null) {
+    return 'other';
+  }
+  let outcome: Awaited<ReturnType<typeof assessment.assessHeadReceipts>>;
+  try {
+    outcome = await assessment.assessHeadReceipts({
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      candidateHeadSha: latest.artifacts.headCommit,
+      policyRevision: record.runPolicyRevision,
+    });
+  } catch {
+    return 'other';
+  }
+  if (outcome.outcome !== 'rejected') {
+    return 'other';
+  }
+  const blockers = outcome.blockerDetails;
+  if (blockers === undefined || blockers.length === 0 || blockers.some((blocker) => blocker.kind !== 'other')) {
+    return 'other';
+  }
+  const reviewFindings = await reviewFindingsAtHead(ctx, latest.id, latest.artifacts.headCommit);
+  return reviewFindings ? 'review-findings' : 'other';
 }
 
 /** The head12 of the LATEST `accepted` accept result's key over all heads; null without one. */
@@ -369,7 +441,23 @@ export async function acceptanceFactsOf(
 ): Promise<AcceptanceFacts> {
   const acceptance = acceptanceOf(entries, record.runId, head12);
   const acceptanceRetry = acceptanceRetryOf(entries, record.runId, head12);
-  const acceptanceRejection = acceptanceRejectionOf(entries, record.runId, head12);
+  // F61: the journal-only read is three-valued; a pre-AR1 (`unclassified`)
+  // rejection is classified from the assessment at the head, only in
+  // `accepting` — the only state whose decider rule reads this fact — and
+  // never while halted. Every failed read parks as today (`other`).
+  const rejectionRead = acceptanceRejectionOf(entries, record.runId, head12);
+  let acceptanceRejection: AcceptanceFacts['acceptanceRejection'] = 'other';
+  if (rejectionRead === 'review-findings') {
+    acceptanceRejection = 'review-findings';
+  } else if (
+    rejectionRead === 'unclassified' &&
+    state === 'accepting' &&
+    !halted &&
+    latest !== null &&
+    latest.artifacts !== null
+  ) {
+    acceptanceRejection = await classifyRejectionFromAssessment(ctx, record, latest);
+  }
   const acceptedHead12 = acceptedHead12Of(entries, record.runId);
   let preMerge: AcceptanceFacts['preMerge'] = 'none';
   let ci: AcceptanceFacts['ci'] = 'unknown';

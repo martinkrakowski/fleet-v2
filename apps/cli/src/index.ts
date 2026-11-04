@@ -634,7 +634,8 @@ doctor prints one check per line (JSON documents with --json). Without
 doctor --host <name> prints only that host's probe subset.
 
 The hosts group manages the installation file's named hosts: list, add,
-edit and remove, each write confirmed and compare-and-swapped.
+edit and remove, each write confirmed and compare-and-swapped, and shows or
+installs the user-scope daemon scheduler units from the daemon section.
 
 The seats group lists the installation file's seats, checks them with the
 loader and the doctor's seat probes (seats list, seats check), and shows or
@@ -676,7 +677,7 @@ JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
 Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
-  hosts list|add|edit|remove
+  hosts list|add|edit|remove|daemon
   seats list|check|free-tier [status|on|off] [--yes]
   policy auto-merge [status|on|off] [--allow-high-risk true|false] [--on-blocked ask-owner|hold] [--yes]
   projects list|show|probe|add|adopt|edit|retire

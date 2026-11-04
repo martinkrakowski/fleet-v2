@@ -18,7 +18,9 @@ import type {
   LiveTailContent,
   PolicySection,
   ResolvedConductorPolicy,
+  ResolvedConductorReaperDiskPolicy,
   ResolvedConductorReaperPolicy,
+  ResolvedConductorReaperWorktreePolicy,
   SeatModel,
   SeatRole,
 } from './types.js';
@@ -351,13 +353,16 @@ export function resolveAutoMergePolicy(policy: PolicySection | undefined): AutoM
   });
 }
 
-/** Repair kinds in canonical order; the first four are record-only (D14). */
+/** Repair kinds in canonical order; the first four are record-only (D14); `merged-worktree` and
+ * `orphan-session` are destructive (D17). `orphan-session` stays last. */
 export const CONDUCTOR_REAPER_REPAIR_KINDS: readonly ConductorReaperRepairKind[] = Object.freeze([
-  'dead-attempt', 'leaked-slot', 'stale-stop', 'stale-attention', 'orphan-session',
+  'dead-attempt', 'leaked-slot', 'stale-stop', 'stale-attention', 'merged-worktree', 'orphan-session',
 ]);
 
-/** The one destructive repair kind: an opt-in per installation, never a default (D14). */
-export const CONDUCTOR_DESTRUCTIVE_REPAIR_KINDS: readonly ConductorReaperRepairKind[] = Object.freeze(['orphan-session']);
+/** The destructive repair kinds: an opt-in per installation, never a default (D14, D17). */
+export const CONDUCTOR_DESTRUCTIVE_REPAIR_KINDS: readonly ConductorReaperRepairKind[] = Object.freeze([
+  'orphan-session', 'merged-worktree',
+]);
 
 /** Inclusive integer bounds per number, in minutes (K2 brief, decision 4). */
 export const CONDUCTOR_MINUTE_BOUNDS = Object.freeze({
@@ -375,7 +380,37 @@ const CONDUCTOR_REAPER_KEYS: readonly string[] = [
   'graceMinutes',
   'staleStopMinutes',
   'repairs',
+  'worktrees',
+  'disk',
 ];
+
+const CONDUCTOR_REAPER_WORKTREE_KEYS: readonly string[] = [
+  'retentionHours',
+  'maxRemovalsPerPass',
+  'passBudgetSeconds',
+];
+
+const CONDUCTOR_REAPER_DISK_KEYS: readonly string[] = [
+  'minFreePercent',
+  'clearFreePercent',
+];
+
+/** Inclusive integer bounds for `policy.conductor.reaper.worktrees` (KWp; the plan fixes none). */
+export const CONDUCTOR_REAPER_WORKTREE_BOUNDS: Readonly<
+  Record<string, Readonly<{ min: number; max: number }>>
+> = Object.freeze({
+  retentionHours: Object.freeze({ min: 1, max: 8760 }),
+  maxRemovalsPerPass: Object.freeze({ min: 1, max: 1000 }),
+  passBudgetSeconds: Object.freeze({ min: 1, max: 3600 }),
+});
+
+/** Inclusive integer bounds for `policy.conductor.reaper.disk` (KWp; the plan fixes none). */
+export const CONDUCTOR_REAPER_DISK_BOUNDS: Readonly<
+  Record<string, Readonly<{ min: number; max: number }>>
+> = Object.freeze({
+  minFreePercent: Object.freeze({ min: 0, max: 100 }),
+  clearFreePercent: Object.freeze({ min: 0, max: 100 }),
+});
 
 function readConductorRepairs(
   value: unknown,
@@ -388,6 +423,7 @@ function readConductorRepairs(
     'leaked-slot': false,
     'stale-stop': false,
     'stale-attention': false,
+    'merged-worktree': false,
     'orphan-session': false,
   };
   for (const key of Object.keys(value)) {
@@ -404,13 +440,90 @@ function readConductorRepairs(
   return Object.freeze(repairs);
 }
 
+function readConductorWorktrees(
+  value: unknown,
+): ResolvedConductorReaperWorktreePolicy | undefined {
+  if (!isPlainRecord(value) || hasUnknownKeys(value, CONDUCTOR_REAPER_WORKTREE_KEYS)) {
+    return undefined;
+  }
+  const retentionHours = readBoundedInteger(
+    readOwnDataProperty(value, 'retentionHours'),
+    CONDUCTOR_REAPER_WORKTREE_BOUNDS.retentionHours,
+  );
+  if (Object.hasOwn(value, 'retentionHours') && retentionHours === undefined) {
+    return undefined;
+  }
+  const maxRemovalsPerPass = readBoundedInteger(
+    readOwnDataProperty(value, 'maxRemovalsPerPass'),
+    CONDUCTOR_REAPER_WORKTREE_BOUNDS.maxRemovalsPerPass,
+  );
+  if (Object.hasOwn(value, 'maxRemovalsPerPass') && maxRemovalsPerPass === undefined) {
+    return undefined;
+  }
+  const passBudgetSeconds = readBoundedInteger(
+    readOwnDataProperty(value, 'passBudgetSeconds'),
+    CONDUCTOR_REAPER_WORKTREE_BOUNDS.passBudgetSeconds,
+  );
+  if (Object.hasOwn(value, 'passBudgetSeconds') && passBudgetSeconds === undefined) {
+    return undefined;
+  }
+  return Object.freeze({
+    retentionHours: retentionHours ?? 24,
+    maxRemovalsPerPass: maxRemovalsPerPass ?? 10,
+    passBudgetSeconds: passBudgetSeconds ?? 120,
+  });
+}
+
+function readConductorDisk(value: unknown): ResolvedConductorReaperDiskPolicy | undefined {
+  if (!isPlainRecord(value) || hasUnknownKeys(value, CONDUCTOR_REAPER_DISK_KEYS)) {
+    return undefined;
+  }
+  const minFreePercent = readBoundedInteger(
+    readOwnDataProperty(value, 'minFreePercent'),
+    CONDUCTOR_REAPER_DISK_BOUNDS.minFreePercent,
+  );
+  if (Object.hasOwn(value, 'minFreePercent') && minFreePercent === undefined) {
+    return undefined;
+  }
+  const clearFreePercent = readBoundedInteger(
+    readOwnDataProperty(value, 'clearFreePercent'),
+    CONDUCTOR_REAPER_DISK_BOUNDS.clearFreePercent,
+  );
+  if (Object.hasOwn(value, 'clearFreePercent') && clearFreePercent === undefined) {
+    return undefined;
+  }
+  if ((minFreePercent ?? 15) >= (clearFreePercent ?? 20)) {
+    return undefined;
+  }
+  return Object.freeze({
+    minFreePercent: minFreePercent ?? 15,
+    clearFreePercent: clearFreePercent ?? 20,
+  });
+}
+
 function freshDefaultConductorRepairs(): Readonly<Record<ConductorReaperRepairKind, boolean>> {
   return Object.freeze({
     'dead-attempt': false,
     'leaked-slot': false,
     'stale-stop': false,
     'stale-attention': false,
+    'merged-worktree': false,
     'orphan-session': false,
+  });
+}
+
+function freshDefaultConductorWorktrees(): ResolvedConductorReaperWorktreePolicy {
+  return Object.freeze({
+    retentionHours: 24,
+    maxRemovalsPerPass: 10,
+    passBudgetSeconds: 120,
+  });
+}
+
+function freshDefaultConductorDisk(): ResolvedConductorReaperDiskPolicy {
+  return Object.freeze({
+    minFreePercent: 15,
+    clearFreePercent: 20,
   });
 }
 
@@ -421,6 +534,8 @@ function freshDefaultConductorReaper(): ResolvedConductorReaperPolicy {
     graceMinutes: 5,
     staleStopMinutes: 30,
     repairs: freshDefaultConductorRepairs(),
+    worktrees: freshDefaultConductorWorktrees(),
+    disk: freshDefaultConductorDisk(),
   });
 }
 
@@ -442,7 +557,8 @@ export const DEFAULT_CONDUCTOR_POLICY: ResolvedConductorPolicy = freshDefaultCon
  * The effective conductor policy: the block's own data properties with every absent optional
  * field defaulted, only when every present block is a plain record with only known keys, a
  * boolean `enabled`, and well-formed optional fields (booleans, integers within
- * CONDUCTOR_MINUTE_BOUNDS, only known repair kinds); absent or malformed anywhere is the
+ * CONDUCTOR_MINUTE_BOUNDS / CONDUCTOR_REAPER_WORKTREE_BOUNDS / CONDUCTOR_REAPER_DISK_BOUNDS,
+ * only known repair kinds, and an ordered disk pair); absent or malformed anywhere is the
  * whole default (off, report-only). Always a fresh, deeply frozen object with the keys in
  * canonical order.
  */
@@ -503,12 +619,28 @@ export function resolveConductorPolicy(policy: PolicySection | undefined): Resol
         return freshDefaultConductorPolicy();
       }
     }
+    let worktrees: ResolvedConductorReaperWorktreePolicy | undefined;
+    if (Object.hasOwn(reaperValue, 'worktrees')) {
+      worktrees = readConductorWorktrees(readOwnDataProperty(reaperValue, 'worktrees'));
+      if (worktrees === undefined) {
+        return freshDefaultConductorPolicy();
+      }
+    }
+    let disk: ResolvedConductorReaperDiskPolicy | undefined;
+    if (Object.hasOwn(reaperValue, 'disk')) {
+      disk = readConductorDisk(readOwnDataProperty(reaperValue, 'disk'));
+      if (disk === undefined) {
+        return freshDefaultConductorPolicy();
+      }
+    }
     reaper = Object.freeze({
       enabled: reaperEnabled,
       intervalMinutes: intervalMinutes ?? 10,
       graceMinutes: graceMinutes ?? 5,
       staleStopMinutes: staleStopMinutes ?? 30,
       repairs: repairs ?? freshDefaultConductorRepairs(),
+      worktrees: worktrees ?? freshDefaultConductorWorktrees(),
+      disk: disk ?? freshDefaultConductorDisk(),
     });
   }
   return Object.freeze({

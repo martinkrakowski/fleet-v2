@@ -25,6 +25,29 @@ export function isKnowledgeTriageFlag(value: unknown): value is KnowledgeTriageF
   return typeof value === 'string' && KNOWLEDGE_TRIAGE_FLAG_VALUES.includes(value);
 }
 
+/**
+ * What a stored claim asserts. `fact` is a statement the keeper path may
+ * promote, `observed` is a recorded observation, and `failed` is an approach
+ * that was tried and disproved. Optional on the record, so entries written
+ * before claim kinds existed load unchanged and read as `fact`.
+ */
+export const KNOWLEDGE_CLAIM_KINDS = ['fact', 'observed', 'failed'] as const;
+
+export type KnowledgeClaimKind = (typeof KNOWLEDGE_CLAIM_KINDS)[number];
+
+const KNOWLEDGE_CLAIM_KIND_VALUES: readonly string[] = KNOWLEDGE_CLAIM_KINDS;
+
+/** True exactly for a declared claim kind value. */
+export function isKnowledgeClaimKind(value: unknown): value is KnowledgeClaimKind {
+  return typeof value === 'string' && KNOWLEDGE_CLAIM_KIND_VALUES.includes(value);
+}
+
+/** The kind an entry without an explicit kind reads as. */
+export const DEFAULT_KNOWLEDGE_CLAIM_KIND: KnowledgeClaimKind = 'fact';
+
+/** Hard upper bound for the `claimText` of a `failed` claim, in characters. */
+export const MAX_FAILED_CLAIM_TEXT_CHARS = 300;
+
 /** Hard upper bound for a recorded `overrideReason`, in characters. */
 export const MAX_OVERRIDE_REASON_CHARS = 1024;
 
@@ -71,6 +94,11 @@ export interface KnowledgeEntryRecord {
   readonly sourceAttemptId: string;
   readonly sourceCommitSha: string;
   readonly claimText: string;
+  /**
+   * What this claim asserts. Optional so entries written before claim kinds
+   * existed load unchanged; an absent kind reads as `fact`.
+   */
+  readonly claimKind?: KnowledgeClaimKind;
   readonly pathPrefixes: readonly string[];
   readonly sharedAcrossProjects: boolean;
   readonly disposition: KnowledgeDispositionValue;

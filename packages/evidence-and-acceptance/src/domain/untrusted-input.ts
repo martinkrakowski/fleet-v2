@@ -40,7 +40,7 @@ function isMarkerTail(text: string, start: number): boolean {
 }
 
 /** Every `<<<` that opens a marker word becomes `[<<<]`; the rest is left alone. */
-function defangMarkerLikeTokens(text: string): string {
+export function defangMarkerLikeTokens(text: string): string {
   let output = '';
   let index = 0;
   for (;;) {
@@ -49,8 +49,13 @@ function defangMarkerLikeTokens(text: string): string {
       return output + text.slice(index);
     }
     output += text.slice(index, next);
-    output += isMarkerTail(text, next + 3) ? '[<<<]' : '<<<';
-    index = next + 3;
+    if (isMarkerTail(text, next + 3)) {
+      output += '[<<<]';
+      index = next + 3;
+    } else {
+      output += '<';
+      index = next + 1;
+    }
   }
 }
 

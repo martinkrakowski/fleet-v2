@@ -162,12 +162,66 @@ describe('worktree listing and removal-fact reads over a fake executor', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('listWorktrees answers unknown when git worktree list exits 0 with empty or malformed output', async () => {
+    const { executor: emptyExecutor } = fakeExecutor({
+      [LIST_MARKER]: { stdout: '' },
+    });
+    const emptyAdapter = new WorkspaceAdapter({
+      executorForRecordedHost: executorForRecordedHost(emptyExecutor),
+    });
+    const emptyResult = await emptyAdapter.listWorktrees(listRequest());
+    expect(emptyResult).toEqual({
+      outcome: 'unknown',
+      reason: 'git worktree list output could not be parsed',
+    });
+
+    const { executor: malformedExecutor } = fakeExecutor({
+      [LIST_MARKER]: { stdout: 'unexpected output before any worktree\n' },
+    });
+    const malformedAdapter = new WorkspaceAdapter({
+      executorForRecordedHost: executorForRecordedHost(malformedExecutor),
+    });
+    const malformedResult = await malformedAdapter.listWorktrees(listRequest());
+    expect(malformedResult).toEqual({
+      outcome: 'unknown',
+      reason: 'git worktree list output could not be parsed',
+    });
+  });
+
   it('listWorktrees answers unknown invalid-request and runs no command for a relative repositoryRoot', async () => {
     const { executor, calls } = fakeExecutor();
     const adapter = new WorkspaceAdapter({ executorForRecordedHost: executorForRecordedHost(executor) });
     const result = await adapter.listWorktrees(listRequest({ repositoryRoot: 'relative/path' }));
     expect(result).toEqual({ outcome: 'unknown', reason: 'invalid-request' });
     expect(calls).toHaveLength(0);
+  });
+
+  it('inspectWorktreeForRemoval answers unknown (not refused) when git worktree list exits 0 with empty or malformed output', async () => {
+    const { executor: emptyExecutor, calls: emptyCalls } = fakeExecutor({
+      [LIST_MARKER]: { stdout: '' },
+    });
+    const emptyAdapter = new WorkspaceAdapter({
+      executorForRecordedHost: executorForRecordedHost(emptyExecutor),
+    });
+    const emptyResult = await emptyAdapter.inspectWorktreeForRemoval(inspectRequest());
+    expect(emptyResult).toEqual({
+      outcome: 'unknown',
+      reason: 'git worktree list output could not be parsed',
+    });
+    expect(emptyCalls).toHaveLength(1);
+
+    const { executor: malformedExecutor, calls: malformedCalls } = fakeExecutor({
+      [LIST_MARKER]: { stdout: 'corrupt worktree list output\n' },
+    });
+    const malformedAdapter = new WorkspaceAdapter({
+      executorForRecordedHost: executorForRecordedHost(malformedExecutor),
+    });
+    const malformedResult = await malformedAdapter.inspectWorktreeForRemoval(inspectRequest());
+    expect(malformedResult).toEqual({
+      outcome: 'unknown',
+      reason: 'git worktree list output could not be parsed',
+    });
+    expect(malformedCalls).toHaveLength(1);
   });
 
   it('inspectWorktreeForRemoval refuses not-a-linked-worktree for a path the list does not carry and runs no other command', async () => {
@@ -232,6 +286,30 @@ describe('worktree listing and removal-fact reads over a fake executor', () => {
         expect(banned).not.toContain(token);
       }
     }
+  });
+
+  it('inspectWorktreeForRemoval requests reflog with --format=%gD and parses reflog selector timestamp', async () => {
+    const { executor, calls } = fakeExecutor({
+      [LIST_MARKER]: { stdout: worktreeListWith() },
+      [PWD_MARKER]: { stdout: `${CLONE}\n` },
+      [MERGE_BASE_MARKER]: { exitCode: 0 },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      [REFLOG_MARKER]: { stdout: 'HEAD@{2026-06-01T12:00:00+00:00}\n' },
+      [INDEX_PATH_MARKER]: { stdout: `${WORKTREE}/.git/index\n` },
+      [FIND_MARKER]: { stdout: '1767225600\n' },
+      [STAT_GNU_MARKER]: { stdout: '1767225600\n' },
+      [DU_MARKER]: { stdout: `8\t${WORKTREE}\n` },
+    });
+    const adapter = new WorkspaceAdapter({ executorForRecordedHost: executorForRecordedHost(executor) });
+    const result = await adapter.inspectWorktreeForRemoval(inspectRequest());
+    expect(result.outcome).toBe('inspected');
+    if (result.outcome !== 'inspected') return;
+    const reflogCall = calls.find((call) => call.argv.includes('reflog'));
+    expect(reflogCall?.argv).toContain('--format=%gD');
+    expect(reflogCall?.argv).not.toContain('--format=%cd');
+    expect(result.facts.lastActivity.iso).toBe('2026-06-01T12:00:00.000Z');
   });
 });
 
@@ -415,6 +493,34 @@ describe('worktree listing and removal-fact reads against real git', () => {
     expect(result.outcome).toBe('inspected');
     if (result.outcome !== 'inspected') return;
     expect(result.facts.inProgressOperations).toContain('MERGE_HEAD');
+  });
+
+  it('inspectWorktreeForRemoval reports recent reflog timestamp when HEAD commit has an old committer date', async () => {
+    const s = await setup();
+    const oldCommitDate = '2020-01-01T00:00:00Z';
+    await execFileAsync(
+      'git',
+      ['-c', 'user.name=Fleet Test', '-c', 'user.email=fleet-test@example.invalid', 'commit', '--allow-empty', '-m', 'old commit'],
+      {
+        cwd: s.worktreePath,
+        env: {
+          ...process.env,
+          GIT_COMMITTER_DATE: oldCommitDate,
+          GIT_AUTHOR_DATE: oldCommitDate,
+        },
+      },
+    );
+    // HEAD was recently updated by switching to a new branch in the worktree:
+    await s.git(['checkout', '-b', 'feature/recent-action'], s.worktreePath);
+
+    const result = await s.adapter.inspectWorktreeForRemoval(inspectedRequest(s));
+    expect(result.outcome).toBe('inspected');
+    if (result.outcome !== 'inspected') return;
+    expect(result.facts.lastActivity.iso).toBeDefined();
+    const reportedMs = Date.parse(result.facts.lastActivity.iso!);
+    const oldMs = Date.parse(oldCommitDate);
+    // %cd would report oldMs (2020), while %gD reports the reflog entry timestamp (recent):
+    expect(reportedMs).toBeGreaterThan(oldMs);
   });
 
   it('readFilesystemSpace reads free and total bytes of the filesystem holding a path', async () => {

@@ -311,6 +311,91 @@ describe('worktree listing and removal-fact reads over a fake executor', () => {
     expect(reflogCall?.argv).not.toContain('--format=%cd');
     expect(result.facts.lastActivity.iso).toBe('2026-06-01T12:00:00.000Z');
   });
+
+  it('inspectWorktreeForRemoval runs status with --no-optional-locks and core.fsmonitor=false', async () => {
+    const { executor, calls } = fakeExecutor({
+      [LIST_MARKER]: { stdout: worktreeListWith() },
+      [PWD_MARKER]: { stdout: `${CLONE}\n` },
+      [MERGE_BASE_MARKER]: { exitCode: 0 },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      [REFLOG_MARKER]: { stdout: '2026-01-01T00:00:00+00:00\n' },
+      [INDEX_PATH_MARKER]: { stdout: `${WORKTREE}/.git/index\n` },
+      [FIND_MARKER]: { stdout: '1767225600\n' },
+      [STAT_GNU_MARKER]: { stdout: '1767225600\n' },
+      [DU_MARKER]: { stdout: `8\t${WORKTREE}\n` },
+    });
+    const adapter = new WorkspaceAdapter({ executorForRecordedHost: executorForRecordedHost(executor) });
+    const result = await adapter.inspectWorktreeForRemoval(inspectRequest());
+    expect(result.outcome).toBe('inspected');
+    const statusCall = calls.find((call) => call.argv.includes('status'));
+    expect(statusCall).toBeDefined();
+    expect(statusCall?.argv).toContain('--no-optional-locks');
+    expect(statusCall?.argv).toContain('core.fsmonitor=false');
+  });
+
+  it('readFilesystemSpace calls df with -P and parses POSIX output', async () => {
+    const { executor, calls } = fakeExecutor({
+      df: {
+        stdout:
+          'Filesystem 1024-blocks Used Available Capacity Mounted on\n' +
+          '/dev/mapper/very-long-filesystem-name 52428800 25736136 26205688 50% /\n',
+      },
+    });
+    const adapter = new WorkspaceAdapter({ executorForRecordedHost: executorForRecordedHost(executor) });
+    const result = await adapter.readFilesystemSpace({
+      path: CLONE,
+      recordedHost: RECORDED_HOST,
+    });
+    expect(result).toEqual({
+      outcome: 'read',
+      freeBytes: 26205688 * 1024,
+      totalBytes: 52428800 * 1024,
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.argv).toContain('-P');
+  });
+
+  it('readFilesystemSpace answers unknown for non-numeric or negative values', async () => {
+    const { executor: nonNumericExecutor } = fakeExecutor({
+      df: {
+        stdout:
+          'Filesystem 1024-blocks Used Available Capacity Mounted on\n' +
+          '/dev/sda1 NaN 100 50% /\n',
+      },
+    });
+    const nonNumericAdapter = new WorkspaceAdapter({
+      executorForRecordedHost: executorForRecordedHost(nonNumericExecutor),
+    });
+    const nonNumericResult = await nonNumericAdapter.readFilesystemSpace({
+      path: CLONE,
+      recordedHost: RECORDED_HOST,
+    });
+    expect(nonNumericResult).toEqual({
+      outcome: 'unknown',
+      reason: 'df output could not be parsed',
+    });
+
+    const { executor: negativeExecutor } = fakeExecutor({
+      df: {
+        stdout:
+          'Filesystem 1024-blocks Used Available Capacity Mounted on\n' +
+          '/dev/sda1 1000 500 -200 50% /\n',
+      },
+    });
+    const negativeAdapter = new WorkspaceAdapter({
+      executorForRecordedHost: executorForRecordedHost(negativeExecutor),
+    });
+    const negativeResult = await negativeAdapter.readFilesystemSpace({
+      path: CLONE,
+      recordedHost: RECORDED_HOST,
+    });
+    expect(negativeResult).toEqual({
+      outcome: 'unknown',
+      reason: 'df output could not be parsed',
+    });
+  });
 });
 
 describe('worktree listing and removal-fact reads against real git', () => {
@@ -521,6 +606,29 @@ describe('worktree listing and removal-fact reads against real git', () => {
     const oldMs = Date.parse(oldCommitDate);
     // %cd would report oldMs (2020), while %gD reports the reflog entry timestamp (recent):
     expect(reportedMs).toBeGreaterThan(oldMs);
+  });
+
+  it('inspectWorktreeForRemoval does not execute core.fsmonitor hook configured in worktree', async () => {
+    const s = await setup();
+    const markerFile = path.join(s.worktreeRoot, 'fsmonitor-executed.marker');
+    const hookFile = path.join(s.worktreeRoot, 'fsmonitor-hook.sh');
+    await fs.writeFile(
+      hookFile,
+      '#!/bin/sh\ntouch "' + markerFile + '"\nexit 1\n',
+      { mode: 0o755 },
+    );
+    await s.git(['config', 'core.fsmonitor', hookFile], s.worktreePath);
+
+    const result = await s.adapter.inspectWorktreeForRemoval(inspectedRequest(s));
+    expect(result.outcome).toBe('inspected');
+    if (result.outcome !== 'inspected') return;
+    expect(result.facts.status).toEqual({ tracked: 0, untracked: 0, unmerged: 0 });
+
+    const markerExists = await fs
+      .stat(markerFile)
+      .then(() => true)
+      .catch(() => false);
+    expect(markerExists).toBe(false);
   });
 
   it('readFilesystemSpace reads free and total bytes of the filesystem holding a path', async () => {

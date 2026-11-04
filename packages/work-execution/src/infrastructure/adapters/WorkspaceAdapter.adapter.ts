@@ -667,6 +667,17 @@ function parseDuKilobytes(stdout: string): number | null {
   return kilobytes;
 }
 
+function parseFilesystemKilobytes(field: string | undefined): number | null {
+  if (field === undefined || !/^\d+$/.test(field)) {
+    return null;
+  }
+  const kilobytes = Number.parseInt(field, 10);
+  if (!Number.isSafeInteger(kilobytes) || kilobytes < 0) {
+    return null;
+  }
+  return kilobytes;
+}
+
 function parseReflogTimestamp(stdout: string): number | null {
   const trimmed = stdout.trim();
   if (trimmed === '') return null;
@@ -724,7 +735,11 @@ export class WorkspaceAdapter implements WorkspacePort {
 
     let statusOutput: string;
     try {
-      statusOutput = await this.runGit(worktreePath, ['status', '--porcelain=v1', '-uall'], executor);
+      statusOutput = await this.runGit(
+        worktreePath,
+        ['--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--porcelain=v1', '-uall'],
+        executor,
+      );
     } catch (error) {
       throw new Error(`Unable to read git status in ${worktreePath}: ${String(error)}`, {
         cause: error,
@@ -1626,7 +1641,17 @@ export class WorkspaceAdapter implements WorkspacePort {
     worktreePath: string,
   ): Promise<{ outcome: 'read'; status: WorktreeStatusCounts } | { outcome: 'unknown'; reason: string }> {
     const statusRun = await executor.run(
-      ['git', '-C', worktreePath, 'status', '--porcelain', '--untracked-files=all'],
+      [
+        'git',
+        '--no-optional-locks',
+        '-c',
+        'core.fsmonitor=false',
+        '-C',
+        worktreePath,
+        'status',
+        '--porcelain',
+        '--untracked-files=all',
+      ],
       { timeoutMs: GIT_TIMEOUT_MS },
     );
     if (statusRun.exitCode === null || statusRun.error !== undefined) {
@@ -1694,7 +1719,7 @@ export class WorkspaceAdapter implements WorkspacePort {
     } catch {
       return { outcome: 'unknown', reason: 'no executor for the read' };
     }
-    const run = await executor.run(['df', '-k', request.path], { timeoutMs: GIT_TIMEOUT_MS });
+    const run = await executor.run(['df', '-P', '-k', request.path], { timeoutMs: GIT_TIMEOUT_MS });
     if (run.exitCode === null || run.error !== undefined) {
       return { outcome: 'unknown', reason: 'df did not report an exit code' };
     }
@@ -1707,9 +1732,9 @@ export class WorkspaceAdapter implements WorkspacePort {
       return { outcome: 'unknown', reason: 'df printed no line' };
     }
     const fields = last.trim().split(/\s+/);
-    const total = Number.parseInt(fields[1] ?? '', 10);
-    const available = Number.parseInt(fields[3] ?? '', 10);
-    if (!Number.isSafeInteger(total) || !Number.isSafeInteger(available)) {
+    const total = parseFilesystemKilobytes(fields[1]);
+    const available = parseFilesystemKilobytes(fields[3]);
+    if (total === null || available === null) {
       return { outcome: 'unknown', reason: 'df output could not be parsed' };
     }
     return { outcome: 'read', freeBytes: available * 1024, totalBytes: total * 1024 };

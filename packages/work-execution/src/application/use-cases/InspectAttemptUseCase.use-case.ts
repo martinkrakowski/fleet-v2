@@ -124,69 +124,60 @@ const EXPLAIN_TERMINAL_STATES: readonly AttemptStateValue[] = [
   'cancelled',
 ];
 
+function legal(command: ExplainNextCommand['command']): ExplainNextCommand {
+  return { command, legal: true, reason: '' };
+}
+
+function refused(command: ExplainNextCommand['command'], reason: ExplainNextCommand['reason']): ExplainNextCommand {
+  return { command, legal: false, reason };
+}
+
+/** `reconcile` and `stop` share one shape: live, terminal, or not yet dispatched. */
+function lifecycleCommand(
+  command: 'reconcile' | 'stop',
+  state: AttemptStateValue,
+  hasSession: boolean,
+): ExplainNextCommand {
+  if (EXPLAIN_TERMINAL_STATES.includes(state)) {
+    return refused(command, 'terminal-state');
+  }
+  if (!EXPLAIN_LIVE_STATES.includes(state)) {
+    return refused(command, 'not-dispatched');
+  }
+  return command === 'stop' && !hasSession ? refused(command, 'no-session') : legal(command);
+}
+
+function collectCommand(attempt: AttemptRecord): ExplainNextCommand {
+  const hasReceipt = attempt.completionReceipt !== null && attempt.completionReceipt !== undefined;
+  if (attempt.state === 'ended') {
+    return hasReceipt ? legal('collect') : refused('collect', 'no-completion-receipt');
+  }
+  if (attempt.state === 'collected' && !hasReceipt) {
+    return refused('collect', 'no-completion-receipt');
+  }
+  return refused('collect', 'not-ended');
+}
+
+function acceptCommand(attempt: AttemptRecord): ExplainNextCommand {
+  if (attempt.state !== 'collected') {
+    return refused('accept', 'not-collected');
+  }
+  const headCommit = attempt.artifacts?.headCommit;
+  return typeof headCommit === 'string' && headCommit !== '' ? legal('accept') : refused('accept', 'no-head');
+}
+
 /** The next-command table: one entry per fixed command, derived from the attempt record alone. */
 function explainNextCommands(attempt: AttemptRecord): ExplainNextCommand[] {
   const { state } = attempt;
   const hasSession = typeof attempt.sessionId === 'string' && attempt.sessionId !== '';
-  const head =
-    typeof attempt.artifacts?.headCommit === 'string' && attempt.artifacts.headCommit !== ''
-      ? attempt.artifacts.headCommit
-      : null;
-
-  const commands: ExplainNextCommand[] = [];
-  commands.push(
-    state === 'intent-recorded'
-      ? { command: 'dispatch', legal: true, reason: '' }
-      : { command: 'dispatch', legal: false, reason: 'already-dispatched' },
-  );
-  if (EXPLAIN_LIVE_STATES.includes(state)) {
-    commands.push({ command: 'reconcile', legal: true, reason: '' });
-  } else if (EXPLAIN_TERMINAL_STATES.includes(state)) {
-    commands.push({ command: 'reconcile', legal: false, reason: 'terminal-state' });
-  } else {
-    commands.push({ command: 'reconcile', legal: false, reason: 'not-dispatched' });
-  }
-  if (EXPLAIN_LIVE_STATES.includes(state)) {
-    if (hasSession) {
-      commands.push({ command: 'stop', legal: true, reason: '' });
-    } else {
-      commands.push({ command: 'stop', legal: false, reason: 'no-session' });
-    }
-  } else if (EXPLAIN_TERMINAL_STATES.includes(state)) {
-    commands.push({ command: 'stop', legal: false, reason: 'terminal-state' });
-  } else {
-    commands.push({ command: 'stop', legal: false, reason: 'not-dispatched' });
-  }
-  if (state === 'ended') {
-    if (attempt.completionReceipt !== null && attempt.completionReceipt !== undefined) {
-      commands.push({ command: 'collect', legal: true, reason: '' });
-    } else {
-      commands.push({ command: 'collect', legal: false, reason: 'no-completion-receipt' });
-    }
-  } else if (state === 'collected') {
-    if (attempt.completionReceipt !== null && attempt.completionReceipt !== undefined) {
-      commands.push({ command: 'collect', legal: false, reason: 'not-ended' });
-    } else {
-      commands.push({ command: 'collect', legal: false, reason: 'no-completion-receipt' });
-    }
-  } else {
-    commands.push({ command: 'collect', legal: false, reason: 'not-ended' });
-  }
-  if (state === 'collected') {
-    if (head !== null) {
-      commands.push({ command: 'accept', legal: true, reason: '' });
-    } else {
-      commands.push({ command: 'accept', legal: false, reason: 'no-head' });
-    }
-  } else {
-    commands.push({ command: 'accept', legal: false, reason: 'not-collected' });
-  }
-  if (state === 'collected' || state === 'cancelled') {
-    commands.push({ command: 'fix', legal: true, reason: '' });
-  } else {
-    commands.push({ command: 'fix', legal: false, reason: 'prior-not-ready' });
-  }
-  return commands;
+  return [
+    state === 'intent-recorded' ? legal('dispatch') : refused('dispatch', 'already-dispatched'),
+    lifecycleCommand('reconcile', state, hasSession),
+    lifecycleCommand('stop', state, hasSession),
+    collectCommand(attempt),
+    acceptCommand(attempt),
+    state === 'collected' || state === 'cancelled' ? legal('fix') : refused('fix', 'prior-not-ready'),
+  ];
 }
 
 export class ExplainAttemptUseCase {

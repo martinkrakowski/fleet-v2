@@ -2366,7 +2366,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare refusal details (MX7)', () => 
     expect(await refusedPrepareDetailOf(harness)).toBe('prepare-no-review-findings');
   });
 
-  it('the newest failed receipt is all out of scope and an older one has an in-scope finding: the handover carries the older one\'s finding', async () => {
+  it('the newest failed receipt is all out of scope and an older one has an in-scope finding: the prepare refuses no-in-scope-findings', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'accepting', NOW);
     const briefKey = reviewKey('brief-check', 0, HEAD12_A);
@@ -2425,14 +2425,13 @@ describe('AdvanceLaneRunUseCase fix-round prepare refusal details (MX7)', () => 
       outcome: 'acted',
       step: 'prepare',
       key: prepareKey(1, 0, 2),
-      result: 'completed',
-      reasonCode: 'prepared',
+      result: 'refused',
+      reasonCode: 'no-in-scope-findings',
     });
-    expect(harness.fixRequests).toHaveLength(1);
-    expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[minor] src/ex.ts:4 — tighten the guard']);
+    expect(harness.fixRequests).toHaveLength(0);
   });
 
-  it('no failed receipt has an in-scope finding: the prepare refuses prepare-no-review-findings', async () => {
+  it('no failed receipt has an in-scope finding: the prepare refuses no-in-scope-findings', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'accepting', NOW);
     const briefKey = reviewKey('brief-check', 0, HEAD12_A);
@@ -2485,7 +2484,15 @@ describe('AdvanceLaneRunUseCase fix-round prepare refusal details (MX7)', () => 
     });
 
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
-    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-no-review-findings');
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'refused',
+      reasonCode: 'no-in-scope-findings',
+    });
+    expect(harness.fixRequests).toHaveLength(0);
   });
 
   it('prepare-no-review-request: a review failure whose intent has no minted request id refuses with its own token', async () => {

@@ -880,9 +880,10 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     if (failure.acceptHead12 !== null) {
       // AR1/MX7: the rejection's review source is receipt-driven. Walk the
       // run's final review results at the rejected head, latest first, and
-      // take the newest whose receipt has at least one in-scope finding —
-      // a GB1 `review-passed` with `minor-only-findings` included. Keep
-      // walking past failed receipts that have no in-scope finding.
+      // take the newest candidate whose receipt is found and has at least one
+      // finding (including a GB1 review-passed with minor-only-findings).
+      // If that receipt's findings are all out of scope, refuse no-in-scope-findings
+      // and do not continue to older candidates.
       // Receipt summaries carry no finding disposition, so without the lane's changed paths an out-of-scope finding
       // would look in scope and could be handed over: this walk fails closed instead (unlike the review path below).
       if (changed === null) {
@@ -891,12 +892,13 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
       let inScope: readonly ReviewRequestFinding[] | null = null;
       for (const candidate of reviewResultKeysAtHead(entries, record.runId, failure.acceptHead12)) {
         const found = await candidateReceiptOf(ctx, prior, candidate);
-        if (found !== null) {
+        if (found !== null && found.findings.length > 0) {
           const candidateInScope = inScopeFindingsOf(found.findings, changed, prior.worktreePath);
           if (candidateInScope.length > 0) {
             inScope = candidateInScope;
             break;
           }
+          return refuse('no-in-scope-findings');
         }
       }
       if (inScope === null) {

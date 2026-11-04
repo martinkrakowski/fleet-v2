@@ -45,7 +45,7 @@ export type LaneRunKeyVia = (typeof LANE_RUN_KEY_VIAS)[number];
 /** The reaper's finding kinds (plan §3.9.2). Stored data from K1b on; K10 imports this tuple, it does not redeclare it. */
 export const REAPER_FINDING_KINDS = [
   'orphan-session', 'dead-attempt', 'driverless-run', 'leaked-slot', 'stale-stop', 'orphan-worktree',
-  'stale-attention',
+  'stale-attention', 'merged-worktree', 'disk-pressure',
 ] as const;
 export type ReaperFindingKind = (typeof REAPER_FINDING_KINDS)[number];
 

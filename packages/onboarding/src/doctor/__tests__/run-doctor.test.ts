@@ -1039,4 +1039,37 @@ describe('runDoctor server probes (P1)', () => {
     const lines = await collect(loadedResult(model), probes);
     expect(lines.filter((line) => line.check === 'model-listed')).toEqual([]);
   });
+
+  it('skips server probe and omits model-listed when probeServers is false', async () => {
+    const model = sampleModel({
+      seats: [
+        { id: 'impl', tool: 'opencode', model: 'acme/alpha-1', roles: ['implementer'], costClass: 'free' },
+      ],
+    });
+    const { probes, calls } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes, {
+      probeSeats: true,
+      probeServers: false,
+    });
+
+    expect(calls.some((call) => call.startsWith('serverProbe:'))).toBe(false);
+    expect(lines.filter((line) => line.check === 'server-answers')).toEqual([]);
+    expect(lines.filter((line) => line.check === 'model-listed')).toEqual([]);
+  });
+
+  it('probes servers and emits model-listed by default when probeServers is omitted', async () => {
+    const model = sampleModel({
+      seats: [
+        { id: 'impl', tool: 'opencode', model: 'acme/alpha-1', roles: ['implementer'], costClass: 'free' },
+      ],
+    });
+    const { probes, calls } = fakeProbes();
+    const lines = await collect(loadedResult(model), probes, {
+      probeSeats: true,
+    });
+
+    expect(calls).toContain('serverProbe:local:4096');
+    expect(lines.filter((line) => line.check === 'server-answers')).toHaveLength(1);
+    expect(lines.filter((line) => line.check === 'model-listed')).toHaveLength(1);
+  });
 });

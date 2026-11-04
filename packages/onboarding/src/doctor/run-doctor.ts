@@ -32,6 +32,12 @@ export interface RunDoctorOptions {
    */
   readonly probeSeats: boolean;
   /**
+   * Probe every opencode server the installation runs and report
+   * `server-answers` lines plus `model-listed`. `false` skips server probes
+   * and does not emit `model-listed`. Defaults to `true`.
+   */
+  readonly probeServers?: boolean;
+  /**
    * The operator environment the routing check inspects (H3b). The engine
    * itself never reads `process.env`; the CLI root passes it. When omitted,
    * no routing lines are reported.
@@ -671,15 +677,22 @@ async function seatLines(
  * stable. The server answers are computed before the `model-listed` line is
  * yielded (that line needs the union of the servers' model ids), but the
  * host lines are yielded before the server lines so every `host` line stays
- * together.
+ * together. When `options.probeServers` is `false`, server probing and the
+ * `model-listed` check are skipped entirely.
  */
 export async function* runDoctor(
   result: DoctorableInstallation,
   probes: DoctorProbes,
   options: RunDoctorOptions,
 ): AsyncGenerator<DoctorLine> {
-  const serverAnswers = await serverLines(result.model, probes);
-  const seatModelCheck = seatModelLine(result.model, serverAnswers.models);
+  const probeServers = options.probeServers ?? true;
+  const serverAnswers = probeServers
+    ? await serverLines(result.model, probes)
+    : undefined;
+  const seatModelCheck =
+    probeServers && serverAnswers !== undefined
+      ? seatModelLine(result.model, serverAnswers.models)
+      : undefined;
   for (const doctorLine of await installationLines(result)) {
     yield doctorLine;
   }
@@ -692,8 +705,10 @@ export async function* runDoctor(
   for (const doctorLine of await hostLines(result.model, probes)) {
     yield doctorLine;
   }
-  for (const doctorLine of serverAnswers.lines) {
-    yield doctorLine;
+  if (serverAnswers !== undefined) {
+    for (const doctorLine of serverAnswers.lines) {
+      yield doctorLine;
+    }
   }
   for (const doctorLine of await toolLines(result.model, probes)) {
     yield doctorLine;

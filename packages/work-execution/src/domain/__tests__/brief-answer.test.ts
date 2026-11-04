@@ -77,12 +77,18 @@ describe('parseBriefAnswer', () => {
     });
   });
 
-  it('refuses notes after the dispatch marker', () => {
+  it('refuses an answer that opens with the dispatch marker as text before the notes marker', () => {
     const answer = ['===DISPATCH===', 'dispatch', '===NOTES===', 'notes'].join('\n');
     expect(parseBriefAnswer(answer)).toEqual({
       ok: false,
-      reason: 'notes-after-dispatch',
+      reason: 'text-before-notes-marker',
     });
+  });
+
+  it('refuses a github_pat_ shaped answer (both secret registries are checked)', () => {
+    const secret = `github${'_pat_'}${'A'.repeat(24)}`;
+    const answer = ['===NOTES===', 'notes', '===DISPATCH===', `brief ${secret}`].join('\n');
+    expect(parseBriefAnswer(answer)).toEqual({ ok: false, reason: 'secret-shaped' });
   });
 
   it('refuses an empty dispatch', () => {
@@ -259,7 +265,7 @@ describe('lintBrief', () => {
   });
 
   it('does not let imperative prose satisfy the commit item', () => {
-    for (const prose of ['Please commit.', 'Don\'t commit.', 'Never commit.']) {
+    for (const prose of ['Please commit.', 'Don\'t commit.', 'Never commit.', 'Do not commit changes.', 'Commit early and often.']) {
       const brief = [
         '# File list',
         '- packages/a.ts',

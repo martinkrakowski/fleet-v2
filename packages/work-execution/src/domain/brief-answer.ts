@@ -6,7 +6,7 @@
  * on a violation the result is a typed refusal and nothing else.
  */
 
-import { LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
+import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
 const NOTES_MARKER = '===NOTES===';
 const DISPATCH_MARKER = '===DISPATCH===';
@@ -72,17 +72,15 @@ export function parseBriefAnswer(answer: unknown): ParseBriefAnswerResult {
   const notesIndex = notesMarkers[0];
   const dispatchIndex = dispatchMarkers[0];
 
-  // Marker layout: the notes marker must come before the dispatch marker. An
-  // answer whose dispatch marker precedes its notes marker is refused here,
-  // before the leading-text check, so the marker order violation reports
-  // `notes-after-dispatch` rather than `text-before-notes-marker`.
-  if (notesIndex > dispatchIndex) {
-    return { ok: false, reason: 'notes-after-dispatch' };
-  }
-
+  // The first non-blank line must be the notes marker. This check runs before
+  // the marker-order check, so an answer that opens with the dispatch marker
+  // reports `text-before-notes-marker`.
   const firstNonBlank = lines.find((line) => line.trim().length > 0);
   if (firstNonBlank === undefined || firstNonBlank.trim() !== NOTES_MARKER) {
     return { ok: false, reason: 'text-before-notes-marker' };
+  }
+  if (notesIndex > dispatchIndex) {
+    return { ok: false, reason: 'notes-after-dispatch' };
   }
 
   const notes = stripOuterBlank(lines.slice(notesIndex + 1, dispatchIndex));
@@ -121,12 +119,12 @@ function stripOuterBlank(blockLines: readonly string[]): string {
 }
 
 /**
- * Scan against the full lane-diff registry (S2): the 17 named patterns the
- * lane diff check uses, not the narrower legacy `SECRET_PATTERNS` set. A
- * token shape only in the broader registry must still be refused.
+ * `containsSecretShape` (the contract the plan names) plus the lane-diff
+ * registry, as the operator-coordination entities check: the short registry
+ * misses shapes such as `github_pat_`. Refusing on either is the safe side.
  */
 function textContainsSecretShape(text: string): boolean {
-  return LANE_DIFF_SECRET_PATTERNS.some((entry) => entry.regex.test(text));
+  return containsSecretShape(text) || LANE_DIFF_SECRET_PATTERNS.some((entry) => entry.regex.test(text));
 }
 
 export interface BriefLintFinding {
@@ -195,33 +193,25 @@ function sectionHasBody(headings: readonly Heading[], lines: readonly string[], 
   return false;
 }
 
+/** An optional list marker, then the tier value line (`Tier 1`, `Tier: 2`, `tier k`). */
+const TIER_LINE = /^\s*(?:[-*]\s+)?tier\s*:?\s*[012k]\b/i;
+
 /**
- * True when a line satisfies the inline form of a checklist item: the item's
- * label (case-insensitive) followed by a colon or whitespace and a value, as
- * in `Tier: 1`, `Size: about 45 minutes`, or the compact authoring line
- * `Tier 1. Size: about 45 minutes, one commit.` — where the commit item
- * appears as a phrase ending in the label word and carrying a quantity value
- * (a number or a quantifier word), so bare prose like `Avoid commit.` never
- * satisfies the item. A bare label with no value does not count.
+ * The inline forms that satisfy Tier, Size and Commit, anchored at the start
+ * of a line: `Tier: 1`, `Size: about 45 minutes`, `Commit: one commit`, and the
+ * authoring line `Tier 1. Size: about 45 minutes, one commit.` that
+ * dispatch-conducted inserts. Prose that merely mentions the word (`Avoid
+ * commit.`, `Do not commit changes.`) never satisfies an item.
  */
+const INLINE_FORMS: ReadonlyMap<string, readonly RegExp[]> = new Map([
+  ['tier', [TIER_LINE]],
+  ['size', [/^\s*(?:[-*]\s+)?size\s*:\s*\S/i, /^\s*(?:[-*]\s+)?tier\s*:?\s*[012k]\.\s+size\s*:\s*\S/i]],
+  ['commit', [/^\s*(?:[-*]\s+)?commit\s*:\s*\S/i, /^\s*(?:[-*]\s+)?tier\s*:?\s*[012k]\..*\bone commit\.?\s*$/i]],
+]);
+
 function lineIsInlineItem(rawLine: string, label: string): boolean {
-  const content = rawLine.replace(/^#{0,6}\s*/, '').trim();
-  const word = label.toLowerCase().replace(/[^a-z]/g, '');
-  if (word.length === 0) {
-    return false;
-  }
-  // `Tier: 1` / `Size: about 45 minutes` — label, colon, value.
-  if (new RegExp(`(^|\\s)${word}\\s*:\\s*\\S`, 'i').test(content)) {
-    return true;
-  }
-  // `Tier 1` — label, whitespace, value.
-  if (new RegExp(`(^|\\s)${word}\\s+\\S`, 'i').test(content)) {
-    return true;
-  }
-  // `one commit.` — a phrase ending in the label word whose value is a
-  // quantity (a number or a quantifier word), never a bare prose mention
-  // like `Avoid commit.`.
-  return new RegExp(`(^|\\s)(?:one|single|an|a|\\d+)\\s+${word}[.!?]*\\s*$`, 'i').test(content);
+  const forms = INLINE_FORMS.get(label.toLowerCase()) ?? [];
+  return forms.some((form) => form.test(rawLine));
 }
 
 /**

@@ -114,6 +114,21 @@ describe('parseBriefAnswer', () => {
       reason: 'secret-shaped',
     });
   });
+
+  it('refuses a secret shape only in the broader lane-diff registry', () => {
+    // A github fine-grained token matches `LANE_DIFF_SECRET_PATTERNS` but not
+    // the narrower legacy `SECRET_PATTERNS` set the answer scan used before.
+    const answer = [
+      '===NOTES===',
+      'notes',
+      '===DISPATCH===',
+      'token ' + 'github_pat_' + 'a'.repeat(24),
+    ].join('\n');
+    expect(parseBriefAnswer(answer)).toEqual({
+      ok: false,
+      reason: 'secret-shaped',
+    });
+  });
 });
 
 describe('lintBrief', () => {
@@ -193,5 +208,49 @@ describe('lintBrief', () => {
     const brief = fullBrief + '\nghp_' + 'a'.repeat(30);
     const result = lintBrief(brief);
     expect(result.findings[0]).toEqual({ rule: 'secret-shaped', label: '' });
+  });
+
+  it('accepts tier, size, and commit provided as inline lines', () => {
+    const brief = [
+      '# File list',
+      '- packages/a.ts',
+      '# Commands',
+      'yarn build',
+      'Tier: 1',
+      'Size: about 45 minutes',
+      'Commit: one commit',
+      '# Validity',
+      'base branch: main',
+      '## Hard to undo',
+      'None',
+      '## Assumptions',
+      'Assume X',
+      '## Challenge this',
+      'Challenge Y',
+    ].join('\n');
+    const result = lintBrief(brief);
+    expect(result.ok).toBe(true);
+    expect(result.findings).toEqual([]);
+  });
+
+  it('accepts the compact tier/size/commit authoring line', () => {
+    const brief = [
+      '# File list',
+      '- packages/a.ts',
+      '# Commands',
+      'yarn build',
+      'Tier 1. Size: about 45 minutes, one commit.',
+      '# Validity',
+      'base branch: main',
+      '## Hard to undo',
+      'None',
+      '## Assumptions',
+      'Assume X',
+      '## Challenge this',
+      'Challenge Y',
+    ].join('\n');
+    const result = lintBrief(brief);
+    expect(result.ok).toBe(true);
+    expect(result.findings).toEqual([]);
   });
 });

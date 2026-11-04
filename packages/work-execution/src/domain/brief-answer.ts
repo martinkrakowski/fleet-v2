@@ -6,7 +6,7 @@
  * on a violation the result is a typed refusal and nothing else.
  */
 
-import { containsSecretShape } from '@fleet/shared';
+import { LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
 const NOTES_MARKER = '===NOTES===';
 const DISPATCH_MARKER = '===DISPATCH===';
@@ -92,7 +92,7 @@ export function parseBriefAnswer(answer: unknown): ParseBriefAnswerResult {
     return { ok: false, reason: 'empty-dispatch' };
   }
 
-  if (containsSecretShape(answer)) {
+  if (textContainsSecretShape(answer)) {
     return { ok: false, reason: 'secret-shaped' };
   }
 
@@ -118,6 +118,15 @@ function stripOuterBlank(blockLines: readonly string[]): string {
     end -= 1;
   }
   return blockLines.slice(start, end).join('\n');
+}
+
+/**
+ * Scan against the full lane-diff registry (S2): the 17 named patterns the
+ * lane diff check uses, not the narrower legacy `SECRET_PATTERNS` set. A
+ * token shape only in the broader registry must still be refused.
+ */
+function textContainsSecretShape(text: string): boolean {
+  return LANE_DIFF_SECRET_PATTERNS.some((entry) => entry.regex.test(text));
 }
 
 export interface BriefLintFinding {
@@ -155,6 +164,9 @@ const REQUIRED_SECTIONS: readonly RequiredSection[] = [
 
 const HEADING_RE = /^\s{0,3}#{1,6}\s+(.+)$/;
 
+/** The checklist items the plan names as lines, which an inline line may satisfy. */
+const INLINE_LABELS: ReadonlySet<string> = new Set(['tier', 'size', 'commit']);
+
 /**
  * Normalise a heading's captured text: trimmed, trailing `#` characters
  * removed, internal whitespace collapsed to single spaces, lower-cased.
@@ -184,10 +196,39 @@ function sectionHasBody(headings: readonly Heading[], lines: readonly string[], 
 }
 
 /**
+ * True when a line satisfies the inline form of a checklist item: the item's
+ * label (case-insensitive) followed by a colon or whitespace and a value, as
+ * in `Tier: 1`, `Size: about 45 minutes`, or the compact authoring line
+ * `Tier 1. Size: about 45 minutes, one commit.` — where the commit item
+ * appears as a phrase ending in the label word. A bare label with no value
+ * does not count.
+ */
+function lineIsInlineItem(rawLine: string, label: string): boolean {
+  const content = rawLine.replace(/^#{0,6}\s*/, '').trim();
+  const word = label.toLowerCase().replace(/[^a-z]/g, '');
+  if (word.length === 0) {
+    return false;
+  }
+  // `Tier: 1` / `Size: about 45 minutes` — label, colon, value.
+  if (new RegExp(`(^|\\s)${word}\\s*:\\s*\\S`, 'i').test(content)) {
+    return true;
+  }
+  // `Tier 1` — label, whitespace, value.
+  if (new RegExp(`(^|\\s)${word}\\s+\\S`, 'i').test(content)) {
+    return true;
+  }
+  // `one commit.` — a phrase ending in the label word.
+  return new RegExp(`(^|\\s)\\S+\\s+${word}[.!?]*\\s*$`, 'i').test(content);
+}
+
+/**
  * CO15: refuse a brief that is missing a required section — the six checklist
  * items and the three D7 sections. It returns findings; it never throws. The
  * `secret-shaped` finding comes first when the brief carries a secret shape,
  * and the heading checks still run so it is never the only finding by itself.
+ * Tier, Size, and Commit — the three items the plan names as lines — are also
+ * satisfied by an inline line, so a brief carrying them without headings is
+ * not rejected as missing those sections.
  */
 export function lintBrief(brief: unknown): BriefLintResult {
   const findings: BriefLintFinding[] = [];
@@ -196,7 +237,7 @@ export function lintBrief(brief: unknown): BriefLintResult {
     return { ok: false, findings: [{ rule: 'not-a-brief', label: '' }] };
   }
 
-  if (containsSecretShape(brief)) {
+  if (textContainsSecretShape(brief)) {
     findings.push({ rule: 'secret-shaped', label: '' });
   }
 
@@ -210,9 +251,13 @@ export function lintBrief(brief: unknown): BriefLintResult {
   });
 
   for (const section of REQUIRED_SECTIONS) {
-    if (!sectionHasBody(headings, lines, section.label)) {
-      findings.push({ rule: section.rule, label: section.label });
+    if (sectionHasBody(headings, lines, section.label)) {
+      continue;
     }
+    if (INLINE_LABELS.has(section.label.toLowerCase()) && lines.some((line) => lineIsInlineItem(line, section.label))) {
+      continue;
+    }
+    findings.push({ rule: section.rule, label: section.label });
   }
 
   return { ok: findings.length === 0, findings };

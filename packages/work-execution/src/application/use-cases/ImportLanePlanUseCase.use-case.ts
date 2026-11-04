@@ -357,6 +357,60 @@ async function resolveLaneCurrentId(
   return { resolved: true, laneId: lane.laneId, plan };
 }
 
+function buildLinkRecord(
+  request: LinkPullRequestRequest,
+  resolvedLaneId: string,
+  nowIso: () => string,
+): { ok: true; record: PullRequestLinkRecord } | { ok: false; result: LinkPullRequestResult } {
+  let linkedAtIso: string;
+  try {
+    linkedAtIso = nowIso();
+  } catch {
+    return { ok: false, result: linkRefusal('invalid', 'the link record was refused') };
+  }
+  const created = PullRequestLink.create({
+    version: PULL_REQUEST_LINK_RECORD_VERSION,
+    repository: request.repository,
+    number: request.number,
+    projectId: request.projectId,
+    planId: request.planId,
+    laneId: resolvedLaneId,
+    source: request.source,
+    linkedAtIso,
+  });
+  if (!created.success) {
+    return { ok: false, result: linkRefusal('invalid', 'the link record was refused') };
+  }
+  return { ok: true, record: created.value.toRecord() };
+}
+
+async function resolveAliasUnchangedLink(
+  lanePlanRepo: LanePlanRepositoryPort,
+  request: LinkPullRequestRequest,
+  plan: LanePlanRecord | null,
+  resolvedLaneId: string,
+): Promise<PullRequestLinkRecord | null> {
+  if (request.planId === null || plan === null) {
+    return null;
+  }
+  const existing = await lanePlanRepo.findPullRequestLink(request.repository, request.number);
+  if (
+    existing === null ||
+    existing.projectId !== request.projectId ||
+    existing.planId !== request.planId
+  ) {
+    return null;
+  }
+  const storedLane = plan.lanes.find(
+    (candidate) =>
+      candidate.laneId === existing.laneId || candidate.aliases.includes(existing.laneId),
+  );
+  if (storedLane !== undefined && storedLane.laneId === resolvedLaneId) {
+    return existing;
+  }
+  return null;
+}
+
 /**
  * The shared link code path of LinkPullRequestUseCase and the mergedPr
  * backfill on import. Never throws; every failure is a refusal result.
@@ -387,20 +441,11 @@ async function runLinkPullRequest(
     plan = resolved.plan;
   }
 
-  const created = PullRequestLink.create({
-    version: PULL_REQUEST_LINK_RECORD_VERSION,
-    repository: request.repository,
-    number: request.number,
-    projectId: request.projectId,
-    planId: request.planId,
-    laneId: resolvedLaneId,
-    source: request.source,
-    linkedAtIso: nowIso(),
-  });
-  if (!created.success) {
-    return linkRefusal('invalid', 'the link record was refused');
+  const built = buildLinkRecord(request, resolvedLaneId, nowIso);
+  if (!built.ok) {
+    return built.result;
   }
-  const record = created.value.toRecord();
+  const record = built.record;
 
   let saveResult: SavePullRequestLinkResult;
   try {
@@ -416,21 +461,18 @@ async function runLinkPullRequest(
     return { outcome: 'unchanged', link: saveResult.link };
   }
   if (saveResult.code === 'pr-already-linked') {
-    if (request.planId !== null && plan !== null && saveResult.linkedLaneId !== null) {
-      const storedLane = plan.lanes.find(
-        (candidate) =>
-          candidate.laneId === saveResult.linkedLaneId ||
-          candidate.aliases.includes(saveResult.linkedLaneId as string),
+    try {
+      const aliasMatch = await resolveAliasUnchangedLink(
+        lanePlanRepo,
+        request,
+        plan,
+        resolvedLaneId,
       );
-      if (storedLane !== undefined && storedLane.laneId === resolvedLaneId) {
-        let existing: PullRequestLinkRecord | null = null;
-        try {
-          existing = await lanePlanRepo.findPullRequestLink(request.repository, request.number);
-        } catch {
-          existing = null;
-        }
-        return { outcome: 'unchanged', link: existing ?? record };
+      if (aliasMatch !== null) {
+        return { outcome: 'unchanged', link: aliasMatch };
       }
+    } catch {
+      return linkRefusal('store', 'the store could not be read');
     }
     return linkRefusal(
       'pr-already-linked',

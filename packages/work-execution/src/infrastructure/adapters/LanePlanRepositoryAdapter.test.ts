@@ -253,6 +253,42 @@ describe('LanePlanRepositoryAdapter fail closed', () => {
     );
     await expect(adapter.listLanePlans()).rejects.toBeInstanceOf(StateFileUnreadableError);
   });
+
+  it('rejects pull-request-links.json containing conflicting links for the same pull request', async () => {
+    const recordA = {
+      version: 1,
+      repository: 'acme/app',
+      number: 42,
+      projectId: 'proj-1',
+      planId: 'plan-1',
+      laneId: 'lane-A',
+      source: 'sidecar',
+      linkedAtIso: '2026-10-25T00:00:00.000Z',
+      schemaVersion: 1,
+    };
+    const recordB = {
+      version: 1,
+      repository: 'acme/app',
+      number: 42,
+      projectId: 'proj-1',
+      planId: 'plan-1',
+      laneId: 'lane-B',
+      source: 'sidecar',
+      linkedAtIso: '2026-10-26T00:00:00.000Z',
+      schemaVersion: 1,
+    };
+    await fs.writeFile(
+      path.join(tempDir, 'pull-request-links.json'),
+      JSON.stringify([recordA, recordB]),
+    );
+    const adapter = new LanePlanRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.findPullRequestLink('acme/app', 42)).rejects.toBeInstanceOf(
+      StateFileUnreadableError,
+    );
+    await expect(adapter.listPullRequestLinks()).rejects.toBeInstanceOf(
+      StateFileUnreadableError,
+    );
+  });
 });
 
 describe('LanePlanRepositoryAdapter read-only', () => {

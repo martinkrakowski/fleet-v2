@@ -445,7 +445,17 @@ export class LanePlanRepositoryAdapter implements LanePlanRepositoryPort {
       return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
     }
     for (const item of inspection.records) {
-      map.set(pullRequestLinkKey({ repository: item.repository, number: item.number }), item);
+      const key = pullRequestLinkKey({ repository: item.repository, number: item.number });
+      const existing = map.get(key) ?? null;
+      if (existing !== null && decidePullRequestLink(existing, item) === 'pr-already-linked') {
+        return rejectUnreadableStateFile(
+          target,
+          `conflicting stored link for ${key}`,
+          buffer,
+          this.options?.readOnly === true,
+        );
+      }
+      map.set(key, item);
     }
     return map;
   }

@@ -236,6 +236,70 @@ describe('LinkPullRequestUseCase', () => {
     expect(repo.links.get('acme/app#251')?.laneId).toBe('legacy-L1');
   });
 
+  it('refuses a PR already linked in a different project or plan even if its laneId is an alias in the requested plan', async () => {
+    const plan = storedPlan({ lanes: [storedLane('L1', { aliases: ['legacy-L1'] })] });
+    const repo = new FakeLanePlanRepo([plan]);
+    await repo.savePullRequestLink({
+      version: 1,
+      repository: 'acme/app',
+      number: 251,
+      projectId: 'other-project',
+      planId: 'other-plan',
+      laneId: 'legacy-L1',
+      source: 'sidecar',
+      linkedAtIso: '2026-10-25T00:00:00.000Z',
+    });
+    const { useCase } = makeHarness({ lanePlanRepo: repo });
+    const result = await useCase.linkPullRequest(validRequest());
+    expect(result.outcome).toBe('refused');
+    if (result.outcome === 'refused') {
+      expect(result.code).toBe('pr-already-linked');
+      expect(result.reason).toBe('the pull request is already linked to lane legacy-L1');
+    }
+    expect(repo.links.size).toBe(1);
+    expect(repo.links.get('acme/app#251')?.projectId).toBe('other-project');
+  });
+
+  it('refuses with store when looking up an alias link throws', async () => {
+    const plan = storedPlan({ lanes: [storedLane('L1', { aliases: ['legacy-L1'] })] });
+    const repo = new FakeLanePlanRepo([plan]);
+    await repo.savePullRequestLink({
+      version: 1,
+      repository: 'acme/app',
+      number: 251,
+      projectId: 'proj-1',
+      planId: 'plan-1',
+      laneId: 'legacy-L1',
+      source: 'sidecar',
+      linkedAtIso: '2026-10-25T00:00:00.000Z',
+    });
+    repo.findPullRequestLink = async () => {
+      throw new Error('store unreadable on purpose');
+    };
+    const { useCase } = makeHarness({ lanePlanRepo: repo });
+    const result = await useCase.linkPullRequest(validRequest());
+    expect(result.outcome).toBe('refused');
+    if (result.outcome === 'refused') {
+      expect(result.code).toBe('store');
+      expect(result.reason).toBe('the store could not be read');
+    }
+  });
+
+  it('refuses when nowIso throws, and never throws', async () => {
+    const { useCase } = makeHarness({
+      lanePlanRepo: new FakeLanePlanRepo([storedPlan()]),
+      nowIso: () => {
+        throw new Error('clock threw');
+      },
+    });
+    const result = await useCase.linkPullRequest(validRequest());
+    expect(result.outcome).toBe('refused');
+    if (result.outcome === 'refused') {
+      expect(result.code).toBe('invalid');
+      expect(result.reason).toBe('the link record was refused');
+    }
+  });
+
   it('refuses an unknown plan or an unknown lane as unknown-lane, writing nothing', async () => {
     const { repo, useCase } = makeHarness({
       lanePlanRepo: new FakeLanePlanRepo([storedPlan()]),

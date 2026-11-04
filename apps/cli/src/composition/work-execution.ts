@@ -23,15 +23,18 @@ import {
   CommitEditOnlyAttemptUseCase,
   DispatchAttemptUseCase,
   ExecuteAuthorizedForgeActionUseCase,
+  ExplainAttemptUseCase,
   EnqueueMergeUseCase,
   ExecutionObservationAdapter,
   GatePredicateAdapter,
   ProcessTreeTerminationAdapter,
   ImportLanePlanUseCase,
+  ImportTrainStateUseCase,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
   LanePlanRepositoryAdapter,
+  LegacyTrainStateReadAdapter,
   ListMergeQueueUseCase,
   ListUnregisteredProjectsUseCase,
   LocalExecutor,
@@ -510,8 +513,14 @@ export function composeExecution(input: ComposeExecutionInput) {
   const processTreeTermination = new ProcessTreeTerminationAdapter({ executorForHost });
 
   const mergeQueueRepository = new MergeQueueRepositoryAdapter({ stateDir });
-  const enqueueMerge = new EnqueueMergeUseCase({ queue: mergeQueueRepository, forge: forgeRead });
+  const enqueueMerge = new EnqueueMergeUseCase({ queue: mergeQueueRepository });
   const listMergeQueue = new ListMergeQueueUseCase({ queue: mergeQueueRepository });
+  const importTrainState = new ImportTrainStateUseCase({
+    legacyState: new LegacyTrainStateReadAdapter(),
+    queue: mergeQueueRepository,
+    mintUlid: () => newUlid(),
+    nowIso: () => new Date().toISOString(),
+  });
 
   // WB4a: the lane-plan store — one adapter is both stores (in-memory when
   // stateDir is omitted, lane-plans.json otherwise). Its change signal
@@ -577,6 +586,11 @@ export function composeExecution(input: ComposeExecutionInput) {
     inspectAttempt: new InspectAttemptUseCase({
       attemptRepo: attemptRepository,
       runnerForAttempt,
+    }),
+    explainAttempt: new ExplainAttemptUseCase({
+      attemptRepo: attemptRepository,
+      journal: executionJournal,
+      acceptanceEvidence,
     }),
     prepareBriefPackage: new PrepareBriefPackageUseCase({
       briefAuthoring,
@@ -644,6 +658,7 @@ export function composeExecution(input: ComposeExecutionInput) {
     mergeQueueRepository,
     enqueueMerge,
     listMergeQueue,
+    importTrainState,
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({
       attemptRepo: attemptRepository,
       workOrderRepo: workOrderRepository,

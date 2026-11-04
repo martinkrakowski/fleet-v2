@@ -17,8 +17,6 @@ export interface MergeQueueEnqueueCommand {
   readonly successorEntryId: string;
   readonly enqueuedAtIso: string;
   readonly deadlineIso: string;
-  /** The resolved base; when absent the use case reads it from the forge. */
-  readonly baseBranch?: string;
 }
 
 export interface MergeQueueDropCommand {

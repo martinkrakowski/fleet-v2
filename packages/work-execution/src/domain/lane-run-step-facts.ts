@@ -9,7 +9,7 @@
 import { laneRunJournalDispatchResult } from './lane-run-journal.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from './lane-run-journal.js';
 import { LANE_RUN_JOURNAL_ENTRY_VERSION } from './lane-run-journal.js';
-import { LANE_RUN_MAX_RETRY, parseLaneRunKey } from './lane-run-keys.js';
+import { parseLaneRunKey } from './lane-run-keys.js';
 import type { ParsedLaneRunKey } from './lane-run-keys.js';
 import { LANE_RUN_ID_PATTERN } from './lane-run-records.js';
 import type { LaneRunKeyStep } from './lane-run-records.js';
@@ -34,6 +34,8 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'merge-off', 'notice-recorded', 'notice-refused', 'no-in-scope-findings',
   'gate-congested', // KF-30c2: a gate run that exhausted the gate-slot wait limit; the conductor may retry it
   'premerge-success', 'premerge-failure', 'premerge-overtaken', // KS7a-2: the merge hold's `premerge` commit status
+  'ci-failed', // GB4: the keyed `ci` step's refusal of the exact head's CI read
+  'ci-overtaken', // GB4 fix rounds 1-2: a pending `ci` intent whose head/round moved, or whose CI has since passed
 ] as const;
 export type LaneRunResultReasonCode = (typeof LANE_RUN_RESULT_REASON_CODES)[number];
 
@@ -255,90 +257,6 @@ export function laneRunGateCongestion(
   return { retry: latest.retry, atIso: result.recordedAtIso };
 }
 
-/** F62: why the gate read was unknown; the fixed lowercase token in the gate result's detail. */
-export const LANE_RUN_GATE_UNKNOWN_CAUSES = [
-  'gate-output-unreadable',
-  'gate-slot-unavailable',
-  'gate-receipts-unrecorded',
-] as const;
-export type LaneRunGateUnknownCause = (typeof LANE_RUN_GATE_UNKNOWN_CAUSES)[number];
-
-/** F62: the one gate re-run a resume from an `ambiguous gate` park may mint. */
-export interface LaneRunGateRetryFact {
-  /** The retry ordinal (1..9) of the re-run's key. */
-  readonly retry: number;
-}
-
-/**
- * F62: the retry fact of the gate at `head12` — the ONE re-run a resume from an
- * `ambiguous gate` park may mint, or null when no re-run is allowed.
- *
- * Allowed exactly when: the run's LATEST gate intent at `head12` holds an
- * ambiguous `gate-unknown` result; exactly ONE gate intent at that head holds
- * such a result (the budget of one); and a `parked` conduct entry of this run
- * comes AFTER that result in journal order (the run was parked — the first
- * unknown read parks; only a resume asks for the re-run). The ordinal is the
- * next free one at that head (the highest retry ordinal among the gate intents
- * there, plus one) and never above `LANE_RUN_MAX_RETRY`.
- */
-export function laneRunGateRetryFact(
-  entries: readonly LaneRunJournalEntryRecord[],
-  runId: string,
-  head12: string | null,
-): LaneRunGateRetryFact | null {
-  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId) || head12 === null) {
-    return null;
-  }
-  const intents: Array<{ readonly key: string; readonly retry: number }> = [];
-  for (const { entry, parsed } of stepIntentsOf(entries, runId)) {
-    if (parsed.step !== 'gate' || parsed.head12 !== head12 || entry.key === null) {
-      continue;
-    }
-    intents.push({ key: entry.key, retry: parsed.retry ?? 0 });
-  }
-  if (intents.length === 0) {
-    return null;
-  }
-  // The gate runs whose result is an ambiguous `gate-unknown` read.
-  const unknownReads: Array<{ readonly key: string; readonly at: number }> = [];
-  for (const intent of intents) {
-    const at = entries.findIndex(
-      (entry) =>
-        entry.kind === 'result' &&
-        entry.key === intent.key &&
-        entry.outcome === 'ambiguous' &&
-        entry.reasonCode === 'gate-unknown',
-    );
-    if (at !== -1) {
-      unknownReads.push({ key: intent.key, at });
-    }
-  }
-  if (unknownReads.length !== 1) {
-    return null;
-  }
-  const latest = intents[intents.length - 1]!;
-  const latestRead = unknownReads.find((read) => read.key === latest.key);
-  if (latestRead === undefined) {
-    return null;
-  }
-  // The run was parked after that read: the park is what a resume answers.
-  let parked = false;
-  for (const entry of entries.slice(latestRead.at + 1)) {
-    if (entry.kind === 'conduct' && entry.runId === runId && entry.state === 'parked') {
-      parked = true;
-      break;
-    }
-  }
-  if (!parked) {
-    return null;
-  }
-  const retry = intents.reduce((max, intent) => Math.max(max, intent.retry), 0) + 1;
-  if (retry > LANE_RUN_MAX_RETRY) {
-    return null;
-  }
-  return { retry };
-}
-
 const PREMERGE_HEAD12_PATTERN = /^[0-9a-f]{12}$/;
 
 /**
@@ -473,6 +391,36 @@ export function laneRunRecordedSeatAdvance(
     return null;
   }
   return parsed.step;
+}
+
+/**
+ * GB4: true when this run has a final `ci` result with reason `ci-failed`
+ * at `head12` in `round` — the CI failure is already journalled and only the
+ * transition to `fixing` is left. Pure; never throws.
+ */
+export function laneRunCiFailureRecorded(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  round: number,
+  head12: string | null,
+): boolean {
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId) || head12 === null) {
+    return false;
+  }
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index]!;
+    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.runId !== runId) {
+      continue;
+    }
+    if (parsed.step === 'ci' && entry.reasonCode === 'ci-failed' && parsed.round === round && parsed.head12 === head12) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** The dispatch intent time of an attempt (its recordedAtIso), or null. */

@@ -80,11 +80,10 @@ export const READ_ONLY_REVIEW_TOOLS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * The shell commands the lane server's `reviewer` agent may already run, so a
- * strictly read-only shell command is read-only proof by design. The proof
- * grammar below is an allow-list, never a deny-list: read-only commands can
- * still write or execute, so anything not shaped exactly like the forms here
- * is refused.
+ * The shell commands the lane server's `reviewer` agent may already run. This
+ * allow-list is a defence-in-depth filter of what a reviewer may run, **never**
+ * a read-only proof: even a command accepted here voids the review's
+ * read-only verification, because the review prompt forbids every shell call.
  */
 export const READ_ONLY_REVIEW_SHELL_COMMANDS: ReadonlySet<string> = new Set([
   'git',
@@ -321,11 +320,13 @@ function isReadOnlyListCommand(command: string, words: readonly string[]): boole
 }
 
 /**
- * True only for a shell command the lane server's `reviewer` agent may run as
- * read-only proof: `git diff|log|show|status`, `grep`, `rg`, `sed -n`, `cat`,
- * `ls` and `wc` in the strict shapes above. Pure and fail-closed: anything
- * unparsable, over-long, carrying a shell metacharacter, an assignment, an
- * unknown flag or an unsafe path is refused.
+ * True only for a shell command the lane server's `reviewer` agent may run:
+ * `git diff|log|show|status`, `grep`, `rg`, `sed -n`, `cat`, `ls` and `wc` in
+ * the strict shapes above. Pure and fail-closed: anything unparsable,
+ * over-long, carrying a shell metacharacter, an assignment, an unknown flag
+ * or an unsafe path is refused. This is a defence-in-depth filter of what a
+ * reviewer may run, never a read-only proof: even a command accepted here
+ * voids the review's read-only verification.
  */
 export function isReadOnlyReviewCommand(command: unknown): boolean {
   if (typeof command !== 'string') {
@@ -377,31 +378,6 @@ export function isReadOnlyReviewCommand(command: unknown): boolean {
     default:
       return false;
   }
-}
-
-/**
- * The shell command a bash/shell tool event carries, read from the PART's
- * input placements only (`part.input.command` and `part.state.input.command`);
- * null when no placement holds one or when the placements disagree. An
- * event-level `input` is never read, so a passing placement cannot hide a
- * failing one.
- */
-function extractShellCommand(record: Record<string, unknown>): string | null {
-  const part = isPlainRecord(record.part) ? record.part : null;
-  if (part === null) {
-    return null;
-  }
-  const state = isPlainRecord(part.state) ? part.state : null;
-  const commands: string[] = [];
-  for (const input of [part.input, state?.input]) {
-    if (isPlainRecord(input) && typeof input.command === 'string') {
-      commands.push(input.command);
-    }
-  }
-  if (commands.length === 0) {
-    return null;
-  }
-  return commands.every((command) => command === commands[0]) ? commands[0] : null;
 }
 
 /** Recognised event types for review runner stream. Any unrecognised event voids read-only. */
@@ -557,6 +533,31 @@ export const REVIEW_CHECKLIST: string = [
 
 /** Byte cap for the diff embedded in a kind review prompt. */
 export const MAX_OCM_EMBEDDED_DIFF_BYTES = 120_000;
+
+/** The fixed reason a review is refused because the diff under review could not be read. */
+export const DIFF_UNAVAILABLE_REASON = 'diff-unavailable';
+/** The fixed reason a review is refused because the diff under review exceeded the embedding limit. */
+export const DIFF_TRUNCATED_REASON = 'diff-truncated';
+
+export type DiffEmbedding =
+  | { readonly kind: 'embedded'; readonly diff: string }
+  | { readonly kind: 'refused'; readonly reason: string };
+
+/**
+ * Pure classification of a read diff before a review is sent. A throw, a
+ * null, a non-string or a blank read means the change could not be seen; a
+ * diff over the embedding cap means the review would judge only part of the
+ * change. Either way the review is refused (`unknown`), never sent.
+ */
+export function classifyDiffForEmbedding(diff: string | null): DiffEmbedding {
+  if (typeof diff !== 'string' || diff.trim() === '') {
+    return { kind: 'refused', reason: DIFF_UNAVAILABLE_REASON };
+  }
+  if (Buffer.byteLength(diff, 'utf8') > MAX_OCM_EMBEDDED_DIFF_BYTES) {
+    return { kind: 'refused', reason: DIFF_TRUNCATED_REASON };
+  }
+  return { kind: 'embedded', diff };
+}
 
 export function buildReviewPrompt(
   request: RunIndependentReviewRequest,
@@ -854,24 +855,46 @@ export function createOcmReviewTransport(
     // does not need a shell to see the change.
     const nonce = (options.makeNonce ?? defaultNonce)();
     let embeddedDiff: string | null = null;
-    let diffUnavailable = false;
-    if (request.kind !== undefined && options.baseCommit !== undefined && options.readDiff !== undefined) {
-      // A failed diff read never aborts the review: the prompt carries the
-      // "diff not available" note next to the tools sentence and the tools
-      // still work against the candidate head.
-      let diff: string | null = null;
-      try {
-        const read = await options.readDiff(options.baseCommit, request.candidateHeadSha);
-        if (typeof read === 'string' && read.trim() !== '') {
-          diff = read;
-        }
-      } catch {
-        diff = null;
+    if (request.kind !== undefined) {
+      // F68: a kind review with no diff source is refused exactly like an
+      // unreadable diff: a review that cannot see the change can still answer
+      // PASS, so the transport refuses before the prompt and the spawn.
+      if (options.baseCommit === undefined || options.readDiff === undefined) {
+        const afterMissing = await options.readHead(dir);
+        return {
+          rawOutput: DIFF_UNAVAILABLE_REASON,
+          readOnlyVerified:
+            before === request.candidateHeadSha && afterMissing === request.candidateHeadSha,
+          result: 'unknown',
+          findings: [],
+          completedAtIso: new Date().toISOString(),
+        };
       }
-      embeddedDiff = diff;
-      diffUnavailable = diff === null;
+      // A thrown read is a missing diff: classify the read result uniformly.
+      let read: string | null = null;
+      try {
+        read = await options.readDiff(options.baseCommit, request.candidateHeadSha);
+      } catch {
+        read = null;
+      }
+      const embedding = classifyDiffForEmbedding(read);
+      if (embedding.kind === 'refused') {
+        // F68: a review that cannot see the change is never a pass. The
+        // transport refuses here instead of sending a review that could pass
+        // without the diff. `unknown` is the outcome the callers treat as
+        // not-accepted, and the fixed reason travels as the raw output.
+        const after = await options.readHead(dir);
+        return {
+          rawOutput: embedding.reason,
+          readOnlyVerified: before === request.candidateHeadSha && after === request.candidateHeadSha,
+          result: 'unknown',
+          findings: [],
+          completedAtIso: new Date().toISOString(),
+        };
+      }
+      embeddedDiff = embedding.diff;
     }
-    const prompt = buildReviewPrompt(request, nonce, embeddedDiff, diffUnavailable);
+    const prompt = buildReviewPrompt(request, nonce, embeddedDiff);
     const argv: string[] = [
       '--dir',
       dir,
@@ -943,17 +966,11 @@ export function createOcmReviewTransport(
           readOnlyVoided = true;
         } else {
           toolNames.push(toolName);
-          if (READ_ONLY_REVIEW_TOOLS.has(toolName)) {
-            // already read-only proof
-          } else if (toolName === 'bash' || toolName === 'shell') {
-            // The lane server's reviewer agent denies bash except a read-only
-            // command list, so a strictly read-only command is proof by
-            // design; anything else (or no readable command) voids.
-            const command = extractShellCommand(parsed);
-            if (command === null || !isReadOnlyReviewCommand(command)) {
-              readOnlyVoided = true;
-            }
-          } else {
+          // F68: the prompt voids any shell call whatever the command, so no
+          // command is read: the four read-only tools keep the proof and every
+          // other tool (bash and shell included, `git status` included, an
+          // unreadable command included) voids it.
+          if (!READ_ONLY_REVIEW_TOOLS.has(toolName)) {
             readOnlyVoided = true;
           }
         }

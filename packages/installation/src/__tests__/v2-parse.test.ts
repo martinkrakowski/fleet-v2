@@ -1198,3 +1198,150 @@ describe('parseInstallation v2', () => {
     }
   });
 });
+
+describe('parseInstallation v2 daemon', () => {
+  const daemon = {
+    nodePath: '/srv/fleet/node/bin/node',
+    cliPath: '/srv/fleet/cli/fleet-v2.mjs',
+    stateDir: '/srv/fleet/state',
+    unitDir: '/srv/fleet/units',
+    installationFile: '/srv/fleet/fleet.json',
+  };
+
+  it('accepts a full daemon section', () => {
+    expect(parseInstallation({ ...validV2, daemon })).toEqual({
+      ok: true,
+      installation: { ...validV2, daemon },
+    });
+  });
+
+  it('stays valid without the section and leaves daemon unset', () => {
+    const result = parseInstallation(validV2);
+    expect(result).toEqual({ ok: true, installation: validV2 });
+    if (result.ok) {
+      expect(result.installation.daemon).toBeUndefined();
+    }
+  });
+
+  it('refuses an unknown key inside daemon without echoing it', () => {
+    const result = parseInstallation({
+      ...validV2,
+      daemon: { ...daemon, interval: 60 },
+    });
+    expect(result).toEqual({ ok: false, errors: ['daemon: unknown key'] });
+    if (!result.ok) {
+      expect(result.errors.join(' ')).not.toContain('interval');
+    }
+  });
+
+  it('requires every field when the section is present', () => {
+    const result = parseInstallation({
+      ...validV2,
+      daemon: {
+        cliPath: daemon.cliPath,
+        stateDir: daemon.stateDir,
+        unitDir: daemon.unitDir,
+        installationFile: daemon.installationFile,
+      },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['daemon.nodePath: required'],
+    });
+  });
+
+  it('refuses a relative path without echoing it', () => {
+    const result = parseInstallation({
+      ...validV2,
+      daemon: { ...daemon, nodePath: 'bin/node' },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['daemon.nodePath: must be an absolute path'],
+    });
+    if (!result.ok) {
+      expect(result.errors.join(' ')).not.toContain('bin/node');
+    }
+  });
+
+  it('refuses a path with a space without echoing it', () => {
+    const result = parseInstallation({
+      ...validV2,
+      daemon: { ...daemon, cliPath: '/srv/fleet/cli/my fleet.mjs' },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['daemon.cliPath: must be an absolute path with no spaces or quotes'],
+    });
+    if (!result.ok) {
+      expect(result.errors.join(' ')).not.toContain('my fleet');
+    }
+  });
+
+  it('refuses a path containing a credential pattern without echoing it', () => {
+    const result = parseInstallation({
+      ...validV2,
+      daemon: { ...daemon, stateDir: '/srv/fleet/ghp_1234567890abcdef' },
+    });
+    expect(result).toEqual({ ok: false, errors: ['daemon.stateDir: refused'] });
+    if (!result.ok) {
+      expect(result.errors.join(' ')).not.toContain('ghp_');
+    }
+  });
+
+  it.each([
+    '%',
+    '*',
+    '?',
+    '"',
+    "'",
+    '`',
+    '\\',
+    '{',
+    '}',
+  ])('refuses a path containing %s without echoing it', (character) => {
+    const result = parseInstallation({
+      ...validV2,
+      daemon: { ...daemon, stateDir: `/srv/fleet/x${character}y` },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['daemon.stateDir: must be an absolute path with no spaces or quotes'],
+    });
+    if (!result.ok) {
+      expect(result.errors.join(' ')).not.toContain(character);
+    }
+  });
+
+  it.each(['github_pat_', 'sk-', 'AKIA', 'xoxb-'])(
+    'refuses a path containing the credential shape %s without echoing it',
+    (prefix) => {
+      const result = parseInstallation({
+        ...validV2,
+        daemon: { ...daemon, stateDir: `/srv/fleet/${prefix}rest` },
+      });
+      expect(result).toEqual({ ok: false, errors: ['daemon.stateDir: refused'] });
+      if (!result.ok) {
+        expect(result.errors.join(' ')).not.toContain(prefix);
+      }
+    },
+  );
+
+  it('reports refused when a path carries both a credential shape and a space', () => {
+    const result = parseInstallation({
+      ...validV2,
+      daemon: { ...daemon, stateDir: '/srv/fleet/ghp_abc state' },
+    });
+    expect(result).toEqual({ ok: false, errors: ['daemon.stateDir: refused'] });
+    if (!result.ok) {
+      expect(result.errors.join(' ')).not.toContain('ghp_');
+    }
+  });
+
+  it('still rejects a daemon key in a v1 file', () => {
+    expect(parseInstallation({ schemaVersion: 1, daemon })).toEqual({
+      ok: false,
+      errors: ['installation: unknown key'],
+    });
+  });
+});

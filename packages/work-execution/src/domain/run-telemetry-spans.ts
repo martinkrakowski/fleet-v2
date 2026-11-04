@@ -110,6 +110,7 @@ const STEP_SPAN_KINDS: Readonly<Record<LaneRunKeyStep, TelemetrySpanKind>> = Obj
   push: 'TOOL',
   merge: 'TOOL',
   premerge: 'TOOL',
+  ci: 'GUARDRAIL', // GB4: a CI check is a guardrail, like the gate
 });
 
 /** The steps whose span hangs under the round span; the rest hang under the root (plan §3.1). */

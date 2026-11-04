@@ -1,0 +1,9 @@
+[Unit]
+Description=Fleet v2 daemon tick
+
+[Service]
+Type=oneshot
+ExecStart={{nodePath}} {{cliPath}} --state-dir {{stateDir}} daemon tick
+Environment=FLEET_STATE_DIR={{stateDir}}
+Environment=FLEET_INSTALLATION_FILE={{installationFile}}
+Nice=5

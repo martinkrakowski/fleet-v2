@@ -11,11 +11,14 @@ import type {
   ChainTrigger,
   ChainsSection,
   ConductorPolicy,
+  ConductorReaperDiskPolicy,
   ConductorReaperPolicy,
   ConductorReaperRepairs,
+  ConductorReaperWorktreePolicy,
   CostClass,
   CoverageReaderName,
   CoverageUnitKind,
+  DaemonSection,
   DecisionConsumers,
   DecisionsSectionV2,
   FallbackSeat,
@@ -46,7 +49,13 @@ import type {
   WorktreeSection,
 } from './types.js';
 
-import { BOARD_BOUNDS, CONDUCTOR_MINUTE_BOUNDS, CONDUCTOR_REAPER_REPAIR_KINDS } from './policy.js';
+import {
+  BOARD_BOUNDS,
+  CONDUCTOR_MINUTE_BOUNDS,
+  CONDUCTOR_REAPER_DISK_BOUNDS,
+  CONDUCTOR_REAPER_REPAIR_KINDS,
+  CONDUCTOR_REAPER_WORKTREE_BOUNDS,
+} from './policy.js';
 import { readOwnDataProperty } from './policy-read.js';
 import { readTelemetryPolicyBlock } from './telemetry-policy.js';
 import { readSeatsPolicyBlock } from './seats-policy.js';
@@ -80,6 +89,7 @@ const V2_ROOT_KEYS: readonly string[] = [
   'verification',
   'waves',
   'decisions',
+  'daemon',
 ];
 const RUNNER_KEYS: readonly string[] = [
   'agent',
@@ -185,6 +195,17 @@ const CONDUCTOR_REAPER_KEYS: readonly string[] = [
   'graceMinutes',
   'staleStopMinutes',
   'repairs',
+  'worktrees',
+  'disk',
+];
+const CONDUCTOR_REAPER_WORKTREE_KEYS: readonly string[] = [
+  'retentionHours',
+  'maxRemovalsPerPass',
+  'passBudgetSeconds',
+];
+const CONDUCTOR_REAPER_DISK_KEYS: readonly string[] = [
+  'minFreePercent',
+  'clearFreePercent',
 ];
 const GIT_SHELF_KEYS: readonly string[] = [
   'provider',
@@ -210,6 +231,17 @@ const ANSWER_FILE_DECISIONS_KEYS: readonly string[] = [
   'answerFile',
   'consumers',
 ];
+const DAEMON_KEYS: readonly string[] = [
+  'nodePath',
+  'cliPath',
+  'stateDir',
+  'unitDir',
+  'installationFile',
+];
+// Credential shapes a daemon field never carries: the raw string is checked
+// (the value is never echoed), so a prefix anywhere in it refuses the path.
+const DAEMON_CREDENTIAL_PATTERN =
+  /ghp_|github_pat_|sk-|AKIA|PRIVATE KEY|xox[barps]-/;
 // Per-consumer settings (K3): two known consumers, each with its own keys.
 const DECISION_CONSUMERS_KEYS: readonly (keyof DecisionConsumers)[] = [
   'knowledge-ranking',
@@ -446,6 +478,38 @@ function readOptionalAbsolutePath(
     return undefined;
   }
   return value.trim();
+}
+
+/**
+ * A daemon section path field: an absolute path that carries no whitespace or
+ * unit/shell metacharacters and no credential shape. Reuses
+ * `readRequiredAbsolutePath`; every message names only the field.
+ */
+function readRequiredDaemonPath(
+  record: JsonObject,
+  key: string,
+  fieldPath: string,
+  errors: string[],
+): string | undefined {
+  const raw = record[key];
+  const value = readRequiredAbsolutePath(record, key, fieldPath, errors);
+  if (value === undefined) {
+    return undefined;
+  }
+  // The credential check comes first so a value carrying both a credential
+  // shape and a refused character reports `refused`, never the milder shape
+  // error, and the credential prefix is never echoed either way.
+  if (typeof raw === 'string' && DAEMON_CREDENTIAL_PATTERN.test(raw)) {
+    errors.push(`${fieldPath}: refused`);
+    return undefined;
+  }
+  if (/\s/.test(value) || /["'`\\{}%*?]/.test(value)) {
+    errors.push(
+      `${fieldPath}: must be an absolute path with no spaces or quotes`,
+    );
+    return undefined;
+  }
+  return value;
 }
 
 function isCanonicalBase64Of32Bytes(value: string): boolean {
@@ -1880,7 +1944,7 @@ function parseConductorRepairs(
     if (!Object.hasOwn(value, kind)) {
       continue;
     }
-    const flag = value[kind];
+    const flag = readOwnDataProperty(value, kind);
     if (typeof flag !== 'boolean') {
       errors.push(`policy.conductor.reaper.repairs.${kind}: must be a boolean`);
       continue;
@@ -1888,6 +1952,116 @@ function parseConductorRepairs(
     repairs[kind] = flag;
   }
   return repairs;
+}
+
+function readConductorReaperNumber(
+  record: JsonObject,
+  field: string,
+  path: string,
+  bounds: Readonly<{ min: number; max: number }>,
+  errors: string[],
+): number | undefined {
+  if (!Object.hasOwn(record, field)) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(record as Record<string, unknown>, field);
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < bounds.min ||
+    value > bounds.max
+  ) {
+    errors.push(`${path}.${field}: must be an integer ${bounds.min}..${bounds.max}`);
+    return undefined;
+  }
+  return value;
+}
+
+function parseConductorWorktrees(
+  reaper: JsonObject,
+  errors: string[],
+): ConductorReaperWorktreePolicy | undefined {
+  if (!Object.hasOwn(reaper, 'worktrees')) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(reaper as Record<string, unknown>, 'worktrees');
+  if (!isJsonObject(value)) {
+    errors.push('policy.conductor.reaper.worktrees: must be an object');
+    return undefined;
+  }
+  collectUnknownKeys(
+    value,
+    CONDUCTOR_REAPER_WORKTREE_KEYS,
+    'policy.conductor.reaper.worktrees',
+    errors,
+  );
+  const retentionHours = readConductorReaperNumber(
+    value,
+    'retentionHours',
+    'policy.conductor.reaper.worktrees',
+    CONDUCTOR_REAPER_WORKTREE_BOUNDS.retentionHours,
+    errors,
+  );
+  const maxRemovalsPerPass = readConductorReaperNumber(
+    value,
+    'maxRemovalsPerPass',
+    'policy.conductor.reaper.worktrees',
+    CONDUCTOR_REAPER_WORKTREE_BOUNDS.maxRemovalsPerPass,
+    errors,
+  );
+  const passBudgetSeconds = readConductorReaperNumber(
+    value,
+    'passBudgetSeconds',
+    'policy.conductor.reaper.worktrees',
+    CONDUCTOR_REAPER_WORKTREE_BOUNDS.passBudgetSeconds,
+    errors,
+  );
+  return {
+    ...(retentionHours !== undefined ? { retentionHours } : {}),
+    ...(maxRemovalsPerPass !== undefined ? { maxRemovalsPerPass } : {}),
+    ...(passBudgetSeconds !== undefined ? { passBudgetSeconds } : {}),
+  };
+}
+
+function parseConductorDisk(
+  reaper: JsonObject,
+  errors: string[],
+): ConductorReaperDiskPolicy | undefined {
+  if (!Object.hasOwn(reaper, 'disk')) {
+    return undefined;
+  }
+  const value = readOwnDataProperty(reaper as Record<string, unknown>, 'disk');
+  if (!isJsonObject(value)) {
+    errors.push('policy.conductor.reaper.disk: must be an object');
+    return undefined;
+  }
+  collectUnknownKeys(
+    value,
+    CONDUCTOR_REAPER_DISK_KEYS,
+    'policy.conductor.reaper.disk',
+    errors,
+  );
+  const minFreePercent = readConductorReaperNumber(
+    value,
+    'minFreePercent',
+    'policy.conductor.reaper.disk',
+    CONDUCTOR_REAPER_DISK_BOUNDS.minFreePercent,
+    errors,
+  );
+  const clearFreePercent = readConductorReaperNumber(
+    value,
+    'clearFreePercent',
+    'policy.conductor.reaper.disk',
+    CONDUCTOR_REAPER_DISK_BOUNDS.clearFreePercent,
+    errors,
+  );
+  if ((minFreePercent ?? 15) >= (clearFreePercent ?? 20)) {
+    errors.push('policy.conductor.reaper.disk: minFreePercent must be less than clearFreePercent');
+  }
+  return {
+    ...(minFreePercent !== undefined ? { minFreePercent } : {}),
+    ...(clearFreePercent !== undefined ? { clearFreePercent } : {}),
+  };
 }
 
 function parseConductorReaper(
@@ -1927,6 +2101,8 @@ function parseConductorReaper(
     errors,
   );
   const repairs = parseConductorRepairs(value, errors);
+  const worktrees = parseConductorWorktrees(value, errors);
+  const disk = parseConductorDisk(value, errors);
   if (errors.length !== before || enabled === undefined) {
     return undefined;
   }
@@ -1936,6 +2112,8 @@ function parseConductorReaper(
     ...(graceMinutes !== undefined ? { graceMinutes } : {}),
     ...(staleStopMinutes !== undefined ? { staleStopMinutes } : {}),
     ...(repairs !== undefined ? { repairs } : {}),
+    ...(worktrees !== undefined ? { worktrees } : {}),
+    ...(disk !== undefined ? { disk } : {}),
   };
 }
 
@@ -2468,6 +2646,66 @@ function parseV2Decisions(
   return undefined;
 }
 
+/**
+ * Parse the optional v2 `daemon` section: five required absolute paths with no
+ * whitespace, shell/unit metacharacters or credential shapes (CO6). Unknown
+ * keys are refused; messages name only the field, never a value.
+ */
+function parseV2Daemon(
+  value: JsonObject,
+  errors: string[],
+): DaemonSection | undefined {
+  if (!Object.hasOwn(value, 'daemon')) {
+    return undefined;
+  }
+  const section = value.daemon;
+  if (!isJsonObject(section)) {
+    errors.push('daemon: must be an object');
+    return undefined;
+  }
+  collectUnknownKeys(section, DAEMON_KEYS, 'daemon', errors);
+  const nodePath = readRequiredDaemonPath(
+    section,
+    'nodePath',
+    'daemon.nodePath',
+    errors,
+  );
+  const cliPath = readRequiredDaemonPath(
+    section,
+    'cliPath',
+    'daemon.cliPath',
+    errors,
+  );
+  const stateDir = readRequiredDaemonPath(
+    section,
+    'stateDir',
+    'daemon.stateDir',
+    errors,
+  );
+  const unitDir = readRequiredDaemonPath(
+    section,
+    'unitDir',
+    'daemon.unitDir',
+    errors,
+  );
+  const installationFile = readRequiredDaemonPath(
+    section,
+    'installationFile',
+    'daemon.installationFile',
+    errors,
+  );
+  if (
+    nodePath === undefined ||
+    cliPath === undefined ||
+    stateDir === undefined ||
+    unitDir === undefined ||
+    installationFile === undefined
+  ) {
+    return undefined;
+  }
+  return { nodePath, cliPath, stateDir, unitDir, installationFile };
+}
+
 function parseV2Verification(
   value: JsonObject,
   errors: string[],
@@ -2583,6 +2821,7 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   const verification = parseV2Verification(value, errors);
   const waves = parseWavesSection(value, errors);
   const decisions = parseV2Decisions(value, errors);
+  const daemon = parseV2Daemon(value, errors);
 
   if (errors.length > 0) {
     return { ok: false, errors };
@@ -2621,6 +2860,9 @@ function parseInstallationV2(value: JsonObject): ParseResult {
   }
   if (decisions !== undefined) {
     installation.decisions = decisions;
+  }
+  if (daemon !== undefined) {
+    installation.daemon = daemon;
   }
   return { ok: true, installation };
 }

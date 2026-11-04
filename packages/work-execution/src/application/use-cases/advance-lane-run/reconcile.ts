@@ -12,7 +12,7 @@ import { conductDispatching } from './prepare-dispatch.js';
 import { gatePreCheck, runCollectBody, runGateBody } from './collect-gate.js';
 import { reconcileReview } from './review-fix.js';
 import { reconcileAccept, reconcileMerge, reconcilePrPush } from './merge.js';
-import { reconcilePremerge } from './premerge.js';
+import { reconcilePremerge, recordCiFailure } from './premerge.js';
 
 /**
  * The `reconcile` decisions (K4-7, §3.5): an intent without a result is
@@ -48,6 +48,9 @@ export async function performReconcile(ctx: AdvanceStepContext,
   }
   if (decision.step === 'premerge') {
     return reconcilePremerge(ctx, record, gathered, decision, request);
+  }
+  if (decision.step === 'ci') {
+    return reconcileCi(ctx, record, gathered, decision, request);
   }
   if (decision.step === 'stop') {
     return reconcileStop(ctx, record, gathered, decision, request);
@@ -417,6 +420,61 @@ export async function reconcileCollect(ctx: AdvanceStepContext,
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode: 'collected' };
   }
   return runCollectBody(ctx, record, gathered, decision, request, decision.key);
+}
+
+/**
+ * The `ci` reconcile (GB4): an intent without a result is reconciled, never
+ * repeated. The exact-head CI fact must still confirm the failure; an
+ * unknown, a moved head or a pending check is never a CI failure. The
+ * result is appended under the pending key — no second intent — and the
+ * run enters `fixing`.
+ *
+ * Fix round 1: a pending key whose head or round no longer matches the
+ * current facts is overtaken, never journalled as a CI failure. The stale
+ * key takes an `overtaken` result, the pending intent resolves, and the
+ * decider issues a fresh `ci` act at the current head.
+ *
+ * Fix round 2: a pending key whose head still matches but whose CI has
+ * since passed is overtaken too — the failure no longer holds, so the
+ * intent resolves without entering fixing and the run reaches the normal
+ * transition to `merging`.
+ */
+export async function reconcileCi(ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  const parsed = parseLaneRunKey(decision.key);
+  const stale = parsed === null
+    || parsed.kind !== 'step'
+    || parsed.step !== 'ci'
+    || parsed.runId !== record.runId
+    || parsed.round !== record.round
+    || parsed.head12 !== gathered.facts.head12;
+  if (stale) {
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'overtaken', 'ci-overtaken');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'overtaken', reasonCode: 'ci-overtaken' };
+  }
+  const ci = gathered.facts.ci;
+  if (ci === 'failed') {
+    return recordCiFailure(ctx, record, gathered, decision, request);
+  }
+  if (ci === 'passed') {
+    // GB4 fix round 2: the failure was superseded by a pass at the same
+    // head — the pending intent is overtaken, never journalled as a CI
+    // failure, so the decider's next decision is the normal transition to
+    // `merging`.
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'overtaken', 'ci-overtaken');
+    if (resultRefusal !== null) {
+      return { outcome: 'refused', reason: resultRefusal };
+    }
+    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'overtaken', reasonCode: 'ci-overtaken' };
+  }
+  return { outcome: 'waiting', reason: ci === 'pending' ? 'ci-pending' : 'ci-unknown' };
 }
 
 /**

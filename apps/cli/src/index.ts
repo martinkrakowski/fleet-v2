@@ -66,6 +66,7 @@ import { knowledgeCommands } from './commands/knowledge.js';
 import { coordinationCommands } from './commands/coordination.js';
 import { questionsCommands } from './commands/questions.js';
 import { mergeCommands } from './merge.js';
+import { tuiCommand } from './tui/command.js';
 
 export { resolveRunnerSettings };
 
@@ -674,6 +675,8 @@ killall halt marker; --lift clears the pause then the marker. Run
 The report group prints the weekly run-journal service report (read-only, one
 JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
 
+The tui group opens the shared terminal shell: screens are read in-process from the local state stores and the shell never writes. Run 'fleet-v2 tui --help'.
+
 Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
@@ -687,6 +690,7 @@ Commands:
   telemetry export|status
   killall [--lift]
   report weekly
+  tui
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
   attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared|explain
@@ -822,6 +826,9 @@ export async function runCli(
     }
     if (group === 'report') {
       return await reportCommand(restArgv.slice(1), io, activeRuntime, reportOptions ?? {});
+    }
+    if (group === 'tui') {
+      return await tuiCommand(restArgv.slice(1), io, activeRuntime);
     }
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);

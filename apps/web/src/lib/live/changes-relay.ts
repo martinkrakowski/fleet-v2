@@ -95,6 +95,12 @@ export async function createChangeRelay(
   }
 
   if (upstream.status !== 200 || upstream.body === null) {
+    abort.abort();
+    try {
+      await upstream.body?.cancel();
+    } catch {
+      // The upstream is discarded; cancel failure never changes the result.
+    }
     return {
       status: "unavailable",
       reason: `the api boundary answered ${upstream.status} for /v1/changes`,

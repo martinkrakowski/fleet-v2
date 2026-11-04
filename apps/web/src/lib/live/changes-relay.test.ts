@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   createChangeRelay,
@@ -112,6 +112,47 @@ describe("createChangeRelay", () => {
     }
     expect(relay.reason).toContain("501");
     expect("body" in relay).toBe(false);
+  });
+
+  it("cancels the upstream body and aborts when the upstream answers non-200", async () => {
+    const cancelSpy = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      cancel: cancelSpy,
+    });
+    const calls: FetchCall[] = [];
+    const relay = await createChangeRelay({
+      url: "http://127.0.0.1:3001",
+      token: TOKEN,
+      fetchImpl: fakeFetch(502, body, calls),
+    });
+    expect(relay.status).toBe("unavailable");
+    if (relay.status !== "unavailable") {
+      throw new Error("relay unexpectedly streamed");
+    }
+    expect(relay.reason).toContain("502");
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+    expect(calls[0]?.init?.signal?.aborted).toBe(true);
+  });
+
+  it("answers unavailable even when the upstream body cancel throws", async () => {
+    const cancelSpy = vi.fn(() => {
+      throw new Error("upstream cancel failed");
+    });
+    const body = new ReadableStream<Uint8Array>({
+      cancel: cancelSpy,
+    });
+    const calls: FetchCall[] = [];
+    const relay = await createChangeRelay({
+      url: "http://127.0.0.1:3001",
+      token: TOKEN,
+      fetchImpl: fakeFetch(503, body, calls),
+    });
+    expect(relay.status).toBe("unavailable");
+    if (relay.status !== "unavailable") {
+      throw new Error("relay unexpectedly streamed");
+    }
+    expect(relay.reason).toContain("503");
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
   });
 
   it("answers unavailable with a host-free reason when the fetch throws", async () => {

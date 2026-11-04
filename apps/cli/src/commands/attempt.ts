@@ -268,4 +268,12 @@ export const attemptCommands: Readonly<Record<string, CommandHandler>> = {
         nowIso: optStr(p, 'nowIso') ?? new Date().toISOString(),
       });
     },
+    // E2: a read-only explanation of one attempt; never writes.
+    explain: async (p, rt) => {
+      const attemptId = str(p, 'attemptId').trim();
+      if (attemptId === '') {
+        throw new CliUsageError('attempt explain needs --attempt-id');
+      }
+      return rt.execution.explainAttempt.explainAttempt({ attemptId });
+    },
 };

@@ -289,6 +289,45 @@ describe('LanePlanRepositoryAdapter fail closed', () => {
       StateFileUnreadableError,
     );
   });
+
+  it('rejects pull-request-links.json holding duplicate entries for the same pull request and lane with different source or timestamp, writing nothing', async () => {
+    const recordA = {
+      version: 1,
+      repository: 'acme/app',
+      number: 42,
+      projectId: 'proj-1',
+      planId: 'plan-1',
+      laneId: 'lane-A',
+      source: 'sidecar',
+      linkedAtIso: '2026-10-25T00:00:00.000Z',
+      schemaVersion: 1,
+    };
+    const recordB = {
+      version: 1,
+      repository: 'acme/app',
+      number: 42,
+      projectId: 'proj-1',
+      planId: 'plan-1',
+      laneId: 'lane-A',
+      source: 'cli',
+      linkedAtIso: '2026-10-26T00:00:00.000Z',
+      schemaVersion: 1,
+    };
+    const filePath = path.join(tempDir, 'pull-request-links.json');
+    const content = JSON.stringify([recordA, recordB]);
+    await fs.writeFile(filePath, content, 'utf8');
+
+    const adapter = new LanePlanRepositoryAdapter({ stateDir: tempDir });
+    await expect(adapter.findPullRequestLink('acme/app', 42)).rejects.toBeInstanceOf(
+      StateFileUnreadableError,
+    );
+    await expect(adapter.listPullRequestLinks()).rejects.toBeInstanceOf(
+      StateFileUnreadableError,
+    );
+
+    const afterRead = await fs.readFile(filePath, 'utf8');
+    expect(afterRead).toBe(content);
+  });
 });
 
 describe('LanePlanRepositoryAdapter read-only', () => {

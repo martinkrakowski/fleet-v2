@@ -20,6 +20,7 @@ import type {
   SaveLanePlanResult,
   SavePullRequestLinkResult,
 } from '../../ports/out/LanePlanRepositoryPort.out-port.js';
+import type { LinkPullRequestRequest } from '../../ports/in/ImportLanePlanPort.in-port.js';
 import {
   LinkPullRequestUseCase,
   type LinkPullRequestDependencies,
@@ -328,6 +329,25 @@ describe('LinkPullRequestUseCase', () => {
     if (result.outcome === 'refused') {
       expect(result.code).toBe('invalid');
       expect(result.reason).toBe('number must be a positive integer');
+    }
+    expect(repo.links.size).toBe(0);
+  });
+
+  it('refuses null or non-object request as invalid and does not throw', async () => {
+    const { repo, useCase } = makeHarness({
+      lanePlanRepo: new FakeLanePlanRepo([storedPlan()]),
+    });
+    const nullResult = await useCase.linkPullRequest(null as unknown as LinkPullRequestRequest);
+    expect(nullResult.outcome).toBe('refused');
+    if (nullResult.outcome === 'refused') {
+      expect(nullResult.code).toBe('invalid');
+      expect(nullResult.reason).toBe('request must be a non-null object');
+    }
+    const nonObjectResult = await useCase.linkPullRequest('not-an-object' as unknown as LinkPullRequestRequest);
+    expect(nonObjectResult.outcome).toBe('refused');
+    if (nonObjectResult.outcome === 'refused') {
+      expect(nonObjectResult.code).toBe('invalid');
+      expect(nonObjectResult.reason).toBe('request must be a non-null object');
     }
     expect(repo.links.size).toBe(0);
   });

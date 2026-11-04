@@ -290,6 +290,9 @@ function linkRefusal(code: LinkPullRequestRefusalCode, reason: string): LinkPull
 function validateLinkPullRequestRequest(
   request: LinkPullRequestRequest,
 ): { ok: true } | { ok: false; result: LinkPullRequestResult } {
+  if (typeof request !== 'object' || request === null) {
+    return { ok: false, result: linkRefusal('invalid', 'request must be a non-null object') };
+  }
   if (
     typeof request.repository !== 'string' ||
     request.repository.trim().length === 0 ||

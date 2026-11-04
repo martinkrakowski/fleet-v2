@@ -446,8 +446,7 @@ export class LanePlanRepositoryAdapter implements LanePlanRepositoryPort {
     }
     for (const item of inspection.records) {
       const key = pullRequestLinkKey({ repository: item.repository, number: item.number });
-      const existing = map.get(key) ?? null;
-      if (existing !== null && decidePullRequestLink(existing, item) === 'pr-already-linked') {
+      if (map.has(key)) {
         return rejectUnreadableStateFile(
           target,
           `conflicting stored link for ${key}`,

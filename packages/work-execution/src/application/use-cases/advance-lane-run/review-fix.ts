@@ -700,7 +700,7 @@ async function candidateReceiptOf(
   ctx: AdvanceStepContext,
   prior: AttemptRecord,
   candidate: { readonly key: string; readonly step: ReviewKind },
-): Promise<{ readonly findings: readonly ReviewRequestFinding[] } | null> {
+): Promise<{ readonly findings: readonly ReviewRequestFinding[]; readonly verdict: string } | null> {
   const reviewRequest = ctx.deps.reviewRequest;
   if (reviewRequest === undefined || prior.artifacts === null) {
     return null;
@@ -892,12 +892,17 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
       let inScope: readonly ReviewRequestFinding[] | null = null;
       for (const candidate of reviewResultKeysAtHead(entries, record.runId, failure.acceptHead12)) {
         const found = await candidateReceiptOf(ctx, prior, candidate);
-        if (found !== null && found.findings.length > 0) {
-          const candidateInScope = inScopeFindingsOf(found.findings, changed, prior.worktreePath);
-          if (candidateInScope.length > 0) {
-            inScope = candidateInScope;
-            break;
-          }
+        if (found === null || found.findings.length === 0) {
+          continue;
+        }
+        const candidateInScope = inScopeFindingsOf(found.findings, changed, prior.worktreePath);
+        if (candidateInScope.length > 0) {
+          inScope = candidateInScope;
+          break;
+        }
+        // The newest FAILED receipt decides: with no in-scope finding, refuse rather than reach back to an older one.
+        // A passed receipt (GB1 minor-only findings) is used only when it has an in-scope finding, else skipped.
+        if (found.verdict === 'failed') {
           return refuse('no-in-scope-findings');
         }
       }

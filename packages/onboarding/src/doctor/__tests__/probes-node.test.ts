@@ -380,18 +380,18 @@ describe('createNodeDoctorProbes', () => {
         '--max-time',
         '5',
         '--noproxy',
-        '*',
+        '127.0.0.1,localhost',
         '-o',
         '/dev/null',
         '-w',
         '%{http_code}',
         'http://127.0.0.1:4096/api/info',
       ],
-      ['curl', '-sS', '--max-time', '5', '--noproxy', '*', 'http://127.0.0.1:4096/api/model'],
+      ['curl', '-sS', '--max-time', '5', '--noproxy', '127.0.0.1,localhost', 'http://127.0.0.1:4096/api/model'],
     ]);
   });
 
-  it('bypasses any proxy by passing --noproxy * in every loopback curl probe', async () => {
+  it('bypasses any proxy for loopback (--noproxy 127.0.0.1,localhost, no glob for a remote shell) in every loopback curl probe', async () => {
     const local = fakeExecutor(({ argv }) =>
       argv.some((arg) => arg.endsWith('/api/model'))
         ? { exitCode: 0, signal: null, stdout: '{"data":{"models":{}}}', stderr: '' }
@@ -404,7 +404,7 @@ describe('createNodeDoctorProbes', () => {
     for (const call of local.calls) {
       const noproxyIndex = call.argv.indexOf('--noproxy');
       expect(noproxyIndex).toBeGreaterThan(-1);
-      expect(call.argv[noproxyIndex + 1]).toBe('*');
+      expect(call.argv[noproxyIndex + 1]).toBe('127.0.0.1,localhost');
     }
   });
 
@@ -432,7 +432,7 @@ describe('createNodeDoctorProbes', () => {
       '--max-time',
       '5',
       '--noproxy',
-      '*',
+      '127.0.0.1,localhost',
       '-o',
       '/dev/null',
       '-w',

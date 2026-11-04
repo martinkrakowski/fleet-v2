@@ -423,7 +423,7 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
           '--max-time',
           '5',
           '--noproxy',
-          '*',
+          '127.0.0.1,localhost',
           '-o',
           '/dev/null',
           '-w',
@@ -464,7 +464,7 @@ export function createNodeDoctorProbes(deps: NodeDoctorProbesDeps = {}): DoctorP
           '--max-time',
           '5',
           '--noproxy',
-          '*',
+          '127.0.0.1,localhost',
           `http://127.0.0.1:${port}/api/model`,
         ],
       );

@@ -154,6 +154,8 @@ export interface LaneRunFacts {
   readonly acceptanceRejection?: 'review-findings' | 'other';
   /** `CiStatePort` at `head12` (PC/K6). */
   readonly ci: 'pending' | 'passed' | 'failed' | 'unknown';
+  /** GB4: a final `ci` result with reason `ci-failed` is already recorded at this head in this round; absent reads as false. */
+  readonly ciFailureRecorded?: boolean;
   /** The run's PR as the forge reports it (K6, AM4b); `containsLaneHead` is true when the PR head is, or contains as an ancestor, the collected lane head (CT-2a). */
   readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
   /** The step whose latest result in this round at this head was a refusal (K1b). */
@@ -828,6 +830,12 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
     };
 
     const watchingCiRules = (): LaneRunDecision => {
+      // GB4: the CI failure is already journalled under the `ci` key (a
+      // crash between the result and the transition): resume only the
+      // transition, never the key.
+      if (facts.ciFailureRecorded === true) {
+        return enter('fixing');
+      }
       if (facts.ci === 'pending') {
         return wait('ci-pending');
       }
@@ -837,7 +845,15 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (facts.ci === 'passed') {
         return enter('merging');
       }
-      return afterFailure(record.round, 'ci');
+      const outcome = afterFailure(record.round, 'ci');
+      if (outcome.kind === 'park') {
+        return park(outcome.reason, null);
+      }
+      const attempt = facts.attempt;
+      if (attempt === null) {
+        return WAIT_FACTS_INCONSISTENT;
+      }
+      return act({ step: 'ci', round: record.round, seatIndex: attempt.seatIndex, head12: facts.head12, retry: null, attemptOrdinal: null });
     };
 
     const mergingRules = (): LaneRunDecision => {

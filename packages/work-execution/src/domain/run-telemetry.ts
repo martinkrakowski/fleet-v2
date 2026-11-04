@@ -24,7 +24,7 @@ import type { TelemetryAttributeValue, TelemetrySpanKind } from './run-telemetry
 /** Fixed span names (plan §3.1); `review` names a hand-run review receipt until receipts carry a kind. */
 export const TELEMETRY_SPAN_NAMES = [
   'lane-run', 'round', 'prepare', 'dispatch', 'attempt', 'usage', 'collect', 'reconcile', 'stop', 'gate',
-  'brief-check', 'code-review', 'pre-merge', 'review', 'accept', 'open-pr', 'push', 'merge', 'ci-wait',
+  'brief-check', 'code-review', 'pre-merge', 'review', 'accept', 'open-pr', 'push', 'merge', 'ci', 'ci-wait',
   'park', 'stop-request',
 ] as const;
 export type TelemetrySpanName = (typeof TELEMETRY_SPAN_NAMES)[number];

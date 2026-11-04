@@ -10,8 +10,9 @@ import { describe, expect, it } from 'vitest';
 
 import type { FleetInstallation, ForgeSectionV2 } from '@fleet/installation';
 
-import { createFleetCliRuntime } from '../composition.js';
+import { createFleetCliRuntime, type FleetCliRuntime } from '../composition.js';
 import { runCli } from '../index.js';
+import { runMergeWait, type MergeWaitClock } from '../merge.js';
 
 const VALID_SHA = '3dd5d90509461e3d2154b52da28671aeffa84130';
 const GITHUB_FORGE: ForgeSectionV2 = {
@@ -205,7 +206,7 @@ describe('merge wait', () => {
         '--pull-request',
         '202',
         '--max',
-        '50ms',
+        '3s',
         '--interval',
         '10ms',
       ],
@@ -217,7 +218,7 @@ describe('merge wait', () => {
     expect(JSON.parse(out.join(''))).toEqual({ outcome: 'ready', headOid: VALID_SHA });
   });
 
-  it('exits 1 with wait-timeout once the budget is spent', async () => {
+  it('exits 1 bounded by a tiny --max: the read is capped at the budget, never the 30 s timeout', async () => {
     const { io, out } = collectIo();
     const forgeGhRunner = async () => ({
       exitCode: 0,
@@ -244,10 +245,86 @@ describe('merge wait', () => {
     );
 
     expect(code).toBe(1);
+    // A read deadline under the forge adapter's 2 s budget floor answers
+    // budget-exhausted; either way the whole wait stays inside --max.
     expect(JSON.parse(out.join(''))).toEqual({
-      outcome: 'still-waiting',
-      reason: 'wait-timeout',
-      lastReason: 'checks-pending',
+      outcome: 'unknown',
+      reason: 'budget-exhausted',
+    });
+  });
+
+  describe('with an injected clock (CO25: --max bounds an in-flight read)', () => {
+    /** A fake clock: `sleep` advances it, so no test waits on real time. */
+    function makeClock(): { readonly clock: MergeWaitClock; readonly nowMs: () => number } {
+      let nowMs = 0;
+      return {
+        clock: {
+          now: () => nowMs,
+          sleep: async (ms) => {
+            nowMs += ms;
+          },
+        },
+        nowMs: () => nowMs,
+      };
+    }
+
+    function fakeRuntime(
+      read: (request: { readonly deadlineIso: string }) => Promise<unknown>,
+    ): FleetCliRuntime {
+      return {
+        execution: { inspectMergeReadiness: { inspectMergeReadiness: read } },
+      } as unknown as FleetCliRuntime;
+    }
+
+    const payload = {
+      repository: 'example-owner/example-repo',
+      pullRequest: 202,
+      max: '20ms',
+      interval: '10ms',
+    };
+
+    it('ends still-waiting / wait-timeout within --max when one read outlasts the budget and never starts another read', async () => {
+      const { clock, nowMs } = makeClock();
+      const deadlines: string[] = [];
+      const read = async (request: { readonly deadlineIso: string }) => {
+        deadlines.push(request.deadlineIso);
+        await clock.sleep(50); // one forge read slower than the whole --max budget
+        return { outcome: 'still-waiting', reason: 'checks-pending' };
+      };
+      const runtime = fakeRuntime(read);
+
+      const answer = await runMergeWait(payload, runtime, clock);
+
+      expect(answer).toEqual({
+        outcome: 'still-waiting',
+        reason: 'wait-timeout',
+        lastReason: 'checks-pending',
+      });
+      expect(deadlines).toEqual([new Date(20).toISOString()]); // first read capped at the budget end
+      expect(deadlines).toHaveLength(1); // the spent budget never starts a second read
+      expect(nowMs()).toBe(50); // the wait ended within about --max (one read past it, no extra polling)
+    });
+
+    it('caps every read deadline at the remaining budget across fast polls', async () => {
+      const { clock } = makeClock();
+      const deadlines: string[] = [];
+      const read = async (request: { readonly deadlineIso: string }) => {
+        deadlines.push(request.deadlineIso);
+        return { outcome: 'still-waiting', reason: 'checks-pending' };
+      };
+      const runtime = fakeRuntime(read);
+
+      const answer = await runMergeWait(payload, runtime, clock);
+
+      expect(answer).toEqual({
+        outcome: 'still-waiting',
+        reason: 'wait-timeout',
+        lastReason: 'checks-pending',
+      });
+      expect(deadlines).toEqual([
+        new Date(20).toISOString(), // first read: min(30 s, 20 ms of budget)
+        new Date(20).toISOString(), // the second read: never past the budget end
+      ]);
     });
   });
 });

@@ -274,7 +274,7 @@ function retryStopKey(retry: number): string {
 }
 
 function collectKey(): string {
-  return stepKey({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: null, head12: null });
+  return stepKey({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: 1, head12: null });
 }
 
 function gateKey(): string {
@@ -2022,6 +2022,65 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
     expect(harness.workOrders.get('wo-example-1')).toMatchObject({
       state: 'stopped',
       revision: 2,
+    });
+  });
+
+  it('test 18 (F87): a second collect in the same round carries the attempt ordinal and is not refused', async () => {
+    // a1's journal, as an old (pre-F87) journal has it: its collect sits under
+    // the legacy ordinal-less key r0/collect/0. a2 re-prepares the same seat in
+    // the same round; before the fix its collect reused r0/collect/0 and the
+    // journal refused it duplicate-key forever.
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1', 'attempt-example-2'] }),
+      [endedAttempt({ id: 'attempt-example-2', completionReceipt: receipt({ attemptId: 'attempt-example-2' }) })],
+    );
+    const dispatch1 = stepKey({ round: 0, step: 'dispatch', seatIndex: 0, attemptOrdinal: 1, head12: null });
+    await appendIntent(harness, dispatch1, 'attempt-example-1', NOW);
+    await appendResult(harness, dispatch1, 'completed', 'dispatch-started', NOW);
+    const legacyCollect = `${RUN_ID}/r0/collect/0`;
+    await appendIntent(harness, legacyCollect, 'attempt-example-1', NOW);
+    await appendResult(harness, legacyCollect, 'completed', 'collected', NOW);
+    await conduct(harness, 'seat-failed', NOW);
+    const prepare2 = stepKey({ round: 0, step: 'prepare', seatIndex: 0, attemptOrdinal: 2, head12: null });
+    await appendIntent(harness, prepare2, 'attempt-example-2', NOW);
+    await appendResult(harness, prepare2, 'completed', 'prepared', NOW);
+    const dispatch2 = stepKey({ round: 0, step: 'dispatch', seatIndex: 0, attemptOrdinal: 2, head12: null });
+    await appendIntent(harness, dispatch2, 'attempt-example-2', NOW);
+    await appendResult(harness, dispatch2, 'completed', 'dispatch-started', NOW);
+    await conduct(harness, 'collecting', NOW);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'collect',
+      key: `${RUN_ID}/r0/collect/0/a2`,
+      result: 'completed',
+      reasonCode: 'collected',
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries).toContainEqual(
+      expect.objectContaining({ kind: 'intent', key: `${RUN_ID}/r0/collect/0/a2` }),
+    );
+    expect(entries).toContainEqual(
+      expect.objectContaining({ kind: 'intent', key: legacyCollect }),
+    );
+  });
+
+  it('test 19 (F87): a refused collect intent carries the journal refusal and its detail', async () => {
+    const ended = endedAttempt();
+    const harness = await makeHarness(runRecord(), [ended]);
+    await conduct(harness, 'collecting', NOW);
+    // The collect key is already spent (an intent with a final result), so it is
+    // not a pending intent: the decider still acts, and the collect's own intent
+    // append is refused duplicate-key.
+    await appendIntent(harness, collectKey(), 'attempt-example-1', NOW);
+    await appendResult(harness, collectKey(), 'completed', 'collected', NOW);
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'journal-refused',
+      journalRefusal: 'duplicate-key',
+      detail: null,
     });
   });
 });

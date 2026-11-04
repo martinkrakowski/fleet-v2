@@ -368,7 +368,7 @@ describe('global rules', () => {
       attempt: attemptFact({ phase: 'collected', collection: null }),
     });
     expect(decide(rec, facts)).toEqual({
-      kind: 'act', step: 'collect', key: `${RUN_ID}/r0/collect/0`, round: 0, seatIndex: 0, head12: null, retry: null,
+      kind: 'act', step: 'collect', key: `${RUN_ID}/r0/collect/0/a1`, round: 0, seatIndex: 0, head12: null, retry: null,
     });
   });
 
@@ -743,7 +743,7 @@ describe('collecting state', () => {
   it('C1: before collection, collects', () => {
     const facts = baseFacts({ state: 'collecting', attempt: attemptFact() });
     expect(decide(record({}), facts)).toEqual({
-      kind: 'act', step: 'collect', key: `${RUN_ID}/r0/collect/0`, round: 0, seatIndex: 0, head12: null, retry: null,
+      kind: 'act', step: 'collect', key: `${RUN_ID}/r0/collect/0/a1`, round: 0, seatIndex: 0, head12: null, retry: null,
     });
   });
 
@@ -1688,7 +1688,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
 
     const s3 = baseFacts({ state: 'collecting', stopMode: 'graceful', attempt: attemptFact({ phase: 'collected', collection: null }), ...grace });
     expect(decide(rec, s3)).toEqual({
-      kind: 'act', step: 'collect', key: `${RUN_ID}/r0/collect/0`, round: 0, seatIndex: 0, head12: null, retry: null,
+      kind: 'act', step: 'collect', key: `${RUN_ID}/r0/collect/0/a1`, round: 0, seatIndex: 0, head12: null, retry: null,
     });
 
     const sealed = { commits: 2, manifest: 'sealed' as const, headUnchanged: false };

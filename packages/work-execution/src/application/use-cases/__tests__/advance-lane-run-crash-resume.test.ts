@@ -225,7 +225,7 @@ function stopKey(round = 0, seatIndex = 0): string {
 }
 
 function collectKey(): string {
-  return stepKey({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: null, head12: null });
+  return stepKey({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: 1, head12: null });
 }
 
 function gateKey(): string {

@@ -1,7 +1,9 @@
 /**
  * The idempotency keys of plan §3.2 and §3.8: step keys
  * `<runId>/r<round>/<step>/<seatIndex>[/a<n>][@<head12>][/retry<n>]` (including
- * `reconcile`), the control keys `<runId>/stop@<via>` (graceful) and
+ * `reconcile`; `collect` now always carries `/a<n>`, the collected attempt's
+ * ordinal, and its legacy ordinal-less form `<runId>/r<round>/collect/<seatIndex>`
+ * is still read but no longer buildable), the control keys `<runId>/stop@<via>` (graceful) and
  * `<runId>/stop-force@<via>` (force), with via web or cli and the mode read from
  * the key, `<runId>/park/<n>/resume@<via>` (with via web or cli), the request channel's
  * `request/<requestId>`, the reaper's `reaper/<subjectId>/<kind>@<findingId>`,
@@ -13,7 +15,9 @@
  * Pure; builders and the parser never throw and never echo input.
  * `parseLaneRunKey(buildX(…))` always returns the same parts, and building a
  * parsed key returns the same string, except a `/r<n>` merge key: its parsed parts
- * carry no retry proof, so rebuilding one is refused by design. K1b's journal refuses
+ * carry no retry proof, so rebuilding one is refused by design, and except a
+ * legacy ordinal-less `collect` key: it parses to `attemptOrdinal: null`, so
+ * rebuilding it is refused by design. K1b's journal refuses
  * a second intent with the same key.
  */
 
@@ -513,7 +517,32 @@ function parseStepKeySegments(segments: string[], key: string): ParsedLaneRunKey
   let attemptOrdinal: number | null = null;
   let head12: string | null = null;
   let retry: number | null = null;
-  if (LANE_RUN_KEY_ATTEMPT_RULE[step] === 'required') {
+  if (step === 'collect') {
+    // The collect step's own branch, before the generic attempt-rule branches:
+    // since F87 collect keys carry `/a<n>`, but the legacy ordinal-less form
+    // (and its legacy `retry<n>` tail) is still read for older journals.
+    if (!SEAT_INDEX_TEXT_PATTERN.test(segments[3])) {
+      return null;
+    }
+    seatIndex = Number(segments[3]);
+    if (segments.length === 4) {
+      attemptOrdinal = null;
+      retry = null;
+    } else if (segments.length === 5) {
+      const tail = segments[4];
+      if (ATTEMPT_SEGMENT_PATTERN.test(tail)) {
+        attemptOrdinal = Number(tail.slice(1));
+        retry = null;
+      } else if (RETRY_SEGMENT_PATTERN.test(tail)) {
+        attemptOrdinal = null;
+        retry = Number(tail.slice(5));
+      } else {
+        return null;
+      }
+    } else {
+      return null;
+    }
+  } else if (LANE_RUN_KEY_ATTEMPT_RULE[step] === 'required') {
     if (segments.length !== 5 || !SEAT_INDEX_TEXT_PATTERN.test(segments[3])) {
       return null;
     }
@@ -541,6 +570,19 @@ function parseStepKeySegments(segments: string[], key: string): ParsedLaneRunKey
       }
       retry = Number(segments[4].slice(5));
     }
+  }
+  if (step === 'collect' && attemptOrdinal === null) {
+    // A legacy ordinal-less collect key cannot go through the builder (F87 refuses
+    // building one), so validate it by reconstructing the exact string instead.
+    if (!LANE_RUN_ID_PATTERN.test(segments[0])) {
+      return null;
+    }
+    const rebuilt = segments[0] + '/r' + round + '/collect/' + seatIndex +
+      (retry === null ? '' : '/retry' + retry);
+    if (rebuilt !== key) {
+      return null;
+    }
+    return { kind: 'step', runId: segments[0], round, step, seatIndex, attemptOrdinal, head12, retry };
   }
   const built = buildLaneRunStepKey({ runId: segments[0], round, step, seatIndex, attemptOrdinal, head12, retry });
   if (!built.ok || built.key !== key) {

@@ -631,7 +631,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
           seatIndex: attempt.seatIndex,
           head12: null,
           retry: null,
-          attemptOrdinal: null,
+          attemptOrdinal: record.attemptIds.indexOf(attempt.attemptId) + 1,
         });
       }
       if (attempt.collection.commits === 0) {

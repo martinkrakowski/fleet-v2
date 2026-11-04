@@ -86,6 +86,7 @@ import {
   performEnter,
   performPark,
   raiseParkNotice,
+  refusedResult,
   saveOrRefuse,
 } from './advance-lane-run/step-context.js';
 import {
@@ -263,7 +264,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       if (parkedConducts === record.parkCount - 1) {
         const appended = await appendConduct(this.ctx, request, 'parked');
         if (!appended.ok) {
-          return { outcome: 'refused', reason: appended.reason };
+          return refusedResult(appended);
         }
         // A crash before the notice landed is repaired here too: re-raise the
         // saved park's notice under its key before returning `repaired`.

@@ -68,7 +68,7 @@ function asInput(text: string): TelemetryHashInput {
 }
 
 function stepKey(step: string, extra: string, round = 0, runId = RUN_ID): string {
-  const attemptRule = ['prepare', 'dispatch'].includes(step);
+  const attemptRule = ['prepare', 'dispatch', 'collect'].includes(step);
   const headRule = ['gate', 'brief-check', 'code-review', 'pre-merge', 'accept', 'open-pr', 'push', 'merge'].includes(step);
   const built = buildLaneRunStepKey({
     runId,
@@ -87,7 +87,7 @@ function stepKey(step: string, extra: string, round = 0, runId = RUN_ID): string
 const PREPARE_KEY = stepKey('prepare', '');
 const DISPATCH_KEY = stepKey('dispatch', '');
 const COLLECT_KEY = stepKey('collect', '');
-const COLLECT_RETRY_KEY = stepKey('collect', '/retry1');
+const COLLECT_RETRY_KEY = stepKey('collect', '').replace('/a1', '/retry1');
 const GATE_KEY = stepKey('gate', '');
 const CODE_REVIEW_KEY = stepKey('code-review', '');
 const ACCEPT_KEY = stepKey('accept', '');

@@ -6,7 +6,7 @@ import type { AttemptRecord } from '../../../domain/execution-records.js';
 import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-port.js';
 import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendRunIntent, appendRunResult, performPark } from './step-context.js';
+import { appendRunIntent, appendRunResult, performPark, refusedResult } from './step-context.js';
 import { manifestExpectedArtifacts, readFrozenManifestVerified, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { historyEntryOf } from '../../../domain/seat-selection.js';
 
@@ -37,7 +37,7 @@ export async function performCollect(ctx: AdvanceStepContext,
   }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   return runCollectBody(ctx, record, gathered, decision, request, decision.key);
 }
@@ -72,7 +72,7 @@ export async function runCollectBody(ctx: AdvanceStepContext,
   if (latest.state !== 'ended' || latest.completionReceipt === null) {
     const resultRefusal = await appendRunResult(ctx, request, key, 'refused', 'no-completion-receipt');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'no-completion-receipt' };
   }
@@ -85,7 +85,7 @@ export async function runCollectBody(ctx: AdvanceStepContext,
   if (expectedArtifacts === null) {
     const resultRefusal = await appendRunResult(ctx, request, key, 'refused', 'collect-refused');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'collect-refused' };
   }
@@ -98,14 +98,14 @@ export async function runCollectBody(ctx: AdvanceStepContext,
     if (committed.outcome === 'refused') {
       const resultRefusal = await appendRunResult(ctx, request, key, 'refused', 'edit-only-refused');
       if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
+        return refusedResult(resultRefusal);
       }
       return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'edit-only-refused' };
     }
     if (committed.outcome === 'unknown') {
       const resultRefusal = await appendRunResult(ctx, request, key, 'ambiguous', 'edit-only-unknown');
       if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
+        return refusedResult(resultRefusal);
       }
       return { outcome: 'acted', step: decision.step, key, result: 'ambiguous', reasonCode: 'edit-only-unknown' };
     }
@@ -119,13 +119,13 @@ export async function runCollectBody(ctx: AdvanceStepContext,
   if (collected.outcome === 'collected') {
     const resultRefusal = await appendRunResult(ctx, request, key, 'completed', 'collected');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'collected' };
   }
   const resultRefusal = await appendRunResult(ctx, request, key, 'refused', 'collect-refused');
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key, result: 'refused', reasonCode: 'collect-refused' };
 }
@@ -284,7 +284,7 @@ export async function performGate(ctx: AdvanceStepContext,
   }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   return runGateBody(ctx, record, gathered, decision, request, decision.key);
 }
@@ -349,7 +349,7 @@ export async function runGateBody(ctx: AdvanceStepContext,
     if (!recorded) {
       const resultRefusal = await appendRunResult(ctx, request, key, 'ambiguous', 'gate-unknown');
       if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
+        return refusedResult(resultRefusal);
       }
       return { outcome: 'acted', step: decision.step, key, result: 'ambiguous', reasonCode: 'gate-unknown' };
     }
@@ -357,14 +357,14 @@ export async function runGateBody(ctx: AdvanceStepContext,
   if (verdict.verdict === 'passed') {
     const resultRefusal = await appendRunResult(ctx, request, key, 'completed', 'gate-passed');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'gate-passed' };
   }
   if (verdict.verdict === 'failed') {
     const resultRefusal = await appendRunResult(ctx, request, key, 'completed', 'gate-failed');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'gate-failed' };
   }
@@ -374,13 +374,13 @@ export async function runGateBody(ctx: AdvanceStepContext,
   if (verdict.verdict === 'unknown' && verdict.congested === true) {
     const congestedRefusal = await appendRunResult(ctx, request, key, 'completed', 'gate-congested');
     if (congestedRefusal !== null) {
-      return { outcome: 'refused', reason: congestedRefusal };
+      return refusedResult(congestedRefusal);
     }
     return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'gate-congested' };
   }
   const resultRefusal = await appendRunResult(ctx, request, key, 'ambiguous', 'gate-unknown');
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key, result: 'ambiguous', reasonCode: 'gate-unknown' };
 }

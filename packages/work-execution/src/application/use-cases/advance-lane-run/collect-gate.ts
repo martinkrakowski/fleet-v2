@@ -347,7 +347,7 @@ export async function runGateBody(ctx: AdvanceStepContext,
     // run-result is appended; any failure fails closed to `gate-unknown`.
     const recorded = await recordGateReceipts(ctx, record, latest, key, request, verdict.results ?? []);
     if (!recorded) {
-      const resultRefusal = await appendRunResult(ctx, request, key, 'ambiguous', 'gate-unknown', 'gate-receipts-unrecorded');
+      const resultRefusal = await appendRunResult(ctx, request, key, 'ambiguous', 'gate-unknown');
       if (resultRefusal !== null) {
         return { outcome: 'refused', reason: resultRefusal };
       }
@@ -372,13 +372,13 @@ export async function runGateBody(ctx: AdvanceStepContext,
   // completed `gate-congested` run (never a pass); any other `unknown` stays
   // exactly as today (`ambiguous` / `gate-unknown`).
   if (verdict.verdict === 'unknown' && verdict.congested === true) {
-    const congestedRefusal = await appendRunResult(ctx, request, key, 'completed', 'gate-congested', 'gate-slot-unavailable');
+    const congestedRefusal = await appendRunResult(ctx, request, key, 'completed', 'gate-congested');
     if (congestedRefusal !== null) {
       return { outcome: 'refused', reason: congestedRefusal };
     }
     return { outcome: 'acted', step: decision.step, key, result: 'completed', reasonCode: 'gate-congested' };
   }
-  const resultRefusal = await appendRunResult(ctx, request, key, 'ambiguous', 'gate-unknown', 'gate-output-unreadable');
+  const resultRefusal = await appendRunResult(ctx, request, key, 'ambiguous', 'gate-unknown');
   if (resultRefusal !== null) {
     return { outcome: 'refused', reason: resultRefusal };
   }

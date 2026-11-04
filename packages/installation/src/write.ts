@@ -64,6 +64,15 @@ export function writeInstallationV2(installation: FleetInstallationV2): string {
   if (installation.decisions !== undefined) {
     document.decisions = serializeDecisions(installation.decisions);
   }
+  if (installation.daemon !== undefined) {
+    document.daemon = {
+      nodePath: installation.daemon.nodePath,
+      cliPath: installation.daemon.cliPath,
+      stateDir: installation.daemon.stateDir,
+      unitDir: installation.daemon.unitDir,
+      installationFile: installation.daemon.installationFile,
+    };
+  }
   return `${JSON.stringify(document, null, 2)}\n`;
 }
 
@@ -219,6 +228,29 @@ function serializePolicy(policy: PolicySection): Record<string, unknown> {
           }
         }
         reaper.repairs = repairs;
+      }
+      if (policy.conductor.reaper.worktrees !== undefined) {
+        const worktrees: Record<string, unknown> = {};
+        if (policy.conductor.reaper.worktrees.retentionHours !== undefined) {
+          worktrees.retentionHours = policy.conductor.reaper.worktrees.retentionHours;
+        }
+        if (policy.conductor.reaper.worktrees.maxRemovalsPerPass !== undefined) {
+          worktrees.maxRemovalsPerPass = policy.conductor.reaper.worktrees.maxRemovalsPerPass;
+        }
+        if (policy.conductor.reaper.worktrees.passBudgetSeconds !== undefined) {
+          worktrees.passBudgetSeconds = policy.conductor.reaper.worktrees.passBudgetSeconds;
+        }
+        reaper.worktrees = worktrees;
+      }
+      if (policy.conductor.reaper.disk !== undefined) {
+        const disk: Record<string, unknown> = {};
+        if (policy.conductor.reaper.disk.minFreePercent !== undefined) {
+          disk.minFreePercent = policy.conductor.reaper.disk.minFreePercent;
+        }
+        if (policy.conductor.reaper.disk.clearFreePercent !== undefined) {
+          disk.clearFreePercent = policy.conductor.reaper.disk.clearFreePercent;
+        }
+        reaper.disk = disk;
       }
       conductor.reaper = reaper;
     }

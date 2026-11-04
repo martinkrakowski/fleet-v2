@@ -5,7 +5,8 @@
     "outDir": "dist",
     "composite": true,
     "declaration": true,
-    "emitDeclarationOnly": false
+    "emitDeclarationOnly": false,
+    "jsx": "react-jsx"
   },
   "include": [
     "src/**/*"

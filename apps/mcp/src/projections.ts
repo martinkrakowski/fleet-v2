@@ -896,3 +896,144 @@ export function projectConductorStatus(
     ),
   };
 }
+
+/** A hex digest: 64 lowercase hex digits. */
+const HEX64_PATTERN = /^[0-9a-f]{64}$/;
+
+function asHexDigest(value: unknown): string | null {
+  const text = asString(value);
+  return text !== null && HEX64_PATTERN.test(text) ? text : null;
+}
+
+export interface BriefPreviewSeatProjection {
+  readonly id: string | null;
+  readonly model: string | null;
+  readonly tool: string | null;
+  readonly variant: string | null;
+  readonly agent: string | null;
+  readonly on: string[];
+}
+
+function projectPreviewSeat(value: unknown): BriefPreviewSeatProjection {
+  const seat = asRecord(value);
+  return {
+    id: asString(seat?.id),
+    model: asString(seat?.model),
+    tool: asString(seat?.tool),
+    variant: asString(seat?.variant),
+    agent: asString(seat?.agent),
+    on: stringList(seat?.on),
+  };
+}
+
+function projectPreviewSeatList(value: unknown): BriefPreviewSeatProjection[] {
+  return Array.isArray(value) ? value.map(projectPreviewSeat) : [];
+}
+
+export type BriefPreviewProjection =
+  | {
+      readonly outcome: "previewed";
+      readonly preview: {
+        readonly attemptId: string | null;
+        readonly briefDigest: string | null;
+        readonly modelAssignment: {
+          readonly model: string | null;
+          readonly variant: string | null;
+          readonly seatTool: string | null;
+        };
+        readonly seatPlan:
+          | {
+              readonly version: number | null;
+              readonly "first-pass": BriefPreviewSeatProjection[];
+              readonly fix: BriefPreviewSeatProjection[];
+              readonly review: BriefPreviewSeatProjection[];
+            }
+          | null;
+        readonly acceptance: {
+          readonly commitRequired: boolean | null;
+          readonly diffCheck: boolean | null;
+          readonly commandCount: number | null;
+          readonly commandDigests: string[];
+        };
+        readonly prNotesPresent: boolean | null;
+        readonly selectedKnowledgeVersions: readonly {
+          readonly knowledgeEntryId: string | null;
+          readonly version: string | null;
+        }[];
+      };
+    }
+  | {
+      readonly outcome: "rejected";
+      readonly reasonClass: "acceptance-spec-shell" | null;
+      readonly reason: string | null;
+    }
+  | { readonly outcome: string };
+
+/**
+ * Project the brief-preview result (MX7; plan §3.7): the acceptance spec
+ * appears only as flags, a command count and one digest per command — never an
+ * argv element, an owned path, an allowed path prefix, an expected-artifact
+ * path or the worktree path. Dropped: every other field, including any argv
+ * element, owned path, prefix, artifact path or worktree path, and a digest
+ * that is not 64 hex digits.
+ */
+export function projectBriefPreview(result: unknown): BriefPreviewProjection {
+  const record = asRecord(result);
+  if (record?.outcome === "previewed") {
+    const preview = asRecord(record.preview);
+    const modelAssignment = asRecord(preview?.modelAssignment);
+    const seatPlan = asRecord(preview?.seatPlan);
+    const acceptance = asRecord(preview?.acceptance);
+    const selected = Array.isArray(preview?.selectedKnowledgeVersions)
+      ? preview.selectedKnowledgeVersions
+      : [];
+    return {
+      outcome: "previewed",
+      preview: {
+        attemptId: asString(preview?.attemptId),
+        briefDigest: asHexDigest(preview?.briefDigest),
+        modelAssignment: {
+          model: asString(modelAssignment?.model),
+          variant: asString(modelAssignment?.variant),
+          seatTool: asString(modelAssignment?.seatTool),
+        },
+        seatPlan: seatPlan
+          ? {
+              version: asNumber(seatPlan.version),
+              "first-pass": projectPreviewSeatList(seatPlan["first-pass"]),
+              fix: projectPreviewSeatList(seatPlan.fix),
+              review: projectPreviewSeatList(seatPlan.review),
+            }
+          : null,
+        acceptance: {
+          commitRequired: asBoolean(acceptance?.commitRequired),
+          diffCheck: asBoolean(acceptance?.diffCheck),
+          commandCount: asNumber(acceptance?.commandCount),
+          commandDigests: stringList(acceptance?.commandDigests).filter(
+            (digest) => HEX64_PATTERN.test(digest),
+          ),
+        },
+        prNotesPresent: asBoolean(preview?.prNotesPresent),
+        selectedKnowledgeVersions: selected.map((entry) => {
+          const knowledge = asRecord(entry);
+          return {
+            knowledgeEntryId: asString(knowledge?.knowledgeEntryId),
+            version: asString(knowledge?.version),
+          };
+        }),
+      },
+    };
+  }
+  if (record?.outcome === "rejected") {
+    const reason = asString(record.reason);
+    return {
+      outcome: "rejected",
+      reasonClass:
+        record.reasonClass === "acceptance-spec-shell"
+          ? "acceptance-spec-shell"
+          : null,
+      reason: reason !== null ? reason.slice(0, 500) : null,
+    };
+  }
+  return { outcome: asString(record?.outcome) ?? "unknown" };
+}

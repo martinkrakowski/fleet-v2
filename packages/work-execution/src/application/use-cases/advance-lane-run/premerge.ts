@@ -23,7 +23,7 @@ import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendRunIntent, appendRunResult } from './step-context.js';
+import { appendRunIntent, appendRunResult, performEnter } from './step-context.js';
 
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
 type ReconcileDecision = Extract<LaneRunDecision, { kind: 'reconcile' }>;
@@ -321,6 +321,69 @@ export async function performPremerge(
     read.receipt?.findings.length ?? 0,
     receiptId,
   );
+}
+
+/** The `ci` key's final (non-ambiguous) result, or null when it has none. */
+async function ciFinalResultOf(ctx: AdvanceStepContext, key: string): Promise<boolean> {
+  const entries = await ctx.deps.runJournal.listForKey(key);
+  return entries.some((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous');
+}
+
+/**
+ * GB4: record the CI failure under the `ci` key and enter `fixing`.
+ * The intent is already journalled (the act wrote it; the reconcile never
+ * writes a second one). The write order is result, then the conduct entry
+ * of the transition, so a crash between the two leaves the run in
+ * `watching-ci` with the result recorded — the decider's `ciFailureRecorded`
+ * fact then resumes only the transition.
+ */
+export async function recordCiFailure(ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: ActDecision | ReconcileDecision,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'ci-failed');
+  if (resultRefusal !== null) {
+    return { outcome: 'refused', reason: resultRefusal };
+  }
+  return enterFixingAfterCi(ctx, record, gathered, decision, request);
+}
+
+/** The transition part of a recorded CI failure: enter `fixing` and report the acted shape. */
+async function enterFixingAfterCi(ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: ActDecision | ReconcileDecision,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  const entered = await performEnter(ctx, record, gathered.facts.state, 'fixing', request);
+  if (entered.outcome !== 'entered') {
+    return entered;
+  }
+  return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'ci-failed' };
+}
+
+/**
+ * The `act ci` step (GB4): the CI failure at the exact head becomes a
+ * keyed `refused` / `ci-failed` result and the run enters `fixing`. A key
+ * that already carries its final result is never written again: only the
+ * missing transition is performed.
+ */
+export async function performCiFailure(ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: ActDecision,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  if (await ciFinalResultOf(ctx, decision.key)) {
+    return enterFixingAfterCi(ctx, record, gathered, decision, request);
+  }
+  const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
+  if (intentRefusal !== null) {
+    return { outcome: 'refused', reason: intentRefusal };
+  }
+  return recordCiFailure(ctx, record, gathered, decision, request);
 }
 
 /**

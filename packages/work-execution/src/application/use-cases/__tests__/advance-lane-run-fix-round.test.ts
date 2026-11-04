@@ -45,6 +45,7 @@ import type {
   ReviewRequestResult,
 } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.out-port.js';
+import type { HeadCiStateRead, ReadHeadCiStateRequest } from '../../ports/out/CiStatePort.out-port.js';
 import type {
   PrepareFixAttemptRequest,
   PrepareFixAttemptResult,
@@ -352,6 +353,23 @@ function gateKey(): string {
   return built.key;
 }
 
+function ciKey(): string {
+  const built = buildLaneRunStepKey({
+    runId: RUN_ID,
+    round: 0,
+    step: 'ci',
+    seatIndex: 0,
+    attemptOrdinal: null,
+    head12: HEAD12_A,
+    retry: null,
+  });
+  expect(built.ok).toBe(true);
+  if (!built.ok) {
+    throw new Error('fixture must build a ci key');
+  }
+  return built.key;
+}
+
 interface Harness {
   readonly runRepo: LaneRunRepositoryAdapter;
   readonly runJournal: LaneRunJournalAdapter;
@@ -367,6 +385,8 @@ interface Harness {
   readonly gateRequests: readonly EvaluateAttemptGateRequest[];
   readonly reviewOpenRequests: readonly OpenReviewAssessmentRequest[];
   readonly gateReceiptRequests: readonly RecordGateReceiptsRequest[];
+  /** Every `readHeadCiState` call's arguments, in call order (GB4). */
+  readonly ciRequests: readonly ReadHeadCiStateRequest[];
   /** Every `readBriefFile` call's arguments, in call order. */
   readonly briefFileReads: readonly { worktreePath: string; relativePath: string; recordedHost: AttemptRunnerRecord | null | undefined }[];
   /** Every `readBriefManifest` call's arguments, in call order. */
@@ -389,6 +409,7 @@ interface Harness {
   setSameFamily(fn: SameModelFamily): void;
   setJournalBaseline(length: number): void;
   setGateAnswer(answer: EvaluateAttemptGateResult): void;
+  setCiAnswer(answer: HeadCiStateRead): void;
   setReviewAssessmentAnswer(answer: OpenReviewAssessmentResult): void;
   markAttemptCancelled(attemptId: string, stopReason: AttemptRecord['stopReason']): Promise<void>;
 }
@@ -421,6 +442,7 @@ async function makeHarness(
   const gateRequests: EvaluateAttemptGateRequest[] = [];
   const reviewOpenRequests: OpenReviewAssessmentRequest[] = [];
   const gateReceiptRequests: RecordGateReceiptsRequest[] = [];
+  const ciRequests: ReadHeadCiStateRequest[] = [];
   const briefFileReads: { worktreePath: string; relativePath: string; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
   const briefManifestReads: { worktreePath: string; manifestPath: string | undefined; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
   const changedPathReads: { worktreePath: string; baseCommit: string; headCommit: string; recordedHost: AttemptRunnerRecord | null | undefined }[] = [];
@@ -434,6 +456,9 @@ async function makeHarness(
   let sameFamilyImpl: SameModelFamily = (left, right) => left === right;
   let gateAnswer: EvaluateAttemptGateResult = { verdict: 'passed' };
   let reviewAssessmentAnswer: OpenReviewAssessmentResult = { outcome: 'open' };
+  // GB4: the CI read answers the prior's collected head by default; every
+  // existing test is in the fixing/ready states and never reads the port.
+  let ciAnswer: HeadCiStateRead = { headSha: COMMIT_A, state: 'passed', reason: 'read' };
   const reviewAnswer: (request: ReviewRequest) => Promise<ReviewRequestResult> = async (request) => ({
     outcome: 'receipt',
     receipt: {
@@ -677,6 +702,13 @@ async function makeHarness(
           },
         }
       : {}),
+    // GB4: the recording CI read; the fact reader answers the exact head.
+    ciState: {
+      readHeadCiState: async (request) => {
+        ciRequests.push(request);
+        return ciAnswer;
+      },
+    },
   };
 
   return {
@@ -693,6 +725,7 @@ async function makeHarness(
     gateRequests,
     reviewOpenRequests,
     gateReceiptRequests,
+    ciRequests,
     briefFileReads,
     briefManifestReads,
     changedPathReads,
@@ -738,6 +771,9 @@ async function makeHarness(
     },
     setGateAnswer: (answer) => {
       gateAnswer = answer;
+    },
+    setCiAnswer: (answer) => {
+      ciAnswer = answer;
     },
     setReviewAssessmentAnswer: (answer) => {
       reviewAssessmentAnswer = answer;
@@ -3179,5 +3215,100 @@ describe('KF-20: the gate and the review open the evidence assessment with the m
     // The review is requested, not refused `assessment-unavailable`.
     expect(harness.reviewRequests).toHaveLength(1);
     expect(harness.reviewRequests[0]).toMatchObject({ kind: 'brief-check', implementerModel: 'fix-model-1' });
+  });
+});
+
+describe('AdvanceLaneRunUseCase CI-red fix round (GB4)', () => {
+  /** A watching-ci run whose CI read failed at the collected head; the next advance is the `act ci` step. */
+  async function seedCiRed(harness: Harness): Promise<void> {
+    // The run watched CI at an ACCEPTED head: the accept result carries the
+    // head the facts read (the decider's head-change guard needs it).
+    const accept = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, accept, null, NOW);
+    await appendResult(harness, accept, 'completed', 'accepted', NOW);
+    harness.setCiAnswer({ headSha: COMMIT_A, state: 'failed', reason: 'read' });
+    await conduct(harness, 'watching-ci', NOW);
+  }
+
+  it('a CI-red open-PR run acts the keyed ci step, records the failure and prepares its fix round without parking', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    await seedCiRed(harness);
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'ci',
+      key: ciKey(),
+      result: 'refused',
+      reasonCode: 'ci-failed',
+    });
+    // Exactly one intent and one result under the ci key; the CI read went to the exact head.
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())[0]).toMatchObject({
+      outcome: 'refused',
+      reasonCode: 'ci-failed',
+    });
+    expect(harness.ciRequests).toEqual([{ headSha: COMMIT_A }]);
+
+    // The fix round is prepared, never parked `step-refused`.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    expect(harness.fixRequests).toHaveLength(1);
+    expect(harness.parkNoticeRequests).toHaveLength(0);
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
+  });
+
+  it('the CI fix handover names the ci-failed reason and no gate check', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    await seedCiRed(harness);
+    await advance(harness);
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'prepare', result: 'completed' });
+
+    const prose = harness.briefRequests[0]!.proseMarkdown;
+    expect(prose).toContain('[gate] ci-failed');
+    expect(prose).not.toContain('[gate] command');
+  });
+
+  it('a crash after the ci intent reconciles it: one intent, one result, no second intent', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    await appendIntent(harness, ciKey(), null, NOW);
+    await seedCiRed(harness);
+
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'ci',
+      key: ciKey(),
+      result: 'refused',
+      reasonCode: 'ci-failed',
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
+    expect(harness.parkNoticeRequests).toHaveLength(0);
+  });
+
+  it('a crash after the ci result resumes only the transition to fixing', async () => {
+    const harness = await makeHarness(runRecord({ prNumber: 7 }), [collectedAttempt()], { wireParkNotice: true });
+    const accept = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, accept, null, NOW);
+    await appendResult(harness, accept, 'completed', 'accepted', NOW);
+    await appendIntent(harness, ciKey(), null, NOW);
+    await appendResult(harness, ciKey(), 'refused', 'ci-failed', NOW);
+    await conduct(harness, 'watching-ci', NOW);
+    harness.setCiAnswer({ headSha: COMMIT_A, state: 'failed', reason: 'read' });
+
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.filter((entry) => entry.kind === 'intent' && entry.key === ciKey())).toHaveLength(1);
+    expect(entries.filter((entry) => entry.kind === 'result' && entry.key === ciKey())).toHaveLength(1);
+    expect(harness.parkNoticeRequests).toHaveLength(0);
   });
 });

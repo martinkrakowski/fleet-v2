@@ -1290,14 +1290,31 @@ describe('accepting, premerge, PR and CI states', () => {
     assertDecision(facts, record({}), decide(record({}), facts), { kind: 'enter', to: 'merging' });
   });
 
-  it('W4: ci failed enters fixing, after round 2 parks ci-failed-no-rounds', () => {
-    const failed = baseFacts({ state: 'watching-ci', head12: HEAD, acceptedHead12: HEAD, ci: 'failed' });
-    assertDecision(failed, record({}), decide(record({}), failed), { kind: 'enter', to: 'fixing' });
+  it('W4: ci failed acts the keyed ci step, after round 2 parks ci-failed-no-rounds', () => {
+    const failed = baseFacts({
+      state: 'watching-ci', head12: HEAD, acceptedHead12: HEAD, ci: 'failed',
+      attempt: attemptFact({ phase: 'collected' }),
+    });
+    expect(decide(record({}), failed)).toEqual({
+      kind: 'act', step: 'ci', key: `${RUN_ID}/r0/ci/0@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+    });
     const rec = record({ round: 2, attemptIds: ['a1', 'a2', 'a3'] });
     const roundTwo = baseFacts({ state: 'watching-ci', head12: HEAD, acceptedHead12: HEAD, ci: 'failed' });
     assertDecision(roundTwo, rec, decide(rec, roundTwo), {
       kind: 'park', reason: 'ci-failed-no-rounds', qualifier: null, parkedFrom: 'watching-ci',
     });
+  });
+
+  it('W4: a ci failed fact with no attempt waits facts-inconsistent, never acts', () => {
+    const failed = baseFacts({ state: 'watching-ci', head12: HEAD, acceptedHead12: HEAD, ci: 'failed' });
+    expect(decide(record({}), failed)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+  });
+
+  it('W4: a recorded ci failure resumes only the transition to fixing', () => {
+    const failed = baseFacts({
+      state: 'watching-ci', head12: HEAD, acceptedHead12: HEAD, ci: 'failed', ciFailureRecorded: true,
+    });
+    assertDecision(failed, record({}), decide(record({}), failed), { kind: 'enter', to: 'fixing' });
   });
 });
 

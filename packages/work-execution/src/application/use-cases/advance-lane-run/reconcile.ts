@@ -12,7 +12,7 @@ import { conductDispatching } from './prepare-dispatch.js';
 import { gatePreCheck, runCollectBody, runGateBody } from './collect-gate.js';
 import { reconcileReview } from './review-fix.js';
 import { reconcileAccept, reconcileMerge, reconcilePrPush } from './merge.js';
-import { reconcilePremerge } from './premerge.js';
+import { reconcilePremerge, recordCiFailure } from './premerge.js';
 
 /**
  * The `reconcile` decisions (K4-7, §3.5): an intent without a result is
@@ -48,6 +48,9 @@ export async function performReconcile(ctx: AdvanceStepContext,
   }
   if (decision.step === 'premerge') {
     return reconcilePremerge(ctx, record, gathered, decision, request);
+  }
+  if (decision.step === 'ci') {
+    return reconcileCi(ctx, record, gathered, decision, request);
   }
   if (decision.step === 'stop') {
     return reconcileStop(ctx, record, gathered, decision, request);
@@ -417,6 +420,26 @@ export async function reconcileCollect(ctx: AdvanceStepContext,
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode: 'collected' };
   }
   return runCollectBody(ctx, record, gathered, decision, request, decision.key);
+}
+
+/**
+ * The `ci` reconcile (GB4): an intent without a result is reconciled, never
+ * repeated. The exact-head CI fact must still confirm the failure; an
+ * unknown, a moved head or a pending check is never a CI failure. The
+ * result is appended under the pending key — no second intent — and the
+ * run enters `fixing`.
+ */
+export async function reconcileCi(ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: Extract<LaneRunDecision, { kind: 'reconcile' }>,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult> {
+  const ci = gathered.facts.ci;
+  if (ci !== 'failed') {
+    return { outcome: 'waiting', reason: ci === 'pending' ? 'ci-pending' : 'ci-unknown' };
+  }
+  return recordCiFailure(ctx, record, gathered, decision, request);
 }
 
 /**

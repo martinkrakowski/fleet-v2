@@ -341,6 +341,79 @@ describe('ReviewTransportRouter', () => {
     expect(result.readOnlyVerified).toBe(true);
   });
 
+  it('an opencode kind review embeds the location diff', async () => {
+    const diffCalls: Array<readonly [string, string]> = [];
+    const location: ReviewLocation = {
+      ...fixtureLocation(
+        { kind: 'installation', remotePort: 46000, remoteHost: '' },
+        BASE_REQUEST.candidateHeadSha,
+      ),
+      readDiff: async (fromSha, toSha) => {
+        diffCalls.push([fromSha, toSha] as const);
+        return 'diff --git a/f b/f\n+added line\n';
+      },
+    };
+    const kindRequest: RunIndependentReviewRequest = {
+      ...BASE_REQUEST,
+      kind: 'brief-check',
+      briefText: 'Do the thing.',
+    };
+    const prompts: string[] = [];
+    const fakeSpawn: OcmReviewTransportSpawn = async (_file, args) => {
+      prompts.push(args[args.length - 1]);
+      return { exitCode: 0, stdout: PASS_FIXTURE, stderr: '' };
+    };
+    const router = createReviewTransportRouter({
+      seats: SEATS,
+      chains: CHAINS,
+      locate: async () => location,
+      ocmRunBin: '/bundled/bin/ocm-run',
+      ocmSpawn: fakeSpawn,
+      makeNonce: () => 'a'.repeat(32),
+    });
+
+    const result = await router(kindRequest);
+
+    expect(diffCalls).toEqual([['base-sha', kindRequest.candidateHeadSha]]);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('<<<UNTRUSTED nonce=' + 'a'.repeat(32) + ' label="diff">>>');
+    expect(prompts[0]).toContain('+added line');
+    expect(result.result).toBe('pass');
+  });
+
+  it('an opencode kind review whose location diff is null is not a pass', async () => {
+    const location: ReviewLocation = {
+      ...fixtureLocation(
+        { kind: 'installation', remotePort: 46000, remoteHost: '' },
+        BASE_REQUEST.candidateHeadSha,
+      ),
+      readDiff: async () => null,
+    };
+    const kindRequest: RunIndependentReviewRequest = {
+      ...BASE_REQUEST,
+      kind: 'brief-check',
+      briefText: 'Do the thing.',
+    };
+    let spawnCalled = false;
+    const fakeSpawn: OcmReviewTransportSpawn = async () => {
+      spawnCalled = true;
+      return { exitCode: 0, stdout: PASS_FIXTURE, stderr: '' };
+    };
+    const router = createReviewTransportRouter({
+      seats: SEATS,
+      chains: CHAINS,
+      locate: async () => location,
+      ocmRunBin: '/bundled/bin/ocm-run',
+      ocmSpawn: fakeSpawn,
+    });
+
+    const result = await router(kindRequest);
+
+    expect(result.result).toBe('unknown');
+    expect(result.rawOutput).toBe('diff-unavailable');
+    expect(spawnCalled).toBe(false);
+  });
+
   it('installation ssh route uses the configured host even when process.env.OCM_HOST leaks', async () => {
     const savedOcmHost = process.env.OCM_HOST;
     process.env.OCM_HOST = 'leak.example';

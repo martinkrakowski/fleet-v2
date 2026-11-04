@@ -669,6 +669,20 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
       reason: BLOCKER_TEXT,
       blockerDetails: [{ kind: 'other', text: BLOCKER_TEXT }],
     });
+    // The receipt fake answers a found, passed receipt (F61 correction of the
+    // AR1 fixture: the receipts "passed" case is not a not-found receipt).
+    harness.setReceiptAnswer({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'receipt-example-1',
+        requestId: null,
+        kind: 'brief-check',
+        reviewerModel: 'reviewer-example-1',
+        candidateHeadSha: COMMIT,
+        verdict: 'passed',
+        findings: [],
+      },
+    });
     expect(await advance(harness)).toEqual({
       outcome: 'acted',
       step: 'accept',
@@ -695,7 +709,9 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     await resumeAccepting(harness, LATER);
     const receiptsBefore = harness.receiptsRequests.length;
     expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'acceptance-rejected', qualifier: null });
-    expect(harness.receiptsRequests).toHaveLength(receiptsBefore);
+    // F61: the null-detail rejection is classified from the assessment once per
+    // advance in accepting; the accept act itself did not run again.
+    expect(harness.receiptsRequests.length - receiptsBefore).toBe(1);
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey());
     expect(intents).toHaveLength(1);
@@ -709,6 +725,37 @@ describe('AdvanceLaneRunUseCase accept act (K6-5)', () => {
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey());
     expect(intents).toHaveLength(1);
+  });
+
+  it('F61: a pre-AR1 rejection with a null detail and review blockers enters fixing', async () => {
+    const harness = await acceptingHarness();
+    // Journal the pre-AR1 rejection by hand: no detail on the accept result.
+    await appendIntent(harness, acceptKey(), null, NOW);
+    await appendResult(harness, acceptKey(), 'completed', 'acceptance-rejected', NOW);
+    harness.setReceiptsAnswer({
+      outcome: 'rejected',
+      reason: BLOCKER_TEXT,
+      blockerDetails: [{ kind: 'other', text: BLOCKER_TEXT }],
+    });
+    harness.setReceiptAnswer(FAILED_BRIEF_CHECK_RECEIPT);
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === acceptKey());
+    expect(intents).toHaveLength(1);
+  });
+
+  it('F61: a pre-AR1 rejection with a null detail and a non-review blocker parks acceptance-rejected', async () => {
+    const harness = await acceptingHarness();
+    await appendIntent(harness, acceptKey(), null, NOW);
+    await appendResult(harness, acceptKey(), 'completed', 'acceptance-rejected', NOW);
+    harness.setReceiptsAnswer({
+      outcome: 'rejected',
+      reason: BLOCKER_TEXT,
+      blockerDetails: [{ kind: 'door', text: BLOCKER_TEXT }],
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'acceptance-rejected', qualifier: null });
+    // A standing blocker short-circuits before any receipt read.
+    expect(harness.receiptRequests).toEqual([]);
   });
 
   it('AR1: a review-blocked rejection at round 2 parks with the accept intents unchanged', async () => {

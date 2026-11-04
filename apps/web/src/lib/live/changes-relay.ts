@@ -10,6 +10,8 @@
  * helpers; the token is passed in, never read here.
  */
 
+import { describeFailure } from "../api/describe-failure";
+
 export interface ChangeSignal {
   readonly seq: number;
   readonly kind: string;
@@ -28,7 +30,11 @@ export function parseChangeSignal(line: string): ChangeSignal | null {
   if (typeof parsed !== "object" || parsed === null) {
     return null;
   }
-  const record = parsed as { readonly seq?: unknown; readonly kind?: unknown; readonly id?: unknown };
+  const record = parsed as {
+    readonly seq?: unknown;
+    readonly kind?: unknown;
+    readonly id?: unknown;
+  };
   if (typeof record.seq !== "number" || typeof record.kind !== "string") {
     return null;
   }
@@ -59,30 +65,6 @@ export interface ChangeRelayOptions {
 export type ChangeRelay =
   | { readonly status: "streaming"; readonly body: ReadableStream<Uint8Array> }
   | { readonly status: "unavailable"; readonly reason: string };
-
-const PLAIN_WORDS = /^[A-Za-z ]{1,80}$/;
-const ERROR_CODE = /^[A-Z][A-Z0-9_]{1,40}$/;
-
-/**
- * A host-free reason for a failed request: the raw message can name the API host (an ENOTFOUND
- * message, a URL), and this text reaches the page. Keep only a plain-words message ("fetch failed")
- * and the system error code (ENOTFOUND, ECONNREFUSED), never the original text.
- *
- * Copied from `apps/web/src/lib/api/transport.ts` (this lane may not edit that file).
- */
-function describeFailure(error: unknown): string {
-  if (!(error instanceof Error)) {
-    return "unknown error";
-  }
-  const words = PLAIN_WORDS.test(error.message) ? error.message : "request failed";
-  const cause = (error as { readonly cause?: unknown }).cause;
-  const code =
-    typeof cause === "object" && cause !== null ? (cause as { readonly code?: unknown }).code : undefined;
-  if (typeof code === "string" && ERROR_CODE.test(code)) {
-    return words + " (" + code + ")";
-  }
-  return words;
-}
 
 export async function createChangeRelay(
   options: ChangeRelayOptions,

@@ -2,7 +2,7 @@
 // Pure: no filesystem, no subprocess, no clock, no id minted here.
 // Ids and codes only; an unknown or malformed item is reported, never guessed.
 
-import { containsSecretShape } from '@fleet/shared';
+import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { parseBaseBranch } from './base-branch.js';
 import { isMergeHex40 } from './merge-queue-records.js';
 
@@ -64,10 +64,26 @@ interface ValidatedEntry { readonly key: string; readonly value: string; }
 type ItemValidator = (item: unknown, side: 'fleet' | 'shell') => ValidatedEntry | null;
 type ComparePair<T> = { readonly fleet: readonly T[]; readonly shell: readonly T[] };
 
+/**
+ * A plain object whose own properties are all data properties. An accessor
+ * (getter) is refused before any field is read, so reading an item never runs
+ * caller code and the comparators stay pure.
+ */
 function isRecordObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  return Object.values(Object.getOwnPropertyDescriptors(value)).every((descriptor) => 'value' in descriptor);
+}
+
+/**
+ * Both secret registries, as the operator-coordination entities check them:
+ * the short `SECRET_PATTERNS` misses shapes such as `github_pat_` that the
+ * lane-diff registry names. A secret-shaped value is never echoed in a
+ * divergence.
+ */
+function isSecretShaped(text: string): boolean {
+  return containsSecretShape(text) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(text));
 }
 
 function isSafePullRequest(value: unknown): value is number {
@@ -76,7 +92,7 @@ function isSafePullRequest(value: unknown): value is number {
 
 function isBoundedId(value: unknown, pattern: RegExp, maxLength: number): value is string {
   if (typeof value !== 'string' || value.length > maxLength) return false;
-  return pattern.test(value) && !containsSecretShape(value);
+  return pattern.test(value) && !isSecretShaped(value);
 }
 
 function validateMergeSetItem(item: unknown, side: 'fleet' | 'shell'): ValidatedEntry | null {
@@ -124,6 +140,7 @@ function validateBriefVerdictItem(item: unknown): ValidatedEntry | null {
   const { briefId, verdict } = item;
   if (!isBoundedId(briefId, BRIEF_ID_PATTERN, 128)) return null;
   if (typeof verdict !== 'string' || verdict.length > 64 || !BRIEF_VERDICT_PATTERN.test(verdict)) return null;
+  if (isSecretShaped(verdict)) return null;
   return { key: briefId, value: verdict };
 }
 

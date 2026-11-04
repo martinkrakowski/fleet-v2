@@ -243,4 +243,34 @@ describe('shadow comparators', () => {
       { key: 'invalid-shell-list', code: 'invalid-item', fleet: null, shell: null },
     ]);
   });
+  it('a github_pat_ brief id is invalid-item and never echoed (both registries are checked)', () => {
+    const secret = `github${'_pat_'}${'A'.repeat(24)}`;
+    const result = compareShadowBriefVerdicts({ fleet: [{ briefId: secret, verdict: 'ok' }], shell: [] });
+    expect(result.divergences).toEqual([
+      { key: 'invalid-fleet-0', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it('a secret-shaped brief verdict is invalid-item and never echoed', () => {
+    const secret = `s${'k-'}${'a'.repeat(22)}`;
+    const result = compareShadowBriefVerdicts({
+      fleet: [{ briefId: 'brief-1', verdict: secret }],
+      shell: [{ briefId: 'brief-1', verdict: 'ok' }],
+    });
+    expect(result.divergences.map((divergence) => divergence.code)).toContain('invalid-item');
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it('an item with an accessor property is invalid-item and the getter never runs', () => {
+    let calls = 0;
+    const item = {};
+    Object.defineProperty(item, 'headOid', { enumerable: true, get: () => { calls += 1; return FIRST_HEAD; } });
+    Object.defineProperty(item, 'pullRequest', { enumerable: true, value: 1 });
+    const result = compareShadowMergeSets({ fleet: [item as ShadowMergeSetItem], shell: [] });
+    expect(result.divergences).toEqual([
+      { key: 'invalid-fleet-0', code: 'invalid-item', fleet: null, shell: null },
+    ]);
+    expect(calls).toBe(0);
+  });
 });

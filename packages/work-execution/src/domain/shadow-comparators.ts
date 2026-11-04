@@ -77,6 +77,15 @@ function isRecordObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Read only the item's own data properties: an inherited field (for example a
+ * getter planted on `Object.prototype`) reads as undefined, so it is reported
+ * as an invalid item and never run.
+ */
+function ownFields(item: Record<string, unknown>, names: readonly string[]): unknown[] {
+  return names.map((name) => (Object.hasOwn(item, name) ? item[name] : undefined));
+}
+
+/**
  * Both secret registries, as the operator-coordination entities check them:
  * the short `SECRET_PATTERNS` misses shapes such as `github_pat_` that the
  * lane-diff registry names. A secret-shaped value is never echoed in a
@@ -97,14 +106,14 @@ function isBoundedId(value: unknown, pattern: RegExp, maxLength: number): value 
 
 function validateMergeSetItem(item: unknown, side: 'fleet' | 'shell'): ValidatedEntry | null {
   if (!isRecordObject(item)) return null;
-  const { pullRequest, headOid } = item;
+  const [pullRequest, headOid] = ownFields(item, ['pullRequest', 'headOid']);
   if (!isSafePullRequest(pullRequest) || !isMergeHex40(headOid)) return null;
   return { key: `${pullRequest}@${headOid}`, value: side === 'fleet' ? 'would-merge' : 'merged' };
 }
 
 function validateGateVerdictItem(item: unknown): ValidatedEntry | null {
   if (!isRecordObject(item)) return null;
-  const { headOid, predicate, verdict } = item;
+  const [headOid, predicate, verdict] = ownFields(item, ['headOid', 'predicate', 'verdict']);
   if (!isMergeHex40(headOid) || !isBoundedId(predicate, PREDICATE_PATTERN, 120)) return null;
   if (typeof verdict !== 'string' || !GATE_VERDICTS.includes(verdict)) return null;
   return { key: `${headOid}#${predicate}`, value: verdict };
@@ -112,7 +121,7 @@ function validateGateVerdictItem(item: unknown): ValidatedEntry | null {
 
 function validatePremergeStatusItem(item: unknown): ValidatedEntry | null {
   if (!isRecordObject(item)) return null;
-  const { headOid, state } = item;
+  const [headOid, state] = ownFields(item, ['headOid', 'state']);
   if (!isMergeHex40(headOid)) return null;
   if (typeof state !== 'string' || !PREMERGE_STATES.includes(state)) return null;
   return { key: headOid, value: state };
@@ -120,16 +129,16 @@ function validatePremergeStatusItem(item: unknown): ValidatedEntry | null {
 
 function validateEnqueueSetItem(item: unknown): ValidatedEntry | null {
   if (!isRecordObject(item)) return null;
-  const { pullRequest, headOid, base } = item;
+  const [pullRequest, headOid, base] = ownFields(item, ['pullRequest', 'headOid', 'base']);
   if (!isSafePullRequest(pullRequest) || !isMergeHex40(headOid)) return null;
   const parsedBase = parseBaseBranch(base);
-  if (parsedBase === undefined) return null;
+  if (parsedBase === undefined || isSecretShaped(parsedBase)) return null;
   return { key: `${pullRequest}@${headOid}@${parsedBase}`, value: 'queued' };
 }
 
 function validateChainMemberItem(item: unknown): ValidatedEntry | null {
   if (!isRecordObject(item)) return null;
-  const { chain, pullRequest, headOid } = item;
+  const [chain, pullRequest, headOid] = ownFields(item, ['chain', 'pullRequest', 'headOid']);
   if (!isBoundedId(chain, CHAIN_PATTERN, 200)) return null;
   if (!isSafePullRequest(pullRequest) || !isMergeHex40(headOid)) return null;
   return { key: `${chain}@${pullRequest}@${headOid}`, value: 'member' };
@@ -137,7 +146,7 @@ function validateChainMemberItem(item: unknown): ValidatedEntry | null {
 
 function validateBriefVerdictItem(item: unknown): ValidatedEntry | null {
   if (!isRecordObject(item)) return null;
-  const { briefId, verdict } = item;
+  const [briefId, verdict] = ownFields(item, ['briefId', 'verdict']);
   if (!isBoundedId(briefId, BRIEF_ID_PATTERN, 128)) return null;
   if (typeof verdict !== 'string' || verdict.length > 64 || !BRIEF_VERDICT_PATTERN.test(verdict)) return null;
   if (isSecretShaped(verdict)) return null;

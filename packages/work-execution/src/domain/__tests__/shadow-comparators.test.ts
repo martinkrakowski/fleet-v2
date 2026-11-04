@@ -273,4 +273,23 @@ describe('shadow comparators', () => {
     ]);
     expect(calls).toBe(0);
   });
+  it('a secret-shaped base is invalid-item and never echoed', () => {
+    const base = `chain/${'antigravity-oauth'}-token`;
+    const result = compareShadowEnqueueSets({ fleet: [{ pullRequest: 1, headOid: FIRST_HEAD, base }], shell: [] });
+    expect(JSON.stringify(result)).not.toContain('oauth');
+  });
+
+  it('an inherited field is never read: a prototype getter does not make an item valid', () => {
+    let calls = 0;
+    Object.defineProperty(Object.prototype, 'headOid', { configurable: true, get: () => { calls += 1; return FIRST_HEAD; } });
+    try {
+      const result = compareShadowMergeSets({ fleet: [{ pullRequest: 1 } as unknown as ShadowMergeSetItem], shell: [] });
+      expect(result.divergences).toEqual([
+        { key: 'invalid-fleet-0', code: 'invalid-item', fleet: null, shell: null },
+      ]);
+      expect(calls).toBe(0);
+    } finally {
+      delete (Object.prototype as Record<string, unknown>).headOid;
+    }
+  });
 });

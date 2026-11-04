@@ -963,6 +963,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       },
     }));
 
+    harness.setChangedPaths(['src/ex.ts']);
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
 
     const result = await advance(harness);
@@ -1041,6 +1042,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       },
     }));
 
+    harness.setChangedPaths(['src/ex.ts']);
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
 
     const result = await advance(harness);
@@ -1085,6 +1087,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
       },
     }));
 
+    harness.setChangedPaths(['src/ex.ts']);
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
 
     expect(await advance(harness)).toEqual({
@@ -1133,6 +1136,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
         : { outcome: 'not-found' as const },
     );
 
+    harness.setChangedPaths(['src/ex.ts']);
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
 
     expect(await advance(harness)).toEqual({
@@ -2240,6 +2244,44 @@ describe('AdvanceLaneRunUseCase fix-round prepare refusal details (MX7)', () => 
     return (results[0]!.detail as string | null) ?? null;
   }
 
+  it('AR1 without changed paths fails closed: the fix prepare hands the minor-only brief-check receipt behind the review-findings rejection', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'accepting', NOW);
+    // The MX7 journal: the GB1 minor-only brief-check pass, the code-review
+    // pass, then the accept rejected with the review-findings detail.
+    const briefKey = reviewKey('brief-check', 0, HEAD12_A);
+    const briefRequestId = 'review-' + harness.deps.newUlid();
+    await appendIntent(harness, briefKey, briefRequestId, NOW);
+    await appendResult(harness, briefKey, 'completed', 'review-passed', NOW, 'minor-only-findings');
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    await appendIntent(harness, codeKey, null, NOW);
+    await appendResult(harness, codeKey, 'completed', 'review-passed', NOW);
+    const acceptKey = acceptKeyAt(HEAD12_A);
+    await appendIntent(harness, acceptKey, null, NOW);
+    await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+    // The brief-check receipt is failed with one minor finding — the
+    // unresolved finding the acceptance rejection named.
+    harness.setFindReceiptAnswer(async (request) => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-' + request.requestId,
+        requestId: request.requestId,
+        kind: 'brief-check',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [
+          { findingId: 'finding-1', severity: 'minor', summary: 'tighten the guard', filePath: 'src/ex.ts', line: 4 },
+        ],
+      },
+    }));
+
+    // no changed paths: summaries carry no disposition, so the walk refuses instead of guessing scope
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+    expect(await refusedPrepareDetailOf(harness)).toBe('prepare-scope-unavailable');
+  });
+
+
   it('prepare-round-out-of-range: a round-3 prepare decision refuses with its own token', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     const ctx: AdvanceStepContext = { deps: harness.deps };
@@ -2319,6 +2361,7 @@ describe('AdvanceLaneRunUseCase fix-round prepare refusal details (MX7)', () => 
     const acceptKey = acceptKeyAt(HEAD12_A);
     await appendIntent(harness, acceptKey, null, NOW);
     await appendResult(harness, acceptKey, 'completed', 'acceptance-rejected', NOW, 'review-findings');
+    harness.setChangedPaths(['src/ex.ts']);
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
     expect(await refusedPrepareDetailOf(harness)).toBe('prepare-no-review-findings');
   });

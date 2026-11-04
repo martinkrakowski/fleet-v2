@@ -883,6 +883,11 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
       // take the newest whose receipt has at least one in-scope finding —
       // a GB1 `review-passed` with `minor-only-findings` included. Keep
       // walking past failed receipts that have no in-scope finding.
+      // Receipt summaries carry no finding disposition, so without the lane's changed paths an out-of-scope finding
+      // would look in scope and could be handed over: this walk fails closed instead (unlike the review path below).
+      if (changed === null) {
+        return refuse('prepare-refused', 'prepare-scope-unavailable');
+      }
       let inScope: readonly ReviewRequestFinding[] | null = null;
       for (const candidate of reviewResultKeysAtHead(entries, record.runId, failure.acceptHead12)) {
         const found = await candidateReceiptOf(ctx, prior, candidate);

@@ -164,8 +164,11 @@ function explainNextCommands(attempt: AttemptRecord): ExplainNextCommand[] {
       commands.push({ command: 'collect', legal: false, reason: 'no-completion-receipt' });
     }
   } else if (state === 'collected') {
-    // Already collected: never `not-ended`, which would be false.
-    commands.push({ command: 'collect', legal: false, reason: 'not-collected' });
+    if (attempt.completionReceipt !== null && attempt.completionReceipt !== undefined) {
+      commands.push({ command: 'collect', legal: false, reason: 'not-ended' });
+    } else {
+      commands.push({ command: 'collect', legal: false, reason: 'no-completion-receipt' });
+    }
   } else {
     commands.push({ command: 'collect', legal: false, reason: 'not-ended' });
   }
@@ -207,6 +210,49 @@ export class ExplainAttemptUseCase {
     const entries = await this.deps.journal.listJournalEntriesForAttempt(attemptId);
     const reservations = await this.deps.journal.listActiveReservations();
 
+    let gateLine: ExplainAttemptLine;
+    const head =
+      typeof first.artifacts?.headCommit === 'string' && first.artifacts.headCommit !== ''
+        ? first.artifacts.headCommit
+        : null;
+    if (head === null) {
+      gateLine = {
+        source: 'gate',
+        status: 'unknown',
+        detail: 'no collected head to judge',
+        readAt: null,
+      };
+    } else if (this.deps.acceptanceEvidence === undefined) {
+      gateLine = {
+        source: 'gate',
+        status: 'unknown',
+        detail: 'no acceptance source is configured',
+        readAt: null,
+      };
+    } else {
+      const acceptance = await this.deps.acceptanceEvidence.readAcceptance({
+        attemptId,
+        candidateHeadSha: head,
+      });
+      if (acceptance.outcome === 'found') {
+        gateLine = {
+          source: 'gate',
+          status: 'known',
+          detail: `acceptance ${acceptance.assessment.state} at ${acceptance.assessment.candidateHeadSha} (receipt ${acceptance.assessment.acceptanceReceiptId ?? 'none'})`,
+          readAt: acceptance.assessment.candidateHeadSha,
+        };
+      } else {
+        gateLine = {
+          source: 'gate',
+          status: 'unknown',
+          detail: `no acceptance receipt is recorded for head ${head}`,
+          readAt: head,
+        };
+      }
+    }
+
+    // The final attempt read must be the last read: if the attempt's revision
+    // changes while the reads above run, refuse rather than explain stale data.
     const last = await this.deps.attemptRepo.findAttemptById(attemptId);
     if (last === null || (last.revision ?? 0) !== (first.revision ?? 0)) {
       return {
@@ -257,47 +303,6 @@ export class ExplainAttemptUseCase {
         detail: `held on ${held.hostId} slot ${held.slotIndex}`,
         readAt: held.reservedAtIso,
       };
-    }
-
-    let gateLine: ExplainAttemptLine;
-    const head =
-      typeof last.artifacts?.headCommit === 'string' && last.artifacts.headCommit !== ''
-        ? last.artifacts.headCommit
-        : null;
-    if (head === null) {
-      gateLine = {
-        source: 'gate',
-        status: 'unknown',
-        detail: 'no collected head to judge',
-        readAt: null,
-      };
-    } else if (this.deps.acceptanceEvidence === undefined) {
-      gateLine = {
-        source: 'gate',
-        status: 'unknown',
-        detail: 'no acceptance source is configured',
-        readAt: null,
-      };
-    } else {
-      const acceptance = await this.deps.acceptanceEvidence.readAcceptance({
-        attemptId,
-        candidateHeadSha: head,
-      });
-      if (acceptance.outcome === 'found') {
-        gateLine = {
-          source: 'gate',
-          status: 'known',
-          detail: `acceptance ${acceptance.assessment.state} at ${acceptance.assessment.candidateHeadSha} (receipt ${acceptance.assessment.acceptanceReceiptId ?? 'none'})`,
-          readAt: acceptance.assessment.candidateHeadSha,
-        };
-      } else {
-        gateLine = {
-          source: 'gate',
-          status: 'unknown',
-          detail: `no acceptance receipt is recorded for head ${head}`,
-          readAt: head,
-        };
-      }
     }
 
     const next = explainNextCommands(last);

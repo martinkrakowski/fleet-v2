@@ -266,7 +266,7 @@ describe('ExplainAttemptUseCase', () => {
     expect(byCommand.collect).toEqual({
       command: 'collect',
       legal: false,
-      reason: 'not-collected',
+      reason: 'no-completion-receipt',
     });
     expect(byCommand.accept.legal).toBe(true);
     expect(byCommand.fix.legal).toBe(true);
@@ -274,6 +274,91 @@ describe('ExplainAttemptUseCase', () => {
       command: 'reconcile',
       legal: false,
       reason: 'terminal-state',
+    });
+  });
+
+  it('refuses collect with no-completion-receipt for a collected attempt without a receipt', async () => {
+    const attempt = makeAttemptRecord({ state: 'collected', completionReceipt: null });
+    const useCase = new ExplainAttemptUseCase({
+      attemptRepo: new InMemoryAttemptRepo([attempt]),
+      journal: new InMemoryJournal(),
+    });
+
+    const result = await useCase.explainAttempt({ attemptId: attempt.id });
+    expect(result.outcome).toBe('explained');
+    if (result.outcome !== 'explained') return;
+
+    const collect = result.next.find((command) => command.command === 'collect')!;
+    expect(collect.legal).toBe(false);
+    expect(collect.reason).toBe('no-completion-receipt');
+  });
+
+  it('refuses collect with not-ended for a collected attempt with a receipt', async () => {
+    const attempt = makeAttemptRecord({
+      state: 'collected',
+      completionReceipt: {
+        attemptId: 'att-001',
+        sessionId: 'ses_1',
+        endedAtIso: '2026-10-15T10:20:00Z',
+        authoritative: true,
+        exitStatus: 0,
+        stoppedByRequest: false,
+      },
+    });
+    const useCase = new ExplainAttemptUseCase({
+      attemptRepo: new InMemoryAttemptRepo([attempt]),
+      journal: new InMemoryJournal(),
+    });
+
+    const result = await useCase.explainAttempt({ attemptId: attempt.id });
+    expect(result.outcome).toBe('explained');
+    if (result.outcome !== 'explained') return;
+
+    const collect = result.next.find((command) => command.command === 'collect')!;
+    expect(collect.legal).toBe(false);
+    expect(collect.reason).toBe('not-ended');
+  });
+
+  it('refuses with unknown when the attempt revision changes during readAcceptance', async () => {
+    const attempt = makeAttemptRecord({
+      state: 'collected',
+      artifacts: {
+        headCommit: HEAD,
+        commitsSinceBase: [HEAD],
+        collectedArtifactPaths: ['/tmp/patch.diff'],
+        notes: 'present',
+      },
+    });
+    class MutatingAcceptanceEvidence implements AcceptanceEvidencePort {
+      async readAcceptance(_request: ReadAcceptanceRequest): Promise<ReadAcceptanceResult> {
+        attemptAtRead.revision = (attemptAtRead.revision ?? 0) + 1;
+        return acceptanceFound;
+      }
+    }
+    const attemptAtRead = attempt as { revision?: number | null };
+    class SnapshotAttemptRepo implements AttemptRepositoryPort {
+      async findAttemptById(): Promise<AttemptRecord | null> {
+        return { ...attempt };
+      }
+      async saveAttempt(_record: AttemptRecord): Promise<void> {}
+      async listAttemptsByWorkOrder(_workOrderId: string): Promise<readonly AttemptRecord[]> {
+        return [];
+      }
+      async listAllAttempts(): Promise<readonly AttemptRecord[]> {
+        return [];
+      }
+    }
+    const useCase = new ExplainAttemptUseCase({
+      attemptRepo: new SnapshotAttemptRepo(),
+      journal: new InMemoryJournal(),
+      acceptanceEvidence: new MutatingAcceptanceEvidence(),
+    });
+
+    const result = await useCase.explainAttempt({ attemptId: attempt.id });
+    expect(result).toEqual({
+      outcome: 'unknown',
+      attemptId: attempt.id,
+      reason: 'the attempt changed while it was being explained; run it again',
     });
   });
 });

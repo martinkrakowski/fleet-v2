@@ -287,3 +287,42 @@ describe('writeInstallationV2', () => {
     });
   });
 });
+
+describe('writeInstallationV2 daemon', () => {
+  const daemon = {
+    nodePath: '/srv/fleet/node/bin/node',
+    cliPath: '/srv/fleet/cli/fleet-v2.mjs',
+    stateDir: '/srv/fleet/state',
+    unitDir: '/srv/fleet/units',
+    installationFile: '/srv/fleet/fleet.json',
+  };
+
+  it('round-trips a daemon section through the writer', () => {
+    const installation = parseV2Fixture({ ...validV2, daemon });
+    const written = writeInstallationV2(installation);
+    expect(written.endsWith('\n')).toBe(true);
+    expect(parseInstallation(JSON.parse(written))).toEqual({
+      ok: true,
+      installation,
+    });
+  });
+
+  it('emits daemon after decisions and only when present', () => {
+    const absent = writeInstallationV2(parseV2Fixture(validV2));
+    expect(absent).not.toContain('"daemon"');
+
+    const installation = parseV2Fixture({ ...validV2, daemon });
+    const written = writeInstallationV2(installation);
+    const document = JSON.parse(written) as Record<string, unknown>;
+    expect(Object.keys(document)[Object.keys(document).length - 1]).toBe('daemon');
+    expect(document.daemon).toEqual(daemon);
+  });
+
+  it('derives daemon onto the model and leaves it unset when absent', () => {
+    const outcome = deriveInstallationModel(parseV2Fixture({ ...validV2, daemon }));
+    expect(outcome.model.daemon).toEqual(daemon);
+
+    const absentOutcome = deriveInstallationModel(parseV2Fixture(validV2));
+    expect(absentOutcome.model.daemon).toBeUndefined();
+  });
+});

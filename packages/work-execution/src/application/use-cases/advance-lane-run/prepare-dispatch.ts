@@ -65,16 +65,23 @@ export async function performPrepare(ctx: AdvanceStepContext,
     return ceiling;
   }
   const nowIso = request.nowIso;
-  const refuse = async (reasonCode: LaneRunResultReasonCode): Promise<AdvanceLaneRunResult> => {
+  const refuse = async (reasonCode: LaneRunResultReasonCode, detail?: string | null): Promise<AdvanceLaneRunResult> => {
     const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
     if (intentRefusal !== null) {
       return { outcome: 'refused', reason: intentRefusal };
     }
-    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode);
+    const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode, detail ?? null);
     if (resultRefusal !== null) {
       return { outcome: 'refused', reason: resultRefusal };
     }
-    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
+    return {
+      outcome: 'acted',
+      step: decision.step,
+      key: decision.key,
+      result: 'refused',
+      reasonCode,
+      ...(detail ? { detail } : {}),
+    };
   };
 
   const source = latestAttemptRecordOf(gathered);

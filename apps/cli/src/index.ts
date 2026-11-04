@@ -66,6 +66,7 @@ import { knowledgeCommands } from './commands/knowledge.js';
 import { coordinationCommands } from './commands/coordination.js';
 import { questionsCommands } from './commands/questions.js';
 import { mergeCommands } from './merge.js';
+import { tuiCommand } from './tui/command.js';
 
 export { resolveRunnerSettings };
 
@@ -99,7 +100,10 @@ function isPerLineResult(result: unknown): result is CliPerLineResult {
   return (
     typeof result === 'object' &&
     result !== null &&
-    Array.isArray((result as { lines?: unknown }).lines)
+    Array.isArray((result as { lines?: unknown }).lines) &&
+    (result as { lines: readonly unknown[] }).lines.every(
+      (line) => typeof line === 'string',
+    )
   );
 }
 
@@ -631,7 +635,8 @@ doctor prints one check per line (JSON documents with --json). Without
 doctor --host <name> prints only that host's probe subset.
 
 The hosts group manages the installation file's named hosts: list, add,
-edit and remove, each write confirmed and compare-and-swapped.
+edit and remove, each write confirmed and compare-and-swapped, and shows or
+installs the user-scope daemon scheduler units from the daemon section.
 
 The seats group lists the installation file's seats, checks them with the
 loader and the doctor's seat probes (seats list, seats check), and shows or
@@ -670,10 +675,12 @@ killall halt marker; --lift clears the pause then the marker. Run
 The report group prints the weekly run-journal service report (read-only, one
 JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
 
+The tui group opens the shared terminal shell: screens are read in-process from the local state stores and the shell never writes. Run 'fleet-v2 tui --help'.
+
 Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
-  hosts list|add|edit|remove
+  hosts list|add|edit|remove|daemon
   seats list|check|free-tier [status|on|off] [--yes]
   policy auto-merge [status|on|off] [--allow-high-risk true|false] [--on-blocked ask-owner|hold] [--yes]
   projects list|show|probe|add|adopt|edit|retire
@@ -683,9 +690,10 @@ Commands:
   telemetry export|status
   killall [--lift]
   report weekly
+  tui
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
-  attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared
+  attempt dispatch|reconcile|stop|collect|usage|fix|next-seat|accept|auto-merge|cancel-prepared|explain
   forge execute
   evidence request-verification|record-verification|request-review|record-review|disposition|assess|inspect
   knowledge capture-notes|check-claim|decide|publish|propose-context|select-context|candidates|record-reuse|supersede
@@ -818,6 +826,9 @@ export async function runCli(
     }
     if (group === 'report') {
       return await reportCommand(restArgv.slice(1), io, activeRuntime, reportOptions ?? {});
+    }
+    if (group === 'tui') {
+      return await tuiCommand(restArgv.slice(1), io, activeRuntime);
     }
     if (group === 'help' || group === '--help' || group === '-h') {
       io.stdout(`${HELP_TEXT}\n`);

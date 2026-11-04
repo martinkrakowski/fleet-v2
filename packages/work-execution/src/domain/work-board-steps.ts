@@ -5,8 +5,7 @@
 
 import { resolveLaneRunBaseBranch } from './base-branch.js';
 import type { BaseBranchValue } from './base-branch.js';
-import { parseTimeMs } from './work-board-facts.js';
-import { isPlainText } from './work-board.js';
+import { isPlainText, parseTimeMs } from './work-board-facts.js';
 import type {
   BoardAttemptFact,
   BoardDeclarationFact,

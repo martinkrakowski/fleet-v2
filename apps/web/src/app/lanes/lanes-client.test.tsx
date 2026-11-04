@@ -64,6 +64,11 @@ describe("LanesClient live-source wiring", () => {
     expect(refresh).toContain("router.refresh()");
     expect(refresh).toContain("[source, fallbackReason, intervalMs, router]");
   });
+
+  it("still polls every 30 s and now also subscribes to change signals", () => {
+    expect(refresh).toContain("30_000");
+    expect(client).toContain("useChangeSignals(");
+  });
 });
 
 describe("LanesClient fixture fallback wiring", () => {

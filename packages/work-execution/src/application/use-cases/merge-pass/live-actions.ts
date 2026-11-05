@@ -15,7 +15,11 @@ import type {
   LaneRunJournalOutcome,
   LaneRunJournalRefusal,
 } from '../../../domain/lane-run-journal.js';
-import { LANE_RUN_JOURNAL_ENTRY_VERSION, readLaneRunJournalEntry } from '../../../domain/lane-run-journal.js';
+import {
+  LANE_RUN_JOURNAL_ENTRY_VERSION,
+  LANE_RUN_JOURNAL_REFUSALS,
+  readLaneRunJournalEntry,
+} from '../../../domain/lane-run-journal.js';
 import type { MergeKeyRetryProof } from '../../../domain/lane-run-keys.js';
 import { buildMergeKey, head12Of } from '../../../domain/lane-run-keys.js';
 import type { MergeQueueEntryRecord, MergeShadowReason } from '../../../domain/merge-queue-records.js';
@@ -358,6 +362,20 @@ function mintIds(deps: MergeLiveActionDependencies, count: number): readonly str
   return ids;
 }
 
+const COMPARED_ENTRY_FIELDS = [
+  'entryId', 'kind', 'key', 'runId', 'recordedAtIso', 'mode', 'expectedRevision', 'mintedId', 'outcome',
+  'reasonCode', 'detail', 'grantId', 'state',
+] as const;
+
+/** Whether the journal's stored copy is the entry we submitted, field for field. */
+function isSameEntry(stored: LaneRunJournalEntryRecord, submitted: LaneRunJournalEntryRecord): boolean {
+  return COMPARED_ENTRY_FIELDS.every((field) => stored[field] === submitted[field]);
+}
+
+function isJournalRefusal(value: unknown): value is LaneRunJournalRefusal {
+  return (LANE_RUN_JOURNAL_REFUSALS as readonly unknown[]).includes(value);
+}
+
 type AppendOutcome =
   | { readonly ok: true }
   | { readonly ok: false; readonly refusal: LaneRunJournalRefusal }
@@ -373,12 +391,11 @@ async function appendEntry(
     if (isRecord(appended) && appended['outcome'] === 'appended') {
       // Only an answer that carries back the very entry we submitted proves it is durable.
       const stored = readLaneRunJournalEntry(appended['entry']);
-      return stored.ok && stored.entry.entryId === entry.entryId && stored.entry.key === entry.key
-        ? { ok: true }
-        : { ok: false, refusal: null };
+      return stored.ok && isSameEntry(stored.entry, entry) ? { ok: true } : { ok: false, refusal: null };
     }
-    if (isRecord(appended) && appended['outcome'] === 'refused' && typeof appended['reason'] === 'string') {
-      return { ok: false, refusal: appended['reason'] as LaneRunJournalRefusal };
+    const reason = isRecord(appended) && appended['outcome'] === 'refused' ? appended['reason'] : null;
+    if (isJournalRefusal(reason)) {
+      return { ok: false, refusal: reason };
     }
     return { ok: false, refusal: null };
   } catch {
@@ -455,7 +472,20 @@ function isWellFormedRead(read: unknown): read is ReadForgeMergeResult {
   return (
     FORGE_PR_STATES.includes(read['prState']) &&
     isMergeHex40(read['liveHeadSha']) &&
-    Array.isArray(read['contexts'])
+    Array.isArray(read['contexts']) &&
+    (read['contexts'] as readonly unknown[]).every(isWellFormedContext)
+  );
+}
+
+/** A context snapshot as the port declares it; a partial one cannot prove a status is present. */
+function isWellFormedContext(context: unknown): boolean {
+  return (
+    isRecord(context) &&
+    typeof context['name'] === 'string' &&
+    typeof context['state'] === 'string' &&
+    context['state'].length > 0 &&
+    typeof context['isGreen'] === 'boolean' &&
+    (context['creatorLogin'] === null || typeof context['creatorLogin'] === 'string')
   );
 }
 
@@ -529,10 +559,7 @@ function reconcileVerdict(
     return reconciled('overtaken', 'head-moved');
   }
   if (request.action === 'post-status') {
-    const contexts: readonly unknown[] = read.contexts;
-    const present = contexts.some(
-      (context) => isRecord(context) && context['name'] === 'premerge' && context['state'] !== 'missing',
-    );
+    const present = read.contexts.some((context) => context.name === 'premerge' && context.state !== 'missing');
     if (present) {
       return reconciled('reconciled', 'status-present');
     }

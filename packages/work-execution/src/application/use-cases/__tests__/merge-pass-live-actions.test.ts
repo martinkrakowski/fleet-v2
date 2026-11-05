@@ -17,7 +17,11 @@ import type {
   MergeForgeActionRequest,
   MergeForgeActionResult,
 } from '../../ports/out/MergeForgeActionPort.out-port.js';
-import type { ForgeMergeReadPort, ReadForgeMergeResult } from '../../ports/out/ForgeMergeReadPort.out-port.js';
+import type {
+  ForgeMergeReadPort,
+  MergeContextSnapshot,
+  ReadForgeMergeResult,
+} from '../../ports/out/ForgeMergeReadPort.out-port.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
 import { LANE_RUN_JOURNAL_ENTRY_VERSION } from '../../../domain/lane-run-journal.js';
 import { prepareLaneRunJournalAppend } from '../../../domain/lane-run-journal.js';
@@ -639,5 +643,64 @@ describe('performMergeLiveAction never throws and never acts twice (DT9b fix rou
       expect(journal.entries[1]).toMatchObject({ outcome: 'ambiguous', reasonCode: 'reconcile-unknown' });
       expect(forgeAction.requests).toHaveLength(0);
     }
+  });
+
+  it('never calls the forge when the journal answers appended with a different entry than the intent', async () => {
+    const { journal, forgeAction, deps } = build();
+    const realAppend = journal.append.bind(journal);
+    journal.append = async (entry) => {
+      const answer = await realAppend(entry);
+      return answer.outcome === 'appended'
+        ? { outcome: 'appended', entry: { ...answer.entry, mintedId: '01JB00000000000000000000ZZ' } }
+        : answer;
+    };
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(result).toEqual({ outcome: 'unavailable', journalKey: KEY_MERGE_PR, reasonCode: 'journal-unavailable' });
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('reports an unknown journal refusal reason as unavailable, inside the declared outcome type', async () => {
+    const { journal, forgeAction, deps } = build();
+    journal.append = async () =>
+      ({ outcome: 'refused', reason: 'unexpected', detail: null }) as unknown as LaneRunJournalAppendResult;
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(result).toEqual({ outcome: 'unavailable', journalKey: KEY_MERGE_PR, reasonCode: 'journal-unavailable' });
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('does not settle a post-status as status-present from a partial premerge context', async () => {
+    const { journal, forgeAction, forgeRead, deps } = build();
+    seedIntent(journal, KEY_POST_STATUS);
+    forgeRead.result = {
+      outcome: 'ok',
+      prState: 'open',
+      liveHeadSha: HEAD,
+      mergeState: 'clean',
+      contexts: [{ name: 'premerge' } as unknown as MergeContextSnapshot],
+      unresolvedThreads: 0,
+    };
+    const status = { context: 'premerge' as const, state: 'success' as const, description: 'premerge passed' };
+    const result = await performMergeLiveAction(deps, makeRequest({ action: 'post-status', status }));
+    expect(result).toEqual({ outcome: 'ambiguous', journalKey: KEY_POST_STATUS, reasonCode: 'reconcile-unknown' });
+    expect(journal.entries[1]).toMatchObject({ outcome: 'ambiguous', reasonCode: 'reconcile-unknown' });
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('settles a post-status as status-present from a well-formed premerge context', async () => {
+    const { journal, forgeAction, forgeRead, deps } = build();
+    seedIntent(journal, KEY_POST_STATUS);
+    forgeRead.result = {
+      outcome: 'ok',
+      prState: 'open',
+      liveHeadSha: HEAD,
+      mergeState: 'clean',
+      contexts: [{ name: 'premerge', state: 'SUCCESS', isGreen: true, creatorLogin: 'fleet-bot' }],
+      unresolvedThreads: 0,
+    };
+    const status = { context: 'premerge' as const, state: 'success' as const, description: 'premerge passed' };
+    const result = await performMergeLiveAction(deps, makeRequest({ action: 'post-status', status }));
+    expect(result).toEqual({ outcome: 'reconciled', journalKey: KEY_POST_STATUS, reconcile: 'status-present' });
+    expect(journal.entries[1]).toMatchObject({ outcome: 'reconciled', reasonCode: 'status-present' });
+    expect(forgeAction.requests).toHaveLength(0);
   });
 });

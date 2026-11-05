@@ -532,6 +532,14 @@ describe('RunDaemonTickUseCase (DT10a)', () => {
       [{ tickId: TICK_A, repositories: [null], forgeReachable: true }, 'invalid-repository'],
       [{ tickId: TICK_A, repositories: [repoRef(DIGEST_A, { owner: '..' })], forgeReachable: true }, 'invalid-repository'],
       [{ tickId: TICK_A, repositories: [repoRef(DIGEST_A, { projectId: '' })], forgeReachable: true }, 'invalid-repository'],
+      [
+        {
+          tickId: TICK_A,
+          repositories: [repoRef(DIGEST_A, { policy: { policyRevision: 'rev-1' } as unknown as MergeRepoPolicy })],
+          forgeReachable: true,
+        },
+        'invalid-repository',
+      ],
       [{ tickId: TICK_A, repositories: [], forgeReachable: true, jobFilter: [1] }, 'invalid-job-filter'],
       [{ tickId: TICK_A, repositories: [] }, 'forge-probe-missing'],
       [{ tickId: TICK_A, repositories: [], forgeReachable: 'yes' }, 'forge-probe-missing'],
@@ -592,10 +600,13 @@ describe('RunDaemonTickUseCase (DT10a)', () => {
         grantId: null,
         state: null,
       }) as LaneRunJournalEntryRecord;
+    const during = '2026-11-01T12:00:01.000Z';
     h.journal.byKey.set(key, [
-      journalEntry('intent', '2026-11-01T11:00:00.000Z', `0${'7'.repeat(25)}`),
-      journalEntry('intent', NOW, `0${'8'.repeat(25)}`),
-      journalEntry('result', NOW, `0${'9'.repeat(25)}`),
+      journalEntry('intent', '2026-11-01T11:00:00.000Z', `0${'6'.repeat(25)}`),
+      // stamped in the same millisecond as the job's start: written before this pass, never projected
+      journalEntry('result', NOW, `0${'7'.repeat(25)}`),
+      journalEntry('intent', during, `0${'8'.repeat(25)}`),
+      journalEntry('result', during, `0${'9'.repeat(25)}`),
     ]);
 
     await h.run({ repositories: [repoRef(DIGEST_A)] });

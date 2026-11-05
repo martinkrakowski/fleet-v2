@@ -116,7 +116,7 @@ function isRepositorySegment(value: unknown): value is string {
   return typeof value === 'string' && REPOSITORY_SEGMENT_PATTERN.test(value) && value !== '.' && value !== '..';
 }
 
-/** A repository the registry may serve: valid owner, repo, digest, project id and policy revision. */
+/** A repository the registry may serve: valid owner, repo, digest, project id and the policy's required fields. */
 function isUsableRepository(value: unknown): value is DaemonRepositoryRef {
   if (!isRecord(value)) {
     return false;
@@ -131,7 +131,10 @@ function isUsableRepository(value: unknown): value is DaemonRepositoryRef {
     value.projectId.length > 0 &&
     isRecord(policy) &&
     typeof policy.policyRevision === 'string' &&
-    policy.policyRevision.length > 0
+    policy.policyRevision.length > 0 &&
+    typeof policy.updateBranch === 'boolean' &&
+    isRecord(policy.veto) &&
+    typeof policy.veto.mode === 'string'
   );
 }
 
@@ -249,13 +252,20 @@ function normalizeHalt(value: unknown): ConductorHaltState {
   return { state: 'unreadable' };
 }
 
-/** True when a journal entry is an intent or a result recorded at or after `sinceIso`. */
-function appendedSince(entry: unknown, sinceIso: string): boolean {
+/**
+ * True when a journal entry is an intent or a result recorded strictly after
+ * `sinceIso`, the job's start read before its lease was taken. Strictly after,
+ * so an entry stamped in the same millisecond as the start (necessarily
+ * written before this pass began) is never attributed to this tick; the
+ * worst case is one line of this pass left out, which the projection's
+ * regeneration from the journal restores (plan §3.1).
+ */
+function appendedAfter(entry: unknown, sinceIso: string): boolean {
   return (
     isRecord(entry) &&
     (entry.kind === 'intent' || entry.kind === 'result') &&
     typeof entry.recordedAtIso === 'string' &&
-    Date.parse(entry.recordedAtIso) >= Date.parse(sinceIso)
+    Date.parse(entry.recordedAtIso) > Date.parse(sinceIso)
   );
 }
 
@@ -801,7 +811,7 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
         continue;
       }
       for (const entry of Array.isArray(entries) ? entries : []) {
-        if (!appendedSince(entry, run.startedAtIso)) {
+        if (!appendedAfter(entry, run.startedAtIso)) {
           continue;
         }
         const event = projectJournalEntryToDaemonEvent({

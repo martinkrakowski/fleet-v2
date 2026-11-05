@@ -649,8 +649,17 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     return { kind: 'ready', entry: record };
   }
 
+  /**
+   * The stale window never undercuts the longest a live reset or refill can
+   * run (their budgets plus a minute), so a live guard is never reaped.
+   */
   private staleMinutes(): number {
-    return clampInt(this.options.stalePrepareMinutes, 90, 1, 100_000);
+    const longestMs = Math.max(
+      clampInt(this.options.budgetsMs?.reset, 900_000, 1, 3_600_000),
+      clampInt(this.options.budgetsMs?.refill, 3_600_000, 1, 14_400_000),
+    );
+    const floor = Math.ceil(longestMs / 60_000) + 1;
+    return Math.max(floor, clampInt(this.options.stalePrepareMinutes, 90, 1, 100_000));
   }
 
   /** Slots whose claim link is older than the stale window; null when unreadable. */

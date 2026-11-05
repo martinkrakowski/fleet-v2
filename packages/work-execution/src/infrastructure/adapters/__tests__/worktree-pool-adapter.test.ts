@@ -414,6 +414,17 @@ describe('WorktreePoolAdapter refillAfterMerge', () => {
     expect(host.worktrees.has(`${POOL}/w1`)).toBe(false);
   });
 
+  it('never sets the stale window below the longest live operation', async () => {
+    const host = new FakeHost();
+    const adapter = make(host, { stalePrepareMinutes: 1, budgetsMs: { reset: 600_000, refill: 1_200_000 } });
+    await adapter.refillAfterMerge({ projectId: 'proj', mergedBaseCommit: BASE, recordedHost: HOST });
+    const windows = host.calls
+      .filter((c) => c.argv[0] === 'find')
+      .map((c) => Number((c.argv[c.argv.indexOf('-mmin') + 1] ?? '').replace('+', '')));
+    expect(windows.length).toBeGreaterThan(0);
+    for (const minutes of windows) expect(minutes).toBeGreaterThanOrEqual(21);
+  });
+
   it('does not reap a fresh prepare claim or a live taken claim', async () => {
     const host = new FakeHost();
     host.add(1);

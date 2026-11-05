@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { AttemptRecord } from '../src/domain/execution-records.js';
-import type { AttemptRepositoryPort } from '../src/application/ports/out/AttemptRepositoryPort.out-port.js';
+import { InMemoryAttemptRepository } from '../src/application/ports/out/__tests__/in-memory-attempt-repository.js';
 import type { ExecutionRunnerPort } from '../src/application/ports/out/ExecutionRunnerPort.out-port.js';
 import { PrepareFixAttemptUseCase } from '../src/application/use-cases/PrepareFixAttemptUseCase.use-case.js';
 import { RunnerForAttemptAdapter } from '../src/infrastructure/adapters/RunnerForAttemptAdapter.adapter.js';
@@ -50,26 +50,6 @@ function createPriorAttempt(overrides: Partial<AttemptRecord> = {}): AttemptReco
   };
 }
 
-class InMemoryAttemptRepo implements AttemptRepositoryPort {
-  readonly store = new Map<string, AttemptRecord>();
-
-  async saveAttempt(record: AttemptRecord): Promise<void> {
-    this.store.set(record.id, record);
-  }
-
-  async findAttemptById(attemptId: string): Promise<AttemptRecord | null> {
-    return this.store.get(attemptId) ?? null;
-  }
-
-  async listAttemptsByWorkOrder(workOrderId: string): Promise<readonly AttemptRecord[]> {
-    return Array.from(this.store.values()).filter((a) => a.workOrderId === workOrderId);
-  }
-
-  async listAllAttempts(): Promise<readonly AttemptRecord[]> {
-    return Array.from(this.store.values());
-  }
-}
-
 function stubRunner(): ExecutionRunnerPort {
   return {
     describeCapabilities: () => ({
@@ -95,7 +75,7 @@ function stubRunner(): ExecutionRunnerPort {
 
 describe('PrepareFixAttemptUseCase routing after an opencode first pass', () => {
   it('inherits the prior opencode host block, worktreePath and baseCommit', async () => {
-    const attemptRepo = new InMemoryAttemptRepo();
+    const attemptRepo = new InMemoryAttemptRepository();
     const prior = createPriorAttempt();
     await attemptRepo.saveAttempt(prior);
 
@@ -124,7 +104,7 @@ describe('PrepareFixAttemptUseCase routing after an opencode first pass', () => 
   });
 
   it('refuses with exactly "No fix seat available: " plus the selection reason and saves no record', async () => {
-    const attemptRepo = new InMemoryAttemptRepo();
+    const attemptRepo = new InMemoryAttemptRepository();
     const prior = createPriorAttempt({
       seatPlan: {
         version: 1,

@@ -13,6 +13,12 @@ export interface ProjectProfileView {
   >;
   readonly gateProcedures: readonly string[];
   readonly revision: number;
+
+  /**
+   * AD-1: the project's lane cap — how many lanes the project may hold at
+   * once. Absent means the profile declares no cap.
+   */
+  readonly maxConcurrentLanes?: number | null;
 }
 
 export interface ProjectProfileReadPort {

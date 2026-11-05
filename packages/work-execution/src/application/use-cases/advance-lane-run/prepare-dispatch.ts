@@ -684,7 +684,7 @@ export async function performDispatch(ctx: AdvanceStepContext,
   if (latest === null || latest.state !== 'intent-recorded') {
     return { outcome: 'waiting', reason: 'facts-inconsistent' };
   }
-  const notStarted = await cancelNotStartedAttempt(ctx, record, latest, facts, decision, request);
+  const notStarted = await cancelNotStartedAttempt(ctx, record, latest, facts, decision, request, nowIso);
   if (notStarted !== null) {
     return notStarted;
   }
@@ -989,6 +989,7 @@ async function cancelNotStartedAttempt(
   facts: LaneRunFacts,
   decision: Extract<LaneRunDecision, { kind: 'act' }>,
   request: AdvanceLaneRunRequest,
+  nowIso: string,
 ): Promise<AdvanceLaneRunResult | null> {
   if (facts.attempt !== null && facts.attempt.dispatchResult === 'not-started') {
     const cancel = ctx.deps.cancelPreparedAttempt;
@@ -1002,7 +1003,7 @@ async function cancelNotStartedAttempt(
     if (await hasIncompleteWorktreeRecovery(ctx, latest.id)) {
       return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
     }
-    await cancel.cancelPreparedAttempt({ attemptId: latest.id, nowIso: request.nowIso });
+    await cancel.cancelPreparedAttempt({ attemptId: latest.id, nowIso });
     return { outcome: 'waiting', reason: 'dispatch-pending' };
   }
   return null;

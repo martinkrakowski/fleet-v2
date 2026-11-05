@@ -62,6 +62,7 @@ export * from "./ProcessTreeTerminationPort.out-port.js";
 export * from "./ProjectProbePort.out-port.js";
 export * from "./ProjectProbeRecordPort.out-port.js";
 export * from "./ProjectProfileReadPort.out-port.js";
+export * from "./RepositoryFactsPort.out-port.js";
 export * from "./ReviewAssessmentPort.out-port.js";
 export * from "./ReviewRequestPort.out-port.js";
 export * from "./RunnerForAttemptPort.out-port.js";

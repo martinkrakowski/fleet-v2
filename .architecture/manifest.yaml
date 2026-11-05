@@ -377,6 +377,8 @@ bounded_contexts:
           - ExportLegacyTrainStateUseCase
           - InspectMergeReadinessUseCase
           - ManageDaemonSchedulerUseCase
+          - InventoryRelaunchUseCase
+          - BuildFactPackUseCase
         ports:
           in:
             - RegisterWorkOrderPort
@@ -414,6 +416,8 @@ bounded_contexts:
             - ExportLegacyTrainStatePort
             - InspectMergeReadinessPort
             - ManageDaemonSchedulerPort
+            - InventoryRelaunchPort
+            - BuildFactPackPort
           out:
             - WorkOrderRepositoryPort
             - AttemptRepositoryPort
@@ -480,8 +484,9 @@ bounded_contexts:
             - KillallStopAgentPort
             - LegacyTrainStateReadPort
             - DaemonSchedulerPort
+            - RepositoryFactsPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, MergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter, DaemonLeaseAdapter, DaemonStatusFileAdapter, DaemonEventProjectionAdapter, DaemonPauseAdapter, MergeQueueRepositoryAdapter, GhForgeMergeReadAdapter, GitMirrorPatchIdentityAdapter, MergeVerificationAdapter, JevMergeVetoAdapter, MergeNotificationAdapter, KillallHaltMarkerAdapter, KillallTrainPauseAdapter, KillallStopAgentUnavailableAdapter, LanePlanRepositoryAdapter, LegacyTrainStateReadAdapter, SystemdUserSchedulerAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, MergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter, DaemonLeaseAdapter, DaemonStatusFileAdapter, DaemonEventProjectionAdapter, DaemonPauseAdapter, MergeQueueRepositoryAdapter, GhForgeMergeReadAdapter, GitMirrorPatchIdentityAdapter, MergeVerificationAdapter, JevMergeVetoAdapter, MergeNotificationAdapter, KillallHaltMarkerAdapter, KillallTrainPauseAdapter, KillallStopAgentUnavailableAdapter, LanePlanRepositoryAdapter, LegacyTrainStateReadAdapter, SystemdUserSchedulerAdapter, RepositoryFactsAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       ImportLanePlanPort: "Import one validated plan sidecar revision per (projectId, planId): project match, greater-revision CAS with digest idempotency, the cycle check across every stored plan, dropped lanes kept; it authorizes nothing."
@@ -583,6 +588,9 @@ bounded_contexts:
       ManageDaemonSchedulerPort: "Render, show and uninstall the user-scope scheduler units that run one daemon tick at a fixed interval (systemd service and timer, oneshot, no resident process); writing the unit files happens only on explicit apply, show and uninstall print keys only, and enabling the timer and lingering are printed for the operator, never run."
       LegacyTrainStateReadPort: "Read the shell merge train's state directory read-only (queue lines, parked list, chain records, batch state) and return the raw lines with their source kind; an absent file is known absence, an unreadable one is unreadable; it never writes, locks or deletes, and no path or other file content crosses the port."
       DaemonSchedulerPort: "Write, read and remove one scheduler unit pair for the daemon tick under the operator's user scope from rendered text the caller supplies; it never enables a unit, starts a process, runs a command or reads a credential, and reports written, unchanged, absent or unreadable."
+      InventoryRelaunchPort: "Report, read-only, what a relaunch would find on each lane host: runner worktree state by directory, the registered clone's worktree listing, the conductor status, and each lane's population (conducted, attempt-recorded, unrecorded); risk flags as counts only and worktree paths only in the local CLI output; it writes nothing, journals nothing and mutates no worktree."
+      BuildFactPackPort: "Build the fact pack a brief writer reads for one lane: read-only repository facts at a pinned commit, rendered into the authoring prompt with every repository-sourced text wrapped as untrusted input; a secret-shaped fact refuses the pack; it writes nothing and runs no command outside the read-only fact reads."
+      RepositoryFactsPort: "Read repository facts at one pinned commit, read-only, through the command executor: file listings, file ranges, the manifest and plan rows a lane names; bounded sizes; an unreadable or oversized read is reported, never truncated silently; no write, no network, no credential path."
     adapter_bindings:
       - { adapter: WorkOrderRepositoryAdapter, implements: WorkOrderRepositoryPort, integration: local-transactional-store }
       - { adapter: AttemptRepositoryAdapter, implements: AttemptRepositoryPort, integration: local-transactional-store }
@@ -706,6 +714,7 @@ bounded_contexts:
       - { adapter: KillallStopAgentUnavailableAdapter, implements: KillallStopAgentPort, integration: in-process-unavailable }
       - { adapter: LegacyTrainStateReadAdapter, implements: LegacyTrainStateReadPort, integration: read-only-shell-train-state-files }
       - { adapter: SystemdUserSchedulerAdapter, implements: DaemonSchedulerPort, integration: systemd-user-unit-files-no-activation }
+      - { adapter: RepositoryFactsAdapter, implements: RepositoryFactsPort, integration: injected-command-executor-read-only-git }
     domain_specification:
       aggregate_roots: [WorkOrder, Attempt, LaneRun, LanePlan, PullRequestLink]
       child_ownership: { ActionJournalEntry: Attempt, CapacityReservation: Attempt, PlannedLane: LanePlan }

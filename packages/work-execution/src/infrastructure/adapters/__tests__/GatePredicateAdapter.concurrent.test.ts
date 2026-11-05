@@ -22,7 +22,7 @@ import type {
 } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { LaneDiffCheckPort, LaneDiffCheckResult } from '../../../application/ports/out/LaneDiffCheckPort.out-port.js';
 import type { RunnerForAttemptHostSpec } from '../ConfirmRecordedHost.js';
-import { MAX_GATE_ARGV_ENTRIES, MAX_GATE_COMMANDS, gateCommandPredicateName } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
+import { MAX_GATE_ARGV_ENTRIES, MAX_GATE_ARG_CHARACTERS, MAX_GATE_COMMANDS, gateCommandPredicateName } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -219,6 +219,33 @@ describe('GatePredicateAdapter concurrency (KS3)', () => {
     slots = 3;
     await adapter.evaluateGatePredicates(requestWith(['c1', 'c2', 'c3', 'c4'], '/lanes/r'));
     expect(executor.peak).toBe(3);
+  });
+
+  it('refuses an empty spec and arguments beyond the acceptance spec limits', async () => {
+    const executor = new RecordingExecutor();
+    const adapter = makeAdapter(executor, 2);
+    const withCommands = (commands: unknown): EvaluateGatePredicatesRequest =>
+      ({ ...requestWith(['x']), spec: { commitRequired: true, diffCheck: true, commands } }) as never;
+    for (const commands of [[], [{ argv: ['a'.repeat(MAX_GATE_ARG_CHARACTERS + 1)] }], [{ argv: ['a\0b'] }]]) {
+      expect((await adapter.evaluateGatePredicates(withCommands(commands))).outcome).toBe('unavailable');
+    }
+    expect(executor.commandRuns).toBe(0);
+  });
+
+  it('withholds a secret-shaped coverage reason from the result', async () => {
+    const secretShaped = ['ghp', '_', 'a'.repeat(24)].join('');
+    const executor = new RecordingExecutor({ a: { result: { stdout: secretShaped } } });
+    const adapter = makeAdapter(executor, 2);
+    const request: EvaluateGatePredicatesRequest = {
+      ...requestWith(['a']),
+      spec: {
+        commitRequired: true,
+        diffCheck: true,
+        commands: [{ argv: ['a'], coverage: { reader: 'vitest-summary', unitKind: 'tests', minUnits: 1 } }],
+      },
+    };
+    const results = evaluated(await adapter.evaluateGatePredicates(request));
+    expect(JSON.stringify(results)).not.toContain(secretShaped);
   });
 
   it('refuses a request with more commands or arguments than an acceptance spec allows', async () => {

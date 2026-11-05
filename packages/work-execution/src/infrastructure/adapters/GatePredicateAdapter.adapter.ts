@@ -63,7 +63,7 @@ import type {
   CheckCoverage,
   EvidenceResultValue,
 } from '@fleet/evidence-and-acceptance';
-import { MAX_GATE_ARGV_ENTRIES, MAX_GATE_COMMANDS, gateCommandPredicateName } from '../../domain/value-objects/AcceptanceSpec.vo.js';
+import { MAX_GATE_ARGV_ENTRIES, MAX_GATE_ARG_CHARACTERS, MAX_GATE_COMMANDS, gateCommandPredicateName } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import type { GateCommand } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 
@@ -208,9 +208,22 @@ function boundedDetail(detail: unknown): string {
   return detail.length > MAX_DETAIL_LENGTH ? detail.slice(0, MAX_DETAIL_LENGTH) : detail;
 }
 
+/** The coverage with a withheld or cut reason when a reader's reason text is secret-shaped or long. */
+function boundedCoverage(coverage: CheckCoverage): CheckCoverage {
+  if (coverage.ran) {
+    return coverage;
+  }
+  const reason = boundedDetail(coverage.reason);
+  return reason === coverage.reason ? coverage : { ran: false, reason };
+}
+
 function withBoundedDetail(result: GatePredicateResult): GatePredicateResult {
   const detail = boundedDetail(result.detail);
-  return detail === result.detail ? result : { ...result, detail };
+  const coverage = result.coverage === undefined ? undefined : boundedCoverage(result.coverage);
+  if (detail === result.detail && coverage === result.coverage) {
+    return result;
+  }
+  return { ...result, detail, ...(coverage === undefined ? {} : { coverage }) };
 }
 
 /** A predicate that could not run: unknown, never a pass. */
@@ -234,7 +247,7 @@ function isUsableRequest(request: EvaluateGatePredicatesRequest): boolean {
   if (spec === null || typeof spec !== 'object' || !Array.isArray(spec.commands)) {
     return false;
   }
-  if (spec.commands.length > MAX_GATE_COMMANDS) {
+  if (spec.commands.length < 1 || spec.commands.length > MAX_GATE_COMMANDS) {
     return false;
   }
   return spec.commands.every(
@@ -244,7 +257,9 @@ function isUsableRequest(request: EvaluateGatePredicatesRequest): boolean {
       Array.isArray((command as { argv?: unknown }).argv) &&
       (command as { argv: unknown[] }).argv.length > 0 &&
       (command as { argv: unknown[] }).argv.length <= MAX_GATE_ARGV_ENTRIES &&
-      (command as { argv: unknown[] }).argv.every((entry) => typeof entry === 'string'),
+      (command as { argv: unknown[] }).argv.every(
+        (entry) => typeof entry === 'string' && entry.length <= MAX_GATE_ARG_CHARACTERS && !entry.includes('\0'),
+      ),
   );
 }
 

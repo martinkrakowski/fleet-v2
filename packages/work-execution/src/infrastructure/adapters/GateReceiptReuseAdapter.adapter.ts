@@ -116,7 +116,15 @@ export function readStorableGateResult(value: unknown): StoredGatePassResult | n
     if (record.coverage === undefined) {
       return base;
     }
-    return isCheckCoverage(record.coverage) ? { ...base, coverage: record.coverage } : null;
+    const coverage = record.coverage;
+    if (!isCheckCoverage(coverage)) {
+      return null;
+    }
+    // A reader's reason text is stored data too: bounded and secret-free, or the receipt is not stored.
+    if (!coverage.ran && (coverage.reason.length > GATE_RECEIPT_MAX_DETAIL_LENGTH || isSecretShaped(coverage.reason))) {
+      return null;
+    }
+    return { ...base, coverage };
   } catch {
     return null;
   }

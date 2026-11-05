@@ -80,6 +80,8 @@ describe('GateReceiptReuseAdapter', () => {
       { ...PASS, exitCode: 1.5 },
       { ...PASS, durationMs: -1 },
       { ...PASS, coverage: { ran: 'yes' } },
+      { ...PASS, coverage: { ran: false, reason: secretShaped } },
+      { ...PASS, coverage: { ran: false, reason: 'r'.repeat(301) } },
       null,
       'pass',
     ];

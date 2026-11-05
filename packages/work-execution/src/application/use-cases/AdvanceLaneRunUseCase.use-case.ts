@@ -405,7 +405,7 @@ export class AdvanceLaneRunUseCase implements AdvanceLaneRunPort {
       return performCancel(this.ctx, decision, request);
     }
     if (decision.kind === 'enter') {
-      return performEnter(this.ctx, record, facts.state, decision.to, request, decision.reason);
+      return performEnter(this.ctx, record, facts.state, decision.to, request);
     }
     return performPark(this.ctx, record, decision.reason, decision.qualifier, decision.parkedFrom, request);
   }

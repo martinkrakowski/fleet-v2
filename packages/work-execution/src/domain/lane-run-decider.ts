@@ -199,10 +199,7 @@ export type LaneRunDecision =
   | { readonly kind: 'reconcile'; readonly step: LaneRunKeyStep; readonly key: string }
   | { readonly kind: 'cancel'; readonly key: string; readonly attemptId: string; readonly round: number;
       readonly seatIndex: number; readonly retry: number | null }
-  | { readonly kind: 'enter'; readonly to: LaneRunStateValue;
-      /** Set only when the run entered `stopped` because the graceful stop's grace passed (GD7):
-       * the wait reason the conductor pass reports for the owner's attention. */
-      readonly reason?: 'stop-grace-exceeded' }
+  | { readonly kind: 'enter'; readonly to: LaneRunStateValue }
   | { readonly kind: 'park'; readonly reason: LaneRunParkReason; readonly qualifier: string | null;
       readonly parkedFrom: LaneRunStateValue }
   | { readonly kind: 'wait'; readonly reason: LaneRunWaitReason }
@@ -1089,7 +1086,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       // again. Inside the grace the drain still gets its chance to finish collect
       // or gate. A live attempt keeps today's behaviour (GD3).
       if (!live && drainContinues && gracePassed()) {
-        return { kind: 'enter', to: 'stopped', reason: 'stop-grace-exceeded' };
+        return enter('stopped');
       }
       // GD4: inside the drain states the state rules apply, with GD5 and GD6.
       let decision: LaneRunDecision;

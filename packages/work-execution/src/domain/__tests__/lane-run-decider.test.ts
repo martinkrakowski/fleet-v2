@@ -1765,7 +1765,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
       stopRequestedAtIso: '2026-10-27T09:00:00.000Z',
       attempt: attemptFact({ phase: 'collected', collection: null }),
     });
-    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped', reason: 'stop-grace-exceeded' });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
   });
 
   it('GD7: the same collecting drain inside the grace still lets the collecting rules decide', () => {
@@ -1791,7 +1791,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
       gate: 'none',
       attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'sealed' } }),
     });
-    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped', reason: 'stop-grace-exceeded' });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
   });
 
   it('GD7: a live running attempt past the grace still waits stop-grace-exceeded', () => {
@@ -1813,7 +1813,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
       stopRequestedAtIso: null,
       attempt: attemptFact({ phase: 'collected', collection: null }),
     });
-    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped', reason: 'stop-grace-exceeded' });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
   });
 
   it('the run deadline still stops the attempt under a graceful stop', () => {

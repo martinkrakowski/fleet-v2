@@ -63,8 +63,6 @@ export async function performEnter(ctx: AdvanceStepContext,
   from: LaneRunStateValue,
   to: LaneRunStateValue,
   request: AdvanceLaneRunRequest,
-  /** When the run entered `stopped` because the graceful stop's grace passed (GD7): the reason the conductor pass reports as attention. */
-  reason?: 'stop-grace-exceeded',
 ): Promise<AdvanceLaneRunResult> {
   const settledOpenPr =
     record.parked !== null &&
@@ -92,7 +90,7 @@ export async function performEnter(ctx: AdvanceStepContext,
       return { outcome: 'refused', reason: saved.reason };
     }
   }
-  return reason === undefined ? { outcome: 'entered', state: to } : { outcome: 'entered', state: to, reason };
+  return { outcome: 'entered', state: to };
 }
 
 /** The park reasons that also ask one keyed owner question (K6 header). */

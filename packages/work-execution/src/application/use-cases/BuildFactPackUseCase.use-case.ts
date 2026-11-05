@@ -164,6 +164,16 @@ export class BuildFactPackUseCase implements BuildFactPackPort {
   }
 
   public async buildFactPack(request: BuildFactPackRequest): Promise<BuildFactPackResult> {
+    // Never throws: a runtime-malformed request (a throwing getter included)
+    // is a typed refusal, like every other failure.
+    try {
+      return await this.build(request);
+    } catch {
+      return { outcome: 'refused', refusal: INVALID_REQUEST };
+    }
+  }
+
+  private async build(request: BuildFactPackRequest): Promise<BuildFactPackResult> {
     // A null request or a non-array facts list is refused, never thrown on.
     if (typeof request !== 'object' || request === null || !Array.isArray(request.facts)
       || typeof request.laneId !== 'string' || typeof request.commit !== 'string'

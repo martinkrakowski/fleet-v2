@@ -41,8 +41,8 @@ function sizeAnswer(bytes: number): CommandRunResult {
 }
 
 const HAPPY_ANSWERS = {
-  [`env GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent/fleet-v2-repository-facts-no-grafts git --no-replace-objects -c core.pager=cat -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c protocol.allow=never -C ${REPOSITORY} cat-file -s ${COMMIT}:${BLOB_PATH}`]: sizeAnswer(BLOB.length),
-  [`env GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent/fleet-v2-repository-facts-no-grafts git --no-replace-objects -c core.pager=cat -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c protocol.allow=never -C ${REPOSITORY} cat-file blob ${COMMIT}:${BLOB_PATH}`]: { exitCode: 0, signal: null, stdout: BLOB, stderr: '' },
+  [`env GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL=none GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent/fleet-v2-repository-facts-no-grafts git --no-replace-objects -c core.pager=cat -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c protocol.allow=never -C ${REPOSITORY} cat-file -s ${COMMIT}:${BLOB_PATH}`]: sizeAnswer(BLOB.length),
+  [`env GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL=none GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent/fleet-v2-repository-facts-no-grafts git --no-replace-objects -c core.pager=cat -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c protocol.allow=never -C ${REPOSITORY} cat-file blob ${COMMIT}:${BLOB_PATH}`]: { exitCode: 0, signal: null, stdout: BLOB, stderr: '' },
 };
 
 function makeAdapter(executor: CommandExecutorPort, overrides: { maxFactBytes?: number } = {}): RepositoryFactsAdapter {
@@ -75,6 +75,7 @@ describe('RepositoryFactsAdapter', () => {
     expect(blobCall.argv).toContain('GIT_NO_REPLACE_OBJECTS=1');
     // No read may reach the network: no lazy fetch, no transport at all.
     expect(blobCall.argv).toContain('GIT_NO_LAZY_FETCH=1');
+    expect(blobCall.argv).toContain('GIT_ALLOW_PROTOCOL=none');
     const allowIndex = blobCall.argv.indexOf('protocol.allow=never');
     expect(allowIndex).toBeGreaterThan(0);
     expect(blobCall.argv[allowIndex - 1]).toBe('-c');
@@ -86,7 +87,7 @@ describe('RepositoryFactsAdapter', () => {
   });
 
   it('lists the files under a prefix at the pinned commit', async () => {
-    const listingArgvKey = `env GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent/fleet-v2-repository-facts-no-grafts git --no-replace-objects -c core.pager=cat -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c protocol.allow=never -C ${REPOSITORY} ls-tree -r --name-only ${COMMIT} -- packages/work-execution`;
+    const listingArgvKey = `env GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL=none GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent/fleet-v2-repository-facts-no-grafts git --no-replace-objects -c core.pager=cat -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c protocol.allow=never -C ${REPOSITORY} ls-tree -r --name-only ${COMMIT} -- packages/work-execution`;
     const { executor, recorded } = makeExecutor({
       [listingArgvKey]: { exitCode: 0, signal: null, stdout: 'packages/work-execution/a.ts\npackages/work-execution/b.ts\n', stderr: '' },
     });
@@ -112,7 +113,7 @@ describe('RepositoryFactsAdapter', () => {
     const { executor, recorded } = makeExecutor({
       ...HAPPY_ANSWERS,
       // The size answer now exceeds the default 1 MiB cap.
-      [`env GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent/fleet-v2-repository-facts-no-grafts git --no-replace-objects -c core.pager=cat -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c protocol.allow=never -C ${REPOSITORY} cat-file -s ${COMMIT}:${BLOB_PATH}`]: sizeAnswer(2 * 1024 * 1024),
+      [`env GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL=none GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent/fleet-v2-repository-facts-no-grafts git --no-replace-objects -c core.pager=cat -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c protocol.allow=never -C ${REPOSITORY} cat-file -s ${COMMIT}:${BLOB_PATH}`]: sizeAnswer(2 * 1024 * 1024),
     });
     const adapter = makeAdapter(executor);
 
@@ -130,7 +131,7 @@ describe('RepositoryFactsAdapter', () => {
 
   it('reports an unreadable file when git fails', async () => {
     const { executor } = makeExecutor({
-      [`env GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent/fleet-v2-repository-facts-no-grafts git --no-replace-objects -c core.pager=cat -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c protocol.allow=never -C ${REPOSITORY} cat-file -s ${COMMIT}:${BLOB_PATH}`]: { exitCode: 5, signal: null, stdout: '', stderr: 'boom' },
+      [`env GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL=none GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/nonexistent/fleet-v2-repository-facts-no-grafts git --no-replace-objects -c core.pager=cat -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.attributesFile=/dev/null -c protocol.allow=never -C ${REPOSITORY} cat-file -s ${COMMIT}:${BLOB_PATH}`]: { exitCode: 5, signal: null, stdout: '', stderr: 'boom' },
     });
     const adapter = makeAdapter(executor);
 

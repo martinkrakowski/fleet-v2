@@ -76,6 +76,9 @@ const GIT_TIMEOUT_MS = 30_000;
 const GIT_ARGV_PREFIX = [
   'env',
   'GIT_NO_LAZY_FETCH=1',
+  // Overrides every protocol.allow and protocol.<name>.allow setting: no
+  // protocol is named, so no transport is allowed on any git version.
+  'GIT_ALLOW_PROTOCOL=none',
   'GIT_TERMINAL_PROMPT=0',
   'GIT_NO_REPLACE_OBJECTS=1',
   'GIT_GRAFT_FILE=/nonexistent/fleet-v2-repository-facts-no-grafts',

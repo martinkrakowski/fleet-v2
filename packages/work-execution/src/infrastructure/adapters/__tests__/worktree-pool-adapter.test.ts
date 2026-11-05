@@ -398,6 +398,32 @@ describe('WorktreePoolAdapter resetToBase', () => {
     expect(host.worktrees.get(`${POOL}/w1`)!.dirty).toBe(false);
   });
 
+  it('does not rebuild a slot whose claim owner cannot be read', async () => {
+    const host = new FakeHost();
+    host.add(1);
+    host.claims.set(`${CLAIMS}/w1`, 'run-x');
+    host.override = (t) => (t[0] === 'readlink' ? FAIL() : undefined);
+    const result = await make(host).resetToBase({ worktreePath: `${POOL}/w1`, baseCommit: NEXT, recordedHost: HOST });
+    expect(result).toEqual({ outcome: 'refused', reason: 'not-accounted-for' });
+    expect(host.worktrees.get(`${POOL}/w1`)!.head).toBe(BASE);
+    expect(host.claims.size).toBe(1);
+  });
+
+  it('refill never rebuilds a slot a run claimed after its snapshot', async () => {
+    const host = new FakeHost();
+    host.add(1, BASE, true);
+    const adapter = make(host, { maxEntries: 1 });
+    let lists = 0;
+    host.override = (t) => {
+      if (t[0] === 'worktree' && t[1] === 'list' && (lists += 1) === 2) host.claims.set(`${CLAIMS}/w1`, 'run-late');
+      return undefined;
+    };
+    const result = await adapter.refillAfterMerge({ projectId: 'proj', mergedBaseCommit: NEXT, recordedHost: HOST });
+    expect(result.outcome).not.toBe('refilled');
+    expect(host.worktrees.get(`${POOL}/w1`)!.head).toBe(BASE);
+    expect(host.claims.get(`${CLAIMS}/w1`)).toBe('run-late');
+  });
+
   it('reports unknown when the executor does not answer', async () => {
     const host = new FakeHost();
     host.add(1);

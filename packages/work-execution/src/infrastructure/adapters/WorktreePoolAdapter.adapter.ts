@@ -433,6 +433,7 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     index: number,
     base: string,
     deadline: number,
+    requireIdle = false,
   ): Promise<ResetWorktreeToBaseResult> {
     const slots = await this.listSlots(view, deadline);
     const claims = slots === null ? null : await this.readClaims(view, deadline);
@@ -440,9 +441,12 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     const slot = slots.get(index);
     if (slot === undefined || slot.prunable) return { outcome: 'refused', reason: 'not-accounted-for' };
     const holder = claims.get(index);
-    if (holder !== undefined && holder.startsWith('prepare-')) {
+    // Being prepared, or held by an owner that cannot be read: not ours to rebuild.
+    if (holder !== undefined && (holder.startsWith('prepare-') || holder === '?')) {
       return { outcome: 'refused', reason: 'not-accounted-for' };
     }
+    // A refill's snapshot said idle: a claim that appeared since is a live run's.
+    if (requireIdle && holder !== undefined) return { outcome: 'unknown' };
     const known = await this.git(view, view.config.repositoryPath, ['cat-file', '-e', `${base}^{commit}`], deadline);
     if (known.kind === 'unknown') return { outcome: 'unknown' };
     if (known.kind === 'fail') return { outcome: 'refused', reason: 'invalid-request' };
@@ -605,7 +609,7 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
         record = this.entry(projectId, index, slot.path, merged, 'warm', null);
       } else {
         // At an older base, dirty or unreadable: rebuild it rather than leave it occupying the slot.
-        const reset = await this.resetIn(view, projectId, index, merged, deadline);
+        const reset = await this.resetIn(view, projectId, index, merged, deadline, true);
         record = reset.outcome === 'reset' ? reset.entry : null;
       }
       if (record === null) failed = true;

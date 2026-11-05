@@ -52,6 +52,7 @@ import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../domain/lane-run-jour
 import { LANE_RUN_LEASE_MAX_MS } from '../../domain/lane-run-lease.js';
 import type { LaneRunLeaseRecord } from '../../domain/lane-run-records.js';
 import {
+  MERGE_VETO_MODES,
   findMergeQueueHead,
   orderMergeQueue,
   type MergeQueueEntryRecord,
@@ -134,7 +135,7 @@ function isUsableRepository(value: unknown): value is DaemonRepositoryRef {
     policy.policyRevision.length > 0 &&
     typeof policy.updateBranch === 'boolean' &&
     isRecord(policy.veto) &&
-    typeof policy.veto.mode === 'string'
+    (MERGE_VETO_MODES as readonly unknown[]).includes(policy.veto.mode)
   );
 }
 
@@ -266,6 +267,16 @@ function appendedAfter(entry: unknown, sinceIso: string): boolean {
     (entry.kind === 'intent' || entry.kind === 'result') &&
     typeof entry.recordedAtIso === 'string' &&
     Date.parse(entry.recordedAtIso) > Date.parse(sinceIso)
+  );
+}
+
+/** True when the port's acquired lease is exactly the one the domain decided: same scope, holder and fence. */
+function isExpectedLease(actual: unknown, expected: DaemonLeaseRecord): boolean {
+  return (
+    isRecord(actual) &&
+    actual.scope === expected.scope &&
+    actual.holderId === expected.holderId &&
+    actual.fence === expected.fence
   );
 }
 
@@ -728,15 +739,15 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       await this.releaseLease(ctx, scope, decision.lease.fence);
       return unreadable;
     }
-    if (!isRecord(acquired)) {
+    if (isRecord(acquired) && acquired.outcome === 'ok') {
+      if (isExpectedLease(acquired.lease, decision.lease)) {
+        return { ok: true, fence: decision.lease.fence };
+      }
+      // A success that is not exactly the lease the domain decided: it may still be held, so release the expected fence.
+      await this.releaseLease(ctx, scope, decision.lease.fence);
       return unreadable;
     }
-    if (acquired.outcome === 'ok') {
-      const fence = isRecord(acquired.lease) ? acquired.lease.fence : undefined;
-      if (typeof fence === 'number' && Number.isSafeInteger(fence) && fence >= 1) {
-        return { ok: true, fence };
-      }
-      // A success the tick cannot read: the lease may be held, so release the expected fence.
+    if (!isRecord(acquired) || acquired.outcome !== 'refused') {
       await this.releaseLease(ctx, scope, decision.lease.fence);
       return unreadable;
     }

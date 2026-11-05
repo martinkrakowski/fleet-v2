@@ -540,6 +540,14 @@ describe('RunDaemonTickUseCase (DT10a)', () => {
         },
         'invalid-repository',
       ],
+      [
+        {
+          tickId: TICK_A,
+          repositories: [repoRef(DIGEST_A, { policy: { ...mergePolicy(), veto: { mode: 'typo' } } as unknown as MergeRepoPolicy })],
+          forgeReachable: true,
+        },
+        'invalid-repository',
+      ],
       [{ tickId: TICK_A, repositories: [], forgeReachable: true, jobFilter: [1] }, 'invalid-job-filter'],
       [{ tickId: TICK_A, repositories: [] }, 'forge-probe-missing'],
       [{ tickId: TICK_A, repositories: [], forgeReachable: 'yes' }, 'forge-probe-missing'],
@@ -709,6 +717,32 @@ describe('RunDaemonTickUseCase (DT10a)', () => {
     expect(malformed.lease.releases).toEqual([
       expect.objectContaining({ scope: `merge/${DIGEST_A}`, holderId: TICK_A, fence: 1 }),
     ]);
+
+    const foreign = makeHarness();
+    foreign.lease.acquire = async (request) => ({
+      outcome: 'ok',
+      lease: {
+        version: DAEMON_RECORD_VERSION,
+        scope: request.scope,
+        holderId: `tick-0${'2'.repeat(25)}`,
+        fence: 7,
+        leaseUntilIso: request.leaseUntilIso,
+      },
+    });
+    const garbage = makeHarness();
+    garbage.lease.acquire = async () => 'ok' as unknown as DaemonLeaseResult;
+
+    const foreignResult = await foreign.run({ repositories: [repoRef(DIGEST_A)] });
+    const garbageResult = await garbage.run({ repositories: [repoRef(DIGEST_A)] });
+
+    for (const [harness, outcome] of [
+      [foreign, foreignResult],
+      [garbage, garbageResult],
+    ] as const) {
+      expect(outcome.status?.jobs[0]).toMatchObject({ outcome: 'refused', reasonCode: 'lease-unreadable' });
+      expect(harness.mergePass.requests).toHaveLength(0);
+      expect(harness.lease.releases).toEqual([expect.objectContaining({ fence: 1, holderId: TICK_A })]);
+    }
 
     const failing = makeHarness();
     failing.lease.acquire = async () => {

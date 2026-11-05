@@ -205,78 +205,106 @@ function serializePolicy(policy: PolicySection): Record<string, unknown> {
     };
   }
   if (policy.conductor !== undefined) {
-    const conductor: Record<string, unknown> = { enabled: policy.conductor.enabled };
-    if (policy.conductor.stopGraceMinutes !== undefined) {
-      conductor.stopGraceMinutes = policy.conductor.stopGraceMinutes;
-    }
-    if (policy.conductor.reaper !== undefined) {
-      const reaper: Record<string, unknown> = { enabled: policy.conductor.reaper.enabled };
-      if (policy.conductor.reaper.intervalMinutes !== undefined) {
-        reaper.intervalMinutes = policy.conductor.reaper.intervalMinutes;
-      }
-      if (policy.conductor.reaper.graceMinutes !== undefined) {
-        reaper.graceMinutes = policy.conductor.reaper.graceMinutes;
-      }
-      if (policy.conductor.reaper.staleStopMinutes !== undefined) {
-        reaper.staleStopMinutes = policy.conductor.reaper.staleStopMinutes;
-      }
-      if (policy.conductor.reaper.repairs !== undefined) {
-        const repairs: Record<string, unknown> = {};
-        for (const kind of CONDUCTOR_REAPER_REPAIR_KINDS) {
-          if (policy.conductor.reaper.repairs[kind] !== undefined) {
-            repairs[kind] = policy.conductor.reaper.repairs[kind];
-          }
-        }
-        reaper.repairs = repairs;
-      }
-      if (policy.conductor.reaper.worktrees !== undefined) {
-        const worktrees: Record<string, unknown> = {};
-        if (policy.conductor.reaper.worktrees.retentionHours !== undefined) {
-          worktrees.retentionHours = policy.conductor.reaper.worktrees.retentionHours;
-        }
-        if (policy.conductor.reaper.worktrees.maxRemovalsPerPass !== undefined) {
-          worktrees.maxRemovalsPerPass = policy.conductor.reaper.worktrees.maxRemovalsPerPass;
-        }
-        if (policy.conductor.reaper.worktrees.passBudgetSeconds !== undefined) {
-          worktrees.passBudgetSeconds = policy.conductor.reaper.worktrees.passBudgetSeconds;
-        }
-        reaper.worktrees = worktrees;
-      }
-      if (policy.conductor.reaper.disk !== undefined) {
-        const disk: Record<string, unknown> = {};
-        if (policy.conductor.reaper.disk.minFreePercent !== undefined) {
-          disk.minFreePercent = policy.conductor.reaper.disk.minFreePercent;
-        }
-        if (policy.conductor.reaper.disk.clearFreePercent !== undefined) {
-          disk.clearFreePercent = policy.conductor.reaper.disk.clearFreePercent;
-        }
-        reaper.disk = disk;
-      }
-      conductor.reaper = reaper;
-    }
-    out.conductor = conductor;
+    out.conductor = serializeConductorPolicy(policy.conductor);
   }
   if (policy.board !== undefined) {
-    const board: Record<string, unknown> = {};
-    if (policy.board.forgeStaleMinutes !== undefined) {
-      board.forgeStaleMinutes = policy.board.forgeStaleMinutes;
-    }
-    if (policy.board.declarationTtlMinutes !== undefined) {
-      board.declarationTtlMinutes = policy.board.declarationTtlMinutes;
-    }
-    if (policy.board.doneWindowDays !== undefined) {
-      board.doneWindowDays = policy.board.doneWindowDays;
-    }
-    if (policy.board.forgeSyncMinutes !== undefined) {
-      board.forgeSyncMinutes = policy.board.forgeSyncMinutes;
-    }
-    out.board = board;
+    out.board = serializeBoardPolicy(policy.board);
   }
   if (policy.telemetry !== undefined) {
     out.telemetry = serializePolicyBlock(policy.telemetry, TELEMETRY_POLICY_KEYS);
   }
   if (policy.seats !== undefined) {
     out.seats = serializePolicyBlock(policy.seats, SEATS_POLICY_KEYS);
+  }
+  return out;
+}
+
+function serializeBoardPolicy(board: NonNullable<PolicySection['board']>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (board.forgeStaleMinutes !== undefined) {
+    out.forgeStaleMinutes = board.forgeStaleMinutes;
+  }
+  if (board.declarationTtlMinutes !== undefined) {
+    out.declarationTtlMinutes = board.declarationTtlMinutes;
+  }
+  if (board.doneWindowDays !== undefined) {
+    out.doneWindowDays = board.doneWindowDays;
+  }
+  if (board.forgeSyncMinutes !== undefined) {
+    out.forgeSyncMinutes = board.forgeSyncMinutes;
+  }
+  return out;
+}
+
+function serializeConductorPolicy(
+  conductor: NonNullable<PolicySection['conductor']>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { enabled: conductor.enabled };
+  if (conductor.stopGraceMinutes !== undefined) {
+    out.stopGraceMinutes = conductor.stopGraceMinutes;
+  }
+  if (conductor.reaper !== undefined) {
+    out.reaper = serializeConductorReaper(conductor.reaper);
+  }
+  return out;
+}
+
+function serializeConductorReaper(
+  reaper: NonNullable<NonNullable<PolicySection['conductor']>['reaper']>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { enabled: reaper.enabled };
+  if (reaper.intervalMinutes !== undefined) {
+    out.intervalMinutes = reaper.intervalMinutes;
+  }
+  if (reaper.graceMinutes !== undefined) {
+    out.graceMinutes = reaper.graceMinutes;
+  }
+  if (reaper.staleStopMinutes !== undefined) {
+    out.staleStopMinutes = reaper.staleStopMinutes;
+  }
+  if (reaper.repairs !== undefined) {
+    const repairs: Record<string, unknown> = {};
+    for (const kind of CONDUCTOR_REAPER_REPAIR_KINDS) {
+      if (reaper.repairs[kind] !== undefined) {
+        repairs[kind] = reaper.repairs[kind];
+      }
+    }
+    out.repairs = repairs;
+  }
+  if (reaper.worktrees !== undefined) {
+    out.worktrees = serializeReaperWorktrees(reaper.worktrees);
+  }
+  if (reaper.disk !== undefined) {
+    out.disk = serializeReaperDisk(reaper.disk);
+  }
+  return out;
+}
+
+function serializeReaperWorktrees(
+  worktrees: NonNullable<NonNullable<NonNullable<PolicySection['conductor']>['reaper']>['worktrees']>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (worktrees.retentionHours !== undefined) {
+    out.retentionHours = worktrees.retentionHours;
+  }
+  if (worktrees.maxRemovalsPerPass !== undefined) {
+    out.maxRemovalsPerPass = worktrees.maxRemovalsPerPass;
+  }
+  if (worktrees.passBudgetSeconds !== undefined) {
+    out.passBudgetSeconds = worktrees.passBudgetSeconds;
+  }
+  return out;
+}
+
+function serializeReaperDisk(
+  disk: NonNullable<NonNullable<NonNullable<PolicySection['conductor']>['reaper']>['disk']>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (disk.minFreePercent !== undefined) {
+    out.minFreePercent = disk.minFreePercent;
+  }
+  if (disk.clearFreePercent !== undefined) {
+    out.clearFreePercent = disk.clearFreePercent;
   }
   return out;
 }

@@ -17,13 +17,26 @@
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
-import type { LanePlanRecord, PlannedLaneRef } from '../../domain/lane-plan-records.js';
-import { LANE_PLAN_RECORD_VERSION } from '../../domain/lane-plan-records.js';
+import type {
+  LanePlanRecord,
+  PlannedLaneRef,
+  PullRequestLinkRecord,
+} from '../../domain/lane-plan-records.js';
+import {
+  LANE_PLAN_RECORD_VERSION,
+  PULL_REQUEST_LINK_RECORD_VERSION,
+} from '../../domain/lane-plan-records.js';
 import { LanePlan } from '../../domain/entities/LanePlan.js';
+import {
+  decidePullRequestLink,
+  PullRequestLink,
+  pullRequestLinkKey,
+} from '../../domain/entities/PullRequestLink.js';
 import { findLanePlanCycle, type LanePlanGraphPlan } from '../../domain/lane-plan-graph.js';
 import type {
   LanePlanRepositoryPort,
   SaveLanePlanResult,
+  SavePullRequestLinkResult,
 } from '../../application/ports/out/LanePlanRepositoryPort.out-port.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
 import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
@@ -95,6 +108,40 @@ export function parseLanePlanStateRecord(raw: unknown): LanePlanRecord | undefin
   return parsed.status === 'ok' ? parsed.record : undefined;
 }
 
+/** The schema-version policy of `pull-request-links.json` (Q5a, D6). */
+export const PULL_REQUEST_LINK_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy(
+  'pull-request-links.json',
+  {
+    writerVersion: PULL_REQUEST_LINK_RECORD_VERSION,
+    acceptedVersions: [1],
+  },
+);
+
+/**
+ * The versioned reader's record parser for `pull-request-links.json`: the
+ * `schemaVersion` check runs first, then the full `PullRequestLink.create`
+ * body validation on the stripped record. Never throws.
+ */
+export function parseVersionedPullRequestLinkStateRecord(
+  raw: unknown,
+): VersionedRecordParseResult<PullRequestLinkRecord> {
+  const versionCheck = readStoreRecordSchemaVersion(raw, PULL_REQUEST_LINK_STORE_VERSION_POLICY);
+  if (versionCheck.status !== 'ok') {
+    return versionCheck;
+  }
+  const result = PullRequestLink.create(withoutSchemaVersion(raw as Record<string, unknown>));
+  if (!result.success) {
+    return { status: 'invalid' };
+  }
+  return { status: 'ok', record: result.value.toRecord(), schemaVersion: versionCheck.schemaVersion };
+}
+
+/** The reader's record parser for `pull-request-links.json`. */
+export function parsePullRequestLinkStateRecord(raw: unknown): PullRequestLinkRecord | undefined {
+  const parsed = parseVersionedPullRequestLinkStateRecord(raw);
+  return parsed.status === 'ok' ? parsed.record : undefined;
+}
+
 /** The graph plan of a stored record: stored lanes carry their aliases. */
 function lanePlanGraphPlanFromRecord(record: LanePlanRecord): LanePlanGraphPlan {
   return {
@@ -126,6 +173,7 @@ function findCycleAcrossPlans(
 
 export class LanePlanRepositoryAdapter implements LanePlanRepositoryPort {
   private readonly inMemoryRecords = new Map<string, LanePlanRecord>();
+  private readonly inMemoryPullRequestLinks = new Map<string, PullRequestLinkRecord>();
   private readonly changeSignal: ChangeSignalPort;
   private signalEmitFailuresCount = 0;
 
@@ -265,6 +313,150 @@ export class LanePlanRepositoryAdapter implements LanePlanRepositoryPort {
       return list;
     }
     return list.filter((record) => record.projectId === projectId);
+  }
+
+  async savePullRequestLink(record: PullRequestLinkRecord): Promise<SavePullRequestLinkResult> {
+    assertStoreWritable(this.options?.readOnly === true, 'LanePlanRepositoryAdapter');
+    const created = PullRequestLink.create(record);
+    if (!created.success) {
+      return { outcome: 'refused', code: 'invalid', linkedLaneId: null };
+    }
+    const validRecord = created.value.toRecord();
+    const key = pullRequestLinkKey({ repository: validRecord.repository, number: validRecord.number });
+    const stateDir = this.options?.stateDir;
+    if (stateDir === undefined) {
+      return this.savePullRequestLinkInMemory(validRecord, key);
+    }
+    return this.savePullRequestLinkFile(validRecord, key, stateDir);
+  }
+
+  private savePullRequestLinkInMemory(
+    record: PullRequestLinkRecord,
+    key: string,
+  ): SavePullRequestLinkResult {
+    const existing = this.inMemoryPullRequestLinks.get(key) ?? null;
+    const decision = decidePullRequestLink(existing, record);
+    if (decision === 'create') {
+      this.inMemoryPullRequestLinks.set(key, record);
+      this.signal({ kind: 'plan', id: key, stateFile: null, before: null, written: null });
+      return { outcome: 'saved', link: record };
+    }
+    if (decision === 'no-op') {
+      return { outcome: 'unchanged', link: existing as PullRequestLinkRecord };
+    }
+    return { outcome: 'refused', code: 'pr-already-linked', linkedLaneId: existing!.laneId };
+  }
+
+  private async savePullRequestLinkFile(
+    record: PullRequestLinkRecord,
+    key: string,
+    stateDir: string,
+  ): Promise<SavePullRequestLinkResult> {
+    const target = path.join(stateDir, 'pull-request-links.json');
+    const lockPath = path.join(stateDir, 'pull-request-links.json.lock');
+
+    let before: ChangeSignal['before'] = null;
+    let written: ChangeSignal['written'] = null;
+
+    const outcome = await withFileLock(lockPath, async (): Promise<SavePullRequestLinkResult> => {
+      before = await this.safeStat(target);
+      const links = await this.readPullRequestLinksFromDisk(target);
+      const existing = links.get(key) ?? null;
+      const decision = decidePullRequestLink(existing, record);
+      if (decision === 'no-op') {
+        return { outcome: 'unchanged', link: existing as PullRequestLinkRecord };
+      }
+      if (decision === 'pr-already-linked') {
+        return { outcome: 'refused', code: 'pr-already-linked', linkedLaneId: existing!.laneId };
+      }
+      links.set(key, record);
+      const payload = [...links.values()].map((link) => ({
+        ...link,
+        schemaVersion: PULL_REQUEST_LINK_STORE_VERSION_POLICY.writerVersion,
+      }));
+      await writeJsonAtomically(target, payload);
+      written = await this.safeStat(target);
+      return { outcome: 'saved', link: record };
+    });
+
+    if (outcome.outcome === 'saved') {
+      this.signal({
+        kind: 'plan',
+        id: key,
+        stateFile: path.resolve(target),
+        before,
+        written,
+      });
+    }
+    return outcome;
+  }
+
+  async findPullRequestLink(repository: string, number: number): Promise<PullRequestLinkRecord | null> {
+    const stateDir = this.options?.stateDir;
+    const key = pullRequestLinkKey({ repository, number });
+    if (stateDir === undefined) {
+      return this.inMemoryPullRequestLinks.get(key) ?? null;
+    }
+    const target = path.join(stateDir, 'pull-request-links.json');
+    const links = await this.readPullRequestLinksFromDisk(target);
+    return links.get(key) ?? null;
+  }
+
+  async listPullRequestLinks(projectId?: string): Promise<readonly PullRequestLinkRecord[]> {
+    const stateDir = this.options?.stateDir;
+    if (stateDir === undefined) {
+      const records = [...this.inMemoryPullRequestLinks.values()];
+      if (projectId === undefined) {
+        return records;
+      }
+      return records.filter((record) => record.projectId === projectId);
+    }
+    const target = path.join(stateDir, 'pull-request-links.json');
+    const links = await this.readPullRequestLinksFromDisk(target);
+    const list = [...links.values()];
+    if (projectId === undefined) {
+      return list;
+    }
+    return list.filter((record) => record.projectId === projectId);
+  }
+
+  private async readPullRequestLinksFromDisk(
+    target: string,
+  ): Promise<Map<string, PullRequestLinkRecord>> {
+    const map = new Map<string, PullRequestLinkRecord>();
+    let buffer: Buffer;
+    try {
+      buffer = await fs.readFile(target);
+    } catch (error: unknown) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        (error as { code?: string }).code === 'ENOENT'
+      ) {
+        return map;
+      }
+      throw error;
+    }
+    const inspection = inspectVersionedRecordListBytes(buffer, parseVersionedPullRequestLinkStateRecord);
+    if (inspection.status === 'unknown-version') {
+      throw new StateFileUnknownVersionError(target, inspection.recordIndex);
+    }
+    if (inspection.status === 'unreadable') {
+      return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
+    }
+    for (const item of inspection.records) {
+      const key = pullRequestLinkKey({ repository: item.repository, number: item.number });
+      if (map.has(key)) {
+        return rejectUnreadableStateFile(
+          target,
+          `conflicting stored link for ${key}`,
+          buffer,
+          this.options?.readOnly === true,
+        );
+      }
+      map.set(key, item);
+    }
+    return map;
   }
 
   private async readRecordsFromDisk(target: string): Promise<Map<string, LanePlanRecord>> {

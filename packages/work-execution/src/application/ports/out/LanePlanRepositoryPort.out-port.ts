@@ -1,15 +1,31 @@
 // @generated outbound contract scaffold — refined for lane WB4a.
 /**
- * LanePlanRepositoryPort persists lane-plan records (work-board plan §3.2):
- * a plan is keyed (projectId, planId) and each save is a compare-and-swap
+ * LanePlanRepositoryPort persists lane-plan records **and** the plan's pull
+ * request links (one lane per pull request, §3.2 "PR links are unique").
+ * A plan is keyed (projectId, planId) and each save is a compare-and-swap
  * on `revision` — a stored revision >= the incoming one is an error, never
- * a silent overwrite. Known absence is null; unreadable state is an error.
+ * a silent overwrite. A link is keyed (repository, number); a stored link
+ * is never replaced and never deleted. Known absence is null; unreadable
+ * state is an error.
  */
-import type { LanePlanRecord, PlannedLaneRef } from '../../../domain/lane-plan-records.js';
+import type {
+  LanePlanRecord,
+  PlannedLaneRef,
+  PullRequestLinkRecord,
+} from '../../../domain/lane-plan-records.js';
 
 export type SaveLanePlanResult =
   | { readonly outcome: 'saved' }
   | { readonly outcome: 'cycle'; readonly cycle: readonly PlannedLaneRef[] };
+
+export type SavePullRequestLinkResult =
+  | { readonly outcome: 'saved'; readonly link: PullRequestLinkRecord }
+  | { readonly outcome: 'unchanged'; readonly link: PullRequestLinkRecord }
+  | {
+      readonly outcome: 'refused';
+      readonly code: 'pr-already-linked' | 'invalid';
+      readonly linkedLaneId: string | null;
+    };
 
 export interface LanePlanRepositoryPort {
   /** Persist one plan revision; CAS on `revision`: a stored revision >= the incoming one is an error, never a silent overwrite. */
@@ -20,4 +36,10 @@ export interface LanePlanRepositoryPort {
   findLanePlan(projectId: string, planId: string): Promise<LanePlanRecord | null>;
   /** Every stored plan, optionally narrowed to one project. */
   listLanePlans(projectId?: string): Promise<readonly LanePlanRecord[]>;
+  /** Persist one pull request's link, keyed (repository, number). Create-if-absent: a stored link is never replaced and never deleted. */
+  savePullRequestLink(record: PullRequestLinkRecord): Promise<SavePullRequestLinkResult>;
+  /** Known absence is null; unreadable state is an error. */
+  findPullRequestLink(repository: string, number: number): Promise<PullRequestLinkRecord | null>;
+  /** Every stored link, optionally narrowed to one project. */
+  listPullRequestLinks(projectId?: string): Promise<readonly PullRequestLinkRecord[]>;
 }

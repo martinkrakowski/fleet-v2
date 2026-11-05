@@ -2,6 +2,7 @@
 
 export * from "./AdvanceLaneRunPort.in-port.js";
 export * from "./AutoMergeAttemptPort.in-port.js";
+export * from "./BuildFactPackPort.in-port.js";
 export * from "./CancelPreparedAttemptPort.in-port.js";
 export * from "./CloseWorkOrderPort.in-port.js";
 export * from "./CollectAttemptArtifactsPort.in-port.js";
@@ -20,6 +21,7 @@ export * from "./InspectDaemonStatusPort.in-port.js";
 export * from "./InspectLaneRunsPort.in-port.js";
 export * from "./InspectMergeReadinessPort.in-port.js";
 export * from "./InspectWorkOrderPort.in-port.js";
+export * from "./InventoryRelaunchPort.in-port.js";
 export * from "./ListAttemptJournalPort.in-port.js";
 export * from "./ListAttemptsPort.in-port.js";
 export * from "./ListConductorPassesPort.in-port.js";

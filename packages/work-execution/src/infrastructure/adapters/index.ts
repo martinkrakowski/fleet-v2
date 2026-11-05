@@ -71,6 +71,7 @@ export * from "./ProjectProbeAdapter.adapter.js";
 export * from "./ProjectProbeRecordAdapter.adapter.js";
 export * from "./ProjectProfileReadAdapter.adapter.js";
 export * from "./RecordingRunTelemetryAdapter.adapter.js";
+export * from "./RepositoryFactsAdapter.adapter.js";
 export * from "./ResolvePhysicalPath.helper.js";
 export * from "./ReviewAssessmentAdapter.adapter.js";
 export * from "./ReviewRequestAdapter.adapter.js";

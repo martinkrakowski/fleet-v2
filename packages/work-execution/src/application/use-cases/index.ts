@@ -3,6 +3,7 @@
 export * from "./advance-lane-run/index.js";
 export * from "./AdvanceLaneRunUseCase.use-case.js";
 export * from "./AutoMergeAttemptUseCase.use-case.js";
+export * from "./BuildFactPackUseCase.use-case.js";
 export * from "./CancelPreparedAttemptUseCase.use-case.js";
 export * from "./CloseWorkOrderUseCase.use-case.js";
 export * from "./CollectAttemptArtifactsUseCase.use-case.js";
@@ -21,6 +22,7 @@ export * from "./InspectDaemonStatusUseCase.use-case.js";
 export * from "./InspectLaneRunsUseCase.use-case.js";
 export * from "./InspectMergeReadinessUseCase.use-case.js";
 export * from "./InspectWorkOrderUseCase.use-case.js";
+export * from "./InventoryRelaunchUseCase.use-case.js";
 export * from "./ListAttemptJournalUseCase.use-case.js";
 export * from "./ListAttemptsUseCase.use-case.js";
 export * from "./ListConductorPassesUseCase.use-case.js";

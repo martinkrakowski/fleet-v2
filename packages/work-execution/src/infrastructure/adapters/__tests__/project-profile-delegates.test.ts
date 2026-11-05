@@ -38,7 +38,7 @@ function makeRecordRequest(
 }
 
 describe('ProjectProfileReadAdapter', () => {
-  it('maps a found answer to a ProjectProfileView copying only the six fields', async () => {
+  it('maps a found answer to a ProjectProfileView copying the view fields', async () => {
     const profile = makeProfile();
     const answerProfile = { ...profile, displayName: 'Acme', policyRevision: 'p1' };
     const adapter = new ProjectProfileReadAdapter({
@@ -48,6 +48,27 @@ describe('ProjectProfileReadAdapter', () => {
     const result = await adapter.readProjectProfile('proj-a');
     expect(result).toEqual(profile);
     expect(result?.clones).not.toBe(answerProfile.clones);
+  });
+
+  it('maps the profile\'s lane cap into the view', async () => {
+    const profile = makeProfile({ maxConcurrentLanes: 3 });
+    const adapter = new ProjectProfileReadAdapter({
+      inspect: async () => ({ outcome: 'found', profile }),
+    });
+
+    const result = await adapter.readProjectProfile('proj-a');
+    expect(result?.maxConcurrentLanes).toBe(3);
+  });
+
+  it('refuses a lane cap that is not a positive integer', async () => {
+    const profile = { ...makeProfile(), maxConcurrentLanes: 0 };
+    const adapter = new ProjectProfileReadAdapter({
+      inspect: async () => ({ outcome: 'found', profile }),
+    });
+
+    await expect(adapter.readProjectProfile('proj-a')).rejects.toThrow(
+      'ProjectProfileReadAdapter received a malformed profile for proj-a',
+    );
   });
 
   it('maps a not-found answer to null', async () => {

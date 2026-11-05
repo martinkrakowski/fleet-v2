@@ -508,10 +508,13 @@ function readStartFlags(argv: readonly string[], io: CliIo): StartFlags | null {
  * AD-2: raise one stored attention item per crashed start the status view
  * reports, except the attempt a retry continues (`skipAttemptId`). The body
  * is exactly the five keys of `RecordAttentionItemBody`. Best-effort and
- * read-only: it prints nothing, and a refusal or throw never fails a start.
+ * read-only: a refusal or throw never fails a start, and the scan stays
+ * silent unless a read failed, in which case the operator is told the
+ * results were incomplete.
  */
 async function raiseCrashedStartNotices(
   runtime: FleetCliRuntime,
+  io: CliIo,
   nowIso: string,
   skipAttemptId: string | undefined,
 ): Promise<void> {
@@ -549,6 +552,11 @@ async function raiseCrashedStartNotices(
     } catch {
       // A notice never fails a start.
     }
+  }
+  if (result.crashedStartsIncomplete === true) {
+    // A failed attempt read means the list may miss crashed starts; tell the
+    // operator rather than letting an empty list read as "none".
+    io.stderr('conductor start: the crashed-start scan was incomplete; some held reservations were not checked\n');
   }
 }
 
@@ -612,11 +620,6 @@ async function startCommand(
     io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'conductor-disabled' })}\n`);
     return 1;
   }
-  // AD-2: surface crashed-start reservations as attention items. Best-effort;
-  // a retry with the same attempt id continues the crashed start, so it
-  // raises nothing for it. The `--abandon` path returned earlier and raises
-  // nothing.
-  await raiseCrashedStartNotices(runtime, nowIsoOf(options), flags.attemptId);
   if ((flags.runId === undefined) !== (flags.attemptId === undefined)) {
     io.stderr(`--run-id and --attempt-id are given together or not at all\n${CONDUCTOR_HELP}\n`);
     return 2;
@@ -643,6 +646,12 @@ async function startCommand(
     io.stderr(`conductor start has no start port in this driver\n${CONDUCTOR_HELP}\n`);
     return 2;
   }
+  // AD-2: surface crashed-start reservations as attention items. The flags
+  // and the brief are validated above; the scan writes stored items, so it
+  // must not run before a usage error. Best-effort; a retry with the same
+  // attempt id continues the crashed start, so it raises nothing for it. The
+  // `--abandon` path returned earlier and raises nothing.
+  await raiseCrashedStartNotices(runtime, io, nowIsoOf(options), flags.attemptId);
   const result = await driver.start.startLaneRun({
     runId,
     attemptId,

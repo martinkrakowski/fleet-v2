@@ -12,7 +12,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   conductorRevision,
@@ -928,6 +928,64 @@ describe('conductor start (K7-7)', () => {
     expect(result.code).toBe(0);
     const items = await runtime.coordination.attentionItemRepository.list({ projectId: 'project-example-1' });
     expect(items).toEqual([]);
+  });
+
+  it('a usage error persists no attention item for a crashed start', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir);
+    const crashedAttemptId = 'attempt-01JB0000000000000000000001';
+    await runtime.execution.workOrderRepository.saveWorkOrder({
+      id: 'wo-example-1',
+      projectId: 'project-example-1',
+      taskId: 'task-example-1',
+      laneId: 'lane-example-1',
+      repository: 'repo-example-1',
+      baseCommit: 'a'.repeat(40),
+      ownedPaths: ['packages/example/src'],
+      policyRevision: 'policy-example-1',
+      prerequisiteWorkOrderIds: [],
+      state: 'approved',
+      revision: 1,
+      createdAtIso: NOW,
+      updatedAtIso: NOW,
+    });
+    await runtime.execution.executionJournal.saveCapacityReservation({
+      id: 'reservation-crashed-1',
+      attemptId: crashedAttemptId,
+      hostId: 'host-example-1',
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      hostName: 'lane-host-example',
+      workOrderId: 'wo-example-1',
+      reservedAtIso: new Date(Date.parse(NOW) - 10 * 60 * 1000).toISOString(),
+      releasedAtIso: null,
+    });
+    const briefPath = writeBriefRequest(dir, briefFixture());
+    const fake = makeFakeDriver({ enabled: true });
+    const result = await runConductor(runtime, ['start', '--brief-request', briefPath], {
+      stateDir: dir,
+      buildDriver: () => fake.driver,
+    });
+    expect(result.code).toBe(2);
+    const items = await runtime.coordination.attentionItemRepository.list({ projectId: 'project-example-1' });
+    expect(items).toEqual([]);
+  });
+
+  it('a start warns when the crashed-start scan is incomplete', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir);
+    vi.spyOn(runtime.execution.executionJournal, 'listActiveReservations').mockRejectedValue(
+      new Error('store unavailable'),
+    );
+    const briefPath = writeBriefRequest(dir, briefFixture());
+    const fake = makeFakeDriver({ enabled: true });
+    const result = await runConductor(runtime, ['start', '--brief-request', briefPath, '--tier', '2'], {
+      stateDir: dir,
+      buildDriver: () => fake.driver,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr.join('\n')).toContain('the crashed-start scan was incomplete');
   });
 });
 

@@ -144,7 +144,7 @@ export async function raiseParkNotice(
       reason,
       parkCount: record.parkCount,
       ...(qualifier === null ? {} : { qualifier }),
-      ...(reason === 'blocker-after-round-2' && parkedFindings !== undefined && parkedFindings !== null
+      ...(reason === 'blocker-after-round-2' && parkedFindings !== undefined && parkedFindings !== null && parkedFindings.length > 0
         ? { findings: parkedFindings }
         : {}),
     };
@@ -250,9 +250,11 @@ export async function releaseWorkOrderAtEnd(ctx: AdvanceStepContext,
 /**
  * The bounded findings snapshot of a blocker-after-round-2 park, read once at
  * park time and frozen on the parked record so repair and every retry reuse it
- * (GB2 correction 2). `null` means the decision that findings are absent
- * (unwired deps, a missing attempt or head, or a non-found/non-failed receipt);
- * every failure falls through to `null`, never throws.
+ * (GB2 correction 2). `null` means the findings could not be read at park time
+ * (unwired deps, a missing attempt or head, an `unavailable` receipt lookup, or
+ * a read throw); `[]` means the receipts were read and there was no failed
+ * code-review receipt at that head. Every failure falls through to `null`,
+ * never throws.
  */
 async function blockerFindingsFor(
   ctx: AdvanceStepContext,
@@ -278,8 +280,14 @@ async function blockerFindingsFor(
       candidateHeadSha: head,
       kind: 'code-review',
     });
-    if (found.outcome !== 'found' || found.receipt.verdict !== 'failed') {
+    // An `unavailable` lookup is a store that could not answer, not a
+    // confirmed absence: it stays unread (`null`) so a later park or the
+    // reader's receipt fallback can still recover the findings.
+    if (found.outcome === 'unavailable') {
       return null;
+    }
+    if (found.outcome !== 'found' || found.receipt.verdict !== 'failed') {
+      return [];
     }
     return boundedFindingsView(found.receipt.findings);
   } catch {

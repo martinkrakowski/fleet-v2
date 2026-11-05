@@ -28,7 +28,7 @@ import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import { readFrozenBriefVerified } from './frozen-manifest.js';
 import { conductedRunnerOf } from './conducted-host.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, saveOrRefuse } from './step-context.js';
+import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, refusedResult, saveOrRefuse } from './step-context.js';
 import { lastDispatchLeftDirtyWorktree } from './dirty-handover.js';
 import { nonPassingGatePredicatesOf } from '../RequestAttemptAcceptanceUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
@@ -171,7 +171,7 @@ async function finishReview(
 ): Promise<AdvanceLaneRunResult> {
   const resultRefusal = await appendRunResult(ctx, request, decision.key, result, reasonCode, detail);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   // KF-33b2: the acted result carries a non-null journalled detail so the
   // conductor pass can report an `out-of-scope-findings` attention item.
@@ -435,7 +435,7 @@ export async function performReview(
       return read.result;
     }
     const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
-    return intentRefusal === null ? finishReview(ctx, request, decision, 'refused', read.refuse) : { outcome: 'refused', reason: intentRefusal };
+    return intentRefusal === null ? finishReview(ctx, request, decision, 'refused', read.refuse) : refusedResult(intentRefusal);
   }
   const { latest, head, workOrder, reviewerModel, implementerModel } = read.inputs;
   if (request.startGate !== undefined) {
@@ -447,7 +447,7 @@ export async function performReview(
   const requestId = 'review-' + ctx.deps.newUlid();
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, requestId);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   // The frozen brief is read ONCE, digest-verified here (SEC-3b): the
   // required checks come from its manifest and a brief check's reviewer text
@@ -539,7 +539,7 @@ export async function reconcileReview(
   if (requestId === null) {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'ambiguous', 'review-unknown');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'review-unknown' };
   }
@@ -560,7 +560,7 @@ export async function reconcileReview(
     const resolved = reconciledReviewOf(parsed.step as ReviewKind, found.receipt, mapped);
     const resultRefusal = await appendRunResult(ctx, request, decision.key, resolved.result, resolved.reasonCode, resolved.detail);
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode: resolved.reasonCode };
   }
@@ -568,7 +568,7 @@ export async function reconcileReview(
   const reasonCode = ambiguous ? 'review-unknown' : 'review-no-receipt';
   const resultRefusal = await appendRunResult(ctx, request, decision.key, ambiguous ? 'ambiguous' : 'completed', reasonCode);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: ambiguous ? 'ambiguous' : 'completed', reasonCode };
 }
@@ -1089,7 +1089,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   };
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, briefFixRequest.fixAttemptId);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   // KF-6: place the fix round's brief package from the prior attempt's frozen
   // manifest before preparing the fix attempt. The handover text is the prose;
@@ -1107,7 +1107,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   const refusePrepared = async (detail: string): Promise<AdvanceLaneRunResult> => {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'prepare-refused', detail);
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'prepare-refused', detail };
   };
@@ -1149,7 +1149,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', 'prepared');
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'prepared' };
 }

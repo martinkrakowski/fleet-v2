@@ -53,6 +53,14 @@ import type {
   RecordGateReceiptsResult,
 } from '../../ports/out/GateReceiptPort.out-port.js';
 import type { GatePredicatePort, EvaluateGatePredicatesResult } from '../../ports/out/GatePredicatePort.out-port.js';
+import type {
+  DispatchAttemptRequest,
+  DispatchAttemptResult,
+} from '../../ports/in/DispatchAttemptPort.in-port.js';
+import type {
+  CancelPreparedAttemptRequest,
+  CancelPreparedAttemptResult,
+} from '../../ports/in/CancelPreparedAttemptPort.in-port.js';
 import type { GatePredicateResult } from '../../ports/out/GatePredicatePort.out-port.js';
 import { RequestAttemptAcceptanceUseCase } from '../RequestAttemptAcceptanceUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
@@ -274,11 +282,25 @@ function retryStopKey(retry: number): string {
 }
 
 function collectKey(): string {
-  return stepKey({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: null, head12: null });
+  return stepKey({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: 1, head12: null });
 }
 
 function gateKey(): string {
   return stepKey({ round: 0, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
+}
+
+/** Reserve capacity for one prepared attempt, like the conductor's admission. */
+async function admit(harness: Harness, attemptId: string): Promise<void> {
+  await harness.executionJournal.saveCapacityReservation({
+    id: harness.deps.newUlid(),
+    attemptId,
+    hostId: 'host-example-1',
+    slotIndex: 0,
+    held: true,
+    seatTool: 'opencode',
+    reservedAtIso: NOW,
+    releasedAtIso: null,
+  });
 }
 
 function activeAnswer(attempt: AttemptRecord): ReconcileAttemptResult {
@@ -2022,6 +2044,158 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
     expect(harness.workOrders.get('wo-example-1')).toMatchObject({
       state: 'stopped',
       revision: 2,
+    });
+  });
+
+  it('test 18 (F87): a refused pivot dispatch hands the dirty worktree over and the re-prepared a3 collects under its ordinal key', async () => {
+    // a1's journal, as an old (pre-F87) journal has it: its collect sits under
+    // the legacy ordinal-less key r0/collect/0. Seat 0 fails, the next seat is
+    // prepared as a2, and a2's dispatch is refused with a dirty worktree — the
+    // GB3c round-0 handover cancels a2 and re-prepares seat 0 as a3 in the
+    // same round. Before the fix a3's collect reused r0/collect/0 and the
+    // journal refused it duplicate-key forever.
+    const WORKTREE_REFUSAL = 'Worktree ' + WORKTREE + ' has uncommitted changes: src/ex.ts';
+    const harness = await makeHarness(
+      runRecord({ attemptIds: ['attempt-example-1'] }),
+      [endedAttempt()],
+    );
+    const dispatch1 = stepKey({ round: 0, step: 'dispatch', seatIndex: 0, attemptOrdinal: 1, head12: null });
+    await appendIntent(harness, dispatch1, 'attempt-example-1', NOW);
+    await appendResult(harness, dispatch1, 'completed', 'dispatch-started', NOW);
+    const legacyCollect = `${RUN_ID}/r0/collect/0`;
+    await appendIntent(harness, legacyCollect, 'attempt-example-1', NOW);
+    await appendResult(harness, legacyCollect, 'completed', 'collected', NOW);
+    await conduct(harness, 'seat-failed', NOW);
+
+    // Wire the pivot dispatch path the collect-gate harness leaves unwired:
+    // the first dispatch refuses with a dirty worktree, later ones start.
+    const dispatchRequests: DispatchAttemptRequest[] = [];
+    let refuseDispatch = true;
+    Object.assign(harness.deps, {
+      dispatchAttempt: {
+        dispatchAttempt: async (request: DispatchAttemptRequest): Promise<DispatchAttemptResult> => {
+          dispatchRequests.push(request);
+          if (refuseDispatch) {
+            return { outcome: 'refused', reason: WORKTREE_REFUSAL };
+          }
+          const attempt = await harness.attemptRepo.findAttemptById(request.attemptId);
+          return {
+            outcome: 'started',
+            attempt: attempt ?? attemptFixture({ id: request.attemptId }),
+            sessionId: 'session-' + request.attemptId,
+          };
+        },
+      },
+      cancelPreparedAttempt: {
+        cancelPreparedAttempt: async (request: CancelPreparedAttemptRequest): Promise<CancelPreparedAttemptResult> => {
+          const existing = await harness.attemptRepo.findAttemptById(request.attemptId);
+          if (existing === null || existing.state !== 'intent-recorded') {
+            return { outcome: 'refused', reason: 'not-prepared' };
+          }
+          const cancelled: AttemptRecord = {
+            ...existing,
+            revision: (existing.revision ?? 0) + 1,
+            state: 'cancelled',
+            outcome: 'stopped',
+            updatedAtIso: request.nowIso,
+          };
+          await harness.attemptRepo.saveAttempt(cancelled);
+          await harness.executionJournal.releaseCapacityReservation(request.attemptId, request.nowIso);
+          return { outcome: 'cancelled', attempt: cancelled, capacity: 'released' };
+        },
+      },
+    });
+
+    // Advance 1: seat 0 failed, so the decider prepares the next first-pass
+    // seat as a2 (r0/prepare/1/a2).
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: `${RUN_ID}/r0/prepare/1/a2`,
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    const attempt2 = (await harness.runRepo.get(RUN_ID))?.attemptIds[1] ?? null;
+    expect(typeof attempt2).toBe('string');
+    await admit(harness, attempt2 as string);
+    // Advance 2: a2's dispatch is refused with a dirty worktree; the round-0
+    // pivot handover cancels a2 and hands the worktree over unchanged.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'dispatch',
+      key: `${RUN_ID}/r0/dispatch/1/a2`,
+      result: 'refused',
+      reasonCode: 'dispatch-refused',
+    });
+    expect((await harness.attemptRepo.findAttemptById(attempt2 as string))?.state).toBe('cancelled');
+    expect(dispatchRequests[0]?.allowUncommittedHandover).toBeUndefined();
+    refuseDispatch = false;
+
+    // Advance 3: the handover re-prepares seat 0 in the same round as a3.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: `${RUN_ID}/r0/prepare/0/a3`,
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+    const attempt3 = (await harness.runRepo.get(RUN_ID))?.attemptIds[2] ?? null;
+    expect(typeof attempt3).toBe('string');
+    await admit(harness, attempt3 as string);
+    // Advance 4: a3 dispatches on the handed-over worktree.
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted',
+      step: 'dispatch',
+      key: `${RUN_ID}/r0/dispatch/0/a3`,
+      result: 'completed',
+      reasonCode: 'dispatch-started',
+    });
+    expect(dispatchRequests[1]?.allowUncommittedHandover).toBe(true);
+    const stored3 = await harness.attemptRepo.findAttemptById(attempt3 as string);
+    expect(stored3).not.toBeNull();
+    await harness.attemptRepo.saveAttempt({
+      ...stored3!,
+      revision: (stored3!.revision ?? 0) + 1,
+      state: 'ended',
+      sessionId: 'session-example-3',
+      completionReceipt: receipt({ attemptId: attempt3 as string, sessionId: 'session-example-3' }),
+    });
+    await conduct(harness, 'collecting', LATER);
+
+    // a3's collect must carry its ordinal: journalled under r0/collect/0/a3,
+    // never the legacy key.
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'collect',
+      key: `${RUN_ID}/r0/collect/0/a3`,
+      result: 'completed',
+      reasonCode: 'collected',
+    });
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries).toContainEqual(
+      expect.objectContaining({ kind: 'intent', key: `${RUN_ID}/r0/collect/0/a3` }),
+    );
+    expect(entries).toContainEqual(
+      expect.objectContaining({ kind: 'intent', key: legacyCollect }),
+    );
+  });
+
+  it('test 19 (F87): a refused collect intent carries the journal refusal and its detail', async () => {
+    const ended = endedAttempt();
+    const harness = await makeHarness(runRecord(), [ended]);
+    await conduct(harness, 'collecting', NOW);
+    // The collect key is already spent (an intent with a final result), so it is
+    // not a pending intent: the decider still acts, and the collect's own intent
+    // append is refused duplicate-key.
+    await appendIntent(harness, collectKey(), 'attempt-example-1', NOW);
+    await appendResult(harness, collectKey(), 'completed', 'collected', NOW);
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'refused',
+      reason: 'journal-refused',
+      journalRefusal: 'duplicate-key',
+      detail: null,
     });
   });
 });

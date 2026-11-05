@@ -1,5 +1,5 @@
 /** The `act prepare` and `act dispatch` steps of AdvanceLaneRunUseCase (AL-1). */
-import type { AdvanceLaneRunRefusal, AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
+import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import { AttemptRevisionConflictError } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import { parseSeatTool, type AttemptRecord, type AttemptSeatOverrideRecord, type AttemptSeatSelectionRecord } from '../../../domain/execution-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
@@ -13,8 +13,8 @@ import { SeatPlan } from '../../../domain/value-objects/SeatPlan.vo.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { parseStopReason, MODEL_REFUSAL_CLASSES } from '../../../domain/value-objects/StopReason.vo.js';
 import { conductedRunnerOf } from './conducted-host.js';
-import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendConduct, appendRunIntent, appendRunResult, ceilingPark, performPark, saveOrRefuse } from './step-context.js';
+import type { AdvanceStepContext, AdvanceStepRefusal, GatheredLaneRunFacts } from './step-context.js';
+import { appendConduct, appendRunIntent, appendRunResult, ceilingPark, performPark, refusedResult, saveOrRefuse } from './step-context.js';
 import { manifestExpectedArtifacts, manifestPositiveInteger, manifestTimeLimitSeconds, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { performFixPrepare } from './review-fix.js';
 import { parkSpentOneWayKey } from './merge.js';
@@ -68,11 +68,11 @@ export async function performPrepare(ctx: AdvanceStepContext,
   const refuse = async (reasonCode: LaneRunResultReasonCode, detail?: string | null): Promise<AdvanceLaneRunResult> => {
     const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
     if (intentRefusal !== null) {
-      return { outcome: 'refused', reason: intentRefusal };
+      return refusedResult(intentRefusal);
     }
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode, detail ?? null);
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return {
       outcome: 'acted',
@@ -115,7 +115,7 @@ export async function performPrepare(ctx: AdvanceStepContext,
   const attemptId = 'attempt-' + ctx.deps.newUlid();
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, attemptId);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   // The next attempt keeps the run's host identity (seam register: a conducted
   // attempt always carries its runner host); the session fields stay null and
@@ -162,7 +162,7 @@ export async function performPrepare(ctx: AdvanceStepContext,
     if (error instanceof AttemptRevisionConflictError) {
       const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'attempt-exists');
       if (resultRefusal !== null) {
-        return { outcome: 'refused', reason: resultRefusal };
+        return refusedResult(resultRefusal);
       }
       return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'attempt-exists' };
     }
@@ -183,7 +183,7 @@ export async function performPrepare(ctx: AdvanceStepContext,
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', 'prepared');
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'prepared' };
 }
@@ -735,21 +735,21 @@ export async function performDispatch(ctx: AdvanceStepContext,
   }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, latest.id);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   if (fixSeat.kind === 'refused') {
     const resultRefusal = await appendRunResult(
       ctx, request, decision.key, 'refused', 'dispatch-refused', fixSeat.detail,
     );
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
   }
   if (!inputsReadable) {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'dispatch-inputs-unreadable');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
   }
@@ -832,11 +832,11 @@ export async function performDispatch(ctx: AdvanceStepContext,
     }
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', reasonCode);
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     const conductRefusal = await conductDispatching(ctx, facts.state, request);
     if (conductRefusal !== null) {
-      return { outcome: 'refused', reason: conductRefusal };
+      return refusedResult(conductRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
   }
@@ -866,7 +866,7 @@ export async function performDispatch(ctx: AdvanceStepContext,
     advanceDetail ?? dispatchRefusalDetail(dispatched.reason),
   );
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   // GB3a/GB3c: a refused dispatch whose attempt is a fix seat or a round-0
   // pivot seat and whose detail is a dirty-worktree detail cancels the attempt
@@ -894,7 +894,7 @@ export async function performDispatch(ctx: AdvanceStepContext,
   if (reasonCode === 'runner-refused') {
     const conductRefusal = await conductDispatching(ctx, facts.state, request);
     if (conductRefusal !== null) {
-      return { outcome: 'refused', reason: conductRefusal };
+      return refusedResult(conductRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
   }
@@ -905,10 +905,10 @@ export async function performDispatch(ctx: AdvanceStepContext,
 export async function conductDispatching(ctx: AdvanceStepContext,
   state: LaneRunStateValue,
   request: AdvanceLaneRunRequest,
-): Promise<AdvanceLaneRunRefusal | null> {
+): Promise<AdvanceStepRefusal | null> {
   if (state === 'dispatching') {
     return null;
   }
   const appended = await appendConduct(ctx, request, 'dispatching');
-  return appended.ok ? null : appended.reason;
+  return appended.ok ? null : appended;
 }

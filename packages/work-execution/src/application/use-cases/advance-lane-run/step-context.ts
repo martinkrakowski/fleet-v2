@@ -5,7 +5,7 @@ import type { AttemptRecord } from '../../../domain/execution-records.js';
 import type { LaneRunFacts } from '../../../domain/lane-run-decider.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
-import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import type { LaneRunJournalOutcome, LaneRunJournalRefusal } from '../../../domain/lane-run-journal.js';
 import type { LaneRunParkReason, LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.out-port.js';
 import { boundedFindingsView } from '../../../domain/park-findings-view.js';
@@ -21,7 +21,28 @@ export interface AdvanceStepContext {
 
 export type WriteOutcome =
   | { readonly ok: true; readonly record?: LaneRunRecord }
-  | { readonly ok: false; readonly reason: AdvanceLaneRunRefusal };
+  | { readonly ok: false; readonly reason: AdvanceLaneRunRefusal;
+      readonly journalRefusal?: LaneRunJournalRefusal; readonly detail?: string | null };
+
+/**
+ * A refusal an advance step returns: the coarse port reason plus, when the
+ * refusal came from the journal, the journal's typed refusal and its detail.
+ */
+export interface AdvanceStepRefusal {
+  readonly reason: AdvanceLaneRunRefusal;
+  readonly journalRefusal?: LaneRunJournalRefusal;
+  readonly detail?: string | null;
+}
+
+/** Build the port's `refused` result from a step refusal, carrying the journal's reason and detail only when known. */
+export function refusedResult(refusal: AdvanceStepRefusal): AdvanceLaneRunResult {
+  return {
+    outcome: 'refused',
+    reason: refusal.reason,
+    ...(refusal.journalRefusal !== undefined ? { journalRefusal: refusal.journalRefusal } : {}),
+    ...(refusal.detail !== undefined ? { detail: refusal.detail } : {}),
+  };
+}
 
 /**
  * One advance's facts plus what its decision hooks need. Kept per call, never on
@@ -58,7 +79,7 @@ export async function performEnter(ctx: AdvanceStepContext,
   }
   const appended = await appendConduct(ctx, request, to);
   if (!appended.ok) {
-    return { outcome: 'refused', reason: appended.reason };
+    return refusedResult(appended);
   }
   if (record.parked !== null) {
     const saved = await saveOrRefuse(ctx,
@@ -292,7 +313,7 @@ export async function performPark(ctx: AdvanceStepContext,
   }
   const appended = await appendConduct(ctx, request, 'parked');
   if (!appended.ok) {
-    return { outcome: 'refused', reason: appended.reason };
+    return refusedResult(appended);
   }
   await raiseParkNotice(ctx, saved.record ?? parkedRecord, reason, qualifier, request);
   return { outcome: 'parked', reason, qualifier };
@@ -314,11 +335,12 @@ export async function appendRunIntent(ctx: AdvanceStepContext,
   request: AdvanceLaneRunRequest,
   key: string,
   mintedId: string | null,
-): Promise<AdvanceLaneRunRefusal | null> {
+): Promise<AdvanceStepRefusal | null> {
   const appended = await ctx.deps.runJournal.append(
     laneRunIntentEntry(ctx.deps.newUlid(), request.runId, key, mintedId, request.nowIso),
   );
-  return appended.outcome === 'appended' ? null : 'journal-refused';
+  return appended.outcome === 'appended' ? null
+    : { reason: 'journal-refused', journalRefusal: appended.reason, detail: appended.detail };
 }
 
 export async function appendRunResult(ctx: AdvanceStepContext,
@@ -327,11 +349,12 @@ export async function appendRunResult(ctx: AdvanceStepContext,
   outcome: LaneRunJournalOutcome,
   reasonCode: LaneRunResultReasonCode | null,
   detail: string | null = null,
-): Promise<AdvanceLaneRunRefusal | null> {
+): Promise<AdvanceStepRefusal | null> {
   const appended = await ctx.deps.runJournal.append(
     laneRunResultEntry(ctx.deps.newUlid(), request.runId, key, outcome, reasonCode, request.nowIso, detail),
   );
-  return appended.outcome === 'appended' ? null : 'journal-refused';
+  return appended.outcome === 'appended' ? null
+    : { reason: 'journal-refused', journalRefusal: appended.reason, detail: appended.detail };
 }
 
 /** The minted id of a key's intent, or null when the key has no intent. */
@@ -352,7 +375,8 @@ export async function appendConduct(ctx: AdvanceStepContext,
   const appended = await ctx.deps.runJournal.append(
     laneRunConductEntry(ctx.deps.newUlid(), request.runId, state, request.nowIso),
   );
-  return appended.outcome === 'appended' ? { ok: true } : { ok: false, reason: 'journal-refused' };
+  return appended.outcome === 'appended' ? { ok: true }
+    : { ok: false, reason: 'journal-refused', journalRefusal: appended.reason, detail: appended.detail };
 }
 
 export async function saveOrRefuse(ctx: AdvanceStepContext, next: LaneRunRecord, request: AdvanceLaneRunRequest): Promise<WriteOutcome> {

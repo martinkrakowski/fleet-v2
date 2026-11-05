@@ -420,7 +420,7 @@ describe('deriveSessionStartMarks', () => {
       buildLaneRunStepKey({ runId: RUN_A, round: 0, step: 'code-review', seatIndex: 0, attemptOrdinal: null, head12: 'fedcba987654', retry: null }),
     );
     const collectKey = mustBuild(
-      buildLaneRunStepKey({ runId: RUN_A, round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: null, head12: null, retry: null }),
+      buildLaneRunStepKey({ runId: RUN_A, round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: 1, head12: null, retry: null }),
     );
     return [
       laneRunIntentEntry('e1', RUN_A, dispatchKey, null, T0),

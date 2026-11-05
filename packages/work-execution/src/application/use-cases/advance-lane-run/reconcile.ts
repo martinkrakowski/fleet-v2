@@ -7,7 +7,7 @@ import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendConduct, appendRunIntent, appendRunResult, intentMintedIdOf, releaseWorkOrderAtEnd, saveOrRefuse } from './step-context.js';
+import { appendConduct, appendRunIntent, appendRunResult, intentMintedIdOf, refusedResult, releaseWorkOrderAtEnd, saveOrRefuse } from './step-context.js';
 import { conductDispatching } from './prepare-dispatch.js';
 import { gatePreCheck, runCollectBody, runGateBody } from './collect-gate.js';
 import { reconcileReview } from './review-fix.js';
@@ -85,7 +85,7 @@ export async function reconcilePrepare(ctx: AdvanceStepContext,
   if (mintedId === null) {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'not-started', 'attempt-absent');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'not-started', reasonCode: 'attempt-absent' };
   }
@@ -105,7 +105,7 @@ export async function reconcilePrepare(ctx: AdvanceStepContext,
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, outcome, reasonCode);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: outcome, reasonCode };
 }
@@ -144,11 +144,11 @@ export async function reconcileDispatch(ctx: AdvanceStepContext,
   if (attempt !== null && attempt.state === 'cancelled') {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'runner-refused');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     const conductRefusal = await conductDispatching(ctx, gathered.facts.state, request);
     if (conductRefusal !== null) {
-      return { outcome: 'refused', reason: conductRefusal };
+      return refusedResult(conductRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'runner-refused' };
   }
@@ -163,7 +163,7 @@ export async function reconcileDispatch(ctx: AdvanceStepContext,
     // unknown, refused, not-found: the next advance parks `ambiguous dispatch`.
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'ambiguous', 'dispatch-unknown');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'dispatch-unknown' };
   }
@@ -180,11 +180,11 @@ export async function reconcileDispatchStarted(ctx: AdvanceStepContext,
 ): Promise<AdvanceLaneRunResult> {
   const resultRefusal = await appendRunResult(ctx, request, decision.key, 'reconciled', reasonCode);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   const conductRefusal = await conductDispatching(ctx, gathered.facts.state, request);
   if (conductRefusal !== null) {
-    return { outcome: 'refused', reason: conductRefusal };
+    return refusedResult(conductRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode };
 }
@@ -208,7 +208,7 @@ export async function reconcileDispatchByWorktree(ctx: AdvanceStepContext,
   const ambiguous = async (reasonCode: LaneRunResultReasonCode): Promise<AdvanceLaneRunResult> => {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'ambiguous', reasonCode);
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode };
   };
@@ -246,7 +246,7 @@ export async function reconcileDispatchByWorktree(ctx: AdvanceStepContext,
   if (worktree.state === 'running') {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'ambiguous', 'worktree-running');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'worktree-running' };
   }
@@ -281,7 +281,7 @@ export async function closeDispatchNotStarted(ctx: AdvanceStepContext,
 ): Promise<AdvanceLaneRunResult> {
   const resultRefusal = await appendRunResult(ctx, request, decision.key, 'not-started', 'worktree-idle');
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: 'not-started', reasonCode: 'worktree-idle' };
 }
@@ -317,7 +317,7 @@ export async function reconcileStop(ctx: AdvanceStepContext,
   if (!terminal) {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', 'stop-unconfirmed');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-unconfirmed' };
   }
@@ -328,20 +328,20 @@ export async function reconcileStop(ctx: AdvanceStepContext,
     const reasonCode = held ? 'stop-force-slot-held' : 'stop-force';
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', reasonCode);
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     // Before the terminal conduct entry: a crash between the two leaves a
     // non-terminal run the next pass re-ends (the release is idempotent).
     await releaseWorkOrderAtEnd(ctx, record, 'stopped', request);
     const appended = await appendConduct(ctx, request, 'stopped');
     if (!appended.ok) {
-      return { outcome: 'refused', reason: appended.reason };
+      return refusedResult(appended);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', 'stop-timeout');
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode: 'stop-timeout' };
 }
@@ -391,7 +391,7 @@ export async function reconcileCancel(ctx: AdvanceStepContext,
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, outcome, reasonCode);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: outcome, reasonCode };
 }
@@ -415,7 +415,7 @@ export async function reconcileCollect(ctx: AdvanceStepContext,
   if (latest.state === 'collected') {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'reconciled', 'collected');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode: 'collected' };
   }
@@ -455,7 +455,7 @@ export async function reconcileCi(ctx: AdvanceStepContext,
   if (stale) {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'overtaken', 'ci-overtaken');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'overtaken', reasonCode: 'ci-overtaken' };
   }
@@ -470,7 +470,7 @@ export async function reconcileCi(ctx: AdvanceStepContext,
     // `merging`.
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'overtaken', 'ci-overtaken');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'overtaken', reasonCode: 'ci-overtaken' };
   }
@@ -518,13 +518,13 @@ export async function reconcileForceStop(ctx: AdvanceStepContext,
   if (!entries.some((entry) => entry.kind === 'intent')) {
     const intentRefusal = await appendRunIntent(ctx, request, decision.key, latest.id);
     if (intentRefusal !== null) {
-      return { outcome: 'refused', reason: intentRefusal };
+      return refusedResult(intentRefusal);
     }
   }
   if ((latest.runner ?? null) === null && (parseSeatTool(latest.seatSelection?.tool) ?? 'opencode') === 'agy') {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'ambiguous', 'worktree-unknown');
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'ambiguous', reasonCode: 'worktree-unknown' };
   }
@@ -544,7 +544,7 @@ export async function reconcileForceStop(ctx: AdvanceStepContext,
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, outcome, reasonCode);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: outcome, reasonCode };
 }

@@ -23,7 +23,7 @@ import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendRunIntent, appendRunResult, performEnter } from './step-context.js';
+import { appendRunIntent, appendRunResult, performEnter, refusedResult } from './step-context.js';
 
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
 type ReconcileDecision = Extract<LaneRunDecision, { kind: 'reconcile' }>;
@@ -67,7 +67,7 @@ async function appendPremergeResult(
 ): Promise<AdvanceLaneRunResult> {
   const resultRefusal = await appendRunResult(ctx, request, decision.key, outcome, reasonCode);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: outcome, reasonCode };
 }
@@ -81,7 +81,7 @@ async function refuseKeyedPremerge(
 ): Promise<AdvanceLaneRunResult> {
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   return appendPremergeResult(ctx, request, decision, 'refused', reasonCode);
 }
@@ -191,7 +191,7 @@ async function postPremerge(
   if (appendIntent) {
     const intentRefusal = await appendRunIntent(ctx, request, decision.key, actionId);
     if (intentRefusal !== null) {
-      return { outcome: 'refused', reason: intentRefusal };
+      return refusedResult(intentRefusal);
     }
   }
   const refuseGrant = async (): Promise<AdvanceLaneRunResult> =>
@@ -300,7 +300,7 @@ export async function performPremerge(
     const actionId = 'forge-' + ctx.deps.newUlid();
     const intentRefusal = await appendRunIntent(ctx, request, decision.key, actionId);
     if (intentRefusal !== null) {
-      return { outcome: 'refused', reason: intentRefusal };
+      return refusedResult(intentRefusal);
     }
     return appendPremergeResult(ctx, request, decision, 'ambiguous', 'review-unknown');
   }
@@ -399,7 +399,7 @@ export async function recordCiFailure(ctx: AdvanceStepContext,
 ): Promise<AdvanceLaneRunResult> {
   const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'ci-failed');
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return enterFixingAfterCi(ctx, record, gathered, decision, request);
 }
@@ -445,7 +445,7 @@ export async function performCiFailure(ctx: AdvanceStepContext,
   }
   const intentRefusal = await appendRunIntent(ctx, request, resolved.key, null);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   return recordCiFailure(ctx, record, gathered, keyDecision, request);
 }

@@ -370,7 +370,7 @@ describe('laneRunGateCongestion', () => {
 });
 
 describe('laneRunRefusedStep', () => {
-  const collectKey = keyOf({ round: 0, step: 'collect', seatIndex: 0 });
+  const collectKey = keyOf({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: 1 });
 
   it('returns the step of the latest refused final result in the round', () => {
     const entries = [

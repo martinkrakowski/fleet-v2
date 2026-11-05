@@ -114,8 +114,8 @@ describe('key builders', () => {
     });
   });
 
-  it('requires attemptOrdinal 1..32 on prepare and dispatch and forbids it elsewhere', () => {
-    for (const step of ['prepare', 'dispatch'] as const) {
+  it('requires attemptOrdinal 1..32 on prepare, dispatch and collect and forbids it elsewhere', () => {
+    for (const step of ['prepare', 'dispatch', 'collect'] as const) {
       for (const attemptOrdinal of [1, 32]) {
         const parts: LaneRunStepKeyParts = {
           runId: RUN_ID,
@@ -149,7 +149,7 @@ describe('key builders', () => {
     }
 
     for (const step of LANE_RUN_KEY_STEPS) {
-      if (step === 'prepare' || step === 'dispatch') continue;
+      if (step === 'prepare' || step === 'dispatch' || step === 'collect') continue;
       if (step === 'premerge') {
         expect(buildLaneRunStepKey({
           runId: RUN_ID, round: 1, step, seatIndex: 0, attemptOrdinal: 1, head12: HEAD12, retry: null,
@@ -856,11 +856,13 @@ describe('parseLaneRunKey', () => {
     `${RUN_ID}/r0/dispatch/0/a33`,
     `${RUN_ID}/r1/dispatch/0@0123456789ab`,
     `${RUN_ID}/r1/dispatch/0/a1@0123456789ab`,
-    `${RUN_ID}/r1/collect/0/a1`,
     `${RUN_ID}/r1/gate/0@0123456789ab/a1`,
     `${RUN_ID}/r1/park/0@0123456789ab`,
     `${RUN_ID}/r1/merge/0@0123456789ab/retry1`,
     `${RUN_ID}/r1/gate/0@0123456789ab/retry0`,
+    `${RUN_ID}/r1/collect/0/a1/retry0`,
+    `${RUN_ID}/r1/collect/0/a0/retry1`,
+    `${RUN_ID}/r1/collect/0/a1/extra`,
     `${RUN_ID}/park/0/resume@web`,
     `${RUN_ID}/park/01/resume@web`,
     `${RUN_ID}/park/1/extra/resume@web`,
@@ -905,6 +907,31 @@ describe('parseLaneRunKey', () => {
     'merge/fedcba987654/42/0123456789ab/bogus',
   ])('rejects %j', (key) => {
     expect(parseLaneRunKey(key)).toBeNull();
+  });
+
+  it('still parses a legacy ordinal-less collect key', () => {
+    expect(parseLaneRunKey(`${RUN_ID}/r1/collect/0`)).toEqual({
+      kind: 'step', runId: RUN_ID, round: 1, step: 'collect', seatIndex: 0, attemptOrdinal: null, head12: null, retry: null,
+    });
+  });
+
+  it('parses a collect key that carries the attempt ordinal', () => {
+    expect(parseLaneRunKey(`${RUN_ID}/r1/collect/0/a1`)).toEqual({
+      kind: 'step', runId: RUN_ID, round: 1, step: 'collect', seatIndex: 0, attemptOrdinal: 1, head12: null, retry: null,
+    });
+  });
+
+  it('parses a collect key that carries both the attempt ordinal and a retry', () => {
+    const parts: LaneRunStepKeyParts = {
+      runId: RUN_ID, round: 1, step: 'collect', seatIndex: 0, attemptOrdinal: 1, head12: null, retry: 1,
+    };
+    const built = buildLaneRunStepKey(parts);
+    expect(built).toEqual({ ok: true, key: `${RUN_ID}/r1/collect/0/a1/retry1` });
+    if (!built.ok) throw new Error('unreachable: collect retry key must build');
+    expect(parseLaneRunKey(built.key)).toEqual({ kind: 'step', ...parts });
+    const parsed = parseLaneRunKey(built.key);
+    if (parsed === null || parsed.kind !== 'step') throw new Error('unreachable: parsed collect retry key');
+    expect(buildLaneRunStepKey(parsed)).toEqual(built);
   });
 });
 

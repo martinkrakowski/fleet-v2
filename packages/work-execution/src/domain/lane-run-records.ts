@@ -53,9 +53,17 @@ export const LANE_RUN_KEY_HEAD_RULE = {
   reconcile: 'absent',
 } as const satisfies Record<LaneRunKeyStep, 'required' | 'absent'>;
 
-/** Whether a step key carries `/a<n>`. */
+/**
+ * Whether a step key carries `/a<n>`.
+ *
+ * The two tables' rules: `collect` keys never carry `@<head12>` (`collect` stays
+ * `'absent'` in LANE_RUN_KEY_HEAD_RULE), but since F87 they must carry the collected
+ * attempt's ordinal: `<runId>/r<round>/collect/<seatIndex>/a<n>` (n 1..32). The legacy
+ * ordinal-less form `<runId>/r<round>/collect/<seatIndex>` is still *read* by the
+ * parser for journals written before this change, but is no longer buildable.
+ */
 export const LANE_RUN_KEY_ATTEMPT_RULE = {
-  prepare: 'required', dispatch: 'required', stop: 'absent', collect: 'absent',
+  prepare: 'required', dispatch: 'required', stop: 'absent', collect: 'required',
   gate: 'absent', 'brief-check': 'absent', 'code-review': 'absent', 'pre-merge': 'absent',
   accept: 'absent', 'open-pr': 'absent', push: 'absent', merge: 'absent', premerge: 'absent', ci: 'absent', park: 'absent',
   reconcile: 'absent',

@@ -247,7 +247,7 @@ function stepKey(parts: {
 }
 
 const DISPATCH_KEY = stepKey({ round: 0, step: 'dispatch', seatIndex: 0, attemptOrdinal: 1, head12: null });
-const COLLECT_KEY = stepKey({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: null, head12: null });
+const COLLECT_KEY = stepKey({ round: 0, step: 'collect', seatIndex: 0, attemptOrdinal: 1, head12: null });
 const GATE_KEY = stepKey({ round: 0, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12_A });
 const BRIEF_CHECK_KEY = stepKey({ round: 0, step: 'brief-check', seatIndex: 0, attemptOrdinal: null, head12: HEAD12_A });
 

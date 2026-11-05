@@ -19,7 +19,7 @@ import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js';
-import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, saveOrRefuse } from './step-context.js';
+import { appendRunIntent, appendRunResult, intentMintedIdOf, performPark, refusedResult, saveOrRefuse } from './step-context.js';
 import { readVerifiedFrozenManifest } from './frozen-manifest.js';
 
 type ActDecision = Extract<LaneRunDecision, { kind: 'act' }>;
@@ -677,7 +677,7 @@ async function runAcceptBody(
   }
   const resultRefusal = await appendRunResult(ctx, request, key, result, reasonCode, detail);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key, result, reasonCode, ...(detail !== null ? { detail } : {}) };
 }
@@ -703,7 +703,7 @@ export async function performAccept(
   }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   return runAcceptBody(ctx, record, gathered, decision, request, decision.key);
 }
@@ -890,11 +890,11 @@ async function refuseKeyed(
 ): Promise<AdvanceLaneRunResult> {
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode, detail);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
 }
@@ -1026,12 +1026,12 @@ async function runPrPushBody(
   const actionId = 'forge-' + ctx.deps.newUlid();
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, actionId);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   const refuseGrant = async (): Promise<AdvanceLaneRunResult> => {
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'grant-refused', baseBranch);
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'grant-refused' };
   };
@@ -1103,7 +1103,7 @@ async function runPrPushBody(
     const reasonCode = kind === 'push-and-open-pr' ? 'pr-opened' : 'pushed';
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', reasonCode, baseBranch);
     if (resultRefusal !== null) {
-      return { outcome: 'refused', reason: resultRefusal };
+      return refusedResult(resultRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'completed', reasonCode };
   }
@@ -1112,7 +1112,7 @@ async function runPrPushBody(
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', 'forge-refused', baseBranch);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode: 'forge-refused' };
 }
@@ -1174,7 +1174,7 @@ async function appendReconcileResult(
 ): Promise<AdvanceLaneRunResult> {
   const resultRefusal = await appendRunResult(ctx, request, decision.key, outcome, reasonCode);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result: outcome, reasonCode };
 }
@@ -1261,7 +1261,7 @@ export async function performMerge(
   }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
   if (intentRefusal !== null) {
-    return { outcome: 'refused', reason: intentRefusal };
+    return refusedResult(intentRefusal);
   }
   let result: 'completed' | 'refused' | 'ambiguous';
   let reasonCode: LaneRunResultReasonCode;
@@ -1295,7 +1295,7 @@ export async function performMerge(
   }
   const resultRefusal = await appendRunResult(ctx, request, decision.key, result, reasonCode);
   if (resultRefusal !== null) {
-    return { outcome: 'refused', reason: resultRefusal };
+    return refusedResult(resultRefusal);
   }
   return { outcome: 'acted', step: decision.step, key: decision.key, result, reasonCode };
 }

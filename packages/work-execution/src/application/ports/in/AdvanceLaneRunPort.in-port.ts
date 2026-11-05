@@ -11,7 +11,7 @@
  */
 
 import type { LaneRunWaitReason } from '../../../domain/lane-run-decider.js';
-import type { LaneRunJournalOutcome } from '../../../domain/lane-run-journal.js';
+import type { LaneRunJournalOutcome, LaneRunJournalRefusal } from '../../../domain/lane-run-journal.js';
 import type { LaneRunKeyStep, LaneRunParkReason } from '../../../domain/lane-run-records.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
@@ -52,7 +52,11 @@ export type AdvanceLaneRunResult =
       readonly detail?: string | null }
   | { readonly outcome: 'not-built'; readonly decision: 'act' | 'reconcile' | 'cancel'; readonly step: LaneRunKeyStep }
   | { readonly outcome: 'not-wired'; readonly step: LaneRunKeyStep }
-  | { readonly outcome: 'refused'; readonly reason: AdvanceLaneRunRefusal };
+  | { readonly outcome: 'refused'; readonly reason: AdvanceLaneRunRefusal;
+      /** When the refusal came from the journal: the journal's typed refusal reason. */
+      readonly journalRefusal?: LaneRunJournalRefusal;
+      /** When the refusal came from the journal: the journal's detail (may be null). */
+      readonly detail?: string | null };
 
 export interface AdvanceLaneRunPort {
   /** One driver step: at most one external action, keyed intent before it, result after it. */

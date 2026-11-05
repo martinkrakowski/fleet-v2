@@ -79,6 +79,34 @@ function seededEndpointGate(): SessionStartGate {
   };
 }
 
+/** Fix round 2: a gate that grants both rules and records endpoint commits. */
+function recordingGrantingGate() {
+  const commits: { endpointKey: string; nowIso: string }[] = [];
+  const gate: SessionStartGate & { readonly commits: typeof commits } = {
+    commits,
+    tryStart: () => ({ ok: true }),
+    tryStartForEndpoint: () => ({ ok: true }),
+    commitStartForEndpoint: (endpointKey, nowIso) => {
+      commits.push({ endpointKey, nowIso });
+    },
+  };
+  return gate;
+}
+
+/** Fix round 2: an endpoint grant the global gate blocks must not be committed. */
+function recordingGlobalDenyEndpointGrantGate() {
+  const commits: { endpointKey: string; nowIso: string }[] = [];
+  const gate: SessionStartGate & { readonly commits: typeof commits } = {
+    commits,
+    tryStart: () => ({ ok: false, retryAfterMs: 5_000 }),
+    tryStartForEndpoint: () => ({ ok: true }),
+    commitStartForEndpoint: (endpointKey, nowIso) => {
+      commits.push({ endpointKey, nowIso });
+    },
+  };
+  return gate;
+}
+
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
 const LATER = '2026-10-27T10:01:00.000Z';
@@ -1296,6 +1324,39 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(harness.dispatchRequests).toHaveLength(1);
     const entries = await harness.runJournal.listForRun(RUN_ID);
     expect(entries[0]).toMatchObject({ kind: 'intent', key, mintedId: 'attempt-example-1' });
+  });
+
+  it('fix round 2: an endpoint grant is committed only after the global gate grants', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const gate = recordingGrantingGate();
+    const result = await advance(harness, { startGate: gate });
+    expect(result).toMatchObject({ outcome: 'acted', step: 'dispatch', reasonCode: 'dispatch-started' });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect(gate.commits).toEqual([{ endpointKey: 'opencode:lane-host-example:4166', nowIso: LATER }]);
+  });
+
+  it('fix round 2: a global-denied endpoint grant is never committed', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const gate = recordingGlobalDenyEndpointGrantGate();
+    const result = await advance(harness, { startGate: gate });
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(harness.dispatchRequests).toEqual([]);
+    expect(gate.commits).toEqual([]);
+  });
+
+  it('fix round 2: a started attempt with a malformed updatedAtIso still seeds the endpoint stagger', async () => {
+    const prior = attemptFixture({
+      id: 'attempt-example-0',
+      state: 'running',
+      updatedAtIso: 'not-a-date',
+    });
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const result = await advance(harness, { startGate: seededEndpointGate() });
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(harness.dispatchRequests).toEqual([]);
   });
 
   it('test 21 (KF-34a1): a seat-pivot dispatch is denied the same way, before the pivot intent', async () => {

@@ -78,9 +78,34 @@ describe('SessionStartSpacing', () => {
   it('CO13: two starts on the same endpoint inside the interval are spaced', () => {
     const gate = new SessionStartSpacing(20_000, null);
     expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
+    gate.commitStartForEndpoint('opencode:host:4166', NOW);
     const denied = gate.tryStartForEndpoint('run-b', at(5_000), 'opencode:host:4166', null);
     expect(denied).toEqual({ ok: false, retryAfterMs: 15_000 });
     expect(gate.tryStartForEndpoint('run-b', at(20_000), 'opencode:host:4166', null)).toEqual({ ok: true });
+  });
+
+  it('CO13: a grant is not recorded until committed', () => {
+    const gate = new SessionStartSpacing(20_000, null);
+    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
+    // No commit: the next start on the same endpoint is not spaced.
+    expect(gate.tryStartForEndpoint('run-b', at(5_000), 'opencode:host:4166', null)).toEqual({ ok: true });
+    gate.commitStartForEndpoint('opencode:host:4166', at(5_000));
+    expect(gate.tryStartForEndpoint('run-c', at(6_000), 'opencode:host:4166', null)).toEqual({
+      ok: false,
+      retryAfterMs: 19_000,
+    });
+  });
+
+  it('CO13: a malformed durable seed denies one full interval', () => {
+    const gate = new SessionStartSpacing(20_000, null);
+    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', 'not-a-date')).toEqual({
+      ok: false,
+      retryAfterMs: 20_000,
+    });
+    expect(gate.tryStartForEndpoint('run-a', at(20_000), 'opencode:host:4166', 'not-a-date')).toEqual({
+      ok: false,
+      retryAfterMs: 20_000,
+    });
   });
 
   it('CO13: two starts on different endpoints are both granted', () => {
@@ -101,6 +126,7 @@ describe('SessionStartSpacing', () => {
   it('CO13: pendingMs returns the endpoint wait for the denied run', () => {
     const gate = new SessionStartSpacing(20_000, null);
     expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
+    gate.commitStartForEndpoint('opencode:host:4166', NOW);
     expect(gate.tryStartForEndpoint('run-b', at(3_000), 'opencode:host:4166', null)).toEqual({
       ok: false,
       retryAfterMs: 17_000,

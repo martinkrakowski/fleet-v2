@@ -48,8 +48,12 @@ export class SessionStartSpacing implements SessionStartGate {
   /**
    * CO13: the per-runner-endpoint dispatch stagger. The seeded last start is
    * the later of the endpoint's own last start and the durable seed passed in;
-   * a granted start is remembered for that endpoint. A denied start reserves
-   * the run's turn at now + retryAfterMs.
+   * a durable seed that cannot be dated is kept so the pure rule waits one full
+   * interval (never too early). A granted start is NOT recorded here — the
+   * caller commits it with `commitStartForEndpoint` only once the dispatch
+   * actually proceeds past every gate, so a grant the global gate then blocks
+   * never counts as a start. A denied start reserves the run's turn at now +
+   * retryAfterMs.
    */
   tryStartForEndpoint(
     runId: string,
@@ -59,26 +63,33 @@ export class SessionStartSpacing implements SessionStartGate {
   ): { readonly ok: true } | { readonly ok: false; readonly retryAfterMs: number } {
     const endpointMs = this.endpointLastStartMs.get(endpointKey);
     const persistedMs = lastStartIso === null ? NaN : Date.parse(lastStartIso);
-    let seededMs: number | null = null;
-    if (endpointMs !== undefined && !Number.isNaN(endpointMs)) {
-      seededMs = endpointMs;
+    let seededIso: string | null = null;
+    if (lastStartIso !== null && !Number.isFinite(persistedMs)) {
+      seededIso = lastStartIso;
+    } else {
+      if (endpointMs !== undefined && !Number.isNaN(endpointMs)) {
+        seededIso = new Date(endpointMs).toISOString();
+      }
+      if (!Number.isNaN(persistedMs) && (seededIso === null || persistedMs > Date.parse(seededIso))) {
+        seededIso = lastStartIso;
+      }
     }
-    if (!Number.isNaN(persistedMs) && (seededMs === null || persistedMs > seededMs)) {
-      seededMs = persistedMs;
-    }
-    const seededIso = seededMs === null ? null : new Date(seededMs).toISOString();
     const decision = decideDispatchStagger({
       nowIso,
       lastStartIso: seededIso,
       minIntervalMs: this.staggerMs,
     });
     if (decision.ok) {
-      this.endpointLastStartMs.set(endpointKey, Date.parse(nowIso));
       this.endpointReservations.delete(runId);
       return { ok: true };
     }
     this.endpointReservations.set(runId, Date.parse(nowIso) + decision.retryAfterMs);
     return decision;
+  }
+
+  /** CO13: record an endpoint start once it actually proceeded past every gate. */
+  commitStartForEndpoint(endpointKey: string, nowIso: string): void {
+    this.endpointLastStartMs.set(endpointKey, Date.parse(nowIso));
   }
 
   /** The ms until the run's reserved turn, or 0 when it holds none. */

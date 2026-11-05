@@ -34,6 +34,13 @@ export interface SessionStartGate {
     endpointKey: string,
     lastStartIso: string | null,
   ): { readonly ok: true } | { readonly ok: false; readonly retryAfterMs: number };
+  /**
+   * CO13: record an endpoint start that actually proceeded past every gate,
+   * so a grant the global gate then blocks never counts as a start. Optional:
+   * a gate without it commits nothing, so the existing fakes and the review
+   * path are unchanged.
+   */
+  commitStartForEndpoint?(endpointKey: string, nowIso: string): void;
 }
 
 export interface AdvanceLaneRunRequest {

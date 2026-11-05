@@ -715,13 +715,19 @@ export async function performDispatch(ctx: AdvanceStepContext,
   // sets one) never dispatches: it refuses and parks with a fixed detail,
   // never a guessed or inherited seat field.
   const fixSeat = fixSeatForDispatch(latest, manifest);
-  const endpointWait = await endpointStaggerWaitOf(ctx, record, latest, request);
-  if (endpointWait !== null) {
-    return endpointWait;
+  const endpointCheck = await endpointStaggerWaitOf(ctx, record, latest, request);
+  if (endpointCheck.kind === 'wait') {
+    return endpointCheck.result;
   }
   const staggered = startGateWaitOf(request, fixSeat, inputsReadable);
   if (staggered !== null) {
     return staggered;
+  }
+  if (endpointCheck.kind === 'grant') {
+    // CO13: commit the endpoint start only now, after the global gate also
+    // granted — an endpoint grant the global gate blocks never counts as a
+    // start, so the retry is not delayed again by the endpoint gate.
+    request.startGate?.commitStartForEndpoint?.(endpointCheck.endpointKey, request.nowIso);
   }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, latest.id);
   if (intentRefusal !== null) {
@@ -951,45 +957,54 @@ function startGateWaitOf(
 }
 
 /**
- * CO13: the per-runner-endpoint dispatch stagger wait, before the one-way
+ * CO13: the per-runner-endpoint dispatch stagger check, before the one-way
  * dispatch intent. A denied start is a wait — never a refusal and never a
  * spent key. No gate, no endpoint-scoped method or no endpoint identity means
- * nothing to enforce (today's behaviour).
+ * nothing to enforce (today's behaviour). A granted start is reported so the
+ * caller commits it only after the global gate also grants.
  */
+type EndpointStaggerCheck =
+  | { readonly kind: 'wait'; readonly result: AdvanceLaneRunResult }
+  | { readonly kind: 'grant'; readonly endpointKey: string }
+  | { readonly kind: 'none' };
+
 async function endpointStaggerWaitOf(
   ctx: AdvanceStepContext,
   record: LaneRunRecord,
   latest: AttemptRecord,
   request: AdvanceLaneRunRequest,
-): Promise<AdvanceLaneRunResult | null> {
+): Promise<EndpointStaggerCheck> {
   const gate = request.startGate;
   if (gate === undefined || gate.tryStartForEndpoint === undefined) {
-    return null;
+    return { kind: 'none' };
   }
   const endpoint = dispatchEndpointFactsOf(latest.runner);
   if (endpoint === null) {
-    return null;
+    return { kind: 'none' };
   }
   const endpointKey = dispatchEndpointKey(endpoint);
   const lastStartIso = await lastStartIsoForEndpoint(ctx, endpointKey);
   const decision = gate.tryStartForEndpoint(request.runId, request.nowIso, endpointKey, lastStartIso);
   if (decision.ok) {
-    return null;
+    return { kind: 'grant', endpointKey };
   }
   await journalDispatchStaggerWait(ctx, record, latest, request, endpointKey, decision.retryAfterMs);
-  return { outcome: 'waiting', reason: 'session-stagger' };
+  return { kind: 'wait', result: { outcome: 'waiting', reason: 'session-stagger' } };
 }
 
 /**
  * CO13: the durable seed for one endpoint — the latest `updatedAtIso` of any
  * attempt that started on it. An attempt's `updatedAtIso` is never earlier
  * than its start, so the measured gap is never shorter than the true one — the
- * safe direction.
+ * safe direction. A started attempt whose `updatedAtIso` cannot be dated is
+ * treated as the newest (never too early), so it still seeds the endpoint and
+ * the stagger is enforced instead of silently skipped.
  */
 async function lastStartIsoForEndpoint(ctx: AdvanceStepContext, endpointKey: string): Promise<string | null> {
   const attempts = await ctx.deps.attemptRepo.listAllAttempts();
   let latestMs: number | null = null;
   let latestIso: string | null = null;
+  let malformedLatestIso: string | null = null;
   for (const attempt of attempts) {
     if (attempt.runner === null || attempt.runner === undefined) {
       continue;
@@ -1014,10 +1029,17 @@ async function lastStartIsoForEndpoint(ctx: AdvanceStepContext, endpointKey: str
       continue;
     }
     const ms = Date.parse(attempt.updatedAtIso);
-    if (!Number.isNaN(ms) && (latestMs === null || ms > latestMs)) {
+    if (!Number.isFinite(ms)) {
+      malformedLatestIso = attempt.updatedAtIso;
+      continue;
+    }
+    if (latestMs === null || ms > latestMs) {
       latestMs = ms;
       latestIso = attempt.updatedAtIso;
     }
+  }
+  if (malformedLatestIso !== null) {
+    return malformedLatestIso;
   }
   return latestIso;
 }

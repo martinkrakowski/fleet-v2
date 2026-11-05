@@ -54,9 +54,19 @@ describe('decideDispatchStagger', () => {
     });
   });
 
-  it('an unparseable last start and now never block', () => {
+  it('an unparseable clock never blocks', () => {
+    expect(decideDispatchStagger({ nowIso: 'not-a-date', lastStartIso: at(-5_000), minIntervalMs: 20_000 })).toEqual({
+      ok: true,
+    });
     expect(decideDispatchStagger({ nowIso: 'not-a-date', lastStartIso: 'not-a-date', minIntervalMs: 20_000 })).toEqual({
       ok: true,
+    });
+  });
+
+  it('an unparseable last-start seed waits one full interval', () => {
+    expect(decideDispatchStagger({ nowIso: NOW, lastStartIso: 'not-a-date', minIntervalMs: 20_000 })).toEqual({
+      ok: false,
+      retryAfterMs: 20_000,
     });
   });
 });

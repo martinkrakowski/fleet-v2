@@ -69,8 +69,10 @@ export function dispatchEndpointFactsOf(runner: AttemptRunnerRecord | null | und
 /**
  * Whether a session start may happen now for one endpoint. Pure and never
  * throws, in this order: a broken interval falls back to the default; a zero
- * interval, a missing last start, or unparseable times never block; a last
- * start in the future waits one full interval from now.
+ * interval, a missing last start, or an unparseable clock never block; a
+ * provided last-start seed that cannot be dated waits one full interval
+ * (never too early); a last start in the future waits one full interval from
+ * now.
  */
 export function decideDispatchStagger(facts: DispatchStaggerFacts): DispatchStaggerDecision {
   const interval =
@@ -85,8 +87,14 @@ export function decideDispatchStagger(facts: DispatchStaggerFacts): DispatchStag
   }
   const lastMs = Date.parse(facts.lastStartIso);
   const nowMs = Date.parse(facts.nowIso);
-  if (!Number.isFinite(lastMs) || !Number.isFinite(nowMs)) {
+  if (!Number.isFinite(nowMs)) {
+    // An unparseable clock never blocks a lane.
     return { ok: true };
+  }
+  if (!Number.isFinite(lastMs)) {
+    // A provided seed that cannot be dated must never silence the stagger:
+    // wait one full interval rather than granting.
+    return { ok: false, retryAfterMs: interval };
   }
   const elapsed = nowMs - lastMs;
   if (elapsed >= interval) {

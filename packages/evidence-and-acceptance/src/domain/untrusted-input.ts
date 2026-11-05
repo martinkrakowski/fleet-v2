@@ -37,17 +37,24 @@ const MARKER_NOISE_LIMIT = 64;
 /**
  * Cyrillic and Greek letters that look like a Latin letter render a marker
  * word unreadable to the plain `startsWith` check; each maps to its Latin
- * equivalent before the match. Capital forms only: the word is lowercased
- * after the mapping, and lowercase look-alikes fold through the same capitals
- * via `toLowerCase` on the mapped text.
+ * equivalent before the match. Capital and lowercase forms are both listed:
+ * `toLowerCase` runs after the mapping, so a lowercase look-alike cannot fold
+ * through the capitals' entries.
  */
 const LOOKALIKE_LATIN = new Map<string, string>([
-  ['\u0423', 'U'], ['\u0405', 'S'], ['\u0410', 'A'], ['\u0412', 'B'], ['\u0415', 'E'],
-  ['\u041D', 'H'], ['\u041E', 'O'], ['\u0420', 'P'], ['\u0421', 'C'], ['\u0422', 'T'],
-  ['\u0425', 'X'], ['\u0391', 'A'], ['\u0392', 'B'], ['\u0395', 'E'], ['\u0397', 'H'],
-  ['\u0399', 'I'], ['\u039A', 'K'], ['\u039C', 'M'], ['\u039D', 'N'], ['\u039F', 'O'],
-  ['\u03A1', 'P'], ['\u03A4', 'T'], ['\u03A7', 'X'], ['\u0406', 'I'], ['\u041A', 'K'],
-  ['\u041C', 'M'],
+  ['\u0423', 'U'], ['\u0443', 'u'], ['\u0405', 'S'], ['\u0455', 's'],
+  ['\u0410', 'A'], ['\u0430', 'a'], ['\u0412', 'B'], ['\u0432', 'b'],
+  ['\u0415', 'E'], ['\u0435', 'e'], ['\u041D', 'H'], ['\u043D', 'h'],
+  ['\u041E', 'O'], ['\u043E', 'o'], ['\u0420', 'P'], ['\u0440', 'p'],
+  ['\u0421', 'C'], ['\u0441', 'c'], ['\u0422', 'T'], ['\u0442', 't'],
+  ['\u0425', 'X'], ['\u0445', 'x'], ['\u0406', 'I'], ['\u0456', 'i'],
+  ['\u041A', 'K'], ['\u043A', 'k'], ['\u041C', 'M'], ['\u043C', 'm'],
+  ['\u0391', 'A'], ['\u03B1', 'a'], ['\u0392', 'B'], ['\u03B2', 'b'],
+  ['\u0395', 'E'], ['\u03B5', 'e'], ['\u0397', 'H'], ['\u03B7', 'h'],
+  ['\u0399', 'I'], ['\u03B9', 'i'], ['\u039A', 'K'], ['\u03BA', 'k'],
+  ['\u039C', 'M'], ['\u03BC', 'm'], ['\u039D', 'N'], ['\u03BD', 'n'],
+  ['\u039F', 'O'], ['\u03BF', 'o'], ['\u03A1', 'P'], ['\u03C1', 'p'],
+  ['\u03A4', 'T'], ['\u03C4', 't'], ['\u03A7', 'X'], ['\u03C7', 'x'],
 ]);
 
 /** Whether the text at `start` opens a marker word once the noise is removed. */

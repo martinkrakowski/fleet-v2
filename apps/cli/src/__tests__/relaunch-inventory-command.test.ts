@@ -118,4 +118,29 @@ describe('relaunch inventory', () => {
     expect(code).toBe(2);
     expect(err.join('')).toContain('Subcommands: inventory');
   });
+  it('refuses with exit 1 when the profile records cannot be read, never reporting zero hosts', async () => {
+    const { io, out } = collectIo();
+    let called = false;
+    const runtime = {
+      coordination: {
+        listProjectProfiles: {
+          listProjectProfiles: async () => ({ outcome: 'rejected', reason: 'store unreadable' }),
+        },
+      },
+      execution: {
+        inventoryRelaunch: {
+          inventoryRelaunch: async () => {
+            called = true;
+            return { outcome: 'inventoried' };
+          },
+        },
+      },
+    } as unknown as FleetCliRuntime;
+
+    const code = await runCli(['relaunch', 'inventory'], io, runtime);
+
+    expect(code).toBe(1);
+    expect(called).toBe(false);
+    expect(JSON.parse(out.join(''))).toEqual({ outcome: 'refused', reason: 'records-unreadable' });
+  });
 });

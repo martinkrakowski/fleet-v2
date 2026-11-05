@@ -43,12 +43,22 @@ export type RelaunchPopulation = 'conducted' | 'attempt-recorded' | 'unrecorded'
 /** What the runner reports for one worktree directory. */
 export type RelaunchRunnerState = 'idle' | 'running' | 'unknown';
 
+/**
+ * Whether the row's record is proven to own the listed worktree. A path
+ * match alone proves nothing: a reaped worktree's path can be reused by a
+ * later lane. `proven`: the listed branch is the run's branch, or the runner
+ * reports the record's own session running there. `unknown`: no fact proves
+ * it either way, so the claim is reported and counted, never trusted.
+ * `none`: an unrecorded row has no record to own it.
+ */
+export type RelaunchRecordOwnership = 'proven' | 'unknown' | 'none';
+
 /** One lane the inventory found. */
 export interface RelaunchLaneRow {
   readonly population: RelaunchPopulation;
   /** The run id (conducted), the attempt id (attempt-recorded) or `worktree-<12 hex>` (unrecorded). */
   readonly laneId: string;
-  /** The lane host; `unknown-host` when the record names no host. */
+  /** The lane host: the host whose clone listed the worktree. */
   readonly hostName: string;
   /** The worktree path. Local CLI output only; never in a web or API payload. */
   readonly worktreePath: string;
@@ -58,6 +68,8 @@ export interface RelaunchLaneRow {
   readonly attemptId: string | null;
   /** The runner's state for that worktree directory. */
   readonly runnerState: RelaunchRunnerState;
+  /** Whether the record is proven to own the worktree. */
+  readonly ownership: RelaunchRecordOwnership;
 }
 
 /** The risk flag codes the inventory reports. */
@@ -67,6 +79,8 @@ export const RELAUNCH_RISK_FLAG_CODES = [
   'unrecorded-worktrees',
   'running-worktrees',
   'unknown-worktree-read',
+  'unproven-lane-records',
+  'driver-lease-unknown',
 ] as const;
 export type RelaunchRiskFlagCode = (typeof RELAUNCH_RISK_FLAG_CODES)[number];
 
@@ -96,8 +110,8 @@ export interface RelaunchHostInventory {
 export interface RelaunchConductorStatus {
   /** The halt marker; an unreadable marker reads as halted. */
   readonly halted: boolean;
-  /** The driver lease: absent, lapsed or live. */
-  readonly driverLease: 'absent' | 'lapsed' | 'live';
+  /** The driver lease: absent, lapsed or live; unknown when the read throws. */
+  readonly driverLease: 'absent' | 'lapsed' | 'live' | 'unknown';
   /** The recorded lane runs. */
   readonly runCount: number;
 }
@@ -110,7 +124,12 @@ export type InventoryRelaunchResult =
       readonly riskFlags: readonly RelaunchRiskFlag[];
       readonly hosts: readonly RelaunchHostInventory[];
     }
-  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' };
+  /**
+   * `invalid-request`: the request is malformed. `records-unreadable`: the
+   * run, attempt or profile records could not be read, so no population can
+   * be told; the inventory is refused rather than guessed.
+   */
+  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' | 'records-unreadable' };
 
 export interface InventoryRelaunchPort {
   inventoryRelaunch(request: InventoryRelaunchRequest): Promise<InventoryRelaunchResult>;

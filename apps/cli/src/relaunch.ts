@@ -9,7 +9,7 @@
 
 import { optStr, type CommandHandler } from './commands/payload.js';
 import type { FleetCliRuntime } from './composition.js';
-import type { AttemptRunnerRecord, RelaunchCloneRef } from '@fleet/work-execution';
+import type { AttemptRunnerRecord, InventoryRelaunchResult, RelaunchCloneRef } from '@fleet/work-execution';
 import type { HostSection } from '@fleet/installation';
 
 /**
@@ -32,26 +32,34 @@ function recordedHostOf(hostName: string, rt: FleetCliRuntime): AttemptRunnerRec
   };
 }
 
+/** The refusal for unreadable profile records (exit 1). */
+const UNREADABLE: InventoryRelaunchResult = { outcome: 'refused', reason: 'records-unreadable' };
+
 export const relaunchCommands: Readonly<Record<string, CommandHandler>> = {
   inventory: async (p, rt) => {
     const hostName = optStr(p, 'host') ?? null;
     // D18: only the clones of active project profiles are read; never a
-    // host-wide scan. An unreadable profile listing reports zero hosts.
-    const profiles = await rt.coordination.listProjectProfiles.listProjectProfiles({ status: 'active' });
+    // host-wide scan. An unreadable profile listing is not "no clones": the
+    // inventory is refused rather than reporting zero hosts.
+    let profiles: Awaited<ReturnType<FleetCliRuntime['coordination']['listProjectProfiles']['listProjectProfiles']>>;
+    try {
+      profiles = await rt.coordination.listProjectProfiles.listProjectProfiles({ status: 'active' });
+    } catch {
+      return UNREADABLE;
+    }
+    if (profiles.outcome !== 'listed') return UNREADABLE;
     const clones: RelaunchCloneRef[] = [];
-    if (profiles.outcome === 'listed') {
-      for (const profile of profiles.profiles) {
-        if (profile.status !== 'active') continue;
-        for (const [cloneHost, clone] of Object.entries(profile.clones)) {
-          if (hostName !== null && cloneHost !== hostName) continue;
-          clones.push({
-            projectId: profile.projectId,
-            hostName: cloneHost,
-            clonePath: clone.path,
-            worktreeRoot: clone.worktreeRoot,
-            recordedHost: recordedHostOf(cloneHost, rt),
-          });
-        }
+    for (const profile of profiles.profiles) {
+      if (profile.status !== 'active') continue;
+      for (const [cloneHost, clone] of Object.entries(profile.clones)) {
+        if (hostName !== null && cloneHost !== hostName) continue;
+        clones.push({
+          projectId: profile.projectId,
+          hostName: cloneHost,
+          clonePath: clone.path,
+          worktreeRoot: clone.worktreeRoot,
+          recordedHost: recordedHostOf(cloneHost, rt),
+        });
       }
     }
     return rt.execution.inventoryRelaunch.inventoryRelaunch({

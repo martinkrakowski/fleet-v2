@@ -354,7 +354,7 @@ describe('InventoryRelaunchUseCase', () => {
   it('counts a running lane in the running-worktrees flag with the path on the row', async () => {
     const h = harness({
       runs: [{ ...RUN, attemptIds: ['attempt-1'] }],
-      attempts: [attemptFixture('attempt-1', { worktreePath: '/clones/repo-worktrees/wt-lane-1' })],
+      attempts: [attemptFixture('attempt-1', { worktreePath: '/clones/repo-worktrees/wt-lane-1', sessionId: 'ses-1' })],
       workspaceResult: {
         outcome: 'listed',
         worktrees: [listedWorktree('/clones/repo'), listedWorktree('/clones/repo-worktrees/wt-lane-1')],
@@ -817,5 +817,57 @@ describe('InventoryRelaunchUseCase', () => {
       { code: 'unrecorded-worktrees', count: 1 },
       { code: 'unknown-runner-state', count: 1 },
     ]);
+  });
+  it('reports a branch-proven conducted claim as unproven when another session runs there', async () => {
+    const h = harness({
+      runs: [{ ...RUN, attemptIds: ['attempt-1', 'attempt-2'] }],
+      attempts: [
+        attemptFixture('attempt-1', { worktreePath: '/clones/repo-worktrees/wt-a', sessionId: 'ses-1' }),
+        attemptFixture('attempt-2', {
+          worktreePath: '/clones/repo-worktrees/wt-a',
+          sessionId: 'ses-2',
+          createdAtIso: '2026-10-31T01:00:00.000Z',
+        }),
+      ],
+      workspaceResult: {
+        outcome: 'listed',
+        worktrees: [listedWorktree('/clones/repo'), listedWorktree('/clones/repo-worktrees/wt-a')],
+      },
+      runnerForAttempt: makeRunnerForAttempt(makeRunner({ state: 'running', sessionId: 'ses-foreign' })),
+    });
+    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [cloneFixture()] });
+    if (result.outcome !== 'inventoried') throw new Error('expected inventoried');
+    expect(result.hosts[0].lanes[0]).toMatchObject({
+      population: 'conducted',
+      runId: 'run-1',
+      attemptId: 'attempt-2',
+      ownership: 'unknown',
+    });
+    expect(result.hosts[0].riskFlags).toEqual([
+      { code: 'running-worktrees', count: 1 },
+      { code: 'unproven-lane-records', count: 1 },
+    ]);
+  });
+
+  it('keeps a branch-proven conducted claim proven when an earlier attempt of the run is the running session', async () => {
+    const h = harness({
+      runs: [{ ...RUN, attemptIds: ['attempt-1', 'attempt-2'] }],
+      attempts: [
+        attemptFixture('attempt-1', { worktreePath: '/clones/repo-worktrees/wt-a', sessionId: 'ses-1' }),
+        attemptFixture('attempt-2', {
+          worktreePath: '/clones/repo-worktrees/wt-a',
+          sessionId: 'ses-2',
+          createdAtIso: '2026-10-31T01:00:00.000Z',
+        }),
+      ],
+      workspaceResult: {
+        outcome: 'listed',
+        worktrees: [listedWorktree('/clones/repo'), listedWorktree('/clones/repo-worktrees/wt-a')],
+      },
+      runnerForAttempt: makeRunnerForAttempt(makeRunner({ state: 'running', sessionId: 'ses-1' })),
+    });
+    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [cloneFixture()] });
+    if (result.outcome !== 'inventoried') throw new Error('expected inventoried');
+    expect(result.hosts[0].lanes[0]).toMatchObject({ population: 'conducted', ownership: 'proven' });
   });
 });

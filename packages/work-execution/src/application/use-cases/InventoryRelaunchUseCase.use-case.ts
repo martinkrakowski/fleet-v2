@@ -13,9 +13,11 @@
  * never proves that a record owns the worktree, because a reaped path can be
  * reused: a conducted record is proven by the listed branch (`fleet/<runId>`
  * or the run's recorded branch), and any record by the runner reporting its
- * own session running there. A record proven not to own the path (another
- * branch, another session) is dropped; a claim nothing proves either way is
- * reported with `ownership: 'unknown'` and counted. A clone whose host is
+ * own session running there. A record disproved (another branch with no
+ * own session running, or another session running) is dropped; a claim
+ * nothing proves, or that the facts contradict (the run's branch checked
+ * out with another session running), is reported with `ownership:
+ * 'unknown'` and counted. A clone whose host is
  * absent from the installation routes no read and is counted as an unknown
  * listing, never read on the local executor.
  *
@@ -81,8 +83,12 @@ interface InternalLaneRow {
   attemptId: string | null;
   runnerState: RelaunchRunnerState;
   ownership: RelaunchRecordOwnership;
-  /** The claiming attempt's recorded session, used to prove or disprove the claim. */
-  readonly claimSessionId: string | null;
+  /**
+   * The recorded sessions of the claiming attempts (for a branch-proven
+   * conducted row, every attempt of that run at this path), used to prove or
+   * disprove the claim against the session the runner reports running.
+   */
+  readonly claimSessions: ReadonlySet<string>;
   /** The runner block the runner-state read is routed by; never in the result. */
   readonly routing: AttemptRunnerRecord;
   /**
@@ -143,6 +149,65 @@ function increment(counts: Map<string, number>, key: string, by = 1): void {
   counts.set(key, (counts.get(key) ?? 0) + by);
 }
 
+/** The listing facts of the requested clones, per host. */
+interface CloneListing {
+  readonly lanes: readonly ListedLane[];
+  readonly clones: ReadonlyMap<string, number>;
+  readonly listed: ReadonlyMap<string, number>;
+  readonly unknown: ReadonlyMap<string, number>;
+}
+
+function groupByWorktree(attempts: readonly AttemptRecord[]): Map<string, AttemptRecord[]> {
+  const groups = new Map<string, AttemptRecord[]>();
+  for (const attempt of attempts) {
+    const group = groups.get(attempt.worktreePath);
+    if (group === undefined) groups.set(attempt.worktreePath, [attempt]);
+    else group.push(attempt);
+  }
+  return groups;
+}
+
+/** One host's inventory; risk flags are counts only, and a flag whose count is 0 is omitted. */
+function hostInventory(
+  hostName: string,
+  rows: readonly InternalLaneRow[],
+  listing: CloneListing,
+): RelaunchHostInventory {
+  const lanes = rows
+    .filter((row) => row.hostName === hostName)
+    .sort((left, right) => byCodeUnit(left.worktreePath, right.worktreePath));
+  const count = (predicate: (row: InternalLaneRow) => boolean): number => lanes.filter(predicate).length;
+  const conducted = count((row) => row.population === 'conducted');
+  const attemptRecorded = count((row) => row.population === 'attempt-recorded');
+  const unrecorded = count((row) => row.population === 'unrecorded');
+  const flagCounts: readonly (readonly [RelaunchRiskFlag['code'], number])[] = [
+    ['unrecorded-worktrees', unrecorded],
+    ['running-worktrees', count((row) => row.runnerState === 'running')],
+    ['unknown-worktree-read', listing.unknown.get(hostName) ?? 0],
+    ['unproven-lane-records', count((row) => row.ownership === 'unknown')],
+    ['unknown-runner-state', count((row) => row.runnerState === 'unknown')],
+  ];
+  return {
+    hostName,
+    cloneCount: listing.clones.get(hostName) ?? 0,
+    worktreeCount: listing.listed.get(hostName) ?? 0,
+    counts: { conducted, attemptRecorded, unrecorded },
+    riskFlags: flagCounts.filter(([, n]) => n > 0).map(([code, n]) => ({ code, count: n })),
+    lanes: lanes.map(
+      (row): RelaunchLaneRow => ({
+        population: row.population,
+        laneId: row.laneId,
+        hostName: row.hostName,
+        worktreePath: row.worktreePath,
+        runId: row.runId,
+        attemptId: row.attemptId,
+        runnerState: row.runnerState,
+        ownership: row.ownership,
+      }),
+    ),
+  };
+}
+
 export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
   constructor(private readonly deps?: InventoryRelaunchDependencies) {}
 
@@ -178,56 +243,17 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
     // 2. Map the attempts to runs and group them by worktree path.
     const runByAttemptId = new Map<string, LaneRunRecord>();
     for (const run of runs) {
-      for (const attemptId of run.attemptIds) {
-        runByAttemptId.set(attemptId, run);
-      }
+      for (const attemptId of run.attemptIds) runByAttemptId.set(attemptId, run);
     }
-    const attemptsByWorktree = new Map<string, AttemptRecord[]>();
-    for (const attempt of attempts) {
-      const group = attemptsByWorktree.get(attempt.worktreePath);
-      if (group === undefined) {
-        attemptsByWorktree.set(attempt.worktreePath, [attempt]);
-      } else {
-        group.push(attempt);
-      }
-    }
+    const attemptsByWorktree = groupByWorktree(attempts);
 
     // 3. Read the registered clones (D18: registered clones only, no
     //    host-wide scan) of the requested host(s).
     const clones = request.clones.filter(
       (clone) => request.hostName === null || clone.hostName === request.hostName,
     );
-    const hostClones = new Map<string, number>();
-    const hostListed = new Map<string, number>();
-    const hostUnknownListings = new Map<string, number>();
-    const listedLanes: ListedLane[] = [];
-    const seenLanes = new Set<string>();
-    for (const clone of clones) {
-      increment(hostClones, clone.hostName);
-      const cloneHost = clone.recordedHost;
-      if (cloneHost === null) {
-        // The clone's host is absent from the installation: nothing routes the
-        // read to that host, and a local fallback could inspect the wrong
-        // repository. Report the listing as unknown instead.
-        increment(hostUnknownListings, clone.hostName);
-        continue;
-      }
-      const listed = await this.listClone(clone, cloneHost);
-      if (listed === null) {
-        increment(hostUnknownListings, clone.hostName);
-        continue;
-      }
-      increment(hostListed, clone.hostName, listed.length);
-      for (const entry of listed) {
-        // The clone's own main checkout is not a lane; only worktrees under
-        // the clone's worktree root count.
-        if (entry.path === clone.clonePath || !pathUnderPrefix(entry.path, clone.worktreeRoot)) continue;
-        const key = `${clone.hostName}\u0000${entry.path}`;
-        if (seenLanes.has(key)) continue;
-        seenLanes.add(key);
-        listedLanes.push({ entry, hostName: clone.hostName, cloneHost });
-      }
-    }
+    const listing = await this.readListings(clones);
+    const listedLanes = listing.lanes;
 
     // 4. One row per listed lane, claimed by a record only where nothing
     //    disproves the claim.
@@ -244,45 +270,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
 
     // 6. Group by host: one inventory per host of the requested clones.
     const hostNames = new Set<string>(clones.map((clone) => clone.hostName));
-    const hosts: RelaunchHostInventory[] = [];
-    for (const hostName of [...hostNames].sort(byCodeUnit)) {
-      const lanes = rows
-        .filter((row) => row.hostName === hostName)
-        .sort((left, right) => byCodeUnit(left.worktreePath, right.worktreePath));
-      const conducted = lanes.filter((row) => row.population === 'conducted').length;
-      const attemptRecorded = lanes.filter((row) => row.population === 'attempt-recorded').length;
-      const unrecorded = lanes.filter((row) => row.population === 'unrecorded').length;
-      const running = lanes.filter((row) => row.runnerState === 'running').length;
-      const unproven = lanes.filter((row) => row.ownership === 'unknown').length;
-      const unknownRunner = lanes.filter((row) => row.runnerState === 'unknown').length;
-      const unknownListings = hostUnknownListings.get(hostName) ?? 0;
-      // Risk flags, counts only; omit a flag whose count is 0.
-      const riskFlags: RelaunchRiskFlag[] = [];
-      if (unrecorded > 0) riskFlags.push({ code: 'unrecorded-worktrees', count: unrecorded });
-      if (running > 0) riskFlags.push({ code: 'running-worktrees', count: running });
-      if (unknownListings > 0) riskFlags.push({ code: 'unknown-worktree-read', count: unknownListings });
-      if (unproven > 0) riskFlags.push({ code: 'unproven-lane-records', count: unproven });
-      if (unknownRunner > 0) riskFlags.push({ code: 'unknown-runner-state', count: unknownRunner });
-      hosts.push({
-        hostName,
-        cloneCount: hostClones.get(hostName) ?? 0,
-        worktreeCount: hostListed.get(hostName) ?? 0,
-        counts: { conducted, attemptRecorded, unrecorded },
-        riskFlags,
-        lanes: lanes.map(
-          (row): RelaunchLaneRow => ({
-            population: row.population,
-            laneId: row.laneId,
-            hostName: row.hostName,
-            worktreePath: row.worktreePath,
-            runId: row.runId,
-            attemptId: row.attemptId,
-            runnerState: row.runnerState,
-            ownership: row.ownership,
-          }),
-        ),
-      });
-    }
+    const hosts = [...hostNames].sort(byCodeUnit).map((hostName) => hostInventory(hostName, rows, listing));
 
     // 7. Conductor status. An unreadable halt marker reads as halted; an
     //    unreadable lease is unknown, never absent.
@@ -299,6 +287,39 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       riskFlags,
       hosts,
     };
+  }
+
+  /** Read every requested clone's listing; a clone whose host is absent from the installation is never read. */
+  private async readListings(clones: readonly RelaunchCloneRef[]): Promise<CloneListing> {
+    const cloneCounts = new Map<string, number>();
+    const listedCounts = new Map<string, number>();
+    const unknownCounts = new Map<string, number>();
+    const lanes: ListedLane[] = [];
+    const seen = new Set<string>();
+    for (const clone of clones) {
+      increment(cloneCounts, clone.hostName);
+      // A null host block means the host is absent from the installation:
+      // nothing routes the read there, and a local fallback could inspect
+      // the wrong repository, so the listing is unknown.
+      const cloneHost = clone.recordedHost;
+      const listed = cloneHost === null ? null : await this.listClone(clone, cloneHost);
+      if (cloneHost === null || listed === null) {
+        increment(unknownCounts, clone.hostName);
+        continue;
+      }
+      increment(listedCounts, clone.hostName, listed.length);
+      for (const entry of listed) {
+        // The clone's own main checkout is not a lane; only worktrees under
+        // the clone's worktree root count.
+        const key = `${clone.hostName}\u0000${entry.path}`;
+        if (entry.path === clone.clonePath || !pathUnderPrefix(entry.path, clone.worktreeRoot) || seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        lanes.push({ entry, hostName: clone.hostName, cloneHost });
+      }
+    }
+    return { lanes, clones: cloneCounts, listed: listedCounts, unknown: unknownCounts };
   }
 
   /** One clone's listing, or null when it is unknown (missing method, unknown answer or a throw). */
@@ -338,14 +359,14 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       const branch = lane.entry.branch;
       if (branch === null) {
         // Detached: the branch proves nothing either way.
-        return this.recordedRow(lane, latestAttempt(conducted), runByAttemptId, 'unknown');
+        return this.recordedRow(lane, conducted, runByAttemptId, 'unknown');
       }
       const matching = conducted.filter((attempt) => {
         const run = runByAttemptId.get(attempt.id);
         return run !== undefined && branchOfRun(run) === branch;
       });
       if (matching.length > 0) {
-        return this.recordedRow(lane, latestAttempt(matching), runByAttemptId, 'proven');
+        return this.recordedRow(lane, matching, runByAttemptId, 'proven');
       }
       // Another branch is checked out: the conducted records are stale here
       // unless the runner later reports one of their own sessions running.
@@ -357,23 +378,31 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
     const unrun = candidates.filter((attempt) => !runByAttemptId.has(attempt.id));
     const row =
       unrun.length > 0
-        ? this.recordedRow(lane, latestAttempt(unrun), runByAttemptId, 'unknown')
+        ? this.recordedRow(lane, unrun, runByAttemptId, 'unknown')
         : this.unrecordedRow(lane);
     return { ...row, branchDisproved };
   }
 
+  /** The row of the latest claiming attempt; `claims` is non-empty and shares one population. */
   private recordedRow(
     lane: ListedLane,
-    attempt: AttemptRecord,
+    claims: readonly AttemptRecord[],
     runByAttemptId: ReadonlyMap<string, LaneRunRecord>,
     ownership: RelaunchRecordOwnership,
   ): InternalLaneRow {
+    const attempt = latestAttempt(claims);
     // The run of the claiming attempt itself, never of another attempt.
     const run = runByAttemptId.get(attempt.id);
     // The attempt's own runner block routes the read only when it names the
     // host that listed the path; otherwise the clone's block does, so a
     // legacy record never falls back to the local executor.
     const routing = recordedHostName(attempt) === lane.hostName && attempt.runner ? attempt.runner : lane.cloneHost;
+    // A branch-proven run claims with all its attempts here; any other claim
+    // is the latest attempt alone.
+    const sessionOwners = ownership === 'proven' ? claims : [attempt];
+    const claimSessions = new Set(
+      sessionOwners.map((claim) => claim.sessionId).filter((id): id is string => isNonBlankString(id)),
+    );
     return {
       population: run === undefined ? 'attempt-recorded' : 'conducted',
       laneId: run === undefined ? attempt.id : run.runId,
@@ -383,7 +412,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       attemptId: attempt.id,
       runnerState: 'unknown',
       ownership,
-      claimSessionId: isNonBlankString(attempt.sessionId) ? attempt.sessionId : null,
+      claimSessions,
       routing,
       branchDisproved: [],
     };
@@ -399,7 +428,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       attemptId: null,
       runnerState: 'unknown',
       ownership: 'none',
-      claimSessionId: null,
+      claimSessions: new Set<string>(),
       routing: lane.cloneHost,
       branchDisproved: [],
     };
@@ -427,34 +456,40 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
     }
     // Copy the worktree run state union, never widen it.
     row.runnerState = answer.state;
-    if (answer.state !== 'running') return;
-    const runningSession = answer.sessionId;
-    if (row.ownership === 'unknown' && row.claimSessionId !== null && runningSession === row.claimSessionId) {
+    if (answer.state === 'running') this.applyRunningSession(row, answer.sessionId);
+  }
+
+  /**
+   * The session running in the directory is the direct fact: it proves the
+   * claim whose own session it is, reclaims a conducted claim the branch
+   * disproved, and otherwise contradicts the row's claim. A contradicted
+   * claim with a recorded session is stale and the lane is unrecorded; a
+   * branch-proven claim that is contradicted is reported unknown, never
+   * dropped, because the run's branch is still checked out there.
+   */
+  private applyRunningSession(row: InternalLaneRow, runningSession: string): void {
+    if (row.claimSessions.has(runningSession)) {
       row.ownership = 'proven';
       return;
     }
-    if (row.ownership !== 'proven') {
-      // A conducted record the branch disproved, whose own session runs here:
-      // the running session is the direct fact, so that run owns the lane.
-      const reclaimed = row.branchDisproved
-        .filter(({ attempt }) => isNonBlankString(runningSession) && attempt.sessionId === runningSession)
-        .map(({ attempt }) => attempt);
-      if (reclaimed.length > 0) {
-        const attempt = latestAttempt(reclaimed);
-        const run = row.branchDisproved.find((claim) => claim.attempt.id === attempt.id)?.run;
-        if (run !== undefined) {
-          row.population = 'conducted';
-          row.laneId = run.runId;
-          row.runId = run.runId;
-          row.attemptId = attempt.id;
-          row.ownership = 'proven';
-          return;
-        }
+    const reclaimed = row.branchDisproved.filter(({ attempt }) => attempt.sessionId === runningSession);
+    if (isNonBlankString(runningSession) && reclaimed.length > 0) {
+      const attempt = latestAttempt(reclaimed.map((claim) => claim.attempt));
+      const runId = reclaimed.find((claim) => claim.attempt.id === attempt.id)?.run.runId ?? null;
+      if (runId !== null) {
+        row.population = 'conducted';
+        row.laneId = runId;
+        row.runId = runId;
+        row.attemptId = attempt.id;
+        row.ownership = 'proven';
+        return;
       }
     }
-    if (row.ownership !== 'unknown' || row.claimSessionId === null) return;
-    // Another session runs in the directory: the record is stale here, and
-    // the running lane is one no record claims.
+    if (row.ownership === 'proven') {
+      row.ownership = 'unknown';
+      return;
+    }
+    if (row.ownership !== 'unknown' || row.claimSessions.size === 0) return;
     row.population = 'unrecorded';
     row.laneId = this.unrecordedLaneId(row.worktreePath);
     row.runId = null;

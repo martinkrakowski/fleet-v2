@@ -208,26 +208,30 @@ function serializePolicy(policy: PolicySection): Record<string, unknown> {
     out.conductor = serializeConductorPolicy(policy.conductor);
   }
   if (policy.board !== undefined) {
-    const board: Record<string, unknown> = {};
-    if (policy.board.forgeStaleMinutes !== undefined) {
-      board.forgeStaleMinutes = policy.board.forgeStaleMinutes;
-    }
-    if (policy.board.declarationTtlMinutes !== undefined) {
-      board.declarationTtlMinutes = policy.board.declarationTtlMinutes;
-    }
-    if (policy.board.doneWindowDays !== undefined) {
-      board.doneWindowDays = policy.board.doneWindowDays;
-    }
-    if (policy.board.forgeSyncMinutes !== undefined) {
-      board.forgeSyncMinutes = policy.board.forgeSyncMinutes;
-    }
-    out.board = board;
+    out.board = serializeBoardPolicy(policy.board);
   }
   if (policy.telemetry !== undefined) {
     out.telemetry = serializePolicyBlock(policy.telemetry, TELEMETRY_POLICY_KEYS);
   }
   if (policy.seats !== undefined) {
     out.seats = serializePolicyBlock(policy.seats, SEATS_POLICY_KEYS);
+  }
+  return out;
+}
+
+function serializeBoardPolicy(board: NonNullable<PolicySection['board']>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (board.forgeStaleMinutes !== undefined) {
+    out.forgeStaleMinutes = board.forgeStaleMinutes;
+  }
+  if (board.declarationTtlMinutes !== undefined) {
+    out.declarationTtlMinutes = board.declarationTtlMinutes;
+  }
+  if (board.doneWindowDays !== undefined) {
+    out.doneWindowDays = board.doneWindowDays;
+  }
+  if (board.forgeSyncMinutes !== undefined) {
+    out.forgeSyncMinutes = board.forgeSyncMinutes;
   }
   return out;
 }

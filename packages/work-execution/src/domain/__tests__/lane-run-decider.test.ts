@@ -1816,6 +1816,17 @@ describe('cancel and modes (plan §3.9.1)', () => {
     assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
   });
 
+  it('GD7: an invalid stopRequestedAtIso with no live attempt in collecting enters stopped', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'collecting',
+      stopMode: 'graceful',
+      stopRequestedAtIso: 'not-a-timestamp',
+      attempt: attemptFact({ phase: 'collected', collection: null }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
+  });
+
   it('the run deadline still stops the attempt under a graceful stop', () => {
     const rec = record({});
     const facts = baseFacts({ state: 'running', stopMode: 'graceful', attempt: attemptFact({ deadlineIso: NOW }) });

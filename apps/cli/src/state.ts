@@ -13,6 +13,17 @@ import * as path from 'node:path';
 import { boundDoctorDetail, type DoctorLine } from '@fleet/onboarding';
 import {
   WORK_EXECUTION_STATE_FILES,
+  LaneRunJournalAdapter,
+  LaneRunRepositoryAdapter,
+  inspectVersionedRecordListBytes,
+  liveRunAttemptIds,
+  parseVersionedAttemptStateRecord,
+  parseVersionedJournalEntryStateRecord,
+  parseVersionedReservationStateRecord,
+  planAttemptScopedCompaction,
+  type ActionJournalEntryRecord,
+  type AttemptRecord,
+  type CapacityReservationRecord,
   type RestoreStateFileOutcome,
   type StateFileCheck,
   type StateFileDescriptor,
@@ -40,7 +51,7 @@ export const STATE_FILE_DESCRIPTORS: readonly StateFileDescriptor[] = [
   ...OPERATOR_COORDINATION_STATE_FILES,
 ];
 
-export const STATE_HELP = `Usage: fleet-v2 [--state-dir <path>] state check | state restore <file> --from <quarantine copy> [--yes]
+export const STATE_HELP = `Usage: fleet-v2 [--state-dir <path>] state check | state restore <file> --from <quarantine copy> [--yes] | state compact [--yes]
 
 Read-only check of every JSON state store under the state directory
 (--state-dir or FLEET_STATE_DIR): one line per store file (ok, missing,
@@ -55,6 +66,15 @@ state check prints; --from is a copy name or path directly inside <state
 dir>/quarantine (no symlinks); it shows both record counts, asks y/N unless
 --yes, writes under the store's lock and keeps the replaced bytes as a
 quarantine copy; it never repairs.
+
+compact removes finished records from attempts.json, journal.json and
+reservations.json: only collected or cancelled attempts that no live lane run,
+held reservation or unfinished journal entry references, with their finished
+journal entries and released reservations. It runs state check first, refuses
+(and writes nothing) when any store is unreadable, asks y/N unless --yes,
+writes under each store's lock, keeps the last five pre-compaction copies in
+<state dir>/quarantine and runs state check again. Exit codes for compact: 0
+compacted or nothing to compact; 1 refused, declined or failed; 2 usage.
 
 Exit codes: 0 every store file is readable or missing, 1 any store file is
 unreadable or holds an unsupported schemaVersion, 2 usage error (including
@@ -351,6 +371,255 @@ async function stateRestore(
   return 0;
 }
 
+/** The three attempt-scoped stores `state compact` rewrites, in apply order. */
+const COMPACT_BASENAMES = ['attempts.json', 'journal.json', 'reservations.json'] as const;
+type CompactBasename = (typeof COMPACT_BASENAMES)[number];
+
+/** A store larger than this is refused rather than read into memory. */
+const MAX_COMPACT_STORE_BYTES = 64 * 1024 * 1024;
+const MAX_COMPACT_REASON_CHARS = 200;
+
+const COMPACT_CONFIRM_QUESTION = `compact the attempt-scoped stores (${COMPACT_BASENAMES.join(', ')})? [y/N]`;
+
+function sha256Hex(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/** A refusal reason that is safe to print: no state-directory path, no free-form error text, bounded. */
+function safeCompactReason(reason: string, stateDir: string): string {
+  let text = reason;
+  if (stateDir !== '') {
+    text = text.split(stateDir).join('<state dir>');
+  }
+  text = text.replace(/\s*\(([^)]*)\)/g, (_match, inner: string) =>
+    /^[A-Z][A-Z0-9_]{1,24}$/.test(inner) ? ` (${inner})` : '',
+  );
+  text = text.replace(/\S*[\\/]\S*/g, '<path>');
+  return text.length > MAX_COMPACT_REASON_CHARS ? `${text.slice(0, MAX_COMPACT_REASON_CHARS)}...` : text;
+}
+
+function compactRefusal(io: CliIo, message: string): number {
+  io.stderr(`state compact refused: ${message}\n`);
+  io.stdout('nothing changed\n');
+  return 1;
+}
+
+function badBasenames(checks: readonly StateFileCheck[]): string {
+  return checks
+    .filter((check) => isBadStateFileResult(check.result))
+    .map((check) => check.basename)
+    .join(', ');
+}
+
+interface CompactStore<T> {
+  readonly basename: CompactBasename;
+  readonly sha256: string | null;
+  readonly records: readonly T[];
+}
+
+type CompactStoreRead<T> =
+  | { readonly ok: true; readonly store: CompactStore<T> }
+  | { readonly ok: false; readonly message: string };
+
+/** Read one store through its own parser; a symlink, a non-file, an oversized or an unreadable store is a typed refusal. */
+async function readCompactStore<T>(
+  stateDir: string,
+  basename: CompactBasename,
+  parseRecord: Parameters<typeof inspectVersionedRecordListBytes<T>>[1],
+): Promise<CompactStoreRead<T>> {
+  const target = path.join(stateDir, basename);
+  let bytes: Buffer;
+  try {
+    const stat = await fs.lstat(target);
+    if (!stat.isFile()) {
+      return { ok: false, message: `${basename} is not a regular file` };
+    }
+    if (stat.size > MAX_COMPACT_STORE_BYTES) {
+      return { ok: false, message: `${basename} is too large to compact` };
+    }
+    bytes = await fs.readFile(target);
+  } catch (error: unknown) {
+    const code = errorCodeOf(error);
+    if (code === 'ENOENT') {
+      return { ok: true, store: { basename, sha256: null, records: [] } };
+    }
+    return { ok: false, message: `${basename} could not be read (${code})` };
+  }
+  if (bytes.length > MAX_COMPACT_STORE_BYTES) {
+    return { ok: false, message: `${basename} is too large to compact` };
+  }
+  const inspection = inspectVersionedRecordListBytes(bytes, parseRecord);
+  if (inspection.status === 'unknown-version') {
+    return { ok: false, message: `${basename} has an unsupported schemaVersion` };
+  }
+  if (inspection.status !== 'ok') {
+    return { ok: false, message: `${basename} is unreadable: ${safeCompactReason(inspection.detail, stateDir)}` };
+  }
+  return { ok: true, store: { basename, sha256: sha256Hex(bytes), records: inspection.records } };
+}
+
+/** `fleet-v2 state compact [--yes]` (lane EX-3c): the operator half of the state compaction. */
+async function stateCompact(
+  argv: readonly string[],
+  io: CliIo,
+  stateDir: string,
+  options: StateCliOptions,
+): Promise<number> {
+  let yes = false;
+  for (const token of argv) {
+    if (token === '--yes') {
+      yes = true;
+      continue;
+    }
+    io.stderr(`Unknown state compact option: ${token}\n${STATE_HELP}\n`);
+    return 2;
+  }
+
+  // 2. Check before: any unreadable store refuses, nothing is written.
+  let before: StateFileCheck[];
+  try {
+    before = await checkStateDirectory(stateDir);
+  } catch {
+    return compactRefusal(io, 'the state check could not run');
+  }
+  const badBefore = badBasenames(before);
+  if (badBefore !== '') {
+    return compactRefusal(io, `${badBefore} is not readable`);
+  }
+
+  // 3. Read the three stores through their own parsers.
+  const attemptsRead = await readCompactStore<AttemptRecord>(stateDir, 'attempts.json', parseVersionedAttemptStateRecord);
+  if (!attemptsRead.ok) {
+    return compactRefusal(io, attemptsRead.message);
+  }
+  const journalRead = await readCompactStore<ActionJournalEntryRecord>(
+    stateDir,
+    'journal.json',
+    parseVersionedJournalEntryStateRecord,
+  );
+  if (!journalRead.ok) {
+    return compactRefusal(io, journalRead.message);
+  }
+  const reservationsRead = await readCompactStore<CapacityReservationRecord>(
+    stateDir,
+    'reservations.json',
+    parseVersionedReservationStateRecord,
+  );
+  if (!reservationsRead.ok) {
+    return compactRefusal(io, reservationsRead.message);
+  }
+  const stores = [attemptsRead.store, journalRead.store, reservationsRead.store];
+
+  // 4 + 5. Live-run protection, then the plan. Any failure here is a refusal: unknown stays protected.
+  let removable: ReadonlySet<string>[];
+  try {
+    const runs = await new LaneRunRepositoryAdapter({ stateDir, readOnly: true }).list();
+    const journals = await new LaneRunJournalAdapter({ stateDir, readOnly: true }).listForRuns(
+      runs.map((run) => run.runId),
+    );
+    const plan = planAttemptScopedCompaction({
+      attempts: attemptsRead.store.records,
+      reservations: reservationsRead.store.records,
+      journalEntries: journalRead.store.records,
+      liveRunAttemptIds: liveRunAttemptIds(runs, journals),
+    });
+    removable = [
+      new Set(plan.removableAttemptIds),
+      new Set(plan.removableJournalEntryIds),
+      new Set(plan.removableReservationIds),
+    ];
+  } catch {
+    return compactRefusal(io, 'the lane runs could not be read');
+  }
+
+  // 6. Keep lists: every record id minus the plan's removable ids.
+  const keepLists = stores.map((store, index) =>
+    (store.records as readonly { readonly id: string }[])
+      .map((record) => record.id)
+      .filter((id) => !removable[index]!.has(id)),
+  );
+
+  // 7. Nothing to do: no confirmation, no writes.
+  if (stores.every((store, index) => keepLists[index]!.length === store.records.length)) {
+    io.stdout('state compact: nothing to compact\n');
+    return 0;
+  }
+
+  // 8. Confirm (destructive).
+  if (!yes) {
+    let confirmed = false;
+    try {
+      const confirm = options.confirm ?? confirmFromStdin(io);
+      confirmed = await confirm(COMPACT_CONFIRM_QUESTION);
+    } catch {
+      confirmed = false;
+    }
+    if (!confirmed) {
+      io.stdout('nothing changed\n');
+      return 1;
+    }
+  }
+
+  // 9. Apply store by store; the first refusal stops the loop, and stores already compacted stay compacted.
+  let compactedCount = 0;
+  let failed = false;
+  for (const [index, store] of stores.entries()) {
+    if (store.sha256 === null) {
+      io.stdout(`missing ${store.basename}: nothing to compact\n`);
+      continue;
+    }
+    const descriptor = STATE_FILE_DESCRIPTORS.find((candidate) => candidate.basename === store.basename);
+    if (descriptor?.compact === undefined) {
+      io.stderr(`state compact refused: ${store.basename}: the store cannot be compacted\n`);
+      failed = true;
+      break;
+    }
+    let outcome: Awaited<ReturnType<NonNullable<StateFileDescriptor['compact']>>>;
+    try {
+      outcome = await descriptor.compact({ stateDir, keepIds: keepLists[index]!, expectedCurrentSha256: store.sha256 });
+    } catch {
+      io.stderr(`state compact refused: ${store.basename}: the compaction failed\n`);
+      failed = true;
+      break;
+    }
+    if (outcome.status === 'refused') {
+      io.stderr(`state compact refused: ${store.basename}: ${safeCompactReason(outcome.reason, stateDir)}\n`);
+      failed = true;
+      break;
+    }
+    if (outcome.status === 'unchanged') {
+      io.stdout(`unchanged ${store.basename}: ${outcome.recordCount} ${recordWord(outcome.recordCount)}\n`);
+      continue;
+    }
+    compactedCount += 1;
+    io.stdout(`compacted ${store.basename}: ${outcome.beforeCount} -> ${outcome.afterCount} records\n`);
+    if (outcome.quarantinePath !== null) {
+      io.stdout(`pre-compaction bytes kept at quarantine/${path.basename(outcome.quarantinePath)}\n`);
+    }
+  }
+
+  // 10. Summary.
+  io.stdout(`state compact: ${compactedCount} of ${COMPACT_BASENAMES.length} stores compacted\n`);
+
+  // 11. Check after.
+  let after: StateFileCheck[];
+  try {
+    after = await checkStateDirectory(stateDir);
+  } catch {
+    io.stderr('state check after compaction failed: the state check could not run\n');
+    return 1;
+  }
+  const badAfter = badBasenames(after);
+  if (badAfter !== '') {
+    io.stderr(`state check after compaction failed: ${badAfter}\n`);
+    return 1;
+  }
+  io.stdout(`state check after compaction: all ${after.length} store files readable or missing\n`);
+
+  // 12. Exit code.
+  return failed ? 1 : 0;
+}
+
 /** The doctor's state line: PASS, FAIL naming the bad files, or UNKNOWN. */
 export async function stateDoctorLine(stateDir: string): Promise<DoctorLine> {
   const base = { scope: 'state' as const, subject: stateDir, check: 'state-files' };
@@ -387,7 +656,7 @@ export async function stateCommand(
     io.stdout(`${STATE_HELP}\n`);
     return 0;
   }
-  if (subcommand !== 'check' && subcommand !== 'restore') {
+  if (subcommand !== 'check' && subcommand !== 'restore' && subcommand !== 'compact') {
     io.stderr(`Unknown state subcommand: ${subcommand === '' ? '(none)' : subcommand}\n${STATE_HELP}\n`);
     return 2;
   }
@@ -397,6 +666,9 @@ export async function stateCommand(
   }
   if (subcommand === 'check') {
     return stateCheck(argv.slice(1), io, options.stateDir);
+  }
+  if (subcommand === 'compact') {
+    return stateCompact(argv.slice(1), io, options.stateDir, options);
   }
   return stateRestore(argv.slice(1), io, options.stateDir, options);
 }

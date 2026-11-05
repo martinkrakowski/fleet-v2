@@ -657,7 +657,9 @@ flag); run 'fleet-v2 init --help' for its flags.
 state check reads every JSON state store under the state directory and reports
 ok, missing, unreadable or invalid record per file; it never writes. state
 restore replaces a missing or unreadable store from a quarantine copy after
-confirmation; it is CLI only.
+confirmation; it is CLI only. state compact removes finished attempt, journal
+and reservation records no live run references, keeps the last five
+pre-compaction copies in quarantine and checks the stores before and after.
 
 A seat plan lists ordered seats per role (first-pass, fix, review). brief
 prepare --seatPlanFromInstallation builds it from the installation's chains;
@@ -691,7 +693,7 @@ Commands:
   policy auto-merge [status|on|off] [--allow-high-risk true|false] [--on-blocked ask-owner|hold] [--yes]
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
-  state check|restore
+  state check|restore|compact
   conductor status|halt|stop|resume|start|run
   telemetry export|status
   killall [--lift]

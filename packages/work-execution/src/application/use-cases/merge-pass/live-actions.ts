@@ -9,6 +9,7 @@
  */
 
 import type { ForgeRefusalKind } from '../../../domain/coordination-keys.js';
+import { FORGE_REFUSAL_KINDS } from '../../../domain/coordination-keys.js';
 import type {
   LaneRunJournalEntryRecord,
   LaneRunJournalOutcome,
@@ -24,8 +25,12 @@ import {
   readMergeQueueEntryRecord,
 } from '../../../domain/merge-queue-records.js';
 import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
-import type { MergeForgeActionPort, MergeForgeActionRequest } from '../../ports/out/MergeForgeActionPort.out-port.js';
-import type { ForgeMergeReadPort } from '../../ports/out/ForgeMergeReadPort.out-port.js';
+import type {
+  MergeForgeActionPort,
+  MergeForgeActionRequest,
+  MergeForgeActionResult,
+} from '../../ports/out/MergeForgeActionPort.out-port.js';
+import type { ForgeMergeReadPort, ReadForgeMergeResult } from '../../ports/out/ForgeMergeReadPort.out-port.js';
 
 export type MergeLiveActionKind = 'merge-pr' | 'update-branch' | 'post-status';
 
@@ -40,6 +45,9 @@ const SHADOW_REASON_BY_ACTION: Record<MergeLiveActionKind, MergeShadowReason> = 
   'update-branch': 'would-update-branch',
   'post-status': 'would-post-status',
 };
+
+/** The longest grant id or branch name accepted (a ref name is at most 255 bytes on the forge). */
+const MAX_TOKEN_LENGTH = 255;
 
 /** The merge-pass budget floor: a call with under 2 s left is not started (plan §3.1). */
 const MIN_BUDGET_REMAINING_MS = 2000;
@@ -100,19 +108,192 @@ export type MergeLiveActionOutcome =
   | { readonly outcome: 'reconciled'; readonly journalKey: string; readonly reconcile: 'merged' | 'absent' | 'head-moved' | 'closed' | 'status-present' }
   | { readonly outcome: 'skipped'; readonly journalKey: string; readonly reasonCode: 'already-settled' | 'budget-exhausted' }
   | { readonly outcome: 'invalid-request'; readonly reasonCode: string }
-  | { readonly outcome: 'journal-refused'; readonly journalKey: string; readonly refusal: LaneRunJournalRefusal };
+  | { readonly outcome: 'journal-refused'; readonly journalKey: string; readonly refusal: LaneRunJournalRefusal }
+  /**
+   * A port threw or answered outside its contract (the journal could not be
+   * read or written, or the id minter failed). Nothing was acted on after the
+   * failure: an unreadable journal or an unminted id stops before any forge
+   * call; a result append that threw after the action leaves the intent for
+   * the next call's reconcile.
+   */
+  | { readonly outcome: 'unavailable'; readonly journalKey: string; readonly reasonCode: 'journal-unavailable' | 'id-unavailable' };
+
+/** The request after validation: a snapshot, so a later read never re-runs a caller's getter. */
+interface ValidatedRequest {
+  readonly entry: MergeQueueEntryRecord;
+  readonly action: MergeLiveActionKind;
+  readonly execution: 'live' | 'shadow';
+  readonly shadowReason: MergeShadowReason | null;
+  readonly expectedHeadOid: string;
+  readonly branchName: string;
+  readonly grantId: string;
+  readonly status: MergeLivePostStatus | null;
+  readonly nowIso: string;
+  readonly deadlineIso: string;
+  readonly nowMs: number;
+  readonly deadlineMs: number;
+  readonly key: string;
+}
+
+type Validation =
+  | { readonly ok: true; readonly request: ValidatedRequest }
+  | { readonly ok: false; readonly reasonCode: string };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isBoundedToken(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= MAX_TOKEN_LENGTH &&
+    !hasControlCharacter(value)
+  );
+}
+
+function isLiveActionKind(value: unknown): value is MergeLiveActionKind {
+  return typeof value === 'string' && (MERGE_LIVE_ACTION_KINDS as readonly string[]).includes(value);
+}
+
+function readStatus(action: MergeLiveActionKind, input: unknown): MergeLivePostStatus | null | 'invalid' {
+  if (action !== 'post-status') {
+    return input === null ? null : 'invalid';
+  }
+  if (!isRecord(input)) {
+    return 'invalid';
+  }
+  const { context, state, description } = input;
+  if (context !== 'premerge' || (state !== 'success' && state !== 'failure')) {
+    return 'invalid';
+  }
+  if (typeof description !== 'string' || description.length === 0) {
+    return 'invalid';
+  }
+  return { context, state, description };
+}
+
+function readRetry(
+  input: unknown,
+): { readonly ordinal: unknown; readonly proof: MergeKeyRetryProof | null } | null | 'invalid' {
+  if (input === null) {
+    return null;
+  }
+  if (!isRecord(input) || input['ordinal'] === undefined || input['ordinal'] === null) {
+    return 'invalid';
+  }
+  // The ordinal's range and the proof's shape are buildMergeKey's to refuse.
+  return { ordinal: input['ordinal'], proof: (input['proof'] ?? null) as MergeKeyRetryProof | null };
+}
+
+/** Step 1 and step 2: validate the request and build its key. Nothing is written; no port is called. */
+function validateRequest(input: unknown): Validation {
+  if (!isRecord(input)) {
+    return { ok: false, reasonCode: 'invalid-request' };
+  }
+  const entryRead = readMergeQueueEntryRecord(input['entry']);
+  if (!entryRead.ok) {
+    return { ok: false, reasonCode: 'invalid-entry' };
+  }
+  const entry = entryRead.record;
+  if (!isMergeQueueEntryLive(entry)) {
+    return { ok: false, reasonCode: 'invalid-entry' };
+  }
+  const action = input['action'];
+  if (!isLiveActionKind(action)) {
+    return { ok: false, reasonCode: 'invalid-action' };
+  }
+  const execution = input['execution'];
+  const shadowReason = input['shadowReason'];
+  let validShadowReason: MergeShadowReason | null;
+  if (execution === 'shadow') {
+    if (shadowReason !== SHADOW_REASON_BY_ACTION[action]) {
+      return { ok: false, reasonCode: 'invalid-execution' };
+    }
+    validShadowReason = SHADOW_REASON_BY_ACTION[action];
+  } else if (execution === 'live' && shadowReason === null) {
+    validShadowReason = null;
+  } else {
+    return { ok: false, reasonCode: 'invalid-execution' };
+  }
+  const expectedHeadOid = input['expectedHeadOid'];
+  if (!isMergeHex40(expectedHeadOid) || expectedHeadOid !== entry.headOid) {
+    return { ok: false, reasonCode: 'invalid-head' };
+  }
+  if (action === 'merge-pr' && entry.verifiedHeadOid !== entry.headOid) {
+    return { ok: false, reasonCode: 'invalid-head' };
+  }
+  const branchName = input['branchName'];
+  if (!isBoundedToken(branchName)) {
+    return { ok: false, reasonCode: 'invalid-branch' };
+  }
+  const grantId = input['grantId'];
+  if (!isBoundedToken(grantId)) {
+    return { ok: false, reasonCode: 'invalid-grant' };
+  }
+  const status = readStatus(action, input['status']);
+  if (status === 'invalid') {
+    return { ok: false, reasonCode: 'invalid-status' };
+  }
+  const nowIso = input['nowIso'];
+  const deadlineIso = input['deadlineIso'];
+  if (typeof nowIso !== 'string' || typeof deadlineIso !== 'string') {
+    return { ok: false, reasonCode: 'invalid-deadline' };
+  }
+  const nowMs = Date.parse(nowIso);
+  const deadlineMs = Date.parse(deadlineIso);
+  if (!Number.isFinite(nowMs) || !Number.isFinite(deadlineMs) || deadlineMs <= nowMs) {
+    return { ok: false, reasonCode: 'invalid-deadline' };
+  }
+
+  // Step 2 — build the key (never by hand). A malformed retry is refused, never read as the base key.
+  const retry = readRetry(input['retry']);
+  const head12 = head12Of(expectedHeadOid);
+  if (retry === 'invalid' || head12 === null) {
+    return { ok: false, reasonCode: 'invalid-key' };
+  }
+  const builtKey = buildMergeKey({
+    repoDigest: entry.repoDigest,
+    pullRequest: entry.pullRequest,
+    head12,
+    action,
+    attemptOrdinal: null,
+    retry: (retry?.ordinal ?? null) as number | null,
+    retryProof: retry?.proof ?? null,
+  });
+  if (!builtKey.ok) {
+    return { ok: false, reasonCode: 'invalid-key' };
+  }
+  return {
+    ok: true,
+    request: {
+      entry,
+      action,
+      execution,
+      shadowReason: validShadowReason,
+      expectedHeadOid,
+      branchName,
+      grantId,
+      status,
+      nowIso,
+      deadlineIso,
+      nowMs,
+      deadlineMs,
+      key: builtKey.key,
+    },
+  };
+}
 
 function intentEntry(
-  deps: MergeLiveActionDependencies,
-  request: MergeLiveActionRequest,
-  key: string,
+  request: ValidatedRequest,
+  entryId: string,
   mintedId: string | null,
 ): LaneRunJournalEntryRecord {
   return {
     version: LANE_RUN_JOURNAL_ENTRY_VERSION,
-    entryId: deps.mintId(),
+    entryId,
     kind: 'intent',
-    key,
+    key: request.key,
     runId: request.entry.runId,
     recordedAtIso: request.nowIso,
     mode: null,
@@ -127,18 +308,17 @@ function intentEntry(
 }
 
 function resultEntry(
-  deps: MergeLiveActionDependencies,
-  request: MergeLiveActionRequest,
-  key: string,
+  request: ValidatedRequest,
+  entryId: string,
   outcome: LaneRunJournalOutcome,
   reasonCode: string | null,
   grantId: string | null,
 ): LaneRunJournalEntryRecord {
   return {
     version: LANE_RUN_JOURNAL_ENTRY_VERSION,
-    entryId: deps.mintId(),
+    entryId,
     kind: 'result',
-    key,
+    key: request.key,
     runId: request.entry.runId,
     recordedAtIso: request.nowIso,
     mode: null,
@@ -152,14 +332,170 @@ function resultEntry(
   };
 }
 
-async function appendEntried(
+/** Mints `count` ids before anything is written; null when the minter throws or answers a non-string. */
+function mintIds(deps: MergeLiveActionDependencies, count: number): readonly string[] | null {
+  const ids: string[] = [];
+  try {
+    for (let index = 0; index < count; index += 1) {
+      const id: unknown = deps.mintId();
+      if (typeof id !== 'string' || id.length === 0) {
+        return null;
+      }
+      ids.push(id);
+    }
+  } catch {
+    return null;
+  }
+  return ids;
+}
+
+type AppendOutcome =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly refusal: LaneRunJournalRefusal }
+  | { readonly ok: false; readonly refusal: null };
+
+/** One journal append; a throw or an off-contract answer is `refusal: null` (journal unavailable). */
+async function appendEntry(
   deps: MergeLiveActionDependencies,
   entry: LaneRunJournalEntryRecord,
-): Promise<{ readonly ok: true } | { readonly ok: false; readonly refusal: LaneRunJournalRefusal }> {
-  const appended = await deps.journal.append(entry);
-  return appended.outcome === 'appended'
-    ? { ok: true }
-    : { ok: false, refusal: appended.reason };
+): Promise<AppendOutcome> {
+  try {
+    const appended: unknown = await deps.journal.append(entry);
+    if (isRecord(appended) && appended['outcome'] === 'appended') {
+      return { ok: true };
+    }
+    if (isRecord(appended) && appended['outcome'] === 'refused' && typeof appended['reason'] === 'string') {
+      return { ok: false, refusal: appended['reason'] as LaneRunJournalRefusal };
+    }
+    return { ok: false, refusal: null };
+  } catch {
+    return { ok: false, refusal: null };
+  }
+}
+
+function appendFailure(key: string, appended: AppendOutcome): MergeLiveActionOutcome | null {
+  if (appended.ok) {
+    return null;
+  }
+  return appended.refusal === null
+    ? { outcome: 'unavailable', journalKey: key, reasonCode: 'journal-unavailable' }
+    : { outcome: 'journal-refused', journalKey: key, refusal: appended.refusal };
+}
+
+/** The key's journal entries; null when the journal throws or answers outside its contract. */
+async function listKey(
+  deps: MergeLiveActionDependencies,
+  key: string,
+): Promise<readonly LaneRunJournalEntryRecord[] | null> {
+  try {
+    const entries: unknown = await deps.journal.listForKey(key);
+    if (!Array.isArray(entries) || !entries.every((item: unknown): boolean => isRecord(item))) {
+      return null;
+    }
+    return entries as readonly LaneRunJournalEntryRecord[];
+  } catch {
+    return null;
+  }
+}
+
+/** The reconcile read; a throw reads as `unavailable` (the outcome stays unknown, never guessed). */
+async function readForge(
+  deps: MergeLiveActionDependencies,
+  request: ValidatedRequest,
+): Promise<ReadForgeMergeResult> {
+  try {
+    return await deps.forgeRead.readForgeMerge({
+      repository: request.entry.repository,
+      pullRequestNumber: request.entry.pullRequest,
+      headSha: request.expectedHeadOid,
+      requiredContexts: ['premerge'],
+      nowIso: request.nowIso,
+      deadlineIso: request.deadlineIso,
+    });
+  } catch {
+    return { outcome: 'unavailable', code: 'unknown', reason: 'port threw' };
+  }
+}
+
+/** The one forge action; a throw or an off-contract answer is ambiguous (reconciled later, never retried blind). */
+async function performForgeAction(
+  deps: MergeLiveActionDependencies,
+  forgeRequest: MergeForgeActionRequest,
+): Promise<MergeForgeActionResult> {
+  try {
+    const result: unknown = await deps.forgeAction.performMergeForgeAction(forgeRequest);
+    if (isRecord(result) && result['outcome'] === 'executed' && isMergeHex40(result['headSha'])) {
+      return { outcome: 'executed', headSha: result['headSha'] };
+    }
+    if (isRecord(result) && result['outcome'] === 'refused') {
+      const kind = result['refusalKind'];
+      const refusalKind: ForgeRefusalKind = (FORGE_REFUSAL_KINDS as readonly unknown[]).includes(kind)
+        ? (kind as ForgeRefusalKind)
+        : 'other';
+      const reason = typeof result['reason'] === 'string' ? result['reason'] : '';
+      return { outcome: 'refused', reason, refusalKind };
+    }
+    return { outcome: 'ambiguous', reason: 'off-contract answer' };
+  } catch {
+    return { outcome: 'ambiguous', reason: 'port threw' };
+  }
+}
+
+function forgeRequestOf(request: ValidatedRequest, actionId: string): MergeForgeActionRequest {
+  const base = {
+    actionId,
+    repository: request.entry.repository,
+    pullRequestNumber: request.entry.pullRequest,
+    branchName: request.branchName,
+    expectedHeadSha: request.expectedHeadOid,
+    deadlineIso: request.deadlineIso,
+  };
+  if (request.action === 'post-status' && request.status !== null) {
+    return { ...base, kind: 'post-status', status: request.status };
+  }
+  return request.action === 'merge-pr'
+    ? { ...base, kind: 'merge-pr' }
+    : { ...base, kind: 'update-branch' };
+}
+
+function reconcileVerdict(
+  request: ValidatedRequest,
+  read: ReadForgeMergeResult,
+): { readonly journal: LaneRunJournalOutcome; readonly reasonCode: string; readonly returned: MergeLiveActionOutcome } {
+  const key = request.key;
+  const reconciled = (
+    journal: LaneRunJournalOutcome,
+    reconcile: 'merged' | 'absent' | 'head-moved' | 'closed' | 'status-present',
+  ) => ({ journal, reasonCode: reconcile, returned: { outcome: 'reconciled', journalKey: key, reconcile } as const });
+  if (read.outcome === 'not-found') {
+    return reconciled('not-started', 'absent');
+  }
+  if (read.outcome !== 'ok') {
+    return {
+      journal: 'ambiguous',
+      reasonCode: 'reconcile-unknown',
+      returned: { outcome: 'ambiguous', journalKey: key, reasonCode: 'reconcile-unknown' },
+    };
+  }
+  if (read.prState === 'merged') {
+    return reconciled('reconciled', 'merged');
+  }
+  if (read.prState === 'closed') {
+    return reconciled('reconciled', 'closed');
+  }
+  if (read.liveHeadSha !== request.expectedHeadOid) {
+    return reconciled('overtaken', 'head-moved');
+  }
+  if (request.action === 'post-status') {
+    const contexts: readonly unknown[] = Array.isArray(read.contexts) ? read.contexts : [];
+    const present = contexts.some(
+      (context) => isRecord(context) && context['name'] === 'premerge' && context['state'] !== 'missing',
+    );
+    if (present) {
+      return reconciled('reconciled', 'status-present');
+    }
+  }
+  return reconciled('not-started', 'absent');
 }
 
 /**
@@ -168,137 +504,65 @@ async function appendEntried(
  */
 async function reconcile(
   deps: MergeLiveActionDependencies,
-  request: MergeLiveActionRequest,
-  entry: MergeQueueEntryRecord,
-  key: string,
+  request: ValidatedRequest,
 ): Promise<MergeLiveActionOutcome> {
-  const read = await deps.forgeRead.readForgeMerge({
-    repository: entry.repository,
-    pullRequestNumber: entry.pullRequest,
-    headSha: request.expectedHeadOid,
-    requiredContexts: ['premerge'],
-    nowIso: request.nowIso,
-    deadlineIso: request.deadlineIso,
-  });
-
-  let journalOutcome: LaneRunJournalOutcome;
-  let reasonCode: string;
-  let returned: MergeLiveActionOutcome;
-
-  if (read.outcome === 'ok' && read.prState === 'merged') {
-    journalOutcome = 'reconciled';
-    reasonCode = 'merged';
-    returned = { outcome: 'reconciled', journalKey: key, reconcile: 'merged' };
-  } else if (read.outcome === 'ok' && read.prState === 'closed') {
-    journalOutcome = 'reconciled';
-    reasonCode = 'closed';
-    returned = { outcome: 'reconciled', journalKey: key, reconcile: 'closed' };
-  } else if (read.outcome === 'ok' && read.liveHeadSha !== request.expectedHeadOid) {
-    journalOutcome = 'overtaken';
-    reasonCode = 'head-moved';
-    returned = { outcome: 'reconciled', journalKey: key, reconcile: 'head-moved' };
-  } else if (read.outcome === 'ok' && request.action === 'post-status') {
-    const premerge = read.contexts.find((context) => context.name === 'premerge');
-    if (premerge !== undefined && premerge.state !== 'missing') {
-      journalOutcome = 'reconciled';
-      reasonCode = 'status-present';
-      returned = { outcome: 'reconciled', journalKey: key, reconcile: 'status-present' };
-    } else {
-      journalOutcome = 'not-started';
-      reasonCode = 'absent';
-      returned = { outcome: 'reconciled', journalKey: key, reconcile: 'absent' };
-    }
-  } else if (read.outcome === 'ok') {
-    journalOutcome = 'not-started';
-    reasonCode = 'absent';
-    returned = { outcome: 'reconciled', journalKey: key, reconcile: 'absent' };
-  } else if (read.outcome === 'not-found') {
-    journalOutcome = 'not-started';
-    reasonCode = 'absent';
-    returned = { outcome: 'reconciled', journalKey: key, reconcile: 'absent' };
-  } else {
-    journalOutcome = 'ambiguous';
-    reasonCode = 'reconcile-unknown';
-    returned = { outcome: 'ambiguous', journalKey: key, reasonCode: 'reconcile-unknown' };
+  const ids = mintIds(deps, 1);
+  if (ids === null) {
+    return { outcome: 'unavailable', journalKey: request.key, reasonCode: 'id-unavailable' };
   }
+  const read = await readForge(deps, request);
+  const verdict = reconcileVerdict(request, read);
+  const appended = await appendEntry(deps, resultEntry(request, ids[0] ?? '', verdict.journal, verdict.reasonCode, null));
+  return appendFailure(request.key, appended) ?? verdict.returned;
+}
 
-  const appended = await appendEntried(deps, resultEntry(deps, request, key, journalOutcome, reasonCode, null));
-  if (!appended.ok) {
-    return { outcome: 'journal-refused', journalKey: key, refusal: appended.refusal };
+/** Step 6, shadow: journal the intent and a dry-run result; the forge is not called. */
+async function actShadow(
+  deps: MergeLiveActionDependencies,
+  request: ValidatedRequest,
+  shadowReason: MergeShadowReason,
+): Promise<MergeLiveActionOutcome> {
+  const ids = mintIds(deps, 2);
+  if (ids === null) {
+    return { outcome: 'unavailable', journalKey: request.key, reasonCode: 'id-unavailable' };
   }
-  return returned;
+  const intentFailure = appendFailure(request.key, await appendEntry(deps, intentEntry(request, ids[0] ?? '', null)));
+  if (intentFailure !== null) {
+    return intentFailure;
+  }
+  const resultFailure = appendFailure(
+    request.key,
+    await appendEntry(deps, resultEntry(request, ids[1] ?? '', 'dry-run', shadowReason, null)),
+  );
+  return resultFailure ?? { outcome: 'dry-run', journalKey: request.key, shadowReason };
 }
 
 /**
- * Step 6 — act (at most one forge call per invocation). Shadow journals a
- * dry-run and never calls the forge; live journals the intent before the
- * action and reconciles any later crash instead of acting twice.
+ * Step 6, live: at most one forge call. Every id is minted before the intent,
+ * the intent is journalled before the action, and a later crash is reconciled
+ * instead of acting twice.
  */
-async function act(
+async function actLive(
   deps: MergeLiveActionDependencies,
-  request: MergeLiveActionRequest,
-  entry: MergeQueueEntryRecord,
-  key: string,
+  request: ValidatedRequest,
 ): Promise<MergeLiveActionOutcome> {
-  if (request.execution === 'shadow') {
-    const shadowReason = request.shadowReason;
-    if (shadowReason === null) {
-      return { outcome: 'invalid-request', reasonCode: 'invalid-execution' };
-    }
-    const intentAppended = await appendEntried(deps, intentEntry(deps, request, key, null));
-    if (!intentAppended.ok) {
-      return { outcome: 'journal-refused', journalKey: key, refusal: intentAppended.refusal };
-    }
-    const resultAppended = await appendEntried(
-      deps,
-      resultEntry(deps, request, key, 'dry-run', shadowReason, null),
-    );
-    if (!resultAppended.ok) {
-      return { outcome: 'journal-refused', journalKey: key, refusal: resultAppended.refusal };
-    }
-    return { outcome: 'dry-run', journalKey: key, shadowReason };
+  const key = request.key;
+  const ids = mintIds(deps, 3);
+  if (ids === null) {
+    return { outcome: 'unavailable', journalKey: key, reasonCode: 'id-unavailable' };
+  }
+  const actionId = ids[0] ?? '';
+  const forgeRequest = forgeRequestOf(request, actionId);
+  const intentFailure = appendFailure(key, await appendEntry(deps, intentEntry(request, ids[1] ?? '', actionId)));
+  if (intentFailure !== null) {
+    return intentFailure;
   }
 
-  const actionId = deps.mintId();
-  const intentAppended = await appendEntried(deps, intentEntry(deps, request, key, actionId));
-  if (!intentAppended.ok) {
-    return { outcome: 'journal-refused', journalKey: key, refusal: intentAppended.refusal };
-  }
-
-  let forgeRequest: MergeForgeActionRequest;
-  if (request.action === 'post-status') {
-    const status = request.status;
-    if (status === null) {
-      return { outcome: 'invalid-request', reasonCode: 'invalid-status' };
-    }
-    forgeRequest = {
-      actionId,
-      repository: entry.repository,
-      pullRequestNumber: entry.pullRequest,
-      branchName: request.branchName,
-      expectedHeadSha: request.expectedHeadOid,
-      deadlineIso: request.deadlineIso,
-      kind: 'post-status',
-      status,
-    };
-  } else {
-    forgeRequest = {
-      actionId,
-      repository: entry.repository,
-      pullRequestNumber: entry.pullRequest,
-      branchName: request.branchName,
-      expectedHeadSha: request.expectedHeadOid,
-      deadlineIso: request.deadlineIso,
-      kind: request.action,
-    };
-  }
-
-  const forgeResult = await deps.forgeAction.performMergeForgeAction(forgeRequest);
+  const forgeResult = await performForgeAction(deps, forgeRequest);
 
   let journalOutcome: LaneRunJournalOutcome;
   let reasonCode: string | null;
   let returned: MergeLiveActionOutcome;
-
   if (forgeResult.outcome === 'executed') {
     journalOutcome = 'completed';
     reasonCode = null;
@@ -310,126 +574,57 @@ async function act(
   } else if (forgeResult.outcome === 'refused') {
     journalOutcome = 'refused';
     reasonCode = forgeResult.refusalKind;
-    returned = {
-      outcome: 'refused',
-      journalKey: key,
-      refusalKind: forgeResult.refusalKind,
-      reasonCode: forgeResult.refusalKind,
-    };
+    returned = { outcome: 'refused', journalKey: key, refusalKind: forgeResult.refusalKind, reasonCode };
   } else {
     journalOutcome = 'ambiguous';
     reasonCode = 'forge-ambiguous';
     returned = { outcome: 'ambiguous', journalKey: key, reasonCode: 'forge-ambiguous' };
   }
 
-  const resultAppended = await appendEntried(
-    deps,
-    resultEntry(deps, request, key, journalOutcome, reasonCode, request.grantId),
+  // A refused or failed result append leaves the intent with no final result: the next call reconciles it.
+  const resultFailure = appendFailure(
+    key,
+    await appendEntry(deps, resultEntry(request, ids[2] ?? '', journalOutcome, reasonCode, request.grantId)),
   );
-  if (!resultAppended.ok) {
-    return { outcome: 'journal-refused', journalKey: key, refusal: resultAppended.refusal };
-  }
-  return returned;
+  return resultFailure ?? returned;
 }
 
+/**
+ * Performs one keyed merge-pass action for one decided entry. Never throws:
+ * malformed input is `invalid-request`, a failing port is a typed outcome.
+ */
 export async function performMergeLiveAction(
   deps: MergeLiveActionDependencies,
   request: MergeLiveActionRequest,
 ): Promise<MergeLiveActionOutcome> {
-  // Step 1 — validate; nothing is written and the forge is not called.
-  const entryRead = readMergeQueueEntryRecord(request.entry);
-  if (!entryRead.ok) {
-    return { outcome: 'invalid-request', reasonCode: 'invalid-entry' };
+  let validation: Validation;
+  try {
+    validation = validateRequest(request);
+  } catch {
+    // A hostile getter or proxy on the request: refused, never thrown on.
+    return { outcome: 'invalid-request', reasonCode: 'invalid-request' };
   }
-  const entry = entryRead.record;
-  if (!isMergeQueueEntryLive(entry)) {
-    return { outcome: 'invalid-request', reasonCode: 'invalid-entry' };
+  if (!validation.ok) {
+    return { outcome: 'invalid-request', reasonCode: validation.reasonCode };
   }
-  if (!MERGE_LIVE_ACTION_KINDS.includes(request.action)) {
-    return { outcome: 'invalid-request', reasonCode: 'invalid-action' };
-  }
-  if (request.execution === 'shadow') {
-    if (request.shadowReason !== SHADOW_REASON_BY_ACTION[request.action]) {
-      return { outcome: 'invalid-request', reasonCode: 'invalid-execution' };
-    }
-  } else if (request.shadowReason !== null) {
-    return { outcome: 'invalid-request', reasonCode: 'invalid-execution' };
-  }
-  if (!isMergeHex40(request.expectedHeadOid) || request.expectedHeadOid !== entry.headOid) {
-    return { outcome: 'invalid-request', reasonCode: 'invalid-head' };
-  }
-  if (request.action === 'merge-pr' && entry.verifiedHeadOid !== entry.headOid) {
-    return { outcome: 'invalid-request', reasonCode: 'invalid-head' };
-  }
-  if (
-    typeof request.branchName !== 'string' ||
-    request.branchName.length === 0 ||
-    request.branchName.length > 255 ||
-    hasControlCharacter(request.branchName)
-  ) {
-    return { outcome: 'invalid-request', reasonCode: 'invalid-branch' };
-  }
-  if (typeof request.grantId !== 'string' || request.grantId.length === 0) {
-    return { outcome: 'invalid-request', reasonCode: 'invalid-grant' };
-  }
-  if (request.action === 'post-status') {
-    const status = request.status;
-    if (status === null || status.context !== 'premerge' || status.description.length === 0) {
-      return { outcome: 'invalid-request', reasonCode: 'invalid-status' };
-    }
-    if (status.state !== 'success' && status.state !== 'failure') {
-      return { outcome: 'invalid-request', reasonCode: 'invalid-status' };
-    }
-  } else if (request.status !== null) {
-    return { outcome: 'invalid-request', reasonCode: 'invalid-status' };
-  }
-  const nowMs = Date.parse(request.nowIso);
-  const deadlineMs = Date.parse(request.deadlineIso);
-  if (Number.isNaN(nowMs) || Number.isNaN(deadlineMs) || deadlineMs <= nowMs) {
-    return { outcome: 'invalid-request', reasonCode: 'invalid-deadline' };
-  }
-
-  // Step 2 — build the key (never by hand).
-  const head12 = head12Of(request.expectedHeadOid);
-  if (head12 === null) {
-    return { outcome: 'invalid-request', reasonCode: 'invalid-key' };
-  }
-  const builtKey = buildMergeKey({
-    repoDigest: entry.repoDigest,
-    pullRequest: entry.pullRequest,
-    head12,
-    action: request.action,
-    attemptOrdinal: null,
-    retry: request.retry?.ordinal ?? null,
-    retryProof: request.retry?.proof ?? null,
-  });
-  if (!builtKey.ok) {
-    return { outcome: 'invalid-request', reasonCode: 'invalid-key' };
-  }
-  const key = builtKey.key;
+  const valid = validation.request;
 
   // Step 3 — budget (plan §3.1): a call with under 2 s left is not started.
-  if (deadlineMs - nowMs < MIN_BUDGET_REMAINING_MS) {
-    return { outcome: 'skipped', journalKey: key, reasonCode: 'budget-exhausted' };
+  if (valid.deadlineMs - valid.nowMs < MIN_BUDGET_REMAINING_MS) {
+    return { outcome: 'skipped', journalKey: valid.key, reasonCode: 'budget-exhausted' };
   }
 
   // Step 4 — read the key's journal entries.
-  const entries = await deps.journal.listForKey(key);
-  let final: LaneRunJournalEntryRecord | null = null;
-  let intent: LaneRunJournalEntryRecord | null = null;
-  for (const entryRecord of entries) {
-    if (final === null && entryRecord.kind === 'result' && entryRecord.outcome !== 'ambiguous') {
-      final = entryRecord;
-    }
-    if (intent === null && entryRecord.kind === 'intent') {
-      intent = entryRecord;
-    }
+  const entries = await listKey(deps, valid.key);
+  if (entries === null) {
+    return { outcome: 'unavailable', journalKey: valid.key, reasonCode: 'journal-unavailable' };
   }
-  if (final !== null) {
-    return { outcome: 'skipped', journalKey: key, reasonCode: 'already-settled' };
+  const settled = entries.some((record) => record.kind === 'result' && record.outcome !== 'ambiguous');
+  if (settled) {
+    return { outcome: 'skipped', journalKey: valid.key, reasonCode: 'already-settled' };
   }
-  if (intent !== null) {
-    return reconcile(deps, request, entry, key);
+  if (entries.some((record) => record.kind === 'intent')) {
+    return reconcile(deps, valid);
   }
-  return act(deps, request, entry, key);
+  return valid.shadowReason !== null ? actShadow(deps, valid, valid.shadowReason) : actLive(deps, valid);
 }

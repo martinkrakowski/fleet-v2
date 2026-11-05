@@ -371,7 +371,7 @@ describe('KS2 pre-merge review fixes', () => {
   });
 
   it('refuses a toolchain version that is not a version string', () => {
-    const bad = { ...components(), toolchainVersions: { ...components().toolchainVersions, node: 'any text at all' } };
+    const bad = { ...components(), toolchainVersions: { node: 'any text at all', yarn: '4.12.0', hexagen: '0.14.0', turbo: '2.11.5' } };
     expect(buildGateReceiptKey(bad).ok).toBe(false);
   });
 

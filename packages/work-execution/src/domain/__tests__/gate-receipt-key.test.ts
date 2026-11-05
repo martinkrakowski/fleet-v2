@@ -100,6 +100,35 @@ describe('buildGateReceiptKey', () => {
     }).not.toThrow();
     expect(result?.ok).toBe(false);
   });
+
+  it('reports the first unreadable field when a later field throws', () => {
+    // A throwing descriptor on a LATER field must be reported as that field's
+    // unreadable reason, not as `predicate-id-unreadable`. An accessor property
+    // read through `Reflect.getOwnPropertyDescriptor(...).value` is simply
+    // `undefined`, so a Proxy with a throwing trap exercises the real throw.
+    const base = components() as unknown as Record<string, unknown>;
+    const throwOn = (target: string): unknown =>
+      new Proxy(base, {
+        getOwnPropertyDescriptor(t, key) {
+          if (key === target) {
+            throw new Error('boom');
+          }
+          return Reflect.getOwnPropertyDescriptor(t, key);
+        },
+      });
+    expect(buildGateReceiptKey(throwOn('declaredEnvironmentDigest') as unknown as GateReceiptKeyInput)).toEqual({
+      ok: false,
+      reason: 'declared-environment-digest-unreadable',
+    });
+    expect(buildGateReceiptKey(throwOn('toolchainVersions') as unknown as GateReceiptKeyInput)).toEqual({
+      ok: false,
+      reason: 'toolchain-version-unreadable',
+    });
+    expect(buildGateReceiptKey(throwOn('treeHash') as unknown as GateReceiptKeyInput)).toEqual({
+      ok: false,
+      reason: 'tree-hash-unreadable',
+    });
+  });
 });
 
 describe('readGateReceiptKeyRecord', () => {

@@ -155,24 +155,29 @@ function validateGateReceiptKeyComponents(parts: GateReceiptKeyInput): GateRecei
 }
 
 export function buildGateReceiptKey(input: GateReceiptKeyInput): GateReceiptKeyBuild {
+  // Tracks which field's read is in flight, so a throw from Reflect (e.g. a
+  // hostile proxy) is reported as THAT field's unreadable reason — the required
+  // first-unreadable-field result — never as another field's reason.
+  let currentReason: GateReceiptKeyMissReason = 'predicate-id-unreadable';
   try {
     // Read the expected own keys through their descriptors so no getter runs; a
     // throwing descriptor (or a non-object input) is caught below as a miss.
-    const read = (key: string): unknown => {
+    const read = (key: string, reason: GateReceiptKeyMissReason): unknown => {
+      currentReason = reason;
       const descriptor = Reflect.getOwnPropertyDescriptor(input, key);
       return descriptor === undefined ? undefined : descriptor.value;
     };
     return validateGateReceiptKeyComponents({
-      predicateId: read('predicateId'),
-      treeHash: read('treeHash'),
-      predicateDefinitionDigest: read('predicateDefinitionDigest'),
-      toolchainVersions: read('toolchainVersions'),
-      declaredEnvironmentDigest: read('declaredEnvironmentDigest'),
+      predicateId: read('predicateId', 'predicate-id-unreadable'),
+      treeHash: read('treeHash', 'tree-hash-unreadable'),
+      predicateDefinitionDigest: read('predicateDefinitionDigest', 'predicate-definition-digest-unreadable'),
+      toolchainVersions: read('toolchainVersions', 'toolchain-version-unreadable'),
+      declaredEnvironmentDigest: read('declaredEnvironmentDigest', 'declared-environment-digest-unreadable'),
     });
   } catch {
-    // A hostile getter or proxy trap must never escape: report the first
-    // component as unreadable with a fixed reason that echoes no value.
-    return { ok: false, reason: 'predicate-id-unreadable' };
+    // A hostile getter or proxy trap must never escape: report the component
+    // whose read threw, with a fixed reason that echoes no value.
+    return { ok: false, reason: currentReason };
   }
 }
 

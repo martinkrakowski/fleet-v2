@@ -308,10 +308,14 @@ describe('file store faults', () => {
     const results = await Promise.all(
       Array.from({ length: 6 }, (_, i) => adapter.recordGateReceipt(request(makeKey(), 'pass', `receipt:r${i}`))),
     );
-    expect(results.filter((r) => r.outcome === 'recorded').length).toBeGreaterThanOrEqual(1);
-    expect(results.every((r) => r.outcome === 'recorded' || r.outcome === 'already-recorded')).toBe(true);
-    const found = await adapter.findGateReceipt(makeKey());
-    expect(found.outcome).toBe('hit');
+    expect(results.filter((r) => r.outcome === 'recorded')).toHaveLength(1);
+    expect(results.filter((r) => r.outcome === 'already-recorded')).toHaveLength(5);
+    const winner = results.findIndex((r) => r.outcome === 'recorded');
+    expect(await adapter.findGateReceipt(makeKey())).toEqual({
+      outcome: 'hit',
+      verdict: 'pass',
+      receiptRef: `receipt:r${winner}`,
+    });
     expect(await adapter.recordGateReceipt(request(makeKey(), 'fail', 'receipt:late'))).toEqual({
       outcome: 'already-recorded',
     });
@@ -325,6 +329,31 @@ describe('file store faults', () => {
     );
     expect(await adapter.recordGateReceipt(request(makeKey()))).toEqual({ outcome: 'refused', reason: 'store-full' });
     expect((await adapter.findGateReceipt(makeKey())).outcome).toBe('miss');
+  });
+
+  it('never exceeds the receipt bound when different keys are recorded concurrently', async () => {
+    const adapter = new GateReceiptReuseAdapter({ stateDir: dir, maxRecords: 1 });
+    const results = await Promise.all(
+      Array.from({ length: 5 }, (_, i) => adapter.recordGateReceipt(request(makeKey({ predicateId: `k${i}` })))),
+    );
+    expect(results.filter((r) => r.outcome === 'recorded')).toHaveLength(1);
+    expect((await readdir(storeDir)).filter((n) => n.endsWith('.json'))).toHaveLength(1);
+  });
+
+  it('never follows a symlinked state directory', async () => {
+    const elsewhere = path.join(dir, 'elsewhere');
+    await mkdir(elsewhere);
+    const link = path.join(dir, 'state-link');
+    await symlink(elsewhere, link);
+    const adapter = new GateReceiptReuseAdapter({ stateDir: link });
+    expect((await adapter.findGateReceipt(makeKey())).outcome).toBe('miss');
+    expect(await adapter.recordGateReceipt(request(makeKey()))).toEqual({ outcome: 'refused', reason: 'store-unreadable' });
+    expect(await readdir(elsewhere)).toEqual([]);
+  });
+
+  it('clamps an enormous receipt bound', async () => {
+    const adapter = new GateReceiptReuseAdapter({ stateDir: dir, maxRecords: Number.MAX_SAFE_INTEGER });
+    expect(await adapter.recordGateReceipt(request(makeKey()))).toEqual({ outcome: 'recorded' });
   });
 
 });

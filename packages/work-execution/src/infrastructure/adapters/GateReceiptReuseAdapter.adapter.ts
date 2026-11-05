@@ -44,6 +44,7 @@ export const GATE_RECEIPT_STORE_DIRECTORY = 'gate-receipts';
 export const GATE_RECEIPT_RECORD_VERSION = 1 as const;
 export const GATE_RECEIPT_MAX_FILE_BYTES = 4096;
 export const GATE_RECEIPT_DEFAULT_MAX_RECORDS = 2000;
+export const GATE_RECEIPT_HARD_MAX_RECORDS = 100_000;
 export const GATE_RECEIPT_DEFAULT_DEADLINE_MS = 5000;
 const STALE_TEMP_AGE_MS = 60 * 60 * 1000;
 const MAX_TEMP_SWEEP = 100;
@@ -208,12 +209,13 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
   private readonly maxRecords: number;
   private readonly deadlineMs: number;
   private tempCounter = 0;
+  private writeQueue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly options?: GateReceiptReuseAdapterOptions) {
     const maxRecords = options?.maxRecords;
     this.maxRecords =
       typeof maxRecords === 'number' && Number.isSafeInteger(maxRecords) && maxRecords >= 1
-        ? maxRecords
+        ? Math.min(maxRecords, GATE_RECEIPT_HARD_MAX_RECORDS)
         : GATE_RECEIPT_DEFAULT_MAX_RECORDS;
     const deadlineMs = options?.deadlineMs;
     this.deadlineMs =
@@ -260,12 +262,23 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
       }
       return await withDeadline<RecordGateReceiptResult>(
         this.deadlineMs,
-        () => this.record(read.key, { verdict, receiptRef }),
+        () => this.serialized(() => this.record(read.key, { verdict, receiptRef })),
         { outcome: 'refused', reason: 'store-timeout' },
       );
     } catch {
       return { outcome: 'refused', reason: 'store-failed' };
     }
+  }
+
+  /**
+   * Writes of one adapter run one at a time, so the receipt count, a repair of an unreadable receipt and
+   * the write-once publication cannot interleave inside this process. Between processes the guard is the
+   * exclusive `link`; a state directory has one writing driver by the fleet's rule.
+   */
+  private serialized<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.writeQueue.then(work, work);
+    this.writeQueue = run.catch(() => undefined);
+    return run;
   }
 
   private async find(key: GateReceiptKey): Promise<FindGateReceiptResult> {
@@ -345,7 +358,7 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
    * without it an absent store is `null`. Anything that is not a plain directory is a failure.
    */
   private async openStoreDirectory(stateDir: string, create: boolean): Promise<string | null> {
-    const stateStat = await this.statOrNull(stateDir);
+    const stateStat = await this.lstatOrNull(stateDir);
     if (stateStat === null) {
       if (!create) {
         return null;
@@ -377,18 +390,6 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
       throw new StoreFailure('store-unreadable');
     }
     return directory;
-  }
-
-  /** The configured state directory is the trusted root, so a symlink there is followed. */
-  private async statOrNull(target: string): Promise<import('node:fs').Stats | null> {
-    try {
-      return await fs.stat(target);
-    } catch (error: unknown) {
-      if (errorCode(error) === 'ENOENT') {
-        return null;
-      }
-      throw error;
-    }
   }
 
   private async lstatOrNull(target: string): Promise<import('node:fs').Stats | null> {

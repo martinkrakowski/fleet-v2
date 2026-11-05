@@ -90,6 +90,21 @@ describe('state file compaction', () => {
     expect(await fs.readFile(path.join(tempDir, dataPath))).toEqual(storeBytes([record('a'), record('b')]));
   });
 
+  it('refuses and writes nothing when the quarantine directory is a symlink (EX-3b pre-merge major)', async () => {
+    const original = await seed([record('a'), record('b'), record('c')]);
+    const elsewhere = path.join(tempDir, 'elsewhere');
+    await fs.mkdir(elsewhere);
+    await fs.symlink(elsewhere, path.join(tempDir, 'quarantine'));
+    const outcome = await descriptor.compact!({
+      stateDir: tempDir,
+      keepIds: ['a', 'b'],
+      expectedCurrentSha256: sha256(original),
+    });
+    expect(outcome.status).toBe('refused');
+    expect(await fs.readdir(elsewhere)).toEqual([]);
+    expect(await fs.readFile(path.join(tempDir, dataPath))).toEqual(original);
+  });
+
   it('writes nothing when the store changed since the plan was computed', async () => {
     const original = await seed([record('a'), record('b'), record('c')]);
     const outcome = await descriptor.compact!({

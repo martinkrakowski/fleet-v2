@@ -391,6 +391,15 @@ export interface KeepQuarantineCopyOptions {
  * reuse-on-equal-bytes and pruning as `quarantineUnreadable`). Throws the
  * underlying error only when no copy could be written.
  */
+/** Whether `dirPath` does not exist, or is a directory itself and not a symlink to one. */
+async function isAbsentOrRealDirectory(dirPath: string): Promise<boolean> {
+  try {
+    return (await fs.lstat(dirPath)).isDirectory();
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+}
+
 export async function keepQuarantineCopy(
   filePath: string,
   bytes: Buffer,
@@ -1134,6 +1143,11 @@ async function compactRecordListStore(
         const beforeInspection = inspect(compactedBytes);
         if (beforeInspection.status !== 'ok' || beforeInspection.recordCount !== kept.length) {
           return { status: 'refused', reason: 'the compacted file did not verify; nothing was written' };
+        }
+
+        // The quarantine directory must be a real directory: a symlink planted there would receive the store's bytes.
+        if (!(await isAbsentOrRealDirectory(path.join(path.dirname(filePath), 'quarantine')))) {
+          return { status: 'refused', reason: 'the quarantine directory is not a real directory; nothing was written' };
         }
 
         let quarantinePath: string | null = null;

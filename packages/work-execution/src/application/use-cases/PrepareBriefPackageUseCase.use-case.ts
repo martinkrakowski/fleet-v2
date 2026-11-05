@@ -351,6 +351,35 @@ function validatePlacement(
   return { worktreePath };
 }
 
+/** Whether `value` is a well-shaped context decision with the declared fields. */
+function isContextDecisionObject(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    isNonEmpty(record.proposalId) &&
+    isNonEmpty(record.knowledgeEntryId) &&
+    isNonEmpty(record.version) &&
+    typeof record.proposedBecause === 'string' &&
+    typeof record.accepted === 'boolean' &&
+    typeof record.decisionBecause === 'string'
+  );
+}
+
+/** Why `contextDecisions` is unusable, or null when it is a valid array of decisions (the contract requires it). */
+function contextDecisionsError(value: unknown): string | null {
+  if (!Array.isArray(value)) {
+    return 'contextDecisions must be an array of context decisions';
+  }
+  for (const decision of value) {
+    if (!isContextDecisionObject(decision)) {
+      return 'contextDecisions must be an array of context decisions';
+    }
+  }
+  return null;
+}
+
 /**
  * The reviewer must be named and differ from the implementer model, an
  * optional seat plan is validated, pr notes are validated when present, and
@@ -379,6 +408,9 @@ function validateReviewerAndPlan(
     if (notesError !== null) {
       return { reason: notesError };
     }
+  }
+  if (contextDecisionsError(request.contextDecisions) !== null) {
+    return { reason: 'contextDecisions must be an array of context decisions' };
   }
   const decisions = request.contextDecisions ?? [];
   if (decisions.some((decision) => !isNonEmpty(decision.decisionBecause))) {

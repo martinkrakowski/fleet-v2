@@ -186,6 +186,37 @@ describe('parseHostDescriptor', () => {
     expect(result.errors).toContain('descriptor.tools: names more than one tool');
   });
 
+  it('refuses the same tool named twice', () => {
+    const result = parseHostDescriptor({
+      ...validDescriptor,
+      tools: [
+        { name: 'opencode', version: '1.2.3' },
+        { name: 'opencode', version: '9.9.9' },
+      ],
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.errors).toContain(
+      'descriptor.tools[1].name: names the same tool twice',
+    );
+  });
+
+  it('still accepts a single tool entry', () => {
+    const result = parseHostDescriptor({
+      ...validDescriptor,
+      tools: [{ name: 'opencode', version: '1.2.3' }],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.descriptor.tools).toEqual([
+      { name: 'opencode', version: '1.2.3' },
+    ]);
+  });
+
   it('refuses a descriptor that is not an object and a tool entry with an unknown key', () => {
     const notObject = parseHostDescriptor('opencode');
     expect(notObject.ok).toBe(false);

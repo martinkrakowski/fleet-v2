@@ -103,33 +103,74 @@ async function blockedReviewFindings(
 }
 
 /**
- * The fixed refusal detail of a `step-refused` park (GB3a): the detail of the
- * run's last final result on the park's qualifier step, or null when there is
- * none. The park's qualifier is never matched against a result of another step.
+ * The run's result entries on the park's qualifier step, in journal order:
+ * same run id, a parsable step key naming the qualifier, and never an
+ * `ambiguous` outcome. The park's qualifier is never matched against a result
+ * of another step.
+ */
+function qualifierResultEntries(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  qualifier: string,
+): { entry: LaneRunJournalEntryRecord; head12: string | null }[] {
+  const matched: { entry: LaneRunJournalEntryRecord; head12: string | null }[] = [];
+  for (const entry of entries) {
+    if (entry.kind !== 'result' || entry.runId !== runId || entry.outcome === 'ambiguous') {
+      continue;
+    }
+    const parsed = entry.key === null ? null : parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.step !== qualifier) {
+      continue;
+    }
+    matched.push({ entry, head12: parsed.head12 });
+  }
+  return matched;
+}
+
+/**
+ * The usable refusal detail among the latest head's qualifier results, or
+ * null. Older heads are never consulted: a head whose gate result carries no
+ * detail reports its own `gate-` reason code instead of an earlier head's
+ * detail.
+ */
+function latestHeadRefusalDetail(
+  matched: readonly { entry: LaneRunJournalEntryRecord; head12: string | null }[],
+): string | null {
+  if (matched.length === 0) {
+    return null;
+  }
+  const latestHead = matched[matched.length - 1]!.head12;
+  const ofHead = matched.filter((candidate) => candidate.head12 === latestHead);
+  for (let index = ofHead.length - 1; index >= 0; index -= 1) {
+    const detail = ofHead[index]!.entry.detail;
+    // GB3c: a result whose detail is null or a `next-seat-` seat-advance token
+    // does not express the refusal that parked the run.
+    if (detail !== null && !detail.startsWith('next-seat-')) {
+      return detail;
+    }
+  }
+  for (let index = ofHead.length - 1; index >= 0; index -= 1) {
+    const reasonCode = ofHead[index]!.entry.reasonCode;
+    if (reasonCode !== null && reasonCode.startsWith('gate-')) {
+      return reasonCode;
+    }
+  }
+  return null;
+}
+
+/**
+ * The fixed refusal detail of a `step-refused` park (GB3a): the cause comes
+ * from the latest head's results on the park's qualifier step — the newest
+ * usable detail there, else that head's newest `gate-` reason code — or null
+ * when the latest head expresses no cause. An older head's detail is never
+ * reported.
  */
 function parkRefusalDetailOf(record: LaneRunRecord, entries: readonly LaneRunJournalEntryRecord[]): string | null {
   const parked = record.parked;
   if (parked === null || parked.reason !== 'step-refused' || parked.qualifier === null) {
     return null;
   }
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const entry = entries[index];
-    if (entry.kind !== 'result' || entry.runId !== record.runId || entry.outcome === 'ambiguous') {
-      continue;
-    }
-    const parsed = entry.key === null ? null : parseLaneRunKey(entry.key);
-    if (parsed === null || parsed.kind !== 'step' || parsed.step !== parked.qualifier) {
-      continue;
-    }
-    // GB3c: a later result of the qualifier step whose detail is null or a
-    // `next-seat-` seat-advance token does not express the refusal that
-    // parked the run — keep scanning back for the refusal detail.
-    if (entry.detail === null || entry.detail.startsWith('next-seat-')) {
-      continue;
-    }
-    return entry.detail;
-  }
-  return null;
+  return latestHeadRefusalDetail(qualifierResultEntries(entries, record.runId, parked.qualifier));
 }
 
 /** The status view of one run from its record and journal. */

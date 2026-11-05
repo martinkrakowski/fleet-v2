@@ -149,3 +149,37 @@ describe('InspectLaneRunsUseCase parkDetail (GB3c)', () => {
     expect(view.parkDetail).toBe('worktree-uncommitted');
   });
 });
+
+/** A gate step key for one head: `<runId>/r0/gate/<seatIndex>@<head12>` (no attempt ordinal). */
+function gateKey(seatIndex: number, head12: string): string {
+  const built = buildLaneRunStepKey({
+    runId: RUN_ID,
+    round: 0,
+    step: 'gate',
+    seatIndex,
+    attemptOrdinal: null,
+    head12,
+    retry: null,
+  });
+  expect(built.ok).toBe(true);
+  if (!built.ok) {
+    throw new Error('fixture must build a gate step key');
+  }
+  return built.key;
+}
+
+describe('InspectLaneRunsUseCase parkDetail: latest head only (CX7a)', () => {
+  it('reports the newer head gate- reason code when its result carries no detail, never an older head detail', async () => {
+    const record = runRecord({
+      parked: { reason: 'step-refused', qualifier: 'gate', parkedFrom: 'gating', questionId: null },
+      parkCount: 1,
+    });
+    const pairs = [
+      resultPair(0, gateKey(0, 'ffffffffffff'), 'completed', 'gate-failed', 'gate-unknown'),
+      resultPair(1, gateKey(0, '0123456789ab'), 'completed', 'gate-congested', null),
+    ];
+    const view = await inspectView(record, pairs);
+    expect(view.parkDetail).toBe('gate-congested');
+    expect(view.parkDetail).not.toBe('gate-unknown');
+  });
+});

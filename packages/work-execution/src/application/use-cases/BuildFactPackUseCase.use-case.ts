@@ -64,6 +64,8 @@ function hasControlCharacter(value: string): boolean {
 /** At most this many facts in one pack, and at most this many UTF-8 bytes of fact text in total. */
 export const FACT_PACK_MAX_FACTS = 32;
 export const FACT_PACK_MAX_TEXT_BYTES = 256_000;
+/** The rendered prompt as a whole, headers and markers included. */
+export const FACT_PACK_MAX_PROMPT_BYTES = 300_000;
 
 const PACK_TOO_LARGE = {
   reason: 'pack-too-large',
@@ -220,17 +222,19 @@ export class BuildFactPackUseCase implements BuildFactPackPort {
       sections.push({ label: fact.label, path: factPath(fact), text: read.text });
     }
 
-    return {
-      outcome: 'built',
-      prompt: renderFactPackPrompt({
-        laneId: request.laneId,
-        repositoryPath: request.repositoryPath,
-        commit: request.commit,
-        sections,
-        nonce,
-      }),
-      factCount: sections.length,
-    };
+    const prompt = renderFactPackPrompt({
+      laneId: request.laneId,
+      repositoryPath: request.repositoryPath,
+      commit: request.commit,
+      sections,
+      nonce,
+    });
+    if (Buffer.byteLength(prompt, 'utf8') > FACT_PACK_MAX_PROMPT_BYTES) {
+      // The whole prompt is bounded too: a long lane id, path or label set
+      // cannot grow it past the limit.
+      return { outcome: 'refused', refusal: PACK_TOO_LARGE };
+    }
+    return { outcome: 'built', prompt, factCount: sections.length };
   }
 
   /** One port read, mapped to a section text or a typed refusal reason. */
@@ -295,6 +299,10 @@ function factPath(fact: BuildFactPackFact): string {
 }
 
 function isFactWellFormed(fact: BuildFactPackFact): boolean {
+  // A null or non-object fact, or a non-string label, is malformed, never thrown on.
+  if (typeof fact !== 'object' || fact === null || typeof fact.label !== 'string') {
+    return false;
+  }
   if (!LABEL_PATTERN.test(fact.label)) {
     return false;
   }

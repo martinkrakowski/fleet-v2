@@ -63,6 +63,7 @@ import type {
   CheckCoverage,
   EvidenceResultValue,
 } from '@fleet/evidence-and-acceptance';
+import { gateCommandPredicateName } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import type { GateCommand } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 
@@ -144,7 +145,7 @@ function skipped(name: string, kind: GatePredicateKind): GatePredicateResult {
 }
 
 function commandName(command: GateCommand, index: number): string {
-  return ('command ' + (index + 1) + ': ' + command.argv.join(' ')).slice(0, 120);
+  return gateCommandPredicateName(command.argv, index);
 }
 
 /** Raw command verdict before coverage is applied; exit 255 is only a transport failure when remote. */
@@ -736,7 +737,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
         ? []
         : [
             '/usr/bin/env',
-            'FLEET_V2_GATE_SLOTS=' + String(gateSlot.slots),
+            'FLEET_V2_GATE_SLOTS=' + String(readGateSlotCapacity(gateSlot.slots)),
             'FLEET_V2_GATE_WAIT_MAX_SECONDS=' + String(waitSeconds),
             gateSlot.path,
           ]),

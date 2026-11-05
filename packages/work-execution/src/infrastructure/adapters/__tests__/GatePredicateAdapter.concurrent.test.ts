@@ -22,6 +22,7 @@ import type {
 } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { LaneDiffCheckPort, LaneDiffCheckResult } from '../../../application/ports/out/LaneDiffCheckPort.out-port.js';
 import type { RunnerForAttemptHostSpec } from '../ConfirmRecordedHost.js';
+import { gateCommandPredicateName } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -336,6 +337,38 @@ describe('GatePredicateAdapter concurrency (KS3)', () => {
     });
     const unavailable = await refusing.evaluateGatePredicates(requestWith(['a']));
     expect(JSON.stringify(unavailable)).not.toContain(secretShaped);
+  });
+
+  it('withholds a secret-shaped argv from the predicate name, agreeing with the use case name', async () => {
+    const secretShaped = ['ghp', '_', 'a'.repeat(24)].join('');
+    const argv = ['deploy', '--token', secretShaped];
+    const executor = new RecordingExecutor();
+    const adapter = makeAdapter(executor, 2);
+    const request: EvaluateGatePredicatesRequest = {
+      ...requestWith(['x']),
+      spec: { commitRequired: true, diffCheck: true, commands: [{ argv }] },
+    };
+    const results = evaluated(await adapter.evaluateGatePredicates(request));
+    expect(JSON.stringify(results)).not.toContain(secretShaped);
+    expect(results[2]?.name).toBe(gateCommandPredicateName(argv, 0));
+    expect(results[2]?.name).toBe('command 1: [argv withheld: secret-shaped text]');
+    expect(gateCommandPredicateName(['plain', 'args'], 1)).toBe('command 2: plain args');
+  });
+
+  it('passes a normalised slot count to the gate-slot wrapper, never a raw invalid one', async () => {
+    for (const [declared, expected] of [[9999, '1'], [0, '1'], [4, '4']] as const) {
+      const executor = new RecordingExecutor();
+      const seen: string[][] = [];
+      const spying: CommandExecutorPort = {
+        run: async (argv, options) => {
+          seen.push([...argv]);
+          return executor.run(argv, options);
+        },
+      };
+      await makeAdapter(spying, declared).evaluateGatePredicates(requestWith(['a']));
+      const wrapped = seen.find((argv) => argv.includes(GATE_SLOT_PATH));
+      expect(wrapped).toContain('FLEET_V2_GATE_SLOTS=' + expected);
+    }
   });
 
   it('bounds every detail and the output a command may capture', async () => {

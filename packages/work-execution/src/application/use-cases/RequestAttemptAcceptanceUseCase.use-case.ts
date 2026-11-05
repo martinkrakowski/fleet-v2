@@ -49,7 +49,7 @@ import type { AttemptRecord, WorkOrderRecord, ActionJournalEntryRecord } from '.
 import { WorkOrder } from '../../domain/entities/WorkOrder.js';
 import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import type { AllowedSeatPort } from '../ports/out/AllowedSeatPort.out-port.js';
-import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
+import { AcceptanceSpec, gateCommandPredicateName } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
 import { readFrozenManifestAtHostVerified } from './advance-lane-run/frozen-manifest.js';
 import type {
@@ -169,7 +169,7 @@ function expectedGatePredicates(spec: AcceptanceSpec): readonly ExpectedGatePred
     { name: 'commit', kind: 'commit' },
     { name: 'diff-check', kind: 'diff-check' },
     ...spec.getCommands().map((command, index) => ({
-      name: ('command ' + String(index + 1) + ': ' + command.argv.join(' ')).slice(0, 120),
+      name: gateCommandPredicateName(command.argv, index),
       kind: 'command' as const,
     })),
   ];

@@ -167,6 +167,15 @@ describe('decideMergeTransition', () => {
     expect(replay).toMatchObject({ outcome: 'applied', successor: { entryId: id(7) } });
     expect(replay.outcome === 'applied' && replay.entries).toHaveLength(2);
 
+    // An independently enqueued head is adopted and takes the earlier position and the link.
+    const raced = entry({ entryId: id(8), headOid: HEAD_2, enqueuedAtIso: '2026-11-01T11:00:00.000Z', enqueuedBy: 'cli' });
+    const adopted = decideMergeTransition([stored, raced], command);
+    expect(adopted).toMatchObject({
+      outcome: 'applied',
+      successor: { entryId: id(8), enqueuedAtIso: '2026-11-01T10:00:00.000Z', supersedes: id(1), enqueuedBy: 'cli', revision: 2 },
+    });
+    expect(adopted.outcome === 'applied' && adopted.entries).toHaveLength(2);
+
     // A successor needs a superseded predecessor and a matching link.
     expect(decideMergeTransition([stored], { ...command, next: parked }).outcome).toBe('refused');
     expect(decideMergeTransition([stored], { ...command, successor: { ...built.successor, supersedes: id(5) } }).outcome).toBe('refused');

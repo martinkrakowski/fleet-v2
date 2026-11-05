@@ -16,6 +16,7 @@ import {
   isMergeSafeId,
   readMergeQueueEntryRecord,
   sameMergeQueueIdentity,
+  compareMergeQueueEntries,
 } from './merge-queue-records.js';
 import type {
   MergeDropReason,
@@ -298,6 +299,66 @@ const IMMUTABLE_KEYS = [
   'supersedes', 'runId', 'attemptId', 'workOrderId', 'tier',
 ] as const;
 
+function sameRepository(left: MergeQueueEntryRecord, right: MergeQueueEntryRecord): boolean {
+  return (
+    left.repository.owner === right.repository.owner &&
+    left.repository.repo === right.repository.repo &&
+    left.repoDigest === right.repoDigest &&
+    left.pullRequest === right.pullRequest
+  );
+}
+
+/** The next record keeps the stored entry's identity and moves exactly one revision. */
+function validNextRecord(target: MergeQueueEntryRecord, raw: unknown): MergeQueueEntryRecord | null {
+  const read = readMergeQueueEntryRecord(raw);
+  if (!read.ok || read.record.revision !== target.revision + 1 || !sameRepository(read.record, target)) {
+    return null;
+  }
+  return IMMUTABLE_KEYS.every((key) => read.record[key] === target[key]) ? read.record : null;
+}
+
+function validSuccessor(
+  entries: readonly MergeQueueEntryRecord[],
+  target: MergeQueueEntryRecord,
+  next: MergeQueueEntryRecord,
+  raw: unknown,
+): MergeQueueEntryRecord | null {
+  const read = readMergeQueueEntryRecord(raw);
+  if (
+    next.state !== 'superseded' ||
+    !read.ok ||
+    read.record.supersedes !== target.entryId ||
+    read.record.revision !== 1 ||
+    read.record.headOid === target.headOid ||
+    !sameRepository(read.record, target)
+  ) {
+    return null;
+  }
+  const candidate = read.record;
+  return entries.some((other) => other.entryId === candidate.entryId) ? null : candidate;
+}
+
+/**
+ * A live entry of the successor's identity already exists (a retry that
+ * minted another id, or an enqueue that raced the pass). It is adopted as the
+ * successor and, in the same write, takes the earlier of the two queue
+ * positions and the supersedes link, so the update never loses the PR its place.
+ */
+function adoptExistingSuccessor(
+  existing: MergeQueueEntryRecord,
+  target: MergeQueueEntryRecord,
+): MergeQueueEntryRecord | null {
+  const earlier = compareMergeQueueEntries(target, existing) < 0 ? target.enqueuedAtIso : existing.enqueuedAtIso;
+  const supersedes = existing.supersedes ?? target.entryId;
+  if (earlier === existing.enqueuedAtIso && supersedes === existing.supersedes) {
+    return existing;
+  }
+  const read = readMergeQueueEntryRecord({
+    ...existing, enqueuedAtIso: earlier, supersedes, revision: existing.revision + 1,
+  });
+  return read.ok ? read.record : null;
+}
+
 /**
  * Compare-and-set one entry. The write applies only when the stored revision
  * is the expected one, the next record is valid, differs by exactly one
@@ -320,60 +381,48 @@ export function decideMergeTransition(
     if (terminal(target)) {
       return { outcome: 'refused', reason: 'terminal-entry' };
     }
-    const nextRead = readMergeQueueEntryRecord(transition.next);
-    if (!nextRead.ok || nextRead.record.revision !== target.revision + 1) {
+    const record = validNextRecord(target, transition.next);
+    if (record === null) {
       return { outcome: 'refused', reason: 'invalid-record' };
     }
-    const record = nextRead.record;
-    for (const key of IMMUTABLE_KEYS) {
-      if (record[key] !== target[key]) {
-        return { outcome: 'refused', reason: 'invalid-record' };
-      }
+    if (transition.successor === null) {
+      return record.state === 'superseded'
+        ? { outcome: 'refused', reason: 'invalid-successor' }
+        : applied(entries, target, record, null, null);
     }
-    if (
-      record.repository.owner !== target.repository.owner ||
-      record.repository.repo !== target.repository.repo
-    ) {
-      return { outcome: 'refused', reason: 'invalid-record' };
-    }
-
-    let successor: MergeQueueEntryRecord | null = null;
-    let append: MergeQueueEntryRecord | null = null;
-    if (transition.successor !== null) {
-      const successorRead = readMergeQueueEntryRecord(transition.successor);
-      if (
-        record.state !== 'superseded' ||
-        !successorRead.ok ||
-        successorRead.record.supersedes !== target.entryId ||
-        successorRead.record.revision !== 1 ||
-        successorRead.record.pullRequest !== target.pullRequest ||
-        successorRead.record.repoDigest !== target.repoDigest ||
-        successorRead.record.repository.owner !== target.repository.owner ||
-        successorRead.record.repository.repo !== target.repository.repo ||
-        successorRead.record.headOid === target.headOid
-      ) {
-        return { outcome: 'refused', reason: 'invalid-successor' };
-      }
-      const candidate = successorRead.record;
-      if (entries.some((other) => other.entryId === candidate.entryId)) {
-        return { outcome: 'refused', reason: 'invalid-successor' };
-      }
-      const existing = entries.find(
-        (other) => isMergeQueueEntryLive(other) && sameMergeQueueIdentity(other, candidate),
-      );
-      successor = existing ?? candidate;
-      append = existing === undefined ? candidate : null;
-    } else if (record.state === 'superseded') {
+    const candidate = validSuccessor(entries, target, record, transition.successor);
+    if (candidate === null) {
       return { outcome: 'refused', reason: 'invalid-successor' };
     }
-
-    const nextEntries = entries.map((other) => (other.entryId === target.entryId ? record : other));
-    if (append !== null) {
-      nextEntries.push(append);
+    const existing = entries.find((other) => isMergeQueueEntryLive(other) && sameMergeQueueIdentity(other, candidate));
+    if (existing === undefined) {
+      return applied(entries, target, record, candidate, candidate);
     }
-    return { outcome: 'applied', entries: nextEntries, record, successor };
+    const adopted = adoptExistingSuccessor(existing, target);
+    return adopted === null
+      ? { outcome: 'refused', reason: 'invalid-successor' }
+      : applied(entries, target, record, adopted, null, adopted);
   } catch {
     return { outcome: 'refused', reason: 'invalid-record' };
   }
 }
 
+function applied(
+  entries: readonly MergeQueueEntryRecord[],
+  target: MergeQueueEntryRecord,
+  record: MergeQueueEntryRecord,
+  successor: MergeQueueEntryRecord | null,
+  append: MergeQueueEntryRecord | null,
+  replace?: MergeQueueEntryRecord,
+): MergeTransitionDecision {
+  const nextEntries = entries.map((other) => {
+    if (other.entryId === target.entryId) {
+      return record;
+    }
+    return replace !== undefined && other.entryId === replace.entryId ? replace : other;
+  });
+  if (append !== null) {
+    nextEntries.push(append);
+  }
+  return { outcome: 'applied', entries: nextEntries, record, successor };
+}

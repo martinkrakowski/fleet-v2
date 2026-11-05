@@ -54,11 +54,13 @@ const closedForge = { ...greenForge, prState: 'closed' } as ReadForgeMergeResult
 class FakeNotifier implements MergeNotificationPort {
   readonly requests: MergeNotificationRequest[] = [];
   readonly delivered = new Set<string>();
-  mode: 'ok' | 'refuse' | 'throw' | 'garbage' = 'ok';
+  mode: 'ok' | 'refuse' | 'unavailable' | 'suppress' | 'throw' | 'garbage' = 'ok';
   async notifyMergeEvent(request: MergeNotificationRequest): Promise<MergeNotificationOutcome> {
     this.requests.push(request);
     if (this.mode === 'throw') throw new Error('sk-live-0123456789abcdef0123456789 /etc/passwd');
     if (this.mode === 'refuse') return { outcome: 'refused', reason: 'sk-live-0123456789abcdef0123456789' };
+    if (this.mode === 'unavailable') return { outcome: 'unavailable', reason: 'sk-live-0123456789abcdef0123456789' };
+    if (this.mode === 'suppress') return { outcome: 'suppressed', reason: 'notifications-disabled' };
     if (this.mode === 'garbage') return undefined as unknown as MergeNotificationOutcome;
     if (this.delivered.has(request.key)) return { outcome: 'duplicate' };
     this.delivered.add(request.key);
@@ -287,7 +289,7 @@ describe('RunMergePassUseCase (DT9c): park, drop and notifications', () => {
   });
 
   it('a notification that fails leaves the entry untouched; the retry delivers it exactly once', async () => {
-    for (const mode of ['refuse', 'throw', 'garbage'] as const) {
+    for (const mode of ['refuse', 'unavailable', 'throw', 'garbage'] as const) {
       const notifier = new FakeNotifier();
       notifier.mode = mode;
       const h = await harness({ forge: closedForge, notifier });
@@ -302,6 +304,15 @@ describe('RunMergePassUseCase (DT9c): park, drop and notifications', () => {
       expect(retried.entries[0].decision).toBe('recorded');
       expect(notifier.delivered.size).toBe(1);
     }
+  });
+
+  it('a deliberate suppression (notifications switched off) lets the transition through', async () => {
+    const notifier = new FakeNotifier();
+    notifier.mode = 'suppress';
+    const h = await harness({ forge: closedForge, notifier });
+    const result = await h.useCase.runMergePass(h.request());
+    expect(result.entries[0].decision).toBe('recorded');
+    expect((await h.list())[0].state).toBe('dropped');
   });
 
   it('a crash between the notification and the write replays under the same key', async () => {

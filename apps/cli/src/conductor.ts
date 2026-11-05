@@ -56,6 +56,7 @@ import {
   type ConductorPassTraceInput,
   type ConductorPassTracePort,
   type RunTelemetryMarkPort,
+  type WorkOrderRecord,
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
@@ -134,7 +135,9 @@ would do; it reaches no host, needs neither --live nor
 policy.conductor.enabled, and never writes the real state. conductor start
 reserves capacity and prepares a worktree on a lane host; it needs
 policy.conductor.enabled and a state directory, and dispatches nothing.
-start --abandon works while the conductor is disabled.
+start --abandon works while the conductor is disabled. The status document
+also lists the reservations a crashed start left held, and conductor start
+raises one attention item per crashed start.
 
 Each subcommand prints one JSON document on stdout (conductor run prints one
 JSON line per pass; conductor schedule without --json prints text lines and,
@@ -502,6 +505,54 @@ function readStartFlags(argv: readonly string[], io: CliIo): StartFlags | null {
 }
 
 /**
+ * AD-2: raise one stored attention item per crashed start the status view
+ * reports, except the attempt a retry continues (`skipAttemptId`). The body
+ * is exactly the five keys of `RecordAttentionItemBody`. Best-effort and
+ * read-only: it prints nothing, and a refusal or throw never fails a start.
+ */
+async function raiseCrashedStartNotices(
+  runtime: FleetCliRuntime,
+  nowIso: string,
+  skipAttemptId: string | undefined,
+): Promise<void> {
+  let result: Awaited<ReturnType<FleetCliRuntime['conductor']['inspectLaneRuns']['inspectLaneRuns']>>;
+  try {
+    result = await runtime.conductor.inspectLaneRuns.inspectLaneRuns({ nowIso });
+  } catch {
+    return;
+  }
+  if (result.outcome !== 'listed') {
+    return;
+  }
+  for (const crashed of result.crashedStarts) {
+    if (crashed.attemptId === skipAttemptId || crashed.workOrderId === null) {
+      continue;
+    }
+    let workOrder: WorkOrderRecord | null;
+    try {
+      workOrder = await runtime.execution.workOrderRepository.findWorkOrderById(crashed.workOrderId);
+    } catch {
+      continue;
+    }
+    if (workOrder === null) {
+      continue;
+    }
+    const body = {
+      projectId: workOrder.projectId,
+      kind: 'crashed-start',
+      subject: { kind: 'attempt', ref: crashed.attemptId },
+      workOrderId: crashed.workOrderId,
+      summary: `A lane start crashed and left capacity slot ${crashed.slotIndex} held for attempt ${crashed.attemptId}.`,
+    };
+    try {
+      await runtime.coordination.recordAttentionItem.recordAttentionItem(body, 'conductor');
+    } catch {
+      // A notice never fails a start.
+    }
+  }
+}
+
+/**
  * `conductor start` (K7-D7): reserve capacity, prepare the run's worktree at
  * the reserved path, place the brief, record the first attempt and the run.
  * It runs no model and dispatches nothing; it takes no `--live`. Guarded, in
@@ -561,6 +612,11 @@ async function startCommand(
     io.stdout(`${JSON.stringify({ outcome: 'refused', reason: 'conductor-disabled' })}\n`);
     return 1;
   }
+  // AD-2: surface crashed-start reservations as attention items. Best-effort;
+  // a retry with the same attempt id continues the crashed start, so it
+  // raises nothing for it. The `--abandon` path returned earlier and raises
+  // nothing.
+  await raiseCrashedStartNotices(runtime, nowIsoOf(options), flags.attemptId);
   if ((flags.runId === undefined) !== (flags.attemptId === undefined)) {
     io.stderr(`--run-id and --attempt-id are given together or not at all\n${CONDUCTOR_HELP}\n`);
     return 2;

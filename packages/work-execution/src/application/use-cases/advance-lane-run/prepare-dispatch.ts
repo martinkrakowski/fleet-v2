@@ -708,11 +708,8 @@ export async function performDispatch(ctx: AdvanceStepContext,
     return spent;
   }
   const manifest = await readVerifiedFrozenManifest(latest, ctx.deps.artifactPort, ctx.deps.computeDigest);
-  const stepLimit = manifestPositiveInteger(manifest, 'stepLimit');
-  const timeLimitSeconds = manifestTimeLimitSeconds(manifest);
-  const expectedArtifacts = manifestExpectedArtifacts(manifest);
-  const briefPackagePath = latest.briefPackagePath;
-  const briefDigest = latest.briefDigest;
+  const { stepLimit, timeLimitSeconds, expectedArtifacts, briefPackagePath, briefDigest } =
+    dispatchInputsOf(latest, manifest);
   const inputsReadable =
     stepLimit !== null &&
     timeLimitSeconds !== null &&
@@ -777,27 +774,7 @@ export async function performDispatch(ctx: AdvanceStepContext,
     // Later writes in this advance (a park) must chain on the saved revision.
     record = saved.record ?? record;
   }
-  const seatForOverride: AttemptSeatSelectionRecord | null =
-    latest.kind === 'initial' && latest.priorAttemptId !== null
-      ? (latest.seatSelection ?? null)
-      : fixSeat.kind === 'seat'
-        ? fixSeat.seat
-        : null;
-  const seatOverride: AttemptSeatOverrideRecord | null =
-    seatForOverride === null
-      ? null
-      : {
-          model: seatForOverride.model,
-          ...(seatForOverride.agent !== null ? { agent: seatForOverride.agent } : {}),
-          ...(seatForOverride.variant !== null ? { variant: seatForOverride.variant } : {}),
-          ...(fixSeat.kind === 'seat' && fixSeat.overrideVariant !== undefined ? { variant: fixSeat.overrideVariant } : {}),
-          reason:
-            latest.kind === 'fix'
-              ? 'fix seat ' + seatForOverride.seatId
-              : 'seat-plan pivot to ' + seatForOverride.seatId,
-          setBy: 'conductor',
-          expiresAtIso: new Date(Date.parse(nowIso) + timeLimitSeconds * 1000).toISOString(),
-        };
+  const seatOverride = seatOverrideFor(latest, fixSeat, nowIso, timeLimitSeconds);
   // GB3a/GB3c: a fix dispatch or a round-0 pivot dispatch following a
   // dirty-worktree refusal carries the handed-over worktree as-is, so the
   // next seat's uncommitted work is accepted instead of refused again.
@@ -822,14 +799,7 @@ export async function performDispatch(ctx: AdvanceStepContext,
       : {}),
   });
   if (dispatched.outcome === 'started' || dispatched.outcome === 'blocked' || dispatched.outcome === 'unknown') {
-    let reasonCode: LaneRunResultReasonCode;
-    if (dispatched.outcome === 'started') {
-      reasonCode = 'dispatch-started';
-    } else if (dispatched.outcome === 'blocked') {
-      reasonCode = 'dispatch-blocked';
-    } else {
-      reasonCode = 'dispatch-unknown';
-    }
+    const reasonCode = dispatchOutcomeReasonCode(dispatched.outcome);
     const resultRefusal = await appendRunResult(ctx, request, decision.key, 'completed', reasonCode);
     if (resultRefusal !== null) {
       return refusedResult(resultRefusal);
@@ -847,12 +817,7 @@ export async function performDispatch(ctx: AdvanceStepContext,
   // still this round's and the next advance cancels it and prepares again
   // at that round (KF-17).
   const stored = await ctx.deps.attemptRepo.findAttemptById(latest.id);
-  let reasonCode: LaneRunResultReasonCode;
-  if (stored !== null && stored.state === 'cancelled') {
-    reasonCode = 'runner-refused';
-  } else {
-    reasonCode = 'dispatch-refused';
-  }
+  const reasonCode = refusedDispatchReasonCode(stored);
   // KF-16: the refused result journals a fixed detail code derived from the
   // refusal text, for the dispatch-refused park and the runner-refused pivot
   // alike. G11a: a runner refusal is the provider-outcome boundary — the
@@ -879,6 +844,90 @@ export async function performDispatch(ctx: AdvanceStepContext,
   // The spent refusal key is already recorded above. Success returns acted
   // without parking so the next advance prepares the next seat.
   const detail = dispatchRefusalDetail(dispatched.reason);
+  return handoverOrRecovery(ctx, record, latest, request, detail, reasonCode, decision, facts.state);
+}
+
+function dispatchInputsOf(
+  latest: AttemptRecord,
+  manifest: Record<string, unknown> | null,
+): {
+  stepLimit: number | null;
+  timeLimitSeconds: number | null;
+  expectedArtifacts: readonly string[] | null;
+  briefPackagePath: string | null;
+  briefDigest: string | null;
+} {
+  return {
+    stepLimit: manifestPositiveInteger(manifest, 'stepLimit'),
+    timeLimitSeconds: manifestTimeLimitSeconds(manifest),
+    expectedArtifacts: manifestExpectedArtifacts(manifest),
+    briefPackagePath: latest.briefPackagePath,
+    briefDigest: latest.briefDigest,
+  };
+}
+
+function seatOverrideFor(
+  latest: AttemptRecord,
+  fixSeat: FixSeatForDispatch,
+  nowIso: string,
+  timeLimitSeconds: number,
+): AttemptSeatOverrideRecord | null {
+  let seatForOverride: AttemptSeatSelectionRecord | null;
+  if (latest.kind === 'initial' && latest.priorAttemptId !== null) {
+    seatForOverride = latest.seatSelection ?? null;
+  } else if (fixSeat.kind === 'seat') {
+    seatForOverride = fixSeat.seat;
+  } else {
+    seatForOverride = null;
+  }
+  if (seatForOverride === null) {
+    return null;
+  }
+  return {
+    model: seatForOverride.model,
+    ...(seatForOverride.agent !== null ? { agent: seatForOverride.agent } : {}),
+    ...(seatForOverride.variant !== null ? { variant: seatForOverride.variant } : {}),
+    ...(fixSeat.kind === 'seat' && fixSeat.overrideVariant !== undefined ? { variant: fixSeat.overrideVariant } : {}),
+    reason:
+      latest.kind === 'fix'
+        ? 'fix seat ' + seatForOverride.seatId
+        : 'seat-plan pivot to ' + seatForOverride.seatId,
+    setBy: 'conductor',
+    expiresAtIso: new Date(Date.parse(nowIso) + timeLimitSeconds * 1000).toISOString(),
+  };
+}
+
+function dispatchOutcomeReasonCode(
+  outcome: 'started' | 'blocked' | 'unknown',
+): 'dispatch-started' | 'dispatch-blocked' | 'dispatch-unknown' {
+  if (outcome === 'started') {
+    return 'dispatch-started';
+  }
+  if (outcome === 'blocked') {
+    return 'dispatch-blocked';
+  }
+  return 'dispatch-unknown';
+}
+
+function refusedDispatchReasonCode(
+  stored: AttemptRecord | null,
+): 'runner-refused' | 'dispatch-refused' {
+  if (stored !== null && stored.state === 'cancelled') {
+    return 'runner-refused';
+  }
+  return 'dispatch-refused';
+}
+
+async function handoverOrRecovery(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+  detail: string,
+  reasonCode: 'runner-refused' | 'dispatch-refused',
+  decision: Extract<LaneRunDecision, { kind: 'act' }>,
+  state: LaneRunStateValue,
+): Promise<AdvanceLaneRunResult> {
   if (reasonCode === 'dispatch-refused') {
     if (handsOverDirtyWorktree(latest)) {
       if (isDirtyWorktreeDetail(detail) && (await handOverDirtyWorktree(ctx, latest, request))) {
@@ -892,13 +941,13 @@ export async function performDispatch(ctx: AdvanceStepContext,
     }
   }
   if (reasonCode === 'runner-refused') {
-    const conductRefusal = await conductDispatching(ctx, facts.state, request);
+    const conductRefusal = await conductDispatching(ctx, state, request);
     if (conductRefusal !== null) {
       return refusedResult(conductRefusal);
     }
     return { outcome: 'acted', step: decision.step, key: decision.key, result: 'refused', reasonCode };
   }
-  return performPark(ctx, record, 'step-refused', 'dispatch', facts.state, request);
+  return performPark(ctx, record, 'step-refused', 'dispatch', state, request);
 }
 
 /** The `dispatching` conduct entry after a dispatch, unless the run is already in it. */

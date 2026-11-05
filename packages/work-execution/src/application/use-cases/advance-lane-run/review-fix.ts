@@ -604,6 +604,68 @@ function reviewResultKeysAtHead(
   return candidates;
 }
 
+type FixingSource = {
+  readonly key: string | null;
+  readonly acceptHead12: string | null;
+  readonly source: 'review' | 'gate';
+  readonly reasonCode: string;
+};
+
+type FixingSourceOfEntryVerdict =
+  | { readonly kind: 'skip' }
+  | { readonly kind: 'stop' }
+  | { readonly kind: 'source'; readonly source: FixingSource };
+
+/**
+ * One journal entry's contribution to the fix source: a source object when
+ * this entry sent the run fixing, `skip` when it is not a candidate, and
+ * `stop` when the walk must end with no source (an accept rejection whose key
+ * carries no head).
+ */
+function fixingSourceOfEntry(
+  entry: LaneRunJournalEntryRecord,
+  parsed: ReturnType<typeof parseLaneRunKey>,
+  runId: string,
+): FixingSourceOfEntryVerdict {
+  if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+    return { kind: 'skip' };
+  }
+  if (parsed === null || parsed.kind !== 'step') {
+    return { kind: 'skip' };
+  }
+  if (
+    (parsed.step === 'brief-check' || parsed.step === 'code-review') &&
+    entry.reasonCode === 'review-failed'
+  ) {
+    return { kind: 'source', source: { key: entry.key, acceptHead12: null, source: 'review', reasonCode: entry.reasonCode } };
+  }
+  if (parsed.step === 'gate' && entry.reasonCode === 'gate-failed') {
+    return { kind: 'source', source: { key: entry.key, acceptHead12: null, source: 'gate', reasonCode: entry.reasonCode } };
+  }
+  if (parsed.step === 'ci' && entry.reasonCode === 'ci-failed') {
+    // GB4: a CI failure is a gate-shaped source with its bare reason code;
+    // the gate-predicate refusal (gate-failed only) never fires for it.
+    return { kind: 'source', source: { key: entry.key, acceptHead12: null, source: 'gate', reasonCode: entry.reasonCode } };
+  }
+  if (parsed.step === 'pre-merge' && entry.reasonCode !== null) {
+    return { kind: 'source', source: { key: entry.key, acceptHead12: null, source: 'gate', reasonCode: entry.reasonCode } };
+  }
+  if (
+    parsed.step === 'accept' &&
+    entry.reasonCode === 'acceptance-rejected' &&
+    (entry.detail === 'review-findings' || entry.detail === null)
+  ) {
+    // AR1/MX7: the review source of an accept rejection is receipt-driven.
+    // No key is picked from the journal result alone: `performFixPrepare`
+    // lists the review results at this head and walks their receipts.
+    if (parsed.head12 === null) {
+      return { kind: 'stop' };
+    }
+    return { kind: 'source', source: { key: null, acceptHead12: parsed.head12, source: 'review', reasonCode: 'review-failed' } };
+  }
+  return { kind: 'skip' };
+}
+
 /**
  * Why the run is `fixing`: the LATEST final result entry of this run whose
  * key's step sent it there — a `brief-check`/`code-review` result with reason
@@ -619,51 +681,18 @@ function reviewResultKeysAtHead(
 function fixingFailureSourceOf(
   entries: readonly LaneRunJournalEntryRecord[],
   runId: string,
-): {
-  readonly key: string | null;
-  readonly acceptHead12: string | null;
-  readonly source: 'review' | 'gate';
-  readonly reasonCode: string;
-} | null {
+): FixingSource | null {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index]!;
-    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
-      continue;
-    }
     const parsed = parseLaneRunKey(entry.key);
-    if (parsed === null || parsed.kind !== 'step') {
+    const verdict = fixingSourceOfEntry(entry, parsed, runId);
+    if (verdict.kind === 'skip') {
       continue;
     }
-    if (
-      (parsed.step === 'brief-check' || parsed.step === 'code-review') &&
-      entry.reasonCode === 'review-failed'
-    ) {
-      return { key: entry.key, acceptHead12: null, source: 'review', reasonCode: entry.reasonCode };
+    if (verdict.kind === 'stop') {
+      return null;
     }
-    if (parsed.step === 'gate' && entry.reasonCode === 'gate-failed') {
-      return { key: entry.key, acceptHead12: null, source: 'gate', reasonCode: entry.reasonCode };
-    }
-    if (parsed.step === 'ci' && entry.reasonCode === 'ci-failed') {
-      // GB4: a CI failure is a gate-shaped source with its bare reason code;
-      // the gate-predicate refusal (gate-failed only) never fires for it.
-      return { key: entry.key, acceptHead12: null, source: 'gate', reasonCode: entry.reasonCode };
-    }
-    if (parsed.step === 'pre-merge' && entry.reasonCode !== null) {
-      return { key: entry.key, acceptHead12: null, source: 'gate', reasonCode: entry.reasonCode };
-    }
-    if (
-      parsed.step === 'accept' &&
-      entry.reasonCode === 'acceptance-rejected' &&
-      (entry.detail === 'review-findings' || entry.detail === null)
-    ) {
-      // AR1/MX7: the review source of an accept rejection is receipt-driven.
-      // No key is picked from the journal result alone: `performFixPrepare`
-      // lists the review results at this head and walks their receipts.
-      if (parsed.head12 === null) {
-        return null;
-      }
-      return { key: null, acceptHead12: parsed.head12, source: 'review', reasonCode: 'review-failed' };
-    }
+    return verdict.source;
   }
   return null;
 }

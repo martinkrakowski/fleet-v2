@@ -57,17 +57,8 @@ export class KnowledgeEntry {
     if (typeof record.claimText !== 'string' || record.claimText.trim().length === 0) {
       throw new Error('KnowledgeEntry requires a non-empty claimText');
     }
-    if (record.claimKind !== undefined && !isKnowledgeClaimKind(record.claimKind)) {
-      throw new Error(
-        `KnowledgeEntry claimKind must be one of ${KNOWLEDGE_CLAIM_KINDS.join(', ')}`,
-      );
-    }
-    const claimKind = record.claimKind ?? DEFAULT_KNOWLEDGE_CLAIM_KIND;
-    if (claimKind === 'failed' && record.claimText.length > MAX_FAILED_CLAIM_TEXT_CHARS) {
-      throw new Error(
-        `KnowledgeEntry claimText must be at most ${MAX_FAILED_CLAIM_TEXT_CHARS} characters for a failed claim`,
-      );
-    }
+    const claimKind = resolveClaimKind(record);
+    assertFailedClaimTextWithinCap(record, claimKind);
     if (!Array.isArray(record.pathPrefixes) || !record.pathPrefixes.every((entry) => typeof entry === 'string')) {
       throw new Error('KnowledgeEntry requires string pathPrefixes');
     }
@@ -365,5 +356,30 @@ function validateOverrideReasonShape(value: string, label: string): void {
   }
   if (containsSecretShape(value)) {
     throw new Error(`${label} must not contain a credential shape`);
+  }
+}
+
+/**
+ * Resolve a record's claim kind: an unknown kind is refused; an absent one
+ * reads as the default.
+ */
+function resolveClaimKind(record: KnowledgeEntryRecord): KnowledgeClaimKind {
+  if (record.claimKind !== undefined && !isKnowledgeClaimKind(record.claimKind)) {
+    throw new Error(
+      `KnowledgeEntry claimKind must be one of ${KNOWLEDGE_CLAIM_KINDS.join(', ')}`,
+    );
+  }
+  return record.claimKind ?? DEFAULT_KNOWLEDGE_CLAIM_KIND;
+}
+
+/** A failed claim's text is bounded by the failed-claim cap. */
+function assertFailedClaimTextWithinCap(
+  record: KnowledgeEntryRecord,
+  claimKind: KnowledgeClaimKind,
+): void {
+  if (claimKind === 'failed' && record.claimText.length > MAX_FAILED_CLAIM_TEXT_CHARS) {
+    throw new Error(
+      `KnowledgeEntry claimText must be at most ${MAX_FAILED_CLAIM_TEXT_CHARS} characters for a failed claim`,
+    );
   }
 }

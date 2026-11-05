@@ -687,6 +687,96 @@ function parseReflogTimestamp(stdout: string): number | null {
   return Number.isNaN(ms) ? null : ms;
 }
 
+async function readReflogActivityMs(
+  executor: CommandExecutorPort,
+  worktreePath: string,
+): Promise<number | null> {
+  const reflogRun = await executor.run(
+    ['git', '-C', worktreePath, 'reflog', 'show', '-1', '--date=iso-strict', '--format=%gD', 'HEAD'],
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
+  if (reflogRun.exitCode === 0 && reflogRun.error === undefined) {
+    return parseReflogTimestamp(reflogRun.stdout);
+  }
+  return null;
+}
+
+async function detectStatFlavour(
+  executor: CommandExecutorPort,
+  worktreePath: string,
+): Promise<'gnu' | 'bsd' | null> {
+  const gnuStatRun = await executor.run(['stat', '-c', '%Y', worktreePath], {
+    timeoutMs: GIT_TIMEOUT_MS,
+  });
+  if (gnuStatRun.exitCode === 0 && gnuStatRun.error === undefined) {
+    return 'gnu';
+  }
+  const bsdStatRun = await executor.run(['stat', '-f', '%m', worktreePath], {
+    timeoutMs: GIT_TIMEOUT_MS,
+  });
+  if (bsdStatRun.exitCode === 0 && bsdStatRun.error === undefined) {
+    return 'bsd';
+  }
+  return null;
+}
+
+async function readIndexActivityMs(
+  executor: CommandExecutorPort,
+  worktreePath: string,
+  flavour: 'gnu' | 'bsd',
+): Promise<number | null> {
+  const indexPathRun = await executor.run(
+    ['git', '-C', worktreePath, 'rev-parse', '--git-path', 'index'],
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
+  if (indexPathRun.exitCode !== 0 || indexPathRun.error !== undefined) {
+    return null;
+  }
+  let indexPath = indexPathRun.stdout.trim();
+  if (!indexPath.startsWith('/')) {
+    indexPath = path.join(worktreePath, indexPath);
+  }
+  const indexStatRun = await executor.run(
+    flavour === 'gnu' ? ['stat', '-c', '%Y', indexPath] : ['stat', '-f', '%m', indexPath],
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
+  if (
+    indexStatRun.exitCode !== 0 ||
+    indexStatRun.error !== undefined ||
+    indexStatRun.stdout.trim() === ''
+  ) {
+    return null;
+  }
+  const seconds = Number.parseInt(indexStatRun.stdout.trim(), 10);
+  if (!Number.isSafeInteger(seconds)) {
+    return null;
+  }
+  return seconds * 1000;
+}
+
+async function walkTreeActivity(
+  executor: CommandExecutorPort,
+  worktreePath: string,
+  flavour: 'gnu' | 'bsd',
+): Promise<{ newestMs: number | null; unknown: boolean }> {
+  const walkArgv =
+    flavour === 'gnu'
+      ? ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y', '{}', '+']
+      : ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-f', '%m', '{}', '+'];
+  const walkRun = await executor.run(walkArgv, { timeoutMs: GIT_TIMEOUT_MS });
+  let newestMs: number | null = null;
+  for (const line of walkRun.stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    const seconds = Number.parseInt(trimmed, 10);
+    if (Number.isSafeInteger(seconds) && (newestMs === null || seconds * 1000 > newestMs)) {
+      newestMs = seconds * 1000;
+    }
+  }
+  const unknown = walkRun.exitCode === null || walkRun.error !== undefined || walkRun.exitCode !== 0;
+  return { newestMs, unknown };
+}
+
 export class WorkspaceAdapter implements WorkspacePort {
   constructor(private readonly options?: WorkspaceAdapterOptions) {}
 
@@ -1753,32 +1843,13 @@ export class WorkspaceAdapter implements WorkspacePort {
     // reflog: the newest reflog entry's timestamp; a non-zero exit or empty
     // stdout contributes nothing.
     let newestMs: number | null = null;
-    const reflogRun = await executor.run(
-      ['git', '-C', worktreePath, 'reflog', 'show', '-1', '--date=iso-strict', '--format=%gD', 'HEAD'],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
-    if (reflogRun.exitCode === 0 && reflogRun.error === undefined) {
-      const ms = parseReflogTimestamp(reflogRun.stdout);
-      if (ms !== null) {
-        newestMs = ms;
-      }
+    const reflogMs = await readReflogActivityMs(executor, worktreePath);
+    if (reflogMs !== null) {
+      newestMs = reflogMs;
     }
 
     // Detect the `stat` flavour once: GNU (`-c %Y`) or BSD (`-f %m`).
-    const gnuStatRun = await executor.run(['stat', '-c', '%Y', worktreePath], {
-      timeoutMs: GIT_TIMEOUT_MS,
-    });
-    let flavour: 'gnu' | 'bsd' | null = null;
-    if (gnuStatRun.exitCode === 0 && gnuStatRun.error === undefined) {
-      flavour = 'gnu';
-    } else {
-      const bsdStatRun = await executor.run(['stat', '-f', '%m', worktreePath], {
-        timeoutMs: GIT_TIMEOUT_MS,
-      });
-      if (bsdStatRun.exitCode === 0 && bsdStatRun.error === undefined) {
-        flavour = 'bsd';
-      }
-    }
+    const flavour = await detectStatFlavour(executor, worktreePath);
 
     let unknown = false;
     if (flavour === null) {
@@ -1786,46 +1857,17 @@ export class WorkspaceAdapter implements WorkspacePort {
       unknown = true;
     } else {
       // Index mtime: resolve the index path, then stat it with the detected flavour.
-      const indexPathRun = await executor.run(
-        ['git', '-C', worktreePath, 'rev-parse', '--git-path', 'index'],
-        { timeoutMs: GIT_TIMEOUT_MS },
-      );
-      if (indexPathRun.exitCode === 0 && indexPathRun.error === undefined) {
-        let indexPath = indexPathRun.stdout.trim();
-        if (!indexPath.startsWith('/')) {
-          indexPath = path.join(worktreePath, indexPath);
-        }
-        const indexStatRun = await executor.run(
-          flavour === 'gnu' ? ['stat', '-c', '%Y', indexPath] : ['stat', '-f', '%m', indexPath],
-          { timeoutMs: GIT_TIMEOUT_MS },
-        );
-        if (
-          indexStatRun.exitCode === 0 &&
-          indexStatRun.error === undefined &&
-          indexStatRun.stdout.trim() !== ''
-        ) {
-          const seconds = Number.parseInt(indexStatRun.stdout.trim(), 10);
-          if (Number.isSafeInteger(seconds) && (newestMs === null || seconds * 1000 > newestMs)) {
-            newestMs = seconds * 1000;
-          }
-        }
+      const indexMs = await readIndexActivityMs(executor, worktreePath, flavour);
+      if (indexMs !== null && (newestMs === null || indexMs > newestMs)) {
+        newestMs = indexMs;
       }
 
       // Bounded tree walk: newest file mtime under the worktree, skipping .git.
-      const walkArgv =
-        flavour === 'gnu'
-          ? ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y', '{}', '+']
-          : ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-f', '%m', '{}', '+'];
-      const walkRun = await executor.run(walkArgv, { timeoutMs: GIT_TIMEOUT_MS });
-      for (const line of walkRun.stdout.split('\n')) {
-        const trimmed = line.trim();
-        if (trimmed === '') continue;
-        const seconds = Number.parseInt(trimmed, 10);
-        if (Number.isSafeInteger(seconds) && (newestMs === null || seconds * 1000 > newestMs)) {
-          newestMs = seconds * 1000;
-        }
+      const walk = await walkTreeActivity(executor, worktreePath, flavour);
+      if (walk.newestMs !== null && (newestMs === null || walk.newestMs > newestMs)) {
+        newestMs = walk.newestMs;
       }
-      if (walkRun.exitCode === null || walkRun.error !== undefined || walkRun.exitCode !== 0) {
+      if (walk.unknown) {
         unknown = true;
       }
     }

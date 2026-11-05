@@ -828,6 +828,21 @@ export type RestoreStateFileOutcome =
   | { readonly status: 'restored'; readonly recordCount: number; readonly previousCopyPath: string | null }
   | { readonly status: 'refused'; readonly reason: string };
 
+export interface StateFileCompactionRequest {
+  readonly stateDir: string;
+  /** The ids of the records to keep; every other record in the file is removed. */
+  readonly keepIds: readonly string[];
+  /** sha256 hex of the file bytes the keep list was computed from; a changed file is refused. */
+  readonly expectedCurrentSha256: string;
+  /** The store lock's wait budget; defaults to 10 000 ms like the store's own writes. */
+  readonly lockTimeoutMs?: number;
+}
+
+export type StateFileCompactionOutcome =
+  | { readonly status: 'compacted'; readonly beforeCount: number; readonly afterCount: number; readonly quarantinePath: string | null }
+  | { readonly status: 'unchanged'; readonly recordCount: number }
+  | { readonly status: 'refused'; readonly reason: string };
+
 /** One JSON state store a context owns, as `fleet-v2 state` sees it. */
 export interface StateFileDescriptor {
   readonly basename: string;
@@ -841,6 +856,8 @@ export interface StateFileDescriptor {
   readQuarantineCopy(stateDir: string, from: string): Promise<QuarantineCopyRead>;
   /** Under the store's lock: re-validate, compare-and-swap on the current bytes, keep them as a quarantine copy, write the candidate's exact bytes atomically. */
   restore(request: RestoreStateFileRequest): Promise<RestoreStateFileOutcome>;
+  /** Compact the store: keep only the records whose id is in the request. Record-list stores only. */
+  readonly compact?: (request: StateFileCompactionRequest) => Promise<StateFileCompactionOutcome>;
 }
 
 function errorCodeOf(error: unknown): string {
@@ -1033,6 +1050,120 @@ async function restoreRecordListStore(
 }
 
 /**
+ * Compact a record-list store under its lock: keep exactly the records whose
+ * id is in `request.keepIds`, write the compacted file beside the original,
+ * verify it with the store's own `inspect`, keep the pre-compaction bytes as
+ * a quarantine copy, then swap the compacted file in. A compaction that cannot
+ * verify itself writes nothing and leaves the store as it found it.
+ */
+async function compactRecordListStore(
+  inspect: (bytes: Buffer) => StateFileInspection,
+  request: StateFileCompactionRequest,
+  relativePath: string,
+): Promise<StateFileCompactionOutcome> {
+  const filePath = path.join(request.stateDir, relativePath);
+  const tempPath = `${filePath}.compacted`;
+  return withFileLock<StateFileCompactionOutcome>(
+    `${filePath}.lock`,
+    async () => {
+      const removeTemp = async (): Promise<void> => {
+        try {
+          await fs.rm(tempPath, { force: true });
+        } catch {
+          // ignore
+        }
+      };
+      try {
+        let current: Buffer;
+        try {
+          current = await fs.readFile(filePath);
+        } catch (error: unknown) {
+          const code = errorCodeOf(error);
+          if (code === 'ENOENT') {
+            return { status: 'refused', reason: 'the store file does not exist' };
+          }
+          return { status: 'refused', reason: `the store file could not be read (${code})` };
+        }
+
+        const currentSha = createHash('sha256').update(current).digest('hex');
+        if (currentSha !== request.expectedCurrentSha256) {
+          return { status: 'refused', reason: 'the store changed since the compaction plan was computed' };
+        }
+
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(current.toString('utf8'));
+        } catch {
+          return { status: 'refused', reason: 'the store file is not a record list' };
+        }
+        if (!Array.isArray(parsed)) {
+          return { status: 'refused', reason: 'the store file is not a record list' };
+        }
+
+        for (const element of parsed) {
+          if (
+            typeof element !== 'object' ||
+            element === null ||
+            typeof (element as { id?: unknown }).id !== 'string' ||
+            (element as { id: string }).id.length === 0
+          ) {
+            return { status: 'refused', reason: 'a record without an id cannot be compacted safely' };
+          }
+        }
+
+        const keepIds = new Set(request.keepIds);
+        const kept = parsed.filter((element) => keepIds.has((element as { id: string }).id));
+        if (kept.length === parsed.length) {
+          return { status: 'unchanged', recordCount: kept.length };
+        }
+
+        const compactedBytes = Buffer.from(`${JSON.stringify(kept, null, 2)}\n`, 'utf8');
+
+        const beforeInspection = inspect(compactedBytes);
+        if (beforeInspection.status !== 'ok' || beforeInspection.recordCount !== kept.length) {
+          return { status: 'refused', reason: 'the compacted file did not verify; nothing was written' };
+        }
+
+        let quarantinePath: string | null = null;
+        try {
+          const copy = await keepQuarantineCopy(filePath, current);
+          quarantinePath = copy.quarantinePath;
+        } catch {
+          return { status: 'refused', reason: 'the pre-compaction bytes could not be kept; nothing was written' };
+        }
+
+        await fs.writeFile(tempPath, compactedBytes);
+        await fs.rename(tempPath, filePath);
+
+        let swapped: Buffer;
+        try {
+          swapped = await fs.readFile(filePath);
+        } catch (error: unknown) {
+          await removeTemp();
+          const code = errorCodeOf(error);
+          return { status: 'refused', reason: `the compacted file could not be verified after the swap (${code})` };
+        }
+        if (!swapped.equals(compactedBytes)) {
+          await writeBytesAtomically(filePath, current);
+          await removeTemp();
+          return {
+            status: 'refused',
+            reason: 'the compacted file did not verify after the swap; the previous bytes were restored',
+          };
+        }
+
+        return { status: 'compacted', beforeCount: parsed.length, afterCount: kept.length, quarantinePath };
+      } catch (error: unknown) {
+        await removeTemp();
+        const message = error instanceof Error ? error.message : String(error);
+        return { status: 'refused', reason: `the compaction failed (${message})` };
+      }
+    },
+    { timeoutMs: request.lockTimeoutMs ?? 10_000 },
+  );
+}
+
+/**
  * The descriptor plumbing shared by the single-file stores: quarantine-name
  * recognition, the read-only `check`, quarantine-copy reads and `restore`.
  * `inspect` is the pure parser the store's reader applies. `relativePath` is
@@ -1088,7 +1219,11 @@ export function describeRecordListStore<T>(
       ? { status: 'ok', recordCount: result.records.length }
       : { status: 'unreadable', detail: listError, recordIndex: null };
   };
-  return buildStateFileDescriptor(basename, inspect);
+  const descriptor = buildStateFileDescriptor(basename, inspect);
+  return {
+    ...descriptor,
+    compact: (request) => compactRecordListStore(inspect, request, basename),
+  };
 }
 
 /**
@@ -1112,7 +1247,11 @@ export function describeVersionedRecordListStore<T>(
       ? { status: 'ok', recordCount: result.records.length, schemaVersions: result.schemaVersions }
       : { status: 'unreadable', detail: listError, recordIndex: null };
   };
-  return buildStateFileDescriptor(basename, inspect);
+  const descriptor = buildStateFileDescriptor(basename, inspect);
+  return {
+    ...descriptor,
+    compact: (request) => compactRecordListStore(inspect, request, basename),
+  };
 }
 
 /** A record-list store's current bytes, or null when the file does not exist yet. */

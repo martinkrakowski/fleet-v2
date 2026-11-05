@@ -687,7 +687,7 @@ describe('ForgeActionAdapter create-branch (lane CO7)', () => {
 
   it('classifies the create failure when the read-back finds no branch', async () => {
     const forbidden = { exitCode: 1, stdout: '', stderr: 'gh: Resource not accessible by integration (HTTP 403)' };
-    const { adapter } = makeChainAdapter([forbidden, MISSING]);
+    const { adapter } = makeChainAdapter([forbidden, MISSING, OK]);
     const result = await adapter.performMergeForgeAction(createBranchRequest());
     expect(result.outcome).toBe('refused');
     if (result.outcome === 'refused') {
@@ -797,9 +797,17 @@ describe('ForgeActionAdapter readMergeBranchHead (lane CO7)', () => {
     expect(calls[0]!.ghConfigDir).toBe(MERGE_DIR);
   });
 
-  it('returns not-found on a 404', async () => {
-    const { adapter } = makeChainAdapter([MISSING]);
+  it('returns not-found on a 404 only when the repository itself reads', async () => {
+    const { adapter, calls } = makeChainAdapter([MISSING, OK]);
     expect(await adapter.readMergeBranchHead(read)).toEqual({ outcome: 'not-found' });
+    expect(calls[1]!.args).toEqual(['api', `repos/${OWNER}/${REPO}`]);
+  });
+
+  it('keeps a 404 unavailable when the repository cannot be read or the probe throws', async () => {
+    for (const probe of [MISSING, { throw: true } as GhAnswer]) {
+      const { adapter } = makeChainAdapter([MISSING, probe]);
+      expect((await adapter.readMergeBranchHead(read)).outcome).toBe('unavailable');
+    }
   });
 
   it('returns unavailable, never not-found, for other failures and bad bodies', async () => {

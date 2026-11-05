@@ -1222,11 +1222,33 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     }
     if (gh.exitCode !== 0) {
       if (/HTTP 404|Not Found/i.test(`${gh.stderr}\n${gh.stdout}`)) {
-        return { outcome: 'not-found' };
+        return this.confirmBranchAbsent(request, runGh, configDir);
       }
       return { outcome: 'unavailable', reason: 'gh api branch read failed' };
     }
     return this.parseBranchHeadBody(gh.stdout, request.branchName);
+  }
+
+  /**
+   * A 404 on the ref read also answers a repository the identity cannot see, so it proves the branch absent
+   * only when the repository itself reads; otherwise the answer stays unavailable, never a guess.
+   */
+  private async confirmBranchAbsent(
+    request: MergeBranchHeadRequest,
+    runGh: NonNullable<ForgeActionDelegate['runGh']>,
+    configDir: string,
+  ): Promise<MergeBranchHeadResult> {
+    const unresolved: MergeBranchHeadResult = { outcome: 'unavailable', reason: 'branch read could not confirm the branch is absent' };
+    const budget = this.budgetCallTimeoutMs(request.deadlineIso);
+    if (!budget.ok) {
+      return unresolved;
+    }
+    try {
+      const probe = await runGh(['api', `repos/${request.repository.owner}/${request.repository.repo}`], configDir, budget.timeoutMs);
+      return probe.exitCode === 0 ? { outcome: 'not-found' } : unresolved;
+    } catch {
+      return unresolved;
+    }
   }
 
   private parseBranchHeadBody(stdout: string, branchName: string): MergeBranchHeadResult {

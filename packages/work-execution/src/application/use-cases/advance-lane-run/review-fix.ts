@@ -515,7 +515,8 @@ export async function performReview(
  * brief-check state later reads the recorded receipt instead of requesting a
  * second review. Failure-tolerant by design — an unwired port, missing facts,
  * an existing brief-check intent, an unavailable seat or a built-key failure
- * starts nothing, and a throw from `performReview` is swallowed — because a
+ * starts nothing, and a throw from the journal read or `performReview` is
+ * swallowed — because a
  * review that cannot start must never block or change the gate's own result:
  * the brief-check state keeps behaving exactly as it does without the
  * in-flight start. The session-start gate inside `performReview` still sits
@@ -541,36 +542,37 @@ export async function startBriefCheckInFlight(
   if (gathered.facts.briefCheck.verdict !== 'none') {
     return;
   }
-  const entries = await ctx.deps.runJournal.listForRun(record.runId);
-  const seat = reviewSeatOf(ctx, record, 'brief-check', entries, gathered.attemptRecords);
-  if (!seat.ok) {
-    return;
-  }
-  const key = buildLaneRunStepKey({
-    runId: record.runId,
-    round: record.round,
-    step: 'brief-check',
-    seatIndex: seat.seatIndex,
-    attemptOrdinal: null,
-    head12,
-    retry: null,
-  });
-  if (!key.ok) {
-    return;
-  }
-  const decision: ActDecision = {
-    kind: 'act',
-    step: 'brief-check',
-    key: key.key,
-    round: record.round,
-    seatIndex: seat.seatIndex,
-    head12,
-    retry: null,
-  };
   try {
+    const entries = await ctx.deps.runJournal.listForRun(record.runId);
+    const seat = reviewSeatOf(ctx, record, 'brief-check', entries, gathered.attemptRecords);
+    if (!seat.ok) {
+      return;
+    }
+    const key = buildLaneRunStepKey({
+      runId: record.runId,
+      round: record.round,
+      step: 'brief-check',
+      seatIndex: seat.seatIndex,
+      attemptOrdinal: null,
+      head12,
+      retry: null,
+    });
+    if (!key.ok) {
+      return;
+    }
+    const decision: ActDecision = {
+      kind: 'act',
+      step: 'brief-check',
+      key: key.key,
+      round: record.round,
+      seatIndex: seat.seatIndex,
+      head12,
+      retry: null,
+    };
     await performReview(ctx, record, gathered, decision, request);
   } catch {
-    // A review that cannot start never blocks the gate.
+    // A review that cannot start — a journal read, a seat, a key or the
+    // request itself — never blocks the gate.
   }
 }
 

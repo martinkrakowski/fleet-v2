@@ -700,11 +700,15 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
     const leaseUntilIso = new Date(
       Date.parse(startedAtIso) + Math.min(LANE_RUN_LEASE_MAX_MS, (ctx.request.budgetSeconds + 10) * 1000),
     ).toISOString();
+    const unreadable = { ok: false, outcome: { outcome: 'refused', reasonCode: 'lease-unreadable' } } as const;
     let current: DaemonLeaseRecord | null;
     try {
       current = await this.deps.lease.read(scope);
     } catch {
-      return { ok: false, outcome: { outcome: 'refused', reasonCode: 'lease-unreadable' } };
+      return unreadable;
+    }
+    if (current !== null && !isRecord(current)) {
+      return unreadable;
     }
     const acquireRequest = {
       holderId: ctx.request.tickId,
@@ -720,10 +724,21 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
     try {
       acquired = await this.deps.lease.acquire({ scope, ...acquireRequest });
     } catch {
-      return { ok: false, outcome: { outcome: 'refused', reasonCode: 'lease-unreadable' } };
+      // The write may have landed before the failure: release the fence the domain expected.
+      await this.releaseLease(ctx, scope, decision.lease.fence);
+      return unreadable;
+    }
+    if (!isRecord(acquired)) {
+      return unreadable;
     }
     if (acquired.outcome === 'ok') {
-      return { ok: true, fence: acquired.lease.fence };
+      const fence = isRecord(acquired.lease) ? acquired.lease.fence : undefined;
+      if (typeof fence === 'number' && Number.isSafeInteger(fence) && fence >= 1) {
+        return { ok: true, fence };
+      }
+      // A success the tick cannot read: the lease may be held, so release the expected fence.
+      await this.releaseLease(ctx, scope, decision.lease.fence);
+      return unreadable;
     }
     if (acquired.reason === 'lease-held' || acquired.reason === 'lease-moved') {
       return { ok: false, outcome: { outcome: 'skipped', reasonCode: acquired.reason } };

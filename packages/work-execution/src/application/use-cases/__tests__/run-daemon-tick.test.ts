@@ -694,6 +694,34 @@ describe('RunDaemonTickUseCase (DT10a)', () => {
     expect(h.mergePass.requests.map((request) => request.repoDigest)).toEqual([DIGEST_B]);
   });
 
+  it('a malformed or failing lease acquire refuses the job and releases the expected fence', async () => {
+    const malformed = makeHarness();
+    malformed.lease.acquire = async (request) => {
+      malformed.lease.acquires.push(request);
+      return { outcome: 'ok' } as unknown as DaemonLeaseResult;
+    };
+
+    const result = await malformed.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.status?.jobs[0]).toMatchObject({ outcome: 'refused', reasonCode: 'lease-unreadable', leaseFence: null });
+    expect(malformed.mergePass.requests).toHaveLength(0);
+    expect(malformed.lease.releases).toEqual([
+      expect.objectContaining({ scope: `merge/${DIGEST_A}`, holderId: TICK_A, fence: 1 }),
+    ]);
+
+    const failing = makeHarness();
+    failing.lease.acquire = async () => {
+      throw new Error('lease write exploded');
+    };
+
+    const failed = await failing.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(failed.status?.jobs[0]).toMatchObject({ outcome: 'refused', reasonCode: 'lease-unreadable' });
+    expect(failing.lease.releases).toHaveLength(1);
+    expect(failing.mergePass.requests).toHaveLength(0);
+  });
+
   it('a failing status write refuses the tick as status-write-failed', async () => {
     const h = makeHarness();
     h.status.throwOnWrite = true;

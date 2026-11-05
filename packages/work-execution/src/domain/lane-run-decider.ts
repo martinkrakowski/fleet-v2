@@ -1050,7 +1050,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       return stopAct(facts.attempt, wait('stop-unconfirmed'));
     }
 
-    // G4i / GD1–GD6 (§3.9.1): a graceful stop drains the run's live attempt.
+    // G4i / GD1–GD7 (§3.9.1): a graceful stop drains the run's live attempt.
     if (facts.stopMode === 'graceful') {
       const phase = facts.attempt === null ? null : facts.attempt.phase;
       const live = phase === 'dispatching' || phase === 'running' || phase === 'blocked';
@@ -1059,15 +1059,16 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       const drainGate: Exclude<LaneRunFacts['gate'], 'congested'> =
         facts.gate === 'congested' ? 'unknown' : facts.gate;
       const drainContinues = laneRunDrainContinues(facts.state, drainGate);
-      const drainWait = (): LaneRunDecision => {
+      // The stop's grace has passed when the stop's time is missing or unparseable:
+      // an unknown stop time cannot be inside a grace window (GD7).
+      const gracePassed = (): boolean => {
         if (facts.stopRequestedAtIso === null || Number.isNaN(Date.parse(facts.stopRequestedAtIso))) {
-          return wait('stop-grace-exceeded');
+          return true;
         }
-        if (now >= Date.parse(facts.stopRequestedAtIso) + facts.stopGraceMinutes * 60_000) {
-          return wait('stop-grace-exceeded');
-        }
-        return wait('stop-draining');
+        return now >= Date.parse(facts.stopRequestedAtIso) + facts.stopGraceMinutes * 60_000;
       };
+      const drainWait = (): LaneRunDecision =>
+        gracePassed() ? wait('stop-grace-exceeded') : wait('stop-draining');
       // GD1: nothing live left to drain ends the run.
       if ((phase === null || !live) && !drainContinues) {
         return enter('stopped');
@@ -1079,6 +1080,13 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       // GD3: a live attempt outside the drain states waits on the drain.
       if (live && !drainContinues) {
         return drainWait();
+      }
+      // GD7 (§3.9.1, F90): a drain state with no live attempt whose stop grace has
+      // passed ends the run, instead of running the state's own rules again and
+      // again. Inside the grace the drain still gets its chance to finish collect
+      // or gate. A live attempt keeps today's behaviour (GD3).
+      if (!live && drainContinues && gracePassed()) {
+        return enter('stopped');
       }
       // GD4: inside the drain states the state rules apply, with GD5 and GD6.
       let decision: LaneRunDecision;

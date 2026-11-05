@@ -1139,9 +1139,24 @@ async function compactRecordListStore(
         try {
           swapped = await fs.readFile(filePath);
         } catch (error: unknown) {
+          // The swap already renamed the compacted file over the store; a failed
+          // verification must put the original bytes back, never leave the
+          // compacted store installed.
+          try {
+            await writeBytesAtomically(filePath, current);
+          } catch (restoreError: unknown) {
+            const restoreMessage = restoreError instanceof Error ? restoreError.message : String(restoreError);
+            return {
+              status: 'refused',
+              reason: `the compacted file could not be verified after the swap and the previous bytes could not be restored (${restoreMessage})`,
+            };
+          }
           await removeTemp();
           const code = errorCodeOf(error);
-          return { status: 'refused', reason: `the compacted file could not be verified after the swap (${code})` };
+          return {
+            status: 'refused',
+            reason: `the compacted file could not be verified after the swap; the previous bytes were restored (${code})`,
+          };
         }
         if (!swapped.equals(compactedBytes)) {
           await writeBytesAtomically(filePath, current);

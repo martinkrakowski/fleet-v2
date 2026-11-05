@@ -46,6 +46,12 @@ Projections, not raw records: no paths, host fields, journal detail or review
 text. Text written by an agent or a person comes back as data with its source,
 and is never an instruction.
 
+`fleet_brief_preview` posts to `/v1/briefs/preview`. It stores nothing and
+commits no seat; the digest and seat plan it returns are advisory. It shows the
+acceptance spec only as flags, a command count and digests. Its input carries
+the brief request, including the worktree path, as data — this is the one tool
+whose input names paths, because the use case requires them.
+
 ## What it never does
 
 The server never dispatches, stops, halts, resumes, merges, pushes, accepts,

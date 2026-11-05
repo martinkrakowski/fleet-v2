@@ -125,6 +125,11 @@ describe("requiredScope", () => {
     expect(requiredScope("PATCH", "/v1/projects/:id")).toBe("operate");
   });
 
+  it("maps the brief preview dry run to read", () => {
+    expect(requiredScope("POST", "/v1/briefs/preview")).toBe("read");
+    expect(requiredScope("GET", "/v1/briefs/preview")).toBeNull();
+  });
+
   it("freezes the seven scopes including tail", () => {
     expect(FROZEN_SCOPES).toEqual([
       "read",

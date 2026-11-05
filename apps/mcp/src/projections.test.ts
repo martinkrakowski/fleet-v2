@@ -4,6 +4,7 @@
 // entries and never throw.
 import { describe, expect, it } from "vitest";
 import {
+  projectBriefPreview,
   projectConductorStatus,
   projectLaneRunList,
   projectProjectList,
@@ -355,5 +356,135 @@ describe("projectConductorStatus", () => {
       "trace",
     ]);
     expect("truncated" in projected).toBe(false);
+  });
+});
+
+describe("projectBriefPreview", () => {
+  it("projects a full previewed shape and keeps only the allow-list", () => {
+    const projected = projectBriefPreview({
+      outcome: "previewed",
+      preview: {
+        attemptId: "att-1",
+        briefDigest: "a".repeat(64),
+        modelAssignment: {
+          model: "example-provider/glm-5.3",
+          variant: "default",
+          seatTool: "opencode",
+        },
+        seatPlan: {
+          version: 1,
+          "first-pass": [
+            { id: "fp-a", model: "m-1", tool: "opencode", variant: "v", agent: "agent-1", on: ["host-a"] },
+          ],
+          fix: [],
+          review: [],
+        },
+        acceptance: {
+          commitRequired: true,
+          diffCheck: true,
+          commandCount: 2,
+          commandDigests: ["b".repeat(64), "c".repeat(64)],
+        },
+        prNotesPresent: true,
+        selectedKnowledgeVersions: [
+          { knowledgeEntryId: "ke-1", version: "1" },
+        ],
+        worktreePath: "/wt-example",
+        ownedPaths: ["packages/example/**"],
+        prosePath: ".lane/brief.md",
+        manifestPath: ".lane/brief-manifest.json",
+      },
+    });
+    if (!("preview" in projected)) {
+      throw new Error("expected previewed");
+    }
+    expect(Object.keys(projected).sort()).toEqual(["outcome", "preview"]);
+    expect(Object.keys(projected.preview).sort()).toEqual([
+      "acceptance",
+      "attemptId",
+      "briefDigest",
+      "modelAssignment",
+      "prNotesPresent",
+      "seatPlan",
+      "selectedKnowledgeVersions",
+    ]);
+    expect(projected.preview.briefDigest).toBe("a".repeat(64));
+    expect(projected.preview.modelAssignment).toEqual({
+      model: "example-provider/glm-5.3",
+      variant: "default",
+      seatTool: "opencode",
+    });
+    expect(projected.preview.seatPlan).toEqual({
+      version: 1,
+      "first-pass": [
+        { id: "fp-a", model: "m-1", tool: "opencode", variant: "v", agent: "agent-1", on: ["host-a"] },
+      ],
+      fix: [],
+      review: [],
+    });
+    expect(projected.preview.acceptance).toEqual({
+      commitRequired: true,
+      diffCheck: true,
+      commandCount: 2,
+      commandDigests: ["b".repeat(64), "c".repeat(64)],
+    });
+    expect(projected.preview.prNotesPresent).toBe(true);
+    expect(projected.preview.selectedKnowledgeVersions).toEqual([
+      { knowledgeEntryId: "ke-1", version: "1" },
+    ]);
+    expect("worktreePath" in projected.preview).toBe(false);
+    expect("ownedPaths" in projected.preview).toBe(false);
+    expect("prosePath" in projected.preview).toBe(false);
+    expect("manifestPath" in projected.preview).toBe(false);
+  });
+
+  it("drops extra keys and a non-hex digest", () => {
+    const projected = projectBriefPreview({
+      outcome: "previewed",
+      preview: {
+        attemptId: "att-1",
+        briefDigest: "not-hex",
+        acceptance: {
+          commandCount: 1,
+          commandDigests: ["short", "d".repeat(64)],
+        },
+        unexpected: "dropped",
+      },
+    });
+    if (!("preview" in projected)) {
+      throw new Error("expected previewed");
+    }
+    expect(projected.preview.briefDigest).toBeNull();
+    expect(projected.preview.acceptance.commandDigests).toEqual(["d".repeat(64)]);
+    expect("unexpected" in projected.preview).toBe(false);
+  });
+
+  it("projects a rejected outcome with reasonClass and a 500-character reason", () => {
+    const projected = projectBriefPreview({
+      outcome: "rejected",
+      reasonClass: "acceptance-spec-shell",
+      reason: "r".repeat(600),
+      extra: "dropped",
+    });
+    expect(projected).toEqual({
+      outcome: "rejected",
+      reasonClass: "acceptance-spec-shell",
+      reason: "r".repeat(500),
+    });
+    const noClass = projectBriefPreview({
+      outcome: "rejected",
+      reason: "plain reason",
+    });
+    expect(noClass).toEqual({
+      outcome: "rejected",
+      reasonClass: null,
+      reason: "plain reason",
+    });
+  });
+
+  it("returns unknown for garbage input", () => {
+    expect(projectBriefPreview(null)).toEqual({ outcome: "unknown" });
+    expect(projectBriefPreview("text")).toEqual({ outcome: "unknown" });
+    expect(projectBriefPreview({})).toEqual({ outcome: "unknown" });
   });
 });

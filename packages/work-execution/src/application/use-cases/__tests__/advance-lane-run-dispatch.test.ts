@@ -1416,6 +1416,31 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(gate.seeds).toEqual([LATER]);
   });
 
+  it('fix round 4: a failing journal read with an undated started attempt still waits instead of throwing', async () => {
+    const prior = attemptFixture({
+      id: 'attempt-example-0',
+      state: 'running',
+      updatedAtIso: 'not-a-date',
+    });
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const journal = harness.deps.executionJournal;
+    const original = journal.listJournalEntriesForAttempt.bind(journal);
+    let failReads = true;
+    journal.listJournalEntriesForAttempt = async (attemptId: string) => {
+      if (failReads) {
+        throw new Error('journal read failed');
+      }
+      return original(attemptId);
+    };
+    const gate = seededEndpointGate();
+    const result = await advance(harness, { startGate: gate });
+    failReads = false;
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(gate.seeds).toEqual([LATER]);
+    expect(harness.dispatchRequests).toEqual([]);
+  });
+
   it('test 21 (KF-34a1): a seat-pivot dispatch is denied the same way, before the pivot intent', async () => {
     const harness = await makeHarness(runRecord(), [attemptFixture()]);
     harness.setDispatchAnswer(async (request) => {

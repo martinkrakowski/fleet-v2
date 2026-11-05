@@ -1132,9 +1132,14 @@ async function undatedStartSeenMs(
   if (journal.appendJournalEntry === undefined) {
     return null;
   }
-  const prior = await journal.listJournalEntriesForAttempt(latest.id);
-  const seen = prior.find((entry) => isStaggerWaitEntry(entry, true));
-  const seenMs = seen === undefined ? NaN : Date.parse(seen.recordedAtIso);
+  let seenMs = NaN;
+  try {
+    const prior = await journal.listJournalEntriesForAttempt(latest.id);
+    const seen = prior.find((entry) => isStaggerWaitEntry(entry, true));
+    seenMs = seen === undefined ? NaN : Date.parse(seen.recordedAtIso);
+  } catch {
+    // A failing journal read never fails the wait: the sighting is now.
+  }
   if (Number.isFinite(seenMs)) {
     return seenMs;
   }

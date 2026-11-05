@@ -14,6 +14,7 @@ export * from "./AutoMergeOwnerRoutingAdapter.adapter.js";
 export * from "./BriefAuthoringAdapter.adapter.js";
 export * from "./BriefKnowledgeAdapter.adapter.js";
 export * from "./BriefReadRepositoryAdapter.adapter.js";
+export * from "./ChainRepositoryAdapter.adapter.js";
 export * from "./CiStateAdapter.adapter.js";
 export * from "./ConductorDriverLeaseAdapter.adapter.js";
 export * from "./ConductorForgeGrantAdapter.adapter.js";

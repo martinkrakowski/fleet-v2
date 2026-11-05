@@ -13,6 +13,7 @@ export * from "./AutoMergeSettingsPort.out-port.js";
 export * from "./BriefAuthoringPort.out-port.js";
 export * from "./BriefKnowledgePort.out-port.js";
 export * from "./BriefReadRepositoryPort.out-port.js";
+export * from "./ChainRepositoryPort.out-port.js";
 export * from "./ChangeSignalPort.out-port.js";
 export * from "./CiStatePort.out-port.js";
 export * from "./CommandExecutorPort.out-port.js";

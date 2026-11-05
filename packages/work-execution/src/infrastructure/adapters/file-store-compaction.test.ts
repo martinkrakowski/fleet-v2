@@ -4,8 +4,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { describeRecordListStore } from './file-store.js';
-import type { StateFileDescriptor } from './file-store.js';
+import { describeRecordListStore, describeVersionedRecordListStore } from './file-store.js';
+import type { StateFileDescriptor, VersionedRecordParseResult } from './file-store.js';
 
 function trivialParseRecord(raw: unknown): { id: string } | undefined {
   if (typeof raw === 'object' && raw !== null && typeof (raw as { id?: unknown }).id === 'string') {
@@ -152,5 +152,69 @@ describe('state file compaction', () => {
     }
 
     expect(await quarantineCopies()).toHaveLength(5);
+  });
+
+  it('writes nothing when the store has an unsupported schemaVersion', async () => {
+    const versionedDescriptor = describeVersionedRecordListStore(
+      dataPath,
+      (raw): VersionedRecordParseResult<{ id: string }> => {
+        if (typeof raw !== 'object' || raw === null) {
+          return { status: 'invalid' };
+        }
+        const obj = raw as { id?: unknown; schemaVersion?: unknown };
+        if (obj.schemaVersion !== 1) {
+          return { status: 'unknown-version' };
+        }
+        if (typeof obj.id === 'string' && obj.id.length > 0) {
+          return { status: 'ok', record: { id: obj.id }, schemaVersion: 1 };
+        }
+        return { status: 'invalid' };
+      },
+    );
+    const raw = Buffer.from(
+      `${JSON.stringify([{ id: 'a', schemaVersion: 1 }, { id: 'b', schemaVersion: 99 }], null, 2)}\n`,
+      'utf8',
+    );
+    await fs.writeFile(path.join(tempDir, dataPath), raw);
+    const outcome = await versionedDescriptor.compact!({
+      stateDir: tempDir,
+      keepIds: ['a'],
+      expectedCurrentSha256: sha256(raw),
+    });
+
+    expect(outcome.status).toBe('refused');
+    const finalBytes = await fs.readFile(path.join(tempDir, dataPath));
+    expect(finalBytes).toEqual(raw);
+    await expect(fs.access(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+    await expect(fs.access(path.join(tempDir, `${dataPath}.compacted`))).rejects.toThrow();
+  });
+
+  it('writes nothing when a record is invalid but still has an id', async () => {
+    const strictDescriptor = describeRecordListStore(
+      dataPath,
+      (raw) =>
+        typeof raw === 'object' &&
+        raw !== null &&
+        typeof (raw as { id?: unknown }).id === 'string' &&
+        typeof (raw as { kind?: unknown }).kind === 'string'
+          ? { id: (raw as { id: string }).id }
+          : undefined,
+    );
+    const raw = Buffer.from(
+      `${JSON.stringify([{ id: 'a', kind: 'x' }, { id: 'b' }], null, 2)}\n`,
+      'utf8',
+    );
+    await fs.writeFile(path.join(tempDir, dataPath), raw);
+    const outcome = await strictDescriptor.compact!({
+      stateDir: tempDir,
+      keepIds: ['a'],
+      expectedCurrentSha256: sha256(raw),
+    });
+
+    expect(outcome.status).toBe('refused');
+    const finalBytes = await fs.readFile(path.join(tempDir, dataPath));
+    expect(finalBytes).toEqual(raw);
+    await expect(fs.access(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+    await expect(fs.access(path.join(tempDir, `${dataPath}.compacted`))).rejects.toThrow();
   });
 });

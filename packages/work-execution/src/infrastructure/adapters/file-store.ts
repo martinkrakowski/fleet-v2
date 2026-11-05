@@ -1090,6 +1090,18 @@ async function compactRecordListStore(
           return { status: 'refused', reason: 'the store changed since the compaction plan was computed' };
         }
 
+        // The current store must verify with the descriptor's own `inspect`
+        // before any record is dropped: a record with an unknown schema version
+        // or invalid fields but a string `id` would otherwise be silently
+        // deleted by excluding it from `keepIds`.
+        const currentInspection = inspect(current);
+        if (currentInspection.status !== 'ok') {
+          return {
+            status: 'refused',
+            reason: `the store does not verify (${currentInspection.detail}); nothing was written`,
+          };
+        }
+
         let parsed: unknown;
         try {
           parsed = JSON.parse(current.toString('utf8'));

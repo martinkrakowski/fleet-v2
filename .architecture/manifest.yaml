@@ -369,6 +369,7 @@ bounded_contexts:
           - ListConductorPassesUseCase
           - ReapOrphanSessionsUseCase
           - EnqueueMergeUseCase
+          - StartChainUseCase
           - ListMergeQueueUseCase
           - RunMergePassUseCase
           - RunDaemonTickUseCase
@@ -410,6 +411,7 @@ bounded_contexts:
             - InspectDaemonStatusPort
             - SetDaemonPausePort
             - EnqueueMergePort
+            - StartChainPort
             - RunMergePassPort
             - ListMergeQueuePort
             - ImportTrainStatePort
@@ -471,6 +473,7 @@ bounded_contexts:
             - DaemonEventProjectionPort
             - DaemonPausePort
             - MergeQueueRepositoryPort
+            - ChainRepositoryPort
             - ForgeMergeReadPort
             - MergeForgeActionPort
             - MergeGrantPort
@@ -485,8 +488,10 @@ bounded_contexts:
             - LegacyTrainStateReadPort
             - DaemonSchedulerPort
             - RepositoryFactsPort
+            - GateReceiptReusePort
+            - WorktreePoolPort
       infrastructure:
-        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, MergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter, DaemonLeaseAdapter, DaemonStatusFileAdapter, DaemonEventProjectionAdapter, DaemonPauseAdapter, MergeQueueRepositoryAdapter, GhForgeMergeReadAdapter, GitMirrorPatchIdentityAdapter, MergeVerificationAdapter, JevMergeVetoAdapter, MergeNotificationAdapter, KillallHaltMarkerAdapter, KillallTrainPauseAdapter, KillallStopAgentUnavailableAdapter, LanePlanRepositoryAdapter, LegacyTrainStateReadAdapter, SystemdUserSchedulerAdapter, RepositoryFactsAdapter]
+        adapters: [WorkOrderRepositoryAdapter, AttemptRepositoryAdapter, ExecutionJournalAdapter, BriefAuthoringAdapter, ExecutionRunnerAdapter, AgyRunnerAdapter, WorkspaceAdapter, AttemptArtifactAdapter, ForgeActionAdapter, ForgeReadAdapter, AcceptanceAssessmentAdapter, AcceptanceEvidenceAdapter, OwnerDecisionAdapter, AttemptOwnerDecisionAdapter, BriefKnowledgeAdapter, ActionAuthorizationAdapter, ExecutionObservationAdapter, RunnerSelectorAdapter, AllowedSeatAdapter, RunnerForAttemptAdapter, LaneDiffCheckAdapter, GatePredicateAdapter, OpencodeApiUsageAdapter, ProjectProbeAdapter, ProjectProfileReadAdapter, ProjectProbeRecordAdapter, LocalExecutor, SshExecutor, NoopChangeSignalAdapter, LaneRunRepositoryAdapter, ConductorDriverLeaseAdapter, LaneRunJournalAdapter, ReviewRequestAdapter, CiStateAdapter, PolicyMergeGrantAdapter, MergeGrantAdapter, AutoMergeOwnerRoutingAdapter, ConductorForgeGrantAdapter, LaneRunParkNoticeAdapter, ReviewAssessmentAdapter, AcceptanceReceiptReadAdapter, TelemetryDispositionAdapter, NoopRunTelemetryMarkAdapter, InMemoryRunTelemetryMarkAdapter, NoopRunTelemetryAdapter, RecordingRunTelemetryAdapter, OtlpHttpRunTelemetryAdapter, ProcessTreeTerminationAdapter, ConductorPassTraceAdapter, DaemonLeaseAdapter, DaemonStatusFileAdapter, DaemonEventProjectionAdapter, DaemonPauseAdapter, MergeQueueRepositoryAdapter, GhForgeMergeReadAdapter, GitMirrorPatchIdentityAdapter, MergeVerificationAdapter, JevMergeVetoAdapter, MergeNotificationAdapter, KillallHaltMarkerAdapter, KillallTrainPauseAdapter, KillallStopAgentUnavailableAdapter, LanePlanRepositoryAdapter, LegacyTrainStateReadAdapter, SystemdUserSchedulerAdapter, RepositoryFactsAdapter, GateReceiptReuseAdapter, WorktreePoolAdapter, ChainRepositoryAdapter]
     contracts:
       RegisterWorkOrderPort: "Record an approved bounded work unit, base commit, owned paths, policy revision and prerequisite work; reject invalid or conflicting ownership."
       ImportLanePlanPort: "Import one validated plan sidecar revision per (projectId, planId): project match, greater-revision CAS with digest idempotency, the cycle check across every stored plan, dropped lanes kept; it authorizes nothing."
@@ -566,6 +571,8 @@ bounded_contexts:
       InspectDaemonStatusPort: "Return the recorded daemon status record v1 read-only (tick id, times, exit code, paused/halted/forge-reachable flags and per-job/per-repository summaries); never runs a tick or mutates state."
       SetDaemonPausePort: "Write or clear the daemon pause marker so ticks run no job except the notifier's paused line; an unreadable marker reads as paused."
       EnqueueMergePort: "Enqueue one pull request head for the merge pass by conductor or CLI, returning the first entry on a duplicate and superseding an earlier head with a successor entry that inherits its predecessor's position; the entry records its base branch (main or chain/<name>), read from the forge when the caller names none."
+      StartChainPort: "Start a chain for a project: validate the chain name, record a ChainRecord v1 as a keyed intent, then create chain/<name> from the recorded main commit through the forge and reconcile the result; an existing branch at that commit reconciles as started, one at another commit refuses, and a repeated call with the same key returns the recorded outcome without a second forge call."
+      ChainRepositoryPort: "Store and read ChainRecord v1 records per project with compare-and-set on the record revision; an unreadable or unknown-version record is reported, never treated as absent; it performs no forge or git action."
       RunMergePassPort: "Run one bounded merge pass for one repository under its lease: gather facts, run the pure decider once per live entry with at most one keyed action each (intent before action), reconcile ambiguous outcomes and write successor entries and notifications; unknown facts never yield a merge act. Entries are ordered and judged per (repository, base branch) and the strict up-to-date check is against the pull request's own base."
       ListMergeQueuePort: "List merge-queue entries live-first in queue order with the head of each base branch named, read-only, without mutating state."
       DaemonJobPort: "Describe one registered daemon job (jobId, leaseScope) and run one bounded pass with nowIso and deadlineIso, returning completed, budget-exhausted, skipped or refused outcomes."
@@ -575,7 +582,7 @@ bounded_contexts:
       DaemonPausePort: "Read and write the pause marker; an unreadable marker reads as paused."
       MergeQueueRepositoryPort: "Persist merge-queue entries v1 by identity (repository, pull request, head oid) with CAS-guarded revisions, supersede transitions, inherited position for successors and the queue head per (repository, base branch); known absence is separate from unreadable state."
       ForgeMergeReadPort: "Read merge-pass forge facts for one exact head: PR state and live head, merge state status, required contexts by name with creator login, and fully paginated review threads, classifying errors; unknown never merges."
-      MergeForgeActionPort: "Apply one repo-scoped forge action (merge-pr, update-branch or post-status) through a stable action id at the expected head; the request carries actionId, repository{owner,repo}, pullRequestNumber, branchName and expectedHeadSha, and a status field is refused on any kind but post-status."
+      MergeForgeActionPort: "Apply one repo-scoped forge action (merge-pr, update-branch, post-status or create-branch) through a stable action id at the expected head, and read a branch's head; the request carries actionId, repository{owner,repo}, pullRequestNumber, branchName and expectedHeadSha, a status field is refused on any kind but post-status, and create-branch creates only a registered chain/<name> branch at the given commit, reporting an existing branch at that commit as already applied and one at another commit as a refusal."
       MergeGrantPort: "Issue one merge policy grant bound to (repository, pull request, expected head sha) at policy:merge@<revision> through operator coordination; it never decides eligibility."
       PatchIdentityPort: "Decide whether an update-branch carry is allowed under the speed-plan file rule and patch-id guard against a bare mirror of the repository with allow-listed argv through the command executor; never touches the live checkout."
       MergeVerificationPort: "Request and read the verification receipt for one exact head through the evidence context's procedure; a receipt naming another head is unknown."
@@ -591,6 +598,8 @@ bounded_contexts:
       InventoryRelaunchPort: "Report, read-only, what a relaunch would find on each lane host: runner worktree state by directory, the registered clone's worktree listing, the conductor status, and each lane's population (conducted, attempt-recorded, unrecorded); risk flags as counts only and worktree paths only in the local CLI output; it writes nothing, journals nothing and mutates no worktree."
       BuildFactPackPort: "Build the fact pack a brief writer reads for one lane: read-only repository facts at a pinned commit, rendered into the authoring prompt with every repository-sourced text wrapped as untrusted input; a secret-shaped fact refuses the pack; it writes nothing and runs no command outside the read-only fact reads."
       RepositoryFactsPort: "Read repository facts at one pinned commit, read-only, through the command executor: file listings, file ranges, the manifest and plan rows a lane names; bounded sizes; an unreadable or oversized read is reported, never truncated silently; no write, no network, no credential path."
+      GateReceiptReusePort: "Find a recorded gate receipt by its full versioned key (predicate id, tree hash, predicate definition digest, toolchain versions, declared environment digest) and record a new receipt under that key; a lookup hits only on an equal key, and an unreadable component, an unknown key version or an unreadable store is a miss, never a hit; it never runs a predicate and stores no secret value."
+      WorktreePoolPort: "Take a warm lane worktree for a project and base commit from the pool, reset it to that base, and refill the pool after a merge, on the recorded host; take returns a worktree or an empty pool, never one already taken; reset refuses a tree it cannot account for and reports an unknown directory instead of deleting it; it pushes nothing and holds no credential."
     adapter_bindings:
       - { adapter: WorkOrderRepositoryAdapter, implements: WorkOrderRepositoryPort, integration: local-transactional-store }
       - { adapter: AttemptRepositoryAdapter, implements: AttemptRepositoryPort, integration: local-transactional-store }
@@ -715,6 +724,9 @@ bounded_contexts:
       - { adapter: LegacyTrainStateReadAdapter, implements: LegacyTrainStateReadPort, integration: read-only-shell-train-state-files }
       - { adapter: SystemdUserSchedulerAdapter, implements: DaemonSchedulerPort, integration: systemd-user-unit-files-no-activation }
       - { adapter: RepositoryFactsAdapter, implements: RepositoryFactsPort, integration: injected-command-executor-read-only-git }
+      - { adapter: GateReceiptReuseAdapter, implements: GateReceiptReusePort, integration: local-transactional-store }
+      - { adapter: WorktreePoolAdapter, implements: WorktreePoolPort, integration: injected-command-executor-recorded-host-git }
+      - { adapter: ChainRepositoryAdapter, implements: ChainRepositoryPort, integration: local-transactional-store }
     domain_specification:
       aggregate_roots: [WorkOrder, Attempt, LaneRun, LanePlan, PullRequestLink]
       child_ownership: { ActionJournalEntry: Attempt, CapacityReservation: Attempt, PlannedLane: LanePlan }

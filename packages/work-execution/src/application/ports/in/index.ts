@@ -46,6 +46,7 @@ export * from "./RunConductorPassPort.in-port.js";
 export * from "./RunDaemonTickPort.in-port.js";
 export * from "./RunMergePassPort.in-port.js";
 export * from "./SetDaemonPausePort.in-port.js";
+export * from "./StartChainPort.in-port.js";
 export * from "./StartLaneRunPort.in-port.js";
 export * from "./StopAttemptPort.in-port.js";
 export * from "./SyncPlanDecisionsPort.in-port.js";

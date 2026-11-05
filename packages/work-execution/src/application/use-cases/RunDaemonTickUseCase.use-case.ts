@@ -314,19 +314,19 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
     }
 
     const projected: DaemonEventRecord[] = [];
-    for (const run of runs) {
-      const event = projectJobOutcomeToDaemonEvent({
-        eventId: this.deps.newUlid(),
-        tickId: request.tickId,
-        jobId: run.jobId,
-        jobOutcome: run.outcome,
-        recordedAtIso: finishedAtIso,
-      });
-      if (event.ok) {
-        projected.push(event.record);
-      }
-    }
     try {
+      for (const run of runs) {
+        const event = projectJobOutcomeToDaemonEvent({
+          eventId: this.deps.newUlid(),
+          tickId: request.tickId,
+          jobId: run.jobId,
+          jobOutcome: run.outcome,
+          recordedAtIso: finishedAtIso,
+        });
+        if (event.ok) {
+          projected.push(event.record);
+        }
+      }
       await this.deps.events.append(projected);
     } catch {
       // a projection failure never fails the tick

@@ -185,6 +185,7 @@ function makeHarness(overrides: {
   readonly nowFn?: () => string;
   readonly mergePassResult?: RunMergePassResult;
   readonly queueEntries?: readonly MergeQueueEntryRecord[];
+  readonly newUlid?: () => string;
 } = {}): Harness {
   const status = new FakeStatus();
   if (overrides.previousStatus !== undefined) {
@@ -221,10 +222,12 @@ function makeHarness(overrides: {
     sleep: async (ms: number) => {
       sleeps.push(ms);
     },
-    newUlid: () => {
-      ulidSequence += 1;
-      return '0' + String(ulidSequence).padStart(25, '0');
-    },
+    newUlid:
+      overrides.newUlid ??
+      (() => {
+        ulidSequence += 1;
+        return '0' + String(ulidSequence).padStart(25, '0');
+      }),
   };
   const useCase = new RunDaemonTickUseCase(deps);
   const run = (requestOverrides: Partial<RunDaemonTickRequest> = {}) =>
@@ -423,6 +426,22 @@ describe('RunDaemonTickUseCase (DT10a)', () => {
       `merge-pass:${DIGEST_A}`,
       `merge-pass:${DIGEST_B}`,
     ]);
+  });
+
+  it('a throwing ULID mint never fails the tick after the status was written', async () => {
+    const h = makeHarness({
+      newUlid: () => {
+        throw new Error('ulid mint exploded');
+      },
+    });
+
+    const result = await h.run();
+
+    expect(result.outcome).toBe('completed');
+    expect(result.exitCode).toBe(0);
+    expect(result.status).not.toBeNull();
+    expect(h.status.writes).toHaveLength(1);
+    expect(h.events.events).toHaveLength(0);
   });
 
   it('a rejected port call returns a refused tick result instead of throwing', async () => {

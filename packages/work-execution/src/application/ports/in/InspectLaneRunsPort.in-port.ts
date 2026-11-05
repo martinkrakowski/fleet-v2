@@ -12,6 +12,40 @@ import type { RunStopMode } from '../../../domain/lane-run-transitions.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { BaseBranchValue } from '../../../domain/base-branch.js';
 
+/**
+ * The grace, in minutes, before a held reservation is reported as a crashed
+ * start: the reaper's grace default (conductor plan §3.9.2, decision D13) —
+ * a start that is still running is not a crashed start. It is a constant
+ * here; the policy key `policy.conductor.reaper.graceMinutes` belongs to a
+ * later unit (KWp), and is not read from the installation.
+ */
+export const CRASHED_START_GRACE_MINUTES = 5;
+
+/**
+ * The age, in minutes, a crashed-start reservation must reach before a start raises a stored attention item for it
+ * (AD-2 pre-merge). A reservation is made before the worktree and the brief are prepared, and the attempt and run are
+ * recorded after, so a live start that is still preparing looks like a crashed one; the status view lists it after
+ * CRASHED_START_GRACE_MINUTES as a candidate, but a durable notice waits until no start's preparation could still be
+ * running.
+ */
+export const CRASHED_START_NOTICE_MINUTES = 60;
+
+/**
+ * One held reservation left by a crashed start: a capacity reservation whose
+ * attempt id no run lists, held for at least `CRASHED_START_GRACE_MINUTES`
+ * (the ListLaneRunsPort rule: no worktree path, ssh alias, port or transport
+ * crosses the view).
+ */
+export interface CrashedStartView {
+  readonly attemptId: string;
+  readonly workOrderId: string | null;
+  readonly hostName: string | null;
+  readonly slotIndex: number;
+  readonly reservedAtIso: string;
+  /** Whole minutes held; null when the recorded time cannot be read. */
+  readonly heldMinutes: number | null;
+}
+
 export interface LaneRunStatusView {
   readonly runId: string;
   readonly workOrderId: string;
@@ -67,6 +101,15 @@ export type InspectLaneRunsResult =
         readonly lapsed: boolean;
       } | null;
       readonly runs: readonly LaneRunStatusView[];
+      /** Held reservations left by crashed starts; an empty array when there are none. */
+      readonly crashedStarts: readonly CrashedStartView[];
+      /**
+       * Present only when a crashed-start read failed: the reservations store
+       * or an attempt read threw, so the array may be missing crashed starts
+       * and an empty array must not be read as "none". A wired caller that
+       * read cleanly, and an unwired one, carry no flag.
+       */
+      readonly crashedStartsIncomplete?: true;
     }
   | { readonly outcome: 'not-found'; readonly runId: string };
 

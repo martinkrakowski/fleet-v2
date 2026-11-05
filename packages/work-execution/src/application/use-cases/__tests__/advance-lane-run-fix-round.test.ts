@@ -3249,36 +3249,31 @@ describe('KF-20: the gate and the review open the evidence assessment with the m
     expect(await advance(harness)).toMatchObject({
       outcome: 'acted', step: 'gate', result: 'completed', reasonCode: 'gate-passed',
     });
-    expect(harness.reviewOpenRequests).toHaveLength(1);
-    expect(harness.reviewOpenRequests[0]).toMatchObject({
-      attemptId: 'attempt-fix-1',
-      candidateHeadSha: COMMIT_A,
-      policyRevision: 'policy-example-1',
-      implementerModel: 'fix-model-1',
-      requiredChecks: ['check-1'],
-    });
-    expect(harness.gateReceiptRequests).toHaveLength(1);
-
-    // The brief-check opens the SAME assessment: the same implementerModel,
-    // head and policy — never a `head-mismatch` refusal.
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
-    const reviewAct = await advance(harness);
-    expect(reviewAct).toMatchObject({
-      outcome: 'acted', step: 'brief-check', result: 'completed', reasonCode: 'review-passed',
-    });
+    // The gate act starts the brief-check review beside the gate (KS6): the
+    // in-flight brief-check opens its assessment with the same implementer
+    // model, head and policy as the gate's own receipt-recording open — never
+    // a `head-mismatch` refusal — and its receipt is recorded before the
+    // gate's result entry.
     expect(harness.reviewOpenRequests).toHaveLength(2);
-    const [gateOpen, reviewOpen] = harness.reviewOpenRequests;
-    expect(reviewOpen!.implementerModel).toBe(gateOpen!.implementerModel);
-    expect(reviewOpen).toMatchObject({
-      attemptId: 'attempt-fix-1',
-      candidateHeadSha: COMMIT_A,
-      policyRevision: 'policy-example-1',
-      implementerModel: 'fix-model-1',
-      requiredChecks: ['check-1'],
-    });
-    // The review is requested, not refused `assessment-unavailable`.
+    for (const open of harness.reviewOpenRequests) {
+      expect(open).toMatchObject({
+        attemptId: 'attempt-fix-1',
+        candidateHeadSha: COMMIT_A,
+        policyRevision: 'policy-example-1',
+        implementerModel: 'fix-model-1',
+        requiredChecks: ['check-1'],
+      });
+    }
+    expect(harness.gateReceiptRequests).toHaveLength(1);
+    // The review is requested beside the gate, not refused `assessment-unavailable`.
     expect(harness.reviewRequests).toHaveLength(1);
     expect(harness.reviewRequests[0]).toMatchObject({ kind: 'brief-check', implementerModel: 'fix-model-1' });
+
+    // The recorded receipt is read: the brief-check state never opens a
+    // second assessment and never requests a second review.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
+    expect(harness.reviewOpenRequests).toHaveLength(2);
+    expect(harness.reviewRequests).toHaveLength(1);
   });
 });
 
@@ -3496,5 +3491,85 @@ describe('AdvanceLaneRunUseCase CI-red fix round (GB4)', () => {
     const prose = harness.briefRequests[0]!.proseMarkdown;
     expect(prose).toContain('[gate] ci-failed');
     expect(prose).not.toContain('[gate] command');
+  });
+
+  it('d) a gate failure with a failed brief-check receipt at the same head carries the findings beside the gate deltas', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    // The failed brief-check receipt is recorded at the same head the gate
+    // failed: its findings join the gate's failed checks in the fix brief.
+    await seedReviewFailure(harness, [blockerFinding()], 'brief-check');
+    await seedGateFailure(harness);
+    await harness.executionJournal.appendJournalEntry({
+      id: 'attempt-example-1:accept:' + COMMIT_A + ':0',
+      attemptId: 'attempt-example-1',
+      workOrderId: 'wo-example-1',
+      action: 'accept',
+      baseCommit: COMMIT_A,
+      recordedAtIso: NOW,
+      status: 'completed',
+      sessionId: null,
+      detail: JSON.stringify({
+        predicate: 'command 1',
+        kind: 'command',
+        verdict: 'fail',
+        exitCode: 1,
+        durationMs: 10,
+        detail: 'gate detail text that must never appear',
+      }),
+    });
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+
+    const prose = harness.briefRequests[0]!.proseMarkdown!;
+    expect(prose).toContain('[blocker] src/ex.ts:4 — blocks the acceptance check');
+    expect(prose).toContain('[gate] command 1 — fail, exit 1');
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual([
+      '[blocker] src/ex.ts:4 — blocks the acceptance check',
+      '[gate] command 1 — fail, exit 1',
+    ]);
+  });
+
+  it('e) a gate failure with no review receipt keeps today’s brief exactly', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await seedGateFailure(harness);
+    await harness.executionJournal.appendJournalEntry({
+      id: 'attempt-example-1:accept:' + COMMIT_A + ':0',
+      attemptId: 'attempt-example-1',
+      workOrderId: 'wo-example-1',
+      action: 'accept',
+      baseCommit: COMMIT_A,
+      recordedAtIso: NOW,
+      status: 'completed',
+      sessionId: null,
+      detail: JSON.stringify({
+        predicate: 'command 1',
+        kind: 'command',
+        verdict: 'fail',
+        exitCode: 1,
+        durationMs: 10,
+        detail: 'gate detail text that must never appear',
+      }),
+    });
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+
+    const prose = harness.briefRequests[0]!.proseMarkdown!;
+    expect(prose).toContain('[gate] command 1 — fail, exit 1');
+    expect(prose).not.toContain('[blocker]');
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual(['[gate] command 1 — fail, exit 1']);
   });
 });

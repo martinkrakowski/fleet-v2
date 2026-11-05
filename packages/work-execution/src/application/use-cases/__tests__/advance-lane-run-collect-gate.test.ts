@@ -53,6 +53,7 @@ import type {
   RecordGateReceiptsResult,
 } from '../../ports/out/GateReceiptPort.out-port.js';
 import type { GatePredicatePort, EvaluateGatePredicatesResult } from '../../ports/out/GatePredicatePort.out-port.js';
+import type { ReviewRequest, ReviewRequestResult } from '../../ports/out/ReviewRequestPort.out-port.js';
 import type {
   DispatchAttemptRequest,
   DispatchAttemptResult,
@@ -111,6 +112,12 @@ const SEAT_PLAN = {
   ],
   fix: [{ id: 'fx-1', model: 'model-example-1', tool: 'opencode' }],
   review: [],
+};
+
+/** A seat plan with one review seat, so a brief-check can start beside the gate. */
+const SEAT_PLAN_WITH_REVIEW = {
+  ...SEAT_PLAN,
+  review: [{ id: 'rv-1', model: 'reviewer-example-1', tool: 'opencode' }],
 };
 
 const SEAT_SELECTION = {
@@ -235,7 +242,7 @@ function makeUlidMinter(): () => string {
 
 function stepKey(parts: {
   readonly round: number;
-  readonly step: 'dispatch' | 'stop' | 'collect' | 'gate' | 'prepare';
+  readonly step: 'dispatch' | 'stop' | 'collect' | 'gate' | 'prepare' | 'brief-check';
   readonly seatIndex: number;
   readonly attemptOrdinal: number | null;
   readonly head12: string | null;
@@ -289,6 +296,11 @@ function gateKey(): string {
   return stepKey({ round: 0, step: 'gate', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
 }
 
+/** The brief-check key the in-flight start builds: the same shape the brief-check state uses. */
+function briefCheckKey(): string {
+  return stepKey({ round: 0, step: 'brief-check', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
+}
+
 /** Reserve capacity for one prepared attempt, like the conductor's admission. */
 async function admit(harness: Harness, attemptId: string): Promise<void> {
   await harness.executionJournal.saveCapacityReservation({
@@ -329,6 +341,7 @@ interface Harness {
   readonly callOrder: string[];
   readonly deps: AdvanceLaneRunDependencies;
   readonly reviewOpenRequests: readonly OpenReviewAssessmentRequest[];
+  readonly reviewRequests: readonly ReviewRequest[];
   readonly gateReceiptRequests: readonly RecordGateReceiptsRequest[];
   /** The harness's work-order store (KF-36a-2); seeded with a copy of the fixture. */
   readonly workOrders: Map<string, WorkOrderRecord>;
@@ -353,6 +366,8 @@ interface HarnessOptions {
   readonly wireGate?: boolean;
   readonly wireReviewAssessment?: boolean;
   readonly wireGateReceipts?: boolean;
+  /** Wire the KS6 brief-check fake: it records the request and answers a passed receipt. */
+  readonly wireReviewRequest?: boolean;
   /** Wire the KF-36a `workOrderRelease` fake over the harness's work-order map. */
   readonly wireWorkOrderRelease?: boolean;
 }
@@ -372,6 +387,7 @@ async function makeHarness(
   const gateRequests: EvaluateAttemptGateRequest[] = [];
   const reviewOpenRequests: OpenReviewAssessmentRequest[] = [];
   const gateReceiptRequests: RecordGateReceiptsRequest[] = [];
+  const reviewRequests: ReviewRequest[] = [];
   const callOrder: string[] = [];
   // KF-36a-2: a per-harness work-order store, seeded with a copy of the fixture
   // (never the fixture itself — the release fake writes only into this map).
@@ -521,6 +537,30 @@ async function makeHarness(
           },
         }
       : {}),
+    ...(options.wireReviewRequest === true
+      ? {
+          sameModelFamily: (left: string, right: string) => left === right,
+          reviewRequest: {
+            requestReview: async (request: ReviewRequest): Promise<ReviewRequestResult> => {
+              reviewRequests.push(request);
+              return {
+                outcome: 'receipt',
+                receipt: {
+                  receiptId: 'rcpt-' + request.requestId,
+                  requestId: request.requestId,
+                  kind: request.kind,
+                  reviewerModel: request.reviewerModel,
+                  candidateHeadSha: request.candidateHeadSha,
+                  verdict: 'passed',
+                  findings: [],
+                },
+              };
+            },
+            findReviewReceipt: async () => ({ outcome: 'not-found' }) as const,
+            findLatestReceiptOfKind: async () => ({ outcome: 'not-found' }) as const,
+          },
+        }
+      : {}),
     ...(options.wireGateReceipts === true
       ? {
           gateReceipts: {
@@ -542,6 +582,7 @@ async function makeHarness(
     commitRequests,
     gateRequests,
     reviewOpenRequests,
+    reviewRequests,
     gateReceiptRequests,
     workOrders,
     callOrder,
@@ -2197,5 +2238,74 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
       journalRefusal: 'duplicate-key',
       detail: null,
     });
+  });
+
+  it('test 20 (KS6): the gate act starts the brief-check review beside the gate', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, seatPlan: SEAT_PLAN_WITH_REVIEW });
+    const harness = await makeHarness(runRecord(), [collected], { wireReviewRequest: true, wireReviewAssessment: true });
+    await harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['command 1'] }));
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: gateKey(),
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    // The review went out beside the gate, on the sealed diff (the collected head).
+    expect(harness.reviewRequests).toEqual([expect.objectContaining({ kind: 'brief-check', candidateHeadSha: COMMIT })]);
+    // The journal holds the gate intent, then the brief-check intent with its
+    // minted request id, then the review's result, then the gate's result.
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    const gateIntentIndex = entries.findIndex((entry) => entry.kind === 'intent' && entry.key === gateKey());
+    const briefIntentIndex = entries.findIndex((entry) => entry.kind === 'intent' && entry.key === briefCheckKey());
+    const briefResultIndex = entries.findIndex((entry) => entry.kind === 'result' && entry.key === briefCheckKey());
+    const gateResultIndex = entries.findIndex((entry) => entry.kind === 'result' && entry.key === gateKey());
+    expect(gateIntentIndex).toBeGreaterThanOrEqual(0);
+    expect(briefIntentIndex).toBeGreaterThan(gateIntentIndex);
+    expect(briefResultIndex).toBeGreaterThan(briefIntentIndex);
+    expect(gateResultIndex).toBeGreaterThan(briefResultIndex);
+    expect(entries[briefIntentIndex]).toMatchObject({ kind: 'intent', mintedId: expect.stringMatching(/^review-/) });
+    expect(entries[briefResultIndex]).toMatchObject({ kind: 'result', outcome: 'completed', reasonCode: 'review-passed' });
+    expect(entries[gateResultIndex]).toMatchObject({ kind: 'result', outcome: 'completed', reasonCode: 'gate-passed' });
+  });
+
+  it('test 21 (KS6): the brief-check state reads the recorded receipt instead of requesting a second review', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, seatPlan: SEAT_PLAN_WITH_REVIEW });
+    const harness = await makeHarness(runRecord(), [collected], { wireReviewRequest: true, wireReviewAssessment: true });
+    await harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['command 1'] }));
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'gate', reasonCode: 'gate-passed' });
+    // The gate's verdict is consumed only after the review's receipt is recorded: the next advance enters brief-check.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
+    // The recorded receipt is read: no second review request is made.
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
+    expect(harness.reviewRequests).toHaveLength(1);
+  });
+
+  it('test 22 (KS6): without the review wiring the gate act behaves exactly as before', async () => {
+    const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, seatPlan: SEAT_PLAN_WITH_REVIEW });
+    const harness = await makeHarness(runRecord(), [collected], { wireReviewAssessment: true });
+    harness.setManifestVerdict('sealed');
+    await conduct(harness, 'gating', NOW);
+
+    const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'gate',
+      key: gateKey(),
+      result: 'completed',
+      reasonCode: 'gate-passed',
+    });
+    expect(harness.gateRequests).toEqual([{ attemptId: 'attempt-example-1', candidateHeadSha: COMMIT }]);
+    expect(harness.reviewRequests).toHaveLength(0);
+    // No brief-check intent or result was appended: the review never started.
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries.some((entry) => entry.kind !== 'conduct' && entry.key === briefCheckKey())).toBe(false);
   });
 });

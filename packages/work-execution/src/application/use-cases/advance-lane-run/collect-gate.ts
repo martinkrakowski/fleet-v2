@@ -9,6 +9,7 @@ import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js
 import { appendRunIntent, appendRunResult, performPark, refusedResult } from './step-context.js';
 import { manifestExpectedArtifacts, readFrozenManifestVerified, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { historyEntryOf } from '../../../domain/seat-selection.js';
+import { startBriefCheckInFlight } from './review-fix.js';
 
 /**
  * The `act collect` decision (K4-6): collect an ended attempt's artifacts
@@ -286,7 +287,7 @@ export async function performGate(ctx: AdvanceStepContext,
   if (intentRefusal !== null) {
     return refusedResult(intentRefusal);
   }
-  return runGateBody(ctx, record, gathered, decision, request, decision.key);
+  return runGateBody(ctx, record, gathered, decision, request, decision.key, true);
 }
 
 /** The gate's pre-checks before its intent (K4-6): the wiring, the attempt's artifacts, the sealed collection. */
@@ -326,6 +327,7 @@ export async function runGateBody(ctx: AdvanceStepContext,
   decision: Extract<LaneRunDecision, { kind: 'act' | 'reconcile' }>,
   request: AdvanceLaneRunRequest,
   key: string,
+  startReview = false,
 ): Promise<AdvanceLaneRunResult> {
   const gate = ctx.deps.evaluateAttemptGate;
   if (gate === undefined) {
@@ -337,11 +339,29 @@ export async function runGateBody(ctx: AdvanceStepContext,
   }
   const parsedKey = parseLaneRunKey(key);
   const gateRun = parsedKey !== null && parsedKey.kind === 'step' ? (parsedKey.retry ?? undefined) : undefined;
-  const verdict = await gate.evaluateAttemptGate({
+  // KS6: the evaluation is launched without being awaited, so the brief-check
+  // review starts beside it (the review runs while the gate runs). The
+  // settled outcome keeps a throwing port behaving exactly as today — the
+  // throw leaves the advance — and leaves no rejection unhandled.
+  const gateOutcome = gate.evaluateAttemptGate({
     attemptId: latest.id,
     candidateHeadSha: latest.artifacts.headCommit,
     ...(gateRun === undefined ? {} : { gateRun }),
-  });
+  }).then(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+  if (startReview) {
+    // The reconcile must never start a second review, so only the act starts
+    // it; the review's intent and result are appended between the gate's
+    // intent and the gate's result.
+    await startBriefCheckInFlight(ctx, record, gathered, request);
+  }
+  const settled = await gateOutcome;
+  if (!settled.ok) {
+    throw settled.error;
+  }
+  const verdict = settled.value;
   if (verdict.verdict === 'passed' || verdict.verdict === 'failed') {
     // KF-13a: record one verification receipt per acceptance check before the
     // run-result is appended; any failure fails closed to `gate-unknown`.

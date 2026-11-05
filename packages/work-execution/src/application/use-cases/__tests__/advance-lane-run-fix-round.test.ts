@@ -1400,6 +1400,70 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(unwiredRequest?.findings).toBeUndefined();
   });
 
+  it('f4) a blocker-after-round-2 park stores [] when the failed review receipt carries no findings', async () => {
+    const latestAttempt = { ...collectedAttempt(), id: 'attempt-example-3' };
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, latestAttempt],
+      { wireParkNotice: true },
+    );
+    await seedReviewFailure(harness, []);
+    harness.setFindLatestReceiptAnswer(async () => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-latest',
+        requestId: null,
+        kind: 'code-review',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [],
+      },
+    }));
+
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked?.findings).toEqual([]);
+  });
+
+  it('f5) a blocker-after-round-2 park stores null when the receipt read throws', async () => {
+    const latestAttempt = { ...collectedAttempt(), id: 'attempt-example-3' };
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, latestAttempt],
+      { wireParkNotice: true },
+    );
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setFindLatestReceiptAnswer(async () => {
+      throw new Error('store down');
+    });
+
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked?.findings).toBeNull();
+  });
+
+  it('f6) a blocker-after-round-2 park stores null when the receipt lookup is unavailable', async () => {
+    const latestAttempt = { ...collectedAttempt(), id: 'attempt-example-3' };
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, latestAttempt],
+      { wireParkNotice: true },
+    );
+    await seedReviewFailure(harness, [blockerFinding()]);
+    harness.setFindLatestReceiptAnswer(async () => ({
+      outcome: 'unavailable',
+      reason: 'unreadable',
+    }));
+
+    const result = await advance(harness);
+    expect(result).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked?.findings).toBeNull();
+  });
+
   it('g) journals the prepare intent before the port call', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await seedReviewFailure(harness, [blockerFinding()]);

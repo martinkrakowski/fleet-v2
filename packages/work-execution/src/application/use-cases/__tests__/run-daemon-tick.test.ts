@@ -56,8 +56,12 @@ function repoRef(digest: string, overrides: Partial<DaemonRepositoryRef> = {}): 
 
 class FakeStatus implements Pick<DaemonStatusPort, 'read' | 'write'> {
   readValue: DaemonStatusFileRead = { status: 'missing' };
+  throwOnRead = false;
   readonly writes: BuildDaemonStatusInput[] = [];
   async read(): Promise<DaemonStatusFileRead> {
+    if (this.throwOnRead) {
+      throw new Error('status store exploded');
+    }
     return this.readValue;
   }
   async write(input: BuildDaemonStatusInput) {
@@ -419,6 +423,21 @@ describe('RunDaemonTickUseCase (DT10a)', () => {
       `merge-pass:${DIGEST_A}`,
       `merge-pass:${DIGEST_B}`,
     ]);
+  });
+
+  it('a rejected port call returns a refused tick result instead of throwing', async () => {
+    const h = makeHarness();
+    h.status.throwOnRead = true;
+
+    const result = await h.run();
+
+    expect(result.outcome).toBe('refused');
+    expect(result.reasonCode).toBe('tick-failed');
+    expect(result.exitCode).toBe(1);
+    expect(result.status).toBeNull();
+    expect(result.jobs).toHaveLength(0);
+    expect(h.status.writes).toHaveLength(0);
+    expect(h.mergePass.requests).toHaveLength(0);
   });
 
   it('a repository with an invalid digest gets no job instance', async () => {

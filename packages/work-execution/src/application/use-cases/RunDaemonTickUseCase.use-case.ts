@@ -184,7 +184,19 @@ interface JobRun {
 export class RunDaemonTickUseCase implements RunDaemonTickPort {
   constructor(private readonly deps: RunDaemonTickDependencies) {}
 
+  /**
+   * The never-throws contract: a rejected port call, a throwing clock or a
+   * throwing ULID mint never escapes; the tick returns a refused result.
+   */
   async runTick(request: RunDaemonTickRequest): Promise<RunDaemonTickResult> {
+    try {
+      return await this.runTickInner(request);
+    } catch {
+      return this.refused(request.tickId, 'tick-failed');
+    }
+  }
+
+  private async runTickInner(request: RunDaemonTickRequest): Promise<RunDaemonTickResult> {
     if (!DAEMON_TICK_ID_PATTERN.test(request.tickId)) {
       return this.refused(request.tickId, 'invalid-tick-id');
     }

@@ -232,6 +232,107 @@ export interface VerifySavedPatchRequest {
   readonly recordedHost?: AttemptRunnerRecord | null;
 }
 
+/**
+ * KW2 (D18): the request to list one registered clone's worktrees. The read
+ * runs on the recorded host's executor. A clone that is not registered is
+ * never read (D18: no host-wide scan, no unregistered repository).
+ */
+export interface ListWorktreesRequest {
+  /** The registered clone to list (absolute, normalised). */
+  readonly repositoryRoot: string;
+  /** The attempt's recorded runner block: the read runs on that host's executor. */
+  readonly recordedHost?: AttemptRunnerRecord | null;
+}
+
+/** One worktree of one clone, as `git worktree list --porcelain` reports it. */
+export interface ListedWorktree {
+  /** The worktree path as git lists it (absolute). */
+  readonly path: string;
+  /** The entry's HEAD sha, or null when the list carried none. */
+  readonly head: string | null;
+  /** The checked-out branch without `refs/heads/`, or null when detached. */
+  readonly branch: string | null;
+  /** The worktree is locked (`git worktree lock`); the reaper never touches it. */
+  readonly locked: boolean;
+  /** The administrative entry is stale (its directory is gone); never pruned here. */
+  readonly prunable: boolean;
+}
+
+export type ListWorktreesResult =
+  | { readonly outcome: 'listed'; readonly worktrees: readonly ListedWorktree[] }
+  /** The command did not answer, or answered unreadably: nothing is known. */
+  | { readonly outcome: 'unknown'; readonly reason: string };
+
+/**
+ * KW2 (D18): the request to read one worktree's removal facts. Every fact is
+ * true, false or unknown, and unknown is never true (conductor plan §3.10.2).
+ */
+export interface InspectWorktreeForRemovalRequest {
+  /** The registered clone the worktree belongs to (absolute, normalised). */
+  readonly repositoryRoot: string;
+  /** The worktree to inspect (absolute, normalised). */
+  readonly worktreePath: string;
+  /** The repository's remote-tracking default branch, e.g. `origin/main`. */
+  readonly defaultRef: string;
+  /** The attempt's recorded runner block: the read runs on that host's executor. */
+  readonly recordedHost?: AttemptRunnerRecord | null;
+}
+
+/** One worktree's porcelain status, counted. Ignored paths are never counted. */
+export interface WorktreeStatusCounts {
+  /** Tracked paths with a change (staged or not), unmerged paths excluded. */
+  readonly tracked: number;
+  /** Untracked paths (`??`). */
+  readonly untracked: number;
+  /** Paths in a merge state (`UU`, `AA`, `DD`, `AU`, `UA`, `DU`, `UD`). */
+  readonly unmerged: number;
+}
+
+/** One worktree's last activity: the newest of the reflog, the index and the tree walk. */
+export interface WorktreeLastActivity {
+  /** The newest activity time as an ISO 8601 string, or null when none was readable. */
+  readonly iso: string | null;
+  /** The bounded tree walk did not finish (or a read was unreadable): `quiet` is unknown, never true. */
+  readonly unknown: boolean;
+}
+
+/** Every fact the reaper needs about one worktree. */
+export interface WorktreeRemovalFacts {
+  readonly path: string;
+  readonly head: string | null;
+  /** The checked-out branch, or null when HEAD is detached. */
+  readonly branch: string | null;
+  readonly detached: boolean;
+  /** HEAD is reachable from `defaultRef`; null when the answer is unknown. */
+  readonly headOnDefault: boolean | null;
+  readonly status: WorktreeStatusCounts;
+  readonly locked: boolean;
+  /** The in-progress operation files present in the worktree's git directory. */
+  readonly inProgressOperations: readonly string[];
+  readonly lastActivity: WorktreeLastActivity;
+  /** The worktree's size in bytes, or null when the measurement ran out of budget. */
+  readonly sizeBytes: number | null;
+}
+
+export type InspectWorktreeForRemovalResult =
+  | { readonly outcome: 'inspected'; readonly facts: WorktreeRemovalFacts }
+  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' | 'not-a-linked-worktree' }
+  | { readonly outcome: 'unknown'; readonly reason: string };
+
+/**
+ * KW2: the request to read the free space of the filesystem holding a path.
+ */
+export interface ReadFilesystemSpaceRequest {
+  /** An absolute path on the filesystem to measure. */
+  readonly path: string;
+  /** The attempt's recorded runner block: the read runs on that host's executor. */
+  readonly recordedHost?: AttemptRunnerRecord | null;
+}
+
+export type ReadFilesystemSpaceResult =
+  | { readonly outcome: 'read'; readonly freeBytes: number; readonly totalBytes: number }
+  | { readonly outcome: 'unknown'; readonly reason: string };
+
 export interface WorkspacePort {
   /** Inspect the worktree as a typed record; part of readiness, once per prepared environment. */
   inspectWorktree(request: WorktreeInspectionRequest): Promise<WorktreeInspection>;
@@ -303,6 +404,29 @@ export interface WorkspacePort {
    * conductor-plan :146).
    */
   removeLaneWorktree?(request: RemoveLaneWorktreeRequest): Promise<RemoveLaneWorktreeResult>;
+
+  /**
+   * KW2 (D18): list one registered clone's worktrees. Read-only: it never
+   * prunes, removes, locks or fetches anything, and it never scans a host.
+   */
+  listWorktrees?(request: ListWorktreesRequest): Promise<ListWorktreesResult>;
+
+  /**
+   * KW2 (D18): read one worktree's removal facts — HEAD, branch or detached,
+   * the ancestor answer against the default branch, the porcelain status
+   * counts, the lock, the in-progress operations, the last activity and the
+   * budgeted size.
+   */
+  inspectWorktreeForRemoval?(
+    request: InspectWorktreeForRemovalRequest,
+  ): Promise<InspectWorktreeForRemovalResult>;
+
+  /**
+   * KW2: read the free and total bytes of the filesystem holding a path.
+   */
+  readFilesystemSpace?(
+    request: ReadFilesystemSpaceRequest,
+  ): Promise<ReadFilesystemSpaceResult>;
 }
 
 /**

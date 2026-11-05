@@ -129,15 +129,20 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
           ? 0
           : null;
 
+    // An incomplete comparison is never a pass: it answers `unknown` (exit 1)
+    // and `equal` is false, so matching entries beside an unparseable shell
+    // line or unreadable chain/batch state cannot read as a clean shadow day.
+    const complete =
+      unknownLines.length === 0 &&
+      shellState.chains.status !== 'unreadable' &&
+      shellState.batch.status !== 'unreadable';
     return {
-      outcome: 'completed',
+      outcome: complete ? 'completed' : 'unknown',
+      ...(complete ? {} : { reason: 'shell-state-incomplete' }),
       kind: 'enqueue-set',
       fleetBase: 'main',
-      equal: result.equal,
-      complete:
-        unknownLines.length === 0 &&
-        shellState.chains.status !== 'unreadable' &&
-        shellState.batch.status !== 'unreadable',
+      equal: complete && result.equal,
+      complete,
       compared: result.compared,
       fleetCount: result.fleetCount,
       shellCount: result.shellCount,

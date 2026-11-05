@@ -157,8 +157,11 @@ describe('cutover shadow report (CO32)', () => {
     await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n${badLine}\n`);
 
     const result = await cli(runtime, shadowReportArgs(stateDir));
-    expect(result.code).toBe(0);
-    const body = JSON.parse(result.out) as { complete: boolean; shell: { unknownLines: number[] } };
+    expect(result.code).toBe(1);
+    const body = JSON.parse(result.out) as { outcome: string; equal: boolean; complete: boolean; shell: { unknownLines: number[] } };
+    expect(body.outcome).toBe('unknown');
+    expect(body.equal).toBe(false);
+    expect(body.outcome).toBe('unknown');
     expect(body.complete).toBe(false);
     expect(body.shell.unknownLines).toEqual([2]);
     expect(result.out).not.toContain(badLine);
@@ -354,8 +357,11 @@ describe('cutover shadow report (CO32)', () => {
     await fs.writeFile(path.join(stateDir, 'parked'), `7 ${HEAD_A} main\n${badLine}\n`);
 
     const result = await cli(runtime, shadowReportArgs(stateDir));
-    expect(result.code).toBe(0);
-    const body = JSON.parse(result.out) as { complete: boolean; shell: { unknownLines: number[] } };
+    expect(result.code).toBe(1);
+    const body = JSON.parse(result.out) as { outcome: string; equal: boolean; complete: boolean; shell: { unknownLines: number[] } };
+    expect(body.outcome).toBe('unknown');
+    expect(body.equal).toBe(false);
+    expect(body.outcome).toBe('unknown');
     expect(body.complete).toBe(false);
     expect(body.shell.unknownLines).toEqual([2]);
     expect(result.out).not.toContain(badLine);
@@ -372,11 +378,13 @@ describe('cutover shadow report (CO32)', () => {
     await fs.writeFile(path.join(stateDir, 'chains'), 'not a directory');
 
     const result = await cli(runtime, shadowReportArgs(stateDir));
-    expect(result.code).toBe(0);
+    expect(result.code).toBe(1);
     const body = JSON.parse(result.out) as {
+      outcome: string;
       complete: boolean;
       shell: { chainFiles: number | null };
     };
+    expect(body.outcome).toBe('unknown');
     expect(body.complete).toBe(false);
     expect(body.shell.chainFiles).toBeNull();
     expect(result.out).not.toContain(stateDir);
@@ -393,11 +401,13 @@ describe('cutover shadow report (CO32)', () => {
     await fs.mkdir(path.join(stateDir, 'batch'));
 
     const result = await cli(runtime, shadowReportArgs(stateDir));
-    expect(result.code).toBe(0);
+    expect(result.code).toBe(1);
     const body = JSON.parse(result.out) as {
+      outcome: string;
       complete: boolean;
       shell: { batchLines: number | null };
     };
+    expect(body.outcome).toBe('unknown');
     expect(body.complete).toBe(false);
     expect(body.shell.batchLines).toBeNull();
     expect(result.out).not.toContain(stateDir);

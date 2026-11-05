@@ -395,6 +395,9 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
       for (const index of indexes) {
         const slot = slots.get(index);
         if (slot !== undefined && !slot.prunable && claims.get(index) === owner) {
+          // A slot being reset is not handed back; only a proven absent guard passes.
+          const resetting = await this.call(view, ['test', '-L', `${view.claimsDir}/w${index}.reset`], deadline);
+          if (resetting.kind !== 'fail') continue;
           const record = this.entry(projectId, index, slot.path, slot.head, 'taken', runId);
           if (record !== null && isWorktreePoolBaseCommit(slot.head)) return { outcome: 'taken', entry: record };
         }

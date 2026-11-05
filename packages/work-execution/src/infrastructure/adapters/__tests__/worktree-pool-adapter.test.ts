@@ -58,7 +58,10 @@ class FakeHost implements CommandExecutorPort {
     if (hooked !== undefined) return hooked;
     if (isGit) return this.git(dir, words);
     const [cmd, ...a] = words;
-    if (cmd === 'test') return this.claimsDir ? OK() : FAIL();
+    if (cmd === 'test') {
+      if (a[0] === '-L') return this.claims.has(a[1] ?? '') ? OK() : FAIL();
+      return this.claimsDir ? OK() : FAIL();
+    }
     if (cmd === 'mkdir') { this.claimsDir = true; return OK(); }
     if (cmd === 'ls') {
       return OK([...this.claims.keys()].map((k) => k.slice(CLAIMS.length + 1)).join('\n'));
@@ -169,6 +172,17 @@ describe('WorktreePoolAdapter take', () => {
     expect(first).toMatchObject({ outcome: 'taken', entry: { entryId: 'proj#1', baseCommit: BASE } });
     expect(host.claims.size).toBe(1);
     expect(await take(make(host), 'run-2', NEXT)).toEqual({ outcome: 'empty' });
+  });
+
+  it('does not hand a slot back to its run while a reset holds it', async () => {
+    const host = new FakeHost();
+    host.add(1);
+    const adapter = make(host);
+    await take(adapter, 'run-1');
+    host.claims.set(`${CLAIMS}/w1.reset`, 'reset');
+    expect(await take(adapter, 'run-1', NEXT)).toEqual({ outcome: 'empty' });
+    host.claims.delete(`${CLAIMS}/w1.reset`);
+    expect((await take(adapter, 'run-1')).outcome).toBe('taken');
   });
 
   it('keeps unknown unknown: unreadable claims, listings and status never read as free', async () => {

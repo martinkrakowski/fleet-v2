@@ -20,6 +20,7 @@ import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJ
 import { MergeQueueRepositoryAdapter } from '../../../infrastructure/adapters/MergeQueueRepositoryAdapter.adapter.js';
 import { sha256HexDigest } from '../../../infrastructure/adapters/AttemptArtifactAdapter.adapter.js';
 import type { MergeRepoPolicy } from '../../../domain/merge-queue-decider.js';
+import { buildVetoEntry } from '../../../domain/merge-pass-transitions.js';
 import type { MergeTransitionDecision } from '../../../domain/merge-pass-transitions.js';
 
 const OWNER = 'fleet';
@@ -403,6 +404,46 @@ describe('RunMergePassUseCase (DT9c): hostile input and bounds', () => {
     const h = await harness({ forge: pending, seed: 120 });
     const result = await h.useCase.runMergePass(h.request());
     expect(result.entries).toHaveLength(100);
+  });
+
+  it('a long queue is served in rotation: no entry behind the first 100 is starved', async () => {
+    const pending: ReadForgeMergeResult = {
+      ...greenForge,
+      contexts: [{ name: 'gate', state: 'PENDING', isGreen: false, creatorLogin: null }, greenContexts()[1]],
+    } as ReadForgeMergeResult;
+    const h = await harness({ forge: pending, seed: 250 });
+    const seen = new Set<string>();
+    for (let pass = 0; pass < 4; pass += 1) {
+      const result = await h.useCase.runMergePass(h.request());
+      expect(result.entries.length).toBeLessThanOrEqual(100);
+      for (const report of result.entries) seen.add(report.entryId);
+      h.clock.now += 60_000;
+    }
+    expect(seen.size).toBe(250);
+  });
+
+  it('a park that later becomes a veto hold notifies under its own event and key', async () => {
+    const h = await harness({ forge: failedGate, policy: { veto: { mode: 'live', holdConfidence: 0.8 } } });
+    await h.useCase.runMergePass(h.request());
+    expect(h.notifier.requests.map((r) => r.event)).toEqual(['parked']);
+
+    // The checks turn green and a stored veto answer says hold.
+    const [parked] = await h.list();
+    const held = buildVetoEntry(parked, { outcome: 'hold-for-human', confidence: 0.95, mode: 'live', decisionReceiptId: 'receipt-1' });
+    if (!held.ok) throw new Error('fixture');
+    await h.queue.applyMergeTransition({
+      entryId: parked.entryId, expectedRevision: parked.revision, next: held.record, successor: null,
+      deadlineIso: new Date(START + 3_600_000).toISOString(),
+    });
+    h.forge.result = greenForge;
+    h.clock.now += 3_600_000;
+
+    const result = await h.useCase.runMergePass(h.request());
+
+    expect(result.entries[0]).toMatchObject({ decision: 'recorded', reasonCode: 'veto-hold' });
+    expect(h.notifier.requests.map((r) => r.event)).toEqual(['parked', 'veto-hold']);
+    expect(h.notifier.requests[1].key).toBe(`veto-hold:${parked.entryId}`);
+    expect((await h.list())[0]).toMatchObject({ state: 'parked', reason: 'veto-hold' });
   });
 
   it('reports only fixed lowercase reason tokens', async () => {

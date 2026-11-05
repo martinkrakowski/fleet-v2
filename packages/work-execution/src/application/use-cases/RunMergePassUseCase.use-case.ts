@@ -40,6 +40,7 @@ import {
   buildParkedEntry,
   buildReadyEntry,
   buildSupersession,
+  isMergeParkReason,
   dropNotificationEvent,
   mergeNotificationKey,
   parkNotificationEvent,
@@ -95,6 +96,31 @@ const MERGE_STATE_BY_TOKEN: Record<string, 'CLEAN' | 'BEHIND' | 'BLOCKED' | 'UNK
   blocked: 'BLOCKED',
   unknown: 'UNKNOWN',
 };
+
+/**
+ * At most MAX_ENTRIES_PER_PASS entries per pass: the queue head always, the
+ * rest in queue order rotated by the pass minute, so a long run of parked
+ * entries at the front cannot starve the entries behind it.
+ */
+function selectEntriesForPass(
+  ordered: readonly MergeQueueEntryRecord[],
+  head: MergeQueueEntryRecord | null,
+  nowMs: number,
+): readonly MergeQueueEntryRecord[] {
+  if (ordered.length <= MAX_ENTRIES_PER_PASS) {
+    return ordered;
+  }
+  const rest = ordered.filter((entry) => head === null || entry.entryId !== head.entryId);
+  const window = MAX_ENTRIES_PER_PASS - (head === null ? 0 : 1);
+  const step = Number.isFinite(nowMs) ? Math.floor(nowMs / 60_000) : 0;
+  const offset = (step * window) % rest.length;
+  const rotated = [...rest.slice(offset), ...rest.slice(0, offset)].slice(0, window);
+  const chosen = new Set(rotated.map((entry) => entry.entryId));
+  if (head !== null) {
+    chosen.add(head.entryId);
+  }
+  return ordered.filter((entry) => chosen.has(entry.entryId));
+}
 
 /** The budget guard of D-DT9: a call is never started with under 2 s left. */
 function callAllowed(nowIso: string, deadlineIso: string): boolean {
@@ -172,8 +198,9 @@ export class RunMergePassUseCase implements RunMergePassPort {
     const repoRecords = records.filter(
       (record) => typeof record === 'object' && record !== null && record.repoDigest === request.repoDigest,
     );
-    const live = orderMergeQueue(repoRecords, request.repoDigest).slice(0, MAX_ENTRIES_PER_PASS);
-    const head = findMergeQueueHead(live, request.repoDigest);
+    const ordered = orderMergeQueue(repoRecords, request.repoDigest);
+    const head = findMergeQueueHead(ordered, request.repoDigest);
+    const live = selectEntriesForPass(ordered, head, Date.parse(this.deps.nowIso()));
 
     // The kill switch, read once; an unreadable read is a halt (fail closed).
     // D-DT9: the budget is checked before this outbound read too.
@@ -341,8 +368,12 @@ export class RunMergePassUseCase implements RunMergePassPort {
     if (entry.state === 'parked' && sameMergeEntryContent(entry, built.record)) {
       return this.report(entry, 'no-action', decision.reason, null); // already stored
     }
-    const notify =
-      entry.state === 'parked' ? null : { event: parkNotificationEvent(decision.reason), id: entry.entryId };
+    // A park notifies on its first entry and again when it changes event (a
+    // hold for a veto has its own line); the (event, id) key keeps each once.
+    const event = parkNotificationEvent(decision.reason);
+    const previousEvent =
+      entry.state === 'parked' && isMergeParkReason(entry.reason) ? parkNotificationEvent(entry.reason) : null;
+    const notify = previousEvent === event ? null : { event, id: entry.entryId };
     const persisted = await this.persist(request, entry, built.record, null, notify);
     if (persisted.status === 'failed') {
       return this.report(entry, 'no-action', persisted.reasonCode, null);

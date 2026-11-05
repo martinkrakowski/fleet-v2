@@ -64,6 +64,10 @@ export function parkNotificationEvent(reason: MergeParkReason): MergeNotificatio
   return reason === 'veto-hold' ? 'veto-hold' : 'parked';
 }
 
+export function isMergeParkReason(value: unknown): value is MergeParkReason {
+  return (MERGE_PARK_REASONS as readonly unknown[]).includes(value);
+}
+
 function terminal(entry: MergeQueueEntryRecord): boolean {
   return !isMergeQueueEntryLive(entry);
 }

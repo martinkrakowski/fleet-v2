@@ -68,9 +68,15 @@ const GIT_TIMEOUT_MS = 30_000;
  * Applied to every git command: the replace-ref pin and a grafts path that
  * never exists travel inside the command itself (`env ...` first), so the
  * setting survives an ssh transport — mirroring LaneDiffCheckAdapter.
+ * No read may reach the network: `GIT_NO_LAZY_FETCH=1` stops a partial
+ * clone's lazy fetch of a missing promised object (git 2.44 and later), and
+ * `protocol.allow=never` refuses every transport on any git version, so a
+ * missing object fails the read instead of being fetched.
  */
 const GIT_ARGV_PREFIX = [
   'env',
+  'GIT_NO_LAZY_FETCH=1',
+  'GIT_TERMINAL_PROMPT=0',
   'GIT_NO_REPLACE_OBJECTS=1',
   'GIT_GRAFT_FILE=/nonexistent/fleet-v2-repository-facts-no-grafts',
   'git',
@@ -83,6 +89,8 @@ const GIT_ARGV_PREFIX = [
   'core.hooksPath=/dev/null',
   '-c',
   'core.attributesFile=/dev/null',
+  '-c',
+  'protocol.allow=never',
   '-C',
 ] as const;
 

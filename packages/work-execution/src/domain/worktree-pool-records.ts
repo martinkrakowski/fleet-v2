@@ -105,6 +105,9 @@ function readValidatedSnapshot(snapshot: Record<string, unknown>): WorktreePoolE
   if (!isRunIdValue(snapshot.takenByRunId)) {
     return refusal('malformed', 'WorktreePoolEntry takenByRunId must be null or an id string');
   }
+  if (snapshot.state === 'warm' && snapshot.takenByRunId !== null) {
+    return refusal('malformed', 'WorktreePoolEntry warm entries must not name a run');
+  }
   const revision = snapshot.revision;
   if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) {
     return refusal('malformed', 'WorktreePoolEntry revision must be a non-negative safe integer');

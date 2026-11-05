@@ -68,6 +68,15 @@ describe('worktree pool entry record', () => {
     }
   });
 
+  it('refuses a warm entry that names a run', () => {
+    const input = makeRecord({ takenByRunId: 'run-1' });
+    const result = readWorktreePoolEntryRecord(input);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('malformed');
+    }
+  });
+
   it('predicate helpers match the record domain', () => {
     expect(isWorktreePoolBaseCommit(BASE)).toBe(true);
     expect(isWorktreePoolBaseCommit(BASE.toUpperCase())).toBe(false);

@@ -73,9 +73,15 @@ export type RefillWorktreePoolResult =
   | { readonly outcome: 'refused'; readonly reason: 'invalid-request' | 'pool-full' }
   | { readonly outcome: 'unknown' };
 
+/**
+ * The warm worktree pool contract. All three operations are required members:
+ * an adapter that cannot serve one must fail loudly (the KS4b adapter throws
+ * `Not implemented` until it lands), never quietly omit it. A consumer may
+ * call any operation without guarding its presence; refusal and unknown
+ * outcomes are carried by the result types, not by a missing method.
+ */
 export interface WorktreePoolPort {
-  // Optional until KS4b implements the adapter; the generated empty stub must keep type-checking.
-  take?(request: TakeWarmWorktreeRequest): Promise<TakeWarmWorktreeResult>;
-  resetToBase?(request: ResetWorktreeToBaseRequest): Promise<ResetWorktreeToBaseResult>;
-  refillAfterMerge?(request: RefillWorktreePoolRequest): Promise<RefillWorktreePoolResult>;
+  take(request: TakeWarmWorktreeRequest): Promise<TakeWarmWorktreeResult>;
+  resetToBase(request: ResetWorktreeToBaseRequest): Promise<ResetWorktreeToBaseResult>;
+  refillAfterMerge(request: RefillWorktreePoolRequest): Promise<RefillWorktreePoolResult>;
 }

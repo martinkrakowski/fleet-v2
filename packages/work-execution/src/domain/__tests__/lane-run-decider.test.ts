@@ -365,6 +365,7 @@ describe('global rules', () => {
     const facts = baseFacts({
       state: 'collecting',
       stopMode: 'graceful',
+      stopRequestedAtIso: '2026-10-27T09:16:00.000Z',
       attempt: attemptFact({ phase: 'collected', collection: null }),
     });
     expect(decide(rec, facts)).toEqual({
@@ -1724,7 +1725,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
   it('a zero-commit collection ends the drain stopped, never preparing the next seat', () => {
     const rec = record({});
     const attempt = attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 0, manifest: 'sealed' } });
-    const collecting = baseFacts({ state: 'collecting', stopMode: 'graceful', attempt });
+    const collecting = baseFacts({ state: 'collecting', stopMode: 'graceful', stopRequestedAtIso: '2026-10-27T09:16:00.000Z', attempt });
     assertDecision(collecting, rec, decide(rec, collecting), { kind: 'enter', to: 'seat-failed' });
     const seatFailed = baseFacts({ state: 'seat-failed', stopMode: 'graceful', attempt });
     assertDecision(seatFailed, rec, decide(rec, seatFailed), { kind: 'enter', to: 'stopped' });
@@ -1733,7 +1734,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
   it('an unsealed collection parks, then the parked run enters stopped', () => {
     const attempt = attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'missing' } });
     const rec = record({});
-    const collecting = baseFacts({ state: 'collecting', stopMode: 'graceful', attempt });
+    const collecting = baseFacts({ state: 'collecting', stopMode: 'graceful', stopRequestedAtIso: '2026-10-27T09:16:00.000Z', attempt });
     assertDecision(collecting, rec, decide(rec, collecting), {
       kind: 'park', reason: 'artifacts-unsealed', qualifier: null, parkedFrom: 'collecting',
     });
@@ -1754,6 +1755,65 @@ describe('cancel and modes (plan §3.9.1)', () => {
     expect(decide(rec, exceeded)).toEqual({ kind: 'wait', reason: 'stop-grace-exceeded' });
     const none = baseFacts({ state: 'running', stopMode: 'graceful', attempt, stopRequestedAtIso: null });
     expect(decide(rec, none)).toEqual({ kind: 'wait', reason: 'stop-grace-exceeded' });
+  });
+
+  it('GD7: a collecting drain with no live attempt and the grace passed enters stopped', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'collecting',
+      stopMode: 'graceful',
+      stopRequestedAtIso: '2026-10-27T09:00:00.000Z',
+      attempt: attemptFact({ phase: 'collected', collection: null }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
+  });
+
+  it('GD7: the same collecting drain inside the grace still lets the collecting rules decide', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'collecting',
+      stopMode: 'graceful',
+      stopRequestedAtIso: '2026-10-27T09:16:00.000Z',
+      attempt: attemptFact({ phase: 'collected', collection: null }),
+    });
+    expect(decide(rec, facts)).toEqual({
+      kind: 'act', step: 'collect', key: `${RUN_ID}/r0/collect/0/a1`, round: 0, seatIndex: 0, head12: null, retry: null,
+    });
+  });
+
+  it('GD7: a gating drain with no live attempt and the grace passed enters stopped', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'gating',
+      stopMode: 'graceful',
+      stopRequestedAtIso: '2026-10-27T09:00:00.000Z',
+      head12: HEAD,
+      gate: 'none',
+      attempt: attemptFact({ phase: 'collected', collection: { headUnchanged: false, commits: 2, manifest: 'sealed' } }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
+  });
+
+  it('GD7: a live running attempt past the grace still waits stop-grace-exceeded', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'running',
+      stopMode: 'graceful',
+      stopRequestedAtIso: '2026-10-27T09:00:00.000Z',
+      attempt: attemptFact(),
+    });
+    expect(decide(rec, facts)).toEqual({ kind: 'wait', reason: 'stop-grace-exceeded' });
+  });
+
+  it('GD7: a missing stopRequestedAtIso with no live attempt in collecting enters stopped', () => {
+    const rec = record({});
+    const facts = baseFacts({
+      state: 'collecting',
+      stopMode: 'graceful',
+      stopRequestedAtIso: null,
+      attempt: attemptFact({ phase: 'collected', collection: null }),
+    });
+    assertDecision(facts, rec, decide(rec, facts), { kind: 'enter', to: 'stopped' });
   });
 
   it('the run deadline still stops the attempt under a graceful stop', () => {
@@ -1777,7 +1837,7 @@ describe('cancel and modes (plan §3.9.1)', () => {
     const lifted = baseFacts({ state: 'parked', stopMode: 'graceful', halted: false, head12: HEAD, gate: 'none', attempt });
     assertDecision(lifted, parkedRec, decide(parkedRec, lifted), { kind: 'enter', to: 'gating' });
 
-    const resumed = baseFacts({ state: 'gating', stopMode: 'graceful', halted: false, head12: HEAD, gate: 'none', attempt });
+    const resumed = baseFacts({ state: 'gating', stopMode: 'graceful', halted: false, head12: HEAD, gate: 'none', stopRequestedAtIso: '2026-10-27T09:16:00.000Z', attempt });
     expect(decide(rec, resumed)).toEqual({
       kind: 'act', step: 'gate', key: `${RUN_ID}/r0/gate/0@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
     });

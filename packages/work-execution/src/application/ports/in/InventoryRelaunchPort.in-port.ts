@@ -80,6 +80,7 @@ export const RELAUNCH_RISK_FLAG_CODES = [
   'running-worktrees',
   'unknown-worktree-read',
   'unproven-lane-records',
+  'unknown-runner-state',
   'driver-lease-unknown',
 ] as const;
 export type RelaunchRiskFlagCode = (typeof RELAUNCH_RISK_FLAG_CODES)[number];

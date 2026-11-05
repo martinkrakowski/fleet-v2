@@ -776,4 +776,46 @@ describe('InventoryRelaunchUseCase', () => {
       { code: 'driver-lease-unknown', count: 1 },
     ]);
   });
+  it('keeps a conducted claim the branch disproved when the runner reports its own session running there', async () => {
+    const h = harness({
+      runs: [{ ...RUN, attemptIds: ['attempt-1'] }],
+      attempts: [
+        attemptFixture('attempt-1', { worktreePath: '/clones/repo-worktrees/wt-a', sessionId: 'ses-run-1' }),
+      ],
+      workspaceResult: {
+        outcome: 'listed',
+        worktrees: [
+          listedWorktree('/clones/repo'),
+          { ...listedWorktree('/clones/repo-worktrees/wt-a'), branch: 'fleet/renamed' },
+        ],
+      },
+      runnerForAttempt: makeRunnerForAttempt(makeRunner({ state: 'running', sessionId: 'ses-run-1' })),
+    });
+    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [cloneFixture()] });
+    if (result.outcome !== 'inventoried') throw new Error('expected inventoried');
+    expect(result.hosts[0].counts).toEqual({ conducted: 1, attemptRecorded: 0, unrecorded: 0 });
+    expect(result.hosts[0].lanes[0]).toMatchObject({
+      population: 'conducted',
+      laneId: 'run-1',
+      runId: 'run-1',
+      attemptId: 'attempt-1',
+      ownership: 'proven',
+    });
+  });
+
+  it('counts the rows whose runner state is unknown', async () => {
+    const h = harness({
+      attempts: [],
+      workspaceResult: {
+        outcome: 'listed',
+        worktrees: [listedWorktree('/clones/repo'), listedWorktree('/clones/repo-worktrees/wt-1')],
+      },
+    });
+    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [cloneFixture()] });
+    if (result.outcome !== 'inventoried') throw new Error('expected inventoried');
+    expect(result.hosts[0].riskFlags).toEqual([
+      { code: 'unrecorded-worktrees', count: 1 },
+      { code: 'unknown-runner-state', count: 1 },
+    ]);
+  });
 });

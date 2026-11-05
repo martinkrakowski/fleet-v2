@@ -85,6 +85,12 @@ interface InternalLaneRow {
   readonly claimSessionId: string | null;
   /** The runner block the runner-state read is routed by; never in the result. */
   readonly routing: AttemptRunnerRecord;
+  /**
+   * Conducted attempts the listed branch disproved. The runner reporting one
+   * of their own sessions running in the directory still proves that claim
+   * (the direct fact wins over the branch).
+   */
+  readonly branchDisproved: readonly { readonly attempt: AttemptRecord; readonly run: LaneRunRecord }[];
 }
 
 /** UTF-16 code-unit order: identical to the default sort(), stated explicitly (Sonar S2871). */
@@ -248,6 +254,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       const unrecorded = lanes.filter((row) => row.population === 'unrecorded').length;
       const running = lanes.filter((row) => row.runnerState === 'running').length;
       const unproven = lanes.filter((row) => row.ownership === 'unknown').length;
+      const unknownRunner = lanes.filter((row) => row.runnerState === 'unknown').length;
       const unknownListings = hostUnknownListings.get(hostName) ?? 0;
       // Risk flags, counts only; omit a flag whose count is 0.
       const riskFlags: RelaunchRiskFlag[] = [];
@@ -255,6 +262,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       if (running > 0) riskFlags.push({ code: 'running-worktrees', count: running });
       if (unknownListings > 0) riskFlags.push({ code: 'unknown-worktree-read', count: unknownListings });
       if (unproven > 0) riskFlags.push({ code: 'unproven-lane-records', count: unproven });
+      if (unknownRunner > 0) riskFlags.push({ code: 'unknown-runner-state', count: unknownRunner });
       hosts.push({
         hostName,
         cloneCount: hostClones.get(hostName) ?? 0,
@@ -325,6 +333,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       return host === null || host === lane.hostName;
     });
     const conducted = candidates.filter((attempt) => runByAttemptId.has(attempt.id));
+    let branchDisproved: InternalLaneRow['branchDisproved'] = [];
     if (conducted.length > 0) {
       const branch = lane.entry.branch;
       if (branch === null) {
@@ -338,13 +347,19 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       if (matching.length > 0) {
         return this.recordedRow(lane, latestAttempt(matching), runByAttemptId, 'proven');
       }
-      // Another branch is checked out: the conducted records are stale here.
+      // Another branch is checked out: the conducted records are stale here
+      // unless the runner later reports one of their own sessions running.
+      branchDisproved = conducted.flatMap((attempt) => {
+        const run = runByAttemptId.get(attempt.id);
+        return run === undefined ? [] : [{ attempt, run }];
+      });
     }
     const unrun = candidates.filter((attempt) => !runByAttemptId.has(attempt.id));
-    if (unrun.length > 0) {
-      return this.recordedRow(lane, latestAttempt(unrun), runByAttemptId, 'unknown');
-    }
-    return this.unrecordedRow(lane);
+    const row =
+      unrun.length > 0
+        ? this.recordedRow(lane, latestAttempt(unrun), runByAttemptId, 'unknown')
+        : this.unrecordedRow(lane);
+    return { ...row, branchDisproved };
   }
 
   private recordedRow(
@@ -370,6 +385,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       ownership,
       claimSessionId: isNonBlankString(attempt.sessionId) ? attempt.sessionId : null,
       routing,
+      branchDisproved: [],
     };
   }
 
@@ -385,6 +401,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       ownership: 'none',
       claimSessionId: null,
       routing: lane.cloneHost,
+      branchDisproved: [],
     };
   }
 
@@ -410,13 +427,32 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
     }
     // Copy the worktree run state union, never widen it.
     row.runnerState = answer.state;
-    if (answer.state !== 'running' || row.ownership !== 'unknown' || row.claimSessionId === null) {
-      return;
-    }
-    if (answer.sessionId === row.claimSessionId) {
+    if (answer.state !== 'running') return;
+    const runningSession = answer.sessionId;
+    if (row.ownership === 'unknown' && row.claimSessionId !== null && runningSession === row.claimSessionId) {
       row.ownership = 'proven';
       return;
     }
+    if (row.ownership !== 'proven') {
+      // A conducted record the branch disproved, whose own session runs here:
+      // the running session is the direct fact, so that run owns the lane.
+      const reclaimed = row.branchDisproved
+        .filter(({ attempt }) => isNonBlankString(runningSession) && attempt.sessionId === runningSession)
+        .map(({ attempt }) => attempt);
+      if (reclaimed.length > 0) {
+        const attempt = latestAttempt(reclaimed);
+        const run = row.branchDisproved.find((claim) => claim.attempt.id === attempt.id)?.run;
+        if (run !== undefined) {
+          row.population = 'conducted';
+          row.laneId = run.runId;
+          row.runId = run.runId;
+          row.attemptId = attempt.id;
+          row.ownership = 'proven';
+          return;
+        }
+      }
+    }
+    if (row.ownership !== 'unknown' || row.claimSessionId === null) return;
     // Another session runs in the directory: the record is stale here, and
     // the running lane is one no record claims.
     row.population = 'unrecorded';

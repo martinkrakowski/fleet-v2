@@ -1676,8 +1676,7 @@ async function conductorStatusExit(
   });
   // The status document carries `crashedStarts` only; an incomplete scan is told on stderr, not as an extra field.
   if (result.outcome === 'listed' && result.crashedStartsIncomplete === true) {
-    const { crashedStartsIncomplete: _incomplete, ...document } = result;
-    io.stdout(`${JSON.stringify(document)}\n`);
+    io.stdout(`${JSON.stringify(result, (key: string, value: unknown) => (key === 'crashedStartsIncomplete' ? undefined : value))}\n`);
     io.stderr(crashedStartScanWarning('status', 'incomplete') ?? '');
     return exitFor(result);
   }

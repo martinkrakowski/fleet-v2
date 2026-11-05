@@ -342,3 +342,41 @@ describe('gateReceiptKeysEqual and string reads (KS2 review fixes)', () => {
     }
   });
 });
+
+describe('KS2 pre-merge review fixes', () => {
+  function key() {
+    const built = buildGateReceiptKey(components());
+    if (!built.ok) throw new Error('fixture key must build');
+    return built.key;
+  }
+
+  it('a supplied key with a throwing accessor is a miss, not a throw', () => {
+    const hostile = Object.defineProperty({ ...key() }, 'predicateId', {
+      enumerable: true,
+      get() {
+        throw new Error('hostile');
+      },
+    });
+    expect(() => decideGateReceiptReuse(hostile, stored())).not.toThrow();
+    expect(decideGateReceiptReuse(hostile, stored())).toEqual({ outcome: 'miss', reason: 'supplied-key-unreadable' });
+  });
+
+  it('a supplied key of another schema version is a miss, even with matching components', () => {
+    const other = { ...key(), schemaVersion: 2 } as unknown as Parameters<typeof decideGateReceiptReuse>[0];
+    expect(decideGateReceiptReuse(other, stored()).outcome).toBe('miss');
+  });
+
+  it('refuses a secret-shaped predicate id', () => {
+    expect(buildGateReceiptKey({ ...components(), predicateId: 'ghp_' + 'x'.repeat(36) }).ok).toBe(false);
+  });
+
+  it('refuses a toolchain version that is not a version string', () => {
+    const bad = { ...components(), toolchainVersions: { ...components().toolchainVersions, node: 'any text at all' } };
+    expect(buildGateReceiptKey(bad).ok).toBe(false);
+  });
+
+  it('two malformed keys with the same missing fields are not equal', () => {
+    const malformed = { schemaVersion: 1, predicateId: 'x' } as unknown as Parameters<typeof gateReceiptKeysEqual>[0];
+    expect(gateReceiptKeysEqual(malformed, malformed)).toBe(false);
+  });
+});

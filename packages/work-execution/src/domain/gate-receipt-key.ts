@@ -7,6 +7,8 @@
 // when every component was readable and equal. No filesystem, no subprocess, no
 // Node builtins, no console; this module never throws.
 
+import { containsSecretShape } from '@fleet/shared';
+
 import {
   isPlainRecordObject,
   readRecordSchemaVersion,
@@ -65,7 +67,7 @@ export type GateReceiptStoredRead =
 
 export type GateReceiptReuse =
   | { readonly outcome: 'reuse'; readonly key: GateReceiptKey }
-  | { readonly outcome: 'miss'; readonly reason: 'no-stored-receipt' | 'stored-key-unreadable' | 'stored-key-version-unknown' }
+  | { readonly outcome: 'miss'; readonly reason: 'no-stored-receipt' | 'stored-key-unreadable' | 'stored-key-version-unknown' | 'supplied-key-unreadable' }
   | { readonly outcome: 'miss'; readonly reason: 'key-changed'; readonly changedComponent: GateReceiptKeyComponent };
 
 const TREE_HASH_PATTERN = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -88,7 +90,8 @@ function readTrimmedString(value: unknown, maxLength: number): string | undefine
     return undefined;
   }
   // Control characters are refused before trimming, so a leading or trailing tab or newline is refused too.
-  if (hasControlCharacter(value)) {
+  // A secret-shaped value never enters a key, which is stored data.
+  if (hasControlCharacter(value) || containsSecretShape(value)) {
     return undefined;
   }
   const trimmed = value.trim();
@@ -98,8 +101,22 @@ function readTrimmedString(value: unknown, maxLength: number): string | undefine
   return trimmed;
 }
 
-function isObjectRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
+/** A version string such as 22.11.0 or 4.12.0-rc.1: letters, digits and . + _ - only, at most 64 characters. */
+const TOOLCHAIN_VERSION_PATTERN = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/;
+
+function readToolchainVersion(value: unknown): string | undefined {
+  const read = readTrimmedString(value, 64);
+  return read !== undefined && TOOLCHAIN_VERSION_PATTERN.test(read) ? read : undefined;
+}
+
+/** The key, re-read and validated as stored data would be; null for anything unreadable, versioned otherwise or hostile. */
+function readSuppliedKey(key: unknown): GateReceiptKey | null {
+  try {
+    const read = readGateReceiptKeyRecord(key);
+    return read.ok ? read.record : null;
+  } catch {
+    return null;
+  }
 }
 
 function isTreeHash(value: unknown): value is string {
@@ -159,10 +176,10 @@ function readGateReceiptKeyComponents(parts: GateReceiptKeyInput): GateReceiptKe
     if (!isPlainRecordObject(toolchainVersions)) {
       return { ok: false, reason: 'toolchain-version-unreadable' };
     }
-    const node = readTrimmedString(readOwnProperty(toolchainVersions, 'node'), 64);
-    const yarn = readTrimmedString(readOwnProperty(toolchainVersions, 'yarn'), 64);
-    const hexagen = readTrimmedString(readOwnProperty(toolchainVersions, 'hexagen'), 64);
-    const turbo = readTrimmedString(readOwnProperty(toolchainVersions, 'turbo'), 64);
+    const node = readToolchainVersion(readOwnProperty(toolchainVersions, 'node'));
+    const yarn = readToolchainVersion(readOwnProperty(toolchainVersions, 'yarn'));
+    const hexagen = readToolchainVersion(readOwnProperty(toolchainVersions, 'hexagen'));
+    const turbo = readToolchainVersion(readOwnProperty(toolchainVersions, 'turbo'));
     if (node === undefined || yarn === undefined || hexagen === undefined || turbo === undefined) {
       return { ok: false, reason: 'toolchain-version-unreadable' };
     }
@@ -204,11 +221,11 @@ export function gateReceiptKeysEqual(left: GateReceiptKey, right: GateReceiptKey
   }
 }
 
-function keyComponentsEqual(left: GateReceiptKey, right: GateReceiptKey): boolean {
-  if (!isObjectRecord(left) || !isObjectRecord(right)) {
-    return false;
-  }
-  if (!isObjectRecord(left.toolchainVersions) || !isObjectRecord(right.toolchainVersions)) {
+function keyComponentsEqual(suppliedLeft: GateReceiptKey, suppliedRight: GateReceiptKey): boolean {
+  // Only two readable keys can be equal: an unreadable component on either side is a miss.
+  const left = readSuppliedKey(suppliedLeft);
+  const right = readSuppliedKey(suppliedRight);
+  if (left === null || right === null) {
     return false;
   }
   return (
@@ -245,7 +262,12 @@ export function readGateReceiptKeyRecord(input: unknown): GateReceiptStoredRead 
   return { ok: true, record: built.key };
 }
 
-export function decideGateReceiptReuse(key: GateReceiptKey, stored: unknown): GateReceiptReuse {
+export function decideGateReceiptReuse(suppliedKey: GateReceiptKey, stored: unknown): GateReceiptReuse {
+  // The supplied key is re-validated too: a hostile, malformed or other-version key is a miss, never a reuse.
+  const key = readSuppliedKey(suppliedKey);
+  if (key === null) {
+    return { outcome: 'miss', reason: 'supplied-key-unreadable' };
+  }
   if (stored === null || stored === undefined) {
     return { outcome: 'miss', reason: 'no-stored-receipt' };
   }

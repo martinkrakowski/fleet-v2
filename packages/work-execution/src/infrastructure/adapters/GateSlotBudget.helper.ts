@@ -33,13 +33,28 @@ export function readGateSlotCapacity(value: unknown): number {
 }
 
 export class GateSlotBudget {
-  readonly capacity: number;
+  private limit: number;
   private active = 0;
   private peakActive = 0;
   private readonly waiters: Array<() => void> = [];
 
   constructor(capacity: unknown) {
-    this.capacity = readGateSlotCapacity(capacity);
+    this.limit = readGateSlotCapacity(capacity);
+  }
+
+  /** The number of tasks that may hold a slot at once, right now. */
+  get capacity(): number {
+    return this.limit;
+  }
+
+  /**
+   * A request declares the host's slot count again. While tasks run or wait the
+   * budget only ever lowers (never exceeds what either declaration allows);
+   * once idle it takes the declared count, so a lowered count does not stick.
+   */
+  reconcile(capacity: unknown): void {
+    const declared = readGateSlotCapacity(capacity);
+    this.limit = this.active === 0 && this.waiters.length === 0 ? declared : Math.min(this.limit, declared);
   }
 
   /** The most tasks that ever held a slot at once. */

@@ -79,4 +79,18 @@ describe('GateSlotBudget', () => {
     expect(results).toEqual([{ ok: true, value: 'a' }, { ok: false }, { ok: true, value: 'c' }]);
     expect(budget.peak).toBeLessThanOrEqual(2);
   });
+
+  it('reconciles a new declaration conservatively while busy and fully once idle', async () => {
+    const budget = new GateSlotBudget(2);
+    const running = budget.run(() => tick(10));
+    budget.reconcile(5);
+    expect(budget.capacity).toBe(2);
+    budget.reconcile(1);
+    expect(budget.capacity).toBe(1);
+    await running;
+    budget.reconcile(4);
+    expect(budget.capacity).toBe(4);
+    budget.reconcile('nonsense');
+    expect(budget.capacity).toBe(1);
+  });
 });

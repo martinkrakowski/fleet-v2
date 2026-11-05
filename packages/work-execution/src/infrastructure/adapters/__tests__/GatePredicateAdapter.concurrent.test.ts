@@ -22,7 +22,7 @@ import type {
 } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { LaneDiffCheckPort, LaneDiffCheckResult } from '../../../application/ports/out/LaneDiffCheckPort.out-port.js';
 import type { RunnerForAttemptHostSpec } from '../ConfirmRecordedHost.js';
-import { gateCommandPredicateName } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
+import { MAX_GATE_ARGV_ENTRIES, MAX_GATE_COMMANDS, gateCommandPredicateName } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -196,6 +196,48 @@ describe('GatePredicateAdapter concurrency (KS3)', () => {
     const adapter = makeAdapter(executor, 8, { maxConcurrentPredicates: 2 });
     await adapter.evaluateGatePredicates(requestWith(['a', 'b', 'c', 'd', 'e']));
     expect(executor.peak).toBe(2);
+  });
+
+  it('shares one budget per host when requests declare different slot counts', async () => {
+    const executor = new RecordingExecutor({ a: { delayMs: 15 } });
+    let slots = 2;
+    const adapter = new GatePredicateAdapter({
+      executorForRecordedHost: () => ({
+        ok: true,
+        executor,
+        hostSpec: { transport: 'local', runner: { kind: 'opencode', gateSlot: { path: GATE_SLOT_PATH, slots } } },
+      }),
+      laneDiffCheckFor: () => new CleanDiff(),
+    });
+    const first = adapter.evaluateGatePredicates(requestWith(['a1', 'a2', 'a3', 'a4'], '/lanes/p'));
+    await tick(2);
+    slots = 3;
+    const second = adapter.evaluateGatePredicates(requestWith(['b1', 'b2', 'b3', 'b4'], '/lanes/q'));
+    await Promise.all([first, second]);
+    expect(executor.peak).toBeLessThanOrEqual(2);
+    // Idle again, the declared count is taken as it stands.
+    slots = 3;
+    await adapter.evaluateGatePredicates(requestWith(['c1', 'c2', 'c3', 'c4'], '/lanes/r'));
+    expect(executor.peak).toBe(3);
+  });
+
+  it('refuses a request with more commands or arguments than an acceptance spec allows', async () => {
+    const executor = new RecordingExecutor();
+    const adapter = makeAdapter(executor, 4);
+    const tooMany = requestWith(Array.from({ length: MAX_GATE_COMMANDS + 1 }, (_, index) => 'c' + String(index)));
+    expect((await adapter.evaluateGatePredicates(tooMany)).outcome).toBe('unavailable');
+    const tooLong: EvaluateGatePredicatesRequest = {
+      ...requestWith(['x']),
+      spec: {
+        commitRequired: true,
+        diffCheck: true,
+        commands: [{ argv: Array.from({ length: MAX_GATE_ARGV_ENTRIES + 1 }, () => 'a') }],
+      },
+    };
+    expect((await adapter.evaluateGatePredicates(tooLong)).outcome).toBe('unavailable');
+    const atLimit = requestWith(Array.from({ length: MAX_GATE_COMMANDS }, (_, index) => 'c' + String(index)));
+    expect((await adapter.evaluateGatePredicates(atLimit)).outcome).toBe('evaluated');
+    expect(executor.peak).toBeLessThanOrEqual(4);
   });
 
   it('treats an invalid declared slot count as one slot, never more', async () => {

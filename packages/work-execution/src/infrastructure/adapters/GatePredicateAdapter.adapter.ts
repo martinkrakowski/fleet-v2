@@ -63,7 +63,7 @@ import type {
   CheckCoverage,
   EvidenceResultValue,
 } from '@fleet/evidence-and-acceptance';
-import { gateCommandPredicateName } from '../../domain/value-objects/AcceptanceSpec.vo.js';
+import { MAX_GATE_ARGV_ENTRIES, MAX_GATE_COMMANDS, gateCommandPredicateName } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import type { GateCommand } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 
@@ -234,12 +234,16 @@ function isUsableRequest(request: EvaluateGatePredicatesRequest): boolean {
   if (spec === null || typeof spec !== 'object' || !Array.isArray(spec.commands)) {
     return false;
   }
+  if (spec.commands.length > MAX_GATE_COMMANDS) {
+    return false;
+  }
   return spec.commands.every(
     (command: unknown) =>
       command !== null &&
       typeof command === 'object' &&
       Array.isArray((command as { argv?: unknown }).argv) &&
       (command as { argv: unknown[] }).argv.length > 0 &&
+      (command as { argv: unknown[] }).argv.length <= MAX_GATE_ARGV_ENTRIES &&
       (command as { argv: unknown[] }).argv.every((entry) => typeof entry === 'string'),
   );
 }
@@ -262,7 +266,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
   private readonly maxConcurrentPredicates: number | undefined;
   private readonly maxOutputBytes: number;
   private readonly receiptReuse: GateReceiptReuseWiring | undefined;
-  /** One budget per host and capacity, shared by every lane gated through this adapter. */
+  /** One budget per host, shared by every lane gated through this adapter. */
   private readonly budgets = new Map<string, GateSlotBudget>();
   /** Passing runs in flight by receipt key, so an identical predicate on another lane waits instead of running twice. */
   private readonly inFlight = new Map<string, Promise<GatePredicateResult>>();
@@ -303,9 +307,10 @@ export class GatePredicateAdapter implements GatePredicatePort {
     const capacity =
       this.maxConcurrentPredicates === undefined ? declared : Math.min(declared, this.maxConcurrentPredicates);
     const hostName = request.runner?.hostName;
-    const id = (typeof hostName === 'string' && hostName.length > 0 ? hostName : 'legacy') + '|' + String(capacity);
+    const id = typeof hostName === 'string' && hostName.length > 0 ? hostName : 'legacy';
     const existing = this.budgets.get(id);
     if (existing !== undefined) {
+      existing.reconcile(capacity);
       return existing;
     }
     const created = new GateSlotBudget(capacity);

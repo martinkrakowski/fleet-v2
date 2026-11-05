@@ -368,6 +368,7 @@ describe('KS2 pre-merge review fixes', () => {
 
   it('refuses a secret-shaped predicate id', () => {
     expect(buildGateReceiptKey({ ...components(), predicateId: 'ghp_' + 'x'.repeat(36) }).ok).toBe(false);
+    expect(buildGateReceiptKey({ ...components(), predicateId: 'github_pat_' + 'A'.repeat(20) }).ok).toBe(false);
   });
 
   it('refuses a toolchain version that is not a version string', () => {

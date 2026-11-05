@@ -7,7 +7,7 @@
 // when every component was readable and equal. No filesystem, no subprocess, no
 // Node builtins, no console; this module never throws.
 
-import { containsSecretShape } from '@fleet/shared';
+import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
 import {
   isPlainRecordObject,
@@ -91,7 +91,7 @@ function readTrimmedString(value: unknown, maxLength: number): string | undefine
   }
   // Control characters are refused before trimming, so a leading or trailing tab or newline is refused too.
   // A secret-shaped value never enters a key, which is stored data.
-  if (hasControlCharacter(value) || containsSecretShape(value)) {
+  if (hasControlCharacter(value) || isSecretShaped(value)) {
     return undefined;
   }
   const trimmed = value.trim();
@@ -99,6 +99,11 @@ function readTrimmedString(value: unknown, maxLength: number): string | undefine
     return undefined;
   }
   return trimmed;
+}
+
+/** True when a string matches containsSecretShape or any of the lane-diff secret patterns (the full registry). */
+function isSecretShaped(text: string): boolean {
+  return containsSecretShape(text) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(text));
 }
 
 /** A version string such as 22.11.0 or 4.12.0-rc.1: letters, digits and . + _ - only, at most 64 characters. */

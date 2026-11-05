@@ -75,6 +75,21 @@ describe('state file compaction', () => {
     expect(sha256(quarantined)).toBe(sha256(original));
   });
 
+  it('never writes through a pre-existing <store>.compacted symlink (EX-3b review minor)', async () => {
+    const original = await seed([record('a'), record('b'), record('c')]);
+    const victim = path.join(tempDir, 'unrelated.txt');
+    await fs.writeFile(victim, 'keep me\n');
+    await fs.symlink(victim, path.join(tempDir, `${dataPath}.compacted`));
+    const outcome = await descriptor.compact!({
+      stateDir: tempDir,
+      keepIds: ['a', 'b'],
+      expectedCurrentSha256: sha256(original),
+    });
+    expect(outcome.status).toBe('compacted');
+    expect(await fs.readFile(victim, 'utf8')).toBe('keep me\n');
+    expect(await fs.readFile(path.join(tempDir, dataPath))).toEqual(storeBytes([record('a'), record('b')]));
+  });
+
   it('writes nothing when the store changed since the plan was computed', async () => {
     const original = await seed([record('a'), record('b'), record('c')]);
     const outcome = await descriptor.compact!({

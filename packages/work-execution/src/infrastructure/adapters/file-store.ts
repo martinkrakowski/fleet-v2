@@ -1144,7 +1144,10 @@ async function compactRecordListStore(
           return { status: 'refused', reason: 'the pre-compaction bytes could not be kept; nothing was written' };
         }
 
-        await fs.writeFile(tempPath, compactedBytes);
+        // A pre-existing <store>.compacted entry is removed first (rm deletes a symlink without following it), and the
+        // temp file is created exclusively, so compaction never writes through a link planted in the state directory.
+        await fs.rm(tempPath, { force: true });
+        await fs.writeFile(tempPath, compactedBytes, { flag: 'wx' });
         await fs.rename(tempPath, filePath);
 
         let swapped: Buffer;

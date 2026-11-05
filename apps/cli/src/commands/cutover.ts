@@ -3,6 +3,13 @@
  * `shadow report` subcommand compares the fleet-v2 merge queue against the
  * shell train's recorded queue for one repository and prints one JSON document
  * of ids and codes. It writes nothing and grants nothing.
+ *
+ * The fleet merge queue keeps a `parked` entry live, so the shell side must be
+ * counted the same way: a shell parked PR is absent from the shell queue file
+ * but present in the shell parked list, so the parked list's `pr sha base`
+ * lines are parsed with the same queue parser and merged into the shell set.
+ * A parked list that is unreadable or secret-shaped refuses the report —
+ * comparing without it would silently mis-report parked PRs.
  */
 
 import { firstPositional, str, CliUsageError, type Payload } from './payload.js';
@@ -63,10 +70,33 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
       };
     }
 
-    const understood = parsed.lines.filter(
-      (line): line is Extract<LegacyTrainQueueLine, { ok: true }> => line.ok,
-    );
-    const unknownLines = parsed.lines.filter((line) => !line.ok).map((line) => line.line);
+    // The shell queue excludes the PRs it parked, while the fleet queue keeps
+    // `parked` entries live. Merge the shell parked list in so both sides
+    // count the same PRs. Refuse when the parked list cannot be understood.
+    const parked = shellState.parked;
+    if (parked.status === 'unreadable') {
+      return { outcome: 'refused', reason: 'shell-queue-unreadable', kind: 'enqueue-set' };
+    }
+    let parkedLines: readonly LegacyTrainQueueLine[] = [];
+    if (parked.status === 'read') {
+      const parsedParked = parseLegacyTrainQueue(parked.lines.join('\n'));
+      if (!parsedParked.ok) {
+        return {
+          outcome: 'refused',
+          reason: parsedParked.reason === 'secret-shaped' ? 'secret-shaped' : 'shell-queue-unreadable',
+          kind: 'enqueue-set',
+        };
+      }
+      parkedLines = parsedParked.lines;
+    }
+
+    const understood = parsed.lines
+      .concat(parkedLines)
+      .filter((line): line is Extract<LegacyTrainQueueLine, { ok: true }> => line.ok);
+    const unknownLines = parsed.lines
+      .concat(parkedLines)
+      .filter((line) => !line.ok)
+      .map((line) => line.line);
 
     const deadlineIso = new Date(Date.now() + 60_000).toISOString();
     const view = await runtime.execution.listMergeQueue.list({ repository, deadlineIso });

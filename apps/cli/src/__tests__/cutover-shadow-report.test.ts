@@ -247,4 +247,117 @@ describe('cutover shadow report (CO32)', () => {
     expect(body.compared).toBe(1);
     expect(body.equal).toBe(true);
   });
+
+  it('counts a shell parked PR as present on the shell side, matching a live fleet parked entry', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    // The fleet parked 7@HEAD_A (still live, so it is included); the shell
+    // parked it too, so it left the shell queue and sits in the parked list.
+    // The port has no park operation, so the parked record is seeded directly
+    // into the store the adapter reloads on first use.
+    const parkedEntry = {
+      version: 1,
+      entryId: ulid(1),
+      repository: { owner: 'fleet', repo: 'v2' },
+      repoDigest: 'a'.repeat(12),
+      pullRequest: 7,
+      headOid: HEAD_A,
+      state: 'parked',
+      reason: 'conflict',
+      attempt: 0,
+      notBeforeIso: null,
+      enqueuedAtIso: '2026-11-01T10:00:00.000Z',
+      enqueuedBy: 'cli',
+      supersedes: null,
+      runId: null,
+      attemptId: null,
+      workOrderId: null,
+      tier: 2,
+      verifiedHeadOid: null,
+      verifiedBy: null,
+      policyRevision: null,
+      premergeReceiptHeadOid: null,
+      veto: null,
+      mergeCommitOid: null,
+      mergedAtIso: null,
+      revision: 1,
+    };
+    await fs.writeFile(path.join(stateDir, 'merge-queue.json'), JSON.stringify([parkedEntry]));
+    await fs.writeFile(path.join(stateDir, 'queue'), '');
+    await fs.writeFile(path.join(stateDir, 'parked'), `7 ${HEAD_A} main\n`);
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(0);
+    const body = JSON.parse(result.out) as {
+      equal: boolean;
+      compared: number;
+      fleetCount: number;
+      shellCount: number;
+      divergences: unknown[];
+      shell: { parkedLines: number };
+    };
+    expect(body.equal).toBe(true);
+    expect(body.divergences).toEqual([]);
+    expect(body.fleetCount).toBe(1);
+    expect(body.shellCount).toBe(1);
+    expect(body.compared).toBe(1);
+    expect(body.shell.parkedLines).toBe(1);
+  });
+
+  it('refuses when the shell parked list is unreadable or secret-shaped', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
+    await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n`);
+    // A directory at the parked path makes readFile fail with EISDIR, which
+    // the legacy reader adapter reports as `unreadable`.
+    await fs.mkdir(path.join(stateDir, 'parked'));
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.out)).toEqual({
+      outcome: 'refused',
+      reason: 'shell-queue-unreadable',
+      kind: 'enqueue-set',
+    });
+    expect(result.out).not.toContain(stateDir);
+  });
+
+  it('refuses a secret-shaped shell parked list without echoing the secret', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
+    await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n`);
+    const secret = ['sk', '-', 'aB3cD5eF7gH9iJ1kL2mN3'].join('');
+    await fs.writeFile(path.join(stateDir, 'parked'), `7 ${HEAD_A} main\n${secret}\n`);
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.out)).toEqual({
+      outcome: 'refused',
+      reason: 'secret-shaped',
+      kind: 'enqueue-set',
+    });
+    expect(result.out).not.toContain(secret);
+  });
+
+  it('reports unknown shell parked lines by number without echoing them', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
+    await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n`);
+    const badLine = 'not a parked line';
+    await fs.writeFile(path.join(stateDir, 'parked'), `7 ${HEAD_A} main\n${badLine}\n`);
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(0);
+    const body = JSON.parse(result.out) as { complete: boolean; shell: { unknownLines: number[] } };
+    expect(body.complete).toBe(false);
+    expect(body.shell.unknownLines).toEqual([2]);
+    expect(result.out).not.toContain(badLine);
+  });
 });

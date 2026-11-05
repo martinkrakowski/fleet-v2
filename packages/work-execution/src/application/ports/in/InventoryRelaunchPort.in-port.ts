@@ -19,7 +19,12 @@ export interface RelaunchCloneRef {
   readonly clonePath: string;
   /** The directory holding that clone's worktrees; only worktrees under it count. */
   readonly worktreeRoot: string;
-  /** The host's recorded runner block; it routes the read to that host. */
+  /**
+   * The host's recorded runner block; it routes the read to that host. Null
+   * means the host is absent from the installation: the read cannot be
+   * routed, so the inventory reports an unknown listing for that host rather
+   * than falling back to a local executor.
+   */
   readonly recordedHost: AttemptRunnerRecord | null;
 }
 

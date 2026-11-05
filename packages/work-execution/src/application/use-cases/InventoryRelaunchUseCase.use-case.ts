@@ -4,11 +4,16 @@
  * CO26, §4 step 2). It reads the recorded lane runs and attempts, the
  * registered clones' worktree listings, the runner's state per worktree
  * directory and the conductor's status, and classifies every lane into one
- * of the three populations (conducted, attempt-recorded, unrecorded). Risk
- * flags are counts only; worktree paths appear in the local CLI output only.
- * It writes nothing, journals nothing and mutates no worktree. An unreadable
- * listing, a missing runner or a thrown read is reported `unknown` and
- * counted, never guessed (unknown is never true).
+ * of the three populations (conducted, attempt-recorded, unrecorded). A
+ * recorded attempt is a lane only while its worktree still appears in the
+ * current clone listing: a reaped worktree keeps no lane, and a stale record
+ * never claims a reused path. A clone whose host is absent from the
+ * installation routes no read and is counted as an unknown listing, never
+ * read on the local executor. Risk flags are counts only; worktree paths
+ * appear in the local CLI output only. It writes nothing, journals nothing
+ * and mutates no worktree. An unreadable listing, a missing runner or a
+ * thrown read is reported `unknown` and counted, never guessed (unknown is
+ * never true).
  */
 
 import type { AttemptRecord, AttemptRunnerRecord } from '../../domain/execution-records.js';
@@ -106,7 +111,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       }
     }
 
-    // 4. Group the attempts by worktree path; one row per recorded worktree.
+    // 4. Group the attempts by worktree path.
     const attemptsByWorktree = new Map<string, AttemptRecord[]>();
     for (const attempt of attempts) {
       const group = attemptsByWorktree.get(attempt.worktreePath);
@@ -116,10 +121,67 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
         group.push(attempt);
       }
     }
+
+    // 5. Read the registered clones (D18: registered clones only, no host-wide
+    //    scan) first, so a lane is only a lane while its worktree still appears
+    //    in the current clone listing. A recorded attempt whose worktree is
+    //    gone (reaped) is not a lane, and it never claims a reused path. A
+    //    clone whose host is absent from the installation routes no read: it
+    //    is counted as an unknown listing, never read on the local executor.
+    const hostClones = new Map<string, number>();
+    const hostListed = new Map<string, number>();
+    const hostUnknownListings = new Map<string, number>();
+    const listedLanePaths = new Set<string>();
+    const listedLanes: {
+      readonly path: string;
+      readonly hostName: string;
+      readonly recordedHost: AttemptRunnerRecord | null;
+    }[] = [];
+    for (const clone of request.clones) {
+      if (request.hostName !== null && clone.hostName !== request.hostName) {
+        continue;
+      }
+      hostClones.set(clone.hostName, (hostClones.get(clone.hostName) ?? 0) + 1);
+      const recordedHost = clone.recordedHost;
+      if (recordedHost === null) {
+        // The clone's host is absent from the installation: nothing routes the
+        // read to that host, and a local fallback could inspect the wrong
+        // repository. Report the host as unknown instead.
+        hostUnknownListings.set(clone.hostName, (hostUnknownListings.get(clone.hostName) ?? 0) + 1);
+        continue;
+      }
+      let listed: Awaited<ReturnType<NonNullable<typeof deps.workspace.listWorktrees>>> | undefined;
+      try {
+        listed = await deps.workspace.listWorktrees?.({ repositoryRoot: clone.clonePath, recordedHost });
+      } catch {
+        // A throwing read is an unreadable listing: counted as unknown,
+        // never thrown out of the inventory.
+        hostUnknownListings.set(clone.hostName, (hostUnknownListings.get(clone.hostName) ?? 0) + 1);
+        continue;
+      }
+      if (listed === undefined || listed.outcome !== 'listed') {
+        // An unreadable listing is counted and never throws, never guesses.
+        hostUnknownListings.set(clone.hostName, (hostUnknownListings.get(clone.hostName) ?? 0) + 1);
+        continue;
+      }
+      hostListed.set(clone.hostName, (hostListed.get(clone.hostName) ?? 0) + listed.worktrees.length);
+      for (const entry of listed.worktrees) {
+        // The clone's own main checkout is not a lane.
+        if (entry.path === clone.clonePath) continue;
+        // Only worktrees under the clone's worktree root count.
+        if (!pathUnderPrefix(entry.path, clone.worktreeRoot)) continue;
+        listedLanePaths.add(entry.path);
+        listedLanes.push({ path: entry.path, hostName: clone.hostName, recordedHost });
+      }
+    }
+
+    // 6. One row per recorded worktree that still appears in the current clone
+    //    listings. The recorded runner block per worktree directory is kept in
+    //    a local map; it is never in the result.
     const rows: InternalLaneRow[] = [];
-    // 5. The recorded runner block per worktree directory; never in the result.
     const recordedBlocks = new Map<string, AttemptRunnerRecord | null>();
     for (const [worktreePath, group] of attemptsByWorktree) {
+      if (!listedLanePaths.has(worktreePath)) continue;
       const latest = latestAttempt(group);
       const conducted = group.some((attempt) => runIdByAttemptId.has(attempt.id));
       const runId = conducted ? (runIdByAttemptId.get(latest.id) ?? null) : null;
@@ -142,54 +204,23 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       recordedBlocks.set(worktreePath, latest.runner ?? null);
     }
 
-    // 6. Read the registered clones (D18: registered clones only, no host-wide scan).
-    const hostClones = new Map<string, number>();
-    const hostListed = new Map<string, number>();
-    const hostUnknownListings = new Map<string, number>();
-    for (const clone of request.clones) {
-      if (request.hostName !== null && clone.hostName !== request.hostName) {
-        continue;
-      }
-      hostClones.set(clone.hostName, (hostClones.get(clone.hostName) ?? 0) + 1);
-      let listed: Awaited<ReturnType<NonNullable<typeof deps.workspace.listWorktrees>>> | undefined;
-      try {
-        listed = await deps.workspace.listWorktrees?.({
-          repositoryRoot: clone.clonePath,
-          recordedHost: clone.recordedHost ?? undefined,
-        });
-      } catch {
-        // A throwing read is an unreadable listing: counted as unknown,
-        // never thrown out of the inventory.
-        hostUnknownListings.set(clone.hostName, (hostUnknownListings.get(clone.hostName) ?? 0) + 1);
-        continue;
-      }
-      if (listed === undefined || listed.outcome !== 'listed') {
-        // An unreadable listing is counted and never throws, never guesses.
-        hostUnknownListings.set(clone.hostName, (hostUnknownListings.get(clone.hostName) ?? 0) + 1);
-        continue;
-      }
-      hostListed.set(clone.hostName, (hostListed.get(clone.hostName) ?? 0) + listed.worktrees.length);
-      for (const entry of listed.worktrees) {
-        // The clone's own main checkout is not a lane.
-        if (entry.path === clone.clonePath) continue;
-        // Only worktrees under the clone's worktree root count.
-        if (!pathUnderPrefix(entry.path, clone.worktreeRoot)) continue;
-        // Already recorded (conducted or attempt-recorded) worktrees are skipped.
-        if (recordedBlocks.has(entry.path)) continue;
-        rows.push({
-          population: 'unrecorded',
-          laneId: `worktree-${deps.computeDigest(entry.path).slice(0, 12)}`,
-          hostName: clone.hostName,
-          worktreePath: entry.path,
-          runId: null,
-          attemptId: null,
-          runnerState: 'unknown',
-        });
-        recordedBlocks.set(entry.path, clone.recordedHost);
-      }
+    // 7. The unrecorded lanes: listed worktrees no recorded lane claims. The
+    //    clone's recorded runner block routes the later runner-state read.
+    for (const lane of listedLanes) {
+      if (recordedBlocks.has(lane.path)) continue;
+      rows.push({
+        population: 'unrecorded',
+        laneId: `worktree-${deps.computeDigest(lane.path).slice(0, 12)}`,
+        hostName: lane.hostName,
+        worktreePath: lane.path,
+        runId: null,
+        attemptId: null,
+        runnerState: 'unknown',
+      });
+      recordedBlocks.set(lane.path, lane.recordedHost);
     }
 
-    // 7. Read the runner state per worktree directory; unknown when the runner
+    // 8. Read the runner state per worktree directory; unknown when the runner
     //    cannot tell, refuses or throws.
     for (const row of rows) {
       const recordedBlock = recordedBlocks.get(row.worktreePath) ?? null;
@@ -211,7 +242,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       }
     }
 
-    // 8. Group by host: one inventory per host name seen (rows and clones).
+    // 9. Group by host: one inventory per host name seen (rows and clones).
     const hostNames = new Set<string>();
     for (const clone of request.clones) {
       if (request.hostName !== null && clone.hostName !== request.hostName) continue;
@@ -230,7 +261,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       const unrecorded = lanes.filter((row) => row.population === 'unrecorded').length;
       const running = lanes.filter((row) => row.runnerState === 'running').length;
       const unknownListings = hostUnknownListings.get(hostName) ?? 0;
-      // 9. Risk flags, counts only; omit a flag whose count is 0.
+      // 10. Risk flags, counts only; omit a flag whose count is 0.
       const riskFlags: RelaunchRiskFlag[] = [];
       if (unrecorded > 0) riskFlags.push({ code: 'unrecorded-worktrees', count: unrecorded });
       if (running > 0) riskFlags.push({ code: 'running-worktrees', count: running });
@@ -245,7 +276,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
       });
     }
 
-    // 10. Conductor status.
+    // 11. Conductor status.
     const haltState = await deps.halt.read();
     const halted = isConductorHalted(haltState);
     const lease = await deps.driverLease.read();
@@ -255,7 +286,7 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
     if (halted) riskFlags.push({ code: 'conductor-halted', count: 1 });
     if (driverLease === 'live') riskFlags.push({ code: 'driver-lease-live', count: 1 });
 
-    // 11. Return.
+    // 12. Return.
     return {
       outcome: 'inventoried',
       nowIso: request.nowIso,

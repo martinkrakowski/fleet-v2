@@ -12,7 +12,11 @@ import type { FleetCliRuntime } from './composition.js';
 import type { AttemptRunnerRecord, RelaunchCloneRef } from '@fleet/work-execution';
 import type { HostSection } from '@fleet/installation';
 
-/** The host's recorded runner block; null when the host is not in the installation. */
+/**
+ * The host's recorded runner block, or null when the host is not in the
+ * installation. A null block routes no read: the inventory reports that
+ * host as unknown instead of inspecting the path on the local executor.
+ */
 function recordedHostOf(hostName: string, rt: FleetCliRuntime): AttemptRunnerRecord | null {
   const host: HostSection | undefined = rt.installation?.hosts?.[hostName];
   if (host === undefined) return null;

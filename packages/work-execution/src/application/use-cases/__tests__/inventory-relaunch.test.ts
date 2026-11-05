@@ -16,6 +16,7 @@ import type { ConductorDriverLeaseRecord } from '../../../domain/lane-run-lease.
 import type { ConductorHaltRecord } from '../../../domain/conductor-halt.js';
 import type {
   ListedWorktree,
+  ListWorktreesRequest,
   ListWorktreesResult,
 } from '../../ports/out/WorkspacePort.out-port.js';
 import type {
@@ -175,13 +176,18 @@ function makeRunnerForAttempt(runner: ExecutionRunnerPort): RunnerForAttemptPort
 interface Harness {
   readonly useCase: InventoryRelaunchUseCase;
   /** How many times each store was read so far. */
-  readonly readCalls: { readonly runs: () => number; readonly attempts: () => number };
+  readonly readCalls: {
+    readonly runs: () => number;
+    readonly attempts: () => number;
+    readonly listWorktrees: () => number;
+  };
 }
 
 function harness(options: {
   runs?: LaneRunRecord[];
   attempts?: AttemptRecord[];
   workspaceResult?: ListWorktreesResult;
+  workspaceFn?: (request: ListWorktreesRequest) => ListWorktreesResult | Promise<ListWorktreesResult>;
   halted?: boolean;
   driverLease?: ConductorDriverLeaseRecord | null;
   runnerForAttempt?: RunnerForAttemptPort;
@@ -201,8 +207,13 @@ function harness(options: {
       return options.attempts ?? [];
     },
   };
+  let listCalls = 0;
   const workspace = {
-    async listWorktrees() {
+    async listWorktrees(request: ListWorktreesRequest) {
+      listCalls += 1;
+      if (options.workspaceFn !== undefined) {
+        return options.workspaceFn(request);
+      }
       return options.workspaceResult ?? { outcome: 'listed', worktrees: [] };
     },
   };
@@ -227,7 +238,10 @@ function harness(options: {
     ...(options.runnerForAttempt !== undefined ? { runnerForAttempt: options.runnerForAttempt } : {}),
     computeDigest: options.computeDigest ?? ((_text: string) => 'a'.repeat(64)),
   });
-  return { useCase, readCalls: { runs: () => runCalls, attempts: () => attemptCalls } };
+  return {
+    useCase,
+    readCalls: { runs: () => runCalls, attempts: () => attemptCalls, listWorktrees: () => listCalls },
+  };
 }
 
 function inventory(h: Harness, request: InventoryRelaunchRequest): Promise<InventoryRelaunchResult> {
@@ -238,10 +252,21 @@ describe('InventoryRelaunchUseCase', () => {
   it('classifies an attempt of a recorded run as conducted and an unrun attempt as attempt-recorded', async () => {
     const h = harness({
       runs: [{ ...RUN, attemptIds: ['attempt-1'] }],
-      attempts: [attemptFixture('attempt-1', { worktreePath: '/wt/a' }), attemptFixture('attempt-2', { worktreePath: '/wt/b' })],
+      attempts: [
+        attemptFixture('attempt-1', { worktreePath: '/clones/repo-worktrees/wt-a' }),
+        attemptFixture('attempt-2', { worktreePath: '/clones/repo-worktrees/wt-b' }),
+      ],
+      workspaceResult: {
+        outcome: 'listed',
+        worktrees: [
+          listedWorktree('/clones/repo'),
+          listedWorktree('/clones/repo-worktrees/wt-a'),
+          listedWorktree('/clones/repo-worktrees/wt-b'),
+        ],
+      },
       runnerForAttempt: makeRunnerForAttempt(makeRunner({ state: 'idle' })),
     });
-    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [] });
+    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [cloneFixture()] });
     if (result.outcome !== 'inventoried') throw new Error('expected inventoried');
     expect(result.hosts).toHaveLength(1);
     const host = result.hosts[0];
@@ -253,7 +278,7 @@ describe('InventoryRelaunchUseCase', () => {
         population: 'conducted',
         laneId: 'run-1',
         hostName: 'lane-host',
-        worktreePath: '/wt/a',
+        worktreePath: '/clones/repo-worktrees/wt-a',
         runId: 'run-1',
         attemptId: 'attempt-1',
         runnerState: 'idle',
@@ -262,7 +287,7 @@ describe('InventoryRelaunchUseCase', () => {
         population: 'attempt-recorded',
         laneId: 'attempt-2',
         hostName: 'lane-host',
-        worktreePath: '/wt/b',
+        worktreePath: '/clones/repo-worktrees/wt-b',
         runId: null,
         attemptId: 'attempt-2',
         runnerState: 'idle',
@@ -322,14 +347,21 @@ describe('InventoryRelaunchUseCase', () => {
   it('counts a running lane in the running-worktrees flag with the path on the row', async () => {
     const h = harness({
       runs: [{ ...RUN, attemptIds: ['attempt-1'] }],
-      attempts: [attemptFixture('attempt-1', { worktreePath: '/wt/lane-1' })],
+      attempts: [attemptFixture('attempt-1', { worktreePath: '/clones/repo-worktrees/wt-lane-1' })],
+      workspaceResult: {
+        outcome: 'listed',
+        worktrees: [listedWorktree('/clones/repo'), listedWorktree('/clones/repo-worktrees/wt-lane-1')],
+      },
       runnerForAttempt: makeRunnerForAttempt(makeRunner({ state: 'running', sessionId: 'ses-1' })),
     });
-    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [] });
+    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [cloneFixture()] });
     if (result.outcome !== 'inventoried') throw new Error('expected inventoried');
     const host = result.hosts[0];
     expect(host.riskFlags).toEqual([{ code: 'running-worktrees', count: 1 }]);
-    expect(host.lanes[0]).toMatchObject({ worktreePath: '/wt/lane-1', runnerState: 'running' });
+    expect(host.lanes[0]).toMatchObject({
+      worktreePath: '/clones/repo-worktrees/wt-lane-1',
+      runnerState: 'running',
+    });
   });
 
   it('counts an unreadable listing as unknown-worktree-read and never throws', async () => {
@@ -353,14 +385,22 @@ describe('InventoryRelaunchUseCase', () => {
       runs: [{ ...RUN, attemptIds: ['attempt-1'] }],
       attempts: [
         attemptFixture('attempt-1', {
-          worktreePath: '/wt/a',
+          worktreePath: '/clones/repo-worktrees/wt-a',
           runner: { ...RECORDED_HOST, hostName: 'host-a' },
         }),
         attemptFixture('attempt-2', {
-          worktreePath: '/wt/b',
+          worktreePath: '/clones/repo-worktrees/wt-b',
           runner: { ...RECORDED_HOST, hostName: 'host-b' },
         }),
       ],
+      workspaceResult: {
+        outcome: 'listed',
+        worktrees: [
+          listedWorktree('/clones/repo'),
+          listedWorktree('/clones/repo-worktrees/wt-a'),
+          listedWorktree('/clones/repo-worktrees/wt-b'),
+        ],
+      },
       runnerForAttempt: {
         runnerForAttempt(request) {
           if (request.runner?.hostName === 'host-a') {
@@ -370,7 +410,7 @@ describe('InventoryRelaunchUseCase', () => {
         },
       },
     });
-    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [] });
+    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [cloneFixture()] });
     if (result.outcome !== 'inventoried') throw new Error('expected inventoried');
     const states = result.hosts.flatMap((host) => host.lanes.map((lane) => lane.runnerState));
     expect(states.sort()).toEqual(['unknown', 'unknown']);
@@ -389,13 +429,77 @@ describe('InventoryRelaunchUseCase', () => {
   it('reads only and calls the run store list exactly once', async () => {
     const h = harness({
       runs: [{ ...RUN, attemptIds: ['attempt-1'] }],
-      attempts: [attemptFixture('attempt-1')],
+      attempts: [attemptFixture('attempt-1', { worktreePath: '/clones/repo-worktrees/wt-a' })],
+      workspaceResult: {
+        outcome: 'listed',
+        worktrees: [listedWorktree('/clones/repo'), listedWorktree('/clones/repo-worktrees/wt-a')],
+      },
       runnerForAttempt: makeRunnerForAttempt(makeRunner({ state: 'idle' })),
     });
-    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [] });
+    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [cloneFixture()] });
     if (result.outcome !== 'inventoried') throw new Error('expected inventoried');
+    expect(result.hosts[0].lanes).toHaveLength(1);
     expect(h.readCalls.runs()).toBe(1);
     expect(h.readCalls.attempts()).toBe(1);
+  });
+
+  it('counts a clone whose host is absent from the installation as an unknown listing and never lists locally', async () => {
+    const h = harness({
+      attempts: [],
+      workspaceResult: {
+        outcome: 'listed',
+        worktrees: [listedWorktree('/clones/repo'), listedWorktree('/clones/repo-worktrees/wt-1')],
+      },
+      runnerForAttempt: makeRunnerForAttempt(makeRunner({ state: 'idle' })),
+    });
+    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [cloneFixture({ recordedHost: null })] });
+    if (result.outcome !== 'inventoried') throw new Error('expected inventoried');
+    const host = result.hosts[0];
+    expect(host.cloneCount).toBe(1);
+    expect(host.worktreeCount).toBe(0);
+    expect(host.counts).toEqual({ conducted: 0, attemptRecorded: 0, unrecorded: 0 });
+    expect(host.riskFlags).toEqual([{ code: 'unknown-worktree-read', count: 1 }]);
+    expect(host.lanes).toEqual([]);
+    expect(h.readCalls.listWorktrees()).toBe(0);
+  });
+
+  it('drops a recorded attempt whose worktree no longer appears in the current clone listing', async () => {
+    const h = harness({
+      runs: [{ ...RUN, attemptIds: ['attempt-1'] }],
+      attempts: [attemptFixture('attempt-1', { worktreePath: '/clones/repo-worktrees/gone' })],
+      workspaceResult: {
+        outcome: 'listed',
+        worktrees: [listedWorktree('/clones/repo'), listedWorktree('/clones/repo-worktrees/wt-1')],
+      },
+      runnerForAttempt: makeRunnerForAttempt(makeRunner({ state: 'idle' })),
+    });
+    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [cloneFixture()] });
+    if (result.outcome !== 'inventoried') throw new Error('expected inventoried');
+    const host = result.hosts[0];
+    expect(host.counts).toEqual({ conducted: 0, attemptRecorded: 0, unrecorded: 1 });
+    expect(host.lanes.map((lane) => lane.worktreePath)).toEqual(['/clones/repo-worktrees/wt-1']);
+    expect(host.lanes[0]).toMatchObject({ population: 'unrecorded' });
+  });
+
+  it('keeps a recorded lane whose worktree is still listed without duplicating it as unrecorded', async () => {
+    const h = harness({
+      runs: [{ ...RUN, attemptIds: ['attempt-1'] }],
+      attempts: [attemptFixture('attempt-1', { worktreePath: '/clones/repo-worktrees/wt-a' })],
+      workspaceResult: {
+        outcome: 'listed',
+        worktrees: [listedWorktree('/clones/repo'), listedWorktree('/clones/repo-worktrees/wt-a')],
+      },
+      runnerForAttempt: makeRunnerForAttempt(makeRunner({ state: 'idle' })),
+    });
+    const result = await inventory(h, { nowIso: NOW, hostName: null, clones: [cloneFixture()] });
+    if (result.outcome !== 'inventoried') throw new Error('expected inventoried');
+    const host = result.hosts[0];
+    expect(host.counts).toEqual({ conducted: 1, attemptRecorded: 0, unrecorded: 0 });
+    expect(host.lanes).toHaveLength(1);
+    expect(host.lanes[0]).toMatchObject({
+      population: 'conducted',
+      worktreePath: '/clones/repo-worktrees/wt-a',
+    });
   });
 
   it('reports the conductor status and the global risk flags as counts', async () => {

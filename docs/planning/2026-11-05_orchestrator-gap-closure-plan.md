@@ -2,14 +2,14 @@
 
 - **Date:** 2026-11-05. Anchors checked against `main` at `38d08b6e`. Every plan cited below is a file in `docs/planning/` of this repository.
 - **Target repository:** `fleet-v2`. The bridge tooling that runs lanes and the merge train today lives outside this repository, in the owner's private orchestrator tooling. This plan names it only as the bridge to retire. Nothing from that tooling (hosts, paths, scripts, seat choices, operational history) is copied here, in line with `docs/architecture.md`.
-- **Status:** rev 1, draft. Nothing built. Not yet reviewed. Rev 1 adds G16–G24, OG-20–OG-28 and D-OG8 from an operator's reading of two days of conducted runs (§10). Decisions D-OG1–D-OG8 (§7) are open. No lane from this plan is scheduled until the owner records them.
-- **Builds on:** `2026-10-27_conductor-plan.md` (§3.1, §3.2, §3.6, §3.7, §3.8, K6, K7, K11, CB-D1, CB1), `2026-10-28_lane-pipeline-speed-plan.md` (§3.3, §3.3.1, D21, D22, D33, KS1, KS5, KS7, A-S1, OS-1), `2026-10-31_daemon-tick-plan.md` (the merge pass, D-DT1–D-DT9), `2026-10-31_remaining-work-plan.md` (Waves 0–7, D-R2, D-R8), `2026-10-31_continuous-replanning-plan.md`, `2026-10-31_jev-merge-veto-decision.md`, `2026-11-01_lanes-board-and-killall-plan.md` (halt and pause), `2026-10-20_auto-merge-policy-plan.md` (A4, A11), `2026-10-27_lane-run-telemetry-plan.md`, `2026-10-16_onboarding-and-init.md`, `2026-10-16_add-host.md`, `2026-10-23_host-programs-and-client-server-packaging-plan.md`.
+- **Status:** rev 2, draft. Nothing built. Rev 1 added G16–G24, OG-20–OG-28 and D-OG8; rev 2 answers the first review (§10). Decisions D-OG1–D-OG9 (§7) are open. No lane from this plan is scheduled until the owner records them.
+- **Builds on:** `2026-10-27_conductor-plan.md` (§3.1, §3.2, §3.6, §3.7, §3.8, K6, K7, K11, CB-D1, CB1), `2026-10-28_lane-pipeline-speed-plan.md` (§3.3, §3.3.1, D21, D22, D33, D34, KS1, KS5, KS7a, KS7b, A-S1, OS-1), `2026-10-31_daemon-tick-plan.md` (the merge pass, D-DT1–D-DT9), `2026-10-31_remaining-work-plan.md` (Waves 0–7, D-R2, D-R8), `2026-10-31_continuous-replanning-plan.md`, `2026-10-31_jev-merge-veto-decision.md`, `2026-11-01_lanes-board-and-killall-plan.md` (halt and pause), `2026-10-20_auto-merge-policy-plan.md` (A4, A11), `2026-10-27_lane-run-telemetry-plan.md`, `2026-10-16_onboarding-and-init.md`, `2026-10-16_add-host.md`, `2026-10-23_host-programs-and-client-server-packaging-plan.md`.
 
 **Short answer.** The bridge does five jobs that fleet-v2 does not yet do: it drives many conducted runs with one safe driver, it runs the merge train and its chain rules, it validates briefs and acceptance commands before dispatch, it talks to the owner (notifications, seat rotation, review-thread replies), and it notices and recovers runs that stop making progress. Most of the merge work is already planned in fleet-v2 and only needs to be sequenced. The chain rules, the driver-safety rules, the acceptance allow-list and the thread helper have no lane yet. This plan adds them, retires the bridge in stages, and keeps the owner's policy values out of the product.
 
 ## 1. Goal
 
-A user who installs fleet-v2 and points an agent at it can run conducted lanes, merge them through a train with chains, and get notified of parks and merges, with no bridge scripts. Every guard the bridge enforces today (one driver, allow-listed acceptance commands, premerge on every head, no merge without a current receipt) is enforced by fleet-v2 itself and covered by a test.
+A user who installs fleet-v2 and points an agent at it can run conducted lanes, merge them through a train with chains, and get notified of parks and merges, with no bridge scripts. Every guard the bridge enforces today (one driver, validated acceptance commands with the refusal reason shown, premerge on every head, no merge without a current receipt) is enforced by fleet-v2 itself and covered by a test.
 
 **Non-goals.** No copy of the bridge's scripts into this repository. No owner policy values (seat choices, hosts, fallbacks, limits) in product code; they stay in the installation file. No model decides to merge. No automatic resolution of review threads in v1 (see D-OG2). No GitHub merge queue (D22).
 
@@ -19,12 +19,12 @@ Checked by reading the planning documents and by searching `apps/cli`, `apps/api
 
 | # | Bridge capability (generic) | What fleet-v2 has | Planned where | Gap |
 |---|---|---|---|---|
-| G1 | Merge pass: enqueue, up-to-date check, merge, park with a reason | `attempt auto-merge`, `policy auto-merge`, `forge execute`; the `merge` stage in K6 | Daemon merge pass (daemon-tick §3.3); KS7 and A-S1 (speed plan) | Planned, not built. Sequencing only |
-| G2 | Premerge status on every head change, re-posted after a branch update | `premerge` status design (KS1, KS7, OS-1) | Speed plan §3.3.1, §4.4 | Re-post on every head change is not an acceptance criterion in any lane. Add it (OG-5) |
-| G3 | Premerge carried across a branch update when the PR's own patch is unchanged | Nothing | None found | Missing. A candidate rule that needs a decision (D-OG4) |
+| G1 | Merge pass: enqueue, up-to-date check, merge, park with a reason | `attempt auto-merge`, `policy auto-merge`, `forge execute`; the `merge` stage in K6 | Daemon merge pass (daemon-tick §3.3), which splits KS7 into KS7a (post `premerge`) and KS7b (enqueue for the controlled merge pass); A-S1 (speed plan) | Planned, not built. Sequencing only. Native forge auto-merge stays an unbuilt optional adapter (daemon-tick §3.3): it could merge before the pass applies its verification, pause and veto checks |
+| G2 | Premerge status on every head change, re-posted after a branch update | `premerge` status design (KS1, KS7a, OS-1) | Speed plan §3.3.1, §4.4 | Speed plan §3.3.1 already rules that a new head starts with no `premerge`. What is missing is an acceptance criterion that every new head of a train-touched PR gets an explicit status, with its value defined (OG-4) |
+| G3 | Premerge carried across a branch update when the PR's own patch is unchanged | Nothing built | Speed plan §3.3.1: a Tier 2 `success` may carry across a forge branch update only when the update changed no file in the lane's diff | Planned, not built (OG-5). The bridge uses a different identity (the PR's patch against its merge base); whether to adopt it is D-OG4 |
 | G4 | Chains: a dependent set merges into `chain/<name>`, refreshed after each `main` merge, landed by one integration PR | `work-order` `baseBranch` (CB-D1, CB1) | Conductor plan §3.6 describes chains; only CB1 is a lane | Missing: chain start, refresh and landing, and a ruleset for chain branches (OG-6, OG-7) |
 | G5 | One safe driver over many runs: a lock, re-read of run ids, refusal when another driver is alive | One driver by convention (conductor plan, line 519); O9 claims `start-lane-run`; K11b' is a driver pass; the CLI refuses `stop` and `resume` while a driver lease is live | Partly planned | No lane for an explicit driver lock with liveness check (OG-2). The bridge enforces one driver with an operating-system file lock, separate from the conductor's driver lease; OG-2 must name which of the two survives |
-| G6 | Acceptance commands and brief argv validated before dispatch; the real refusal reason printed | `brief prepare`, `conductor start --brief-request` | Not in the planning documents | Missing: an argv allow-list in fleet-v2, and the refusal reason printed by `conductor start` (OG-3) |
+| G6 | Acceptance commands and brief argv validated before dispatch; the real refusal reason printed | `AcceptanceSpec` validates every command (argv shape, a named program, no shell string, shell basenames refused), and `PrepareBriefPackage` runs that check before preparing a brief | — | Two separate gaps. (a) Diagnostics: `conductor start` does not print the refusal reason from that check (OG-3). (b) Policy: rejecting shell basenames is not a sandbox, as the code itself says; interpreters, wrappers and package scripts still run arbitrary code. Any command policy beyond today's check needs a threat model first (D-OG9, OG-3b) |
 | G7 | Review-thread reply and resolve in one call, from a file | `forge execute`; acceptance counts unresolved threads (A4, A11) | Daemon plan §3.6 says the daemon never resolves threads | Missing as an operator helper. Its scope is D-OG2 (OG-8) |
 | G8 | `gh` located at a configured path; doctor says exactly how to fix it | Doctor with seat probes (P1, remaining plan W4) | Remaining plan W4 | Probe for the forge binary path not named. Add it to P1 (OG-1) |
 | G9 | Owner notifications on park, merge and drop | Nothing live | E4 (remaining plan W6); daemon plan notifier job | Planned late (W6). Decide whether to pull earlier (D-OG5) |
@@ -50,20 +50,23 @@ Three rules shape the work.
 
 1. **The conductor owns runs; the daemon owns the merge pass.** The daemon tick (daemon-tick §3.1) carries the merge pass, the notifier and the replan digest. The conductor's driver stays `conductor run --live` (D-DT1). The driver lock (OG-2) is a property of the driver, not of the daemon.
 2. **Every one-way action has a durable intent before it and a reconciliation after it.** This is already the journal rule (conductor §3.2). Chain landing, merge and thread resolution follow it.
-3. **Product code carries mechanisms; the installation file carries values.** Chain names, merge policy, seat choices and notification targets are installation values. The allow-list of acceptance argv (OG-3) is a product rule.
+3. **Product code carries mechanisms; the installation file carries values.** Chain names, merge policy, seat choices and notification targets are installation values. Acceptance-command validation (`AcceptanceSpec`, and OG-3b if D-OG9 adds a policy) is a product rule.
 
 ### 3.1 Driver safety (G5, G6)
 
 One driver per state directory. `conductor run --live` takes a driver lease (existing `ConductorDriverLeaseAdapter`), refuses to start while another live driver holds it, and re-reads the set of run ids between passes so a run added with `conductor start` is picked up without a restart. A stale lease is reclaimed only after its liveness check fails.
 
-Acceptance commands and brief argv are checked by `brief prepare` against an allow-list (a shell is never invoked; argv[0] must be on the list). `conductor start` prints the refusal reason from the brief check, not a redacted code.
+Acceptance commands are already validated by `AcceptanceSpec` before a brief is prepared (no shell is invoked, and a shell basename is refused). What fleet-v2 adds is the diagnostic: `conductor start` prints the refusal reason from that check, not a redacted code (OG-3). That check is not a sandbox: a gate runs the lane's own code, so interpreters, wrappers and package scripts can still execute anything. A command policy beyond it is a separate decision (D-OG9) with its own threat model: it guards against a mistaken brief, not a hostile lane, unless the gate host itself is isolated.
 
 ### 3.2 Merge path (G1, G2, G3, G14)
 
-The merge pass is the daemon job already described in daemon-tick §3.3. Its prerequisites are KS1 (transition table), KS7 (premerge post and enable auto-merge at head) and OS-1 (Tier 2 hold). Two additions:
+The merge pass is the daemon job already described in daemon-tick §3.3. Its prerequisites are KS1 (transition table), KS7a (post `premerge`), KS7b (enqueue the merge for the controlled merge pass) and OS-1 (Tier 2 hold). Native forge auto-merge is not enabled: the merge call comes only from the pass, after its checks. Two additions:
 
-- The premerge status is re-posted on every head change of a PR the train touches, as an acceptance criterion of KS7 (OG-5).
-- If D-OG4 is accepted, a branch update that leaves the PR's own patch identical carries the premerge status. The patch identity is computed as in the bridge's rule: the patch of the PR against its merge base, with whitespace and three context lines kept. A changed patch never carries.
+- Every new head of a PR the train touches gets an explicit `premerge` status, as an acceptance criterion of KS7a (OG-4):
+  - `pending` until a qualifying receipt exists for that exact head;
+  - `failure` when that head has unresolved review findings;
+  - `success` only from evidence naming that exact head, or from the carry rule below.
+- Carry (OG-5) follows speed plan §3.3.1: a Tier 2 `success` carries across a forge branch update only when the update changed no file in the lane's diff. Any other new head (a fix push, an arbitrary commit) starts `pending`, and a fix round after review findings needs a new receipt (D34). If D-OG4 adopts the bridge's identity instead (the PR's patch against its merge base, whitespace and three context lines kept), the rule changes in one place and keeps the same refusals: a changed patch, an empty identity or a non-`success` status never carries.
 
 The halt marker (lanes-board-and-killall) pauses the merge pass before any merge call. A merge call already sent completes and is reported.
 
@@ -72,7 +75,7 @@ The halt marker (lanes-board-and-killall) pauses the merge pass before any merge
 A chain is a work-order `baseBranch` of the form `chain/<name>` (CB1) plus three operations, each an intent in the journal:
 
 - **start**: create `chain/<name>` from `main` and record it.
-- **refresh**: after every merge to `main`, merge `main` into each open chain branch through the forge's branch update, never by local git (daemon-tick §3.6). A conflict becomes an attention item and blocks landing.
+- **refresh**: after every merge to `main`, merge `main` into each open chain branch. The forge's pull-request update-branch call cannot do this: it updates a PR's head from its base, and a chain with no integration PR has no PR to update. Refresh is a separate typed operation on the forge port: merge one named branch into another, authorized only for `chain/<name>` heads the installation has registered. It is never local git (daemon-tick §3.6). Each refresh is an intent before the call and a reconciliation after it. A merge that reports a conflict becomes an attention item and blocks landing. Concurrency guard: the call carries the chain head the intent recorded, and is refused if the head moved. Only one refresh per chain runs at a time, inside the chain's serial base. A refresh never silently changes an integration head under review: once an integration PR exists, a refresh creates a new head, which starts `pending` under the rule above, and records an attention item naming the PR.
 - **land**: when every link is merged into the chain, open one integration PR `chain/<name>` → `main`. Its body lists each link's evidence. It requires `gate` and `premerge` on its exact head.
 
 Each base is served serially by the merge pass; different bases proceed in parallel (conductor plan §3.6). Cleanup after landing deletes the chain branch, the link branches and their worktrees, and archives the chain record. Until a ruleset covers `refs/heads/chain/**` (an owner setting, D-OG7), the merge pass is the only enforcer, so the pass must refuse chain merges that fail any check.
@@ -105,18 +108,19 @@ Tiers follow the house style: T0 is documentation or tooling with no product cod
 
 | ID | Unit | Gap | Tier | Wave | Depends | Acceptance |
 |---|---|---|---|---|---|---|
-| OG-0 | This plan, decisions recorded in §7 | all | T0 | 0 | — | Owner records D-OG1–D-OG7 |
+| OG-0 | This plan, decisions recorded in §7 | all | T0 | 0 | — | Owner records D-OG1–D-OG9 |
 | OG-1 | Add a forge-binary path probe to doctor (P1) | G8 | T1 | W4 | P1 | Doctor prints the exact fix line when the configured path is missing; no secret in output |
-| OG-2 | Driver lease with liveness check; run-id re-read between passes; refusal while another driver holds the lease | G5 | T2 | W3, after K11a | O9 | Two drivers on one state directory: the second refuses; a stale lease is reclaimed only after the liveness check fails; a run added mid-session is picked up |
-| OG-3 | Acceptance argv allow-list in `brief prepare`; `conductor start` prints the real refusal reason | G6 | T1 | W2 | — | A shell invocation is refused; an allowed argv is accepted; the refusal names the rule |
-| OG-4 | Premerge re-post on every head change of a train-touched PR (KS7 acceptance) | G2 | T1 | W1, with KS7 | KS7 | A new head gets `premerge` before the pass considers it |
-| OG-5 | Patch-identity carry of premerge after a branch update (if D-OG4 accepted) | G3 | T2 | W1, after OG-4 | OG-4, D-OG4 | An unchanged patch carries; a changed patch, an empty patch identity or a non-success status does not |
-| OG-6 | Chain start, refresh and landing as journalled intents; refresh through the forge only | G4 | T2 | W3 | CB1, K6 | Refresh after a `main` merge updates every open chain; a conflict parks with an attention item; landing refuses when a link lacks evidence |
+| OG-2 | Driver lease with liveness check; run-id re-read between passes; refusal while another driver holds the lease | G5 | T2 | W5, after O9 | O9 | Two drivers on one state directory: the second refuses; a stale lease is reclaimed only after the liveness check fails; a run added mid-session is picked up |
+| OG-3 | `conductor start` prints the refusal reason from the existing `AcceptanceSpec` and brief checks | G6 | T1 | W2 | — | Each existing refusal (shell string, shell basename, empty argv, argv[0] not a program) reaches the `conductor start` output with its rule named; no redacted code; no change to what is accepted |
+| OG-3b | Command policy beyond today's check (only if D-OG9 asks for one) | G6 | T1 | W2, after OG-3 | D-OG9 | Its threat model is written first. Tests cover each case it claims to stop (an interpreter with `-c`, a wrapper such as `env` or `xargs`, a package script) and state each case it does not stop |
+| OG-4 | Explicit `premerge` on every new head of a train-touched PR (KS7a acceptance) | G2 | T1 | W1, with KS7a | KS7a | A new head is `pending` before the pass considers it; it becomes `success` only from a receipt naming that exact head, or by OG-5's carry; a head with unresolved findings is `failure`. Tests: an arbitrary push, a fix push after a failed review, and a branch update with carry disabled each stay `pending` and never inherit `success` |
+| OG-5 | Carry of a Tier 2 `success` across a forge branch update, by the speed plan §3.3.1 rule (or by the identity D-OG4 chooses) | G3 | T2 | W1, after OG-4 | OG-4 | A branch update that touches no file in the lane's diff carries; one that touches any lane file, a fix push, an empty identity or a non-`success` source does not; the carry is off by a flag until its shadow window passes |
+| OG-6 | Chain start, refresh and landing as journalled intents; refresh through a typed, authorized branch-merge operation on the forge port | G4 | T2 | W3 | CB1 (merged), K6 (built), D-OG3 | Refresh after a `main` merge updates every open chain; a conflict parks with an attention item; landing refuses when a link lacks evidence |
 | OG-7 | Merge pass refuses chain merges failing `gate`, `premerge`, threads or up-to-date | G4 | T2 | W3 | OG-6, D-DT8 | A chain PR missing any check does not merge, with a test per check |
 | OG-8 | `fleet-v2 forge threads` (list, reply from file, resolve), operator-run | G7 | T1 | W5 | T3a | Reply and resolve happen in one call each; the daemon has no call path to it (test) |
 | OG-9 | Restore the cited single-copy ocm-run plan, or re-state it in this plan's successor; hash-pin the one copy | G12 | T0 | W0 | — | The referenced file exists in `docs/planning/`; `scripts/ocm-run-hash.txt` matches the one copy |
 | OG-10 | Install and migration notes: what a bridge user keeps, moves or deletes | G13 | T0 | W7 | OG-19 | `docs/runbooks` gets a migration page; `installation.example` has the values a bridge user needs |
-| OG-11 | Merge pass in shadow beside the bridge; comparison report | G1 | T2 | W1 | KS7, daemon-tick §4 | Three days of shadow runs; the would-merge set matches the bridge's merges or each difference is explained |
+| OG-11 | Merge pass in shadow beside the bridge; comparison report | G1 | T2 | W1 | KS7a, KS7b, daemon-tick §4 | Three days of shadow runs; the would-merge set matches the bridge's merges or each difference is explained |
 | OG-12 | Owner notifications on park, merge and drop (E4 earlier, if D-OG5) | G9 | T2 | W6 (or W2 if pulled) | E4 | Each park, merge and drop emits one notification; a failed send is recorded and retried, never silent |
 | OG-13 | Seat rotation policy in the installation file, with the rotation rule in the loader | G10 | T1 | W4 | onboarding-and-init | A seat outage moves to the next seat in the policy; rotation is tested with fixtures |
 | OG-14 | Lane usage row format for the telemetry log, aligned with the usage record | G11 | T1 | W4 | OT5 | A finished attempt writes one row with the fields in the telemetry plan |
@@ -125,9 +129,9 @@ Tiers follow the house style: T0 is documentation or tooling with no product cod
 | OG-17 | Bridge retirement: parity check, cutover, removal of bridge scripts from the operator's path | all | T2 | W7 | OG-11, OG-15, OG-6, OG-7, OG-20, OG-21, OG-22, OG-23, OG-24, OG-27 | §3.5 stages 2 and 3 complete; the parity report is in `docs/runbooks` |
 | OG-18 | Public-safety check: no host, path, token or seat value in any product file | all | T0 | every wave | — | The check runs in the gate and fails on a match from a list the owner maintains outside the repository |
 | OG-19 | Installation values for chains, merge policy and notifications | G10, G13 | T1 | W4 | D-OG3 | Values load and validate; no value is required by the product's defaults |
-| OG-20 | Stuck-run report in the driver: a live run whose state, park reason and round are unchanged for a set time (an installation value) is reported once per period | G16 | T1 | W3 | OG-2 | A fixture run held in one state past the limit is reported; a terminal or parked run never is; a changed state resets the timer |
+| OG-20 | Stuck-run report in the driver: a live run whose state, park reason and round are unchanged for a set time (an installation value) is reported once per period | G16 | T1 | W3 | — (the existing `conductor run --live` driver; it does not need OG-2's lease) | A fixture run held in one state past the limit is reported; a terminal or parked run never is; a changed state resets the timer |
 | OG-21 | A graceful stop takes effect at the next step boundary; a run in collect with no live attempt is at a boundary | G17 | T2 | W3 | — | A run stuck in collect stops on a graceful stop within one pass; a run with a live attempt waits for the attempt to end |
-| OG-22 | Orphaned-reservation detection and release, each release a journalled intent | G18 | T2 | W3 | O9 | A reservation with no live run is reported, then released by an explicit command; a reservation of a live run is never released |
+| OG-22 | Orphaned-reservation detection and release, each release a journalled intent | G18 | T2 | W3 | — (it reads today's capacity reservations; O9 changes who claims a start, not what a reservation is) | A reservation with no live run is reported, then released by an explicit command; a reservation of a live run is never released |
 | OG-23 | Brief structure check before registration, one retry on a malformed answer, brief written against the base-branch head with that commit recorded | G19 | T1 | W2, with OG-3 | OG-3 | Each structural fault is refused with its rule named; a narration line before the first marker gets one retry; the recorded commit is the base-branch head at writing time |
 | OG-24 | Checked deploy of the driver's build | G20 | T1 | W4 | — | A deploy during a merge is refused; a failing suite leaves the previous build in place; the installed bytes match the built ones |
 | OG-25 | Batch merges in the merge pass (if D-OG8 keeps them) | G21 | T2 | W5 | OG-11, D-OG8 | A failing batch splits; a batch that cannot split parks each member with a reason; a passing batch merges in order |
@@ -135,14 +139,17 @@ Tiers follow the house style: T0 is documentation or tooling with no product cod
 | OG-27 | Journal compatibility rule and fixtures: one fixture per released key format replays and advances on the current build | G23 | T1 | W3 | — | Every fixture replays; a key format change without an old-form reader fails the gate |
 | OG-28 | Doctor reports CI runner slots that are not active | G24 | T1 | W4 | P1 | A down slot is reported with its name and the fix line; no token in output |
 
-**Ordering.** W0 documents, the single-copy plan and the routing audit (OG-0, OG-9, OG-26). W1 the merge path and shadow (OG-4, OG-5, OG-11), which the remaining plan already puts first. W2 the allow-list and the brief check (OG-3, OG-23). W3 driver safety, run recovery, journal compatibility and chains (OG-2, OG-20, OG-21, OG-22, OG-27, OG-6, OG-7). W4 doctor, seats, telemetry, values, deploy and runner health (OG-1, OG-13, OG-14, OG-19, OG-24, OG-28). W5 threads, halt and batches (OG-8, OG-15, OG-25). W6 notifications (OG-12). W7 retirement (OG-10, OG-16, OG-17). OG-18 runs in every gate.
+**Ordering.** W0 documents, the single-copy plan and the routing audit (OG-0, OG-9, OG-26). W1 the merge path and shadow (OG-4, OG-5, OG-11), which the remaining plan already puts first. W2 the refusal diagnostics, any command policy D-OG9 asks for, and the brief check (OG-3, OG-3b, OG-23). W3 run recovery, journal compatibility and chains (OG-20, OG-21, OG-22, OG-27, OG-6, OG-7). W4 doctor, seats, telemetry, values, deploy and runner health (OG-1, OG-13, OG-14, OG-19, OG-24, OG-28). W5 the driver lease after O9, threads, halt and batches (OG-2, OG-8, OG-15, OG-25). W6 notifications (OG-12). W7 retirement (OG-10, OG-16, OG-17). OG-18 runs in every gate.
+
+**Dependency check (rev 2).** Every unit's prerequisites are in the same or an earlier wave. External waves come from the remaining-work plan: KS1, KS7a and KS7b in W1, P1 and OT5 in W4, O9 and T3a in W5, and E4 in W6. CB1 has merged and K6 is built. OG-2 moved from W3 to W5 because it needs O9. OG-20 and OG-22 no longer depend on O9, for the reasons given in their rows.
 
 ## 6. Hard to undo
 
 - **Retiring the bridge.** Once the bridge's scripts are removed from the operator's path, a regression means rebuilding them. Stage 3 waits for the parity report and a clean shadow window.
 - **Chain landing.** A landed integration PR is a one-way merge. OG-7 must have tests for each check before OG-6 lands anything to `main`.
-- **Premerge carry (OG-5).** A carry that is wrong lets an unreviewed change through. It is off until D-OG4 is accepted and has its own shadow window.
-- **The allow-list (OG-3).** A too-strict list blocks legitimate briefs; a too-loose one defeats its purpose. Start with the current bridge's accepted argv set, recorded in fixtures, and widen only by a reviewed change.
+- **Premerge carry (OG-5).** A carry that is wrong lets an unreviewed change through. It is off by a flag until its shadow window passes, and it never applies to a fix push (D34).
+- **A command policy (OG-3b).** A too-strict policy blocks legitimate briefs, and a too-loose one gives false assurance. Neither is a sandbox. It is built only after D-OG9 records its threat model, starting from fixtures of the argv the current briefs use.
+- **Chain refresh (OG-6).** A refresh is a merge commit on a shared branch and cannot be taken back without a revert. The head guard and the attention item are what keep it visible.
 
 ## 7. Decisions for the owner
 
@@ -151,16 +158,17 @@ Tiers follow the house style: T0 is documentation or tooling with no product cod
 | D-OG1 | Keep the bridge running beside fleet-v2 until shadow parity, then retire it | Yes, retire in three stages (§3.5); no retirement by date | Avoids a gap in merges |
 | D-OG2 | Who resolves review threads | Operator, through the helper; the daemon never resolves | Daemon plan §3.6 already rules out daemon resolution |
 | D-OG3 | Chain mechanics in fleet-v2 or private | In fleet-v2 (OG-6, OG-7): the mechanism is generic. Chain names, policy and any owner-only steps stay in the installation file | Chains are useful to any user of the product |
-| D-OG4 | Carry premerge across a branch update when the PR's patch is unchanged | Accept, behind a flag, with a shadow window; off by default | Removes parks on generated shared files; the risk is a stale receipt |
+| D-OG4 | Which identity decides a carry: speed plan §3.3.1 (no file in the lane's diff touched) or the bridge's (the PR's patch against its merge base unchanged) | Keep §3.3.1 for v1, behind a flag with a shadow window; compare the two in the shadow before changing | Both remove parks on generated shared files; the risk is a stale receipt |
 | D-OG5 | Pull notifications (E4) earlier from W6 to W2 | Pull earlier only if the bridge's notifications are needed during W2–W5; otherwise keep W6 | Affects how fast a park is seen |
 | D-OG6 | Who owns seat rotation | The installation policy in fleet-v2 owns the rule; the operator's probe stays a probe | One rule, one place |
 | D-OG7 | Ruleset for `refs/heads/chain/**` | Owner setting, applied after OG-7; until then the merge pass is the only enforcer and must refuse chain merges that fail a check | Two enforcers are safer than one |
+| D-OG9 | Whether to add a command policy beyond today's `AcceptanceSpec` check, and against what threat | No new policy in v1; ship OG-3's diagnostics. Revisit only with a written threat model and, for hostile lanes, an isolated gate host | A policy that is not a sandbox can look like one |
 | D-OG8 | Batch merges in v1, or one PR at a time | One at a time in v1 (daemon-tick §3.3); batches as OG-25 after the shadow window, if merge throughput needs them | Batches raise throughput but add split and park rules, and a wrong split can park good PRs |
 
 ## 8. Assumptions
 
 - The daemon merge pass (daemon-tick) is built before OG-11 starts. If not, OG-11 waits.
-- KS1, KS5 and KS7 land as the speed plan describes. KS5 (file-level admission) is needed before conducted lanes run in parallel within a package.
+- KS1, KS5, KS7a and KS7b land as the speed plan and the daemon-tick plan describe. KS5 (file-level admission) is needed before conducted lanes run in parallel within a package.
 - The forge exposes what `forge execute` needs for chain branches (branch update, check reads). Not verified against the current forge adapter.
 - The bridge's parity list in §2 is complete for the owner's use. It was compiled from reading the bridge, not from a run-by-run comparison.
 - A new user has no bridge. This plan's end state works without it, so no user-facing step depends on it.
@@ -173,5 +181,11 @@ Tiers follow the house style: T0 is documentation or tooling with no product cod
 
 ## 10. Review record
 
+- Rev 2, 2026-11-05. Answers the first review (changes requested on rev 1):
+  - (1) KS7 is KS7a and KS7b throughout; native auto-merge stays unbuilt and unused.
+  - (2) OG-4 defines `pending`, `failure` and `success` per exact head, with tests that no push inherits `success`. Re-posting is OG-4, not OG-5. G3 and OG-5 now follow the carry rule speed plan §3.3.1 already sets.
+  - (3) Chain refresh is a typed, authorized branch-merge operation with a head guard, reconciliation and conflict handling, and never silently moves an integration head under review.
+  - (4) The workbook was checked as a dependency graph: OG-2 moved to W5 after O9, and OG-20 and OG-22 dropped O9 with reasons.
+  - (5) G6 and OG-3 separate the existing `AcceptanceSpec` validation, the missing diagnostic and any new policy (OG-3b, D-OG9, with a threat model).
 - Rev 1, 2026-11-05. Adds G16–G24, OG-20–OG-28 and D-OG8, and corrects G5 (two locks today). Sources: an operator's reading of the bridge's failure log and two days of conducted runs; the generic capability is stated, not the incidents. Not reviewed.
 - Rev 0, 2026-11-05. Not reviewed. Before any lane from this plan is accepted, it needs an independent review that checks §2 against the bridge and the open decisions in §7.

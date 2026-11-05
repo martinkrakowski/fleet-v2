@@ -28,9 +28,10 @@ const MARKER_NOISE = /[\p{Cf}\p{Default_Ignorable_Code_Point}\s]/u;
 const MARKER_WORD_LENGTH = 12;
 
 /**
- * A run of more than this many noise characters after `<<<` is not a marker:
- * bounding the scan keeps `defangMarkerLikeTokens` linear over texts with many
- * `<<<` and long invisible runs.
+ * A run of more than this many noise characters after `<<<` is ambiguous: the
+ * scan stops there (keeping `defangMarkerLikeTokens` linear over texts with
+ * many `<<<` and long invisible runs) and the tail is treated as a marker so
+ * a forged closing marker hidden behind the noise is still defanged.
  */
 const MARKER_NOISE_LIMIT = 64;
 
@@ -70,7 +71,10 @@ function isMarkerTail(text: string, start: number): boolean {
     if (MARKER_NOISE.test(character)) {
       noiseCount += 1;
       if (noiseCount > MARKER_NOISE_LIMIT) {
-        return false;
+        // The scan is bounded, so whether a marker word follows cannot be told
+        // cheaply; treat the tail as a marker so the `<<<` is defanged instead
+        // of being left intact as a forged marker opener.
+        return true;
       }
       continue;
     }

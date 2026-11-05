@@ -351,6 +351,22 @@ function validatePlacement(
   return { worktreePath };
 }
 
+/** Whether `value` is a well-shaped context decision with the declared fields. */
+function isContextDecisionObject(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.proposalId === 'string' &&
+    typeof record.knowledgeEntryId === 'string' &&
+    typeof record.version === 'string' &&
+    typeof record.proposedBecause === 'string' &&
+    typeof record.accepted === 'boolean' &&
+    typeof record.decisionBecause === 'string'
+  );
+}
+
 /** Why `contextDecisions` is unusable, or null when it is absent or a valid array of decisions. */
 function contextDecisionsError(value: unknown): string | null {
   if (value === undefined || value === null) {
@@ -360,7 +376,7 @@ function contextDecisionsError(value: unknown): string | null {
     return 'contextDecisions must be an array of context decisions';
   }
   for (const decision of value) {
-    if (typeof decision !== 'object' || decision === null || Array.isArray(decision)) {
+    if (!isContextDecisionObject(decision)) {
       return 'contextDecisions must be an array of context decisions';
     }
   }

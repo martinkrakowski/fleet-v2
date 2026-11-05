@@ -116,6 +116,39 @@ describe('PrepareBriefPackageUseCase contextDecisions validation', () => {
     expect(result).toEqual({ outcome: 'rejected', reason: REASON });
   });
 
+  it('rejects a contextDecisions entry whose accepted field is not a boolean', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest({
+      contextDecisions: [
+        { decisionBecause: 'reviewed', accepted: 'false' },
+      ] as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'],
+    });
+    const result = await useCase.prepareBriefPackage(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+  });
+
+  it('rejects a contextDecisions entry that omits required decision fields', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest({
+      contextDecisions: [
+        { decisionBecause: 'reviewed', accepted: true },
+      ] as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'],
+    });
+    const result = await useCase.prepareBriefPackage(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+  });
+
+  it('rejects a contextDecisions entry with non-string knowledge fields', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest({
+      contextDecisions: [
+        { proposalId: 'p-1', knowledgeEntryId: 7, version: 'v1', proposedBecause: 'match', accepted: true, decisionBecause: 'reviewed' },
+      ] as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'],
+    });
+    const result = await useCase.prepareBriefPackage(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+  });
+
   it('previewBriefPackage rejects a non-array contextDecisions without throwing and echoes no path', async () => {
     const useCase = makeUseCase({ worktreePath: '/wt' });
     const request = validRequest({ contextDecisions: {} as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'] });

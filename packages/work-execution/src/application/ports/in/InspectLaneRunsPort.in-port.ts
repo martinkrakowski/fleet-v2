@@ -94,6 +94,13 @@ export type InspectLaneRunsResult =
       readonly runs: readonly LaneRunStatusView[];
       /** Held reservations left by crashed starts; an empty array when there are none. */
       readonly crashedStarts: readonly CrashedStartView[];
+      /**
+       * Present only when a crashed-start read failed: the reservations store
+       * or an attempt read threw, so the array may be missing crashed starts
+       * and an empty array must not be read as "none". A wired caller that
+       * read cleanly, and an unwired one, carry no flag.
+       */
+      readonly crashedStartsIncomplete?: true;
     }
   | { readonly outcome: 'not-found'; readonly runId: string };
 

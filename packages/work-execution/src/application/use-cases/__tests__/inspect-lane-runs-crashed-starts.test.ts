@@ -10,7 +10,7 @@
  * read reports nothing.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
@@ -202,6 +202,16 @@ describe('InspectLaneRunsUseCase crashed starts (AD-2)', () => {
     const withoutAttemptRepo = makeHarness({ withAttemptRepo: false });
     await seedHeldReservation(withoutAttemptRepo.executionJournal);
     expect(await crashedStarts(withoutAttemptRepo)).toEqual([]);
+
+    // An unwired caller is a composition gap, not a failed read: no flag.
+    for (const harness of [withoutJournal, withoutAttemptRepo]) {
+      const result = await harness.useCase.inspectLaneRuns({ nowIso: NOW });
+      expect(result.outcome).toBe('listed');
+      if (result.outcome !== 'listed') {
+        throw new Error('expected listed');
+      }
+      expect(result.crashedStartsIncomplete).toBeUndefined();
+    }
   });
 
   it('the crashed start view carries no worktree path, ssh alias, port or transport', async () => {
@@ -228,5 +238,43 @@ describe('InspectLaneRunsUseCase crashed starts (AD-2)', () => {
     await seedHeldReservation(harness.executionJournal, { id: 'reservation-c', attemptId: 'attempt-mid' });
     const views = await crashedStarts(harness);
     expect(views.map((view) => view.attemptId)).toEqual(['attempt-alpha', 'attempt-mid', 'attempt-zeta']);
+  });
+
+  it('a clean read carries no incomplete flag', async () => {
+    const harness = makeHarness();
+    await seedHeldReservation(harness.executionJournal);
+    const result = await harness.useCase.inspectLaneRuns({ nowIso: NOW });
+    expect(result.outcome).toBe('listed');
+    if (result.outcome !== 'listed') {
+      throw new Error('expected listed');
+    }
+    expect(result.crashedStarts).toHaveLength(1);
+    expect(result.crashedStartsIncomplete).toBeUndefined();
+  });
+
+  it('a throwing reservations store reports the crashed starts as incomplete', async () => {
+    const harness = makeHarness();
+    await seedHeldReservation(harness.executionJournal);
+    vi.spyOn(harness.executionJournal, 'listActiveReservations').mockRejectedValue(new Error('store unavailable'));
+    const result = await harness.useCase.inspectLaneRuns({ nowIso: NOW });
+    expect(result.outcome).toBe('listed');
+    if (result.outcome !== 'listed') {
+      throw new Error('expected listed');
+    }
+    expect(result.crashedStarts).toEqual([]);
+    expect(result.crashedStartsIncomplete).toBe(true);
+  });
+
+  it('a throwing attempt read reports the crashed starts as incomplete', async () => {
+    const harness = makeHarness();
+    await seedHeldReservation(harness.executionJournal);
+    vi.spyOn(harness.attemptRepo, 'findAttemptById').mockRejectedValue(new Error('attempt read failed'));
+    const result = await harness.useCase.inspectLaneRuns({ nowIso: NOW });
+    expect(result.outcome).toBe('listed');
+    if (result.outcome !== 'listed') {
+      throw new Error('expected listed');
+    }
+    expect(result.crashedStarts).toEqual([]);
+    expect(result.crashedStartsIncomplete).toBe(true);
   });
 });

@@ -217,30 +217,34 @@ async function statusViewOf(
  * The crashed starts among the held reservations (AD-2): a held reservation
  * whose attempt id no run lists, held for at least
  * `CRASHED_START_GRACE_MINUTES`, whose attempt is absent or still
- * `intent-recorded`. Read-only and best-effort: a missing dependency, an
- * unparseable time or a throwing read reports nothing. The result is sorted
- * by attempt id so the output is deterministic.
+ * `intent-recorded`. Read-only and best-effort: a missing dependency or an
+ * unparseable time reports nothing; a throwing reservations read or a
+ * throwing attempt read reports an empty array with `incomplete: true`, so
+ * the caller knows the array may be missing crashed starts rather than
+ * reading an empty array as "none". The result is sorted by attempt id so
+ * the output is deterministic.
  */
 async function crashedStartsOf(
   deps: InspectLaneRunsDependencies,
   allRuns: readonly LaneRunRecord[],
   nowIso: string,
-): Promise<readonly CrashedStartView[]> {
+): Promise<{ views: readonly CrashedStartView[]; incomplete: boolean }> {
   if (deps.executionJournal === undefined || deps.attemptRepo === undefined) {
-    return [];
+    return { views: [], incomplete: false };
   }
   const nowMs = Date.parse(nowIso);
   if (!Number.isFinite(nowMs)) {
-    return [];
+    return { views: [], incomplete: false };
   }
   let reservations: readonly CapacityReservationRecord[];
   try {
     reservations = await deps.executionJournal.listActiveReservations();
   } catch {
-    return [];
+    return { views: [], incomplete: true };
   }
   const attemptIdsListedByRuns = new Set(allRuns.flatMap((run) => run.attemptIds));
   const views: CrashedStartView[] = [];
+  let incomplete = false;
   for (const reservation of reservations) {
     if (attemptIdsListedByRuns.has(reservation.attemptId)) {
       continue;
@@ -256,6 +260,7 @@ async function crashedStartsOf(
     try {
       attempt = await deps.attemptRepo.findAttemptById(reservation.attemptId);
     } catch {
+      incomplete = true;
       continue;
     }
     if (attempt !== null && attempt.state !== 'intent-recorded') {
@@ -270,7 +275,7 @@ async function crashedStartsOf(
       heldMinutes: Math.floor((nowMs - reservedMs) / 60_000),
     });
   }
-  return views.sort((left, right) => byCodeUnit(left.attemptId, right.attemptId));
+  return { views: views.sort((left, right) => byCodeUnit(left.attemptId, right.attemptId)), incomplete };
 }
 
 export class InspectLaneRunsUseCase implements InspectLaneRunsPort {
@@ -310,7 +315,7 @@ export class InspectLaneRunsUseCase implements InspectLaneRunsPort {
     // AD-2: the crashed starts are computed over *all* runs, even when one
     // run id was asked for (a run lists its attempt ids regardless of the
     // requested view).
-    const crashedStarts = await crashedStartsOf(
+    const crashed = await crashedStartsOf(
       this.deps,
       request.runId === undefined ? known : await this.deps.runRepo.list(),
       request.nowIso,
@@ -321,7 +326,8 @@ export class InspectLaneRunsUseCase implements InspectLaneRunsPort {
       halt: halt.state,
       driver: driverLease,
       runs,
-      crashedStarts,
+      crashedStarts: crashed.views,
+      ...(crashed.incomplete ? { crashedStartsIncomplete: true } : {}),
     };
   }
 }

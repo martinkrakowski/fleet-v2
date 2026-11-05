@@ -9,7 +9,7 @@ import type { AdvanceStepContext, GatheredLaneRunFacts } from './step-context.js
 import { appendRunIntent, appendRunResult, performPark, refusedResult } from './step-context.js';
 import { manifestExpectedArtifacts, readFrozenManifestVerified, readVerifiedFrozenManifest } from './frozen-manifest.js';
 import { historyEntryOf } from '../../../domain/seat-selection.js';
-import { startBriefCheckInFlight } from './review-fix.js';
+import { startReviewsInFlight } from './review-fix.js';
 
 /**
  * The `act collect` decision (K4-6): collect an ended attempt's artifacts
@@ -340,9 +340,10 @@ export async function runGateBody(ctx: AdvanceStepContext,
   const parsedKey = parseLaneRunKey(key);
   const gateRun = parsedKey !== null && parsedKey.kind === 'step' ? (parsedKey.retry ?? undefined) : undefined;
   // KS6: the evaluation is launched without being awaited, so the brief-check
-  // review starts beside it (the review runs while the gate runs). The
-  // settled outcome keeps a throwing port behaving exactly as today — the
-  // throw leaves the advance — and leaves no rejection unhandled.
+  // and code-review start beside it (the reviews run while the gate runs,
+  // one after the other). The settled outcome keeps a throwing port behaving
+  // exactly as today — the throw leaves the advance — and leaves no rejection
+  // unhandled.
   const gateOutcome = gate.evaluateAttemptGate({
     attemptId: latest.id,
     candidateHeadSha: latest.artifacts.headCommit,
@@ -353,9 +354,9 @@ export async function runGateBody(ctx: AdvanceStepContext,
   );
   if (startReview) {
     // The reconcile must never start a second review, so only the act starts
-    // it; the review's intent and result are appended between the gate's
+    // them; the reviews' intents and results are appended between the gate's
     // intent and the gate's result.
-    await startBriefCheckInFlight(ctx, record, gathered, request);
+    await startReviewsInFlight(ctx, record, gathered, request);
   }
   const settled = await gateOutcome;
   if (!settled.ok) {

@@ -509,24 +509,24 @@ export async function performReview(
 }
 
 /**
- * KS6: the brief-check review starts beside the gate. The gate body calls
- * this right after its own evaluation is launched, so the review is requested
- * on the sealed diff (the collected head) while the gate runs, and the
- * brief-check state later reads the recorded receipt instead of requesting a
- * second review. Failure-tolerant by design — an unwired port, missing facts,
- * an existing brief-check intent, an unavailable seat or a built-key failure
+ * KS6: one review starts beside the gate. The gate body calls this for the
+ * brief-check and then the code-review, so each review is requested on the
+ * sealed diff (the collected head) while the gate runs, and the matching
+ * state later reads the recorded receipt instead of requesting a second
+ * review. Failure-tolerant by design — an unwired port, missing facts, an
+ * existing intent of the kind, an unavailable seat or a built-key failure
  * starts nothing, and a throw from the journal read or `performReview` is
- * swallowed — because a
- * review that cannot start must never block or change the gate's own result:
- * the brief-check state keeps behaving exactly as it does without the
- * in-flight start. The session-start gate inside `performReview` still sits
- * before its one-way intent, so a staggered refusal writes nothing here.
+ * swallowed — because a review that cannot start must never block or change
+ * the gate's own result: the state keeps behaving exactly as it does without
+ * the in-flight start. The session-start gate inside `performReview` still
+ * sits before its one-way intent, so a staggered refusal writes nothing here.
  */
-export async function startBriefCheckInFlight(
+async function startReviewInFlight(
   ctx: AdvanceStepContext,
   record: LaneRunRecord,
   gathered: GatheredLaneRunFacts,
   request: AdvanceLaneRunRequest,
+  kind: ReviewKind,
 ): Promise<void> {
   if (
     ctx.deps.reviewRequest === undefined ||
@@ -539,19 +539,20 @@ export async function startBriefCheckInFlight(
   if (gathered.latestAttempt === null || gathered.latestAttempt.artifacts === null || head12 === null) {
     return;
   }
-  if (gathered.facts.briefCheck.verdict !== 'none') {
+  const fact = kind === 'brief-check' ? gathered.facts.briefCheck : gathered.facts.codeReview;
+  if (fact.verdict !== 'none') {
     return;
   }
   try {
     const entries = await ctx.deps.runJournal.listForRun(record.runId);
-    const seat = reviewSeatOf(ctx, record, 'brief-check', entries, gathered.attemptRecords);
+    const seat = reviewSeatOf(ctx, record, kind, entries, gathered.attemptRecords);
     if (!seat.ok) {
       return;
     }
     const key = buildLaneRunStepKey({
       runId: record.runId,
       round: record.round,
-      step: 'brief-check',
+      step: kind,
       seatIndex: seat.seatIndex,
       attemptOrdinal: null,
       head12,
@@ -562,7 +563,7 @@ export async function startBriefCheckInFlight(
     }
     const decision: ActDecision = {
       kind: 'act',
-      step: 'brief-check',
+      step: kind,
       key: key.key,
       round: record.round,
       seatIndex: seat.seatIndex,
@@ -574,6 +575,23 @@ export async function startBriefCheckInFlight(
     // A review that cannot start — a journal read, a seat, a key or the
     // request itself — never blocks the gate.
   }
+}
+
+/**
+ * KS6: the brief-check and code-review start beside the gate, in that order.
+ * Each runs on the sealed diff while the gate evaluates; the two reviews run
+ * one after the other (the review transport owns the lane's worktree), and
+ * the session-start gate may space them. A review that cannot start here
+ * starts later from its own state, exactly as today.
+ */
+export async function startReviewsInFlight(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  request: AdvanceLaneRunRequest,
+): Promise<void> {
+  await startReviewInFlight(ctx, record, gathered, request, 'brief-check');
+  await startReviewInFlight(ctx, record, gathered, request, 'code-review');
 }
 
 /**
@@ -667,6 +685,48 @@ function reviewResultKeysAtHead(
     if (parsed.step !== 'brief-check' && parsed.step !== 'code-review') {
       continue;
     }
+    candidates.push({ key: entry.key, step: parsed.step });
+  }
+  return candidates;
+}
+
+/**
+ * KS6: every review key of this run at `head12`, latest first (journal order)
+ * — final result keys AND pending intent keys. A review whose outcome was
+ * `unknown` leaves its intent without a result (K5-4b reconciles it later),
+ * yet its receipt may already be recorded; the gate-failure fix scan reads
+ * such a receipt too. Which candidate actually carries the unresolved
+ * findings is decided by its receipt, not by the journal result alone.
+ */
+function reviewKeysAtHead(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  head12: string,
+): { readonly key: string; readonly step: ReviewKind }[] {
+  const candidates: { key: string; step: ReviewKind }[] = [];
+  const seen = new Set<string>();
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index]!;
+    if (entry.key === null || entry.runId !== runId) {
+      continue;
+    }
+    if (entry.kind !== 'result' && entry.kind !== 'intent') {
+      continue;
+    }
+    if (entry.kind === 'result' && entry.outcome === 'ambiguous') {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.head12 !== head12) {
+      continue;
+    }
+    if (parsed.step !== 'brief-check' && parsed.step !== 'code-review') {
+      continue;
+    }
+    if (seen.has(entry.key)) {
+      continue;
+    }
+    seen.add(entry.key);
     candidates.push({ key: entry.key, step: parsed.step });
   }
   return candidates;
@@ -1272,13 +1332,14 @@ async function fixPrepareGatePredicatesStep(
 
 /**
  * KS6: a gate failure's fix brief also carries the in-scope findings of the
- * review receipts already recorded at the failed head (the brief-check that
- * ran beside the gate). The changed set is read once, the run's final review
- * results at the head are walked latest first, and the walk stops at the
- * first candidate whose receipt carries at least one in-scope finding. No new
- * refusals: a missing or unreadable receipt, a receipt with no findings or a
- * receipt whose findings are all out of scope simply adds nothing — the
- * gate's own deltas still make the brief.
+ * review receipts already recorded at the failed head (the brief-check and
+ * code-review that ran beside the gate). The changed set is read once, the
+ * run's review keys at the head — final results and pending intents whose
+ * receipt may already be recorded — are walked latest first, and the walk
+ * stops at the first candidate whose receipt carries at least one in-scope
+ * finding. No new refusals: a missing or unreadable receipt, a receipt with
+ * no findings or a receipt whose findings are all out of scope simply adds
+ * nothing — the gate's own deltas still make the brief.
  */
 async function fixPrepareGateReviewFindingsStep(
   shared: FixPrepareWired,
@@ -1288,7 +1349,7 @@ async function fixPrepareGateReviewFindingsStep(
     return { status: 'ok', value: [] };
   }
   const changed = await changedPathsOf(shared.ctx, shared.gathered, context.prior, context.prior.artifacts.headCommit);
-  for (const candidate of reviewResultKeysAtHead(context.entries, shared.record.runId, context.head)) {
+  for (const candidate of reviewKeysAtHead(context.entries, shared.record.runId, context.head)) {
     const found = await candidateReceiptOf(shared.ctx, context.prior, candidate);
     if (found === null) {
       continue;

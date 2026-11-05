@@ -3249,12 +3249,12 @@ describe('KF-20: the gate and the review open the evidence assessment with the m
     expect(await advance(harness)).toMatchObject({
       outcome: 'acted', step: 'gate', result: 'completed', reasonCode: 'gate-passed',
     });
-    // The gate act starts the brief-check review beside the gate (KS6): the
-    // in-flight brief-check opens its assessment with the same implementer
-    // model, head and policy as the gate's own receipt-recording open — never
-    // a `head-mismatch` refusal — and its receipt is recorded before the
-    // gate's result entry.
-    expect(harness.reviewOpenRequests).toHaveLength(2);
+    // The gate act starts the brief-check and code-review reviews beside the
+    // gate (KS6): the in-flight reviews open their assessments with the same
+    // implementer model, head and policy as the gate's own receipt-recording
+    // open — never a `head-mismatch` refusal — and their receipts are
+    // recorded before the gate's result entry.
+    expect(harness.reviewOpenRequests).toHaveLength(3);
     for (const open of harness.reviewOpenRequests) {
       expect(open).toMatchObject({
         attemptId: 'attempt-fix-1',
@@ -3265,15 +3265,16 @@ describe('KF-20: the gate and the review open the evidence assessment with the m
       });
     }
     expect(harness.gateReceiptRequests).toHaveLength(1);
-    // The review is requested beside the gate, not refused `assessment-unavailable`.
-    expect(harness.reviewRequests).toHaveLength(1);
+    // The reviews are requested beside the gate, not refused `assessment-unavailable`.
+    expect(harness.reviewRequests).toHaveLength(2);
     expect(harness.reviewRequests[0]).toMatchObject({ kind: 'brief-check', implementerModel: 'fix-model-1' });
+    expect(harness.reviewRequests[1]).toMatchObject({ kind: 'code-review', implementerModel: 'fix-model-1' });
 
-    // The recorded receipt is read: the brief-check state never opens a
-    // second assessment and never requests a second review.
+    // The recorded receipts are read: neither review state opens a second
+    // assessment or requests a second review.
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
-    expect(harness.reviewOpenRequests).toHaveLength(2);
-    expect(harness.reviewRequests).toHaveLength(1);
+    expect(harness.reviewOpenRequests).toHaveLength(3);
+    expect(harness.reviewRequests).toHaveLength(2);
   });
 });
 
@@ -3519,6 +3520,101 @@ describe('AdvanceLaneRunUseCase CI-red fix round (GB4)', () => {
     });
 
     const result = await advance(harness);
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'prepare',
+      key: prepareKey(1, 0, 2),
+      result: 'completed',
+      reasonCode: 'prepared',
+    });
+
+    const prose = harness.briefRequests[0]!.proseMarkdown!;
+    expect(prose).toContain('[blocker] src/ex.ts:4 — blocks the acceptance check');
+    expect(prose).toContain('[gate] command 1 — fail, exit 1');
+    expect(harness.fixRequests[0]!.numberedFixes).toEqual([
+      '[blocker] src/ex.ts:4 — blocks the acceptance check',
+      '[gate] command 1 — fail, exit 1',
+    ]);
+  });
+
+  it('d2) a gate failure with a pending review intent whose receipt is recorded carries the findings beside the gate deltas', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    // The brief-check outcome was unknown: its intent stays without a result
+    // (K5-4b), yet its receipt is already recorded at the same head the gate
+    // failed. The gate-failure fix scan reads the pending intent's receipt too.
+    const gateKeyStr = gateKey();
+    await appendIntent(harness, gateKeyStr, null, NOW);
+    await appendIntent(harness, reviewKey('brief-check', 0, HEAD12_A), 'review-' + harness.deps.newUlid(), NOW);
+    await appendResult(harness, gateKeyStr, 'completed', 'gate-failed', NOW);
+    await conduct(harness, 'fixing', NOW);
+    harness.setFindReceiptAnswer(async (request) => ({
+      outcome: 'found',
+      receipt: {
+        receiptId: 'rcpt-' + request.requestId,
+        requestId: request.requestId,
+        kind: 'brief-check',
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: COMMIT_A,
+        verdict: 'failed',
+        findings: [blockerFinding()],
+      },
+    }));
+    await harness.executionJournal.appendJournalEntry({
+      id: 'attempt-example-1:accept:' + COMMIT_A + ':0',
+      attemptId: 'attempt-example-1',
+      workOrderId: 'wo-example-1',
+      action: 'accept',
+      baseCommit: COMMIT_A,
+      recordedAtIso: NOW,
+      status: 'completed',
+      sessionId: null,
+      detail: JSON.stringify({
+        predicate: 'command 1',
+        kind: 'command',
+        verdict: 'fail',
+        exitCode: 1,
+        durationMs: 10,
+        detail: 'gate detail text that must never appear',
+      }),
+    });
+
+    const ctx: AdvanceStepContext = { deps: harness.deps };
+    const request: AdvanceLaneRunRequest = {
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    };
+    const decision = {
+      kind: 'act' as const,
+      step: 'prepare' as const,
+      key: prepareKey(1, 0, 2),
+      round: 1,
+      seatIndex: 0,
+      head12: null,
+      retry: null,
+    };
+    const refuse = async (reasonCode: LaneRunResultReasonCode, detail: string | null = null) => {
+      const intentRefusal = await appendRunIntent(ctx, request, decision.key, null);
+      expect(intentRefusal).toBeNull();
+      const resultRefusal = await appendRunResult(ctx, request, decision.key, 'refused', reasonCode, detail);
+      expect(resultRefusal).toBeNull();
+      return {
+        outcome: 'acted' as const,
+        step: decision.step,
+        key: decision.key,
+        result: 'refused' as const,
+        reasonCode,
+        ...(detail ? { detail } : {}),
+      };
+    };
+    const gathered = { facts: { state: 'fixing' }, attemptRecords: [collectedAttempt()] } as unknown as GatheredLaneRunFacts;
+    const record = (await harness.runRepo.get(RUN_ID))!;
+    // The prepare fake asserts the intent precedes the port call: set the
+    // journal baseline to the current length (the act appends exactly one
+    // intent before the fake runs).
+    harness.setJournalBaseline((await harness.runJournal.listForRun(RUN_ID)).length);
+    const result = await performFixPrepare(ctx, record, gathered, decision, request, refuse);
     expect(result).toEqual({
       outcome: 'acted',
       step: 'prepare',

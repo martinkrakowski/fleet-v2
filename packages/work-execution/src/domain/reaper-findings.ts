@@ -419,48 +419,83 @@ export function classifyZombies(
   reaperPolicy: ReaperPolicy,
 ): readonly ReaperFinding[] {
   try {
-    const observations =
-      facts !== null && typeof facts === 'object' && Array.isArray(facts.observations) ? facts.observations : [];
-    const openFindings =
-      facts !== null && typeof facts === 'object' && Array.isArray(facts.openFindings) ? facts.openFindings : [];
-    const policy = reaperPolicy === null || typeof reaperPolicy !== 'object' ? {} : reaperPolicy;
-    const graceMinutes = minutesOf(policy.graceMinutes, DEFAULT_GRACE_MINUTES);
-    const staleStopMinutes = minutesOf(policy.staleStopMinutes, DEFAULT_STALE_STOP_MINUTES);
-    const minFreePercent = minutesOf(policy.minFreePercent, DEFAULT_MIN_FREE_PERCENT);
-    const graceMs = graceMinutes * MINUTE_MS;
-    const nowCanonical = isCanonicalIso(nowIso);
+    const inputs = reaperInputsOf(facts, reaperPolicy, nowIso);
     // Without a canonical clock value no finding is emitted: a stored finding needs real sighting times, and a clock
     // that cannot be read (or carries a secret shape) must never reach one. The next pass with a good clock reports.
-    if (!nowCanonical) {
+    if (!inputs.nowCanonical) {
       return [];
     }
-    const nowMs = msOf(nowIso);
-    const computed: ReaperFinding[] = [];
-    const mergedSubjects = new Set<string>();
-
-    for (const observation of observations) {
-      const finding = classifyObservation(
-        observation,
-        openFindings,
-        nowIso,
-        nowMs,
-        nowCanonical,
-        graceMs,
-        staleStopMinutes,
-        minFreePercent,
-        policy.repairs,
-      );
-      if (finding === null) {
-        continue;
-      }
-      computed.push(finding);
-      if (finding.kind === 'merged-worktree') {
-        mergedSubjects.add(finding.subject);
-      }
-    }
-
+    const { computed, mergedSubjects } = collectFindings(inputs.observations, inputs.openFindings, inputs);
     return applyPrecedence(computed, mergedSubjects);
   } catch {
     return [];
   }
+}
+
+function reaperInputsOf(
+  facts: ReaperFacts,
+  reaperPolicy: ReaperPolicy,
+  nowIso: string,
+): {
+  observations: readonly ReaperObservation[];
+  openFindings: readonly ReaperFinding[];
+  policy: ReaperPolicy;
+  graceMs: number;
+  staleStopMinutes: number;
+  minFreePercent: number;
+  nowCanonical: boolean;
+  nowMs: number | null;
+  nowIso: string;
+} {
+  let observations: readonly ReaperObservation[] = [];
+  if (facts !== null && typeof facts === 'object' && Array.isArray(facts.observations)) {
+    observations = facts.observations;
+  }
+  let openFindings: readonly ReaperFinding[] = [];
+  if (facts !== null && typeof facts === 'object' && Array.isArray(facts.openFindings)) {
+    openFindings = facts.openFindings;
+  }
+  let policy: ReaperPolicy = {};
+  if (reaperPolicy !== null && typeof reaperPolicy === 'object') {
+    policy = reaperPolicy;
+  }
+  const graceMinutes = minutesOf(policy.graceMinutes, DEFAULT_GRACE_MINUTES);
+  const staleStopMinutes = minutesOf(policy.staleStopMinutes, DEFAULT_STALE_STOP_MINUTES);
+  const minFreePercent = minutesOf(policy.minFreePercent, DEFAULT_MIN_FREE_PERCENT);
+  const graceMs = graceMinutes * MINUTE_MS;
+  const nowCanonical = isCanonicalIso(nowIso);
+  const nowMs = msOf(nowIso);
+  return { observations, openFindings, policy, graceMs, staleStopMinutes, minFreePercent, nowCanonical, nowMs, nowIso };
+}
+
+function collectFindings(
+  observations: readonly ReaperObservation[],
+  openFindings: readonly ReaperFinding[],
+  inputs: ReturnType<typeof reaperInputsOf>,
+): { computed: ReaperFinding[]; mergedSubjects: Set<string> } {
+  const computed: ReaperFinding[] = [];
+  const mergedSubjects = new Set<string>();
+
+  for (const observation of observations) {
+    const finding = classifyObservation(
+      observation,
+      openFindings,
+      inputs.nowIso,
+      inputs.nowMs,
+      inputs.nowCanonical,
+      inputs.graceMs,
+      inputs.staleStopMinutes,
+      inputs.minFreePercent,
+      inputs.policy.repairs,
+    );
+    if (finding === null) {
+      continue;
+    }
+    computed.push(finding);
+    if (finding.kind === 'merged-worktree') {
+      mergedSubjects.add(finding.subject);
+    }
+  }
+
+  return { computed, mergedSubjects };
 }

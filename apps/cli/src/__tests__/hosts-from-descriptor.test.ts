@@ -271,6 +271,23 @@ describe("fleet-v2 hosts add --from-descriptor", () => {
     expect(readFileSync(file, "utf8")).toBe(before);
   });
 
+  it("names no descriptor path when the file cannot be read", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, baseInstallation(path.join(dir, "worktrees")));
+    const descriptorPath = path.join(dir, "nope.json");
+    const before = readFileSync(file, "utf8");
+    const { code, stderr } = await runHosts(
+      ["add", "lanehost", "--from-descriptor", descriptorPath, "--yes"],
+      file,
+    );
+    expect(code).toBe(1);
+    expect(stderr).toContain("the host descriptor file could not be read");
+    expect(stderr).not.toContain(descriptorPath);
+    expect(stderr).not.toContain(dir);
+    expect(readFileSync(file, "utf8")).toBe(before);
+  });
+
   it("refuses a descriptor file that is not JSON", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");

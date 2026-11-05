@@ -97,6 +97,97 @@ function makeUseCase(deps: { worktreePath?: string } = {}) {
   });
 }
 
+describe('PrepareBriefPackageUseCase contextDecisions validation', () => {
+  const REASON = 'contextDecisions must be an array of context decisions';
+
+  it('rejects a missing or null contextDecisions, which the contract requires (CX7a review minor)', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    for (const value of [undefined, null]) {
+      const request = validRequest({ contextDecisions: value as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'] });
+      const result = await useCase.prepareBriefPackage(request);
+      expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+    }
+  });
+
+  it('rejects a context decision with an empty identifier, entry or version (CX7a review minor)', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const base = {
+      proposalId: 'p-1', knowledgeEntryId: 'ke-1', version: 'v1',
+      proposedBecause: 'lexical match', accepted: true, decisionBecause: 'applicable to this lane',
+    };
+    for (const field of ['proposalId', 'knowledgeEntryId', 'version'] as const) {
+      const request = validRequest({ contextDecisions: [{ ...base, [field]: '' }] });
+      const result = await useCase.prepareBriefPackage(request);
+      expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+    }
+  });
+
+  it('rejects a contextDecisions that is not an array without throwing', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest({ contextDecisions: {} as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'] });
+    const result = await useCase.prepareBriefPackage(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+  });
+
+  it('rejects a contextDecisions entry that is not an object', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest({
+      contextDecisions: ['not-an-object'] as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'],
+    });
+    const result = await useCase.prepareBriefPackage(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+  });
+
+  it('rejects a contextDecisions entry whose accepted field is not a boolean', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest({
+      contextDecisions: [
+        { decisionBecause: 'reviewed', accepted: 'false' },
+      ] as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'],
+    });
+    const result = await useCase.prepareBriefPackage(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+  });
+
+  it('rejects a contextDecisions entry that omits required decision fields', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest({
+      contextDecisions: [
+        { decisionBecause: 'reviewed', accepted: true },
+      ] as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'],
+    });
+    const result = await useCase.prepareBriefPackage(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+  });
+
+  it('rejects a contextDecisions entry with non-string knowledge fields', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest({
+      contextDecisions: [
+        { proposalId: 'p-1', knowledgeEntryId: 7, version: 'v1', proposedBecause: 'match', accepted: true, decisionBecause: 'reviewed' },
+      ] as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'],
+    });
+    const result = await useCase.prepareBriefPackage(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+  });
+
+  it('previewBriefPackage rejects a non-array contextDecisions without throwing and echoes no path', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest({ contextDecisions: {} as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'] });
+    const result = await useCase.previewBriefPackage(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+    if (result.outcome === 'rejected') {
+      expect(result.reason).not.toContain('/wt');
+    }
+  });
+
+  it('still prepares a valid request with one accepted decision', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const result = await useCase.prepareBriefPackage(validRequest());
+    expect(result.outcome).toBe('prepared');
+  });
+});
+
 describe('PrepareBriefPackageUseCase path validation', () => {
   it('rejects when worktreePath is missing from the request and deps', async () => {
     const useCase = makeUseCase();

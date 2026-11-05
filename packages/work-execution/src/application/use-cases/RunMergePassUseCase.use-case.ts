@@ -135,6 +135,10 @@ export class RunMergePassUseCase implements RunMergePassPort {
     const head = findMergeQueueHead(live, request.repoDigest);
 
     // The kill switch, read once; an unreadable read is a halt (fail closed).
+    // D-DT9: the budget is checked before this outbound read too.
+    if (!callAllowed(this.deps.nowIso(), request.deadlineIso)) {
+      return { outcome: 'budget-exhausted', reasonCode: null, entries };
+    }
     let halted: boolean;
     try {
       halted = isConductorHalted(await this.deps.halt.read());
@@ -262,6 +266,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
     }
     const key = built.key;
 
+    this.ensureBudget(request); // D-DT9: guard before the journal read
     const existing = await this.deps.journal.listForKey(key);
     if (existing.length > 0) {
       return this.report(entry, 'no-action', 'already-journalled', null);
@@ -283,6 +288,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
       grantId: null,
       state: null,
     };
+    this.ensureBudget(request); // D-DT9: guard before the intent append
     const appended = await this.deps.journal.append(intent);
     if (appended.outcome === 'refused') {
       return this.report(
@@ -309,6 +315,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
       grantId: null,
       state: null,
     };
+    this.ensureBudget(request); // D-DT9: guard before the result append
     const appendedResult = await this.deps.journal.append(result);
     if (appendedResult.outcome === 'refused') {
       return this.report(
@@ -319,6 +326,13 @@ export class RunMergePassUseCase implements RunMergePassPort {
       );
     }
     return this.report(entry, 'journalled', decision.shadowReason, key);
+  }
+
+  /** D-DT9: no outbound call may start with under 2 s left on the pass budget. */
+  private ensureBudget(request: RunMergePassRequest): void {
+    if (!callAllowed(this.deps.nowIso(), request.deadlineIso)) {
+      throw new MergePassBudgetExhausted();
+    }
   }
 
   /** Gather every fact one decider run needs, exactly as plan §3.3 names them. */
@@ -469,6 +483,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
     let count = 0;
     try {
       for (const head12 of head12s) {
+        this.ensureBudget(request); // D-DT9: guard before each journal read
         const built = buildMergeKey({
           repoDigest: request.repoDigest,
           pullRequest: entry.pullRequest,
@@ -491,7 +506,10 @@ export class RunMergePassUseCase implements RunMergePassPort {
           }
         }
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof MergePassBudgetExhausted) {
+        throw error; // a spent budget is the pass outcome, not an unknown count
+      }
       return 'unknown';
     }
     return count;

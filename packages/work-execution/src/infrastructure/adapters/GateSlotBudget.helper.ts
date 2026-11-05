@@ -55,6 +55,7 @@ export class GateSlotBudget {
   reconcile(capacity: unknown): void {
     const declared = readGateSlotCapacity(capacity);
     this.limit = this.active === 0 && this.waiters.length === 0 ? declared : Math.min(this.limit, declared);
+    this.wake();
   }
 
   /** The most tasks that ever held a slot at once. */
@@ -85,12 +86,11 @@ export class GateSlotBudget {
   }
 
   private acquire(): Promise<void> {
-    if (this.active < this.capacity) {
+    if (this.waiters.length === 0 && this.active < this.limit) {
       this.take();
       return Promise.resolve();
     }
     return new Promise<void>((resolve) => {
-      // The slot is handed over by release(), which counts it before waking the waiter.
       this.waiters.push(resolve);
     });
   }
@@ -102,13 +102,20 @@ export class GateSlotBudget {
     }
   }
 
-  private release(): void {
-    const next = this.waiters.shift();
-    if (next !== undefined) {
-      // Hand the slot straight over: active stays the same, so a newcomer cannot jump the queue.
+  /** Wake waiters, in order, while slots are free under the CURRENT capacity (a lowered one frees none until enough tasks end). */
+  private wake(): void {
+    while (this.waiters.length > 0 && this.active < this.limit) {
+      const next = this.waiters.shift();
+      if (next === undefined) {
+        break;
+      }
+      this.take();
       next();
-      return;
     }
+  }
+
+  private release(): void {
     this.active -= 1;
+    this.wake();
   }
 }

@@ -93,4 +93,40 @@ describe('GateSlotBudget', () => {
     budget.reconcile('nonsense');
     expect(budget.capacity).toBe(1);
   });
+
+  it('never starts a waiter while a lowered capacity is still full', async () => {
+    const budget = new GateSlotBudget(2);
+    let releaseA: () => void = () => undefined;
+    let releaseB: () => void = () => undefined;
+    let active = 0;
+    let observedPeak = 0;
+    const hold = (setRelease: (fn: () => void) => void): (() => Promise<void>) => () => {
+      active += 1;
+      observedPeak = Math.max(observedPeak, active);
+      return new Promise<void>((resolve) => {
+        setRelease(() => {
+          active -= 1;
+          resolve();
+        });
+      });
+    };
+    const a = budget.run(hold((fn) => (releaseA = fn)));
+    const b = budget.run(hold((fn) => (releaseB = fn)));
+    let thirdStarted = false;
+    const c = budget.run(async () => {
+      thirdStarted = true;
+      expect(active).toBe(0);
+    });
+    await tick(2);
+    budget.reconcile(1);
+    releaseA();
+    await a;
+    await tick(2);
+    expect(thirdStarted).toBe(false);
+    releaseB();
+    await b;
+    await c;
+    expect(thirdStarted).toBe(true);
+    expect(observedPeak).toBe(2);
+  });
 });

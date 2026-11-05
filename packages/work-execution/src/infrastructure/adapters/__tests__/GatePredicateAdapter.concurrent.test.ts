@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { GatePredicateAdapter } from '../GatePredicateAdapter.adapter.js';
+import { GatePredicateAdapter, boundedCoverage } from '../GatePredicateAdapter.adapter.js';
 import type { GatePredicateAdapterOptions } from '../GatePredicateAdapter.adapter.js';
 import { GateReceiptReuseAdapter, InMemoryGateReceiptRecordStore } from '../GateReceiptReuseAdapter.adapter.js';
 import type { GateReceiptRecordStore } from '../GateReceiptReuseAdapter.adapter.js';
@@ -246,6 +246,20 @@ describe('GatePredicateAdapter concurrency (KS3)', () => {
     };
     const results = evaluated(await adapter.evaluateGatePredicates(request));
     expect(JSON.stringify(results)).not.toContain(secretShaped);
+  });
+
+  it('withholds a long or secret-shaped coverage reason whole instead of echoing a prefix', () => {
+    const secretShaped = ['ghp', '_', 'a'.repeat(24)].join('');
+    const long = boundedCoverage({ ran: false, reason: 'r'.repeat(400) });
+    expect(long).toEqual({ ran: false, reason: 'coverage reason withheld: too long' });
+    expect(boundedCoverage({ ran: false, reason: 'leak ' + secretShaped })).toEqual({
+      ran: false,
+      reason: 'detail withheld: secret-shaped text',
+    });
+    const fine = { ran: false as const, reason: 'no summary line' };
+    expect(boundedCoverage(fine)).toBe(fine);
+    const ran = { ran: true as const, unitKind: 'tests' as const, units: 3 };
+    expect(boundedCoverage(ran)).toBe(ran);
   });
 
   it('refuses a request with more commands or arguments than an acceptance spec allows', async () => {

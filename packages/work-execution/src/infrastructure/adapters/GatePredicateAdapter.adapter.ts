@@ -106,6 +106,7 @@ const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 /** Longest result detail the adapter returns; longer text is cut. */
 const MAX_DETAIL_LENGTH = 300;
 const WITHHELD_DETAIL = 'detail withheld: secret-shaped text';
+const WITHHELD_LONG_DETAIL = 'coverage reason withheld: too long';
 const DEFAULT_COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
 /** The fixed last stderr line `bin/gate-slot` prints when no slot freed up (KF-30a). */
 const GATE_SLOT_WAIT_LIMIT_LINE = 'gate-slot: no slot within the wait limit';
@@ -209,11 +210,15 @@ function boundedDetail(detail: unknown): string {
 }
 
 /** The coverage with a withheld or cut reason when a reader's reason text is secret-shaped or long. */
-function boundedCoverage(coverage: CheckCoverage): CheckCoverage {
+export function boundedCoverage(coverage: CheckCoverage): CheckCoverage {
   if (coverage.ran) {
     return coverage;
   }
-  const reason = boundedDetail(coverage.reason);
+  // A long reason is withheld whole, never cut: its prefix would still be echoed.
+  const reason =
+    typeof coverage.reason === 'string' && coverage.reason.length > MAX_DETAIL_LENGTH
+      ? WITHHELD_LONG_DETAIL
+      : boundedDetail(coverage.reason);
   return reason === coverage.reason ? coverage : { ran: false, reason };
 }
 

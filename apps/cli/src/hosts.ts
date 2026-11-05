@@ -580,7 +580,8 @@ async function writeHost(
       text = await readFile(args.fromDescriptor, "utf8");
     } catch {
       io.stderr(
-        `hosts add --from-descriptor: the descriptor file could not be read (${args.fromDescriptor})\n`,
+        // The operator-supplied path can be a credential path; nothing from it appears here.
+        "hosts add --from-descriptor: the host descriptor file could not be read\n",
       );
       return 1;
     }

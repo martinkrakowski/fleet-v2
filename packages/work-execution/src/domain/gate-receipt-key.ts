@@ -102,83 +102,88 @@ function isSha256Hex(value: unknown): value is string {
   return typeof value === 'string' && SHA256_HEX_PATTERN.test(value);
 }
 
-/**
- * Validate the five raw components (already read defensively by the caller) in
- * the fixed table order of the contract and build the key record. Returns the
- * first unreadable component as a miss; never throws.
- */
-function validateGateReceiptKeyComponents(parts: GateReceiptKeyInput): GateReceiptKeyBuild {
-  const predicateId = readTrimmedString(parts.predicateId, 128);
-  if (predicateId === undefined) {
-    return { ok: false, reason: 'predicate-id-unreadable' };
-  }
-
-  if (!isTreeHash(parts.treeHash)) {
-    return { ok: false, reason: 'tree-hash-unreadable' };
-  }
-
-  if (!isSha256Hex(parts.predicateDefinitionDigest)) {
-    return { ok: false, reason: 'predicate-definition-digest-unreadable' };
-  }
-
-  const toolchainVersions = parts.toolchainVersions;
-  if (!isPlainRecordObject(toolchainVersions)) {
-    return { ok: false, reason: 'toolchain-version-unreadable' };
-  }
-  const readToolchain = (name: string): unknown => {
-    const descriptor = Reflect.getOwnPropertyDescriptor(toolchainVersions, name);
-    return descriptor === undefined ? undefined : descriptor.value;
-  };
-  const node = readTrimmedString(readToolchain('node'), 64);
-  const yarn = readTrimmedString(readToolchain('yarn'), 64);
-  const hexagen = readTrimmedString(readToolchain('hexagen'), 64);
-  const turbo = readTrimmedString(readToolchain('turbo'), 64);
-  if (node === undefined || yarn === undefined || hexagen === undefined || turbo === undefined) {
-    return { ok: false, reason: 'toolchain-version-unreadable' };
-  }
-
-  if (!isSha256Hex(parts.declaredEnvironmentDigest)) {
-    return { ok: false, reason: 'declared-environment-digest-unreadable' };
-  }
-
-  return {
-    ok: true,
-    key: {
-      schemaVersion: GATE_RECEIPT_KEY_SCHEMA_VERSION,
-      predicateId,
-      treeHash: parts.treeHash,
-      predicateDefinitionDigest: parts.predicateDefinitionDigest,
-      toolchainVersions: { node, yarn, hexagen, turbo },
-      declaredEnvironmentDigest: parts.declaredEnvironmentDigest,
-    },
-  };
+/** The raw value of an own property, read through its descriptor so no getter runs. */
+function readOwnProperty(target: object, key: string): unknown {
+  const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+  return descriptor === undefined ? undefined : descriptor.value;
 }
 
-export function buildGateReceiptKey(input: GateReceiptKeyInput): GateReceiptKeyBuild {
-  // Tracks which field's read is in flight, so a throw from Reflect (e.g. a
-  // hostile proxy) is reported as THAT field's unreadable reason — the required
-  // first-unreadable-field result — never as another field's reason.
+/**
+ * Read the five key components in the fixed table order of the contract, each
+ * through its own descriptor so no getter runs, and validate each before moving
+ * to the next. The first unreadable component is returned as a miss; a throw
+ * from any defensive read (e.g. a hostile proxy trap) is reported as the
+ * component whose read was in flight, never as another component's reason.
+ * Unknown extra fields are ignored. Never throws.
+ */
+function readGateReceiptKeyComponents(parts: GateReceiptKeyInput): GateReceiptKeyBuild {
+  // Tracks which component's read is in flight, so a throw from Reflect (e.g.
+  // a hostile proxy) is reported as THAT component's unreadable reason — the
+  // required first-unreadable-field result — never as another component's after
+  // it has already been checked.
   let currentReason: GateReceiptKeyMissReason = 'predicate-id-unreadable';
   try {
-    // Read the expected own keys through their descriptors so no getter runs; a
+    // Read each expected own key through its descriptor so no getter runs; a
     // throwing descriptor (or a non-object input) is caught below as a miss.
     const read = (key: string, reason: GateReceiptKeyMissReason): unknown => {
       currentReason = reason;
-      const descriptor = Reflect.getOwnPropertyDescriptor(input, key);
+      const descriptor = Reflect.getOwnPropertyDescriptor(parts, key);
       return descriptor === undefined ? undefined : descriptor.value;
     };
-    return validateGateReceiptKeyComponents({
-      predicateId: read('predicateId', 'predicate-id-unreadable'),
-      treeHash: read('treeHash', 'tree-hash-unreadable'),
-      predicateDefinitionDigest: read('predicateDefinitionDigest', 'predicate-definition-digest-unreadable'),
-      toolchainVersions: read('toolchainVersions', 'toolchain-version-unreadable'),
-      declaredEnvironmentDigest: read('declaredEnvironmentDigest', 'declared-environment-digest-unreadable'),
-    });
+
+    const predicateId = readTrimmedString(read('predicateId', 'predicate-id-unreadable'), 128);
+    if (predicateId === undefined) {
+      return { ok: false, reason: 'predicate-id-unreadable' };
+    }
+
+    const treeHash = read('treeHash', 'tree-hash-unreadable');
+    if (!isTreeHash(treeHash)) {
+      return { ok: false, reason: 'tree-hash-unreadable' };
+    }
+
+    const predicateDefinitionDigest = read('predicateDefinitionDigest', 'predicate-definition-digest-unreadable');
+    if (!isSha256Hex(predicateDefinitionDigest)) {
+      return { ok: false, reason: 'predicate-definition-digest-unreadable' };
+    }
+
+    currentReason = 'toolchain-version-unreadable';
+    const toolchainVersions = read('toolchainVersions', 'toolchain-version-unreadable');
+    if (!isPlainRecordObject(toolchainVersions)) {
+      return { ok: false, reason: 'toolchain-version-unreadable' };
+    }
+    const node = readTrimmedString(readOwnProperty(toolchainVersions, 'node'), 64);
+    const yarn = readTrimmedString(readOwnProperty(toolchainVersions, 'yarn'), 64);
+    const hexagen = readTrimmedString(readOwnProperty(toolchainVersions, 'hexagen'), 64);
+    const turbo = readTrimmedString(readOwnProperty(toolchainVersions, 'turbo'), 64);
+    if (node === undefined || yarn === undefined || hexagen === undefined || turbo === undefined) {
+      return { ok: false, reason: 'toolchain-version-unreadable' };
+    }
+
+    const declaredEnvironmentDigest = read('declaredEnvironmentDigest', 'declared-environment-digest-unreadable');
+    if (!isSha256Hex(declaredEnvironmentDigest)) {
+      return { ok: false, reason: 'declared-environment-digest-unreadable' };
+    }
+
+    return {
+      ok: true,
+      key: {
+        schemaVersion: GATE_RECEIPT_KEY_SCHEMA_VERSION,
+        predicateId,
+        treeHash,
+        predicateDefinitionDigest,
+        toolchainVersions: { node, yarn, hexagen, turbo },
+        declaredEnvironmentDigest,
+      },
+    };
   } catch {
     // A hostile getter or proxy trap must never escape: report the component
     // whose read threw, with a fixed reason that echoes no value.
     return { ok: false, reason: currentReason };
   }
+}
+
+export function buildGateReceiptKey(input: GateReceiptKeyInput): GateReceiptKeyBuild {
+  return readGateReceiptKeyComponents(input);
 }
 
 export function gateReceiptKeysEqual(left: GateReceiptKey, right: GateReceiptKey): boolean {
@@ -204,32 +209,16 @@ export function readGateReceiptKeyRecord(input: unknown): GateReceiptStoredRead 
       ? { ok: false, reason: 'stored-key-version-unknown' }
       : { ok: false, reason: 'stored-key-unreadable' };
   }
-  // readRecordSchemaVersion guarantees a plain record object; narrow `input` so
-  // the defensive reads below can use Reflect on it.
-  if (!isPlainRecordObject(input)) {
+  // readRecordSchemaVersion guarantees a plain record object, so the record's
+  // own fields can be read defensively below.
+  const built = readGateReceiptKeyComponents(input as GateReceiptKeyInput);
+  if (!built.ok) {
+    // Any unreadable stored field is a single miss reason: the stored key is unusable.
     return { ok: false, reason: 'stored-key-unreadable' };
   }
-  try {
-    const read = (key: string): unknown => {
-      const descriptor = Reflect.getOwnPropertyDescriptor(input, key);
-      return descriptor === undefined ? undefined : descriptor.value;
-    };
-    const built = validateGateReceiptKeyComponents({
-      predicateId: read('predicateId'),
-      treeHash: read('treeHash'),
-      predicateDefinitionDigest: read('predicateDefinitionDigest'),
-      toolchainVersions: read('toolchainVersions'),
-      declaredEnvironmentDigest: read('declaredEnvironmentDigest'),
-    });
-    if (!built.ok) {
-      return { ok: false, reason: 'stored-key-unreadable' };
-    }
-    // Unknown extra fields in the stored object are ignored: the gate's result
-    // lives beside the key in the same record.
-    return { ok: true, record: built.key };
-  } catch {
-    return { ok: false, reason: 'stored-key-unreadable' };
-  }
+  // Unknown extra fields in the stored object are ignored: the gate's result
+  // lives beside the key in the same record.
+  return { ok: true, record: built.key };
 }
 
 export function decideGateReceiptReuse(key: GateReceiptKey, stored: unknown): GateReceiptReuse {

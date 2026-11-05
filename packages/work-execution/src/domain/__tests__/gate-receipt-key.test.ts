@@ -129,6 +129,44 @@ describe('buildGateReceiptKey', () => {
       reason: 'tree-hash-unreadable',
     });
   });
+
+  it('reports the first unreadable field before a later throwing descriptor', () => {
+    // An earlier unreadable field must win even when a LATER descriptor throws:
+    // the fields are checked in table order, so the later throw is never seen.
+    const base = components() as unknown as Record<string, unknown>;
+    base.predicateId = 'bad\u0000id';
+    const input = new Proxy(base, {
+      getOwnPropertyDescriptor(t, key) {
+        if (key === 'treeHash') {
+          throw new Error('boom');
+        }
+        return Reflect.getOwnPropertyDescriptor(t, key);
+      },
+    });
+    expect(buildGateReceiptKey(input as unknown as GateReceiptKeyInput)).toEqual({
+      ok: false,
+      reason: 'predicate-id-unreadable',
+    });
+  });
+
+  it('reports a throwing toolchain descriptor as the toolchain reason', () => {
+    // A throw while reading a toolchain version belongs to the toolchain
+    // component, never to a later component such as the declared environment.
+    const base = components() as unknown as Record<string, unknown>;
+    const toolchain = base.toolchainVersions as Record<string, unknown>;
+    base.toolchainVersions = new Proxy(toolchain, {
+      getOwnPropertyDescriptor(t, key) {
+        if (key === 'turbo') {
+          throw new Error('boom');
+        }
+        return Reflect.getOwnPropertyDescriptor(t, key);
+      },
+    });
+    expect(buildGateReceiptKey(base as unknown as GateReceiptKeyInput)).toEqual({
+      ok: false,
+      reason: 'toolchain-version-unreadable',
+    });
+  });
 });
 
 describe('readGateReceiptKeyRecord', () => {

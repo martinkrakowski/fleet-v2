@@ -636,6 +636,25 @@ describe('laneRunSpans attempt and usage spans (OT1b-2)', () => {
     expect(spanNamed(notTerminal.spans, 'attempt')).toBeUndefined();
   });
 
+  it("ends a later attempt's span at its own collect, not an earlier attempt's in the same round and seat (CX8)", () => {
+    entryCounter = 0;
+    const dispatchA3 = DISPATCH_KEY.replace('/a1', '/a3');
+    const collectA3 = COLLECT_KEY.replace('/a1', '/a3');
+    const journal = [
+      entry('intent', { key: DISPATCH_KEY, recordedAtIso: time(3), mintedId: 'attempt-earlier-1' }),
+      stepResult(DISPATCH_KEY, 4),
+      stepIntent(COLLECT_KEY, 6), stepResult(COLLECT_KEY, 7),
+      stepIntent(dispatchA3, 30), stepResult(dispatchA3, 31),
+      stepIntent(collectA3, 40), stepResult(collectA3, 41),
+      conductOf('merged', 42),
+    ];
+    const result = laneRunSpans(hmac, factsOf(journal, 'example', [makeAttempt()]));
+    const attempt = spanNamed(result.spans, 'attempt') as { startIso: string; endIso: string } | undefined;
+    expect(attempt).toBeDefined();
+    expect(attempt?.startIso).toBe(time(31));
+    expect(attempt?.endIso).toBe(time(41));
+  });
+
   it('emits the usage span under the attempt only for opencode-db usage, with token counts and metered cost', () => {
     const result = laneRunSpans(hmac, factsOf(baseJournal(), 'example', [makeAttempt()]));
     const usage = spanNamed(result.spans, 'usage');

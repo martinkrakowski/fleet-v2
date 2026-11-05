@@ -101,7 +101,7 @@ describe('cutover shadow report (CO32)', () => {
       shellCount: number;
       truncated: boolean;
       divergences: unknown[];
-      shell: { queue: string; parkedLines: number; chainFiles: number; batchLines: number };
+      shell: { queue: string; parkedLines: number; chainFiles: number | null; batchLines: number | null };
     };
     expect(body.outcome).toBe('completed');
     expect(body.kind).toBe('enqueue-set');
@@ -359,5 +359,47 @@ describe('cutover shadow report (CO32)', () => {
     expect(body.complete).toBe(false);
     expect(body.shell.unknownLines).toEqual([2]);
     expect(result.out).not.toContain(badLine);
+  });
+
+  it('reports an unreadable chains directory as null and incomplete, never as zero', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
+    await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n`);
+    // A regular file where the chains directory is expected makes readdir fail
+    // with ENOTDIR, which the legacy reader adapter reports as `unreadable`.
+    await fs.writeFile(path.join(stateDir, 'chains'), 'not a directory');
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(0);
+    const body = JSON.parse(result.out) as {
+      complete: boolean;
+      shell: { chainFiles: number | null };
+    };
+    expect(body.complete).toBe(false);
+    expect(body.shell.chainFiles).toBeNull();
+    expect(result.out).not.toContain(stateDir);
+  });
+
+  it('reports an unreadable batch file as null and incomplete, never as zero', async () => {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'fleet-cli-cutover-'));
+    tempStateDirs.push(stateDir);
+    const runtime = createFleetCliRuntime({ stateDir });
+    await enqueue(runtime, { owner: 'fleet', repo: 'v2' }, 7, HEAD_A, ulid(1));
+    await fs.writeFile(path.join(stateDir, 'queue'), `7 ${HEAD_A} main\n`);
+    // A directory at the batch path makes readFile fail with EISDIR, which
+    // the legacy reader adapter reports as `unreadable`.
+    await fs.mkdir(path.join(stateDir, 'batch'));
+
+    const result = await cli(runtime, shadowReportArgs(stateDir));
+    expect(result.code).toBe(0);
+    const body = JSON.parse(result.out) as {
+      complete: boolean;
+      shell: { batchLines: number | null };
+    };
+    expect(body.complete).toBe(false);
+    expect(body.shell.batchLines).toBeNull();
+    expect(result.out).not.toContain(stateDir);
   });
 });

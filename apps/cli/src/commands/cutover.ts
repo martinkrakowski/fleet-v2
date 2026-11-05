@@ -112,12 +112,32 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
     }));
     const result = compareShadowEnqueueSets({ fleet, shell });
 
+    // A missing chains directory or batch file genuinely means empty; an
+    // unreadable one means the count is unknown. Report `null` for unknown so
+    // an operator never mistakes unavailable state for empty state, and mark
+    // the report incomplete when any source was unreadable.
+    const chainFiles =
+      shellState.chains.status === 'read'
+        ? shellState.chains.chains.length
+        : shellState.chains.status === 'absent'
+          ? 0
+          : null;
+    const batchLines =
+      shellState.batch.status === 'read'
+        ? shellState.batch.lines.length
+        : shellState.batch.status === 'absent'
+          ? 0
+          : null;
+
     return {
       outcome: 'completed',
       kind: 'enqueue-set',
       fleetBase: 'main',
       equal: result.equal,
-      complete: unknownLines.length === 0,
+      complete:
+        unknownLines.length === 0 &&
+        shellState.chains.status !== 'unreadable' &&
+        shellState.batch.status !== 'unreadable',
       compared: result.compared,
       fleetCount: result.fleetCount,
       shellCount: result.shellCount,
@@ -127,8 +147,8 @@ export const cutoverCommands: Readonly<Record<string, CommandHandler>> = {
         queue: 'read',
         unknownLines,
         parkedLines: shellState.parked.status === 'read' ? shellState.parked.lines.length : 0,
-        chainFiles: shellState.chains.status === 'read' ? shellState.chains.chains.length : 0,
-        batchLines: shellState.batch.status === 'read' ? shellState.batch.lines.length : 0,
+        chainFiles,
+        batchLines,
       },
     };
   },

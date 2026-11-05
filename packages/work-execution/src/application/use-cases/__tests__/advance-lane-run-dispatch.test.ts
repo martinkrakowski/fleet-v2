@@ -70,6 +70,15 @@ function grantingEndpointGate(): SessionStartGate {
   };
 }
 
+/** Fix round 1: an endpoint rule that denies only when a durable seed exists. */
+function seededEndpointGate(): SessionStartGate {
+  return {
+    tryStart: () => ({ ok: true }),
+    tryStartForEndpoint: (_runId, _nowIso, _endpointKey, lastStartIso) =>
+      lastStartIso === null ? { ok: true } : { ok: false, retryAfterMs: 12_345 },
+  };
+}
+
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
 const LATER = '2026-10-27T10:01:00.000Z';
@@ -1240,6 +1249,36 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     await advance(harness, { startGate: denyingEndpointGate() });
     const entries = await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1');
     expect(entries.filter((entry) => entry.action === 'dispatch' && entry.status === 'refused')).toHaveLength(1);
+  });
+
+  it('fix round 1: a cancelled attempt that started a session still seeds the endpoint stagger', async () => {
+    const prior = attemptFixture({
+      id: 'attempt-example-0',
+      state: 'cancelled',
+      sessionId: 'session-prior',
+      updatedAtIso: LATER,
+    });
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const result = await advance(harness, { startGate: seededEndpointGate() });
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(harness.dispatchRequests).toEqual([]);
+  });
+
+  it('fix round 1: a cancelled attempt that never started a session does not seed the endpoint stagger', async () => {
+    const prior = attemptFixture({ id: 'attempt-example-0', state: 'cancelled', updatedAtIso: LATER });
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const key = dispatchKey(0, 0, 1);
+    const result = await advance(harness, { startGate: seededEndpointGate() });
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'dispatch',
+      key,
+      result: 'completed',
+      reasonCode: 'dispatch-started',
+    });
+    expect(harness.dispatchRequests).toHaveLength(1);
   });
 
   it('CO13: a granting endpoint gate dispatches exactly as test 20 does', async () => {

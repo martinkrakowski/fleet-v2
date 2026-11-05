@@ -994,15 +994,20 @@ async function lastStartIsoForEndpoint(ctx: AdvanceStepContext, endpointKey: str
     if (attempt.runner === null || attempt.runner === undefined) {
       continue;
     }
-    // An `intent-recorded` or `cancelled` attempt never started.
-    if (
-      attempt.state !== 'dispatching' &&
-      attempt.state !== 'running' &&
-      attempt.state !== 'reconciling' &&
-      attempt.state !== 'blocked' &&
-      attempt.state !== 'ended' &&
-      attempt.state !== 'collected'
-    ) {
+    // An `intent-recorded` attempt never started. A `cancelled` attempt can
+    // still have started a session (it keeps the runner and session it was
+    // given), so it seeds the endpoint when a session is recorded; without a
+    // session it never started.
+    const startedStates = [
+      'dispatching',
+      'running',
+      'reconciling',
+      'blocked',
+      'ended',
+      'collected',
+    ] as const;
+    const cancelledWithSession = attempt.state === 'cancelled' && attempt.sessionId !== null;
+    if (!startedStates.includes(attempt.state as (typeof startedStates)[number]) && !cancelledWithSession) {
       continue;
     }
     if (dispatchEndpointKey(dispatchEndpointFactsOf(attempt.runner)) !== endpointKey) {

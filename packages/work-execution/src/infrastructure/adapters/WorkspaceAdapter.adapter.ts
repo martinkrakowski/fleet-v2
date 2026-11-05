@@ -371,6 +371,96 @@ export function parseWorktreeList(stdout: string): ListedWorktreeEntry[] | null 
 function listedWorktreeAt(entries: readonly ListedWorktreeEntry[], targetPath: string): ListedWorktreeEntry | null {
   return entries.find((entry) => entry.path === targetPath) ?? null;
 }
+
+/** The outcome of resolving one worktree path in the clone's `worktree list`. */
+type ListedLaneWorktree =
+  | { readonly kind: 'entry'; readonly entry: ListedWorktreeEntry }
+  | { readonly kind: 'not-listed' }
+  | { readonly kind: 'unknown' }
+  | { readonly kind: 'refused' };
+
+/**
+ * Step 3 of `removeLaneWorktree`: find the worktree — git must list the
+ * path (or its physical form) as a worktree of this clone. A failed or
+ * exit-code-less list is `unknown`, a non-zero exit is `refused`, an
+ * unparsable listing is `unknown`.
+ */
+async function listedLaneWorktree(
+  executor: CommandExecutorPort,
+  clonePath: string,
+  worktreePath: string,
+): Promise<ListedLaneWorktree> {
+  const listRun = await executor.run(
+    ['git', '-C', clonePath, 'worktree', 'list', '--porcelain'],
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
+  if (listRun.exitCode === null || listRun.error !== undefined) {
+    return { kind: 'unknown' };
+  }
+  if (listRun.exitCode !== 0) {
+    return { kind: 'refused' };
+  }
+  const listed = parseWorktreeList(listRun.stdout);
+  if (listed === null) {
+    return { kind: 'unknown' };
+  }
+  const entry = listedWorktreeAt(listed, worktreePath);
+  if (entry !== null) {
+    return { kind: 'entry', entry };
+  }
+  // A symlinked worktree path (macOS `/var/folders/...` →
+  // `/private/var/...`) is listed under its physical form; accept
+  // either, as `alreadyPreparedOutcome` does. Unresolvable falls back
+  // to the path as given.
+  const physicalWorktreePath = await resolvePhysicalPath(executor, worktreePath, GIT_TIMEOUT_MS);
+  if (physicalWorktreePath !== null && physicalWorktreePath !== worktreePath) {
+    const physicalEntry = listedWorktreeAt(listed, physicalWorktreePath);
+    if (physicalEntry !== null) {
+      return { kind: 'entry', entry: physicalEntry };
+    }
+  }
+  return { kind: 'not-listed' };
+}
+
+/**
+ * Steps 6–7 of `removeLaneWorktree`: only a clean worktree goes — nothing
+ * uncommitted and no untracked file (`--untracked-files=all` lists every
+ * untracked file; ignored files are not listed and are lost on removal, as
+ * K-WT accepts) — then one `worktree remove` call with no flags. The branch
+ * is kept. The removal answers the branch tip the list showed, so the reap
+ * can journal it.
+ */
+async function removeCleanListedWorktree(
+  executor: CommandExecutorPort,
+  clonePath: string,
+  worktreePath: string,
+  branchTip: string,
+): Promise<RemoveLaneWorktreeResult> {
+  const statusRun = await executor.run(
+    ['git', '-C', worktreePath, 'status', '--porcelain', '--untracked-files=all'],
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
+  if (statusRun.exitCode === null || statusRun.error !== undefined) {
+    return { outcome: 'unknown' };
+  }
+  if (statusRun.exitCode !== 0) {
+    return { outcome: 'refused', reason: 'git-refused' };
+  }
+  if (statusRun.stdout.trim() !== '') {
+    return { outcome: 'refused', reason: 'dirty' };
+  }
+  const removeRun = await executor.run(
+    ['git', '-C', clonePath, 'worktree', 'remove', worktreePath],
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
+  if (removeRun.exitCode === null || removeRun.error !== undefined) {
+    return { outcome: 'unknown' };
+  }
+  if (removeRun.exitCode !== 0) {
+    return { outcome: 'refused', reason: 'git-refused' };
+  }
+  return { outcome: 'removed', branchTip };
+}
 const COMMIT_HEAD_PATTERN = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 const COMMIT_ATTEMPT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
@@ -429,6 +519,47 @@ function parseRawDiffTree(stdout: string): { readonly dstMode: string; readonly 
     entries.push({ dstMode: meta.slice(1).split(' ')[1] ?? '', path });
   }
   return entries;
+}
+
+/**
+ * Step 1 of `commitLaneOutput`: the request validation alone, before any
+ * command runs — the worktree root, the expected head, the attempt id, the
+ * implementer model and non-empty allowed-path prefixes.
+ */
+function commitRequestIsInvalid(request: CommitLaneOutputRequest): boolean {
+  const worktreeRefusal = worktreeRootRefusal(request.worktreePath);
+  const allowedPathPrefixes = request.allowedPathPrefixes;
+  const prefixesValid =
+    allowedPathPrefixes.length > 0 &&
+    allowedPathPrefixes.every((prefix) => typeof prefix === 'string' && prefix !== '');
+  return (
+    worktreeRefusal !== null ||
+    COMMIT_HEAD_PATTERN.test(request.expectedHead) !== true ||
+    COMMIT_ATTEMPT_ID_PATTERN.test(request.attemptId) !== true ||
+    isValidAgyModel(request.implementerModel) !== true ||
+    prefixesValid !== true
+  );
+}
+
+/**
+ * Step 7b of `commitLaneOutput`: the staged-tree check. Raw `-z` output:
+ * ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0" per entry.
+ * Parsed strictly: anything that is not a sequence of complete, well-formed
+ * records refuses (fail closed). A symlink (120000) or gitlink (160000) is
+ * never committed, nor a protected path, nor anything outside the prefixes.
+ */
+function stagedTreeOutsideAllowedPaths(diffStdout: string, allowedPathPrefixes: readonly string[]): boolean {
+  const entries = parseRawDiffTree(diffStdout);
+  return (
+    entries === null ||
+    entries.some(
+      (entry) =>
+        entry.dstMode === '120000' ||
+        entry.dstMode === '160000' ||
+        isFixedProtectedPath(entry.path) ||
+        allowedPathPrefixes.some((prefix) => pathUnderPrefix(entry.path, prefix)) !== true,
+    )
+  );
 }
 
 function patchPathRefusal(patchPath: unknown, worktreePath: string): 'invalid-request' | 'patch-path-inside-worktree' | null {
@@ -980,18 +1111,7 @@ export class WorkspaceAdapter implements WorkspacePort {
 
   async commitLaneOutput(request: CommitLaneOutputRequest): Promise<CommitLaneOutputResult> {
     // 1. Validate before any command runs.
-    const worktreeRefusal = worktreeRootRefusal(request.worktreePath);
-    const allowedPathPrefixes = request.allowedPathPrefixes;
-    const prefixesValid =
-      allowedPathPrefixes.length > 0 &&
-      allowedPathPrefixes.every((prefix) => typeof prefix === 'string' && prefix !== '');
-    if (
-      worktreeRefusal !== null ||
-      COMMIT_HEAD_PATTERN.test(request.expectedHead) !== true ||
-      COMMIT_ATTEMPT_ID_PATTERN.test(request.attemptId) !== true ||
-      isValidAgyModel(request.implementerModel) !== true ||
-      prefixesValid !== true
-    ) {
+    if (commitRequestIsInvalid(request)) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
 
@@ -1019,30 +1139,10 @@ export class WorkspaceAdapter implements WorkspacePort {
     }
 
     // 5. HEAD must be the dispatch head; a crash after the commit reads as
-    // already-committed instead of a head-moved refusal. `already-committed`
-    // must prove the commit is this adapter's: the dispatch head as the only
-    // parent, this adapter's exact message, and a worktree holding nothing
-    // beyond that commit. A foreign commit carrying the trailer never passes.
+    // already-committed instead of a head-moved refusal (the ownership
+    // proof lives in `alreadyCommittedOutcome`).
     if (head !== request.expectedHead) {
-      const parentsRun = await this.runCommitGit(executor, worktreePath, ['show', '-s', '--format=%P', 'HEAD']);
-      if (!parentsRun.ok) return { outcome: 'error', reason: parentsRun.reason };
-      const parents = parentsRun.stdout.trim();
-      if (parents !== request.expectedHead) {
-        return { outcome: 'refused', reason: 'head-moved' };
-      }
-      const messageRun = await this.runCommitGit(executor, worktreePath, ['show', '-s', '--format=%B', 'HEAD']);
-      if (!messageRun.ok) return { outcome: 'error', reason: messageRun.reason };
-      const expectedMessage = editOnlyCommitMessage(request.attemptId, request.implementerModel);
-      // Trailing whitespace only: a leading newline or space is an agent-written body.
-      if (messageRun.stdout.replace(/\s+$/u, '') !== expectedMessage.replace(/\s+$/u, '')) {
-        return { outcome: 'refused', reason: 'head-moved' };
-      }
-      const ownershipTree = await this.stageAndCompareWithHeadTree(executor, worktreePath);
-      if (!ownershipTree.ok) return { outcome: 'error', reason: ownershipTree.reason };
-      if (ownershipTree.tree !== ownershipTree.headTree) {
-        return { outcome: 'refused', reason: 'head-moved' };
-      }
-      return { outcome: 'already-committed', headCommit: head, branchRef };
+      return this.alreadyCommittedOutcome(executor, request, worktreePath, head, branchRef);
     }
 
     // 6–7. Stage the change set, write the staged tree and compare it with
@@ -1064,21 +1164,7 @@ export class WorkspaceAdapter implements WorkspacePort {
       ['diff-tree', '-r', '--no-renames', '-z', request.expectedHead, tree],
     );
     if (!diffTreeRun.ok) return { outcome: 'error', reason: diffTreeRun.reason };
-    // Raw `-z` output: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0" per entry.
-    // Parsed strictly: anything that is not a sequence of complete, well-formed
-    // records refuses (fail closed). A symlink (120000) or gitlink (160000) is
-    // never committed, nor a protected path, nor anything outside the prefixes.
-    const entries = parseRawDiffTree(diffTreeRun.stdout);
-    const outsideAllowedPaths =
-      entries === null ||
-      entries.some(
-        (entry) =>
-          entry.dstMode === '120000' ||
-          entry.dstMode === '160000' ||
-          isFixedProtectedPath(entry.path) ||
-          allowedPathPrefixes.some((prefix) => pathUnderPrefix(entry.path, prefix)) !== true,
-      );
-    if (outsideAllowedPaths) {
+    if (stagedTreeOutsideAllowedPaths(diffTreeRun.stdout, request.allowedPathPrefixes)) {
       return { outcome: 'refused', reason: 'outside-allowed-paths' };
     }
 
@@ -1108,6 +1194,41 @@ export class WorkspaceAdapter implements WorkspacePort {
 
     // 10. Done.
     return { outcome: 'committed', headCommit: commit, branchRef };
+  }
+
+  /**
+   * The already-committed path: HEAD moved past `expectedHead` and the
+   * commit must be proven to be this adapter's — the dispatch head as the
+   * only parent, this adapter's exact message, and a worktree holding
+   * nothing beyond that commit. A foreign commit carrying the trailer never
+   * passes.
+   */
+  private async alreadyCommittedOutcome(
+    executor: CommandExecutorPort,
+    request: CommitLaneOutputRequest,
+    worktreePath: string,
+    head: string,
+    branchRef: string,
+  ): Promise<CommitLaneOutputResult> {
+    const parentsRun = await this.runCommitGit(executor, worktreePath, ['show', '-s', '--format=%P', 'HEAD']);
+    if (!parentsRun.ok) return { outcome: 'error', reason: parentsRun.reason };
+    const parents = parentsRun.stdout.trim();
+    if (parents !== request.expectedHead) {
+      return { outcome: 'refused', reason: 'head-moved' };
+    }
+    const messageRun = await this.runCommitGit(executor, worktreePath, ['show', '-s', '--format=%B', 'HEAD']);
+    if (!messageRun.ok) return { outcome: 'error', reason: messageRun.reason };
+    const expectedMessage = editOnlyCommitMessage(request.attemptId, request.implementerModel);
+    // Trailing whitespace only: a leading newline or space is an agent-written body.
+    if (messageRun.stdout.replace(/\s+$/u, '') !== expectedMessage.replace(/\s+$/u, '')) {
+      return { outcome: 'refused', reason: 'head-moved' };
+    }
+    const ownershipTree = await this.stageAndCompareWithHeadTree(executor, worktreePath);
+    if (!ownershipTree.ok) return { outcome: 'error', reason: ownershipTree.reason };
+    if (ownershipTree.tree !== ownershipTree.headTree) {
+      return { outcome: 'refused', reason: 'head-moved' };
+    }
+    return { outcome: 'already-committed', headCommit: head, branchRef };
   }
 
   /**
@@ -1463,108 +1584,63 @@ export class WorkspaceAdapter implements WorkspacePort {
     if (selector === undefined) {
       return { outcome: 'unknown' };
     }
-    let executor: CommandExecutorPort;
     try {
       const resolved = selector(request.recordedHost);
       if (!resolved.ok) {
         return { outcome: 'unknown' };
       }
-      executor = resolved.executor;
+      return await this.removeListedLaneWorktree(request, resolved.executor);
     } catch {
       return { outcome: 'unknown' };
     }
+  }
 
+  /**
+   * Steps 3–7 of `removeLaneWorktree` on a resolved executor: find the
+   * worktree in the clone's list, check its branch, tip and lock, then
+   * remove it only when it is clean. The outer try/catch stays in
+   * `removeLaneWorktree` and answers `unknown` on any throw.
+   */
+  private async removeListedLaneWorktree(
+    request: RemoveLaneWorktreeRequest,
+    executor: CommandExecutorPort,
+  ): Promise<RemoveLaneWorktreeResult> {
     const { clonePath, worktreePath, branch } = request;
-
-    try {
-      // 3. Find the worktree: git must list the path (or its physical form)
-      //    as a worktree of this clone.
-      const listRun = await executor.run(
-        ['git', '-C', clonePath, 'worktree', 'list', '--porcelain'],
-        { timeoutMs: GIT_TIMEOUT_MS },
-      );
-      if (listRun.exitCode === null || listRun.error !== undefined) {
-        return { outcome: 'unknown' };
-      }
-      if (listRun.exitCode !== 0) {
-        return { outcome: 'refused', reason: 'git-refused' };
-      }
-      const listed = parseWorktreeList(listRun.stdout);
-      if (listed === null) {
-        return { outcome: 'unknown' };
-      }
-      let entry = listedWorktreeAt(listed, worktreePath);
-      if (entry === null) {
-        // A symlinked worktree path (macOS `/var/folders/...` →
-        // `/private/var/...`) is listed under its physical form; accept
-        // either, as `alreadyPreparedOutcome` does. Unresolvable falls back
-        // to the path as given.
-        const physicalWorktreePath = await resolvePhysicalPath(executor, worktreePath, GIT_TIMEOUT_MS);
-        if (physicalWorktreePath !== null && physicalWorktreePath !== worktreePath) {
-          entry = listedWorktreeAt(listed, physicalWorktreePath);
-        }
-      }
-      if (entry === null) {
-        // Not listed: gone is `already-removed`; a present path that git
-        // does not list as a worktree of this clone is never touched.
-        const exists = await this.pathExists(worktreePath, worktreePath, executor);
-        return exists
-          ? { outcome: 'refused', reason: 'not-a-worktree' }
-          : { outcome: 'already-removed' };
-      }
-
-      // 4. The branch is the record of the run (D17): a detached entry, or
-      //    one on another branch, is refused, never removed.
-      if (entry.branch === null || entry.branch !== branch) {
-        return { outcome: 'refused', reason: 'branch-mismatch' };
-      }
-
-      // 4b. The listed tip is what the reap journals as the recovery handle, so
-      //     it must be a real commit before anything is removed; an unborn or
-      //     unreadable HEAD answers unknown with nothing removed.
-      const branchTip = entry.head;
-      if (branchTip === null || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(branchTip) || /^0+$/.test(branchTip)) {
-        return { outcome: 'unknown' };
-      }
-
-      // 5. A locked worktree is never removed.
-      if (entry.locked) {
-        return { outcome: 'refused', reason: 'locked' };
-      }
-
-      // 6. Only a clean worktree goes: nothing uncommitted and no untracked
-      //    file (`--untracked-files=all` lists every untracked file; ignored
-      //    files are not listed and are lost on removal, as K-WT accepts).
-      const statusRun = await executor.run(
-        ['git', '-C', worktreePath, 'status', '--porcelain', '--untracked-files=all'],
-        { timeoutMs: GIT_TIMEOUT_MS },
-      );
-      if (statusRun.exitCode === null || statusRun.error !== undefined) {
-        return { outcome: 'unknown' };
-      }
-      if (statusRun.exitCode !== 0) {
-        return { outcome: 'refused', reason: 'git-refused' };
-      }
-      if (statusRun.stdout.trim() !== '') {
-        return { outcome: 'refused', reason: 'dirty' };
-      }
-
-      // 7. Remove: one call, no flags. The branch is kept. The removal
-      //    answers the branch tip the list showed, so the reap can journal it.
-      const removeRun = await executor.run(
-        ['git', '-C', clonePath, 'worktree', 'remove', worktreePath],
-        { timeoutMs: GIT_TIMEOUT_MS },
-      );
-      if (removeRun.exitCode === null || removeRun.error !== undefined) {
-        return { outcome: 'unknown' };
-      }
-      if (removeRun.exitCode !== 0) {
-        return { outcome: 'refused', reason: 'git-refused' };
-      }
-      return { outcome: 'removed', branchTip };
-    } catch {
+    const found = await listedLaneWorktree(executor, clonePath, worktreePath);
+    if (found.kind === 'unknown') {
       return { outcome: 'unknown' };
     }
+    if (found.kind === 'refused') {
+      return { outcome: 'refused', reason: 'git-refused' };
+    }
+    if (found.kind === 'not-listed') {
+      // Not listed: gone is `already-removed`; a present path that git
+      // does not list as a worktree of this clone is never touched.
+      const exists = await this.pathExists(worktreePath, worktreePath, executor);
+      return exists
+        ? { outcome: 'refused', reason: 'not-a-worktree' }
+        : { outcome: 'already-removed' };
+    }
+
+    // 4. The branch is the record of the run (D17): a detached entry, or
+    //    one on another branch, is refused, never removed.
+    if (found.entry.branch === null || found.entry.branch !== branch) {
+      return { outcome: 'refused', reason: 'branch-mismatch' };
+    }
+
+    // 4b. The listed tip is what the reap journals as the recovery handle, so
+    //     it must be a real commit before anything is removed; an unborn or
+    //     unreadable HEAD answers unknown with nothing removed.
+    const branchTip = found.entry.head;
+    if (branchTip === null || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(branchTip) || /^0+$/.test(branchTip)) {
+      return { outcome: 'unknown' };
+    }
+
+    // 5. A locked worktree is never removed.
+    if (found.entry.locked) {
+      return { outcome: 'refused', reason: 'locked' };
+    }
+    return removeCleanListedWorktree(executor, clonePath, worktreePath, branchTip);
   }
 
   /**

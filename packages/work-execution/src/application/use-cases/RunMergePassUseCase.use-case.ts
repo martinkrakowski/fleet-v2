@@ -222,6 +222,17 @@ export class RunMergePassUseCase implements RunMergePassPort {
       decision = second;
     }
 
+    if (request.policy.shadow === true) {
+      // The action journaled now completes its own open intent with its real
+      // reason (journalShadowAct); every other open shadow intent is closed.
+      const current =
+        decision.kind === 'act' && decision.execution === 'shadow'
+          ? decision.action === 'premerge-carry'
+            ? 'post-status'
+            : decision.action
+          : null;
+      await this.closeOpenShadowIntents(request, entry, current);
+    }
     return this.actOnDecision(request, entry, decision);
   }
 
@@ -315,6 +326,67 @@ export class RunMergePassUseCase implements RunMergePassPort {
     }
 
     return this.appendShadowResult(request, entry, decision, key);
+  }
+
+  /**
+   * Under a shadow policy every merge intent this pass family writes is a
+   * dry-run, so an intent left open by an earlier pass's spent budget is
+   * closed here after the decider runs, whatever it decides now (the PR may
+   * have closed or its head moved). The result is `dry-run` with reason
+   * `shadow-intent-closed`; nothing external ran, so nothing is re-read. A
+   * live policy leaves open intents to DT9b's reconcile, which re-reads the
+   * forge.
+   */
+  private async closeOpenShadowIntents(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    except: string | null,
+  ): Promise<void> {
+    const head12 = head12Of(entry.headOid);
+    if (head12 === null) {
+      return;
+    }
+    for (const action of ['merge-pr', 'update-branch', 'post-status'] as const) {
+      if (action === except) {
+        continue;
+      }
+      const built = buildMergeKey({
+        repoDigest: request.repoDigest,
+        pullRequest: entry.pullRequest,
+        head12,
+        action,
+        attemptOrdinal: null,
+        retry: null,
+      });
+      if (!built.ok) {
+        continue;
+      }
+      this.ensureBudget(request); // D-DT9: guard before the journal read
+      const existing = await this.deps.journal.listForKey(built.key);
+      const open =
+        existing.some((candidate) => candidate.kind === 'intent') &&
+        !existing.some((candidate) => candidate.kind === 'result');
+      if (!open) {
+        continue;
+      }
+      this.ensureBudget(request); // D-DT9: guard before the result append
+      await this.deps.journal.append({
+        version: LANE_RUN_JOURNAL_ENTRY_VERSION,
+        entryId: this.deps.newUlid(),
+        kind: 'result',
+        key: built.key,
+        runId: entry.runId,
+        recordedAtIso: this.deps.nowIso(),
+        mode: null,
+        expectedRevision: null,
+        mintedId: null,
+        outcome: 'dry-run',
+        reasonCode: 'shadow-intent-closed',
+        detail: null,
+        grantId: null,
+        state: null,
+      });
+    }
   }
 
   /** The `dry-run` result that completes a shadow act's intent. */

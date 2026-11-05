@@ -390,6 +390,26 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
     expect(await journalOf(journal)).toHaveLength(2);
   });
 
+  it('an open shadow intent is closed on the next pass even when the decision changed', async () => {
+    // The PR closed after an earlier pass appended its intent: the decider no
+    // longer asks for a merge, and the open intent still gets its result.
+    const closedForge = { ...greenForge, prState: 'closed' } as ReadForgeMergeResult;
+    const { useCase, deps, request } = makeUseCase([makeEntry()], closedForge);
+    const key = `merge/${DIGEST}/1/${HEAD12}/merge-pr`;
+    await deps.journal.append({
+      version: 1, entryId: '01JB0000000000000000000099', kind: 'intent', key, runId: makeEntry().runId,
+      recordedAtIso: NOW, mode: null, expectedRevision: null, mintedId: null, outcome: null,
+      reasonCode: null, detail: null, grantId: null, state: null,
+    } as LaneRunJournalEntryRecord);
+
+    await useCase.runMergePass(request);
+
+    const after = await deps.journal.listForKey(key);
+    expect(after.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(after[1].outcome).toBe('dry-run');
+    expect(after[1].reasonCode).toBe('shadow-intent-closed');
+  });
+
   it('a null request or one without a repository is refused, never thrown on', async () => {
     const { useCase, request } = makeUseCase([makeEntry()], greenForge);
     for (const bad of [null, { ...request, repository: undefined }, { ...request, repository: { owner: 1, repo: REPO } }]) {

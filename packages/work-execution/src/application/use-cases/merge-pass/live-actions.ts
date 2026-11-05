@@ -186,41 +186,85 @@ function readRetry(
   return { ordinal: input['ordinal'], proof: (input['proof'] ?? null) as MergeKeyRetryProof | null };
 }
 
+function readExecution(
+  action: MergeLiveActionKind,
+  execution: unknown,
+  shadowReason: unknown,
+): { readonly execution: 'live' | 'shadow'; readonly shadowReason: MergeShadowReason | null } | null {
+  if (execution === 'shadow' && shadowReason === SHADOW_REASON_BY_ACTION[action]) {
+    return { execution, shadowReason: SHADOW_REASON_BY_ACTION[action] };
+  }
+  if (execution === 'live' && shadowReason === null) {
+    return { execution, shadowReason: null };
+  }
+  return null;
+}
+
+function readTimes(
+  nowIso: unknown,
+  deadlineIso: unknown,
+): { readonly nowIso: string; readonly deadlineIso: string; readonly nowMs: number; readonly deadlineMs: number } | null {
+  if (typeof nowIso !== 'string' || typeof deadlineIso !== 'string') {
+    return null;
+  }
+  const nowMs = Date.parse(nowIso);
+  const deadlineMs = Date.parse(deadlineIso);
+  if (!Number.isFinite(nowMs) || !Number.isFinite(deadlineMs) || deadlineMs <= nowMs) {
+    return null;
+  }
+  return { nowIso, deadlineIso, nowMs, deadlineMs };
+}
+
+/** Step 2 — build the key (never by hand). A malformed retry is refused, never read as the base key. */
+function buildKey(
+  entry: MergeQueueEntryRecord,
+  action: MergeLiveActionKind,
+  expectedHeadOid: string,
+  retryInput: unknown,
+): string | null {
+  const retry = readRetry(retryInput);
+  const head12 = head12Of(expectedHeadOid);
+  if (retry === 'invalid' || head12 === null) {
+    return null;
+  }
+  const builtKey = buildMergeKey({
+    repoDigest: entry.repoDigest,
+    pullRequest: entry.pullRequest,
+    head12,
+    action,
+    attemptOrdinal: null,
+    retry: (retry?.ordinal ?? null) as number | null,
+    retryProof: retry?.proof ?? null,
+  });
+  return builtKey.ok ? builtKey.key : null;
+}
+
+/** The entry, if it reads and is live; null otherwise (a merged/dropped/superseded entry never acts). */
+function readLiveEntry(input: unknown): MergeQueueEntryRecord | null {
+  const entryRead = readMergeQueueEntryRecord(input);
+  return entryRead.ok && isMergeQueueEntryLive(entryRead.record) ? entryRead.record : null;
+}
+
 /** Step 1 and step 2: validate the request and build its key. Nothing is written; no port is called. */
 function validateRequest(input: unknown): Validation {
   if (!isRecord(input)) {
     return { ok: false, reasonCode: 'invalid-request' };
   }
-  const entryRead = readMergeQueueEntryRecord(input['entry']);
-  if (!entryRead.ok) {
-    return { ok: false, reasonCode: 'invalid-entry' };
-  }
-  const entry = entryRead.record;
-  if (!isMergeQueueEntryLive(entry)) {
+  const entry = readLiveEntry(input['entry']);
+  if (entry === null) {
     return { ok: false, reasonCode: 'invalid-entry' };
   }
   const action = input['action'];
   if (!isLiveActionKind(action)) {
     return { ok: false, reasonCode: 'invalid-action' };
   }
-  const execution = input['execution'];
-  const shadowReason = input['shadowReason'];
-  let validShadowReason: MergeShadowReason | null;
-  if (execution === 'shadow') {
-    if (shadowReason !== SHADOW_REASON_BY_ACTION[action]) {
-      return { ok: false, reasonCode: 'invalid-execution' };
-    }
-    validShadowReason = SHADOW_REASON_BY_ACTION[action];
-  } else if (execution === 'live' && shadowReason === null) {
-    validShadowReason = null;
-  } else {
+  const mode = readExecution(action, input['execution'], input['shadowReason']);
+  if (mode === null) {
     return { ok: false, reasonCode: 'invalid-execution' };
   }
   const expectedHeadOid = input['expectedHeadOid'];
-  if (!isMergeHex40(expectedHeadOid) || expectedHeadOid !== entry.headOid) {
-    return { ok: false, reasonCode: 'invalid-head' };
-  }
-  if (action === 'merge-pr' && entry.verifiedHeadOid !== entry.headOid) {
+  const headVerified = action !== 'merge-pr' || entry.verifiedHeadOid === entry.headOid;
+  if (!isMergeHex40(expectedHeadOid) || expectedHeadOid !== entry.headOid || !headVerified) {
     return { ok: false, reasonCode: 'invalid-head' };
   }
   const branchName = input['branchName'];
@@ -235,52 +279,17 @@ function validateRequest(input: unknown): Validation {
   if (status === 'invalid') {
     return { ok: false, reasonCode: 'invalid-status' };
   }
-  const nowIso = input['nowIso'];
-  const deadlineIso = input['deadlineIso'];
-  if (typeof nowIso !== 'string' || typeof deadlineIso !== 'string') {
+  const times = readTimes(input['nowIso'], input['deadlineIso']);
+  if (times === null) {
     return { ok: false, reasonCode: 'invalid-deadline' };
   }
-  const nowMs = Date.parse(nowIso);
-  const deadlineMs = Date.parse(deadlineIso);
-  if (!Number.isFinite(nowMs) || !Number.isFinite(deadlineMs) || deadlineMs <= nowMs) {
-    return { ok: false, reasonCode: 'invalid-deadline' };
-  }
-
-  // Step 2 — build the key (never by hand). A malformed retry is refused, never read as the base key.
-  const retry = readRetry(input['retry']);
-  const head12 = head12Of(expectedHeadOid);
-  if (retry === 'invalid' || head12 === null) {
-    return { ok: false, reasonCode: 'invalid-key' };
-  }
-  const builtKey = buildMergeKey({
-    repoDigest: entry.repoDigest,
-    pullRequest: entry.pullRequest,
-    head12,
-    action,
-    attemptOrdinal: null,
-    retry: (retry?.ordinal ?? null) as number | null,
-    retryProof: retry?.proof ?? null,
-  });
-  if (!builtKey.ok) {
+  const key = buildKey(entry, action, expectedHeadOid, input['retry']);
+  if (key === null) {
     return { ok: false, reasonCode: 'invalid-key' };
   }
   return {
     ok: true,
-    request: {
-      entry,
-      action,
-      execution,
-      shadowReason: validShadowReason,
-      expectedHeadOid,
-      branchName,
-      grantId,
-      status,
-      nowIso,
-      deadlineIso,
-      nowMs,
-      deadlineMs,
-      key: builtKey.key,
-    },
+    request: { entry, action, ...mode, expectedHeadOid, branchName, grantId, status, ...times, key },
   };
 }
 

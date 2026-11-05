@@ -315,7 +315,11 @@ export class RunMergePassUseCase implements RunMergePassPort {
       grantId: null,
       state: null,
     };
-    this.ensureBudget(request); // D-DT9: guard before the result append
+    // The result append completes the intent already journaled. The budget
+    // guard ran before the intent append (D-DT9): once the pair is started it
+    // is finished, because a spent budget mid-pair would leave a dangling
+    // intent that a later pass reads as `already-journalled`, and the dry-run
+    // result would never be recorded.
     const appendedResult = await this.deps.journal.append(result);
     if (appendedResult.outcome === 'refused') {
       return this.report(

@@ -332,6 +332,64 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
     expect(deps.forgeRead.calls).toBe(0);
   });
 
+  it('completes the intent and result pair when the budget expires between the appends', async () => {
+    // The pass clock jumps past the deadline the moment the intent is appended.
+    // The result must still be appended: a mid-pair budget split would leave a
+    // dangling intent that later passes read as `already-journalled`, and the
+    // dry-run result would never be recorded.
+    const journal = new LaneRunJournalAdapter();
+    let clock = NOW;
+    const clockControlledJournal: Pick<LaneRunJournalPort, 'append' | 'listForKey'> = {
+      async append(entry) {
+        const appended = await journal.append(entry);
+        if (appended.outcome === 'appended' && entry.kind === 'intent') {
+          clock = '2026-11-01T12:15:00.000Z'; // past DEADLINE
+        }
+        return appended;
+      },
+      async listForKey(key) {
+        return journal.listForKey(key);
+      },
+    };
+
+    const forgeRead = forgeReadFake(greenForge);
+    const verification = verificationFake();
+    let ulid = 0;
+    const useCase = new RunMergePassUseCase({
+      queue: queueFake([makeEntry()]),
+      forgeRead,
+      verification,
+      journal: clockControlledJournal,
+      halt: haltFake,
+      newUlid: () => `01JB${String(++ulid).padStart(22, '0').slice(-22)}`,
+      nowIso: () => clock,
+    });
+    const request: RunMergePassRequest = {
+      repository: { owner: OWNER, repo: REPO },
+      repoDigest: DIGEST,
+      projectId: 'proj-1',
+      policy: makePolicy(),
+      deadlineIso: DEADLINE,
+    };
+
+    const result = await useCase.runMergePass(request);
+
+    expect(result.outcome).toBe('completed');
+    expect(result.entries[0]).toEqual({
+      entryId: expect.any(String),
+      head12: HEAD12,
+      decision: 'journalled',
+      reasonCode: 'would-merge',
+      journalKey: `merge/${DIGEST}/1/${HEAD12}/merge-pr`,
+    });
+    const entries = await journalOf(journal);
+    expect(entries).toHaveLength(2);
+    expect(entries[0].kind).toBe('intent');
+    expect(entries[1].kind).toBe('result');
+    expect(entries[1].outcome).toBe('dry-run');
+    expect(entries[1].reasonCode).toBe('would-merge');
+  });
+
   it('an unknown veto never blocks the shadow merge', async () => {
     const { useCase, deps, request } = makeUseCase([makeEntry()], greenForge, {
       veto: { mode: 'shadow' },

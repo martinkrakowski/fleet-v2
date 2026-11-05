@@ -18,6 +18,7 @@ import type { AttemptRecord } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
 import {
+  laneRunConductEntry,
   laneRunIntentEntry,
   laneRunResultEntry,
 } from '../../../domain/lane-run-step-facts.js';
@@ -171,6 +172,13 @@ export interface LaneRunScenario {
   journal(): Promise<readonly LaneRunJournalEntryRecord[]>;
   /** The run record as stored. */
   record(): Promise<LaneRunRecord | null>;
+  /** How many times the fake dispatch port has been called so far. */
+  dispatchCalls(): number;
+}
+
+export interface LaneRunScenarioOptions {
+  /** When set, the fixture appends one terminal conduct entry at setup, so the run starts terminal. */
+  readonly terminalState?: 'merged' | 'stopped';
 }
 
 /**
@@ -180,7 +188,10 @@ export interface LaneRunScenario {
  * `completed` — the benign outcome that keeps every later pass settled —
  * so a short sequence still drives all four passes.
  */
-export async function makeLaneRunScenario(outcomes: readonly PortOutcome[]): Promise<LaneRunScenario> {
+export async function makeLaneRunScenario(
+  outcomes: readonly PortOutcome[],
+  options: LaneRunScenarioOptions = {},
+): Promise<LaneRunScenario> {
   const runRepo = new LaneRunRepositoryAdapter();
   const runJournal = new LaneRunJournalAdapter();
   const attemptRepo = new AttemptRepositoryAdapter();
@@ -188,6 +199,7 @@ export async function makeLaneRunScenario(outcomes: readonly PortOutcome[]): Pro
   const newUlid = makeUlidMinter();
 
   let cursor = 0;
+  let dispatchCallCount = 0;
   const nextOutcome = (): PortOutcome => {
     const outcome = outcomes[cursor];
     cursor += 1;
@@ -220,6 +232,7 @@ export async function makeLaneRunScenario(outcomes: readonly PortOutcome[]): Pro
 
   const dispatchAttempt = {
     dispatchAttempt: async (): Promise<DispatchAttemptResult> => {
+      dispatchCallCount += 1;
       const outcome = nextOutcome();
       if (outcome === 'thrown') {
         throw new FakePortThrowError('runner threw');
@@ -330,6 +343,15 @@ export async function makeLaneRunScenario(outcomes: readonly PortOutcome[]): Pro
     throw new Error('fixture must append the prepare result');
   }
 
+  if (options.terminalState !== undefined) {
+    const appendedConduct = await runJournal.append(
+      laneRunConductEntry(newUlid(), RUN_ID, options.terminalState, NOW),
+    );
+    if (appendedConduct.outcome !== 'appended') {
+      throw new Error('fixture must append the terminal conduct entry');
+    }
+  }
+
   const useCase = new AdvanceLaneRunUseCase(deps);
   return {
     deps,
@@ -342,6 +364,7 @@ export async function makeLaneRunScenario(outcomes: readonly PortOutcome[]): Pro
       }),
     journal: () => runJournal.listForRun(RUN_ID),
     record: () => runRepo.get(RUN_ID),
+    dispatchCalls: () => dispatchCallCount,
   };
 }
 

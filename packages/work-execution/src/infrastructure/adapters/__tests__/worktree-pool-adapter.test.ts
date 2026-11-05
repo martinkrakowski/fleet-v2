@@ -78,6 +78,7 @@ class FakeHost implements CommandExecutorPort {
       return OK();
     }
     if (cmd === 'find') {
+      if (a.includes('-delete')) { for (const k of [...this.claims.keys()]) if (k.endsWith('.reset') && this.stale.has(k.slice(CLAIMS.length + 1))) this.claims.delete(k); return OK(); }
       return OK([...this.stale].map((s) => `${CLAIMS}/${s}`).join('\n'));
     }
     return FAIL('unscripted');
@@ -343,6 +344,20 @@ describe('WorktreePoolAdapter resetToBase', () => {
     expect(host.calls.some((c) => c.argv.includes('rm') && c.argv.includes('-rf') && !c.argv.some((w) => w.endsWith('/.lane')))).toBe(false);
   });
 
+  it('lets only one reset run on a claimed slot, and clears a stale reset guard', async () => {
+    const host = new FakeHost();
+    host.add(1);
+    const adapter = make(host);
+    await take(adapter, 'run-1');
+    const req = { worktreePath: `${POOL}/w1`, baseCommit: NEXT, recordedHost: HOST };
+    const results = await Promise.all([adapter.resetToBase(req), adapter.resetToBase(req)]);
+    expect(results.map((r) => r.outcome).sort()).toEqual(['reset', 'unknown']);
+    host.claims.set(`${CLAIMS}/w1.reset`, 'reset');
+    host.stale.add('w1.reset');
+    expect((await adapter.refillAfterMerge({ projectId: 'proj', mergedBaseCommit: NEXT, recordedHost: HOST })).outcome).toBe('refilled');
+    expect(host.claims.has(`${CLAIMS}/w1.reset`)).toBe(false);
+  });
+
   it('reports unknown when the executor does not answer', async () => {
     const host = new FakeHost();
     host.add(1);
@@ -389,6 +404,14 @@ describe('WorktreePoolAdapter refillAfterMerge', () => {
     expect(result.outcome).toBe('refilled');
     expect(host.claims.size).toBe(0);
     expect(host.worktrees.has(`${POOL}/w2`)).toBe(true); // recreated clean after the reap
+  });
+
+  it('leaves a fresh prepare claim alone even while its worktree is not yet listed', async () => {
+    const host = new FakeHost();
+    host.claims.set(`${CLAIMS}/w1`, 'prepare-fresh');
+    await make(host).refillAfterMerge({ projectId: 'proj', mergedBaseCommit: BASE, recordedHost: HOST });
+    expect(host.claims.get(`${CLAIMS}/w1`)).toBe('prepare-fresh');
+    expect(host.worktrees.has(`${POOL}/w1`)).toBe(false);
   });
 
   it('does not reap a fresh prepare claim or a live taken claim', async () => {

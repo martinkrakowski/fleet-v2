@@ -108,6 +108,11 @@ interface ListedWorktree {
   readonly prunable: boolean;
 }
 
+interface PoolState {
+  readonly slots: Map<number, ListedWorktree>;
+  readonly claims: Map<number, string>;
+}
+
 interface PoolView {
   readonly poolDir: string;
   readonly claimsDir: string;
@@ -433,15 +438,37 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     if (known.kind === 'unknown') return { outcome: 'unknown' };
     if (known.kind === 'fail') return { outcome: 'refused', reason: 'invalid-request' };
 
-    // An unclaimed slot is guarded while it is rebuilt; a claimed one stays
-    // under its holder's claim (never opened to others mid-reset).
+    // One reset at a time per slot: an exclusive guard link beside the claim.
+    // An unclaimed slot is also held by a prepare claim while it is rebuilt; a
+    // claimed one stays under its holder's claim (never opened to others).
+    const resetGuard = `${view.claimsDir}/w${index}.reset`;
+    const made = await this.call(view, ['mkdir', '-p', '--', view.claimsDir], deadline);
+    if (made.kind !== 'ok') return { outcome: 'unknown' };
+    const guarded = await this.call(view, ['ln', '-s', '--', 'reset', resetGuard], deadline);
+    if (guarded.kind !== 'ok') return { outcome: 'unknown' };
+    try {
+      return await this.resetGuarded(view, projectId, index, slot.path, holder, base, deadline);
+    } finally {
+      await this.call(view, ['rm', '-f', '--', resetGuard], Math.max(deadline, this.now() + 5000));
+    }
+  }
+
+  private async resetGuarded(
+    view: PoolView,
+    projectId: string,
+    index: number,
+    path: string,
+    holder: string | undefined,
+    base: string,
+    deadline: number,
+  ): Promise<ResetWorktreeToBaseResult> {
     if (holder === undefined && !(await this.claim(view, index, `prepare-${randomUUID()}`, deadline))) {
       return { outcome: 'unknown' };
     }
-    const ready = await this.rebuild(view, slot.path, base, deadline);
+    const ready = await this.rebuild(view, path, base, deadline);
     if (ready !== 'yes') return { outcome: 'unknown' }; // the guard stays: it is reaped, never served
     if (!(await this.release(view, index, deadline))) return { outcome: 'unknown' };
-    const record = this.entry(projectId, index, slot.path, base, 'warm', null);
+    const record = this.entry(projectId, index, path, base, 'warm', null);
     return record === null ? { outcome: 'unknown' } : { outcome: 'reset', entry: record };
   }
 
@@ -487,74 +514,104 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     merged: string,
     deadline: number,
   ): Promise<RefillWorktreePoolResult> {
-    let slots = await this.listSlots(view, deadline);
-    let claims = slots === null ? null : await this.readClaims(view, deadline);
-    if (slots === null || claims === null) return { outcome: 'unknown' };
+    const state = await this.reap(view, deadline);
+    if (state === null) return { outcome: 'unknown' };
+    const { slots, claims } = state;
+    const target = clampInt(view.config.targetSize, 2, 1, this.maxEntries);
+    const ready = new Map<number, WorktreePoolEntryRecord>();
+    let failed = await this.reconcileIdle(view, projectId, merged, state, ready, deadline);
+    failed = (await this.createMissing(view, projectId, merged, state, target, ready, deadline)) || failed;
 
-    // Reap: a claim with no worktree, and a prepare claim past the stale window.
+    const entries = [...ready.entries()].sort((a, b) => a[0] - b[0]).map(([, record]) => record);
+    if (entries.length > 0) return { outcome: 'refilled', entries };
+    let used = 0;
+    for (let index = 1; index <= this.maxEntries; index += 1) {
+      if (slots.has(index) || claims.has(index)) used += 1;
+    }
+    return used >= this.maxEntries && !failed ? { outcome: 'refused', reason: 'pool-full' } : { outcome: 'unknown' };
+  }
+
+  /**
+   * Reap, then read the pool afresh. A claim with no worktree behind it is
+   * dangling, except a prepare claim, which guards a worktree still being
+   * added; a prepare claim is reaped only past the stale window, with its
+   * half-built tree. Null when the pool could not be read.
+   */
+  private async reap(view: PoolView, deadline: number): Promise<PoolState | null> {
+    const slots = await this.listSlots(view, deadline);
+    const claims = slots === null ? null : await this.readClaims(view, deadline);
+    if (slots === null || claims === null) return null;
     const stale = await this.stalePrepareClaims(view, deadline);
-    if (stale === null) return { outcome: 'unknown' };
+    if (stale === null) return null;
+    // A reset guard left by a crashed reset, past the stale window.
+    await this.call(
+      view,
+      ['find', view.claimsDir, '-mindepth', '1', '-maxdepth', '1', '-name', 'w*.reset', '-mmin', `+${this.staleMinutes()}`, '-delete'],
+      deadline,
+    );
     for (const [index, owner] of claims) {
       const slot = slots.get(index);
-      const dangling = slot === undefined || slot.prunable;
-      if (!(dangling || (owner.startsWith('prepare-') && stale.has(index)))) continue;
+      const isPrepare = owner.startsWith('prepare-');
+      const gone = slot === undefined || slot.prunable;
+      if (isPrepare ? !stale.has(index) : !gone) continue;
       if (slot !== undefined && !slot.prunable) {
         const removed = await this.git(view, view.config.repositoryPath, ['worktree', 'remove', '--force', slot.path], deadline);
         if (removed.kind !== 'ok') continue;
       }
       await this.release(view, index, deadline);
     }
-    if (claims.size > 0) {
-      await this.git(view, view.config.repositoryPath, ['worktree', 'prune'], deadline);
-      slots = await this.listSlots(view, deadline);
-      claims = slots === null ? null : await this.readClaims(view, deadline);
-      if (slots === null || claims === null) return { outcome: 'unknown' };
-    }
+    if (claims.size === 0) return { slots, claims };
+    await this.git(view, view.config.repositoryPath, ['worktree', 'prune'], deadline);
+    const freshSlots = await this.listSlots(view, deadline);
+    const freshClaims = freshSlots === null ? null : await this.readClaims(view, deadline);
+    return freshSlots === null || freshClaims === null ? null : { slots: freshSlots, claims: freshClaims };
+  }
 
-    const target = clampInt(view.config.targetSize, 2, 1, this.maxEntries);
-    const ready = new Map<number, WorktreePoolEntryRecord>();
+  /** Move idle warm entries to the merged base; true when one could not be proved warm. */
+  private async reconcileIdle(
+    view: PoolView,
+    projectId: string,
+    merged: string,
+    state: PoolState,
+    ready: Map<number, WorktreePoolEntryRecord>,
+    deadline: number,
+  ): Promise<boolean> {
     let failed = false;
-
-    // Move idle warm entries that sit at an older base.
-    for (const index of [...slots.keys()].sort((a, b) => a - b)) {
-      const slot = slots.get(index);
-      if (slot === undefined || slot.prunable || claims.has(index)) continue;
+    for (const index of [...state.slots.keys()].sort((a, b) => a - b)) {
+      const slot = state.slots.get(index);
+      if (slot === undefined || slot.prunable || state.claims.has(index)) continue;
+      let record: WorktreePoolEntryRecord | null = null;
       if (slot.head !== merged) {
         const reset = await this.resetIn(view, projectId, index, merged, deadline);
-        if (reset.outcome === 'reset') ready.set(index, reset.entry);
-        else failed = true;
-      } else {
-        const clean = await this.isCleanAt(view, slot.path, merged, deadline);
-        const record = clean === 'yes' ? this.entry(projectId, index, slot.path, merged, 'warm', null) : null;
-        if (record !== null) ready.set(index, record);
-        else failed = true;
+        record = reset.outcome === 'reset' ? reset.entry : null;
+      } else if ((await this.isCleanAt(view, slot.path, merged, deadline)) === 'yes') {
+        record = this.entry(projectId, index, slot.path, merged, 'warm', null);
       }
+      if (record === null) failed = true;
+      else ready.set(index, record);
     }
+    return failed;
+  }
 
-    // Create missing entries in free slots, up to the target.
-    let blockedByFullPool = false;
+  /** Create entries in free slots up to the target; true when one failed or time ran out. */
+  private async createMissing(
+    view: PoolView,
+    projectId: string,
+    merged: string,
+    state: PoolState,
+    target: number,
+    ready: Map<number, WorktreePoolEntryRecord>,
+    deadline: number,
+  ): Promise<boolean> {
+    let failed = false;
     for (let index = 1; index <= this.maxEntries && ready.size < target; index += 1) {
-      if (slots.has(index) || claims.has(index)) continue;
-      if (this.now() >= deadline) {
-        failed = true;
-        break;
-      }
+      if (state.slots.has(index) || state.claims.has(index)) continue;
+      if (this.now() >= deadline) return true;
       const created = await this.createSlot(view, projectId, index, merged, deadline);
       if (created.kind === 'ready') ready.set(index, created.entry);
-      else if (created.kind === 'lost') continue;
-      else failed = true;
+      else if (created.kind === 'failed') failed = true;
     }
-    if (ready.size < target) {
-      let used = 0;
-      for (let index = 1; index <= this.maxEntries; index += 1) {
-        if (slots.has(index) || claims.has(index)) used += 1;
-      }
-      blockedByFullPool = used >= this.maxEntries;
-    }
-
-    const entries = [...ready.entries()].sort((a, b) => a[0] - b[0]).map(([, record]) => record);
-    if (entries.length === 0) return blockedByFullPool && !failed ? { outcome: 'refused', reason: 'pool-full' } : { outcome: 'unknown' };
-    return { outcome: 'refilled', entries };
+    return failed;
   }
 
   private async createSlot(
@@ -592,12 +649,16 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     return { kind: 'ready', entry: record };
   }
 
+  private staleMinutes(): number {
+    return clampInt(this.options.stalePrepareMinutes, 90, 1, 100_000);
+  }
+
   /** Slots whose claim link is older than the stale window; null when unreadable. */
   private async stalePrepareClaims(view: PoolView, deadline: number): Promise<Set<number> | null> {
     const exists = await this.call(view, ['test', '-d', view.claimsDir], deadline);
     if (exists.kind === 'unknown') return null;
     if (exists.kind === 'fail') return new Set();
-    const minutes = clampInt(this.options.stalePrepareMinutes, 90, 1, 100_000);
+    const minutes = this.staleMinutes();
     const found = await this.call(
       view,
       ['find', view.claimsDir, '-mindepth', '1', '-maxdepth', '1', '-name', 'w*', '-mmin', `+${minutes}`],

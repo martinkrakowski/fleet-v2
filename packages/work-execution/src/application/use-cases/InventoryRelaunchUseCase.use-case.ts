@@ -127,6 +127,9 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
         typeof latest.runner?.hostName === 'string' && latest.runner.hostName.trim() !== ''
           ? latest.runner.hostName
           : 'unknown-host';
+      // When the request names one host, only that host's lanes belong in the
+      // inventory; a record that names no host (unknown-host) never matches.
+      if (request.hostName !== null && hostName !== request.hostName) continue;
       rows.push({
         population: conducted ? 'conducted' : 'attempt-recorded',
         laneId: conducted ? (runId ?? latest.id) : latest.id,
@@ -148,10 +151,18 @@ export class InventoryRelaunchUseCase implements InventoryRelaunchPort {
         continue;
       }
       hostClones.set(clone.hostName, (hostClones.get(clone.hostName) ?? 0) + 1);
-      const listed = await deps.workspace.listWorktrees?.({
-        repositoryRoot: clone.clonePath,
-        recordedHost: clone.recordedHost ?? undefined,
-      });
+      let listed: Awaited<ReturnType<NonNullable<typeof deps.workspace.listWorktrees>>> | undefined;
+      try {
+        listed = await deps.workspace.listWorktrees?.({
+          repositoryRoot: clone.clonePath,
+          recordedHost: clone.recordedHost ?? undefined,
+        });
+      } catch {
+        // A throwing read is an unreadable listing: counted as unknown,
+        // never thrown out of the inventory.
+        hostUnknownListings.set(clone.hostName, (hostUnknownListings.get(clone.hostName) ?? 0) + 1);
+        continue;
+      }
       if (listed === undefined || listed.outcome !== 'listed') {
         // An unreadable listing is counted and never throws, never guesses.
         hostUnknownListings.set(clone.hostName, (hostUnknownListings.get(clone.hostName) ?? 0) + 1);

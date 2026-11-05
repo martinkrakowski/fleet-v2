@@ -16,7 +16,7 @@ import type {
 import type {
   RepositoryFactsPort,
 } from '../ports/out/RepositoryFactsPort.out-port.js';
-import { wrapUntrusted } from '@fleet/evidence-and-acceptance';
+import { defangMarkerLikeTokens, wrapUntrusted } from '@fleet/evidence-and-acceptance';
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
 export const FACT_PACK_INPUT_RULE =
@@ -102,14 +102,16 @@ function secretShapeRuleName(text: string): string | null {
 /**
  * Renders the prompt shape: one untrusted block per fact, blank line between
  * blocks, one blank line after the rule. Pure: throws on a nonce or label
- * `wrapUntrusted` rejects, so the caller validates both first.
+ * `wrapUntrusted` rejects, so the caller validates both first. The rendered
+ * markers are defanged (`[<<<]`, not a bare `<<<`) so a reader cannot copy
+ * the prompt's own markers out of the rendered text.
  */
 export function renderFactPackPrompt(input: RenderFactPackPromptInput): string {
   const { laneId, repositoryPath, commit, sections, nonce } = input;
   const blocks = sections.map((section) => [
     `## ${section.label} (${section.path})`,
     '',
-    wrapUntrusted({ label: section.label, text: section.text, nonce }),
+    defangMarkerLikeTokens(wrapUntrusted({ label: section.label, text: section.text, nonce })),
   ].join('\n'));
   return [
     `# Fact pack - lane ${laneId}`,
@@ -140,7 +142,13 @@ export class BuildFactPackUseCase implements BuildFactPackPort {
       return { outcome: 'refused', refusal: INVALID_REQUEST };
     }
 
-    const nonce = this.mintNonce();
+    let nonce: string;
+    try {
+      nonce = this.mintNonce();
+    } catch {
+      // `wrapUntrusted` would throw; the use case never does.
+      return { outcome: 'refused', refusal: INVALID_REQUEST };
+    }
     if (!NONCE_PATTERN.test(nonce)) {
       // `wrapUntrusted` would throw; the use case never does.
       return { outcome: 'refused', refusal: INVALID_REQUEST };
@@ -148,7 +156,13 @@ export class BuildFactPackUseCase implements BuildFactPackPort {
 
     const sections: FactPackSection[] = [];
     for (const fact of request.facts) {
-      const read = await this.readFact(request, fact);
+      let read: Awaited<ReturnType<BuildFactPackUseCase['readFact']>>;
+      try {
+        read = await this.readFact(request, fact);
+      } catch {
+        // A rejecting port call is a read failure, not an exception path.
+        read = { outcome: 'refused', reason: 'fact-unreadable' };
+      }
       if (read.outcome !== 'read') {
         return {
           outcome: 'refused',

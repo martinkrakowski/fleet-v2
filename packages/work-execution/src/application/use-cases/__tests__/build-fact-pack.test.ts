@@ -86,12 +86,14 @@ describe('BuildFactPackUseCase', () => {
     }
     expect(result.factCount).toBe(2);
     expect(result.prompt).toContain(FACT_PACK_INPUT_RULE);
-    const openings = result.prompt.match(/<<<UNTRUSTED nonce=[0-9a-f]+ label="[^"]*">>>/g) ?? [];
-    const closings = result.prompt.match(/<<<END UNTRUSTED nonce=[0-9a-f]+>>>/g) ?? [];
+    const openings = result.prompt.match(/\[<<<\]UNTRUSTED nonce=[0-9a-f]+ label="[^"]*">>>/g) ?? [];
+    const closings = result.prompt.match(/\[<<<\]END UNTRUSTED nonce=[0-9a-f]+>>>/g) ?? [];
     expect(openings).toHaveLength(2);
     expect(closings).toHaveLength(2);
-    expect(result.prompt).toContain('<<<UNTRUSTED nonce=0123456789abcdef label="plan row">>>');
-    expect(result.prompt).toContain('first fact text\n<<<END UNTRUSTED nonce=0123456789abcdef>>>');
+    expect(result.prompt).toContain('[<<<]UNTRUSTED nonce=0123456789abcdef label="plan row">>>');
+    expect(result.prompt).toContain('first fact text\n[<<<]END UNTRUSTED nonce=0123456789abcdef>>>');
+    // No bare marker opener survives the rendering.
+    expect(result.prompt).not.toMatch(/(^|[^[])<<</);
     // The same nonce opens and closes every block.
     const nonces = [...result.prompt.matchAll(/nonce=([0-9a-f]+)/g)].map((match) => match[1]);
     expect(new Set(nonces).size).toBe(1);
@@ -171,6 +173,30 @@ describe('BuildFactPackUseCase', () => {
       refusal: { reason: 'invalid-request', label: null, rule: null },
     });
     expect(port.calls).toHaveLength(0);
+  });
+
+  it('refuses instead of throwing when mintNonce or the port rejects', async () => {
+    const throwingNonce = makeUseCase(new FakeRepositoryFactsPort(), () => {
+      throw new Error('entropy exhausted');
+    });
+    await expect(throwingNonce.buildFactPack(BASE_REQUEST)).resolves.toEqual({
+      outcome: 'refused',
+      refusal: { reason: 'invalid-request', label: null, rule: null },
+    });
+
+    const rejectingPort: RepositoryFactsPort = {
+      listFilesAtCommit: () => Promise.reject(new Error('port down')),
+      readFileRangeAtCommit: () => Promise.reject(new Error('port down')),
+      readMatchingLinesAtCommit: () => Promise.reject(new Error('port down')),
+    };
+    const result = await makeUseCase(rejectingPort).buildFactPack({
+      ...BASE_REQUEST,
+      facts: [{ kind: 'matching-lines', label: 'the fact', path: 'docs/a.md', token: 'x' }],
+    });
+    expect(result).toEqual({
+      outcome: 'refused',
+      refusal: { reason: 'fact-unreadable', label: 'the fact', rule: null },
+    });
   });
 
   it('reports an absent, unreadable or oversized fact as a refusal', async () => {

@@ -337,6 +337,19 @@ describe('fleet-v2 state compact', () => {
     expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
   });
 
+  it('refuses when a parent directory of a store, such as daemon, is a link', async () => {
+    const dir = makeTempDir();
+    const outside = makeTempDir();
+    await fs.writeFile(path.join(outside, 'status.json'), '{}\n');
+    await fs.symlink(outside, path.join(dir, 'daemon'));
+    const original = await seedFinished(dir);
+    const result = await compact(dir);
+    expect(result.code).toBe(1);
+    expect(result.err).toContain('state compact refused: daemon is a link');
+    expect(await fs.readFile(path.join(dir, 'attempts.json'), 'utf8')).toBe(original.attempts);
+    expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
+  });
+
   it('compacts when a directory-backed store such as daemon/leases exists', async () => {
     const dir = makeTempDir();
     await fs.mkdir(path.join(dir, 'daemon', 'leases'), { recursive: true });

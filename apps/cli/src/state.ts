@@ -479,9 +479,17 @@ async function compactPreflight(stateDir: string): Promise<string | null> {
   };
   try {
     for (const descriptor of STATE_FILE_DESCRIPTORS) {
-      const other = await lstatOrNull(path.join(stateDir, descriptor.basename));
-      if (other?.isSymbolicLink() === true) {
-        return `${descriptor.basename} is a link`;
+      // Every segment of the store's path, parents included: a linked parent directory leads out of the state directory too.
+      const segments = descriptor.basename.split('/');
+      for (let depth = 1; depth <= segments.length; depth += 1) {
+        const prefix = segments.slice(0, depth).join('/');
+        const other = await lstatOrNull(path.join(stateDir, prefix));
+        if (other?.isSymbolicLink() === true) {
+          return `${prefix} is a link`;
+        }
+        if (other === null) {
+          break;
+        }
       }
     }
     for (const basename of COMPACT_BASENAMES) {

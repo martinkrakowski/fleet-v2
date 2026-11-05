@@ -749,11 +749,7 @@ export async function performDispatch(ctx: AdvanceStepContext,
     timeLimitSeconds,
     expectedArtifacts,
     nowIso,
-    ...(seatOverride !== null ? { seatOverride } : {}),
-    ...(handover ? { allowUncommittedHandover: true } : {}),
-    ...(ctx.deps.installationSchemaVersion !== undefined
-      ? { installationSchemaVersion: ctx.deps.installationSchemaVersion }
-      : {}),
+    ...optionalDispatchFields(seatOverride, handover, ctx.deps.installationSchemaVersion),
   });
   if (dispatched.outcome === 'started' || dispatched.outcome === 'blocked' || dispatched.outcome === 'unknown') {
     return dispatchedOutcomeResult(ctx, facts, decision, request, dispatched);
@@ -791,7 +787,7 @@ export async function performDispatch(ctx: AdvanceStepContext,
   // The spent refusal key is already recorded above. Success returns acted
   // without parking so the next advance prepares the next seat.
   const detail = dispatchRefusalDetail(dispatched.reason);
-  return handoverOrRecovery(ctx, record, latest, request, detail, reasonCode, decision, facts.state);
+  return handoverOrRecovery(ctx, record, latest, request, { detail, reasonCode }, decision, facts.state);
 }
 
 function dispatchInputsOf(
@@ -865,16 +861,41 @@ function refusedDispatchReasonCode(
   return 'dispatch-refused';
 }
 
+/** The optional fields of a dispatch request, each present only when it has a value. */
+function optionalDispatchFields<TSeatOverride, TVersion>(
+  seatOverride: TSeatOverride | null,
+  handover: boolean,
+  installationSchemaVersion: TVersion | undefined,
+): { seatOverride?: TSeatOverride; allowUncommittedHandover?: true; installationSchemaVersion?: TVersion } {
+  const fields: { seatOverride?: TSeatOverride; allowUncommittedHandover?: true; installationSchemaVersion?: TVersion } = {};
+  if (seatOverride !== null) {
+    fields.seatOverride = seatOverride;
+  }
+  if (handover) {
+    fields.allowUncommittedHandover = true;
+  }
+  if (installationSchemaVersion !== undefined) {
+    fields.installationSchemaVersion = installationSchemaVersion;
+  }
+  return fields;
+}
+
+/** A refused dispatch's journalled detail and reason code. */
+interface DispatchRefusal {
+  readonly detail: string;
+  readonly reasonCode: 'runner-refused' | 'dispatch-refused';
+}
+
 async function handoverOrRecovery(
   ctx: AdvanceStepContext,
   record: LaneRunRecord,
   latest: AttemptRecord,
   request: AdvanceLaneRunRequest,
-  detail: string,
-  reasonCode: 'runner-refused' | 'dispatch-refused',
+  refusal: DispatchRefusal,
   decision: Extract<LaneRunDecision, { kind: 'act' }>,
   state: LaneRunStateValue,
 ): Promise<AdvanceLaneRunResult> {
+  const { detail, reasonCode } = refusal;
   if (reasonCode === 'dispatch-refused') {
     if (handsOverDirtyWorktree(latest)) {
       if (isDirtyWorktreeDetail(detail) && (await handOverDirtyWorktree(ctx, latest, request))) {

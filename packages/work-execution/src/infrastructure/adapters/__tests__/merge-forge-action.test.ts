@@ -736,6 +736,25 @@ describe('ForgeActionAdapter create-branch (lane CO7)', () => {
     }
   });
 
+  it('refuses a throwing getter, a kind getter and a sparse repository without throwing', async () => {
+    const thrower = (key: string) => {
+      const request = { ...createBranchRequest() } as unknown as Record<string, unknown>;
+      Object.defineProperty(request, key, { get() { throw new Error('boom'); }, enumerable: true });
+      return request as unknown as MergeForgeActionRequest;
+    };
+    for (const key of ['deadlineIso', 'branchName', 'expectedHeadSha', 'repository', 'actionId']) {
+      const { adapter, calls } = makeChainAdapter([OK]);
+      const result = await adapter.performMergeForgeAction(thrower(key));
+      expect(result.outcome).toBe('refused');
+      expect(calls).toHaveLength(0);
+    }
+    const kindGetter = Object.defineProperty({}, 'kind', { get() { throw new Error('boom'); }, enumerable: true });
+    const { adapter } = makeChainAdapter([OK]);
+    await expect(adapter.performMergeForgeAction(kindGetter as unknown as MergeForgeActionRequest)).resolves.toMatchObject({
+      outcome: 'refused',
+    });
+  });
+
   it('refuses a null request and a missing merge identity without a gh call', async () => {
     const first = makeChainAdapter([OK]);
     const nullResult = await first.adapter.performMergeForgeAction(null as unknown as MergeForgeActionRequest);
@@ -789,6 +808,17 @@ describe('ForgeActionAdapter readMergeBranchHead (lane CO7)', () => {
       const { adapter } = makeChainAdapter([answer]);
       expect((await adapter.readMergeBranchHead(read)).outcome).toBe('unavailable');
     }
+  });
+
+  it('is unavailable, not a rejection, for a throwing getter', async () => {
+    const { adapter, calls } = makeChainAdapter([OK]);
+    const request = {} as Record<string, unknown>;
+    for (const key of ['deadlineIso', 'repository', 'branchName']) {
+      Object.defineProperty(request, key, { get() { throw new Error('boom'); }, enumerable: true });
+    }
+    const result = await adapter.readMergeBranchHead(request as unknown as typeof read);
+    expect(result.outcome).toBe('unavailable');
+    expect(calls).toHaveLength(0);
   });
 
   it('is unavailable for invalid input, no identity and an exhausted budget, without a gh call', async () => {

@@ -191,6 +191,9 @@ export class StartChainUseCase implements StartChainPort {
   private async recover(command: ValidCommand, record: ChainRecord): Promise<StartChainDecision> {
     const head = await this.readHead(command);
     if (head.outcome === 'not-found') {
+      // The branch is provably absent, so the earlier attempt wrote nothing. Retrying is safe: the create is
+      // an atomic ref creation at a fixed commit under the same action id, and an existing ref reconciles by
+      // reading it. Without this retry an intent whose forge call never ran could never progress.
       return this.createBranch(command, record);
     }
     return this.settleFromHead(command, record, head);

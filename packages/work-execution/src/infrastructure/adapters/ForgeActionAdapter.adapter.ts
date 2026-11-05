@@ -155,6 +155,42 @@ const MIN_REMAINING_TO_START_MS = 2_000;
 /** A merge-pass request that is bound to a pull request (every kind but create-branch). */
 type MergePullRequestRequest = Exclude<MergeForgeActionRequest, { readonly kind: 'create-branch' }>;
 
+/** One own data property, read without running a getter; undefined for anything else. */
+function ownData(source: unknown, key: string): unknown {
+  try {
+    if (typeof source !== 'object' || source === null) {
+      return undefined;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    return descriptor === undefined ? undefined : descriptor.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A plain copy of a create-branch request's own data properties; absent keys stay absent. */
+function snapshotCreateBranchRequest(request: object): MergeForgeCreateBranchRequest {
+  const repository = ownData(request, 'repository');
+  const copy: Record<string, unknown> = {
+    kind: 'create-branch',
+    actionId: ownData(request, 'actionId'),
+    repository:
+      typeof repository === 'object' && repository !== null
+        ? { owner: ownData(repository, 'owner'), repo: ownData(repository, 'repo') }
+        : repository,
+    branchName: ownData(request, 'branchName'),
+    sourceBranch: ownData(request, 'sourceBranch'),
+    expectedHeadSha: ownData(request, 'expectedHeadSha'),
+    deadlineIso: ownData(request, 'deadlineIso'),
+  };
+  for (const key of ['pullRequestNumber', 'status']) {
+    if (Object.getOwnPropertyDescriptor(request, key) !== undefined) {
+      copy[key] = ownData(request, key) ?? true;
+    }
+  }
+  return copy as unknown as MergeForgeCreateBranchRequest;
+}
+
 /** The largest ref body a branch-head read parses. */
 const MAX_REF_BODY_CHARS = 65_536;
 
@@ -588,10 +624,20 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
 
   // --- MergeForgeActionPort (repo-scoped merge pass path, DT6a) ---------------
 
-  async performMergeForgeAction(request: MergeForgeActionRequest): Promise<MergeForgeActionResult> {
-    if (typeof request !== 'object' || request === null) {
+  async performMergeForgeAction(rawRequest: MergeForgeActionRequest): Promise<MergeForgeActionResult> {
+    if (typeof rawRequest !== 'object' || rawRequest === null) {
       return this.mergeRefusedOther('invalid request');
     }
+    if (ownData(rawRequest, 'kind') === 'create-branch') {
+      // A create-branch request is read through its own data properties once, so no getter runs twice or throws.
+      return this.performCreateBranch(snapshotCreateBranchRequest(rawRequest));
+    }
+    const kind = ownData(rawRequest, 'kind');
+    if (kind !== 'merge-pr' && kind !== 'update-branch' && kind !== 'post-status') {
+      // Includes an accessor `kind`, which would run its getter at the first read below.
+      return this.mergeRefusedOther('invalid request');
+    }
+    const request = rawRequest as MergePullRequestRequest;
     const statusRefusal = this.mergeStatusRefusal(request);
     if (statusRefusal !== null) {
       return statusRefusal;
@@ -603,9 +649,6 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     const identityRefusal = this.mergeIdentityRefusal(request);
     if (identityRefusal !== null) {
       return identityRefusal;
-    }
-    if (request.kind === 'create-branch') {
-      return this.runCreateBranch(request);
     }
     const headGuard = await this.mergeReadHeadGuard(request);
     if (headGuard !== null) {
@@ -661,10 +704,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
   }
 
   /** Attempt-bound validation mirrored for merge requests before any subprocess or read runs. */
-  private mergeValidationRefusal(request: MergeForgeActionRequest): MergeForgeActionResult | null {
-    if (request.kind === 'create-branch') {
-      return this.createBranchValidationRefusal(request);
-    }
+  private mergeValidationRefusal(request: MergePullRequestRequest): MergeForgeActionResult | null {
     if (!Number.isFinite(Date.parse(request.deadlineIso))) {
       return this.mergeRefusedOther('unparseable deadline');
     }
@@ -1008,10 +1048,24 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
 
   // --- create-branch (lane CO7): chain/<name> from main at a recorded commit ---
 
+  private async performCreateBranch(request: MergeForgeCreateBranchRequest): Promise<MergeForgeActionResult> {
+    const refusal = this.createBranchValidationRefusal(request);
+    if (refusal !== null) {
+      return refusal;
+    }
+    if (this.mergeConfigDir() === null) {
+      return this.mergeRefusedOther('no merger identity is configured');
+    }
+    return this.runCreateBranch(request);
+  }
+
   /** Validation for create-branch: fixed reasons only, no input value echoed. */
   private createBranchValidationRefusal(request: MergeForgeCreateBranchRequest): MergeForgeActionResult | null {
     if ('pullRequestNumber' in request) {
       return this.mergeRefusedOther('create-branch carries no pull request');
+    }
+    if ('status' in request) {
+      return this.mergeRefusedOther('status is only valid for post-status');
     }
     if (typeof request.actionId !== 'string' || request.actionId.length === 0 || request.actionId.length > 256) {
       return this.mergeRefusedOther('Invalid action id');
@@ -1038,7 +1092,8 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     if (typeof repository !== 'object' || repository === null) {
       return false;
     }
-    const { owner, repo } = repository as { readonly owner?: unknown; readonly repo?: unknown };
+    const owner = ownData(repository, 'owner');
+    const repo = ownData(repository, 'repo');
     return (
       typeof owner === 'string' &&
       typeof repo === 'string' &&
@@ -1121,13 +1176,20 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     if (typeof request !== 'object' || request === null) {
       return { outcome: 'unavailable', reason: 'invalid request' };
     }
-    if (typeof request.deadlineIso !== 'string' || !Number.isFinite(Date.parse(request.deadlineIso))) {
+    const deadlineIso = ownData(request, 'deadlineIso');
+    const repository = ownData(request, 'repository');
+    const branchName = ownData(request, 'branchName');
+    if (typeof deadlineIso !== 'string' || !Number.isFinite(Date.parse(deadlineIso))) {
       return { outcome: 'unavailable', reason: 'unparseable deadline' };
     }
-    if (!this.isValidRepositoryRef(request.repository) || !this.isChainBranch(request.branchName)) {
+    if (!this.isValidRepositoryRef(repository) || !this.isChainBranch(branchName)) {
       return { outcome: 'unavailable', reason: 'invalid request' };
     }
-    return this.readBranchHead(request);
+    return this.readBranchHead({
+      repository: { owner: ownData(repository, 'owner') as string, repo: ownData(repository, 'repo') as string },
+      branchName,
+      deadlineIso,
+    });
   }
 
   /** One `gh api` read of the branch ref (the API, never a local git read), bounded by the budget. */

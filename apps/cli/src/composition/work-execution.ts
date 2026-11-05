@@ -515,8 +515,9 @@ export function composeExecution(input: ComposeExecutionInput) {
   const mergeQueueRepository = new MergeQueueRepositoryAdapter({ stateDir });
   const enqueueMerge = new EnqueueMergeUseCase({ queue: mergeQueueRepository });
   const listMergeQueue = new ListMergeQueueUseCase({ queue: mergeQueueRepository });
+  const legacyTrainState = new LegacyTrainStateReadAdapter();
   const importTrainState = new ImportTrainStateUseCase({
-    legacyState: new LegacyTrainStateReadAdapter(),
+    legacyState: legacyTrainState,
     queue: mergeQueueRepository,
     mintUlid: () => newUlid(),
     nowIso: () => new Date().toISOString(),
@@ -659,6 +660,7 @@ export function composeExecution(input: ComposeExecutionInput) {
     enqueueMerge,
     listMergeQueue,
     importTrainState,
+    legacyTrainState,
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase({
       attemptRepo: attemptRepository,
       workOrderRepo: workOrderRepository,

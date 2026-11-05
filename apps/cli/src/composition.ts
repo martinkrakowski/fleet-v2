@@ -102,6 +102,7 @@ import {
   type EnqueueMergeUseCase,
   type ListMergeQueueUseCase,
   type ImportTrainStateUseCase,
+  type LegacyTrainStateReadAdapter,
   type MergeQueueRepositoryAdapter,
   type ForgeActionDelegate,
   type GhInvocationResult,
@@ -752,6 +753,8 @@ export interface FleetCliRuntime {
     readonly enqueueMerge: EnqueueMergeUseCase;
     readonly listMergeQueue: ListMergeQueueUseCase;
     readonly importTrainState: ImportTrainStateUseCase;
+    /** CO32: the read-only shell train state reader behind the cutover shadow report. */
+    readonly legacyTrainState: LegacyTrainStateReadAdapter;
     /** CO25: the read-only merge readiness check for one pull request. */
     readonly inspectMergeReadiness: InspectMergeReadinessUseCase;
   };

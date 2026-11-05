@@ -407,13 +407,16 @@ function findDispatchGroup(
 
 /**
  * The collect-key group of the same (round, seat, attempt ordinal) (CX8). A legacy ordinal-less collect key
- * of the same (round, seat) is used only when no collect key carries this attempt's ordinal.
+ * of the same (round, seat) is used only when no collect key carries this attempt's ordinal, and only when
+ * its intent was recorded at or after this attempt's dispatch result: an earlier legacy collect belongs to
+ * an earlier attempt of the same seat.
  */
 function findCollectGroup(
   groups: readonly KeyGroup[],
   round: number,
   seatIndex: number,
   attemptOrdinal: number | null,
+  dispatchEndIso: string,
 ): KeyGroup | null {
   let legacy: KeyGroup | null = null;
   for (const group of groups) {
@@ -424,7 +427,8 @@ function findCollectGroup(
     if (parsed.attemptOrdinal === attemptOrdinal) {
       return group;
     }
-    if (parsed.attemptOrdinal === null && legacy === null) {
+    const legacyStartIso = group.intent?.recordedAtIso ?? null;
+    if (parsed.attemptOrdinal === null && legacy === null && legacyStartIso !== null && legacyStartIso >= dispatchEndIso) {
       legacy = group;
     }
   }
@@ -713,7 +717,13 @@ function buildAttemptSpans(
     if (dispatchFinal === null) {
       continue;
     }
-    const collect = findCollectGroup(groups, dispatch.round, dispatch.seatIndex, dispatch.attemptOrdinal);
+    const collect = findCollectGroup(
+      groups,
+      dispatch.round,
+      dispatch.seatIndex,
+      dispatch.attemptOrdinal,
+      dispatchFinal.recordedAtIso,
+    );
     if (collect === null) {
       continue;
     }

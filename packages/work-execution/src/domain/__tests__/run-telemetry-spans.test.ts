@@ -655,6 +655,35 @@ describe('laneRunSpans attempt and usage spans (OT1b-2)', () => {
     expect(attempt?.endIso).toBe(time(41));
   });
 
+  it("never gives a later attempt an earlier attempt's legacy ordinal-less collect (CX8)", () => {
+    entryCounter = 0;
+    const legacyCollect = COLLECT_KEY.replace('/a1', '');
+    const dispatchA3 = DISPATCH_KEY.replace('/a1', '/a3');
+    const journal = [
+      entry('intent', { key: DISPATCH_KEY, recordedAtIso: time(3), mintedId: 'attempt-earlier-1' }),
+      stepResult(DISPATCH_KEY, 4),
+      stepIntent(legacyCollect, 6), stepResult(legacyCollect, 7),
+      stepIntent(dispatchA3, 30), stepResult(dispatchA3, 31),
+      conductOf('merged', 42),
+    ];
+    const result = laneRunSpans(hmac, factsOf(journal, 'example', [makeAttempt()]));
+    expect(spanNamed(result.spans, 'attempt')).toBeUndefined();
+    expect(result.rejectedInvalid).toBe(0);
+  });
+
+  it('still pairs a legacy ordinal-less collect recorded after the dispatch (CX8)', () => {
+    entryCounter = 0;
+    const legacyCollect = COLLECT_KEY.replace('/a1', '');
+    const journal = [
+      stepIntent(DISPATCH_KEY, 3), stepResult(DISPATCH_KEY, 4),
+      stepIntent(legacyCollect, 6), stepResult(legacyCollect, 7),
+      conductOf('merged', 42),
+    ];
+    const result = laneRunSpans(hmac, factsOf(journal, 'example', [makeAttempt()]));
+    const attempt = spanNamed(result.spans, 'attempt') as { endIso: string } | undefined;
+    expect(attempt?.endIso).toBe(time(7));
+  });
+
   it('emits the usage span under the attempt only for opencode-db usage, with token counts and metered cost', () => {
     const result = laneRunSpans(hmac, factsOf(baseJournal(), 'example', [makeAttempt()]));
     const usage = spanNamed(result.spans, 'usage');

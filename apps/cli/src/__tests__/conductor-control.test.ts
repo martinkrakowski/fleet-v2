@@ -236,6 +236,33 @@ describe('fleet-v2 conductor (K7-4)', () => {
     expect(runs[0].reviewFindings).toEqual([]);
   });
 
+  it('status lists the reservation a crashed start left held', async () => {
+    const runtime = makeRuntime(tempStateDir());
+    await runtime.execution.executionJournal.saveCapacityReservation({
+      id: 'reservation-crashed-1',
+      attemptId: 'attempt-crashed-1',
+      hostId: 'host-example-1',
+      slotIndex: 0,
+      held: true,
+      seatTool: 'opencode',
+      hostName: 'lane-host-example',
+      workOrderId: 'wo-example-1',
+      reservedAtIso: new Date(Date.parse(NOW) - 10 * 60 * 1000).toISOString(),
+      releasedAtIso: null,
+    });
+    const result = await runConductor(runtime, ['status']);
+    expect(result.code).toBe(0);
+    const document = parseDocument(result.stdout);
+    expect(document).toMatchObject({ outcome: 'listed' });
+    const crashedStarts = document.crashedStarts as readonly Record<string, unknown>[];
+    expect(crashedStarts).toHaveLength(1);
+    expect(crashedStarts[0]).toMatchObject({
+      attemptId: 'attempt-crashed-1',
+      slotIndex: 0,
+      hostName: 'lane-host-example',
+    });
+  });
+
   it('halt sets and lifts the kill switch; status shows it', async () => {
     const runtime = makeRuntime(tempStateDir());
     await seedPlainRun(runtime);

@@ -301,4 +301,30 @@ describe('file store faults', () => {
     });
     expect((await readdir(storeDir)).filter((n) => n.endsWith('.json'))).toHaveLength(1);
   });
+  it('repairs a torn receipt once when several writers race', async () => {
+    const adapter = new GateReceiptReuseAdapter({ stateDir: dir });
+    const file = await receiptPath(adapter);
+    await writeFile(file, '{"torn');
+    const results = await Promise.all(
+      Array.from({ length: 6 }, (_, i) => adapter.recordGateReceipt(request(makeKey(), 'pass', `receipt:r${i}`))),
+    );
+    expect(results.filter((r) => r.outcome === 'recorded').length).toBeGreaterThanOrEqual(1);
+    expect(results.every((r) => r.outcome === 'recorded' || r.outcome === 'already-recorded')).toBe(true);
+    const found = await adapter.findGateReceipt(makeKey());
+    expect(found.outcome).toBe('hit');
+    expect(await adapter.recordGateReceipt(request(makeKey(), 'fail', 'receipt:late'))).toEqual({
+      outcome: 'already-recorded',
+    });
+  });
+
+  it('reports a directory flooded with foreign names as full without reading it whole', async () => {
+    const adapter = new GateReceiptReuseAdapter({ stateDir: dir, maxRecords: 1 });
+    await mkdir(storeDir, { recursive: true });
+    await Promise.all(
+      Array.from({ length: 1200 }, (_, i) => writeFile(path.join(storeDir, `foreign-${i}.txt`), '')),
+    );
+    expect(await adapter.recordGateReceipt(request(makeKey()))).toEqual({ outcome: 'refused', reason: 'store-full' });
+    expect((await adapter.findGateReceipt(makeKey())).outcome).toBe('miss');
+  });
+
 });

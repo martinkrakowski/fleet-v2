@@ -47,6 +47,7 @@ export const GATE_RECEIPT_DEFAULT_MAX_RECORDS = 2000;
 export const GATE_RECEIPT_DEFAULT_DEADLINE_MS = 5000;
 const STALE_TEMP_AGE_MS = 60 * 60 * 1000;
 const MAX_TEMP_SWEEP = 100;
+const MAX_FOREIGN_ENTRIES = 1000;
 const MAX_RECEIPT_REF_LENGTH = 200;
 const RECEIPT_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@#+=-]*$/;
 const RECORD_FILE_PATTERN = /^[0-9a-f]{64}\.json$/;
@@ -331,7 +332,7 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
       if (!replacing && (await this.storeIsFull(directory))) {
         return { outcome: 'refused', reason: 'store-full' };
       }
-      return await this.writeOnce(directory, target, serializeReceipt(key, receipt), replacing);
+      return await this.writeOnce(directory, target, key, serializeReceipt(key, receipt), replacing);
     } catch (error: unknown) {
       const reason: RecordGateReceiptRefusalReason =
         error instanceof StoreFailure ? error.reason : 'store-failed';
@@ -436,24 +437,43 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
     }
   }
 
-  /** Count the stored receipts and sweep stale temp files left by a crashed writer. */
+  /**
+   * Count the stored receipts and sweep stale temp files left by a crashed writer. The directory is walked
+   * entry by entry and the walk stops past a fixed bound, so a directory flooded with other names is
+   * reported full instead of being read whole.
+   */
   private async storeIsFull(directory: string): Promise<boolean> {
-    const names = await fs.readdir(directory);
+    const walkLimit = this.maxRecords + MAX_TEMP_SWEEP + MAX_FOREIGN_ENTRIES;
+    const dirHandle = await fs.opendir(directory);
     let records = 0;
+    let walked = 0;
     let swept = 0;
-    for (const name of names) {
-      if (RECORD_FILE_PATTERN.test(name)) {
-        records += 1;
-      } else if (name.endsWith('.tmp') && swept < MAX_TEMP_SWEEP) {
-        swept += 1;
-        try {
-          const stat = await fs.lstat(path.join(directory, name));
-          if (stat.isFile() && Date.now() - stat.mtimeMs > STALE_TEMP_AGE_MS) {
-            await fs.rm(path.join(directory, name), { force: true });
-          }
-        } catch {
-          // best effort
+    try {
+      for await (const entry of dirHandle) {
+        walked += 1;
+        if (walked > walkLimit) {
+          return true;
         }
+        const name = entry.name;
+        if (RECORD_FILE_PATTERN.test(name)) {
+          records += 1;
+        } else if (name.endsWith('.tmp') && swept < MAX_TEMP_SWEEP) {
+          swept += 1;
+          try {
+            const stat = await fs.lstat(path.join(directory, name));
+            if (stat.isFile() && Date.now() - stat.mtimeMs > STALE_TEMP_AGE_MS) {
+              await fs.rm(path.join(directory, name), { force: true });
+            }
+          } catch {
+            // best effort
+          }
+        }
+      }
+    } finally {
+      try {
+        await dirHandle.close();
+      } catch {
+        // already closed by the iterator
       }
     }
     return records >= this.maxRecords;
@@ -461,11 +481,12 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
 
   /**
    * Write `content` as a whole file first, then publish it under `target` in one step: `link` when the name
-   * is free (it fails if anyone published first), `rename` only to replace a file already found unreadable.
+   * is free (it fails if anyone published first), a file already found unreadable is removed first.
    */
   private async writeOnce(
     directory: string,
     target: string,
+    key: GateReceiptKey,
     content: string,
     replacing: boolean,
   ): Promise<RecordGateReceiptResult> {
@@ -486,13 +507,24 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
       await handle.close();
       handle = null;
       if (replacing) {
-        const stat = await this.lstatOrNull(target);
-        if (stat !== null && !stat.isFile()) {
-          // A symlink or directory in the receipt's place is left alone.
-          return { outcome: 'refused', reason: 'store-unreadable' };
+        // Replace an unreadable file only by removing it and then publishing exclusively, so two writers
+        // repairing one key cannot both win: the second link finds the name taken. The file is read again
+        // right before removal, so a receipt another writer has just published is never removed.
+        const again = await this.readStored(target, key);
+        if (again.status === 'ok') {
+          return { outcome: 'already-recorded' };
         }
-        await fs.rename(temp, target);
-        return { outcome: 'recorded' };
+        if (again.status === 'version-unknown') {
+          return { outcome: 'refused', reason: 'store-version-unknown' };
+        }
+        if (again.status === 'unreadable') {
+          const stat = await this.lstatOrNull(target);
+          if (stat !== null && !stat.isFile()) {
+            // A symlink or directory in the receipt's place is left alone.
+            return { outcome: 'refused', reason: 'store-unreadable' };
+          }
+          await fs.rm(target, { force: true });
+        }
       }
       try {
         await fs.link(temp, target);

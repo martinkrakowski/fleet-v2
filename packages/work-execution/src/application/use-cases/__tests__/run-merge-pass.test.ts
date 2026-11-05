@@ -332,11 +332,10 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
     expect(deps.forgeRead.calls).toBe(0);
   });
 
-  it('completes the intent and result pair when the budget expires between the appends', async () => {
-    // The pass clock jumps past the deadline the moment the intent is appended.
-    // The result must still be appended: a mid-pair budget split would leave a
-    // dangling intent that later passes read as `already-journalled`, and the
-    // dry-run result would never be recorded.
+  it('a budget spent between the appends leaves the intent open, and the next pass completes the pair', async () => {
+    // The pass clock jumps past the deadline the moment the intent is appended,
+    // so the result append is not started (D-DT9 guards every journal call).
+    // The next pass finds the open intent and writes only its result.
     const journal = new LaneRunJournalAdapter();
     let clock = NOW;
     const clockControlledJournal: Pick<LaneRunJournalPort, 'append' | 'listForKey'> = {
@@ -372,22 +371,31 @@ describe('RunMergePassUseCase (DT9a, shadow mode)', () => {
       deadlineIso: DEADLINE,
     };
 
-    const result = await useCase.runMergePass(request);
+    const first = await useCase.runMergePass(request);
+    expect(first.outcome).toBe('budget-exhausted');
+    const afterFirst = await journalOf(journal);
+    expect(afterFirst.map((entry) => entry.kind)).toEqual(['intent']);
 
-    expect(result.outcome).toBe('completed');
-    expect(result.entries[0]).toEqual({
-      entryId: expect.any(String),
-      head12: HEAD12,
-      decision: 'journalled',
-      reasonCode: 'would-merge',
-      journalKey: `merge/${DIGEST}/1/${HEAD12}/merge-pr`,
-    });
-    const entries = await journalOf(journal);
-    expect(entries).toHaveLength(2);
-    expect(entries[0].kind).toBe('intent');
-    expect(entries[1].kind).toBe('result');
-    expect(entries[1].outcome).toBe('dry-run');
-    expect(entries[1].reasonCode).toBe('would-merge');
+    clock = NOW; // the next pass has a fresh budget
+    const second = await useCase.runMergePass(request);
+    expect(second.outcome).toBe('completed');
+    expect(second.entries[0].decision).toBe('journalled');
+    const afterSecond = await journalOf(journal);
+    expect(afterSecond.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(afterSecond[1].outcome).toBe('dry-run');
+    expect(afterSecond[1].reasonCode).toBe('would-merge');
+
+    const third = await useCase.runMergePass(request);
+    expect(third.entries[0].reasonCode).toBe('already-journalled');
+    expect(await journalOf(journal)).toHaveLength(2);
+  });
+
+  it('a null request or one without a repository is refused, never thrown on', async () => {
+    const { useCase, request } = makeUseCase([makeEntry()], greenForge);
+    for (const bad of [null, { ...request, repository: undefined }, { ...request, repository: { owner: 1, repo: REPO } }]) {
+      const result = await useCase.runMergePass(bad as unknown as RunMergePassRequest);
+      expect(result).toEqual({ outcome: 'refused', reasonCode: 'invalid-request', entries: [] });
+    }
   });
 
   it('an unknown veto never blocks the shadow merge', async () => {

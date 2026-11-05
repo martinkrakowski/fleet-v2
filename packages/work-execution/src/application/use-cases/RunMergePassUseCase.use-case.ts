@@ -95,7 +95,7 @@ function contextStateOf(snapshot: MergeContextSnapshot): MergeContextFact {
   if (CONTEXT_FAILED_TOKENS.has(snapshot.state)) {
     return { state: 'failure', creatorLogin: snapshot.creatorLogin };
   }
-  return { state: 'failure' };
+  return { state: 'failure', creatorLogin: snapshot.creatorLogin };
 }
 
 export class RunMergePassUseCase implements RunMergePassPort {
@@ -170,9 +170,17 @@ export class RunMergePassUseCase implements RunMergePassPort {
   }
 
   private isValidRequest(request: RunMergePassRequest): boolean {
-    const { owner, repo } = request.repository;
-    const validSegment = (value: string) =>
-      REPOSITORY_SEGMENT_PATTERN.test(value) && value !== '.' && value !== '..';
+    // A null request or a missing repository is refused, never thrown on.
+    if (typeof request !== 'object' || request === null) {
+      return false;
+    }
+    const repository: unknown = (request as { repository?: unknown }).repository;
+    if (typeof repository !== 'object' || repository === null) {
+      return false;
+    }
+    const { owner, repo } = repository as { owner?: unknown; repo?: unknown };
+    const validSegment = (value: unknown) =>
+      typeof value === 'string' && REPOSITORY_SEGMENT_PATTERN.test(value) && value !== '.' && value !== '..';
     return (
       validSegment(owner) &&
       validSegment(repo) &&
@@ -268,8 +276,15 @@ export class RunMergePassUseCase implements RunMergePassPort {
 
     this.ensureBudget(request); // D-DT9: guard before the journal read
     const existing = await this.deps.journal.listForKey(key);
-    if (existing.length > 0) {
+    if (existing.some((candidate) => candidate.kind === 'result')) {
       return this.report(entry, 'no-action', 'already-journalled', null);
+    }
+    if (existing.some((candidate) => candidate.kind === 'intent')) {
+      // A pass whose budget ran out between the intent and its result left
+      // the intent open: this pass completes the pair instead of reporting
+      // it journalled forever. A dry-run has no external effect, so only
+      // the result is written; no second intent.
+      return this.appendShadowResult(request, entry, decision, key);
     }
 
     const intent: LaneRunJournalEntryRecord = {
@@ -299,6 +314,16 @@ export class RunMergePassUseCase implements RunMergePassPort {
       );
     }
 
+    return this.appendShadowResult(request, entry, decision, key);
+  }
+
+  /** The `dry-run` result that completes a shadow act's intent. */
+  private async appendShadowResult(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    decision: Extract<MergeStepDecision, { kind: 'act' }>,
+    key: string,
+  ): Promise<MergePassEntryReport> {
     const result: LaneRunJournalEntryRecord = {
       version: LANE_RUN_JOURNAL_ENTRY_VERSION,
       entryId: this.deps.newUlid(),
@@ -315,11 +340,9 @@ export class RunMergePassUseCase implements RunMergePassPort {
       grantId: null,
       state: null,
     };
-    // The result append completes the intent already journaled. The budget
-    // guard ran before the intent append (D-DT9): once the pair is started it
-    // is finished, because a spent budget mid-pair would leave a dangling
-    // intent that a later pass reads as `already-journalled`, and the dry-run
-    // result would never be recorded.
+    // D-DT9: guard before the result append too. If the budget is spent the
+    // intent stays open and the next pass completes it (see journalShadowAct).
+    this.ensureBudget(request);
     const appendedResult = await this.deps.journal.append(result);
     if (appendedResult.outcome === 'refused') {
       return this.report(
@@ -505,7 +528,9 @@ export class RunMergePassUseCase implements RunMergePassPort {
           continue; // a shadow trial is not an update
         }
         for (const candidate of entries) {
-          if (candidate.kind === 'intent' && nowMs - Date.parse(candidate.recordedAtIso) < UPDATE_WINDOW_MS) {
+          const ageMs = nowMs - Date.parse(candidate.recordedAtIso);
+          // Within the last hour only: a future-dated intent is not counted.
+          if (candidate.kind === 'intent' && ageMs >= 0 && ageMs < UPDATE_WINDOW_MS) {
             count += 1;
           }
         }

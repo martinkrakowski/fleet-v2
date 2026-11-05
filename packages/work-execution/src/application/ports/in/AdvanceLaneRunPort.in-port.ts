@@ -41,7 +41,9 @@ export type AdvanceLaneRunRefusal =
   | 'journal-refused' | 'save-refused' | 'illegal-transition';
 
 export type AdvanceLaneRunResult =
-  | { readonly outcome: 'entered'; readonly state: LaneRunStateValue }
+  | { readonly outcome: 'entered'; readonly state: LaneRunStateValue;
+      /** Set only when the run entered `stopped` because the graceful stop's grace passed (GD7): the reason the conductor pass reports as attention. */
+      readonly reason?: 'stop-grace-exceeded' }
   | { readonly outcome: 'parked'; readonly reason: LaneRunParkReason; readonly qualifier: string | null }
   | { readonly outcome: 'repaired'; readonly state: LaneRunStateValue }
   | { readonly outcome: 'waiting'; readonly reason: LaneRunWaitReason }

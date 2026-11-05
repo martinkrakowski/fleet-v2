@@ -478,7 +478,12 @@ export class RunConductorPassUseCase implements RunConductorPassPort {
           startGate: ctx.startGate,
         });
         steps.push(step);
-        if (step.outcome === 'waiting' && step.reason === 'stop-grace-exceeded') {
+        // GD7: a graceful drain ended `stopped` once its grace passed; the owner
+        // gets the same notice a drain still waiting past the grace gets.
+        if (
+          (step.outcome === 'waiting' && step.reason === 'stop-grace-exceeded') ||
+          (step.outcome === 'entered' && step.reason === 'stop-grace-exceeded')
+        ) {
           attention.push({ runId: record.runId, kind: 'stop-grace-exceeded' });
         }
         // KF-33b2: a review that passed only through out-of-scope dispositions

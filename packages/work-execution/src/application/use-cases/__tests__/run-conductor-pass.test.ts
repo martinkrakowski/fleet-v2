@@ -389,6 +389,19 @@ describe('RunConductorPassUseCase grace', () => {
     }
     expect(second.attention).toEqual([{ runId: RUN_ID, kind: 'stop-grace-exceeded' }]);
   });
+
+  it('a graceful drain the advance ends stopped by the passed grace reports the same attention item', async () => {
+    const fx = stores();
+    await createRun(fx.repo);
+    const ended: AdvanceLaneRunResult = { outcome: 'entered', state: 'stopped', reason: 'stop-grace-exceeded' };
+    const advance = new ScriptedAdvance(new Map([[RUN_ID, [ended]]]));
+    const pass = await runPass(fx, HOLDER, NOW, advance);
+    expect(pass).toMatchObject({ outcome: 'completed' });
+    if (pass.outcome !== 'completed') {
+      throw new Error('expected completed');
+    }
+    expect(pass.attention).toEqual([{ runId: RUN_ID, kind: 'stop-grace-exceeded' }]);
+  });
 });
 
 describe('RunConductorPassUseCase out-of-scope attention (KF-33b2)', () => {

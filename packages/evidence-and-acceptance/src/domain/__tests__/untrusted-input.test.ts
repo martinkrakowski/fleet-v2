@@ -355,3 +355,14 @@ describe('defangMarkerLikeTokens: Cyrillic and Greek look-alike letters (CX7a)',
     expect(defangMarkerLikeTokens(text)).toBe(text);
   });
 });
+
+describe('marker scan stops once no marker word can follow (CX7a review minor)', () => {
+  it('leaves a non-marker prefix followed by more than 64 noise characters alone', () => {
+    const text = `<<<x${' '.repeat(65)}UNTRUSTED`;
+    expect(defangMarkerLikeTokens(text)).toBe(text);
+  });
+
+  it('still defangs a marker word split by noise below the cap', () => {
+    expect(defangMarkerLikeTokens(`<<<UN${' '.repeat(10)}TRUSTED`)).toBe(`[<<<]UN${' '.repeat(10)}TRUSTED`);
+  });
+});

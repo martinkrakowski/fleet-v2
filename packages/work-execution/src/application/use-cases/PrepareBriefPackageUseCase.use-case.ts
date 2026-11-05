@@ -358,20 +358,17 @@ function isContextDecisionObject(value: unknown): boolean {
   }
   const record = value as Record<string, unknown>;
   return (
-    typeof record.proposalId === 'string' &&
-    typeof record.knowledgeEntryId === 'string' &&
-    typeof record.version === 'string' &&
+    isNonEmpty(record.proposalId) &&
+    isNonEmpty(record.knowledgeEntryId) &&
+    isNonEmpty(record.version) &&
     typeof record.proposedBecause === 'string' &&
     typeof record.accepted === 'boolean' &&
     typeof record.decisionBecause === 'string'
   );
 }
 
-/** Why `contextDecisions` is unusable, or null when it is absent or a valid array of decisions. */
+/** Why `contextDecisions` is unusable, or null when it is a valid array of decisions (the contract requires it). */
 function contextDecisionsError(value: unknown): string | null {
-  if (value === undefined || value === null) {
-    return null;
-  }
   if (!Array.isArray(value)) {
     return 'contextDecisions must be an array of context decisions';
   }

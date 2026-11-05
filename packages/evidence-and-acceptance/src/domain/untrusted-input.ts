@@ -58,6 +58,9 @@ const LOOKALIKE_LATIN = new Map<string, string>([
   ['\u03A4', 'T'], ['\u03C4', 't'], ['\u03A7', 'X'], ['\u03C7', 'x'],
 ]);
 
+/** The marker words, lower case, with their noise removed. */
+const MARKER_WORDS: readonly string[] = ['untrusted', 'enduntrusted'];
+
 /** Whether the text at `start` opens a marker word once the noise is removed. */
 function isMarkerTail(text: string, start: number): boolean {
   // Walk by code point, not UTF-16 unit: a supplementary invisible character (for example U+E0001 or U+E0100) is
@@ -79,9 +82,18 @@ function isMarkerTail(text: string, start: number): boolean {
       continue;
     }
     compact.push(LOOKALIKE_LATIN.get(character) ?? character);
+    if (!couldOpenMarkerWord(compact.join('').toLowerCase())) {
+      // No marker word can follow, so later noise cannot make this a marker.
+      return false;
+    }
   }
   const lower = compact.join('').toLowerCase();
   return lower.startsWith('untrusted') || lower.startsWith('enduntrusted');
+}
+
+/** Whether `lower` is still the start of a marker word (or already holds one). */
+function couldOpenMarkerWord(lower: string): boolean {
+  return MARKER_WORDS.some((word) => word.startsWith(lower) || lower.startsWith(word));
 }
 
 /** Every `<<<` that opens a marker word becomes `[<<<]`; the rest is left alone. */

@@ -100,6 +100,28 @@ function makeUseCase(deps: { worktreePath?: string } = {}) {
 describe('PrepareBriefPackageUseCase contextDecisions validation', () => {
   const REASON = 'contextDecisions must be an array of context decisions';
 
+  it('rejects a missing or null contextDecisions, which the contract requires (CX7a review minor)', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    for (const value of [undefined, null]) {
+      const request = validRequest({ contextDecisions: value as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'] });
+      const result = await useCase.prepareBriefPackage(request);
+      expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+    }
+  });
+
+  it('rejects a context decision with an empty identifier, entry or version (CX7a review minor)', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const base = {
+      proposalId: 'p-1', knowledgeEntryId: 'ke-1', version: 'v1',
+      proposedBecause: 'lexical match', accepted: true, decisionBecause: 'applicable to this lane',
+    };
+    for (const field of ['proposalId', 'knowledgeEntryId', 'version'] as const) {
+      const request = validRequest({ contextDecisions: [{ ...base, [field]: '' }] });
+      const result = await useCase.prepareBriefPackage(request);
+      expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+    }
+  });
+
   it('rejects a contextDecisions that is not an array without throwing', async () => {
     const useCase = makeUseCase({ worktreePath: '/wt' });
     const request = validRequest({ contextDecisions: {} as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'] });

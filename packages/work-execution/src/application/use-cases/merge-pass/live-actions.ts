@@ -15,7 +15,7 @@ import type {
   LaneRunJournalOutcome,
   LaneRunJournalRefusal,
 } from '../../../domain/lane-run-journal.js';
-import { LANE_RUN_JOURNAL_ENTRY_VERSION } from '../../../domain/lane-run-journal.js';
+import { LANE_RUN_JOURNAL_ENTRY_VERSION, readLaneRunJournalEntry } from '../../../domain/lane-run-journal.js';
 import type { MergeKeyRetryProof } from '../../../domain/lane-run-keys.js';
 import { buildMergeKey, head12Of } from '../../../domain/lane-run-keys.js';
 import type { MergeQueueEntryRecord, MergeShadowReason } from '../../../domain/merge-queue-records.js';
@@ -371,7 +371,11 @@ async function appendEntry(
   try {
     const appended: unknown = await deps.journal.append(entry);
     if (isRecord(appended) && appended['outcome'] === 'appended') {
-      return { ok: true };
+      // Only an answer that carries back the very entry we submitted proves it is durable.
+      const stored = readLaneRunJournalEntry(appended['entry']);
+      return stored.ok && stored.entry.entryId === entry.entryId && stored.entry.key === entry.key
+        ? { ok: true }
+        : { ok: false, refusal: null };
     }
     if (isRecord(appended) && appended['outcome'] === 'refused' && typeof appended['reason'] === 'string') {
       return { ok: false, refusal: appended['reason'] as LaneRunJournalRefusal };
@@ -398,10 +402,19 @@ async function listKey(
 ): Promise<readonly LaneRunJournalEntryRecord[] | null> {
   try {
     const entries: unknown = await deps.journal.listForKey(key);
-    if (!Array.isArray(entries) || !entries.every((item: unknown): boolean => isRecord(item))) {
+    if (!Array.isArray(entries)) {
       return null;
     }
-    return entries as readonly LaneRunJournalEntryRecord[];
+    // A record that does not read cannot prove the key unused: fail closed, never act on it.
+    const records: LaneRunJournalEntryRecord[] = [];
+    for (const item of entries as readonly unknown[]) {
+      const read = readLaneRunJournalEntry(item);
+      if (!read.ok || read.entry.key !== key) {
+        return null;
+      }
+      records.push(read.entry);
+    }
+    return records;
   } catch {
     return null;
   }
@@ -412,8 +425,9 @@ async function readForge(
   deps: MergeLiveActionDependencies,
   request: ValidatedRequest,
 ): Promise<ReadForgeMergeResult> {
+  let read: unknown;
   try {
-    return await deps.forgeRead.readForgeMerge({
+    read = await deps.forgeRead.readForgeMerge({
       repository: request.entry.repository,
       pullRequestNumber: request.entry.pullRequest,
       headSha: request.expectedHeadOid,
@@ -424,6 +438,25 @@ async function readForge(
   } catch {
     return { outcome: 'unavailable', code: 'unknown', reason: 'port threw' };
   }
+  return isWellFormedRead(read) ? read : { outcome: 'unavailable', code: 'unreadable', reason: 'off-contract answer' };
+}
+
+const FORGE_PR_STATES: readonly unknown[] = ['open', 'merged', 'closed'];
+const FORGE_READ_NON_OK_OUTCOMES: readonly unknown[] = ['not-found', 'budget-exhausted', 'unavailable'];
+
+/** An `ok` read must name a known PR state, a 40-hex live head and a context list; anything else is unknown. */
+function isWellFormedRead(read: unknown): read is ReadForgeMergeResult {
+  if (!isRecord(read)) {
+    return false;
+  }
+  if (read['outcome'] !== 'ok') {
+    return FORGE_READ_NON_OK_OUTCOMES.includes(read['outcome']);
+  }
+  return (
+    FORGE_PR_STATES.includes(read['prState']) &&
+    isMergeHex40(read['liveHeadSha']) &&
+    Array.isArray(read['contexts'])
+  );
 }
 
 /** The one forge action; a throw or an off-contract answer is ambiguous (reconciled later, never retried blind). */
@@ -496,7 +529,7 @@ function reconcileVerdict(
     return reconciled('overtaken', 'head-moved');
   }
   if (request.action === 'post-status') {
-    const contexts: readonly unknown[] = Array.isArray(read.contexts) ? read.contexts : [];
+    const contexts: readonly unknown[] = read.contexts;
     const present = contexts.some(
       (context) => isRecord(context) && context['name'] === 'premerge' && context['state'] !== 'missing',
     );

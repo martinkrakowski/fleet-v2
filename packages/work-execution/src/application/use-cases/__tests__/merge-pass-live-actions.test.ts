@@ -588,4 +588,56 @@ describe('performMergeLiveAction never throws and never acts twice (DT9b fix rou
     expect(journal.entries).toHaveLength(0);
     expect(forgeAction.requests).toHaveLength(0);
   });
+
+  it('never calls the forge when the journal claims an append without returning the entry', async () => {
+    const { journal, forgeAction, deps } = build();
+    journal.append = async () => ({ outcome: 'appended' }) as unknown as LaneRunJournalAppendResult;
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(result).toEqual({ outcome: 'unavailable', journalKey: KEY_MERGE_PR, reasonCode: 'journal-unavailable' });
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('fails closed when the key read returns a malformed record, writing nothing and calling no port', async () => {
+    const { journal, forgeAction, forgeRead, deps } = build();
+    const realAppend = journal.append.bind(journal);
+    let appends = 0;
+    journal.append = async (entry) => {
+      appends += 1;
+      return realAppend(entry);
+    };
+    for (const listed of [[{}], [null], 'nope']) {
+      journal.listForKey = async () => listed as unknown as readonly LaneRunJournalEntryRecord[];
+      const result = await performMergeLiveAction(deps, makeRequest());
+      expect(result).toEqual({ outcome: 'unavailable', journalKey: KEY_MERGE_PR, reasonCode: 'journal-unavailable' });
+    }
+    expect(appends).toBe(0);
+    expect(forgeAction.requests).toHaveLength(0);
+    expect(forgeRead.calls).toBe(0);
+  });
+
+  it('fails closed when the key read returns a record of another key', async () => {
+    const { journal, forgeAction, deps } = build();
+    seedIntent(journal, KEY_UPDATE_BRANCH);
+    journal.listForKey = async () => journal.entries;
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(result).toEqual({ outcome: 'unavailable', journalKey: KEY_MERGE_PR, reasonCode: 'journal-unavailable' });
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('keeps the key pending when the reconcile read answers ok off contract', async () => {
+    for (const bad of [
+      { outcome: 'ok', prState: 'unknown', liveHeadSha: HEAD, mergeState: 'clean', contexts: [], unresolvedThreads: 0 },
+      { outcome: 'ok', prState: 'open', liveHeadSha: 'zz', mergeState: 'clean', contexts: [], unresolvedThreads: 0 },
+      { outcome: 'ok', prState: 'open', liveHeadSha: HEAD, mergeState: 'clean', contexts: null, unresolvedThreads: 0 },
+      { outcome: 'maybe' },
+    ]) {
+      const { journal, forgeAction, forgeRead, deps } = build();
+      seedIntent(journal, KEY_MERGE_PR);
+      forgeRead.result = bad as unknown as ReadForgeMergeResult;
+      const result = await performMergeLiveAction(deps, makeRequest());
+      expect(result).toEqual({ outcome: 'ambiguous', journalKey: KEY_MERGE_PR, reasonCode: 'reconcile-unknown' });
+      expect(journal.entries[1]).toMatchObject({ outcome: 'ambiguous', reasonCode: 'reconcile-unknown' });
+      expect(forgeAction.requests).toHaveLength(0);
+    }
+  });
 });

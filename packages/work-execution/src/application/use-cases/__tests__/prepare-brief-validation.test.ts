@@ -97,6 +97,42 @@ function makeUseCase(deps: { worktreePath?: string } = {}) {
   });
 }
 
+describe('PrepareBriefPackageUseCase contextDecisions validation', () => {
+  const REASON = 'contextDecisions must be an array of context decisions';
+
+  it('rejects a contextDecisions that is not an array without throwing', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest({ contextDecisions: {} as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'] });
+    const result = await useCase.prepareBriefPackage(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+  });
+
+  it('rejects a contextDecisions entry that is not an object', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest({
+      contextDecisions: ['not-an-object'] as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'],
+    });
+    const result = await useCase.prepareBriefPackage(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+  });
+
+  it('previewBriefPackage rejects a non-array contextDecisions without throwing and echoes no path', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const request = validRequest({ contextDecisions: {} as unknown as PrepareBriefPackageUseCaseRequest['contextDecisions'] });
+    const result = await useCase.previewBriefPackage(request);
+    expect(result).toEqual({ outcome: 'rejected', reason: REASON });
+    if (result.outcome === 'rejected') {
+      expect(result.reason).not.toContain('/wt');
+    }
+  });
+
+  it('still prepares a valid request with one accepted decision', async () => {
+    const useCase = makeUseCase({ worktreePath: '/wt' });
+    const result = await useCase.prepareBriefPackage(validRequest());
+    expect(result.outcome).toBe('prepared');
+  });
+});
+
 describe('PrepareBriefPackageUseCase path validation', () => {
   it('rejects when worktreePath is missing from the request and deps', async () => {
     const useCase = makeUseCase();

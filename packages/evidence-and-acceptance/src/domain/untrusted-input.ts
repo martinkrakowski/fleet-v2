@@ -27,18 +27,47 @@ const MARKER_NOISE = /[\p{Cf}\p{Default_Ignorable_Code_Point}\s]/u;
 /** `end` + `untrusted` is the longest marker word that can follow `<<<`. */
 const MARKER_WORD_LENGTH = 12;
 
+/**
+ * A run of more than this many noise characters after `<<<` is not a marker:
+ * bounding the scan keeps `defangMarkerLikeTokens` linear over texts with many
+ * `<<<` and long invisible runs.
+ */
+const MARKER_NOISE_LIMIT = 64;
+
+/**
+ * Cyrillic and Greek letters that look like a Latin letter render a marker
+ * word unreadable to the plain `startsWith` check; each maps to its Latin
+ * equivalent before the match. Capital forms only: the word is lowercased
+ * after the mapping, and lowercase look-alikes fold through the same capitals
+ * via `toLowerCase` on the mapped text.
+ */
+const LOOKALIKE_LATIN = new Map<string, string>([
+  ['\u0423', 'U'], ['\u0405', 'S'], ['\u0410', 'A'], ['\u0412', 'B'], ['\u0415', 'E'],
+  ['\u041D', 'H'], ['\u041E', 'O'], ['\u0420', 'P'], ['\u0421', 'C'], ['\u0422', 'T'],
+  ['\u0425', 'X'], ['\u0391', 'A'], ['\u0392', 'B'], ['\u0395', 'E'], ['\u0397', 'H'],
+  ['\u0399', 'I'], ['\u039A', 'K'], ['\u039C', 'M'], ['\u039D', 'N'], ['\u039F', 'O'],
+  ['\u03A1', 'P'], ['\u03A4', 'T'], ['\u03A7', 'X'], ['\u0406', 'I'], ['\u041A', 'K'],
+  ['\u041C', 'M'],
+]);
+
 /** Whether the text at `start` opens a marker word once the noise is removed. */
 function isMarkerTail(text: string, start: number): boolean {
   // Walk by code point, not UTF-16 unit: a supplementary invisible character (for example U+E0001 or U+E0100) is
-  // two surrogate halves that the noise class does not match one at a time. The cap counts code points.
+  // two surrogate halves that the noise class does not match one at a time. The caps count code points.
   const compact: string[] = [];
+  let noiseCount = 0;
   for (const character of text.slice(start)) {
     if (compact.length >= MARKER_WORD_LENGTH) {
       break;
     }
-    if (!MARKER_NOISE.test(character)) {
-      compact.push(character);
+    if (MARKER_NOISE.test(character)) {
+      noiseCount += 1;
+      if (noiseCount > MARKER_NOISE_LIMIT) {
+        return false;
+      }
+      continue;
     }
+    compact.push(LOOKALIKE_LATIN.get(character) ?? character);
   }
   const lower = compact.join('').toLowerCase();
   return lower.startsWith('untrusted') || lower.startsWith('enduntrusted');

@@ -64,6 +64,32 @@ function isValidPort(port: number): boolean {
   return Number.isInteger(port) && port >= 1 && port <= 65535;
 }
 
+/** The name a tool entry declares, or null when it names nothing usable. */
+function toolNameOf(entry: unknown): string | null {
+  if (!isRecord(entry)) {
+    return null;
+  }
+  const name = entry.name;
+  return typeof name === 'string' ? name : null;
+}
+
+/**
+ * A repeated tool name hides a later entry's version from the single
+ * comparison the CLI makes, so each repeat is refused at its own index.
+ */
+function duplicateToolNameError(tools: readonly unknown[], index: number): string | null {
+  const name = toolNameOf(tools[index]);
+  if (name === null) {
+    return null;
+  }
+  for (let earlier = 0; earlier < index; earlier += 1) {
+    if (toolNameOf(tools[earlier]) === name) {
+      return `descriptor.tools[${index}].name: names the same tool twice`;
+    }
+  }
+  return null;
+}
+
 export function parseHostDescriptor(value: unknown): HostDescriptorResult {
   if (!isRecord(value)) {
     return { ok: false, errors: ['descriptor: must be an object'] };
@@ -94,6 +120,10 @@ export function parseHostDescriptor(value: unknown): HostDescriptorResult {
   } else {
     for (const [index, entry] of tools.entries()) {
       const path = `descriptor.tools[${index}]`;
+      const duplicateNameError = duplicateToolNameError(tools, index);
+      if (duplicateNameError !== null) {
+        errors.push(duplicateNameError);
+      }
       if (!isRecord(entry)) {
         errors.push(`${path}: must be an object`);
         continue;

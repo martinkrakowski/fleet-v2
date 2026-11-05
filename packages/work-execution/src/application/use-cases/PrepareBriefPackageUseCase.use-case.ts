@@ -351,6 +351,22 @@ function validatePlacement(
   return { worktreePath };
 }
 
+/** Why `contextDecisions` is unusable, or null when it is absent or a valid array of decisions. */
+function contextDecisionsError(value: unknown): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!Array.isArray(value)) {
+    return 'contextDecisions must be an array of context decisions';
+  }
+  for (const decision of value) {
+    if (typeof decision !== 'object' || decision === null || Array.isArray(decision)) {
+      return 'contextDecisions must be an array of context decisions';
+    }
+  }
+  return null;
+}
+
 /**
  * The reviewer must be named and differ from the implementer model, an
  * optional seat plan is validated, pr notes are validated when present, and
@@ -379,6 +395,9 @@ function validateReviewerAndPlan(
     if (notesError !== null) {
       return { reason: notesError };
     }
+  }
+  if (contextDecisionsError(request.contextDecisions) !== null) {
+    return { reason: 'contextDecisions must be an array of context decisions' };
   }
   const decisions = request.contextDecisions ?? [];
   if (decisions.some((decision) => !isNonEmpty(decision.decisionBecause))) {

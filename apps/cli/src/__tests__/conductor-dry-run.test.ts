@@ -476,7 +476,7 @@ describe('conductor run --dry-run (K7-8)', () => {
       'dispatch', 'collect', 'gate', 'brief-check', 'code-review', 'accept', 'open-pr', 'premerge', 'merge',
     ]);
     expect(would[0]).toMatchObject({ key: `${RUN_ID}/r0/dispatch/0/a1`, result: 'completed', reasonCode: 'dispatch-started' });
-    expect(would[1]).toMatchObject({ key: `${RUN_ID}/r0/collect/0`, result: 'completed', reasonCode: 'collected' });
+    expect(would[1]).toMatchObject({ key: `${RUN_ID}/r0/collect/0/a1`, result: 'completed', reasonCode: 'collected' });
     expect(would[2]).toMatchObject({ key: `${RUN_ID}/r0/gate/0@dddddddddddd`, result: 'completed', reasonCode: 'gate-passed' });
     expect(would[3]).toMatchObject({ key: `${RUN_ID}/r0/brief-check/0@dddddddddddd`, result: 'completed', reasonCode: 'review-passed' });
     expect(would[4]).toMatchObject({ key: `${RUN_ID}/r0/code-review/0@dddddddddddd`, result: 'completed', reasonCode: 'review-passed' });

@@ -450,8 +450,7 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
     try {
       return await this.runTickInner(request);
     } catch {
-      const tickId = isRecord(request) && typeof request.tickId === 'string' ? request.tickId : '';
-      return refused(tickId, 'tick-failed');
+      return refused(safeTickId(request), 'tick-failed');
     }
   }
 
@@ -939,6 +938,15 @@ function queueNumbers(
     headEntryId: findMergeQueueHead(queue.entries, digest)?.entryId ?? null,
     lastMergedHead12: lastMergedHead12(queue.entries, digest),
   };
+}
+
+/** The request's tick id for a last-resort refusal; '' when it is absent, not a string or its read throws. */
+function safeTickId(request: unknown): string {
+  try {
+    return isRecord(request) && typeof request.tickId === 'string' ? request.tickId : '';
+  } catch {
+    return '';
+  }
 }
 
 function refused(tickId: string, reasonCode: string): RunDaemonTickResult {

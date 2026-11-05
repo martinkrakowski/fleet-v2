@@ -553,6 +553,17 @@ describe('RunDaemonTickUseCase (DT10a)', () => {
       [{ tickId: TICK_A, repositories: [], forgeReachable: 'yes' }, 'forge-probe-missing'],
     ];
 
+    const hostile = {
+      get tickId(): string {
+        throw new Error('getter exploded');
+      },
+    };
+    await expect(h.useCase.runTick(hostile as unknown as RunDaemonTickRequest)).resolves.toMatchObject({
+      outcome: 'refused',
+      tickId: '',
+      reasonCode: 'tick-failed',
+    });
+
     for (const [request, reasonCode] of cases) {
       const result = await h.useCase.runTick(request as RunDaemonTickRequest);
       expect(result).toMatchObject({ outcome: 'refused', exitCode: 1, status: null, reasonCode });

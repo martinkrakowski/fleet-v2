@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildGateReceiptKey,
   decideGateReceiptReuse,
+  gateReceiptKeysEqual,
   readGateReceiptKeyRecord,
   type GateReceiptKeyInput,
 } from '../gate-receipt-key.js';
@@ -302,5 +303,42 @@ describe('decideGateReceiptReuse', () => {
       result = decideGateReceiptReuse(key.key, hostile);
     }).not.toThrow();
     expect(result?.outcome).toBe('miss');
+  });
+});
+
+describe('gateReceiptKeysEqual and string reads (KS2 review fixes)', () => {
+  function key() {
+    const built = buildGateReceiptKey(components());
+    if (!built.ok) throw new Error('fixture key must build');
+    return built.key;
+  }
+
+  it('compares unequal, without throwing, for null, a non-object or missing toolchain versions', () => {
+    const k = key();
+    for (const bad of [null, undefined, 42, 'key', { ...k, toolchainVersions: null }]) {
+      expect(() => gateReceiptKeysEqual(k, bad as never)).not.toThrow();
+      expect(gateReceiptKeysEqual(k, bad as never)).toBe(false);
+      expect(gateReceiptKeysEqual(bad as never, k)).toBe(false);
+    }
+  });
+
+  it('compares unequal, without throwing, when an accessor throws', () => {
+    const hostile = Object.defineProperty({ ...key() }, 'treeHash', {
+      get() {
+        throw new Error('hostile');
+      },
+    });
+    expect(() => gateReceiptKeysEqual(key(), hostile)).not.toThrow();
+    expect(gateReceiptKeysEqual(key(), hostile)).toBe(false);
+  });
+
+  it('still compares equal keys as equal', () => {
+    expect(gateReceiptKeysEqual(key(), key())).toBe(true);
+  });
+
+  it('refuses a predicate id with a leading or trailing tab or newline', () => {
+    for (const predicateId of ['\tcommand 1: corepack yarn build', 'command 1: corepack yarn build\n']) {
+      expect(buildGateReceiptKey({ ...components(), predicateId }).ok).toBe(false);
+    }
   });
 });

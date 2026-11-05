@@ -87,11 +87,19 @@ function readTrimmedString(value: unknown, maxLength: number): string | undefine
   if (typeof value !== 'string') {
     return undefined;
   }
+  // Control characters are refused before trimming, so a leading or trailing tab or newline is refused too.
+  if (hasControlCharacter(value)) {
+    return undefined;
+  }
   const trimmed = value.trim();
-  if (trimmed.length < 1 || trimmed.length > maxLength || hasControlCharacter(trimmed)) {
+  if (trimmed.length < 1 || trimmed.length > maxLength) {
     return undefined;
   }
   return trimmed;
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
 }
 
 function isTreeHash(value: unknown): value is string {
@@ -186,7 +194,23 @@ export function buildGateReceiptKey(input: GateReceiptKeyInput): GateReceiptKeyB
   return readGateReceiptKeyComponents(input);
 }
 
+/** Whether two keys are equal on every component; anything that is not a readable key compares unequal, never throws. */
 export function gateReceiptKeysEqual(left: GateReceiptKey, right: GateReceiptKey): boolean {
+  try {
+    return keyComponentsEqual(left, right);
+  } catch {
+    // A hostile accessor or a malformed value is a miss, never an exception.
+    return false;
+  }
+}
+
+function keyComponentsEqual(left: GateReceiptKey, right: GateReceiptKey): boolean {
+  if (!isObjectRecord(left) || !isObjectRecord(right)) {
+    return false;
+  }
+  if (!isObjectRecord(left.toolchainVersions) || !isObjectRecord(right.toolchainVersions)) {
+    return false;
+  }
   return (
     left.schemaVersion === right.schemaVersion &&
     left.predicateId === right.predicateId &&

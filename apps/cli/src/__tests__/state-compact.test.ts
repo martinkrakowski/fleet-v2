@@ -10,6 +10,8 @@ import * as path from 'node:path';
 
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { LaneRunRepositoryAdapter, type LaneRunRecord } from '@fleet/work-execution';
+
 import { runCli, type CliIo } from '../index.js';
 
 const createdDirs: string[] = [];
@@ -320,17 +322,61 @@ describe('fleet-v2 state compact', () => {
     expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
   });
 
-  it('refuses when the quarantine directory is a symlink and leaves the store as found', async () => {
+  it('refuses when the quarantine directory is a symlink and writes nothing', async () => {
     const dir = makeTempDir();
     const outside = makeTempDir();
     const original = await seedFinished(dir);
     await fs.symlink(outside, path.join(dir, 'quarantine'));
     const result = await compact(dir);
     expect(result.code).toBe(1);
-    expect(result.err).toContain('state compact refused: attempts.json:');
-    expect(result.out).toContain('state compact: 0 of 3 stores compacted\n');
+    expect(result.err).toContain('state compact refused: the quarantine directory is not a real directory');
+    expect(result.out).toContain('nothing changed');
     expect(await fs.readFile(path.join(dir, 'attempts.json'), 'utf8')).toBe(original.attempts);
     expect(await fs.readdir(outside)).toEqual([]);
+  });
+
+  it('refuses when a .compacted temp name is a directory and keeps no quarantine copy', async () => {
+    const dir = makeTempDir();
+    const original = await seedFinished(dir);
+    await fs.mkdir(path.join(dir, 'attempts.json.compacted'));
+    const result = await compact(dir);
+    expect(result.code).toBe(1);
+    expect(result.err).toContain('attempts.json.compacted is a directory');
+    expect(await fs.readFile(path.join(dir, 'attempts.json'), 'utf8')).toBe(original.attempts);
+    expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
+  });
+
+  it('refuses a store above the size bound without reading it', async () => {
+    const dir = makeTempDir();
+    await seed(dir, 'attempts.json', [ATTEMPT('att-done', 'collected')]);
+    await fs.truncate(path.join(dir, 'journal.json'), 65 * 1024 * 1024).catch(async () => {
+      await fs.writeFile(path.join(dir, 'journal.json'), '');
+      await fs.truncate(path.join(dir, 'journal.json'), 65 * 1024 * 1024);
+    });
+    const result = await compact(dir);
+    expect(result.code).toBe(1);
+    expect(result.err).toContain('state compact refused: journal.json is too large to compact');
+    expect(result.out).toContain('nothing changed');
+    expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
+  });
+
+  it('refuses when a lane run starts listing a removable attempt after the plan was made', async () => {
+    const dir = makeTempDir();
+    const original = await seedFinished(dir);
+    const list = vi
+      .spyOn(LaneRunRepositoryAdapter.prototype, 'list')
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([LIVE_RUN as unknown as LaneRunRecord]);
+    try {
+      const result = await compact(dir);
+      expect(result.code).toBe(1);
+      expect(result.err).toContain('state compact refused: the lane runs changed while the plan was being made');
+      expect(result.out).toContain('nothing changed');
+      expect(await fs.readFile(path.join(dir, 'attempts.json'), 'utf8')).toBe(original.attempts);
+      expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
+    } finally {
+      list.mockRestore();
+    }
   });
 
   it('prints ids, counts and fixed reasons only: no record text, secrets or state-directory paths', async () => {

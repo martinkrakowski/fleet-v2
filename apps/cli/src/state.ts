@@ -458,6 +458,172 @@ async function readCompactStore<T>(
   return { ok: true, store: { basename, sha256: sha256Hex(bytes), records: inspection.records } };
 }
 
+/**
+ * Before any store is read: each of the three stores, its `.compacted` temp name and the quarantine
+ * directory must be absent or a real file or directory of the right kind, and no store may exceed the
+ * size bound. A link is never followed, so this runs before `state check` reads anything.
+ */
+async function compactPreflight(stateDir: string): Promise<string | null> {
+  const lstatOrNull = async (target: string): Promise<Awaited<ReturnType<typeof fs.lstat>> | null> => {
+    try {
+      return await fs.lstat(target);
+    } catch (error: unknown) {
+      if (errorCodeOf(error) === 'ENOENT') {
+        return null;
+      }
+      throw error;
+    }
+  };
+  try {
+    for (const basename of COMPACT_BASENAMES) {
+      const store = await lstatOrNull(path.join(stateDir, basename));
+      if (store !== null && !store.isFile()) {
+        return `${basename} is not a regular file`;
+      }
+      if (store !== null && store.size > MAX_COMPACT_STORE_BYTES) {
+        return `${basename} is too large to compact`;
+      }
+      const temp = await lstatOrNull(path.join(stateDir, `${basename}.compacted`));
+      if (temp !== null && temp.isDirectory()) {
+        return `${basename}.compacted is a directory`;
+      }
+    }
+    const quarantine = await lstatOrNull(path.join(stateDir, 'quarantine'));
+    if (quarantine !== null && !quarantine.isDirectory()) {
+      return 'the quarantine directory is not a real directory';
+    }
+  } catch (error: unknown) {
+    return `the state directory could not be inspected (${errorCodeOf(error)})`;
+  }
+  return null;
+}
+
+interface CompactPlan {
+  readonly stores: readonly CompactStore<{ readonly id: string }>[];
+  readonly keepLists: readonly (readonly string[])[];
+  readonly removable: readonly ReadonlySet<string>[];
+}
+
+/** The attempt ids a live lane run lists; throws when the runs cannot be read. */
+async function readLiveRunAttemptIds(stateDir: string): Promise<readonly string[]> {
+  const runs = await new LaneRunRepositoryAdapter({ stateDir, readOnly: true }).list();
+  const journals = await new LaneRunJournalAdapter({ stateDir, readOnly: true }).listForRuns(
+    runs.map((run) => run.runId),
+  );
+  return liveRunAttemptIds(runs, journals);
+}
+
+/** Read the three stores and plan; a string is a refusal message. */
+async function planCompaction(stateDir: string): Promise<CompactPlan | string> {
+  const attempts = await readCompactStore<AttemptRecord>(stateDir, 'attempts.json', parseVersionedAttemptStateRecord);
+  if (!attempts.ok) {
+    return attempts.message;
+  }
+  const journal = await readCompactStore<ActionJournalEntryRecord>(
+    stateDir,
+    'journal.json',
+    parseVersionedJournalEntryStateRecord,
+  );
+  if (!journal.ok) {
+    return journal.message;
+  }
+  const reservations = await readCompactStore<CapacityReservationRecord>(
+    stateDir,
+    'reservations.json',
+    parseVersionedReservationStateRecord,
+  );
+  if (!reservations.ok) {
+    return reservations.message;
+  }
+  try {
+    const plan = planAttemptScopedCompaction({
+      attempts: attempts.store.records,
+      reservations: reservations.store.records,
+      journalEntries: journal.store.records,
+      liveRunAttemptIds: await readLiveRunAttemptIds(stateDir),
+    });
+    const removable = [
+      new Set(plan.removableAttemptIds),
+      new Set(plan.removableJournalEntryIds),
+      new Set(plan.removableReservationIds),
+    ];
+    const stores = [attempts.store, journal.store, reservations.store];
+    const keepLists = stores.map((store, index) =>
+      store.records.map((record) => record.id).filter((id) => !removable[index]!.has(id)),
+    );
+    return { stores, keepLists, removable };
+  } catch {
+    return 'the lane runs could not be read';
+  }
+}
+
+/** True when a run now lists an attempt the plan is about to remove (the lane runs moved after the plan was made). */
+async function liveRunsMovedUnderPlan(stateDir: string, plan: CompactPlan): Promise<boolean> {
+  try {
+    const live = await readLiveRunAttemptIds(stateDir);
+    return live.some((id) => plan.removable[0]!.has(id));
+  } catch {
+    return true;
+  }
+}
+
+async function confirmCompaction(io: CliIo, options: StateCliOptions): Promise<boolean> {
+  try {
+    const confirm = options.confirm ?? confirmFromStdin(io);
+    return await confirm(COMPACT_CONFIRM_QUESTION);
+  } catch {
+    return false;
+  }
+}
+
+/** Apply the plan store by store; the first refusal stops the loop, and stores already compacted stay compacted. */
+async function applyCompaction(
+  io: CliIo,
+  stateDir: string,
+  plan: CompactPlan,
+): Promise<{ readonly compactedCount: number; readonly failed: boolean }> {
+  let compactedCount = 0;
+  for (const [index, store] of plan.stores.entries()) {
+    if (store.sha256 === null) {
+      io.stdout(`missing ${store.basename}: nothing to compact\n`);
+      continue;
+    }
+    const descriptor = STATE_FILE_DESCRIPTORS.find((candidate) => candidate.basename === store.basename);
+    let refusal: string | null = null;
+    let outcome: Awaited<ReturnType<NonNullable<StateFileDescriptor['compact']>>> | null = null;
+    if (descriptor?.compact === undefined) {
+      refusal = 'the store cannot be compacted';
+    } else {
+      try {
+        outcome = await descriptor.compact({
+          stateDir,
+          keepIds: plan.keepLists[index]!,
+          expectedCurrentSha256: store.sha256,
+        });
+      } catch {
+        refusal = 'the compaction failed';
+      }
+    }
+    if (outcome?.status === 'refused') {
+      refusal = safeCompactReason(outcome.reason, stateDir);
+    }
+    if (refusal !== null || outcome === null) {
+      io.stderr(`state compact refused: ${store.basename}: ${refusal ?? 'the compaction failed'}\n`);
+      return { compactedCount, failed: true };
+    }
+    if (outcome.status === 'unchanged') {
+      io.stdout(`unchanged ${store.basename}: ${outcome.recordCount} ${recordWord(outcome.recordCount)}\n`);
+    } else if (outcome.status === 'compacted') {
+      compactedCount += 1;
+      io.stdout(`compacted ${store.basename}: ${outcome.beforeCount} -> ${outcome.afterCount} records\n`);
+      if (outcome.quarantinePath !== null) {
+        io.stdout(`pre-compaction bytes kept at quarantine/${path.basename(outcome.quarantinePath)}\n`);
+      }
+    }
+  }
+  return { compactedCount, failed: false };
+}
+
 /** `fleet-v2 state compact [--yes]` (lane EX-3c): the operator half of the state compaction. */
 async function stateCompact(
   argv: readonly string[],
@@ -465,17 +631,15 @@ async function stateCompact(
   stateDir: string,
   options: StateCliOptions,
 ): Promise<number> {
-  let yes = false;
-  for (const token of argv) {
-    if (token === '--yes') {
-      yes = true;
-      continue;
-    }
-    io.stderr(`Unknown state compact option: ${token}\n${STATE_HELP}\n`);
+  const unknownOption = argv.find((token) => token !== '--yes');
+  if (unknownOption !== undefined) {
+    io.stderr(`Unknown state compact option: ${unknownOption}\n${STATE_HELP}\n`);
     return 2;
   }
-
-  // 2. Check before: any unreadable store refuses, nothing is written.
+  const preflight = await compactPreflight(stateDir);
+  if (preflight !== null) {
+    return compactRefusal(io, preflight);
+  }
   let before: StateFileCheck[];
   try {
     before = await checkStateDirectory(stateDir);
@@ -486,122 +650,23 @@ async function stateCompact(
   if (badBefore !== '') {
     return compactRefusal(io, `${badBefore} is not readable`);
   }
-
-  // 3. Read the three stores through their own parsers.
-  const attemptsRead = await readCompactStore<AttemptRecord>(stateDir, 'attempts.json', parseVersionedAttemptStateRecord);
-  if (!attemptsRead.ok) {
-    return compactRefusal(io, attemptsRead.message);
+  const plan = await planCompaction(stateDir);
+  if (typeof plan === 'string') {
+    return compactRefusal(io, plan);
   }
-  const journalRead = await readCompactStore<ActionJournalEntryRecord>(
-    stateDir,
-    'journal.json',
-    parseVersionedJournalEntryStateRecord,
-  );
-  if (!journalRead.ok) {
-    return compactRefusal(io, journalRead.message);
-  }
-  const reservationsRead = await readCompactStore<CapacityReservationRecord>(
-    stateDir,
-    'reservations.json',
-    parseVersionedReservationStateRecord,
-  );
-  if (!reservationsRead.ok) {
-    return compactRefusal(io, reservationsRead.message);
-  }
-  const stores = [attemptsRead.store, journalRead.store, reservationsRead.store];
-
-  // 4 + 5. Live-run protection, then the plan. Any failure here is a refusal: unknown stays protected.
-  let removable: ReadonlySet<string>[];
-  try {
-    const runs = await new LaneRunRepositoryAdapter({ stateDir, readOnly: true }).list();
-    const journals = await new LaneRunJournalAdapter({ stateDir, readOnly: true }).listForRuns(
-      runs.map((run) => run.runId),
-    );
-    const plan = planAttemptScopedCompaction({
-      attempts: attemptsRead.store.records,
-      reservations: reservationsRead.store.records,
-      journalEntries: journalRead.store.records,
-      liveRunAttemptIds: liveRunAttemptIds(runs, journals),
-    });
-    removable = [
-      new Set(plan.removableAttemptIds),
-      new Set(plan.removableJournalEntryIds),
-      new Set(plan.removableReservationIds),
-    ];
-  } catch {
-    return compactRefusal(io, 'the lane runs could not be read');
-  }
-
-  // 6. Keep lists: every record id minus the plan's removable ids.
-  const keepLists = stores.map((store, index) =>
-    (store.records as readonly { readonly id: string }[])
-      .map((record) => record.id)
-      .filter((id) => !removable[index]!.has(id)),
-  );
-
-  // 7. Nothing to do: no confirmation, no writes.
-  if (stores.every((store, index) => keepLists[index]!.length === store.records.length)) {
+  if (plan.stores.every((store, index) => plan.keepLists[index]!.length === store.records.length)) {
     io.stdout('state compact: nothing to compact\n');
     return 0;
   }
-
-  // 8. Confirm (destructive).
-  if (!yes) {
-    let confirmed = false;
-    try {
-      const confirm = options.confirm ?? confirmFromStdin(io);
-      confirmed = await confirm(COMPACT_CONFIRM_QUESTION);
-    } catch {
-      confirmed = false;
-    }
-    if (!confirmed) {
-      io.stdout('nothing changed\n');
-      return 1;
-    }
+  if (!argv.includes('--yes') && !(await confirmCompaction(io, options))) {
+    io.stdout('nothing changed\n');
+    return 1;
   }
-
-  // 9. Apply store by store; the first refusal stops the loop, and stores already compacted stay compacted.
-  let compactedCount = 0;
-  let failed = false;
-  for (const [index, store] of stores.entries()) {
-    if (store.sha256 === null) {
-      io.stdout(`missing ${store.basename}: nothing to compact\n`);
-      continue;
-    }
-    const descriptor = STATE_FILE_DESCRIPTORS.find((candidate) => candidate.basename === store.basename);
-    if (descriptor?.compact === undefined) {
-      io.stderr(`state compact refused: ${store.basename}: the store cannot be compacted\n`);
-      failed = true;
-      break;
-    }
-    let outcome: Awaited<ReturnType<NonNullable<StateFileDescriptor['compact']>>>;
-    try {
-      outcome = await descriptor.compact({ stateDir, keepIds: keepLists[index]!, expectedCurrentSha256: store.sha256 });
-    } catch {
-      io.stderr(`state compact refused: ${store.basename}: the compaction failed\n`);
-      failed = true;
-      break;
-    }
-    if (outcome.status === 'refused') {
-      io.stderr(`state compact refused: ${store.basename}: ${safeCompactReason(outcome.reason, stateDir)}\n`);
-      failed = true;
-      break;
-    }
-    if (outcome.status === 'unchanged') {
-      io.stdout(`unchanged ${store.basename}: ${outcome.recordCount} ${recordWord(outcome.recordCount)}\n`);
-      continue;
-    }
-    compactedCount += 1;
-    io.stdout(`compacted ${store.basename}: ${outcome.beforeCount} -> ${outcome.afterCount} records\n`);
-    if (outcome.quarantinePath !== null) {
-      io.stdout(`pre-compaction bytes kept at quarantine/${path.basename(outcome.quarantinePath)}\n`);
-    }
+  if (await liveRunsMovedUnderPlan(stateDir, plan)) {
+    return compactRefusal(io, 'the lane runs changed while the plan was being made');
   }
-
-  // 10. Summary.
+  const { compactedCount, failed } = await applyCompaction(io, stateDir, plan);
   io.stdout(`state compact: ${compactedCount} of ${COMPACT_BASENAMES.length} stores compacted\n`);
-
-  // 11. Check after.
   let after: StateFileCheck[];
   try {
     after = await checkStateDirectory(stateDir);
@@ -615,8 +680,6 @@ async function stateCompact(
     return 1;
   }
   io.stdout(`state check after compaction: all ${after.length} store files readable or missing\n`);
-
-  // 12. Exit code.
   return failed ? 1 : 0;
 }
 

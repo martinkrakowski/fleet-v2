@@ -333,7 +333,7 @@ describe('InspectLaneRunsUseCase (GB2)', () => {
     expect(run.reviewFindings).toEqual([FINDING]);
   });
 
-  it('returns [] and does not call receipt store when parked findings is explicitly null even with receipt available', async () => {
+  it('a null findings snapshot falls back to the receipt and shows its findings', async () => {
     const findLatestReceiptOfKind = vi.fn(async (request: { candidateHeadSha: string }) => ({
       outcome: 'found' as const,
       receipt: {
@@ -350,6 +350,28 @@ describe('InspectLaneRunsUseCase (GB2)', () => {
       reviewReceipts: { findLatestReceiptOfKind },
     });
     await seedParkedRun(harness, 'blocker-after-round-2', 1, [ATTEMPT_ID], null);
+    const [run] = await statusRuns(harness);
+    expect(run.reviewFindings).toEqual([FINDING]);
+    expect(findLatestReceiptOfKind).toHaveBeenCalled();
+  });
+
+  it('an empty-array snapshot shows [] without reading the receipts', async () => {
+    const findLatestReceiptOfKind = vi.fn(async (request: { candidateHeadSha: string }) => ({
+      outcome: 'found' as const,
+      receipt: {
+        receiptId: 'rcpt-1',
+        requestId: null,
+        kind: 'code-review' as const,
+        reviewerModel: 'review-model-1',
+        candidateHeadSha: request.candidateHeadSha,
+        verdict: 'failed' as const,
+        findings: [FINDING],
+      },
+    }));
+    const harness = makeHarness({
+      reviewReceipts: { findLatestReceiptOfKind },
+    });
+    await seedParkedRun(harness, 'blocker-after-round-2', 1, [ATTEMPT_ID], []);
     const [run] = await statusRuns(harness);
     expect(run.reviewFindings).toEqual([]);
     expect(findLatestReceiptOfKind).not.toHaveBeenCalled();

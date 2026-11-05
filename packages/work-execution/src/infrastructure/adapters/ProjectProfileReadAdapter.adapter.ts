@@ -3,7 +3,8 @@
  * in-process to operator-coordination's InspectProjectProfilePort, bound by
  * the composition root (same delegate pattern as ActionAuthorizationAdapter).
  * Without a delegate it throws. The supplier's `found` answer is mapped to a
- * ProjectProfileView copying only the six view fields, validating their
+ * ProjectProfileView copying the view fields — including the project's lane
+ * cap (`maxConcurrentLanes`, AD-1) — validating their
  * types; `not-found` maps to null; `rejected` throws with its reason; any
  * other or malformed answer throws a malformed-profile error.
  */
@@ -85,6 +86,14 @@ function mapProfile(projectId: string, profile: Record<string, unknown>): Projec
   if (!Number.isInteger(profile.revision) || (profile.revision as number) < 0) {
     throw malformed(projectId);
   }
+  if (
+    profile.maxConcurrentLanes !== undefined &&
+    profile.maxConcurrentLanes !== null &&
+    (!Number.isInteger(profile.maxConcurrentLanes) || (profile.maxConcurrentLanes as number) < 1)
+  ) {
+    throw malformed(projectId);
+  }
+  const laneCap = profile.maxConcurrentLanes;
   return {
     projectId: profile.projectId,
     status: profile.status,
@@ -92,6 +101,7 @@ function mapProfile(projectId: string, profile: Record<string, unknown>): Projec
     clones,
     gateProcedures: profile.gateProcedures,
     revision: profile.revision as number,
+    ...(laneCap !== undefined && laneCap !== null ? { maxConcurrentLanes: laneCap as number } : {}),
   };
 }
 

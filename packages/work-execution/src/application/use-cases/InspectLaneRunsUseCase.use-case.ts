@@ -84,7 +84,7 @@ async function fallbackReviewFindings(
   }
 }
 
-/** The bounded findings of the parked head's failed code review; `null` when not a blocker park. */
+/** The bounded findings of the parked head's failed code review; `null` when not a blocker park. A stored null snapshot is an unread snapshot and falls back to the receipts. */
 async function blockedReviewFindings(
   deps: InspectLaneRunsDependencies,
   record: LaneRunRecord,
@@ -93,11 +93,8 @@ async function blockedReviewFindings(
   if (parked === null || parked.reason !== 'blocker-after-round-2') {
     return null;
   }
-  if (parked.findings === undefined) {
+  if (parked.findings === undefined || parked.findings === null) {
     return fallbackReviewFindings(deps, record);
-  }
-  if (parked.findings === null) {
-    return [];
   }
   return boundedFindingsView(parked.findings);
 }

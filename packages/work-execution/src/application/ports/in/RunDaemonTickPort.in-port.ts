@@ -24,18 +24,24 @@ export interface DaemonRepositoryRef {
 export interface RunDaemonTickRequest {
   /** `tick-<ulid>`, minted by the caller; it is the holder id on every lease. */
   readonly tickId: string;
-  /** The repositories to serve. The tick orders the jobs itself. */
+  /** The repositories to serve, one job instance each. The tick orders the jobs itself; a malformed or repeated repository (same digest or same owner/repo) refuses the whole tick. */
   readonly repositories: readonly DaemonRepositoryRef[];
   /** The tick's budget in seconds (default 45). */
   readonly budgetSeconds?: number;
   /** Only these job ids run (`--job`); absent runs every job. */
   readonly jobFilter?: readonly string[];
-  /** The forge probe's verdict; absent asks the forge port. */
-  readonly forgeReachable?: boolean;
+  /**
+   * The caller's forge probe verdict (plan §3.1: `gh api rate_limit`, 10 s),
+   * required: no declared port carries the probe, so the composition root runs
+   * it. Forge-touching jobs run only when this is true **and** the forge
+   * transport is configured; otherwise each is `skipped: forge-unreachable`.
+   * A missing or non-boolean value refuses the tick (`forge-probe-missing`).
+   */
+  readonly forgeReachable: boolean;
 }
 
 export interface RunDaemonTickResult {
-  /** `refused` when the tick could not run at all: a bad tick id, a bad clock, an unreadable status store or a refused status write. */
+  /** `refused` when the tick could not run at all: a malformed request, a bad clock, an unreadable status store or a refused status write. Nothing is written before a refusal, except that a refused status write may follow jobs that ran. */
   readonly outcome: 'completed' | 'refused';
   /** 0 completed (including every skipped job and `budget-exhausted`); 1 a refused job or an unreadable status store. */
   readonly exitCode: 0 | 1;
@@ -44,7 +50,13 @@ export interface RunDaemonTickResult {
   readonly status: DaemonStatusRecord | null;
   /** One record per job instance, in the order the jobs ran. */
   readonly jobs: readonly DaemonJobStatusRecord[];
-  /** The refusal reason when `outcome` is `refused`. */
+  /**
+   * The refusal reason when `outcome` is `refused`: `invalid-request`,
+   * `invalid-tick-id`, `invalid-budget`, `invalid-repositories`,
+   * `invalid-repository`, `duplicate-repository`, `invalid-job-filter`,
+   * `forge-probe-missing`, `invalid-clock`, `status-unreadable`,
+   * `status-write-failed`, or `tick-failed` (the last-resort guard).
+   */
   readonly reasonCode?: string;
 }
 

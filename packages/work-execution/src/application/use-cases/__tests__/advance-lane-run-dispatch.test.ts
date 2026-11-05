@@ -54,6 +54,22 @@ function grantingStartGate(): SessionStartGate {
   return { tryStart: () => ({ ok: true }) };
 }
 
+/** CO13: a gate whose endpoint rule always denies; the global rule grants. */
+function denyingEndpointGate(): SessionStartGate {
+  return {
+    tryStart: () => ({ ok: true }),
+    tryStartForEndpoint: () => ({ ok: false, retryAfterMs: 12_345 }),
+  };
+}
+
+/** CO13: a gate whose endpoint rule always grants; the global rule grants. */
+function grantingEndpointGate(): SessionStartGate {
+  return {
+    tryStart: () => ({ ok: true }),
+    tryStartForEndpoint: () => ({ ok: true }),
+  };
+}
+
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
 const LATER = '2026-10-27T10:01:00.000Z';
@@ -1188,6 +1204,49 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     await admit(harness, 'attempt-example-1');
     const key = dispatchKey(0, 0, 1);
     const result = await advance(harness, { startGate: grantingStartGate() });
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'dispatch',
+      key,
+      result: 'completed',
+      reasonCode: 'dispatch-started',
+    });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries[0]).toMatchObject({ kind: 'intent', key, mintedId: 'attempt-example-1' });
+  });
+
+  it('CO13: a denying endpoint gate waits session-stagger before the dispatch intent, spends no key and journals one refused dispatch entry', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const result = await advance(harness, { startGate: denyingEndpointGate() });
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(harness.dispatchRequests).toEqual([]);
+    // The wait sits before the one-way intent: nothing is journalled in the run journal.
+    expect(await harness.runJournal.listForRun(RUN_ID)).toEqual([]);
+    // The attempt is untouched.
+    expect((await harness.attemptRepo.findAttemptById('attempt-example-1'))?.state).toBe('intent-recorded');
+    // The execution journal holds exactly one refused dispatch wait entry.
+    const entries = await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1');
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ action: 'dispatch', status: 'refused' });
+    expect(entries[0].detail).toMatch(/^dispatch stagger wait: endpoint opencode:lane-host-example:4166/);
+  });
+
+  it('CO13: a second wait for the same attempt appends no second entry', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    await advance(harness, { startGate: denyingEndpointGate() });
+    await advance(harness, { startGate: denyingEndpointGate() });
+    const entries = await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1');
+    expect(entries.filter((entry) => entry.action === 'dispatch' && entry.status === 'refused')).toHaveLength(1);
+  });
+
+  it('CO13: a granting endpoint gate dispatches exactly as test 20 does', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const key = dispatchKey(0, 0, 1);
+    const result = await advance(harness, { startGate: grantingEndpointGate() });
     expect(result).toEqual({
       outcome: 'acted',
       step: 'dispatch',

@@ -3,6 +3,7 @@ import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in
 import type { DispatchAttemptResult } from '../../ports/in/DispatchAttemptPort.in-port.js';
 import { AttemptRevisionConflictError } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import { parseSeatTool, type AttemptRecord, type AttemptSeatOverrideRecord, type AttemptSeatSelectionRecord } from '../../../domain/execution-records.js';
+import { dispatchEndpointFactsOf, dispatchEndpointKey } from '../../../domain/dispatch-stagger.js';
 import type { LaneRunDecision, LaneRunFacts } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunCursorsRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
@@ -714,6 +715,10 @@ export async function performDispatch(ctx: AdvanceStepContext,
   // sets one) never dispatches: it refuses and parks with a fixed detail,
   // never a guessed or inherited seat field.
   const fixSeat = fixSeatForDispatch(latest, manifest);
+  const endpointWait = await endpointStaggerWaitOf(ctx, record, latest, request);
+  if (endpointWait !== null) {
+    return endpointWait;
+  }
   const staggered = startGateWaitOf(request, fixSeat, inputsReadable);
   if (staggered !== null) {
     return staggered;
@@ -943,6 +948,114 @@ function startGateWaitOf(
     }
   }
   return null;
+}
+
+/**
+ * CO13: the per-runner-endpoint dispatch stagger wait, before the one-way
+ * dispatch intent. A denied start is a wait — never a refusal and never a
+ * spent key. No gate, no endpoint-scoped method or no endpoint identity means
+ * nothing to enforce (today's behaviour).
+ */
+async function endpointStaggerWaitOf(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+): Promise<AdvanceLaneRunResult | null> {
+  const gate = request.startGate;
+  if (gate === undefined || gate.tryStartForEndpoint === undefined) {
+    return null;
+  }
+  const endpoint = dispatchEndpointFactsOf(latest.runner);
+  if (endpoint === null) {
+    return null;
+  }
+  const endpointKey = dispatchEndpointKey(endpoint);
+  const lastStartIso = await lastStartIsoForEndpoint(ctx, endpointKey);
+  const decision = gate.tryStartForEndpoint(request.runId, request.nowIso, endpointKey, lastStartIso);
+  if (decision.ok) {
+    return null;
+  }
+  await journalDispatchStaggerWait(ctx, record, latest, request, endpointKey, decision.retryAfterMs);
+  return { outcome: 'waiting', reason: 'session-stagger' };
+}
+
+/**
+ * CO13: the durable seed for one endpoint — the latest `updatedAtIso` of any
+ * attempt that started on it. An attempt's `updatedAtIso` is never earlier
+ * than its start, so the measured gap is never shorter than the true one — the
+ * safe direction.
+ */
+async function lastStartIsoForEndpoint(ctx: AdvanceStepContext, endpointKey: string): Promise<string | null> {
+  const attempts = await ctx.deps.attemptRepo.listAllAttempts();
+  let latestMs: number | null = null;
+  let latestIso: string | null = null;
+  for (const attempt of attempts) {
+    if (attempt.runner === null || attempt.runner === undefined) {
+      continue;
+    }
+    // An `intent-recorded` or `cancelled` attempt never started.
+    if (
+      attempt.state !== 'dispatching' &&
+      attempt.state !== 'running' &&
+      attempt.state !== 'reconciling' &&
+      attempt.state !== 'blocked' &&
+      attempt.state !== 'ended' &&
+      attempt.state !== 'collected'
+    ) {
+      continue;
+    }
+    if (dispatchEndpointKey(dispatchEndpointFactsOf(attempt.runner)) !== endpointKey) {
+      continue;
+    }
+    const ms = Date.parse(attempt.updatedAtIso);
+    if (!Number.isNaN(ms) && (latestMs === null || ms > latestMs)) {
+      latestMs = ms;
+      latestIso = attempt.updatedAtIso;
+    }
+  }
+  return latestIso;
+}
+
+/**
+ * CO13: journal one wait reason per attempt, naming the endpoint and the retry
+ * delay in ids and codes only. The `refused` status is deliberate: a
+ * non-`refused` `dispatch` entry makes `dispatchEverJournalled` true, and that
+ * would make the reconcile path believe a runner was contacted. A failing
+ * append must never fail the wait: catch it, ignore it and let the wait stand.
+ */
+async function journalDispatchStaggerWait(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  latest: AttemptRecord,
+  request: AdvanceLaneRunRequest,
+  endpointKey: string,
+  retryAfterMs: number,
+): Promise<void> {
+  const journal = ctx.deps.executionJournal;
+  if (journal.appendJournalEntry === undefined) {
+    return;
+  }
+  const prior = await journal.listJournalEntriesForAttempt(latest.id);
+  if (prior.some((entry) => entry.action === 'dispatch' && entry.detail !== null && entry.detail.startsWith('dispatch stagger wait:'))) {
+    return;
+  }
+  try {
+    await journal.appendJournalEntry({
+      id: `${latest.id}:dispatch:${prior.length + 1}`,
+      attemptId: latest.id,
+      workOrderId: record.workOrderId,
+      action: 'dispatch',
+      baseCommit: latest.baseCommit,
+      recordedAtIso: request.nowIso,
+      status: 'refused',
+      sessionId: null,
+      detail: `dispatch stagger wait: endpoint ${endpointKey}, retry after ${retryAfterMs} ms`,
+    });
+  } catch {
+    // The wait stands even when the journal append fails; the reason is then
+    // only in the conductor pass trace.
+  }
 }
 
 /** A fix attempt's refused fix seat: journal the fixed refusal, then park. */

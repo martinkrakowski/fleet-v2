@@ -23,6 +23,17 @@ import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunSta
  */
 export interface SessionStartGate {
   tryStart(runId: string, nowIso: string): { readonly ok: true } | { readonly ok: false; readonly retryAfterMs: number };
+  /**
+   * CO13: the per-runner-endpoint dispatch stagger. Optional: a gate without
+   * it spaces no endpoint, so the existing fakes and the review path are
+   * unchanged.
+   */
+  tryStartForEndpoint?(
+    runId: string,
+    nowIso: string,
+    endpointKey: string,
+    lastStartIso: string | null,
+  ): { readonly ok: true } | { readonly ok: false; readonly retryAfterMs: number };
 }
 
 export interface AdvanceLaneRunRequest {

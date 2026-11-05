@@ -73,4 +73,38 @@ describe('SessionStartSpacing', () => {
     expect(gate.pendingMs('run-b', at(3_000))).toBe(17_000);
     expect(gate.pendingMs('run-b', at(21_000))).toBe(0);
   });
+
+  // CO13: the per-runner-endpoint dispatch stagger on the same gate.
+  it('CO13: two starts on the same endpoint inside the interval are spaced', () => {
+    const gate = new SessionStartSpacing(20_000, null);
+    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
+    const denied = gate.tryStartForEndpoint('run-b', at(5_000), 'opencode:host:4166', null);
+    expect(denied).toEqual({ ok: false, retryAfterMs: 15_000 });
+    expect(gate.tryStartForEndpoint('run-b', at(20_000), 'opencode:host:4166', null)).toEqual({ ok: true });
+  });
+
+  it('CO13: two starts on different endpoints are both granted', () => {
+    const gate = new SessionStartSpacing(20_000, null);
+    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host-a:4166', null)).toEqual({ ok: true });
+    expect(gate.tryStartForEndpoint('run-b', NOW, 'opencode:host-b:4166', null)).toEqual({ ok: true });
+  });
+
+  it('CO13: the durable seed denies the first start on that endpoint', () => {
+    const gate = new SessionStartSpacing(20_000, null);
+    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', at(-5_000))).toEqual({
+      ok: false,
+      retryAfterMs: 15_000,
+    });
+    expect(gate.tryStartForEndpoint('run-a', at(15_000), 'opencode:host:4166', at(-5_000))).toEqual({ ok: true });
+  });
+
+  it('CO13: pendingMs returns the endpoint wait for the denied run', () => {
+    const gate = new SessionStartSpacing(20_000, null);
+    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
+    expect(gate.tryStartForEndpoint('run-b', at(3_000), 'opencode:host:4166', null)).toEqual({
+      ok: false,
+      retryAfterMs: 17_000,
+    });
+    expect(gate.pendingMs('run-b', at(3_000))).toBe(17_000);
+  });
 });

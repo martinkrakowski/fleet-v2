@@ -50,6 +50,7 @@ export * from "./run-telemetry-spans.js";
 export * from "./seat-selection.js";
 export * from "./shadow-comparators.js";
 export * from "./snapshot-sections.js";
+export * from "./state-compaction.js";
 export * from "./value-objects/index.js";
 export * from "./work-board.js";
 export * from "./work-board-facts.js";

@@ -56,6 +56,8 @@ import {
   type ConductorPassTraceInput,
   type ConductorPassTracePort,
   type RunTelemetryMarkPort,
+  type WorkOrderRecord,
+  CRASHED_START_NOTICE_MINUTES,
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
@@ -134,7 +136,9 @@ would do; it reaches no host, needs neither --live nor
 policy.conductor.enabled, and never writes the real state. conductor start
 reserves capacity and prepares a worktree on a lane host; it needs
 policy.conductor.enabled and a state directory, and dispatches nothing.
-start --abandon works while the conductor is disabled.
+start --abandon works while the conductor is disabled. The status document
+also lists the reservations a crashed start left held, and conductor start
+raises one attention item per crashed start.
 
 Each subcommand prints one JSON document on stdout (conductor run prints one
 JSON line per pass; conductor schedule without --json prints text lines and,
@@ -501,6 +505,74 @@ function readStartFlags(argv: readonly string[], io: CliIo): StartFlags | null {
   return { maxActiveRuns: 1, ...flags, abandon, dryRun, live };
 }
 
+/** How the crashed-start scan went: the caller, not the helper, tells the operator. */
+type CrashedStartScan = 'complete' | 'incomplete' | 'failed';
+
+/**
+ * AD-2: raise one stored attention item per crashed start the status view
+ * reports that has been held for at least CRASHED_START_NOTICE_MINUTES, except
+ * the attempt a retry continues (`skipAttemptId`). A younger candidate may be a
+ * live start still preparing, so it raises nothing. The body is exactly the five
+ * keys of `RecordAttentionItemBody`. Best-effort: a refusal or throw never fails
+ * a start. It prints nothing; it returns how the scan went.
+ */
+async function raiseCrashedStartNotices(
+  runtime: FleetCliRuntime,
+  nowIso: string,
+  skipAttemptId: string | undefined,
+): Promise<CrashedStartScan> {
+  let result: Awaited<ReturnType<FleetCliRuntime['conductor']['inspectLaneRuns']['inspectLaneRuns']>>;
+  try {
+    result = await runtime.conductor.inspectLaneRuns.inspectLaneRuns({ nowIso });
+  } catch {
+    return 'failed';
+  }
+  if (result.outcome !== 'listed') {
+    return 'complete';
+  }
+  for (const crashed of result.crashedStarts) {
+    if (crashed.attemptId === skipAttemptId || crashed.workOrderId === null) {
+      continue;
+    }
+    if (crashed.heldMinutes === null || crashed.heldMinutes < CRASHED_START_NOTICE_MINUTES) {
+      continue;
+    }
+    let workOrder: WorkOrderRecord | null;
+    try {
+      workOrder = await runtime.execution.workOrderRepository.findWorkOrderById(crashed.workOrderId);
+    } catch {
+      continue;
+    }
+    if (workOrder === null) {
+      continue;
+    }
+    const body = {
+      projectId: workOrder.projectId,
+      kind: 'crashed-start',
+      subject: { kind: 'attempt', ref: crashed.attemptId },
+      workOrderId: crashed.workOrderId,
+      summary: `A lane start crashed and left capacity slot ${crashed.slotIndex} held for attempt ${crashed.attemptId}.`,
+    };
+    try {
+      await runtime.coordination.recordAttentionItem.recordAttentionItem(body, 'conductor');
+    } catch {
+      // A notice never fails a start.
+    }
+  }
+  return result.crashedStartsIncomplete === true ? 'incomplete' : 'complete';
+}
+
+/** The operator's line for a scan that did not check every held reservation, or null when it did. */
+function crashedStartScanWarning(command: string, scan: CrashedStartScan): string | null {
+  if (scan === 'incomplete') {
+    return `conductor ${command}: the crashed-start scan was incomplete; some held reservations were not checked\n`;
+  }
+  if (scan === 'failed') {
+    return `conductor ${command}: the crashed-start scan failed; held reservations were not checked\n`;
+  }
+  return null;
+}
+
 /**
  * `conductor start` (K7-D7): reserve capacity, prepare the run's worktree at
  * the reserved path, place the brief, record the first attempt and the run.
@@ -586,6 +658,15 @@ async function startCommand(
   if (driver.start === null) {
     io.stderr(`conductor start has no start port in this driver\n${CONDUCTOR_HELP}\n`);
     return 2;
+  }
+  // AD-2: surface crashed-start reservations as attention items. The flags
+  // and the brief are validated above; the scan writes stored items, so it
+  // must not run before a usage error. Best-effort; a retry with the same
+  // attempt id continues the crashed start, so it raises nothing for it. The
+  // `--abandon` path returned earlier and raises nothing.
+  const scanWarning = crashedStartScanWarning('start', await raiseCrashedStartNotices(runtime, nowIsoOf(options), flags.attemptId));
+  if (scanWarning !== null) {
+    io.stderr(scanWarning);
   }
   const result = await driver.start.startLaneRun({
     runId,
@@ -1593,6 +1674,12 @@ async function conductorStatusExit(
     nowIso,
     ...(runId !== undefined ? { runId } : {}),
   });
+  // The status document carries `crashedStarts` only; an incomplete scan is told on stderr, not as an extra field.
+  if (result.outcome === 'listed' && result.crashedStartsIncomplete === true) {
+    io.stdout(`${JSON.stringify(result, (key: string, value: unknown) => (key === 'crashedStartsIncomplete' ? undefined : value))}\n`);
+    io.stderr(crashedStartScanWarning('status', 'incomplete') ?? '');
+    return exitFor(result);
+  }
   io.stdout(`${JSON.stringify(result)}\n`);
   return exitFor(result);
 }

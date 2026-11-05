@@ -715,19 +715,60 @@ export async function performDispatch(ctx: AdvanceStepContext,
   // sets one) never dispatches: it refuses and parks with a fixed detail,
   // never a guessed or inherited seat field.
   const fixSeat = fixSeatForDispatch(latest, manifest);
-  const endpointCheck = await endpointStaggerWaitOf(ctx, record, latest, request);
+  // CO13: the endpoint stagger is asked only when this dispatch can start a
+  // session (mirroring the global gate), so a refused fix seat or unreadable
+  // inputs report their own refusal at once instead of waiting first.
+  const endpointCheck = await endpointStaggerWaitOf(
+    ctx, record, latest, request, fixSeat.kind !== 'refused' && inputsReadable,
+  );
   if (endpointCheck.kind === 'wait') {
     return endpointCheck.result;
   }
+  // CO13: the endpoint grant holds a start at once; every path that contacts
+  // no runner (the global gate waits, the intent or the raise is refused, the
+  // runner refuses, or anything throws before the runner call) releases it,
+  // so a start that never happened never delays a later one.
+  const contact = { runnerContacted: false };
+  try {
+    return await dispatchPastEndpointGate(ctx, record, gathered, decision, request, {
+      dispatch, latest, manifest, fixSeat, contact,
+    });
+  } finally {
+    if (endpointCheck.kind === 'grant' && !contact.runnerContacted) {
+      request.startGate?.releaseStartForEndpoint?.(request.runId);
+    }
+  }
+}
+
+/** The dispatch after the endpoint gate granted (or had nothing to enforce). */
+async function dispatchPastEndpointGate(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  decision: Extract<LaneRunDecision, { kind: 'act' }>,
+  request: AdvanceLaneRunRequest,
+  past: {
+    readonly dispatch: NonNullable<AdvanceStepContext['deps']['dispatchAttempt']>;
+    readonly latest: AttemptRecord;
+    readonly manifest: Record<string, unknown> | null;
+    readonly fixSeat: FixSeatForDispatch;
+    readonly contact: { runnerContacted: boolean };
+  },
+): Promise<AdvanceLaneRunResult> {
+  const facts = gathered.facts;
+  const nowIso = request.nowIso;
+  const { dispatch, latest, manifest, fixSeat, contact } = past;
+  const { stepLimit, timeLimitSeconds, expectedArtifacts, briefPackagePath, briefDigest } =
+    dispatchInputsOf(latest, manifest);
+  const inputsReadable =
+    stepLimit !== null &&
+    timeLimitSeconds !== null &&
+    expectedArtifacts !== null &&
+    briefPackagePath !== null &&
+    briefDigest !== null;
   const staggered = startGateWaitOf(request, fixSeat, inputsReadable);
   if (staggered !== null) {
     return staggered;
-  }
-  if (endpointCheck.kind === 'grant') {
-    // CO13: commit the endpoint start only now, after the global gate also
-    // granted — an endpoint grant the global gate blocks never counts as a
-    // start, so the retry is not delayed again by the endpoint gate.
-    request.startGate?.commitStartForEndpoint?.(endpointCheck.endpointKey, request.nowIso);
   }
   const intentRefusal = await appendRunIntent(ctx, request, decision.key, latest.id);
   if (intentRefusal !== null) {
@@ -749,6 +790,9 @@ export async function performDispatch(ctx: AdvanceStepContext,
   // dirty-worktree refusal carries the handed-over worktree as-is, so the
   // next seat's uncommitted work is accepted instead of refused again.
   const handover = await dirtyHandoverRequested(ctx, latest, record);
+  // CO13: from here a runner may be contacted, so the held endpoint start
+  // stands — even when the call throws (the safe direction).
+  contact.runnerContacted = true;
   const dispatched = await dispatch.dispatchAttempt({
     attemptId: latest.id,
     workOrderId: record.workOrderId,
@@ -765,6 +809,9 @@ export async function performDispatch(ctx: AdvanceStepContext,
   if (dispatched.outcome === 'started' || dispatched.outcome === 'blocked' || dispatched.outcome === 'unknown') {
     return dispatchedOutcomeResult(ctx, facts, decision, request, dispatched);
   }
+  // CO13: a runner refusal started no session, so the held endpoint start is
+  // released and delays no later start.
+  contact.runnerContacted = false;
   // Refused: a runner refusal saved with its stop reason (S1) pivots through
   // seat-failed; anything else parks for the owner (the key is spent). A
   // refused FIX dispatch recovers in the same round after resume: the round
@@ -959,13 +1006,14 @@ function startGateWaitOf(
 /**
  * CO13: the per-runner-endpoint dispatch stagger check, before the one-way
  * dispatch intent. A denied start is a wait — never a refusal and never a
- * spent key. No gate, no endpoint-scoped method or no endpoint identity means
- * nothing to enforce (today's behaviour). A granted start is reported so the
- * caller commits it only after the global gate also grants.
+ * spent key. No gate, no endpoint-scoped method, no endpoint identity, or a
+ * dispatch that cannot start a session (`canStart` false: a refused fix seat
+ * or unreadable inputs) means nothing to enforce. A granted start is held by
+ * the gate; the caller releases it when no runner is contacted.
  */
 type EndpointStaggerCheck =
   | { readonly kind: 'wait'; readonly result: AdvanceLaneRunResult }
-  | { readonly kind: 'grant'; readonly endpointKey: string }
+  | { readonly kind: 'grant' }
   | { readonly kind: 'none' };
 
 async function endpointStaggerWaitOf(
@@ -973,9 +1021,10 @@ async function endpointStaggerWaitOf(
   record: LaneRunRecord,
   latest: AttemptRecord,
   request: AdvanceLaneRunRequest,
+  canStart: boolean,
 ): Promise<EndpointStaggerCheck> {
   const gate = request.startGate;
-  if (gate === undefined || gate.tryStartForEndpoint === undefined) {
+  if (!canStart || gate === undefined || gate.tryStartForEndpoint === undefined) {
     return { kind: 'none' };
   }
   const endpoint = dispatchEndpointFactsOf(latest.runner);
@@ -986,62 +1035,75 @@ async function endpointStaggerWaitOf(
   const lastStartIso = await lastStartIsoForEndpoint(ctx, endpointKey);
   const decision = gate.tryStartForEndpoint(request.runId, request.nowIso, endpointKey, lastStartIso);
   if (decision.ok) {
-    return { kind: 'grant', endpointKey };
+    return { kind: 'grant' };
   }
   await journalDispatchStaggerWait(ctx, record, latest, request, endpointKey, decision.retryAfterMs);
   return { kind: 'wait', result: { outcome: 'waiting', reason: 'session-stagger' } };
 }
 
+/** The attempt states that mean a session was started (or may have been). */
+const STARTED_ATTEMPT_STATES: ReadonlySet<string> = new Set([
+  'dispatching',
+  'running',
+  'reconciling',
+  'blocked',
+  'ended',
+  'collected',
+]);
+
 /**
- * CO13: the durable seed for one endpoint — the latest `updatedAtIso` of any
- * attempt that started on it. An attempt's `updatedAtIso` is never earlier
- * than its start, so the measured gap is never shorter than the true one — the
- * safe direction. A started attempt whose `updatedAtIso` cannot be dated is
- * treated as the newest (never too early), so it still seeds the endpoint and
- * the stagger is enforced instead of silently skipped.
+ * True when the attempt started (or may have started) a session. An
+ * `intent-recorded` attempt never started. A `cancelled` attempt can still
+ * have started one (it keeps the runner and session it was given), so it
+ * counts when a session is recorded; without a session it never started.
+ */
+function attemptStartedSession(attempt: AttemptRecord): boolean {
+  if (attempt.state === 'cancelled') {
+    return attempt.sessionId !== null;
+  }
+  return STARTED_ATTEMPT_STATES.has(attempt.state);
+}
+
+/**
+ * The datable start bound of one started attempt, in ms, or null. An
+ * attempt's `updatedAtIso` is never earlier than its start, so the measured
+ * gap is never shorter than the true one — the safe direction. When
+ * `updatedAtIso` cannot be dated, its `createdAtIso` is the next bound (the
+ * attempt cannot have started before it was created); when neither can be
+ * dated the attempt seeds nothing, so a corrupt record never blocks the
+ * endpoint for ever (the global session-start spacing still applies).
+ */
+function attemptStartBoundMs(attempt: AttemptRecord): number | null {
+  const updatedMs = Date.parse(attempt.updatedAtIso);
+  if (Number.isFinite(updatedMs)) {
+    return updatedMs;
+  }
+  const createdMs = Date.parse(attempt.createdAtIso);
+  return Number.isFinite(createdMs) ? createdMs : null;
+}
+
+/**
+ * CO13: the durable seed for one endpoint — the latest datable start bound of
+ * any attempt that started a session on it, as an ISO string, or null. The
+ * result is always a valid timestamp, so one malformed record can never make
+ * every retry wait another full interval.
  */
 async function lastStartIsoForEndpoint(ctx: AdvanceStepContext, endpointKey: string): Promise<string | null> {
   const attempts = await ctx.deps.attemptRepo.listAllAttempts();
   let latestMs: number | null = null;
-  let latestIso: string | null = null;
-  let malformedLatestIso: string | null = null;
   for (const attempt of attempts) {
-    if (attempt.runner === null || attempt.runner === undefined) {
-      continue;
-    }
-    // An `intent-recorded` attempt never started. A `cancelled` attempt can
-    // still have started a session (it keeps the runner and session it was
-    // given), so it seeds the endpoint when a session is recorded; without a
-    // session it never started.
-    const startedStates = [
-      'dispatching',
-      'running',
-      'reconciling',
-      'blocked',
-      'ended',
-      'collected',
-    ] as const;
-    const cancelledWithSession = attempt.state === 'cancelled' && attempt.sessionId !== null;
-    if (!startedStates.includes(attempt.state as (typeof startedStates)[number]) && !cancelledWithSession) {
+    if (attempt.runner === null || attempt.runner === undefined || !attemptStartedSession(attempt)) {
       continue;
     }
     if (dispatchEndpointKey(dispatchEndpointFactsOf(attempt.runner)) !== endpointKey) {
       continue;
     }
-    const ms = Date.parse(attempt.updatedAtIso);
-    if (!Number.isFinite(ms)) {
-      malformedLatestIso = attempt.updatedAtIso;
-      continue;
-    }
-    if (latestMs === null || ms > latestMs) {
+    const ms = attemptStartBoundMs(attempt);
+    if (ms !== null && (latestMs === null || ms > latestMs)) {
       latestMs = ms;
-      latestIso = attempt.updatedAtIso;
     }
   }
-  if (malformedLatestIso !== null) {
-    return malformedLatestIso;
-  }
-  return latestIso;
+  return latestMs === null ? null : new Date(latestMs).toISOString();
 }
 
 /**

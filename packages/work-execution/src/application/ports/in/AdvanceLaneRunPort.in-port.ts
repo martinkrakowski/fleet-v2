@@ -35,12 +35,13 @@ export interface SessionStartGate {
     lastStartIso: string | null,
   ): { readonly ok: true } | { readonly ok: false; readonly retryAfterMs: number };
   /**
-   * CO13: record an endpoint start that actually proceeded past every gate,
-   * so a grant the global gate then blocks never counts as a start. Optional:
-   * a gate without it commits nothing, so the existing fakes and the review
-   * path are unchanged.
+   * CO13: drop the run's endpoint start that `tryStartForEndpoint` granted
+   * and held, when no runner was contacted after all (another gate waited,
+   * the intent or the round raise was refused, or the runner refused), so a
+   * start that never happened delays no later start. Optional: a gate without
+   * it holds nothing, so the existing fakes and the review path are unchanged.
    */
-  commitStartForEndpoint?(endpointKey: string, nowIso: string): void;
+  releaseStartForEndpoint?(runId: string): void;
 }
 
 export interface AdvanceLaneRunRequest {

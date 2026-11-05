@@ -70,38 +70,38 @@ function grantingEndpointGate(): SessionStartGate {
   };
 }
 
-/** Fix round 1: an endpoint rule that denies only when a durable seed exists. */
-function seededEndpointGate(): SessionStartGate {
-  return {
+/** Fix round 1: an endpoint rule that denies only when a durable seed exists; it records each seed. */
+function seededEndpointGate() {
+  const seeds: (string | null)[] = [];
+  const gate: SessionStartGate & { readonly seeds: typeof seeds } = {
+    seeds,
     tryStart: () => ({ ok: true }),
-    tryStartForEndpoint: (_runId, _nowIso, _endpointKey, lastStartIso) =>
-      lastStartIso === null ? { ok: true } : { ok: false, retryAfterMs: 12_345 },
-  };
-}
-
-/** Fix round 2: a gate that grants both rules and records endpoint commits. */
-function recordingGrantingGate() {
-  const commits: { endpointKey: string; nowIso: string }[] = [];
-  const gate: SessionStartGate & { readonly commits: typeof commits } = {
-    commits,
-    tryStart: () => ({ ok: true }),
-    tryStartForEndpoint: () => ({ ok: true }),
-    commitStartForEndpoint: (endpointKey, nowIso) => {
-      commits.push({ endpointKey, nowIso });
+    tryStartForEndpoint: (_runId, _nowIso, _endpointKey, lastStartIso) => {
+      seeds.push(lastStartIso);
+      return lastStartIso === null ? { ok: true } : { ok: false, retryAfterMs: 12_345 };
     },
   };
   return gate;
 }
 
-/** Fix round 2: an endpoint grant the global gate blocks must not be committed. */
-function recordingGlobalDenyEndpointGrantGate() {
-  const commits: { endpointKey: string; nowIso: string }[] = [];
-  const gate: SessionStartGate & { readonly commits: typeof commits } = {
-    commits,
-    tryStart: () => ({ ok: false, retryAfterMs: 5_000 }),
-    tryStartForEndpoint: () => ({ ok: true }),
-    commitStartForEndpoint: (endpointKey, nowIso) => {
-      commits.push({ endpointKey, nowIso });
+/**
+ * Fix round 3: a gate whose endpoint rule grants (holding the start) and
+ * records every endpoint ask and every release; the global rule answers as
+ * given.
+ */
+function recordingEndpointGate(globalOk = true) {
+  const asks: string[] = [];
+  const releases: string[] = [];
+  const gate: SessionStartGate & { readonly asks: typeof asks; readonly releases: typeof releases } = {
+    asks,
+    releases,
+    tryStart: () => (globalOk ? { ok: true } : { ok: false, retryAfterMs: 5_000 }),
+    tryStartForEndpoint: (_runId, _nowIso, endpointKey) => {
+      asks.push(endpointKey);
+      return { ok: true };
+    },
+    releaseStartForEndpoint: (runId) => {
+      releases.push(runId);
     },
   };
   return gate;
@@ -1326,37 +1326,78 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(entries[0]).toMatchObject({ kind: 'intent', key, mintedId: 'attempt-example-1' });
   });
 
-  it('fix round 2: an endpoint grant is committed only after the global gate grants', async () => {
+  it('fix round 3: a started dispatch keeps the held endpoint start (no release)', async () => {
     const harness = await makeHarness(runRecord(), [attemptFixture()]);
     await admit(harness, 'attempt-example-1');
-    const gate = recordingGrantingGate();
+    const gate = recordingEndpointGate();
     const result = await advance(harness, { startGate: gate });
     expect(result).toMatchObject({ outcome: 'acted', step: 'dispatch', reasonCode: 'dispatch-started' });
     expect(harness.dispatchRequests).toHaveLength(1);
-    expect(gate.commits).toEqual([{ endpointKey: 'opencode:lane-host-example:4166', nowIso: LATER }]);
+    expect(gate.asks).toEqual(['opencode:lane-host-example:4166']);
+    expect(gate.releases).toEqual([]);
   });
 
-  it('fix round 2: a global-denied endpoint grant is never committed', async () => {
+  it('fix round 3: an endpoint grant the global gate then blocks is released', async () => {
     const harness = await makeHarness(runRecord(), [attemptFixture()]);
     await admit(harness, 'attempt-example-1');
-    const gate = recordingGlobalDenyEndpointGrantGate();
+    const gate = recordingEndpointGate(false);
     const result = await advance(harness, { startGate: gate });
     expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
     expect(harness.dispatchRequests).toEqual([]);
-    expect(gate.commits).toEqual([]);
+    expect(gate.releases).toEqual([RUN_ID]);
   });
 
-  it('fix round 2: a started attempt with a malformed updatedAtIso still seeds the endpoint stagger', async () => {
+  it('fix round 3: a runner refusal releases the held endpoint start', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: 'refused by the example runner' }));
+    await admit(harness, 'attempt-example-1');
+    const gate = recordingEndpointGate();
+    const result = await advance(harness, { startGate: gate });
+    expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    expect(gate.asks).toHaveLength(1);
+    expect(gate.releases).toEqual([RUN_ID]);
+  });
+
+  it('fix round 3: unreadable dispatch inputs refuse at once without asking the endpoint gate', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await harness.setManifest(JSON.stringify({ timeLimitSeconds: 2700 }));
+    await admit(harness, 'attempt-example-1');
+    const gate = recordingEndpointGate();
+    const result = await advance(harness, { startGate: gate });
+    expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    expect(gate.asks).toEqual([]);
+    const entries = await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1');
+    expect(entries.some((entry) => entry.detail?.startsWith('dispatch stagger wait:') === true)).toBe(false);
+  });
+
+  it('fix round 3: a started attempt with a malformed updatedAtIso seeds the endpoint from its createdAtIso', async () => {
     const prior = attemptFixture({
       id: 'attempt-example-0',
       state: 'running',
+      createdAtIso: NOW,
       updatedAtIso: 'not-a-date',
     });
     const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
     await admit(harness, 'attempt-example-1');
-    const result = await advance(harness, { startGate: seededEndpointGate() });
+    const gate = seededEndpointGate();
+    const result = await advance(harness, { startGate: gate });
     expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
-    expect(harness.dispatchRequests).toEqual([]);
+    expect(gate.seeds).toEqual([NOW]);
+  });
+
+  it('fix round 3: a started attempt with no datable timestamp never hands the gate a malformed seed', async () => {
+    const prior = attemptFixture({
+      id: 'attempt-example-0',
+      state: 'running',
+      createdAtIso: 'not-a-date',
+      updatedAtIso: 'not-a-date',
+    });
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const gate = seededEndpointGate();
+    const result = await advance(harness, { startGate: gate });
+    expect(result).toMatchObject({ outcome: 'acted', step: 'dispatch', reasonCode: 'dispatch-started' });
+    expect(gate.seeds).toEqual([null]);
   });
 
   it('test 21 (KF-34a1): a seat-pivot dispatch is denied the same way, before the pivot intent', async () => {

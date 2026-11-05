@@ -17,6 +17,11 @@ export class SessionStartSpacing implements SessionStartGate {
   private readonly endpointLastStartMs = new Map<string, number>();
   /** CO13: per-run endpoint reservations (runId -> slot ms). */
   private readonly endpointReservations = new Map<string, number>();
+  /** CO13: per-run held endpoint starts (runId -> the hold and what it replaced). */
+  private readonly endpointHolds = new Map<
+    string,
+    { readonly endpointKey: string; readonly heldMs: number; readonly previousMs: number | undefined }
+  >();
 
   constructor(
     private readonly staggerMs: number,
@@ -47,13 +52,14 @@ export class SessionStartSpacing implements SessionStartGate {
 
   /**
    * CO13: the per-runner-endpoint dispatch stagger. The seeded last start is
-   * the later of the endpoint's own last start and the durable seed passed in;
-   * a durable seed that cannot be dated is kept so the pure rule waits one full
-   * interval (never too early). A granted start is NOT recorded here — the
-   * caller commits it with `commitStartForEndpoint` only once the dispatch
-   * actually proceeds past every gate, so a grant the global gate then blocks
-   * never counts as a start. A denied start reserves the run's turn at now +
-   * retryAfterMs.
+   * the later of the endpoint's own last start in this gate and the durable
+   * seed passed in; a durable seed that cannot be dated is dropped (garbage
+   * never blocks a lane). A granted start is HELD for the endpoint at once, so
+   * a sibling run asking in the same pass is spaced from it; the caller
+   * releases the hold with `releaseStartForEndpoint` when no runner was
+   * contacted (another gate waited, the intent was refused, the runner
+   * refused), so a start that never happened delays nobody. A denied start
+   * reserves the run's turn at now + retryAfterMs.
    */
   tryStartForEndpoint(
     runId: string,
@@ -63,33 +69,45 @@ export class SessionStartSpacing implements SessionStartGate {
   ): { readonly ok: true } | { readonly ok: false; readonly retryAfterMs: number } {
     const endpointMs = this.endpointLastStartMs.get(endpointKey);
     const persistedMs = lastStartIso === null ? NaN : Date.parse(lastStartIso);
-    let seededIso: string | null = null;
-    if (lastStartIso !== null && !Number.isFinite(persistedMs)) {
-      seededIso = lastStartIso;
-    } else {
-      if (endpointMs !== undefined && !Number.isNaN(endpointMs)) {
-        seededIso = new Date(endpointMs).toISOString();
-      }
-      if (!Number.isNaN(persistedMs) && (seededIso === null || persistedMs > Date.parse(seededIso))) {
-        seededIso = lastStartIso;
-      }
-    }
+    const candidates = [endpointMs ?? NaN, persistedMs].filter((ms) => Number.isFinite(ms));
+    const seededIso = candidates.length === 0 ? null : new Date(Math.max(...candidates)).toISOString();
     const decision = decideDispatchStagger({
       nowIso,
       lastStartIso: seededIso,
       minIntervalMs: this.staggerMs,
     });
-    if (decision.ok) {
-      this.endpointReservations.delete(runId);
-      return { ok: true };
+    if (!decision.ok) {
+      this.endpointReservations.set(runId, Date.parse(nowIso) + decision.retryAfterMs);
+      return decision;
     }
-    this.endpointReservations.set(runId, Date.parse(nowIso) + decision.retryAfterMs);
-    return decision;
+    this.endpointReservations.delete(runId);
+    const nowMs = Date.parse(nowIso);
+    if (Number.isFinite(nowMs)) {
+      this.endpointHolds.set(runId, { endpointKey, heldMs: nowMs, previousMs: endpointMs });
+      this.endpointLastStartMs.set(endpointKey, nowMs);
+    }
+    return { ok: true };
   }
 
-  /** CO13: record an endpoint start once it actually proceeded past every gate. */
-  commitStartForEndpoint(endpointKey: string, nowIso: string): void {
-    this.endpointLastStartMs.set(endpointKey, Date.parse(nowIso));
+  /**
+   * CO13: drop the run's held endpoint start when no runner was contacted.
+   * The endpoint's last start goes back to what it was before the hold,
+   * unless a later hold on the same endpoint has replaced it since.
+   */
+  releaseStartForEndpoint(runId: string): void {
+    const hold = this.endpointHolds.get(runId);
+    if (hold === undefined) {
+      return;
+    }
+    this.endpointHolds.delete(runId);
+    if (this.endpointLastStartMs.get(hold.endpointKey) !== hold.heldMs) {
+      return;
+    }
+    if (hold.previousMs === undefined) {
+      this.endpointLastStartMs.delete(hold.endpointKey);
+    } else {
+      this.endpointLastStartMs.set(hold.endpointKey, hold.previousMs);
+    }
   }
 
   /** The ms until the run's reserved turn, or 0 when it holds none. */

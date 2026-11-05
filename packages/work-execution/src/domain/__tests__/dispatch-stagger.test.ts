@@ -63,10 +63,9 @@ describe('decideDispatchStagger', () => {
     });
   });
 
-  it('an unparseable last-start seed waits one full interval', () => {
+  it('an unparseable last-start seed never blocks (the brief rule: garbage never blocks a lane)', () => {
     expect(decideDispatchStagger({ nowIso: NOW, lastStartIso: 'not-a-date', minIntervalMs: 20_000 })).toEqual({
-      ok: false,
-      retryAfterMs: 20_000,
+      ok: true,
     });
   });
 });

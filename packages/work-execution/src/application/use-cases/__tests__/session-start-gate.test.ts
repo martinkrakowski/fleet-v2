@@ -78,34 +78,51 @@ describe('SessionStartSpacing', () => {
   it('CO13: two starts on the same endpoint inside the interval are spaced', () => {
     const gate = new SessionStartSpacing(20_000, null);
     expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
-    gate.commitStartForEndpoint('opencode:host:4166', NOW);
     const denied = gate.tryStartForEndpoint('run-b', at(5_000), 'opencode:host:4166', null);
     expect(denied).toEqual({ ok: false, retryAfterMs: 15_000 });
     expect(gate.tryStartForEndpoint('run-b', at(20_000), 'opencode:host:4166', null)).toEqual({ ok: true });
   });
 
-  it('CO13: a grant is not recorded until committed', () => {
+  it('fix round 3: a grant holds the endpoint at once, so a sibling asking before any release is spaced', () => {
     const gate = new SessionStartSpacing(20_000, null);
     expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
-    // No commit: the next start on the same endpoint is not spaced.
-    expect(gate.tryStartForEndpoint('run-b', at(5_000), 'opencode:host:4166', null)).toEqual({ ok: true });
-    gate.commitStartForEndpoint('opencode:host:4166', at(5_000));
-    expect(gate.tryStartForEndpoint('run-c', at(6_000), 'opencode:host:4166', null)).toEqual({
+    expect(gate.tryStartForEndpoint('run-b', at(1_000), 'opencode:host:4166', null)).toEqual({
       ok: false,
       retryAfterMs: 19_000,
     });
   });
 
-  it('CO13: a malformed durable seed denies one full interval', () => {
+  it('fix round 3: a released hold delays no later start on the endpoint', () => {
     const gate = new SessionStartSpacing(20_000, null);
-    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', 'not-a-date')).toEqual({
+    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
+    gate.releaseStartForEndpoint('run-a');
+    expect(gate.tryStartForEndpoint('run-b', at(1_000), 'opencode:host:4166', null)).toEqual({ ok: true });
+    // Releasing an unknown run, or the same run twice, changes nothing.
+    gate.releaseStartForEndpoint('run-a');
+    gate.releaseStartForEndpoint('run-unknown');
+    expect(gate.tryStartForEndpoint('run-c', at(2_000), 'opencode:host:4166', null)).toEqual({
       ok: false,
-      retryAfterMs: 20_000,
+      retryAfterMs: 19_000,
     });
-    expect(gate.tryStartForEndpoint('run-a', at(20_000), 'opencode:host:4166', 'not-a-date')).toEqual({
+  });
+
+  it('fix round 3: a release restores the earlier start, never an older one', () => {
+    const gate = new SessionStartSpacing(20_000, null);
+    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
+    expect(gate.tryStartForEndpoint('run-b', at(20_000), 'opencode:host:4166', null)).toEqual({ ok: true });
+    gate.releaseStartForEndpoint('run-b');
+    // run-a's start at NOW stands: at 10 s it still spaces the endpoint.
+    expect(gate.tryStartForEndpoint('run-c', at(25_000), 'opencode:host:4166', null)).toEqual({ ok: true });
+    gate.releaseStartForEndpoint('run-c');
+    expect(gate.tryStartForEndpoint('run-d', at(10_000), 'opencode:host:4166', null)).toEqual({
       ok: false,
-      retryAfterMs: 20_000,
+      retryAfterMs: 10_000,
     });
+  });
+
+  it('fix round 3: a malformed durable seed is dropped and never blocks the endpoint', () => {
+    const gate = new SessionStartSpacing(20_000, null);
+    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', 'not-a-date')).toEqual({ ok: true });
   });
 
   it('CO13: two starts on different endpoints are both granted', () => {
@@ -126,7 +143,6 @@ describe('SessionStartSpacing', () => {
   it('CO13: pendingMs returns the endpoint wait for the denied run', () => {
     const gate = new SessionStartSpacing(20_000, null);
     expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
-    gate.commitStartForEndpoint('opencode:host:4166', NOW);
     expect(gate.tryStartForEndpoint('run-b', at(3_000), 'opencode:host:4166', null)).toEqual({
       ok: false,
       retryAfterMs: 17_000,

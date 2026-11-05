@@ -22,6 +22,15 @@ import type { BaseBranchValue } from '../../../domain/base-branch.js';
 export const CRASHED_START_GRACE_MINUTES = 5;
 
 /**
+ * The age, in minutes, a crashed-start reservation must reach before a start raises a stored attention item for it
+ * (AD-2 pre-merge). A reservation is made before the worktree and the brief are prepared, and the attempt and run are
+ * recorded after, so a live start that is still preparing looks like a crashed one; the status view lists it after
+ * CRASHED_START_GRACE_MINUTES as a candidate, but a durable notice waits until no start's preparation could still be
+ * running.
+ */
+export const CRASHED_START_NOTICE_MINUTES = 60;
+
+/**
  * One held reservation left by a crashed start: a capacity reservation whose
  * attempt id no run lists, held for at least `CRASHED_START_GRACE_MINUTES`
  * (the ListLaneRunsPort rule: no worktree path, ssh alias, port or transport

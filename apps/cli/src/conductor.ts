@@ -57,6 +57,7 @@ import {
   type ConductorPassTracePort,
   type RunTelemetryMarkPort,
   type WorkOrderRecord,
+  CRASHED_START_NOTICE_MINUTES,
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
@@ -504,31 +505,36 @@ function readStartFlags(argv: readonly string[], io: CliIo): StartFlags | null {
   return { maxActiveRuns: 1, ...flags, abandon, dryRun, live };
 }
 
+/** How the crashed-start scan went: the caller, not the helper, tells the operator. */
+type CrashedStartScan = 'complete' | 'incomplete' | 'failed';
+
 /**
  * AD-2: raise one stored attention item per crashed start the status view
- * reports, except the attempt a retry continues (`skipAttemptId`). The body
- * is exactly the five keys of `RecordAttentionItemBody`. Best-effort and
- * read-only: a refusal or throw never fails a start, and the scan stays
- * silent unless a read failed, in which case the operator is told the
- * results were incomplete.
+ * reports that has been held for at least CRASHED_START_NOTICE_MINUTES, except
+ * the attempt a retry continues (`skipAttemptId`). A younger candidate may be a
+ * live start still preparing, so it raises nothing. The body is exactly the five
+ * keys of `RecordAttentionItemBody`. Best-effort: a refusal or throw never fails
+ * a start. It prints nothing; it returns how the scan went.
  */
 async function raiseCrashedStartNotices(
   runtime: FleetCliRuntime,
-  io: CliIo,
   nowIso: string,
   skipAttemptId: string | undefined,
-): Promise<void> {
+): Promise<CrashedStartScan> {
   let result: Awaited<ReturnType<FleetCliRuntime['conductor']['inspectLaneRuns']['inspectLaneRuns']>>;
   try {
     result = await runtime.conductor.inspectLaneRuns.inspectLaneRuns({ nowIso });
   } catch {
-    return;
+    return 'failed';
   }
   if (result.outcome !== 'listed') {
-    return;
+    return 'complete';
   }
   for (const crashed of result.crashedStarts) {
     if (crashed.attemptId === skipAttemptId || crashed.workOrderId === null) {
+      continue;
+    }
+    if (crashed.heldMinutes === null || crashed.heldMinutes < CRASHED_START_NOTICE_MINUTES) {
       continue;
     }
     let workOrder: WorkOrderRecord | null;
@@ -553,11 +559,18 @@ async function raiseCrashedStartNotices(
       // A notice never fails a start.
     }
   }
-  if (result.crashedStartsIncomplete === true) {
-    // A failed attempt read means the list may miss crashed starts; tell the
-    // operator rather than letting an empty list read as "none".
-    io.stderr('conductor start: the crashed-start scan was incomplete; some held reservations were not checked\n');
+  return result.crashedStartsIncomplete === true ? 'incomplete' : 'complete';
+}
+
+/** The operator's line for a scan that did not check every held reservation, or null when it did. */
+function crashedStartScanWarning(command: string, scan: CrashedStartScan): string | null {
+  if (scan === 'incomplete') {
+    return `conductor ${command}: the crashed-start scan was incomplete; some held reservations were not checked\n`;
   }
+  if (scan === 'failed') {
+    return `conductor ${command}: the crashed-start scan failed; held reservations were not checked\n`;
+  }
+  return null;
 }
 
 /**
@@ -651,7 +664,10 @@ async function startCommand(
   // must not run before a usage error. Best-effort; a retry with the same
   // attempt id continues the crashed start, so it raises nothing for it. The
   // `--abandon` path returned earlier and raises nothing.
-  await raiseCrashedStartNotices(runtime, io, nowIsoOf(options), flags.attemptId);
+  const scanWarning = crashedStartScanWarning('start', await raiseCrashedStartNotices(runtime, nowIsoOf(options), flags.attemptId));
+  if (scanWarning !== null) {
+    io.stderr(scanWarning);
+  }
   const result = await driver.start.startLaneRun({
     runId,
     attemptId,
@@ -1658,6 +1674,13 @@ async function conductorStatusExit(
     nowIso,
     ...(runId !== undefined ? { runId } : {}),
   });
+  // The status document carries `crashedStarts` only; an incomplete scan is told on stderr, not as an extra field.
+  if (result.outcome === 'listed' && result.crashedStartsIncomplete === true) {
+    const { crashedStartsIncomplete: _incomplete, ...document } = result;
+    io.stdout(`${JSON.stringify(document)}\n`);
+    io.stderr(crashedStartScanWarning('status', 'incomplete') ?? '');
+    return exitFor(result);
+  }
   io.stdout(`${JSON.stringify(result)}\n`);
   return exitFor(result);
 }

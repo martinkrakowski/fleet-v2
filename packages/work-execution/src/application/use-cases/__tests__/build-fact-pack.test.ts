@@ -196,6 +196,28 @@ describe('BuildFactPackUseCase', () => {
     }
   });
 
+  it('refuses a null request or a non-array facts list instead of throwing', async () => {
+    const port = new FakeRepositoryFactsPort();
+    for (const bad of [null, { ...BASE_REQUEST, facts: null }, { ...BASE_REQUEST, laneId: 7 }]) {
+      const result = await makeUseCase(port).buildFactPack(bad as unknown as BuildFactPackRequest);
+      expect(result).toEqual({ outcome: 'refused', refusal: { reason: 'invalid-request', label: null, rule: null } });
+    }
+    expect(port.calls).toEqual([]);
+  });
+
+  it('bounds the pack: too many facts or too much text refuses pack-too-large', async () => {
+    const one = BASE_REQUEST.facts[0];
+    const many = Array.from({ length: 33 }, () => one);
+    const tooMany = new FakeRepositoryFactsPort();
+    const first = await makeUseCase(tooMany).buildFactPack({ ...BASE_REQUEST, facts: many } as BuildFactPackRequest);
+    expect(first).toEqual({ outcome: 'refused', refusal: { reason: 'pack-too-large', label: null, rule: null } });
+    expect(tooMany.calls).toEqual([]);
+
+    const big = new FakeRepositoryFactsPort(undefined, { status: 'read', text: 'x'.repeat(100_000) });
+    const second = await makeUseCase(big).buildFactPack({ ...BASE_REQUEST, facts: [one, one, one] } as BuildFactPackRequest);
+    expect(second).toEqual({ outcome: 'refused', refusal: { reason: 'pack-too-large', label: null, rule: null } });
+  });
+
   it('refuses an invalid nonce instead of throwing', async () => {
     const port = new FakeRepositoryFactsPort(
       { status: 'read', paths: [] },

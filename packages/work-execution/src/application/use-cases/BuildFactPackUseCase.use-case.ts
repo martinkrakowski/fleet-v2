@@ -61,6 +61,16 @@ function hasControlCharacter(value: string): boolean {
   return false;
 }
 
+/** At most this many facts in one pack, and at most this many UTF-8 bytes of fact text in total. */
+export const FACT_PACK_MAX_FACTS = 32;
+export const FACT_PACK_MAX_TEXT_BYTES = 256_000;
+
+const PACK_TOO_LARGE = {
+  reason: 'pack-too-large',
+  label: null,
+  rule: null,
+} as const;
+
 const INVALID_REQUEST = {
   reason: 'invalid-request',
   label: null,
@@ -152,11 +162,18 @@ export class BuildFactPackUseCase implements BuildFactPackPort {
   }
 
   public async buildFactPack(request: BuildFactPackRequest): Promise<BuildFactPackResult> {
-    if (!isNonEmptyControlFree(request.laneId)
+    // A null request or a non-array facts list is refused, never thrown on.
+    if (typeof request !== 'object' || request === null || !Array.isArray(request.facts)
+      || typeof request.laneId !== 'string' || typeof request.commit !== 'string'
+      || typeof request.repositoryPath !== 'string'
+      || !isNonEmptyControlFree(request.laneId)
       || !COMMIT_PATTERN.test(request.commit)
       || !isNonEmptyControlFree(request.repositoryPath)
       || !request.facts.every((fact) => isFactWellFormed(fact))) {
       return { outcome: 'refused', refusal: INVALID_REQUEST };
+    }
+    if (request.facts.length > FACT_PACK_MAX_FACTS) {
+      return { outcome: 'refused', refusal: PACK_TOO_LARGE };
     }
 
     let nonce: string;
@@ -172,6 +189,7 @@ export class BuildFactPackUseCase implements BuildFactPackPort {
     }
 
     const sections: FactPackSection[] = [];
+    let textBytes = 0;
     for (const fact of request.facts) {
       let read: Awaited<ReturnType<BuildFactPackUseCase['readFact']>>;
       try {
@@ -192,6 +210,12 @@ export class BuildFactPackUseCase implements BuildFactPackPort {
           outcome: 'refused',
           refusal: { reason: 'secret-shaped', label: fact.label, rule },
         };
+      }
+      textBytes += Buffer.byteLength(read.text, 'utf8');
+      if (textBytes > FACT_PACK_MAX_TEXT_BYTES) {
+        // The pack's total is bounded, not only each read: refuse before the
+        // prompt grows past it.
+        return { outcome: 'refused', refusal: PACK_TOO_LARGE };
       }
       sections.push({ label: fact.label, path: factPath(fact), text: read.text });
     }

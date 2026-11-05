@@ -18,6 +18,7 @@ export type BuildFactPackRefusalReason =
   | 'fact-absent'
   | 'fact-unreadable'
   | 'fact-oversized'
+  | 'pack-too-large'
   | 'secret-shaped';
 
 export interface BuildFactPackRefusal {

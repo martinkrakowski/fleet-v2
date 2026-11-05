@@ -68,6 +68,16 @@ describe('worktree pool entry record', () => {
     }
   });
 
+  it('refuses, without throwing, a hostile proxy whose traps throw (KS4a pre-merge minor)', () => {
+    const throwing = () => {
+      throw new Error('hostile');
+    };
+    const hostile = new Proxy(makeRecord(), { ownKeys: throwing, get: throwing, getOwnPropertyDescriptor: throwing });
+    expect(() => readWorktreePoolEntryRecord(hostile)).not.toThrow();
+    const result = readWorktreePoolEntryRecord(hostile);
+    expect(result.ok).toBe(false);
+  });
+
   it('refuses a warm entry that names a run', () => {
     const input = makeRecord({ takenByRunId: 'run-1' });
     const result = readWorktreePoolEntryRecord(input);

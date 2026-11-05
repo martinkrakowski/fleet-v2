@@ -32,6 +32,7 @@ export * from "./lane-run-review-facts.js";
 export * from "./lane-run-step-facts.js";
 export * from "./lane-run-transitions.js";
 export * from "./legacy-train-queue.js";
+export * from "./merge-pass-transitions.js";
 export * from "./merge-queue-decider.js";
 export * from "./merge-queue-operations.js";
 export * from "./merge-queue-records.js";

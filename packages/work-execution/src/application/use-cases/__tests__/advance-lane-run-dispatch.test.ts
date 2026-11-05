@@ -1379,7 +1379,8 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
       createdAtIso: '2026-10-27T09:00:00.000Z',
       updatedAtIso: 'not-a-date',
     });
-    const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
+    // The current attempt was prepared just before this dispatch (the cap's anchor).
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture({ updatedAtIso: LATER })]);
     await admit(harness, 'attempt-example-1');
     const at = (ms: number): string => new Date(Date.parse(LATER) + ms).toISOString();
     // A fresh gate per pass, as the conductor builds one.
@@ -1408,7 +1409,8 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
       createdAtIso: 'not-a-date',
       updatedAtIso: 'not-a-date',
     });
-    const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
+    // The current attempt was prepared just before this dispatch (the cap's anchor).
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture({ updatedAtIso: LATER })]);
     await admit(harness, 'attempt-example-1');
     const gate = seededEndpointGate();
     const result = await advance(harness, { startGate: gate });
@@ -1422,7 +1424,8 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
       state: 'running',
       updatedAtIso: 'not-a-date',
     });
-    const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
+    // The current attempt was prepared just before this dispatch (the cap's anchor).
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture({ updatedAtIso: LATER })]);
     await admit(harness, 'attempt-example-1');
     const journal = harness.deps.executionJournal;
     const original = journal.listJournalEntriesForAttempt.bind(journal);
@@ -1439,6 +1442,38 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
     expect(gate.seeds).toEqual([LATER]);
     expect(harness.dispatchRequests).toEqual([]);
+  });
+
+  it('fix round 5: an undated start with a journal that always fails is still bounded', async () => {
+    const prior = attemptFixture({
+      id: 'attempt-example-0',
+      state: 'running',
+      updatedAtIso: 'not-a-date',
+    });
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const preparedAt = (await harness.attemptRepo.findAttemptById('attempt-example-1'))?.updatedAtIso;
+    if (preparedAt === undefined) {
+      throw new Error('fixture must hold the prepared attempt');
+    }
+    // Every stagger wait append fails, so no sighting is ever recorded.
+    const journal = harness.executionJournal;
+    const append = journal.appendJournalEntry.bind(journal);
+    journal.appendJournalEntry = async (entry: Parameters<typeof append>[0]) => {
+      if (entry.detail?.startsWith('dispatch stagger wait:') === true) {
+        throw new Error('journal append failed');
+      }
+      return append(entry);
+    };
+    const after = (ms: number): string => new Date(Date.parse(preparedAt) + ms).toISOString();
+    // Every pass (a fresh gate each) would re-sight the undated start "now"
+    // for ever; the cap (prepared + 20 s) ends the wait one interval later.
+    const early = await advance(harness, { startGate: new SessionStartSpacing(20_000, null), nowIso: after(10_000) });
+    expect(early).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    const late = after(40_000);
+    const result = await advance(harness, { startGate: new SessionStartSpacing(20_000, null), nowIso: late });
+    expect(result).toMatchObject({ outcome: 'acted', step: 'dispatch', reasonCode: 'dispatch-started' });
+    expect(harness.dispatchRequests).toHaveLength(1);
   });
 
   it('test 21 (KF-34a1): a seat-pivot dispatch is denied the same way, before the pivot intent', async () => {

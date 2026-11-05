@@ -3,7 +3,11 @@ import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in
 import type { DispatchAttemptResult } from '../../ports/in/DispatchAttemptPort.in-port.js';
 import { AttemptRevisionConflictError } from '../../ports/out/AttemptRepositoryPort.out-port.js';
 import { parseSeatTool, type AttemptRecord, type AttemptSeatOverrideRecord, type AttemptSeatSelectionRecord } from '../../../domain/execution-records.js';
-import { dispatchEndpointFactsOf, dispatchEndpointKey } from '../../../domain/dispatch-stagger.js';
+import {
+  DEFAULT_DISPATCH_STAGGER_MS,
+  dispatchEndpointFactsOf,
+  dispatchEndpointKey,
+} from '../../../domain/dispatch-stagger.js';
 import type { LaneRunDecision, LaneRunFacts } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
 import type { LaneRunCursorsRecord, LaneRunRecord } from '../../../domain/lane-run-records.js';
@@ -1121,7 +1125,13 @@ async function endpointStartSeedOf(
 /**
  * When this attempt first saw an undated start on its endpoint: the recorded
  * time of its undated wait entry, else now (the first sighting, journaled by
- * the wait that follows). Null when no journal can remember it.
+ * the wait that follows). The sighting is capped at one default interval
+ * after this attempt's own `updatedAtIso` (stable while it waits: a wait
+ * writes no attempt record), so even a journal whose reads or appends keep
+ * failing cannot push the sighting forward for ever — the wait ends by then
+ * plus one interval. Null when no journal can remember the sighting, or when
+ * the cap cannot be dated and no sighting is recorded: the undated record
+ * then seeds nothing (the global session-start spacing still applies).
  */
 async function undatedStartSeenMs(
   ctx: AdvanceStepContext,
@@ -1138,13 +1148,17 @@ async function undatedStartSeenMs(
     const seen = prior.find((entry) => isStaggerWaitEntry(entry, true));
     seenMs = seen === undefined ? NaN : Date.parse(seen.recordedAtIso);
   } catch {
-    // A failing journal read never fails the wait: the sighting is now.
+    // A failing journal read never fails the wait: the sighting is now, capped below.
   }
   if (Number.isFinite(seenMs)) {
     return seenMs;
   }
   const nowMs = Date.parse(nowIso);
-  return Number.isFinite(nowMs) ? nowMs : null;
+  const capMs = Date.parse(latest.updatedAtIso) + DEFAULT_DISPATCH_STAGGER_MS;
+  if (!Number.isFinite(nowMs) || !Number.isFinite(capMs)) {
+    return null;
+  }
+  return Math.min(nowMs, capMs);
 }
 
 /** True for this lane's dispatch stagger wait entry of the given kind (undated or not). */

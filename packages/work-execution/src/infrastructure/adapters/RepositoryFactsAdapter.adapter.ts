@@ -31,6 +31,36 @@ export interface RepositoryFactsAdapterOptions {
 /** A plain object name: 40–64 lowercase hex digits. */
 const COMMIT_PATTERN = /^[0-9a-f]{40,64}$/;
 
+/** Whether any control character (C0, DEL, C1) appears in the value. */
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0);
+    if (code === undefined) {
+      continue;
+    }
+    if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * A safe literal path prefix for `ls-tree`: no pathspec magic (a leading `:`
+ * would be parsed as a magic signature such as `:(top,glob)`, listing across
+ * the repository instead of the requested subtree), no glob metacharacters,
+ * relative with no `..` segment, and no control characters.
+ */
+function isSafePathPrefix(value: string): boolean {
+  if (value.length === 0 || value.startsWith(':') || value.startsWith('/') || hasControlCharacter(value)) {
+    return false;
+  }
+  if (/[?*[\]]/.test(value)) {
+    return false;
+  }
+  return !value.split('/').some((segment) => segment === '..');
+}
+
 /** Wall-clock budget for one git read. */
 const GIT_TIMEOUT_MS = 30_000;
 
@@ -82,7 +112,7 @@ export class RepositoryFactsAdapter implements RepositoryFactsPort {
   public async listFilesAtCommit(
     request: RepositoryFactsRequest & { readonly pathPrefix: string },
   ): Promise<RepositoryFileListing> {
-    if (!COMMIT_PATTERN.test(request.commit)) {
+    if (!COMMIT_PATTERN.test(request.commit) || !isSafePathPrefix(request.pathPrefix)) {
       return { status: 'unreadable', paths: [] };
     }
     const outcome = await this.runGit(request.repositoryPath, [

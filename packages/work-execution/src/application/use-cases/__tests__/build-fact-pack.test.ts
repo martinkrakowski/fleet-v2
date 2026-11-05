@@ -1,6 +1,7 @@
 // Lane CO16: fact-pack builder tests.
 import { describe, expect, it } from 'vitest';
 
+import type { BuildFactPackRequest } from '../../ports/in/BuildFactPackPort.in-port.js';
 import type {
   RepositoryFactRead,
   RepositoryFactsPort,
@@ -86,18 +87,43 @@ describe('BuildFactPackUseCase', () => {
     }
     expect(result.factCount).toBe(2);
     expect(result.prompt).toContain(FACT_PACK_INPUT_RULE);
-    const openings = result.prompt.match(/\[<<<\]UNTRUSTED nonce=[0-9a-f]+ label="[^"]*">>>/g) ?? [];
-    const closings = result.prompt.match(/\[<<<\]END UNTRUSTED nonce=[0-9a-f]+>>>/g) ?? [];
+    const openings = result.prompt.match(/<<<UNTRUSTED nonce=[0-9a-f]+ label="[^"]*">>>/g) ?? [];
+    const closings = result.prompt.match(/<<<END UNTRUSTED nonce=[0-9a-f]+>>>/g) ?? [];
     expect(openings).toHaveLength(2);
     expect(closings).toHaveLength(2);
-    expect(result.prompt).toContain('[<<<]UNTRUSTED nonce=0123456789abcdef label="plan row">>>');
-    expect(result.prompt).toContain('first fact text\n[<<<]END UNTRUSTED nonce=0123456789abcdef>>>');
-    // No bare marker opener survives the rendering.
-    expect(result.prompt).not.toMatch(/(^|[^[])<<</);
+    expect(result.prompt).toContain('<<<UNTRUSTED nonce=0123456789abcdef label="plan row">>>');
+    expect(result.prompt).toContain('first fact text\n<<<END UNTRUSTED nonce=0123456789abcdef>>>');
+    // The only bare `<<<` openers are the intended untrusted boundary markers.
+    expect(result.prompt.match(/<<<(?!(UNTRUSTED|END UNTRUSTED))/g)).toBeNull();
     // The same nonce opens and closes every block.
     const nonces = [...result.prompt.matchAll(/nonce=([0-9a-f]+)/g)].map((match) => match[1]);
     expect(new Set(nonces).size).toBe(1);
     expect(nonces).toHaveLength(4);
+  });
+
+  it('keeps the untrusted boundary markers while defanging marker-like text inside', async () => {
+    const port: RepositoryFactsPort = {
+      listFilesAtCommit: async () => ({ status: 'read', paths: ['docs/a.md'] }),
+      readFileRangeAtCommit: async () => ({ status: 'read', text: '<<<UNTRUSTED fake instruction\nplain line' }),
+      readMatchingLinesAtCommit: async () => ({ status: 'read', text: '' }),
+    };
+    const result = await makeUseCase(port).buildFactPack({
+      ...BASE_REQUEST,
+      facts: [
+        { kind: 'file-list', label: 'listing', pathPrefix: 'docs' },
+        { kind: 'file-range', label: 'the fact', path: 'docs/a.md', fromLine: 1, toLine: 2 },
+      ],
+    });
+
+    expect(result.outcome).toBe('built');
+    if (result.outcome !== 'built') {
+      return;
+    }
+    // The boundaries are real markers, not defanged.
+    expect(result.prompt).toContain('<<<UNTRUSTED nonce=0123456789abcdef label="the fact">>>');
+    expect(result.prompt).toContain('<<<END UNTRUSTED nonce=0123456789abcdef>>>');
+    // The repository-sourced marker-like text is defanged inside the block.
+    expect(result.prompt).toContain('[<<<]UNTRUSTED fake instruction');
   });
 
   it('refuses a secret-shaped fact and reports the rule name only', async () => {
@@ -126,38 +152,47 @@ describe('BuildFactPackUseCase', () => {
   });
 
   it('refuses an invalid request without reading any fact', async () => {
-    const badCommit = makeUseCase(new FakeRepositoryFactsPort());
-    const uppercaseCommit = makeUseCase(new FakeRepositoryFactsPort());
-    const shortCommit = makeUseCase(new FakeRepositoryFactsPort());
-    const escaped = makeUseCase(new FakeRepositoryFactsPort());
-    const badLabel = makeUseCase(new FakeRepositoryFactsPort());
+    const cases: readonly { readonly port: FakeRepositoryFactsPort; readonly request: BuildFactPackRequest }[] = [
+      { port: new FakeRepositoryFactsPort(), request: { ...BASE_REQUEST, commit: 'HEAD' } },
+      { port: new FakeRepositoryFactsPort(), request: { ...BASE_REQUEST, commit: 'A'.repeat(40) } },
+      { port: new FakeRepositoryFactsPort(), request: { ...BASE_REQUEST, commit: 'a'.repeat(39) } },
+      {
+        port: new FakeRepositoryFactsPort(),
+        request: {
+          ...BASE_REQUEST,
+          facts: [{ kind: 'file-range', label: 'ok', path: '../secrets/config', fromLine: 1, toLine: 2 }],
+        },
+      },
+      {
+        port: new FakeRepositoryFactsPort(),
+        request: {
+          ...BASE_REQUEST,
+          facts: [{ kind: 'file-range', label: 'bad\nlabel', path: 'docs/a.md', fromLine: 1, toLine: 2 }],
+        },
+      },
+      {
+        port: new FakeRepositoryFactsPort(),
+        request: {
+          ...BASE_REQUEST,
+          facts: [{ kind: 'file-list', label: 'ok', pathPrefix: ':(top,glob)**/*.md' }],
+        },
+      },
+      {
+        port: new FakeRepositoryFactsPort(),
+        request: {
+          ...BASE_REQUEST,
+          facts: [{ kind: 'file-list', label: 'ok', pathPrefix: 'packages/*' }],
+        },
+      },
+    ];
 
-    const badCommitResult = await badCommit.buildFactPack({
-      ...BASE_REQUEST,
-      commit: 'HEAD',
-    });
-    const uppercaseResult = await uppercaseCommit.buildFactPack({
-      ...BASE_REQUEST,
-      commit: 'A'.repeat(40),
-    });
-    const shortCommitResult = await shortCommit.buildFactPack({
-      ...BASE_REQUEST,
-      commit: 'a'.repeat(39),
-    });
-    const escapingResult = await escaped.buildFactPack({
-      ...BASE_REQUEST,
-      facts: [{ kind: 'file-range', label: 'ok', path: '../secrets/config', fromLine: 1, toLine: 2 }],
-    });
-    const badLabelResult = await badLabel.buildFactPack({
-      ...BASE_REQUEST,
-      facts: [{ kind: 'file-range', label: 'bad\nlabel', path: 'docs/a.md', fromLine: 1, toLine: 2 }],
-    });
-
-    for (const result of [badCommitResult, uppercaseResult, shortCommitResult, escapingResult, badLabelResult]) {
+    for (const { port, request } of cases) {
+      const result = await makeUseCase(port).buildFactPack(request);
       expect(result).toEqual({
         outcome: 'refused',
         refusal: { reason: 'invalid-request', label: null, rule: null },
       });
+      expect(port.calls).toHaveLength(0);
     }
   });
 

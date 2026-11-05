@@ -16,7 +16,7 @@ import type {
 import type {
   RepositoryFactsPort,
 } from '../ports/out/RepositoryFactsPort.out-port.js';
-import { defangMarkerLikeTokens, wrapUntrusted } from '@fleet/evidence-and-acceptance';
+import { wrapUntrusted } from '@fleet/evidence-and-acceptance';
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
 export const FACT_PACK_INPUT_RULE =
@@ -79,6 +79,23 @@ function isSafeRelativePath(value: string): boolean {
   return !value.split('/').some((segment) => segment === '..');
 }
 
+/**
+ * A safe literal path prefix for `ls-tree`: relative, no `..` segment, no
+ * control characters, and no git pathspec magic or glob metacharacters. A
+ * leading `:` would be parsed as a pathspec magic signature (for example
+ * `:(top,glob)` — listing across the repository instead of the subtree), and
+ * `*?[]` would widen the match beyond the literal prefix.
+ */
+function isSafePathPrefix(value: string): boolean {
+  if (!isNonEmptyControlFree(value) || value.startsWith('/') || value.startsWith(':')) {
+    return false;
+  }
+  if (/[?*[\]]/.test(value)) {
+    return false;
+  }
+  return !value.split('/').some((segment) => segment === '..');
+}
+
 function isPositiveInteger(value: number): boolean {
   return Number.isInteger(value) && value >= 1;
 }
@@ -102,16 +119,16 @@ function secretShapeRuleName(text: string): string | null {
 /**
  * Renders the prompt shape: one untrusted block per fact, blank line between
  * blocks, one blank line after the rule. Pure: throws on a nonce or label
- * `wrapUntrusted` rejects, so the caller validates both first. The rendered
- * markers are defanged (`[<<<]`, not a bare `<<<`) so a reader cannot copy
- * the prompt's own markers out of the rendered text.
+ * `wrapUntrusted` rejects, so the caller validates both first. The untrusted
+ * boundary markers are left intact; `wrapUntrusted` defangs marker-like tokens
+ * inside the fact text itself, so the boundaries stay real in the prompt.
  */
 export function renderFactPackPrompt(input: RenderFactPackPromptInput): string {
   const { laneId, repositoryPath, commit, sections, nonce } = input;
   const blocks = sections.map((section) => [
     `## ${section.label} (${section.path})`,
     '',
-    defangMarkerLikeTokens(wrapUntrusted({ label: section.label, text: section.text, nonce })),
+    wrapUntrusted({ label: section.label, text: section.text, nonce }),
   ].join('\n'));
   return [
     `# Fact pack - lane ${laneId}`,
@@ -259,7 +276,7 @@ function isFactWellFormed(fact: BuildFactPackFact): boolean {
   }
   switch (fact.kind) {
     case 'file-list':
-      return isNonEmptyControlFree(fact.pathPrefix);
+      return isSafePathPrefix(fact.pathPrefix);
     case 'file-range':
       return isSafeRelativePath(fact.path)
         && isPositiveInteger(fact.fromLine)

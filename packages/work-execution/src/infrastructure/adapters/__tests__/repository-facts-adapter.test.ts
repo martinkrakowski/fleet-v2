@@ -139,6 +139,21 @@ describe('RepositoryFactsAdapter', () => {
     expect(read).toEqual({ status: 'unreadable' });
   });
 
+  it('refuses a pathspec-magic or glob prefix without running git', async () => {
+    const { executor, recorded } = makeExecutor({});
+    const adapter = makeAdapter(executor);
+
+    for (const pathPrefix of [':(top,glob)**/*.md', 'packages/*', 'packages/..', '/abs/path']) {
+      const listing = await adapter.listFilesAtCommit({
+        repositoryPath: REPOSITORY,
+        commit: COMMIT,
+        pathPrefix,
+      });
+      expect(listing).toEqual({ status: 'unreadable', paths: [] });
+    }
+    expect(recorded).toHaveLength(0);
+  });
+
   it('refuses a commit that is not a plain object name without running git', async () => {
     const { executor, recorded } = makeExecutor({});
     const adapter = makeAdapter(executor);

@@ -315,7 +315,7 @@ describe('fleet-v2 state compact', () => {
     await fs.symlink(outsideFile, path.join(dir, 'attempts.json'));
     const result = await compact(dir);
     expect(result.code).toBe(1);
-    expect(result.err).toContain('state compact refused: attempts.json is not a regular file');
+    expect(result.err).toContain('state compact refused: attempts.json is a link');
     expect(result.out).toContain('nothing changed');
     expect(await fs.readFile(outsideFile, 'utf8')).toBe(text);
     expect(await exists(path.join(outside, 'quarantine'))).toBe(false);
@@ -331,10 +331,19 @@ describe('fleet-v2 state compact', () => {
     const original = await seedFinished(dir);
     const result = await compact(dir);
     expect(result.code).toBe(1);
-    expect(result.err).toContain('state compact refused: work-orders.json is not a regular file');
+    expect(result.err).toContain('state compact refused: work-orders.json is a link');
     expect(result.out).toContain('nothing changed');
     expect(await fs.readFile(path.join(dir, 'attempts.json'), 'utf8')).toBe(original.attempts);
     expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
+  });
+
+  it('compacts when a directory-backed store such as daemon/leases exists', async () => {
+    const dir = makeTempDir();
+    await fs.mkdir(path.join(dir, 'daemon', 'leases'), { recursive: true });
+    await seedFinished(dir);
+    const result = await compact(dir);
+    expect(result.code).toBe(0);
+    expect(await idsOf(dir, 'attempts.json')).toEqual(['att-live']);
   });
 
   it('refuses when the quarantine directory is a symlink and writes nothing', async () => {

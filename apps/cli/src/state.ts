@@ -480,8 +480,8 @@ async function compactPreflight(stateDir: string): Promise<string | null> {
   try {
     for (const descriptor of STATE_FILE_DESCRIPTORS) {
       const other = await lstatOrNull(path.join(stateDir, descriptor.basename));
-      if (other !== null && !other.isFile()) {
-        return `${descriptor.basename} is not a regular file`;
+      if (other?.isSymbolicLink() === true) {
+        return `${descriptor.basename} is a link`;
       }
     }
     for (const basename of COMPACT_BASENAMES) {

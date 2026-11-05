@@ -171,6 +171,7 @@ export function buildLiveConductorDriver(
     attemptRepo: execution.attemptRepository,
     executionJournal: execution.executionJournal,
     maxActiveRuns: options.maxActiveRuns,
+    profileRead: conductor.profileRead,
     candidateHosts: laneRunnerCandidateHosts(runtime.installation),
     forgeRead: execution.forgeRead,
     newReservationId: () => 'res-' + conductor.newUlid(),

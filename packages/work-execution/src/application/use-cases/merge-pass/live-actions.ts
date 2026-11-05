@@ -59,7 +59,8 @@ const MIN_BUDGET_REMAINING_MS = 2000;
 function hasControlCharacter(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
-    if (code <= 0x1f || code === 0x7f) {
+    // C0, DEL and C1 (U+0080..U+009F) are all control characters.
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) {
       return true;
     }
   }
@@ -276,7 +277,8 @@ function validateRequest(input: unknown): Validation {
     return { ok: false, reasonCode: 'invalid-branch' };
   }
   const grantId = input['grantId'];
-  if (!isBoundedToken(grantId)) {
+  // The brief asks only for a non-empty grant id; the journal validates what it stores.
+  if (typeof grantId !== 'string' || grantId.length === 0) {
     return { ok: false, reasonCode: 'invalid-grant' };
   }
   const status = readStatus(action, input['status']);
@@ -452,14 +454,46 @@ async function readForge(
       nowIso: request.nowIso,
       deadlineIso: request.deadlineIso,
     });
+    // Validated and copied inside the guard: a hostile getter on the answer is an unknown read, never a
+    // throw, and the copy is what the verdict reads, so a getter cannot answer differently the second time.
+    if (isWellFormedRead(read)) {
+      return snapshotRead(read);
+    }
   } catch {
     return { outcome: 'unavailable', code: 'unknown', reason: 'port threw' };
   }
-  return isWellFormedRead(read) ? read : { outcome: 'unavailable', code: 'unreadable', reason: 'off-contract answer' };
+  return { outcome: 'unavailable', code: 'unreadable', reason: 'off-contract answer' };
 }
 
 const FORGE_PR_STATES: readonly unknown[] = ['open', 'merged', 'closed'];
+const FORGE_MERGE_STATES: readonly unknown[] = ['clean', 'behind', 'blocked', 'unknown'];
+
+function isUnresolvedThreads(value: unknown): boolean {
+  return value === 'unknown' || (Number.isSafeInteger(value) && (value as number) >= 0);
+}
 const FORGE_READ_NON_OK_OUTCOMES: readonly unknown[] = ['not-found', 'budget-exhausted', 'unavailable'];
+
+function snapshotRead(read: ReadForgeMergeResult): ReadForgeMergeResult {
+  if (read.outcome === 'ok') {
+    return {
+      outcome: 'ok',
+      prState: read.prState,
+      liveHeadSha: read.liveHeadSha,
+      mergeState: read.mergeState,
+      unresolvedThreads: read.unresolvedThreads,
+      contexts: read.contexts.map((context) => ({
+        name: context.name,
+        state: context.state,
+        isGreen: context.isGreen,
+        creatorLogin: context.creatorLogin,
+      })),
+    };
+  }
+  if (read.outcome === 'unavailable') {
+    return { outcome: 'unavailable', code: 'unknown', reason: 'forge unavailable' };
+  }
+  return read.outcome === 'not-found' ? { outcome: 'not-found' } : { outcome: 'budget-exhausted' };
+}
 
 /** An `ok` read must name a known PR state, a 40-hex live head and a context list; anything else is unknown. */
 function isWellFormedRead(read: unknown): read is ReadForgeMergeResult {
@@ -472,6 +506,8 @@ function isWellFormedRead(read: unknown): read is ReadForgeMergeResult {
   return (
     FORGE_PR_STATES.includes(read['prState']) &&
     isMergeHex40(read['liveHeadSha']) &&
+    FORGE_MERGE_STATES.includes(read['mergeState']) &&
+    isUnresolvedThreads(read['unresolvedThreads']) &&
     Array.isArray(read['contexts']) &&
     (read['contexts'] as readonly unknown[]).every(isWellFormedContext)
   );
@@ -621,6 +657,11 @@ async function actLive(
     return { outcome: 'unavailable', journalKey: key, reasonCode: 'id-unavailable' };
   }
   const actionId = ids[0] ?? '';
+  // The grant is the one field the result carries that the intent does not: a grant the journal cannot
+  // record (over 256 bytes, blank, secret-shaped) is refused here, before the intent, never after the act.
+  if (!readLaneRunJournalEntry(resultEntry(request, ids[2] ?? '', 'completed', null, request.grantId)).ok) {
+    return { outcome: 'invalid-request', reasonCode: 'invalid-grant' };
+  }
   const forgeRequest = forgeRequestOf(request, actionId);
   const intentFailure = appendFailure(key, await appendEntry(deps, intentEntry(request, ids[1] ?? '', actionId)));
   if (intentFailure !== null) {

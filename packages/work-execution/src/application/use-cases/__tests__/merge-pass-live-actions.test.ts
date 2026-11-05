@@ -703,4 +703,62 @@ describe('performMergeLiveAction never throws and never acts twice (DT9b fix rou
     expect(journal.entries[1]).toMatchObject({ outcome: 'reconciled', reasonCode: 'status-present' });
     expect(forgeAction.requests).toHaveLength(0);
   });
+
+  it('keeps the key pending when the reconcile read answers with a throwing getter', async () => {
+    const { journal, forgeAction, forgeRead, deps } = build();
+    seedIntent(journal, KEY_MERGE_PR);
+    // `then` answers undefined so the await resolves; the trap fires when the answer is validated.
+    forgeRead.result = new Proxy({} as ReadForgeMergeResult, {
+      get(_target, property) {
+        if (property === 'then') {
+          return undefined;
+        }
+        throw new Error('trap');
+      },
+    });
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(result).toEqual({ outcome: 'ambiguous', journalKey: KEY_MERGE_PR, reasonCode: 'reconcile-unknown' });
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('keeps the key pending when an ok reconcile read has an off-contract merge state or thread count', async () => {
+    for (const bad of [
+      { outcome: 'ok', prState: 'open', liveHeadSha: HEAD, mergeState: 'bogus', contexts: [], unresolvedThreads: 0 },
+      { outcome: 'ok', prState: 'open', liveHeadSha: HEAD, mergeState: 'clean', contexts: [], unresolvedThreads: -1 },
+    ]) {
+      const { journal, forgeAction, forgeRead, deps } = build();
+      seedIntent(journal, KEY_MERGE_PR);
+      forgeRead.result = bad as unknown as ReadForgeMergeResult;
+      const result = await performMergeLiveAction(deps, makeRequest());
+      expect(result).toEqual({ outcome: 'ambiguous', journalKey: KEY_MERGE_PR, reasonCode: 'reconcile-unknown' });
+      expect(forgeAction.requests).toHaveLength(0);
+    }
+  });
+
+  it('refuses a branch name with a C1 control character', async () => {
+    const { journal, forgeAction, deps } = build();
+    const result = await performMergeLiveAction(deps, makeRequest({ branchName: 'feat/x\u0085y' }));
+    expect(result).toEqual({ outcome: 'invalid-request', reasonCode: 'invalid-branch' });
+    expect(journal.entries).toHaveLength(0);
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('accepts a non-empty grant id longer than 255 characters that the journal can record', async () => {
+    const { journal, forgeAction, deps } = build();
+    const grantId = 'g'.repeat(256);
+    const result = await performMergeLiveAction(deps, makeRequest({ grantId }));
+    expect(result.outcome).toBe('acted');
+    expect(forgeAction.requests).toHaveLength(1);
+    expect(journal.entries[1]).toMatchObject({ outcome: 'completed', grantId });
+  });
+
+  it('refuses a grant the journal cannot record before the intent, so the forge never acts without its result', async () => {
+    for (const grantId of ['g'.repeat(300), '   ']) {
+      const { journal, forgeAction, deps } = build();
+      const result = await performMergeLiveAction(deps, makeRequest({ grantId }));
+      expect(result).toEqual({ outcome: 'invalid-request', reasonCode: 'invalid-grant' });
+      expect(journal.entries).toHaveLength(0);
+      expect(forgeAction.requests).toHaveLength(0);
+    }
+  });
 });

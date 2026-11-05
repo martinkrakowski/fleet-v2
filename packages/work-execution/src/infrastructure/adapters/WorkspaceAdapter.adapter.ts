@@ -380,6 +380,12 @@ type ListedLaneWorktree =
   | { readonly kind: 'refused' };
 
 /**
+ * One extracted step of `commitLaneOutput`: either the step's data, or the
+ * result that ends the method (`failure`).
+ */
+type LaneCommitStep<T> = { readonly data: T } | { readonly failure: CommitLaneOutputResult };
+
+/**
  * Step 3 of `removeLaneWorktree`: find the worktree — git must list the
  * path (or its physical form) as a worktree of this clone. A failed or
  * exit-code-less list is `unknown`, a non-zero exit is `refused`, an
@@ -1109,49 +1115,60 @@ export class WorkspaceAdapter implements WorkspacePort {
     return { ok: true, tree: treeRun.stdout.trim(), headTree: headTreeRun.stdout.trim() };
   }
 
-  async commitLaneOutput(request: CommitLaneOutputRequest): Promise<CommitLaneOutputResult> {
-    // 1. Validate before any command runs.
-    if (commitRequestIsInvalid(request)) {
-      return { outcome: 'refused', reason: 'invalid-request' };
-    }
-
-    // 2. The commit runs on the recorded host's executor when there is one.
-    let executor: CommandExecutorPort;
+  /**
+   * Step 2 of `commitLaneOutput`: the commit runs on the recorded host's
+   * executor when there is one.
+   */
+  private laneCommitExecutor(request: CommitLaneOutputRequest): LaneCommitStep<CommandExecutorPort> {
     try {
-      executor = this.executorFor(request.recordedHost);
+      return { data: this.executorFor(request.recordedHost) };
     } catch {
-      return { outcome: 'error', reason: 'worktree host could not be resolved' };
+      return { failure: { outcome: 'error', reason: 'worktree host could not be resolved' } };
     }
+  }
 
-    const { worktreePath } = request;
-
+  /**
+   * Steps 3–4 of `commitLaneOutput`: read HEAD, then the checked-out
+   * branch, refusing a detached head.
+   */
+  private async laneCommitHeadAndBranch(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+  ): Promise<LaneCommitStep<{ head: string; branchRef: string }>> {
     // 3. Read HEAD.
     const headRun = await this.runCommitGit(executor, worktreePath, ['rev-parse', '--verify', 'HEAD^{commit}']);
-    if (!headRun.ok) return { outcome: 'error', reason: headRun.reason };
+    if (!headRun.ok) return { failure: { outcome: 'error', reason: headRun.reason } };
     const head = headRun.stdout.trim();
 
     // 4. The checked-out branch, else a detached head is refused.
     const branchRun = await this.runCommitGit(executor, worktreePath, ['symbolic-ref', '-q', 'HEAD']);
-    if (!branchRun.ok) return { outcome: 'refused', reason: 'detached-head' };
+    if (!branchRun.ok) return { failure: { outcome: 'refused', reason: 'detached-head' } };
     const branchRef = branchRun.stdout.trim();
     if (branchRef.startsWith('refs/heads/') !== true) {
-      return { outcome: 'refused', reason: 'detached-head' };
+      return { failure: { outcome: 'refused', reason: 'detached-head' } };
     }
+    return { data: { head, branchRef } };
+  }
 
-    // 5. HEAD must be the dispatch head; a crash after the commit reads as
-    // already-committed instead of a head-moved refusal (the ownership
-    // proof lives in `alreadyCommittedOutcome`).
-    if (head !== request.expectedHead) {
-      return this.alreadyCommittedOutcome(executor, request, worktreePath, head, branchRef);
-    }
-
+  /**
+   * Steps 6–7b of `commitLaneOutput`: stage the change set, write the
+   * staged tree and compare it with HEAD's tree (the shared comparison
+   * helper), then re-check the tree that is actually about to be committed
+   * against the allowed-path prefixes.
+   */
+  private async laneCommitStagedTree(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+    expectedHead: string,
+    allowedPathPrefixes: readonly string[],
+  ): Promise<LaneCommitStep<{ tree: string }>> {
     // 6–7. Stage the change set, write the staged tree and compare it with
     // HEAD's tree (the shared comparison helper).
     const stagedTree = await this.stageAndCompareWithHeadTree(executor, worktreePath);
-    if (!stagedTree.ok) return { outcome: 'error', reason: stagedTree.reason };
+    if (!stagedTree.ok) return { failure: { outcome: 'error', reason: stagedTree.reason } };
     const tree = stagedTree.tree;
     if (tree === stagedTree.headTree) {
-      return { outcome: 'nothing-to-commit' };
+      return { failure: { outcome: 'nothing-to-commit' } };
     }
 
     // 7b. The diff check ran before staging; re-check the tree that is
@@ -1161,39 +1178,117 @@ export class WorkspaceAdapter implements WorkspacePort {
     const diffTreeRun = await this.runCommitGit(
       executor,
       worktreePath,
-      ['diff-tree', '-r', '--no-renames', '-z', request.expectedHead, tree],
+      ['diff-tree', '-r', '--no-renames', '-z', expectedHead, tree],
     );
-    if (!diffTreeRun.ok) return { outcome: 'error', reason: diffTreeRun.reason };
-    if (stagedTreeOutsideAllowedPaths(diffTreeRun.stdout, request.allowedPathPrefixes)) {
-      return { outcome: 'refused', reason: 'outside-allowed-paths' };
+    if (!diffTreeRun.ok) return { failure: { outcome: 'error', reason: diffTreeRun.reason } };
+    if (stagedTreeOutsideAllowedPaths(diffTreeRun.stdout, allowedPathPrefixes)) {
+      return { failure: { outcome: 'refused', reason: 'outside-allowed-paths' } };
     }
+    return { data: { tree } };
+  }
 
-    // 8. Write the commit: the dispatch head is the only parent.
+  /**
+   * Step 8 of `commitLaneOutput`: write the commit — the dispatch head is
+   * the only parent.
+   */
+  private async laneCommitWrite(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+    tree: string,
+    expectedHead: string,
+    commitMessage: string,
+  ): Promise<LaneCommitStep<string>> {
     const commitRun = await this.runCommitGit(
       executor,
       worktreePath,
-      [
-        'commit-tree', tree, '-p', request.expectedHead, '--no-gpg-sign',
-        '-m', editOnlyCommitMessage(request.attemptId, request.implementerModel),
-      ],
+      ['commit-tree', tree, '-p', expectedHead, '--no-gpg-sign', '-m', commitMessage],
     );
-    if (!commitRun.ok) return { outcome: 'error', reason: commitRun.reason };
+    if (!commitRun.ok) return { failure: { outcome: 'error', reason: commitRun.reason } };
     const commit = commitRun.stdout.trim();
     if (COMMIT_HEAD_PATTERN.test(commit) !== true) {
-      return { outcome: 'error', reason: 'git commit-tree failed' };
+      return { failure: { outcome: 'error', reason: 'git commit-tree failed' } };
     }
+    return { data: commit };
+  }
 
-    // 9. Move the branch by compare-and-swap: git refuses when the branch
-    // moved since `expectedHead`, and then nothing was moved.
+  /**
+   * Step 9 of `commitLaneOutput`: move the branch by compare-and-swap —
+   * git refuses when the branch moved since `expectedHead`, and then
+   * nothing was moved.
+   */
+  private async laneCommitRefSwap(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+    branchRef: string,
+    commit: string,
+    expectedHead: string,
+    attemptId: string,
+  ): Promise<CommitLaneOutputResult> {
     const updateRun = await this.runCommitGit(
       executor,
       worktreePath,
-      ['update-ref', '-m', 'fleet edit-only commit ' + request.attemptId, branchRef, commit, request.expectedHead],
+      ['update-ref', '-m', 'fleet edit-only commit ' + attemptId, branchRef, commit, expectedHead],
     );
     if (!updateRun.ok) return { outcome: 'refused', reason: 'ref-moved' };
 
     // 10. Done.
     return { outcome: 'committed', headCommit: commit, branchRef };
+  }
+
+  async commitLaneOutput(request: CommitLaneOutputRequest): Promise<CommitLaneOutputResult> {
+    // 1. Validate before any command runs.
+    if (commitRequestIsInvalid(request)) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+
+    // 2. The commit runs on the recorded host's executor when there is one.
+    const executorStep = this.laneCommitExecutor(request);
+    if ('failure' in executorStep) return executorStep.failure;
+    const executor = executorStep.data;
+
+    const { worktreePath } = request;
+
+    // 3–4. Read HEAD and the checked-out branch.
+    const headAndBranch = await this.laneCommitHeadAndBranch(executor, worktreePath);
+    if ('failure' in headAndBranch) return headAndBranch.failure;
+    const { head, branchRef } = headAndBranch.data;
+
+    // 5. HEAD must be the dispatch head; a crash after the commit reads as
+    // already-committed instead of a head-moved refusal (the ownership
+    // proof lives in `alreadyCommittedOutcome`).
+    if (head !== request.expectedHead) {
+      return this.alreadyCommittedOutcome(executor, request, worktreePath, head, branchRef);
+    }
+
+    // 6–7b. Stage the change set, compare the staged tree with HEAD's tree
+    // and re-check the allowed-path prefixes on the committed tree.
+    const stagedTree = await this.laneCommitStagedTree(
+      executor,
+      worktreePath,
+      request.expectedHead,
+      request.allowedPathPrefixes,
+    );
+    if ('failure' in stagedTree) return stagedTree.failure;
+
+    // 8. Write the commit: the dispatch head is the only parent.
+    const commitStep = await this.laneCommitWrite(
+      executor,
+      worktreePath,
+      stagedTree.data.tree,
+      request.expectedHead,
+      editOnlyCommitMessage(request.attemptId, request.implementerModel),
+    );
+    if ('failure' in commitStep) return commitStep.failure;
+
+    // 9–10. Move the branch by compare-and-swap, then report the commit.
+    return this.laneCommitRefSwap(
+      executor,
+      worktreePath,
+      branchRef,
+      commitStep.data,
+      request.expectedHead,
+      request.attemptId,
+    );
   }
 
   /**
@@ -1571,25 +1666,43 @@ export class WorkspaceAdapter implements WorkspacePort {
    * is configured, nothing runs. Gitdir linkage is proven by the `worktree
    * list` check: git itself lists the path as a worktree of this clone (E6).
    */
+  /**
+   * Step 2 of `removeLaneWorktree`: the write runs on the recorded host's
+   * executor and nowhere else — never the configured or legacy fallback.
+   * No host executor configured, a refusal or a throw yields `null` —
+   * nothing has run.
+   */
+  private recordedHostExecutor(
+    recordedHost: AttemptRunnerRecord | null | undefined,
+  ): CommandExecutorPort | null {
+    const selector = this.options?.executorForRecordedHost;
+    if (selector === undefined) {
+      return null;
+    }
+    try {
+      const resolved = selector(recordedHost);
+      if (!resolved.ok) {
+        return null;
+      }
+      return resolved.executor;
+    } catch {
+      return null;
+    }
+  }
+
   async removeLaneWorktree(request: RemoveLaneWorktreeRequest): Promise<RemoveLaneWorktreeResult> {
     // 1. Validate before anything runs (no executor call on a bad request).
     if (removeLaneWorktreeRequestIsValid(request) !== true) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
 
-    // 2. The write runs on the recorded host's executor and nowhere else:
-    //    never the configured or legacy fallback. No host executor
-    //    configured, a refusal or a throw is `unknown` — nothing has run.
-    const selector = this.options?.executorForRecordedHost;
-    if (selector === undefined) {
+    // 2. The write runs on the recorded host's executor and nowhere else.
+    const executor = this.recordedHostExecutor(request.recordedHost);
+    if (executor === null) {
       return { outcome: 'unknown' };
     }
     try {
-      const resolved = selector(request.recordedHost);
-      if (!resolved.ok) {
-        return { outcome: 'unknown' };
-      }
-      return await this.removeListedLaneWorktree(request, resolved.executor);
+      return await this.removeListedLaneWorktree(request, executor);
     } catch {
       return { outcome: 'unknown' };
     }
@@ -1624,23 +1737,61 @@ export class WorkspaceAdapter implements WorkspacePort {
 
     // 4. The branch is the record of the run (D17): a detached entry, or
     //    one on another branch, is refused, never removed.
-    if (found.entry.branch === null || found.entry.branch !== branch) {
-      return { outcome: 'refused', reason: 'branch-mismatch' };
+    const branchRefusal = this.listedWorktreeBranchRefusal(found.entry, branch);
+    if (branchRefusal !== null) {
+      return branchRefusal;
     }
 
     // 4b. The listed tip is what the reap journals as the recovery handle, so
     //     it must be a real commit before anything is removed; an unborn or
     //     unreadable HEAD answers unknown with nothing removed.
-    const branchTip = found.entry.head;
-    if (branchTip === null || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(branchTip) || /^0+$/.test(branchTip)) {
+    const branchTip = this.listedWorktreeBranchTip(found.entry);
+    if (branchTip === null) {
       return { outcome: 'unknown' };
     }
 
     // 5. A locked worktree is never removed.
-    if (found.entry.locked) {
-      return { outcome: 'refused', reason: 'locked' };
+    const lockRefusal = this.listedWorktreeLockRefusal(found.entry);
+    if (lockRefusal !== null) {
+      return lockRefusal;
     }
     return removeCleanListedWorktree(executor, clonePath, worktreePath, branchTip);
+  }
+
+  /**
+   * Step 4 of `removeListedLaneWorktree`: the branch is the record of the
+   * run (D17) — a detached entry, or one on another branch, is refused,
+   * never removed.
+   */
+  private listedWorktreeBranchRefusal(
+    entry: ListedWorktreeEntry,
+    branch: string,
+  ): RemoveLaneWorktreeResult | null {
+    if (entry.branch === null || entry.branch !== branch) {
+      return { outcome: 'refused', reason: 'branch-mismatch' };
+    }
+    return null;
+  }
+
+  /**
+   * Step 4b of `removeListedLaneWorktree`: the listed tip is what the reap
+   * journals as the recovery handle, so it must be a real commit before
+   * anything is removed; an unborn or unreadable HEAD answers `null`.
+   */
+  private listedWorktreeBranchTip(entry: ListedWorktreeEntry): string | null {
+    const branchTip = entry.head;
+    if (branchTip === null || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(branchTip) || /^0+$/.test(branchTip)) {
+      return null;
+    }
+    return branchTip;
+  }
+
+  /** Step 5 of `removeListedLaneWorktree`: a locked worktree is never removed. */
+  private listedWorktreeLockRefusal(entry: ListedWorktreeEntry): RemoveLaneWorktreeResult | null {
+    if (entry.locked) {
+      return { outcome: 'refused', reason: 'locked' };
+    }
+    return null;
   }
 
   /**

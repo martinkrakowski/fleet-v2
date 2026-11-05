@@ -32,6 +32,7 @@ class FakeHost implements CommandExecutorPort {
   readonly stale = new Set<string>();
   readonly commits = new Set<string>([BASE, NEXT]);
   claimsDir = true;
+  filters = false;
   clock = 0;
   /** Return a result to override a command, keyed on its joined tail. */
   override: ((tail: string[]) => CommandRunResult | undefined) | undefined;
@@ -111,6 +112,7 @@ class FakeHost implements CommandExecutorPort {
         return FAIL();
       case 'rev-parse': return wt === undefined ? FAIL() : OK(`${wt.head}\n`);
       case 'status': return wt === undefined ? FAIL() : OK(wt.dirty ? ' M file\n' : '');
+      case 'config': return this.filters ? OK('filter.x.smudge cmd\n') : FAIL();
       case 'cat-file': return this.commits.has((a[2] ?? '').split('^')[0] ?? '') ? OK() : FAIL();
       case 'checkout': if (wt) { wt.head = a[3] ?? wt.head; } return wt ? OK() : FAIL();
       case 'clean': if (wt) wt.dirty = false; return wt ? OK() : FAIL();
@@ -370,6 +372,30 @@ describe('WorktreePoolAdapter resetToBase', () => {
     host.stale.add('w1.reset');
     expect((await adapter.refillAfterMerge({ projectId: 'proj', mergedBaseCommit: NEXT, recordedHost: HOST })).outcome).toBe('refilled');
     expect(host.claims.has(`${CLAIMS}/w1.reset`)).toBe(false);
+  });
+
+  it('never checks out in a clone that defines a filter driver, or when that cannot be read', async () => {
+    const host = new FakeHost();
+    host.add(1);
+    host.filters = true;
+    const req = { worktreePath: `${POOL}/w1`, baseCommit: NEXT, recordedHost: HOST };
+    expect(await make(host).resetToBase(req)).toEqual({ outcome: 'unknown' });
+    expect(host.worktrees.get(`${POOL}/w1`)!.head).toBe(BASE);
+    expect((await make(host).refillAfterMerge({ projectId: 'proj', mergedBaseCommit: NEXT, recordedHost: HOST })).outcome).toBe('unknown');
+    expect(host.worktrees.size).toBe(1);
+    host.filters = false;
+    host.claims.clear(); // the aborted attempts left their guards; reaping is covered elsewhere
+    host.override = (t) => (t[0] === 'config' ? { exitCode: null, signal: null, stdout: '', stderr: '', error: 'x' } : undefined);
+    expect(await make(host).resetToBase(req)).toEqual({ outcome: 'unknown' });
+  });
+
+  it('rebuilds an idle entry that sits at the merged base but is dirty', async () => {
+    const host = new FakeHost();
+    host.add(1, NEXT, true);
+    host.add(2, NEXT);
+    const result = await make(host).refillAfterMerge({ projectId: 'proj', mergedBaseCommit: NEXT, recordedHost: HOST });
+    expect(result.outcome === 'refilled' ? result.entries.length : 0).toBe(2);
+    expect(host.worktrees.get(`${POOL}/w1`)!.dirty).toBe(false);
   });
 
   it('reports unknown when the executor does not answer', async () => {

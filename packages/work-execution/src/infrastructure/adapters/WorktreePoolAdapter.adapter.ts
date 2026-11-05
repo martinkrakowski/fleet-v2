@@ -90,6 +90,7 @@ const GIT_PREFIX = [
   'GIT_NO_LAZY_FETCH=1',
   'GIT_TERMINAL_PROMPT=0',
   'GIT_CONFIG_NOSYSTEM=1',
+  'GIT_CONFIG_GLOBAL=/dev/null',
   'git',
   '-c', 'core.hooksPath=/dev/null',
   '-c', 'protocol.allow=never',
@@ -395,11 +396,16 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
       for (const index of indexes) {
         const slot = slots.get(index);
         if (slot !== undefined && !slot.prunable && claims.get(index) === owner) {
-          // A slot being reset is not handed back; only a proven absent guard passes.
-          const resetting = await this.call(view, ['test', '-L', `${view.claimsDir}/w${index}.reset`], deadline);
-          if (resetting.kind !== 'fail') continue;
+          // A slot being reset is not handed back. The retake holds the reset
+          // guard (exclusive) while it hands the entry out, so a reset cannot
+          // start between the check and the handout.
+          const guard = `${view.claimsDir}/w${index}.reset`;
+          const held = await this.call(view, ['ln', '-s', '--', 'retake', guard], deadline);
+          if (held.kind !== 'ok') continue;
           const record = this.entry(projectId, index, slot.path, slot.head, 'taken', runId);
+          await this.call(view, ['rm', '-f', '--', guard], Math.max(deadline, this.now() + 5000));
           if (record !== null && isWorktreePoolBaseCommit(slot.head)) return { outcome: 'taken', entry: record };
+          continue;
         }
       }
     }
@@ -475,8 +481,19 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     return record === null ? { outcome: 'unknown' } : { outcome: 'reset', entry: record };
   }
 
+  /**
+   * A checkout runs any configured clean/smudge filter the base's attributes
+   * name, so a clone with a filter driver is never checked out: true only when
+   * the clone is proven to define none.
+   */
+  private async hasNoFilterDriver(view: PoolView, deadline: number): Promise<boolean> {
+    const found = await this.git(view, view.config.repositoryPath, ['config', '--get-regexp', '^filter\\.'], deadline);
+    return found.kind === 'fail'; // exit 1: no key matched
+  }
+
   /** Move a listed worktree to `base`, clear its residue, run the prepare steps, and prove it clean. */
   private async rebuild(view: PoolView, path: string, base: string, deadline: number): Promise<'yes' | 'no' | 'unknown'> {
+    if (!(await this.hasNoFilterDriver(view, deadline))) return 'unknown';
     const steps: (readonly string[])[] = [
       [...GIT_PREFIX, '-C', path, 'checkout', '--detach', '--force', base],
       [...GIT_PREFIX, '-C', path, 'clean', '-fd', '-e', 'node_modules'],
@@ -584,11 +601,12 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
       const slot = state.slots.get(index);
       if (slot === undefined || slot.prunable || state.claims.has(index)) continue;
       let record: WorktreePoolEntryRecord | null = null;
-      if (slot.head !== merged) {
+      if (slot.head === merged && (await this.isCleanAt(view, slot.path, merged, deadline)) === 'yes') {
+        record = this.entry(projectId, index, slot.path, merged, 'warm', null);
+      } else {
+        // At an older base, dirty or unreadable: rebuild it rather than leave it occupying the slot.
         const reset = await this.resetIn(view, projectId, index, merged, deadline);
         record = reset.outcome === 'reset' ? reset.entry : null;
-      } else if ((await this.isCleanAt(view, slot.path, merged, deadline)) === 'yes') {
-        record = this.entry(projectId, index, slot.path, merged, 'warm', null);
       }
       if (record === null) failed = true;
       else ready.set(index, record);
@@ -631,6 +649,10 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     const guard = `prepare-${randomUUID()}`;
     if (!(await this.claim(view, index, guard, deadline))) return { kind: 'lost' };
     const path = this.slotPath(view, index);
+    if (!(await this.hasNoFilterDriver(view, deadline))) {
+      await this.release(view, index, deadline);
+      return { kind: 'failed' };
+    }
     const added = await this.git(view, view.config.repositoryPath, ['worktree', 'add', '--detach', path, merged], deadline);
     if (added.kind === 'fail') {
       // Nothing was created (an existing directory is left alone): give the slot back.

@@ -5,12 +5,20 @@
 // and diff-check findings (path, line, rule) — never a matched value.
 /**
  * GatePredicateAdapter implements GatePredicatePort over an injected
- * CommandExecutorPort (resolved for the attempt's recorded host). It runs the
- * predicates in order: the commit since the base at the candidate head with a
- * clean tree, the lane diff check, then each fixed argv command with its
- * declared coverage. The first predicate that does not pass stops the run;
- * every later predicate is reported skipped and is never executed, so a
- * command never runs after a failed diff check.
+ * CommandExecutorPort (resolved for the attempt's recorded host). The commit
+ * since the base at the candidate head with a clean tree runs first, then the
+ * lane diff check; a command never runs after either did not pass (those
+ * commands are reported skipped). The fixed argv commands then run
+ * concurrently (KS3), bounded by the host's in-process slot budget (the
+ * declared gate-slot count). With one slot, or none declared, the run is the
+ * sequential gate of old: the first non-pass stops it and later commands are
+ * reported skipped, never executed. Results come back in declared order, each as that
+ * predicate really ended: one predicate's failure or timeout never cancels,
+ * relabels or hides another's. The verdict is decided from the first non-pass
+ * in declared order by the use case, so K4-2's typed verdict is unchanged.
+ * With a receipt reuse wiring (KS2), a command whose full key equals a
+ * recorded passing receipt is not run again. Nothing here throws for runtime
+ * input; a predicate that could not run is `unknown`, never a pass.
  */
 
 import type {
@@ -40,6 +48,12 @@ import type {
   LaneDiffCheckResult,
 } from '../../application/ports/out/LaneDiffCheckPort.out-port.js';
 import { SshExecutor } from './SshExecutor.adapter.js';
+import { GateSlotBudget, readGateSlotCapacity } from './GateSlotBudget.helper.js';
+import { createHash } from 'node:crypto';
+import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
+import { buildGateReceiptKey } from '../../domain/gate-receipt-key.js';
+import type { GateReceiptKey } from '../../domain/gate-receipt-key.js';
+import type { GateReceiptReusePort } from '../../application/ports/out/GateReceiptReusePort.out-port.js';
 import {
   applyCoverage,
   isCheckCoverage,
@@ -63,10 +77,34 @@ export interface GatePredicateAdapterOptions {
   readonly isRemote?: (executor: CommandExecutorPort) => boolean;
   /** Millisecond clock for durations; default Date.now. */
   readonly nowMs?: () => number;
+  /**
+   * Further cap on concurrent predicates per host, never above the host's
+   * declared gate-slot count. Default: the declared slot count (one when the
+   * host declares none).
+   */
+  readonly maxConcurrentPredicates?: number;
+  /** Cap on the output one command may produce (stdout + stderr); default 16 MiB. */
+  readonly maxOutputBytes?: number;
+  /** KS2 receipt reuse; absent means every command runs, exactly as before. */
+  readonly receiptReuse?: GateReceiptReuseWiring;
+}
+
+/**
+ * What the receipt key needs beyond the spec: the toolchain versions and the
+ * declared environment digest of the host, read through its executor. Each
+ * returns an unvalidated value; an unreadable one (or a throw) is a miss.
+ */
+export interface GateReceiptReuseWiring {
+  readonly port: GateReceiptReusePort;
+  readonly toolchainVersions: (executor: CommandExecutorPort, worktreePath: string) => Promise<unknown>;
+  readonly declaredEnvironmentDigest: (executor: CommandExecutorPort, worktreePath: string) => Promise<unknown>;
 }
 
 const COMMIT_PATTERN = /^[0-9a-f]{40,64}$/;
-const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+/** Longest result detail the adapter returns; longer text is cut. */
+const MAX_DETAIL_LENGTH = 300;
+const WITHHELD_DETAIL = 'detail withheld: secret-shaped text';
 const DEFAULT_COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
 /** The fixed last stderr line `bin/gate-slot` prints when no slot freed up (KF-30a). */
 const GATE_SLOT_WAIT_LIMIT_LINE = 'gate-slot: no slot within the wait limit';
@@ -158,6 +196,60 @@ function detailForCommand(
   return exit + ', coverage not read (' + reason + ')';
 }
 
+/** A detail that is cut to the bound and withheld whole when it looks like a secret. Never throws. */
+function boundedDetail(detail: unknown): string {
+  if (typeof detail !== 'string') {
+    return '';
+  }
+  if (containsSecretShape(detail) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(detail))) {
+    return WITHHELD_DETAIL;
+  }
+  return detail.length > MAX_DETAIL_LENGTH ? detail.slice(0, MAX_DETAIL_LENGTH) : detail;
+}
+
+function withBoundedDetail(result: GatePredicateResult): GatePredicateResult {
+  const detail = boundedDetail(result.detail);
+  return detail === result.detail ? result : { ...result, detail };
+}
+
+/** A predicate that could not run: unknown, never a pass. */
+function unknownResult(
+  name: string,
+  kind: GatePredicateKind,
+  detail: string,
+  durationMs: number,
+): GatePredicateResult {
+  return { name, kind, verdict: 'unknown', exitCode: null, durationMs, detail };
+}
+
+function isUsableRequest(request: EvaluateGatePredicatesRequest): boolean {
+  if (request === null || typeof request !== 'object' || typeof request.worktreePath !== 'string') {
+    return false;
+  }
+  if (request.worktreePath.length === 0 || !Array.isArray(request.allowedPathPrefixes)) {
+    return false;
+  }
+  const spec = request.spec as { commands?: unknown } | null | undefined;
+  if (spec === null || typeof spec !== 'object' || !Array.isArray(spec.commands)) {
+    return false;
+  }
+  return spec.commands.every(
+    (command: unknown) =>
+      command !== null &&
+      typeof command === 'object' &&
+      Array.isArray((command as { argv?: unknown }).argv) &&
+      (command as { argv: unknown[] }).argv.length > 0 &&
+      (command as { argv: unknown[] }).argv.every((entry) => typeof entry === 'string'),
+  );
+}
+
+/** The receipt key inputs read once per request: unvalidated, the key builder refuses what is unreadable. */
+interface ReceiptContext {
+  readonly treeHash: unknown;
+  readonly toolchainVersions: unknown;
+  readonly declaredEnvironmentDigest: unknown;
+}
+
 export class GatePredicateAdapter implements GatePredicatePort {
   private readonly executorForRecordedHost: (
     runner: AttemptRunnerRecord | null,
@@ -166,6 +258,13 @@ export class GatePredicateAdapter implements GatePredicatePort {
   private readonly commandTimeoutMs: number;
   private readonly isRemote: (executor: CommandExecutorPort) => boolean;
   private readonly nowMs: () => number;
+  private readonly maxConcurrentPredicates: number | undefined;
+  private readonly maxOutputBytes: number;
+  private readonly receiptReuse: GateReceiptReuseWiring | undefined;
+  /** One budget per host and capacity, shared by every lane gated through this adapter. */
+  private readonly budgets = new Map<string, GateSlotBudget>();
+  /** Passing runs in flight by receipt key, so an identical predicate on another lane waits instead of running twice. */
+  private readonly inFlight = new Map<string, Promise<GatePredicateResult>>();
 
   constructor(options: GatePredicateAdapterOptions) {
     this.executorForRecordedHost = options.executorForRecordedHost;
@@ -174,14 +273,54 @@ export class GatePredicateAdapter implements GatePredicatePort {
     this.commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
     this.isRemote = options.isRemote ?? ((executor) => executor instanceof SshExecutor);
     this.nowMs = options.nowMs ?? (() => Date.now());
+    this.maxConcurrentPredicates =
+      options.maxConcurrentPredicates === undefined
+        ? undefined
+        : readGateSlotCapacity(options.maxConcurrentPredicates);
+    this.maxOutputBytes =
+      typeof options.maxOutputBytes === 'number' &&
+      Number.isSafeInteger(options.maxOutputBytes) &&
+      options.maxOutputBytes > 0
+        ? Math.min(options.maxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES)
+        : DEFAULT_MAX_OUTPUT_BYTES;
+    this.receiptReuse = options.receiptReuse;
   }
 
   async evaluateGatePredicates(
     request: EvaluateGatePredicatesRequest,
   ): Promise<EvaluateGatePredicatesResult> {
+    try {
+      return await this.evaluateGuarded(request);
+    } catch {
+      return { outcome: 'unavailable', reason: 'gate predicate evaluation did not complete' };
+    }
+  }
+
+  /** The budget of the request's host: the declared gate-slot count (one when none), cut by the adapter's own cap. */
+  private budgetFor(request: EvaluateGatePredicatesRequest, gateSlot: GateSlotConfiguration | undefined): GateSlotBudget {
+    const declared = gateSlot === undefined ? 1 : readGateSlotCapacity(gateSlot.slots);
+    const capacity =
+      this.maxConcurrentPredicates === undefined ? declared : Math.min(declared, this.maxConcurrentPredicates);
+    const hostName = request.runner?.hostName;
+    const id = (typeof hostName === 'string' && hostName.length > 0 ? hostName : 'legacy') + '|' + String(capacity);
+    const existing = this.budgets.get(id);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const created = new GateSlotBudget(capacity);
+    this.budgets.set(id, created);
+    return created;
+  }
+
+  private async evaluateGuarded(
+    request: EvaluateGatePredicatesRequest,
+  ): Promise<EvaluateGatePredicatesResult> {
+    if (!isUsableRequest(request)) {
+      return { outcome: 'unavailable', reason: 'gate predicate request is malformed' };
+    }
     const resolved = this.executorForRecordedHost(request.runner);
     if (!resolved.ok) {
-      return { outcome: 'unavailable', reason: resolved.reason };
+      return { outcome: 'unavailable', reason: boundedDetail(resolved.reason) };
     }
     const executor = resolved.executor;
     // KF-30b: the host's declared gate-slot throttle. Absent means the
@@ -193,28 +332,216 @@ export class GatePredicateAdapter implements GatePredicatePort {
             path: resolved.hostSpec.runner.gateSlot.path,
             slots: resolved.hostSpec.runner.gateSlot.slots,
           };
+    const budget = this.budgetFor(request, gateSlot);
 
-    const commit = await this.commitPredicate(executor, request);
-    const diff =
-      commit.verdict === 'pass'
-        ? await this.diffPredicate(executor, request)
-        : skipped('diff-check', 'diff-check');
+    // Commit and diff check run first, one at a time, inside the budget; they gate every command.
+    const commitRun = await budget.run(() => this.commitPredicate(executor, request));
+    const commit = commitRun.ok
+      ? commitRun.value
+      : unknownResult('commit', 'commit', 'commit predicate did not complete', 0);
+    let diff: GatePredicateResult;
+    if (commit.verdict === 'pass') {
+      const diffRun = await budget.run(() => this.diffPredicate(executor, request));
+      diff = diffRun.ok
+        ? diffRun.value
+        : unknownResult('diff-check', 'diff-check', 'diff check did not complete', 0);
+    } else {
+      diff = skipped('diff-check', 'diff-check');
+    }
 
-    const initial: Promise<GatePredicateResult[]> = Promise.resolve([]);
-    const commandResults = await request.spec.commands.reduce(
-      (chain, command, index) =>
-        chain.then(async (done) => {
-          const blocked =
-            diff.verdict !== 'pass' || done.some((result) => result.verdict !== 'pass');
-          const next = blocked
+    const gated = diff.verdict !== 'pass';
+    let receiptContext: Promise<ReceiptContext | null> | null = null;
+    const contextOnce = (): Promise<ReceiptContext | null> => {
+      receiptContext ??= this.readReceiptContext(executor, request, budget);
+      return receiptContext;
+    };
+    // Every command starts at once; the budget decides how many really run. Each
+    // predicateForCommand call settles on its own and never throws, so one
+    // command's failure or timeout cannot cancel or relabel another's result.
+    const commandResults: GatePredicateResult[] = [];
+    if (budget.capacity === 1) {
+      // One slot: exactly the sequential gate of old. The first non-pass stops the
+      // run and every later command is reported skipped and never executed.
+      for (const [index, command] of request.spec.commands.entries()) {
+        const blocked = gated || commandResults.some((result) => result.verdict !== 'pass');
+        commandResults.push(
+          blocked
             ? skipped(commandName(command, index), 'command')
-            : await this.runCommand(executor, request.worktreePath, command, index, gateSlot);
-          return [...done, next];
-        }),
-      initial,
-    );
+            : await this.predicateForCommand(executor, request, command, index, gateSlot, budget, contextOnce),
+        );
+      }
+    } else {
+      commandResults.push(
+        ...(await Promise.all(
+          request.spec.commands.map((command, index) =>
+            gated
+              ? Promise.resolve(skipped(commandName(command, index), 'command'))
+              : this.predicateForCommand(executor, request, command, index, gateSlot, budget, contextOnce),
+          ),
+        )),
+      );
+    }
 
-    return { outcome: 'evaluated', results: [commit, diff, ...commandResults] };
+    return {
+      outcome: 'evaluated',
+      results: [commit, diff, ...commandResults].map(withBoundedDetail),
+    };
+  }
+
+  /** The tree hash, toolchain versions and declared environment digest, or null when reuse is not wired. Never throws. */
+  private async readReceiptContext(
+    executor: CommandExecutorPort,
+    request: EvaluateGatePredicatesRequest,
+    budget: GateSlotBudget,
+  ): Promise<ReceiptContext | null> {
+    const wiring = this.receiptReuse;
+    if (wiring === undefined) {
+      return null;
+    }
+    const read = await budget.run(async () => {
+      const tree = await this.runGit(executor, request.worktreePath, [
+        'rev-parse',
+        '--verify',
+        '--quiet',
+        request.candidateHeadSha + '^{tree}',
+      ]);
+      const treeHash = gitFailed(tree) || tree.exitCode !== 0 ? undefined : tree.stdout.trim();
+      const toolchainVersions = await wiring.toolchainVersions(executor, request.worktreePath);
+      const declaredEnvironmentDigest = await wiring.declaredEnvironmentDigest(executor, request.worktreePath);
+      return { treeHash, toolchainVersions, declaredEnvironmentDigest };
+    });
+    return read.ok ? read.value : null;
+  }
+
+  /** One command's outcome: a reused receipt, a run, or `unknown`. Never throws. */
+  private async predicateForCommand(
+    executor: CommandExecutorPort,
+    request: EvaluateGatePredicatesRequest,
+    command: GateCommand,
+    index: number,
+    gateSlot: GateSlotConfiguration | undefined,
+    budget: GateSlotBudget,
+    contextOnce: () => Promise<ReceiptContext | null>,
+  ): Promise<GatePredicateResult> {
+    const name = commandName(command, index);
+    const started = this.nowMs();
+    try {
+      const execute = async (): Promise<GatePredicateResult> => {
+        const run = await budget.run(() =>
+          this.runCommand(executor, request.worktreePath, command, index, gateSlot),
+        );
+        return run.ok
+          ? run.value
+          : unknownResult(name, 'command', 'command did not complete', this.nowMs() - started);
+      };
+      const wiring = this.receiptReuse;
+      const key = wiring === undefined ? null : await this.receiptKeyFor(command, name, contextOnce);
+      if (wiring === undefined || key === null) {
+        return await execute();
+      }
+      const found = await this.findReceipt(wiring, key);
+      if (found !== null) {
+        return { ...found, name, kind: 'command' };
+      }
+      const flightId = JSON.stringify(key);
+      const flying = this.inFlight.get(flightId);
+      if (flying !== undefined) {
+        const shared = await flying;
+        if (shared.verdict === 'pass') {
+          return { ...shared, name, kind: 'command', durationMs: 0, detail: 'reused receipt: ' + shared.detail };
+        }
+        // The other run did not pass (a timeout may be transient): run this one's own.
+        return await execute();
+      }
+      const flight = (async (): Promise<GatePredicateResult> => {
+        const result = await execute();
+        if (result.verdict === 'pass') {
+          await this.recordReceipt(wiring, key, result);
+        }
+        return result;
+      })();
+      this.inFlight.set(flightId, flight);
+      try {
+        return await flight;
+      } finally {
+        if (this.inFlight.get(flightId) === flight) {
+          this.inFlight.delete(flightId);
+        }
+      }
+    } catch {
+      return unknownResult(name, 'command', 'command did not complete', this.nowMs() - started);
+    }
+  }
+
+  /** The command's receipt key, or null when any component is unreadable (a miss: the command just runs). */
+  private async receiptKeyFor(
+    command: GateCommand,
+    name: string,
+    contextOnce: () => Promise<ReceiptContext | null>,
+  ): Promise<GateReceiptKey | null> {
+    try {
+      const context = await contextOnce();
+      if (context === null) {
+        return null;
+      }
+      const built = buildGateReceiptKey({
+        predicateId: name,
+        treeHash: context.treeHash,
+        predicateDefinitionDigest: createHash('sha256')
+          .update(JSON.stringify({ argv: command.argv, coverage: command.coverage ?? null }))
+          .digest('hex'),
+        toolchainVersions: context.toolchainVersions,
+        declaredEnvironmentDigest: context.declaredEnvironmentDigest,
+      });
+      return built.ok ? built.key : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async findReceipt(
+    wiring: GateReceiptReuseWiring,
+    key: GateReceiptKey,
+  ): Promise<GatePredicateResult | null> {
+    try {
+      const found = await wiring.port.findGateReceipt(key);
+      if (found.outcome !== 'hit' || found.result.verdict !== 'pass') {
+        return null;
+      }
+      return {
+        name: '',
+        kind: 'command',
+        verdict: 'pass',
+        exitCode: found.result.exitCode,
+        durationMs: 0,
+        detail: 'reused receipt: ' + found.result.detail,
+        ...(found.result.coverage === undefined ? {} : { coverage: found.result.coverage }),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** A failure to record never changes the result: the next gate just runs the command again. */
+  private async recordReceipt(
+    wiring: GateReceiptReuseWiring,
+    key: GateReceiptKey,
+    result: GatePredicateResult,
+  ): Promise<void> {
+    try {
+      await wiring.port.recordGateReceipt({
+        key,
+        result: {
+          verdict: 'pass',
+          exitCode: result.exitCode,
+          durationMs: result.durationMs,
+          detail: boundedDetail(result.detail),
+          ...(result.coverage === undefined ? {} : { coverage: result.coverage }),
+        },
+      });
+    } catch {
+      // Unrecorded is a miss next time, never a failure now.
+    }
   }
 
   private async runGit(
@@ -420,7 +747,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
       run = await executor.run(argv, {
         cwd: worktreePath,
         timeoutMs: this.commandTimeoutMs,
-        maxBufferBytes: MAX_OUTPUT_BYTES,
+        maxBufferBytes: this.maxOutputBytes,
       });
     } catch {
       return {

@@ -290,12 +290,13 @@ export class RunMergePassUseCase implements RunMergePassPort {
     if (existing.some((candidate) => candidate.kind === 'result')) {
       return this.report(entry, 'no-action', 'already-journalled', null);
     }
-    if (existing.some((candidate) => candidate.kind === 'intent')) {
+    const openIntent = existing.find((candidate) => candidate.kind === 'intent');
+    if (openIntent !== undefined) {
       // A pass whose budget ran out between the intent and its result left
       // the intent open: this pass completes the pair instead of reporting
       // it journalled forever. A dry-run has no external effect, so only
       // the result is written; no second intent.
-      return this.appendShadowResult(request, entry, decision, key);
+      return this.appendShadowResult(request, entry, decision, key, openIntent.runId);
     }
 
     const intent: LaneRunJournalEntryRecord = {
@@ -325,7 +326,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
       );
     }
 
-    return this.appendShadowResult(request, entry, decision, key);
+    return this.appendShadowResult(request, entry, decision, key, entry.runId);
   }
 
   /**
@@ -363,10 +364,8 @@ export class RunMergePassUseCase implements RunMergePassPort {
       }
       this.ensureBudget(request); // D-DT9: guard before the journal read
       const existing = await this.deps.journal.listForKey(built.key);
-      const open =
-        existing.some((candidate) => candidate.kind === 'intent') &&
-        !existing.some((candidate) => candidate.kind === 'result');
-      if (!open) {
+      const openIntent = existing.find((candidate) => candidate.kind === 'intent');
+      if (openIntent === undefined || existing.some((candidate) => candidate.kind === 'result')) {
         continue;
       }
       this.ensureBudget(request); // D-DT9: guard before the result append
@@ -375,7 +374,8 @@ export class RunMergePassUseCase implements RunMergePassPort {
         entryId: this.deps.newUlid(),
         kind: 'result',
         key: built.key,
-        runId: entry.runId,
+        // The key has no run in it: the result names the intent's own run.
+        runId: openIntent.runId,
         recordedAtIso: this.deps.nowIso(),
         mode: null,
         expectedRevision: null,
@@ -395,13 +395,14 @@ export class RunMergePassUseCase implements RunMergePassPort {
     entry: MergeQueueEntryRecord,
     decision: Extract<MergeStepDecision, { kind: 'act' }>,
     key: string,
+    runId: string | null,
   ): Promise<MergePassEntryReport> {
     const result: LaneRunJournalEntryRecord = {
       version: LANE_RUN_JOURNAL_ENTRY_VERSION,
       entryId: this.deps.newUlid(),
       kind: 'result',
       key,
-      runId: entry.runId,
+      runId,
       recordedAtIso: this.deps.nowIso(),
       mode: null,
       expectedRevision: null,

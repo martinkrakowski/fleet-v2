@@ -15,7 +15,9 @@
  * Guards: neither method throws and each is bounded by a deadline; a symlink
  * as the state directory, the store directory or a receipt file is never
  * followed; a receipt file over 4 KiB or a store over `maxRecords` receipts is
- * refused; a secret-shaped key or reference is refused before anything is
+ * refused; the configured `stateDir` path is the operator's trusted root, so a symlink in its ancestors
+ * (for example /tmp or /var on macOS) is accepted, while the state directory itself, the store directory
+ * and every receipt file must not be symlinks; a secret-shaped key or reference is refused before anything is
  * written and is never echoed (results carry fixed reasons only).
  */
 

@@ -66,6 +66,7 @@ import { knowledgeCommands } from './commands/knowledge.js';
 import { coordinationCommands } from './commands/coordination.js';
 import { questionsCommands } from './commands/questions.js';
 import { mergeCommands } from './merge.js';
+import { cutoverCommands } from './commands/cutover.js';
 import { tuiCommand } from './tui/command.js';
 
 export { resolveRunnerSettings };
@@ -267,6 +268,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   coordination: coordinationCommands,
   questions: questionsCommands,
   merge: mergeCommands,
+  cutover: cutoverCommands,
 };
 
 // ---------------------------------------------------------------------------
@@ -672,6 +674,10 @@ the configuration status. Run 'fleet-v2 telemetry --help'.
 The killall group stops every running lane, pauses the merge train and sets the
 killall halt marker; --lift clears the pause then the marker. Run
 'fleet-v2 killall --help'.
+
+The cutover group reports the shadow comparison of the fleet-v2 merge queue
+against the shell train's recorded queue for one repository (read-only, ids and
+codes only). Run 'fleet-v2 cutover --help'.
 The report group prints the weekly run-journal service report (read-only, one
 JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
 
@@ -690,6 +696,7 @@ Commands:
   telemetry export|status
   killall [--lift]
   report weekly
+  cutover shadow report --repository owner/repo --legacy-state-dir <path>
   tui
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve
@@ -860,7 +867,8 @@ export async function runCli(
     // positional id; every other group keeps the strict flags-only shape.
     const allowPositional =
       (group === 'questions' && QUESTIONS_POSITIONAL_SUBCOMMANDS.has(subcommand)) ||
-      (group === 'knowledge' && subcommand === 'candidates');
+      (group === 'knowledge' && subcommand === 'candidates') ||
+      (group === 'cutover' && subcommand === 'shadow');
     const payload = parseFlags(rest, { allowPositional });
     const result = await handler(payload, activeRuntime);
     // Line-oriented outputs (`knowledge candidates`, `decisions report`)

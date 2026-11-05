@@ -39,6 +39,7 @@ import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import type { SessionStartGate } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
+import { SessionStartSpacing } from '../advance-lane-run/session-start-gate.js';
 import type {
   PreserveWorktreeEditsRequest,
   PreserveWorktreeEditsResult,
@@ -1370,22 +1371,37 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(entries.some((entry) => entry.detail?.startsWith('dispatch stagger wait:') === true)).toBe(false);
   });
 
-  it('fix round 3: a started attempt with a malformed updatedAtIso seeds the endpoint from its createdAtIso', async () => {
+  it('fix round 3: an undated started attempt waits one full interval from its first sighting, then grants', async () => {
     const prior = attemptFixture({
       id: 'attempt-example-0',
       state: 'running',
-      createdAtIso: NOW,
+      // Created long before: the creation time is never used as a start bound.
+      createdAtIso: '2026-10-27T09:00:00.000Z',
       updatedAtIso: 'not-a-date',
     });
     const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
     await admit(harness, 'attempt-example-1');
-    const gate = seededEndpointGate();
-    const result = await advance(harness, { startGate: gate });
-    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
-    expect(gate.seeds).toEqual([NOW]);
+    const at = (ms: number): string => new Date(Date.parse(LATER) + ms).toISOString();
+    // A fresh gate per pass, as the conductor builds one.
+    const first = await advance(harness, { startGate: new SessionStartSpacing(20_000, null), nowIso: LATER });
+    expect(first).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    const entries = await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1');
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ action: 'dispatch', status: 'refused', recordedAtIso: LATER });
+    expect(entries[0].detail).toBe(
+      'dispatch stagger wait: endpoint opencode:lane-host-example:4166, retry after 20000 ms, last start undated',
+    );
+    // 10 s later the first sighting still spaces the endpoint (no second entry).
+    const second = await advance(harness, { startGate: new SessionStartSpacing(20_000, null), nowIso: at(10_000) });
+    expect(second).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1')).toHaveLength(1);
+    // One interval after the first sighting the start is granted: the corrupt record blocks no longer.
+    const third = await advance(harness, { startGate: new SessionStartSpacing(20_000, null), nowIso: at(20_000) });
+    expect(third).toMatchObject({ outcome: 'acted', step: 'dispatch', reasonCode: 'dispatch-started' });
+    expect(harness.dispatchRequests).toHaveLength(1);
   });
 
-  it('fix round 3: a started attempt with no datable timestamp never hands the gate a malformed seed', async () => {
+  it('fix round 3: an undated started attempt never hands the gate a malformed seed', async () => {
     const prior = attemptFixture({
       id: 'attempt-example-0',
       state: 'running',
@@ -1396,8 +1412,8 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     await admit(harness, 'attempt-example-1');
     const gate = seededEndpointGate();
     const result = await advance(harness, { startGate: gate });
-    expect(result).toMatchObject({ outcome: 'acted', step: 'dispatch', reasonCode: 'dispatch-started' });
-    expect(gate.seeds).toEqual([null]);
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(gate.seeds).toEqual([LATER]);
   });
 
   it('test 21 (KF-34a1): a seat-pivot dispatch is denied the same way, before the pivot intent', async () => {

@@ -13,15 +13,12 @@ import type { SessionStartGate } from '../../ports/in/AdvanceLaneRunPort.in-port
 export class SessionStartSpacing implements SessionStartGate {
   private readonly reservations = new Map<string, number>();
   private nextFreeMs: number;
-  /** CO13: per-endpoint last-start ms (endpointKey -> ms). */
-  private readonly endpointLastStartMs = new Map<string, number>();
+  /** CO13: per-endpoint kept start ms (endpointKey -> ms): holds that were never released. */
+  private readonly endpointKeptMs = new Map<string, number>();
   /** CO13: per-run endpoint reservations (runId -> slot ms). */
   private readonly endpointReservations = new Map<string, number>();
-  /** CO13: per-run held endpoint starts (runId -> the hold and what it replaced). */
-  private readonly endpointHolds = new Map<
-    string,
-    { readonly endpointKey: string; readonly heldMs: number; readonly previousMs: number | undefined }
-  >();
+  /** CO13: per-run open endpoint holds (runId -> the held start), until released or superseded. */
+  private readonly endpointHolds = new Map<string, { readonly endpointKey: string; readonly heldMs: number }>();
 
   constructor(
     private readonly staggerMs: number,
@@ -67,9 +64,8 @@ export class SessionStartSpacing implements SessionStartGate {
     endpointKey: string,
     lastStartIso: string | null,
   ): { readonly ok: true } | { readonly ok: false; readonly retryAfterMs: number } {
-    const endpointMs = this.endpointLastStartMs.get(endpointKey);
     const persistedMs = lastStartIso === null ? NaN : Date.parse(lastStartIso);
-    const candidates = [endpointMs ?? NaN, persistedMs].filter((ms) => Number.isFinite(ms));
+    const candidates = [this.endpointLastStartMs(endpointKey), persistedMs].filter((ms) => Number.isFinite(ms));
     const seededIso = candidates.length === 0 ? null : new Date(Math.max(...candidates)).toISOString();
     const decision = decideDispatchStagger({
       nowIso,
@@ -81,32 +77,45 @@ export class SessionStartSpacing implements SessionStartGate {
       return decision;
     }
     this.endpointReservations.delete(runId);
+    // A run's earlier hold that was never released is a start that happened:
+    // keep it before the run's new hold replaces it.
+    const earlier = this.endpointHolds.get(runId);
+    if (earlier !== undefined) {
+      this.keepStart(earlier.endpointKey, earlier.heldMs);
+      this.endpointHolds.delete(runId);
+    }
     const nowMs = Date.parse(nowIso);
     if (Number.isFinite(nowMs)) {
-      this.endpointHolds.set(runId, { endpointKey, heldMs: nowMs, previousMs: endpointMs });
-      this.endpointLastStartMs.set(endpointKey, nowMs);
+      this.endpointHolds.set(runId, { endpointKey, heldMs: nowMs });
     }
     return { ok: true };
   }
 
   /**
-   * CO13: drop the run's held endpoint start when no runner was contacted.
-   * The endpoint's last start goes back to what it was before the hold,
-   * unless a later hold on the same endpoint has replaced it since.
+   * CO13: drop the run's open endpoint hold when no runner was contacted. The
+   * endpoint's last start is then the latest of its kept starts and the other
+   * runs' open holds, so a release never restores a start that was itself
+   * released and never loosens another run's hold.
    */
   releaseStartForEndpoint(runId: string): void {
-    const hold = this.endpointHolds.get(runId);
-    if (hold === undefined) {
-      return;
-    }
     this.endpointHolds.delete(runId);
-    if (this.endpointLastStartMs.get(hold.endpointKey) !== hold.heldMs) {
-      return;
+  }
+
+  /** The endpoint's last start in this gate: its latest kept start or open hold, or NaN. */
+  private endpointLastStartMs(endpointKey: string): number {
+    let latest = this.endpointKeptMs.get(endpointKey) ?? NaN;
+    for (const hold of this.endpointHolds.values()) {
+      if (hold.endpointKey === endpointKey && (Number.isNaN(latest) || hold.heldMs > latest)) {
+        latest = hold.heldMs;
+      }
     }
-    if (hold.previousMs === undefined) {
-      this.endpointLastStartMs.delete(hold.endpointKey);
-    } else {
-      this.endpointLastStartMs.set(hold.endpointKey, hold.previousMs);
+    return latest;
+  }
+
+  private keepStart(endpointKey: string, ms: number): void {
+    const kept = this.endpointKeptMs.get(endpointKey);
+    if (kept === undefined || ms > kept) {
+      this.endpointKeptMs.set(endpointKey, ms);
     }
   }
 

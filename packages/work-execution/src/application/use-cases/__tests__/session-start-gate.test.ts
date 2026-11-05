@@ -120,6 +120,40 @@ describe('SessionStartSpacing', () => {
     });
   });
 
+  it('fix round 3: releasing overlapping holds in any order never restores a released start', () => {
+    const gate = new SessionStartSpacing(20_000, null);
+    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
+    expect(gate.tryStartForEndpoint('run-b', at(20_000), 'opencode:host:4166', null)).toEqual({ ok: true });
+    gate.releaseStartForEndpoint('run-a');
+    gate.releaseStartForEndpoint('run-b');
+    // Neither hold remains, so nothing spaces the endpoint — even for a sibling
+    // whose step clock was read earlier (10 s after run-a's released hold).
+    expect(gate.tryStartForEndpoint('run-c', at(10_000), 'opencode:host:4166', null)).toEqual({ ok: true });
+  });
+
+  it('fix round 3: releasing an older hold never loosens a later hold', () => {
+    const gate = new SessionStartSpacing(20_000, null);
+    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
+    expect(gate.tryStartForEndpoint('run-b', at(20_000), 'opencode:host:4166', null)).toEqual({ ok: true });
+    gate.releaseStartForEndpoint('run-a');
+    expect(gate.tryStartForEndpoint('run-c', at(25_000), 'opencode:host:4166', null)).toEqual({
+      ok: false,
+      retryAfterMs: 15_000,
+    });
+  });
+
+  it('fix round 3: an earlier start a run kept still spaces the endpoint after its next hold is released', () => {
+    const gate = new SessionStartSpacing(20_000, null);
+    expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', null)).toEqual({ ok: true });
+    // run-a's first start was kept (never released); its next start is granted elsewhere then released.
+    expect(gate.tryStartForEndpoint('run-a', at(1_000), 'opencode:host:other', null)).toEqual({ ok: true });
+    gate.releaseStartForEndpoint('run-a');
+    expect(gate.tryStartForEndpoint('run-b', at(5_000), 'opencode:host:4166', null)).toEqual({
+      ok: false,
+      retryAfterMs: 15_000,
+    });
+  });
+
   it('fix round 3: a malformed durable seed is dropped and never blocks the endpoint', () => {
     const gate = new SessionStartSpacing(20_000, null);
     expect(gate.tryStartForEndpoint('run-a', NOW, 'opencode:host:4166', 'not-a-date')).toEqual({ ok: true });

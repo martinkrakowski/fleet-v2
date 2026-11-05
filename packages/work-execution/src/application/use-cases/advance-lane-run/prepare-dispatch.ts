@@ -1032,12 +1032,16 @@ async function endpointStaggerWaitOf(
     return { kind: 'none' };
   }
   const endpointKey = dispatchEndpointKey(endpoint);
-  const lastStartIso = await lastStartIsoForEndpoint(ctx, endpointKey);
-  const decision = gate.tryStartForEndpoint(request.runId, request.nowIso, endpointKey, lastStartIso);
+  const seed = await endpointStartSeedOf(ctx, latest, request.nowIso, endpointKey);
+  const decision = gate.tryStartForEndpoint(request.runId, request.nowIso, endpointKey, seed.lastStartIso);
   if (decision.ok) {
     return { kind: 'grant' };
   }
-  await journalDispatchStaggerWait(ctx, record, latest, request, endpointKey, decision.retryAfterMs);
+  await journalDispatchStaggerWait(ctx, record, latest, request, {
+    endpointKey,
+    retryAfterMs: decision.retryAfterMs,
+    undated: seed.undated,
+  });
   return { kind: 'wait', result: { outcome: 'waiting', reason: 'session-stagger' } };
 }
 
@@ -1064,33 +1068,32 @@ function attemptStartedSession(attempt: AttemptRecord): boolean {
   return STARTED_ATTEMPT_STATES.has(attempt.state);
 }
 
-/**
- * The datable start bound of one started attempt, in ms, or null. An
- * attempt's `updatedAtIso` is never earlier than its start, so the measured
- * gap is never shorter than the true one — the safe direction. When
- * `updatedAtIso` cannot be dated, its `createdAtIso` is the next bound (the
- * attempt cannot have started before it was created); when neither can be
- * dated the attempt seeds nothing, so a corrupt record never blocks the
- * endpoint for ever (the global session-start spacing still applies).
- */
-function attemptStartBoundMs(attempt: AttemptRecord): number | null {
-  const updatedMs = Date.parse(attempt.updatedAtIso);
-  if (Number.isFinite(updatedMs)) {
-    return updatedMs;
-  }
-  const createdMs = Date.parse(attempt.createdAtIso);
-  return Number.isFinite(createdMs) ? createdMs : null;
-}
+/** The wait-entry detail prefix, and the suffix that marks a wait on an undated start. */
+const STAGGER_WAIT_PREFIX = 'dispatch stagger wait:';
+const UNDATED_WAIT_SUFFIX = ', last start undated';
 
 /**
- * CO13: the durable seed for one endpoint — the latest datable start bound of
- * any attempt that started a session on it, as an ISO string, or null. The
- * result is always a valid timestamp, so one malformed record can never make
- * every retry wait another full interval.
+ * CO13: the durable seed for one endpoint, as a valid ISO string or null —
+ * never a malformed timestamp. A started attempt's `updatedAtIso` is never
+ * earlier than its start, so the measured gap is never shorter than the true
+ * one — the safe direction. A started attempt whose `updatedAtIso` cannot be
+ * dated has an unknown start: it is treated as starting when THIS attempt
+ * first waited on an undated start (its journaled undated wait entry), or now
+ * when there is none yet. That waits one full interval from the moment the
+ * undated start was first seen — and then grants, so one corrupt record never
+ * blocks the endpoint for ever. Without a journal to remember that moment the
+ * undated record seeds nothing (the global session-start spacing still
+ * applies).
  */
-async function lastStartIsoForEndpoint(ctx: AdvanceStepContext, endpointKey: string): Promise<string | null> {
+async function endpointStartSeedOf(
+  ctx: AdvanceStepContext,
+  latest: AttemptRecord,
+  nowIso: string,
+  endpointKey: string,
+): Promise<{ readonly lastStartIso: string | null; readonly undated: boolean }> {
   const attempts = await ctx.deps.attemptRepo.listAllAttempts();
   let latestMs: number | null = null;
+  let undated = false;
   for (const attempt of attempts) {
     if (attempt.runner === null || attempt.runner === undefined || !attemptStartedSession(attempt)) {
       continue;
@@ -1098,38 +1101,83 @@ async function lastStartIsoForEndpoint(ctx: AdvanceStepContext, endpointKey: str
     if (dispatchEndpointKey(dispatchEndpointFactsOf(attempt.runner)) !== endpointKey) {
       continue;
     }
-    const ms = attemptStartBoundMs(attempt);
-    if (ms !== null && (latestMs === null || ms > latestMs)) {
+    const ms = Date.parse(attempt.updatedAtIso);
+    if (!Number.isFinite(ms)) {
+      undated = true;
+    } else if (latestMs === null || ms > latestMs) {
       latestMs = ms;
     }
   }
-  return latestMs === null ? null : new Date(latestMs).toISOString();
+  const undatedMs = undated ? await undatedStartSeenMs(ctx, latest, nowIso) : null;
+  if (undatedMs !== null && (latestMs === null || undatedMs > latestMs)) {
+    latestMs = undatedMs;
+  }
+  return {
+    lastStartIso: latestMs === null ? null : new Date(latestMs).toISOString(),
+    undated: undatedMs !== null,
+  };
 }
 
 /**
- * CO13: journal one wait reason per attempt, naming the endpoint and the retry
- * delay in ids and codes only. The `refused` status is deliberate: a
- * non-`refused` `dispatch` entry makes `dispatchEverJournalled` true, and that
- * would make the reconcile path believe a runner was contacted. A failing
- * append must never fail the wait: catch it, ignore it and let the wait stand.
+ * When this attempt first saw an undated start on its endpoint: the recorded
+ * time of its undated wait entry, else now (the first sighting, journaled by
+ * the wait that follows). Null when no journal can remember it.
+ */
+async function undatedStartSeenMs(
+  ctx: AdvanceStepContext,
+  latest: AttemptRecord,
+  nowIso: string,
+): Promise<number | null> {
+  const journal = ctx.deps.executionJournal;
+  if (journal.appendJournalEntry === undefined) {
+    return null;
+  }
+  const prior = await journal.listJournalEntriesForAttempt(latest.id);
+  const seen = prior.find((entry) => isStaggerWaitEntry(entry, true));
+  const seenMs = seen === undefined ? NaN : Date.parse(seen.recordedAtIso);
+  if (Number.isFinite(seenMs)) {
+    return seenMs;
+  }
+  const nowMs = Date.parse(nowIso);
+  return Number.isFinite(nowMs) ? nowMs : null;
+}
+
+/** True for this lane's dispatch stagger wait entry of the given kind (undated or not). */
+function isStaggerWaitEntry(
+  entry: { readonly action: string; readonly detail: string | null },
+  undated: boolean,
+): boolean {
+  if (entry.action !== 'dispatch' || entry.detail === null || !entry.detail.startsWith(STAGGER_WAIT_PREFIX)) {
+    return false;
+  }
+  return entry.detail.endsWith(UNDATED_WAIT_SUFFIX) === undated;
+}
+
+/**
+ * CO13: journal one wait reason per attempt and kind (a dated wait, a wait on
+ * an undated start), naming the endpoint and the retry delay in ids and codes
+ * only. The undated kind's recorded time is what bounds that wait (see
+ * `endpointStartSeedOf`). The `refused` status is deliberate: a non-`refused`
+ * `dispatch` entry makes `dispatchEverJournalled` true, and that would make the
+ * reconcile path believe a runner was contacted. A failing read or append must
+ * never fail the wait: catch it, ignore it and let the wait stand.
  */
 async function journalDispatchStaggerWait(
   ctx: AdvanceStepContext,
   record: LaneRunRecord,
   latest: AttemptRecord,
   request: AdvanceLaneRunRequest,
-  endpointKey: string,
-  retryAfterMs: number,
+  wait: { readonly endpointKey: string; readonly retryAfterMs: number; readonly undated: boolean },
 ): Promise<void> {
   const journal = ctx.deps.executionJournal;
   if (journal.appendJournalEntry === undefined) {
     return;
   }
-  const prior = await journal.listJournalEntriesForAttempt(latest.id);
-  if (prior.some((entry) => entry.action === 'dispatch' && entry.detail !== null && entry.detail.startsWith('dispatch stagger wait:'))) {
-    return;
-  }
   try {
+    const prior = await journal.listJournalEntriesForAttempt(latest.id);
+    if (prior.some((entry) => isStaggerWaitEntry(entry, wait.undated))) {
+      return;
+    }
     await journal.appendJournalEntry({
       id: `${latest.id}:dispatch:${prior.length + 1}`,
       attemptId: latest.id,
@@ -1139,11 +1187,13 @@ async function journalDispatchStaggerWait(
       recordedAtIso: request.nowIso,
       status: 'refused',
       sessionId: null,
-      detail: `dispatch stagger wait: endpoint ${endpointKey}, retry after ${retryAfterMs} ms`,
+      detail: `${STAGGER_WAIT_PREFIX} endpoint ${wait.endpointKey}, retry after ${wait.retryAfterMs} ms${
+        wait.undated ? UNDATED_WAIT_SUFFIX : ''
+      }`,
     });
   } catch {
-    // The wait stands even when the journal append fails; the reason is then
-    // only in the conductor pass trace.
+    // The wait stands even when the journal read or append fails; the reason
+    // is then only in the conductor pass trace.
   }
 }
 

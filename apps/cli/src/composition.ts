@@ -58,6 +58,7 @@ import {
   InspectAttemptUseCase,
   InspectMergeReadinessUseCase,
   InspectWorkOrderUseCase,
+  InventoryRelaunchUseCase,
   LaneRunParkNoticeAdapter,
   ListUnregisteredProjectsUseCase,
   OpencodeApiUsageAdapter,
@@ -84,6 +85,7 @@ import {
   resolveInstallationForgeMode,
   resolveRoleExecutors,
   resolveRunnerCapabilityProfile,
+  sha256HexDigest,
   ConductorDriverLeaseAdapter,
   ConductorHaltAdapter,
   InspectLaneRunsUseCase,
@@ -757,6 +759,8 @@ export interface FleetCliRuntime {
     readonly legacyTrainState: LegacyTrainStateReadAdapter;
     /** CO25: the read-only merge readiness check for one pull request. */
     readonly inspectMergeReadiness: InspectMergeReadinessUseCase;
+    /** CO26: the read-only relaunch inventory per lane host. */
+    readonly inventoryRelaunch: InventoryRelaunchUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -1063,6 +1067,18 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     runJournal: conductor.laneRunJournal,
   });
 
+  // CO26: the read-only relaunch inventory reads the same lane-run stores the
+  // conductor composes, beside closeWorkOrder / listStaleWorkOrders.
+  const inventoryRelaunch = new InventoryRelaunchUseCase({
+    runRepo: conductor.laneRunRepository,
+    attemptRepo: attemptRepository,
+    workspace,
+    halt: conductor.halt,
+    driverLease: conductor.driverLease,
+    runnerForAttempt,
+    computeDigest: sha256HexDigest,
+  });
+
   const { telemetry } = composeTelemetry({
     stateDir,
     policy: resolveTelemetryPolicy(options?.installation?.policy),
@@ -1103,7 +1119,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     coordination,
     knowledge,
     evidence,
-    execution: { ...execution, closeWorkOrder, listStaleWorkOrders, inspectMergeReadiness },
+    execution: { ...execution, closeWorkOrder, listStaleWorkOrders, inspectMergeReadiness, inventoryRelaunch },
     conductor,
     runnerTunnel,
     telemetry,

@@ -322,6 +322,21 @@ describe('fleet-v2 state compact', () => {
     expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
   });
 
+  it('refuses before state check reads any other store that is a symlink', async () => {
+    const dir = makeTempDir();
+    const outside = makeTempDir();
+    const outsideFile = path.join(outside, 'work-orders.json');
+    await fs.writeFile(outsideFile, '[]\n');
+    await fs.symlink(outsideFile, path.join(dir, 'work-orders.json'));
+    const original = await seedFinished(dir);
+    const result = await compact(dir);
+    expect(result.code).toBe(1);
+    expect(result.err).toContain('state compact refused: work-orders.json is not a regular file');
+    expect(result.out).toContain('nothing changed');
+    expect(await fs.readFile(path.join(dir, 'attempts.json'), 'utf8')).toBe(original.attempts);
+    expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
+  });
+
   it('refuses when the quarantine directory is a symlink and writes nothing', async () => {
     const dir = makeTempDir();
     const outside = makeTempDir();

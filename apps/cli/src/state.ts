@@ -74,7 +74,10 @@ journal entries and released reservations. It runs state check first, refuses
 (and writes nothing) when any store is unreadable, asks y/N unless --yes,
 writes under each store's lock, keeps the last five pre-compaction copies in
 <state dir>/quarantine and runs state check again. Exit codes for compact: 0
-compacted or nothing to compact; 1 refused, declined or failed; 2 usage.
+compacted or nothing to compact; 1 refused, declined or failed; 2 usage. Run
+it with the conductor stopped: it locks one store at a time, so a lane run
+saved while it works is only caught by a second read of the lane runs just
+before the stores are rewritten.
 
 Exit codes: 0 every store file is readable or missing, 1 any store file is
 unreadable or holds an unsupported schemaVersion, 2 usage error (including
@@ -475,6 +478,12 @@ async function compactPreflight(stateDir: string): Promise<string | null> {
     }
   };
   try {
+    for (const descriptor of STATE_FILE_DESCRIPTORS) {
+      const other = await lstatOrNull(path.join(stateDir, descriptor.basename));
+      if (other !== null && !other.isFile()) {
+        return `${descriptor.basename} is not a regular file`;
+      }
+    }
     for (const basename of COMPACT_BASENAMES) {
       const store = await lstatOrNull(path.join(stateDir, basename));
       if (store !== null && !store.isFile()) {

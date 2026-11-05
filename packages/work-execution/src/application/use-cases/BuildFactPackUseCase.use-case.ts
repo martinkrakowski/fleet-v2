@@ -79,13 +79,13 @@ const INVALID_REQUEST = {
   rule: null,
 } as const;
 
-function isNonEmptyControlFree(value: string): boolean {
-  return value.length > 0 && !hasControlCharacter(value);
+function isNonEmptyControlFree(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && !hasControlCharacter(value);
 }
 
 /** A relative path: no leading `/`, no `..` segment, no control characters. */
-function isSafeRelativePath(value: string): boolean {
-  if (value.length === 0 || value.startsWith('/') || hasControlCharacter(value)) {
+function isSafeRelativePath(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length === 0 || value.startsWith('/') || hasControlCharacter(value)) {
     return false;
   }
   return !value.split('/').some((segment) => segment === '..');
@@ -98,7 +98,7 @@ function isSafeRelativePath(value: string): boolean {
  * `:(top,glob)` — listing across the repository instead of the subtree), and
  * `*?[]` would widen the match beyond the literal prefix.
  */
-function isSafePathPrefix(value: string): boolean {
+function isSafePathPrefix(value: unknown): value is string {
   if (!isNonEmptyControlFree(value) || value.startsWith('/') || value.startsWith(':')) {
     return false;
   }
@@ -108,8 +108,8 @@ function isSafePathPrefix(value: string): boolean {
   return !value.split('/').some((segment) => segment === '..');
 }
 
-function isPositiveInteger(value: number): boolean {
-  return Number.isInteger(value) && value >= 1;
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1;
 }
 /**
  * The rule CO15 uses (`brief-answer.ts`): the short registry plus the full
@@ -171,7 +171,7 @@ export class BuildFactPackUseCase implements BuildFactPackPort {
       || !isNonEmptyControlFree(request.laneId)
       || !COMMIT_PATTERN.test(request.commit)
       || !isNonEmptyControlFree(request.repositoryPath)
-      || !request.facts.every((fact) => isFactWellFormed(fact))) {
+      || !isDenseArrayOfWellFormedFacts(request.facts)) {
       return { outcome: 'refused', refusal: INVALID_REQUEST };
     }
     if (request.facts.length > FACT_PACK_MAX_FACTS) {
@@ -298,6 +298,16 @@ function factPath(fact: BuildFactPackFact): string {
   return fact.kind === 'file-list' ? fact.pathPrefix : fact.path;
 }
 
+/** Every index present (no holes, which every() would skip) and every fact well formed. */
+function isDenseArrayOfWellFormedFacts(facts: readonly BuildFactPackFact[]): boolean {
+  for (let index = 0; index < facts.length; index += 1) {
+    if (!Object.hasOwn(facts, index) || !isFactWellFormed(facts[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function isFactWellFormed(fact: BuildFactPackFact): boolean {
   // A null or non-object fact, or a non-string label, is malformed, never thrown on.
   if (typeof fact !== 'object' || fact === null || typeof fact.label !== 'string') {
@@ -312,10 +322,13 @@ function isFactWellFormed(fact: BuildFactPackFact): boolean {
     case 'file-range':
       return isSafeRelativePath(fact.path)
         && isPositiveInteger(fact.fromLine)
+        && typeof fact.toLine === 'number'
         && Number.isInteger(fact.toLine)
         && fact.toLine >= fact.fromLine;
     case 'matching-lines':
       return isSafeRelativePath(fact.path) && isNonEmptyControlFree(fact.token);
+    default:
+      return false;
   }
 }
 

@@ -198,7 +198,18 @@ describe('BuildFactPackUseCase', () => {
 
   it('refuses a null request or a non-array facts list instead of throwing', async () => {
     const port = new FakeRepositoryFactsPort();
-    for (const bad of [null, { ...BASE_REQUEST, facts: null }, { ...BASE_REQUEST, laneId: 7 }, { ...BASE_REQUEST, facts: [null] }]) {
+    const sparse = new Array(2);
+    sparse[1] = BASE_REQUEST.facts[0];
+    for (const bad of [
+      null,
+      { ...BASE_REQUEST, facts: null },
+      { ...BASE_REQUEST, laneId: 7 },
+      { ...BASE_REQUEST, facts: [null] },
+      { ...BASE_REQUEST, facts: [{ kind: 'file-range', label: 'x', path: null, fromLine: 1, toLine: 1 }] },
+      { ...BASE_REQUEST, facts: [{ kind: 'file-range', label: 'x', path: 'a.md', fromLine: '1', toLine: 2 }] },
+      { ...BASE_REQUEST, facts: [{ kind: 'unknown-kind', label: 'x' }] },
+      { ...BASE_REQUEST, facts: sparse },
+    ]) {
       const result = await makeUseCase(port).buildFactPack(bad as unknown as BuildFactPackRequest);
       expect(result).toEqual({ outcome: 'refused', refusal: { reason: 'invalid-request', label: null, rule: null } });
     }

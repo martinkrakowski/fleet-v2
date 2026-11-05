@@ -17,8 +17,12 @@ export interface TakeWarmWorktreeRequest {
   readonly baseCommit: string;
   /** The admitted run, when known. */
   readonly runId?: string | null;
-  /** Routes the adapter to the recorded host. */
-  readonly recordedHost?: AttemptRunnerRecord | null;
+  /**
+   * The recorded host the pool must work on. The contract requires it: the
+   * pool never substitutes its own host, so a caller without a recorded host
+   * is refused rather than served from a wrong clone.
+   */
+  readonly recordedHost: AttemptRunnerRecord;
 }
 
 export type TakeWarmWorktreeResult =
@@ -33,8 +37,12 @@ export interface ResetWorktreeToBaseRequest {
   readonly worktreePath: string;
   /** 40 lowercase hex: the base to move it to. */
   readonly baseCommit: string;
-  /** Routes the adapter to the recorded host. */
-  readonly recordedHost?: AttemptRunnerRecord | null;
+  /**
+   * The recorded host the pool must work on. The contract requires it: the
+   * pool never substitutes its own host, so a caller without a recorded host
+   * is refused rather than reset on a wrong clone.
+   */
+  readonly recordedHost: AttemptRunnerRecord;
 }
 
 export type ResetWorktreeToBaseResult =
@@ -52,8 +60,12 @@ export interface RefillWorktreePoolRequest {
   readonly projectId: string;
   /** 40 lowercase hex: the commit the merge moved the project to. */
   readonly mergedBaseCommit: string;
-  /** Routes the adapter to the recorded host. */
-  readonly recordedHost?: AttemptRunnerRecord | null;
+  /**
+   * The recorded host the pool must work on. The contract requires it: the
+   * pool never substitutes its own host, so a caller without a recorded host
+   * is refused rather than refilled on a wrong clone.
+   */
+  readonly recordedHost: AttemptRunnerRecord;
 }
 
 export type RefillWorktreePoolResult =

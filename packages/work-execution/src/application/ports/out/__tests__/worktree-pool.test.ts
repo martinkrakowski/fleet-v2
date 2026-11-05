@@ -13,11 +13,21 @@ import {
   isWorktreePoolBaseCommit,
   isWorktreePoolEntryState,
 } from '../../../../domain/worktree-pool-records.js';
+import type { AttemptRunnerRecord } from '../../../../domain/execution-records.js';
 import type { WorktreePoolEntryRecord } from '../../../../domain/worktree-pool-records.js';
 
 const BASE = '0123456789abcdef0123456789abcdef01234567';
 const BASE_2 = '0123456789abcdef0123456789abcdef01234568';
 const PROJECT = 'proj-a';
+const RECORDED_HOST: AttemptRunnerRecord = {
+  kind: 'opencode',
+  remotePort: 4001,
+  host: 'runner-host',
+  hostName: 'runner-host',
+  agent: 'build',
+  model: 'test-model',
+  variant: null,
+};
 
 /**
  * In-memory fake of the warm worktree pool. It keeps the pool's entries in a
@@ -147,7 +157,7 @@ function warmEntry(n: number, overrides: Partial<WorktreePoolEntryRecord> = {}):
 describe('InMemoryWorktreePool', () => {
   it('take returns a worktree', async () => {
     const pool = new InMemoryWorktreePool({ entries: [warmEntry(1), warmEntry(2)] });
-    const result = await pool.take({ projectId: PROJECT, baseCommit: BASE, runId: 'run-1' });
+    const result = await pool.take({ projectId: PROJECT, baseCommit: BASE, runId: 'run-1', recordedHost: RECORDED_HOST });
     expect(result).toMatchObject({ outcome: 'taken' });
     if (result.outcome === 'taken') {
       expect(result.entry.worktreePath).toBe(`/fleet/pool/${PROJECT}/1`);
@@ -159,14 +169,14 @@ describe('InMemoryWorktreePool', () => {
 
   it('take returns an empty pool', async () => {
     const pool = new InMemoryWorktreePool();
-    const result = await pool.take({ projectId: PROJECT, baseCommit: BASE });
+    const result = await pool.take({ projectId: PROJECT, baseCommit: BASE, recordedHost: RECORDED_HOST });
     expect(result).toEqual({ outcome: 'empty' });
   });
 
   it('take never returns one already taken', async () => {
     const taken = warmEntry(1, { state: 'taken', takenByRunId: 'other-run', revision: 2 });
     const pool = new InMemoryWorktreePool({ entries: [taken, warmEntry(2)] });
-    const result = await pool.take({ projectId: PROJECT, baseCommit: BASE });
+    const result = await pool.take({ projectId: PROJECT, baseCommit: BASE, recordedHost: RECORDED_HOST });
     expect(result.outcome).toBe('taken');
     if (result.outcome === 'taken') {
       expect(result.entry.worktreePath).toBe(`/fleet/pool/${PROJECT}/2`);
@@ -175,7 +185,7 @@ describe('InMemoryWorktreePool', () => {
 
   it('reset moves a worktree to the base commit', async () => {
     const pool = new InMemoryWorktreePool({ entries: [warmEntry(1)] });
-    const result = await pool.resetToBase({ worktreePath: `/fleet/pool/${PROJECT}/1`, baseCommit: BASE_2 });
+    const result = await pool.resetToBase({ worktreePath: `/fleet/pool/${PROJECT}/1`, baseCommit: BASE_2, recordedHost: RECORDED_HOST });
     expect(result).toMatchObject({ outcome: 'reset' });
     if (result.outcome === 'reset') {
       expect(result.entry.baseCommit).toBe(BASE_2);
@@ -185,13 +195,13 @@ describe('InMemoryWorktreePool', () => {
 
   it('reset refuses an unknown worktree', async () => {
     const pool = new InMemoryWorktreePool({ entries: [warmEntry(1)] });
-    const result = await pool.resetToBase({ worktreePath: '/fleet/pool/other/9', baseCommit: BASE_2 });
+    const result = await pool.resetToBase({ worktreePath: '/fleet/pool/other/9', baseCommit: BASE_2, recordedHost: RECORDED_HOST });
     expect(result).toEqual({ outcome: 'refused', reason: 'unknown-worktree' });
   });
 
   it('refill after a merge tops the pool up at the merged base commit', async () => {
     const pool = new InMemoryWorktreePool({ entries: [warmEntry(1)] });
-    const result = await pool.refillAfterMerge({ projectId: PROJECT, mergedBaseCommit: BASE_2 });
+    const result = await pool.refillAfterMerge({ projectId: PROJECT, mergedBaseCommit: BASE_2, recordedHost: RECORDED_HOST });
     expect(result.outcome).toBe('refilled');
     if (result.outcome === 'refilled') {
       expect(result.entries).toHaveLength(2);
@@ -207,7 +217,7 @@ describe('InMemoryWorktreePool', () => {
 
   it('refill refuses when the pool is full', async () => {
     const pool = new InMemoryWorktreePool({ entries: [warmEntry(1), warmEntry(2)] });
-    const result = await pool.refillAfterMerge({ projectId: PROJECT, mergedBaseCommit: BASE });
+    const result = await pool.refillAfterMerge({ projectId: PROJECT, mergedBaseCommit: BASE, recordedHost: RECORDED_HOST });
     expect(result).toEqual({ outcome: 'refused', reason: 'pool-full' });
   });
 });

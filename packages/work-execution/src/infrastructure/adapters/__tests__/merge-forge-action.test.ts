@@ -748,6 +748,15 @@ describe('ForgeActionAdapter create-branch (lane CO7)', () => {
       expect(result.outcome).toBe('refused');
       expect(calls).toHaveLength(0);
     }
+    const trapped = new Proxy(createBranchRequest(), {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === 'pullRequestNumber') throw new Error('boom');
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const proxied = makeChainAdapter([OK]);
+    await expect(proxied.adapter.performMergeForgeAction(trapped)).resolves.toMatchObject({ outcome: 'refused' });
+    expect(proxied.calls).toHaveLength(0);
     const kindGetter = Object.defineProperty({}, 'kind', { get() { throw new Error('boom'); }, enumerable: true });
     const { adapter } = makeChainAdapter([OK]);
     await expect(adapter.performMergeForgeAction(kindGetter as unknown as MergeForgeActionRequest)).resolves.toMatchObject({

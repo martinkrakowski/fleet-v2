@@ -164,6 +164,7 @@ function ownData(source: unknown, key: string): unknown {
     const descriptor = Object.getOwnPropertyDescriptor(source, key);
     return descriptor === undefined ? undefined : descriptor.value;
   } catch {
+    // A Proxy trap may throw; the value then reads as absent.
     return undefined;
   }
 }
@@ -630,7 +631,13 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     }
     if (ownData(rawRequest, 'kind') === 'create-branch') {
       // A create-branch request is read through its own data properties once, so no getter runs twice or throws.
-      return this.performCreateBranch(snapshotCreateBranchRequest(rawRequest));
+      let snapshot: MergeForgeCreateBranchRequest;
+      try {
+        snapshot = snapshotCreateBranchRequest(rawRequest);
+      } catch {
+        return this.mergeRefusedOther('invalid request');
+      }
+      return this.performCreateBranch(snapshot);
     }
     const kind = ownData(rawRequest, 'kind');
     if (kind !== 'merge-pr' && kind !== 'update-branch' && kind !== 'post-status') {

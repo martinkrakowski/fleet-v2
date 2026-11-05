@@ -61,6 +61,7 @@ import {
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
+import { openChangeWakeReader, resolveWakeConfig, type ChangeWakeReader } from './conductor-wake.js';
 import { buildLiveConductorDriver, buildDryRunConductorDriver, type ConductorDriver, type DryRunStores } from './conductor-wiring.js';
 import { withFileLock } from './file-store.js';
 import type { CliIo } from './index.js';
@@ -88,6 +89,10 @@ export interface ConductorCliOptions {
    * runtime's `RunnerTunnelAdapter`.
    */
   readonly tunnel?: RunnerTunnelPort;
+  /** An injected change-feed reader (tests); null means "no reader". */
+  readonly wakeReader?: ChangeWakeReader | null;
+  /** The opener seam; production uses `openChangeWakeReader`. */
+  readonly openWakeReader?: (config: { readonly baseUrl: string; readonly token: string }) => Promise<ChangeWakeReader | null>;
 }
 
 export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
@@ -895,6 +900,29 @@ async function stopTelemetryExporter(runtime: FleetCliRuntime): Promise<void> {
 }
 
 /**
+ * K9: build the change-feed wake reader for a live run. An injected reader
+ * wins; otherwise the environment must configure both the API base URL and a
+ * wake-token file, and the opener must succeed — a reader that cannot open
+ * prints one line and leaves the driver polling.
+ */
+async function resolveWakeReader(io: CliIo, options: ConductorCliOptions): Promise<ChangeWakeReader | undefined> {
+  if (options.wakeReader !== undefined) {
+    return options.wakeReader ?? undefined;
+  }
+  const config = resolveWakeConfig(process.env);
+  if (config === null) {
+    return undefined;
+  }
+  const opener = options.openWakeReader ?? openChangeWakeReader;
+  const reader = await opener(config);
+  if (reader === null) {
+    io.stderr('conductor run: the change feed is unavailable; polling\n');
+    return undefined;
+  }
+  return reader;
+}
+
+/**
  * `conductor run --live`: the driver. One pass at a time under the state
  * directory's driver lease, polling with back-off from 30 seconds to 2 minutes,
  * with a 10-second floor while a run waits in watching-ci or merging (D31),
@@ -946,6 +974,7 @@ async function runCommand(
   // interrupt during the startup wait stops the tunnel child too.
   const tunnel = options.tunnel ?? runtime.runnerTunnel;
   const controller = new AbortController();
+  let wake: ChangeWakeReader | undefined;
   const signal = options.stopSignal ?? controller.signal;
   const onSignal = (): void => {
     controller.abort();
@@ -989,6 +1018,9 @@ async function runCommand(
     } catch {
       // a lost exporter delays only the next export
     }
+    // K9: open the change-feed wake reader (when configured) so a signal ends
+    // the between-passes sleep; a reader that cannot open never prevents polling.
+    wake = await resolveWakeReader(io, options);
     const holderId = 'driver-' + runtime.conductor.newUlid();
     const seenAttention = new Set<string>();
     return await pollConductorPasses({
@@ -998,6 +1030,7 @@ async function runCommand(
       sleep: options.sleep ?? defaultSleep,
       stopSignal: signal,
       once: flags.once,
+      wake,
       releaseTunnel: () => tunnel.release(),
       eachPass: async (pass, result, nowIso) => {
         io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
@@ -1042,6 +1075,8 @@ async function runCommand(
     }
     // OT5: stop the background exporter within the 2 s stop race (plan §3.5).
     await stopTelemetryExporter(runtime);
+    // K9: close the change-feed reader after the poll loop; idempotent.
+    wake?.close();
   }
 }
 
@@ -1089,6 +1124,11 @@ async function pollConductorPasses(options: {
   readonly stopSignal?: AbortSignal;
   readonly once: boolean;
   /**
+   * K9: the change-feed wake reader; when present its signal ends the
+   * between-passes sleep early.
+   */
+  readonly wake?: ChangeWakeReader;
+  /**
    * KF-35: releases the driver's runner tunnel after `releaseLeases`, leaving
    * the forward running: detached lanes still talk to the server through it.
    */
@@ -1128,7 +1168,37 @@ async function pollConductorPasses(options: {
       if (result.outcome !== 'refused') {
         previousDelay = nextPollDelayMs(previousDelay, result.progressed);
       }
-      await options.sleep(pollSleepMs(previousDelay ?? MIN_POLL_MS, result), signal);
+      const delayMs = pollSleepMs(previousDelay ?? MIN_POLL_MS, result);
+      // K9: a change signal ends the sleep, so the next pass runs at once.
+      let wake = options.wake;
+      let sleepSettled = false;
+      const iteration = new AbortController();
+      const onStop = (): void => iteration.abort();
+      signal.addEventListener('abort', onStop, { once: true });
+      if (signal.aborted) {
+        iteration.abort();
+      }
+      try {
+        const slept = options.sleep(delayMs, iteration.signal).then(() => {
+          sleepSettled = true;
+        });
+        if (wake === undefined) {
+          await slept;
+        } else {
+          const arrived = await Promise.race([
+            slept.then(() => false),
+            wake.waitForSignal(iteration.signal),
+          ]);
+          if (!arrived && !sleepSettled) {
+            // The stream closed without a signal: keep the back-off.
+            wake = undefined;
+            await slept;
+          }
+        }
+      } finally {
+        signal.removeEventListener('abort', onStop);
+        iteration.abort(); // ends a pending sleep timer and a pending waiter
+      }
       if (signal.aborted) {
         break;
       }

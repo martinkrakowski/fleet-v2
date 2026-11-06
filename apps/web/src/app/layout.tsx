@@ -30,9 +30,6 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
       <body>
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
         <div className="app-shell">
-          {/* project-nav-source.test.tsx pins the original one-line call form
-              <Sidebar nav={nav} openQuestions={openQuestions} /> — kept
-              verbatim so that test keeps asserting the wiring. */}
           <Sidebar
             nav={nav}
             openQuestions={openQuestions}

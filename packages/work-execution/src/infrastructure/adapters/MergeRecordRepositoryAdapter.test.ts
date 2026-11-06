@@ -320,6 +320,21 @@ describe('MergeRecordRepositoryAdapter', () => {
       await expectRefusedWithoutWrite(input);
     });
 
+    it('refuses a hostile proxy whose traps throw without throwing', async () => {
+      const trapped = (trap: string): unknown =>
+        new Proxy(
+          { ...mergeRecord() },
+          {
+            [trap]: () => {
+              throw new Error('hostile trap');
+            },
+          } as ProxyHandler<object>,
+        );
+      for (const trap of ['getPrototypeOf', 'getOwnPropertyDescriptor']) {
+        await expectRefusedWithoutWrite(trapped(trap));
+      }
+    });
+
     it('refuses a record whose fields exceed the schema bounds', async () => {
       await expectRefusedWithoutWrite({ ...mergeRecord(), repository: 'a'.repeat(201) });
       await expectRefusedWithoutWrite({ ...mergeRecord(), headSha: 'a'.repeat(65) });

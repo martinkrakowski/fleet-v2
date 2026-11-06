@@ -223,11 +223,15 @@ export class MergeRecordRepositoryAdapter implements MergeRecordRepositoryPort {
     // The store's version check runs on the runtime input before any field is
     // read: a record carrying an unsupported `schemaVersion` is refused, never
     // silently accepted and rewritten with the writer's version.
-    const versionCheck = readStoreRecordSchemaVersion(record, MERGE_RECORD_STORE_VERSION_POLICY);
-    if (versionCheck.status !== 'ok') {
-      return REFUSED;
+    // Runtime input may be a hostile object (a Proxy whose traps throw): any
+    // throw while reading it is a typed refusal, never a rejection.
+    let incoming: Readonly<Record<string, unknown>> | null;
+    try {
+      const versionCheck = readStoreRecordSchemaVersion(record, MERGE_RECORD_STORE_VERSION_POLICY);
+      incoming = versionCheck.status === 'ok' ? readMergeRecordFields(record) : null;
+    } catch {
+      incoming = null;
     }
-    const incoming = readMergeRecordFields(record);
     if (incoming === null) {
       return REFUSED;
     }

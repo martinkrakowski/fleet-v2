@@ -8,6 +8,11 @@ import { describe, expect, it } from 'vitest';
 import { DaemonJobRegistry } from '../RunDaemonTickUseCase.use-case.js';
 import type { DaemonRepositoryRef } from '../../ports/in/RunDaemonTickPort.in-port.js';
 import type { RefreshChainsCommand, RefreshChainsPort, RefreshChainsResult } from '../../ports/in/RefreshChainsPort.in-port.js';
+import type {
+  ChainAttentionCommand,
+  ChainAttentionPort,
+  RaiseChainAttentionResult,
+} from '../../ports/out/ChainAttentionPort.out-port.js';
 import type { MergeRepoPolicy } from '../../../domain/merge-queue-decider.js';
 
 const DIGEST_A = '00000000000a';
@@ -42,6 +47,16 @@ class FakeRefresh implements RefreshChainsPort {
 
   async runRefreshChains(command: RefreshChainsCommand): Promise<RefreshChainsResult> {
     this.requests.push(command);
+    return this.result;
+  }
+}
+
+class FakeAttention implements Pick<ChainAttentionPort, 'raiseChainAttention'> {
+  readonly raises: ChainAttentionCommand[] = [];
+  result: RaiseChainAttentionResult = { outcome: 'raised', reasonCode: null };
+
+  async raiseChainAttention(command: ChainAttentionCommand): Promise<RaiseChainAttentionResult> {
+    this.raises.push(command);
     return this.result;
   }
 }
@@ -102,5 +117,62 @@ describe('DaemonJobRegistry chain-refresh', () => {
     const registry = new DaemonJobRegistry({ mergePass: {} as never });
     const jobs = registry.instances([repoRef(DIGEST_A)]);
     expect(jobs.map((job) => job.jobId)).toEqual([`merge-pass:${DIGEST_A}`]);
+  });
+});
+
+describe('DaemonJobRegistry chain-refresh invalid mode (CO8a)', () => {
+  it('the registry registers one skipped invalid job per repository with its lease scope', () => {
+    const attention = new FakeAttention();
+    const registry = new DaemonJobRegistry({
+      mergePass: {} as never,
+      chainRefreshMode: 'invalid',
+      chainAttention: attention,
+    });
+    const jobs = registry.instances([repoRef(DIGEST_A), repoRef(DIGEST_B)]);
+    expect(jobs.map((job) => job.jobId)).toEqual([
+      `merge-pass:${DIGEST_A}`,
+      `merge-pass:${DIGEST_B}`,
+      `chain-refresh:${DIGEST_A}`,
+      `chain-refresh:${DIGEST_B}`,
+    ]);
+    expect(jobs[2]!.leaseScope).toBe(`chain-refresh/${DIGEST_A}`);
+  });
+
+  it('the invalid job raises exactly one policy-level attention item and is skipped with chain-refresh-mode-invalid', async () => {
+    const attention = new FakeAttention();
+    const registry = new DaemonJobRegistry({
+      mergePass: {} as never,
+      chainRefreshMode: 'invalid',
+      chainAttention: attention,
+    });
+    const jobs = registry.instances([repoRef(DIGEST_A)]);
+    const refreshJob = jobs.find((job) => job.jobId === `chain-refresh:${DIGEST_A}`);
+    expect(refreshJob).toBeDefined();
+    const outcome = await refreshJob!.pass({ nowIso: NOW, deadlineIso: DEADLINE });
+    expect(outcome).toEqual({ outcome: 'skipped', reasonCode: 'chain-refresh-mode-invalid' });
+    expect(attention.raises).toEqual([
+      {
+        projectId: 'proj-1',
+        repository: { owner: 'fleet', repo: 'v2-a' },
+        kind: 'chain-refresh-mode-invalid',
+      },
+    ]);
+  });
+
+  it('a repeat of the invalid job refreshes the same attention item (never duplicates)', async () => {
+    const attention = new FakeAttention();
+    const registry = new DaemonJobRegistry({
+      mergePass: {} as never,
+      chainRefreshMode: 'invalid',
+      chainAttention: attention,
+    });
+    const jobs = registry.instances([repoRef(DIGEST_A)]);
+    const refreshJob = jobs.find((job) => job.jobId === `chain-refresh:${DIGEST_A}`);
+    expect(refreshJob).toBeDefined();
+    await refreshJob!.pass({ nowIso: NOW, deadlineIso: DEADLINE });
+    await refreshJob!.pass({ nowIso: NOW, deadlineIso: DEADLINE });
+    // The same key both times: the store refreshes one item, never a duplicate.
+    expect(attention.raises).toHaveLength(2);
+    expect(attention.raises[0]).toEqual(attention.raises[1]);
   });
 });

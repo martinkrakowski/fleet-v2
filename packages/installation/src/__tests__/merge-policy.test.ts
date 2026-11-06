@@ -108,6 +108,7 @@ const daemonDefaults: ResolvedMergeDaemonPolicy = {
   intervalSeconds: 60,
   budgetSeconds: 45,
   settleSeconds: 20,
+  chainRefresh: 'shadow',
 };
 
 describe('resolveMergePolicy', () => {
@@ -152,7 +153,7 @@ describe('resolveMergePolicy', () => {
       },
       repository({ owner: 'zeta', repo: 'last', repositoryKey: 'zeta/last', projectId: 'p-z' }),
     ]);
-    expect(read.daemon).toEqual({ intervalSeconds: 120, budgetSeconds: 100, settleSeconds: 0 });
+    expect(read.daemon).toEqual({ intervalSeconds: 120, budgetSeconds: 100, settleSeconds: 0, chainRefresh: 'shadow' });
 
     const boundary = expectResolved(
       resolveMergePolicy(
@@ -174,7 +175,7 @@ describe('resolveMergePolicy', () => {
       ),
     );
     expect(boundary.repositories[0].veto).toEqual({ mode: 'off', holdConfidence: 0 });
-    expect(boundary.daemon).toEqual({ intervalSeconds: 10, budgetSeconds: 5, settleSeconds: 20 });
+    expect(boundary.daemon).toEqual({ intervalSeconds: 10, budgetSeconds: 5, settleSeconds: 20, chainRefresh: 'shadow' });
   });
 
   const malformedMerge: readonly (readonly [string, unknown, string?])[] = [
@@ -459,7 +460,7 @@ describe('mergePolicyRevision', () => {
       daemon: daemonDefaults,
     });
     expect(json).toBe(
-      '{"daemon":{"budgetSeconds":45,"intervalSeconds":60,"settleSeconds":20},' +
+      '{"daemon":{"budgetSeconds":45,"chainRefresh":"shadow","intervalSeconds":60,"settleSeconds":20},' +
         '"merge":{"repos":{' +
         '"alpha/first":{"checksGraceMinutes":30,"macosProcedure":"mac","maxAttempts":9,"projectId":"p",' +
         '"requiredContexts":["gate","premerge"],"shadow":true,"unattended":false,"updateBranch":false,' +
@@ -513,7 +514,7 @@ describe('the parsed installation', () => {
     expect(model.policy?.daemon).toEqual(daemon);
 
     const read = expectResolved(resolveMergePolicy(model.policy));
-    expect(read.daemon).toEqual(daemon);
+    expect(read.daemon).toEqual({ ...daemon, chainRefresh: 'shadow' });
     expect(read.repositories.map((entry) => entry.repositoryKey)).toEqual([
       'example-owner/example-repo',
       'example-owner/other-repo',
@@ -602,23 +603,42 @@ describe('the parsed installation', () => {
     }
   });
 
-  it('policy.daemon.chainRefresh: shadow is accepted and the default, live is refused as not enabled, an unknown value is refused', () => {
+  it('policy.daemon.chainRefresh: shadow resolves to shadow; live and unknown values load with a warning and resolve to invalid', () => {
     const shadow = parsePolicy({ daemon: { chainRefresh: 'shadow' } });
-    expect(shadow).toMatchObject({ ok: true });
-    expectResolved(resolveMergePolicy(policyWith(undefined, { chainRefresh: 'shadow' })));
-    expectResolved(resolveMergePolicy(policyWith(undefined, {})));
+    expect(shadow.ok).toBe(true);
+    if (shadow.ok) {
+      expect(shadow.warnings ?? []).toEqual([]);
+    }
+    expect(
+      expectResolved(resolveMergePolicy(policyWith(undefined, { chainRefresh: 'shadow' }))).daemon.chainRefresh,
+    ).toBe('shadow');
+    expect(expectResolved(resolveMergePolicy(policyWith(undefined, {}))).daemon.chainRefresh).toBe('shadow');
 
     const live = parsePolicy({ daemon: { chainRefresh: 'live' } });
-    expect(live.ok ? [] : live.errors).toEqual(['policy.daemon.chainRefresh: live is not enabled']);
-    expectInvalid(
-      resolveMergePolicy(policyWith(undefined, { chainRefresh: 'live' })),
-      'policy-chain-refresh-not-enabled',
-    );
+    expect(live.ok).toBe(true);
+    if (live.ok) {
+      expect(live.warnings ?? []).toEqual(['policy.daemon.chainRefresh: chain-refresh-mode-invalid']);
+      expect(live.installation.policy?.daemon).toMatchObject({ chainRefresh: 'live' });
+    }
+    expect(
+      expectResolved(resolveMergePolicy(policyWith(undefined, { chainRefresh: 'live' }))).daemon.chainRefresh,
+    ).toBe('invalid');
 
     for (const value of ['sometimes', 1, null, true, '']) {
       const unknown = parsePolicy({ daemon: { chainRefresh: value } });
-      expect(unknown.ok ? [] : unknown.errors).toEqual(['policy.daemon.chainRefresh: must be shadow or live']);
-      expectInvalid(resolveMergePolicy(policyWith(undefined, { chainRefresh: value })), 'policy-daemon-invalid');
+      expect(unknown.ok).toBe(true);
+      if (unknown.ok) {
+        // The warning names the key and the reason code, never the value.
+        expect(unknown.warnings ?? []).toEqual(['policy.daemon.chainRefresh: chain-refresh-mode-invalid']);
+        if (value !== '') {
+          expect((unknown.warnings ?? []).join(' ')).not.toContain(String(value));
+        }
+        // The raw value round-trips untouched.
+        expect(unknown.installation.policy?.daemon).toMatchObject({ chainRefresh: value });
+      }
+      expect(
+        expectResolved(resolveMergePolicy(policyWith(undefined, { chainRefresh: value }))).daemon.chainRefresh,
+      ).toBe('invalid');
     }
   });
 

@@ -29,7 +29,15 @@ export const CHAIN_ATTENTION_ACTOR = 'chain-refresh';
 /** The clear via for machine callers (operator coordination contract). */
 const CHAIN_ATTENTION_CLEAR_VIA = 'machine';
 
-const CHAIN_ATTENTION_KINDS: readonly string[] = ['chain-refresh-conflict', 'link-not-landed', 'branch-moved'];
+const CHAIN_ATTENTION_KINDS: readonly string[] = [
+  'chain-refresh-conflict',
+  'link-not-landed',
+  'branch-moved',
+  'chain-refresh-mode-invalid',
+];
+
+/** The policy-level kind: no chain is named; the item names the configuration key. */
+const CHAIN_ATTENTION_POLICY_KIND = 'chain-refresh-mode-invalid';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 
@@ -43,18 +51,24 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** The subject of a chain attention item: the chain run, or the link pull request when one is named. */
+/** The subject of a chain attention item: the chain run, the link pull request when one is named, or the project for the policy-level kind. */
 function subjectOf(command: ChainAttentionCommand): { readonly kind: string; readonly ref: string } {
   const link = command.linkPullRequest;
   if (link !== undefined) {
     return { kind: 'pr', ref: `${link.owner}/${link.repo}#${link.number}` };
   }
-  return { kind: 'run', ref: command.chainName };
+  if (command.kind === CHAIN_ATTENTION_POLICY_KIND) {
+    return { kind: 'project', ref: command.projectId };
+  }
+  return { kind: 'run', ref: command.chainName ?? '' };
 }
 
 /** The fixed summary: the kind, the chain and its repository, composed here, never caller text. */
 function summaryOf(command: ChainAttentionCommand): string {
-  return `${command.kind} chain=${command.chainName} repo=${command.repository.owner}/${command.repository.repo}`;
+  if (command.kind === CHAIN_ATTENTION_POLICY_KIND) {
+    return `${command.kind} policy.daemon.chainRefresh repo=${command.repository.owner}/${command.repository.repo}`;
+  }
+  return `${command.kind} chain=${command.chainName ?? ''} repo=${command.repository.owner}/${command.repository.repo}`;
 }
 
 /** An own data property only: an accessor reads as undefined and never runs. */
@@ -105,13 +119,22 @@ function snapshotCommand(raw: unknown): ChainAttentionCommand | null {
     if (
       typeof projectId !== 'string' ||
       projectId.length === 0 ||
-      typeof chainName !== 'string' ||
-      parseChainName(chainName) === undefined ||
       typeof kind !== 'string' ||
       !CHAIN_ATTENTION_KINDS.includes(kind) ||
       repository === null ||
       link === null
     ) {
+      return null;
+    }
+    if (kind === CHAIN_ATTENTION_POLICY_KIND) {
+      // The policy-level item names the configuration key, never a chain.
+      if (chainName !== undefined) {
+        return null;
+      }
+      const policyBase = { projectId, repository, kind: kind as ChainAttentionKind };
+      return link === undefined ? policyBase : { ...policyBase, linkPullRequest: link };
+    }
+    if (typeof chainName !== 'string' || parseChainName(chainName) === undefined) {
       return null;
     }
     const base = { projectId, repository, chainName, kind: kind as ChainAttentionKind };

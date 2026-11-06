@@ -729,6 +729,7 @@ export const DEFAULT_MERGE_DAEMON_POLICY: ResolvedMergeDaemonPolicy = Object.fre
   intervalSeconds: 60,
   budgetSeconds: 45,
   settleSeconds: 20,
+  chainRefresh: 'shadow',
 });
 
 /**
@@ -775,11 +776,6 @@ const MERGE_INVALID: MergeReadFailure = Object.freeze({ ok: false, reason: 'poli
 const MERGE_SECRET: MergeReadFailure = Object.freeze({ ok: false, reason: 'policy-secret-shape' });
 const MERGE_TOO_LARGE: MergeReadFailure = Object.freeze({ ok: false, reason: 'policy-too-large' });
 const DAEMON_INVALID: MergeReadFailure = Object.freeze({ ok: false, reason: 'policy-daemon-invalid' });
-/** `policy.daemon.chainRefresh: 'live'` is refused until live chain refresh is enabled. */
-const CHAIN_REFRESH_NOT_ENABLED: MergeReadFailure = Object.freeze({
-  ok: false,
-  reason: 'policy-chain-refresh-not-enabled',
-});
 
 function mergeOk<T>(value: T): MergeReadResult<T> {
   return { ok: true, value };
@@ -1065,14 +1061,12 @@ function readDaemonSection(
   if (!intervalSeconds.ok || !budgetSeconds.ok || !settleSeconds.ok) {
     return DAEMON_INVALID;
   }
+  // The chain-refresh mode resolves, never refuses: `shadow` (written or
+  // absent) is valid, and `live` or any unknown value becomes `invalid` so a
+  // typo in this optional key can never stop the whole merge policy (CO8a).
+  let chainRefresh: 'shadow' | 'invalid' = 'shadow';
   if (Object.hasOwn(block, 'chainRefresh')) {
-    const chainRefresh = readOwnDataProperty(block, 'chainRefresh');
-    if (chainRefresh === 'live') {
-      return CHAIN_REFRESH_NOT_ENABLED;
-    }
-    if (chainRefresh !== 'shadow') {
-      return DAEMON_INVALID;
-    }
+    chainRefresh = readOwnDataProperty(block, 'chainRefresh') === 'shadow' ? 'shadow' : 'invalid';
   }
   if (budgetSeconds.value >= intervalSeconds.value) {
     return DAEMON_INVALID;
@@ -1082,6 +1076,7 @@ function readDaemonSection(
       intervalSeconds: intervalSeconds.value,
       budgetSeconds: budgetSeconds.value,
       settleSeconds: settleSeconds.value,
+      chainRefresh,
     }),
   );
 }
@@ -1110,9 +1105,11 @@ function compareRepositoryKeys(
  * configuration and an absent `policy.daemon` is the D-DT9 defaults; anything malformed anywhere
  * in either section (wrong type, unknown key or enum, out-of-range number, bad repository key,
  * missing `projectId`, empty or sparse `requiredContexts`, secret-shaped text, more than 256
- * repositories) refuses the whole section. Never salvages a field, never substitutes a default for
- * a written value, never throws and never runs a getter. `reason` is a code, never a value.
- * Repositories come back sorted by `repositoryKey`; `requiredContexts` keep their written order.
+ * repositories) refuses the whole section. `policy.daemon.chainRefresh` is never a refusal: only
+ * `shadow` (or absent) is `shadow`; `live` and any unknown value resolve to `invalid` (CO8a).
+ * Never salvages a field, never substitutes a default for a written value, never throws and never
+ * runs a getter. `reason` is a code, never a value. Repositories come back sorted by
+ * `repositoryKey`; `requiredContexts` keep their written order.
  */
 export function resolveMergePolicy(policy: PolicySection | undefined): MergePolicyRead {
   try {
@@ -1140,9 +1137,9 @@ export function resolveMergePolicy(policy: PolicySection | undefined): MergePoli
 
 /**
  * The canonical JSON the merge-policy revision hashes: `daemon` (`budgetSeconds`,
- * `intervalSeconds`, `settleSeconds`) then `merge.repos` keyed by `repositoryKey` in ascending
- * order, each entry with its keys in alphabetical order and `requiredContexts` sorted ascending,
- * no whitespace. Pass the resolved sections so an absent block hashes as its default.
+ * `intervalSeconds`, `settleSeconds`, `chainRefresh`) then `merge.repos` keyed by `repositoryKey`
+ * in ascending order, each entry with its keys in alphabetical order and `requiredContexts` sorted
+ * ascending, no whitespace. Pass the resolved sections so an absent block hashes as its default.
  */
 export function canonicalMergePolicyJson(input: {
   readonly repositories: readonly ResolvedMergeRepositoryPolicy[];
@@ -1168,6 +1165,7 @@ export function canonicalMergePolicyJson(input: {
   return JSON.stringify({
     daemon: {
       budgetSeconds: input.daemon.budgetSeconds,
+      chainRefresh: input.daemon.chainRefresh,
       intervalSeconds: input.daemon.intervalSeconds,
       settleSeconds: input.daemon.settleSeconds,
     },

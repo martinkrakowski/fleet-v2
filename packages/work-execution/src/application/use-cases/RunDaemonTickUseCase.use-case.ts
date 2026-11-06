@@ -59,6 +59,7 @@ import {
   orderMergeQueue,
   type MergeQueueEntryRecord,
 } from '../../domain/merge-queue-records.js';
+import type { ChainAttentionPort } from '../ports/out/ChainAttentionPort.out-port.js';
 import type { DaemonJobPort, DaemonJobPassRequest } from '../ports/out/DaemonJobPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { DaemonEventProjectionPort } from '../ports/out/DaemonEventProjectionPort.out-port.js';
@@ -102,6 +103,15 @@ export interface RunDaemonTickDependencies {
   readonly mergePass: RunMergePassPort;
   /** The chain-refresh use case; absent registers no chain-refresh job (lane CO8). */
   readonly chainRefresh?: RefreshChainsPort;
+  /**
+   * The effective chain-refresh mode (CO8a): `shadow` runs the chain-refresh
+   * job as before; `invalid` registers a job that is skipped with the typed
+   * outcome `chain-refresh-mode-invalid` and raises one policy-level attention
+   * item. Absent means `shadow` (and no chain-refresh job without `chainRefresh`).
+   */
+  readonly chainRefreshMode?: 'shadow' | 'invalid';
+  /** Raises the channel-level attention item when `chainRefreshMode` is `invalid`. */
+  readonly chainAttention?: Pick<ChainAttentionPort, 'raiseChainAttention'>;
   /** The tick clock; production real time, tests a fake. Absent means the system clock. */
   readonly now?: () => string;
   /** The tick sleep, awaited for the wake settle delay. Absent means a `setTimeout` promise. */
@@ -114,6 +124,13 @@ export interface DaemonJobRegistryDependencies {
   readonly mergePass: RunMergePassPort;
   /** The chain-refresh use case; absent registers no chain-refresh job (lane CO8). */
   readonly chainRefresh?: RefreshChainsPort;
+  /**
+   * The effective chain-refresh mode (CO8a); see `RunDaemonTickDependencies`.
+   * `invalid` registers the skipped-with-attention job, never a live one.
+   */
+  readonly chainRefreshMode?: 'shadow' | 'invalid';
+  /** Raises the policy-level attention item when `chainRefreshMode` is `invalid`. */
+  readonly chainAttention?: Pick<ChainAttentionPort, 'raiseChainAttention'>;
 }
 
 /** One journal key a merge pass reported as journalled, with the queue entry it acts on. */
@@ -405,14 +422,46 @@ class ChainRefreshJob implements DaemonJobPort {
   }
 }
 
+/**
+ * CO8a: one chain-refresh job instance when `policy.daemon.chainRefresh` is
+ * `invalid`. The job never touches the forge: it raises one policy-level
+ * attention item naming the key (refreshed on a repeat, never duplicated) and
+ * is skipped with the typed outcome `chain-refresh-mode-invalid`. The merge
+ * pass and every other job run normally regardless.
+ */
+class ChainRefreshInvalidJob implements DaemonJobPort {
+  constructor(
+    private readonly repository: DaemonRepositoryRef,
+    private readonly attention: Pick<ChainAttentionPort, 'raiseChainAttention'> | undefined,
+    readonly jobId: string,
+    readonly leaseScope: string,
+  ) {}
+
+  async pass(_request: DaemonJobPassRequest): Promise<DaemonJobOutcome> {
+    try {
+      await this.attention?.raiseChainAttention({
+        projectId: this.repository.projectId,
+        repository: { owner: this.repository.owner, repo: this.repository.repo },
+        kind: 'chain-refresh-mode-invalid',
+      });
+    } catch {
+      // A refused or failing raise never changes the skip outcome: the mode is
+      // invalid either way, and the item is advisory.
+    }
+    return { outcome: 'skipped', reasonCode: 'chain-refresh-mode-invalid' };
+  }
+}
+
 /** The registry that expands the configured repositories into one merge-pass job instance each. */
 export class DaemonJobRegistry {
   constructor(private readonly deps: DaemonJobRegistryDependencies) {}
 
   /**
    * One merge-pass job instance per valid repository, in request order; a repeated
-   * digest keeps the first. When the chain-refresh use case is present, one
-   * chain-refresh job instance per valid repository follows the merge-pass jobs.
+   * digest keeps the first. When the chain-refresh mode is `invalid`, one skipped
+   * chain-refresh job instance (CO8a) per valid repository follows the merge-pass
+   * jobs; otherwise, when the chain-refresh use case is present, one real
+   * chain-refresh job instance per valid repository follows them.
    */
   instances(repositories: readonly DaemonRepositoryRef[]): readonly DaemonJobPort[] {
     const instances: DaemonJobPort[] = [];
@@ -428,7 +477,22 @@ export class DaemonJobRegistry {
       seen.add(repository.repoDigest);
       instances.push(new MergePassJob(repository, this.deps.mergePass, parsed.jobId, parsed.leaseScope));
     }
-    if (this.deps.chainRefresh !== undefined) {
+    if (this.deps.chainRefreshMode === 'invalid') {
+      const refreshSeen = new Set<string>();
+      for (const repository of repositories) {
+        if (!isUsableRepository(repository) || refreshSeen.has(repository.repoDigest)) {
+          continue;
+        }
+        const parsed = parseDaemonJobId(chainRefreshJobId(repository.repoDigest));
+        if (parsed === null || parsed.kind !== 'chain-refresh') {
+          continue;
+        }
+        refreshSeen.add(repository.repoDigest);
+        instances.push(
+          new ChainRefreshInvalidJob(repository, this.deps.chainAttention, parsed.jobId, parsed.leaseScope),
+        );
+      }
+    } else if (this.deps.chainRefresh !== undefined) {
       const refreshSeen = new Set<string>();
       for (const repository of repositories) {
         if (!isUsableRepository(repository) || refreshSeen.has(repository.repoDigest)) {
@@ -637,6 +701,8 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
     const jobs = new DaemonJobRegistry({
       mergePass: this.deps.mergePass,
       ...(this.deps.chainRefresh !== undefined ? { chainRefresh: this.deps.chainRefresh } : {}),
+      ...(this.deps.chainRefreshMode !== undefined ? { chainRefreshMode: this.deps.chainRefreshMode } : {}),
+      ...(this.deps.chainAttention !== undefined ? { chainAttention: this.deps.chainAttention } : {}),
     }).instances(request.repositories);
     const plan = await this.plan(ctx, jobs);
     await this.settle(ctx, plan.settleDelayMs);

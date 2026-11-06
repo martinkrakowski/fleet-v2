@@ -897,6 +897,68 @@ export function projectConductorStatus(
   };
 }
 
+export interface TelemetryStatusProjection {
+  readonly outcome: string | null;
+  readonly enabled: boolean | null;
+  readonly saltFingerprint: string | null;
+  readonly recordedSaltFingerprint: string | null;
+  readonly fingerprintMatch: boolean | null;
+  readonly schemaVersion: number | null;
+  readonly hashPrefix: string | null;
+  readonly route: string | null;
+  readonly lastExportAtIso: string | null;
+  readonly spans: Record<string, number>;
+  readonly counters: Record<string, number>;
+}
+
+/** An 8-hex fingerprint; anything else is not a fingerprint. */
+const FINGERPRINT_PATTERN = /^[0-9a-f]{8}$/;
+
+function asFingerprint(value: unknown): string | null {
+  const text = asString(value);
+  return text !== null && FINGERPRINT_PATTERN.test(text) ? text : null;
+}
+
+/** Keep only entries whose value is a finite number; a non-object becomes {}. */
+function countMap(value: unknown): Record<string, number> {
+  const record = asRecord(value);
+  if (record === null) {
+    return {};
+  }
+  const counts: Record<string, number> = {};
+  for (const [key, item] of Object.entries(record)) {
+    if (typeof item === "number" && Number.isFinite(item)) {
+      counts[key] = item;
+    }
+  }
+  return counts;
+}
+
+/**
+ * Project the telemetry-status result (MX8). Allow-list only: endpoint, token,
+ * salt, projectName, host names and any future field never cross. A fingerprint
+ * that is not 8 lowercase hex becomes null; spans/counters keep only finite
+ * numbers; a missing object becomes {}. Never throws.
+ */
+export function projectTelemetryStatus(
+  result: unknown,
+): TelemetryStatusProjection {
+  const record = asRecord(result);
+  return {
+    outcome: asString(record?.outcome),
+    enabled: asBoolean(record?.enabled),
+    saltFingerprint: asFingerprint(record?.saltFingerprint),
+    recordedSaltFingerprint: asFingerprint(record?.recordedSaltFingerprint),
+    fingerprintMatch: asBoolean(record?.fingerprintMatch),
+    schemaVersion: asNumber(record?.schemaVersion),
+    hashPrefix: asString(record?.hashPrefix),
+    route: asString(record?.route),
+    lastExportAtIso: asString(record?.lastExportAtIso),
+    spans: countMap(record?.spans),
+    counters: countMap(record?.counters),
+  };
+}
+
 /** A hex digest: 64 lowercase hex digits. */
 const HEX64_PATTERN = /^[0-9a-f]{64}$/;
 

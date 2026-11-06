@@ -4,6 +4,8 @@
  * overwrite.
  */
 
+import type { ProjectGeneratorState } from './ProjectProbePort.out-port.js';
+
 export type ProjectProbeReceiptResult = 'pass' | 'fail' | 'unknown';
 
 export interface ProjectProbeReceiptCheck {
@@ -17,6 +19,8 @@ export interface ProjectProbeReceipt {
   readonly probedAtIso: string;
   readonly probedFrom: string;
   readonly checks: readonly ProjectProbeReceiptCheck[];
+  /** The project's generator state; absent when the probe did not read it. */
+  readonly generatorState?: ProjectGeneratorState;
 }
 
 export interface ProjectProbeRecordRequest {

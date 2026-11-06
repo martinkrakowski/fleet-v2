@@ -34,6 +34,9 @@ export const LANE_RUN_RESULT_REASON_CODES = [
   'merge-off', 'notice-recorded', 'notice-refused', 'no-in-scope-findings',
   'gate-congested', // KF-30c2: a gate run that exhausted the gate-slot wait limit; the conductor may retry it
   'premerge-success', 'premerge-failure', 'premerge-overtaken', // KS7a-2: the merge hold's `premerge` commit status
+  // KS7b: the `merge-enqueue` step's final results. The detail of `merge-dropped` / `merge-held` names the
+  // queue's reason token; a pending (queued) entry has no result at all.
+  'merge-dropped', 'merge-held', 'merge-enqueue-refused', 'merge-overtaken',
   'ci-failed', // GB4: the keyed `ci` step's refusal of the exact head's CI read
   'ci-overtaken', // GB4 fix rounds 1-2: a pending `ci` intent whose head/round moved, or whose CI has since passed
 ] as const;
@@ -295,6 +298,57 @@ export function laneRunPremergePost(
     }
   }
   return post;
+}
+
+/** What the merge queue made of the run's enqueued head, read from the journal (KS7b). */
+export type LaneRunMergeEnqueueFact = 'none' | 'merged' | 'dropped-fixable' | 'held' | 'stuck';
+
+/** The queue drop reasons that a fix round can answer: the head conflicts, fails its checks or the macOS verify. */
+export const LANE_RUN_MERGE_DROP_FIXABLE = ['conflict', 'checks', 'macos'] as const;
+
+/**
+ * KS7b: the latest final result of the run's `merge-enqueue` key at (`round`, `head12`)
+ * (`<runId>/r<round>/merge-enqueue@<head12>`), as the merging rules read it. `merged` →
+ * `merged`; `merge-dropped` with detail conflict, checks or macos → `dropped-fixable`;
+ * `merge-held` → `held`; any other final result (a refusal, another drop reason, an
+ * unknown detail) → `stuck`; no final result, a moved head or another round → `none`.
+ * The last such result wins. Pure; never throws.
+ */
+export function laneRunMergeEnqueueFact(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  round: number,
+  head12: string | null,
+): LaneRunMergeEnqueueFact {
+  if (typeof head12 !== 'string' || !PREMERGE_HEAD12_PATTERN.test(head12)) {
+    return 'none';
+  }
+  let fact: LaneRunMergeEnqueueFact = 'none';
+  for (const entry of entries) {
+    if (entry.kind !== 'result' || entry.outcome === 'ambiguous' || entry.key === null || entry.runId !== runId) {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'merge-enqueue' || parsed.head12 !== head12 || parsed.round !== round) {
+      continue;
+    }
+    if (entry.outcome === 'overtaken') {
+      continue;
+    }
+    if (entry.reasonCode === 'merged') {
+      fact = 'merged';
+    } else if (entry.reasonCode === 'merge-held') {
+      fact = 'held';
+    } else if (
+      entry.reasonCode === 'merge-dropped' &&
+      (LANE_RUN_MERGE_DROP_FIXABLE as readonly (string | null)[]).includes(entry.detail)
+    ) {
+      fact = 'dropped-fixable';
+    } else {
+      fact = 'stuck';
+    }
+  }
+  return fact;
 }
 
 /**

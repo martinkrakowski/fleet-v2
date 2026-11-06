@@ -83,6 +83,7 @@ export class ProbeProjectUseCase implements ProbeProjectPort {
         probedAtIso: report.probedAtIso,
         probedFrom: report.probedFrom,
         checks: reportWithGateCheck.checks,
+        generatorState: report.generatorState,
       },
     });
 

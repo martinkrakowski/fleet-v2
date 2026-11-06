@@ -38,7 +38,7 @@ export const LANE_RUN_ID_PATTERN = /^run-[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
  */
 export const LANE_RUN_KEY_STEPS = [
   'prepare', 'dispatch', 'stop', 'collect', 'gate', 'brief-check', 'code-review', 'pre-merge',
-  'accept', 'open-pr', 'push', 'merge', 'premerge', 'ci', 'park', 'reconcile',
+  'accept', 'open-pr', 'push', 'merge', 'premerge', 'merge-enqueue', 'ci', 'park', 'reconcile',
 ] as const;
 export type LaneRunKeyStep = (typeof LANE_RUN_KEY_STEPS)[number];
 
@@ -49,7 +49,7 @@ export const LANE_RUN_ONE_WAY_STEPS = ['prepare', 'dispatch', 'open-pr', 'push',
 export const LANE_RUN_KEY_HEAD_RULE = {
   prepare: 'absent', dispatch: 'absent', stop: 'absent', collect: 'absent',
   gate: 'required', 'brief-check': 'required', 'code-review': 'required', 'pre-merge': 'required',
-  accept: 'required', 'open-pr': 'required', push: 'required', merge: 'required', premerge: 'required', ci: 'required', park: 'absent',
+  accept: 'required', 'open-pr': 'required', push: 'required', merge: 'required', premerge: 'required', 'merge-enqueue': 'required', ci: 'required', park: 'absent',
   reconcile: 'absent',
 } as const satisfies Record<LaneRunKeyStep, 'required' | 'absent'>;
 
@@ -65,7 +65,7 @@ export const LANE_RUN_KEY_HEAD_RULE = {
 export const LANE_RUN_KEY_ATTEMPT_RULE = {
   prepare: 'required', dispatch: 'required', stop: 'absent', collect: 'required',
   gate: 'absent', 'brief-check': 'absent', 'code-review': 'absent', 'pre-merge': 'absent',
-  accept: 'absent', 'open-pr': 'absent', push: 'absent', merge: 'absent', premerge: 'absent', ci: 'absent', park: 'absent',
+  accept: 'absent', 'open-pr': 'absent', push: 'absent', merge: 'absent', premerge: 'absent', 'merge-enqueue': 'absent', ci: 'absent', park: 'absent',
   reconcile: 'absent',
 } as const satisfies Record<LaneRunKeyStep, 'required' | 'absent'>;
 

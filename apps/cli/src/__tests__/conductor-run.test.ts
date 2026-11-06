@@ -8,7 +8,7 @@
  * a forge, or reaches the network.
  */
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -35,6 +35,7 @@ import { runCli } from '../index.js';
 import type { CliIo } from '../index.js';
 import type { ConductorCliOptions } from '../conductor.js';
 import { nextPollDelayMs, PASS_CONCURRENCY_LIMIT, runsWaitOnForge, pollSleepMs } from '../conductor.js';
+import type { ChangeWakeReader } from '../conductor-wake.js';
 import { buildLiveConductorDriver, type ConductorDriver } from '../conductor-wiring.js';
 import { RunnerTunnelAdapter, type TunnelChild } from '../runner-tunnel.js';
 
@@ -550,6 +551,253 @@ describe('conductor run live loop (K7-7)', () => {
     const attentionLines = result.stdout.filter((line) => line.startsWith('{"attention"'));
     expect(attentionLines).toHaveLength(1);
     expect(JSON.parse(attentionLines[0]!)).toEqual({ attention: 'stop-grace-exceeded', runId: RUN_ID });
+  });
+});
+
+describe('conductor run change wake-up (K9)', () => {
+  const WAKE_URL = 'http://127.0.0.1:3001';
+  const WAKE_TOKEN = 'tok_' + 'a'.repeat(40);
+  const WAKE_ENV_KEYS = [
+    'FLEET_API_URL',
+    'FLEET_API_TOKEN_FILE',
+    'FLEET_CONDUCTOR_WAKE_TOKEN_FILE',
+  ] as const;
+
+  function writeWakeTokenFile(dir: string): string {
+    const path = join(dir, 'wake-token');
+    writeFileSync(path, `${WAKE_TOKEN}\n`, { mode: 0o600, encoding: 'utf8' });
+    chmodSync(path, 0o600);
+    return path;
+  }
+
+  function wakeReader(): ChangeWakeReader {
+    return {
+      waitForSignal: async (): Promise<boolean> => true,
+      close: (): void => undefined,
+    };
+  }
+
+  async function withWakeEnv(
+    vars: Partial<Record<(typeof WAKE_ENV_KEYS)[number], string>>,
+    run: () => Promise<void>,
+  ): Promise<void> {
+    const saved = new Map<string, string | undefined>();
+    for (const key of WAKE_ENV_KEYS) {
+      saved.set(key, process.env[key]);
+      delete process.env[key];
+    }
+    for (const [key, value] of Object.entries(vars)) {
+      if (value !== undefined) {
+        process.env[key] = value;
+      }
+    }
+    try {
+      await run();
+    } finally {
+      for (const key of WAKE_ENV_KEYS) {
+        const previous = saved.get(key);
+        if (previous === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = previous;
+        }
+      }
+    }
+  }
+
+  it('a change signal ends the sleep and the next pass runs at once', async () => {
+    const dir = tempStateDir();
+    const fake = makeFakeDriver({
+      enabled: true,
+      passes: [
+        completedPass(),
+        completedPass(),
+        { outcome: 'refused', reason: 'driver-lease-held' },
+      ],
+    });
+    const delays: number[] = [];
+    const result = await runConductor(runtimeOf(dir), ['run', '--live'], {
+      stateDir: dir,
+      buildDriver: () => fake.driver,
+      wakeReader: wakeReader(),
+      sleep: (ms, iterationSignal) =>
+        new Promise<void>((resolve) => {
+          delays.push(ms);
+          const onAbort = (): void => resolve();
+          iterationSignal.addEventListener('abort', onAbort, { once: true });
+        }),
+    });
+    expect(result.code).toBe(1);
+    expect(fake.passCalls).toHaveLength(3);
+    expect(delays).toEqual([30000, 60000]);
+  });
+
+  it('does not open a reader without the wake token file (D9)', async () => {
+    const dir = tempStateDir();
+    const sharedTokenFile = writeWakeTokenFile(dir);
+    let opened = 0;
+    await withWakeEnv(
+      {
+        FLEET_API_URL: WAKE_URL,
+        FLEET_API_TOKEN_FILE: sharedTokenFile,
+      },
+      async () => {
+        const fake = makeFakeDriver({
+          enabled: true,
+          passes: [completedPass(), completedPass(), completedPass()],
+        });
+        const controller = new AbortController();
+        const delays: number[] = [];
+        const result = await runConductor(runtimeOf(dir), ['run', '--live'], {
+          stateDir: dir,
+          buildDriver: () => fake.driver,
+          stopSignal: controller.signal,
+          openWakeReader: async () => {
+            opened += 1;
+            return wakeReader();
+          },
+          sleep: recorderSleep(delays, 3, controller),
+        });
+        expect(result.code).toBe(0);
+        expect(opened).toBe(0);
+        expect(delays).toEqual([30000, 60000, 120000]);
+      },
+    );
+  });
+
+  it('a configured wake opens the reader once with the base URL and token', async () => {
+    const dir = tempStateDir();
+    const tokenFile = writeWakeTokenFile(dir);
+    const calls: Array<{ readonly baseUrl: string; readonly token: string }> = [];
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    await withWakeEnv(
+      {
+        FLEET_API_URL: WAKE_URL,
+        FLEET_CONDUCTOR_WAKE_TOKEN_FILE: tokenFile,
+      },
+      async () => {
+        const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once'], {
+          stateDir: dir,
+          buildDriver: () => fake.driver,
+          openWakeReader: async (config) => {
+            calls.push(config);
+            return wakeReader();
+          },
+        });
+        expect(result.code).toBe(0);
+        expect(calls).toEqual([{ baseUrl: WAKE_URL, token: WAKE_TOKEN }]);
+        expect(fake.passCalls).toHaveLength(1);
+      },
+    );
+  });
+
+  it('the reader is closed when the driver stops', async () => {
+    const dir = tempStateDir();
+    const tokenFile = writeWakeTokenFile(dir);
+    let closed = 0;
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    await withWakeEnv(
+      {
+        FLEET_API_URL: WAKE_URL,
+        FLEET_CONDUCTOR_WAKE_TOKEN_FILE: tokenFile,
+      },
+      async () => {
+        const result = await runConductor(runtimeOf(dir), ['run', '--live', '--once'], {
+          stateDir: dir,
+          buildDriver: () => fake.driver,
+          openWakeReader: async () => ({
+            waitForSignal: async (): Promise<boolean> => false,
+            close: (): void => {
+              closed += 1;
+            },
+          }),
+        });
+        expect(result.code).toBe(0);
+        expect(closed).toBe(1);
+      },
+    );
+  });
+
+  it('the dry run opens no reader', async () => {
+    const dir = tempStateDir();
+    const tokenFile = writeWakeTokenFile(dir);
+    let opened = 0;
+    await withWakeEnv(
+      {
+        FLEET_API_URL: WAKE_URL,
+        FLEET_CONDUCTOR_WAKE_TOKEN_FILE: tokenFile,
+      },
+      async () => {
+        const result = await runConductor(runtimeOf(dir), ['run', '--dry-run', '--once'], {
+          stateDir: dir,
+          openWakeReader: async () => {
+            opened += 1;
+            return wakeReader();
+          },
+        });
+        expect(result.code).toBe(0);
+        expect(opened).toBe(0);
+      },
+    );
+  });
+
+  it('an interrupt during wake-reader startup stops the tunnel child', async () => {
+    const dir = tempStateDir();
+    const tokenFile = writeWakeTokenFile(dir);
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    let resolveExit: (value: { readonly code: number | null }) => void = () => undefined;
+    const exited = new Promise<{ readonly code: number | null }>((resolve) => {
+      resolveExit = resolve;
+    });
+    const killCalls: number[] = [];
+    const child: TunnelChild = {
+      exited,
+      stop: () => {
+        killCalls.push(1);
+        resolveExit({ code: null });
+      },
+      release: () => undefined,
+    };
+    let probes = 0;
+    const tunnel = new RunnerTunnelAdapter({
+      sshHost: 'lane-host',
+      remotePort: 46000,
+      isPortListening: async () => {
+        probes += 1;
+        return probes > 1;
+      },
+      spawner: () => child,
+      sleep: async () => undefined,
+      waitMs: 10_000,
+      pollMs: 1,
+    });
+    const controller = new AbortController();
+    let openedOpeners = 0;
+    await withWakeEnv(
+      {
+        FLEET_API_URL: WAKE_URL,
+        FLEET_CONDUCTOR_WAKE_TOKEN_FILE: tokenFile,
+      },
+      async () => {
+        const result = await runConductor(runtimeOf(dir), ['run', '--live'], {
+          stateDir: dir,
+          buildDriver: () => fake.driver,
+          stopSignal: controller.signal,
+          tunnel,
+          openWakeReader: async () => {
+            openedOpeners += 1;
+            // The interrupt arrives while the wake-reader opener is pending.
+            controller.abort();
+            return new Promise(() => undefined); // never settles
+          },
+        });
+        expect(result.code).toBe(0);
+        expect(openedOpeners).toBe(1);
+        expect(killCalls).toHaveLength(1);
+        expect(tunnel.owned).toBe(false);
+        expect(fake.passCalls).toHaveLength(0);
+      },
+    );
   });
 });
 

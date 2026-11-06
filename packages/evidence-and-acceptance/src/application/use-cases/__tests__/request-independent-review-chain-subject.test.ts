@@ -226,6 +226,25 @@ describe('the chain subject in the evidence context', () => {
     expect(receiptSubjectOf({ ...base, subject: { kind: 'galaxy', projectId: PROJECT } })).toBeNull();
     expect(receiptSubjectOf({ ...base, subject: { kind: 'chain', projectId: PROJECT, chainName: CHAIN } })).toBeNull();
     expect(receiptSubjectOf({ ...base, subject: 'chain' })).toBeNull();
+  });
+
+  it('refuses a subject whose fields of another kind are non-null', () => {
+    const base = { projectId: PROJECT, attemptId: 'attempt-1' };
+    const chain = { kind: 'chain', projectId: PROJECT, chainName: CHAIN, integrationHeadSha: 'a'.repeat(40) };
+    expect(receiptSubjectOf({ ...base, subject: { ...chain, attemptId: 'attempt-1' } })).toBeNull();
+    expect(receiptSubjectOf({ ...base, subject: { ...chain, baseCommit: 'b'.repeat(40) } })).toBeNull();
+    expect(receiptSubjectOf({ ...base, subject: { kind: 'attempt', projectId: PROJECT, attemptId: 'attempt-1', chainName: CHAIN } })).toBeNull();
+    expect(
+      receiptSubjectOf({
+        ...base,
+        subject: { kind: 'brief', projectId: PROJECT, briefPackageDigest: 'd', baseCommit: 'b'.repeat(40), attemptId: 'attempt-1' },
+      }),
+    ).toBeNull();
+    expect(receiptSubjectOf({ ...base, subject: chain })?.kind).toBe('chain');
+  });
+
+  it('keeps reading a clean subject after the other-kind check', () => {
+    const base = { projectId: PROJECT, attemptId: 'attempt-1' };
     const withGetter = {
       ...base,
       get subject() {

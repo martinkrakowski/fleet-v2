@@ -486,7 +486,7 @@ export function aggregateLinkReceipts(links: readonly ChainLinkReceiptInput[]): 
         }),
       );
     }
-    return { ok: true, links: Object.freeze(projections) };
+    return Object.freeze({ ok: true as const, links: Object.freeze(projections) });
   } catch {
     return MISSING;
   }
@@ -640,6 +640,20 @@ export class ReviewChainUseCase implements ReviewChainPort {
     return isBudgetLeft(now, deadlineIso);
   }
 
+  /** Milliseconds from now (the injected clock when there is one) to the deadline; 0 when spent or unreadable. */
+  private msLeft(nowIso: string, deadlineIso: string): number {
+    let now = nowIso;
+    if (this.deps.clock !== undefined) {
+      try {
+        now = this.deps.clock();
+      } catch {
+        return 0;
+      }
+    }
+    const left = Date.parse(deadlineIso) - Date.parse(now);
+    return Number.isFinite(left) && left > 0 ? Math.floor(left) : 0;
+  }
+
   // ---------- shared reads ----------
 
   /** The chain record (started, for this repository and chain) and the chain branch tip. */
@@ -789,6 +803,9 @@ export class ReviewChainUseCase implements ReviewChainPort {
       return refusedWith('budget-exhausted');
     }
     const openPullRequests = await this.countOpenPullRequests(command);
+    if (openPullRequests === 'budget-exhausted') {
+      return refusedWith('budget-exhausted');
+    }
     const models = implementerModelsOf(gathered.attempts);
     const decision = decideChainReviewStart({
       chainName: command.chainName,
@@ -881,14 +898,24 @@ export class ReviewChainUseCase implements ReviewChainPort {
   }
 
   /** Open pull requests against `chain/<name>`: the count, or `unreadable`; never an empty list on failure. */
-  private async countOpenPullRequests(command: ChainReviewCommand): Promise<number | 'unreadable'> {
+  private async countOpenPullRequests(command: ChainReviewCommand): Promise<number | 'unreadable' | 'budget-exhausted'> {
+    // The read may not outlive the command's deadline: its timeout is what is left of the budget.
+    const timeoutMs = this.msLeft(command.nowIso, command.deadlineIso);
+    if (timeoutMs <= 0) {
+      return 'budget-exhausted';
+    }
     try {
-      const listed = await this.deps.forge.listOpenPullRequestsByBase?.({
+      const listed = await this.deps.forge.listOpenPullRequestsByBase({
         base: command.branchName,
         repository: command.repository,
+        timeoutMs,
       });
-      // A forge that cannot list is unreadable, never an empty list.
-      return listed !== undefined && listed.outcome === 'listed' ? listed.pullRequests.length : 'unreadable';
+      // An unavailable list is unreadable, never an empty list.
+      // A read that returned after the deadline is not an answer the review may act on.
+      if (!this.budgetLeft(command.nowIso, command.deadlineIso)) {
+        return 'budget-exhausted';
+      }
+      return listed.outcome === 'listed' ? listed.pullRequests.length : 'unreadable';
     } catch {
       return 'unreadable';
     }
@@ -906,9 +933,9 @@ export class ReviewChainUseCase implements ReviewChainPort {
   ): Promise<{ readonly outcome: 'pinned'; readonly already: boolean } | Fail> {
     let revision = record.revision;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      let decision: Awaited<ReturnType<NonNullable<ChainRepositoryPort['recordChainReviewPin']>>> | undefined;
+      let decision: Awaited<ReturnType<ChainRepositoryPort['recordChainReviewPin']>>;
       try {
-        decision = await this.deps.chains.recordChainReviewPin?.({
+        decision = await this.deps.chains.recordChainReviewPin({
           repository: command.repository,
           chainName: command.chainName,
           expectedRevision: revision,
@@ -916,9 +943,6 @@ export class ReviewChainUseCase implements ReviewChainPort {
           deadlineIso: command.deadlineIso,
         });
       } catch {
-        return unknownWith('store-unavailable');
-      }
-      if (decision === undefined) {
         return unknownWith('store-unavailable');
       }
       if (decision.outcome === 'recorded') {

@@ -218,10 +218,11 @@ export function receiptSubjectOf(record: {
     ) {
       return null;
     }
+    // Exactly the fields of the subject's own kind are set: a field of another kind is never tolerated.
     const complete =
-      kind === 'attempt' ? attemptId !== null
-      : kind === 'chain' ? chainName !== null && integrationHeadSha !== null
-      : briefPackageDigest !== null && baseCommit !== null;
+      kind === 'attempt' ? attemptId !== null && chainName === null && integrationHeadSha === null && briefPackageDigest === null && baseCommit === null
+      : kind === 'chain' ? chainName !== null && integrationHeadSha !== null && attemptId === null && briefPackageDigest === null && baseCommit === null
+      : briefPackageDigest !== null && baseCommit !== null && attemptId === null && chainName === null && integrationHeadSha === null;
     if (!complete) {
       return null;
     }

@@ -468,6 +468,9 @@ export function createDryRunFakes(
       };
     },
     isConfigured: () => true,
+    listOpenPullRequestsByBase: async () => {
+      return { outcome: 'listed', pullRequests: [] };
+    },
   };
 
   const conductorForgeGrant: ConductorForgeGrantPort = {

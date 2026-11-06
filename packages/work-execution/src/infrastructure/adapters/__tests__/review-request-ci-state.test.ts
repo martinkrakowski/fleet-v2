@@ -1104,7 +1104,7 @@ describe('ReviewRequestAdapter with a chain subject', () => {
     expect(await adapter.requestReview(chainRequest({ subject: BRIEF_SUBJECT }))).toEqual({
       outcome: 'refused', reason: 'subject-not-implemented', detail: null,
     });
-    expect(await adapter.requestReview(makeReviewRequest({ kind: 'brief-verify' as never }))).toEqual({
+    expect(await adapter.requestReview(makeReviewRequest({ kind: 'brief-verify' }))).toEqual({
       outcome: 'refused', reason: 'subject-not-implemented', detail: null,
     });
     expect(calls).toHaveLength(0);

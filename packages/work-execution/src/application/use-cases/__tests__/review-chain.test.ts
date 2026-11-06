@@ -109,8 +109,9 @@ interface Script {
   listRuns?: 'throw';
   listQueue?: 'throw';
   attemptThrows?: boolean;
-  open?: ListOpenPullRequestsByBaseResult | 'throw' | 'missing';
-  pin?: ChainReviewPinDecision | 'throw' | 'missing';
+  open?: ListOpenPullRequestsByBaseResult | 'throw';
+  onList?: () => void;
+  pin?: ChainReviewPinDecision | 'throw';
   review?: ReviewRequestResult | 'throw';
   find?: FindReviewReceiptResult | 'throw';
   linkReceipts?: Record<string, ReadReceiptsForHeadResult | 'throw'>;
@@ -125,6 +126,7 @@ function harness(script: Script = {}) {
   const state = { record: script.record === undefined ? startedRecord() : script.record, pinRecordedCount: 0 };
   const links = script.links ?? [link()];
   const receiptReads: string[] = [];
+  const listTimeouts: (number | undefined)[] = [];
 
   const chains: ChainRepositoryPort = {
     async readChain() {
@@ -139,14 +141,11 @@ function harness(script: Script = {}) {
     async recordChainOutcome() {
       throw new Error('not used');
     },
-    ...(script.pin === 'missing'
-      ? {}
-      : {
-          async recordChainReviewPin(command: ChainReviewPinCommand) {
+    async recordChainReviewPin(command: ChainReviewPinCommand) {
             calls.push('pin');
             pins.push(command);
             if (script.pin === 'throw') throw new Error(LEAK);
-            if (script.pin !== undefined && script.pin !== 'missing') return script.pin;
+            if (script.pin !== undefined) return script.pin;
             const current = state.record;
             if (current === null) return { outcome: 'refused', reason: 'chain-not-found' } as const;
             const stored = reviewPinOf(current);
@@ -159,8 +158,7 @@ function harness(script: Script = {}) {
             state.record = applyChainReviewPin(current, command.pin, command.pin.pinnedAtIso);
             state.pinRecordedCount += 1;
             return { outcome: 'recorded' } as const;
-          },
-        }),
+    },
   };
 
   const useCase = new ReviewChainUseCase({
@@ -170,15 +168,13 @@ function harness(script: Script = {}) {
       async readPullRequest() {
         throw new Error('not used');
       },
-      ...(script.open === 'missing'
-        ? {}
-        : {
-            async listOpenPullRequestsByBase() {
-              calls.push('list-open');
-              if (script.open === 'throw') throw new Error(LEAK);
-              return script.open === undefined || script.open === 'missing' ? { outcome: 'listed', pullRequests: [] } : script.open;
-            },
-          }),
+      async listOpenPullRequestsByBase(request) {
+        calls.push('list-open');
+        listTimeouts.push(request.timeoutMs);
+        script.onList?.();
+        if (script.open === 'throw') throw new Error(LEAK);
+        return script.open === undefined ? { outcome: 'listed', pullRequests: [] } : script.open;
+      },
     },
     branches: {
       async readMergeBranchHead() {
@@ -251,7 +247,7 @@ function harness(script: Script = {}) {
     },
     ...(script.clock !== undefined ? { clock: script.clock } : {}),
   });
-  return { useCase, calls, pins, reviews, finds, state, receiptReads };
+  return { useCase, calls, pins, reviews, finds, state, receiptReads, listTimeouts };
 }
 
 function assertFixedCodes(result: unknown): void {
@@ -298,6 +294,15 @@ describe('start: input and budget', () => {
       outcome: 'refused', reason: 'budget-exhausted',
     });
     expect(calls).toEqual([]);
+  });
+
+  it('passes the open-PR read a timeout derived from the deadline, and refuses budget-exhausted when the read ends past it', async () => {
+    let now = NOW;
+    const slow = harness({ clock: () => now, onList: () => { now = '2026-11-06T10:06:00.000Z'; } });
+    expect(await slow.useCase.startChainReview(startCommand())).toEqual({ outcome: 'refused', reason: 'budget-exhausted' });
+    expect(slow.listTimeouts).toEqual([5 * 60 * 1000]);
+    expect(slow.pins).toHaveLength(0);
+    expect(slow.reviews).toHaveLength(0);
   });
 
   it('refuses before the forge call when the clock runs out between steps', async () => {
@@ -352,8 +357,8 @@ describe('start refuses while a pull request against chain/<name> is open', () =
 });
 
 describe('start refuses when the forge or the chain record cannot be read', () => {
-  it('reports unknown with forge-unavailable for an unavailable list, a throw and a forge that cannot list', async () => {
-    for (const open of [{ outcome: 'unavailable', reason: 'gh api pulls failed (exit 1)' } as const, 'throw', 'missing'] as const) {
+  it('reports unknown with forge-unavailable for an unavailable list and a throw', async () => {
+    for (const open of [{ outcome: 'unavailable', reason: 'gh api pulls failed (exit 1)' } as const, 'throw'] as const) {
       const { useCase, pins } = harness({ open });
       const result = await useCase.startChainReview(startCommand());
       expect(result).toEqual({ outcome: 'unknown', reason: 'forge-unavailable' });
@@ -408,9 +413,6 @@ describe('start refuses when the forge or the chain record cannot be read', () =
     const { useCase } = harness({ pin: 'throw' });
     const result = await useCase.startChainReview(startCommand());
     expect(result).toEqual({ outcome: 'unknown', reason: 'store-unavailable' });
-    expect(await harness({ pin: 'missing' }).useCase.startChainReview(startCommand())).toEqual({
-      outcome: 'unknown', reason: 'store-unavailable',
-    });
   });
 
   it('refuses chain-tip-moved when the branch is no longer at the commanded head', async () => {

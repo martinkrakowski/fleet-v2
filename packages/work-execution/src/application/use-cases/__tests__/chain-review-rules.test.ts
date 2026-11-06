@@ -324,6 +324,12 @@ describe('aggregateLinkReceipts', () => {
     expect(Object.isFrozen(only)).toBe(true);
   });
 
+  it('returns a frozen success result', () => {
+    const aggregated = aggregateLinkReceipts([link({ receipts: [receipt()] })]);
+    expect(aggregated.ok).toBe(true);
+    expect(Object.isFrozen(aggregated)).toBe(true);
+  });
+
   it('picks the latest pre-merge receipt and ignores receipts of other kinds', () => {
     const older = receipt({ result: 'fail', completedAtIso: '2026-11-06T08:00:00.000Z' });
     const newer = receipt({ result: 'pass', completedAtIso: '2026-11-06T09:30:00.000Z' });

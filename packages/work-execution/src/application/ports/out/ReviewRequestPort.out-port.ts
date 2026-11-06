@@ -2,15 +2,11 @@
 
 import type { ReviewKind } from '@fleet/evidence-and-acceptance';
 
-export type ReviewRequestKind = ReviewKind;
+/** The kinds a request may name: the stored review kinds plus `brief-verify` (the manifest contract), which is refused at runtime until the brief subject is implemented. */
+export type ReviewRequestKind = ReviewKind | 'brief-verify';
 
-/**
- * The kinds a request may name: the stored review kinds plus `brief-verify`,
- * which is declared here and refused (`subject-not-implemented`) until the
- * brief subject is implemented. `ReviewRequestKind` stays the stored kinds, so
- * every existing use of it, `ReviewRequest.kind` included, is unchanged.
- */
-export type ReviewRequestedKind = ReviewRequestKind | 'brief-verify';
+/** The stored review kinds, which a receipt can carry (`brief-verify` is never stored yet). */
+export type StoredReviewRequestKind = ReviewKind;
 
 export const REVIEW_SUBJECT_KINDS = ['attempt', 'chain', 'brief'] as const;
 
@@ -22,7 +18,7 @@ export type ReviewSubject =
 
 export interface ReviewRequest {
   readonly requestId: string;
-  /** The stored review kinds; `brief-verify` (`ReviewRequestedKind`) is refused at runtime, not typed in yet. */
+  /** `brief-verify` is typed in and refused at runtime (`subject-not-implemented`) until CO18. */
   readonly kind: ReviewRequestKind;
   readonly attemptId: string;
   readonly projectId: string;

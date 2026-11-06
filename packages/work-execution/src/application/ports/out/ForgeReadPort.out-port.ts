@@ -83,10 +83,9 @@ export interface ForgeReadPort {
   readPullRequest(request: ReadPullRequestRequest): Promise<ReadPullRequestResult>;
   /**
    * List every open pull request against one base branch (fully paginated);
-   * mutates nothing. Optional so a reader that cannot list (an older fake, a
-   * partial binding) type-checks; a caller treats its absence as unavailable.
+   * mutates nothing.
    */
-  listOpenPullRequestsByBase?(request: ListOpenPullRequestsByBaseRequest): Promise<ListOpenPullRequestsByBaseResult>;
+  listOpenPullRequestsByBase(request: ListOpenPullRequestsByBaseRequest): Promise<ListOpenPullRequestsByBaseResult>;
   /** Whether a transport and a repository are configured. */
   isConfigured(): boolean;
 }

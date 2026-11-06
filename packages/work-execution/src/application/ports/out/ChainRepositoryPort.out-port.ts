@@ -68,8 +68,7 @@ export interface ChainRepositoryPort {
   readChain(command: ChainReadCommand): Promise<ChainRecordRead>;
   /**
    * Pin the chain tip a combined review covers; never overwrites a stored pin
-   * with another. Optional so a repository without it (the CO7 fakes) still
-   * type-checks; a caller treats its absence as an unavailable store.
+   * with another.
    */
-  recordChainReviewPin?(command: ChainReviewPinCommand): Promise<ChainReviewPinDecision>;
+  recordChainReviewPin(command: ChainReviewPinCommand): Promise<ChainReviewPinDecision>;
 }

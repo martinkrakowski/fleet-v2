@@ -1615,6 +1615,33 @@ describe('readBoundedStoreBytes and readOrQuarantineVersionedRecordList', () => 
     expect(await fs.readFile(filePath)).toEqual(Buffer.from('{ not json'));
   });
 
+  it('echoes neither the lock path nor the store path in a lock-side refusal message, keeping the original error as cause', async () => {
+    await fs.writeFile(filePath, '{ not json');
+    const lockPath = `${filePath}.lock`;
+    const original = Object.assign(new Error(`EACCES: permission denied, open '${lockPath}'`), {
+      code: 'EACCES',
+      path: lockPath,
+    }) as NodeJS.ErrnoException;
+    const realOpen = fs.open.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      if (String(args[1]) === 'wx') {
+        throw original;
+      }
+      return realOpen(...args);
+    });
+
+    const error = await readOrQuarantineVersionedRecordList({ filePath, parseRecord }).catch(
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const unreadable = error as StateFileUnreadableError;
+    expect(unreadable.cause).toBe(original);
+    expect(unreadable.message).not.toContain(lockPath);
+    expect(unreadable.message).not.toContain(filePath);
+    expect(unreadable.message).not.toContain(tempDir);
+    expect(unreadable.message).toContain('EACCES');
+  });
+
   it('refuses a symlinked store directly without taking the store lock', async () => {
     const outside = path.join(tempDir, 'outside.txt');
     await fs.writeFile(outside, '{ not json');

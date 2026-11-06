@@ -233,6 +233,7 @@ export class StateFileUnreadableError extends Error {
     copyError?: unknown,
     postWriteNotes?: QuarantinePostWriteNotes,
     quarantineAttempted?: boolean,
+    redactPaths?: boolean,
   ) {
     const notes: string[] = [];
     if (postWriteNotes?.chmodFailed === true) {
@@ -256,7 +257,7 @@ export class StateFileUnreadableError extends Error {
       // would mislead the operator: nothing was read to quarantine and the
       // store bytes were not modified.
       disposition =
-        copyError instanceof Error && copyError.message !== ''
+        redactPaths !== true && copyError instanceof Error && copyError.message !== ''
           ? `no quarantine was attempted (${copyError.message})`
           : 'no quarantine was attempted';
       advice = 'the store bytes were not modified; resolve the reported condition and retry';
@@ -267,8 +268,10 @@ export class StateFileUnreadableError extends Error {
       disposition = 'its bytes could not be copied';
       advice = 'restore it from that copy or repair it by hand; no command reads or writes this store until then';
     }
+    // A lock-side refusal (`redactPaths`) names no path: the original error,
+    // whose message may carry the lock path, stays in `cause` only.
     super(
-      `State file ${filePath} is unreadable (${detail}); ${disposition}; ${advice}`,
+      `State file${redactPaths === true ? '' : ` ${filePath}`} is unreadable (${detail}); ${disposition}; ${advice}`,
     );
     this.name = 'StateFileUnreadableError';
     this.filePath = filePath;
@@ -889,6 +892,7 @@ export async function readOrQuarantineVersionedRecordList<T>(
         error,
         undefined,
         false,
+        true,
       );
     }
     const code = errorCodeOf(error);
@@ -903,6 +907,7 @@ export async function readOrQuarantineVersionedRecordList<T>(
           error,
           undefined,
           false,
+          true,
         );
       }
     }

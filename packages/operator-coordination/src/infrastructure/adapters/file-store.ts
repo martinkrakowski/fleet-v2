@@ -277,6 +277,14 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/**
+ * A fresh quarantine copy name for `basename` given the first 12 hex of the
+ * sha256 of the copy's bytes; always matches `quarantineCopyPattern(basename)`.
+ */
+export function nextQuarantineCopyName(basename: string, digest12: string): string {
+  return `${basename}.${quarantineUtcStamp()}-${quarantineCounter++}.${digest12}`;
+}
+
 /** The quarantine copy name pattern for one store basename (see `quarantineUnreadable`). */
 function quarantineCopyPattern(basename: string): RegExp {
   return new RegExp(
@@ -426,7 +434,7 @@ export async function keepQuarantineCopy(
   if (typeof reusedPath === 'string') {
     return { quarantinePath: reusedPath, reused: true, chmodFailed: false, pruneFailures: 0 };
   }
-  const baseName = `${basename}.${quarantineUtcStamp()}-${quarantineCounter++}.${digest}`;
+  const baseName = nextQuarantineCopyName(basename, digest);
   await fsImpl.mkdir(quarantineDir, { recursive: true, mode: 0o700 });
   const writtenName = await writeFirstFreeCopy(quarantineDir, baseName, bytes, fsImpl);
   const quarantinePath = path.join(quarantineDir, writtenName);

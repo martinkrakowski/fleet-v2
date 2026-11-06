@@ -14,14 +14,17 @@ import {
   MAX_ORCHESTRATOR_REQUEST_STORE_BYTES,
   MAX_ORCHESTRATOR_REQUEST_STORE_RECORDS,
 } from '../../../application/ports/out/OrchestratorRequestRepositoryPort.out-port.js';
+import { OPERATOR_COORDINATION_STATE_FILES } from '../state-files.js';
 import {
   inspectVersionedRecordListBytes,
+  nextQuarantineCopyName,
   StateFileUnknownVersionError,
   withFileLock,
 } from '../file-store.js';
 import type { OrchestratorRequestRepositoryAdapterOptions } from '../OrchestratorRequestRepositoryAdapter.adapter.js';
 import {
   OrchestratorRequestRepositoryAdapter,
+  serializeOrchestratorRequestStore,
   parseOrchestratorRequestStateRecord,
   parseVersionedOrchestratorRequestStateRecord,
 } from '../OrchestratorRequestRepositoryAdapter.adapter.js';
@@ -733,6 +736,86 @@ describe('OrchestratorRequestRepositoryAdapter', () => {
     expect(await readOnly.list()).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
     expect(await readOnly.get(R1)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
     expect(await fileExists(path.join(tempDir, 'quarantine'))).toBe(false);
+  });
+
+  it('names a quarantined oversized store so state check lists it and state restore can read it, and restore applies the same readability rules', async () => {
+    const descriptor = OPERATOR_COORDINATION_STATE_FILES.find((entry) => entry.basename === 'orchestrator-requests.json')!;
+    const storePath = path.join(tempDir, 'orchestrator-requests.json');
+    await fs.writeFile(storePath, '');
+    await fs.truncate(storePath, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
+    const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
+    expect(await adapter.get(R1)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+    const [name] = await fs.readdir(path.join(tempDir, 'quarantine'));
+    expect(descriptor.isQuarantineCopyName(name!)).toBe(true);
+    const check = await descriptor.check(tempDir);
+    expect(check.result).toEqual({ status: 'missing' });
+    expect(check.quarantineCopies.map((copy) => copy.name)).toEqual([name]);
+    expect(check.quarantineCopies[0]!.sizeBytes).toBe(MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
+    const read = await descriptor.readQuarantineCopy(tempDir, name!);
+    expect(read.status).toBe('read');
+    // The copy exceeds the store's own byte cap, so restore (which re-validates the candidate with the reader's limits) refuses it.
+    const refused = await descriptor.restore({
+      stateDir: tempDir,
+      candidate: (read as { bytes: Buffer }).bytes,
+      expectedCurrentSha256: null,
+    });
+    expect(refused.status).toBe('refused');
+    await expect(fs.stat(storePath)).rejects.toMatchObject({ code: 'ENOENT' });
+    // A within-cap copy named by the same helper restores through the same descriptor.
+    const valid = Buffer.from(
+      JSON.stringify([{ schemaVersion: 1, ...initialRequest(R1) }], null, 2) + '\n',
+    );
+    const validName = nextQuarantineCopyName('orchestrator-requests.json', 'abcdef012345');
+    await fs.writeFile(path.join(tempDir, 'quarantine', validName), valid);
+    const validRead = await descriptor.readQuarantineCopy(tempDir, validName);
+    expect(validRead.status).toBe('read');
+    const restored = await descriptor.restore({
+      stateDir: tempDir,
+      candidate: (validRead as { bytes: Buffer }).bytes,
+      expectedCurrentSha256: null,
+    });
+    expect(restored).toMatchObject({ status: 'restored', recordCount: 1 });
+    expect((await adapter.get(R1)).outcome).toBe('found');
+  });
+
+  it('serializes at exactly the cap and refuses one byte over, and a save over the cap is refused before the store is replaced', async () => {
+    const payload = [{ schemaVersion: 1, ...initialRequest(R1) }];
+    const size = Buffer.byteLength(JSON.stringify(payload, null, 2) + '\n');
+    expect(serializeOrchestratorRequestStore(payload, size)?.byteLength).toBe(size);
+    expect(serializeOrchestratorRequestStore(payload, size - 1)).toBeNull();
+
+    const dir = await fs.mkdtemp(path.join(tempDir, 'cap-'));
+    const storePath = path.join(dir, 'orchestrator-requests.json');
+    const atCap = new OrchestratorRequestRepositoryAdapter({ stateDir: dir, maxStoreBytes: size });
+    expect((await atCap.save(initialRequest(R1), 0)).outcome).toBe('saved');
+    const before = await fs.readFile(storePath);
+    expect(before.byteLength).toBe(size);
+    expect(await atCap.save(initialRequest(R2), 0)).toEqual({
+      outcome: 'refused',
+      code: 'store-limit-exceeded',
+      requestId: R2,
+    });
+    expect((await fs.readFile(storePath)).equals(before)).toBe(true);
+    expect(await atCap.get(R2)).toEqual({ outcome: 'missing' });
+    expect((await fs.readdir(dir)).filter((entry) => entry.endsWith('.tmp'))).toEqual([]);
+
+    const overCap = new OrchestratorRequestRepositoryAdapter({ stateDir: path.join(dir, 'fresh'), maxStoreBytes: size - 1 });
+    expect(await overCap.save(initialRequest(R1), 0)).toMatchObject({ outcome: 'refused', code: 'store-limit-exceeded' });
+    await expect(fs.stat(path.join(dir, 'fresh', 'orchestrator-requests.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('copies list({states}) once during validation so a throwing includes getter on the caller array cannot escape', async () => {
+    const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
+    await adapter.save(initialRequest(R1), 0);
+    const states: string[] = ['queued'];
+    Object.defineProperty(states, 'includes', {
+      get() {
+        throw new Error('hostile includes');
+      },
+    });
+    const result = await adapter.list({ states: states as never });
+    expect(result).toMatchObject({ outcome: 'ok' });
+    expect(result.outcome === 'ok' ? result.requests.map((request) => request.requestId) : []).toEqual([R1]);
   });
 
   it('refuses colliding or unsafe store file names with invalid-store-config', async () => {

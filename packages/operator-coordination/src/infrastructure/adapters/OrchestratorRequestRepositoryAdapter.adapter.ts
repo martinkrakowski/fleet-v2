@@ -20,7 +20,8 @@
  * nothing. With `readOnly` the store never writes and never quarantines.
  */
 
-import { promises as fs } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { createReadStream, promises as fs } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 
 import { containsSecretShape } from '@fleet/shared';
@@ -62,10 +63,11 @@ import {
   assertValidSchemaVersionPolicy,
   FileLockTimeoutError,
   inspectVersionedRecordListBytes,
+  nextQuarantineCopyName,
   readStoreRecordSchemaVersion,
   rejectUnreadableStateFile,
   withFileLock,
-  writeJsonAtomically,
+  writeBytesAtomically,
   type VersionedRecordParseResult,
 } from './file-store.js';
 
@@ -103,6 +105,20 @@ export interface OrchestratorRequestRepositoryAdapterOptions {
   readonly changeSignal?: ChangeSignalPort;
   /** Read-only: saves are refused and an unreadable file is never quarantined. */
   readonly readOnly?: boolean;
+  /** Lower the 16 MiB serialized-store cap (never raise it); a save over it is refused before the store is replaced. */
+  readonly maxStoreBytes?: number;
+}
+
+/**
+ * The store's on-disk text (same format `writeJsonAtomically` used), or null
+ * when it would exceed `maxBytes`. Pure: nothing is written.
+ */
+export function serializeOrchestratorRequestStore(
+  payload: unknown,
+  maxBytes: number = MAX_ORCHESTRATOR_REQUEST_STORE_BYTES,
+): Buffer | null {
+  const bytes = Buffer.from(`${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  return bytes.byteLength > maxBytes ? null : bytes;
 }
 
 /** The stored record without its `schemaVersion` key (OrchestratorRequest.create refuses extra fields). */
@@ -300,15 +316,21 @@ function isClaimLeaseRenewal(
   return recordsDeepEqual(before, normalised);
 }
 
-let oversizedQuarantineCounter = 0;
+/** First 12 hex of the file's sha256, streamed so the file is never held in memory. */
+async function streamDigest12(target: string): Promise<string> {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(target)) {
+    hash.update(chunk as Buffer);
+  }
+  return hash.digest('hex').slice(0, 12);
+}
 
-/** Move an oversized store into `<dir>/quarantine/` by rename, without reading it. */
+/** Move an oversized store into `<dir>/quarantine/` by rename, named as `fleet-v2 state check` and `restore` expect. */
 async function quarantineOversizedStore(target: string): Promise<void> {
   const dir = join(dirname(target), 'quarantine');
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('.', '.');
-  oversizedQuarantineCounter += 1;
-  await fs.rename(target, join(dir, `${basename(target)}.${stamp}-oversized-${process.pid}-${oversizedQuarantineCounter}`));
+  const name = nextQuarantineCopyName(basename(target), await streamDigest12(target));
+  await fs.rename(target, join(dir, name));
 }
 
 /** Extract only a fixed POSIX error code; never a path or free-form message. */
@@ -391,6 +413,15 @@ function listQueryScalarsValid(values: Record<string, unknown>): boolean {
   return values.kind === undefined || isListedMember(ORCHESTRATOR_REQUEST_KINDS, values.kind);
 }
 
+/** A plain copy by index reads only, so no getter or iterator on the caller's array runs. */
+function copyStates(source: readonly OrchestratorRequestState[]): OrchestratorRequestState[] {
+  const copied: OrchestratorRequestState[] = [];
+  for (let index = 0; index < source.length; index += 1) {
+    copied.push(source[index]!);
+  }
+  return copied;
+}
+
 /** `states`: absent, or a plain, dense, bounded array of known states read by data descriptors. */
 function listQueryStatesValid(value: unknown): boolean {
   if (value === undefined) {
@@ -435,6 +466,20 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
 
   constructor(private readonly options: OrchestratorRequestRepositoryAdapterOptions = {}) {
     this.changeSignal = OrchestratorRequestRepositoryAdapter.extractChangeSignal(options);
+  }
+
+  /** The effective serialized-store cap: the port's 16 MiB, or a lower positive integer from the options (read as plain data, never trusted). */
+  private get maxStoreBytes(): number {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(this.options, 'maxStoreBytes');
+      const value: unknown = descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+      if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value < MAX_ORCHESTRATOR_REQUEST_STORE_BYTES) {
+        return value;
+      }
+    } catch {
+      // fall through to the port cap
+    }
+    return MAX_ORCHESTRATOR_REQUEST_STORE_BYTES;
   }
 
   get signalEmitFailures(): number {
@@ -494,7 +539,7 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
       if (proto !== Object.prototype && proto !== null) {
         return { kind: 'invalid-config' };
       }
-      const allowed = ['stateDir', 'fileName', 'changeSignal', 'readOnly'];
+      const allowed = ['stateDir', 'fileName', 'changeSignal', 'readOnly', 'maxStoreBytes'];
       const values: Record<string, unknown> = {};
       for (const key of Reflect.ownKeys(options)) {
         if (typeof key !== 'string' || !allowed.includes(key)) {
@@ -787,8 +832,12 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
               schemaVersion: ORCHESTRATOR_REQUEST_STORE_VERSION_POLICY.writerVersion,
               ...copy(item),
             }));
+          const serialized = serializeOrchestratorRequestStore(payload, this.maxStoreBytes);
+          if (serialized === null) {
+            return { outcome: 'refused', code: 'store-limit-exceeded', requestId: validated.requestId };
+          }
           try {
-            await writeJsonAtomically(target, payload);
+            await writeBytesAtomically(target, serialized);
           } catch (writeError: unknown) {
             return { outcome: 'unknown', code: 'io-error', errorCode: sanitizeErrorCode(writeError) };
           }
@@ -890,7 +939,9 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
       if (!listQueryLimitValid(values.limit)) {
         return null;
       }
-      return values as ParsedListQuery;
+      // Copy `states` once into a plain array so a caller's array (or its getters) is never touched again.
+      const states = values.states === undefined ? undefined : copyStates(values.states as readonly OrchestratorRequestState[]);
+      return { ...(values as ParsedListQuery), ...(states === undefined ? {} : { states }) };
     } catch {
       return null;
     }
@@ -930,7 +981,8 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
       matched = matched.filter((record) => record.state === parsed.state);
     }
     if (parsed.states !== undefined) {
-      matched = matched.filter((record) => parsed.states!.includes(record.state));
+      const states = parsed.states;
+      matched = matched.filter((record) => states.includes(record.state));
     }
     if (parsed.kind !== undefined) {
       matched = matched.filter((record) => record.kind === parsed.kind);

@@ -103,7 +103,8 @@ export function readStorableGateResult(value: unknown): StoredGatePassResult | n
     if (record.verdict !== 'pass') {
       return null;
     }
-    if (exitCode !== null && (typeof exitCode !== 'number' || !Number.isSafeInteger(exitCode))) {
+    // Only a command that exited 0 passed; a pass with any other exit is corrupt or stale, never a receipt.
+    if (exitCode !== 0) {
       return null;
     }
     if (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || durationMs < 0) {
@@ -112,7 +113,7 @@ export function readStorableGateResult(value: unknown): StoredGatePassResult | n
     if (typeof detail !== 'string' || detail.length > GATE_RECEIPT_MAX_DETAIL_LENGTH || isSecretShaped(detail)) {
       return null;
     }
-    const base = { verdict: 'pass' as const, exitCode: exitCode as number | null, durationMs, detail };
+    const base = { verdict: 'pass' as const, exitCode: 0, durationMs, detail };
     if (record.coverage === undefined) {
       return base;
     }

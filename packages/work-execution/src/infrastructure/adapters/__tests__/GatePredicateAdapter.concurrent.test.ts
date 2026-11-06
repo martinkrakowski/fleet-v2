@@ -586,6 +586,29 @@ describe('GatePredicateAdapter receipt reuse (KS2 key, KS3)', () => {
     expect(noTree.commandRuns).toBe(1);
   });
 
+  it('reuses a receipt for a coverage-declaring command only when the stored coverage meets the declaration', async () => {
+    const store = new InMemoryGateReceiptRecordStore();
+    const request = (minUnits: number): EvaluateGatePredicatesRequest => ({
+      ...requestWith(['a']),
+      spec: {
+        commitRequired: true,
+        diffCheck: true,
+        commands: [{ argv: ['a'], coverage: { reader: 'vitest-summary', unitKind: 'tests', minUnits } }],
+      },
+    });
+    const summary = { stdout: ' Tests  7 passed (7)\n' };
+    const first = new RecordingExecutor({ a: { result: summary } });
+    const ran = evaluated(
+      await makeAdapter(first, 2, { receiptReuse: wiring(store) }).evaluateGatePredicates(request(5)),
+    );
+    expect(ran[2]).toMatchObject({ verdict: 'pass' });
+    expect(store.size).toBe(1);
+    // The same declaration reuses the receipt.
+    const second = new RecordingExecutor({ a: { result: summary } });
+    await makeAdapter(second, 2, { receiptReuse: wiring(store) }).evaluateGatePredicates(request(5));
+    expect(second.commandRuns).toBe(0);
+  });
+
   it('never records or reuses a command that did not pass', async () => {
     const store = new InMemoryGateReceiptRecordStore();
     const failing = new RecordingExecutor({ a: { result: { exitCode: 1 } }, b: { result: { exitCode: null, error: 'timed out' } } });

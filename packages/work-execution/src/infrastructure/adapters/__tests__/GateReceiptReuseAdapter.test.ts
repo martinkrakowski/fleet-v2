@@ -78,6 +78,8 @@ describe('GateReceiptReuseAdapter', () => {
       { ...PASS, detail: 'x'.repeat(301) },
       { ...PASS, detail: 'leaked ' + secretShaped },
       { ...PASS, exitCode: 1.5 },
+      { ...PASS, exitCode: 1 },
+      { ...PASS, exitCode: null },
       { ...PASS, durationMs: -1 },
       { ...PASS, coverage: { ran: 'yes' } },
       { ...PASS, coverage: { ran: false, reason: secretShaped } },
@@ -144,6 +146,15 @@ describe('GateReceiptReuseAdapter', () => {
       });
       expect(await adapter.findGateReceipt(key)).toEqual({ outcome: 'miss', reason });
     }
+  });
+
+  it('is a miss for a stored pass with a nonzero exit code', async () => {
+    const key = makeKey();
+    const adapter = new GateReceiptReuseAdapter({
+      get: async () => ({ ...key, result: { ...PASS, exitCode: 1, detail: 'exit 1' } }),
+      putIfAbsent: async () => 'exists',
+    });
+    expect(await adapter.findGateReceipt(key)).toEqual({ outcome: 'miss', reason: 'stored-result-unreadable' });
   });
 
   it('bounds the default in-memory store', async () => {

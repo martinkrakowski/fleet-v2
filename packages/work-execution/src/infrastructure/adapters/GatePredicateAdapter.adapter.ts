@@ -241,6 +241,19 @@ function unknownResult(
   return { name, kind, verdict: 'unknown', exitCode: null, durationMs, detail };
 }
 
+/** Whether a stored coverage meets the command's declaration (none declared: any stored coverage is fine). */
+function coverageSatisfied(command: GateCommand, coverage: CheckCoverage | undefined): boolean {
+  if (command.coverage === undefined) {
+    return true;
+  }
+  return (
+    coverage !== undefined &&
+    coverage.ran &&
+    coverage.unitKind === command.coverage.unitKind &&
+    coverage.units >= command.coverage.minUnits
+  );
+}
+
 function isUsableRequest(request: EvaluateGatePredicatesRequest): boolean {
   if (request === null || typeof request !== 'object' || typeof request.worktreePath !== 'string') {
     return false;
@@ -384,34 +397,48 @@ export class GatePredicateAdapter implements GatePredicatePort {
     // Every command starts at once; the budget decides how many really run. Each
     // predicateForCommand call settles on its own and never throws, so one
     // command's failure or timeout cannot cancel or relabel another's result.
-    const commandResults: GatePredicateResult[] = [];
-    if (budget.capacity === 1) {
-      // One slot: exactly the sequential gate of old. The first non-pass stops the
-      // run and every later command is reported skipped and never executed.
-      for (const [index, command] of request.spec.commands.entries()) {
-        const blocked = gated || commandResults.some((result) => result.verdict !== 'pass');
-        commandResults.push(
-          blocked
-            ? skipped(commandName(command, index), 'command')
-            : await this.predicateForCommand(executor, request, command, index, gateSlot, budget, contextOnce),
-        );
-      }
-    } else {
-      commandResults.push(
-        ...(await Promise.all(
-          request.spec.commands.map((command, index) =>
-            gated
-              ? Promise.resolve(skipped(commandName(command, index), 'command'))
-              : this.predicateForCommand(executor, request, command, index, gateSlot, budget, contextOnce),
-          ),
-        )),
-      );
-    }
+    const commandResults = await this.runCommands(executor, request, gated, gateSlot, budget, contextOnce);
 
     return {
       outcome: 'evaluated',
       results: [commit, diff, ...commandResults].map(withBoundedDetail),
     };
+  }
+
+  /** The commands' results in declared order: sequential with one slot (first non-pass skips the rest), concurrent otherwise. */
+  private async runCommands(
+    executor: CommandExecutorPort,
+    request: EvaluateGatePredicatesRequest,
+    gated: boolean,
+    gateSlot: GateSlotConfiguration | undefined,
+    budget: GateSlotBudget,
+    contextOnce: () => Promise<ReceiptContext | null>,
+  ): Promise<GatePredicateResult[]> {
+    const commands = request.spec.commands;
+    if (budget.capacity !== 1) {
+      // Every command starts at once; the budget decides how many really run. Each
+      // predicateForCommand call settles on its own and never throws, so one
+      // command's failure or timeout cannot cancel or relabel another's result.
+      return Promise.all(
+        commands.map((command, index) =>
+          gated
+            ? Promise.resolve(skipped(commandName(command, index), 'command'))
+            : this.predicateForCommand(executor, request, command, index, gateSlot, budget, contextOnce),
+        ),
+      );
+    }
+    // One slot: exactly the sequential gate of old. The first non-pass stops the
+    // run and every later command is reported skipped and never executed.
+    const results: GatePredicateResult[] = [];
+    for (const [index, command] of commands.entries()) {
+      const blocked = gated || results.some((result) => result.verdict !== 'pass');
+      results.push(
+        blocked
+          ? skipped(commandName(command, index), 'command')
+          : await this.predicateForCommand(executor, request, command, index, gateSlot, budget, contextOnce),
+      );
+    }
+    return results;
   }
 
   /** The tree hash, toolchain versions and declared environment digest, or null when reuse is not wired. Never throws. */
@@ -465,7 +492,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
       if (wiring === undefined || key === null) {
         return await execute();
       }
-      const found = await this.findReceipt(wiring, key);
+      const found = await this.findReceipt(wiring, key, command);
       if (found !== null) {
         return { ...found, name, kind: 'command' };
       }
@@ -528,10 +555,15 @@ export class GatePredicateAdapter implements GatePredicatePort {
   private async findReceipt(
     wiring: GateReceiptReuseWiring,
     key: GateReceiptKey,
+    command: GateCommand,
   ): Promise<GatePredicateResult | null> {
     try {
       const found = await wiring.port.findGateReceipt(key);
-      if (found.outcome !== 'hit' || found.result.verdict !== 'pass') {
+      if (found.outcome !== 'hit' || found.result.verdict !== 'pass' || found.result.exitCode !== 0) {
+        return null;
+      }
+      // A declared coverage must be shown by the receipt too, or the command just runs.
+      if (!coverageSatisfied(command, found.result.coverage)) {
         return null;
       }
       return {

@@ -10,6 +10,7 @@ export * from "./InstallationReferenceAdapter.adapter.js";
 export * from "./LocalDesktopNotificationAdapter.adapter.js";
 export * from "./NoopChangeSignalAdapter.adapter.js";
 export * from "./ObservationPublicationAdapter.adapter.js";
+export * from "./OrchestratorRequestRepositoryAdapter.adapter.js";
 export * from "./OrchestratorSessionRepositoryAdapter.adapter.js";
 export * from "./OwnerItemRepositoryAdapter.adapter.js";
 export * from "./OwnerQuestionRepositoryAdapter.adapter.js";

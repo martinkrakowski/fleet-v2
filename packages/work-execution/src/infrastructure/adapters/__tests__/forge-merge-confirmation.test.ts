@@ -220,6 +220,7 @@ describe('ForgeActionAdapter merge confirmation after a non-zero gh exit', () =>
 });
 
 describe('ForgeActionAdapter.findOpenPullRequestsByHead (legacy PR lookup)', () => {
+  const BOUND = { owner: 'acme', repo: 'app' };
   const OWN_PR = (number: number, sha: string, owner: string, ref = BRANCH): unknown => ({
     number,
     head: { sha, ref, repo: { owner: { login: owner } } },
@@ -235,7 +236,7 @@ describe('ForgeActionAdapter.findOpenPullRequestsByHead (legacy PR lookup)', () 
       ]),
       stderr: '',
     });
-    const adapter = new ForgeActionAdapter({ runGh });
+    const adapter = new ForgeActionAdapter({ runGh, repository: BOUND });
 
     const result = await adapter.findOpenPullRequestsByHead({
       repository: 'acme/app',
@@ -257,12 +258,54 @@ describe('ForgeActionAdapter.findOpenPullRequestsByHead (legacy PR lookup)', () 
         throw new Error('spawn failed');
       },
     ]) {
-      const adapter = new ForgeActionAdapter({ runGh });
+      const adapter = new ForgeActionAdapter({ runGh, repository: BOUND });
       const result = await adapter.findOpenPullRequestsByHead({
         repository: 'acme/app',
         branchName: BRANCH,
       });
       expect(result.outcome).toBe('unreadable');
     }
+  });
+
+  it('refuses when no repository is bound, and never runs gh', async () => {
+    const { runGh, calls } = makeRunGh({ exitCode: 0, stdout: '[]', stderr: '' });
+    const adapter = new ForgeActionAdapter({ runGh });
+
+    const result = await adapter.findOpenPullRequestsByHead({
+      repository: 'acme/app',
+      branchName: BRANCH,
+    });
+
+    expect(result).toEqual({ outcome: 'unreadable', reason: 'legacy-pr-lookup-unbound-repository' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses a query for a repository other than the bound one, and never runs gh', async () => {
+    const { runGh, calls } = makeRunGh({ exitCode: 0, stdout: '[]', stderr: '' });
+    const adapter = new ForgeActionAdapter({ runGh, repository: BOUND });
+
+    const result = await adapter.findOpenPullRequestsByHead({
+      repository: 'other-owner/app',
+      branchName: BRANCH,
+    });
+
+    expect(result).toEqual({ outcome: 'unreadable', reason: 'legacy-pr-lookup-repository-mismatch' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('measures the response in bytes: a multibyte answer over the cap is refused', async () => {
+    const entry = { ...(OWN_PR(7, HEAD_SHA, 'acme') as object), pad: '\u00e9'.repeat(140_000) };
+    const stdout = JSON.stringify([entry]);
+    expect(stdout.length).toBeLessThan(262_144);
+    expect(Buffer.byteLength(stdout, 'utf8')).toBeGreaterThan(262_144);
+    const { runGh } = makeRunGh({ exitCode: 0, stdout, stderr: '' });
+    const adapter = new ForgeActionAdapter({ runGh, repository: BOUND });
+
+    const result = await adapter.findOpenPullRequestsByHead({
+      repository: 'acme/app',
+      branchName: BRANCH,
+    });
+
+    expect(result.outcome).toBe('unreadable');
   });
 });

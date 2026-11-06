@@ -932,7 +932,13 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       return { reason: "legacy-pr-lookup-unreadable" };
     }
     if (answer.outcome !== "read") {
-      return { reason: "legacy-pr-lookup-unreadable" };
+      // The adapter's own typed reasons (unbound or mismatched repository)
+      // pass through; any other unreadable answer is the generic reason.
+      return {
+        reason: answer.reason.startsWith("legacy-pr-lookup-")
+          ? answer.reason
+          : "legacy-pr-lookup-unreadable",
+      };
     }
     if (answer.pullRequests.length === 0) {
       return { reason: "legacy-pr-lookup-none-found" };

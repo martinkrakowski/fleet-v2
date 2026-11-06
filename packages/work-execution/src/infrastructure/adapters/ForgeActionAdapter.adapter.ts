@@ -197,7 +197,7 @@ function snapshotCreateBranchRequest(request: object): MergeForgeCreateBranchReq
 /** Bounds for the legacy open-pull-request head lookup. */
 const PR_HEAD_LOOKUP_TIMEOUT_MS = 15_000;
 const PR_HEAD_LOOKUP_PAGE = 20;
-const MAX_PR_LOOKUP_BODY_CHARS = 262_144;
+const MAX_PR_LOOKUP_BODY_BYTES = 262_144;
 
 /** The largest ref body a branch-head read parses. */
 const MAX_REF_BODY_CHARS = 65_536;
@@ -243,16 +243,25 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     if (parts.length !== 2 || !namePattern.test(owner) || !namePattern.test(repo)) {
       return { outcome: 'unreadable', reason: 'the repository is not owner/repo' };
     }
+    // The head owner always comes from the bound repository, never from the
+    // query: an unbound adapter refuses, and a query for another repository
+    // refuses.
     const bound = this.delegate?.repository;
-    if (bound !== undefined && (bound.owner !== owner || bound.repo !== repo)) {
-      return { outcome: 'unreadable', reason: 'the repository is not the bound repository' };
+    if (bound === undefined) {
+      return { outcome: 'unreadable', reason: 'legacy-pr-lookup-unbound-repository' };
+    }
+    if (
+      bound.owner.toLowerCase() !== owner.toLowerCase() ||
+      bound.repo.toLowerCase() !== repo.toLowerCase()
+    ) {
+      return { outcome: 'unreadable', reason: 'legacy-pr-lookup-repository-mismatch' };
     }
     if (!isSafeBranchName(query.branchName)) {
       return { outcome: 'unreadable', reason: 'the branch name is not safe' };
     }
     const args = [
       'api',
-      `repos/${owner}/${repo}/pulls?head=${encodeURIComponent(`${owner}:${query.branchName}`)}&state=open&per_page=${PR_HEAD_LOOKUP_PAGE}`,
+      `repos/${bound.owner}/${bound.repo}/pulls?head=${encodeURIComponent(`${bound.owner}:${query.branchName}`)}&state=open&per_page=${PR_HEAD_LOOKUP_PAGE}`,
     ];
     let gh: GhInvocationResult;
     try {
@@ -260,7 +269,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     } catch {
       return { outcome: 'unreadable', reason: 'the pull request lookup could not complete' };
     }
-    if (gh.exitCode !== 0 || typeof gh.stdout !== 'string' || gh.stdout.length > MAX_PR_LOOKUP_BODY_CHARS) {
+    if (gh.exitCode !== 0 || typeof gh.stdout !== 'string' || Buffer.byteLength(gh.stdout, 'utf8') > MAX_PR_LOOKUP_BODY_BYTES) {
       return { outcome: 'unreadable', reason: 'the pull request lookup failed' };
     }
     let parsed: unknown;
@@ -289,7 +298,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
         typeof sha !== 'string' ||
         record?.head?.ref !== query.branchName ||
         typeof login !== 'string' ||
-        login.toLowerCase() !== owner.toLowerCase()
+        login.toLowerCase() !== bound.owner.toLowerCase()
       ) {
         // A malformed, fork-headed or other-branch entry is ignored.
         continue;

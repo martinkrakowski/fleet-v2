@@ -333,6 +333,7 @@ async function makeHarness(
         },
       }),
       isConfigured: () => true,
+      listOpenPullRequestsByBase: async () => ({ outcome: "unavailable" as const, reason: "not-used" }),
     },
     ciState: {
       readHeadCiState: async (request) => ({ headSha: request.headSha, state: 'passed', reason: 'read' }),

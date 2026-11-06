@@ -68,7 +68,12 @@ export function keepRunAttempts(
   listed: readonly AttemptRecord[],
 ): readonly AttemptRecord[] | null {
   const kept: AttemptRecord[] = [];
+  const seen = new Set<string>();
   for (const attemptId of run.attemptIds) {
+    if (seen.has(attemptId)) {
+      return null;
+    }
+    seen.add(attemptId);
     const found = listed.find((attempt) => attempt.id === attemptId);
     if (found === undefined) {
       return null;
@@ -291,7 +296,7 @@ export class AppendScorecardUseCase implements AppendScorecardPort {
         const headCommit = attempt.artifacts?.headCommit;
         if (typeof headCommit === 'string' && headCommit.length > 0) {
           const read = await deps.receipts.readReceiptsForHead(attempt.id, headCommit);
-          if (read.outcome === 'unavailable') {
+          if (read.outcome !== 'found' && read.outcome !== 'none') {
             return null;
           }
           reads.push(read);

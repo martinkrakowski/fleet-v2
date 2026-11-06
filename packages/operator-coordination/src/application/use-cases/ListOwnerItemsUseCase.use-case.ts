@@ -26,7 +26,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /** The only keys a filter may carry; any other key is a malformed filter, never an unfiltered read. */
-const FILTER_KEYS: readonly (string | symbol)[] = ['projectId', 'state', 'kind'];
+const FILTER_KEYS: ReadonlySet<string | symbol> = new Set(['projectId', 'state', 'kind']);
 
 export interface ListOwnerItemsDependencies {
   readonly itemRepo: OwnerItemRepositoryPort;
@@ -70,7 +70,7 @@ export class ListOwnerItemsUseCase implements ListOwnerItemsPort {
     let kind: unknown;
     let unknownKey = false;
     try {
-      unknownKey = Reflect.ownKeys(request).some((key) => !FILTER_KEYS.includes(key));
+      unknownKey = Reflect.ownKeys(request).some((key) => !FILTER_KEYS.has(key));
       projectId = request.projectId;
       state = request.state;
       kind = request.kind;

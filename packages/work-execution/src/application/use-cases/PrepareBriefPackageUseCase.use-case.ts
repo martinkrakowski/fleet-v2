@@ -22,7 +22,21 @@ import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateAllowedPathPrefix } from '../../domain/lane-diff-check.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isPlanSecretShaped } from '../../domain/lane-plan-sidecar.js';
+import { isPlainRecordObject } from '../../domain/record-schema-version.js';
+import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 import { AcceptanceSpec, isAcceptanceSpecShellError } from '../../domain/value-objects/AcceptanceSpec.vo.js';
+import { ExecutionLimits } from '../../domain/value-objects/ExecutionLimits.vo.js';
+import {
+  BRIEF_PACKAGE_SCHEMA_VERSION,
+  BRIEF_PACKAGE_MAX_STEP_LIMIT,
+  BRIEF_PACKAGE_MAX_TIME_LIMIT_SECONDS,
+  BRIEF_PACKAGE_MAX_RESOURCE_BOUNDS,
+  BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS,
+  BRIEF_PACKAGE_MAX_RESOURCE_VALUE_CHARS,
+  BRIEF_PACKAGE_MAX_DECISION_REFS,
+  BRIEF_PACKAGE_MAX_PATH_CHARS,
+  BriefPackage,
+} from '../../domain/value-objects/BriefPackage.vo.js';
 import type {
   BriefContextDecision,
   PrepareBriefPackagePort,
@@ -137,6 +151,121 @@ function prNotesError(notes: unknown): string | null {
     }
   }
   return null;
+}
+
+/**
+ * CO28b: the structured frozen inputs are validated — and the typed
+ * `ExecutionLimits` is constructed — before any outbound call (authoring,
+ * ignored-path verification or placement), so a rejected freeze writes
+ * nothing to the worktree and a failing `ExecutionLimits.create` can never
+ * be quietly downgraded to `null` limits on the frozen package. Returns the
+ * validated limits or a fixed, path-free and value-free reason.
+ */
+function validateFrozenInputs(
+  request: PrepareBriefPackageRequest,
+): { readonly ok: true; readonly limits: ExecutionLimits } | { readonly ok: false; readonly reason: string } {
+  if (
+    typeof request.stepLimit !== 'number' ||
+    typeof request.timeLimitSeconds !== 'number' ||
+    !Number.isFinite(request.stepLimit) ||
+    !Number.isFinite(request.timeLimitSeconds) ||
+    request.stepLimit <= 0 ||
+    request.timeLimitSeconds <= 0
+  ) {
+    return { ok: false, reason: 'stepLimit and timeLimitSeconds must be positive' };
+  }
+  if (!Number.isSafeInteger(request.stepLimit) || request.stepLimit > BRIEF_PACKAGE_MAX_STEP_LIMIT) {
+    return {
+      ok: false,
+      reason: `stepLimit must be a whole number between 1 and ${BRIEF_PACKAGE_MAX_STEP_LIMIT}`,
+    };
+  }
+  if (
+    !Number.isSafeInteger(request.timeLimitSeconds) ||
+    request.timeLimitSeconds > BRIEF_PACKAGE_MAX_TIME_LIMIT_SECONDS
+  ) {
+    return {
+      ok: false,
+      reason: `timeLimitSeconds must be a whole number between 1 and ${BRIEF_PACKAGE_MAX_TIME_LIMIT_SECONDS}`,
+    };
+  }
+  const boundsSnapshot = snapshotPlainDataRecord(request.resourceBounds);
+  if (boundsSnapshot === null) {
+    return { ok: false, reason: 'resourceBounds must be an object of string values' };
+  }
+  if (Object.keys(boundsSnapshot).length > BRIEF_PACKAGE_MAX_RESOURCE_BOUNDS) {
+    return {
+      ok: false,
+      reason: `resourceBounds must hold at most ${BRIEF_PACKAGE_MAX_RESOURCE_BOUNDS} entries`,
+    };
+  }
+  // The bounds are sorted here once, so the manifest, the digest input and
+  // the frozen `ExecutionLimits` all carry the same deterministic key order.
+  const sortedBounds: Record<string, string> = {};
+  for (const key of Object.keys(boundsSnapshot).sort()) {
+    if (key.trim().length === 0 || key.includes('\u0000') || key.length > BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS) {
+      return {
+        ok: false,
+        reason: `resourceBounds keys must be non-empty strings of at most ${BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS} characters`,
+      };
+    }
+    const value = boundsSnapshot[key];
+    if (typeof value !== 'string' || value.includes('\u0000') || value.length > BRIEF_PACKAGE_MAX_RESOURCE_VALUE_CHARS) {
+      return {
+        ok: false,
+        reason: `resourceBounds values must be strings of at most ${BRIEF_PACKAGE_MAX_RESOURCE_VALUE_CHARS} characters`,
+      };
+    }
+    if (isPlanSecretShaped(key) || isPlanSecretShaped(value)) {
+      return { ok: false, reason: 'resourceBounds contains a secret-shaped value and was refused' };
+    }
+    sortedBounds[key] = value;
+  }
+  const decisions = request.ownerDecisionReferences;
+  if (!Array.isArray(decisions)) {
+    return { ok: false, reason: 'ownerDecisionReferences must be an array of strings' };
+  }
+  if (decisions.length > BRIEF_PACKAGE_MAX_DECISION_REFS) {
+    return {
+      ok: false,
+      reason: `ownerDecisionReferences must hold at most ${BRIEF_PACKAGE_MAX_DECISION_REFS} entries`,
+    };
+  }
+  for (let index = 0; index < decisions.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(decisions, index);
+    if (descriptor === undefined || !descriptor.enumerable || descriptor.get !== undefined) {
+      return { ok: false, reason: 'ownerDecisionReferences must be a dense array of strings' };
+    }
+    const entry = decisions[index];
+    if (
+      typeof entry !== 'string' ||
+      entry.trim().length === 0 ||
+      // A NUL-bearing reference must be refused here, before authoring and
+      // ignored-path verification run against an input the domain would
+      // reject only at the very end of the pipeline.
+      entry.includes('\u0000') ||
+      entry.length > BRIEF_PACKAGE_MAX_PATH_CHARS
+    ) {
+      return {
+        ok: false,
+        reason: `ownerDecisionReferences entries must be non-empty strings of at most ${BRIEF_PACKAGE_MAX_PATH_CHARS} characters`,
+      };
+    }
+    if (isPlanSecretShaped(entry)) {
+      return { ok: false, reason: 'ownerDecisionReferences contains a secret-shaped value and was refused' };
+    }
+  }
+  // The typed limits are created up front: a failure here is a request
+  // rejection, never a silent `null` limits field on the frozen package.
+  const limitsCreated = ExecutionLimits.create({
+    stepLimit: request.stepLimit,
+    timeLimitSeconds: request.timeLimitSeconds,
+    resourceBounds: sortedBounds,
+  });
+  if (!limitsCreated.success || limitsCreated.value === undefined) {
+    return { ok: false, reason: 'Execution limits are invalid for a frozen brief' };
+  }
+  return { ok: true, limits: limitsCreated.value };
 }
 
 /** Fail-closed model-family comparison (owner rule 2026-10-16). */
@@ -432,6 +561,8 @@ type BuiltBriefPackage =
       readonly plan: SeatPlan | undefined;
       readonly decisions: readonly BriefContextDecision[];
       readonly selectedKnowledgeVersions: readonly SelectedKnowledgeVersion[];
+      /** The validated private copy of the request; the only source for everything after the build. */
+      readonly request: PrepareBriefPackageUseCaseRequest;
     };
 
 /**
@@ -472,13 +603,25 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
    * write. A rejection reason here is the same reason a prepare would give.
    */
   private async build(
-    request: PrepareBriefPackageUseCaseRequest,
+    callerRequest: PrepareBriefPackageUseCaseRequest,
     deps: PrepareBriefPackageDependencies,
     forPreview = false,
   ): Promise<BuiltBriefPackage> {
+    // CO28b: the caller's request is copied once, synchronously, before any
+    // validation or outbound call. Every check and every later read (the
+    // manifest, the digest, `BriefPackage.create`, the placement) uses this
+    // private copy only, so a caller mutating its own arrays or objects
+    // while authoring or ignored-path verification is awaited cannot change
+    // what was validated. A request that cannot be copied (a throwing
+    // getter, a function value) is refused by the callers' catch.
+    const request: PrepareBriefPackageUseCaseRequest = structuredClone(callerRequest);
     const fieldsError = validateBriefFields(request);
     if (fieldsError !== null) {
       return { reason: fieldsError };
+    }
+    const frozenCheck = validateFrozenInputs(request);
+    if (!frozenCheck.ok) {
+      return { reason: frozenCheck.reason };
     }
     const pathsCheck = validatePathsAndSpec(request);
     if ('reason' in pathsCheck) {
@@ -543,8 +686,13 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       .filter((decision) => decision.accepted)
       .map((decision) => ({ knowledgeEntryId: decision.knowledgeEntryId, version: decision.version }));
 
+    // The bounds were validated and sorted before any outbound call; the
+    // limits instance owns its own copy, so the manifest reads from it.
+    const sortedResourceBounds: Readonly<Record<string, string>> = frozenCheck.limits.getResourceBounds();
+
     const manifestJson = JSON.stringify(
       {
+        schemaVersion: BRIEF_PACKAGE_SCHEMA_VERSION,
         attemptId,
         workOrderId: request.workOrderId,
         projectId: request.projectId,
@@ -563,7 +711,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
         acceptanceSpec: pathsCheck.acceptanceSpec.toJSON(),
         stepLimit: request.stepLimit,
         timeLimitSeconds: request.timeLimitSeconds,
-        resourceBounds: request.resourceBounds,
+        resourceBounds: sortedResourceBounds,
         expectedArtifacts: request.expectedArtifacts,
         ownerDecisionReferences: request.ownerDecisionReferences,
         ...(request.prNotes !== undefined
@@ -586,6 +734,38 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       ? deps.computeDigest(briefContent)
       : simpleDeterministicHexDigest(briefContent);
 
+    // CO28b: the frozen package must pass domain validation before any
+    // placement; a refusal here leaves the worktree untouched. The typed
+    // limits were already validated before any outbound call, so a valid
+    // package can never carry `null` limits.
+    const pkg = BriefPackage.create({
+      schemaVersion: BRIEF_PACKAGE_SCHEMA_VERSION,
+      attemptId,
+      briefDigest,
+      prosePath: '.lane/brief.md',
+      manifestPath: '.lane/brief-manifest.json',
+      baseCommit: request.baseCommit,
+      policyRevision: request.policyRevision,
+      independentReviewer: request.independentReviewer,
+      ownedPaths: request.ownedPaths,
+      acceptanceSpec: pathsCheck.acceptanceSpec,
+      limits: frozenCheck.limits,
+      selectedContextVersions: selectedKnowledgeVersions,
+      ownerDecisionReferences: request.ownerDecisionReferences,
+      seatPlan: reviewerCheck.plan ?? null,
+      prNotes:
+        request.prNotes !== undefined
+          ? {
+              hardToUndo: request.prNotes.hardToUndo,
+              assumptions: request.prNotes.assumptions,
+              challengeThis: request.prNotes.challengeThis,
+            }
+          : null,
+    });
+    if (!pkg.success) {
+      return { reason: 'Brief package failed domain validation' };
+    }
+
     return {
       authored,
       attemptId,
@@ -596,6 +776,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       plan: reviewerCheck.plan,
       decisions,
       selectedKnowledgeVersions,
+      request,
     };
   }
 
@@ -605,8 +786,18 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     if (!this.deps) {
       throw new Error('Not implemented: PrepareBriefPackageUseCase');
     }
+    // CO28b: a runtime request that is not a plain object (null, primitive,
+    // array or hostile record) is refused, never thrown on.
+    if (!isPlainRecordObject(request)) {
+      return { outcome: 'rejected', reason: 'Brief request must be a plain object' };
+    }
 
-    const built = await this.build(request, this.deps);
+    let built;
+    try {
+      built = await this.build(request, this.deps);
+    } catch {
+      return { outcome: 'rejected', reason: 'Brief request could not be read safely' };
+    }
     if ('reason' in built) {
       return {
         outcome: 'rejected',
@@ -620,7 +811,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       worktreePath: built.worktreePath,
       proseMarkdown: built.authored.brief.proseMarkdown,
       manifestJson: built.manifestJson,
-      ...(request.recordedHost !== undefined ? { recordedHost: request.recordedHost } : {}),
+      ...(built.request.recordedHost !== undefined ? { recordedHost: built.request.recordedHost } : {}),
     });
     if (placed.outcome === 'refused') {
       return { outcome: 'rejected', reason: placed.reason };
@@ -659,10 +850,21 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       throw new Error('Not implemented: PrepareBriefPackageUseCase');
     }
 
+    // CO28b: a runtime request that is not a plain object (null, primitive,
+    // array or hostile record) is refused, never thrown on.
+    if (!isPlainRecordObject(request)) {
+      return { outcome: 'rejected', reason: 'Brief request must be a plain object' };
+    }
+
     // Preview rejections never echo artifact or offending paths: the preview
     // result must contain no path, so build maps path-bearing rejections to
     // fixed reasons when forPreview is set.
-    const built = await this.build(request, this.deps, true);
+    let built;
+    try {
+      built = await this.build(request, this.deps, true);
+    } catch {
+      return { outcome: 'rejected', reason: 'Brief request could not be read safely' };
+    }
     if ('reason' in built) {
       return {
         outcome: 'rejected',
@@ -678,9 +880,9 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       attemptId: built.attemptId,
       briefDigest: built.briefDigest,
       modelAssignment: {
-        model: request.modelAssignment.model,
-        variant: request.modelAssignment.variant,
-        seatTool: request.modelAssignment.seatTool,
+        model: built.request.modelAssignment.model,
+        variant: built.request.modelAssignment.variant,
+        seatTool: built.request.modelAssignment.seatTool,
       },
       seatPlan: built.plan?.toJSON() ?? null,
       acceptance: {
@@ -689,7 +891,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
         commandCount: commands.length,
         commandDigests,
       },
-      prNotesPresent: request.prNotes !== undefined,
+      prNotesPresent: built.request.prNotes !== undefined,
       selectedKnowledgeVersions: built.selectedKnowledgeVersions,
     };
     return { outcome: 'previewed', preview };

@@ -613,7 +613,7 @@ describe("fleet_work_order", () => {
   });
 });
 
-describe("new read tool names", () => {
+describe("tool names after the read lanes", () => {
   it("are present in FLEET_TOOL_NAMES in order", () => {
     expect([...FLEET_TOOL_NAMES]).toEqual([
       "fleet_coordination",
@@ -629,6 +629,7 @@ describe("new read tool names", () => {
       "fleet_conductor_status",
       "fleet_brief_preview",
       "fleet_telemetry_status",
+      "fleet_seat_observe",
     ]);
   });
 });

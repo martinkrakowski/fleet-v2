@@ -38,6 +38,18 @@ const VIEWS = [
     ),
   },
   {
+    href: "/todo",
+    label: "To-do",
+    sample: false,
+    icon: (
+      <svg className="ic" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 6l2 2 4-4" />
+        <path d="M4 12l2 2 4-4" />
+        <path d="M4 18l2 2 4-4" />
+      </svg>
+    ),
+  },
+  {
     href: "/questions",
     label: "Questions",
     sample: false,
@@ -83,16 +95,30 @@ const VIEWS = [
   },
 ];
 
-function countSuffix(href: string, openQuestions: number | null): string {
-  if (href !== "/questions" || openQuestions === null) return "";
-  if (openQuestions === 0) return " (none open)";
-  return " (" + openQuestions + " open)";
+function countSuffix(
+  href: string,
+  openQuestions: number | null,
+  openTodos: number | null,
+): string {
+  if (href === "/questions") {
+    if (openQuestions === null) return "";
+    if (openQuestions === 0) return " (none open)";
+    return " (" + openQuestions + " open)";
+  }
+  if (href === "/todo") {
+    if (openTodos === null) return "";
+    if (openTodos === 0) return " (none to do)";
+    return " (" + openTodos + " to do)";
+  }
+  return "";
 }
 
 export function ViewNav({
   openQuestions,
+  openTodos,
 }: {
   openQuestions: number | null;
+  openTodos: number | null;
 }) {
   const pathname = usePathname();
   return (
@@ -102,7 +128,7 @@ export function ViewNav({
         {VIEWS.map((view) => {
           const name =
             (view.sample ? view.label + " (sample data)" : view.label) +
-            countSuffix(view.href, openQuestions);
+            countSuffix(view.href, openQuestions, openTodos);
           return (
             <Link
               key={view.href}
@@ -125,6 +151,11 @@ export function ViewNav({
               openQuestions !== null &&
               openQuestions > 0 ? (
                 <span className="sidebar-badge">{openQuestions}</span>
+              ) : null}
+              {view.href === "/todo" &&
+              openTodos !== null &&
+              openTodos > 0 ? (
+                <span className="sidebar-badge">{openTodos}</span>
               ) : null}
             </Link>
           );

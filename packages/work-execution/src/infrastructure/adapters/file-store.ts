@@ -219,7 +219,7 @@ export interface QuarantineFs {
 /**
  * Error thrown when a JSON state file cannot be parsed or validated. The
  * quarantine path names the byte-exact copy kept for recovery; it is null
- * only when the copy itself failed.
+ * only when the copy itself failed or quarantine was never attempted.
  */
 export class StateFileUnreadableError extends Error {
   readonly filePath: string;
@@ -232,6 +232,8 @@ export class StateFileUnreadableError extends Error {
     detail: string,
     copyError?: unknown,
     postWriteNotes?: QuarantinePostWriteNotes,
+    quarantineAttempted?: boolean,
+    redactPaths?: boolean,
   ) {
     const notes: string[] = [];
     if (postWriteNotes?.chmodFailed === true) {
@@ -244,21 +246,40 @@ export class StateFileUnreadableError extends Error {
       notes.push(`pruning old copies failed (${postWriteNotes.pruneFailures})`);
     }
     let disposition: string;
+    let advice: string;
     if (quarantinePath !== null) {
       const notesSuffix = notes.length > 0 ? `; ${notes.join('; ')}` : '';
       disposition = `its bytes were kept at ${quarantinePath}${notesSuffix}`;
+      advice = 'restore it from that copy or repair it by hand; no command reads or writes this store until then';
+    } else if (quarantineAttempted === false) {
+      // Quarantine was never reached (for example a lock-side refusal), so
+      // claiming the bytes could not be copied and advising a manual repair
+      // would mislead the operator: nothing was read to quarantine and the
+      // store bytes were not modified.
+      disposition =
+        redactPaths !== true && copyError instanceof Error && copyError.message !== ''
+          ? `no quarantine was attempted (${copyError.message})`
+          : 'no quarantine was attempted';
+      advice = 'the store bytes were not modified; resolve the reported condition and retry';
     } else if (copyError instanceof Error && copyError.message !== '') {
       disposition = `its bytes could not be copied (${copyError.message})`;
+      advice = 'restore it from that copy or repair it by hand; no command reads or writes this store until then';
     } else {
       disposition = 'its bytes could not be copied';
+      advice = 'restore it from that copy or repair it by hand; no command reads or writes this store until then';
     }
+    // A lock-side refusal (`redactPaths`) names no path: the original error,
+    // whose message may carry the lock path, stays in `cause` only.
     super(
-      `State file ${filePath} is unreadable (${detail}); ${disposition}; restore it from that copy or repair it by hand; no command reads or writes this store until then`,
+      `State file${redactPaths === true ? '' : ` ${filePath}`} is unreadable (${detail}); ${disposition}; ${advice}`,
     );
     this.name = 'StateFileUnreadableError';
     this.filePath = filePath;
     this.quarantinePath = quarantinePath;
     this.detail = detail;
+    if (copyError !== undefined) {
+      this.cause = copyError;
+    }
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
@@ -790,7 +811,10 @@ function classifyBoundedStoreRead<T>(
  * the lock, leaving `filePath` in place so later reads/writes still fail
  * closed. A healthy read takes the unlocked fast path and creates no lock file.
  * A read-only store never locks, creates directories or writes quarantine
- * copies; it throws `StateFileUnreadableReadOnlyError`.
+ * copies; it throws `StateFileUnreadableReadOnlyError`. Lock-side failures on
+ * a corrupt read are typed refusals: a lock timeout or an unwritable state
+ * directory throws `StateFileUnreadableError` (with `quarantinePath: null` and
+ * the original error as cause), never a raw errno or `FileLockTimeoutError`.
  */
 export async function readOrQuarantineVersionedRecordList<T>(
   options: ReadOrQuarantineVersionedStoreOptions<T>,
@@ -816,7 +840,7 @@ export async function readOrQuarantineVersionedRecordList<T>(
       throw new StateFileUnreadableReadOnlyError(options.filePath, locked.detail);
     }
     if (locked.kind === 'unquarantinable') {
-      throw new StateFileUnreadableError(options.filePath, null, locked.detail);
+      throw new StateFileUnreadableError(options.filePath, null, locked.detail, undefined, undefined, false);
     }
     if (!(await isAbsentOrRealDirectory(path.join(path.dirname(options.filePath), 'quarantine')))) {
       throw new StateFileUnreadableError(
@@ -843,7 +867,52 @@ export async function readOrQuarantineVersionedRecordList<T>(
   if (readOnly) {
     throw new StateFileUnreadableReadOnlyError(options.filePath, fast.detail);
   }
-  return withFileLock(`${options.filePath}.lock`, runUnderLock, { timeoutMs: lockTimeoutMs });
+  if (fast.kind === 'unquarantinable') {
+    // A symlink, oversized or non-regular store is refused without reading or
+    // copying it, so taking the store lock would write nothing. Refuse
+    // directly instead of entering `withFileLock`.
+    throw new StateFileUnreadableError(options.filePath, null, fast.detail, undefined, undefined, false);
+  }
+
+  const lockPath = `${options.filePath}.lock`;
+  try {
+    return await withFileLock(lockPath, runUnderLock, { timeoutMs: lockTimeoutMs });
+  } catch (error: unknown) {
+    // Lock-side failures are typed refusals, never raw errnos: a writer's
+    // lock that outlives `lockTimeoutMs` and an unwritable state directory
+    // (EACCES/EROFS/EPERM from `withFileLock`'s mkdir or open('wx')) both
+    // surface as `StateFileUnreadableError` with the original error as cause.
+    // Real I/O failures from reading the store itself (EACCES, EIO, EMFILE
+    // from lstat/open/read) are NOT mapped here and propagate unchanged.
+    if (error instanceof FileLockTimeoutError) {
+      throw new StateFileUnreadableError(
+        options.filePath,
+        null,
+        `timed out waiting for the store lock after ${lockTimeoutMs}ms`,
+        error,
+        undefined,
+        false,
+        true,
+      );
+    }
+    const code = errorCodeOf(error);
+    if (code === 'EACCES' || code === 'EROFS' || code === 'EPERM') {
+      const failedPath =
+        typeof error === 'object' && error !== null ? (error as { path?: unknown }).path : undefined;
+      if (failedPath === lockPath || failedPath === path.dirname(lockPath)) {
+        throw new StateFileUnreadableError(
+          options.filePath,
+          null,
+          `the state directory is not writable (${code})`,
+          error,
+          undefined,
+          false,
+          true,
+        );
+      }
+    }
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -52,3 +52,19 @@ export function consumptionId(actionId: string): string {
 export function observationEventKind(action: string, status: string): string {
   return `execution:${action}:${status}`;
 }
+
+/**
+ * C2': the coordination action scope for removing one attempt's unsealed
+ * worktree. It binds to the attempt and to the exact worktree path digest (a
+ * SHA-256 of the absolute path, computed by the caller), so a different
+ * worktree — or a moved path — is a different scope, and no filesystem path
+ * is ever placed into coordination state or output.
+ */
+export function unsealedWorktreeRemovalScope(attemptId: string, worktreePathSha256: string): string {
+  return `worktree:remove-unsealed:${attemptId}:${worktreePathSha256}`;
+}
+
+/** Deterministic consumption identifier for one unsealed worktree removal. */
+export function unsealedWorktreeRemovalActionId(runId: string, attemptId: string): string {
+  return `reap-unsealed:${runId}:${attemptId}`;
+}

@@ -156,6 +156,23 @@ const LEGACY_LOOKUP_PASS_THROUGH_REASONS: ReadonlySet<string> = new Set([
   "legacy-pr-lookup-repository-mismatch",
 ]);
 
+/**
+ * The comparison key of an `owner/repo` (WB5b2), one function for both sides:
+ * trimmed, one trailing `.git` stripped, lower-cased by an explicit ASCII map
+ * (never Unicode case folding, which maps the Kelvin sign to `k`), and null
+ * unless owner and repo are non-empty and use only `[A-Za-z0-9_.-]`.
+ */
+function canonicalRepositoryKey(raw: string): string | null {
+  let value = raw.trim();
+  if (value.endsWith(".git")) {
+    value = value.slice(0, -4);
+  }
+  const lowered = value.replace(/[A-Z]/g, (letter) =>
+    String.fromCharCode(letter.charCodeAt(0) + 32),
+  );
+  return /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(lowered) ? lowered : null;
+}
+
 /** The longest `actionId` whose completed journal id still fits the merge record's `actionRef`. */
 function actionIdFitsActionRef(actionId: string): boolean {
   return (
@@ -1015,28 +1032,30 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     });
   }
 
-  /** `repository-unbound` or `repository-mismatch` when the port's bound repository is not the work order's; null when it matches or the port does not say. */
+  /**
+   * `repository-unbound`, `repository-invalid` or `repository-mismatch` when
+   * the port's bound repository is not the work order's; null when they match.
+   * Both sides go through one normalisation.
+   */
   private boundRepositoryRefusal(
     deps: ExecuteAuthorizedForgeActionDependencies,
-    normalizedRepository: string,
+    workOrderRepository: string,
   ): string | null {
-    const port = deps.forgePort;
-    if (typeof port.boundRepository !== "function") {
-      return null;
-    }
-    let bound: ReturnType<NonNullable<typeof port.boundRepository>>;
+    let bound: ReturnType<ExecuteAuthorizedForgeActionDependencies["forgePort"]["boundRepository"]>;
     try {
-      bound = port.boundRepository();
+      bound = deps.forgePort.boundRepository();
     } catch {
       return "repository-unbound";
     }
     if (bound === undefined) {
       return "repository-unbound";
     }
-    return `${bound.owner}/${bound.repo}`.toLowerCase() ===
-      normalizedRepository.toLowerCase()
-      ? null
-      : "repository-mismatch";
+    const boundKey = canonicalRepositoryKey(`${bound.owner}/${bound.repo}`);
+    const workOrderKey = canonicalRepositoryKey(workOrderRepository);
+    if (boundKey === null || workOrderKey === null) {
+      return "repository-invalid";
+    }
+    return boundKey === workOrderKey ? null : "repository-mismatch";
   }
 
   /** Whether the attempt's latest completed typed `forge` reference is for a repository other than this one. */

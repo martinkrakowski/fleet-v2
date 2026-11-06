@@ -259,6 +259,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       };
       const forgePort: ForgeActionPort = {
         isConfigured: () => true,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
         async performForgeAction(): Promise<ForgeActionResult> {
           throw new Error("Should never be called");
         },
@@ -314,6 +315,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
       const forgePort: ForgeActionPort = {
         isConfigured: () => true,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
         async performForgeAction(
           _req: ForgeActionRequest,
         ): Promise<ForgeActionResult> {
@@ -412,6 +414,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       // Unconfigured forge port (e.g. no delegate bound)
       const unconfiguredForgePort: ForgeActionPort = {
         isConfigured: () => false,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
         async performForgeAction(): Promise<ForgeActionResult> {
           throw new Error("Should never be called");
         },
@@ -485,6 +488,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
     const successfulForgePort: ForgeActionPort = {
       isConfigured: () => true,
+      boundRepository: () => ({ owner: 'org', repo: 'repo' }),
       async performForgeAction() {
         return {
           outcome: "executed",
@@ -711,6 +715,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       let forgeCalls = 0;
       const forgePort: ForgeActionPort = {
         isConfigured: () => true,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
         async performForgeAction() {
           forgeCalls += 1;
           return {
@@ -841,6 +846,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       };
       const forgePort: ForgeActionPort = {
         isConfigured: () => true,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
         async performForgeAction() {
           return { outcome: "executed", headSha: HEAD };
         },
@@ -879,6 +885,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       const deps = baseDeps(attemptWithDoors([]));
       const throwingForgePort: ForgeActionPort = {
         isConfigured: () => true,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
         async performForgeAction() {
           throw forgeError;
         },
@@ -903,6 +910,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       const deps = baseDeps(attemptWithDoors([]));
       const throwingForgePort: ForgeActionPort = {
         isConfigured: () => true,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
         async performForgeAction() {
           throw forgeError;
         },
@@ -927,6 +935,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       const deps = baseDeps(attemptWithDoors([]));
       const throwingForgePort: ForgeActionPort = {
         isConfigured: () => true,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
         async performForgeAction() {
           throw forgeError;
         },
@@ -1054,6 +1063,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       };
       const forgePort: ForgeActionPort = {
         isConfigured: () => true,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
         async performForgeAction(
           request: ForgeActionRequest,
         ): Promise<ForgeActionResult> {
@@ -1191,6 +1201,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       };
       const forgePort: ForgeActionPort = {
         isConfigured: () => true,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
         async performForgeAction(
           request: ForgeActionRequest,
         ): Promise<ForgeActionResult> {
@@ -1326,6 +1337,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
         };
         const forgePort: ForgeActionPort = {
           isConfigured: () => true,
+          boundRepository: () => ({ owner: 'org', repo: 'repo' }),
           async performForgeAction(): Promise<ForgeActionResult> {
             forgeCalls += 1;
             return { outcome: "executed", headSha: HEAD };
@@ -1395,6 +1407,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
         };
         const forgePort: ForgeActionPort = {
           isConfigured: () => true,
+          boundRepository: () => ({ owner: 'org', repo: 'repo' }),
           async performForgeAction(): Promise<ForgeActionResult> {
             forgeCalls += 1;
             return { outcome: "executed", headSha: HEAD };
@@ -2300,6 +2313,7 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       },
       forgePort: {
         isConfigured: () => true,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
         async performForgeAction(request) {
           seen.push(request);
           return { outcome: "executed", headSha: request.expectedHeadSha };
@@ -2673,6 +2687,42 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       ).toBe("executed");
     });
 
+    it("normalises both repositories alike: .git, whitespace and ASCII case match; Unicode look-alikes never do", async () => {
+      for (const bound of [
+        { owner: "org", repo: "repo.git" },
+        { owner: " org", repo: "repo " },
+        { owner: "ORG", repo: "rEpO" },
+      ]) {
+        const deps = wb5bDeps({ bound });
+        expect(
+          (
+            await deps.useCase.executeAuthorizedForgeAction({
+              ...mergeReq,
+              pullRequestNumber: 7,
+            })
+          ).outcome,
+        ).toBe("executed");
+      }
+      const korgOrder = { ...makeWorkOrderRecord(), repository: "github.com/korg/repo" };
+      for (const bound of [
+        // The Kelvin sign lower-cases to k under Unicode folding.
+        { owner: "\u212Aorg", repo: "repo" },
+        // A Turkish dotless i is not an ASCII letter.
+        { owner: "korg", repo: "repo\u0131" },
+      ]) {
+        const deps = wb5bDeps({ bound, workOrder: korgOrder });
+        expect(
+          await deps.useCase.executeAuthorizedForgeAction({
+            ...mergeReq,
+            pullRequestNumber: 7,
+          }),
+        ).toEqual({ outcome: "refused", reason: "repository-invalid" });
+        expect(deps.reads).toHaveLength(0);
+        expect(deps.consumed).toEqual([]);
+        expect(deps.seen).toHaveLength(0);
+      }
+    });
+
     it("a throwing merge-record store is merge-record-not-saved, and the next pass completes the record without merging again", async () => {
       let state: "open" | "merged" = "open";
       const deps = wb5bDeps({
@@ -2908,6 +2958,7 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       },
       forgePort: {
         isConfigured: () => true,
+        boundRepository: () => ({ owner: 'org', repo: 'repo' }),
         async performForgeAction() {
           return { outcome: "executed", headSha: WB_HEAD };
         },

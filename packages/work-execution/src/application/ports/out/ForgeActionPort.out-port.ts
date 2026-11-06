@@ -74,10 +74,11 @@ export interface ForgeActionPort {
   /**
    * The repository this port acts in (WB5b2), or undefined when none is bound.
    * A merge refuses unless it is the work order's repository, so the verifying
-   * read, the merge and the record all name one repository. Optional: a port
-   * that does not expose it is not checked.
+   * read, the merge and the record all name one repository. Required: a port
+   * that cannot name one answers undefined, and the merge refuses
+   * `repository-unbound`.
    */
-  boundRepository?(): { readonly owner: string; readonly repo: string } | undefined;
+  boundRepository(): { readonly owner: string; readonly repo: string } | undefined;
 
   /** Perform one forge action only against the expected head. */
   performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult>;

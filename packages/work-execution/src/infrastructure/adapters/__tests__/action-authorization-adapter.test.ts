@@ -886,6 +886,9 @@ describe('ActionAuthorizationAdapter through the authorised forge path', () => {
   }
 
   class RecordingForge implements ForgeActionPort {
+    boundRepository(): { owner: string; repo: string } | undefined {
+      return { owner: 'org', repo: 'repo' };
+    }
     readonly requests: ForgeActionRequest[] = [];
     async performForgeAction(request: ForgeActionRequest) {
       this.requests.push(request);

@@ -288,6 +288,9 @@ class FakeActionAuthorization implements ActionAuthorizationPort {
 }
 
 class FakeForge implements ForgeActionPort {
+  boundRepository(): { owner: string; repo: string } | undefined {
+    return { owner: 'org', repo: 'repo' };
+  }
   readonly requests: ForgeActionRequest[] = [];
   journalAtCall: readonly ActionJournalEntryRecord[] = [];
   result: ForgeActionResult = { outcome: "executed", headSha: HEAD_SHA };

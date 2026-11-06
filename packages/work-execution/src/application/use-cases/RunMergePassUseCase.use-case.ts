@@ -18,6 +18,7 @@ import type {
 } from '../ports/in/RunMergePassPort.in-port.js';
 import type { MergeQueueRepositoryPort } from '../ports/out/MergeQueueRepositoryPort.out-port.js';
 import type { ForgeMergeReadPort, MergeContextSnapshot } from '../ports/out/ForgeMergeReadPort.out-port.js';
+import type { MergeNotificationPort } from '../ports/out/MergeNotificationPort.out-port.js';
 import type { MergeVerificationPort } from '../ports/out/MergeVerificationPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
@@ -34,6 +35,18 @@ import {
   orderMergeQueue,
   type MergeQueueEntryRecord,
 } from '../../domain/merge-queue-records.js';
+import {
+  buildDroppedEntry,
+  buildParkedEntry,
+  buildReadyEntry,
+  buildSupersession,
+  isMergeParkReason,
+  dropNotificationEvent,
+  mergeNotificationKey,
+  parkNotificationEvent,
+  sameMergeEntryContent,
+  type MergeNotificationEvent,
+} from '../../domain/merge-pass-transitions.js';
 import { buildMergeKey, head12Of, type MergeKeyAction } from '../../domain/lane-run-keys.js';
 import {
   LANE_RUN_JOURNAL_ENTRY_VERSION,
@@ -42,6 +55,13 @@ import {
 
 export interface RunMergePassDependencies {
   readonly queue: Pick<MergeQueueRepositoryPort, 'listMergeEntries'>;
+  /**
+   * Compare-and-set writes of entry records (DT9c). Absent, the pass stays the
+   * DT9a observer: it records nothing on the queue.
+   */
+  readonly queueWriter?: Pick<MergeQueueRepositoryPort, 'applyMergeTransition'>;
+  /** One notification per (event, id). Absent, no transition that needs one is written. */
+  readonly notifier?: MergeNotificationPort;
   readonly forgeRead: ForgeMergeReadPort;
   readonly verification: MergeVerificationPort;
   readonly journal: Pick<LaneRunJournalPort, 'append' | 'listForKey'>;
@@ -49,6 +69,12 @@ export interface RunMergePassDependencies {
   readonly newUlid: () => string;   // a fresh ULID per journal entry
   readonly nowIso: () => string;    // the pass clock, read fresh
 }
+
+/** Inputs are size-bounded: a larger queue or id is refused or truncated, never read whole. */
+const MAX_QUEUE_RECORDS = 5000;
+const MAX_ENTRIES_PER_PASS = 100;
+const MAX_PROJECT_ID_LENGTH = 256;
+const REASON_TOKEN_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 const REPO_DIGEST_PATTERN = /^[0-9a-f]{12}$/;
@@ -70,6 +96,31 @@ const MERGE_STATE_BY_TOKEN: Record<string, 'CLEAN' | 'BEHIND' | 'BLOCKED' | 'UNK
   blocked: 'BLOCKED',
   unknown: 'UNKNOWN',
 };
+
+/**
+ * At most MAX_ENTRIES_PER_PASS entries per pass: the queue head always, the
+ * rest in queue order rotated by the pass minute, so a long run of parked
+ * entries at the front cannot starve the entries behind it.
+ */
+function selectEntriesForPass(
+  ordered: readonly MergeQueueEntryRecord[],
+  head: MergeQueueEntryRecord | null,
+  nowMs: number,
+): readonly MergeQueueEntryRecord[] {
+  if (ordered.length <= MAX_ENTRIES_PER_PASS) {
+    return ordered;
+  }
+  const rest = ordered.filter((entry) => head === null || entry.entryId !== head.entryId);
+  const window = MAX_ENTRIES_PER_PASS - (head === null ? 0 : 1);
+  const step = Number.isFinite(nowMs) ? Math.floor(nowMs / 60_000) : 0;
+  const offset = (step * window) % rest.length;
+  const rotated = [...rest.slice(offset), ...rest.slice(0, offset)].slice(0, window);
+  const chosen = new Set(rotated.map((entry) => entry.entryId));
+  if (head !== null) {
+    chosen.add(head.entryId);
+  }
+  return ordered.filter((entry) => chosen.has(entry.entryId));
+}
 
 /** The budget guard of D-DT9: a call is never started with under 2 s left. */
 function callAllowed(nowIso: string, deadlineIso: string): boolean {
@@ -102,6 +153,15 @@ export class RunMergePassUseCase implements RunMergePassPort {
   constructor(private readonly deps: RunMergePassDependencies) {}
 
   async runMergePass(request: RunMergePassRequest): Promise<RunMergePassResult> {
+    // The pass never throws on runtime input: any escape is a typed refusal.
+    try {
+      return await this.runPass(request);
+    } catch {
+      return { outcome: 'refused', reasonCode: 'pass-failed', entries: [] };
+    }
+  }
+
+  private async runPass(request: RunMergePassRequest): Promise<RunMergePassResult> {
     if (!this.isValidRequest(request)) {
       return { outcome: 'refused', reasonCode: 'invalid-request', entries: [] };
     }
@@ -128,11 +188,19 @@ export class RunMergePassUseCase implements RunMergePassPort {
       return { outcome: 'refused', reasonCode: 'queue-unreadable', entries };
     }
 
+    // A non-list or an oversized answer is refused, never read whole.
+    if (!Array.isArray(records) || records.length > MAX_QUEUE_RECORDS) {
+      return { outcome: 'refused', reasonCode: 'queue-unreadable', entries };
+    }
+
     // Every record of this repository, any state: the journal-derived update
     // count reads them all, the live order filters to live entries.
-    const repoRecords = records.filter((record) => record.repoDigest === request.repoDigest);
-    const live = orderMergeQueue(repoRecords, request.repoDigest);
-    const head = findMergeQueueHead(live, request.repoDigest);
+    const repoRecords = records.filter(
+      (record) => typeof record === 'object' && record !== null && record.repoDigest === request.repoDigest,
+    );
+    const ordered = orderMergeQueue(repoRecords, request.repoDigest);
+    const head = findMergeQueueHead(ordered, request.repoDigest);
+    const live = selectEntriesForPass(ordered, head, Date.parse(this.deps.nowIso()));
 
     // The kill switch, read once; an unreadable read is a halt (fail closed).
     // D-DT9: the budget is checked before this outbound read too.
@@ -187,6 +255,7 @@ export class RunMergePassUseCase implements RunMergePassPort {
       REPO_DIGEST_PATTERN.test(request.repoDigest) &&
       typeof request.projectId === 'string' &&
       request.projectId.length > 0 &&
+      request.projectId.length <= MAX_PROJECT_ID_LENGTH &&
       typeof request.policy?.policyRevision === 'string' &&
       request.policy.policyRevision.length > 0 &&
       isZonedIsoDateTime(request.deadlineIso)
@@ -202,22 +271,36 @@ export class RunMergePassUseCase implements RunMergePassPort {
     repoRecords: readonly MergeQueueEntryRecord[],
   ): Promise<MergePassEntryReport> {
     const facts = await this.gatherFacts(request, entry, head, halted, repoRecords);
-    let decision = decideMergeStep(entry, facts, request.policy, this.deps.nowIso());
+    let current = entry;
+    let decision = decideMergeStep(current, facts, request.policy, this.deps.nowIso());
 
-    // The decider's `enter` is the only proof the contexts are green: re-run
-    // it on the in-memory ready entry. Nothing is written to the queue.
+    // The decider's `enter` is the only proof the contexts are green. The
+    // verification audit is written to the entry (plan §3.6) and the decider
+    // re-runs on the recorded ready entry, so the same tick still reaches the
+    // action row (the shadow `would-merge`).
     if (decision.kind === 'enter' && decision.state === 'ready') {
-      const readyEntry: MergeQueueEntryRecord = {
-        ...entry,
-        state: 'ready',
+      const built = buildReadyEntry(entry, {
         verifiedHeadOid: decision.verifiedHeadOid,
         verifiedBy: decision.verifiedBy,
         policyRevision: decision.policyRevision,
-        revision: entry.revision + 1,
-      };
-      const second = decideMergeStep(readyEntry, facts, request.policy, this.deps.nowIso());
+        premergeReceiptHeadOid: premergeReceiptHeadOf(request, entry, facts),
+      });
+      if (!built.ok) {
+        return this.report(entry, 'no-action', 'entry-refused', null);
+      }
+      const persisted = await this.persist(request, entry, built.record, null, null);
+      if (persisted.status === 'failed') {
+        return this.report(entry, 'no-action', persisted.reasonCode, null);
+      }
+      current = persisted.status === 'written' ? persisted.record : built.record;
+      const second = decideMergeStep(current, facts, request.policy, this.deps.nowIso());
       if (second.kind === 'enter' && second.state === 'ready') {
-        return this.report(entry, 'no-action', 'enter-ready', null);
+        return this.report(
+          entry,
+          persisted.status === 'written' ? 'recorded' : 'no-action',
+          'enter-ready',
+          null,
+        );
       }
       decision = second;
     }
@@ -225,15 +308,15 @@ export class RunMergePassUseCase implements RunMergePassPort {
     if (request.policy.shadow === true) {
       // The action journaled now completes its own open intent with its real
       // reason (journalShadowAct); every other open shadow intent is closed.
-      const current =
+      const acting =
         decision.kind === 'act' && decision.execution === 'shadow'
           ? decision.action === 'premerge-carry'
             ? 'post-status'
             : decision.action
           : null;
-      await this.closeOpenShadowIntents(request, entry, current);
+      await this.closeOpenShadowIntents(request, current, acting);
     }
-    return this.actOnDecision(request, entry, decision);
+    return this.actOnDecision(request, current, decision);
   }
 
   /** One action per entry per tick (plan §3.3); shadow mode journals, live defers. */
@@ -253,15 +336,146 @@ export class RunMergePassUseCase implements RunMergePassPort {
       }
       return this.journalShadowAct(request, entry, decision);
     }
-    if (decision.kind === 'wait' || decision.kind === 'park' || decision.kind === 'drop') {
-      // The park and the drop are not stored here (DT9c).
+    if (decision.kind === 'wait') {
       return this.report(entry, 'no-action', decision.reason, null);
     }
+    if (decision.kind === 'park') {
+      return this.recordPark(request, entry, decision);
+    }
+    if (decision.kind === 'drop') {
+      return this.recordDrop(request, entry, decision);
+    }
     if (decision.kind === 'supersede') {
-      // The successor entry is DT9c.
-      return this.report(entry, 'no-action', 'superseded', null);
+      return this.recordSupersession(request, entry, decision.liveHeadOid);
     }
     return this.report(entry, 'no-action', 'enter-ready', null);
+  }
+
+  /** A park is stored once; the first park of an entry notifies once (§3.3 "first parked"). */
+  private async recordPark(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    decision: Extract<MergeStepDecision, { kind: 'park' }>,
+  ): Promise<MergePassEntryReport> {
+    const built = buildParkedEntry(entry, {
+      reason: decision.reason,
+      nextAttempt: decision.nextAttempt,
+      notBeforeIso: decision.notBeforeIso,
+    });
+    if (!built.ok) {
+      return this.report(entry, 'no-action', 'entry-refused', null);
+    }
+    if (entry.state === 'parked' && sameMergeEntryContent(entry, built.record)) {
+      return this.report(entry, 'no-action', decision.reason, null); // already stored
+    }
+    // A park notifies on its first entry and again when it changes event (a
+    // hold for a veto has its own line); the (event, id) key keeps each once.
+    const event = parkNotificationEvent(decision.reason);
+    const previousEvent =
+      entry.state === 'parked' && isMergeParkReason(entry.reason) ? parkNotificationEvent(entry.reason) : null;
+    const notify = previousEvent === event ? null : { event, id: entry.entryId };
+    const persisted = await this.persist(request, entry, built.record, null, notify);
+    if (persisted.status === 'failed') {
+      return this.report(entry, 'no-action', persisted.reasonCode, null);
+    }
+    return this.report(entry, persisted.status === 'written' ? 'recorded' : 'no-action', decision.reason, null);
+  }
+
+  private async recordDrop(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    decision: Extract<MergeStepDecision, { kind: 'drop' }>,
+  ): Promise<MergePassEntryReport> {
+    const built = buildDroppedEntry(entry, decision.reason);
+    if (!built.ok) {
+      return this.report(entry, 'no-action', 'entry-refused', null);
+    }
+    const notify = { event: dropNotificationEvent(decision.reason), id: entry.entryId };
+    const persisted = await this.persist(request, entry, built.record, null, notify);
+    if (persisted.status === 'failed') {
+      return this.report(entry, 'no-action', persisted.reasonCode, null);
+    }
+    return this.report(entry, persisted.status === 'written' ? 'recorded' : 'no-action', decision.reason, null);
+  }
+
+  /** The superseded predecessor and its successor are written in one compare-and-set. */
+  private async recordSupersession(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    liveHeadOid: string,
+  ): Promise<MergePassEntryReport> {
+    if (this.deps.queueWriter === undefined) {
+      return this.report(entry, 'no-action', 'superseded', null);
+    }
+    const built = buildSupersession(entry, liveHeadOid, this.deps.newUlid());
+    if (!built.ok) {
+      return this.report(entry, 'no-action', 'entry-refused', null);
+    }
+    const persisted = await this.persist(request, entry, built.predecessor, built.successor, null);
+    if (persisted.status === 'failed') {
+      return this.report(entry, 'no-action', persisted.reasonCode, null);
+    }
+    return this.report(entry, 'recorded', 'superseded', null);
+  }
+
+  /**
+   * Notify, then write, each behind the pass budget (D-DT9). A notification
+   * goes first under its (event, id) key: a crash after it replays the same
+   * decision, the key answers `duplicate`, and the write completes; a crash
+   * before it loses nothing. A notification that cannot be sent leaves the
+   * entry untouched for the next tick, so no transition goes unannounced.
+   */
+  private async persist(
+    request: RunMergePassRequest,
+    entry: MergeQueueEntryRecord,
+    next: MergeQueueEntryRecord,
+    successor: MergeQueueEntryRecord | null,
+    notify: { readonly event: MergeNotificationEvent; readonly id: string } | null,
+  ): Promise<PersistResult> {
+    const writer = this.deps.queueWriter;
+    if (writer === undefined) {
+      return { status: 'skipped' };
+    }
+    if (notify !== null) {
+      const notifier = this.deps.notifier;
+      if (notifier === undefined) {
+        return { status: 'failed', reasonCode: 'notifier-unavailable' };
+      }
+      this.ensureBudget(request);
+      try {
+        const sent = await notifier.notifyMergeEvent({
+          event: notify.event,
+          id: notify.id,
+          key: mergeNotificationKey(notify.event, notify.id),
+          deadlineIso: request.deadlineIso,
+        });
+        const outcome: unknown = sent?.outcome;
+        if (outcome !== 'notified' && outcome !== 'duplicate' && outcome !== 'suppressed') {
+          return { status: 'failed', reasonCode: 'notify-failed' };
+        }
+      } catch {
+        return { status: 'failed', reasonCode: 'notify-failed' };
+      }
+    }
+    this.ensureBudget(request);
+    try {
+      const written = await writer.applyMergeTransition({
+        entryId: entry.entryId,
+        expectedRevision: entry.revision,
+        next,
+        successor,
+        deadlineIso: request.deadlineIso,
+      });
+      if (written.outcome === 'applied') {
+        return { status: 'written', record: written.record };
+      }
+      return {
+        status: 'failed',
+        reasonCode: written.reason === 'revision-conflict' ? 'persist-conflict' : 'persist-refused',
+      };
+    } catch {
+      return { status: 'failed', reasonCode: 'persist-failed' };
+    }
   }
 
   /** The keyed idempotence: one intent, then one `dry-run` result, nothing twice. */
@@ -627,10 +841,38 @@ export class RunMergePassUseCase implements RunMergePassPort {
       entryId: entry.entryId,
       head12: head12Of(entry.headOid) ?? '',
       decision,
-      reasonCode,
+      // Only a fixed lowercase token is ever reported; anything else is withheld.
+      reasonCode: reasonCode !== null && REASON_TOKEN_PATTERN.test(reasonCode) ? reasonCode : 'unspecified',
       journalKey,
     };
   }
+}
+
+type PersistResult =
+  | { readonly status: 'skipped' }
+  | { readonly status: 'written'; readonly record: MergeQueueEntryRecord }
+  | { readonly status: 'failed'; readonly reasonCode: string };
+
+/**
+ * The head the poster's `premerge` status was read green at: set only when the
+ * policy requires `premerge`, the status is `SUCCESS` and its creator is the
+ * poster identity at the entry's exact head; anything else is unknown (null).
+ */
+function premergeReceiptHeadOf(
+  request: RunMergePassRequest,
+  entry: MergeQueueEntryRecord,
+  facts: MergeStepFacts,
+): string | null {
+  const required = request.policy.requiredContexts ?? ['gate', 'premerge'];
+  const poster = request.policy.premergePosterLogin;
+  if (!required.includes('premerge') || typeof poster !== 'string' || poster.length === 0) {
+    return null;
+  }
+  if (typeof facts.contexts !== 'object' || facts.contexts === null || !('premerge' in facts.contexts)) {
+    return null;
+  }
+  const fact = (facts.contexts as Record<string, MergeContextFact>).premerge;
+  return fact.state === 'success' && fact.creatorLogin === poster ? entry.headOid : null;
 }
 
 /** Thrown inward when a read answers `budget-exhausted`; never leaves the use case. */

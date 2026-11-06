@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto';
 
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
@@ -9,6 +13,7 @@ import { laneRunJournalState } from '../../../domain/lane-run-journal.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { AdoptLaneResult } from '../../ports/in/AdoptLanePort.in-port.js';
 import type { CutoverJournalEntry, CutoverJournalPort } from '../../ports/out/CutoverJournalPort.out-port.js';
+import { CutoverJournalAdapter } from '../../../infrastructure/adapters/CutoverJournalAdapter.adapter.js';
 import { AdoptLaneUseCase } from '../AdoptLaneUseCase.use-case.js';
 import type { AdoptLaneDependencies } from '../AdoptLaneUseCase.use-case.js';
 
@@ -670,6 +675,53 @@ describe('AdoptLaneUseCase robustness', () => {
     const digests = ['work-order', 'attempt', 'run'].map((step) => w.cutover.find((e) => e.key === KEY(step) && e.kind === 'result')?.digest);
     expect(new Set(digests).size).toBe(1);
     expect(digests[0]).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('CO28c: every step intent carries the adoption-id digest, and a stored digest from another adoption refuses before any write', async () => {
+    const w = savedWorld();
+    await adopt(w);
+    const intents = ['work-order', 'brief', 'attempt', 'run'].map((step) => w.cutover.find((e) => e.key === KEY(step) && e.kind === 'intent')?.digest);
+    expect(new Set(intents).size).toBe(1);
+    expect(intents[0]).toMatch(/^[0-9a-f]{64}$/);
+    expect(intents[0]).toBe(w.cutover.find((e) => e.key === KEY('run') && e.kind === 'result')?.digest);
+  });
+
+  it('CO28c: a failed work-order save, then a retry with a different workOrderId on the REAL journal adapter, is refused before any write', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'adopt-lane-journal-'));
+    try {
+      const w = savedWorld();
+      const real = new CutoverJournalAdapter({ stateDir: dir });
+      for (const entry of w.cutover) await real.append(entry);
+      const deps: AdoptLaneDependencies = { ...w.deps, cutoverJournal: real };
+      w.fail.add('wo.save');
+      expect((await new AdoptLaneUseCase(deps).execute(request())).outcome).toBe('unknown');
+      w.fail.delete('wo.save');
+      // The intent is durable with the first request's digest; the work order was never written.
+      const stored = await new CutoverJournalAdapter({ stateDir: dir }).listByKeyPrefix(KEY('work-order'));
+      expect(stored.outcome === 'listed' && stored.entries.map((e) => e.kind)).toEqual(['intent']);
+      expect(w.orders.size).toBe(0);
+      const other = request({ workOrder: { ...(request().workOrder as Record<string, unknown>), workOrderId: 'wo-other' } });
+      expect(await new AdoptLaneUseCase(deps).execute(other)).toEqual({ outcome: 'refused', reason: 'idempotency-conflict' });
+      expect(w.orders.size).toBe(0);
+      expect(w.trace.filter((line) => line.startsWith('write:'))).toEqual([]);
+      // The same ids still resume, on the same intent.
+      expect(await new AdoptLaneUseCase(deps).execute(request())).toMatchObject({ outcome: 'adopted', reused: false });
+      const after = await new CutoverJournalAdapter({ stateDir: dir }).listByKeyPrefix(KEY('work-order'));
+      expect(after.outcome === 'listed' && after.entries.filter((e) => e.kind === 'intent')).toHaveLength(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('CO28c: an intent recorded without a digest (an older pass) is still replayed', async () => {
+    const w = savedWorld();
+    w.fail.add('wo.save');
+    expect((await adopt(w)).outcome).toBe('unknown');
+    w.fail.delete('wo.save');
+    const stored = w.cutover.find((e) => e.key === KEY('work-order') && e.kind === 'intent');
+    if (stored === undefined) throw new Error('expected an intent');
+    w.cutover.splice(w.cutover.indexOf(stored), 1, { key: stored.key, kind: 'intent', entryId: stored.entryId, recordedAtIso: stored.recordedAtIso });
+    expect(await adopt(w)).toMatchObject({ outcome: 'adopted' });
   });
 
   it('Luna round 2: AKIA-shaped lane, project and plan ids, and attempt ids, are refused before any write', async () => {

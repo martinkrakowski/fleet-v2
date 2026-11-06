@@ -1302,7 +1302,7 @@ async function sleepBetweenPasses(options: {
  * fires; the pass result is always the one returned, and the loop can never
  * end it early.
  */
-async function runPassWithHeartbeat(
+export async function runPassWithHeartbeat(
   options: {
     readonly driver: ConductorDriver;
     readonly stopSignal?: AbortSignal;

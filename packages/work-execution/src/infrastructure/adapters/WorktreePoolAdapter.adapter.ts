@@ -14,6 +14,10 @@
  *   installed, built or reset; the worktree turns warm only when that claim
  *   is removed after the steps passed. Reaping removes dangling claims and
  *   prepare claims older than the stale window, with their half-built tree.
+ * - A guard link `w<n>.reset` serializes resets, reaps and retakes of one slot. Each
+ *   holder removes it in a `finally`; only a killed process leaves one, and it
+ *   is never reaped by age (a clock race could free a live guard): the slot
+ *   stays unavailable, which is safe, until an operator removes the link.
  * - Every git call is an argv array through `CommandExecutorPort.run` with no
  *   shell, hooks off and no transport allowed. No outcome carries command
  *   output or error text, so no credential path or secret-shaped text is
@@ -590,12 +594,6 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     if (slots === null || claims === null) return null;
     const stale = await this.stalePrepareClaims(view, deadline);
     if (stale === null) return null;
-    // A reset guard left by a crashed reset, past the stale window.
-    await this.call(
-      view,
-      ['find', view.claimsDir, '-mindepth', '1', '-maxdepth', '1', '-name', 'w*.reset', '-mmin', `+${this.staleMinutes()}`, '-delete'],
-      deadline,
-    );
     for (const [index, owner] of claims) {
       const slot = slots.get(index);
       const isPrepare = owner.startsWith('prepare-');
@@ -603,7 +601,8 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
       if (owner === '?' || (isPrepare ? !stale.has(index) : !gone)) continue; // an unreadable owner is never reaped
       await this.reapClaim(view, index, owner, slot, deadline);
     }
-    if (claims.size === 0) return { slots, claims };
+    const anyPrunable = [...slots.values()].some((slot) => slot.prunable);
+    if (claims.size === 0 && !anyPrunable) return { slots, claims };
     await this.git(view, view.config.repositoryPath, ['worktree', 'prune'], deadline);
     const freshSlots = await this.listSlots(view, deadline);
     const freshClaims = freshSlots === null ? null : await this.readClaims(view, deadline);

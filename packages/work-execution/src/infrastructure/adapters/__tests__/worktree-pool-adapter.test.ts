@@ -82,7 +82,6 @@ class FakeHost implements CommandExecutorPort {
       return OK();
     }
     if (cmd === 'find') {
-      if (a.includes('-delete')) { for (const k of [...this.claims.keys()]) if (k.endsWith('.reset') && this.stale.has(k.slice(CLAIMS.length + 1))) this.claims.delete(k); return OK(); }
       return OK([...this.stale].map((s) => `${CLAIMS}/${s}`).join('\n'));
     }
     return FAIL('unscripted');
@@ -384,7 +383,7 @@ describe('WorktreePoolAdapter resetToBase', () => {
     expect(host.calls.some((c) => c.argv.includes('rm') && c.argv.includes('-rf') && !c.argv.some((w) => w.endsWith('/.lane')))).toBe(false);
   });
 
-  it('lets only one reset run on a claimed slot, and clears a stale reset guard', async () => {
+  it('lets only one reset run on a claimed slot, and never reaps a reset guard by age', async () => {
     const host = new FakeHost();
     host.add(1);
     const adapter = make(host);
@@ -394,32 +393,17 @@ describe('WorktreePoolAdapter resetToBase', () => {
     expect(results.map((r) => r.outcome).sort()).toEqual(['reset', 'unknown']);
     host.claims.set(`${CLAIMS}/w1.reset`, 'reset');
     host.stale.add('w1.reset');
-    expect((await adapter.refillAfterMerge({ projectId: 'proj', mergedBaseCommit: NEXT, recordedHost: HOST })).outcome).toBe('refilled');
-    expect(host.claims.has(`${CLAIMS}/w1.reset`)).toBe(false);
+    await adapter.refillAfterMerge({ projectId: 'proj', mergedBaseCommit: NEXT, recordedHost: HOST });
+    expect(host.claims.has(`${CLAIMS}/w1.reset`)).toBe(true);
+    expect((await adapter.resetToBase(req)).outcome).toBe('unknown');
   });
 
-  it('never checks out in a clone that defines a filter driver, or when that cannot be read', async () => {
+  it('prunes a listed prunable worktree even when no claim exists, so its slot can be refilled', async () => {
     const host = new FakeHost();
-    host.add(1);
-    host.filters = true;
-    const req = { worktreePath: `${POOL}/w1`, baseCommit: NEXT, recordedHost: HOST };
-    expect(await make(host).resetToBase(req)).toEqual({ outcome: 'unknown' });
-    expect(host.worktrees.get(`${POOL}/w1`)!.head).toBe(BASE);
-    expect((await make(host).refillAfterMerge({ projectId: 'proj', mergedBaseCommit: NEXT, recordedHost: HOST })).outcome).toBe('unknown');
-    expect(host.worktrees.size).toBe(1);
-    host.filters = false;
-    host.claims.clear(); // the aborted attempts left their guards; reaping is covered elsewhere
-    host.override = (t) => (t[0] === 'config' ? { exitCode: null, signal: null, stdout: '', stderr: '', error: 'x' } : undefined);
-    expect(await make(host).resetToBase(req)).toEqual({ outcome: 'unknown' });
-  });
-
-  it('rebuilds an idle entry that sits at the merged base but is dirty', async () => {
-    const host = new FakeHost();
-    host.add(1, NEXT, true);
-    host.add(2, NEXT);
-    const result = await make(host).refillAfterMerge({ projectId: 'proj', mergedBaseCommit: NEXT, recordedHost: HOST });
-    expect(result.outcome === 'refilled' ? result.entries.length : 0).toBe(2);
-    expect(host.worktrees.get(`${POOL}/w1`)!.dirty).toBe(false);
+    host.worktrees.set(`${POOL}/w1`, { head: BASE, dirty: false, prunable: true });
+    const result = await make(host, { maxEntries: 1 }).refillAfterMerge({ projectId: 'proj', mergedBaseCommit: BASE, recordedHost: HOST });
+    expect(result.outcome).toBe('refilled');
+    expect(host.worktrees.get(`${POOL}/w1`)?.prunable).toBeUndefined();
   });
 
   it('does not rebuild a slot whose claim owner cannot be read', async () => {

@@ -132,6 +132,11 @@ function snapshotsEqual(
 }
 
 function stableSnapshot(value: unknown): Record<string, unknown> | null {
+  // No pure-language test for a Proxy exists, and the domain layer may not
+  // import `node:util` (`isProxy`; lint:arch refuses node builtins here). The
+  // single `Object.getPrototypeOf` inside `isPlainRecordObject` is therefore
+  // the one trap call that cannot be avoided; a Proxy that answers with a
+  // non-plain prototype is refused before any key or descriptor trap runs.
   if (!isPlainRecordObject(value)) {
     return null;
   }
@@ -422,7 +427,7 @@ export class BriefPackage {
     // The snapshot already refuses accessor and non-enumerable properties, so
     // the schema version is read from it rather than through another trap on
     // the raw input.
-    const hasSchemaVersionKey = Object.hasOwn(snapshot, 'schemaVersion');
+    const hasSchemaVersionKey = snapshot.schemaVersion !== undefined;
     if (!hasSchemaVersionKey) {
       const hasStructured = FROZEN_INPUT_KEYS.some((key) => snapshot[key] !== undefined && snapshot[key] !== null);
       schemaVersion = hasStructured ? BRIEF_PACKAGE_SCHEMA_VERSION : INITIAL_RECORD_SCHEMA_VERSION;
@@ -881,6 +886,17 @@ function proseTextError(value: unknown, maxBytes: number): BriefPackageRefusalCo
  * CO28 prose-only digest semantics for packages without structured inputs.
  */
 export function computeBriefPackageDigest(
+  input: unknown,
+  computeDigest?: (content: string) => string,
+): ReturnType<typeof computeBriefPackageDigestUnchecked> {
+  try {
+    return computeBriefPackageDigestUnchecked(input, computeDigest);
+  } catch {
+    return { ok: false, code: 'malformed' };
+  }
+}
+
+function computeBriefPackageDigestUnchecked(
   input: unknown,
   computeDigest?: (content: string) => string,
 ): { readonly ok: true; readonly briefDigest: string; readonly coversStructuredInputs: boolean } | { readonly ok: false; readonly code: BriefPackageRefusalCode } {

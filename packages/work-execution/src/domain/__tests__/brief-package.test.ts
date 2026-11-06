@@ -589,6 +589,42 @@ describe('readBriefPackageManifest', () => {
     expect(computeBriefPackageDigest(digestHostile).ok).toBe(false);
   });
 
+  it('runs at most the single prototype trap on a Proxy that answers with a non-plain prototype', () => {
+    // A trap-free Proxy check is impossible in the domain layer (no node:util),
+    // so the one getPrototypeOf call is unavoidable; every later trap must not run.
+    const traps: string[] = [];
+    const handler: ProxyHandler<Record<string, unknown>> = {
+      getPrototypeOf() { traps.push('getPrototypeOf'); return Array.prototype; },
+      ownKeys(t) { traps.push('ownKeys'); return Reflect.ownKeys(t); },
+      getOwnPropertyDescriptor(t, k) { traps.push('gopd'); return Reflect.getOwnPropertyDescriptor(t, k); },
+      get(t, k) { traps.push('get'); return Reflect.get(t, k); },
+      has(t, k) { traps.push('has'); return Reflect.has(t, k); },
+    };
+    expect(BriefPackage.create(new Proxy(baseProps(frozenInputs()) as Record<string, unknown>, handler)).success).toBe(false);
+    expect(computeBriefPackageDigest(new Proxy({ prose: 'hello' } as Record<string, unknown>, handler)).ok).toBe(false);
+    expect(traps).toEqual(['getPrototypeOf', 'getPrototypeOf']);
+  });
+
+  it('returns a typed refusal when a Proxy trap throws inside computeBriefPackageDigest', () => {
+    const throwing = new Proxy({ prose: 'hello' } as Record<string, unknown>, {
+      getPrototypeOf() { throw new Error('boom'); },
+    });
+    expect(computeBriefPackageDigest(throwing)).toEqual({ ok: false, code: 'malformed' });
+    const throwingString = { prose: 'hello', manifestRaw: 'x' };
+    expect(computeBriefPackageDigest(throwingString, () => { throw new Error('digest boom'); })).toEqual({ ok: false, code: 'malformed' });
+  });
+
+  it('treats an own schemaVersion of undefined as absent', () => {
+    const structured = BriefPackage.create({ ...baseProps(frozenInputs()), schemaVersion: undefined });
+    expect(structured.success).toBe(true);
+    if (!structured.success) return;
+    expect(structured.value.getSchemaVersion()).toBe(2);
+    const prose = BriefPackage.create({ ...baseProps(), schemaVersion: undefined });
+    expect(prose.success).toBe(true);
+    if (!prose.success) return;
+    expect(prose.value.getSchemaVersion()).toBe(1);
+  });
+
   it('returns a typed refusal for throwing getters on frozenInputs instead of throwing', () => {
     const hostileInputs: Record<string, unknown> = {};
     Object.defineProperty(hostileInputs, 'limits', { enumerable: true, get() { throw new Error('boom'); } });

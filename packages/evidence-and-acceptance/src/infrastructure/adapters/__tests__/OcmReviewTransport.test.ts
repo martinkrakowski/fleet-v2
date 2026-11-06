@@ -2725,3 +2725,31 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     expect(transported.findings).toHaveLength(MAX_PARSED_FINDINGS);
   });
 });
+
+describe('RV3 Luna round 1: unrecognised finding severities', () => {
+  it('maps critical to blocker and high to major on FINDING and numbered lines', () => {
+    const text = [
+      'FINDING: critical src/a.ts:3 data loss',
+      'FINDING: HIGH src/b.ts:4 wrong result',
+      '1. `src/c.ts:5` - **critical**. unsafe',
+      '2. `src/d.ts:6` - high: broken',
+      'VERDICT: PASS',
+    ].join('\n');
+    const parsed = parseReviewReplyStrict(text);
+    expect(parsed.findings.map((entry) => entry.severity)).toEqual(['blocker', 'major', 'blocker', 'major']);
+    expect(parsed.result).toBe('fail');
+  });
+
+  it('an unrecognised severity refuses the whole reply as unparseable-verdict, never dropping the finding', () => {
+    for (const reply of [
+      'FINDING: catastrophic src/a.ts:3 data loss\nVERDICT: PASS',
+      '1. `src/a.ts:3` - **showstopper**. data loss\nVERDICT: PASS',
+    ]) {
+      for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
+        const parsed = parse(reply);
+        expect(parsed.result).toBe('unknown');
+        expect(parsed.unknownReason).toBe('unparseable-verdict');
+      }
+    }
+  });
+});

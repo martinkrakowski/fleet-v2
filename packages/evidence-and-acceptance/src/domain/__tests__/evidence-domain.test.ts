@@ -599,6 +599,41 @@ describe('EvidenceAssessment severity-derived review outcomes (RV3)', () => {
     expect(assessment.carriedMinorFindings()).toEqual([]);
   });
 
+  it('a fail receipt whose major is resolved out-of-scope still carries its unresolved minor (Luna round 1)', () => {
+    const assessment = requireValue(
+      EvidenceAssessment.create(
+        assessmentProps({
+          requiredChecks: [],
+          reviewReceipts: [
+            requireValue(
+              ReviewReceipt.create(
+                reviewReceiptProps({
+                  result: 'fail',
+                  findings: [finding('f-1', { severity: 'major' }), finding('f-2', { severity: 'minor' })],
+                }),
+              ),
+            ).toRecord(),
+          ],
+          findingDispositions: [
+            {
+              id: 'fd-1',
+              assessmentId: 'ea-1',
+              findingId: 'f-1',
+              candidateHeadSha: 'sha-1',
+              state: 'out-of-scope',
+              reason: 'not this lane',
+              evidenceRef: 'evidence://fd-1',
+              recordedBy: 'conductor',
+              recordedAtIso: '2026-10-15T00:04:00.000Z',
+            },
+          ],
+        }),
+      ),
+    );
+    expect(assessment.unresolvedFindingIds()).toEqual([]);
+    expect(assessment.carriedMinorFindings().map((entry) => entry.findingId)).toEqual(['f-2']);
+  });
+
   it('a fail receipt with zero findings is an unknown verdict in decideReviewReceiptOutcome', () => {
     const decision = decideReviewReceiptOutcome(reviewReceiptProps({ findings: [] }));
     expect(decision).toEqual({ outcome: 'unknown', unknownReason: 'unparseable-verdict' });

@@ -261,6 +261,14 @@ export class EvidenceAssessment {
         .filter((disposition) => !FindingState.create(disposition.state).value?.isBlocking())
         .map((disposition) => disposition.findingId),
     );
+    // Same sets the acceptance use case passes: a major resolved out-of-scope
+    // must not demote its receipt, or the receipt's unresolved minors drop.
+    const outOfScopeResolvedFindingIds = new Set(
+      this.record.findingDispositions
+        .filter((disposition) => disposition.state === 'out-of-scope')
+        .map((disposition) => disposition.findingId),
+    );
+    const unresolvedFindingIds = new Set(this.unresolvedFindingIds());
     const carried: ReviewFindingRecord[] = [];
     for (const receipt of this.record.reviewReceipts) {
       if (
@@ -269,7 +277,7 @@ export class EvidenceAssessment {
       ) {
         continue;
       }
-      if (decideReviewReceiptOutcome(receipt).outcome !== 'pass') {
+      if (decideReviewReceiptOutcome(receipt, outOfScopeResolvedFindingIds, unresolvedFindingIds).outcome !== 'pass') {
         continue;
       }
       for (const finding of receipt.findings) {

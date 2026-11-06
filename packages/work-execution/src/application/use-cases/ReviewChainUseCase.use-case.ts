@@ -630,6 +630,14 @@ function reasonOfReviewRefusal(reason: string): ReviewChainReason {
   }
 }
 
+/** A missing link receipt is a refusal; any other aggregate failure leaves the verdict unknown. */
+function aggregateFailureOf(reason: ReviewChainReason): Fail {
+  if (reason === 'link-receipt-missing') {
+    return refusedWith(reason);
+  }
+  return unknownWith(reason);
+}
+
 export class ReviewChainUseCase implements ReviewChainPort {
   constructor(private readonly deps: ReviewChainDependencies) {}
 
@@ -1174,7 +1182,7 @@ export class ReviewChainUseCase implements ReviewChainPort {
     const inputs = collected.inputs;
     const aggregate = aggregateLinkReceipts(inputs);
     if (!aggregate.ok) {
-      return aggregate.reason === 'link-receipt-missing' ? refusedWith(aggregate.reason) : unknownWith(aggregate.reason);
+      return aggregateFailureOf(aggregate.reason);
     }
     const links: readonly ChainLinkReceiptProjection[] = aggregate.links;
     const passed = receipt.verdict === 'passed' && links.every((link) => link.result === 'pass');

@@ -230,7 +230,7 @@ const fullV2File = {
         'example-owner/second-repo': { projectId: 'second-project' },
       },
     },
-    daemon: { intervalSeconds: 90, budgetSeconds: 60, settleSeconds: 30 },
+    daemon: { intervalSeconds: 90, budgetSeconds: 60, settleSeconds: 30, chainRefresh: 'shadow' },
   },
   shelf: {
     provider: 'git',

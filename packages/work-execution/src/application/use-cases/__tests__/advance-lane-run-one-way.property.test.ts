@@ -245,6 +245,7 @@ function advanceSeeded(
               },
             }),
             isConfigured: () => true,
+            listOpenPullRequestsByBase: async () => ({ outcome: "unavailable" as const, reason: "not-used" }),
           },
         }
       : scenario.deps;

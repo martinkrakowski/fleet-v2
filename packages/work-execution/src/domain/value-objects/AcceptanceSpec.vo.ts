@@ -6,6 +6,8 @@
  * show. Each command is an argv array; no shell string.
  */
 
+import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
+
 export type GateCoverageReader = 'vitest-summary' | 'hexagen-lint-json' | 'eslint-json';
 export type GateCoverageUnitKind = 'tests' | 'files' | 'checks';
 
@@ -31,6 +33,25 @@ export interface AcceptanceSpecProps {
   readonly commitRequired: true;
   readonly diffCheck: true;
   readonly commands: readonly GateCommand[];
+}
+
+/**
+ * The name a command predicate carries in results and journals: its position
+ * and its argv joined, cut to 120 characters. An argv with secret-shaped text
+ * (before or after the cut) is never echoed: the name says it was withheld.
+ * The gate adapter and the gate use case share this one function so the names
+ * they compare always agree.
+ */
+export function gateCommandPredicateName(argv: readonly string[], index: number): string {
+  const prefix = 'command ' + String(index + 1) + ': ';
+  const joined = argv.join(' ');
+  const cut = (prefix + joined).slice(0, 120);
+  const shaped = (text: string): boolean =>
+    containsSecretShape(text) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(text));
+  if (shaped(joined) || shaped(cut)) {
+    return prefix + '[argv withheld: secret-shaped text]';
+  }
+  return cut;
 }
 
 export const MAX_GATE_COMMANDS = 20;

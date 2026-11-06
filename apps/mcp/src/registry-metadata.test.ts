@@ -1,8 +1,8 @@
 // Registry metadata tests (MX1; plan §3.3, §3.7, D10, D16): the tool names
 // are exactly the registry's list and follow D16, kinds and scopes are within
 // their allowed sets, scope follows kind, annotations follow kind, no tool is
-// destructive, mutating tools ship after T3a with the D11 dry-run flow, and
-// every input schema is a strict object that refuses an extra key.
+// destructive, every tool is `read` until T3a, and every input schema is a
+// strict object that refuses an extra key.
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import type { ApiClientResult, FleetApiClient } from "./client.js";
@@ -105,17 +105,9 @@ describe("registry metadata (MX1; plan §3.3, §3.7, D10, D16)", () => {
     expect(Object.isFrozen(mutating)).toBe(true);
   });
 
-  it("mutating tools ship after T3a with the D11 dry-run flow (MX6a)", () => {
+  it("ships only read tools until T3a (D10; MX6a changes this test)", () => {
     for (const tool of registry.tools) {
-      if (tool.kind !== "mutating") {
-        continue;
-      }
-      expect(tool.scope).toBe("message");
-      // Strictness holds even with the dry-run controls present (§3.7).
-      expect(
-        tool.inputSchema.safeParse({ dry_run: true, unexpected: "example" })
-          .success,
-      ).toBe(false);
+      expect(tool.kind).toBe("read");
     }
   });
 

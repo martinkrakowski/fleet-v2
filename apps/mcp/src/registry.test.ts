@@ -3,7 +3,6 @@
 // accepts a path or URL input, and the registry contains only these names.
 import { describe, expect, it } from "vitest";
 import type { ApiClientResult, FleetApiClient } from "./client.js";
-import { previewDigest } from "./dry-run.js";
 import {
   buildRegistry,
   FLEET_RESOURCE_NAMES,
@@ -94,7 +93,6 @@ describe("buildRegistry", () => {
       "fleet_conductor_status",
       "fleet_brief_preview",
       "fleet_telemetry_status",
-      "fleet_seat_observe",
     ]);
     expect([...registry.resources.map((resource) => resource.name)]).toEqual([
       ...FLEET_RESOURCE_NAMES,
@@ -183,120 +181,6 @@ describe("fleet_coordination tool", () => {
       code: "invalid-input",
       message: "Input does not match the tool schema.",
     });
-    expect(client.calls).toEqual([]);
-  });
-});
-
-describe("fleet_seat_observe tool (MX6a)", () => {
-  const VALID_INPUT = {
-    observationId: "01J0000000000000000000000A",
-    seatId: "seat-1",
-    outcome: "timeout",
-    observedAtIso: "2026-11-06T00:00:00.000Z",
-    subject: { attemptId: "attempt-1" },
-  } as const;
-
-  /** The record the tool would write for `input` (mirrors the handler's shape). */
-  function seatObserveRecordFor(input: typeof VALID_INPUT) {
-    return {
-      version: 1,
-      observationId: input.observationId,
-      seatId: input.seatId,
-      outcome: input.outcome,
-      observedAtIso: input.observedAtIso,
-      subject: input.subject,
-      via: "mcp",
-    };
-  }
-
-  it("defaults to a dry run: no client call, the record and its digest, validated schema-only", async () => {
-    const client = fakeClient({});
-    const registry = buildRegistry(client);
-    const result = await toolNamed(registry, "fleet_seat_observe").handler(
-      VALID_INPUT,
-    );
-    expect(client.calls).toEqual([]);
-    expect(result.isError).toBeUndefined();
-    const payload = JSON.parse(result.content[0]?.text ?? "") as {
-      code: string;
-      validated: string;
-      previewDigest: string;
-      record: Record<string, unknown>;
-    };
-    expect(payload.code).toBe("dry-run");
-    expect(payload.validated).toBe("schema-only");
-    expect(payload.previewDigest).toMatch(/^[0-9a-f]{64}$/);
-    expect(payload.record).toEqual({
-      version: 1,
-      observationId: VALID_INPUT.observationId,
-      seatId: "seat-1",
-      outcome: "timeout",
-      observedAtIso: "2026-11-06T00:00:00.000Z",
-      subject: { attemptId: "attempt-1" },
-      via: "mcp",
-    });
-    expect(payload.previewDigest).toBe(previewDigest(payload.record));
-  });
-
-  it("refuses a write whose echoed digest is missing, wrong or malformed", async () => {
-    const registry = buildRegistry(fakeClient({}));
-    const handler = toolNamed(registry, "fleet_seat_observe").handler;
-    const digest = previewDigest(seatObserveRecordFor(VALID_INPUT));
-    for (const echoed of [undefined, "0".repeat(64), "abc"]) {
-      const result = await handler({
-        ...VALID_INPUT,
-        dry_run: false,
-        ...(echoed === undefined ? {} : { previewDigest: echoed }),
-      });
-      expect(result.isError).toBe(true);
-      expect(JSON.parse(result.content[0]?.text ?? "")).toEqual({
-        code: "digest-mismatch",
-        message: expect.any(String),
-      });
-    }
-    // The correct echo passes the digest gate but still finds no route.
-    const honest = await handler({
-      ...VALID_INPUT,
-      dry_run: false,
-      previewDigest: digest,
-    });
-    expect(JSON.parse(honest.content[0]?.text ?? "")).toMatchObject({
-      code: "route-unavailable",
-    });
-  });
-
-  it("refuses a write locally while SR7 is pending: no client call, nothing recorded", async () => {
-    const client = fakeClient({});
-    const registry = buildRegistry(client);
-    const result = await toolNamed(registry, "fleet_seat_observe").handler({
-      ...VALID_INPUT,
-      dry_run: false,
-      previewDigest: previewDigest(seatObserveRecordFor(VALID_INPUT)),
-    });
-    expect(client.calls).toEqual([]);
-    expect(result.isError).toBe(true);
-    expect(JSON.parse(result.content[0]?.text ?? "")).toEqual({
-      code: "route-unavailable",
-      message: expect.any(String),
-    });
-  });
-
-  it("refuses an extra key and a bad ULID without calling the client", async () => {
-    const client = fakeClient({});
-    const registry = buildRegistry(client);
-    const handler = toolNamed(registry, "fleet_seat_observe").handler;
-    for (const input of [
-      { ...VALID_INPUT, dry_run: true, url: "http://127.0.0.1:9/x" },
-      { ...VALID_INPUT, observationId: "not-a-ulid" },
-      { ...VALID_INPUT, outcome: "crashed" },
-    ]) {
-      const result = await handler(input);
-      expect(result.isError).toBe(true);
-      expect(JSON.parse(result.content[0]?.text ?? "")).toEqual({
-        code: "invalid-input",
-        message: "Input does not match the tool schema.",
-      });
-    }
     expect(client.calls).toEqual([]);
   });
 });

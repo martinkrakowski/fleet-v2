@@ -57,6 +57,18 @@ vi.mock("node:crypto", async (importOriginal) => {
   return { ...actual, randomBytes };
 });
 
+// The module seam for chmod: every `chmodSync` call is recorded (path only) and
+// then forwarded, so a test can assert that no chmod runs on the final code path.
+const chmodSeam = vi.hoisted(() => ({ paths: [] as string[] }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const chmodSync = ((path: Parameters<typeof actual.chmodSync>[0], mode: Parameters<typeof actual.chmodSync>[1]) => {
+    chmodSeam.paths.push(String(path));
+    return actual.chmodSync(path, mode);
+  }) as typeof actual.chmodSync;
+  return { ...actual, chmodSync };
+});
+
 // Nitro auto-imports h3 utilities into the global scope at build time;
 // vitest does not, so stub them globally before loading route modules.
 for (const [key, value] of Object.entries(h3)) {
@@ -165,6 +177,7 @@ describe("T6a web session login", () => {
     resetWebLogin();
     randomSeam.pinnedSuffix = null;
     randomSeam.sizes.length = 0;
+    chmodSeam.paths.length = 0;
     delete process.env.FLEET_API_ALLOWED_ORIGINS;
   });
 
@@ -598,6 +611,31 @@ describe("T6a web session login", () => {
         expect(bootstrapFleetApiFromEnv(env)).toBe(false);
         expect(existsSync(filePath)).toBe(false);
       }
+    });
+
+    it("the issued code file is mode 0600 and no chmod runs on its final path", () => {
+      const filePath = join(tempDir, WEB_LOGIN_CODE_FILE);
+      expect(issueWebLoginCode(tempDir)).toBeTruthy();
+      expect(statSync(filePath).mode & 0o777).toBe(0o600);
+      expect(chmodSeam.paths.includes(filePath)).toBe(false);
+    });
+
+    it("an invalid installation refuses the bootstrap and removes a code file left by an earlier run", () => {
+      const filePath = join(tempDir, WEB_LOGIN_CODE_FILE);
+      const tokenFile = join(tempDir, "api-token");
+      writeFileSync(tokenFile, `${VALID_TOKEN}\n`, { mode: 0o600 });
+      const installationFile = join(tempDir, "fleet.json");
+      writeFileSync(installationFile, "{ not json");
+      writeFileSync(filePath, '{"code":"stale","issuedAtIso":"2026-01-01T00:00:00.000Z"}\n');
+
+      const bootstrapped = bootstrapFleetApiFromEnv({
+        FLEET_STATE_DIR: tempDir,
+        FLEET_API_TOKEN_FILE: tokenFile,
+        FLEET_INSTALLATION_FILE: installationFile,
+      });
+
+      expect(bootstrapped).toBe(false);
+      expect(existsSync(filePath)).toBe(false);
     });
 
     it("a bootstrap with no state directory touches no code file", () => {

@@ -14,6 +14,7 @@ import {
   AppendScorecardUseCase,
   deriveDurationMs,
   deriveVerificationResult,
+  keepRunAttempts,
   type AppendScorecardDependencies,
 } from '../AppendScorecardUseCase.use-case.js';
 
@@ -405,6 +406,26 @@ describe('AppendScorecardUseCase', () => {
     expect(dispositionReads).toBe(0);
   });
 
+  it('refuses a receipt read with an unknown outcome', async () => {
+    const h = harness({ receipt: () => ({ outcome: 'error' } as never) });
+    expect(await new AppendScorecardUseCase(h.deps).appendScorecard({ runId: RUN_ID, nowIso: NOW })).toEqual({
+      outcome: 'refused',
+      reason: 'stores-unreadable',
+    });
+    expect(h.appended).toEqual([]);
+    expect(h.calls).not.toContain('append');
+  });
+
+  it('refuses a run record that repeats an attempt id', async () => {
+    const h = harness({ run: run({ attemptIds: ['a1', 'a1'] }), attempts: [attempt('a1')] });
+    expect(await new AppendScorecardUseCase(h.deps).appendScorecard({ runId: RUN_ID, nowIso: NOW })).toEqual({
+      outcome: 'refused',
+      reason: 'stores-unreadable',
+    });
+    expect(h.appended).toEqual([]);
+    expect(h.calls).not.toContain('append');
+  });
+
   it('refuses a run with more than 64 attempts', async () => {
     const ids = Array.from({ length: 65 }, (_, index) => `attempt-${index}`);
     const h = harness({ run: run({ attemptIds: ids }), attempts: ids.map((id) => attempt(id)) });
@@ -513,5 +534,19 @@ describe('scorecard derivation helpers', () => {
       deriveDurationMs([attempt('a', { createdAtIso: '2026-11-06T09:00:00.000Z', updatedAtIso: '2026-11-06T08:00:00.000Z' })]),
     ).toBeNull();
     expect(deriveDurationMs([attempt('a')])).toBe(30 * 60 * 1000);
+  });
+});
+
+describe('keepRunAttempts', () => {
+  it('returns null when a run repeats an attempt id', () => {
+    expect(keepRunAttempts(run({ attemptIds: ['a1', 'a1'] }), [attempt('a1')])).toBeNull();
+    expect(keepRunAttempts(run({ attemptIds: ['a1', 'a2', 'a1'] }), [attempt('a1'), attempt('a2')])).toBeNull();
+  });
+
+  it('keeps the attempts in attemptIds order for unique ids', () => {
+    const a1 = attempt('a1');
+    const a2 = attempt('a2');
+    expect(keepRunAttempts(run({ attemptIds: ['a2', 'a1'] }), [a1, a2])).toEqual([a2, a1]);
+    expect(keepRunAttempts(run({ attemptIds: [] }), [a1, a2])).toEqual([]);
   });
 });

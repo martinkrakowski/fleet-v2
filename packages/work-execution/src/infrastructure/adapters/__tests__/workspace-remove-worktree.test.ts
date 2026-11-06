@@ -21,8 +21,16 @@ import type {
 } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 import type { ExecutorForRecordedHostResult } from '../ExecutorForHost.helper.js';
 import type { AttemptRunnerRecord } from '../../../domain/execution-records.js';
-import type { RemoveWorktreeRequest } from '../../../application/ports/out/WorkspacePort.out-port.js';
+import type {
+  RemoveWorktreeManifestCheck,
+  RemoveWorktreeRequest,
+} from '../../../application/ports/out/WorkspacePort.out-port.js';
+import type {
+  ArtifactManifestRemovalCheckResult,
+  VerifyArtifactManifestRequest,
+} from '../../../application/ports/out/AttemptArtifactPort.out-port.js';
 import { WorkspaceAdapter } from '../WorkspaceAdapter.adapter.js';
+import { AttemptArtifactAdapter } from '../AttemptArtifactAdapter.adapter.js';
 import { LocalExecutor } from '../LocalExecutor.adapter.js';
 
 const execFileAsync = promisify(execFile);
@@ -92,6 +100,40 @@ const RECORDED_HOST: AttemptRunnerRecord = {
   variant: null,
 };
 
+/** C2': the sealed manifest coordinates every fake-executor request is gated on. */
+const MANIFEST_SHA = 'a'.repeat(64);
+const SEALED_MANIFEST: RemoveWorktreeManifestCheck = {
+  kind: 'sealed',
+  attemptId: 'attempt-1',
+  manifestPath: `.lane/artifacts-manifest-${'a'.repeat(16)}.json`,
+  expectedManifestSha256: MANIFEST_SHA,
+};
+
+/**
+ * C2': the hardened git-read prefix every read inside `removeWorktree` runs
+ * under — no protocol, no lazy fetch, no prompt, no optional locks, no hooks,
+ * no fsmonitor.
+ */
+const GIT_READ_PREFIX = [
+  'env',
+  'GIT_ALLOW_PROTOCOL=none',
+  'GIT_NO_LAZY_FETCH=1',
+  'GIT_TERMINAL_PROMPT=0',
+  'git',
+  '--no-optional-locks',
+  '-c',
+  'core.hooksPath=/dev/null',
+  '-c',
+  'core.fsmonitor=false',
+  '-c',
+  'protocol.allow=never',
+] as const;
+
+/** One hardened git read argv, as the adapter must issue it. */
+function hardenedRead(atPath: string, ...args: string[]): string[] {
+  return [...GIT_READ_PREFIX, '-C', atPath, ...args];
+}
+
 function makeRequest(overrides: Partial<RemoveWorktreeRequest> = {}): RemoveWorktreeRequest {
   return {
     repositoryRoot: CLONE,
@@ -101,6 +143,7 @@ function makeRequest(overrides: Partial<RemoveWorktreeRequest> = {}): RemoveWork
     expectedBranch: BRANCH,
     expectedLastActivityIso: ACTIVITY_ISO,
     recordedHost: RECORDED_HOST,
+    manifest: SEALED_MANIFEST,
     ...overrides,
   };
 }
@@ -163,15 +206,28 @@ function quietActivityCanned(): Readonly<Record<string, CannedSpec>> {
   };
 }
 
+/** The default manifest check: the sealed manifest verifies. */
+function sealedCheck(): (
+  request: VerifyArtifactManifestRequest,
+) => Promise<ArtifactManifestRemovalCheckResult> {
+  return async () => ({ outcome: 'sealed' }) as ArtifactManifestRemovalCheckResult;
+}
+
 async function removeWith(
   canned: Readonly<Record<string, CannedSpec>>,
   request: RemoveWorktreeRequest = makeRequest(),
+  checkArtifactManifest: (
+    request: VerifyArtifactManifestRequest,
+  ) => Promise<ArtifactManifestRemovalCheckResult> = sealedCheck(),
 ): Promise<{ result: Awaited<ReturnType<WorkspaceAdapter['removeWorktree']>>; calls: RunCall[] }> {
   const { executor, calls } = fakeExecutor({
     [PWD_MARKER]: ({ argv }) => ({ stdout: `${argv[argv.length - 1]}\n` }),
     ...canned,
   });
-  const adapter = new WorkspaceAdapter({ executorForRecordedHost: executorForRecordedHost(executor) });
+  const adapter = new WorkspaceAdapter({
+    executorForRecordedHost: executorForRecordedHost(executor),
+    checkArtifactManifest,
+  });
   const result = await adapter.removeWorktree(request);
   return { result, calls };
 }
@@ -190,28 +246,28 @@ describe('removeWorktree over a fake executor', () => {
     });
     expect(result).toEqual({ outcome: 'removed', branchTip: HEAD });
     expect(calls.map((call) => call.argv)).toEqual([
-      ['git', '-C', CLONE, 'worktree', 'list', '--porcelain'],
+      hardenedRead(CLONE, 'worktree', 'list', '--porcelain'),
       ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', CLONE],
       ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', WORKTREE_ROOT],
       ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', WORKTREE],
       ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', CLONE],
-      ['git', '-C', WORKTREE, 'rev-parse', 'HEAD'],
-      ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-C', WORKTREE, 'status', '--porcelain', '--untracked-files=all'],
-      ['git', '-C', WORKTREE, 'rev-parse', '--git-dir'],
+      hardenedRead(WORKTREE, 'rev-parse', 'HEAD'),
+      hardenedRead(WORKTREE, 'status', '--porcelain', '--untracked-files=all'),
+      hardenedRead(WORKTREE, 'rev-parse', '--git-dir'),
       ['test', '-e', `${WORKTREE}/.git/rebase-merge`],
       ['test', '-e', `${WORKTREE}/.git/rebase-apply`],
       ['test', '-e', `${WORKTREE}/.git/MERGE_HEAD`],
       ['test', '-e', `${WORKTREE}/.git/CHERRY_PICK_HEAD`],
       ['test', '-e', `${WORKTREE}/.git/REVERT_HEAD`],
       ['test', '-e', `${WORKTREE}/.git/BISECT_LOG`],
-      ['git', '-C', WORKTREE, 'reflog', 'show', '-1', '--date=iso-strict', '--format=%gD', 'HEAD'],
+      hardenedRead(WORKTREE, 'reflog', 'show', '-1', '--date=iso-strict', '--format=%gD', 'HEAD'),
       ['stat', '-c', '%Y', WORKTREE],
-      ['git', '-C', WORKTREE, 'rev-parse', '--git-path', 'index'],
+      hardenedRead(WORKTREE, 'rev-parse', '--git-path', 'index'),
       ['stat', '-c', '%Y %y', `${WORKTREE}/.git/index`],
       ['find', WORKTREE, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y %y', '{}', '+'],
       ['git', '-C', CLONE, 'worktree', 'remove', WORKTREE],
       ['test', '-e', WORKTREE],
-      ['git', '-C', CLONE, 'worktree', 'list', '--porcelain'],
+      hardenedRead(CLONE, 'worktree', 'list', '--porcelain'),
     ]);
     const removeCalls = calls.filter((call) => call.argv.includes('remove'));
     expect(removeCalls).toHaveLength(1);
@@ -682,6 +738,220 @@ describe('removeWorktree over a fake executor', () => {
   });
 });
 
+describe('removeWorktree manifest gate and hardening (C2\')', () => {
+  const CLEAN_CANNED: Readonly<Record<string, CannedSpec>> = {
+    [LIST_MARKER]: ({ callIndex }) =>
+      callIndex === 0 ? { stdout: worktreeList() } : { stdout: listWithoutWorktree() },
+    [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+    [STATUS_MARKER]: { stdout: '' },
+    [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+    [TEST_E_MARKER]: { exitCode: 1 },
+    ...quietActivityCanned(),
+    [REMOVE_MARKER]: { exitCode: 0 },
+  };
+
+  it('removes a clean unsealed worktree under force-unsealed with a bounded approval reference', async () => {
+    const { result, calls } = await removeWith(
+      CLEAN_CANNED,
+      makeRequest({
+        manifest: {
+          kind: 'force-unsealed',
+          attemptId: 'attempt-1',
+          approvalReference: 'oq-1:cr-1:grant-1',
+        },
+      }),
+    );
+    expect(result).toEqual({ outcome: 'removed', branchTip: HEAD });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(true);
+  });
+
+  it.each([
+    ['uncollected', { kind: 'uncollected' } as RemoveWorktreeManifestCheck, 'artifacts not collected', undefined as unknown as () => Promise<ArtifactManifestRemovalCheckResult>],
+    [
+      'a sealed manifest whose file is gone',
+      SEALED_MANIFEST,
+      'artifacts not collected',
+      (async () => ({ outcome: 'missing' })) as () => Promise<ArtifactManifestRemovalCheckResult>,
+    ],
+    [
+      'a sealed manifest whose artifact changed',
+      SEALED_MANIFEST,
+      'artifacts changed since collection',
+      (async () => ({
+        outcome: 'mismatch',
+        mismatches: [{ path: '.lane/notes.md', kind: 'sha256' }],
+      })) as () => Promise<ArtifactManifestRemovalCheckResult>,
+    ],
+  ])('refuses %s and keeps the worktree', async (_label, manifest, reason, check) => {
+    const { result, calls } = await removeWith(CLEAN_CANNED, makeRequest({ manifest }), check ?? sealedCheck());
+    expect(result).toEqual({ outcome: 'refused', reason });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
+  it('answers unknown when the manifest check answers unknown or throws, and issues no remove', async () => {
+    const unknown = await removeWith(CLEAN_CANNED, makeRequest(), async () => ({
+      outcome: 'unknown',
+      reason: 'manifest-read-failed',
+    }));
+    expect(unknown.result).toEqual({ outcome: 'unknown', reason: 'artifact-manifest-unreadable' });
+    expect(unknown.calls.some((call) => call.argv.includes('remove'))).toBe(false);
+
+    const thrown = await removeWith(CLEAN_CANNED, makeRequest(), async () => {
+      throw new Error('check exploded');
+    });
+    expect(thrown.result).toEqual({ outcome: 'unknown', reason: 'artifact-manifest-unreadable' });
+    expect(thrown.calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
+  it('still refuses dirty, locked and busy under force-unsealed', async () => {
+    const force: RemoveWorktreeManifestCheck = {
+      kind: 'force-unsealed',
+      attemptId: 'attempt-1',
+      approvalReference: 'oq-1:cr-1:grant-1',
+    };
+    const dirty = await removeWith(
+      { ...CLEAN_CANNED, [STATUS_MARKER]: { stdout: ' M src/a.ts\n' } },
+      makeRequest({ manifest: force }),
+    );
+    expect(dirty.result).toEqual({ outcome: 'refused', reason: 'dirty' });
+
+    const locked = await removeWith(
+      { ...CLEAN_CANNED, [LIST_MARKER]: { stdout: `${worktreeList()}locked reason here\n` } },
+      makeRequest({ manifest: force }),
+    );
+    expect(locked.result).toEqual({ outcome: 'refused', reason: 'locked' });
+
+    const busy = await removeWith(
+      { ...CLEAN_CANNED, [FIND_MARKER]: { stdout: '1900000000\n' } },
+      makeRequest({ manifest: force }),
+    );
+    expect(busy.result).toEqual({ outcome: 'refused', reason: 'busy' });
+  });
+
+  it('never throws and returns invalid-request on null, primitive, unknown manifest kind, malformed manifest fields, and throwing getters', async () => {
+    const { executor } = fakeExecutor({});
+    const adapter = new WorkspaceAdapter({
+      executorForRecordedHost: executorForRecordedHost(executor),
+      checkArtifactManifest: sealedCheck(),
+    });
+    const throwing = {
+      get repositoryRoot(): string {
+        throw new Error('getter exploded');
+      },
+    } as unknown as RemoveWorktreeRequest;
+    for (const bad of [
+      null,
+      'not-a-request',
+      7,
+      throwing,
+      makeRequest({ manifest: { kind: 'some-other-kind' } as unknown as RemoveWorktreeManifestCheck }),
+      makeRequest({ manifest: {} as unknown as RemoveWorktreeManifestCheck }),
+      makeRequest({
+        manifest: {
+          kind: 'sealed',
+          attemptId: 'attempt-1',
+          manifestPath: '.lane/artifacts-manifest-deadbeefdeadbeef.json',
+          expectedManifestSha256: MANIFEST_SHA,
+        },
+      }),
+      makeRequest({
+        manifest: {
+          kind: 'sealed',
+          attemptId: 'attempt-1',
+          manifestPath: SEALED_MANIFEST.manifestPath,
+          expectedManifestSha256: 'ZZ'.repeat(32),
+        },
+      }),
+      makeRequest({
+        manifest: {
+          kind: 'force-unsealed',
+          attemptId: 'attempt-1',
+          approvalReference: 'has a slash/in it',
+        },
+      }),
+      makeRequest({
+        manifest: {
+          kind: 'force-unsealed',
+          attemptId: 'attempt-1',
+          approvalReference: 'o'.repeat(300),
+        },
+      }),
+    ] as unknown as RemoveWorktreeRequest[]) {
+      await expect(adapter.removeWorktree(bad)).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+      });
+    }
+  });
+
+  it('refuses a manifest whose nested getter throws, never throws itself', async () => {
+    const { executor, calls } = fakeExecutor({});
+    const adapter = new WorkspaceAdapter({
+      executorForRecordedHost: executorForRecordedHost(executor),
+      checkArtifactManifest: sealedCheck(),
+    });
+    for (const field of ['kind', 'attemptId', 'manifestPath', 'approvalReference']) {
+      const manifest = {
+        kind: 'force-unsealed',
+        attemptId: 'attempt-1',
+        approvalReference: 'oq-1:req-1:grant-1',
+        get [field](): string {
+          throw new Error('nested getter exploded');
+        },
+      } as unknown as RemoveWorktreeManifestCheck;
+      await expect(adapter.removeWorktree(makeRequest({ manifest }))).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+      });
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('refuses oversized paths and fields before running any command and sets maxBufferBytes on subprocess reads', async () => {
+    const oversized = makeRequest({
+      worktreePath: `/srv/fleet/worktrees/${'w'.repeat(5000)}`,
+    });
+    const { result, calls } = await removeWith(CLEAN_CANNED, oversized);
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(calls).toHaveLength(0);
+
+    const longBranch = makeRequest({ expectedBranch: 'b'.repeat(300) });
+    const branchResult = await removeWith(CLEAN_CANNED, longBranch);
+    expect(branchResult.result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    expect(branchResult.calls).toHaveLength(0);
+
+    // Every subprocess call in the happy path carries an explicit budget, and
+    // every call except the shared physical-path helper (`sh -c ... pwd -P`)
+    // carries a bounded output buffer.
+    const happy = await removeWith(CLEAN_CANNED);
+    expect(happy.result.outcome).toBe('removed');
+    for (const call of happy.calls) {
+      expect(call.options?.timeoutMs ?? 0).toBeGreaterThan(0);
+      if (call.argv[0] !== 'sh') {
+        expect(call.options?.maxBufferBytes ?? 0).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('passes protocol-off, lazy-fetch-off, no-optional-locks, hooks-off, and fsmonitor-off on every git read in removeWorktree', async () => {
+    const { result, calls } = await removeWith(CLEAN_CANNED);
+    expect(result.outcome).toBe('removed');
+    const gitReads = calls.filter(
+      (call) => call.argv[0] === 'env' && call.argv.includes('git') && !call.argv.includes('remove'),
+    );
+    // The two worktree lists, HEAD, status, git-dir, reflog and the index path.
+    expect(gitReads.length).toBeGreaterThanOrEqual(7);
+    for (const call of gitReads) {
+      expect(call.argv.slice(0, GIT_READ_PREFIX.length)).toEqual([...GIT_READ_PREFIX]);
+      expect(call.argv).toContain('-C');
+    }
+    // The one write stays the plain five-argv remove, without the prefix.
+    const removes = calls.filter((call) => call.argv.includes('remove'));
+    expect(removes).toHaveLength(1);
+    expect(removes[0]!.argv).toEqual(['git', '-C', CLONE, 'worktree', 'remove', WORKTREE]);
+  });
+});
+
 describe('removeWorktree against real git', () => {
   const createdDirs = new Set<string>();
 
@@ -698,6 +968,7 @@ describe('removeWorktree against real git', () => {
     physicalWorktreePath: string;
     branch: string;
     head: string;
+    sealed: { manifestPath: string; manifestSha256: string };
     adapter: WorkspaceAdapter;
   }> {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-remove-wt-'));
@@ -722,6 +993,20 @@ describe('removeWorktree against real git', () => {
     const branch = 'fleet/run-01ARZ3NDEKTSV4RRFFQ69G5FAV';
     await fs.mkdir(worktreeRoot);
     await git(['worktree', 'add', '-b', branch, worktreePath, head.trim()]);
+    // C2': `.lane/` is ignored in managed clones and every real-git test runs
+    // with a real sealed manifest on disk.
+    await fs.appendFile(path.join(clonePath, '.git', 'info', 'exclude'), '\n.lane/\n', 'utf8');
+    await fs.mkdir(path.join(worktreePath, '.lane'));
+    await fs.writeFile(path.join(worktreePath, '.lane', 'notes.md'), 'notes\n', 'utf8');
+    const artifactAdapter = new AttemptArtifactAdapter({ executor: new LocalExecutor() });
+    const sealed = await artifactAdapter.sealArtifactManifest({
+      attemptId: 'attempt-1',
+      worktreePath,
+      artifactPaths: ['.lane/notes.md'],
+    });
+    if (sealed.outcome !== 'sealed') {
+      throw new Error(`fixture must seal a manifest: ${sealed.reason}`);
+    }
     const adapter = new WorkspaceAdapter({
       executorForRecordedHost: () => ({ ok: true, executor: new LocalExecutor() }),
     });
@@ -732,6 +1017,7 @@ describe('removeWorktree against real git', () => {
       physicalWorktreePath: await fs.realpath(worktreePath),
       branch,
       head: head.trim(),
+      sealed,
       adapter,
     };
   }
@@ -764,6 +1050,12 @@ describe('removeWorktree against real git', () => {
         expectedHead: s.head,
         expectedBranch: s.branch,
         expectedLastActivityIso: await lastActivityIso(s),
+        manifest: {
+          kind: 'sealed',
+          attemptId: 'attempt-1',
+          manifestPath: s.sealed.manifestPath,
+          expectedManifestSha256: s.sealed.manifestSha256,
+        },
         ...overrides,
       }),
     );
@@ -857,6 +1149,12 @@ describe('removeWorktree against real git', () => {
         expectedHead: s.head,
         expectedBranch: s.branch,
         expectedLastActivityIso: baseline,
+        manifest: {
+          kind: 'sealed',
+          attemptId: 'attempt-1',
+          manifestPath: s.sealed.manifestPath,
+          expectedManifestSha256: s.sealed.manifestSha256,
+        },
       }),
     );
     expect(result).toEqual({ outcome: 'refused', reason: 'busy' });
@@ -896,10 +1194,98 @@ describe('removeWorktree against real git', () => {
         expectedHead: s.head,
         expectedBranch: s.branch,
         expectedLastActivityIso: null,
+        manifest: {
+          kind: 'sealed',
+          attemptId: 'attempt-1',
+          manifestPath: s.sealed.manifestPath,
+          expectedManifestSha256: s.sealed.manifestSha256,
+        },
       }),
     );
     expect(result).toEqual({ outcome: 'refused', reason: 'not-a-linked-worktree' });
     const kept = await fs.readFile(path.join(plainDir, 'keep.txt'), 'utf8');
     expect(kept).toBe('keep\n');
+  });
+
+  it('refuses artifacts not collected for an uncollected manifest and keeps the worktree', async () => {
+    const s = await setup();
+    const result = await removeWorktree(s, { manifest: { kind: 'uncollected' } });
+    expect(result).toEqual({ outcome: 'refused', reason: 'artifacts not collected' });
+    const listed = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: s.clonePath });
+    expect(listed.stdout).toContain(s.physicalWorktreePath);
+  });
+
+  it('refuses artifacts not collected when the sealed manifest file is gone and keeps the worktree', async () => {
+    const s = await setup();
+    await fs.rm(path.join(s.worktreePath, s.sealed.manifestPath));
+    const result = await removeWorktree(s);
+    expect(result).toEqual({ outcome: 'refused', reason: 'artifacts not collected' });
+    const listed = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: s.clonePath });
+    expect(listed.stdout).toContain(s.physicalWorktreePath);
+  });
+
+  it('refuses artifacts changed since collection when a sealed artifact was modified and keeps the worktree', async () => {
+    const s = await setup();
+    const artifact = path.join(s.worktreePath, '.lane', 'notes.md');
+    await fs.writeFile(artifact, 'tampered\n', 'utf8');
+    // The activity re-check must pass: the mtime stays older than every
+    // baseline the caller reads after the modification, and carries a
+    // non-zero sub-second part so the reading is not too coarse to prove
+    // quiet.
+    const past = new Date('2020-01-01T00:00:00.123Z');
+    await fs.utimes(artifact, past, past);
+    const result = await removeWorktree(s);
+    expect(result).toEqual({ outcome: 'refused', reason: 'artifacts changed since collection' });
+    const listed = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: s.clonePath });
+    expect(listed.stdout).toContain(s.physicalWorktreePath);
+  });
+
+  it('removes a clean unsealed worktree under force-unsealed with a valid approval reference', async () => {
+    const s = await setup();
+    const result = await removeWorktree(s, {
+      manifest: {
+        kind: 'force-unsealed',
+        attemptId: 'attempt-1',
+        approvalReference: 'oq-1:cr-1:grant-1',
+      },
+    });
+    expect(result).toEqual({ outcome: 'removed', branchTip: s.head });
+    const listed = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: s.clonePath });
+    expect(listed.stdout).not.toContain(s.physicalWorktreePath);
+  });
+
+  it('still refuses dirty, locked and busy under force-unsealed and keeps the worktree', async () => {
+    const force = {
+      kind: 'force-unsealed',
+      attemptId: 'attempt-1',
+      approvalReference: 'oq-1:cr-1:grant-1',
+    } as RemoveWorktreeManifestCheck;
+
+    const dirty = await setup();
+    await fs.writeFile(path.join(dirty.worktreePath, 'untracked.txt'), 'x\n', 'utf8');
+    await expect(
+      removeWorktree(dirty, { manifest: force }),
+    ).resolves.toEqual({ outcome: 'refused', reason: 'dirty' });
+
+    const locked = await setup();
+    await execFileAsync('git', ['worktree', 'lock', locked.worktreePath], { cwd: locked.clonePath });
+    await expect(
+      removeWorktree(locked, { manifest: force }),
+    ).resolves.toEqual({ outcome: 'refused', reason: 'locked' });
+
+    const busy = await setup();
+    const rawGitDir = (
+      await execFileAsync('git', ['rev-parse', '--git-dir'], { cwd: busy.worktreePath })
+    ).stdout.trim();
+    const gitDir = rawGitDir.startsWith('/') ? rawGitDir : path.join(busy.worktreePath, rawGitDir);
+    await fs.writeFile(path.join(gitDir, 'MERGE_HEAD'), 'x\n', 'utf8');
+    await expect(
+      removeWorktree(busy, { manifest: force }),
+    ).resolves.toEqual({ outcome: 'refused', reason: 'busy' });
+
+    for (const s of [dirty, locked, busy]) {
+      const listed = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: s.clonePath });
+      expect(listed.stdout).toContain(s.physicalWorktreePath);
+    }
   });
 });

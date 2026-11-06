@@ -11,7 +11,7 @@
  * unreadable file is a read error (fail closed) that keeps a quarantine copy.
  */
 
-import { promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import {
@@ -114,6 +114,40 @@ export interface SeatObservationRepositoryAdapterOptions {
 
 const SEAT_OBSERVATION_STORE_NAME = 'seat-observations.json';
 
+/** The largest store file either seat adapter will read (bounded, fail closed). */
+const SEAT_STORE_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Reads a store file without following a symlink out of the state directory
+ * and without reading more than `SEAT_STORE_MAX_BYTES`. A missing file is
+ * `null`; a symlink (dangling or not), a non-regular file or an oversized file
+ * throws, so it is never mistaken for "absent".
+ */
+async function readSeatStoreBytes(target: string): Promise<Buffer | null> {
+  let stat;
+  try {
+    stat = await fs.lstat(target);
+  } catch (error: unknown) {
+    if (typeof error === 'object' && error !== null && (error as { code?: string }).code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`${path.basename(target)} is not a regular file; refusing to follow it`);
+  }
+  const handle = await fs.open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.size > SEAT_STORE_MAX_BYTES) {
+      throw new Error(`${path.basename(target)} is not a regular file within ${SEAT_STORE_MAX_BYTES} bytes`);
+    }
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
+}
+
 function isUnsafeStoreId(value: string): boolean {
   return value === '' || value === '.' || value === '..';
 }
@@ -201,18 +235,9 @@ export class SeatObservationRepositoryAdapter implements SeatObservationReposito
   }
 
   private async readRecordsFromDisk(target: string): Promise<SeatObservationRecord[]> {
-    let buffer: Buffer;
-    try {
-      buffer = await fs.readFile(target);
-    } catch (error: unknown) {
-      if (
-        typeof error === 'object' &&
-        error !== null &&
-        (error as { code?: string }).code === 'ENOENT'
-      ) {
-        return [];
-      }
-      throw error;
+    const buffer = await readSeatStoreBytes(target);
+    if (buffer === null) {
+      return [];
     }
     const inspection = inspectVersionedRecordListBytes(
       buffer,

@@ -149,6 +149,24 @@ describe('SeatObservationRepositoryAdapter (file mode)', () => {
     expect(list.map((r) => r.observationId)).toEqual(['obs-1']);
   });
 
+  it('refuses a symlinked store file, dangling or not, instead of reading it or calling it absent', async () => {
+    const outside = path.join(stateDir, 'outside.json');
+    await fs.writeFile(outside, JSON.stringify([]));
+    const target = path.join(stateDir, 'seat-observations.json');
+    await fs.symlink(outside, target);
+    const adapter = new SeatObservationRepositoryAdapter({ stateDir });
+    await expect(adapter.listSeatObservations()).rejects.toThrow(/regular file/);
+    await fs.unlink(target);
+    await fs.symlink(path.join(stateDir, 'nowhere.json'), target);
+    await expect(adapter.listSeatObservations()).rejects.toThrow(/regular file/);
+  });
+
+  it('refuses an oversized store file', async () => {
+    await fs.writeFile(path.join(stateDir, 'seat-observations.json'), Buffer.alloc(8 * 1024 * 1024 + 1, 32));
+    const adapter = new SeatObservationRepositoryAdapter({ stateDir });
+    await expect(adapter.listSeatObservations()).rejects.toThrow(/bytes/);
+  });
+
   it('throws StateFileUnknownVersionError on schemaVersion 2 with no quarantine copy', async () => {
     await fs.writeFile(
       path.join(stateDir, 'seat-observations.json'),

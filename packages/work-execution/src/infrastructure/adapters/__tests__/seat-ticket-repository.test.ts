@@ -90,6 +90,13 @@ describe('SeatTicketRepositoryAdapter (memory mode)', () => {
     expect(await adapter.findSeatTicket('project-a', 'first-pass')).toEqual(stored);
   });
 
+  it('refuses a malformed record (negative ticket, bad date) without storing it', async () => {
+    await expect(
+      adapter.saveSeatTicket(ticket('project-a', 'first-pass', { ticket: -1, revision: -1, updatedAtIso: 'bad' })),
+    ).rejects.toThrow();
+    expect(await adapter.listSeatTickets()).toEqual([]);
+  });
+
   it('refuses an unsafe project id or role', async () => {
     await expect(adapter.saveSeatTicket(ticket('.', 'first-pass'))).rejects.toThrow(
       'SeatTicketRepositoryAdapter refuses an unsafe project id or role',
@@ -140,6 +147,47 @@ describe('SeatTicketRepositoryAdapter (file mode)', () => {
     await fs.writeFile(path.join(stateDir, 'seat-tickets.json'), JSON.stringify([raw]));
     const adapter = new SeatTicketRepositoryAdapter({ stateDir });
     expect(await adapter.findSeatTicket('project-a', 'fix')).toEqual(raw);
+  });
+
+  it('does not write a malformed record to disk', async () => {
+    const adapter = new SeatTicketRepositoryAdapter({ stateDir });
+    await expect(
+      adapter.saveSeatTicket(ticket('project-a', 'first-pass', { ticket: -1 })),
+    ).rejects.toThrow();
+    await expect(fs.stat(path.join(stateDir, 'seat-tickets.json'))).rejects.toThrow();
+  });
+
+  it('treats duplicate (project, role) records as unreadable instead of letting the last win', async () => {
+    const target = path.join(stateDir, 'seat-tickets.json');
+    await fs.writeFile(
+      target,
+      JSON.stringify([
+        { ...ticket('project-a', 'first-pass', { ticket: 10, revision: 1 }), schemaVersion: 1 },
+        { ...ticket('project-a', 'first-pass', { ticket: 5, revision: 2 }), schemaVersion: 1 },
+      ]),
+    );
+    const adapter = new SeatTicketRepositoryAdapter({ stateDir });
+    await expect(
+      adapter.saveSeatTicket(ticket('project-a', 'first-pass', { ticket: 6, revision: 3 })),
+    ).rejects.toBeInstanceOf(StateFileUnreadableError);
+  });
+
+  it('refuses a symlinked store file, dangling or not, instead of reading it or calling it absent', async () => {
+    const outside = path.join(stateDir, 'outside.json');
+    await fs.writeFile(outside, JSON.stringify([]));
+    const target = path.join(stateDir, 'seat-tickets.json');
+    await fs.symlink(outside, target);
+    const adapter = new SeatTicketRepositoryAdapter({ stateDir });
+    await expect(adapter.listSeatTickets()).rejects.toThrow(/regular file/);
+    await fs.unlink(target);
+    await fs.symlink(path.join(stateDir, 'nowhere.json'), target);
+    await expect(adapter.findSeatTicket('project-a', 'first-pass')).rejects.toThrow(/regular file/);
+  });
+
+  it('refuses an oversized store file', async () => {
+    await fs.writeFile(path.join(stateDir, 'seat-tickets.json'), Buffer.alloc(8 * 1024 * 1024 + 1, 32));
+    const adapter = new SeatTicketRepositoryAdapter({ stateDir });
+    await expect(adapter.listSeatTickets()).rejects.toThrow(/bytes/);
   });
 
   it('throws StateFileUnknownVersionError on schemaVersion 2 and writes no quarantine copy', async () => {

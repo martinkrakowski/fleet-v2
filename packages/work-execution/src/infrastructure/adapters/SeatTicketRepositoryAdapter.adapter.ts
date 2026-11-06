@@ -12,7 +12,7 @@
  * closed) that keeps a quarantine copy.
  */
 
-import { promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import { SEAT_TICKET_ROLES, type SeatTicketRecord, type SeatTicketRole } from '../../domain/execution-records.js';
@@ -106,6 +106,40 @@ export interface SeatTicketRepositoryAdapterOptions {
 
 const SEAT_TICKET_STORE_NAME = 'seat-tickets.json';
 
+/** The largest store file either seat adapter will read (bounded, fail closed). */
+const SEAT_STORE_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Reads a store file without following a symlink out of the state directory
+ * and without reading more than `SEAT_STORE_MAX_BYTES`. A missing file is
+ * `null`; a symlink (dangling or not), a non-regular file or an oversized file
+ * throws, so it is never mistaken for "absent".
+ */
+async function readSeatStoreBytes(target: string): Promise<Buffer | null> {
+  let stat;
+  try {
+    stat = await fs.lstat(target);
+  } catch (error: unknown) {
+    if (typeof error === 'object' && error !== null && (error as { code?: string }).code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`${path.basename(target)} is not a regular file; refusing to follow it`);
+  }
+  const handle = await fs.open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.size > SEAT_STORE_MAX_BYTES) {
+      throw new Error(`${path.basename(target)} is not a regular file within ${SEAT_STORE_MAX_BYTES} bytes`);
+    }
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
+}
+
 function seatTicketKey(projectId: string, role: SeatTicketRole): string {
   return `${projectId}\u0000${role}`;
 }
@@ -149,12 +183,21 @@ export class SeatTicketRepositoryAdapter implements SeatTicketRepositoryPort {
     if (isUnsafeStoreId(record.projectId) || !SEAT_TICKET_ROLES.includes(record.role)) {
       throw new Error('SeatTicketRepositoryAdapter refuses an unsafe project id or role');
     }
-    const stateDir = this.options?.stateDir;
-    const key = seatTicketKey(record.projectId, record.role);
-    if (stateDir === undefined) {
-      return this.saveInMemory(record, key);
+    // Validate the whole record through the reader's own parser before either
+    // save path, so nothing the reader would reject is ever stored or written.
+    const parsed = parseSeatTicketStateRecord({
+      ...record,
+      schemaVersion: SEAT_TICKET_STORE_VERSION_POLICY.writerVersion,
+    });
+    if (parsed === undefined) {
+      throw new Error('SeatTicketRepositoryAdapter refuses an invalid seat ticket record');
     }
-    return this.saveOnDisk(record, key, stateDir);
+    const stateDir = this.options?.stateDir;
+    const key = seatTicketKey(parsed.projectId, parsed.role);
+    if (stateDir === undefined) {
+      return this.saveInMemory(parsed, key);
+    }
+    return this.saveOnDisk(parsed, key, stateDir);
   }
 
   private saveInMemory(record: SeatTicketRecord, key: string): SaveSeatTicketOutcome {
@@ -195,18 +238,9 @@ export class SeatTicketRepositoryAdapter implements SeatTicketRepositoryPort {
 
   private async readRecordsFromDisk(target: string): Promise<Map<string, SeatTicketRecord>> {
     const map = new Map<string, SeatTicketRecord>();
-    let buffer: Buffer;
-    try {
-      buffer = await fs.readFile(target);
-    } catch (error: unknown) {
-      if (
-        typeof error === 'object' &&
-        error !== null &&
-        (error as { code?: string }).code === 'ENOENT'
-      ) {
-        return map;
-      }
-      throw error;
+    const buffer = await readSeatStoreBytes(target);
+    if (buffer === null) {
+      return map;
     }
     const inspection = inspectVersionedRecordListBytes(buffer, parseVersionedSeatTicketStateRecord);
     if (inspection.status === 'unknown-version') {
@@ -216,7 +250,13 @@ export class SeatTicketRepositoryAdapter implements SeatTicketRepositoryPort {
       return rejectUnreadableStateFile(target, inspection.detail, buffer, false);
     }
     for (const item of inspection.records) {
-      map.set(seatTicketKey(item.projectId, item.role), item);
+      const itemKey = seatTicketKey(item.projectId, item.role);
+      if (map.has(itemKey)) {
+        // Two records for one (project, role) cannot be merged safely: keeping
+        // either could lower a ticket. Treat the file as unreadable.
+        return rejectUnreadableStateFile(target, 'duplicate seat ticket key', buffer, false);
+      }
+      map.set(itemKey, item);
     }
     return map;
   }

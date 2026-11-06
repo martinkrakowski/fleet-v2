@@ -180,6 +180,16 @@ describe('decideMergeTransition', () => {
     expect(decideMergeTransition([stored], { ...command, next: parked }).outcome).toBe('refused');
     expect(decideMergeTransition([stored], { ...command, successor: { ...built.successor, supersedes: id(5) } }).outcome).toBe('refused');
     expect(decideMergeTransition([stored], { ...command, successor: null }).outcome).toBe('refused');
+    // A successor must inherit the position, origin and run links of its predecessor.
+    for (const wrong of [
+      { enqueuedAtIso: '2026-11-01T12:00:00.000Z' },
+      { enqueuedBy: 'cli' as const },
+      { runId: 'run-01JD00000000000000000000AA' },
+      { tier: 0 as const },
+    ]) {
+      const bad = decideMergeTransition([stored], { ...command, successor: { ...built.successor, ...wrong } });
+      expect(bad).toEqual({ outcome: 'refused', reason: 'invalid-successor' });
+    }
     expect(decideMergeTransition([stored, entry({ entryId: id(2), pullRequest: 4, headOid: HEAD_2 })], command).outcome).toBe('refused'); // id collision
   });
 });

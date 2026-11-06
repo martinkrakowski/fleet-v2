@@ -334,7 +334,13 @@ function validSuccessor(
     read.record.supersedes !== target.entryId ||
     read.record.revision !== 1 ||
     read.record.headOid === target.headOid ||
-    !sameRepository(read.record, target)
+    !sameRepository(read.record, target) ||
+    read.record.enqueuedBy !== 'update' ||
+    read.record.enqueuedAtIso !== target.enqueuedAtIso ||
+    read.record.runId !== target.runId ||
+    read.record.attemptId !== target.attemptId ||
+    read.record.workOrderId !== target.workOrderId ||
+    read.record.tier !== target.tier
   ) {
     return null;
   }

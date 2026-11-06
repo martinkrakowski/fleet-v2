@@ -466,18 +466,13 @@ describe('OcmReviewTransport', () => {
     const open = '<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>\n1. `a.ts:1` — **blocker**. Real';
     const fenceOpen = '```diff\n1. `a.ts:1` — **blocker**. Real';
     const part2 = 'VERDICT: PASS';
-    for (const part1 of [open, fenceOpen]) {
-      const expected = { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
-      expect(parseReviewReplyStrict(`${part1}\n${part2}`, part2)).toEqual(expected);
-      expect(parseReviewReply(`${part1}\n${part2}`, part2)).toEqual(expected);
-    }
-
     const recordedFixture = [
       '{"type":"step_start"}',
       JSON.stringify({ type: 'text', part: { text: open } }),
       JSON.stringify({ type: 'text', part: { text: part2 } }),
     ].join('\n');
     for (const kind of [undefined, 'brief-check' as const]) {
+      let spawnCalls = 0;
       const transport = createOcmReviewTransport({
         ocmRunBin: '/test/ocm-run',
         remotePort: 4096,
@@ -485,11 +480,25 @@ describe('OcmReviewTransport', () => {
         model: baseRequest.reviewerModel,
         resolveReviewDir: async () => '/tmp/review-dir',
         readHead: async () => baseRequest.candidateHeadSha,
-        spawn: async () => ({ exitCode: 0, stdout: recordedFixture, stderr: '' }),
+        // Same diff source the KF-14e kind transports use: without it a kind
+        // request refuses as diff-unavailable before the parser is reached.
+        baseCommit: 'base-sha-1',
+        readDiff: async () => 'diff --git a/f b/f\n+x\n',
+        spawn: async () => {
+          spawnCalls += 1;
+          return { exitCode: 0, stdout: recordedFixture, stderr: '' };
+        },
       });
       const result = await transport(kind === undefined ? baseRequest : ({ ...baseRequest, kind, briefText: 'b' } as never));
+      expect(spawnCalls).toBe(1);
       expect(result.result).toBe('unknown');
+      expect(result.unknownReason).toBe('unparseable-verdict');
       expect(result.findings).toEqual([]);
+    }
+    for (const part1 of [open, fenceOpen]) {
+      const expected = { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
+      expect(parseReviewReplyStrict(`${part1}\n${part2}`, part2)).toEqual(expected);
+      expect(parseReviewReply(`${part1}\n${part2}`, part2)).toEqual(expected);
     }
   });
 
@@ -498,28 +507,33 @@ describe('OcmReviewTransport', () => {
       ['Looks fine.\n', 'VERDICT: PASS'],
       ['Found it.\n1. `a.ts:3` — **blocker**. Broken.', 'VERDICT: FAIL'],
     ];
-    for (const [p1, p2] of cases) {
-      const joined = `${p1}\n${p2}`;
-      const whole = parseReviewReplyStrict(joined);
-      const fixture = [
-        '{"type":"step_start"}',
-        JSON.stringify({ type: 'text', part: { text: p1 } }),
-        JSON.stringify({ type: 'text', part: { text: p2 } }),
-      ].join('\n');
-      const transport = createOcmReviewTransport({
-        ocmRunBin: '/test/ocm-run',
-        remotePort: 4096,
-        agent: 'reviewer',
-        model: baseRequest.reviewerModel,
-        resolveReviewDir: async () => '/tmp/review-dir',
-        readHead: async () => baseRequest.candidateHeadSha,
-        spawn: async () => ({ exitCode: 0, stdout: fixture, stderr: '' }),
-      });
-      const split = await transport(baseRequest);
-      expect(split.result).toBe(whole.result);
-      expect(split.findings.map((f) => [f.severity, f.filePath, f.line])).toEqual(
-        whole.findings.map((f) => [f.severity, f.filePath, f.line]),
-      );
+    // Each request shape is compared with the parser that request actually
+    // uses: lenient `parseReviewReply` for a manual request (no kind), strict
+    // `parseReviewReplyStrict` for a kind request.
+    for (const kind of [undefined, 'brief-check' as const]) {
+      for (const [p1, p2] of cases) {
+        const joined = `${p1}\n${p2}`;
+        const whole = kind === undefined ? parseReviewReply(joined) : parseReviewReplyStrict(joined);
+        const fixture = [
+          '{"type":"step_start"}',
+          JSON.stringify({ type: 'text', part: { text: p1 } }),
+          JSON.stringify({ type: 'text', part: { text: p2 } }),
+        ].join('\n');
+        const transport = createOcmReviewTransport({
+          ocmRunBin: '/test/ocm-run',
+          remotePort: 4096,
+          agent: 'reviewer',
+          model: baseRequest.reviewerModel,
+          resolveReviewDir: async () => '/tmp/review-dir',
+          readHead: async () => baseRequest.candidateHeadSha,
+          spawn: async () => ({ exitCode: 0, stdout: fixture, stderr: '' }),
+          ...(kind === undefined ? {} : { baseCommit: 'base-sha-1', readDiff: async () => 'diff --git a/f b/f\n+x\n' }),
+        });
+        const split = await transport(kind === undefined ? baseRequest : ({ ...baseRequest, kind, briefText: 'b' } as never));
+        expect(split.result).toBe(whole.result);
+        expect(split.findings).toEqual(whole.findings);
+        expect(split.unknownReason).toBe(whole.unknownReason);
+      }
     }
   });
 

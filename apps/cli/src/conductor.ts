@@ -61,6 +61,12 @@ import {
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
+import {
+  heartbeatConductorOrchestrator,
+  pollDelayWhileRegistered,
+  registerConductorOrchestrator,
+  retireConductorOrchestrator,
+} from './conductor-orchestrator.js';
 import { openChangeWakeReader, resolveWakeConfig, type ChangeWakeReader } from './conductor-wake.js';
 import { buildLiveConductorDriver, buildDryRunConductorDriver, type ConductorDriver, type DryRunStores } from './conductor-wiring.js';
 import { withFileLock } from './file-store.js';
@@ -142,9 +148,13 @@ explicit authority; it also needs policy.conductor.enabled and a state
 directory. conductor run --dry-run copies the state stores into a scratch
 directory and drives them with recording fakes, printing what the driver
 would do; it reaches no host, needs neither --live nor
-policy.conductor.enabled, and never writes the real state. conductor start
-reserves capacity and prepares a worktree on a lane host; it needs
-policy.conductor.enabled and a state directory, and dispatches nothing.
+policy.conductor.enabled, and never writes the real state. conductor run
+--live registers one orchestrator session (cliKind conductor, claim
+start-lane-run) after a pass holds the driver lease and retires it on exit.
+It does not claim a request and does not start a lane. Dry-run writes no
+session. conductor start reserves capacity and prepares a worktree on a lane
+host; it needs policy.conductor.enabled and a state directory, and dispatches
+nothing.
 start --abandon works while the conductor is disabled. The status document
 also lists the reservations a crashed start left held, and conductor start
 raises one attention item per crashed start.
@@ -1026,6 +1036,13 @@ async function runCommand(
     onAbort = () => resolve('interrupted');
     signal.addEventListener('abort', onAbort, { once: true });
   });
+  // O9: the orchestrator session this process registers; null until a pass
+  // holds the lease. Its id drives the heartbeat gap and the final retire.
+  let registeredOrchestratorId: string | null = null;
+  // Registration is attempted exactly once per process, whether it succeeds or not.
+  let registrationAttempted = false;
+  // One stderr line per distinct non-renewed heartbeat code per process.
+  const seenHeartbeatCodes = new Set<string>();
   try {
     const startPromise = tunnel.ensureTunnel({
       onEarlyExit: () => {
@@ -1068,11 +1085,18 @@ async function runCommand(
     wake = opened;
     const holderId = 'driver-' + runtime.conductor.newUlid();
     const seenAttention = new Set<string>();
+    // O9: once a session is registered, cap the poll sleep to the heartbeat
+    // gap so the 90 s lease never lapses across the sleep.
+    const baseSleep = options.sleep ?? defaultSleep;
+    const conductorSleep = async (delayMs: number, signal: AbortSignal): Promise<void> => {
+      const delay = registeredOrchestratorId === null ? delayMs : pollDelayWhileRegistered(delayMs);
+      await baseSleep(delay, signal);
+    };
     return await pollConductorPasses({
       driver,
       holderId,
       nowIso: () => nowIsoOf(options),
-      sleep: options.sleep ?? defaultSleep,
+      sleep: conductorSleep,
       stopSignal: signal,
       once: flags.once,
       wake,
@@ -1081,6 +1105,37 @@ async function runCommand(
         io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
         if (result.outcome === 'refused') {
           return { stop: true, exitCode: 1 };
+        }
+        if (result.outcome === 'completed') {
+          if (!registrationAttempted) {
+            registrationAttempted = true;
+            const registration = await registerConductorOrchestrator({
+              sessionRepo: runtime.coordination.orchestratorSessionRepository,
+              listProfiles: () => runtime.coordination.projectProfileRepository.listProfiles(),
+              installation: runtime.installation,
+              clock: { nowIso: () => nowIsoOf(options) },
+              newOrchestratorId: () => runtime.conductor.newUlid(),
+            });
+            registeredOrchestratorId =
+              registration.code === 'registered' ? registration.orchestratorId : null;
+            io.stderr(
+              `${JSON.stringify(
+                registration.code === 'registered'
+                  ? { orchestrator: registration.code, orchestratorId: registration.orchestratorId }
+                  : { orchestrator: registration.code },
+              )}\n`,
+            );
+          } else if (registeredOrchestratorId !== null) {
+            const heartbeat = await heartbeatConductorOrchestrator(
+              runtime.coordination.orchestratorSessionRepository,
+              { nowIso: () => nowIsoOf(options) },
+              registeredOrchestratorId,
+            );
+            if (heartbeat.code !== 'renewed' && !seenHeartbeatCodes.has(heartbeat.code)) {
+              seenHeartbeatCodes.add(heartbeat.code);
+              io.stderr(`${JSON.stringify({ orchestrator: heartbeat.code })}\n`);
+            }
+          }
         }
         await recordPassTrace(io, driver.passTrace, {
           passId: 'pass-' + runtime.conductor.newUlid(),
@@ -1122,6 +1177,16 @@ async function runCommand(
     await stopTelemetryExporter(runtime);
     // K9: close the change-feed reader after the poll loop; idempotent.
     wake?.close();
+    // O9: retire the registered session on exit, including after a throw; the
+    // pass exit code is never changed here.
+    if (registeredOrchestratorId !== null) {
+      const retirement = await retireConductorOrchestrator(
+        runtime.coordination.orchestratorSessionRepository,
+        { nowIso: () => nowIsoOf(options) },
+        registeredOrchestratorId,
+      );
+      io.stderr(`${JSON.stringify({ orchestrator: retirement.code })}\n`);
+    }
   }
 }
 

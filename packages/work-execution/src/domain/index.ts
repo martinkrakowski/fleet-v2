@@ -19,6 +19,7 @@ export * from "./gate-receipt-key.js";
 export * from "./killall-stop.js";
 export * from "./lane-activity-records.js";
 export * from "./lane-diff-check.js";
+export * from "./lane-history.js";
 export * from "./lane-plan-graph.js";
 export * from "./lane-plan-records.js";
 export * from "./lane-plan-sidecar.js";

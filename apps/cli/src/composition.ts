@@ -1137,6 +1137,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     forgeMode,
     mergeForgeRead,
     mergeQueueRepository: execution.mergeQueueRepository,
+    chainBranchRead: execution.forgeAction,
     evidence,
     conductor,
     runGh: (args, timeoutMs) =>

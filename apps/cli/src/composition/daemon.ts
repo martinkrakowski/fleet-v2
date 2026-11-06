@@ -17,6 +17,9 @@ import {
   MergeNotificationAdapter,
   MergePolicyAdapter,
   MergeVerificationAdapter,
+  ChainAttentionAdapter,
+  ChainRepositoryAdapter,
+  RefreshChainsUseCase,
   RunDaemonTickUseCase,
   RunMergePassUseCase,
   computeCallBudget,
@@ -29,6 +32,7 @@ import {
   type MergePolicyAnswer,
   type MergePolicyPort,
   type MergePolicySource,
+  type MergeForgeActionPort,
   type MergeQueueRepositoryAdapter,
   type SetDaemonPausePort,
   type SetDaemonPauseRequest,
@@ -55,6 +59,8 @@ export interface ComposeDaemonInput {
   readonly forgeMode: string | undefined;
   readonly mergeForgeRead: GhForgeMergeReadAdapter;
   readonly mergeQueueRepository: MergeQueueRepositoryAdapter;
+  /** The forge's branch-head read for the shadow chain refresh; only the read is taken from it. */
+  readonly chainBranchRead: Pick<MergeForgeActionPort, 'readMergeBranchHead'>;
   readonly evidence: Pick<FleetCliRuntime['evidence'], 'inspectAcceptanceEvidence' | 'requestVerification'>;
   readonly conductor: Pick<FleetCliRuntime['conductor'], 'laneRunJournal' | 'halt'>;
   readonly runGh: (args: readonly string[], timeoutMs?: number) => Promise<GhInvocationResult>;
@@ -162,6 +168,21 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     newUlid: () => newUlid(),
     nowIso: now,
   });
+  // CO8: the chain-refresh job runs in shadow mode only (`policy.daemon.chainRefresh` has no live
+  // value yet). The forge facade exposes the branch-head read and refuses every action, so no code
+  // path here can merge, push or write to the forge; chain-refresh.sh stays the only merger.
+  const shadowForge: MergeForgeActionPort = {
+    readMergeBranchHead: (request) => input.chainBranchRead.readMergeBranchHead(request),
+    performMergeForgeAction: async () => ({ outcome: 'refused', reason: 'shadow-mode', refusalKind: 'other' }),
+    isConfigured: () => true,
+  };
+  const chainRefresh = new RefreshChainsUseCase({
+    chains: durable ? new ChainRepositoryAdapter({ stateDir }) : new ChainRepositoryAdapter(),
+    forge: shadowForge,
+    attention: new ChainAttentionAdapter(),
+    now,
+    mode: 'shadow',
+  });
   const runDaemonTick = new RunDaemonTickUseCase({
     pause,
     halt: input.conductor.halt,
@@ -172,6 +193,7 @@ export function composeDaemon(input: ComposeDaemonInput): ComposedDaemon {
     forge: input.mergeForgeRead,
     journal: input.conductor.laneRunJournal,
     mergePass: runMergePass,
+    chainRefresh,
     now,
     ...(options?.daemonSleep !== undefined ? { sleep: options.daemonSleep } : {}),
     newUlid: () => newUlid(),

@@ -179,6 +179,7 @@ function harness(script: {
   raise?: FakeAttention['raiseScript'];
   clear?: FakeAttention['clearScript'];
   nowFn?: () => string;
+  mode?: 'shadow' | 'live';
 } = {}) {
   const trace: string[] = [];
   const chains = new FakeChains(script.records ?? [startedRecord()], trace);
@@ -197,6 +198,7 @@ function harness(script: {
     forge,
     attention,
     now: script.nowFn ?? (() => NOW),
+    ...(script.mode !== undefined ? { mode: script.mode } : {}),
   });
   return { useCase, chains, forge, attention, trace };
 }
@@ -269,6 +271,32 @@ describe('RefreshChainsUseCase', () => {
       { chainName: 'example', key: KEY, outcome: 'conflict', attentionRefused: 'store-unreadable' },
     ]);
     expect(h.attention.raises).toHaveLength(1);
+  });
+
+  it('shadow mode observes what it would refresh and writes nothing', async () => {
+    const h = harness({ mode: 'shadow', records: [startedRecord('example'), startedRecord('second')] });
+    const result = await h.useCase.runRefreshChains(command());
+    expect(result.outcome).toBe('skipped');
+    expect(result.reasonCode).toBe('shadow-would-refresh-2');
+    expect(result.chains.map((chain) => [chain.chainName, chain.outcome])).toEqual([
+      ['example', 'skipped'],
+      ['second', 'skipped'],
+    ]);
+    expect(result.chains[0]!.key).toBe(KEY);
+    expect(h.trace).toEqual(['list', 'head']);
+    expect(h.forge.calls).toEqual(['head']);
+    expect(h.attention.raises).toHaveLength(0);
+    expect(h.attention.clears).toHaveLength(0);
+  });
+
+  it('shadow mode reports a chain already refreshed at this main head as nothing to do', async () => {
+    const record = startedRecord('example', {
+      refresh: { key: KEY, mainSha: MAIN, outcome: 'merged', updatedAtIso: NOW },
+    });
+    const h = harness({ mode: 'shadow', records: [record] });
+    const result = await h.useCase.runRefreshChains(command());
+    expect(result.reasonCode).toBe('shadow-nothing-to-refresh');
+    expect(h.trace).toEqual(['list', 'head']);
   });
 
   it('a merged chain clears the conflict mark and clears the attention item', async () => {

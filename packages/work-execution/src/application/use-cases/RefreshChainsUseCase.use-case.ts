@@ -114,6 +114,8 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       readonly forge: MergeForgeActionPort;
       readonly attention: ChainAttentionPort;
       readonly now?: () => string;
+      /** `shadow` observes only: no intent, no forge write, no attention. Default `live`. */
+      readonly mode?: 'shadow' | 'live';
     },
   ) {}
 
@@ -157,6 +159,9 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     if (head.outcome === 'unavailable') {
       return { outcome: 'skipped', reasonCode: 'main-unreadable', chains: [] };
     }
+    if (this.deps.mode === 'shadow') {
+      return this.observe(listed.records, head.headSha);
+    }
     const chains: RefreshChainsChainReport[] = [];
     let budgetHit = false;
     for (const record of listed.records) {
@@ -177,6 +182,35 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       return { outcome: 'budget-exhausted', reasonCode: null, chains };
     }
     return { outcome: 'completed', reasonCode: null, chains };
+  }
+
+  /**
+   * Shadow mode: work out which started chains would be refreshed at this `main` head and report
+   * them by id and code only. Nothing is recorded or written, and the forge is never asked to merge.
+   */
+  private observe(records: readonly ChainRecord[], mainSha: string): RefreshChainsResult {
+    const chains: RefreshChainsChainReport[] = [];
+    let wouldRefresh = 0;
+    for (const record of records) {
+      if (record.state !== 'started') {
+        continue;
+      }
+      const key = chainRefreshKey(record.chainName, mainSha);
+      if (key === null) {
+        continue;
+      }
+      const stored = chainRefreshOf(record);
+      if (stored !== null && stored.key === key && stored.outcome !== 'in-flight') {
+        continue;
+      }
+      wouldRefresh += 1;
+      chains.push({ chainName: record.chainName, key, outcome: 'skipped' });
+    }
+    return {
+      outcome: 'skipped',
+      reasonCode: wouldRefresh === 0 ? 'shadow-nothing-to-refresh' : `shadow-would-refresh-${wouldRefresh}`,
+      chains,
+    };
   }
 
   private async readMainHead(command: ValidCommand): Promise<MergeBranchHeadResult> {

@@ -327,12 +327,14 @@ export class GatePredicateAdapter implements GatePredicatePort {
     const capacity =
       this.maxConcurrentPredicates === undefined ? declared : Math.min(declared, this.maxConcurrentPredicates);
     const hostName = request.runner?.hostName;
+    // The ssh alias names the machine for both a v2 record and a legacy one, so it wins; the host name is
+    // the key only for a host with no alias (a local one).
     const alias = request.runner?.host;
     const id =
-      typeof hostName === 'string' && hostName.length > 0
-        ? 'name:' + hostName
-        : typeof alias === 'string' && alias.length > 0
-          ? 'alias:' + alias
+      typeof alias === 'string' && alias.length > 0
+        ? 'alias:' + alias
+        : typeof hostName === 'string' && hostName.length > 0
+          ? 'name:' + hostName
           : 'legacy';
     const existing = this.budgets.get(id);
     if (existing !== undefined) {

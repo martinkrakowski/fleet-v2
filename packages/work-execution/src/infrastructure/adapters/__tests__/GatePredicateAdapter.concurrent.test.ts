@@ -282,6 +282,18 @@ describe('GatePredicateAdapter concurrency (KS3)', () => {
     expect(same.peak).toBe(1);
   });
 
+  it('shares one budget between a v2 record and a legacy record of the same host alias', async () => {
+    const executor = new RecordingExecutor({ a: { delayMs: 10 } });
+    const adapter = makeAdapter(executor, 1);
+    const record = (hostName: string | null) =>
+      ({ kind: 'opencode', remotePort: 4096, host: 'same-host', hostName }) as unknown as EvaluateGatePredicatesRequest['runner'];
+    await Promise.all([
+      adapter.evaluateGatePredicates({ ...requestWith(['a1'], '/lanes/m1'), runner: record('runner-1') }),
+      adapter.evaluateGatePredicates({ ...requestWith(['a2'], '/lanes/m2'), runner: record(null) }),
+    ]);
+    expect(executor.peak).toBe(1);
+  });
+
   it('refuses a request with more commands or arguments than an acceptance spec allows', async () => {
     const executor = new RecordingExecutor();
     const adapter = makeAdapter(executor, 4);

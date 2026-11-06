@@ -41,6 +41,8 @@ export interface MergePolicyDaemonSettings {
   readonly intervalSeconds: number;
   readonly budgetSeconds: number;
   readonly settleSeconds: number;
+  /** The effective chain-refresh mode: `shadow` or `invalid` (CO8a); never `live`. */
+  readonly chainRefresh: 'shadow' | 'invalid';
 }
 
 /** What the installation seam hands the adapter; the adapter re-validates it before trusting it. */

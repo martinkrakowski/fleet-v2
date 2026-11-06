@@ -161,9 +161,16 @@ export class IndependentReviewAdapter implements IndependentReviewPort {
           code: 'transport',
         };
       }
-      const findings = Array.isArray(rawFindings)
-        ? (rawFindings as unknown as ReviewFindingRecord[]).map((finding) => ({ ...finding }))
-        : [];
+      // A non-array findings value is invalid transport output too: it must
+      // never become a receipt with zero findings.
+      if (!Array.isArray(rawFindings)) {
+        return {
+          outcome: 'unavailable',
+          reason: 'Independent review transport returned non-array findings',
+          code: 'transport',
+        };
+      }
+      const findings = (rawFindings as unknown as ReviewFindingRecord[]).map((finding) => ({ ...finding }));
       const result: unknown = review.result;
       const unknownReason: unknown = review.unknownReason;
       return {

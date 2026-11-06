@@ -462,6 +462,67 @@ describe('OcmReviewTransport', () => {
     expect(result.result).toBe('unknown');
   });
 
+  it('an echo block opened in an earlier text part and never closed refuses the answer (final-part verdict)', async () => {
+    const open = '<<<UNTRUSTED nonce=0123456789abcdef label="diff">>>\n1. `a.ts:1` — **blocker**. Real';
+    const fenceOpen = '```diff\n1. `a.ts:1` — **blocker**. Real';
+    const part2 = 'VERDICT: PASS';
+    for (const part1 of [open, fenceOpen]) {
+      const expected = { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
+      expect(parseReviewReplyStrict(`${part1}\n${part2}`, part2)).toEqual(expected);
+      expect(parseReviewReply(`${part1}\n${part2}`, part2)).toEqual(expected);
+    }
+
+    const recordedFixture = [
+      '{"type":"step_start"}',
+      JSON.stringify({ type: 'text', part: { text: open } }),
+      JSON.stringify({ type: 'text', part: { text: part2 } }),
+    ].join('\n');
+    for (const kind of [undefined, 'brief-check' as const]) {
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => '/tmp/review-dir',
+        readHead: async () => baseRequest.candidateHeadSha,
+        spawn: async () => ({ exitCode: 0, stdout: recordedFixture, stderr: '' }),
+      });
+      const result = await transport(kind === undefined ? baseRequest : ({ ...baseRequest, kind, briefText: 'b' } as never));
+      expect(result.result).toBe('unknown');
+      expect(result.findings).toEqual([]);
+    }
+  });
+
+  it('a clean answer split across text parts parses the same as the same answer as one string', async () => {
+    const cases = [
+      ['Looks fine.\n', 'VERDICT: PASS'],
+      ['Found it.\n1. `a.ts:3` — **blocker**. Broken.', 'VERDICT: FAIL'],
+    ];
+    for (const [p1, p2] of cases) {
+      const joined = `${p1}\n${p2}`;
+      const whole = parseReviewReplyStrict(joined);
+      const fixture = [
+        '{"type":"step_start"}',
+        JSON.stringify({ type: 'text', part: { text: p1 } }),
+        JSON.stringify({ type: 'text', part: { text: p2 } }),
+      ].join('\n');
+      const transport = createOcmReviewTransport({
+        ocmRunBin: '/test/ocm-run',
+        remotePort: 4096,
+        agent: 'reviewer',
+        model: baseRequest.reviewerModel,
+        resolveReviewDir: async () => '/tmp/review-dir',
+        readHead: async () => baseRequest.candidateHeadSha,
+        spawn: async () => ({ exitCode: 0, stdout: fixture, stderr: '' }),
+      });
+      const split = await transport(baseRequest);
+      expect(split.result).toBe(whole.result);
+      expect(split.findings.map((f) => [f.severity, f.filePath, f.line])).toEqual(
+        whole.findings.map((f) => [f.severity, f.filePath, f.line]),
+      );
+    }
+  });
+
   it('final part last line VERDICT: FAIL → fail', async () => {
     const recordedFixture = [
       '{"type":"step_start"}',
@@ -2266,7 +2327,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
       '5. `src/d.ts:4` — **blocker**: colon before summary.',
       '6. `src/e.ts` and `src/f.ts:9` — **nit**. Two paths, one finding.',
     ].join('\n');
-    const parsed = parseReviewReplyStrict(text, 'VERDICT: FIX FIRST\n');
+    const parsed = parseReviewReplyStrict(text + '\nVERDICT: FIX FIRST\n');
     expect(parsed.result).toBe('fail');
     expect(parsed.findings.map((finding) => [finding.severity, finding.filePath, finding.line])).toEqual([
       ['major', 'src/a.ts', null],
@@ -2460,6 +2521,24 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     const casedLine = 'FINDING: BLOCKER a.ts:3 Broken\nVERDICT: PASS';
     expect(parseReviewReplyStrict(casedLine, casedLine).result).toBe('fail');
 
+    // A non-array findings value with a fail result is refused, never a zero-finding fail receipt.
+    for (const badFindings of [undefined, 'x', { length: 0 }]) {
+      const refusedFindings = await new IndependentReviewAdapter({
+        runReview: async () => ({
+          rawOutput: 'x',
+          readOnlyVerified: true,
+          result: 'fail',
+          findings: badFindings as unknown as ReviewFindingRecord[],
+          completedAtIso: '2026-11-06T00:00:00.000Z',
+        }),
+      }).runIndependentReview(baseRequest);
+      expect(refusedFindings).toEqual({
+        outcome: 'unavailable',
+        reason: 'Independent review transport returned non-array findings',
+        code: 'transport',
+      });
+    }
+
     // A null and a throwing-getter request are the typed refusal.
     const throwing = Object.defineProperty({}, 'reviewerModel', {
       get() {
@@ -2610,7 +2689,7 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
   it('robustness (7): parseFindingLines bounds overlong lines and finding count while rawOutput stays capped at MAX_RAW_OUTPUT_LENGTH', async () => {
     // One overlong line is skipped; its FINDING text never becomes a finding.
     const longLine = 'FINDING: blocker src/x.ts:1 ' + 'x'.repeat(MAX_FINDING_LINE_LENGTH + 1);
-    const parsed = parseReviewReplyStrict(longLine, 'VERDICT: FAIL\n');
+    const parsed = parseReviewReplyStrict(longLine + '\nVERDICT: FAIL\n');
     expect(parsed.findings).toEqual([]);
     expect(parsed.result).toBe('unknown');
     expect(parsed.unknownReason).toBe('no-findings-on-fail');

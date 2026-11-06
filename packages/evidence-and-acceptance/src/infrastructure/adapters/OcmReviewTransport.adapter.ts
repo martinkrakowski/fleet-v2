@@ -893,13 +893,19 @@ function lastLineVerdict(verdictText: string): 'PASS' | 'FAIL' | null {
   return verdictMatch[1] === 'PASS' ? 'PASS' : 'FAIL';
 }
 
-/** Findings from every line of `text`; the verdict only from the last non-empty line of `verdictText`. */
-export function parseReviewReply(text: string, verdictText: string): ParsedReviewReply {
-  if (typeof text !== 'string' || typeof verdictText !== 'string') {
+/**
+ * Findings and verdict both come from `text`, the whole answer (every text
+ * part joined in order): one path for every answer shape. The verdict is the
+ * last non-empty line of the text left after untrusted blocks are stripped;
+ * an unclosed block or fence anywhere makes the answer unparseable. The
+ * second parameter is ignored and kept only so existing callers compile.
+ */
+export function parseReviewReply(text: string, _ignoredVerdictText?: string): ParsedReviewReply {
+  if (typeof text !== 'string') {
     return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
   }
   const findings = parseFindingLines(text);
-  const verdict = lastLineVerdict(verdictText);
+  const verdict = lastLineVerdict(text);
   let result: EvidenceResultValue = 'unknown';
   if (verdict === 'PASS') {
     result = findings.some((f) => f.severity === 'blocker') ? 'fail' : 'pass';
@@ -908,7 +914,7 @@ export function parseReviewReply(text: string, verdictText: string): ParsedRevie
   }
   if (result === 'unknown') {
     const unknownReason: ReviewUnknownReason =
-      text.trim() === '' && verdictText.trim() === '' ? 'empty' : 'unparseable-verdict';
+      text.trim() === '' ? 'empty' : 'unparseable-verdict';
     return { result, findings, unknownReason };
   }
   return { result, findings };
@@ -921,12 +927,12 @@ export function parseReviewReply(text: string, verdictText: string): ParsedRevie
  * without findings), and a missing verdict is unknown. Manual reviews keep
  * `parseReviewReply` unchanged.
  */
-export function parseReviewReplyStrict(text: string, verdictText: string): ParsedReviewReply {
-  if (typeof text !== 'string' || typeof verdictText !== 'string') {
+export function parseReviewReplyStrict(text: string, _ignoredVerdictText?: string): ParsedReviewReply {
+  if (typeof text !== 'string') {
     return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
   }
   const findings = parseFindingLines(text);
-  const verdict = lastLineVerdict(verdictText);
+  const verdict = lastLineVerdict(text);
   let result: EvidenceResultValue = 'unknown';
   if (verdict === 'PASS') {
     result = findings.some((f) => f.severity === 'blocker' || f.severity === 'major') ? 'fail' : 'pass';
@@ -935,7 +941,7 @@ export function parseReviewReplyStrict(text: string, verdictText: string): Parse
   }
   if (result === 'unknown') {
     const unknownReason: ReviewUnknownReason =
-      text.trim() === '' && verdictText.trim() === ''
+      text.trim() === ''
         ? 'empty'
         : verdict === null
           ? 'unparseable-verdict'
@@ -1221,12 +1227,11 @@ export function createOcmReviewTransport(
     // 8. Parse verdict, findings, and rawOutput
     // Each text part is a whole message part; a part that does not end in a newline must not glue its last line onto the next part's first.
     const finalText = textParts.join('\n');
-    const lastText = textParts.at(-1) ?? '';
     // A conductor request (a kind) is validated strictly; a manual request keeps today's parse.
     const { result, findings, unknownReason } =
       request.kind !== undefined
-        ? parseReviewReplyStrict(finalText, lastText)
-        : parseReviewReply(finalText, lastText);
+        ? parseReviewReplyStrict(finalText)
+        : parseReviewReply(finalText);
 
     const rawOutput =
       finalText.length > MAX_RAW_OUTPUT_LENGTH ? finalText.slice(-MAX_RAW_OUTPUT_LENGTH) : finalText;

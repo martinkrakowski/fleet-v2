@@ -1585,4 +1585,25 @@ describe('reap zombies', () => {
     expect(result.unknown.some((entry) => entry.reason === 'disk-thresholds-unordered')).toBe(false);
     expect((await store.listOpenFindings()).some((record) => record.finding.kind === 'disk-pressure')).toBe(false);
   });
+  it('leaves a host disk status unknown when one of its clones cannot be read', async () => {
+    const subject = subjectOfFixtureHost();
+    const second = { path: '/srv/clone2', worktreeRoot: '/srv/clone2/.worktrees' };
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    await seedOpenFinding(store, subject, 'disk-pressure');
+    const workspace = makeWorkspace({
+      spaceAnswer: (req) => (req.path === second.worktreeRoot
+        ? ({ outcome: 'unknown', reason: 'read-failed' } as unknown as ReadFilesystemSpaceResult)
+        : { outcome: 'read', freeBytes: 100, totalBytes: 1000 }),
+    });
+    const profiles = makeProfiles([
+      profileView({ clones: { [HOST_NAME]: { path: CLONE, worktreeRoot: ROOT } } }),
+      profileView({ clones: { [HOST_NAME]: second } }),
+    ]);
+    const harness = gatherHarness({ workspace, profiles, store });
+    const result = await runPass(harness, { policy: DISK_POLICY });
+    expect(result.unknown).toContainEqual({ subject, kind: 'disk-pressure', reason: 'disk-unreadable' });
+    expect(result.findings.some((entry) => entry.kind === 'disk-pressure')).toBe(false);
+    expect((await store.listOpenFindings()).some((record) => record.finding.kind === 'disk-pressure')).toBe(true);
+    expect(harness.attention.cleared).toEqual([]);
+  });
 });

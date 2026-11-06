@@ -860,11 +860,14 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     }
     const journalCache = new Map<string, readonly ActionJournalEntryRecord[] | null>();
     const diskByHost = new Map<string, number>();
+    const failedHosts = new Set<string>();
     for (const clone of clones) {
       // D8: one disk read per clone; the host's reading is its worst clone.
       const hostDigest = this.hostDigestOf(clone.hostName, computeDigest, build.unknown);
       if (hostDigest !== null) {
-        await this.readCloneDisk(build, wk, clone, hostDigest, workspace, diskByHost);
+        if (!(await this.readCloneDisk(build, wk, clone, hostDigest, workspace, diskByHost))) {
+          failedHosts.add(hostDigest);
+        }
       }
       const listed = await this.listCloneWorktrees(build, wk, clone, workspace);
       if (listed === null) {
@@ -889,6 +892,9 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       }
     }
     for (const [hostDigest, freePercent] of diskByHost) {
+      if (failedHosts.has(hostDigest)) {
+        continue; // a clone of this host was unreadable: the host's disk status is unknown
+      }
       wk.diskFreePercentByHost.set(hostDigest, freePercent);
       build.observations.push({ kind: 'disk-pressure', subject: hostDigest, youngActivity: false, freePercent });
     }
@@ -1048,11 +1054,11 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     hostDigest: string,
     workspace: NonNullable<ReapZombiesDependencies['workspace']>,
     diskByHost: Map<string, number>,
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (workspace.readFilesystemSpace === undefined) {
       wk.readsComplete = false;
       pushBounded(build.unknown, { subject: hostDigest, kind: 'disk-pressure', reason: 'disk-unreadable' });
-      return;
+      return false;
     }
     let read: ReadFilesystemSpaceResult;
     try {
@@ -1060,21 +1066,22 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     } catch {
       wk.readsComplete = false;
       pushBounded(build.unknown, { subject: hostDigest, kind: 'disk-pressure', reason: 'disk-unreadable' });
-      return;
+      return false;
     }
     if (read === null || read.outcome !== 'read') {
       wk.readsComplete = false;
       pushBounded(build.unknown, { subject: hostDigest, kind: 'disk-pressure', reason: 'disk-unreadable' });
-      return;
+      return false;
     }
     const freePercent = (read.freeBytes / read.totalBytes) * 100;
     if (!Number.isFinite(freePercent)) {
       wk.readsComplete = false;
       pushBounded(build.unknown, { subject: hostDigest, kind: 'disk-pressure', reason: 'disk-unreadable' });
-      return;
+      return false;
     }
     const previous = diskByHost.get(hostDigest);
     diskByHost.set(hostDigest, previous === undefined ? freePercent : Math.min(previous, freePercent));
+    return true;
   }
 
   /**

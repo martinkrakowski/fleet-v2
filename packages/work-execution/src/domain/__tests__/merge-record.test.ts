@@ -127,6 +127,64 @@ describe('MergeRecord.create', () => {
     expect(actionSecretMessage).not.toContain(secret);
   });
 
+  it('handles a __proto__ key and a null-prototype record safely and refuses a class instance', () => {
+    const withProto = JSON.parse(JSON.stringify(VALID).replace('{', '{"__proto__":{"x":1},')) as unknown;
+    expect(() => MergeRecord.create(withProto)).not.toThrow();
+    // An own `__proto__` data key is either refused or dropped; it never reaches
+    // the record or the prototype chain.
+    const protoResult = MergeRecord.create(withProto);
+    if (protoResult.success) {
+      expect(Object.keys(protoResult.value.toRecord())).not.toContain('__proto__');
+      expect(Object.getPrototypeOf(protoResult.value.toRecord())).toBe(Object.prototype);
+    }
+    expect(({} as Record<string, unknown>).x).toBeUndefined();
+
+    const nullProto = Object.assign(Object.create(null) as Record<string, unknown>, VALID);
+    expect(() => MergeRecord.create(nullProto)).not.toThrow();
+    const nullResult = MergeRecord.create(nullProto);
+    expect(nullResult.success).toBe(true);
+    if (nullResult.success) {
+      expect(nullResult.value.toRecord()).toEqual(VALID);
+      expect(Object.getPrototypeOf(nullResult.value.toRecord())).toBe(Object.prototype);
+    }
+
+    class Holder {
+      readonly schemaVersion = 1;
+      readonly repository = VALID.repository;
+      readonly number = VALID.number;
+      readonly headSha = VALID.headSha;
+      readonly mergedAtIso = VALID.mergedAtIso;
+      readonly firstSeenAtIso = VALID.firstSeenAtIso;
+      readonly source = VALID.source;
+      readonly merger = VALID.merger;
+    }
+    expect(createError(new Holder())).toBe('MergeRecord requires a plain record');
+  });
+
+  it('does not copy extra fields into toRecord', () => {
+    const result = MergeRecord.create({ ...VALID, extra: 'x', token: 'y' });
+    if (result.success) {
+      expect(Object.keys(result.value.toRecord()).sort()).toEqual(Object.keys(VALID).sort());
+    } else {
+      expect(result.code).toBe('invalid');
+    }
+  });
+
+  it('refuses an oversized headSha and timestamps', () => {
+    expect(createError(patched((record) => { record.headSha = 'a'.repeat(65); }))).toBe('MergeRecord field is too long');
+    expect(createError(patched((record) => { record.mergedAtIso = '2026-10-27T12:00:00.000Z'.padEnd(33, '0'); })))
+      .toBe('MergeRecord field is too long');
+    expect(createError(patched((record) => { record.firstSeenAtIso = '2026-10-27T12:00:00.000Z'.padEnd(33, '0'); })))
+      .toBe('MergeRecord field is too long');
+  });
+
+  it('refuses a control-character actionRef', () => {
+    expect(createError(patched((record) => { record.actionRef = 'bad\u0007ref'; })))
+      .toBe('MergeRecord actionRef: must be plain text of at most 128 characters');
+    expect(createError(patched((record) => { record.actionRef = 'line\nbreak'; })))
+      .toBe('MergeRecord actionRef: must be plain text of at most 128 characters');
+  });
+
   it('refuses a field over the size bound', () => {
     expect(createError(patched((record) => { record.repository = 'x'.repeat(201); })))
       .toBe('MergeRecord field is too long');
@@ -241,7 +299,7 @@ describe('decideMergeRecord', () => {
     // The upgrade persists the stored `forge-observation` record with only
     // `merger` moved to `fleet`; that persisted record must reload through the
     // entity and round-trip.
-    const fleetSighting = { ...VALID, merger: 'fleet' };
+    const fleetSighting = { ...VALID, source: 'fleet-forge-action', merger: 'fleet' };
     const decided = decideMergeRecord(VALID, fleetSighting);
     expect(decided.success).toBe(true);
     if (!decided.success) return;
@@ -284,6 +342,31 @@ describe('decideMergeRecord', () => {
     expect(decideError(null, journal)).toBe('MergeRecord source and merger disagree');
     expect(decideError(undefined, journal)).toBe('MergeRecord source and merger disagree');
     expect(decideError(VALID, journal)).toBe('MergeRecord source and merger disagree');
+  });
+
+  it('refuses an incoming forge-observation with a fleet merger, stored or not', () => {
+    const forged = { ...VALID, source: 'forge-observation', merger: 'fleet' };
+    expect(decideError(null, forged)).toBe('MergeRecord source and merger disagree');
+    expect(decideError(undefined, forged)).toBe('MergeRecord source and merger disagree');
+    expect(decideError(VALID, forged)).toBe('MergeRecord source and merger disagree');
+  });
+
+  it('still loads a stored upgraded forge-observation/fleet record and decides against it', () => {
+    const upgraded = { ...VALID, merger: 'fleet' };
+    expect(MergeRecord.create(upgraded).success).toBe(true);
+    const result = decideMergeRecord(upgraded, VALID);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.outcome).toBe('unchanged');
+    expect(result.record.merger).toBe('fleet');
+  });
+
+  it('freezes the upgraded record', () => {
+    const result = decideMergeRecord(VALID, { ...VALID, source: 'fleet-forge-action', merger: 'fleet' });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.outcome).toBe('upgrade-merger');
+    expect(Object.isFrozen(result.record)).toBe(true);
   });
 
   it('refuses an unreadable stored record instead of treating it as empty', () => {

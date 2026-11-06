@@ -54,7 +54,7 @@ export type MergeRecordResult =
 const MERGE_HEAD_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
- * The source/merger pairing invariant, one way: a `fleet-forge-action` source
+ * The source/merger pairing invariant for LOADING a stored record, one way: a `fleet-forge-action` source
  * claims the fleet path did the merge, so it always pairs with
  * `merger: 'fleet'`. A `forge-observation` source may pair with either merger:
  * it starts as `unknown` and may legitimately have been upgraded to `fleet` by
@@ -62,6 +62,16 @@ const MERGE_HEAD_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
  */
 function mergeSourceMergerAgree(source: MergeRecordSource, merger: MergeRecordMerger): boolean {
   return !(source === 'fleet-forge-action' && merger === 'unknown');
+}
+
+/**
+ * The strict two-way pairing for a NEW sighting (creation and incoming reads):
+ * `forge-observation` pairs only with `unknown` and `fleet-forge-action` only
+ * with `fleet`. Only the fleet path's typed journal entry may move a merger to
+ * `fleet`; a forge observation never claims it.
+ */
+function mergeSourceMergerPaired(source: MergeRecordSource, merger: MergeRecordMerger): boolean {
+  return (source === 'forge-observation') === (merger === 'unknown');
 }
 
 /**
@@ -105,7 +115,14 @@ export class MergeRecord {
     // Invariants are validated in create; the record is frozen on the way in.
   }
 
-  /** The only way in; also used to read a stored record. Never throws. */
+  /**
+   * The only way in; also used to read a stored record. Never throws. This
+   * loader is deliberately relaxed (it accepts a stored upgraded
+   * `forge-observation`/`fleet` record), so the store lane must create a new
+   * record through `decideMergeRecord`, never through `MergeRecord.create`
+   * directly: only the decision function applies the strict pairing to a new
+   * sighting.
+   */
   static create(input: unknown): MergeRecordResult {
     try {
       const read = readMergeRecordRecord(input);
@@ -302,12 +319,11 @@ export function decideMergeRecord(stored: unknown, incoming: unknown): MergeReco
     return invalidDecision('MergeRecord incoming record could not be read');
   }
   const incomingRecord = incomingRead.record;
-  // The incoming record must carry a possible source/merger pair: a
-  // `fleet-forge-action` source claims the fleet path did the merge and must
-  // carry `merger: 'fleet'`. A `forge-observation` sighting may carry either
-  // merger — `unknown` on first sighting or `fleet` when the fleet path's
-  // typed journal entry has already moved it.
-  if (!mergeSourceMergerAgree(incomingRecord.source, incomingRecord.merger)) {
+  // The incoming record is a new sighting and must use the strict pairing
+  // (forge-observation/unknown, fleet-forge-action/fleet): only the fleet
+  // path's typed journal entry may move a merger to `fleet`. The relaxed
+  // pairing applies only when loading a stored, already-upgraded record.
+  if (!mergeSourceMergerPaired(incomingRecord.source, incomingRecord.merger)) {
     return invalidDecision('MergeRecord source and merger disagree');
   }
 
@@ -352,7 +368,7 @@ export function decideMergeRecord(stored: unknown, incoming: unknown): MergeReco
     return {
       success: true,
       outcome: 'upgrade-merger',
-      record: { ...storedRecord, merger: 'fleet' },
+      record: Object.freeze({ ...storedRecord, merger: 'fleet' as const }),
       finding: null,
     };
   }

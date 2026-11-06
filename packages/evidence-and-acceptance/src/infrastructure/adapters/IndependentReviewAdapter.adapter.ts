@@ -152,8 +152,17 @@ export class IndependentReviewAdapter implements IndependentReviewPort {
           code: 'transport',
         };
       }
+      // A non-plain finding is invalid transport output: dropping it would let
+      // a fail receipt carry fewer findings than the reviewer returned.
+      if (Array.isArray(rawFindings) && !rawFindings.every(isPlainRecord)) {
+        return {
+          outcome: 'unavailable',
+          reason: 'Independent review transport returned non-plain findings',
+          code: 'transport',
+        };
+      }
       const findings = Array.isArray(rawFindings)
-        ? (rawFindings.filter(isPlainRecord) as unknown as ReviewFindingRecord[]).map((finding) => ({ ...finding }))
+        ? (rawFindings as unknown as ReviewFindingRecord[]).map((finding) => ({ ...finding }))
         : [];
       const result: unknown = review.result;
       const unknownReason: unknown = review.unknownReason;

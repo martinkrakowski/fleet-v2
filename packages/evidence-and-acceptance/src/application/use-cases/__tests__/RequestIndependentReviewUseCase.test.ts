@@ -702,7 +702,7 @@ describe('unknown cause codes on receipts and the chain-name guard (RV2, CO9 #77
   });
 
   it('parity: the local chain-name validator accepts exactly the chain domain set', async () => {
-    // The cases the chain-name tests pin (work-execution chain-records.test.ts),
+    // The cases the chain-name tests pin (work-execution base-branch.ts CHAIN_PATTERN),
     // mirrored here because contexts never import across.
     const accepted = ['example', 'a-b-1', 'a'.repeat(194)];
     for (const value of accepted) {

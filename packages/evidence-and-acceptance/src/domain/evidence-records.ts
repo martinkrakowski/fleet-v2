@@ -48,7 +48,7 @@ export const REVIEW_UNKNOWN_REASONS = [
 export type ReviewUnknownReason = (typeof REVIEW_UNKNOWN_REASONS)[number];
 
 /**
- * The accepted chain-name set of the chain domain's `parseChainName`, mirrored
+ * The accepted chain-name set of work-execution's base-branch.ts `CHAIN_PATTERN` (the chain name after `chain/`), mirrored
  * locally (contexts never import across): one or more lowercase alphanumeric
  * segments joined by single dashes, and `chain/` + the name stays within the
  * chain domain's 200-character base-branch cap (so the name caps at 194).

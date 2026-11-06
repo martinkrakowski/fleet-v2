@@ -438,7 +438,7 @@ export const REVIEWER_ENV_ALLOWLIST: readonly string[] = [
 ];
 
 const VERDICT_PATTERN = /^VERDICT: (PASS|FAIL|FIX FIRST)$/;
-const FINDING_PATTERN = /^FINDING: (blocker|major|minor|nit) (\S+?)(?::(\d+))? (.+)$/;
+const FINDING_PATTERN = /^FINDING: (blocker|major|minor|nit) (\S+?)(?::(\d+))? (.+)$/i;
 export const MAX_RAW_OUTPUT_LENGTH = 20000;
 
 /** Default wall-clock budget for one review run when the caller gives no timeout. */
@@ -714,6 +714,15 @@ const UNTRUSTED_OPEN_PATTERN = /^<<<UNTRUSTED nonce=([0-9a-f]{16,64}) label="[^"
  * backtracks.
  */
 export function stripUntrustedEchoBlocks(text: string): string {
+  return scanUntrustedEchoBlocks(text).stripped;
+}
+
+/**
+ * The stripped text plus whether an untrusted block or diff fence was opened
+ * and never closed. An unclosed block is a malformed answer: callers refuse it
+ * (no verdict is read) rather than trusting whatever the strip left.
+ */
+function scanUntrustedEchoBlocks(text: string): { readonly stripped: string; readonly unclosed: boolean } {
   const kept: string[] = [];
   let openNonce: string | null = null;
   let fenceToken: string | null = null;
@@ -742,7 +751,7 @@ export function stripUntrustedEchoBlocks(text: string): string {
     }
     kept.push(line);
   }
-  return kept.join('\n');
+  return { stripped: kept.join('\n'), unclosed: openNonce !== null || fenceToken !== null };
 }
 
 /**
@@ -782,14 +791,14 @@ function parseNumberedFindingLine(trimmedLine: string): {
     index += chainMatch[0].length;
   }
   const tail = remainder.slice(index);
-  const tailMatch = /^\s+(?:—|–|-)\s+(?:\*\*(blocker|major|minor|nit)\*\*|(blocker|major|minor|nit))(?:\.\s+|:\s+|\s+)(.+)$/.exec(tail);
+  const tailMatch = /^\s+(?:—|–|-)\s+(?:\*\*(blocker|major|minor|nit)\*\*|(blocker|major|minor|nit))(?:\.\s+|:\s+|\s+)(.+)$/i.exec(tail);
   if (tailMatch === null) {
     return null;
   }
   return {
     firstTarget,
     extraTargets: extraTargets.trim(),
-    severity: (tailMatch[1] ?? tailMatch[2]) as FindingSeverity,
+    severity: (tailMatch[1] ?? tailMatch[2] ?? '').toLowerCase() as FindingSeverity,
     summaryText: tailMatch[3] ?? '',
   };
 }
@@ -826,7 +835,7 @@ function parseFindingLines(text: string): ReviewFindingRecord[] {
     if (findingMatch !== null) {
       findings.push({
         findingId: `review-${findings.length + 1}`,
-        severity: findingMatch[1] as FindingSeverity,
+        severity: findingMatch[1].toLowerCase() as FindingSeverity,
         summary: findingMatch[4].trim(),
         filePath: findingMatch[2] === '-' ? null : findingMatch[2],
         line: findingMatch[3] === undefined ? null : Number.parseInt(findingMatch[3], 10),
@@ -860,7 +869,13 @@ function parseFindingLines(text: string): ReviewFindingRecord[] {
 
 /** The verdict on the last non-empty line of `verdictText`, or null when that line carries none. */
 function lastLineVerdict(verdictText: string): 'PASS' | 'FAIL' | null {
-  const lastNonEmptyLine = verdictText
+  // Echoed untrusted blocks and fenced diffs are data, never the reviewer's
+  // verdict; an unclosed one swallows to EOF, so no verdict line remains.
+  const scanned = scanUntrustedEchoBlocks(verdictText);
+  if (scanned.unclosed) {
+    return null;
+  }
+  const lastNonEmptyLine = scanned.stripped
     .split(/\r?\n/)
     .reverse()
     .find((line) => line.trim() !== '');

@@ -301,7 +301,8 @@ function entryRunIdError(
       parsedKey.kind === 'step' ||
       parsedKey.kind === 'stop' ||
       parsedKey.kind === 'resume' ||
-      parsedKey.kind === 'premerge'
+      parsedKey.kind === 'premerge' ||
+      parsedKey.kind === 'merge-enqueue'
     ) {
       if (runId !== parsedKey.runId) {
         return 'LaneRunJournal runId does not match its key';
@@ -679,13 +680,13 @@ function pendingStepIntent(
     return null;
   }
   const parsed = parseLaneRunKey(entry.key);
-  if (parsed?.kind === 'premerge') {
+  if (parsed?.kind === 'premerge' || parsed?.kind === 'merge-enqueue') {
     if (entryHasFinalResult(entries, entry.key)) {
       return null;
     }
     return {
       key: entry.key,
-      step: 'premerge',
+      step: parsed.kind,
       reconciliation: entryHasAnyResult(entries, entry.key) ? 'ambiguous' : 'unread',
     };
   }

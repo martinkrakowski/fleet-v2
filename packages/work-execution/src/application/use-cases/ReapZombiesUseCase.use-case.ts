@@ -27,7 +27,7 @@
 import { containsSecretShape, readPlainRecord } from '@fleet/shared';
 import type { PlainFieldSchema, PlainRecordSchema } from '@fleet/shared';
 
-import type { ActionJournalEntryRecord, AttemptRecord, CapacityReservationRecord } from '../../domain/execution-records.js';
+import type { ActionJournalEntryRecord, AttemptRecord, AttemptRunnerRecord, CapacityReservationRecord } from '../../domain/execution-records.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type {
   ExecutionJournalPort,
@@ -41,6 +41,14 @@ import type { ExecutionRunnerPort, RunnerSessionStatus } from '../ports/out/Exec
 import type { RunnerForAttemptPort } from '../ports/out/RunnerForAttemptPort.out-port.js';
 import type { ReconcileAttemptPort, ReconcileAttemptResult } from '../ports/in/ReconcileAttemptPort.in-port.js';
 import type {
+  ListWorktreesResult,
+  InspectWorktreeForRemovalResult,
+  ReadFilesystemSpaceResult,
+} from '../ports/out/WorkspacePort.out-port.js';
+import type { ForgeReadPort } from '../ports/out/ForgeReadPort.out-port.js';
+import type { WorkspacePort } from '../ports/out/WorkspacePort.out-port.js';
+import { pathUnderPrefix } from '../../domain/lane-diff-check.js';
+import type {
   ReaperFindingRepositoryPort,
   ReaperFindingStoreRecord,
 } from '../ports/out/ReaperFindingRepositoryPort.out-port.js';
@@ -53,13 +61,16 @@ import type {
   ReaperFindingView,
   ReaperRepairView,
   ReaperUnknownView,
+  ReaperWorktreeView,
 } from '../ports/in/ReapZombiesPort.in-port.js';
 import {
   classifyZombies,
+  type ReaperFact,
   type ReaperFinding,
   type ReaperObservation,
   type ReaperPolicy,
 } from '../../domain/reaper-findings.js';
+import { runnerHasHostName } from '../../domain/execution-records.js';
 import { REAPER_FINDING_KINDS, REAPER_SUBJECT_ID_PATTERN, REQUEST_ID_PATTERN, reaperRepairKey } from '../../domain/lane-run-keys.js';
 
 /**
@@ -93,6 +104,29 @@ export interface ReaperAttentionPort {
   clearAttentionItem(request: unknown, via: string, actor: string): Promise<unknown>;
 }
 
+/**
+ * The project-profile surface the reaper needs, declared locally so
+ * application code imports no cross-package type. The composition root binds
+ * the coordination context's `listProjectProfiles` read here; its shape
+ * satisfies this structurally (D3).
+ */
+export interface ReaperProjectProfileView {
+  readonly projectId: string;
+  readonly status: 'active' | 'retired';
+  readonly defaultBranch: string | null;
+  readonly clones: Readonly<Record<string, { readonly path: string; readonly worktreeRoot: string }>>;
+}
+
+export interface ReaperProjectProfilesPort {
+  listProjectProfiles(request: { readonly status?: 'active' | 'retired' }): Promise<
+    | { readonly outcome: 'listed'; readonly profiles: readonly ReaperProjectProfileView[] }
+    | { readonly outcome: 'rejected'; readonly reason: string }
+  >;
+}
+
+/** The forge read the evidence fact needs (D5), declared locally like the attention port. */
+type ReaperForgeReadPort = Pick<ForgeReadPort, 'readPullRequest' | 'isConfigured'>;
+
 /** The reads, writes and id source the pass needs; narrowed so composition supplies only what it has. */
 export interface ReapZombiesDependencies {
   readonly attemptRepo: Pick<AttemptRepositoryPort, 'listAllAttempts' | 'findAttemptById'>;
@@ -106,9 +140,21 @@ export interface ReapZombiesDependencies {
   readonly reaperFindings: ReaperFindingRepositoryPort;
   /** The composition root mints ULIDs; this lane never mints one itself. */
   readonly newId: () => string;
+  /** Absent: the worktree and disk gathering does not run and claims nothing. */
+  readonly workspace?: Pick<
+    WorkspacePort,
+    'listWorktrees' | 'inspectWorktreeForRemoval' | 'readFilesystemSpace'
+  >;
+  /** Absent: no enumeration of the active profiles' clones. */
+  readonly profiles?: ReaperProjectProfilesPort;
+  /** Absent: the `evidence` fact is unknown, so no merged-worktree finding is reported. */
+  readonly forgeRead?: Pick<ForgeReadPort, 'readPullRequest' | 'isConfigured'>;
+  /** The digest behind a worktree subject; injected, never node:crypto here. */
+  readonly computeDigest?: (text: string) => string;
 }
 
 const MAX_SUBJECTS_PER_PASS = 64;
+const MAX_CLONES_PER_PASS = 16;
 const MAX_ATTENTION_PER_PASS = 64;
 const MAX_SUMMARY_LENGTH = 1024;
 const DEFAULT_GRACE_MINUTES = 5;
@@ -124,6 +170,14 @@ interface SettleContext {
   readonly attentionItems: readonly unknown[];
   readonly staleAttentionBySubject: ReadonlyMap<string, StaleAttentionTarget>;
   readonly unknown: ReaperUnknownView[];
+  /** The resolved reaper policy, for the disk hysteresis thresholds (D8/D9). */
+  readonly policy: ReaperPolicy;
+  /** The current pass's disk readings per host digest; a missing host means the read failed. */
+  readonly diskFreePercentByHost: ReadonlyMap<string, number>;
+  /** The worktrees this pass inspected, with their branch facts, for the settle sweep. */
+  readonly inspectedWorktrees: ReadonlyMap<string, InspectedWorktreeFacts>;
+  /** The subjects this pass reported as busy (D7). */
+  readonly busySubjects: ReadonlySet<string>;
 }
 
 /**
@@ -143,6 +197,43 @@ const ATTENTION_KIND_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 
 function staleAttentionSubject(ref: string, kind: string): string {
   return ref + ':' + kind;
+}
+
+/** The branch facts one inspected worktree carried this pass, for the settle sweep. */
+interface InspectedWorktreeFacts {
+  readonly headOnDefault: 'yes' | 'no' | 'unknown';
+  readonly branch: string | null;
+  readonly evidence: 'merged-pr' | 'ancestor-only' | 'unknown';
+}
+
+/** The context the worktree and disk gathering needs for one pass. */
+interface WorktreeBuild {
+  /** The busy subjects of this pass: reported as `worktree-busy`, never classified. */
+  readonly busySubjects: Set<string>;
+  /** One busy report per busy subject: the evidence read or unknown, and the measured size. */
+  readonly busyReports: Map<string, { readonly evidence: 'merged-pr' | 'ancestor-only' | 'unknown'; readonly sizeBytes: number | null }>;
+  /** The merge evidence per classified subject. */
+  readonly mergedEvidence: Map<string, 'merged-pr' | 'ancestor-only' | 'unknown'>;
+  /** The measured size per subject; null when the measurement ran out of budget. */
+  readonly sizeBySubject: Map<string, number | null>;
+  /** The branch facts of every inspected subject, for the settle sweep. */
+  readonly inspectedWorktrees: Map<string, InspectedWorktreeFacts>;
+  /** The disk free percent per host digest, for the hysteresis close. */
+  readonly diskFreePercentByHost: Map<string, number>;
+  /** Dedupe: the first clone to claim a subject digest wins. */
+  readonly digestByPath: Map<string, string>;
+  /** False once any worktree or disk read of this pass failed: nothing may be closed. */
+  readsComplete: boolean;
+}
+
+/** One registered clone to read (D2/D3): only registered clones' worktrees are ever read. */
+interface CloneRef {
+  readonly projectId: string;
+  readonly hostName: string;
+  readonly clonePath: string;
+  readonly worktreeRoot: string;
+  readonly defaultRef: string;
+  readonly recordedHost: AttemptRunnerRecord;
 }
 
 /** The (ref, kind) a stale-attention subject names: the pass's map first, else parse it; a bare id is the legacy form. */
@@ -246,6 +337,43 @@ function actionJournalHasYoungIntent(entries: readonly ActionJournalEntryRecord[
   return false;
 }
 
+/** D9: the effective retention hours; a missing, non-finite or negative value reads as the default 24. */
+function effectiveRetentionHours(policy: ReaperPolicy): number {
+  const value = policy.retentionHours;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 24;
+}
+
+/**
+ * D9: the effective clear threshold for the disk hysteresis close. The
+ * policy's `clearFreePercent` when finite and ordered above the effective
+ * min; otherwise the fallback (20 when above the min, else the min) — and the
+ * unknown `disk-thresholds-unordered` says so. KWp owns the parse error; the
+ * lane only degrades safely.
+ */
+function effectiveClearPercent(policy: ReaperPolicy, unknown: ReaperUnknownView[]): number {
+  const minRaw = policy.minFreePercent;
+  const min = typeof minRaw === 'number' && Number.isFinite(minRaw) && minRaw >= 0 ? minRaw : 15;
+  const clearRaw = policy.clearFreePercent;
+  if (typeof clearRaw === 'number' && Number.isFinite(clearRaw) && clearRaw > min) {
+    return clearRaw;
+  }
+  pushBounded(unknown, { subject: '', reason: 'disk-thresholds-unordered' });
+  return 20 > min ? 20 : min;
+}
+
+/** `Date.parse` that never throws: an unparsable or absent time reads as null. */
+function msOfSafe(iso: unknown): number | null {
+  if (typeof iso !== 'string') {
+    return null;
+  }
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/** The routing block for a registered clone's reads: it names the clone's host, never a local fallback. */
+function cloneHostBlock(hostName: string): AttemptRunnerRecord {
+  return { kind: 'opencode', remotePort: null, host: hostName, hostName, agent: null, model: null, variant: null };
+}
 
 /** At most this many unknown entries of one bounded reason (`pass-cap`, `subject-unsafe`) per pass. */
 const MAX_BOUNDED_UNKNOWNS = 64;
@@ -262,6 +390,8 @@ function repairFlagSchema(): PlainRecordSchema {
 const POLICY_SCHEMA: PlainRecordSchema = {
   staleStopMinutes: { kind: 'integer', optional: true },
   minFreePercent: { kind: 'integer', optional: true },
+  retentionHours: { kind: 'integer', optional: true },
+  clearFreePercent: { kind: 'integer', optional: true },
   repairs: { kind: 'record', schema: repairFlagSchema(), optional: true },
 };
 
@@ -424,23 +554,36 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
         findings: [],
         attention: [],
         repairs: [],
+        worktrees: [],
         unknown: [...unknown, { subject: '', reason: 'findings-unreadable' }],
       };
     }
-    const readsComplete = facts.attempts !== null && facts.reservations !== null && facts.attentionItems !== null;
 
     // 3-4. Observe and classify. When the attempts read failed, no
     // observation is built at all: a reservation whose attempt could not be
     // read is not classified as `absent`.
     const built = this.newBuild(unknown);
     let findings: ReaperFinding[] = [];
+    let gather: WorktreeBuild | null = null;
     if (facts.attempts !== null) {
       await this.buildObservations(built, facts, nowMs, graceMs);
+      // KW4a: gather the registered clones' worktree and disk facts and merge
+      // their observations before the classification, so the two-sightings
+      // rule, the grace, the precedence and the store all apply unchanged.
+      // Report only (D6): no worktree is removed, no branch is touched.
+      gather = await this.gatherWorktreeAndDisk(built, facts, nowMs, graceMs, policy);
       findings = classifyZombies({ observations: built.observations, openFindings: openRecords.map((r) => r.finding) }, nowIso, policy).map(
         // The reaper never releases capacity: a leaked slot is report-only whatever the policy says.
-        (finding) => (finding.kind === 'leaked-slot' && finding.action === 'repair' ? { ...finding, action: 'report' as const } : finding),
+        // The reaper never repairs a worktree (D6): a merged-worktree repair is report-only too.
+        (finding) =>
+          finding.kind === 'leaked-slot' || finding.kind === 'merged-worktree'
+            ? (finding.action === 'repair' ? { ...finding, action: 'report' as const } : finding)
+            : finding,
       );
     }
+    const gatherReadsComplete = gather === null || gather.readsComplete;
+    const readsComplete =
+      facts.attempts !== null && facts.reservations !== null && facts.attentionItems !== null && gatherReadsComplete;
 
     // 5. Upsert under reused or freshly minted ids.
     const stored = await this.storeFindings(findings, openRecords, unknown);
@@ -456,20 +599,38 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       attentionItems: facts.attentionItems ?? [],
       staleAttentionBySubject: built.staleAttentionBySubject,
       unknown,
+      policy,
+      diskFreePercentByHost: gather === null ? new Map<string, number>() : gather.diskFreePercentByHost,
+      inspectedWorktrees: gather === null ? new Map<string, InspectedWorktreeFacts>() : gather.inspectedWorktrees,
+      busySubjects: gather === null ? new Set<string>() : gather.busySubjects,
     };
 
     // 6. Raise or refresh attention (skipped when the attention read failed).
     const attention = facts.attentionItems === null ? [] : await this.raiseAttention(findings, stored.storedIds, ctx);
+    if (gather !== null && facts.attentionItems !== null) {
+      await this.raiseWorktreeBusyAttention(projectId, gather, attention, unknown);
+    }
 
     // 7. Repair: record-only, keyed, per kind.
     const repairs = await this.runRepairs(findings, stored.storedIds, ctx);
 
-    // 8. Close findings the pass no longer sees, only when every read succeeded.
+    // 8. Close findings the pass no longer sees, only when every read
+    // succeeded — including the worktree and disk reads (D7, D8).
     if (readsComplete) {
       await this.settleUnseenFindings(openRecords, findings, built.cappedKeys, ctx);
+      if (gather !== null) {
+        await this.clearWorktreeBusyItems(projectId, gather, ctx);
+      }
     }
 
-    return { outcome: 'completed', findings: stored.views, attention, repairs, unknown };
+    return {
+      outcome: 'completed',
+      findings: stored.views,
+      attention,
+      repairs,
+      worktrees: gather === null ? [] : this.worktreeViews(gather, findings),
+      unknown,
+    };
   }
 
   private async readFacts(projectId: string, unknown: ReaperUnknownView[]): Promise<PassFacts> {
@@ -664,6 +825,615 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
   }
 
   /**
+   * KW4a: gather the registered clones' worktree and disk facts (D1–D8) and
+   * merge the observations before classification. Report only: no worktree is
+   * removed, no branch is touched, no session is aborted. Returns null when
+   * the dependencies are absent: the gathering does not run and claims
+   * nothing — no finding, no report, no unknown.
+   */
+  private async gatherWorktreeAndDisk(
+    build: ObservationBuild,
+    facts: PassFacts,
+    nowMs: number,
+    graceMs: number,
+    policy: ReaperPolicy,
+  ): Promise<WorktreeBuild | null> {
+    const { workspace, profiles, forgeRead, computeDigest } = this.deps;
+    if (workspace === undefined || profiles === undefined || computeDigest === undefined) {
+      return null;
+    }
+    const wk: WorktreeBuild = {
+      busySubjects: new Set<string>(),
+      busyReports: new Map(),
+      mergedEvidence: new Map(),
+      sizeBySubject: new Map(),
+      inspectedWorktrees: new Map(),
+      diskFreePercentByHost: new Map(),
+      digestByPath: new Map(),
+      readsComplete: true,
+    };
+    const clones = await this.readActiveProfiles(build, wk, profiles);
+    if (clones === null) {
+      return wk;
+    }
+    const journalCache = new Map<string, readonly ActionJournalEntryRecord[] | null>();
+    const hostsRead = new Set<string>();
+    for (const clone of clones) {
+      // D8: one disk read per clone, deduped per host digest.
+      const hostDigest = this.hostDigestOf(clone.hostName, computeDigest, build.unknown);
+      if (hostDigest !== null && !hostsRead.has(hostDigest)) {
+        hostsRead.add(hostDigest);
+        await this.buildDiskObservation(build, wk, clone, hostDigest, workspace);
+      }
+      const listed = await this.listCloneWorktrees(build, wk, clone, workspace);
+      if (listed === null) {
+        continue;
+      }
+      for (const worktreePath of listed) {
+        const subject = this.subjectOf(clone, worktreePath, computeDigest);
+        if (subject === null) {
+          pushBounded(build.unknown, { subject: '', kind: 'merged-worktree', reason: 'digest-invalid' });
+          continue;
+        }
+        if (wk.digestByPath.has(subject)) {
+          continue; // the same subject listed twice: one inspection
+        }
+        if (!claimSubjectSlot(build, 'merged-worktree', subject)) {
+          continue;
+        }
+        wk.digestByPath.set(subject, worktreePath);
+        await this.buildWorktreeObservation(
+          build, wk, clone, worktreePath, subject, facts, nowMs, graceMs, policy, journalCache, forgeRead, workspace,
+        );
+      }
+    }
+    return wk;
+  }
+
+  /**
+   * D3: the clones of the active project profiles, through the coordination
+   * context's existing `listProjectProfiles` read bound locally. A rejected
+   * read or a throw is the unknown `profiles-unreadable` and no clones; a
+   * profile that is not active is skipped; a clone whose path or worktree
+   * root is not a non-empty string is skipped. The clones are capped at
+   * MAX_CLONES_PER_PASS with one `pass-cap` unknown.
+   */
+  private async readActiveProfiles(
+    build: ObservationBuild,
+    wk: WorktreeBuild,
+    profiles: ReaperProjectProfilesPort,
+  ): Promise<readonly CloneRef[] | null> {
+    let answer: Awaited<ReturnType<ReaperProjectProfilesPort['listProjectProfiles']>>;
+    try {
+      answer = await profiles.listProjectProfiles({ status: 'active' });
+    } catch {
+      wk.readsComplete = false;
+      pushBounded(build.unknown, { subject: '', reason: 'profiles-unreadable' });
+      return null;
+    }
+    if (answer.outcome !== 'listed') {
+      wk.readsComplete = false;
+      pushBounded(build.unknown, { subject: '', reason: 'profiles-unreadable' });
+      return null;
+    }
+    const clones: CloneRef[] = [];
+    for (const profile of answer.profiles) {
+      if (!isPlainObject(profile)) {
+        continue;
+      }
+      const projectId = readField(profile, 'projectId');
+      const cloneRecord = readField(profile, 'clones');
+      if (typeof projectId !== 'string' || projectId === '' || !isPlainObject(cloneRecord)) {
+        continue;
+      }
+      const defaultBranchValue = readField(profile, 'defaultBranch');
+      const defaultBranch = typeof defaultBranchValue === 'string' && defaultBranchValue !== ''
+        ? defaultBranchValue
+        : 'main';
+      const defaultRef = 'origin/' + defaultBranch;
+      for (const hostName of Object.keys(cloneRecord)) {
+        if (clones.length >= MAX_CLONES_PER_PASS) {
+          pushBounded(build.unknown, { subject: '', reason: 'pass-cap' });
+          return clones;
+        }
+        const clone = readField(cloneRecord, hostName);
+        if (!isPlainObject(clone)) {
+          continue;
+        }
+        // A throwing getter on a clone field is a malformed record: skipped, never thrown on.
+        const clonePath = readField(clone, 'path');
+        const worktreeRoot = readField(clone, 'worktreeRoot');
+        if (typeof clonePath !== 'string' || clonePath === '' || typeof worktreeRoot !== 'string' || worktreeRoot === '') {
+          continue;
+        }
+        clones.push({
+          projectId,
+          hostName,
+          clonePath,
+          worktreeRoot,
+          defaultRef,
+          recordedHost: cloneHostBlock(hostName),
+        });
+      }
+    }
+    return clones;
+  }
+
+  /** D2: one clone's listed worktrees under its worktree root, never the clone's own main checkout. */
+  private async listCloneWorktrees(
+    build: ObservationBuild,
+    wk: WorktreeBuild,
+    clone: CloneRef,
+    workspace: NonNullable<ReapZombiesDependencies['workspace']>,
+  ): Promise<readonly string[] | null> {
+    if (workspace.listWorktrees === undefined) {
+      wk.readsComplete = false;
+      pushBounded(build.unknown, { subject: '', reason: 'worktree-read-unconfigured' });
+      return null;
+    }
+    let listed: ListWorktreesResult;
+    try {
+      listed = await workspace.listWorktrees({ repositoryRoot: clone.clonePath, recordedHost: clone.recordedHost });
+    } catch {
+      wk.readsComplete = false;
+      pushBounded(build.unknown, { subject: '', reason: 'worktree-list-unreadable' });
+      return null;
+    }
+    if (listed === null || listed.outcome !== 'listed' || !Array.isArray(listed.worktrees)) {
+      wk.readsComplete = false;
+      pushBounded(build.unknown, { subject: '', reason: 'worktree-list-unreadable' });
+      return null;
+    }
+    const paths: string[] = [];
+    for (const entry of listed.worktrees) {
+      if (!isPlainObject(entry)) {
+        continue;
+      }
+      // A throwing getter on an entry field is a malformed record: skipped, never thrown on.
+      const path = readField(entry, 'path');
+      if (typeof path !== 'string' || path === '') {
+        continue; // a malformed entry is skipped, never thrown on
+      }
+      if (path === clone.clonePath || !pathUnderPrefix(path, clone.worktreeRoot)) {
+        continue; // the main checkout, or a worktree of another root: not this clone's
+      }
+      paths.push(path);
+    }
+    return paths;
+  }
+
+  /** D1: the subject is a 12-hex digest of the clone and the worktree; null when the digest is unusable. */
+  private subjectOf(clone: CloneRef, worktreePath: string, computeDigest: (text: string) => string): string | null {
+    let digest: string;
+    try {
+      digest = computeDigest(`${clone.hostName}\u0000${clone.projectId}\u0000${clone.clonePath}\u0000${worktreePath}`);
+    } catch {
+      return null;
+    }
+    return /^[0-9a-f]{12}$/.test(digest) ? digest : null;
+  }
+
+  /** D1: the disk-pressure subject is the host digest; null when the digest is unusable. */
+  private hostDigestOf(hostName: string, computeDigest: (text: string) => string, unknown: ReaperUnknownView[]): string | null {
+    let digest: string;
+    try {
+      digest = computeDigest(`host\u0000${hostName}`);
+    } catch {
+      return null;
+    }
+    if (!/^[0-9a-f]{12}$/.test(digest)) {
+      pushBounded(unknown, { subject: '', kind: 'disk-pressure', reason: 'digest-invalid' });
+      return null;
+    }
+    return digest;
+  }
+
+  /** D8: one disk reading per clone, as a `disk-pressure` observation on the host digest. */
+  private async buildDiskObservation(
+    build: ObservationBuild,
+    wk: WorktreeBuild,
+    clone: CloneRef,
+    hostDigest: string,
+    workspace: NonNullable<ReapZombiesDependencies['workspace']>,
+  ): Promise<void> {
+    if (workspace.readFilesystemSpace === undefined) {
+      wk.readsComplete = false;
+      pushBounded(build.unknown, { subject: hostDigest, kind: 'disk-pressure', reason: 'disk-unreadable' });
+      return;
+    }
+    let read: ReadFilesystemSpaceResult;
+    try {
+      read = await workspace.readFilesystemSpace({ path: clone.worktreeRoot, recordedHost: clone.recordedHost });
+    } catch {
+      wk.readsComplete = false;
+      pushBounded(build.unknown, { subject: hostDigest, kind: 'disk-pressure', reason: 'disk-unreadable' });
+      return;
+    }
+    if (read === null || read.outcome !== 'read') {
+      wk.readsComplete = false;
+      pushBounded(build.unknown, { subject: hostDigest, kind: 'disk-pressure', reason: 'disk-unreadable' });
+      return;
+    }
+    const freePercent = (read.freeBytes / read.totalBytes) * 100;
+    if (!Number.isFinite(freePercent)) {
+      wk.readsComplete = false;
+      pushBounded(build.unknown, { subject: hostDigest, kind: 'disk-pressure', reason: 'disk-unreadable' });
+      return;
+    }
+    wk.diskFreePercentByHost.set(hostDigest, freePercent);
+    build.observations.push({ kind: 'disk-pressure', subject: hostDigest, youngActivity: false, freePercent });
+  }
+
+  /**
+   * D2/D4: one worktree's eleven facts. A refused inspection is not a linked
+   * worktree: skipped with no unknown. An unknown or thrown inspection is the
+   * unknown `worktree-unreadable`. A busy worktree is reported (D7) and gets
+   * no merged-worktree observation.
+   */
+  private async buildWorktreeObservation(
+    build: ObservationBuild,
+    wk: WorktreeBuild,
+    clone: CloneRef,
+    worktreePath: string,
+    subject: string,
+    facts: PassFacts,
+    nowMs: number,
+    graceMs: number,
+    policy: ReaperPolicy,
+    journalCache: Map<string, readonly ActionJournalEntryRecord[] | null>,
+    forgeRead: ReaperForgeReadPort | undefined,
+    workspace: NonNullable<ReapZombiesDependencies['workspace']>,
+  ): Promise<void> {
+    const fail = (reason: string): void => {
+      wk.readsComplete = false;
+      pushBounded(build.unknown, { subject, kind: 'merged-worktree', reason });
+    };
+    if (workspace.inspectWorktreeForRemoval === undefined) {
+      fail('worktree-read-unconfigured');
+      return;
+    }
+    let inspected: InspectWorktreeForRemovalResult;
+    try {
+      inspected = await workspace.inspectWorktreeForRemoval({
+        repositoryRoot: clone.clonePath,
+        worktreePath,
+        defaultRef: clone.defaultRef,
+        recordedHost: clone.recordedHost,
+      });
+    } catch {
+      fail('worktree-unreadable');
+      return;
+    }
+    if (inspected === null) {
+      fail('worktree-unreadable');
+      return;
+    }
+    if (inspected.outcome === 'unknown') {
+      fail('worktree-unreadable');
+      return;
+    }
+    if (inspected.outcome !== 'inspected') {
+      return; // refused: not a linked worktree, no unknown
+    }
+    const facts0 = inspected.facts;
+    wk.sizeBySubject.set(subject, typeof facts0.sizeBytes === 'number' && Number.isFinite(facts0.sizeBytes) ? facts0.sizeBytes : null);
+
+    const naming = this.attemptsNamingWorktree(facts, worktreePath);
+    const held = this.heldReservationsNamingWorktree(facts, worktreePath, naming);
+    const routing = this.worktreeRouting(clone, naming);
+    const retentionMs = effectiveRetentionHours(policy) * 3_600_000;
+
+    const headOnDefault: ReaperFact = facts0.headOnDefault === true ? 'yes' : facts0.headOnDefault === false ? 'no' : 'unknown';
+    const clean: ReaperFact = facts0.status.tracked === 0 && facts0.status.untracked === 0 && facts0.status.unmerged === 0 ? 'yes' : 'no';
+    const unlocked: ReaperFact = facts0.locked ? 'no' : 'yes';
+    const onBranch: ReaperFact = facts0.detached || facts0.branch === null ? 'no' : 'yes';
+    const notBusy: ReaperFact = facts0.inProgressOperations.length === 0 ? 'yes' : 'no';
+    const notPrimary: ReaperFact = 'yes';
+    const activityMs = msOfSafe(facts0.lastActivity.iso);
+    const quiet: ReaperFact = facts0.lastActivity.unknown || activityMs === null
+      ? 'unknown'
+      : nowMs - activityMs >= retentionMs ? 'yes' : 'no';
+    const journal = await this.worktreeJournalFacts(naming, journalCache, build.unknown, subject, nowMs, graceMs);
+    const { noLiveRecord, noYoungIntent } = this.worktreeRecordFacts(naming, held, facts.reservations, nowMs, graceMs, journal.unreadable, journal.youngIntent);
+
+    const runnerIdle = await this.worktreeRunnerIdle(naming, routing, worktreePath);
+
+    // A busy worktree is reported, not classified (D7).
+    if (notBusy === 'no') {
+      wk.busySubjects.add(subject);
+      wk.busyReports.set(subject, { evidence: 'unknown', sizeBytes: wk.sizeBySubject.get(subject) ?? null });
+      return;
+    }
+
+    // D5: the evidence read only when the other ten facts are already yes.
+    const tenFacts: readonly ReaperFact[] = [headOnDefault, clean, unlocked, onBranch, notBusy, notPrimary, quiet, noLiveRecord, runnerIdle, noYoungIntent];
+    const evidence = tenFacts.every((fact) => fact === 'yes')
+      ? await this.readMergeEvidence(build, wk, forgeRead, subject, facts0)
+      : 'unknown';
+    wk.mergedEvidence.set(subject, evidence);
+    wk.inspectedWorktrees.set(subject, { headOnDefault, branch: facts0.branch, evidence });
+
+    build.observations.push({
+      kind: 'merged-worktree',
+      subject,
+      youngActivity: false,
+      facts: {
+        headOnDefault, clean, unlocked, onBranch, notBusy, notPrimary, quiet, noLiveRecord, runnerIdle, noYoungIntent, evidence,
+      },
+    });
+  }
+
+  /** The attempts that name a worktree path, in record order. */
+  private attemptsNamingWorktree(facts: PassFacts, worktreePath: string): readonly AttemptRecord[] {
+    const naming: AttemptRecord[] = [];
+    for (const attempt of facts.attempts ?? []) {
+      if (isPlainObject(attempt) && (attempt as { worktreePath?: unknown }).worktreePath === worktreePath) {
+        naming.push(attempt);
+      }
+    }
+    return naming;
+  }
+
+  /** The held reservations naming the worktree directly or through a naming attempt. */
+  private heldReservationsNamingWorktree(
+    facts: PassFacts,
+    worktreePath: string,
+    naming: readonly AttemptRecord[],
+  ): readonly CapacityReservationRecord[] {
+    const held: CapacityReservationRecord[] = [];
+    if (facts.reservations === null) {
+      return held;
+    }
+    const namingIds = new Set(naming.map((attempt) => attempt.id));
+    for (const reservation of facts.reservations) {
+      if (!isPlainObject(reservation) || (reservation as { held?: unknown }).held !== true) {
+        continue;
+      }
+      const record = reservation as CapacityReservationRecord;
+      const namesDirectly = (record as { worktreePath?: unknown }).worktreePath === worktreePath;
+      if (namesDirectly || namingIds.has(record.attemptId)) {
+        held.push(record);
+      }
+    }
+    return held;
+  }
+
+  /** The routing block for one worktree's reads: the naming attempt's own block when it names the clone's host, else the clone's. */
+  private worktreeRouting(clone: CloneRef, naming: readonly AttemptRecord[]): AttemptRunnerRecord {
+    for (const attempt of naming) {
+      if (runnerHasHostName(attempt.runner) && attempt.runner?.hostName === clone.hostName) {
+        return attempt.runner;
+      }
+    }
+    return clone.recordedHost;
+  }
+
+  /**
+   * The action journal of each naming attempt, read once and cached. The
+   * journal facts: whether an attempt carries a young intent. A failed read
+   * leaves the fact unknown and is the unknown `journal-unreadable`.
+   */
+  private async worktreeJournalFacts(
+    naming: readonly AttemptRecord[],
+    journalCache: Map<string, readonly ActionJournalEntryRecord[] | null>,
+    unknown: ReaperUnknownView[],
+    subject: string,
+    nowMs: number,
+    graceMs: number,
+  ): Promise<{ unreadable: boolean; youngIntent: boolean }> {
+    let youngIntent = false;
+    let unreadable = false;
+    for (const attempt of naming) {
+      let entries = journalCache.get(attempt.id);
+      if (entries === undefined) {
+        try {
+          entries = await this.deps.executionJournal.listJournalEntriesForAttempt(attempt.id);
+        } catch {
+          entries = null;
+        }
+        journalCache.set(attempt.id, entries);
+      }
+      if (entries === null) {
+        unreadable = true;
+        continue;
+      }
+      if (actionJournalHasYoungIntent(entries, nowMs, graceMs)) {
+        youngIntent = true;
+      }
+    }
+    if (unreadable) {
+      pushBounded(unknown, { subject, kind: 'merged-worktree', reason: 'journal-unreadable' });
+    }
+    return { unreadable, youngIntent };
+  }
+
+  /** The `noLiveRecord` and `noYoungIntent` facts of D4 from the naming attempts and the held reservations. */
+  private worktreeRecordFacts(
+    naming: readonly AttemptRecord[],
+    held: readonly CapacityReservationRecord[],
+    reservations: PassFacts['reservations'],
+    nowMs: number,
+    graceMs: number,
+    journalUnknown: boolean,
+    journalYoungIntent: boolean,
+  ): { noLiveRecord: ReaperFact; noYoungIntent: ReaperFact } {
+    if (reservations === null) {
+      // The reservation read failed: unknown stays unknown, nothing is fabricated.
+      return { noLiveRecord: 'unknown', noYoungIntent: 'unknown' };
+    }
+    let noLiveRecord: ReaperFact = 'yes';
+    for (const attempt of naming) {
+      const settled = (attempt.state === 'collected' && attempt.artifacts !== null) || attempt.state === 'cancelled';
+      if (!settled) {
+        noLiveRecord = 'no';
+        break;
+      }
+    }
+    for (const reservation of held) {
+      noLiveRecord = 'no';
+      if (reservationsYoungActivity(reservation.reservedAtIso, nowMs, graceMs)) {
+        break;
+      }
+    }
+    let noYoungIntent: ReaperFact = journalUnknown ? 'unknown' : journalYoungIntent ? 'no' : 'yes';
+    if (noYoungIntent === 'yes') {
+      for (const attempt of naming) {
+        if (attemptYoungActivity(attempt, nowMs, graceMs)) {
+          noYoungIntent = 'no';
+          break;
+        }
+      }
+    }
+    if (noYoungIntent === 'yes') {
+      for (const reservation of held) {
+        if (reservationsYoungActivity(reservation.reservedAtIso, nowMs, graceMs)) {
+          noYoungIntent = 'no';
+          break;
+        }
+      }
+    }
+    return { noLiveRecord, noYoungIntent };
+  }
+
+  /** The `runnerIdle` fact of D4: idle yes, running no, anything else unknown. */
+  private async worktreeRunnerIdle(
+    naming: readonly AttemptRecord[],
+    routing: AttemptRunnerRecord,
+    worktreePath: string,
+  ): Promise<ReaperFact> {
+    const attemptId = naming.length > 0 ? naming[0].id : '';
+    let answer: { readonly state: string };
+    try {
+      const resolved = this.deps.runnerForAttempt.runnerForAttempt({ runner: routing });
+      if (!resolved.ok || resolved.runner.inspectWorktreeRun === undefined) {
+        return 'unknown';
+      }
+      answer = await resolved.runner.inspectWorktreeRun({ attemptId, worktreePath, runner: routing });
+    } catch {
+      return 'unknown';
+    }
+    if (answer === null || answer.state === undefined) {
+      return 'unknown';
+    }
+    return answer.state === 'idle' ? 'yes' : answer.state === 'running' ? 'no' : 'unknown';
+  }
+
+  /** D5: the merge evidence of one worktree, read only when the other ten facts are yes. */
+  private async readMergeEvidence(
+    build: ObservationBuild,
+    wk: WorktreeBuild,
+    forgeRead: ReaperForgeReadPort | undefined,
+    subject: string,
+    inspected: { readonly head: string | null; readonly branch: string | null },
+  ): Promise<'merged-pr' | 'ancestor-only' | 'unknown'> {
+    const unreadable = (): 'unknown' => {
+      wk.readsComplete = false;
+      pushBounded(build.unknown, { subject, kind: 'merged-worktree', reason: 'forge-unreadable' });
+      return 'unknown';
+    };
+    if (forgeRead === undefined || forgeRead.isConfigured === undefined || !forgeRead.isConfigured()) {
+      return unreadable();
+    }
+    if (inspected.branch === null) {
+      return unreadable();
+    }
+    let answer: Awaited<ReturnType<ReaperForgeReadPort['readPullRequest']>>;
+    try {
+      answer = await forgeRead.readPullRequest({
+        ref: { kind: 'branch', branchName: inspected.branch },
+        timeoutMs: 5000,
+      });
+    } catch {
+      return unreadable();
+    }
+    if (answer === null || answer.outcome === 'unavailable') {
+      return unreadable();
+    }
+    if (answer.outcome === 'not-found') {
+      return 'ancestor-only';
+    }
+    const pr = answer.pullRequest;
+    const merged = isPlainObject(pr) && (pr as { state?: unknown }).state === 'merged';
+    const headSha = isPlainObject(pr) ? (pr as { headSha?: unknown }).headSha : undefined;
+    return merged && headSha === inspected.head ? 'merged-pr' : 'ancestor-only';
+  }
+
+  /** D7: one worktree-busy attention item per busy subject, raised or refreshed. */
+  private async raiseWorktreeBusyAttention(
+    projectId: string,
+    gather: WorktreeBuild,
+    attention: ReaperAttentionView[],
+    unknown: ReaperUnknownView[],
+  ): Promise<void> {
+    for (const subject of gather.busySubjects) {
+      if (attention.length >= MAX_ATTENTION_PER_PASS) {
+        pushBounded(unknown, { subject, kind: 'worktree-busy', reason: 'pass-cap' });
+        continue;
+      }
+      const outcome = await this.deps.attention.recordAttentionItem(
+        {
+          projectId,
+          kind: 'worktree-busy',
+          subject: { kind: 'worktree', ref: subject },
+          workOrderId: null,
+          summary: truncate(`Reaper report worktree-busy for worktree ${subject}`),
+        },
+        'reaper',
+      );
+      attention.push({
+        kind: 'worktree-busy',
+        subject,
+        outcome: isReaperAttentionOutcome(outcome.outcome) ? outcome.outcome : 'refused',
+      });
+    }
+  }
+
+  /** D7: clear a worktree-busy item whose subject is not busy this pass, only when every worktree read succeeded. */
+  private async clearWorktreeBusyItems(projectId: string, gather: WorktreeBuild, ctx: SettleContext): Promise<void> {
+    if (!gather.readsComplete) {
+      return; // a failed read never clears anything
+    }
+    for (const [subject] of gather.inspectedWorktrees) {
+      if (gather.busySubjects.has(subject)) {
+        continue;
+      }
+      if (!this.isAttentionItemOpen(subject, 'worktree-busy', ctx.attentionItems)) {
+        continue;
+      }
+      try {
+        await this.deps.attention.clearAttentionItem(
+          { action: 'resolve', projectId, kind: 'worktree-busy', subject: { kind: 'worktree', ref: subject }, reason: 'stale' },
+          'machine',
+          'reaper',
+        );
+      } catch {
+        pushBounded(ctx.unknown, { subject, kind: 'worktree-busy', reason: 'attention-unclearable' });
+      }
+    }
+  }
+
+  /** D11: the worktrees result view — one entry per merged-worktree finding and one per busy subject. */
+  private worktreeViews(gather: WorktreeBuild, findings: readonly ReaperFinding[]): ReaperWorktreeView[] {
+    const views: ReaperWorktreeView[] = [];
+    for (const finding of findings) {
+      if (finding.kind !== 'merged-worktree') {
+        continue;
+      }
+      const sizeBytes = gather.sizeBySubject.get(finding.subject);
+      views.push({
+        subject: finding.subject,
+        report: 'merged-worktree',
+        evidence: gather.mergedEvidence.get(finding.subject) ?? 'unknown',
+        sizeBytes: sizeBytes === undefined ? null : sizeBytes,
+      });
+    }
+    for (const [subject, busy] of gather.busyReports) {
+      views.push({ subject, report: 'worktree-busy', evidence: busy.evidence, sizeBytes: busy.sizeBytes });
+    }
+    return views;
+  }
+
+  /**
    * Upsert every finding under its stored id (reused for an open
    * `(kind, subject)`, else a validated ULID). Null when the id source is
    * invalid. Only a stored finding is exposed or repaired.
@@ -741,7 +1511,11 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       }
       raised += 1;
       // A refusal is recorded in the view, never retried in the same pass.
-      const outcome = await this.recordAttention(ctx.projectId, finding, ctx.attemptsById);
+      // The subject kind comes from the finding kind, never guessed (D7/D8):
+      // a worktree subject is `worktree`, a disk-pressure subject is `host`.
+      const subjectKind =
+        finding.kind === 'merged-worktree' ? 'worktree' : finding.kind === 'disk-pressure' ? 'host' : undefined;
+      const outcome = await this.recordAttention(ctx.projectId, finding, ctx.attemptsById, subjectKind);
       attention.push({ kind: finding.kind, subject: finding.subject, outcome });
     }
     return attention;
@@ -796,9 +1570,10 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     projectId: string,
     finding: ReaperFinding,
     attemptsById: ReadonlyMap<string, AttemptRecord>,
+    subjectKindOverride?: string,
   ): Promise<ReaperAttentionOutcome> {
-    const attempt = attemptsById.get(finding.subject);
-    const subjectKind = attempt !== undefined ? 'attempt' : 'reservation';
+    const attempt = subjectKindOverride === undefined ? attemptsById.get(finding.subject) : undefined;
+    const subjectKind = subjectKindOverride ?? (attempt !== undefined ? 'attempt' : 'reservation');
     const workOrderId = attempt !== undefined ? attempt.workOrderId : null;
     const summary = truncate(
       `Reaper finding ${finding.kind} for ${subjectKind} ${finding.subject}; action ${finding.action}; sightings ${finding.sightings}`,
@@ -1254,6 +2029,25 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       const target = staleAttentionTarget(subject, ctx.staleAttentionBySubject);
       return !this.isAttentionItemOpen(target.ref, target.kind, ctx.attentionItems);
     }
+    if (kind === 'merged-worktree') {
+      // The branch facts of this pass's inspection decide: the merge condition
+      // ended when the branch is gone (detached or null) or the forge read a
+      // definite negative. A busy or dirty worktree keeps the finding open.
+      const inspected = ctx.inspectedWorktrees.get(subject);
+      if (inspected === undefined) {
+        return false;
+      }
+      return inspected.headOnDefault === 'no' || inspected.branch === null || inspected.evidence === 'ancestor-only';
+    }
+    if (kind === 'disk-pressure') {
+      // Hysteresis (D8/D9): the finding closes only when this pass read the
+      // host above the clear threshold; a failed disk read leaves it open.
+      const freePercent = ctx.diskFreePercentByHost.get(subject);
+      if (freePercent === undefined) {
+        return false;
+      }
+      return freePercent > effectiveClearPercent(ctx.policy, ctx.unknown);
+    }
     return false;
   }
 
@@ -1274,7 +2068,11 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     }
     const stale = record.finding.kind === 'stale-attention';
     const target = stale ? staleAttentionTarget(record.finding.subject, ctx.staleAttentionBySubject) : null;
-    const subjectKind = record.finding.kind === 'leaked-slot' ? 'reservation' : 'attempt';
+    const subjectKind =
+      record.finding.kind === 'disk-pressure' ? 'host'
+      : record.finding.kind === 'merged-worktree' ? 'worktree'
+      : record.finding.kind === 'leaked-slot' ? 'reservation'
+      : 'attempt';
     const attentionKind = target?.kind ?? record.finding.kind;
     const attentionRef = target?.ref ?? record.finding.subject;
     try {
@@ -1348,6 +2146,7 @@ function refused(reason: string): ReapZombiesResult {
     findings: [],
     attention: [],
     repairs: [],
+    worktrees: [],
     unknown: [],
   };
 }

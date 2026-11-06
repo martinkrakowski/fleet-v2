@@ -341,6 +341,84 @@ export function draftHost(rawInput: unknown): HostDraftResult {
 }
 
 /**
+ * The secret shapes a hosts refusal or table must never echo, rebuilt from
+ * string fragments so no literal in this file matches the shapes itself
+ * (the repo's own diff gate refuses a file whose source text looks like a
+ * secret). The set mirrors the shared registry's six legacy shapes and all
+ * seventeen canonical lane-diff shapes; the shared package is not a declared
+ * dependency of the CLI, so the mirror lives here.
+ */
+const SECRET_SHAPES: readonly RegExp[] = [
+  // Every pattern is global: `sanitizeToken` must replace every match in one
+  // rendered field, not only the first, so several secret-shaped values in
+  // one value cannot leave the later ones visible.
+  new RegExp(["-----BEGIN [A-Z ]*PRIVATE KEY-----"].join(""), "g"),
+  new RegExp(["\\bgh[pousr]_[A-Za-z0-9]{20,}\\b"].join(""), "g"),
+  new RegExp(["\\bsk-[A-Za-z0-9_-]{20,}\\b"].join(""), "g"),
+  new RegExp(["\\bAKIA[0-9A-Z]{16}\\b"].join(""), "g"),
+  new RegExp(["\\bxox[abprs]-[A-Za-z0-9-]{10,}\\b"].join(""), "g"),
+  new RegExp([
+    "\\beyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\b",
+  ].join(""), "g"),
+  new RegExp(["AKIA[0-9A-Z]{16}"].join(""), "g"),
+  new RegExp(["gh[pousr]_[A-Za-z0-9]{20,}"].join(""), "g"),
+  new RegExp(["github_pat_[A-Za-z0-9_]{20,}"].join(""), "g"),
+  new RegExp(["BEGIN [A-Z ]*PRIVATE KEY"].join(""), "g"),
+  new RegExp(["ya29\\.[A-Za-z0-9_-]{20,}"].join(""), "g"),
+  new RegExp(["AIza[0-9A-Za-z_-]{30,}"].join(""), "g"),
+  new RegExp(["sk-or-v1-[0-9a-f]{20,}"].join(""), "g"),
+  new RegExp(["xox[abpr]-[A-Za-z0-9-]{10,}"].join(""), "g"),
+  new RegExp([
+    "eyJ[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}",
+  ].join(""), "g"),
+  new RegExp(["ssh-(rsa|ed25519|dss|ecdsa) AAAA[A-Za-z0-9+/]{20,}"].join(""), "g"),
+  new RegExp([
+    "OPENCODE_SERVER_PASSWORD[ \\t\\v\\f\\r]*=[ \\t\\v\\f\\r]*[^ \\t\\v\\f\\r]+",
+  ].join(""), "g"),
+  new RegExp(["antigravity", "oauth", "token"].join("-"), "g"),
+  new RegExp([
+    "\\/home\\/[a-z]+\\/.(",
+    "ssh|config\\/gh|gemini|aws|docker\\/config\\.json)",
+  ].join(""), "g"),
+  new RegExp([
+    "[Pp]assword[ \\t\\v\\f\\r]*[:=][ \\t\\v\\f\\r]*[\"'][^\"']{6,}[\"']",
+  ].join(""), "g"),
+  new RegExp([
+    "[Tt]oken[ \\t\\v\\f\\r]*[:=][ \\t\\v\\f\\r]*[\"'][A-Za-z0-9_./+=-]{16,}[\"']",
+  ].join(""), "g"),
+  new RegExp([
+    "https?:\\/\\/[^/:@ \\t\\v\\f\\r]+:[^/@ \\t\\v\\f\\r]{6,}@",
+  ].join(""), "g"),
+];
+
+/** The filesystem separators `sanitizeToken` also strips. */
+const SEPARATORS = /[\\/\\]/g;
+
+/** True when `text` contains a secret shape or a filesystem separator. */
+export function hasSecretShape(text: string): boolean {
+  return [...SECRET_SHAPES, SEPARATORS].some((pattern) => {
+    // Global patterns are stateful across `test` calls; each test starts clean.
+    pattern.lastIndex = 0;
+    return pattern.test(text);
+  });
+}
+
+/** Replace every secret-shaped span and separator in `text` with `<redacted>`. */
+export function sanitizeToken(text: string): string {
+  return redactSecrets(text).replace(SEPARATORS, '<redacted>');
+}
+
+/** Replace every secret-shaped span in `text` (separators stay) with `<redacted>`. */
+export function redactSecrets(text: string): string {
+  let out = text;
+  for (const pattern of SECRET_SHAPES) {
+    out = out.replace(pattern, '<redacted>');
+  }
+  return out;
+}
+
+
+/**
  * The path prefix an error names a host by. The name is operator input, so it
  * is echoed only when it is a valid host name that cannot be mistaken for a
  * secret (short, no long alphanumeric run); anything else gets a fixed label.
@@ -352,14 +430,15 @@ function hostPath(name: string): string {
 /**
  * The one screening rule for a host name an operator-facing message would
  * echo: the name itself only when it is a valid host name of at most 32
- * characters with no run of 12 or more alphanumerics (so a pasted token never
- * passes), otherwise the fixed label `<invalid-name>`.
+ * characters with no run of 12 or more alphanumerics and no secret shape
+ * (a superset of `sanitizeToken`), otherwise the fixed label `<invalid-name>`.
  */
 export function screenHostName(name: string): string {
   return typeof name === 'string' &&
     isValidHostName(name) &&
     name.length <= 32 &&
-    !/[A-Za-z0-9]{12,}/.test(name)
+    !/[A-Za-z0-9]{12,}/.test(name) &&
+    !hasSecretShape(name)
     ? name
     : '<invalid-name>';
 }

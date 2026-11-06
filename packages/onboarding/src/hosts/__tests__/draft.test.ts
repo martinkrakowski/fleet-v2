@@ -864,3 +864,28 @@ describe('applyHostDraft validates the host it files (Luna pre-merge round)', ()
     expect(JSON.stringify(invalid)).not.toContain(secretName);
   });
 });
+
+describe('screenHostName (Fable re-check round)', () => {
+  it('echoes a short, plain, valid name and screens everything else, including sanitizeToken shapes', async () => {
+    const { screenHostName, sanitizeToken } = await import('../draft.js');
+    expect(screenHostName('lane-host')).toBe('lane-host');
+    const hostile = [
+      ['ghp', '_' + 'a1'.repeat(18)].join(''),
+      ['AKIA', 'C'.repeat(16)].join(''),
+      ['xox', 'b-1234567890-abcdefghij'].join(''),
+      ['ya29', '.ab-cd-ef-gh-ij-kl-mn-op-qr'].join(''),
+      'a'.repeat(33),
+      '../x',
+      '',
+    ];
+    for (const name of hostile) {
+      expect(screenHostName(name)).toBe('<invalid-name>');
+    }
+    // A superset of sanitizeToken: whatever it redacts, the screen refuses.
+    for (const name of hostile) {
+      if (sanitizeToken(name) !== name) {
+        expect(screenHostName(name)).toBe('<invalid-name>');
+      }
+    }
+  });
+});

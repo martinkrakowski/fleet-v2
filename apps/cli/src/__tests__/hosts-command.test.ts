@@ -1659,3 +1659,78 @@ describe("moveLaneRunnerRole host-map accessors (Luna pre-merge round)", () => {
     expect(result?.refused).toBe("accessor");
   });
 });
+
+describe("hosts commands screen every host-map key (Fable re-check round)", () => {
+  function fixture(key: string, extra: Record<string, unknown> = {}) {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+        },
+        [key]: {
+          transport: "ssh",
+          sshAlias: "old",
+          worktreeRoot: path.join(dir, "old"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: { "lane-runner": "old-lr", verifier: "old-v" },
+          runner: { kind: "opencode", port: 4200 },
+        },
+        ...extra,
+      },
+    });
+    return { dir, file };
+  }
+
+  it("a secret-shaped sole lane-runner key never reaches stdout or stderr when the role moves", async () => {
+    const key = ["ghp", "_" + "a1".repeat(18)].join("");
+    const { dir, file } = fixture(key);
+    const moved = await runHosts(
+      ["add", "newhost", "--role", "lane-runner", "--worktree-root", path.join(dir, "n"), "--port", "1", "--yes"],
+      file,
+    );
+    expect(moved.stdout + moved.stderr).not.toContain(key);
+    const refused = await runHosts(
+      ["add", "newhost", "--role", "lane-runner", "--worktree-root", "relative", "--port", "1", "--yes"],
+      file,
+    );
+    expect(refused.code).not.toBe(0);
+    expect(refused.stdout + refused.stderr).not.toContain(key);
+  });
+
+  it("a bare-alphanumeric-run key such as a slack-shaped one is screened in notices, list and loader errors", async () => {
+    const key = ["xox", "b-1234567890-abcdefghij"].join("");
+    const { dir, file } = fixture(key);
+    const listed = await runHosts(["list"], file);
+    expect(listed.stdout + listed.stderr).not.toContain(key);
+    const moved = await runHosts(
+      ["add", "newhost", "--role", "lane-runner", "--worktree-root", path.join(dir, "n"), "--port", "1", "--yes"],
+      file,
+    );
+    expect(moved.stdout + moved.stderr).not.toContain(key);
+    expect(moved.stdout).toContain("<invalid-name>");
+    expect(
+      formatRoleAmbiguousRefusal("verifier", [key, "ok-host"]),
+    ).not.toContain(key);
+  });
+
+  it("printed loader errors screen host-map keys", async () => {
+    const key = ["ghp", "_" + "a1".repeat(18)].join("");
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: { [key]: { transport: "carrier-pigeon", worktreeRoot: "/w", roles: ["orchestrator"] } },
+    });
+    for (const argv of [["list"], ["show"], ["remove", "x", "--yes"]]) {
+      const result = await runHosts(argv, file);
+      expect(result.stdout + result.stderr).not.toContain(key);
+    }
+  });
+});

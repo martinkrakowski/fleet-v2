@@ -15,41 +15,47 @@ import type {
   ExecuteAuthorizedForgeActionPort,
   ExecuteAuthorizedForgeActionRequest,
   ExecuteAuthorizedForgeActionResult,
-} from '../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
-import type { AcceptanceEvidencePort } from '../ports/out/AcceptanceEvidencePort.out-port.js';
-import type { OwnerDecisionPort } from '../ports/out/OwnerDecisionPort.out-port.js';
-import type { AttemptOwnerDecisionPort } from '../ports/out/AttemptOwnerDecisionPort.out-port.js';
-import type { ActionAuthorizationPort } from '../ports/out/ActionAuthorizationPort.out-port.js';
-import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
-import type { ExecutionJournalPort } from '../ports/out/ExecutionJournalPort.out-port.js';
-import type { ForgeActionPort } from '../ports/out/ForgeActionPort.out-port.js';
-import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
+} from "../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js";
+import type { AcceptanceEvidencePort } from "../ports/out/AcceptanceEvidencePort.out-port.js";
+import type { OwnerDecisionPort } from "../ports/out/OwnerDecisionPort.out-port.js";
+import type { AttemptOwnerDecisionPort } from "../ports/out/AttemptOwnerDecisionPort.out-port.js";
+import type { ActionAuthorizationPort } from "../ports/out/ActionAuthorizationPort.out-port.js";
+import type { AttemptRepositoryPort } from "../ports/out/AttemptRepositoryPort.out-port.js";
+import type { ExecutionJournalPort } from "../ports/out/ExecutionJournalPort.out-port.js";
+import type { ForgeActionPort } from "../ports/out/ForgeActionPort.out-port.js";
+import type { WorkOrderRepositoryPort } from "../ports/out/WorkOrderRepositoryPort.out-port.js";
 import type {
   ActionJournalEntryRecord,
   ActionJournalPullRequestRef,
   AttemptRecord,
   WorkOrderRecord,
-} from '../../domain/execution-records.js';
-import { WorkOrder } from '../../domain/entities/WorkOrder.js';
-import { MergeRecord } from '../../domain/entities/MergeRecord.js';
-import { PullRequestLink } from '../../domain/entities/PullRequestLink.js';
-import type { PullRequestLinkConflictRecord } from '../../domain/lane-plan-records.js';
-import { isPlanSecretShaped, pullRequestRefError } from '../../domain/lane-plan-sidecar.js';
-import { FORGE_ACTION_KINDS } from '../../domain/coordination-keys.js';
-import type { LanePlanRepositoryPort } from '../ports/out/LanePlanRepositoryPort.out-port.js';
-import type { MergeRecordRepositoryPort } from '../ports/out/MergeRecordRepositoryPort.out-port.js';
-import { AUTHORIZED_BY_PATTERN } from '../../domain/auto-merge.js';
-import { BASE_BRANCH_INVALID_MESSAGE, parseBaseBranch } from '../../domain/base-branch.js';
+} from "../../domain/execution-records.js";
+import { WorkOrder } from "../../domain/entities/WorkOrder.js";
+import { MergeRecord } from "../../domain/entities/MergeRecord.js";
+import { PullRequestLink } from "../../domain/entities/PullRequestLink.js";
+import type { PullRequestLinkConflictRecord } from "../../domain/lane-plan-records.js";
+import {
+  isPlanSecretShaped,
+  pullRequestRefError,
+} from "../../domain/lane-plan-sidecar.js";
+import { FORGE_ACTION_KINDS } from "../../domain/coordination-keys.js";
+import type { LanePlanRepositoryPort } from "../ports/out/LanePlanRepositoryPort.out-port.js";
+import type { MergeRecordRepositoryPort } from "../ports/out/MergeRecordRepositoryPort.out-port.js";
+import { AUTHORIZED_BY_PATTERN } from "../../domain/auto-merge.js";
+import {
+  BASE_BRANCH_INVALID_MESSAGE,
+  parseBaseBranch,
+} from "../../domain/base-branch.js";
 
 /** A safe branch name, the forge read's rule (KF-5b): one safe git ref, never all digits. */
 function isSafeBranchName(value: unknown): value is string {
   return (
-    typeof value === 'string' &&
+    typeof value === "string" &&
     value.length > 0 &&
-    !value.includes('..') &&
-    !value.endsWith('/') &&
-    !value.endsWith('.') &&
-    !value.endsWith('.lock') &&
+    !value.includes("..") &&
+    !value.endsWith("/") &&
+    !value.endsWith(".") &&
+    !value.endsWith(".lock") &&
     /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value) &&
     !/^\d+$/.test(value)
   );
@@ -81,7 +87,7 @@ export interface ExecuteAuthorizedForgeActionDependencies {
    * action before any grant is consumed or subprocess runs; `github` and an
    * unknown mode keep today's behaviour.
    */
-  readonly forgeMode?: 'github' | 'none';
+  readonly forgeMode?: "github" | "none";
   /**
    * Composition-root clock for journal and revision timestamps; the
    * wall-clock default is a scaffold convenience, not an authority source.
@@ -102,22 +108,26 @@ export interface ExecuteAuthorizedForgeActionDependencies {
 }
 
 /** The forge action kinds that act on a pull request (WB5b pre-flight resolution). */
-const PULL_REQUEST_ACTION_KINDS: readonly string[] = ['push-and-open-pr', 'push-to-pr', 'merge-pr'];
+const PULL_REQUEST_ACTION_KINDS: readonly string[] = [
+  "push-and-open-pr",
+  "push-to-pr",
+  "merge-pr",
+];
 
 /** Request ids are bounded plain text with no secret shape and no path separators. */
 const REQUEST_ID_FIELDS: readonly string[] = [
-  'actionId',
-  'attemptId',
-  'workOrderId',
-  'authorizationGrantId',
+  "actionId",
+  "attemptId",
+  "workOrderId",
+  "authorizationGrantId",
 ];
 
 const OPTIONAL_TEXT_FIELDS: readonly string[] = [
-  'authorizedBy',
-  'branchName',
-  'baseBranch',
-  'title',
-  'body',
+  "authorizedBy",
+  "branchName",
+  "baseBranch",
+  "title",
+  "body",
 ];
 
 const MAX_REQUEST_TEXT_CHARS = 256;
@@ -136,14 +146,17 @@ type ForgeActionRequestRead =
  * only, never the offending value.
  */
 function readForgeActionRequest(raw: unknown): ForgeActionRequestRead {
-  const refuse = (reason: string): ForgeActionRequestRead => ({ ok: false, reason });
+  const refuse = (reason: string): ForgeActionRequestRead => ({
+    ok: false,
+    reason,
+  });
   try {
-    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-      return refuse('request must be a plain object');
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      return refuse("request must be a plain object");
     }
     const snapshot: Record<string, unknown> = {};
     for (const key of Reflect.ownKeys(raw)) {
-      if (typeof key !== 'string') {
+      if (typeof key !== "string") {
         continue;
       }
       const descriptor = Object.getOwnPropertyDescriptor(raw, key);
@@ -151,7 +164,7 @@ function readForgeActionRequest(raw: unknown): ForgeActionRequestRead {
         continue;
       }
       if (descriptor.get !== undefined || descriptor.set !== undefined) {
-        return refuse('request fields must be plain data properties');
+        return refuse("request fields must be plain data properties");
       }
       if (!descriptor.enumerable) {
         continue;
@@ -162,44 +175,56 @@ function readForgeActionRequest(raw: unknown): ForgeActionRequestRead {
       const value = snapshot[field];
       // A `push-to-pr` run key is a valid action id and contains `/`; a
       // backslash path separator is refused on every id.
-      const separators = field === 'actionId' ? ['\\'] : ['/', '\\'];
+      const separators = field === "actionId" ? ["\\"] : ["/", "\\"];
       if (
-        typeof value !== 'string' ||
+        typeof value !== "string" ||
         value.trim().length === 0 ||
         value.length > MAX_REQUEST_TEXT_CHARS ||
         separators.some((separator) => value.includes(separator)) ||
         isPlanSecretShaped(value)
       ) {
-        return refuse(`${field} must be non-empty plain text of at most ${MAX_REQUEST_TEXT_CHARS} characters`);
+        return refuse(
+          `${field} must be non-empty plain text of at most ${MAX_REQUEST_TEXT_CHARS} characters`,
+        );
       }
     }
-    const expectedHeadSha = snapshot['expectedHeadSha'];
-    if (typeof expectedHeadSha !== 'string' || !EXPECTED_HEAD_SHA_PATTERN.test(expectedHeadSha)) {
-      return refuse('expectedHeadSha must be a 40-character lowercase sha');
+    const expectedHeadSha = snapshot["expectedHeadSha"];
+    if (
+      typeof expectedHeadSha !== "string" ||
+      !EXPECTED_HEAD_SHA_PATTERN.test(expectedHeadSha)
+    ) {
+      return refuse("expectedHeadSha must be a 40-character lowercase sha");
     }
-    if (!(FORGE_ACTION_KINDS as readonly unknown[]).includes(snapshot['kind'])) {
-      return refuse('kind must be one of push-and-open-pr, push-to-pr, merge-pr, post-status');
+    if (
+      !(FORGE_ACTION_KINDS as readonly unknown[]).includes(snapshot["kind"])
+    ) {
+      return refuse(
+        "kind must be one of push-and-open-pr, push-to-pr, merge-pr, post-status",
+      );
     }
     for (const field of OPTIONAL_TEXT_FIELDS) {
       const value = snapshot[field];
       // Only a string is checked here; a non-string value falls through to
       // the field's own rule (branch name, base branch, authorizedBy).
-      if (typeof value === 'string' && isPlanSecretShaped(value)) {
+      if (typeof value === "string" && isPlanSecretShaped(value)) {
         return refuse(`${field} must be plain text`);
       }
     }
-    const pullRequestNumber = snapshot['pullRequestNumber'];
+    const pullRequestNumber = snapshot["pullRequestNumber"];
     if (
       pullRequestNumber !== undefined &&
       (!Number.isSafeInteger(pullRequestNumber) ||
         (pullRequestNumber as number) < 1 ||
         (pullRequestNumber as number) > MAX_PULL_REQUEST_NUMBER)
     ) {
-      return refuse('pullRequestNumber must be a positive integer');
+      return refuse("pullRequestNumber must be a positive integer");
     }
-    return { ok: true, request: snapshot as unknown as ExecuteAuthorizedForgeActionRequest };
+    return {
+      ok: true,
+      request: snapshot as unknown as ExecuteAuthorizedForgeActionRequest,
+    };
   } catch {
-    return refuse('request could not be read');
+    return refuse("request could not be read");
   }
 }
 
@@ -228,12 +253,14 @@ function canonicalTimestampIso(now: (() => string) | undefined): string | null {
  * repository rules. Anything else is null (unknown stays unknown).
  */
 function normalizeWorkOrderRepository(raw: unknown): string | null {
-  if (typeof raw !== 'string') {
+  if (typeof raw !== "string") {
     return null;
   }
-  const prefix = 'github.com/';
+  const prefix = "github.com/";
   const candidate = raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
-  if (pullRequestRefError('pr', { repository: candidate, number: 1 }) !== null) {
+  if (
+    pullRequestRefError("pr", { repository: candidate, number: 1 }) !== null
+  ) {
     return null;
   }
   return candidate;
@@ -247,20 +274,30 @@ function workOrderLane(workOrder: WorkOrderRecord): {
 } {
   const planRef = workOrder.planRef;
   if (planRef !== undefined) {
-    return { projectId: planRef.projectId, planId: planRef.planId, laneId: planRef.laneId };
+    return {
+      projectId: planRef.projectId,
+      planId: planRef.planId,
+      laneId: planRef.laneId,
+    };
   }
-  return { projectId: workOrder.projectId, planId: null, laneId: workOrder.laneId };
+  return {
+    projectId: workOrder.projectId,
+    planId: null,
+    laneId: workOrder.laneId,
+  };
 }
 
 export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedForgeActionPort {
-  constructor(private readonly deps?: ExecuteAuthorizedForgeActionDependencies) {}
+  constructor(
+    private readonly deps?: ExecuteAuthorizedForgeActionDependencies,
+  ) {}
 
   async executeAuthorizedForgeAction(
     rawRequest: ExecuteAuthorizedForgeActionRequest,
   ): Promise<ExecuteAuthorizedForgeActionResult> {
     const deps = this.deps;
     if (!deps) {
-      throw new Error('Not implemented: ExecuteAuthorizedForgeActionUseCase');
+      throw new Error("Not implemented: ExecuteAuthorizedForgeActionUseCase");
     }
 
     // The request is untrusted runtime input (WB5b): it is read through its
@@ -269,61 +306,79 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     // journalled or executed.
     const requestRead = readForgeActionRequest(rawRequest);
     if (!requestRead.ok) {
-      return { outcome: 'refused', reason: requestRead.reason };
+      return { outcome: "refused", reason: requestRead.reason };
     }
     const request = requestRead.request;
 
     // Forge mode `none` (D6) is an explicit installation choice: every forge
     // action refuses before anything is consumed, journalled or executed.
-    if (deps.forgeMode === 'none') {
+    if (deps.forgeMode === "none") {
       return {
-        outcome: 'refused',
-        reason: "Forge mode is 'none': no forge transport is configured, so forge actions refuse",
+        outcome: "refused",
+        reason:
+          "Forge mode is 'none': no forge transport is configured, so forge actions refuse",
       };
     }
 
     // A policy-authorised action must name a policy setting revision (A8); an
     // owner grant leaves `authorizedBy` absent. Anything else refuses before a
     // grant is consumed or a journal entry is written (A11).
-    if (request.authorizedBy !== undefined && !AUTHORIZED_BY_PATTERN.test(request.authorizedBy)) {
-      return { outcome: 'refused', reason: 'authorizedBy must name a policy setting revision' };
+    if (
+      request.authorizedBy !== undefined &&
+      !AUTHORIZED_BY_PATTERN.test(request.authorizedBy)
+    ) {
+      return {
+        outcome: "refused",
+        reason: "authorizedBy must name a policy setting revision",
+      };
     }
 
     // A requested branch must be safe like the forge read's rule (KF-5b); the
     // run's recorded branch already passed the LaneRun domain guard, but the
     // request is untrusted here and refuses before a grant is consumed.
-    if (request.branchName !== undefined && !isSafeBranchName(request.branchName)) {
-      return { outcome: 'refused', reason: 'branchName must be a safe branch name' };
+    if (
+      request.branchName !== undefined &&
+      !isSafeBranchName(request.branchName)
+    ) {
+      return {
+        outcome: "refused",
+        reason: "branchName must be a safe branch name",
+      };
     }
 
     // A requested base branch is only meaningful for push-and-open-pr, and
     // must parse as `main` or `chain/<lowercase-dashes>` before a grant is
     // consumed (CB-D2).
     if (
-      request.kind === 'push-and-open-pr' &&
+      request.kind === "push-and-open-pr" &&
       request.baseBranch !== undefined &&
       parseBaseBranch(request.baseBranch) === undefined
     ) {
-      return { outcome: 'refused', reason: BASE_BRANCH_INVALID_MESSAGE };
+      return { outcome: "refused", reason: BASE_BRANCH_INVALID_MESSAGE };
     }
 
     // post-status has no default branch: it posts the receipt of the run's
     // branch, so a missing branch refuses before a grant is consumed.
-    if (request.kind === 'post-status' && request.branchName === undefined) {
-      return { outcome: 'refused', reason: 'branchName must be a safe branch name' };
+    if (request.kind === "post-status" && request.branchName === undefined) {
+      return {
+        outcome: "refused",
+        reason: "branchName must be a safe branch name",
+      };
     }
 
     const attempt = await deps.attemptRepo.findAttemptById(request.attemptId);
-    const workOrder = await deps.workOrderRepo.findWorkOrderById(request.workOrderId);
+    const workOrder = await deps.workOrderRepo.findWorkOrderById(
+      request.workOrderId,
+    );
     if (attempt === null || workOrder === null) {
-      return { outcome: 'refused', reason: 'Attempt or work order not found' };
+      return { outcome: "refused", reason: "Attempt or work order not found" };
     }
 
     // A moved head invalidates the readiness the action was authorised on.
     if (attempt.artifacts?.headCommit !== request.expectedHeadSha) {
       return {
-        outcome: 'refused',
-        reason: 'Moved head: attempt headCommit does not match expectedHeadSha',
+        outcome: "refused",
+        reason: "Moved head: attempt headCommit does not match expectedHeadSha",
       };
     }
 
@@ -333,7 +388,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     // the refusal happens before any authorization grant is consumed.
     const doorBlockers = await this.collectForgeDoorBlockers(deps, request);
     if (doorBlockers.length > 0) {
-      return { outcome: 'refused', reason: doorBlockers.join('; ') };
+      return { outcome: "refused", reason: doorBlockers.join("; ") };
     }
 
     // Merge requires current-head acceptance; old readiness is not a receipt.
@@ -341,14 +396,16 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     // only when the assessment state is 'accepted', its head equals the request head,
     // its policy revision equals the attempt's, and its receipt id is non-null.
     // Stale or blocked -> refuse.
-    if (request.kind === 'merge-pr') {
+    if (request.kind === "merge-pr") {
       if (!deps.acceptanceEvidencePort) {
         return {
-          outcome: 'refused',
-          reason: 'Cannot merge without a configured acceptance evidence port',
+          outcome: "refused",
+          reason: "Cannot merge without a configured acceptance evidence port",
         };
       }
-      let acceptance: Awaited<ReturnType<AcceptanceEvidencePort['readAcceptance']>>;
+      let acceptance: Awaited<
+        ReturnType<AcceptanceEvidencePort["readAcceptance"]>
+      >;
       try {
         acceptance = await deps.acceptanceEvidencePort.readAcceptance({
           attemptId: request.attemptId,
@@ -358,61 +415,64 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         // An evidence read that fails is not an absent assessment: it is an
         // unreadable one, and an unreadable assessment never merges.
         return {
-          outcome: 'refused',
+          outcome: "refused",
           reason: `Cannot merge: acceptance evidence could not be read: ${
             error instanceof Error ? error.message : String(error)
           }`,
         };
       }
-      if (acceptance.outcome !== 'found') {
+      if (acceptance.outcome !== "found") {
         return {
-          outcome: 'refused',
+          outcome: "refused",
           reason: `Cannot merge: acceptance assessment not found for attempt ${request.attemptId}`,
         };
       }
       const assessment = acceptance.assessment;
-      if (assessment.state === 'stale') {
+      if (assessment.state === "stale") {
         return {
-          outcome: 'refused',
-          reason: 'Cannot merge: acceptance assessment is stale',
+          outcome: "refused",
+          reason: "Cannot merge: acceptance assessment is stale",
         };
       }
-      if (assessment.state === 'blocked') {
+      if (assessment.state === "blocked") {
         return {
-          outcome: 'refused',
-          reason: 'Cannot merge: acceptance assessment is blocked',
+          outcome: "refused",
+          reason: "Cannot merge: acceptance assessment is blocked",
         };
       }
-      if (assessment.state !== 'accepted') {
+      if (assessment.state !== "accepted") {
         return {
-          outcome: 'refused',
+          outcome: "refused",
           reason: `Cannot merge: assessment state is '${assessment.state}', expected 'accepted'`,
         };
       }
       if (assessment.candidateHeadSha !== request.expectedHeadSha) {
         return {
-          outcome: 'refused',
+          outcome: "refused",
           reason: `Cannot merge: assessment head '${assessment.candidateHeadSha}' does not match expectedHeadSha '${request.expectedHeadSha}'`,
         };
       }
       if (assessment.policyRevision !== workOrder.policyRevision) {
         return {
-          outcome: 'refused',
+          outcome: "refused",
           reason: `Cannot merge: assessment policy revision '${assessment.policyRevision}' does not match attempt policy revision '${workOrder.policyRevision}'`,
         };
       }
       if (!assessment.acceptanceReceiptId) {
         return {
-          outcome: 'refused',
-          reason: 'Cannot merge: acceptance assessment has no receipt ID',
+          outcome: "refused",
+          reason: "Cannot merge: acceptance assessment has no receipt ID",
         };
       }
     }
 
-    if (typeof deps.forgePort.isConfigured === 'function' && !deps.forgePort.isConfigured()) {
+    if (
+      typeof deps.forgePort.isConfigured === "function" &&
+      !deps.forgePort.isConfigured()
+    ) {
       return {
-        outcome: 'refused',
-        reason: 'unavailable',
+        outcome: "refused",
+        reason: "unavailable",
       };
     }
 
@@ -420,17 +480,24 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     // clock refuses before a grant is consumed.
     const canonicalNowIso = canonicalTimestampIso(deps.now);
     if (canonicalNowIso === null) {
-      return { outcome: 'refused', reason: 'the internal clock could not be read' };
+      return {
+        outcome: "refused",
+        reason: "the internal clock could not be read",
+      };
     }
 
-    const normalizedRepository = normalizeWorkOrderRepository(workOrder.repository);
+    const normalizedRepository = normalizeWorkOrderRepository(
+      workOrder.repository,
+    );
 
     // The PR number is resolved structurally before the forge runs (WB5b):
     // from the request, from the attempt's typed journal entries, or from the
     // lane's single stored link — never by parsing journal text, never
     // guessed. A thrown pre-flight read refuses before the grant is consumed.
     let preResolvedPrNumber: number | undefined;
-    if ((PULL_REQUEST_ACTION_KINDS as readonly string[]).includes(request.kind)) {
+    if (
+      (PULL_REQUEST_ACTION_KINDS as readonly string[]).includes(request.kind)
+    ) {
       try {
         preResolvedPrNumber = await this.preResolvePullRequestNumber(
           deps,
@@ -440,20 +507,45 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
           normalizedRepository,
         );
       } catch {
-        return { outcome: 'refused', reason: 'a pre-flight pull-request read failed' };
+        return {
+          outcome: "refused",
+          reason: "a pre-flight pull-request read failed",
+        };
       }
     }
 
-    const authorization = await deps.authorizationPort.consumeActionAuthorization({
-      authorizationGrantId: request.authorizationGrantId,
-      actionId: request.actionId,
-      actionKind: request.kind,
-      expectedHeadSha: request.expectedHeadSha,
-      attemptId: request.attemptId,
-    });
-    if (authorization.outcome !== 'consumed') {
-      await this.appendJournal(deps, request, attempt, 'refused', authorization.reason);
-      return { outcome: 'refused', reason: authorization.reason };
+    // A merge that cannot say which pull request it merges would mark the work
+    // order merged with no merge record: refuse before the grant is consumed
+    // and before any forge call.
+    if (
+      request.kind === "merge-pr" &&
+      deps.mergeRecordRepo !== undefined &&
+      normalizedRepository !== null &&
+      preResolvedPrNumber === undefined
+    ) {
+      return {
+        outcome: "refused",
+        reason: "the pull request number could not be resolved for the merge",
+      };
+    }
+
+    const authorization =
+      await deps.authorizationPort.consumeActionAuthorization({
+        authorizationGrantId: request.authorizationGrantId,
+        actionId: request.actionId,
+        actionKind: request.kind,
+        expectedHeadSha: request.expectedHeadSha,
+        attemptId: request.attemptId,
+      });
+    if (authorization.outcome !== "consumed") {
+      await this.appendJournal(
+        deps,
+        request,
+        attempt,
+        "refused",
+        authorization.reason,
+      );
+      return { outcome: "refused", reason: authorization.reason };
     }
 
     // Intent is durable before the forge subprocess runs.
@@ -461,11 +553,13 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       deps,
       request,
       attempt,
-      'intent-recorded',
+      "intent-recorded",
       `kind=${request.kind} expectedHeadSha=${request.expectedHeadSha}`,
     );
 
-    let forgeResult: Awaited<ReturnType<typeof deps.forgePort.performForgeAction>>;
+    let forgeResult: Awaited<
+      ReturnType<typeof deps.forgePort.performForgeAction>
+    >;
     try {
       forgeResult = await deps.forgePort.performForgeAction({
         actionId: request.actionId,
@@ -481,19 +575,23 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         // Title/body are forwarded only when opening a PR; push-to-pr and
         // merge never carry them (K6-2). The PR base branch (CB-D2) is
         // forwarded the same way.
-        ...(request.kind === 'push-and-open-pr'
+        ...(request.kind === "push-and-open-pr"
           ? {
               ...(request.title !== undefined ? { title: request.title } : {}),
               ...(request.body !== undefined ? { body: request.body } : {}),
-              ...(request.baseBranch !== undefined ? { baseBranch: request.baseBranch } : {}),
+              ...(request.baseBranch !== undefined
+                ? { baseBranch: request.baseBranch }
+                : {}),
             }
           : {}),
         // The status body is forwarded only for post-status.
-        ...(request.kind === 'post-status' && request.status !== undefined
+        ...(request.kind === "post-status" && request.status !== undefined
           ? { status: request.status }
           : {}),
         // The structurally pre-resolved PR number (WB5b) is forwarded when known.
-        ...(preResolvedPrNumber !== undefined ? { pullRequestNumber: preResolvedPrNumber } : {}),
+        ...(preResolvedPrNumber !== undefined
+          ? { pullRequestNumber: preResolvedPrNumber }
+          : {}),
       });
     } catch (error) {
       // The intent is durable but the forge outcome was not recorded; journal
@@ -503,7 +601,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
           deps,
           request,
           attempt,
-          'ambiguous',
+          "ambiguous",
           error instanceof Error ? error.message : String(error),
         );
       } catch {
@@ -512,14 +610,17 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       throw error;
     }
 
-    if (forgeResult.outcome === 'executed') {
-      const resolvedPrNumber = forgeResult.pullRequestNumber ?? preResolvedPrNumber;
+    if (forgeResult.outcome === "executed") {
+      const resolvedPrNumber =
+        forgeResult.pullRequestNumber ?? preResolvedPrNumber;
       // The typed pull-request reference rides on the completed entry (WB5b):
       // merge and PR producers read it structurally, never from `detail`.
       // Note `detail` keeps the executor's rule: a merge entry never says
       // "pull request", or the auto-merge path would misread it.
       const pullRequestRef: ActionJournalPullRequestRef | undefined =
-        request.kind !== 'post-status' && normalizedRepository !== null && resolvedPrNumber !== undefined
+        request.kind !== "post-status" &&
+        normalizedRepository !== null &&
+        resolvedPrNumber !== undefined
           ? { repository: normalizedRepository, number: resolvedPrNumber }
           : undefined;
 
@@ -530,8 +631,9 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         deps,
         request,
         attempt,
-        'completed',
-        request.kind !== 'merge-pr' && forgeResult.pullRequestNumber !== undefined
+        "completed",
+        request.kind !== "merge-pr" &&
+          forgeResult.pullRequestNumber !== undefined
           ? `pull request #${forgeResult.pullRequestNumber}`
           : null,
         pullRequestRef,
@@ -544,7 +646,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       let lanePlanFailure: unknown;
       if (
         deps.lanePlanRepo !== undefined &&
-        request.kind !== 'post-status' &&
+        request.kind !== "post-status" &&
         normalizedRepository !== null &&
         resolvedPrNumber !== undefined
       ) {
@@ -565,8 +667,12 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       // `saveMergeRecord` — and therefore always through the domain's
       // `decideMergeRecord` — with the completed journal entry's id as the
       // `actionRef`.
-      if (request.kind === 'merge-pr') {
-        if (deps.mergeRecordRepo !== undefined && normalizedRepository !== null && resolvedPrNumber !== undefined) {
+      if (request.kind === "merge-pr") {
+        if (
+          deps.mergeRecordRepo !== undefined &&
+          normalizedRepository !== null &&
+          resolvedPrNumber !== undefined
+        ) {
           const created = MergeRecord.create({
             schemaVersion: 1,
             repository: normalizedRepository,
@@ -574,12 +680,12 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
             headSha: forgeResult.headSha,
             mergedAtIso: canonicalNowIso,
             firstSeenAtIso: canonicalNowIso,
-            source: 'fleet-forge-action',
-            merger: 'fleet',
+            source: "fleet-forge-action",
+            merger: "fleet",
             actionRef: completedEntry.id,
           });
           if (!created.success) {
-            throw new Error('the completed merge could not be recorded');
+            throw new Error("the completed merge could not be recorded");
           }
           await deps.mergeRecordRepo.saveMergeRecord(created.value.toRecord());
         }
@@ -593,23 +699,35 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
 
       return forgeResult.pullRequestNumber !== undefined
         ? {
-            outcome: 'executed',
+            outcome: "executed",
             pullRequestNumber: forgeResult.pullRequestNumber,
             headSha: forgeResult.headSha,
           }
-        : { outcome: 'executed', headSha: forgeResult.headSha };
+        : { outcome: "executed", headSha: forgeResult.headSha };
     }
-    if (forgeResult.outcome === 'ambiguous') {
-      await this.appendJournal(deps, request, attempt, 'ambiguous', forgeResult.reason);
+    if (forgeResult.outcome === "ambiguous") {
+      await this.appendJournal(
+        deps,
+        request,
+        attempt,
+        "ambiguous",
+        forgeResult.reason,
+      );
       return {
-        outcome: 'refused',
+        outcome: "refused",
         reason: `Ambiguous forge response requires reconciliation: ${forgeResult.reason}`,
         forgeAmbiguous: true,
       };
     }
-    await this.appendJournal(deps, request, attempt, 'refused', forgeResult.reason);
+    await this.appendJournal(
+      deps,
+      request,
+      attempt,
+      "refused",
+      forgeResult.reason,
+    );
     return {
-      outcome: 'refused',
+      outcome: "refused",
       reason: forgeResult.reason,
       forgeRefusalKind: forgeResult.refusalKind,
     };
@@ -618,17 +736,17 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
   async execute(input?: unknown): Promise<ExecuteAuthorizedForgeActionResult> {
     // Unconfigured is 501 and is checked before any request validation.
     if (!this.deps) {
-      throw new Error('Not implemented: ExecuteAuthorizedForgeActionUseCase');
+      throw new Error("Not implemented: ExecuteAuthorizedForgeActionUseCase");
     }
     // A configured runtime still refuses a missing request object instead of
     // inventing one; the HTTP boundary always supplies an object body, and an
     // empty object body flows into the validation below as a refusal.
-    if (!input || typeof input !== 'object') {
-      throw new Error('Not implemented: ExecuteAuthorizedForgeActionUseCase');
+    if (!input || typeof input !== "object") {
+      throw new Error("Not implemented: ExecuteAuthorizedForgeActionUseCase");
     }
     // An array body is a refusal, never an attempt to read indexed fields.
     if (Array.isArray(input)) {
-      return { outcome: 'refused', reason: 'request must be a plain object' };
+      return { outcome: "refused", reason: "request must be a plain object" };
     }
     // The HTTP entry point copies every own data property and drops
     // `authorizedBy` so a body can never label a merge as a policy merge
@@ -637,7 +755,11 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     const snapshot: Record<string, unknown> = {};
     try {
       for (const key of Reflect.ownKeys(input)) {
-        if (typeof key !== 'string' || key === 'authorizedBy' || key === '__proto__') {
+        if (
+          typeof key !== "string" ||
+          key === "authorizedBy" ||
+          key === "__proto__"
+        ) {
           continue;
         }
         const descriptor = Object.getOwnPropertyDescriptor(input, key);
@@ -652,9 +774,11 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         snapshot[key] = descriptor.value;
       }
     } catch {
-      return { outcome: 'refused', reason: 'request could not be read' };
+      return { outcome: "refused", reason: "request could not be read" };
     }
-    return this.executeAuthorizedForgeAction(snapshot as unknown as ExecuteAuthorizedForgeActionRequest);
+    return this.executeAuthorizedForgeAction(
+      snapshot as unknown as ExecuteAuthorizedForgeActionRequest,
+    );
   }
 
   /** A completed merge advances the work order to the terminal 'merged' state. */
@@ -665,7 +789,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     const workOrder = WorkOrder.fromRecord(workOrderRecord);
     await deps.workOrderRepo.saveWorkOrder({
       ...workOrderRecord,
-      state: 'merged',
+      state: "merged",
       revision: workOrder.nextRevision(),
       updatedAtIso: deps.now?.() ?? new Date().toISOString(),
     });
@@ -675,23 +799,27 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     deps: ExecuteAuthorizedForgeActionDependencies,
     request: ExecuteAuthorizedForgeActionRequest,
     attempt: AttemptRecord,
-    status: ActionJournalEntryRecord['status'],
+    status: ActionJournalEntryRecord["status"],
     detail: string | null,
     pullRequest?: ActionJournalPullRequestRef,
   ): Promise<ActionJournalEntryRecord> {
-    const priorEntries = await deps.journal.listJournalEntriesForAttempt(request.attemptId);
+    const priorEntries = await deps.journal.listJournalEntriesForAttempt(
+      request.attemptId,
+    );
     const sequence = priorEntries.length + 1;
     const entry: ActionJournalEntryRecord = {
       id: `forge:${request.actionId}:${status}:${sequence}`,
       attemptId: request.attemptId,
       workOrderId: request.workOrderId,
-      action: 'forge',
+      action: "forge",
       baseCommit: attempt.baseCommit,
       recordedAtIso: deps.now?.() ?? new Date().toISOString(),
       status,
       sessionId: null,
       detail,
-      ...(request.authorizedBy === undefined ? {} : { authorizedBy: request.authorizedBy }),
+      ...(request.authorizedBy === undefined
+        ? {}
+        : { authorizedBy: request.authorizedBy }),
       ...(pullRequest !== undefined ? { pullRequest } : {}),
     };
     await deps.journal.appendJournalEntry(entry);
@@ -722,10 +850,11 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       const entry = entries[index];
       if (
         entry !== undefined &&
-        entry.status === 'completed' &&
-        entry.action === 'forge' &&
+        entry.status === "completed" &&
+        entry.action === "forge" &&
         entry.pullRequest !== undefined &&
-        (normalizedRepository === null || entry.pullRequest.repository === normalizedRepository)
+        (normalizedRepository === null ||
+          entry.pullRequest.repository === normalizedRepository)
       ) {
         return entry.pullRequest.number;
       }
@@ -735,13 +864,21 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       return undefined;
     }
     const lane = workOrderLane(workOrder);
+    // A stored link carries the plan's current lane id while the work order
+    // may carry an old alias: both sides are resolved before comparing.
+    const resolveLaneId = await laneAliasResolver(
+      lanePlanRepo,
+      lane.projectId,
+      lane.planId,
+    );
+    const wantedLaneId = resolveLaneId(lane.laneId);
     const links = await lanePlanRepo.listPullRequestLinks(lane.projectId);
     const matches = links.filter(
       (link) =>
         link.repository === normalizedRepository &&
         link.projectId === lane.projectId &&
         link.planId === lane.planId &&
-        link.laneId === lane.laneId,
+        resolveLaneId(link.laneId) === wantedLaneId,
     );
     return matches.length === 1 ? matches[0]?.number : undefined;
   }
@@ -765,18 +902,12 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       return;
     }
     const lane = workOrderLane(workOrder);
-    let laneId = lane.laneId;
-    if (lane.planId !== null) {
-      const plan = await lanePlanRepo.findLanePlan(lane.projectId, lane.planId);
-      if (plan !== null) {
-        const match = plan.lanes.find(
-          (candidate) => candidate.laneId === lane.laneId || candidate.aliases.includes(lane.laneId),
-        );
-        if (match !== undefined) {
-          laneId = match.laneId;
-        }
-      }
-    }
+    const resolveLaneId = await laneAliasResolver(
+      lanePlanRepo,
+      lane.projectId,
+      lane.planId,
+    );
+    const laneId = resolveLaneId(lane.laneId);
     const created = PullRequestLink.create({
       version: 1,
       repository,
@@ -784,7 +915,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       projectId: lane.projectId,
       planId: lane.planId,
       laneId,
-      source: 'fleet-forge-action',
+      source: "fleet-forge-action",
       linkedAtIso,
     });
     if (!created.success) {
@@ -792,8 +923,10 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       // still recorded downstream, so this never blocks the merge itself.
       return;
     }
-    const saved = await lanePlanRepo.savePullRequestLink(created.value.toRecord());
-    if (!(saved.outcome === 'refused' && saved.code === 'pr-already-linked')) {
+    const saved = await lanePlanRepo.savePullRequestLink(
+      created.value.toRecord(),
+    );
+    if (!(saved.outcome === "refused" && saved.code === "pr-already-linked")) {
       return;
     }
     const existing = await lanePlanRepo.findPullRequestLink(repository, number);
@@ -802,10 +935,13 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       // invented and no conflict is recorded.
       return;
     }
-    const sameLane = existing.projectId === lane.projectId && existing.planId === lane.planId;
+    const sameLane =
+      existing.projectId === lane.projectId &&
+      existing.planId === lane.planId &&
+      resolveLaneId(existing.laneId) === laneId;
     if (sameLane) {
-      // The stored link names the same plan lane under another (alias) lane
-      // id; that is the same lane, not a conflict.
+      // The stored link names the same plan lane only under an alias the
+      // plan confirms; a different lane of the same plan is a conflict.
       return;
     }
     const conflictRecord: PullRequestLinkConflictRecord = {
@@ -846,12 +982,13 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       ];
     }
     let recorded: Awaited<
-      ReturnType<AttemptOwnerDecisionPort['readAttemptOwnerDecisionReferences']>
+      ReturnType<AttemptOwnerDecisionPort["readAttemptOwnerDecisionReferences"]>
     >;
     try {
-      recorded = await attemptOwnerDecisionPort.readAttemptOwnerDecisionReferences({
-        attemptId: request.attemptId,
-      });
+      recorded =
+        await attemptOwnerDecisionPort.readAttemptOwnerDecisionReferences({
+          attemptId: request.attemptId,
+        });
     } catch (error: unknown) {
       return [
         `owner decision references for attempt '${request.attemptId}' could not be read: ${
@@ -859,7 +996,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         }`,
       ];
     }
-    if (recorded.outcome !== 'recorded') {
+    if (recorded.outcome !== "recorded") {
       return [
         `owner decision references for attempt '${request.attemptId}' are unknown: ${recorded.reason}`,
       ];
@@ -886,15 +1023,43 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         );
         continue;
       }
-      if (decision.outcome === 'approved') {
+      if (decision.outcome === "approved") {
         continue;
       }
-      if (decision.outcome === 'not-approved') {
-        blockers.push(`owner decision '${reference}' is not approved: ${decision.reason}`);
+      if (decision.outcome === "not-approved") {
+        blockers.push(
+          `owner decision '${reference}' is not approved: ${decision.reason}`,
+        );
       } else {
-        blockers.push(`owner decision '${reference}' is unknown: ${decision.reason}`);
+        blockers.push(
+          `owner decision '${reference}' is unknown: ${decision.reason}`,
+        );
       }
     }
     return blockers;
   }
+}
+
+/**
+ * Resolve a lane id to the plan's current lane id through the plan's confirmed
+ * aliases. Without a plan, or for an id the plan does not know, the id is
+ * returned unchanged.
+ */
+async function laneAliasResolver(
+  lanePlanRepo: LanePlanRepositoryPort,
+  projectId: string,
+  planId: string | null,
+): Promise<(laneId: string) => string> {
+  if (planId === null) {
+    return (laneId) => laneId;
+  }
+  const plan = await lanePlanRepo.findLanePlan(projectId, planId);
+  if (plan === null) {
+    return (laneId) => laneId;
+  }
+  return (laneId) =>
+    plan.lanes.find(
+      (candidate) =>
+        candidate.laneId === laneId || candidate.aliases.includes(laneId),
+    )?.laneId ?? laneId;
 }

@@ -1571,6 +1571,89 @@ describe('ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
     expect((await deps.workOrderRepo.findWorkOrderById('wo-001'))?.state).toBe('approved');
   });
 
+  function twoLanePlan(): LanePlanRecord {
+    const lane = (laneId: string, aliases: string[]) => ({
+      laneId,
+      aliases,
+      scope: 'a lane',
+      packages: ['work-execution'],
+      sharedFiles: [],
+      tier: 0 as const,
+      after: [],
+      decisions: [],
+      status: 'planned' as const,
+      brief: null,
+      mergedPr: null,
+    });
+    return {
+      version: 1,
+      projectId: 'proj-001',
+      planId: 'plan-1',
+      revision: 1,
+      digest: 'a'.repeat(64),
+      doc: 'docs/plan.md',
+      lanes: [lane('lane-A', ['lane-auth']), lane('lane-B', [])],
+      decisions: [],
+      exclusiveOrder: [],
+      importedAtIso: '2026-11-01T00:00:00.000Z',
+    } as LanePlanRecord;
+  }
+
+  const planWorkOrder = (): WorkOrderRecord => ({
+    ...makeWorkOrderRecord(),
+    planRef: { projectId: 'proj-001', planId: 'plan-1', laneId: 'lane-auth' },
+  });
+
+  const prLink = (number: number, laneId: string) => ({
+    version: 1 as const,
+    repository: 'org/repo',
+    number,
+    projectId: 'proj-001',
+    planId: 'plan-1',
+    laneId,
+    source: 'cli' as const,
+    linkedAtIso: '2026-11-01T00:00:00.000Z',
+  });
+
+  it('records a conflict when the PR is linked to a different lane of the same plan, and none for a confirmed alias of the same lane', async () => {
+    const different = wb5bDeps({ workOrder: planWorkOrder() });
+    await different.lanePlanRepo.saveLanePlan(twoLanePlan());
+    await different.lanePlanRepo.savePullRequestLink(prLink(7, 'lane-B'));
+    await different.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
+    const conflicts = await different.lanePlanRepo.listPullRequestLinkConflicts!();
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]).toMatchObject({
+      linkedLane: { projectId: 'proj-001', planId: 'plan-1', laneId: 'lane-B' },
+      refusedLane: { projectId: 'proj-001', planId: 'plan-1', laneId: 'lane-A' },
+    });
+    expect(await different.mergeRecordRepo.findMergeRecord('org/repo', 7)).not.toBeNull();
+
+    const alias = wb5bDeps({ workOrder: planWorkOrder() });
+    await alias.lanePlanRepo.saveLanePlan(twoLanePlan());
+    await alias.lanePlanRepo.savePullRequestLink(prLink(8, 'lane-auth'));
+    await alias.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 8 });
+    expect(await alias.lanePlanRepo.listPullRequestLinkConflicts!()).toHaveLength(0);
+  });
+
+  it('resolves an old lane alias against the stored link on a different attempt with no journal reference, and refuses a merge whose PR number cannot be resolved without calling the forge', async () => {
+    const deps = wb5bDeps({ workOrder: planWorkOrder() });
+    await deps.lanePlanRepo.saveLanePlan(twoLanePlan());
+    // The link was stored under the plan's current lane id by another attempt;
+    // this attempt has no typed journal entry and the work order carries the alias.
+    await deps.lanePlanRepo.savePullRequestLink(prLink(9, 'lane-A'));
+    const merged = await deps.useCase.executeAuthorizedForgeAction(mergeReq);
+    expect(merged.outcome).toBe('executed');
+    expect(deps.seen[0]?.pullRequestNumber).toBe(9);
+    expect(await deps.mergeRecordRepo.findMergeRecord('org/repo', 9)).toMatchObject({ merger: 'fleet' });
+
+    const none = wb5bDeps({ workOrder: planWorkOrder() });
+    await none.lanePlanRepo.saveLanePlan(twoLanePlan());
+    const refused = await none.useCase.executeAuthorizedForgeAction(mergeReq);
+    expect(refused.outcome).toBe('refused');
+    expect(none.seen).toHaveLength(0);
+    expect(none.journal.entries.filter((entry) => entry.status === 'completed')).toHaveLength(0);
+  });
+
   it('resolves the PR number across steps without parsing detail: a second-attempt merge reads the typed journal entry', async () => {
     const deps = wb5bDeps({
       forge: (request) =>

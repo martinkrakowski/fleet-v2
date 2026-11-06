@@ -53,6 +53,29 @@ export type MergeRecordResult =
 
 const MERGE_HEAD_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
+/**
+ * The source/merger pairing invariant: `fleet-forge-action` requires
+ * `merger: 'fleet'` and `forge-observation` requires `merger: 'unknown'`.
+ */
+function mergeSourceMergerAgree(source: MergeRecordSource, merger: MergeRecordMerger): boolean {
+  return (source === 'fleet-forge-action' && merger === 'fleet') ||
+    (source === 'forge-observation' && merger === 'unknown');
+}
+
+/**
+ * Canonical UTC check that never throws: a value can match the canonical ISO
+ * shape and still name an impossible calendar date (for example a 30 February),
+ * on which `toISOString()` throws a RangeError. Such a value is refused, not
+ * propagated as a thrown error.
+ */
+function isCanonicalIsoTimestamp(value: string): boolean {
+  try {
+    return new Date(value).toISOString() === value;
+  } catch {
+    return false;
+  }
+}
+
 function hasForbiddenControlCharacter(text: string): boolean {
   for (let index = 0; index < text.length; index += 1) {
     const codePoint = text.codePointAt(index);
@@ -90,10 +113,7 @@ export class MergeRecord {
       // A fresh record must come in with a source/merger pair that agrees; a
       // stored record may legitimately have been upgraded (unknown → fleet), so
       // this invariant is enforced here, not by the shared reader.
-      if (
-        (read.record.source === 'fleet-forge-action' && read.record.merger !== 'fleet') ||
-        (read.record.source === 'forge-observation' && read.record.merger !== 'unknown')
-      ) {
+      if (!mergeSourceMergerAgree(read.record.source, read.record.merger)) {
         return invalid('MergeRecord source and merger disagree');
       }
       return { success: true, value: new MergeRecord(read.record) };
@@ -180,7 +200,7 @@ function readMergeRecordRecord(
   if (
     typeof mergedAtIso !== 'string' ||
     !CANONICAL_ISO_PATTERN.test(mergedAtIso) ||
-    new Date(mergedAtIso).toISOString() !== mergedAtIso
+    !isCanonicalIsoTimestamp(mergedAtIso)
   ) {
     return { ok: false, message: 'MergeRecord mergedAtIso: must be a canonical UTC timestamp' };
   }
@@ -189,7 +209,7 @@ function readMergeRecordRecord(
   if (
     typeof firstSeenAtIso !== 'string' ||
     !CANONICAL_ISO_PATTERN.test(firstSeenAtIso) ||
-    new Date(firstSeenAtIso).toISOString() !== firstSeenAtIso
+    !isCanonicalIsoTimestamp(firstSeenAtIso)
   ) {
     return { ok: false, message: 'MergeRecord firstSeenAtIso: must be a canonical UTC timestamp' };
   }
@@ -278,6 +298,14 @@ export function decideMergeRecord(stored: unknown, incoming: unknown): MergeReco
     return invalidDecision('MergeRecord incoming record could not be read');
   }
   const incomingRecord = incomingRead.record;
+  // The incoming record must carry an agreeing source/merger pair, in
+  // particular when nothing is stored: a `forge-observation` sighting claiming
+  // `merger: 'fleet'` is refused, never recorded. A stored record is exempt —
+  // it may legitimately have been upgraded (`unknown` → `fleet`) — but an
+  // incoming record is a fresh sighting and must agree.
+  if (!mergeSourceMergerAgree(incomingRecord.source, incomingRecord.merger)) {
+    return invalidDecision('MergeRecord source and merger disagree');
+  }
 
   let storedRecord: MergeRecordRecord | null = null;
   if (stored !== null && stored !== undefined) {

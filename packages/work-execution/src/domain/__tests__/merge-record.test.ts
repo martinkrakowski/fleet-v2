@@ -134,6 +134,18 @@ describe('MergeRecord.create', () => {
       .toBe('MergeRecord field is too long');
   });
 
+  it('refuses an impossible calendar date as a non-canonical timestamp', () => {
+    // The canonical ISO shape with an impossible date: `toISOString()` would
+    // throw a RangeError, so create must refuse with the timestamp message,
+    // never the generic read failure, and never throw.
+    expect(() => MergeRecord.create(patched((record) => { record.mergedAtIso = '2026-02-30T12:00:00.000Z'; })))
+      .not.toThrow();
+    expect(createError(patched((record) => { record.mergedAtIso = '2026-02-30T12:00:00.000Z'; })))
+      .toBe('MergeRecord mergedAtIso: must be a canonical UTC timestamp');
+    expect(createError(patched((record) => { record.firstSeenAtIso = '2027-04-31T00:00:00.000Z'; })))
+      .toBe('MergeRecord firstSeenAtIso: must be a canonical UTC timestamp');
+  });
+
   it('refuses a fleet-forge-action source with an unknown merger', () => {
     expect(createError(patched((record) => { record.source = 'fleet-forge-action'; })))
       .toBe('MergeRecord source and merger disagree');
@@ -234,6 +246,19 @@ describe('decideMergeRecord', () => {
     expect(second.outcome).toBe('unchanged');
     expect(second.record).toEqual(first.record);
     expect(first.record).toEqual(VALID);
+  });
+
+  it('refuses an incoming record whose source and merger disagree', () => {
+    // A forge observation claiming the fleet merger is refused, in particular
+    // when nothing is stored — it is never accepted as a new record.
+    const forged = { ...VALID, merger: 'fleet' } as MergeRecordRecord;
+    expect(decideError(null, forged)).toBe('MergeRecord source and merger disagree');
+    expect(decideError(undefined, forged)).toBe('MergeRecord source and merger disagree');
+
+    const journal = { ...VALID, source: 'fleet-forge-action', merger: 'unknown' } as MergeRecordRecord;
+    expect(decideError(null, journal)).toBe('MergeRecord source and merger disagree');
+    // Even against a stored record the incoming sighting must agree.
+    expect(decideError(VALID, journal)).toBe('MergeRecord source and merger disagree');
   });
 
   it('refuses an unreadable stored record instead of treating it as empty', () => {

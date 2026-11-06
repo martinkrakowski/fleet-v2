@@ -34,6 +34,7 @@ import {
 import { causingParkFindingsView, PARK_FINDINGS_MAX_COUNT } from '../../../domain/park-findings-view.js';
 import { renderPrBody } from '../../../domain/lane-run-pr-body.js';
 import type { SameModelFamily } from '../../../domain/seat-selection.js';
+import { ReviewRequestAdapter } from '../../../infrastructure/adapters/ReviewRequestAdapter.adapter.js';
 import { LaneRunRepositoryAdapter } from '../../../infrastructure/adapters/LaneRunRepositoryAdapter.adapter.js';
 import { LaneRunJournalAdapter } from '../../../infrastructure/adapters/LaneRunJournalAdapter.adapter.js';
 import { AttemptRepositoryAdapter } from '../../../infrastructure/adapters/AttemptRepositoryAdapter.adapter.js';
@@ -1206,5 +1207,60 @@ describe('RV3: the WB5a-store-c saved minor-only FAIL receipt end to end', () =>
     expect(openIntent[0]!.mintedId).toMatch(/^forge-/);
     expect(harness.forgeRequests[0]!.actionId).toBe(openIntent[0]!.mintedId);
     expect(harness.grantRequests[0]!.forgeKind).toBe('push-and-open-pr');
+  });
+
+  it('production path (robustness 9): the saved minor-only FAIL receipt read through the real ReviewRequestAdapter is accepted with the minor carried, never fixing or parked', async () => {
+    // The conductor composition (apps/cli/src/composition/conductor.ts) hands
+    // AdvanceLaneRunUseCase a real ReviewRequestAdapter over the evidence
+    // context's review and inspection use cases. Here the same adapter sits
+    // over a stored copy of the saved WB5a-store-c receipt, so verdict mapping,
+    // decideConductorReviewOutcome and carriedMinorsOf all run as production
+    // wires them; only the evidence storage is in memory.
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    let stored: ReviewReceiptRecord[] = [];
+    const adapter = new ReviewRequestAdapter({
+      requestIndependentReview: async (request) => {
+        const receipt = wb5aReceiptRecord({
+          id: 'rr-prod-1',
+          assessmentId: request.assessmentId,
+          projectId: request.projectId,
+          attemptId: request.attemptId,
+          candidateHeadSha: request.candidateHeadSha,
+          kind: request.kind,
+          requestId: request.requestId,
+        });
+        stored = [receipt];
+        return { outcome: 'reviewed', receipt } as never;
+      },
+      inspectAcceptanceEvidence: async () =>
+        ({
+          outcome: 'found',
+          assessment: assessmentRecord({
+            attemptId: 'attempt-example-1',
+            candidateHeadSha: COMMIT_A,
+            reviewReceipts: stored,
+          }),
+        }) as never,
+    });
+    const productionHarness = { ...harness, deps: { ...harness.deps, reviewRequest: adapter } };
+    await conduct(productionHarness, 'code-review', NOW);
+    const codeKey = reviewKey('code-review', 0, HEAD12_A);
+    expect(await advance(productionHarness)).toEqual({
+      outcome: 'acted',
+      step: 'code-review',
+      key: codeKey,
+      result: 'completed',
+      reasonCode: 'review-passed',
+      detail: 'minor-only-findings',
+    });
+    expect(await advance(productionHarness)).toEqual({ outcome: 'entered', state: 'accepting' });
+    expect(await advance(productionHarness)).toMatchObject({ step: 'accept', reasonCode: 'accepted' });
+    expect(await advance(productionHarness)).toEqual({ outcome: 'entered', state: 'opening-pr' });
+    expect((await harness.runRepo.get(RUN_ID))?.parked).toBeNull();
+    const result = await advance(productionHarness);
+    expect(result).toMatchObject({ step: 'open-pr', reasonCode: 'pr-opened' });
+    const prBody = (productionHarness.forgeRequests[0] as unknown as { body?: string }).body ?? '';
+    expect(prBody).toContain(`- [minor] ${WB5A_FILE_PATH}:840`);
+    expect(prBody).not.toContain('symlink or oversized file');
   });
 });

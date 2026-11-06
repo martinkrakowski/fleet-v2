@@ -8,7 +8,7 @@
     "fleet-v2": "./dist/bin.js"
   },
   "scripts": {
-    "build": "sh -c 'tsc' build",
+    "build": "tsc",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",
     "test": "../../node_modules/.bin/vitest run --passWithNoTests --exclude '**/dist/**'",

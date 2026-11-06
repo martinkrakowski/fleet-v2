@@ -90,6 +90,10 @@ const RUNTIME_ONLY = new Set([
   "GIT_CONFIG_COUNT",
   "GIT_ASKPASS",
   "GIT_TERMINAL_PROMPT",
+  // Pinned by e2e tests so a host's git config never reaches a test repository.
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_CONFIG_NOSYSTEM",
   "SSH_ASKPASS",
 ]);
 

@@ -503,6 +503,22 @@ describe('removeWorktree over a fake executor', () => {
     expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
   });
 
+  it('refuses not-a-linked-worktree when the repository root cannot be resolved to a physical path', async () => {
+    const { result, calls } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
+      [PWD_MARKER]: ({ argv }) =>
+        argv[argv.length - 1] === CLONE ? { exitCode: 1 } : { stdout: `${argv[argv.length - 1]}\n` },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'not-a-linked-worktree' });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
   it('answers unknown when the worktree root cannot be resolved to a physical path', async () => {
     const { result, calls } = await removeWith({
       [LIST_MARKER]: ({ callIndex }) =>

@@ -1916,7 +1916,7 @@ export class WorkspaceAdapter implements WorkspacePort {
     if (listed === null) {
       return { outcome: 'unknown', reason: 'git worktree list output could not be parsed' };
     }
-    const entry = await this.findLinkedWorktreeEntry(executor, repositoryRoot, worktreePath, listed);
+    const entry = await this.findLinkedWorktreeEntry(executor, repositoryRoot, worktreePath, listed, true);
     if (entry === null) {
       return { outcome: 'refused', reason: 'not-a-linked-worktree' };
     }
@@ -2211,6 +2211,7 @@ export class WorkspaceAdapter implements WorkspacePort {
     repositoryRoot: string,
     worktreePath: string,
     listed: readonly ListedWorktreeEntry[],
+    requirePhysicalRepositoryRoot = false,
   ): Promise<ListedWorktreeEntry | null> {
     let entry = listedWorktreeAt(listed, worktreePath);
     if (entry === null) {
@@ -2224,6 +2225,11 @@ export class WorkspaceAdapter implements WorkspacePort {
     }
     const physicalRepositoryRoot = await resolvePhysicalPath(executor, repositoryRoot, GIT_TIMEOUT_MS);
     if (physicalRepositoryRoot !== null && entry.path === physicalRepositoryRoot) {
+      return null;
+    }
+    // A removal must prove the entry is not the main checkout; when the
+    // physical repository root cannot be resolved it cannot, so it refuses.
+    if (physicalRepositoryRoot === null && requirePhysicalRepositoryRoot) {
       return null;
     }
     return entry;

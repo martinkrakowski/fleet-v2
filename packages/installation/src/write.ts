@@ -16,6 +16,7 @@ import type {
   FleetInstallationV2,
   ForgeSectionV2,
   HostSection,
+  MergeRepositoryPolicy,
   PolicySection,
   SeatSection,
   ShelfSectionV2,
@@ -232,6 +233,59 @@ function serializePolicy(policy: PolicySection): Record<string, unknown> {
   }
   if (policy.seats !== undefined) {
     out.seats = serializePolicyBlock(policy.seats, SEATS_POLICY_KEYS);
+  }
+  if (policy.merge !== undefined) {
+    out.merge = serializeMergePolicy(policy.merge);
+  }
+  if (policy.daemon !== undefined) {
+    out.daemon = serializePolicyBlock(policy.daemon, MERGE_DAEMON_WRITE_KEYS);
+  }
+  return out;
+}
+
+/** The `policy.daemon` keys in the order parse.ts reads them. */
+const MERGE_DAEMON_WRITE_KEYS: readonly string[] = ['intervalSeconds', 'budgetSeconds', 'settleSeconds'];
+
+function serializeMergePolicy(merge: NonNullable<PolicySection['merge']>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (merge.repos !== undefined) {
+    const repos: Record<string, unknown> = {};
+    for (const key of Object.keys(merge.repos)) {
+      repos[key] = serializeMergeRepository(merge.repos[key]);
+    }
+    out.repos = repos;
+  }
+  return out;
+}
+
+function serializeMergeRepository(repo: MergeRepositoryPolicy): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (repo.projectId !== undefined) {
+    out.projectId = repo.projectId;
+  }
+  if (repo.shadow !== undefined) {
+    out.shadow = repo.shadow;
+  }
+  if (repo.unattended !== undefined) {
+    out.unattended = repo.unattended;
+  }
+  if (repo.requiredContexts !== undefined) {
+    out.requiredContexts = [...repo.requiredContexts];
+  }
+  if (repo.updateBranch !== undefined) {
+    out.updateBranch = repo.updateBranch;
+  }
+  if (repo.macosProcedure !== undefined) {
+    out.macosProcedure = repo.macosProcedure;
+  }
+  if (repo.maxAttempts !== undefined) {
+    out.maxAttempts = repo.maxAttempts;
+  }
+  if (repo.checksGraceMinutes !== undefined) {
+    out.checksGraceMinutes = repo.checksGraceMinutes;
+  }
+  if (repo.veto !== undefined) {
+    out.veto = serializePolicyBlock(repo.veto, ['mode', 'holdConfidence']);
   }
   return out;
 }

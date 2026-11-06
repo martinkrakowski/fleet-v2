@@ -105,8 +105,7 @@ describe("requiredScope", () => {
   });
 
   it("maps the operate family", () => {
-    expect(requiredScope("POST", "/v1/attempts/:id/stop")).toBe("operate");
-    expect(requiredScope("POST", "/v1/attempts/:id/reconcile")).toBe("operate");
+    expect(requiredScope("POST", "/v1/attempts/:id/stop")).toBe("operate");    expect(requiredScope("POST", "/v1/attempts/:id/reconcile")).toBe("operate");
     expect(requiredScope("POST", "/v1/attempts/:id/fix")).toBe("operate");
     expect(requiredScope("POST", "/v1/attempts/:id/acceptance")).toBe("operate");
     expect(requiredScope("POST", "/v1/attempts/:id/cancel-prepared")).toBe("operate");
@@ -124,6 +123,14 @@ describe("requiredScope", () => {
     expect(requiredScope("POST", "/v1/projects/:id/retire")).toBe("operate");
     expect(requiredScope("POST", "/v1/projects/:id/probe")).toBe("operate");
     expect(requiredScope("PATCH", "/v1/projects/:id")).toBe("operate");
+  });
+
+  it("maps the run-control family to operate (A-C)", () => {
+    expect(requiredScope("POST", "/v1/runs/halt")).toBe("operate");
+    expect(requiredScope("POST", "/v1/runs/run-01J00000000000000000000000/stop")).toBe("operate");
+    // The GETs stay null: /v1/runs reads are read-scoped, /v1/runs/:id does not exist yet.
+    expect(requiredScope("GET", "/v1/runs/halt")).toBeNull();
+    expect(requiredScope("GET", "/v1/runs/run-01J00000000000000000000000/stop")).toBeNull();
   });
 
   it("maps the brief preview dry run to read", () => {

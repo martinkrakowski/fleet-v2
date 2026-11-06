@@ -4,6 +4,7 @@ import { LaneRun } from '../entities/LaneRun.js';
 import type { LaneRunRecord } from '../lane-run-records.js';
 import type { LaneRunJournalEntryRecord } from '../lane-run-journal.js';
 import { laneRunConductEntry, laneRunIntentEntry } from '../lane-run-step-facts.js';
+import { laneRunStopKey, laneRunStopForceKey } from '../lane-run-keys.js';
 import { buildLaneRunStepKey } from '../lane-run-keys.js';
 import type { LaneRunKeyResult } from '../lane-run-keys.js';
 import type { CapacityReservationRecord } from '../execution-records.js';
@@ -83,6 +84,17 @@ function mustBuild(result: LaneRunKeyResult): string {
     throw new Error('unreachable: key builder');
   }
   return result.key;
+}
+
+/** A stop intent entry: the keyed control intent with its stop mode stamped. */
+function stopIntentEntry(
+  entryId: string,
+  runId: string,
+  key: string,
+  mode: 'graceful' | 'force',
+  nowIso: string,
+): LaneRunJournalEntryRecord {
+  return { ...laneRunIntentEntry(entryId, runId, key, null, nowIso), mode };
 }
 
 function runIdOf(rows: ReadonlyArray<{ readonly runId: string }>): string[] {
@@ -222,8 +234,69 @@ describe('deriveConductorSchedule', () => {
     expect(schedule.rows.find((row) => row.runId === RUN_B)?.admissionWait).toBe('package-overlap');
   });
 
-  it('omits caps when no trace is recorded', () => {
-    const run = runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-1' });
+  it('projects revision, stop facts and stop parks on each row', () => {
+    const run = runRecord({ runId: RUN_A, attemptIds: ['a1'] });
+    // No stop entry: nulls, with the record's revision carried through.
+    const none = deriveConductorSchedule(facts({ runs: [run] }), NOW);
+    expect(none.rows[0]).toMatchObject({ revision: 1, stopMode: null, stopRequestedAtIso: null });
+
+    // A graceful @web stop intent: stopMode graceful with its request time.
+    const gracefulAt = '2026-10-27T09:00:00.000Z';
+    const withGraceful = deriveConductorSchedule(
+      facts({
+        runs: [run],
+        journals: new Map([
+          [RUN_A, [stopIntentEntry('e1', RUN_A, mustBuild(laneRunStopKey(RUN_A, 'web')), 'graceful', gracefulAt)]],
+        ]),
+      }),
+      NOW,
+    );
+    expect(withGraceful.rows[0]).toMatchObject({ stopMode: 'graceful', stopRequestedAtIso: gracefulAt });
+
+    // Escalation to forced: the strongest mode wins and the request time stays the first intent's.
+    const forcedAt = '2026-10-27T09:30:00.000Z';
+    const withForced = deriveConductorSchedule(
+      facts({
+        runs: [run],
+        journals: new Map([
+          [
+            RUN_A,
+            [
+              stopIntentEntry('e1', RUN_A, mustBuild(laneRunStopKey(RUN_A, 'web')), 'graceful', gracefulAt),
+              stopIntentEntry('e2', RUN_A, mustBuild(laneRunStopForceKey(RUN_A, 'web')), 'force', forcedAt),
+            ],
+          ],
+        ]),
+      }),
+      NOW,
+    );
+    expect(withForced.rows[0]).toMatchObject({ stopMode: 'force', stopRequestedAtIso: gracefulAt });
+
+    // Parked runs keep their park projection, qualifier included.
+    const unconfirmed = runRecord({
+      runId: RUN_B,
+      attemptIds: ['a2'],
+      parked: { reason: 'stop-unconfirmed', qualifier: null, parkedFrom: 'running', questionId: null },
+      parkCount: 1,
+    });
+    const refused = runRecord({
+      runId: RUN_C,
+      attemptIds: ['a3'],
+      parked: { reason: 'stop-refused', qualifier: 'runner-refused', parkedFrom: 'running', questionId: null },
+      parkCount: 1,
+    });
+    const parked = deriveConductorSchedule(facts({ runs: [unconfirmed, refused] }), NOW);
+    expect(parked.rows.find((row) => row.runId === RUN_B)?.park).toEqual({
+      reason: 'stop-unconfirmed',
+      qualifier: null,
+    });
+    expect(parked.rows.find((row) => row.runId === RUN_C)?.park).toEqual({
+      reason: 'stop-refused',
+      qualifier: 'runner-refused',
+    });
+  });
+
+  it('omits caps when no trace is recorded', () => {    const run = runRecord({ runId: RUN_A, attemptIds: ['a1'], workOrderId: 'wo-1' });
     const workOrders = new Map([['wo-1', { repository: 'acme/repo', ownedPaths: ['packages/a'] }]]);
     const schedule = deriveConductorSchedule(facts({ runs: [run], workOrders }), NOW);
     expect(schedule.caps).toBeNull();

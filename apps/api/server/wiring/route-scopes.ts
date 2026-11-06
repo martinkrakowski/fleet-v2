@@ -57,6 +57,9 @@ const MUTATION_ROUTE_RULES: ReadonlyArray<readonly [string, string, string]> = [
   ["POST", "/v1/authorizations/:id/consume", "hook"],
   ["POST", "/v1/forge", "hook"],
   ["POST", "/v1/attempts/:id/stop", "operate"],
+  // A-C: direct conductor run-control writes (operate scope)
+  ["POST", "/v1/runs/halt", "operate"],
+  ["POST", "/v1/runs/:id/stop", "operate"],
   ["POST", "/v1/attempts/:id/reconcile", "operate"],
   ["POST", "/v1/attempts/:id/fix", "operate"],
   ["POST", "/v1/attempts/:id/acceptance", "operate"],

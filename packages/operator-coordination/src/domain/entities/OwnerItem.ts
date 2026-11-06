@@ -402,17 +402,90 @@ function withdrawalErrorValue(withdrawal: unknown): string | null {
   return null;
 }
 
-function historyErrorValue(
-  history: unknown,
-  createdAtIso: string,
-  state: OwnerItemState,
-  resolution: unknown,
-  withdrawal: unknown,
-  kind: OwnerItemKindValue,
-): string | null {
-  if (!Array.isArray(history) || history.length < 1 || history.length > OWNER_ITEM_LIMITS.history) {
+/** The per-entry checks for history entries after the opened entry, one helper per event kind and per previous-state branch. */
+type HistoryTransitionState = {
+  readonly time: number;
+  readonly event: OwnerItemHistoryEntryRecord['event'];
+  readonly reason: string | null;
+};
+
+function closedTransitionError(entry: Record<string, unknown>, kind: OwnerItemKindValue): string | null {
+  if (
+    typeof entry.reason !== 'string' ||
+    !(OWNER_ITEM_RESOLUTIONS_BY_KIND[kind] as readonly string[]).includes(entry.reason)
+  ) {
     return 'invalid';
   }
+  return null;
+}
+
+function withdrawnTransitionError(entry: Record<string, unknown>, kind: OwnerItemKindValue): string | null {
+  if (!(OWNER_ITEM_OWNER_CLOSABLE_KINDS as readonly OwnerItemKindValue[]).includes(kind)) {
+    return 'invalid';
+  }
+  if (typeof entry.reason !== 'string' || !OWNER_ITEM_WITHDRAW_REASONS.includes(entry.reason as OwnerItemWithdrawReason)) {
+    return 'invalid';
+  }
+  return null;
+}
+
+function reopenedTransitionError(entry: Record<string, unknown>): string | null {
+  if (entry.event !== 'reopened' || entry.reason !== null) {
+    return 'invalid';
+  }
+  return null;
+}
+
+/** A transition out of an opened or reopened entry: closed or withdrawn, never reopened. */
+function openedPreviousTransitionError(entry: Record<string, unknown>, kind: OwnerItemKindValue): string | null {
+  if (entry.event === 'closed') {
+    return closedTransitionError(entry, kind);
+  }
+  if (entry.event === 'withdrawn') {
+    return withdrawnTransitionError(entry, kind);
+  }
+  return 'invalid';
+}
+
+/** One history entry (index >= 1): its shape and transition from the previous entry; 'invalid' when refused. */
+function historyTransitionError(
+  entry: Record<string, unknown>,
+  previousEvent: OwnerItemHistoryEntryRecord['event'],
+  previousReason: string | null,
+  previousTime: number,
+  kind: OwnerItemKindValue,
+): HistoryTransitionState | 'invalid' {
+  const event = entry.event;
+  if (event !== 'closed' && event !== 'reopened' && event !== 'withdrawn') {
+    return 'invalid';
+  }
+  if (typeof entry.atIso !== 'string' || timestampErrorValue(entry.atIso) !== null) {
+    return 'invalid';
+  }
+  const time = Date.parse(entry.atIso);
+  if (time < previousTime) {
+    return 'invalid';
+  }
+  if (previousEvent === 'opened' || previousEvent === 'reopened') {
+    if (openedPreviousTransitionError(entry, kind) !== null) {
+      return 'invalid';
+    }
+  } else if (previousEvent === 'closed' && previousReason === 'pr-closed') {
+    if (reopenedTransitionError(entry) !== null) {
+      return 'invalid';
+    }
+  } else {
+    return 'invalid';
+  }
+  return {
+    time,
+    event: event as OwnerItemHistoryEntryRecord['event'],
+    reason: typeof entry.reason === 'string' ? entry.reason : null,
+  };
+}
+
+/** The opened entry that must start every history. */
+function historyStartError(history: readonly unknown[], createdAtIso: string): string | null {
   const first = readPlainObject(history[0], ['event', 'atIso', 'reason']);
   if (
     first === null ||
@@ -423,54 +496,11 @@ function historyErrorValue(
   ) {
     return 'invalid';
   }
-  let previousTime = Date.parse(createdAtIso);
-  let previousEvent: OwnerItemHistoryEntryRecord['event'] = 'opened';
-  let previousReason: string | null = null;
-  for (let index = 1; index < history.length; index += 1) {
-    const entry = readPlainObject(history[index], ['event', 'atIso', 'reason']);
-    if (entry === null) {
-      return 'invalid';
-    }
-    const event = entry.event;
-    if (event !== 'closed' && event !== 'reopened' && event !== 'withdrawn') {
-      return 'invalid';
-    }
-    if (typeof entry.atIso !== 'string' || timestampErrorValue(entry.atIso) !== null) {
-      return 'invalid';
-    }
-    const time = Date.parse(entry.atIso);
-    if (time < previousTime) {
-      return 'invalid';
-    }
-    previousTime = time;
-    if (previousEvent === 'opened' || previousEvent === 'reopened') {
-      if (event === 'closed') {
-        if (
-          typeof entry.reason !== 'string' ||
-          !(OWNER_ITEM_RESOLUTIONS_BY_KIND[kind] as readonly string[]).includes(entry.reason)
-        ) {
-          return 'invalid';
-        }
-      } else if (event === 'withdrawn') {
-        if (!(OWNER_ITEM_OWNER_CLOSABLE_KINDS as readonly OwnerItemKindValue[]).includes(kind)) {
-          return 'invalid';
-        }
-        if (typeof entry.reason !== 'string' || !OWNER_ITEM_WITHDRAW_REASONS.includes(entry.reason as OwnerItemWithdrawReason)) {
-          return 'invalid';
-        }
-      } else {
-        return 'invalid';
-      }
-    } else if (previousEvent === 'closed' && previousReason === 'pr-closed') {
-      if (event !== 'reopened' || entry.reason !== null) {
-        return 'invalid';
-      }
-    } else {
-      return 'invalid';
-    }
-    previousEvent = event;
-    previousReason = typeof entry.reason === 'string' ? entry.reason : null;
-  }
+  return null;
+}
+
+/** The last entry must agree with the record's state, resolution and withdrawal. */
+function historyFinalError(history: readonly unknown[], state: OwnerItemState, resolution: unknown, withdrawal: unknown): string | null {
   const last = readPlainObject(history[history.length - 1], ['event', 'atIso', 'reason']);
   if (last === null) {
     return 'invalid';
@@ -496,6 +526,39 @@ function historyErrorValue(
     }
   }
   return null;
+}
+
+function historyErrorValue(
+  history: unknown,
+  createdAtIso: string,
+  state: OwnerItemState,
+  resolution: unknown,
+  withdrawal: unknown,
+  kind: OwnerItemKindValue,
+): string | null {
+  if (!Array.isArray(history) || history.length < 1 || history.length > OWNER_ITEM_LIMITS.history) {
+    return 'invalid';
+  }
+  if (historyStartError(history, createdAtIso) !== null) {
+    return 'invalid';
+  }
+  let previousTime = Date.parse(createdAtIso);
+  let previousEvent: OwnerItemHistoryEntryRecord['event'] = 'opened';
+  let previousReason: string | null = null;
+  for (let index = 1; index < history.length; index += 1) {
+    const entry = readPlainObject(history[index], ['event', 'atIso', 'reason']);
+    if (entry === null) {
+      return 'invalid';
+    }
+    const transition = historyTransitionError(entry, previousEvent, previousReason, previousTime, kind);
+    if (transition === 'invalid') {
+      return 'invalid';
+    }
+    previousTime = transition.time;
+    previousEvent = transition.event;
+    previousReason = transition.reason;
+  }
+  return historyFinalError(history, state, resolution, withdrawal);
 }
 
 function freezeRefs(refs: unknown): readonly OwnerItemRefRecord[] {

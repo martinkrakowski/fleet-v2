@@ -10,11 +10,13 @@ import { listenHostRefusal } from "../wiring/listen-host";
 import { configureFleetApiRuntime } from "../wiring/runtime";
 import { configureSessionExchange } from "../wiring/session-exchange";
 import { readApiTokenFromFile, setActiveApiToken } from "../wiring/token";
+import { issueWebLoginCode, resetWebLogin } from "../wiring/web-login";
 
 function refuse(): false {
   setActiveApiToken(null);
   configureFleetApiRuntime(null);
   configureSessionExchange();
+  resetWebLogin();
   return false;
 }
 
@@ -45,6 +47,8 @@ export function bootstrapFleetApiFromEnv(env: NodeJS.ProcessEnv = process.env): 
     ownerPublicKey,
     installation: loadResult.installation,
   });
+  // A null return means the login stays closed; the API still serves reads.
+  issueWebLoginCode(stateDir);
   return true;
 }
 

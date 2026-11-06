@@ -751,7 +751,26 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         if ("reason" in legacy) {
           return { outcome: "refused", reason: legacy.reason };
         }
-        preResolvedPrNumber = legacy.number;
+        // The legacy head lookup names the pull request by branch and head
+        // alone (WB5b), which a fork pull request can also satisfy. Before the
+        // grant is consumed the number must pass the same verification as any
+        // other source (WB5b3): the cross-repository refusal applies whatever
+        // the source of the number.
+        const verified = await this.verifyMergeNumber(
+          deps,
+          request,
+          workOrder,
+          normalizedRepository,
+          {
+            number: legacy.number,
+            confirmedBySource: false,
+            linkInvolved: false,
+          },
+        );
+        if ("reason" in verified) {
+          return { outcome: "refused", reason: verified.reason };
+        }
+        preResolvedPrNumber = verified.number;
         legacyLookup = true;
       }
       if (normalizedRepository === null || preResolvedPrNumber === undefined) {
@@ -1365,7 +1384,12 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         read.outcome !== "found" ||
         read.pullRequest.number !== number ||
         typeof read.pullRequest.headSha !== "string" ||
-        typeof read.pullRequest.headRef !== "string"
+        typeof read.pullRequest.headRef !== "string" ||
+        // Fail closed on a malformed snapshot (WB5b3): a missing or
+        // non-boolean isCrossRepository, or an unreadable head owner, is
+        // unreadable — never silently assumed same-repository.
+        typeof read.pullRequest.isCrossRepository !== "boolean" ||
+        typeof read.pullRequest.headRepositoryOwner !== "string"
       ) {
         return { outcome: "unreadable" };
       }

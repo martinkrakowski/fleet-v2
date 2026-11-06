@@ -294,4 +294,52 @@ describe('CutoverJournalAdapter', () => {
     expect(await refusal(big, intent())).toBe('store-unreadable');
     expect((await stat(file)).size).toBe(16 * 1024 * 1024 + 1);
   });
+
+  it('refuses an append when the journal already holds the limit, writes nothing and keeps the file readable; one below the limit appends', async () => {
+    const limit = 10_000;
+    const seed = (count: number): string =>
+      JSON.stringify(
+        Array.from({ length: count }, (_, index) => ({
+          key: `relaunch/abcdef0123456789/lane-${index}/save`,
+          kind: 'intent',
+          entryId: `01HY${String(index + 1).padStart(22, '0')}`,
+          recordedAtIso: NOW,
+          schemaVersion: 2,
+        })),
+      );
+    const full = await stateDir();
+    const fullFile = path.join(full, 'cutover-journal.json');
+    await writeFile(fullFile, seed(limit), 'utf8');
+    const atLimit = new CutoverJournalAdapter({ stateDir: full });
+    expect(await refusal(atLimit, intent('relaunch/abcdef0123456789/lane-extra/save'))).toBe('store-unreadable');
+    expect(JSON.parse(await readFile(fullFile, 'utf8'))).toHaveLength(limit);
+    const listed = await atLimit.listByKeyPrefix('relaunch/');
+    expect(listed.outcome === 'listed' && listed.entries.length).toBe(limit);
+    const below = await stateDir();
+    const belowFile = path.join(below, 'cutover-journal.json');
+    await writeFile(belowFile, seed(limit - 1), 'utf8');
+    const nearLimit = new CutoverJournalAdapter({ stateDir: below });
+    expect(await refusal(nearLimit, intent('relaunch/abcdef0123456789/lane-extra/save'))).toBe('appended');
+    const after = await nearLimit.listByKeyPrefix('relaunch/');
+    expect(after.outcome === 'listed' && after.entries.length).toBe(limit);
+  });
+
+  it('snapshots each existing entry once: a getter that answers validly then throws cannot escape the decision', () => {
+    const flaky = (): CutoverJournalEntry => {
+      let reads = 0;
+      return {
+        get key(): string {
+          reads += 1;
+          if (reads > 1) throw new Error('boom');
+          return KEY;
+        },
+        kind: 'intent',
+        entryId: '01HY0000000000000000000099',
+      } as unknown as CutoverJournalEntry;
+    };
+    expect(prepareCutoverJournalAppend([flaky()], intent('relaunch/abcdef0123456789/lane-9/save')).ok).toBe(true);
+    expect(prepareCutoverJournalAppend([flaky()], intent(KEY))).toEqual({ ok: false, reason: 'duplicate-intent' });
+    const alwaysThrows = { get key(): string { throw new Error('boom'); }, kind: 'intent', entryId: 'x' } as unknown as CutoverJournalEntry;
+    expect(prepareCutoverJournalAppend([alwaysThrows], intent(KEY))).toEqual({ ok: false, reason: 'invalid-entry' });
+  });
 });

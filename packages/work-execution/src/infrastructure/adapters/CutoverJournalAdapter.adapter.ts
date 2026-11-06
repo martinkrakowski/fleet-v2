@@ -141,15 +141,21 @@ export function prepareCutoverJournalAppend(
   existing: readonly CutoverJournalEntry[],
   input: unknown,
 ): CutoverJournalDecision {
+  // Each existing entry is read once into plain values inside the try: a stateful getter cannot answer differently later.
+  const held: { readonly key: string; readonly kind: string; readonly entryId: string; readonly outcome: unknown }[] = [];
   try {
     if (!Array.isArray(existing) || existing.length > MAX_JOURNAL_ENTRIES) return { ok: false, reason: 'invalid-entry' };
+    // A full journal takes no further entry: record 10,001 would make the next read reject the whole file.
+    if (existing.length >= MAX_JOURNAL_ENTRIES) return { ok: false, reason: 'store-unreadable' };
     for (let index = 0; index < existing.length; index += 1) {
-      const held: unknown = index in existing ? existing[index] : undefined;
-      if (typeof held !== 'object' || held === null) return { ok: false, reason: 'invalid-entry' };
-      const fields = held as Record<string, unknown>;
-      if (typeof fields.key !== 'string' || typeof fields.kind !== 'string' || typeof fields.entryId !== 'string') {
+      const raw: unknown = index in existing ? existing[index] : undefined;
+      if (typeof raw !== 'object' || raw === null) return { ok: false, reason: 'invalid-entry' };
+      const fields = raw as Record<string, unknown>;
+      const { key, kind, entryId, outcome } = fields;
+      if (typeof key !== 'string' || typeof kind !== 'string' || typeof entryId !== 'string') {
         return { ok: false, reason: 'invalid-entry' };
       }
+      held.push({ key, kind, entryId, outcome });
     }
   } catch {
     return { ok: false, reason: 'invalid-entry' };
@@ -157,16 +163,16 @@ export function prepareCutoverJournalAppend(
   const read = readCutoverJournalEntry(input);
   if (!read.ok) return read;
   const entry = read.entry;
-  if (existing.some((held) => held.entryId === entry.entryId)) return { ok: false, reason: 'invalid-entry' };
-  const sameKey = existing.filter((held) => held.key === entry.key);
-  const hasIntent = sameKey.some((held) => held.kind === 'intent');
-  const hasResult = sameKey.some((held) => held.kind === 'result');
+  if (held.some((prior) => prior.entryId === entry.entryId)) return { ok: false, reason: 'invalid-entry' };
+  const sameKey = held.filter((prior) => prior.key === entry.key);
+  const hasIntent = sameKey.some((prior) => prior.kind === 'intent');
+  const hasResult = sameKey.some((prior) => prior.kind === 'result');
   if (entry.kind === 'intent') {
     if (hasResult) return { ok: false, reason: 'intent-after-result' };
     return hasIntent ? { ok: false, reason: 'duplicate-intent' } : { ok: true, entry };
   }
   if (!hasIntent) return { ok: false, reason: 'result-without-intent' };
-  if (sameKey.some((held) => held.kind === 'result' && held.outcome !== 'ambiguous')) {
+  if (sameKey.some((prior) => prior.kind === 'result' && prior.outcome !== 'ambiguous')) {
     return { ok: false, reason: 'result-after-final-result' };
   }
   return { ok: true, entry };

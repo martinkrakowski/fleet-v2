@@ -21,6 +21,8 @@ import {
   laneRunConductEntry,
   LocalExecutor,
   ReapLaneWorktreesUseCase,
+  consumptionId,
+  unsealedWorktreeRemovalActionId,
   unsealedWorktreeRemovalScope,
   sha256HexDigest,
   WorkspaceAdapter,
@@ -611,6 +613,42 @@ describe('conductor reap --worktrees against real git (C2\')', () => {
     expect(againDoc.alreadyRemoved).toEqual([{ runId: RUN_ID }]);
     const requestAfter = await s.runtime.coordination.coordinationRequestRepository.findRequestById('req-unsealed-1');
     expect(requestAfter!.consumptions).toHaveLength(1);
+  });
+
+  it('recovers a crash after grant consumption: removes without a second signature or consumption', async () => {
+    const s = await setupReal();
+    await seedScopedApproval(s);
+    // Simulate the crash: the grant was consumed for exactly this action id and
+    // attempt, then the process died before the removal and its journal entry.
+    const actionScope = unsealedWorktreeRemovalScope('attempt-example-1', sha256HexDigest(s.worktreePath));
+    const actionId = unsealedWorktreeRemovalActionId(RUN_ID, 'attempt-example-1');
+    await s.runtime.coordination.syncOneWayOwnerQuestions.syncOneWayOwnerQuestions();
+    const resolved = await s.runtime.coordination.resolveActionAuthorization.resolveActionAuthorization({
+      projectId: 'example-project',
+      actionScope,
+      expectedHeadSha: s.head,
+    });
+    expect(resolved.outcome).toBe('authorized');
+    const consumed = await s.runtime.coordination.recordAuthorizationConsumption.recordAuthorizationConsumption({
+      consumptionId: consumptionId(actionId),
+      grantId: (resolved as { grantId: string }).grantId,
+      actionId,
+      actionScope,
+      attemptId: 'attempt-example-1',
+      expectedHeadSha: s.head,
+      nowIso: NOW,
+    });
+    expect(consumed.outcome).toBe('consumed');
+    // Remove the signed decision file: a second consumption would need a new signature.
+    const decisionsDir = path.join(tempStateDirs2[tempStateDirs2.length - 1]!, 'decisions');
+    await fs.rm(path.join(decisionsDir, 'req-unsealed-1.json'));
+    const result = await runConductor(s.runtime, ['reap', '--worktrees', '--yes', '--force-unsealed']);
+    expect(result.code).toBe(0);
+    const doc = JSON.parse(result.stdout[0]!) as { removed: { runId: string }[] };
+    expect(doc.removed).toEqual([{ runId: RUN_ID, branchTip: expect.any(String) }]);
+    await expect(fs.stat(s.worktreePath)).rejects.toBeTruthy();
+    const request = await s.runtime.coordination.coordinationRequestRepository.findRequestById('req-unsealed-1');
+    expect(request!.consumptions).toHaveLength(1);
   });
 
   it('refuses a dirty worktree under --force-unsealed without consuming the signed grant', async () => {

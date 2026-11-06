@@ -884,6 +884,29 @@ describe('removeWorktree manifest gate and hardening (C2\')', () => {
     }
   });
 
+  it('refuses a manifest whose nested getter throws, never throws itself', async () => {
+    const { executor, calls } = fakeExecutor({});
+    const adapter = new WorkspaceAdapter({
+      executorForRecordedHost: executorForRecordedHost(executor),
+      checkArtifactManifest: sealedCheck(),
+    });
+    for (const field of ['kind', 'attemptId', 'manifestPath', 'approvalReference']) {
+      const manifest = {
+        kind: 'force-unsealed',
+        attemptId: 'attempt-1',
+        approvalReference: 'oq-1:req-1:grant-1',
+        get [field](): string {
+          throw new Error('nested getter exploded');
+        },
+      } as unknown as RemoveWorktreeManifestCheck;
+      await expect(adapter.removeWorktree(makeRequest({ manifest }))).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+      });
+    }
+    expect(calls).toHaveLength(0);
+  });
+
   it('refuses oversized paths and fields before running any command and sets maxBufferBytes on subprocess reads', async () => {
     const oversized = makeRequest({
       worktreePath: `/srv/fleet/worktrees/${'w'.repeat(5000)}`,

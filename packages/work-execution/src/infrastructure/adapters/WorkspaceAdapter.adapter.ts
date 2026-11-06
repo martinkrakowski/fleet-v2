@@ -402,8 +402,15 @@ function isValidApprovalReference(value: unknown): value is string {
  * clean approval reference; anything else is `invalid-request`.
  */
 function removeWorktreeManifestIsValid(manifest: unknown): boolean {
-  const snap = manifest as RemoveWorktreeManifestCheck | null | undefined;
-  if (snap === null || snap === undefined || typeof snap !== 'object' || Array.isArray(snap)) {
+  let snap: Partial<Record<keyof RemoveWorktreeManifestCheck, unknown>> & Record<string, unknown>;
+  try {
+    // Descriptor-safe snapshot: an accessor or a throwing getter reads as invalid.
+    const read = snapshotPlainDataRecord(manifest);
+    if (read === null) {
+      return false;
+    }
+    snap = read;
+  } catch {
     return false;
   }
   const attemptIdOk = (value: unknown): value is string =>
@@ -413,7 +420,8 @@ function removeWorktreeManifestIsValid(manifest: unknown): boolean {
     return true;
   }
   if (snap.kind === 'sealed') {
-    const match = SEALED_MANIFEST_PATH_PATTERN.exec(snap.manifestPath as string);
+    const match =
+      typeof snap.manifestPath === 'string' ? SEALED_MANIFEST_PATH_PATTERN.exec(snap.manifestPath) : null;
     return (
       attemptIdOk(snap.attemptId) &&
       typeof snap.manifestPath === 'string' &&

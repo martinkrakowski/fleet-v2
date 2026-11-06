@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   OrchestratorRequest,
@@ -10,7 +10,10 @@ import {
 import type { OrchestratorRequestRecord } from '../../../domain/orchestrator-request-records.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../../application/ports/out/ChangeSignalPort.out-port.js';
 import type { OrchestratorRequestListQuery } from '../../../application/ports/out/OrchestratorRequestRepositoryPort.out-port.js';
-import { MAX_ORCHESTRATOR_REQUEST_STORE_RECORDS } from '../../../application/ports/out/OrchestratorRequestRepositoryPort.out-port.js';
+import {
+  MAX_ORCHESTRATOR_REQUEST_STORE_BYTES,
+  MAX_ORCHESTRATOR_REQUEST_STORE_RECORDS,
+} from '../../../application/ports/out/OrchestratorRequestRepositoryPort.out-port.js';
 import {
   inspectVersionedRecordListBytes,
   StateFileUnknownVersionError,
@@ -260,6 +263,65 @@ describe('OrchestratorRequestRepositoryAdapter', () => {
     expect(parseOrchestratorRequestStateRecord(throwingProxy)).toBeUndefined();
     expect(parseVersionedOrchestratorRequestStateRecord(null)).toEqual({ status: 'invalid' });
     expect(parseOrchestratorRequestStateRecord('x')).toBeUndefined();
+  });
+
+  it('returns defensive deep copies from in-memory save so a caller mutating the result cannot change the stored record', async () => {
+    const adapter = new OrchestratorRequestRepositoryAdapter({});
+    const created = await adapter.save(initialRequest(R1), 0);
+    if (created.outcome !== 'saved') {
+      throw new Error('unexpected');
+    }
+    (created.request.target as { attemptId: string }).attemptId = 'tampered';
+    (created.request.requestedBy as { sessionId: string }).sessionId = 'tampered';
+    const got = await adapter.get(R1);
+    if (got.outcome !== 'found') {
+      throw new Error('unexpected');
+    }
+    expect(got.request.target).toEqual({ attemptId: 'attempt-example-1' });
+    expect(got.request.requestedBy.sessionId).toBe('session-example-1');
+
+    const transitioned = await adapter.save(claimed(initialRequest(R1)), 1);
+    if (transitioned.outcome !== 'saved') {
+      throw new Error('unexpected');
+    }
+    (transitioned.request.claim as { orchestratorId: string }).orchestratorId = 'tampered';
+    const after = await adapter.get(R1);
+    if (after.outcome !== 'found') {
+      throw new Error('unexpected');
+    }
+    expect(after.request.claim!.orchestratorId).toBe('orch-example-1');
+  });
+
+  it('refuses an oversized store on its stat alone, before any read, with the unreadable-store outcome', async () => {
+    const storePath = path.join(tempDir, 'orchestrator-requests.json');
+    await fs.writeFile(storePath, '');
+    await fs.truncate(storePath, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
+    const readSpy = vi.spyOn(fs, 'readFile');
+    try {
+      const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
+      expect(await adapter.get(R1)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+      expect(await adapter.list()).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+      expect(await adapter.save(initialRequest(R1), 0)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+      expect(readSpy.mock.calls.filter(([target]) => target === storePath)).toEqual([]);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it('returns a sanitized unknown io-error, never a throw or the fs error, when acquiring the lock fails for a non-timeout reason', async () => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      return;
+    }
+    const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
+    await adapter.save(initialRequest(R1), 0);
+    await fs.chmod(tempDir, 0o500);
+    try {
+      const result = await adapter.save(claimed(initialRequest(R1)), 1);
+      expect(result).toEqual({ outcome: 'unknown', code: 'io-error', errorCode: 'EACCES' });
+      expect(JSON.stringify(result)).not.toContain(tempDir);
+    } finally {
+      await fs.chmod(tempDir, 0o700);
+    }
   });
 
   it('guards save with lockTimeoutMs and leaves prior store state intact when a lock times out', async () => {

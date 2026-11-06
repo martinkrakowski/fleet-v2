@@ -327,6 +327,91 @@ type LoadResult =
   | { readonly kind: 'unreadable' }
   | { readonly kind: 'io-error'; readonly errorCode: string };
 
+type ParsedListQuery = {
+  readonly projectId?: string;
+  readonly state?: OrchestratorRequestState;
+  readonly states?: readonly OrchestratorRequestState[];
+  readonly kind?: OrchestratorRequestKind;
+  readonly limit?: number;
+};
+
+const LIST_QUERY_KEYS: readonly string[] = ['projectId', 'state', 'states', 'kind', 'limit'];
+
+/** Plain-object check plus own data descriptors for the closed key set; null when the shape is refused. */
+function readListQueryValues(query: unknown): Record<string, unknown> | null {
+  if (typeof query !== 'object' || query === null || Array.isArray(query)) {
+    return null;
+  }
+  const proto = Object.getPrototypeOf(query);
+  if (proto !== Object.prototype && proto !== null) {
+    return null;
+  }
+  const values: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(query)) {
+    if (typeof key !== 'string' || !LIST_QUERY_KEYS.includes(key)) {
+      return null;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(query, key);
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      return null;
+    }
+    values[key] = descriptor.value;
+  }
+  return values;
+}
+
+function isListedMember(list: readonly string[], value: unknown): boolean {
+  return typeof value === 'string' && list.includes(value);
+}
+
+/** `projectId`, `state` and `kind`: each absent or valid. */
+function listQueryScalarsValid(values: Record<string, unknown>): boolean {
+  if (values.projectId !== undefined && projectIdError(values.projectId) !== null) {
+    return false;
+  }
+  if (values.state !== undefined && !isListedMember(ORCHESTRATOR_REQUEST_STATES, values.state)) {
+    return false;
+  }
+  return values.kind === undefined || isListedMember(ORCHESTRATOR_REQUEST_KINDS, values.kind);
+}
+
+/** `states`: absent, or a plain, dense, bounded array of known states read by data descriptors. */
+function listQueryStatesValid(value: unknown): boolean {
+  if (value === undefined) {
+    return true;
+  }
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    return false;
+  }
+  const states = value as unknown[];
+  if (states.length > ORCHESTRATOR_REQUEST_STATES.length) {
+    return false;
+  }
+  for (let index = 0; index < states.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(states, index)) {
+      return false;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(states, index);
+    if (descriptor === undefined || !('value' in descriptor)) {
+      return false;
+    }
+    if (!ORCHESTRATOR_REQUEST_STATES.includes(states[index] as OrchestratorRequestState)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function listQueryLimitValid(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (typeof value === 'number' &&
+      Number.isSafeInteger(value) &&
+      value >= 1 &&
+      value <= MAX_ORCHESTRATOR_REQUEST_LIST_LIMIT)
+  );
+}
+
 export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequestRepositoryPort {
   private readonly inMemoryRecords = new Map<string, OrchestratorRequestRecord>();
   private readonly changeSignal: ChangeSignalPort;
@@ -488,24 +573,7 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
     try {
       const stat = await fs.stat(target);
       if (stat.size > MAX_ORCHESTRATOR_REQUEST_STORE_BYTES) {
-        let bytes: Buffer;
-        try {
-          bytes = await fs.readFile(target);
-        } catch {
-          bytes = Buffer.alloc(0);
-        }
-        if (bytes.byteLength > 0) {
-          try {
-            await rejectUnreadableStateFile(
-              target,
-              'store exceeds maximum byte size',
-              bytes,
-              this.options?.readOnly === true,
-            );
-          } catch {
-            // The file was quarantined or the read-only read refused; report unknown.
-          }
-        }
+        // Refuse on the stat alone: never read an oversized file into memory (nothing is quarantined either).
         return { kind: 'unreadable' };
       }
       buffer = await fs.readFile(target);
@@ -617,7 +685,7 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
   ): Promise<SaveOrchestratorRequestResult> {
     const decision = this.evaluateSave(validated, expectedRevision, this.inMemoryRecords);
     if (decision.action === 'unchanged') {
-      return { outcome: 'unchanged', request: decision.record };
+      return { outcome: 'unchanged', request: copy(decision.record) };
     }
     if (decision.action === 'refused') {
       return {
@@ -629,11 +697,11 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
       };
     }
     const existing = this.inMemoryRecords.get(validated.requestId);
-    this.inMemoryRecords.set(validated.requestId, validated);
+    this.inMemoryRecords.set(validated.requestId, copy(validated));
     if (!isClaimLeaseRenewal(existing, validated)) {
       this.signal({ kind: 'request', id: validated.requestId, stateFile: null, before: null, written: null });
     }
-    return { outcome: 'saved', request: validated };
+    return { outcome: 'saved', request: copy(validated) };
   }
 
   private async saveToFile(
@@ -708,7 +776,8 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
       if (error instanceof FileLockTimeoutError) {
         return { outcome: 'refused', code: 'lock-timeout', requestId: validated.requestId };
       }
-      throw error;
+      // Any other lock-acquisition I/O failure is a sanitized unknown outcome: never thrown, never the fs error.
+      return { outcome: 'unknown', code: 'io-error', errorCode: sanitizeErrorCode(error) };
     }
 
     if (result.outcome === 'saved' && !wasRenewal) {
@@ -787,94 +856,16 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
   }
 
   /** The list query, read by own property descriptors: closed keys, no symbols, getters or sparse arrays. */
-  private parseListQuery(
-    query: OrchestratorRequestListQuery,
-  ):
-    | {
-        readonly projectId?: string;
-        readonly state?: OrchestratorRequestState;
-        readonly states?: readonly OrchestratorRequestState[];
-        readonly kind?: OrchestratorRequestKind;
-        readonly limit?: number;
-      }
-    | null {
+  private parseListQuery(query: OrchestratorRequestListQuery): ParsedListQuery | null {
     try {
-      if (typeof query !== 'object' || query === null || Array.isArray(query)) {
+      const values = readListQueryValues(query);
+      if (values === null || !listQueryScalarsValid(values) || !listQueryStatesValid(values.states)) {
         return null;
       }
-      const proto = Object.getPrototypeOf(query);
-      if (proto !== Object.prototype && proto !== null) {
+      if (!listQueryLimitValid(values.limit)) {
         return null;
       }
-      const allowed = ['projectId', 'state', 'states', 'kind', 'limit'];
-      const values: Record<string, unknown> = {};
-      for (const key of Reflect.ownKeys(query)) {
-        if (typeof key !== 'string' || !allowed.includes(key)) {
-          return null;
-        }
-        const descriptor = Object.getOwnPropertyDescriptor(query, key);
-        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
-          return null;
-        }
-        values[key] = descriptor.value;
-      }
-      if (values.projectId !== undefined && projectIdError(values.projectId) !== null) {
-        return null;
-      }
-    if (values.state !== undefined) {
-      if (
-        typeof values.state !== 'string' ||
-        !ORCHESTRATOR_REQUEST_STATES.includes(values.state as OrchestratorRequestState)
-      ) {
-        return null;
-      }
-    }
-    if (values.states !== undefined) {
-      if (!Array.isArray(values.states) || Object.getPrototypeOf(values.states) !== Array.prototype) {
-        return null;
-      }
-      const states = values.states as unknown[];
-      if (states.length > ORCHESTRATOR_REQUEST_STATES.length) {
-        return null;
-      }
-      for (let index = 0; index < states.length; index += 1) {
-        if (!Object.prototype.hasOwnProperty.call(states, index)) {
-          return null;
-        }
-        const descriptor = Object.getOwnPropertyDescriptor(states, index);
-        if (descriptor === undefined || !('value' in descriptor)) {
-          return null;
-        }
-        if (!ORCHESTRATOR_REQUEST_STATES.includes(states[index] as OrchestratorRequestState)) {
-          return null;
-        }
-      }
-    }
-    if (values.kind !== undefined) {
-      if (
-        typeof values.kind !== 'string' ||
-        !ORCHESTRATOR_REQUEST_KINDS.includes(values.kind as OrchestratorRequestKind)
-      ) {
-        return null;
-      }
-    }
-      if (values.limit !== undefined) {
-        if (
-          typeof values.limit !== 'number' ||
-          !Number.isSafeInteger(values.limit) ||
-          values.limit < 1 ||
-          values.limit > MAX_ORCHESTRATOR_REQUEST_LIST_LIMIT
-        ) {
-          return null;
-        }
-      }
-      return values as {
-        readonly projectId?: string;
-        readonly state?: OrchestratorRequestState;
-        readonly states?: readonly OrchestratorRequestState[];
-        readonly kind?: OrchestratorRequestKind;
-        readonly limit?: number;
-      };
+      return values as ParsedListQuery;
     } catch {
       return null;
     }

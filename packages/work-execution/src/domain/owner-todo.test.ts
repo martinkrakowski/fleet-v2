@@ -72,6 +72,19 @@ describe('deriveOwnerTodo', () => {
     }
   });
 
+  it('single-quotes an id with shell syntax in the displayed commands (TD1b review minor)', () => {
+    const list = todoFor([entry({ id: 'x$(touch /tmp/p);y', kind: 'other' })]);
+    expect(list.entries[0].commands).toEqual([
+      "fleet-v2 owner-items resolve 'x$(touch /tmp/p);y' --done",
+      "fleet-v2 owner-items withdraw 'x$(touch /tmp/p);y'",
+    ]);
+  });
+
+  it("escapes a single quote inside a quoted id", () => {
+    const list = todoFor([entry({ id: "it's", kind: 'other' })]);
+    expect(list.entries[0].commands[0]).toBe("fleet-v2 owner-items resolve 'it'\\''s' --done");
+  });
+
   it('gives an owner-closable item the resolve and withdraw commands', () => {
     const list = todoFor([entry({ id: 'item-1', kind: 'other' })]);
     expect(list.entries[0].commands).toEqual([

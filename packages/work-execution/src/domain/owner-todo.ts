@@ -62,9 +62,24 @@ function closedByFor(origin: OwnerTodoEntry['origin'], kind: BoardOwnerItemKind)
   return 'owner';
 }
 
+/**
+ * Shell-safe quoting for an id inside a displayed CLI command. An id that is
+ * entirely safe unquoted stays as-is; anything else is single-quoted so
+ * shell metacharacters such as `$` or `;` cannot execute unintended commands.
+ */
+const SAFE_UNQUOTED = /^[A-Za-z0-9._:@/=+-]+$/;
+
+function shellQuote(value: string): string {
+  if (SAFE_UNQUOTED.test(value)) {
+    return value;
+  }
+  return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
 function commandsFor(id: string, closedBy: OwnerTodoClosedBy): readonly string[] {
   if (closedBy !== 'owner' || id.startsWith('-')) return [];
-  return ['fleet-v2 owner-items resolve ' + id + ' --done', 'fleet-v2 owner-items withdraw ' + id];
+  const quoted = shellQuote(id);
+  return ['fleet-v2 owner-items resolve ' + quoted + ' --done', 'fleet-v2 owner-items withdraw ' + quoted];
 }
 
 function ageDaysBetween(sinceIso: string, nowIso: string): number {

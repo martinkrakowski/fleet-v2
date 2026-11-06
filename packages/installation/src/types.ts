@@ -167,6 +167,12 @@ export interface GateSlotSection {
 /** The fields a host runner carries regardless of its kind. */
 interface HostRunnerCommon {
   readonly port: number;
+  /**
+   * The offset the bundled runner program adds to `port` when it dials the
+   * server over an ssh tunnel. The frozen `bin/ocm-run` dials `port + 1`, so
+   * the loader only accepts the offset that program implements; absent means 1.
+   */
+  readonly tunnelOffset?: number;
   readonly authFile?: string;
   readonly capabilities?: RunnerCapabilityDeclaration;
   readonly maxLanes?: number;
@@ -191,6 +197,14 @@ export type HostRunnerSection = OpencodeHostRunnerSection | AgyHostRunnerSection
 export interface HostSection {
   readonly transport: HostTransport;
   readonly sshAlias?: string;
+  /** Optional lowercase container name the host's runner runs in. */
+  readonly container?: string;
+  /**
+   * Per-role ssh alias overrides: `roleAliases[role]` wins over `sshAlias`
+   * for that role. Only roles the host holds may appear, and only on an ssh
+   * host.
+   */
+  readonly roleAliases?: Readonly<Partial<Record<HostRole, string>>>;
   readonly worktreeRoot: string;
   readonly tmpDir?: string;
   readonly roles: readonly HostRole[];
@@ -646,6 +660,7 @@ export interface DerivedRunnerCapabilities {
 export interface OpencodeHostRunnerModel {
   readonly kind: 'opencode';
   readonly port?: number;
+  readonly tunnelOffset?: number;
   readonly authFile?: string;
   readonly capabilities: DerivedRunnerCapabilities;
   readonly maxLanes?: number;
@@ -656,6 +671,7 @@ export interface OpencodeHostRunnerModel {
 export interface AgyHostRunnerModel {
   readonly kind: 'agy';
   readonly port?: number;
+  readonly tunnelOffset?: number;
   readonly authFile?: string;
   readonly capabilities: DerivedRunnerCapabilities;
   readonly maxLanes?: number;
@@ -674,6 +690,8 @@ export type HostRunnerModel = OpencodeHostRunnerModel | AgyHostRunnerModel;
 export interface HostModel {
   readonly transport: HostTransport;
   readonly sshAlias?: string;
+  readonly container?: string;
+  readonly roleAliases?: Readonly<Partial<Record<HostRole, string>>>;
   readonly worktreeRoot?: string;
   readonly tmpDir?: string;
   readonly roles: readonly HostRole[];

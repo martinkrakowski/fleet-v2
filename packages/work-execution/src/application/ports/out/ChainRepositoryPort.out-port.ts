@@ -42,8 +42,33 @@ export interface ChainReadCommand {
   readonly deadlineIso: string;
 }
 
+export interface ChainReviewPinCommand {
+  readonly repository: ChainRepositoryRef;
+  readonly chainName: string;
+  /** Compare-and-set: applies only to the record at this revision. */
+  readonly expectedRevision: number;
+  readonly pin: {
+    readonly headSha: string;
+    readonly requestId: string;
+    readonly key: string;
+    readonly pinnedAtIso: string;
+  };
+  readonly deadlineIso: string;
+}
+
+export type ChainReviewPinDecision =
+  | { readonly outcome: 'recorded' }
+  /** The record already carries this pin (same key and head). */
+  | { readonly outcome: 'already-recorded' }
+  | { readonly outcome: 'refused'; readonly reason: string };
+
 export interface ChainRepositoryPort {
   recordChainIntent(command: ChainIntentCommand): Promise<ChainRecordDecision>;
   recordChainOutcome(command: ChainOutcomeCommand): Promise<ChainRecordDecision>;
   readChain(command: ChainReadCommand): Promise<ChainRecordRead>;
+  /**
+   * Pin the chain tip a combined review covers; never overwrites a stored pin
+   * with another.
+   */
+  recordChainReviewPin(command: ChainReviewPinCommand): Promise<ChainReviewPinDecision>;
 }

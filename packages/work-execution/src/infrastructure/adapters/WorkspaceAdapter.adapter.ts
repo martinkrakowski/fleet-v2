@@ -913,7 +913,8 @@ function parseStatMtime(line: string): { readonly ms: number; readonly fractiona
     const fraction = /^(?:\d{2}:\d{2}:\d{2}|\d+)\.(\d+)$/.exec(token);
     if (fraction !== null) {
       millis = Number.parseInt(fraction[1]!.padEnd(3, '0').slice(0, 3), 10);
-      fractional = true;
+      // An all-zero fraction is a filesystem that stores whole seconds.
+      fractional = /[1-9]/.test(fraction[1]!);
       break;
     }
   }
@@ -1944,6 +1945,16 @@ export class WorkspaceAdapter implements WorkspacePort {
     if (physicalRequestedPath !== entry.path || physicalRequestedPath !== worktreePath) {
       return { outcome: 'refused', reason: 'path-refused' };
     }
+    //     A worktree inside the clone itself (reached through an alias of the
+    //     repository root) is refused as well.
+    const physicalRepositoryRoot = await resolvePhysicalPath(executor, repositoryRoot, GIT_TIMEOUT_MS);
+    if (
+      physicalRepositoryRoot === null ||
+      physicalRequestedPath === physicalRepositoryRoot ||
+      physicalRequestedPath.startsWith(`${physicalRepositoryRoot}/`)
+    ) {
+      return { outcome: 'refused', reason: 'path-refused' };
+    }
 
     // 4. Re-read the facts, in this order, through the same executor.
     //    HEAD first: a moved HEAD refuses before anything else is read.
@@ -2412,7 +2423,10 @@ export class WorkspaceAdapter implements WorkspacePort {
     } else {
       // Index mtime: resolve the index path, then stat it with the detected flavour.
       const indexMtime = await readIndexActivityMs(executor, worktreePath, flavour);
-      if (indexMtime !== null) {
+      if (indexMtime === null) {
+        // An unreadable index is an unreadable activity source: too coarse to prove quiet.
+        coarse = true;
+      } else {
         if (!indexMtime.fractional) coarse = true;
         if (newestMs === null || indexMtime.ms > newestMs) {
           newestMs = indexMtime.ms;

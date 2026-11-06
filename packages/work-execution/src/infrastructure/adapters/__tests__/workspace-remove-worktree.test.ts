@@ -143,7 +143,7 @@ const STAT_MARKER = 'stat -c %Y';
 /** 2026-11-06T00:00:00Z, the epoch second of `ACTIVITY_ISO`. */
 const ACTIVITY_EPOCH = 1793923200;
 /** A stat answer with a sub-second part, older than `ACTIVITY_ISO`. */
-const QUIET_STAT = '1700000000 2023-11-14 22:13:20.000000000 +0000\n';
+const QUIET_STAT = '1700000000 2023-11-14 22:13:20.123456789 +0000\n';
 const INDEX_MARKER = 'rev-parse --git-path index';
 
 /**
@@ -194,6 +194,7 @@ describe('removeWorktree over a fake executor', () => {
       ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', CLONE],
       ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', WORKTREE_ROOT],
       ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', WORKTREE],
+      ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', CLONE],
       ['git', '-C', WORKTREE, 'rev-parse', 'HEAD'],
       ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-C', WORKTREE, 'status', '--porcelain', '--untracked-files=all'],
       ['git', '-C', WORKTREE, 'rev-parse', '--git-dir'],
@@ -548,6 +549,52 @@ describe('removeWorktree over a fake executor', () => {
         argv[argv.length - 1] === WORKTREE
           ? { stdout: `${WORKTREE_ROOT}/real-wt\n` }
           : { stdout: `${argv[argv.length - 1]}\n` },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'path-refused' });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
+  it('refuses busy when a stat answers a fraction of all zeros (a whole-second filesystem)', async () => {
+    const { result, calls } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
+      [FIND_MARKER]: { stdout: '1700000000 2023-11-14 22:13:20.000000000 +0000\n' },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'busy' });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
+  it('refuses busy when the index activity cannot be read', async () => {
+    const { result, calls } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
+      [INDEX_MARKER]: { exitCode: 128 },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'busy' });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
+  it('refuses path-refused when the worktree lies inside the physical repository root', async () => {
+    const { result, calls } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
+      [PWD_MARKER]: ({ argv }) =>
+        argv[argv.length - 1] === CLONE ? { stdout: `${WORKTREE_ROOT}\n` } : { stdout: `${argv[argv.length - 1]}\n` },
       [REMOVE_MARKER]: { exitCode: 0 },
     });
     expect(result).toEqual({ outcome: 'refused', reason: 'path-refused' });

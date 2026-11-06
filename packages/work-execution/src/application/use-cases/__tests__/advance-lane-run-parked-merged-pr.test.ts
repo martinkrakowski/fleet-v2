@@ -222,6 +222,7 @@ async function makeHarness(
               return forgeAnswer;
             },
             isConfigured: () => true,
+            listOpenPullRequestsByBase: async () => ({ outcome: "unavailable" as const, reason: "not-used" }),
           },
         }),
     ...(options.forgeAncestry === 'unwired'

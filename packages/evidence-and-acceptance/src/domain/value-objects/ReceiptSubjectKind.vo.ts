@@ -1,58 +1,30 @@
-// @generated value-object stub — edit freely
 /**
- * ReceiptSubjectKind is an immutable value object.
- *
- * Value objects:
- * - Are immutable (no setters)
- * - Are compared by value, not identity
- * - Contain validation logic
- * - Can be shared safely
- *
- * @example
- * const vo = ReceiptSubjectKind.create(rawValue);
- * if (vo.success) {
- *   // Use vo.value
- * }
+ * ReceiptSubjectKind is an immutable value object over the manifest's receipt
+ * subject enum: a receipt is about an attempt, a chain or a brief. An unknown
+ * kind is a failure result, never an exception and never a default.
  */
+
+import { RECEIPT_SUBJECT_KINDS } from '../evidence-records.js';
+import type { ReceiptSubjectKindValue } from '../evidence-records.js';
+
+const RECEIPT_SUBJECT_KIND_VALUES: readonly string[] = RECEIPT_SUBJECT_KINDS;
+
 export class ReceiptSubjectKind {
-  /**
-   * Private constructor enforces factory pattern.
-   * Use ReceiptSubjectKind.create() instead.
-   */
-  private constructor(private readonly value: unknown) {
-    // Value is immutable after construction
+  private constructor(private readonly value: ReceiptSubjectKindValue) {
+    // Value is immutable after construction.
   }
 
-  /**
-   * Factory method with validation.
-   *
-   * @param value - Raw value to wrap
-   * @returns Result containing ReceiptSubjectKind or validation error
-   *
-   * TODO: Implement validation logic
-   * Example:
-   * static create(value: string): Result<ReceiptSubjectKind, Error> {
-   *   if (!value || value.length === 0) {
-   *     return { success: false, error: new Error('Value cannot be empty') };
-   *   }
-   *   return { success: true, value: new ReceiptSubjectKind(value) };
-   * }
-   */
   static create(value: unknown): { success: boolean; value?: ReceiptSubjectKind; error?: Error } {
-    // TODO: Add validation
-    return { success: true, value: new ReceiptSubjectKind(value) };
+    if (typeof value !== 'string' || !RECEIPT_SUBJECT_KIND_VALUES.includes(value)) {
+      return { success: false, error: new Error('Invalid receipt subject kind') };
+    }
+    return { success: true, value: new ReceiptSubjectKind(value as ReceiptSubjectKindValue) };
   }
 
-  /**
-   * Get the wrapped value.
-   */
-  getValue(): unknown {
+  getValue(): ReceiptSubjectKindValue {
     return this.value;
   }
 
-  /**
-   * Value objects are compared by value.
-   */
   equals(other: ReceiptSubjectKind): boolean {
     return this.value === other.value;
   }

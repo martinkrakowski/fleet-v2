@@ -8,6 +8,7 @@
  */
 
 import type {
+  ReceiptSubject,
   ReviewFindingRecord,
   ReviewReceiptRecord,
   ReviewKind,
@@ -15,6 +16,7 @@ import type {
 import {
   REVIEW_KINDS,
   REVIEW_REQUEST_ID_PATTERN,
+  receiptSubjectOf,
 } from '../evidence-records.js';
 import type { EvidenceResultValue } from '../value-objects/EvidenceResult.vo.js';
 import { EVIDENCE_RESULTS } from '../value-objects/EvidenceResult.vo.js';
@@ -38,6 +40,8 @@ export interface ReviewReceiptProps {
   readonly kind?: ReviewKind;
   /** The conductor's request id (§3.5); absent on manual reviews. */
   readonly requestId?: string;
+  /** What the receipt is about; absent reads as the attempt. */
+  readonly subject?: ReceiptSubject;
 }
 
 function isNonEmptyTrimmedString(value: unknown): value is string {
@@ -111,6 +115,40 @@ function isValidFinding(finding: ReviewFindingRecord): boolean {
   );
 }
 
+/**
+ * The later checks of `create`, in their order: the in-receipt duplicate finding
+ * ids, then the optional kind, requestId and subject. Returns the refusal
+ * message, or null when all hold.
+ */
+function checkOptionalFields(props: ReviewReceiptProps): string | null {
+  // Finding ids are numbered per receipt: one receipt may not raise two
+  // findings under the same id, or dispositions could not name one finding.
+  // The real transport never produces in-receipt duplicates (positional ids).
+  const findingIds = new Set<string>();
+  for (const finding of props.findings) {
+    if (findingIds.has(finding.findingId)) {
+      return `ReviewReceipt contains duplicate finding id '${finding.findingId}'`;
+    }
+    findingIds.add(finding.findingId);
+  }
+  if (props.kind !== undefined && !REVIEW_KINDS.includes(props.kind)) {
+    return 'ReviewReceipt has an invalid kind: ' + String(props.kind);
+  }
+  if (
+    props.requestId !== undefined &&
+    (typeof props.requestId !== 'string' || !REVIEW_REQUEST_ID_PATTERN.test(props.requestId))
+  ) {
+    return 'ReviewReceipt has an invalid requestId';
+  }
+  if (props.requestId !== undefined && props.kind === undefined) {
+    return 'ReviewReceipt with a requestId requires a kind';
+  }
+  if (props.subject !== undefined && receiptSubjectOf(props) === null) {
+    return 'ReviewReceipt has an invalid subject';
+  }
+  return null;
+}
+
 export class ReviewReceipt {
   private constructor(private readonly props: ReviewReceiptProps) {
     // Invariants are validated in create.
@@ -171,39 +209,9 @@ export class ReviewReceipt {
         error: new Error('ReviewReceipt contains an invalid finding'),
       };
     }
-    // Finding ids are numbered per receipt: one receipt may not raise two
-    // findings under the same id, or dispositions could not name one finding.
-    // The real transport never produces in-receipt duplicates (positional ids).
-    const findingIds = new Set<string>();
-    for (const finding of props.findings) {
-      if (findingIds.has(finding.findingId)) {
-        return {
-          success: false,
-          error: new Error(`ReviewReceipt contains duplicate finding id '${finding.findingId}'`),
-        };
-      }
-      findingIds.add(finding.findingId);
-    }
-    if (props.kind !== undefined && !REVIEW_KINDS.includes(props.kind)) {
-      return {
-        success: false,
-        error: new Error('ReviewReceipt has an invalid kind: ' + String(props.kind)),
-      };
-    }
-    if (
-      props.requestId !== undefined &&
-      (typeof props.requestId !== 'string' || !REVIEW_REQUEST_ID_PATTERN.test(props.requestId))
-    ) {
-      return {
-        success: false,
-        error: new Error('ReviewReceipt has an invalid requestId'),
-      };
-    }
-    if (props.requestId !== undefined && props.kind === undefined) {
-      return {
-        success: false,
-        error: new Error('ReviewReceipt with a requestId requires a kind'),
-      };
+    const optionalFieldsError = checkOptionalFields(props);
+    if (optionalFieldsError !== null) {
+      return { success: false, error: new Error(optionalFieldsError) };
     }
     return {
       success: true,

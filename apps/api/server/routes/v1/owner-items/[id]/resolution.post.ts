@@ -18,7 +18,7 @@ import { presentedToken } from "../../../../wiring/presented-token";
  * have no entry point here.
  */
 
-const WITHDRAW_REASONS: readonly string[] = ["no-longer-needed", "duplicate", "superseded"];
+const WITHDRAW_REASONS: ReadonlySet<string> = new Set(["no-longer-needed", "duplicate", "superseded"]);
 
 export default defineEventHandler(async (event) => {
   const itemId = routeParam(event, "id");
@@ -37,7 +37,7 @@ export default defineEventHandler(async (event) => {
       request = { action: "done", itemId, via: "web" };
     } else if (action === "withdraw") {
       const reason = body.reason;
-      if (typeof reason !== "string" || !WITHDRAW_REASONS.includes(reason)) {
+      if (typeof reason !== "string" || !WITHDRAW_REASONS.has(reason)) {
         const failure = refusedEnvelope(
           operationId,
           "owner item resolution withdraw reason is not one of no-longer-needed, duplicate, superseded",

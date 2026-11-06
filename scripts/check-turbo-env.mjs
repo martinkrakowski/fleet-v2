@@ -84,6 +84,9 @@ const RUNTIME_ONLY = new Set([
   "TMPDIR",
   "SYSTEMROOT",
   "YARN_NM_MODE",
+  // Pinned by the release runner for its child installs; never a build input.
+  "COREPACK_ENABLE_DOWNLOAD_PROMPT",
+  "TZ",
   // git and ssh variables the adapters clear or pin for their children.
   "GIT_DIR",
   "GIT_WORK_TREE",

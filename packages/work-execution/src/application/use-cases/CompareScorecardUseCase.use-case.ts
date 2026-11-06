@@ -352,6 +352,18 @@ interface PeriodRow {
 }
 
 function addCounts(summary: MutableSummary, row: PeriodRow): boolean {
+  // Validate every sum first; mutate only when all of them are safe integers.
+  const fixRounds = summary.fixRounds + row.fixRounds;
+  const findings = {
+    blocker: summary.reviewFindings.blocker + row.reviewFindings.blocker,
+    major: summary.reviewFindings.major + row.reviewFindings.major,
+    minor: summary.reviewFindings.minor + row.reviewFindings.minor,
+    nit: summary.reviewFindings.nit + row.reviewFindings.nit,
+  };
+  const sums = [fixRounds, findings.blocker, findings.major, findings.minor, findings.nit];
+  if (!sums.every((sum) => Number.isSafeInteger(sum))) {
+    return false;
+  }
   summary.runCount += 1;
   if (row.finalState === 'merged') {
     summary.mergedRunCount += 1;
@@ -361,14 +373,67 @@ function addCounts(summary: MutableSummary, row: PeriodRow): boolean {
   if (row.firstPassCompleted) {
     summary.firstPassCompletions += 1;
   }
-  summary.fixRounds += row.fixRounds;
-  for (const severity of ['blocker', 'major', 'minor', 'nit'] as const) {
-    summary.reviewFindings[severity] += row.reviewFindings[severity];
-    if (!Number.isSafeInteger(summary.reviewFindings[severity])) {
-      return false;
-    }
-  }
+  summary.fixRounds = fixRounds;
+  summary.reviewFindings.blocker = findings.blocker;
+  summary.reviewFindings.major = findings.major;
+  summary.reviewFindings.minor = findings.minor;
+  summary.reviewFindings.nit = findings.nit;
   return true;
+}
+
+type Boundary = ReturnType<typeof parseBoundaryDate>;
+type RefusalReason = Extract<CompareScorecardResult, { readonly outcome: 'refused' }>['reason'];
+type ParsedCompareRequest =
+  | { readonly refusal: RefusalReason }
+  | { readonly refusal: null; readonly split: NonNullable<Boundary>; readonly from: Boundary; readonly to: Boundary; readonly budgetMs: number };
+
+/** The request validated into boundaries and a budget; a refusal reason otherwise. */
+function parseCompareRequest(request: unknown): ParsedCompareRequest {
+  if (!isPlainObject(request)) {
+    return { refusal: 'invalid-request' };
+  }
+  const record = request as Record<string, unknown>;
+  let split: Boundary;
+  let from: Boundary;
+  let to: Boundary;
+  let budgetMs: unknown;
+  try {
+    split = parseBoundaryDate(record.split, 'split');
+    from = record.from === undefined ? null : parseBoundaryDate(record.from, 'from');
+    to = record.to === undefined ? null : parseBoundaryDate(record.to, 'to');
+    budgetMs = record.budgetMs;
+    if (split === null || (record.from !== undefined && from === null) || (record.to !== undefined && to === null)) {
+      return { refusal: 'invalid-request' };
+    }
+  } catch {
+    return { refusal: 'invalid-request' };
+  }
+  if ((from !== null && from.ms >= split.ms) || (to !== null && split.ms > to.ms)) {
+    return { refusal: 'invalid-range' };
+  }
+  if (budgetMs !== undefined && (!isCount(budgetMs) || budgetMs < 1 || budgetMs > COMPARE_SCORECARD_MAX_BUDGET_MS)) {
+    return { refusal: 'invalid-request' };
+  }
+  return { refusal: null, split, from, to, budgetMs: typeof budgetMs === 'number' ? budgetMs : COMPARE_SCORECARD_DEFAULT_BUDGET_MS };
+}
+
+/** A store read that was skipped (budget) or failed; the deadline is checked before EVERY read. */
+type Budgeted<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly budget: boolean };
+
+async function budgeted<T>(now: () => number, deadlineMs: number, read: () => Promise<T>): Promise<Budgeted<T>> {
+  if (now() >= deadlineMs) {
+    return { ok: false, budget: true };
+  }
+  const result = await guarded(read);
+  return result.ok ? result : { ok: false, budget: false };
+}
+
+function failReason(read: { readonly budget: boolean }): 'budget-exhausted' | 'stores-unreadable' {
+  return read.budget ? 'budget-exhausted' : 'stores-unreadable';
+}
+
+function inRange(rowMs: number, from: Boundary, to: Boundary): boolean {
+  return !((from !== null && rowMs < from.ms) || (to !== null && rowMs > to.ms));
 }
 
 export class CompareScorecardUseCase implements CompareScorecardPort {
@@ -388,39 +453,12 @@ export class CompareScorecardUseCase implements CompareScorecardPort {
     now: () => number,
     request: unknown,
   ): Promise<CompareScorecardResult> {
-    if (!isPlainObject(request)) {
-      return { outcome: 'refused', reason: 'invalid-request' };
+    const parsed = parseCompareRequest(request);
+    if (parsed.refusal !== null) {
+      return { outcome: 'refused', reason: parsed.refusal };
     }
-    const record = request as Record<string, unknown>;
-    let split: ReturnType<typeof parseBoundaryDate>;
-    let from: ReturnType<typeof parseBoundaryDate>;
-    let to: ReturnType<typeof parseBoundaryDate>;
-    let budgetMs: unknown;
-    try {
-      split = parseBoundaryDate(record.split, 'split');
-      from = record.from === undefined ? null : parseBoundaryDate(record.from, 'from');
-      to = record.to === undefined ? null : parseBoundaryDate(record.to, 'to');
-      budgetMs = record.budgetMs;
-    } catch {
-      return { outcome: 'refused', reason: 'invalid-request' };
-    }
-    if (split === null) {
-      return { outcome: 'refused', reason: 'invalid-request' };
-    }
-    if (record.from !== undefined && from === null) {
-      return { outcome: 'refused', reason: 'invalid-request' };
-    }
-    if (record.to !== undefined && to === null) {
-      return { outcome: 'refused', reason: 'invalid-request' };
-    }
-    if ((from !== null && from.ms >= split.ms) || (to !== null && split.ms > to.ms)) {
-      return { outcome: 'refused', reason: 'invalid-range' };
-    }
-    const budgetMsTyped = budgetMs;
-    if (budgetMsTyped !== undefined && (!isCount(budgetMsTyped) || budgetMsTyped < 1 || budgetMsTyped > COMPARE_SCORECARD_MAX_BUDGET_MS)) {
-      return { outcome: 'refused', reason: 'invalid-request' };
-    }
-    const deadlineMs = now() + (typeof budgetMs === 'number' ? budgetMs : COMPARE_SCORECARD_DEFAULT_BUDGET_MS);
+    const { split, from, to } = parsed;
+    const deadlineMs = now() + parsed.budgetMs;
 
     if (now() >= deadlineMs) {
       return { outcome: 'refused', reason: 'scorecard-unreadable' };
@@ -470,56 +508,10 @@ export class CompareScorecardUseCase implements CompareScorecardPort {
     const periodRows: PeriodRow[] = [];
     for (let rowIndex = 0; rowIndex < read.rows.length; rowIndex += 1) {
       try {
-      const row = read.rows[rowIndex];
-      if (!isPlainObject(row)) {
-        unknownRows.push({ kind: 'row-index', rowIndex, reason: 'invalid-row-id' });
-        continue;
-      }
-      const runId = (row as Record<string, unknown>).runId;
-      if (typeof runId !== 'string' || !LANE_SCORECARD_ID_PATTERN.test(runId) || isSecretShaped(runId)) {
-        unknownRows.push({ kind: 'row-index', rowIndex, reason: 'invalid-row-id' });
-        continue;
-      }
-      if (seenRunIds.has(runId)) {
-        unknownRows.push({ kind: 'row', runId, reason: 'duplicate-run-id' });
-        continue;
-      }
-      seenRunIds.add(runId);
-      const shape = validRowShapeOf(row);
-      if (shape === null) {
-        unknownRows.push({ kind: 'row', runId, reason: 'malformed-row' });
-        continue;
-      }
-      if (now() >= deadlineMs) {
-        unknownRows.push({ kind: 'row', runId, reason: 'budget-exhausted' });
-        continue;
-      }
-      const facts = await this.readRowFacts(deps, runId, shape.workOrderId);
-      if (facts.reason !== null) {
-        unknownRows.push({ kind: 'row', runId, reason: facts.reason });
-        continue;
-      }
-      const rowMs = resolveRowCompletionTimestampMs(facts.timestamp);
-      if (rowMs === null) {
-        unknownRows.push({ kind: 'row', runId, reason: 'timestamp-unreadable' });
-        continue;
-      }
-      if ((from !== null && rowMs < from.ms) || (to !== null && rowMs > to.ms)) {
-        continue; // Out of range: ignored cleanly, never counted.
-      }
-      periodRows.push({
-        runId: shape.runId,
-        workOrderId: shape.workOrderId,
-        finalState: shape.finalState,
-        firstPassCompleted: shape.firstPassCompleted,
-        fixRounds: shape.fixRounds,
-        reviewFindings: shape.reviewFindings,
-        prNumber: shape.prNumber,
-        projectId: facts.projectId,
-        repository: facts.repository,
-        period: rowMs < split.ms ? 'before' : 'after',
-        runAttemptIds: facts.runAttemptIds,
-      });
+        const periodRow = await this.periodRowOf(deps, now, deadlineMs, read.rows[rowIndex], rowIndex, seenRunIds, { split, from, to }, unknownRows);
+        if (periodRow !== null) {
+          periodRows.push(periodRow);
+        }
       } catch {
         unknownRows.push({ kind: 'row-index', rowIndex, reason: 'invalid-row-id' });
       }
@@ -539,8 +531,9 @@ export class CompareScorecardUseCase implements CompareScorecardPort {
     }
     for (const defect of escaped.defects) {
       const summary = defect.period === 'before' ? before : after;
-      summary.escapedDefects += 1;
-      if (!Number.isSafeInteger(summary.escapedDefects)) {
+      if (Number.isSafeInteger(summary.escapedDefects + 1)) {
+        summary.escapedDefects += 1;
+      } else {
         unknownRows.push({ kind: 'row', runId: defect.runId, reason: 'stores-unreadable' });
       }
     }
@@ -560,11 +553,68 @@ export class CompareScorecardUseCase implements CompareScorecardPort {
     };
   }
 
+  /** One scorecard row as an in-range period row; null when it is unknown or out of range (unknowns are recorded). */
+  private async periodRowOf(
+    deps: CompareScorecardDependencies,
+    now: () => number,
+    deadlineMs: number,
+    row: unknown,
+    rowIndex: number,
+    seenRunIds: Set<string>,
+    window: { readonly split: NonNullable<Boundary>; readonly from: Boundary; readonly to: Boundary },
+    unknownRows: UnknownScorecardRow[],
+  ): Promise<PeriodRow | null> {
+    const runId = isPlainObject(row) ? (row as Record<string, unknown>).runId : undefined;
+    if (typeof runId !== 'string' || !LANE_SCORECARD_ID_PATTERN.test(runId) || isSecretShaped(runId)) {
+      unknownRows.push({ kind: 'row-index', rowIndex, reason: 'invalid-row-id' });
+      return null;
+    }
+    const unknown = (reason: Extract<UnknownScorecardRow, { readonly kind: 'row' }>['reason']): null => {
+      unknownRows.push({ kind: 'row', runId, reason });
+      return null;
+    };
+    if (seenRunIds.has(runId)) {
+      return unknown('duplicate-run-id');
+    }
+    seenRunIds.add(runId);
+    const shape = validRowShapeOf(row);
+    if (shape === null) {
+      return unknown('malformed-row');
+    }
+    const facts = await this.readRowFacts(deps, now, deadlineMs, runId, shape.workOrderId, shape.finalState === 'merged');
+    if (facts.reason !== null) {
+      return unknown(facts.reason);
+    }
+    const rowMs = resolveRowCompletionTimestampMs(facts.timestamp);
+    if (rowMs === null) {
+      return unknown('timestamp-unreadable');
+    }
+    if (!inRange(rowMs, window.from, window.to)) {
+      return null; // Out of range: ignored cleanly, never counted.
+    }
+    return {
+      runId: shape.runId,
+      workOrderId: shape.workOrderId,
+      finalState: shape.finalState,
+      firstPassCompleted: shape.firstPassCompleted,
+      fixRounds: shape.fixRounds,
+      reviewFindings: shape.reviewFindings,
+      prNumber: shape.prNumber,
+      projectId: facts.projectId,
+      repository: facts.repository,
+      period: rowMs < window.split.ms ? 'before' : 'after',
+      runAttemptIds: facts.runAttemptIds,
+    };
+  }
+
   /** One run's, work order's and journal's facts for one row; null reason when all read cleanly. */
   private async readRowFacts(
     deps: CompareScorecardDependencies,
+    now: () => number,
+    deadlineMs: number,
     runId: string,
     workOrderId: string,
+    requireProject: boolean,
   ): Promise<
     | {
         readonly reason: null;
@@ -578,11 +628,11 @@ export class CompareScorecardUseCase implements CompareScorecardPort {
           readonly workOrderUpdatedAtIso: string | null;
         };
       }
-    | { readonly reason: Extract<UnknownScorecardRowReason, 'run-not-found' | 'work-order-not-found' | 'stores-unreadable'> }
+    | { readonly reason: Extract<UnknownScorecardRowReason, 'run-not-found' | 'work-order-not-found' | 'stores-unreadable' | 'budget-exhausted'> }
   > {
-    const runRead = await guarded(() => deps.runRepo.get(runId));
+    const runRead = await budgeted(now, deadlineMs, () => deps.runRepo.get(runId));
     if (!runRead.ok) {
-      return { reason: 'stores-unreadable' };
+      return { reason: failReason(runRead) };
     }
     const run = runRead.value as LaneRunRecord | null;
     if (run === null) {
@@ -591,16 +641,19 @@ export class CompareScorecardUseCase implements CompareScorecardPort {
     if (run.workOrderId !== workOrderId) {
       return { reason: 'stores-unreadable' };
     }
-    const workOrderRead = await guarded(() => deps.workOrderRepo.findWorkOrderById(workOrderId));
+    const workOrderRead = await budgeted(now, deadlineMs, () => deps.workOrderRepo.findWorkOrderById(workOrderId));
     if (!workOrderRead.ok) {
-      return { reason: 'stores-unreadable' };
+      return { reason: failReason(workOrderRead) };
     }
     const workOrder = workOrderRead.value;
     if (workOrder === null) {
       return { reason: 'work-order-not-found' };
     }
-    const journalRead = await guarded(() => deps.runJournal.listForRun(runId));
-    if (!journalRead.ok || !isDenseArray(journalRead.value) || journalRead.value.length > MAX_JOURNAL_ENTRIES) {
+    const journalRead = await budgeted(now, deadlineMs, () => deps.runJournal.listForRun(runId));
+    if (!journalRead.ok) {
+      return { reason: failReason(journalRead) };
+    }
+    if (!isDenseArray(journalRead.value) || journalRead.value.length > MAX_JOURNAL_ENTRIES) {
       return { reason: 'stores-unreadable' };
     }
     let attempts: readonly { readonly completionReceipt: { readonly endedAtIso: string } | null; readonly updatedAtIso: string }[] = [];
@@ -609,8 +662,11 @@ export class CompareScorecardUseCase implements CompareScorecardPort {
       if (run.attemptIds.length > APPEND_SCORECARD_MAX_ATTEMPTS) {
         return { reason: 'stores-unreadable' };
       }
-      const attemptRead = await guarded(() => deps.attemptRepo.listAttemptsByWorkOrder(workOrderId));
-      if (!attemptRead.ok || !isDenseArray(attemptRead.value) || attemptRead.value.length > APPEND_SCORECARD_MAX_ATTEMPTS) {
+      const attemptRead = await budgeted(now, deadlineMs, () => deps.attemptRepo.listAttemptsByWorkOrder(workOrderId));
+      if (!attemptRead.ok) {
+        return { reason: failReason(attemptRead) };
+      }
+      if (!isDenseArray(attemptRead.value) || attemptRead.value.length > APPEND_SCORECARD_MAX_ATTEMPTS) {
         return { reason: 'stores-unreadable' };
       }
       const byId = new Map<string, unknown>();
@@ -630,13 +686,15 @@ export class CompareScorecardUseCase implements CompareScorecardPort {
       attempts = kept as readonly { readonly completionReceipt: { readonly endedAtIso: string } | null; readonly updatedAtIso: string }[];
       hasAttempts = true;
     }
+    const projectId = isPlainObject(workOrder) ? (workOrder as Record<string, unknown>).projectId : undefined;
+    if (requireProject && (typeof projectId !== 'string' || projectId.length === 0)) {
+      return { reason: 'stores-unreadable' };
+    }
     const updatedAtIso = isPlainObject(workOrder) ? (workOrder as Record<string, unknown>).updatedAtIso : undefined;
     return {
       reason: null,
       runAttemptIds: Array.isArray(run.attemptIds) ? (run.attemptIds as readonly unknown[]) : [],
-      projectId: isPlainObject(workOrder) && typeof (workOrder as Record<string, unknown>).projectId === 'string'
-        ? (workOrder as Record<string, unknown>).projectId as string
-        : '',
+      projectId: typeof projectId === 'string' ? projectId : '',
       repository: isPlainObject(workOrder) ? (workOrder as Record<string, unknown>).repository : undefined,
       timestamp: {
         journal: journalRead.value as readonly LaneRunJournalEntryRecord[],
@@ -799,6 +857,14 @@ type CachedCiCost =
 
 /** The forge answer classified: an unreadable `found` payload is unavailable, never trusted. */
 function classifyCiCost(read: Guarded<ReadPullRequestCiCostResult>): CachedCiCost {
+  try {
+    return classifyCiCostUnguarded(read);
+  } catch {
+    return { kind: 'unavailable' }; // A throwing getter on the forge result is an unknown cost, never a throw.
+  }
+}
+
+function classifyCiCostUnguarded(read: Guarded<ReadPullRequestCiCostResult>): CachedCiCost {
   if (!read.ok) {
     return { kind: 'unavailable' };
   }

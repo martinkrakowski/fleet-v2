@@ -314,7 +314,7 @@ describe('CompareScorecardUseCase', () => {
     }));
     for (const request of [null, undefined, 7, 'split', [], new Date(), Object.create(null)] as readonly unknown[]) {
       const result = await useCase.compareScorecard(request as never);
-      expect(result.outcome === 'refused' || result.outcome === 'compared').toBe(true);
+      expect(result.outcome).toBe('refused');
     }
     const throwing = {};
     Object.defineProperty(throwing, 'split', { get() { throw new Error('boom'); } });
@@ -462,10 +462,10 @@ describe('CompareScorecardUseCase', () => {
       rowOf({ runId: 'run-2', workOrderId: 'wo-2', prNumber: 12 }),
     ];
     let call = 0;
-    // The first six reads answer at the base instant; the seventh read is far past the deadline.
+    // The first ten clock reads (request, scorecard, three store reads per row, the project listing and the first PR) answer at the base instant; the eleventh is far past the deadline.
     const nowMs = () => {
       call += 1;
-      return call > 6 ? 1_000_000_000_000 : 1_000_000;
+      return call > 10 ? 1_000_000_000_000 : 1_000_000;
     };
     const seenTimeouts: number[] = [];
     const scenario: Scenario = {
@@ -634,5 +634,95 @@ describe('CompareScorecardUseCase', () => {
     };
     const unreadable = await compare(depsOf(unreadableAttempts), { split: SPLIT });
     expect(unreadable.outcome === 'compared' && unreadable.unknownRows[0]).toMatchObject({ runId: 'run-1', reason: 'timestamp-unreadable' });
+  });
+
+  describe('Luna pre-merge round 1 (robustness)', () => {
+    function scenarioOf(rows: readonly LaneScorecardRow[], workOrders: ReadonlyMap<string, unknown>): Scenario {
+      return {
+        rows,
+        runs: new Map(rows.map((row) => [row.runId, { workOrderId: row.workOrderId, attemptIds: [] }])),
+        workOrders: workOrders as never,
+        projects: new Map([['', []]]),
+        journals: journalsOf(rows),
+      };
+    }
+
+    it('marks a merged row whose work order has no string projectId unknown instead of counting it with zero escaped defects', async () => {
+      const rows = [rowOf({ runId: 'run-3', workOrderId: 'wo-3', prNumber: null })];
+      const result = await compare(depsOf(scenarioOf(rows, new Map([['wo-3', { repository: 'acme/widget', updatedAtIso: AFTER_TS }]]))), { split: SPLIT });
+      if (result.outcome !== 'compared' || result.scorecardAbsent) {
+        throw new Error('expected a compared result');
+      }
+      expect(result.after.runCount).toBe(0);
+      expect(result.unknownRows).toEqual([{ kind: 'row', runId: 'run-3', reason: 'stores-unreadable' }]);
+    });
+
+    it('checks the deadline before every store read of a row and issues no further reads once the budget is spent', async () => {
+      const rows = [rowOf({ runId: 'run-3', workOrderId: 'wo-3', prNumber: null })];
+      const scenario = scenarioOf(rows, new Map([['wo-3', { projectId: 'p1', repository: 'acme/widget', updatedAtIso: AFTER_TS }]]));
+      let spent = false;
+      const later: string[] = [];
+      const deps = depsOf(scenario, { nowMs: () => (spent ? 1_000_000_000_000 : 1_000_000) });
+      const runGet = deps.runRepo.get.bind(deps.runRepo);
+      deps.runRepo.get = async (runId) => {
+        spent = true;
+        return runGet(runId);
+      };
+      const findWorkOrder = deps.workOrderRepo.findWorkOrderById.bind(deps.workOrderRepo);
+      deps.workOrderRepo.findWorkOrderById = async (id) => {
+        later.push('workOrder');
+        return findWorkOrder(id);
+      };
+      deps.runJournal.listForRun = async () => {
+        later.push('journal');
+        return [] as never;
+      };
+      deps.attemptRepo.listAttemptsByWorkOrder = async () => {
+        later.push('attempts');
+        return [] as never;
+      };
+      const result = await compare(deps, { split: SPLIT, budgetMs: 5_000 });
+      if (result.outcome !== 'compared' || result.scorecardAbsent) {
+        throw new Error('expected a compared result');
+      }
+      expect(later).toEqual([]);
+      expect(result.after.runCount).toBe(0);
+      expect(result.unknownRows).toEqual([{ kind: 'row', runId: 'run-3', reason: 'budget-exhausted' }]);
+    });
+
+    it('turns a forge result with a throwing getter into an unknown CI cost, never a throw', async () => {
+      const rows = [rowOf({ runId: 'run-3', workOrderId: 'wo-3', prNumber: 12 })];
+      const scenario: Scenario = {
+        ...scenarioOf(rows, new Map([['wo-3', { projectId: 'p1', repository: 'acme/widget', updatedAtIso: AFTER_TS }]])),
+        projects: new Map([['p1', []]]),
+        forge: () => {
+          const answer = {};
+          Object.defineProperty(answer, 'outcome', { get() { throw new Error('getter boom'); } });
+          return answer;
+        },
+      };
+      const result = await compare(depsOf(scenario), { split: SPLIT });
+      if (result.outcome !== 'compared' || result.scorecardAbsent) {
+        throw new Error('expected a compared result');
+      }
+      expect(result.after.ciCost.unknownPullRequests).toEqual([{ runId: 'run-3', prNumber: 12, reason: 'ci-cost-unavailable' }]);
+    });
+
+    it('rejects a row whose fixRounds would overflow a safe integer without counting any part of it', async () => {
+      const rows = [
+        rowOf({ runId: 'run-2', workOrderId: 'wo-2', finalState: 'stopped', prNumber: null, fixRounds: Number.MAX_SAFE_INTEGER }),
+        rowOf({ runId: 'run-3', workOrderId: 'wo-3', finalState: 'stopped', prNumber: null, fixRounds: Number.MAX_SAFE_INTEGER, reviewFindings: { blocker: 5, major: 0, minor: 0, nit: 0 } }),
+      ];
+      const workOrder = { projectId: 'p1', repository: 'acme/widget', updatedAtIso: AFTER_TS };
+      const result = await compare(depsOf(scenarioOf(rows, new Map([['wo-2', workOrder], ['wo-3', workOrder]]))), { split: SPLIT });
+      if (result.outcome !== 'compared' || result.scorecardAbsent) {
+        throw new Error('expected a compared result');
+      }
+      expect(result.after.runCount).toBe(1);
+      expect(result.after.stoppedRunCount).toBe(1);
+      expect(result.after.fixRounds).toBe(Number.MAX_SAFE_INTEGER);
+      expect(result.after.reviewFindings.blocker).toBe(1);
+      expect(result.unknownRows).toEqual([{ kind: 'row', runId: 'run-3', reason: 'stores-unreadable' }]);
+    });
   });
 });

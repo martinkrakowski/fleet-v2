@@ -13,6 +13,7 @@ import {
   MAX_CI_COST_WORKFLOWS,
   PULL_REQUEST_CI_COST_QUERY,
   WORKFLOW_NAME_MAX_LENGTH,
+  isSafeWorkflowName,
   parsePullRequestCiCostPage,
   type ForgeReadAdapterOptions,
 } from './ForgeReadAdapter.adapter.js';
@@ -344,5 +345,12 @@ describe('readPullRequestCiCost', () => {
         workflows: [{ workflowName: 'gamma', checkRuns: 1, billedMinutes: 1 }],
       },
     });
+  });
+
+  it('rejects a workflow name that matches the legacy secret registry as well as the lane-diff one', () => {
+    const slackShaped = ['xoxs', 'abcdefghij'].join('-');
+    expect(isSafeWorkflowName(slackShaped)).toBe(false);
+    expect(isSafeWorkflowName(`ci ${slackShaped}`)).toBe(false);
+    expect(isSafeWorkflowName('build')).toBe(true);
   });
 });

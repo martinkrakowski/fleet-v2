@@ -28,7 +28,7 @@ import type { ForgeAncestryPort } from '../../application/ports/out/ForgeAncestr
 import { parseBaseBranch } from '../../domain/base-branch.js';
 import type { GhInvocationResult } from './ForgeActionAdapter.adapter.js';
 import { isSafeBranchName } from './ForgeActionAdapter.adapter.js';
-import { LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
+import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 
 export interface ForgeReadAdapterOptions {
   readonly owner?: string;
@@ -325,7 +325,7 @@ export function isSafeWorkflowName(value: string): boolean {
   if (CONTROL_CHARACTER.test(value) || PATH_SHAPED.test(value) || value === '.' || value === '..') {
     return false;
   }
-  return !LANE_DIFF_SECRET_PATTERNS.some((entry) => entry.regex.test(value));
+  return !containsSecretShape(value) && !LANE_DIFF_SECRET_PATTERNS.some((entry) => entry.regex.test(value));
 }
 
 /**

@@ -345,13 +345,17 @@ describe('ChainRepositoryAdapter (file store)', () => {
         return realRename(from, to);
       }) as typeof fs.rename;
       (fs as { rename: typeof fs.rename }).rename = spy;
+      let decision;
       try {
-        await adapter.recordChainOutcome(outcomeCmd());
+        decision = await adapter.recordChainOutcome(outcomeCmd());
       } finally {
         (fs as { rename: typeof fs.rename }).rename = realRename;
       }
       expect(swapped).toBe(true);
+      expect(decision).toEqual({ outcome: 'recorded' });
       expect(await fs.readdir(outside)).toEqual([]);
+      const stored = JSON.parse(await fs.readFile(path.join(parked, path.basename(fileOf(stateDir))), 'utf8'));
+      expect(stored).toMatchObject({ state: 'started', revision: 2 });
     } finally {
       await fs.rm(outside, { recursive: true, force: true });
     }

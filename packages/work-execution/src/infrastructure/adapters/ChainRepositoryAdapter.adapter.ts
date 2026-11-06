@@ -20,6 +20,11 @@
  *    O_NOFOLLOW, so no link leads out of the state directory;
  *  - reads are size-bounded and the record count is capped.
  * A stale store lock (crashed holder) fails closed as `store-busy`.
+ * Accepted residual (owner-confirmed): the lock is released by name, so a
+ * hostile same-user process that swaps `.store.lock` between the release check
+ * and the unlink can let a third writer in. That process could rewrite the
+ * records directly anyway; the store guards accidents and cooperating writers.
+ * Follow-up: fd-based locking if Node gains it, or a native helper.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
@@ -68,6 +73,7 @@ export const CHAIN_RECORD_MAX_COUNT = 1000;
 const CHAINS_DIR = 'chains';
 const LOCK_FILE = '.store.lock';
 const DEFAULT_LOCK_TIMEOUT_MS = 5000;
+const DIR_FLAGS = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
 
 type Refusal =
   | 'invalid-deadline'
@@ -357,50 +363,68 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
     if (this.root === null) throw new StoreUnavailableError();
     const anchored = process.platform === 'linux';
     if (!anchored && !this.allowUnanchored) throw new StoreUnavailableError();
-    const flags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
-    let rootHandle: fs.FileHandle;
+    const rootHandle = await this.openPinnedRoot(this.root);
+    let chainsHandle: fs.FileHandle | 'absent' | undefined;
     try {
-      rootHandle = await fs.open(this.root.path, flags);
-    } catch {
-      throw new StoreUnavailableError();
-    }
-    let chainsHandle: fs.FileHandle | undefined;
-    try {
-      const rootStat = await rootHandle.stat();
-      if (!rootStat.isDirectory() || rootStat.dev !== this.root.dev || rootStat.ino !== this.root.ino) {
-        throw new StoreUnavailableError();
-      }
       const named = join(anchored ? `/proc/self/fd/${rootHandle.fd}` : this.root.path, CHAINS_DIR);
-      try {
-        chainsHandle = await fs.open(named, flags);
-      } catch (error) {
-        if (errorCode(error) === 'ENOENT' && !create) return 'absent';
-        if (errorCode(error) !== 'ENOENT') throw new StoreUnavailableError();
-        try {
-          await fs.mkdir(named, { mode: 0o700 });
-        } catch (mkdirError) {
-          if (errorCode(mkdirError) !== 'EEXIST') throw new StoreUnavailableError();
-        }
-        try {
-          chainsHandle = await fs.open(named, flags);
-        } catch {
-          throw new StoreUnavailableError();
-        }
-      }
-      if (!(await chainsHandle.stat()).isDirectory()) throw new StoreUnavailableError();
+      chainsHandle = await ChainRepositoryAdapter.openChains(named, create);
+      if (chainsHandle === 'absent') return 'absent';
       if (anchored) return await use(`/proc/self/fd/${chainsHandle.fd}`);
+      const pinned = chainsHandle;
       const verify = async (): Promise<void> => {
-        const [now, pinned] = await Promise.all([fs.lstat(named), (chainsHandle as fs.FileHandle).stat()]);
-        if (now.isSymbolicLink() || now.ino !== pinned.ino || now.dev !== pinned.dev) throw new StoreUnavailableError();
+        const [now, held] = await Promise.all([fs.lstat(named), pinned.stat()]);
+        if (now.isSymbolicLink() || now.ino !== held.ino || now.dev !== held.dev) throw new StoreUnavailableError();
       };
       await verify();
       const result = await use(named);
       await verify();
       return result;
     } finally {
-      await chainsHandle?.close().catch(() => undefined);
+      if (chainsHandle !== undefined && chainsHandle !== 'absent') await chainsHandle.close().catch(() => undefined);
       await rootHandle.close().catch(() => undefined);
     }
+  }
+
+  /** Open the state root without following a link and check it is the directory pinned at construction. */
+  private async openPinnedRoot(root: { readonly path: string; readonly dev: number; readonly ino: number }): Promise<fs.FileHandle> {
+    let handle: fs.FileHandle;
+    try {
+      handle = await fs.open(root.path, DIR_FLAGS);
+    } catch {
+      throw new StoreUnavailableError();
+    }
+    const stat = await handle.stat().catch(() => null);
+    if (stat === null || !stat.isDirectory() || stat.dev !== root.dev || stat.ino !== root.ino) {
+      await handle.close().catch(() => undefined);
+      throw new StoreUnavailableError();
+    }
+    return handle;
+  }
+
+  /** Open (creating when asked) the `chains` directory without following a link. */
+  private static async openChains(named: string, create: boolean): Promise<fs.FileHandle | 'absent'> {
+    let handle: fs.FileHandle;
+    try {
+      handle = await fs.open(named, DIR_FLAGS);
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') throw new StoreUnavailableError();
+      if (!create) return 'absent';
+      try {
+        await fs.mkdir(named, { mode: 0o700 });
+      } catch (mkdirError) {
+        if (errorCode(mkdirError) !== 'EEXIST') throw new StoreUnavailableError();
+      }
+      try {
+        handle = await fs.open(named, DIR_FLAGS);
+      } catch {
+        throw new StoreUnavailableError();
+      }
+    }
+    if (!(await handle.stat().catch(() => null))?.isDirectory()) {
+      await handle.close().catch(() => undefined);
+      throw new StoreUnavailableError();
+    }
+    return handle;
   }
 
   private fileSection(dir: string): Section {

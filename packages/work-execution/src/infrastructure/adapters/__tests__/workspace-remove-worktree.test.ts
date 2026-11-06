@@ -328,6 +328,7 @@ describe('removeWorktree over a fake executor', () => {
     ['branch main', { expectedBranch: 'main' }],
     ['an empty expectedLastActivityIso', { expectedLastActivityIso: '' }],
     ['a non-timestamp expectedLastActivityIso', { expectedLastActivityIso: 'zz' }],
+    ['a normalised calendar date in expectedLastActivityIso', { expectedLastActivityIso: '2026-11-31T00:00:00.000Z' }],
     ['a whole-second expectedLastActivityIso', { expectedLastActivityIso: '2026-11-06T00:00:00Z' }],
     ['a record without a host name', { recordedHost: { ...RECORDED_HOST, hostName: null } }],
   ])('refuses invalid-request for %s, with no command run', async (_label, overrides) => {

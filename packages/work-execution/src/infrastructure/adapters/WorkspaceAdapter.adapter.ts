@@ -317,6 +317,12 @@ function removeWorktreePathRefusal(request: RemoveWorktreeRequest): boolean {
  * activity was readable under the caller's hold) or an ISO-8601 UTC instant with milliseconds (the form `toISOString` writes). Any
  * other malformed request is refused as `invalid-request`.
  */
+/** True when `value` is exactly what `toISOString` writes, so no calendar date was normalised. */
+function isCanonicalIsoInstant(value: string): boolean {
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
 function removeWorktreeRequestIsValid(request: RemoveWorktreeRequest): boolean {
   const { expectedHead, expectedBranch, expectedLastActivityIso, recordedHost } = request;
   if (!runnerHasHostName(recordedHost)) {
@@ -332,7 +338,7 @@ function removeWorktreeRequestIsValid(request: RemoveWorktreeRequest): boolean {
     expectedLastActivityIso !== null &&
     (typeof expectedLastActivityIso !== 'string' ||
       !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(expectedLastActivityIso) ||
-      Number.isNaN(Date.parse(expectedLastActivityIso)))
+      !isCanonicalIsoInstant(expectedLastActivityIso))
   ) {
     return false;
   }

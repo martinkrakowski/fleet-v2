@@ -3,9 +3,17 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import type { LanePlanRecord, PullRequestLinkRecord } from '../../domain/lane-plan-records.js';
+import type {
+  LanePlanRecord,
+  PullRequestLinkConflictRecord,
+  PullRequestLinkRecord,
+} from '../../domain/lane-plan-records.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
-import { LanePlanRepositoryAdapter } from './LanePlanRepositoryAdapter.adapter.js';
+import {
+  LanePlanRepositoryAdapter,
+  parsePullRequestLinkConflictStateRecord,
+  PULL_REQUEST_LINK_CONFLICT_STORE_VERSION_POLICY,
+} from './LanePlanRepositoryAdapter.adapter.js';
 import {
   ReadOnlyStateStoreError,
   StateFileUnreadableError,
@@ -63,6 +71,135 @@ function linkRecord(overrides: Partial<PullRequestLinkRecord> = {}): PullRequest
     ...overrides,
   };
 }
+
+function conflictRecord(overrides: Partial<PullRequestLinkConflictRecord> = {}): PullRequestLinkConflictRecord {
+  return {
+    schemaVersion: PULL_REQUEST_LINK_CONFLICT_STORE_VERSION_POLICY.writerVersion,
+    repository: 'acme/app',
+    number: 42,
+    linkedLane: { projectId: 'proj-1', planId: 'plan-1', laneId: 'L1' },
+    refusedLane: { projectId: 'proj-1', planId: 'plan-1', laneId: 'L2' },
+    recordedAtIso: '2026-11-05T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+describe('LanePlanRepositoryAdapter pull-request link conflicts (WB5b)', () => {
+  it('saves, lists and narrows conflicts in memory; the same conflict twice is unchanged', async () => {
+    const adapter = new LanePlanRepositoryAdapter();
+    const first = await adapter.savePullRequestLinkConflict!(conflictRecord());
+    expect(first).toEqual({ outcome: 'saved', conflict: conflictRecord() });
+    const again = await adapter.savePullRequestLinkConflict!(conflictRecord());
+    expect(again.outcome).toBe('unchanged');
+    if (again.outcome === 'unchanged') {
+      expect(again.conflict).toEqual(conflictRecord());
+    }
+    expect(await adapter.listPullRequestLinkConflicts!()).toHaveLength(1);
+    expect(await adapter.listPullRequestLinkConflicts!('proj-1')).toHaveLength(1);
+    expect(await adapter.listPullRequestLinkConflicts!('other-project')).toHaveLength(0);
+    // The refused lane's project narrows too.
+    const otherSide = await adapter.savePullRequestLinkConflict!(
+      conflictRecord({
+        repository: 'acme/other',
+        linkedLane: { projectId: 'proj-2', planId: null, laneId: 'L9' },
+        refusedLane: { projectId: 'proj-3', planId: null, laneId: 'L8' },
+      }),
+    );
+    expect(otherSide.outcome).toBe('saved');
+    expect(await adapter.listPullRequestLinkConflicts!('proj-2')).toHaveLength(1);
+    expect(await adapter.listPullRequestLinkConflicts!('proj-1')).toHaveLength(1);
+  });
+
+  it('refuses an invalid conflict record without throwing', async () => {
+    const adapter = new LanePlanRepositoryAdapter();
+    const refused = await adapter.savePullRequestLinkConflict!({
+      ...conflictRecord(),
+      refusedLane: { projectId: 'proj-1', planId: 'plan-1', laneId: 'L1' },
+    } as PullRequestLinkConflictRecord);
+    expect(refused.outcome).toBe('refused');
+    if (refused.outcome === 'refused') {
+      expect(refused.code).toBe('invalid');
+      expect(typeof refused.message).toBe('string');
+    }
+  });
+
+  it('a read-only store refuses to save a conflict', async () => {
+    const adapter = new LanePlanRepositoryAdapter({ readOnly: true });
+    await expect(adapter.savePullRequestLinkConflict!(conflictRecord())).rejects.toBeInstanceOf(
+      ReadOnlyStateStoreError,
+    );
+  });
+
+  describe('file store', () => {
+    let tempDir: string;
+
+    beforeEach(async () => {
+      tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-link-conflicts-test-'));
+    });
+
+    afterEach(async () => {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    });
+
+    it('writes link-conflicts.json with schemaVersion 1 and reopens it', async () => {
+      const adapter = new LanePlanRepositoryAdapter({ stateDir: tempDir });
+      expect((await adapter.savePullRequestLinkConflict!(conflictRecord())).outcome).toBe('saved');
+      const onDisk = JSON.parse(
+        await fs.readFile(path.join(tempDir, 'link-conflicts.json'), 'utf8'),
+      ) as Array<Record<string, unknown>>;
+      expect(onDisk).toHaveLength(1);
+      expect(onDisk[0]!.schemaVersion).toBe(1);
+
+      const reopened = new LanePlanRepositoryAdapter({ stateDir: tempDir });
+      expect(await reopened.listPullRequestLinkConflicts!()).toEqual([conflictRecord()]);
+      expect(await reopened.listPullRequestLinkConflicts!('proj-1')).toHaveLength(1);
+    });
+
+    it('saving the same conflict twice is unchanged and does not rewrite link-conflicts.json', async () => {
+      const adapter = new LanePlanRepositoryAdapter({ stateDir: tempDir });
+      await adapter.savePullRequestLinkConflict!(conflictRecord());
+      const before = await fs.readFile(path.join(tempDir, 'link-conflicts.json'), 'utf8');
+      const again = await adapter.savePullRequestLinkConflict!(conflictRecord());
+      expect(again.outcome).toBe('unchanged');
+      const after = await fs.readFile(path.join(tempDir, 'link-conflicts.json'), 'utf8');
+      expect(after).toBe(before);
+    });
+
+    it('fails closed with StateFileUnreadableError / StateFileUnknownVersionError on corrupt or unknown-schemaVersion link-conflicts.json instead of returning empty', async () => {
+      await fs.writeFile(path.join(tempDir, 'link-conflicts.json'), '{ not valid json', 'utf8');
+      const corrupt = new LanePlanRepositoryAdapter({ stateDir: tempDir });
+      await expect(corrupt.listPullRequestLinkConflicts!()).rejects.toBeInstanceOf(StateFileUnreadableError);
+
+      await fs.writeFile(
+        path.join(tempDir, 'link-conflicts.json'),
+        JSON.stringify([{ ...conflictRecord(), schemaVersion: 2 }]),
+        'utf8',
+      );
+      const unknownVersion = new LanePlanRepositoryAdapter({ stateDir: tempDir });
+      await expect(unknownVersion.listPullRequestLinkConflicts!()).rejects.toBeInstanceOf(
+        StateFileUnknownVersionError,
+      );
+
+      // A structurally invalid record is also unreadable, never silence.
+      await fs.writeFile(
+        path.join(tempDir, 'link-conflicts.json'),
+        JSON.stringify([{ ...conflictRecord(), recordedAtIso: 'not-a-timestamp' }]),
+        'utf8',
+      );
+      const invalid = new LanePlanRepositoryAdapter({ stateDir: tempDir });
+      await expect(invalid.listPullRequestLinkConflicts!()).rejects.toBeInstanceOf(StateFileUnreadableError);
+      expect(parsePullRequestLinkConflictStateRecord({ ...conflictRecord(), recordedAtIso: 'oops' })).toBeUndefined();
+    });
+
+    it('a read-only store refuses writes to link-conflicts.json', async () => {
+      const adapter = new LanePlanRepositoryAdapter({ stateDir: tempDir, readOnly: true });
+      await expect(adapter.savePullRequestLinkConflict!(conflictRecord())).rejects.toBeInstanceOf(
+        ReadOnlyStateStoreError,
+      );
+      await expect(fs.stat(path.join(tempDir, 'link-conflicts.json'))).rejects.toThrow();
+    });
+  });
+});
 
 describe('LanePlanRepositoryAdapter memory store', () => {
   it('saves, finds and lists in memory', async () => {

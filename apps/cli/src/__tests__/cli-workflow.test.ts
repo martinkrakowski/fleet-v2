@@ -65,6 +65,43 @@ const POLICY_REVISION = 'policy-1';
 const SESSION_ID = 'ses_cli_workflow_1';
 const RUNNER_PORT = 4166;
 
+/**
+ * WB5b2: a merge's pull request is verified on the forge before the grant. This
+ * workflow composes no forge, so the use case's reader is a stub that shows
+ * the pull request open on the lane's branch at the head (the same deps hook
+ * the composition tests use for the receipt map).
+ */
+function wireOpenPullRequestRead(
+  rt: FleetCliRuntime,
+  headRef: string,
+  headSha: string,
+): void {
+  const deps = (rt.execution.executeAuthorizedForgeAction as unknown as {
+    deps?: { forgeRead?: unknown; forgePort: { boundRepository?: unknown } };
+  }).deps;
+  if (deps === undefined) {
+    throw new Error('the forge use case carries no deps');
+  }
+  // No installation binds a repository here; the work order's is org/repo.
+  deps.forgePort.boundRepository = () => ({ owner: 'org', repo: 'repo' });
+  deps.forgeRead = {
+    readPullRequest: async (request: { ref: { kind: string; number?: number } }) => ({
+      outcome: 'found',
+      pullRequest: {
+        number: request.ref.number ?? 0,
+        state: 'open',
+        mergeState: 'clean',
+        headSha,
+        headRef,
+        baseRef: 'main',
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    }),
+  };
+}
+
 /** One CLI invocation: exit code, raw stdout text and captured stderr. */
 interface Invocation {
   readonly code: number;
@@ -726,6 +763,23 @@ describe('Fleet CLI workflow', () => {
       request: { id: 'dec-1', state: 'approved', grantId: 'grant-1', expectedHeadSha: laneHead },
     });
 
+    // WB5b2: a merge number no typed journal entry confirms must be verified on
+    // the forge, and this workflow has no forge read. The pull request was opened
+    // by an earlier fleet action, so its typed completed entry names number 7.
+    await runtime.execution.executionJournal.appendJournalEntry({
+      id: 'forge:forge-action-0:completed:1',
+      attemptId: ATTEMPT_ID,
+      workOrderId: WORK_ORDER_ID,
+      action: 'forge',
+      status: 'completed',
+      baseCommit: laneHead,
+      recordedAtIso: '2026-10-15T09:00:00Z',
+      sessionId: null,
+      detail: null,
+      pullRequest: { repository: 'org/repo', number: 7 },
+    });
+    wireOpenPullRequestRead(runtime, `feat/${LANE_ID}`, laneHead);
+
     const forge = await cli([
       'forge',
       'execute',
@@ -735,6 +789,7 @@ describe('Fleet CLI workflow', () => {
         attemptId: ATTEMPT_ID,
         workOrderId: WORK_ORDER_ID,
         kind: 'merge-pr',
+        pullRequestNumber: 7,
         expectedHeadSha: laneHead,
         authorizationGrantId: 'grant-1',
       }),
@@ -1172,6 +1227,23 @@ describe('Fleet CLI workflow', () => {
     expect(badKind.code).toBe(2);
     expect(badKind.stderr).toContain("forge kind must be 'push-and-open-pr' or 'merge-pr'");
 
+    // A malformed pullRequestNumber is a usage error, never dropped.
+    for (const bad of ['8junk', 0, -1, 7.5]) {
+      const badNumber = await cli([
+        'forge',
+        'execute',
+        '--json',
+        jsonArg({
+          attemptId: ATTEMPT_ID,
+          kind: 'merge-pr',
+          pullRequestNumber: bad,
+          authorizationGrantId: 'g',
+        }),
+      ]);
+      expect(badNumber.code).toBe(2);
+      expect(badNumber.stderr).toContain('forge pullRequestNumber must be a positive integer');
+    }
+
     // H8: the seat tool is required and never defaulted; missing or
     // undeclared is a usage error (exit 2) on both request commands.
     const missingReserveSeat = await cli([
@@ -1415,7 +1487,10 @@ describe('Fleet CLI workflow', () => {
       `${JSON.stringify({ state: 'approved', decisionRevision: 'dec-mp-1-r1', grantId: 'grant-mp-1', signature: decMp1Signature }, null, 2)}\n`,
     );
 
-    const mpCli = async (argv: readonly string[]): Promise<Invocation> => {
+    const mpCli = async (
+      argv: readonly string[],
+      prepare?: (rt: FleetCliRuntime) => void,
+    ): Promise<Invocation> => {
       const out: string[] = [];
       const err: string[] = [];
       const io: CliIo = {
@@ -1433,14 +1508,12 @@ describe('Fleet CLI workflow', () => {
       // reloaded from `<stateDir>/accepted-receipts.json` and
       // `<stateDir>/authorization-coordinates.json` for the final merge to
       // pass.
-      const code = await runCli(
-        ['--state-dir', multiProcStateDir, ...argv],
-        io,
-        createFleetCliRuntime({
-          stateDir: multiProcStateDir,
-          ghBinaryCandidates: [path.join(binDir, 'gh')],
-        }),
-      );
+      const mpRuntime = createFleetCliRuntime({
+        stateDir: multiProcStateDir,
+        ghBinaryCandidates: [path.join(binDir, 'gh')],
+      });
+      prepare?.(mpRuntime);
+      const code = await runCli(['--state-dir', multiProcStateDir, ...argv], io, mpRuntime);
       return { code, text: out.join(''), stderr: err.join('') };
     };
 
@@ -1836,6 +1909,20 @@ describe('Fleet CLI workflow', () => {
     );
 
     // --- process: forge the merge against reloaded state ----------------------
+    // WB5b2: the typed completed entry of the earlier fleet action names the
+    // pull request, so the merge needs no forge read (this workflow has none).
+    await createFleetCliRuntime({ stateDir: multiProcStateDir }).execution.executionJournal.appendJournalEntry({
+      id: 'forge:forge-mp-action-0:completed:1',
+      attemptId: mpAttemptId,
+      workOrderId: mpWorkOrderId,
+      action: 'forge',
+      status: 'completed',
+      baseCommit: mpLaneHead,
+      recordedAtIso: '2026-10-15T09:00:00Z',
+      sessionId: null,
+      detail: null,
+      pullRequest: { repository: 'org/repo', number: 7 },
+    });
     const forge = await mpCli([
       'forge',
       'execute',
@@ -1845,10 +1932,11 @@ describe('Fleet CLI workflow', () => {
         attemptId: mpAttemptId,
         workOrderId: mpWorkOrderId,
         kind: 'merge-pr',
+        pullRequestNumber: 7,
         expectedHeadSha: mpLaneHead,
         authorizationGrantId: 'grant-mp-1',
       }),
-    ]);
+    ], (rt) => wireOpenPullRequestRead(rt, 'feat/lane-mp-1', mpLaneHead));
     expect(forge.code).toBe(0);
     expect(jsonOf(forge)).toEqual({ outcome: 'executed', headSha: mpLaneHead });
 

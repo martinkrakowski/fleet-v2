@@ -92,6 +92,8 @@ export interface LanePlanSidecar {
 
 export const LANE_PLAN_RECORD_VERSION = 1 as const;
 export const PULL_REQUEST_LINK_RECORD_VERSION = 1 as const;
+/** Record schema version for stored pull-request link conflicts on disk (WB5b). */
+export const PULL_REQUEST_LINK_CONFLICT_SCHEMA_VERSION = 1 as const;
 export const PLANNED_LANE_MAX_ALIASES = 16;
 /** Where a link came from (plan §3.2 "PR links are unique"). */
 export const PULL_REQUEST_LINK_SOURCES = ['fleet-forge-action', 'run', 'sidecar', 'cli'] as const;
@@ -144,4 +146,28 @@ export interface PullRequestLinkRecord {
   readonly laneId: string;
   readonly source: PullRequestLinkSource;
   readonly linkedAtIso: string;
+}
+
+/** One lane tuple named by a link conflict: the work order's own lane in its project. */
+export interface PullRequestLinkConflictLane {
+  readonly projectId: string;
+  readonly planId: string | null;
+  readonly laneId: string;
+}
+
+/**
+ * The durable fact that a pull request was already linked to another lane when
+ * a second lane tried to link or merge it (WB5b). Stored in
+ * `link-conflicts.json`; never evidence against the merge itself, which is
+ * still recorded.
+ */
+export interface PullRequestLinkConflictRecord {
+  readonly schemaVersion: typeof PULL_REQUEST_LINK_CONFLICT_SCHEMA_VERSION;
+  readonly repository: string;
+  readonly number: number;
+  /** The lane the pull request was already linked to. */
+  readonly linkedLane: PullRequestLinkConflictLane;
+  /** The lane whose link or merge was refused. */
+  readonly refusedLane: PullRequestLinkConflictLane;
+  readonly recordedAtIso: string;
 }

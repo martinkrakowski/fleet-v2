@@ -9,16 +9,19 @@
  * fixed message, never echoed.
  */
 
-import { readExactPlainRecord } from '../plain-record-reads.js';
+import { isCalendarDateTime, readExactPlainRecord } from '../plain-record-reads.js';
 import {
   CANONICAL_ISO_PATTERN,
   PLAN_ID_PATTERN,
   PLAN_PROJECT_ID_PATTERN,
   PLANNED_LANE_ID_PATTERN,
+  PULL_REQUEST_LINK_CONFLICT_SCHEMA_VERSION,
   PULL_REQUEST_LINK_RECORD_VERSION,
   PULL_REQUEST_LINK_SOURCES,
 } from '../lane-plan-records.js';
 import type {
+  PullRequestLinkConflictLane,
+  PullRequestLinkConflictRecord,
   PullRequestLinkRecord,
   PullRequestLinkSource,
   PlanPullRequestRef,
@@ -200,6 +203,145 @@ export function decidePullRequestLink(
 
 function invalid(message: string): PullRequestLinkResult {
   return { success: false, error: new Error(message), code: 'invalid' };
+}
+
+/** The upper bound of a pull-request number, shared with the merge record's bound. */
+const MAX_CONFLICT_PULL_REQUEST_NUMBER = 999_999_999;
+
+const CONFLICT_RECORD_KEYS: readonly string[] = [
+  'schemaVersion',
+  'repository',
+  'number',
+  'linkedLane',
+  'refusedLane',
+  'recordedAtIso',
+];
+
+const CONFLICT_LANE_KEYS: readonly string[] = ['projectId', 'planId', 'laneId'];
+
+export type PullRequestLinkConflictRead =
+  | { readonly success: true; readonly record: PullRequestLinkConflictRecord }
+  | { readonly success: false; readonly message: string };
+
+/**
+ * Read one stored pull-request link conflict. Every field is read through its
+ * own property descriptor, so no getter ever runs; a sparse array, a class
+ * instance, an extra key, a malformed lane tuple or an impossible timestamp
+ * is refused with a fixed message and never a throw.
+ */
+export function readPullRequestLinkConflictRecord(input: unknown): PullRequestLinkConflictRead {
+  try {
+    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+      return { success: false, message: 'PullRequestLinkConflict requires a record' };
+    }
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return { success: false, message: 'PullRequestLinkConflict requires a plain record' };
+    }
+    const fields = readExactPlainRecord(input, CONFLICT_RECORD_KEYS);
+    if (fields === null) {
+      return { success: false, message: 'PullRequestLinkConflict must have exactly its record fields' };
+    }
+    // Absent schemaVersion reads as 1 (D6).
+    if (fields.schemaVersion !== undefined && fields.schemaVersion !== PULL_REQUEST_LINK_CONFLICT_SCHEMA_VERSION) {
+      return { success: false, message: 'PullRequestLinkConflict schemaVersion must be 1' };
+    }
+    const refSnapshot = { repository: fields.repository, number: fields.number };
+    const refError = pullRequestRefError('', refSnapshot);
+    if (refError !== null) {
+      return { success: false, message: `PullRequestLinkConflict ${refError.replace(/^\./, '')}` };
+    }
+    if ((fields.number as number) > MAX_CONFLICT_PULL_REQUEST_NUMBER) {
+      return { success: false, message: 'PullRequestLinkConflict number: must be a positive integer' };
+    }
+    const linkedLane = readConflictLane(fields.linkedLane);
+    if (typeof linkedLane === 'string') {
+      return { success: false, message: `PullRequestLinkConflict linkedLane${linkedLane}` };
+    }
+    const refusedLane = readConflictLane(fields.refusedLane);
+    if (typeof refusedLane === 'string') {
+      return { success: false, message: `PullRequestLinkConflict refusedLane${refusedLane}` };
+    }
+    if (
+      linkedLane.projectId === refusedLane.projectId &&
+      linkedLane.planId === refusedLane.planId &&
+      linkedLane.laneId === refusedLane.laneId
+    ) {
+      return { success: false, message: 'PullRequestLinkConflict lanes must differ' };
+    }
+    const recordedAtIso = fields.recordedAtIso;
+    if (
+      typeof recordedAtIso !== 'string' ||
+      isPlanSecretShaped(recordedAtIso) ||
+      !CANONICAL_ISO_PATTERN.test(recordedAtIso) ||
+      !isCalendarDateTime(recordedAtIso) ||
+      new Date(recordedAtIso).toISOString() !== recordedAtIso
+    ) {
+      return { success: false, message: 'PullRequestLinkConflict recordedAtIso must be a canonical UTC timestamp' };
+    }
+    const record: PullRequestLinkConflictRecord = Object.freeze({
+      schemaVersion: PULL_REQUEST_LINK_CONFLICT_SCHEMA_VERSION,
+      repository: fields.repository as string,
+      number: fields.number as number,
+      linkedLane,
+      refusedLane,
+      recordedAtIso,
+    });
+    return { success: true, record };
+  } catch {
+    return { success: false, message: 'PullRequestLinkConflict input could not be read' };
+  }
+}
+
+/** A valid lane tuple, or the message suffix naming why it was refused. */
+function readConflictLane(value: unknown): PullRequestLinkConflictLane | string {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return ': must be an object';
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return ': must be a plain object';
+  }
+  const fields = readExactPlainRecord(value, CONFLICT_LANE_KEYS);
+  if (fields === null) {
+    return ': must have exactly projectId, planId and laneId';
+  }
+  const projectIdError = planIdError('projectId', fields.projectId, PLAN_PROJECT_ID_PATTERN, 'project id');
+  if (projectIdError !== null) {
+    return `.${projectIdError}`;
+  }
+  if (fields.planId !== null) {
+    const planIdCheck = planIdError('planId', fields.planId, PLAN_ID_PATTERN, 'plan id');
+    if (planIdCheck !== null) {
+      return `.${planIdCheck}`;
+    }
+  } else if (fields.planId === undefined) {
+    return '.planId: must be a plan id or null';
+  }
+  const laneIdError = planIdError('laneId', fields.laneId, PLANNED_LANE_ID_PATTERN, 'lane id');
+  if (laneIdError !== null) {
+    return `.${laneIdError}`;
+  }
+  return Object.freeze({
+    projectId: fields.projectId as string,
+    planId: fields.planId as string | null,
+    laneId: fields.laneId as string,
+  });
+}
+
+/**
+ * The deterministic store key of a link conflict, keyed on the repository,
+ * the number and both lane tuples, so the same conflict is never recorded twice.
+ */
+export function pullRequestLinkConflictKey(record: PullRequestLinkConflictRecord): string {
+  const lane = (lane: PullRequestLinkConflictLane): string =>
+    `${lane.projectId}|${lane.planId ?? ''}|${lane.laneId}`;
+  return [
+    record.repository,
+    String(record.number),
+    lane(record.linkedLane),
+    lane(record.refusedLane),
+  ].join('#');
 }
 
 function unreadableInputResult(): PullRequestLinkResult {

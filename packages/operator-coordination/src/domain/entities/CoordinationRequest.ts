@@ -11,6 +11,7 @@
  * gap is recorded explicitly rather than inferred from silence.
  */
 
+import { GRANT_RECORD_VERSION } from '../coordination-records.js';
 import type {
   AuthorizationConsumptionRecord,
   CoordinationRequestRecord,
@@ -33,10 +34,35 @@ import type { CoordinationStateValue } from '../value-objects/CoordinationState.
 const DELIVERY_STATUSES: readonly string[] = ['delivered', 'pending', 'delivery-gap'];
 
 /** The record with writable optional policyGrant/mergeGrant so normalization can omit the keys. */
-type MutableCoordinationRequestRecord = Omit<CoordinationRequestRecord, 'policyGrant' | 'mergeGrant'> & {
+type MutableCoordinationRequestRecord = Omit<
+  CoordinationRequestRecord,
+  'policyGrant' | 'mergeGrant' | 'grantRecordVersion' | 'grantAttemptId'
+> & {
   policyGrant?: PolicyGrantRecord;
   mergeGrant?: MergeGrantRecord;
+  grantRecordVersion?: typeof GRANT_RECORD_VERSION;
+  grantAttemptId?: string;
 };
+
+const MAX_GRANT_ATTEMPT_ID_LENGTH = 256;
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/;
+
+function readOwnDataValue(record: object, key: string): unknown {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(record, key);
+  } catch {
+    throw new Error(`CoordinationRequest ${key} validation failed due to a prohibited Proxy trap execution.`);
+  }
+  if (descriptor === undefined) {
+    return undefined;
+  }
+  if (descriptor.get || descriptor.set) {
+    throw new Error(`CoordinationRequest ${key} cannot be an accessor property.`);
+  }
+  return descriptor.value;
+}
 
 function readGrantProperty(
   record: CoordinationRequestRecord,
@@ -105,6 +131,7 @@ export class CoordinationRequest {
     }
     const policyGrant = CoordinationRequest.readPolicyGrant(record);
     const mergeGrant = CoordinationRequest.readMergeGrant(record);
+    const binding = CoordinationRequest.readGrantBinding(record, policyGrant);
     if (!DELIVERY_STATUSES.includes(record.deliveryStatus)) {
       throw new Error(`CoordinationRequest has an invalid delivery status: ${String(record.deliveryStatus)}`);
     }
@@ -135,7 +162,50 @@ export class CoordinationRequest {
     } else {
       normalized.mergeGrant = mergeGrant;
     }
+    delete normalized.grantRecordVersion;
+    delete normalized.grantAttemptId;
+    if (binding.version !== undefined) {
+      normalized.grantRecordVersion = binding.version;
+    }
+    if (binding.attemptId !== undefined) {
+      normalized.grantAttemptId = binding.attemptId;
+    }
     return new CoordinationRequest(normalized);
+  }
+
+  /**
+   * The stored grant version and the attempt it records. An unknown version, or a
+   * malformed attempt (wrong type, blank, too long, a control or bidi character), makes
+   * the whole record unreadable: it is never read as "no attempt". A recorded attempt
+   * needs version 2, and must be the policy grant's own attempt when there is one.
+   */
+  private static readGrantBinding(
+    record: CoordinationRequestRecord,
+    policyGrant: PolicyGrantRecord | undefined,
+  ): { readonly version?: typeof GRANT_RECORD_VERSION; readonly attemptId?: string } {
+    const version = readOwnDataValue(record, 'grantRecordVersion');
+    const attempt = readOwnDataValue(record, 'grantAttemptId');
+    if (version !== undefined && version !== GRANT_RECORD_VERSION) {
+      throw new Error('CoordinationRequest has an unknown grant record version');
+    }
+    if (attempt === undefined) {
+      return version === undefined ? {} : { version: GRANT_RECORD_VERSION };
+    }
+    if (
+      typeof attempt !== 'string' ||
+      attempt.trim().length === 0 ||
+      attempt.length > MAX_GRANT_ATTEMPT_ID_LENGTH ||
+      CONTROL_CHARACTER.test(attempt)
+    ) {
+      throw new Error('CoordinationRequest grantAttemptId must be a clean non-empty string');
+    }
+    if (version !== GRANT_RECORD_VERSION) {
+      throw new Error('CoordinationRequest grantAttemptId requires grant record version 2');
+    }
+    if (policyGrant !== undefined && policyGrant.attemptId !== attempt) {
+      throw new Error('CoordinationRequest grantAttemptId must be its policy grant attempt');
+    }
+    return { version: GRANT_RECORD_VERSION, attemptId: attempt };
   }
 
   private static readConsumptions(
@@ -409,6 +479,16 @@ export class CoordinationRequest {
 
   getPolicyGrant(): PolicyGrantRecord | null {
     return this.record.policyGrant === undefined ? null : { ...this.record.policyGrant };
+  }
+
+  /** The attempt the grant is bound to: the recorded one, else a policy grant's own; null on a legacy owner grant. */
+  getBoundAttemptId(): string | null {
+    return this.record.grantAttemptId ?? this.record.policyGrant?.attemptId ?? null;
+  }
+
+  /** True for a version-2 record that names no attempt: it authorizes nothing. */
+  isMissingRecordedAttempt(): boolean {
+    return this.record.grantRecordVersion === GRANT_RECORD_VERSION && this.getBoundAttemptId() === null;
   }
 
   getMergeGrant(): MergeGrantRecord | null {

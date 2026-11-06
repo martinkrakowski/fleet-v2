@@ -51,8 +51,8 @@ import { SshExecutor } from './SshExecutor.adapter.js';
 import { GateSlotBudget, readGateSlotCapacity } from './GateSlotBudget.helper.js';
 import { createHash } from 'node:crypto';
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
-import { buildGateReceiptKey } from '../../domain/gate-receipt-key.js';
-import type { GateReceiptKey } from '../../domain/gate-receipt-key.js';
+import { GATE_RECEIPT_TOOLCHAIN_NAMES, buildGateReceiptKey } from '../../domain/gate-receipt-key.js';
+import type { GateReceiptKey, GateReceiptToolchainVersions } from '../../domain/gate-receipt-key.js';
 import type { GateReceiptReusePort } from '../../application/ports/out/GateReceiptReusePort.out-port.js';
 import {
   applyCoverage,
@@ -868,5 +868,149 @@ export class GatePredicateAdapter implements GatePredicatePort {
       detail: detailForCommand(run, command, coverage),
       coverage,
     };
+  }
+}
+
+const PROBE_TIMEOUT_MS = 10_000;
+const VERSION_PROBE_MAX_BYTES = 4096;
+const TURBO_JSON_MAX_BYTES = 65_536;
+const DECLARED_VALUE_MAX_BYTES = 8192;
+const MAX_DECLARED_ENVIRONMENT_NAMES = 16;
+/** The domain's own version rule (`gate-receipt-key.ts`). */
+const TOOLCHAIN_VERSION_TOKEN = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/;
+/** A declared name is passed to `printenv` as an argument, so it can never look like an option or a pattern. */
+const DECLARED_ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+
+/** One guarded receipt-input command: argv, timeout and output cap. A throw or a run with no completed exit is undefined. */
+async function runReceiptProbe(
+  executor: CommandExecutorPort,
+  worktreePath: string,
+  argv: readonly string[],
+  maxBufferBytes: number,
+): Promise<CommandRunResult | undefined> {
+  try {
+    const run = await executor.run(argv, { cwd: worktreePath, timeoutMs: PROBE_TIMEOUT_MS, maxBufferBytes });
+    if (run === null || typeof run !== 'object' || run.error !== undefined || run.exitCode === null) {
+      return undefined;
+    }
+    if (typeof run.exitCode !== 'number' || typeof run.stdout !== 'string') {
+      return undefined;
+    }
+    // The executor enforces the cap; a result past it is still never read, so a key is never built from cut output.
+    return Buffer.byteLength(run.stdout, 'utf8') > maxBufferBytes ? undefined : run;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseToolchainVersion(stdout: string): string | undefined {
+  const token = stdout.split(/\s+/).find((part) => /[0-9]/.test(part));
+  return token !== undefined && TOOLCHAIN_VERSION_TOKEN.test(token) ? token : undefined;
+}
+
+/**
+ * The versions of the gate toolchain on the host, read as `<tool> --version`. Any unreadable tool makes the
+ * whole set unreadable (undefined, a receipt miss). Never throws and never returns a partial set.
+ */
+export async function readGateToolchainVersions(
+  executor: CommandExecutorPort,
+  worktreePath: string,
+): Promise<GateReceiptToolchainVersions | undefined> {
+  try {
+    const versions: Record<string, string> = {};
+    for (const name of GATE_RECEIPT_TOOLCHAIN_NAMES) {
+      const run = await runReceiptProbe(executor, worktreePath, [name, '--version'], VERSION_PROBE_MAX_BYTES);
+      if (run === undefined || run.exitCode !== 0) {
+        return undefined;
+      }
+      const version = parseToolchainVersion(run.stdout);
+      if (version === undefined) {
+        return undefined;
+      }
+      versions[name] = version;
+    }
+    const { node, yarn, hexagen, turbo } = versions;
+    if (node === undefined || yarn === undefined || hexagen === undefined || turbo === undefined) {
+      return undefined;
+    }
+    return { node, yarn, hexagen, turbo };
+  } catch {
+    return undefined;
+  }
+}
+
+/** The sorted union of the `env` names of `turbo.json`'s tasks, or undefined when absent, malformed or too many. */
+function declaredEnvironmentNames(turboJson: string): string[] | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(turboJson);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const tasks = (parsed as { tasks?: unknown }).tasks;
+  if (tasks === null || typeof tasks !== 'object' || Array.isArray(tasks)) {
+    return undefined;
+  }
+  const names = new Set<string>();
+  for (const task of Object.values(tasks)) {
+    const env = task !== null && typeof task === 'object' ? (task as { env?: unknown }).env : undefined;
+    if (env === undefined) {
+      continue;
+    }
+    if (!Array.isArray(env)) {
+      return undefined;
+    }
+    for (const name of env) {
+      if (typeof name !== 'string' || !DECLARED_ENVIRONMENT_NAME.test(name)) {
+        return undefined;
+      }
+      names.add(name);
+      if (names.size > MAX_DECLARED_ENVIRONMENT_NAMES) {
+        return undefined;
+      }
+    }
+  }
+  return names.size === 0 ? undefined : [...names].sort();
+}
+
+/**
+ * The SHA-256 of the declared environment: the `env` names of `turbo.json`'s tasks with their values on the
+ * host. Only the digest is returned; no name's value and no path leaves this function. Any unreadable part is
+ * undefined (a receipt miss). Never throws.
+ */
+export async function readGateDeclaredEnvironmentDigest(
+  executor: CommandExecutorPort,
+  worktreePath: string,
+): Promise<string | undefined> {
+  try {
+    const turbo = await runReceiptProbe(executor, worktreePath, ['cat', 'turbo.json'], TURBO_JSON_MAX_BYTES);
+    if (turbo === undefined || turbo.exitCode !== 0) {
+      return undefined;
+    }
+    const names = declaredEnvironmentNames(turbo.stdout);
+    if (names === undefined) {
+      return undefined;
+    }
+    const entries: Array<[string, string]> = [];
+    for (const name of names) {
+      const run = await runReceiptProbe(executor, worktreePath, ['printenv', name], DECLARED_VALUE_MAX_BYTES);
+      if (run === undefined || (run.exitCode !== 0 && run.exitCode !== 1)) {
+        return undefined;
+      }
+      // printenv exits 1 for a variable that is not set: its value is the empty string.
+      const value = run.exitCode === 1 ? '' : run.stdout.replace(/\n$/, '');
+      if (Buffer.byteLength(value, 'utf8') > DECLARED_VALUE_MAX_BYTES) {
+        return undefined;
+      }
+      entries.push([name, value]);
+    }
+    return createHash('sha256')
+      .update(JSON.stringify({ names, values: Object.fromEntries(entries) }))
+      .digest('hex');
+  } catch {
+    return undefined;
   }
 }

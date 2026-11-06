@@ -180,7 +180,7 @@ const CHAIN_KEYS: readonly (keyof ChainsSection)[] = [
   'fix',
 ];
 const CHAIN_STEP_KEYS: readonly string[] = ['seatId', 'triggers'];
-const POLICY_KEYS: readonly string[] = [
+export const POLICY_KEYS: readonly string[] = [
   'forbiddenRoutes',
   'perLaneCostCeiling',
   'useFreeSeats',

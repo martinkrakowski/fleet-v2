@@ -171,6 +171,11 @@ function readValue(
       if (length > schema.maxLength) {
         return { ok: false, reason: 'too-many-items', field: path };
       }
+      // An array level counts toward `MAX_DEPTH` like a record level, so a
+      // deeply nested array chain cannot bypass the depth bound.
+      if (depth + 1 > MAX_DEPTH) {
+        return { ok: false, reason: 'too-deep', field: path };
+      }
       if (!isValidFieldSchema(schema.items)) {
         return INVALID_SCHEMA;
       }
@@ -186,7 +191,7 @@ function readValue(
           || !itemDescriptor.enumerable) {
           return { ok: false, reason: 'not-data-property', field: itemPath };
         }
-        const itemRead = readValue(itemDescriptor.value, schema.items, depth, itemPath, state);
+        const itemRead = readValue(itemDescriptor.value, schema.items, depth + 1, itemPath, state);
         if (!itemRead.ok) {
           return itemRead;
         }
@@ -214,7 +219,9 @@ function isValidFieldSchema(field: unknown): boolean {
   };
   switch (candidate.kind) {
     case 'string':
-      return typeof candidate.maxLength === 'number' && candidate.maxLength >= 0;
+      return typeof candidate.maxLength === 'number'
+        && Number.isFinite(candidate.maxLength)
+        && candidate.maxLength >= 0;
     case 'integer':
       return (candidate.min === undefined || (typeof candidate.min === 'number' && candidate.min >= 0))
         && (candidate.max === undefined || (typeof candidate.max === 'number' && candidate.max >= 0));
@@ -225,7 +232,9 @@ function isValidFieldSchema(field: unknown): boolean {
     case 'record':
       return true;
     case 'array':
-      return typeof candidate.maxLength === 'number' && candidate.maxLength >= 0;
+      return typeof candidate.maxLength === 'number'
+        && Number.isFinite(candidate.maxLength)
+        && candidate.maxLength >= 0;
     default:
       return false;
   }

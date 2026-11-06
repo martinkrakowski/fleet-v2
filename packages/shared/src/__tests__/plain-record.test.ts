@@ -383,4 +383,41 @@ describe('readPlainRecord', () => {
       field: 'next.next.next.next.next.next.next.next.next',
     });
   });
+
+  it('refuses nine nested array layers as too-deep', () => {
+    let itemSchema: PlainFieldSchema = { kind: 'string', maxLength: 10 };
+    let value: unknown = 'x';
+    for (let i = 0; i < MAX_DEPTH + 1; i += 1) {
+      itemSchema = { kind: 'array', maxLength: 1, items: itemSchema };
+      value = [value];
+    }
+    const schema: PlainRecordSchema = { items: itemSchema };
+    const read = readPlainRecord({ items: value }, schema);
+    expect(read).toEqual({
+      ok: false,
+      reason: 'too-deep',
+      field: 'items[0][0][0][0][0][0][0][0]',
+    });
+  });
+
+  it('refuses a schema with a non-finite bound', () => {
+    expect(readPlainRecord({}, { x: { kind: 'string', maxLength: Infinity } })).toEqual({
+      ok: false,
+      reason: 'invalid-schema',
+      field: null,
+    });
+    expect(readPlainRecord({}, { x: { kind: 'string', maxLength: Number.NaN } })).toEqual({
+      ok: false,
+      reason: 'invalid-schema',
+      field: null,
+    });
+    expect(readPlainRecord(
+      {},
+      { x: { kind: 'array', maxLength: Infinity, items: { kind: 'string', maxLength: 10 } } },
+    )).toEqual({
+      ok: false,
+      reason: 'invalid-schema',
+      field: null,
+    });
+  });
 });

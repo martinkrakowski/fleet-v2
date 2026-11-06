@@ -177,9 +177,11 @@ function applyEnvironmentOverrides(
  * content. Environment overrides apply after parsing a v1 file or an absent
  * file, whatever its status. The result carries the parsed file as
  * `installation` and the derived v2 model with its runner capability sources
- * (D4) as `model`; `warnings` lists accepted-and-ignored v1 fields (D1). When
- * a `validatePolicy` hook is provided the loader calls it with the model and
- * treats every returned string as a load error.
+ * (D4) as `model`; `warnings` lists accepted-and-ignored v1 fields (D1) and
+ * the parser's warning-level findings (such as an invalid
+ * `policy.daemon.chainRefresh` mode, CO8a). When a `validatePolicy` hook is
+ * provided the loader calls it with the model and treats every returned string
+ * as a load error.
  */
 export function loadInstallation(options: LoadOptions = {}): LoadResult {
   const cwd = options.cwd ?? process.cwd();
@@ -188,6 +190,7 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
 
   let installation: FleetInstallation;
   let source: 'absent' | 'loaded';
+  let parseWarnings: string[] = [];
   try {
     const raw = readFileSync(file, 'utf8');
     let parsed: unknown;
@@ -201,6 +204,7 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
       return { status: 'invalid', file, errors: result.errors };
     }
     installation = result.installation;
+    parseWarnings = result.warnings ?? [];
     source = 'loaded';
   } catch (error) {
     if (readErrorCode(error) === 'ENOENT') {
@@ -218,7 +222,8 @@ export function loadInstallation(options: LoadOptions = {}): LoadResult {
     installation = merged.installation;
   }
   const checked = checkInstallationModel(installation);
-  const { model, warnings } = checked;
+  const { model } = checked;
+  const warnings = [...checked.warnings, ...parseWarnings];
   errors.push(...checked.errors);
   if (options.validatePolicy !== undefined) {
     errors.push(...options.validatePolicy(model));

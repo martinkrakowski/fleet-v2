@@ -523,6 +523,36 @@ describe('writeInstallationV2 round trip (shared key lists)', () => {
       expect(writeInstallationV2(second)).toBe(text);
     }
   });
+
+  it('round-trips an invalid chainRefresh value unchanged so the operator sees their own text', () => {
+    const base = {
+      schemaVersion: 2,
+      hosts: {
+        local: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['orchestrator', 'lane-runner'],
+          runner: { kind: 'opencode', port: 46000 },
+        },
+      },
+      forge: { mode: 'none' },
+      policy: { daemon: { chainRefresh: 'livee' } },
+    };
+    const parsed = parseInstallation(base);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect(parsed.warnings).toEqual(['policy.daemon.chainRefresh: chain-refresh-mode-invalid']);
+    const written = writeInstallationV2(parsed.installation as FleetInstallationV2);
+    expect(written).toContain('"chainRefresh": "livee"');
+    const reparsed = parseInstallation(JSON.parse(written));
+    expect(reparsed.ok).toBe(true);
+    if (reparsed.ok) {
+      expect(reparsed.installation).toEqual(parsed.installation);
+      expect(reparsed.warnings).toEqual(parsed.warnings);
+    }
+  });
 });
 
 describe('F96 robustness', () => {

@@ -21,6 +21,8 @@ import type {
   ReviewerSeatCheck,
 } from '../../ports/out/EvidenceSeatPolicyPort.out-port.js';
 import type { RequestIndependentReviewRequest } from '../../ports/in/RequestIndependentReviewPort.in-port.js';
+import { ReviewReceipt } from '../../../domain/entities/ReviewReceipt.js';
+import { isValidChainName } from '../../../domain/evidence-records.js';
 import { RequestIndependentReviewUseCase } from '../RequestIndependentReviewUseCase.use-case.js';
 
 const HEAD1 = '1111111111111111111111111111111111111111';
@@ -523,5 +525,191 @@ describe('brief-check requires the brief text (SEC-4)', () => {
     expect(reviewer.calls).toHaveLength(1);
     expect(reviewer.calls[0]?.kind).toBe('code-review');
     expect('briefText' in reviewer.calls[0]).toBe(false);
+  });
+});
+
+describe('unknown cause codes on receipts and the chain-name guard (RV2, CO9 #774)', () => {
+  const REQUEST_ID = 'review-01JB0000000000000000000002';
+
+  function codeReviewRequest(): RequestIndependentReviewRequest {
+    return {
+      assessmentId: 'asm-1',
+      projectId: 'proj-1',
+      attemptId: 'att-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      reviewerModel: 'openai/gpt-4o',
+      kind: 'code-review',
+      requestId: REQUEST_ID,
+    };
+  }
+
+  function unknownReviewer(unknownReason: string): StubReviewer {
+    const reviewer = new StubReviewer();
+    const delegate = reviewer.runIndependentReview.bind(reviewer);
+    reviewer.runIndependentReview = async (request) => {
+      // The default stub answer is discarded; only the call is recorded.
+      await delegate(request);
+      return {
+        outcome: 'completed',
+        readOnlyVerified: true,
+        result: 'unknown',
+        findings: [],
+        rawOutput: 'the reviewer could not decide',
+        completedAtIso: '2026-11-06T00:00:00.000Z',
+        unknownReason: unknownReason as never,
+      };
+    };
+    return reviewer;
+  }
+
+  for (const unknownReason of ['empty', 'unparseable-verdict', 'no-findings-on-fail']) {
+    it(`stores unknownReason '${unknownReason}' on the receipt and replays it without a second review`, async () => {
+      const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+      const reviewer = unknownReviewer(unknownReason);
+      const archive = new StubArchive();
+      const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
+
+      const first = await useCase.requestIndependentReview(codeReviewRequest());
+      expect(first.outcome).toBe('reviewed');
+      if (first.outcome !== 'reviewed') {
+        throw new Error('expected a recorded review');
+      }
+      expect(first.receipt.result).toBe('unknown');
+      expect(first.receipt.unknownReason).toBe(unknownReason);
+
+      const stored = await repo.findAssessmentById('asm-1');
+      expect(stored?.reviewReceipts[0]?.unknownReason).toBe(unknownReason);
+
+      // Replaying the same requestId returns the stored receipt, unknownReason
+      // included, without running a second review.
+      const replay = await useCase.requestIndependentReview(codeReviewRequest());
+      expect(replay).toEqual(first);
+      expect(reviewer.calls).toHaveLength(1);
+    });
+  }
+
+  it('a completed pass receipt carries no unknownReason key at all', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const reviewer = new StubReviewer();
+    const archive = new StubArchive();
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
+
+      const result = await useCase.requestIndependentReview(codeReviewRequest());
+      expect(result.outcome).toBe('reviewed');
+      if (result.outcome !== 'reviewed') {
+        throw new Error('expected a recorded review');
+      }
+      expect('unknownReason' in result.receipt).toBe(false);
+  });
+
+  it('robustness (1): ReviewReceipt.create refuses null, wrong-typed fields, sparse findings, invalid unknownReason, and throwing getters without throwing', () => {
+    function receiptProps(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+      return {
+        id: 'rr-1',
+        assessmentId: 'asm-1',
+        projectId: 'proj-1',
+        attemptId: 'att-1',
+        candidateHeadSha: HEAD1,
+        reviewerModel: 'openai/gpt-4o',
+        implementerModel: 'anthropic/claude-3-5-sonnet',
+        readOnlyVerified: true,
+        result: 'unknown',
+        findings: [],
+        evidenceRef: 'ref-1',
+        policyRevision: 'pol-1',
+        completedAtIso: '2026-11-06T00:00:00.000Z',
+        ...overrides,
+      };
+    }
+    const refusing: unknown[] = [
+      null,
+      42,
+      'x',
+      [],
+      receiptProps({ unknownReason: 'not-a-code' }),
+      receiptProps({ result: 'pass', unknownReason: 'empty' }),
+      receiptProps({ result: 'fail', unknownReason: 'empty' }),
+      receiptProps({ findings: [null] }),
+      receiptProps({ findings: new Array(1) }),
+      Object.defineProperty({}, 'result', { get() { throw new Error('boom'); }, enumerable: true }),
+    ];
+    for (const bad of refusing) {
+      const created = ReviewReceipt.create(bad as never);
+      expect(created.success).toBe(false);
+      expect(created.error).toBeInstanceOf(Error);
+    }
+    // A sparse findings array is refused with the finding message, not a throw.
+    const sparse = ReviewReceipt.create(receiptProps({ findings: new Array(1) }) as never);
+    expect(sparse.success).toBe(false);
+
+    // A valid unknown receipt with a declared code is accepted, and the absent
+    // code is omitted entirely from the record.
+    const unknown = ReviewReceipt.create(receiptProps({ unknownReason: 'empty' }) as never);
+    expect(unknown.success).toBe(true);
+    expect(unknown.value?.getUnknownReason()).toBe('empty');
+    expect(unknown.value?.toRecord()).toMatchObject({ unknownReason: 'empty' });
+    const plain = ReviewReceipt.create(receiptProps({ result: 'pass' }) as never);
+    expect(plain.success).toBe(true);
+    expect('unknownReason' in plain.value!.toRecord()).toBe(false);
+  });
+
+  it('robustness (3): replaying a requestId returns the stored unknown receipt and unknownReason without a second review call', async () => {
+    const repo = new InMemoryAssessmentRepo([sampleRecord()]);
+    const reviewer = unknownReviewer('unparseable-verdict');
+    const archive = new StubArchive();
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
+
+    const first = await useCase.requestIndependentReview(codeReviewRequest());
+    const replay = await useCase.requestIndependentReview(codeReviewRequest());
+    expect(replay).toEqual(first);
+    expect(reviewer.calls).toHaveLength(1);
+  });
+
+  it('fail-first: a chain subject with a rejected chain name is refused before any assessment or review request', async () => {
+    const repo = new InMemoryAssessmentRepo([]);
+    const reviewer = new StubReviewer();
+    const archive = new StubArchive();
+    const useCase = new RequestIndependentReviewUseCase({ repo, reviewer, archive });
+
+    const result = await useCase.requestIndependentReview({
+      assessmentId: 'asm-chain-1',
+      projectId: 'proj-1',
+      attemptId: 'att-chain-1',
+      candidateHeadSha: HEAD1,
+      policyRevision: 'pol-1',
+      implementerModel: 'anthropic/claude-3-5-sonnet',
+      reviewerModel: 'openai/gpt-4o',
+      kind: 'pre-merge',
+      requestId: REQUEST_ID,
+      subject: {
+        kind: 'chain',
+        projectId: 'proj-1',
+        chainName: 'bad/name',
+        integrationHeadSha: HEAD1,
+      },
+    } as never);
+
+    expect(result.outcome).toBe('rejected');
+    if (result.outcome !== 'rejected') {
+      throw new Error('expected a rejection');
+    }
+    expect(result.rejection).toBe('invalid-request');
+    expect(reviewer.calls).toHaveLength(0);
+    expect(archive.calls).toHaveLength(0);
+    expect(await repo.findAssessmentById('asm-chain-1')).toBeNull();
+  });
+
+  it('parity: the local chain-name validator accepts exactly the chain domain set', async () => {
+    // The cases the chain-name tests pin (work-execution base-branch.ts CHAIN_PATTERN),
+    // mirrored here because contexts never import across.
+    const accepted = ['example', 'a-b-1', 'a'.repeat(194)];
+    for (const value of accepted) {
+      expect(isValidChainName(value), value).toBe(true);
+    }
+    for (const value of ['Chain/x', 'chain/x', 'a/b', 'a--b', '-a', 'a-', '', 'A', 'a b', 'a'.repeat(195), 'a'.repeat(200), 42, null, undefined, {}, ['a']]) {
+      expect(isValidChainName(value), String(value)).toBe(false);
+    }
   });
 });

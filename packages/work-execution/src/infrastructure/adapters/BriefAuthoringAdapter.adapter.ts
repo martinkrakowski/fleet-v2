@@ -146,6 +146,32 @@ async function isSymbolicLink(filePath: string): Promise<boolean> {
 }
 
 /**
+ * True when any existing component of the absolute path is a symlink, or the
+ * path cannot be inspected safely. Each component is inspected with lstat from
+ * the root down and never followed; the first missing component ends the walk
+ * because nothing below it exists yet. A parent-directory (dot-dot) segment is refused: the kernel
+ * would resolve it through a link while path.join resolves it lexically.
+ */
+async function pathCrossesSymbolicLink(absolutePath: string): Promise<boolean> {
+  const segments = absolutePath.split(path.sep).filter((segment) => segment.length > 0);
+  if (segments.includes('..')) {
+    return true;
+  }
+  let current = path.parse(absolutePath).root;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    try {
+      if ((await fs.lstat(current)).isSymbolicLink()) {
+        return true;
+      }
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+    }
+  }
+  return false;
+}
+
+/**
  * The recorded answer, or null when none exists, or 'too-large' when the
  * recorded answer itself exceeds the answer limit. A symlinked answer file is
  * refused like any other unreadable answer: it may point outside the briefs
@@ -304,9 +330,10 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
     if (stem === null) {
       return unavailable('session-command-invalid');
     }
-    // A symlinked briefsDir redirects every read and write outside the intended
-    // directory; refuse before touching the filesystem through the link.
-    if (await isSymbolicLink(request.briefsDir)) {
+    // A symlink anywhere along briefsDir (the leaf or any parent) redirects every
+    // read and write outside the intended directory; refuse before touching the
+    // filesystem through the link.
+    if (await pathCrossesSymbolicLink(request.briefsDir)) {
       return unavailable('session-command-invalid');
     }
     const base = path.join(request.briefsDir, stem);

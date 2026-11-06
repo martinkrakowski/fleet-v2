@@ -56,7 +56,7 @@ interface Setup {
 }
 
 async function setup(): Promise<Setup> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-brief-seat-'));
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-brief-seat-')));
   roots.push(root);
   const checkout = path.join(root, 'checkout');
   const briefsDir = path.join(root, 'briefs');
@@ -234,6 +234,48 @@ describe('BriefAuthoringAdapter seat session', () => {
     expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
     expect(s.executor.calls).toHaveLength(0);
     expect(await fs.readdir(realBriefs)).toEqual([]);
+  });
+
+  it('a symlinked parent of an existing briefsDir is refused and nothing is written through it', async () => {
+    const s = await setup();
+    const realParent = path.join(s.root, 'real-parent');
+    await fs.mkdir(path.join(realParent, 'briefs'), { recursive: true });
+    const linkedParent = path.join(s.root, 'linked-parent');
+    await fs.symlink(realParent, linkedParent);
+    const request = { ...s.request, briefsDir: path.join(linkedParent, 'briefs') };
+    const result = await adapterFor(s.executor).authorBriefSession(request);
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(s.executor.calls).toHaveLength(0);
+    expect(await fs.readdir(path.join(realParent, 'briefs'))).toEqual([]);
+  });
+
+  it('a symlinked parent of a briefsDir that does not exist yet is refused and none is created', async () => {
+    const s = await setup();
+    const realParent = path.join(s.root, 'real-parent');
+    await fs.mkdir(realParent);
+    const linkedParent = path.join(s.root, 'linked-parent');
+    await fs.symlink(realParent, linkedParent);
+    const request = { ...s.request, briefsDir: path.join(linkedParent, 'deep', 'briefs') };
+    const result = await adapterFor(s.executor).authorBriefSession(request);
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(s.executor.calls).toHaveLength(0);
+    expect(await fs.readdir(realParent)).toEqual([]);
+  });
+
+  it('a briefsDir with a dot-dot segment is refused', async () => {
+    const s = await setup();
+    const request = { ...s.request, briefsDir: path.join(s.root, 'elsewhere', '..', 'briefs') };
+    const result = await adapterFor(s.executor).authorBriefSession(request);
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(s.executor.calls).toHaveLength(0);
+  });
+
+  it('a briefsDir that does not exist yet, under real directories, is created and used', async () => {
+    const s = await setup();
+    const request = { ...s.request, briefsDir: path.join(s.root, 'fresh', 'briefs') };
+    const result = await adapterFor(s.executor).authorBriefSession(request);
+    expect(result).toEqual({ outcome: 'answered', answer: s.executor.seat.stdout });
+    expect(await fs.readFile(path.join(request.briefsDir, `${STEM}.answer.md`), 'utf8')).toBe(s.executor.seat.stdout);
   });
 
   it('concurrent retries on a stale intent run the seat exactly once', async () => {

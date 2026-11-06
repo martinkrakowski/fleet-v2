@@ -26,7 +26,10 @@ import type { WorkOrderStateValue } from './value-objects/WorkOrderState.vo.js';
 
 /** Exits of each state besides the universal `parked` and `stopped` (plan §3.2 "Exits"). */
 export const LANE_RUN_EXITS = {
-  ready: ['dispatching'],
+  // CO28 (`AdoptLane`): an adopted run enters `collecting` directly from its initial `ready`, so the gate
+  // decides on the collected commit. `lane-run-decider.ts` still decides only `dispatching` from `ready`;
+  // the `collecting` entry is the adopter's own conduct entry (`canEnterInitialLaneRunState`).
+  ready: ['dispatching', 'collecting'],
   dispatching: ['running', 'seat-failed'],
   running: ['collecting', 'seat-failed'],
   'seat-failed': ['dispatching'],
@@ -52,6 +55,25 @@ export const LANE_RUN_EXITS = {
   stopped: [],
   parked: [],
 } as const satisfies Record<LaneRunStateValue, readonly LaneRunStateValue[]>;
+
+/** The state an adopted run (`provenance: 'adopted'`, CO28) enters from its initial `ready`. */
+export const LANE_RUN_ADOPTED_ENTRY_STATE = 'collecting' as const satisfies LaneRunStateValue;
+
+/**
+ * Whether a run of `provenance` may take `to` as its first conduct entry: a started run enters
+ * `dispatching`, an adopted run enters `collecting`, and nothing else is an initial entry (`ready` also
+ * exits to the other provenance's state in the table, so the table alone cannot say this). Total: any
+ * runtime input other than the two pairs is false and nothing throws.
+ */
+export function canEnterInitialLaneRunState(provenance: unknown, to: unknown): boolean {
+  if (provenance === 'started') {
+    return to === 'dispatching';
+  }
+  if (provenance === 'adopted') {
+    return to === LANE_RUN_ADOPTED_ENTRY_STATE;
+  }
+  return false;
+}
 
 /** States after acceptance in which a changed head re-enters gating (plan §3.2 "Rounds"). */
 export const LANE_RUN_HEAD_CHANGE_STATES = [

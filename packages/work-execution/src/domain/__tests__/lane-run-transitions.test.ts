@@ -65,7 +65,7 @@ const PARKED_ONE_WAY = { reason: 'one-way-door', qualifier: null, parkedFrom: 'g
 const PARKED_HALTED = { reason: 'halted', qualifier: null, parkedFrom: 'gating', questionId: null };
 
 const EXPECTED_EXITS: Record<LaneRunStateValue, readonly LaneRunStateValue[]> = {
-  ready: ['dispatching'],
+  ready: ['dispatching', 'collecting'],
   dispatching: ['running', 'seat-failed'],
   running: ['collecting', 'seat-failed'],
   'seat-failed': ['dispatching'],

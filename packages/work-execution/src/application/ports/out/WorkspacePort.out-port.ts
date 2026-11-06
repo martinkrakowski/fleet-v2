@@ -195,7 +195,32 @@ export interface RemoveWorktreeRequest {
   readonly expectedLastActivityIso: string | null;
   /** The attempt's recorded runner block: the removal runs on that host's executor. */
   readonly recordedHost?: AttemptRunnerRecord | null;
+  /**
+   * C2': the sealed-artifact-manifest coordinates the removal is gated on. A
+   * `sealed` request carries the recorded manifest path and digest and is
+   * removed only when the manifest on disk still verifies; `uncollected` is
+   * always refused; `force-unsealed` carries a consumed owner approval
+   * reference and still runs every git and activity guard.
+   */
+  readonly manifest: RemoveWorktreeManifestCheck;
 }
+
+/**
+ * C2': the manifest coordinates one `removeWorktree` request is gated on.
+ */
+export type RemoveWorktreeManifestCheck =
+  | {
+      readonly kind: 'sealed';
+      readonly attemptId: string;
+      readonly manifestPath: string;
+      readonly expectedManifestSha256: string;
+    }
+  | { readonly kind: 'uncollected' }
+  | {
+      readonly kind: 'force-unsealed';
+      readonly attemptId: string;
+      readonly approvalReference: string;
+    };
 
 /**
  * Why a removal was refused. The plan's seven facts (`head-moved`, `detached`,
@@ -214,7 +239,11 @@ export type RemoveWorktreeRefusal =
   | 'dirty'
   | 'locked'
   | 'busy'
-  | 'git-refused';
+  | 'git-refused'
+  /** C2': the attempt's artifacts were never sealed into a manifest. */
+  | 'artifacts not collected'
+  /** C2': a sealed artifact or the manifest itself changed since collection. */
+  | 'artifacts changed since collection';
 
 export type RemoveWorktreeResult =
   /** Removed; `branchTip` is the HEAD the removal answered. The branch is kept. */

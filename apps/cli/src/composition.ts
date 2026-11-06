@@ -1049,6 +1049,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     evidence,
     profileRead,
     coordination,
+    attemptArtifact,
+    coordinationRequestRepository,
     issuePolicyForgeGrantUseCase,
     autoMergeLoad,
     installation: options?.installation,

@@ -287,7 +287,7 @@ function runLiveOnce(runtime: FleetCliRuntime, stateDir: string): Promise<RunRes
   return runConductorArgs(runtime, stateDir, ['run', '--live', '--once']);
 }
 
-describe('o9 registerConductorOrchestrator input refusal', () => {
+describe('o9-runtime-input-refused: registerConductorOrchestrator input refusal', () => {
   const cases: ReadonlyArray<{
     readonly name: string;
     readonly overrides: Partial<RegisterConductorOrchestratorInput>;

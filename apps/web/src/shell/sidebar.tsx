@@ -22,9 +22,11 @@ function closeDrawer() {
 export function Sidebar({
   nav,
   openQuestions,
+  openTodos,
 }: {
   nav: ProjectNavData;
   openQuestions: number | null;
+  openTodos: number | null;
 }) {
   return (
     <>
@@ -37,7 +39,7 @@ export function Sidebar({
           </svg>
           <span className="sidebar-brand-label">fleet</span>
         </div>
-        <ViewNav openQuestions={openQuestions} />
+        <ViewNav openQuestions={openQuestions} openTodos={openTodos} />
         <Suspense fallback={null}>
           <ProjectNav data={nav} />
         </Suspense>

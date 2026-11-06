@@ -80,11 +80,13 @@ function spawnDiagnosticOf(result: OcmReviewTransportSpawnResult): ReviewTranspo
   const timedOut = safeRead(() => result.timedOut === true) === true;
   const stderr = safeRead(() => result.stderr);
   const stdout = safeRead(() => result.stdout);
+  // A missing or non-string field reads as null (RV4 round 1): the spawn
+  // result shape is not trusted, so only a real string is capped or trimmed.
   return {
     exitCode: exitCode ?? null,
     timedOut,
-    stderr: stderr === null ? null : capUtf8Bytes(stderr, MAX_TRANSPORT_STDERR_BYTES),
-    stdoutEmpty: stdout === null ? null : stdout.trim() === '',
+    stderr: typeof stderr === 'string' ? capUtf8Bytes(stderr, MAX_TRANSPORT_STDERR_BYTES) : null,
+    stdoutEmpty: typeof stdout === 'string' ? stdout.trim() === '' : null,
   };
 }
 
@@ -1257,11 +1259,10 @@ export function createOcmReviewTransport(
       if (error instanceof ReviewTransportError) {
         throw error;
       }
-      const message =
-        error instanceof Error && typeof error.message === 'string'
-          ? error.message
-          : 'reviewer process failed';
-      throw new ReviewTransportError(message, isTimeoutError(error) ? 'timeout' : 'transport');
+      // RV4 round 1: a thrown spawn error's message is never passed through —
+      // it may carry a secret or a path. The fixed message travels instead;
+      // the capped diagnostic (screened downstream) carries the data.
+      throw new ReviewTransportError('reviewer process failed', isTimeoutError(error) ? 'timeout' : 'transport');
     }
     const waitExitCode = safeRead(() => waitResult.exitCode);
     if (waitExitCode === 75 || safeRead(() => waitResult.timedOut === true) === true) {
@@ -1346,11 +1347,10 @@ export function createOcmReviewTransport(
       if (error instanceof ReviewTransportError) {
         throw error;
       }
-      const message =
-        error instanceof Error && typeof error.message === 'string'
-          ? error.message
-          : 'reviewer process failed';
-      throw new ReviewTransportError(message, isTimeoutError(error) ? 'timeout' : 'transport');
+      // RV4 round 1: a thrown spawn error's message is never passed through —
+      // it may carry a secret or a path. The fixed message travels instead;
+      // the capped diagnostic (screened downstream) carries the data.
+      throw new ReviewTransportError('reviewer process failed', isTimeoutError(error) ? 'timeout' : 'transport');
     }
     const spawnExitCode = safeRead(() => spawnResult.exitCode);
     if (spawnExitCode !== 0) {
@@ -1369,11 +1369,13 @@ export function createOcmReviewTransport(
     }
 
     // 7. Parse stdout JSON lines for text and tool parts
+    // A missing or non-string stdout reads as empty; the parse loop never throws.
+    const spawnStdout = safeRead(() => spawnResult.stdout);
     let readOnlyVoided = false;
     let hasStepStart = false;
     const textParts: string[] = [];
     const toolNames: string[] = [];
-    for (const rawLine of spawnResult.stdout.split(/\r?\n/)) {
+    for (const rawLine of (typeof spawnStdout === 'string' ? spawnStdout : '').split(/\r?\n/)) {
       const line = rawLine.trim();
       if (line === '') continue;
       let parsed: unknown;

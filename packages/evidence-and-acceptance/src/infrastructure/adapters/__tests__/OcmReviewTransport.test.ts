@@ -2944,6 +2944,50 @@ describe('RV4: busy worktree transport (seat-busy)', () => {
     }
   });
 
+  it('seat-busy refuses a sparse spawn result with null diagnostics (missing fields)', async () => {
+    // RV4 round 1: the spawn result shape is not trusted — a missing or
+    // non-string stdout/stderr reads as null, never a throw.
+    const sparse = { exitCode: 75 } as unknown as OcmReviewTransportSpawnResult;
+    const transport = makeTransport(async () => sparse);
+
+    const rejection = await transport(request).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(ReviewTransportError);
+    expect((rejection as ReviewTransportError).code).toBe('seat-busy');
+    expect((rejection as ReviewTransportError).diagnostic).toEqual({
+      exitCode: 75,
+      timedOut: false,
+      stderr: null,
+      stdoutEmpty: null,
+    });
+  });
+
+  it('a thrown spawn error carries no stderr and no path in its message', async () => {
+    const SECRET = 'ghp_' + 'a'.repeat(36);
+    const throwingSpawn: OcmReviewTransportSpawn = async () => {
+      throw new Error(`${SECRET} spawned at /tmp/secret-dir/review`);
+    };
+
+    // Both catch sites (the --wait spawn and the review spawn) classify a
+    // thrown error without passing its message through.
+    for (const throwing of [
+      throwingSpawn,
+      (async (_file: string, args: readonly string[]) => {
+        if (args[0] === '--wait') {
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        return throwingSpawn('', [], {});
+      }) as OcmReviewTransportSpawn,
+    ]) {
+      const transport = makeTransport(throwing);
+      const rejection = await transport(request).catch((error: unknown) => error);
+      expect(rejection).toBeInstanceOf(ReviewTransportError);
+      expect((rejection as ReviewTransportError).message).toBe('reviewer process failed');
+      expect((rejection as ReviewTransportError).message).not.toContain(SECRET);
+      expect((rejection as ReviewTransportError).message).not.toContain('/tmp');
+      expect(JSON.stringify(rejection)).not.toContain(SECRET);
+    }
+  });
+
   it('wait is cut at the review timeout and the next pass can dispatch', async () => {
     let calls = 0;
     const transport = makeTransport(async () => {

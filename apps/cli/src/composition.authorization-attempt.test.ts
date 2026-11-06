@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { CoordinationRequestRecord } from '@fleet/operator-coordination';
 import type { AttemptRecord, WorkOrderRecord } from '@fleet/work-execution';
+import { coordinationCommands } from './commands/coordination.js';
 import { createFleetCliRuntime } from './composition.js';
 
 // CO24d: the CLI composition binds a grant to the attempt resolved for it.
@@ -193,5 +194,168 @@ describe('CLI composition: grant bound to its resolved attempt (CO24d)', () => {
       expectedHeadSha: HEAD,
     });
     expect(result).toEqual({ outcome: 'consumed', actionId: 'action-a' });
+  });
+});
+
+// CO24e: the grant record names its attempt, so a grant is bound even when no
+// resolve ran in this process. Runs through the real CLI composition: the real
+// ActionAuthorizationAdapter, delegate, coordination use cases and file-backed
+// repositories in a temp directory; only the gh subprocess is a spy.
+describe('CLI composition: grant record names its attempt (CO24e)', () => {
+  let tempDir: string;
+  const runGh = vi.fn(async () => ({ exitCode: 1, stdout: '', stderr: '' }) as never);
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-cli-co24e-'));
+    runGh.mockClear();
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  function runtimeOf() {
+    return createFleetCliRuntime({
+      stateDir: tempDir,
+      forgeActionDelegate: { runGh, verifyCurrentHeadSha: async () => ({ outcome: 'verified' }) as never },
+    });
+  }
+
+  async function seedAttempts(runtime: ReturnType<typeof createFleetCliRuntime>): Promise<void> {
+    for (const suffix of ['A', 'B']) {
+      await runtime.execution.workOrderRepository.saveWorkOrder(workOrder(`wo-${suffix}`));
+      await runtime.execution.attemptRepository.saveAttempt(attempt(`att-${suffix}`, `wo-${suffix}`));
+    }
+  }
+
+  function forgeFor(suffix: 'A' | 'B', grantId: string) {
+    return {
+      actionId: `action-${suffix}`,
+      attemptId: `att-${suffix}`,
+      workOrderId: `wo-${suffix}`,
+      kind: 'push-and-open-pr' as const,
+      expectedHeadSha: HEAD,
+      authorizationGrantId: grantId,
+      branchName: `feat/lane-${suffix}`,
+    };
+  }
+
+  it('refuses attempt B on an owner grant recorded for attempt A, with no resolve in this process: forge never called', async () => {
+    const runtime = runtimeOf();
+    await seedAttempts(runtime);
+    await runtime.coordination.coordinationRequestRepository.saveRequest({
+      ...grant('grant-1'),
+      grantRecordVersion: 2,
+      grantAttemptId: 'att-A',
+    });
+
+    const result = await runtime.execution.executeAuthorizedForgeAction.executeAuthorizedForgeAction(
+      forgeFor('B', 'grant-1'),
+    );
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'grant-attempt-mismatch' });
+    expect(runGh).not.toHaveBeenCalled();
+    const stored = await runtime.coordination.coordinationRequestRepository.findRequestByGrantId('grant-1');
+    expect(stored?.consumptions).toHaveLength(0);
+  });
+
+  it('refuses attempt B on a policy grant issued for attempt A', async () => {
+    const runtime = runtimeOf();
+    await seedAttempts(runtime);
+    await runtime.coordination.coordinationRequestRepository.saveRequest({
+      ...grant('grant-p'),
+      decisionRevision: 'policy:conductor@309ab8c40bf2',
+      policyGrant: { workOrderId: 'wo-A', attemptId: 'att-A', acceptanceReceiptId: 'receipt-1' },
+      grantRecordVersion: 2,
+      grantAttemptId: 'att-A',
+    });
+    const refused = await runtime.execution.executeAuthorizedForgeAction.executeAuthorizedForgeAction(
+      forgeFor('B', 'grant-p'),
+    );
+    expect(refused).toEqual({ outcome: 'refused', reason: 'grant-attempt-mismatch' });
+    expect(runGh).not.toHaveBeenCalled();
+  });
+
+  it('refuses a version-2 grant that records no attempt, whoever asks', async () => {
+    const runtime = runtimeOf();
+    await seedAttempts(runtime);
+    await runtime.coordination.coordinationRequestRepository.saveRequest({
+      ...grant('grant-1'),
+      grantRecordVersion: 2,
+    });
+    const result = await runtime.execution.actionAuthorization.consumeActionAuthorization({
+      authorizationGrantId: 'grant-1',
+      actionId: 'action-a',
+      actionKind: 'push-and-open-pr',
+      expectedHeadSha: HEAD,
+      attemptId: 'att-A',
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'grant-attempt-unrecorded' });
+    expect(
+      (await runtime.coordination.coordinationRequestRepository.findRequestByGrantId('grant-1'))?.consumptions,
+    ).toHaveLength(0);
+  });
+
+  it('residual path: a coordinate-less legacy grant is consumed by attempt B at the exact head (CO24d rule, kept for old grants)', async () => {
+    const runtime = runtimeOf();
+    await seedAttempts(runtime);
+    await runtime.coordination.coordinationRequestRepository.saveRequest(grant('grant-1'));
+    // No resolve ran and the record names no attempt: scope and exact head are all that bind it.
+    const result = await runtime.execution.actionAuthorization.consumeActionAuthorization({
+      authorizationGrantId: 'grant-1',
+      actionId: 'action-b',
+      actionKind: 'push-and-open-pr',
+      expectedHeadSha: HEAD,
+      attemptId: 'att-B',
+    });
+    expect(result).toEqual({ outcome: 'consumed', actionId: 'action-b' });
+  });
+
+  it('closes the residual: the same grant, once resolved for A (new version), refuses B even in a fresh process without the coordinates file', async () => {
+    const first = runtimeOf();
+    await seedAttempts(first);
+    await first.coordination.coordinationRequestRepository.saveRequest(grant('grant-1'));
+    expect(
+      await first.execution.actionAuthorization.resolveActionAuthorization({
+        actionId: 'action-resolve',
+        projectId: 'project-1',
+        workOrderId: 'wo-A',
+        attemptId: 'att-A',
+        actionKind: 'push-and-open-pr',
+        expectedHeadSha: HEAD,
+        policyRevision: 'pol-1',
+      }),
+    ).toEqual({ outcome: 'granted', authorizationGrantId: 'grant-1' });
+    await fs.rm(path.join(tempDir, 'authorization-coordinates.json'), { force: true });
+
+    const second = runtimeOf();
+    const stored = await second.coordination.coordinationRequestRepository.findRequestByGrantId('grant-1');
+    expect(stored).toMatchObject({ grantRecordVersion: 2, grantAttemptId: 'att-A' });
+    const result = await second.execution.executeAuthorizedForgeAction.executeAuthorizedForgeAction(
+      forgeFor('B', 'grant-1'),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'grant-attempt-mismatch' });
+    expect(runGh).not.toHaveBeenCalled();
+  });
+
+  it('a decision requested with an attempt records it, so forge execute without resolve-auth is bound', async () => {
+    const runtime = runtimeOf();
+    await seedAttempts(runtime);
+    const requested = await coordinationCommands['request-decision'](
+      {
+        requestId: 'req-owner',
+        projectId: 'project-1',
+        kind: 'action-decision',
+        actionScope: 'forge:push-and-open-pr',
+        expectedHeadSha: HEAD,
+        proposalDigest: 'prop-1',
+        policyRevision: 'pol-1',
+        attemptId: 'att-A',
+      },
+      runtime,
+    );
+    expect(requested).toMatchObject({ outcome: 'requested' });
+    const stored = await runtime.coordination.coordinationRequestRepository.findRequestById('req-owner');
+    expect(stored).toMatchObject({ grantRecordVersion: 2, grantAttemptId: 'att-A' });
   });
 });

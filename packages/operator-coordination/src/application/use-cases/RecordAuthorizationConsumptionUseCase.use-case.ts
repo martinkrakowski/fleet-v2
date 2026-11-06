@@ -94,16 +94,18 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
         `grant ${grantId} was recorded for commit ${recorded.expectedHeadSha ?? 'none'}, not ${request.expectedHeadSha.trim()}`,
       );
     }
-    // A policy grant is issued for one attempt and authorizes no other. (An
-    // owner grant records no attempt; the composition that resolved it binds
-    // the attempt before it calls this port.)
-    if (
-      recorded.policyGrant !== undefined &&
-      recorded.policyGrant.attemptId !== request.attemptId.trim()
-    ) {
+    // A grant that records an attempt, owner or policy, authorizes no other
+    // (CO24e). A version-2 record without one authorizes nothing. A legacy grant
+    // records no attempt and keeps the composition's own binding (CO24d) until
+    // it expires. Both checks run before anything is recorded.
+    const aggregate = CoordinationRequest.fromRecord(recorded);
+    if (aggregate.isMissingRecordedAttempt()) {
+      return refused('grant-attempt-unrecorded');
+    }
+    const boundAttemptId = aggregate.getBoundAttemptId();
+    if (boundAttemptId !== null && boundAttemptId !== request.attemptId.trim()) {
       return refused('grant-attempt-mismatch');
     }
-    const aggregate = CoordinationRequest.fromRecord(recorded);
     // The composition root supplies the clock; no authority depends on it here.
     const consumedAtIso =
       typeof request.nowIso === 'string' && request.nowIso.trim().length > 0

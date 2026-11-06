@@ -88,9 +88,10 @@ function containsDisallowedOutputText(value: string): boolean {
 }
 
 /**
- * True when `value` holds a C0 control, DEL, a C1 control or a Unicode bidi
- * control (U+200E/U+200F, U+202A-U+202E, U+2066-U+2069). Such characters
- * can disguise an id or text in a log, a diff or a terminal.
+ * True when `value` holds a C0 control, DEL, a C1 control, a Unicode bidi
+ * control (U+061C, U+200E/U+200F, U+202A-U+202E, U+2066-U+2069), a line or
+ * paragraph separator (U+2028/U+2029) or a byte order mark (U+FEFF). Such
+ * characters can disguise an id or text in a log, a diff or a terminal.
  */
 function hasControlOrBidiCharacter(value: string): boolean {
   for (const character of value) {
@@ -98,10 +99,14 @@ function hasControlOrBidiCharacter(value: string): boolean {
     if (
       code <= 0x1f ||
       (code >= 0x7f && code <= 0x9f) ||
+      code === 0x061c ||
       code === 0x200e ||
       code === 0x200f ||
+      code === 0x2028 ||
+      code === 0x2029 ||
       (code >= 0x202a && code <= 0x202e) ||
-      (code >= 0x2066 && code <= 0x2069)
+      (code >= 0x2066 && code <= 0x2069) ||
+      code === 0xfeff
     ) {
       return true;
     }

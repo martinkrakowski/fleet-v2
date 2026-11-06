@@ -356,6 +356,8 @@ export function composeExecution(input: ComposeExecutionInput) {
         projectId: request.projectId,
         actionScope: forgeActionScope(request.actionKind),
         expectedHeadSha: request.expectedHeadSha,
+        // CO24e: the grant records the attempt it is resolved for, durably.
+        attemptId: request.attemptId,
       });
       if (result.outcome === 'authorized') {
         resolveCoordinates.set(result.grantId, {
@@ -426,20 +428,20 @@ export function composeExecution(input: ComposeExecutionInput) {
         }
       }
       const coordinates = resolveCoordinates.get(request.authorizationGrantId);
-      // A grant resolved in this or an earlier process carries its attempt.
-      // One never resolved (an owner decision granted straight through
-      // `coordination request-decision`, or a policy grant) carries none: the
-      // request's own attempt is then the only candidate, and the consumption
-      // use case checks it against a policy grant's attempt. No attempt is
-      // ever picked by head alone.
-      if (coordinates !== undefined) {
-        if (request.attemptId !== undefined && request.attemptId !== coordinates.attemptId) {
+      // The grant record names its attempt (CO24e: written at issue, at request
+      // time or at the first resolve); the resolve-time coordinates are the
+      // fallback. A legacy grant carries neither: the request's own attempt is
+      // then the only candidate (CO24d), validated at the head below. No
+      // attempt is ever picked by head alone.
+      const resolvedAttemptId = grant.grantAttemptId ?? grant.policyGrant?.attemptId ?? coordinates?.attemptId;
+      if (resolvedAttemptId !== undefined) {
+        if (request.attemptId !== undefined && request.attemptId !== resolvedAttemptId) {
           return { outcome: 'refused', reason: 'grant-attempt-mismatch' };
         }
       } else if (typeof request.attemptId !== 'string') {
         return { outcome: 'refused', reason: 'grant-attempt-unresolved' };
       }
-      const boundAttemptId = coordinates?.attemptId ?? request.attemptId;
+      const boundAttemptId = resolvedAttemptId ?? request.attemptId;
       const attempt =
         typeof boundAttemptId === 'string'
           ? await attemptRepository.findAttemptById(boundAttemptId)

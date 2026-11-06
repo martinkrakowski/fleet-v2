@@ -595,7 +595,8 @@ describe('CO24d: the API composition binds a grant to its resolved attempt', () 
         expectedHeadSha: headH,
         attemptId: 42,
       });
-      expect(result.outcome).toBe('refused');
+      // The reason pins the branch: the adapter's request validation refuses a wrong-typed id before any delegate runs.
+      expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
       expect((await reqRepo.findRequestByGrantId('grant-co24d-2'))?.consumptions).toHaveLength(0);
     } finally {
       rmSync(stateDir, { recursive: true, force: true });

@@ -588,6 +588,8 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
           projectId: request.projectId,
           actionScope: forgeActionScope(request.actionKind),
           expectedHeadSha: request.expectedHeadSha,
+          // CO24e: the grant records the attempt it is resolved for, durably.
+          attemptId: request.attemptId,
         });
         if (result.outcome === "blocked") {
           return { outcome: "blocked", reason: result.reason };

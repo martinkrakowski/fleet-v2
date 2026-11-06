@@ -10,7 +10,7 @@ import * as path from 'node:path';
 
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { LaneRunRepositoryAdapter, type LaneRunRecord } from '@fleet/work-execution';
+import { ConductorDriverLeaseAdapter, LaneRunRepositoryAdapter, type LaneRunRecord } from '@fleet/work-execution';
 
 import { runCli, type CliIo } from '../index.js';
 
@@ -363,6 +363,46 @@ describe('fleet-v2 state compact', () => {
     expect(result.out).toContain('nothing changed');
     expect(await fs.readFile(path.join(dir, 'journal.json'), 'utf8')).toBe(journal);
     expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
+  });
+
+  it('refuses with driver-live while the conductor driver lease is live, even with --yes', async () => {
+    const dir = makeTempDir();
+    const original = await seedFinished(dir);
+    await new ConductorDriverLeaseAdapter({ stateDir: dir }).acquire({
+      holderId: 'driver-other',
+      observedFence: 0,
+      leaseUntilIso: '2099-01-01T00:05:00.000Z',
+      nowIso: '2099-01-01T00:00:00.000Z',
+    });
+    const result = await compact(dir);
+    expect(result.code).toBe(1);
+    expect(result.err).toContain('state compact refused: driver-live');
+    expect(result.out).toContain('nothing changed');
+    expect(await fs.readFile(path.join(dir, 'attempts.json'), 'utf8')).toBe(original.attempts);
+    expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
+  });
+
+  it('refuses with driver-live when the lease file is unreadable (fails closed)', async () => {
+    const dir = makeTempDir();
+    await seedFinished(dir);
+    await fs.writeFile(path.join(dir, 'conductor-driver-lease.json'), 'not valid json');
+    const result = await compact(dir);
+    expect(result.code).toBe(1);
+    expect(result.err).toContain('driver-live');
+  });
+
+  it('compacts when the conductor driver lease has lapsed', async () => {
+    const dir = makeTempDir();
+    await seedFinished(dir);
+    await new ConductorDriverLeaseAdapter({ stateDir: dir }).acquire({
+      holderId: 'driver-other',
+      observedFence: 0,
+      leaseUntilIso: '2020-01-01T00:05:00.000Z',
+      nowIso: '2020-01-01T00:00:00.000Z',
+    });
+    const result = await compact(dir);
+    expect(result.code).toBe(0);
+    expect(await idsOf(dir, 'attempts.json')).toEqual(['att-live']);
   });
 
   it('compacts when a directory-backed store such as daemon/leases exists', async () => {

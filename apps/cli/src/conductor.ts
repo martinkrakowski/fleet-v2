@@ -1044,6 +1044,19 @@ async function runCommand(
   let registrationAttempted = false;
   // One stderr line per distinct non-renewed heartbeat code per process.
   const seenHeartbeatCodes = new Set<string>();
+  // O9 fix: the heartbeat gap is anchored to the last beat, never to the pass
+  // start. A between-pass sleep up to the 60 s cap plus a fresh 60 s in-pass
+  // timer would let the first beat of the next pass arrive up to 120 s after
+  // the previous beat, past the 90 s lease. Waiting only the remainder of the
+  // gap keeps every beat within 60 s of the last. Null until the first beat or
+  // registration, so that first in-pass wait is the full gap.
+  let lastHeartbeatAtMs: number | null = null;
+  const nextBeatDelayMs = (): number => {
+    if (lastHeartbeatAtMs === null) {
+      return CONDUCTOR_HEARTBEAT_GAP_CAP_MS;
+    }
+    return Math.max(0, CONDUCTOR_HEARTBEAT_GAP_CAP_MS - (Date.now() - lastHeartbeatAtMs));
+  };
   // O9 fix: the heartbeat used both during a pass and before the sleep. It
   // no-ops until a session id is registered and never stops the loop.
   const beatNow = async (): Promise<void> => {
@@ -1055,6 +1068,7 @@ async function runCommand(
       { nowIso: () => nowIsoOf(options) },
       registeredOrchestratorId,
     );
+    lastHeartbeatAtMs = Date.now();
     if (heartbeat.code !== 'renewed' && !seenHeartbeatCodes.has(heartbeat.code)) {
       seenHeartbeatCodes.add(heartbeat.code);
       io.stderr(`${JSON.stringify({ orchestrator: heartbeat.code })}\n`);
@@ -1119,6 +1133,7 @@ async function runCommand(
       wake,
       releaseTunnel: () => tunnel.release(),
       heartbeatDuringPass: beatNow,
+      nextBeatDelayMs,
       eachPass: async (pass, result, nowIso) => {
         io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
         if (result.outcome === 'refused') {
@@ -1136,6 +1151,13 @@ async function runCommand(
             });
             registeredOrchestratorId =
               registration.code === 'registered' ? registration.orchestratorId : null;
+            if (registeredOrchestratorId !== null) {
+              // Anchor the gap to the moment the session was created: the next
+              // pass may follow a sleep up to the 60 s cap, and the lease is
+              // only 90 s, so the first beat of that pass must not wait a full
+              // fresh 60 s timer.
+              lastHeartbeatAtMs = Date.now();
+            }
             io.stderr(
               `${JSON.stringify(
                 registration.code === 'registered'
@@ -1273,17 +1295,19 @@ async function sleepBetweenPasses(options: {
 /**
  * O9 fix: run one pass while heartbeating the registered orchestrator session
  * in the background. A pass can outlive the 90-second session lease; the beat
- * fires every 60 seconds until the pass settles, so a live conductor never
- * appears detached while it is still running. Without a registered session
- * (or before registration) the pass runs unchanged. The beat loop ends when
- * the pass settles or the stop signal fires; the pass result is always the
- * one returned, and the loop can never end it early.
+ * fires at most once per 60 seconds, anchored to the last beat (not to the
+ * pass start), so a live conductor never appears detached while it is still
+ * running. Without a registered session (or before registration) the pass
+ * runs unchanged. The beat loop ends when the pass settles or the stop signal
+ * fires; the pass result is always the one returned, and the loop can never
+ * end it early.
  */
 async function runPassWithHeartbeat(
   options: {
     readonly driver: ConductorDriver;
     readonly stopSignal?: AbortSignal;
     readonly heartbeatDuringPass?: () => Promise<void>;
+    readonly nextBeatDelayMs?: () => number;
   },
   passRequest: { readonly holderId: string; readonly nowIso: string },
 ): Promise<RunConductorPassResult> {
@@ -1308,8 +1332,11 @@ async function runPassWithHeartbeat(
         while (!iteration.signal.aborted) {
           // The beat interval uses the raw real-timer sleep, never the
           // poll-loop sleep: a test-recorded poll sleep must not see these
-          // 60-second gaps, and the poll back-off owns that recording.
-          await defaultSleep(CONDUCTOR_HEARTBEAT_GAP_CAP_MS, iteration.signal);
+          // 60-second gaps, and the poll back-off owns that recording. The
+          // wait is the remainder of the heartbeat gap since the last beat,
+          // so a long between-pass sleep cannot push this pass's first beat
+          // past the 90 s lease.
+          await defaultSleep(options.nextBeatDelayMs?.() ?? CONDUCTOR_HEARTBEAT_GAP_CAP_MS, iteration.signal);
           if (iteration.signal.aborted) {
             break;
           }
@@ -1362,6 +1389,11 @@ async function pollConductorPasses(options: {
    * pass, not only after it completes; a no-op until an id is registered.
    */
   readonly heartbeatDuringPass?: () => Promise<void>;
+  /**
+   * O9 fix: how long to wait before the next in-pass beat, measured from the
+   * last beat (or from registration). When absent the full 60 s gap is used.
+   */
+  readonly nextBeatDelayMs?: () => number;
 }): Promise<number> {
   const controller = new AbortController();
   const signal = options.stopSignal ?? controller.signal;

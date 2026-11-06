@@ -376,11 +376,13 @@ describe('ChainRepositoryAdapter (file store)', () => {
     }
   });
 
-  it('never reads or waits on a store lock that is a link to a device', async () => {
+  it('never reads, follows or removes a store lock that is a link to a device', async () => {
     await seed();
     const lock = path.join(stateDir, 'chains', '.store.lock');
     await fs.symlink('/dev/zero', lock);
-    expect(await adapter.recordChainOutcome(outcomeCmd())).toEqual({ outcome: 'refused', reason: 'store-busy' });
+    const impatient = new ChainRepositoryAdapter({ stateDir, lockTimeoutMs: 100 });
+    expect(await impatient.recordChainOutcome(outcomeCmd())).toEqual({ outcome: 'refused', reason: 'store-busy' });
+    expect((await fs.lstat(lock)).isSymbolicLink()).toBe(true);
   });
 
   it('reads a record with a corrupted UTF-8 byte as unreadable', async () => {

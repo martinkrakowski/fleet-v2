@@ -44,7 +44,6 @@ import {
 } from '../../domain/chain-records.js';
 import type { ChainRecord, ChainRepositoryRef } from '../../domain/chain-records.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
-import { FileLockTimeoutError, withFileLock } from './file-store.js';
 
 export interface ChainRepositoryAdapterOptions {
   /** When set, records persist under `<stateDir>/chains`; otherwise in memory. */
@@ -277,26 +276,52 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
     const remaining = Math.max(1, Date.parse(deadlineIso) - Date.now());
     const timeoutMs = Math.min(this.lockTimeoutMs, remaining);
     const decided = await this.withChainsDir(true, async (dir) => {
-      try {
-        // a lock path that is not a plain file (a link, a FIFO) is never read or waited on
-        const lockStat = await fs.lstat(join(dir, LOCK_FILE)).catch(() => null);
-        if (lockStat !== null && !lockStat.isFile()) throw new StoreBusyError();
-        return await withFileLock(
-          join(dir, LOCK_FILE),
-          async () => {
-            if (freshDeadline(deadlineIso) !== 'ok') return refused('deadline-expired');
-            await this.removeOrphanTemps(dir);
-            return run(this.fileSection(dir));
-          },
-          { timeoutMs },
-        );
-      } catch (error) {
-        if (error instanceof FileLockTimeoutError) throw new StoreBusyError();
-        throw error;
-      }
+      return this.withStoreLock(join(dir, LOCK_FILE), timeoutMs, async () => {
+        if (freshDeadline(deadlineIso) !== 'ok') return refused('deadline-expired');
+        await this.removeOrphanTemps(dir);
+        return run(this.fileSection(dir));
+      });
     });
     if (decided === 'absent') throw new StoreUnavailableError();
     return decided;
+  }
+
+  /**
+   * The exclusive store lock: a file created with O_EXCL and O_NOFOLLOW whose
+   * content is never read, so a planted link or device is never followed. A
+   * lock left by a crashed holder fails closed as store-busy until removed by
+   * the operator. Released only when the path still is the file this call made.
+   */
+  private async withStoreLock<T>(lockPath: string, timeoutMs: number, run: () => Promise<T>): Promise<T> {
+    const started = Date.now();
+    let handle: fs.FileHandle | undefined;
+    for (;;) {
+      try {
+        handle = await fs.open(
+          lockPath,
+          fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+          0o600,
+        );
+        break;
+      } catch (error) {
+        if (errorCode(error) !== 'EEXIST') throw new StoreUnavailableError();
+        if (Date.now() - started >= timeoutMs) throw new StoreBusyError();
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    try {
+      const mine = await handle.stat();
+      try {
+        return await run();
+      } finally {
+        const now = await fs.lstat(lockPath).catch(() => null);
+        if (now !== null && now.isFile() && now.ino === mine.ino && now.dev === mine.dev) {
+          await fs.unlink(lockPath).catch(() => undefined);
+        }
+      }
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
   }
 
   // ---------- memory ----------

@@ -99,7 +99,7 @@ describe('grant attempt binding (CO24e)', () => {
       ['a null attempt', { grantRecordVersion: 2, grantAttemptId: null }],
       ['a blank attempt', { grantRecordVersion: 2, grantAttemptId: '  ' }],
       ['a control character in the attempt', { grantRecordVersion: 2, grantAttemptId: 'att\u0001A' }],
-      ['a bidi character in the attempt', { grantRecordVersion: 2, grantAttemptId: 'att‮A' }],
+      ['a bidi character in the attempt', { grantRecordVersion: 2, grantAttemptId: 'att\u202EA' }],
       ['an over-long attempt', { grantRecordVersion: 2, grantAttemptId: 'a'.repeat(257) }],
       ['an attempt without a version', { grantAttemptId: 'att-A' }],
     ])('reads %s as unreadable, never as "no attempt"', async (_label, fields) => {

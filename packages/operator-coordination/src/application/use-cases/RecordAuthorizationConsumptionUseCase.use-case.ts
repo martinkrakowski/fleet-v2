@@ -39,6 +39,20 @@ function refused(reason: string): RecordAuthorizationConsumptionResult {
   return { outcome: 'refused', reason };
 }
 
+/** The refusal for a grant that already authorized an action: the same action, or a second one. */
+function alreadyAuthorizedMessage(grantId: string, existingActionId: string, requestedActionId: string): string {
+  return existingActionId === requestedActionId
+    ? `grant ${grantId} already authorized action ${existingActionId}`
+    : `grant ${grantId} already authorized action ${existingActionId} and never a second action`;
+}
+
+/** The supplied clock instant when it is non-blank text, else the current instant. */
+function consumedAtOf(request: RecordAuthorizationConsumptionRequest): string {
+  return typeof request.nowIso === 'string' && request.nowIso.trim().length > 0
+    ? request.nowIso
+    : new Date().toISOString();
+}
+
 export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizationConsumptionPort {
   constructor(private readonly deps?: RecordAuthorizationConsumptionDependencies) {}
 
@@ -74,11 +88,7 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     if (existing !== undefined) {
       // One grant, one action: a second, unrelated action is never authorized,
       // and the same action is never recorded twice.
-      return refused(
-        existing.actionId === request.actionId.trim()
-          ? `grant ${grantId} already authorized action ${existing.actionId}`
-          : `grant ${grantId} already authorized action ${existing.actionId} and never a second action`,
-      );
+      return refused(alreadyAuthorizedMessage(grantId, existing.actionId, request.actionId.trim()));
     }
     if (recorded.state !== 'approved') {
       return refused(`grant ${grantId} is ${recorded.state}, which authorizes no action`);
@@ -107,10 +117,7 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
       return refused('grant-attempt-mismatch');
     }
     // The composition root supplies the clock; no authority depends on it here.
-    const consumedAtIso =
-      typeof request.nowIso === 'string' && request.nowIso.trim().length > 0
-        ? request.nowIso
-        : new Date().toISOString();
+    const consumedAtIso = consumedAtOf(request);
     const consumption: AuthorizationConsumptionRecord = AuthorizationConsumption.fromRecord({
       consumptionId: request.consumptionId.trim(),
       grantId,

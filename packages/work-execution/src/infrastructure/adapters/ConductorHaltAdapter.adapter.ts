@@ -36,6 +36,7 @@ import {
   withFileLock,
   writeJsonAtomically,
 } from './file-store.js';
+import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 
 export interface ConductorHaltAdapterOptions {
   /** When set, the halt marker persists here and reloads on first use. */
@@ -119,14 +120,33 @@ export class ConductorHaltAdapter implements ConductorHaltPort {
 
   async set(request: { readonly halted: boolean; readonly nowIso: string }): Promise<ConductorHaltSetResult> {
     assertStoreWritable(this.options?.readOnly === true, 'ConductorHaltAdapter');
-    if (!isZonedIsoDateTime(request.nowIso)) {
+    // F96: snapshot and validate every field before any state is read or
+    // written, so a malformed input never touches memory or disk and never
+    // echoes a caller string.
+    let snapshot: Record<string, unknown> | null;
+    try {
+      snapshot = snapshotPlainDataRecord(request);
+    } catch {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
+    if (
+      snapshot === null ||
+      Object.keys(snapshot).length !== 2 ||
+      !Object.hasOwn(snapshot, 'halted') ||
+      !Object.hasOwn(snapshot, 'nowIso') ||
+      typeof snapshot.halted !== 'boolean' ||
+      typeof snapshot.nowIso !== 'string' ||
+      snapshot.nowIso.length > 64 ||
+      !isZonedIsoDateTime(snapshot.nowIso)
+    ) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    const valid = { halted: snapshot.halted, nowIso: snapshot.nowIso };
     const target = this.statePath;
     if (target === null) {
-      return this.mutateInMemory(request);
+      return this.mutateInMemory(valid);
     }
-    return this.mutateOnDisk(target, request);
+    return this.mutateOnDisk(target, valid);
   }
 
   /** Memory mode: one field; nothing stored and `halted: false` still writes the record. */

@@ -420,7 +420,7 @@ const CONFIGURED_EMPTY_BODY_ROUTES: ReadonlyArray<{
   { method: "get", path: "/v1/attempts/attempt-matrix", outcome: "not-found" },
   { method: "post", path: "/v1/attempts/attempt-matrix/artifacts", outcome: "refused" },
   { method: "post", path: "/v1/attempts/attempt-matrix/fix", outcome: "refused" },
-  { method: "post", path: "/v1/attempts/attempt-matrix/stop", outcome: "refused" },
+  { method: "post", path: "/v1/attempts/attempt-matrix/stop", outcome: "refused", status: 404, code: "NOT_FOUND" },
   { method: "post", path: "/v1/attempts/attempt-matrix/acceptance", outcome: "rejected" },
   { method: "post", path: "/v1/attempts/attempt-matrix/notes", outcome: "rejected" },
   { method: "post", path: "/v1/forge", outcome: "refused" },
@@ -649,7 +649,12 @@ describe("501-vs-validation matrix", () => {
       const envelope = envelopeOf(response.payload);
       expect(envelope.code, `${route.method} ${route.path}`).toBe(route.code ?? "OK");
       if (route.status === 404) {
-        expect(envelope.result, `${route.method} ${route.path}`).toBeNull();
+        // The attempt stop route's not-found carries the use case's refusal
+        // (no attempt id exists in the run store); other 404s return null.
+        expect(
+          envelope.result === null || typeof envelope.result?.reason === "string",
+          `${route.method} ${route.path}`,
+        ).toBe(true);
       } else if (route.status !== undefined && route.status >= 400) {
         // A client-error envelope carries a reason instead of a domain outcome.
         expect(typeof envelope.result?.reason, `${route.method} ${route.path}`).toBe("string");

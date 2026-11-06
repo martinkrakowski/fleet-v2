@@ -227,8 +227,9 @@ describe("attempt route limits", () => {
 
     release(refused);
     const first = await firstPending;
-    expect(first.status).toBe(200);
-    expect(first.body.code).toBe("OK");
+    // A-C: the stop route maps a refused outcome to 409 CONFLICT.
+    expect(first.status).toBe(409);
+    expect(first.body.code).toBe("CONFLICT");
   });
 
   it("caps attempt actions globally: a fifth call with four in flight answers 429 BUSY", async () => {
@@ -272,7 +273,8 @@ describe("attempt route limits", () => {
       for (const [, release] of releases) release(refused);
     }
     for (const pending of inFlight) {
-      expect((await pending).status).toBe(200);
+      // A-C: a refused stop outcome maps to 409 CONFLICT.
+      expect((await pending).status).toBe(409);
     }
   });
 

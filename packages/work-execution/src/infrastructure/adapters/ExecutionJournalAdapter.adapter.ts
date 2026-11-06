@@ -671,10 +671,18 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
         () => this.releaseInMemoryIfUnchangedLocked(request),
         () => this.releaseInMemoryIfUnchangedLocked(request),
       );
-    this.fencedReleaseChainsByAttemptId.set(
-      request.attemptId,
-      run.catch(() => undefined),
-    );
+    const tail = run.catch(() => undefined);
+    this.fencedReleaseChainsByAttemptId.set(request.attemptId, tail);
+    // The chain exists only to serialise in-flight releases of the same
+    // attempt. Once the latest link settles it has served its purpose; drop it
+    // so a long-lived process does not retain one resolved promise per attempt
+    // forever. A newer link for the same attempt replaces the entry before the
+    // older one settles, so the identity check keeps the newest chain intact.
+    void tail.then(() => {
+      if (this.fencedReleaseChainsByAttemptId.get(request.attemptId) === tail) {
+        this.fencedReleaseChainsByAttemptId.delete(request.attemptId);
+      }
+    });
     return run;
   }
 

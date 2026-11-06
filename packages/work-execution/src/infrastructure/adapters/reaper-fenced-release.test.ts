@@ -208,6 +208,29 @@ describe('ExecutionJournalAdapter fenced capacity release (plan §3.9.2)', () =>
     expect(signals.filter((signal) => signal.kind === 'capacity').length).toBe(1);
   });
 
+  it('retains no serialisation entry once releases of many distinct attempts settle', async () => {
+    const adapter = new ExecutionJournalAdapter();
+    const attempts = Array.from({ length: 16 }, (_, i) => ({
+      attemptId: `att-many-${i}`,
+      reservationId: `res-many-${i}`,
+    }));
+    for (const { attemptId, reservationId } of attempts) {
+      await adapter.saveCapacityReservation(heldReservation({ id: reservationId, attemptId }));
+    }
+    const chains = (adapter as unknown as { fencedReleaseChainsByAttemptId: Map<string, Promise<unknown>> })
+      .fencedReleaseChainsByAttemptId;
+
+    await Promise.all(
+      attempts.map(({ attemptId, reservationId }) =>
+        adapter.releaseCapacityReservationIfUnchanged(fencedRequest({ attemptId, reservationId })),
+      ),
+    );
+    // The chain cleanup runs one turn after the release settles.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(chains.size).toBe(0);
+  });
+
   it('reports unknown when the reservations store is unreadable', async () => {
     const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
     await adapter.saveCapacityReservation(heldReservation());

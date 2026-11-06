@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -42,9 +42,9 @@ export function removeWebLoginCodeFile(stateDir: string): void {
  * Issue a fresh single-use web login code and persist it to
  * `<stateDir>/web-login-code.json` as `{"code":...,"issuedAtIso":...}`. The
  * file is written through a temp file in the same directory (unpredictable
- * name, created exclusively with `wx` and mode `0o600`), renamed into place,
- * then chmod'ed to `0o600`. On any filesystem error (an existing temp path
- * included) the login stays closed: no code is stored, any earlier code file
+ * name, created exclusively with `wx` and mode `0o600`) and renamed into
+ * place; no later operation touches the final path. On any filesystem error
+ * (an existing temp path included) the login stays closed: no code is stored, any earlier code file
  * is removed and `null` is returned; this function never throws.
  */
 export function issueWebLoginCode(stateDir: string): string | null {
@@ -62,7 +62,6 @@ export function issueWebLoginCode(stateDir: string): string | null {
       { flag: "wx", mode: 0o600, encoding: "utf8" },
     );
     renameSync(tempPath, filePath);
-    chmodSync(filePath, 0o600);
   } catch {
     if (tempPath !== null) {
       try {

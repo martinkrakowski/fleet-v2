@@ -198,6 +198,17 @@ async function setup(shape: ServerShape): Promise<SetupContext> {
   const server = new FakeOpencodeServer(shape);
   const port = await server.port();
 
+  // If any step below throws after the server started listening but before
+  // the full cleanup is registered (for example `fs.mkdir` or `fs.writeFile`
+  // rejects), the test's try/finally is never reached and the listening
+  // server would be left open. Register a server-only cleanup right away so
+  // afterEach can close it; the full cleanup supersedes it below.
+  const serverOnlyCleanup = async (): Promise<void> => {
+    pendingCleanups.delete(serverOnlyCleanup);
+    await server.close();
+  };
+  pendingCleanups.add(serverOnlyCleanup);
+
   const controlDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ocm-contract-'));
   createdDirs.add(controlDir);
   const binDir = path.join(controlDir, 'bin');
@@ -243,6 +254,7 @@ async function setup(shape: ServerShape): Promise<SetupContext> {
   const cleanup = async (): Promise<void> => {
     if (cleaned) return;
     cleaned = true;
+    pendingCleanups.delete(serverOnlyCleanup);
     pendingCleanups.delete(cleanup);
     try {
       await server.close();

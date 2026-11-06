@@ -46,13 +46,6 @@ import {
 } from "@fleet/work-execution";
 import { requireValidInstallationModel, type FleetInstallation } from "@fleet/installation";
 import {
-  AcceptanceReceiptReadAdapter,
-  LaneScorecardFileAdapter,
-  TelemetryDispositionAdapter,
-  type AcceptanceReceiptReadDelegate,
-} from "@fleet/work-execution";
-import {
-  AppendScorecardUseCase,
   CancelPreparedAttemptUseCase,
   CollectAttemptArtifactsUseCase,
   DispatchAttemptUseCase,
@@ -139,12 +132,6 @@ export interface WorkComposition {
     ): Promise<GuardedCancelPreparedResult>;
   };
   executeAuthorizedForgeAction: ExecuteAuthorizedForgeActionUseCase;
-  /**
-   * CO19: appends one lane-performance row for one terminal conducted run to
-   * the versioned scorecard under `<stateDir>/scorecard/`. Only the
-   * scorecard is written; every other store is opened read-only.
-   */
-  appendScorecard: AppendScorecardUseCase;
   /** The attempt's recorded implementer seat; never an operator value. */
   readonly resolveAttemptImplementerSeat?: AttemptImplementerSeatResolver;
 }
@@ -249,12 +236,6 @@ export interface WorkCrossContextDelegates {
   readonly authorization?: ActionAuthorizationDelegate;
   readonly observation?: ExecutionObservationDelegate;
   readonly forge?: ForgeActionDelegate;
-  /**
-   * CO19: the acceptance-evidence inspector behind the scorecard's receipt
-   * read. The API runtime binds the evidence context's inspect use case;
-   * standalone configuration leaves the receipt read refusing.
-   */
-  readonly scorecardReceipts?: AcceptanceReceiptReadDelegate;
   /** Accepted-receipt id per head; a merge without a receipt is refused. */
   readonly acceptedReceiptByHead?: Readonly<Record<string, string>>;
   /**
@@ -295,8 +276,6 @@ function unconfiguredWorkComposition(): WorkComposition {
     prepareFixAttempt: new PrepareFixAttemptUseCase(),
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase(),
     executeAuthorizedForgeAction: new ExecuteAuthorizedForgeActionUseCase(),
-    // Unconfigured appends nothing: the use case keeps the generated refusal.
-    appendScorecard: new AppendScorecardUseCase(),
     // Unconfigured resolves no seat, and says so the same way the use cases
     // do: the HTTP boundary reports 501 instead of inventing a model.
     resolveAttemptImplementerSeat: async () => {
@@ -480,19 +459,6 @@ export function createConfiguredWorkComposition(
   const profileRead = new ProjectProfileReadAdapter(crossContext?.projectProfile);
   const probeRecord = new ProjectProbeRecordAdapter(crossContext?.projectProfile);
 
-  // CO19: the scorecard store and its read-only inputs. The lane-run stores
-  // above are already opened read-only; the disposition store is read through
-  // its own adapter and only the scorecard itself is ever written.
-  const scorecardStore = new LaneScorecardFileAdapter({ stateDir });
-  const appendScorecard = new AppendScorecardUseCase({
-    runRepo: laneRunRepo,
-    attemptRepo,
-    runJournal: laneRunJournal,
-    receipts: new AcceptanceReceiptReadAdapter(crossContext?.scorecardReceipts),
-    dispositions: new TelemetryDispositionAdapter({ stateDir }),
-    scorecard: scorecardStore,
-  });
-
   return {
     installation: options?.installation,
     ...(runnerHost !== undefined ? { runnerHost } : {}),
@@ -603,7 +569,6 @@ export function createConfiguredWorkComposition(
       // Forge mode `none` (D6) refuses every forge action.
       ...(forgeMode === "none" ? { forgeMode: "none" as const } : {}),
     }),
-    appendScorecard,
     // Independence is a fact about the lane, so any boundary that needs the
     // implementer seat reads it from the recorded attempt, never from the
     // request it is answering.

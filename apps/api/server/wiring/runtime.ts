@@ -671,9 +671,6 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
       record: async (request) => operator.recordProjectProbe.execute(request),
     },
     acceptedReceiptByHead,
-    // CO19: the scorecard's receipt read goes through the evidence context's
-    // inspector, the same one `readAcceptance` reads through above.
-    scorecardReceipts: { inspector: evidence.inspectAcceptanceEvidence },
   };
 
   const work = createConfiguredWorkComposition(

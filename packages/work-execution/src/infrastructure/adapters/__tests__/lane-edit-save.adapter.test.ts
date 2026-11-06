@@ -32,7 +32,7 @@ interface World {
   refWritten: boolean;
   timeoutOn?: string;
   /** `.git/info/attributes` state: absent, present without a filter, or selecting a clean filter. */
-  infoAttributes: 'absent' | 'harmless' | 'filter';
+  infoAttributes: 'absent' | 'harmless' | 'filter' | 'probe-error' | 'unsearchable';
   /** When set, the first update-ref fails and the ref appears as this concurrent save (null: still absent). */
   updateRefFailsOnce?: { commit: string; tree: string } | null;
 }
@@ -59,13 +59,10 @@ class FakeExecutor implements CommandExecutorPort {
     if (this.world.timeoutOn !== undefined && sub.startsWith(this.world.timeoutOn)) {
       return { exitCode: null, signal: 'SIGTERM', stdout: '', stderr: '', error: 'timed out' };
     }
-    if (argv[0] === 'test' && argv[1] === '-f') {
-      return this.world.infoAttributes === 'absent' ? exit(1) : ok();
-    }
-    if (argv[0] === 'grep') {
-      if (this.world.infoAttributes === 'filter') return ok();
-      if (this.world.infoAttributes === 'harmless') return exit(1);
-      return exit(2);
+    if (argv[0] === 'sh' && argv[1] === '-c') {
+      // Exit codes of the adapter's probe script: 10 filter, 11 harmless, 20 confirmed absent, else unknown.
+      const codes = { absent: 20, harmless: 11, filter: 10, 'probe-error': 2, unsearchable: 21 } as const;
+      return exit(codes[this.world.infoAttributes]);
     }
     if (argv[0] === 'rm') return ok();
     const inClone = argv[argv.indexOf('-C') + 1] === CLONE;
@@ -341,6 +338,24 @@ describe('LaneEditSaveAdapter', () => {
     for (const verb of ['read-tree', 'add', 'write-tree', 'commit-tree', 'update-ref']) {
       expect(envSubs.some((sub) => sub.startsWith(verb))).toBe(false);
     }
+  });
+
+  it.each(['probe-error', 'unsearchable'] as const)('a %s attributes probe refuses the save before any staging', async (state) => {
+    const executor = new FakeExecutor();
+    executor.world.infoAttributes = state;
+    expect(await new LaneEditSaveAdapter(executor).saveLaneEdits(request())).toEqual({
+      outcome: 'refused', reason: 'unreadable-tree',
+    });
+    const envSubs = executor.subcommands();
+    for (const verb of ['read-tree', 'add', 'write-tree', 'commit-tree', 'update-ref']) {
+      expect(envSubs.some((sub) => sub.startsWith(verb))).toBe(false);
+    }
+  });
+
+  it('a confirmed-absent attributes file proceeds to the save', async () => {
+    const executor = new FakeExecutor();
+    executor.world.infoAttributes = 'absent';
+    expect(await new LaneEditSaveAdapter(executor).saveLaneEdits(request())).toMatchObject({ outcome: 'saved' });
   });
 
   it('an info/attributes file without a clean filter does not refuse the save', async () => {

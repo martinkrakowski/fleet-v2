@@ -18,7 +18,8 @@
  * (`GIT_ATTR_SOURCE`), so no repository-configured `.gitattributes` clean
  * filter runs on untrusted worktree content; the one higher-precedence source
  * left, `$GIT_DIR/info/attributes`, is scanned and the save is refused
- * (`unreadable-tree`) if it assigns the `filter` attribute or cannot be read.
+ * (`unreadable-tree`) if it assigns the `filter` attribute or cannot be read; one
+ * `sh` probe separates confirmed-absent from probe-failed.
  * The `update-ref` carries the all-zeros expected old value, so a concurrent
  * save's ref can never be overwritten: a lost race re-reads the ref and
  * reports `already-saved` or `save-ref-conflict` instead. Nothing returned or
@@ -51,6 +52,24 @@ const SECRET_SHAPED_RUN = /[A-Za-z0-9_-]{32,}/;
 
 /** A gitattributes token that selects a clean/smudge/process filter. */
 const ATTR_FILTER_PATTERN = '(^|[[:space:]])filter([[:space:]=]|$)';
+
+/**
+ * One probe whose exit status tells the cases apart (`$1` the attributes file,
+ * `$2` the filter pattern, `$3` the git dir): 10 a filter is assigned, 11 the
+ * file is readable and assigns none, 20 the file is CONFIRMED absent (its
+ * parent is searchable and holds no such entry). Anything else, a failed grep or
+ * an unsearchable parent, is "unknown" and the save is refused.
+ */
+const ATTR_PROBE_SCRIPT = [
+  'if [ -e "$1" ] || [ -L "$1" ]; then',
+  '  grep -Eq "$2" "$1"; r=$?',
+  '  if [ "$r" -eq 0 ]; then exit 10; fi',
+  '  if [ "$r" -eq 1 ]; then exit 11; fi',
+  '  exit 12',
+  'fi',
+  'if [ -x "$3" ] && { [ -x "$3/info" ] || { [ ! -e "$3/info" ] && [ ! -L "$3/info" ]; }; }; then exit 20; fi',
+  'exit 21',
+].join('\n');
 
 /** Environment hardening that travels inside every argv so it reaches a remote ssh executor too. */
 const ENV_GUARDS = [
@@ -183,11 +202,9 @@ export class LaneEditSaveAdapter implements LaneEditSavePort {
     const gitDirRan = await run(git(worktree, ['rev-parse', '--absolute-git-dir']));
     if (gitDirRan.exitCode !== 0 || !isAbsolute(gitDirRan.stdout)) throw refuse('unreadable-tree');
     const infoAttributes = path.posix.join(gitDirRan.stdout, 'info', 'attributes');
-    const infoExists = await run(['test', '-f', infoAttributes]);
-    if (infoExists.exitCode === 0) {
-      const filterScan = await run(['grep', '-Eq', ATTR_FILTER_PATTERN, infoAttributes]);
-      if (filterScan.exitCode !== 1) throw refuse('unreadable-tree');
-    }
+    const probe = await run(['sh', '-c', ATTR_PROBE_SCRIPT, 'sh', infoAttributes, ATTR_FILTER_PATTERN, gitDirRan.stdout]);
+    // Only a confirmed absence (20) or a readable file without a filter (11) goes on.
+    if (probe.exitCode !== 20 && probe.exitCode !== 11) throw refuse('unreadable-tree');
 
     // A per-save random name: concurrent saves for the same ref never share an index.
     const index = `${worktreeCommon}/fleet-save-index-${crypto.randomBytes(16).toString('hex')}`;

@@ -93,7 +93,7 @@ function fakeProbes(
     },
     toolVersion: async (host, toolId) => {
       calls.push(`toolVersion:${host}:${toolId}`);
-      return '2.1.300';
+      return '1.2.3';
     },
     fileMode: async (host, path) => {
       calls.push(`fileMode:${host}:${path}`);
@@ -357,55 +357,6 @@ describe('runDoctor', () => {
       'claude',
       '--version',
     ]);
-  });
-
-  it('passes the permission-hook version gate for a claude-code version at or above the pinned minimum', async () => {
-    const model = sampleModel({ tools: ['claude-code'] });
-    const { probes } = fakeProbes({ toolVersion: async () => '2.14.0 (Claude Code)' });
-    const lines = await collect(loadedResult(model), probes);
-
-    expect(lines).toContainEqual(
-      expect.objectContaining({
-        scope: 'tool',
-        subject: 'main/claude-code',
-        check: 'permission-hook-version',
-        status: 'PASS',
-      }),
-    );
-    expect(doctorExitCode(lines)).toBe(0);
-  });
-
-  it('fails the permission-hook version gate for a claude-code version below the pinned minimum', async () => {
-    const model = sampleModel({ tools: ['claude-code'] });
-    const { probes } = fakeProbes({ toolVersion: async () => '2.0.9 (Claude Code)' });
-    const lines = await collect(loadedResult(model), probes);
-
-    expect(lines).toContainEqual(
-      expect.objectContaining({
-        scope: 'tool',
-        subject: 'main/claude-code',
-        check: 'permission-hook-version',
-        status: 'FAIL',
-        detail: expect.stringContaining('pinned minimum'),
-      }),
-    );
-    expect(doctorExitCode(lines)).toBe(1);
-  });
-
-  it('fails the permission-hook version gate when the claude version is unparsable', async () => {
-    const model = sampleModel({ tools: ['claude-code'] });
-    const { probes } = fakeProbes({ toolVersion: async () => 'claude: command not found' });
-    const lines = await collect(loadedResult(model), probes);
-
-    expect(lines).toContainEqual(
-      expect.objectContaining({
-        scope: 'tool',
-        subject: 'main/claude-code',
-        check: 'permission-hook-version',
-        status: 'FAIL',
-      }),
-    );
-    expect(doctorExitCode(lines)).toBe(1);
   });
 
   it('reports PASS for a declared runner and UNKNOWN for legacy-asserted and undeclared', async () => {

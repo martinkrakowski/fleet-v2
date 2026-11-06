@@ -22,7 +22,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node <fleet-v2-checkout>/apps/cli/dist/bin.js guard outward-tool",
+            "command": "<the fleet-v2 outward-tool guard command>",
             "timeout": 10,
             "onFailure": "block"
           }

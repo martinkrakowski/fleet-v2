@@ -64,7 +64,7 @@ function passingProbes(calls?: string[]): DoctorProbes {
       return true;
     },
     commandAvailable: async () => true,
-    toolVersion: async () => '2.1.300',
+    toolVersion: async () => '1.0.0',
     fileMode: async () => 0o600,
     worktreeRootWritable: async () => true,
     ocmRunBinary: async () => ({ path: '/repo/bin/ocm-run', sha256: 'c'.repeat(64) }),

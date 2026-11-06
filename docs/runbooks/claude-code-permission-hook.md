@@ -8,12 +8,10 @@ HTTP hook that sends owner approvals for two-way actions to the API, a
 `permissions.deny` rules that refuse the same actions whatever the permission
 mode (see `docs/planning/2026-10-18_orchestrator-interaction-plan.md:84-92`
 and `:316-318`). The repository ships the recipe as data — the deny rules and
-the minimum-version rule in `packages/tooling/src/claude-code.ts` — plus the
-working guard program, `fleet-v2 guard outward-tool`
-(`apps/cli/src/commands/guard.ts`, decision rule
-`claudeCodeOutwardToolDenyReason`), and a copyable settings example at
-`packages/tooling/claude-code-permission-hook.settings.example.json`. It
-ships no API route and no `orchestrator attach` command.
+the minimum-version rule in `packages/tooling/src/claude-code.ts`, and a
+copyable settings example at
+`packages/tooling/claude-code-permission-hook.settings.example.json`. It ships
+no API route, no guard program and no enforced start-up check.
 
 ## Where it runs
 
@@ -26,14 +24,13 @@ settings file, and no `.claude/` file is added here (that path is protected).
 ## Set up
 
 Copy the example into the operator's Claude Code settings and replace the
-placeholders: `<api-port>`, `<thread-id>`, `<fleet-v2-checkout>` (the absolute
-path of this repository's checkout on the orchestrator's machine — the guard
-runs `node <fleet-v2-checkout>/apps/cli/dist/bin.js guard outward-tool`), and
-the `FLEET_HOOK_TOKEN` environment variable. The hook presents a
-`hook`-scoped token minted by the session exchange
-(`apps/api/server/wiring/session-exchange.ts:23-30`); the token is never
-written in the settings file and never left on disk — the example references
-it only through `allowedEnvVars` plus the `Authorization` header.
+placeholders: `<api-port>`, `<thread-id>`,
+`<the fleet-v2 outward-tool guard command>`, and the `FLEET_HOOK_TOKEN`
+environment variable. The hook presents a `hook`-scoped token minted by the
+session exchange (`apps/api/server/wiring/session-exchange.ts:23-30`); the
+token is never written in the settings file and never left on disk — the
+example references it only through `allowedEnvVars` plus the `Authorization`
+header.
 
 ## The matcher
 
@@ -61,33 +58,24 @@ The deny rules, identical to `CLAUDE_CODE_OUTWARD_TOOL_DENY_RULES`:
 
 Why both mechanisms: the deny rules refuse the action in every permission
 mode; the `PreToolUse` guard refuses it even when the command is composed so
-the deny pattern does not match — chained after `&&`, `;`, `|` or `&`,
-hidden in a command substitution (`$(...)` or backticks), behind
-environment assignments or `sudo`/`env`/`timeout`/`nohup`, or inside a
-shell's `-c` script. The guard's contract: it reads the tool input and, for
-an outward action, answers
+the deny pattern does not match. The guard's contract: it reads the tool
+input and, for an outward action, answers
 `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"..."}}`;
 otherwise it says nothing and Claude Code's own rules apply.
-`onFailure: "block"` means a failed guard denies, and the guard also fails
-closed: an input it cannot read denies, it never passes.
+`onFailure: "block"` means a failed guard denies.
 
 ## Check it (the start-up check)
 
-The doctor enforces the rule: on any host whose installation names the
-`claude-code` tool, `fleet-v2 doctor` runs the `claude --version` probe and
-adds a `permission-hook-version` line — PASS when the recorded output is at
-or above the pinned minimum `CLAUDE_CODE_PERMISSION_HOOK_MINIMUM_VERSION` —
-`2.1.295`, the release whose changelog entry introduced `onFailure: "block"`
-for command and HTTP hooks
+Today the check is manual: run `claude --version` and compare it with the
+pinned minimum, `CLAUDE_CODE_PERMISSION_HOOK_MINIMUM_VERSION` — `2.1.295`,
+the release whose changelog entry introduced `onFailure: "block"` for command
+and HTTP hooks
 (`https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md`, checked
-2026-11-05; the changelog entry carries no release date) — and FAIL when it
-is below it or cannot be read, because below the minimum the client ignores
-`onFailure: "block"` and fails open. The doctor's own exit code is 1 on any
-FAIL, so a doctor run is the start-up gate. The manual check remains: run
-`claude --version` and compare it with the pin. **The hook must not be used**
-below the minimum; the `permissions.deny` rules still apply. The
-`fleet-v2 orchestrator attach` command (O5) will carry the same refusal when
-that path exists; it does not exist in this tree.
+2026-11-05; the changelog entry carries no release date). Below the minimum
+the client ignores `onFailure: "block"` and fails open, so **the hook must
+not be used**; the `permissions.deny` rules still apply. fleet-v2 will
+enforce the same check at the orchestrator's start-up once that path exists;
+it does not exist in this tree.
 
 ## What it never does
 
@@ -109,12 +97,13 @@ inert until they land.
    `POST /v1/threads/:id/permissions/:requestId/verdict` are T2c's. There is
    no `apps/api/server/routes/v1/threads/` directory and no `/v1/threads`
    rule in `apps/api/server/wiring/route-scopes.ts`.
-2. **The `orchestrator attach` command.** The doctor enforces the
-   minimum-version rule (see *Check it*), but O5's start-up refusal —
-   `fleet-v2 orchestrator attach` refusing an unsupported client at attach
-   time — is not in this tree (no `orchestrator attach` anywhere under
-   `apps/`).
-3. **The hook-scoped token's source.** `registerInteractiveSession`
+2. **The `PreToolUse` guard program.** Nothing in the tree inspects a tool
+   input and emits `permissionDecision: "deny"`. The settings example's
+   `command` stays a placeholder.
+3. **The enforced start-up check.** There is no orchestrator start-up path to
+   refuse an old client: no `orchestrator attach` anywhere under `apps/`, and
+   no `fleet_thread_read` / `fleet_thread_post` MCP tools.
+4. **The hook-scoped token's source.** `registerInteractiveSession`
    (`apps/api/server/wiring/session-exchange.ts`) has no production caller —
    the web/TUI login lanes have not landed — so no operator can mint a
    `hook`-scoped token yet.
@@ -122,11 +111,11 @@ inert until they land.
 ## Checked against
 
 - Claude Code hooks documentation:
-  `https://code.claude.com/docs/en/hooks` (checked 2026-11-05, re-checked
-  2026-11-06 for the guard command). The example's field names — `matcher`,
-  `type`, `timeout`, `onFailure`, `headers`, `allowedEnvVars`, and the
-  `hookSpecificOutput.permissionDecision: "deny"` PreToolUse answer — match
-  the documentation as shown; no field needed renaming.
+  `https://code.claude.com/docs/en/hooks` (checked 2026-11-05). The example's
+  field names — `matcher`, `type`, `timeout`, `onFailure`, `headers`,
+  `allowedEnvVars`, and the `hookSpecificOutput.permissionDecision: "deny"`
+  PreToolUse answer — match the documentation as shown; no field needed
+  renaming.
 - Claude Code changelog:
   `https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md` —
   `onFailure: "block"` for command and HTTP hooks appears under 2.1.295

@@ -43,6 +43,9 @@ import {
   type ChangeSignalPort,
   type OwnerDecisionDelegate,
   type AttemptOwnerDecisionDelegate,
+  type ConductorHaltPort,
+  type RequestLaneRunStopPort,
+  type StopAttemptRequest,
 } from "@fleet/work-execution";
 import { requireValidInstallationModel, type FleetInstallation } from "@fleet/installation";
 import {
@@ -69,11 +72,6 @@ import {
   resolveImplementerSeat,
   type ImplementerSeatResolution,
 } from "@fleet/work-execution/use-cases";
-import type {
-  ConductorHaltPort,
-  RequestLaneRunStopPort,
-  StopAttemptRequest,
-} from "@fleet/work-execution";
 import { ProbeLimiter } from "./probe-limiter";
 import { withPendingFixLimit } from "./pending-fix-guard";
 import { withRunActiveRefusal, type GuardedCancelPreparedResult } from "./cancel-prepared-guard";
@@ -296,8 +294,8 @@ function unconfiguredWorkComposition(): WorkComposition {
     // use case refuses every request with invalid-request: an API without a
     // runtime never reports a durable write.
     setConductorHalt: {
-      async set() {
-        throw new Error("Not implemented: ConductorHaltPort");
+      set() {
+        return Promise.reject(new Error("Not implemented: ConductorHaltPort"));
       },
     },
     requestLaneRunStop: new RequestLaneRunStopUseCase(),
@@ -585,8 +583,8 @@ export function createConfiguredWorkComposition(
         }
       : {
           setConductorHalt: {
-            async set() {
-              throw new Error("Not implemented: ConductorHaltPort");
+            set() {
+              return Promise.reject(new Error("Not implemented: ConductorHaltPort"));
             },
           },
           requestLaneRunStop: new RequestLaneRunStopUseCase(),

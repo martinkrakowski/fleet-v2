@@ -28,7 +28,7 @@ export default defineEventHandler(async (event) => {
   delete payload.operationId;
   try {
     const composition = workComposition();
-    const ran = await composition.runControlLimiter.run("conductor-halt", async () => {
+    const ran = await composition.runControlLimiter.run("conductor-halt", () => {
       return composition.setConductorHalt.set({
         ...payload,
         nowIso: new Date().toISOString(),

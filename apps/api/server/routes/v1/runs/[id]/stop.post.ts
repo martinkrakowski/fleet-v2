@@ -35,15 +35,15 @@ export default defineEventHandler(async (event) => {
     // Only expectedRevision (required here) and mode are accepted; any extra
     // key refuses with invalid-request inside the use case, after an
     // unconfigured composition has already thrown Not implemented.
-    const hasMode = Object.prototype.hasOwnProperty.call(payload, "mode");
-    const hasExpectedRevision = Object.prototype.hasOwnProperty.call(payload, "expectedRevision");
+    const hasMode = Object.hasOwn(payload, "mode");
+    const hasExpectedRevision = Object.hasOwn(payload, "expectedRevision");
     const hasExtraKey = Object.keys(payload).some(
       (key) => key !== "expectedRevision" && key !== "mode",
     );
     // Invalid :id strings share one limiter bucket so arbitrary paths cannot
     // grow the per-key in-flight set without bound.
     const limiterKey = LANE_RUN_ID_PATTERN.test(runId) ? runId : "invalid-run-id";
-    const ran = await composition.runControlLimiter.run(limiterKey, async () => {
+    const ran = await composition.runControlLimiter.run(limiterKey, () => {
       return composition.requestLaneRunStop.requestLaneRunStop({
         runId,
         via: "web",

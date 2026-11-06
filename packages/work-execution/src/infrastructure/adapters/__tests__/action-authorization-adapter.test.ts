@@ -616,6 +616,35 @@ describe('ActionAuthorizationAdapter attempt coordinate', () => {
     expect(keyed).toEqual({ outcome: 'consumed', actionId: 'pr-feedback/42@0123456789ab' });
   });
 
+  it('reads each stored grant field once, so a stateful proxy cannot present two different records', () => {
+    const reads = new Map<string, number>();
+    const target: Record<string, unknown> = {
+      expectedHeadSha: HEAD_SHA,
+      kind: 'push-to-pr',
+      consumedByActionId: null,
+    };
+    const stateful = new Proxy(target, {
+      getOwnPropertyDescriptor(inner, key) {
+        const count = (reads.get(String(key)) ?? 0) + 1;
+        reads.set(String(key), count);
+        if (key === 'schemaVersion') {
+          return { value: count === 1 ? 1 : 2, enumerable: true, configurable: true, writable: true };
+        }
+        return Reflect.getOwnPropertyDescriptor(inner, key);
+      },
+    });
+
+    const parsed = parseActionAuthorizationGrantEntry(stateful);
+
+    expect(reads.get('schemaVersion')).toBe(1);
+    for (const count of reads.values()) {
+      expect(count).toBeLessThanOrEqual(1);
+    }
+    // One snapshot, one answer: the first read (version 1, no attempt) is the whole record.
+    expect(parsed).toMatchObject({ ok: true, schemaVersion: 1 });
+    expect(parsed.ok && parsed.grant.attemptId).toBeFalsy();
+  });
+
   it('never echoes secret-shaped text or filesystem paths from requests, stored grants, or delegates', async () => {
     const token = syntheticToken();
     const path = syntheticPath();

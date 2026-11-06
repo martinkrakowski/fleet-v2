@@ -161,7 +161,40 @@ export function parseActionAuthorizationGrantEntry(raw: unknown): ParsedActionAu
   }
 }
 
-function parseGrantUnchecked(raw: unknown): ParsedActionAuthorizationGrantRead {
+const GRANT_FIELD_KEYS = ['schemaVersion', 'attemptId', 'expectedHeadSha', 'kind', 'consumedByActionId'] as const;
+
+/**
+ * One snapshot of the stored grant: each field's own descriptor is read exactly
+ * once, so a stateful Proxy cannot answer the version check and the field read
+ * differently. Returns null for a non-object or a field that is not a plain
+ * enumerable data property.
+ */
+function snapshotGrantRecord(raw: unknown): Record<string, unknown> | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return null;
+  }
+  const prototype = Object.getPrototypeOf(raw);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return null;
+  }
+  const snapshot: Record<string, unknown> = {};
+  for (const key of GRANT_FIELD_KEYS) {
+    const field = ownDataDescriptor(raw, key);
+    if (field.state === 'invalid') {
+      return null;
+    }
+    if (field.state === 'data') {
+      snapshot[key] = field.value;
+    }
+  }
+  return snapshot;
+}
+
+function parseGrantUnchecked(source: unknown): ParsedActionAuthorizationGrantRead {
+  const raw = snapshotGrantRecord(source);
+  if (raw === null) {
+    return { ok: false, reason: 'malformed' };
+  }
   const versionCheck = readRecordSchemaVersion(raw, ACTION_AUTHORIZATION_GRANT_SCHEMA_VERSION);
   if (!versionCheck.ok) {
     return { ok: false, reason: versionCheck.reason };

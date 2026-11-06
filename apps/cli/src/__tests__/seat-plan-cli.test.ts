@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 
 import { runCli, type CliIo } from '../index.js';
 import { createFleetCliRuntime } from '../composition.js';
-import { seatPlanFromInstallation, unhealthySeatIdsOf } from '../seat-plan.js';
+import { seatPlanFromCatalog } from '@fleet/work-execution';
 import {
   deriveInstallationModel,
   isFleetInstallationV2,
@@ -54,63 +54,12 @@ function installationModel(overrides: Partial<FleetInstallation> = {}): FleetIns
   return deriveInstallationModel(makeInstallation(overrides)).model;
 }
 
-const FIRST_PASS = [{ id: 'impl-a', model: 'acme/mercury-3', tool: 'opencode', agent: 'lane' }];
-const FIX = [
-  { id: 'impl-b', model: 'acme/argon-4', tool: 'opencode' },
-  { id: 'impl-c', model: 'acme/glm-5.3', tool: 'opencode', variant: 'low', on: ['rate-limited'] },
-];
-const REVIEW = [{ id: 'rev-a', model: 'acme/grok-4.7', tool: 'opencode' }];
-
-function planOf(result: ReturnType<typeof seatPlanFromInstallation>) {
+function planOf(result: ReturnType<typeof seatPlanFromCatalog>) {
   if ('reason' in result) {
     throw new Error(`expected a plan, got reason: ${result.reason}`);
   }
   return result.plan;
 }
-
-// ---------------------------------------------------------------------------
-// seat-plan.ts unit tests
-// ---------------------------------------------------------------------------
-
-describe('seatPlanFromInstallation', () => {
-  it('builds the plan from the fixture chains', () => {
-    const plan = planOf(seatPlanFromInstallation(installationModel()));
-    expect(plan.version).toBe(1);
-    expect(plan['first-pass']).toEqual(FIRST_PASS);
-    expect(plan.fix).toEqual(FIX);
-    expect(plan.review).toEqual(REVIEW);
-  });
-
-  it('fix equals the implementer chain when no fix chain exists', () => {
-    const plan = planOf(
-      seatPlanFromInstallation(installationModel({ chains: { implementer: [{ seatId: 'impl-a' }], reviewer: [{ seatId: 'rev-a' }] } })),
-    );
-    expect(plan.fix).toEqual(plan['first-pass']);
-  });
-
-  it('returns a reason when the installation has no implementer chain', () => {
-    const result = seatPlanFromInstallation(
-      installationModel({ chains: { reviewer: [{ seatId: 'rev-a' }] } }),
-    );
-    expect('reason' in result).toBe(true);
-  });
-});
-
-describe('unhealthySeatIdsOf', () => {
-  it('lists unhealthy seats in file order', () => {
-    const model = installationModel({
-      seats: [
-        { id: 'impl-a', tool: 'opencode', model: 'acme/mercury-3', agent: 'lane', roles: ['implementer'], costClass: 'paid' },
-        { id: 'impl-b', tool: 'opencode', model: 'acme/argon-4', roles: ['implementer'], costClass: 'paid', health: 'unhealthy' },
-      ],
-    });
-    expect(unhealthySeatIdsOf(model)).toEqual(['impl-b']);
-  });
-
-  it('returns [] for an undefined model', () => {
-    expect(unhealthySeatIdsOf(undefined)).toEqual([]);
-  });
-});
 
 // ---------------------------------------------------------------------------
 // CLI tests
@@ -315,7 +264,7 @@ describe('attempt next-seat', () => {
       sessionId: 'session-1',
       completionReceipt: null,
       artifacts: null,
-      seatPlan: planOf(seatPlanFromInstallation(installationModel())),
+      seatPlan: planOf(seatPlanFromCatalog(installationModel())),
       seatSelection: {
         role: 'first-pass',
         seatIndex: 0,
@@ -429,7 +378,7 @@ describe('attempt fix', () => {
       sessionId: 'session-1',
       completionReceipt: null,
       artifacts: null,
-      seatPlan: planOf(seatPlanFromInstallation(installationModel())),
+      seatPlan: planOf(seatPlanFromCatalog(installationModel())),
       seatSelection: {
         role: 'first-pass',
         seatIndex: 0,
@@ -518,6 +467,6 @@ describe('seat plan fixture sanity', () => {
     const installation = makeInstallation();
     expect(isFleetInstallationV2(installation)).toBe(true);
     const model = installationModel();
-    expect(SeatPlan.create(planOf(seatPlanFromInstallation(model))).success).toBe(true);
+    expect(SeatPlan.create(planOf(seatPlanFromCatalog(model))).success).toBe(true);
   });
 });

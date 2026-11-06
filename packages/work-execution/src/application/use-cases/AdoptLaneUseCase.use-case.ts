@@ -326,6 +326,8 @@ const unknown = (reason: AdoptLaneUnknownReason): Halt => new Halt({ outcome: 'u
 
 interface StepState {
   readonly hasIntent: boolean;
+  /** The request digest the step's intent carries; null for an intent recorded without one. */
+  readonly intentDigest: string | null;
   readonly final: CutoverJournalEntry | null;
 }
 
@@ -477,6 +479,11 @@ export class AdoptLaneUseCase implements AdoptLanePort {
 
   /** A recorded result for another brief digest or commit means this call is not a repeat of that adoption. */
   private checkRecordedResults(request: AdoptLaneRequest, states: Map<AdoptLaneStep, StepState>, identity: string): void {
+    // Every intent carries the digest of the ids it was recorded for. A pass that failed after its intent and
+    // before (or during) its write is replayed only with the same ids; any other id is refused before a write.
+    for (const state of states.values()) {
+      if (state.intentDigest !== null && state.intentDigest !== identity) throw refuse('idempotency-conflict');
+    }
     const brief = states.get('brief')?.final;
     if (brief?.outcome === 'completed' && brief.digest !== request.brief.expectedBriefDigest) {
       throw refuse('idempotency-conflict');
@@ -569,7 +576,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
   private async runStep(request: AdoptLaneRequest, step: AdoptLaneStep, state: StepState, identity: string): Promise<void> {
     const key = adoptLaneStepKey(request.planDigest, request.laneId, step);
     if (step === 'work-order') await this.workOrderStep(request, key, state, identity);
-    else if (step === 'brief') await this.briefStep(request, key, state);
+    else if (step === 'brief') await this.briefStep(request, key, state, identity);
     else if (step === 'attempt') await this.attemptStep(request, key, state, identity);
     else await this.runStepRun(request, key, state, identity);
   }
@@ -582,7 +589,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     } else {
       await this.checkWorkOrderFree(request);
     }
-    await this.intent(key, state, request.nowIso);
+    await this.intent(key, state, request.nowIso, identity);
     if (existing === null) {
       await this.guard('work-order-store-unavailable', () => this.deps.workOrderRepo.saveWorkOrder(this.workOrderRecord(request)));
     }
@@ -642,8 +649,8 @@ export class AdoptLaneUseCase implements AdoptLanePort {
   }
 
   /** The brief was verified and frozen unchanged before any write; this step records that fact. */
-  private async briefStep(request: AdoptLaneRequest, key: string, state: StepState): Promise<void> {
-    await this.intent(key, state, request.nowIso);
+  private async briefStep(request: AdoptLaneRequest, key: string, state: StepState, identity: string): Promise<void> {
+    await this.intent(key, state, request.nowIso, identity);
     await this.result(key, request.nowIso, { reasonCode: 'frozen', digest: request.brief.expectedBriefDigest });
   }
 
@@ -653,7 +660,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     const others = await this.guard('attempt-store-unavailable', () => this.deps.attemptRepo.listAttemptsByWorkOrder(workOrder.workOrderId));
     if (others.some((other) => other.id !== attempt.attemptId)) throw refuse('attempt-conflict');
     if (existing !== null && !this.sameAttempt(existing, request)) throw refuse('attempt-conflict');
-    await this.intent(key, state, request.nowIso);
+    await this.intent(key, state, request.nowIso, identity);
     if (existing === null) {
       await this.guard('attempt-store-unavailable', () => this.deps.attemptRepo.saveAttempt(this.attemptRecord(request)));
     }
@@ -699,7 +706,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
 
   private async runStepRun(request: AdoptLaneRequest, key: string, state: StepState, identity: string): Promise<void> {
     const { run } = request;
-    await this.intent(key, state, request.nowIso);
+    await this.intent(key, state, request.nowIso, identity);
     const existing = await this.guard('lane-run-store-unavailable', () => this.deps.runRepo.get(run.runId));
     if (existing === null) {
       const created = await this.guard('lane-run-store-unavailable', () => this.deps.runRepo.create(this.runRecord(request)));
@@ -766,10 +773,10 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     if (appended.outcome !== 'appended') throw unknown('run-journal-unavailable');
   }
 
-  /** Records the intent unless an interrupted pass already did; a refused duplicate counts as recorded. */
-  private async intent(key: string, state: StepState, nowIso: string): Promise<void> {
+  /** Records the intent, with the adoption-id digest, unless an interrupted pass already did; a refused duplicate counts as recorded. */
+  private async intent(key: string, state: StepState, nowIso: string, identity: string): Promise<void> {
     if (state.hasIntent) return;
-    const outcome = await this.append({ key, kind: 'intent', entryId: '', recordedAtIso: nowIso });
+    const outcome = await this.append({ key, kind: 'intent', entryId: '', recordedAtIso: nowIso, digest: identity });
     if (outcome !== 'appended' && outcome !== 'duplicate-intent') throw unknown('journal-append-failed');
   }
 
@@ -803,6 +810,7 @@ function stepState(journal: Journal, key: string): StepState {
   const entries = journal.get(key) ?? [];
   return {
     hasIntent: entries.some((entry) => entry.kind === 'intent'),
+    intentDigest: entries.find((entry) => entry.kind === 'intent')?.digest ?? null,
     final: entries.find(isFinal) ?? null,
   };
 }

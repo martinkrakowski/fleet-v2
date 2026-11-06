@@ -371,4 +371,33 @@ describe('MergePolicyAdapter', () => {
       expect(atBound.repositories).toHaveLength(256);
     }
   });
+
+  it('readMergePolicy refuses extra fields in repository, veto or daemon objects', async () => {
+    const extraRepository = repository({ unexpected: true });
+    expect(await adapterFor(() => resolved({ repositories: [extraRepository] })).readMergePolicy()).toEqual(
+      installationInvalid,
+    );
+    const extraVeto = { mode: 'off', holdConfidence: 0.8, unexpected: true };
+    expect(
+      await adapterFor(() => resolved({ repositories: [repository({ veto: extraVeto })] })).readMergePolicy(),
+    ).toEqual(installationInvalid);
+    const extraDaemon = { intervalSeconds: 60, budgetSeconds: 45, settleSeconds: 20, unexpected: true };
+    expect(await adapterFor(() => resolved({ daemon: extraDaemon })).readMergePolicy()).toEqual(
+      installationInvalid,
+    );
+    const symbolRepository = repository();
+    (symbolRepository as unknown as Record<PropertyKey, unknown>)[Symbol('extra')] = true;
+    expect(await adapterFor(() => resolved({ repositories: [symbolRepository] })).readMergePolicy()).toEqual(
+      installationInvalid,
+    );
+  });
+
+  it('readMergePolicy refuses a repositoryKey that does not match owner/repo', async () => {
+    for (const repositoryKey of ['acme/other', 'acme/widgets/', '/acme/widgets', 'acme', 'ACME/widgets']) {
+      const answer = await adapterFor(() =>
+        resolved({ repositories: [repository({ repositoryKey })] }),
+      ).readMergePolicy();
+      expect([repositoryKey, answer]).toEqual([repositoryKey, installationInvalid]);
+    }
+  });
 });

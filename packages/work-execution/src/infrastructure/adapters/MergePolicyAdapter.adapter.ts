@@ -37,6 +37,22 @@ const MAX_CONTEXT_LENGTH = 64;
 const MAX_TEXT_LENGTH = 256;
 const REVISION_PATTERN = /^[0-9a-f]{12}$/;
 const VETO_MODES: readonly string[] = ['off', 'shadow', 'live'];
+const REPOSITORY_KEYS: readonly string[] = [
+  'owner',
+  'repo',
+  'repositoryKey',
+  'projectId',
+  'shadow',
+  'unattended',
+  'requiredContexts',
+  'updateBranch',
+  'macosProcedure',
+  'maxAttempts',
+  'checksGraceMinutes',
+  'veto',
+];
+const VETO_KEYS: readonly string[] = ['mode', 'holdConfidence'];
+const DAEMON_KEYS: readonly string[] = ['intervalSeconds', 'budgetSeconds', 'settleSeconds'];
 
 const UNREADABLE: MergePolicyAnswer = Object.freeze({
   outcome: 'unknown',
@@ -61,6 +77,26 @@ function isPlainObject(value: unknown): value is object {
 
 function ownValue(record: object, key: string): unknown {
   return Object.getOwnPropertyDescriptor(record, key)?.value;
+}
+
+/**
+ * The resolved data must carry exactly the declared fields — no extra field of any
+ * name (own property or symbol) may ride along. A record with an unexpected key is
+ * malformed and makes the whole answer unknown.
+ */
+function hasExactlyKeys(record: object, expectedKeys: readonly string[]): boolean {
+  const expected = new Set<string>(expectedKeys);
+  let seen = 0;
+  for (const key of Object.getOwnPropertyNames(record)) {
+    if (!expected.has(key)) {
+      return false;
+    }
+    seen += 1;
+  }
+  if (seen !== expected.size) {
+    return false;
+  }
+  return Object.getOwnPropertySymbols(record).length === 0;
 }
 
 function isDenseArray(value: unknown, maxLength: number): value is readonly unknown[] {
@@ -115,6 +151,9 @@ function readVeto(
   if (holdConfidence < 0 || holdConfidence > 1) {
     return undefined;
   }
+  if (!hasExactlyKeys(value, VETO_KEYS)) {
+    return undefined;
+  }
   return Object.freeze({ mode: mode as MergePolicyVetoMode, holdConfidence });
 }
 
@@ -146,7 +185,9 @@ function readRepository(value: unknown): MergePolicyRepository | undefined {
     !isPositiveInteger(maxAttempts) ||
     !isPositiveInteger(checksGraceMinutes) ||
     requiredContexts === undefined ||
-    veto === undefined
+    veto === undefined ||
+    !hasExactlyKeys(value, REPOSITORY_KEYS) ||
+    repositoryKey !== `${owner}/${repo}`
   ) {
     return undefined;
   }
@@ -197,7 +238,8 @@ function readDaemon(value: unknown): MergePolicyDaemonSettings | undefined {
     !Number.isFinite(settleSeconds) ||
     intervalSeconds <= 0 ||
     budgetSeconds <= 0 ||
-    settleSeconds < 0
+    settleSeconds < 0 ||
+    !hasExactlyKeys(value, DAEMON_KEYS)
   ) {
     return undefined;
   }

@@ -66,6 +66,7 @@ import { knowledgeCommands } from './commands/knowledge.js';
 import { coordinationCommands } from './commands/coordination.js';
 import { questionsCommands } from './commands/questions.js';
 import { mergeCommands } from './merge.js';
+import { relaunchCommands } from './relaunch.js';
 import { cutoverCommands } from './commands/cutover.js';
 import { tuiCommand } from './tui/command.js';
 
@@ -268,6 +269,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   coordination: coordinationCommands,
   questions: questionsCommands,
   merge: mergeCommands,
+  relaunch: relaunchCommands,
   cutover: cutoverCommands,
 };
 
@@ -657,7 +659,9 @@ flag); run 'fleet-v2 init --help' for its flags.
 state check reads every JSON state store under the state directory and reports
 ok, missing, unreadable or invalid record per file; it never writes. state
 restore replaces a missing or unreadable store from a quarantine copy after
-confirmation; it is CLI only.
+confirmation; it is CLI only. state compact removes finished attempt, journal
+and reservation records no live run references, keeps the last five
+pre-compaction copies in quarantine and checks the stores before and after.
 
 A seat plan lists ordered seats per role (first-pass, fix, review). brief
 prepare --seatPlanFromInstallation builds it from the installation's chains;
@@ -681,6 +685,12 @@ codes only). Run 'fleet-v2 cutover --help'.
 The report group prints the weekly run-journal service report (read-only, one
 JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
 
+The relaunch group reports what a relaunch would find, read-only: relaunch
+inventory lists, per lane host, the registered clones' worktrees, the runner's
+state per worktree directory, the conductor's status and each lane's
+population (conducted, attempt-recorded, unrecorded). It writes nothing,
+journals nothing and mutates no worktree.
+
 The tui group opens the shared terminal shell: screens are read in-process from the local state stores and the shell never writes. Run 'fleet-v2 tui --help'.
 
 Commands:
@@ -691,11 +701,12 @@ Commands:
   policy auto-merge [status|on|off] [--allow-high-risk true|false] [--on-blocked ask-owner|hold] [--yes]
   projects list|show|probe|add|adopt|edit|retire
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
-  state check|restore
+  state check|restore|compact
   conductor status|halt|stop|resume|start|run
   telemetry export|status
   killall [--lift]
   report weekly
+  relaunch inventory [--host <name>]
   cutover shadow report --repository owner/repo --legacy-state-dir <path>
   tui
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]

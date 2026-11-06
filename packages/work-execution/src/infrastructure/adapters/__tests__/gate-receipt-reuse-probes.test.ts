@@ -340,14 +340,14 @@ describe('gate receipt probe wrapper over a real process (HD1)', () => {
         await writeFile(join(worktree, 'only-here.txt'), 'present-only-in-the-worktree', 'utf8');
         // A binary (not a script, whose interpreter would read the dash itself) at a dash-leading relative path.
         await mkdir(join(worktree, '-d'));
-        await symlink(realpathSync(['/usr/bin/cat', '/bin/cat'].find((path) => existsSync(path)) ?? '/bin/cat'), join(worktree, '-d', 'mycat'));
+        await symlink(realpathSync(['/usr/bin/cat', '/bin/cat'].find((path) => existsSync(path)) ?? '/bin/cat'), join(worktree, '-d', 'cat'));
         const executor = new NoCwdLocalExecutor();
 
         const read = await runReceiptProbe(executor, worktree, ['cat', 'only-here.txt'], 4096);
         expect(read).toMatchObject({ exitCode: 0, stdout: 'present-only-in-the-worktree' });
 
         // The first word after the worktree starts with `-`: without `--` env reads it as its own option.
-        const dashWord = await runReceiptProbe(executor, worktree, ['-d/mycat', 'only-here.txt'], 4096);
+        const dashWord = await runReceiptProbe(executor, worktree, ['-d/cat', 'only-here.txt'], 4096);
         expect(dashWord).toMatchObject({ exitCode: 0, stdout: 'present-only-in-the-worktree' });
 
         // Dash-leading arguments reach the program literally.

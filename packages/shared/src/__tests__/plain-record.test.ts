@@ -420,4 +420,16 @@ describe('readPlainRecord', () => {
       field: null,
     });
   });
+
+  it('refuses an invalid nested record or array item schema even when the field is absent', () => {
+    const badRecord = { a: { kind: 'record', optional: true, schema: { b: { kind: 'bogus' } } } };
+    const badItems = { a: { kind: 'array', optional: true, maxLength: 3, items: { kind: 'string', maxLength: -1 } } };
+    for (const schema of [badRecord, badItems]) {
+      expect(readPlainRecord({}, schema as unknown as PlainRecordSchema)).toEqual({
+        ok: false,
+        reason: 'invalid-schema',
+        field: null,
+      });
+    }
+  });
 });

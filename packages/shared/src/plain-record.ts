@@ -41,6 +41,9 @@ export const MAX_SCHEMA_FIELDS = 64;
 /** At most this many nested record/array levels. */
 export const MAX_DEPTH = 8;
 
+/** A schema nests at most this deep, so validating it up front is bounded. */
+const MAX_SCHEMA_LEVELS = 4 * MAX_DEPTH;
+
 /** A schema that cannot be trusted never leaks a field or value. */
 const INVALID_SCHEMA: PlainRecordRead = { ok: false, reason: 'invalid-schema', field: null };
 
@@ -205,9 +208,22 @@ function readValue(
   }
 }
 
+/** Whether a nested record schema (and everything below it) is well-formed. */
+function isValidRecordSchema(schema: unknown, level: number): boolean {
+  if (typeof schema !== 'object' || schema === null || Array.isArray(schema) || level > MAX_SCHEMA_LEVELS) {
+    return false;
+  }
+  const keys = Object.keys(schema);
+  if (keys.length > MAX_SCHEMA_FIELDS) {
+    return false;
+  }
+  return keys.every((key) => key !== '__proto__'
+    && isValidFieldSchema((schema as Record<string, unknown>)[key], level));
+}
+
 /** Whether a runtime field schema is well-formed enough to trust its bounds. */
-function isValidFieldSchema(field: unknown): boolean {
-  if (typeof field !== 'object' || field === null) {
+function isValidFieldSchema(field: unknown, level = 0): boolean {
+  if (typeof field !== 'object' || field === null || level > MAX_SCHEMA_LEVELS) {
     return false;
   }
   const candidate = field as {
@@ -216,6 +232,8 @@ function isValidFieldSchema(field: unknown): boolean {
     readonly min?: unknown;
     readonly max?: unknown;
     readonly values?: unknown;
+    readonly schema?: unknown;
+    readonly items?: unknown;
   };
   switch (candidate.kind) {
     case 'string':
@@ -230,11 +248,12 @@ function isValidFieldSchema(field: unknown): boolean {
     case 'literal':
       return Array.isArray(candidate.values) && candidate.values.every((entry) => typeof entry === 'string');
     case 'record':
-      return true;
+      return isValidRecordSchema(candidate.schema, level + 1);
     case 'array':
       return typeof candidate.maxLength === 'number'
         && Number.isFinite(candidate.maxLength)
-        && candidate.maxLength >= 0;
+        && candidate.maxLength >= 0
+        && isValidFieldSchema(candidate.items, level + 1);
     default:
       return false;
   }

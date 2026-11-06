@@ -61,6 +61,7 @@ function makeReadPort(result: ReadPullRequestResult | { throw: true }) {
       return result;
     },
     isConfigured: () => true,
+    listOpenPullRequestsByBase: async () => ({ outcome: "unavailable" as const, reason: "not-used" }),
   };
   return { readCalls, port };
 }

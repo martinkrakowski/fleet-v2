@@ -68,6 +68,9 @@ function harness(script: Script = {}) {
       if (script.outcome === 'throw') throw new Error('boom');
       return script.outcome ?? { outcome: 'recorded' };
     },
+    async recordChainReviewPin() {
+      throw new Error("not used");
+    },
   };
   const forge: MergeForgeActionPort = {
     isConfigured: () => true,

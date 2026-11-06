@@ -20,6 +20,7 @@ import type {
   OwnerItemClock,
   OwnerItemIdSource,
   RecordOwnerItemPort,
+  RecordOwnerItemRefusalCode,
   RecordOwnerItemResult,
 } from '../ports/in/RecordOwnerItemPort.in-port.js';
 
@@ -45,67 +46,27 @@ export class RecordOwnerItemUseCase implements RecordOwnerItemPort {
     }
 
     // 1. The body is a closed plain object with exactly the five record keys.
-    let parsed: Record<string, unknown> | null;
-    try {
-      parsed = readPlainObject(body, RECORD_BODY_KEYS);
-    } catch {
-      parsed = null;
-    }
+    const parsed = this.readBody(body);
     if (parsed === null) {
-      return {
-        outcome: 'refused',
-        code: 'request',
-        reason: 'RecordOwnerItem requires exactly projectId, kind, subject, refs and blocks',
-      };
+      return this.refuse('request', 'RecordOwnerItem requires exactly projectId, kind, subject, refs and blocks');
     }
 
     // 2. The actor is who records it; the domain validates createdBy further.
     if (typeof actor !== 'string') {
-      return {
-        outcome: 'refused',
-        code: 'request',
-        reason: 'RecordOwnerItem the actor could not be identified',
-      };
+      return this.refuse('request', 'RecordOwnerItem the actor could not be identified');
     }
 
     // 3. The clock alone supplies the moment.
-    let nowIso: string;
-    try {
-      nowIso = this.deps.clock.nowIso();
-    } catch {
-      return {
-        outcome: 'refused',
-        code: 'clock',
-        reason: 'RecordOwnerItem the clock could not be read',
-      };
-    }
-    if (typeof nowIso !== 'string' || !Number.isFinite(Date.parse(nowIso))) {
-      return {
-        outcome: 'refused',
-        code: 'clock',
-        reason: 'RecordOwnerItem the clock could not be read',
-      };
+    const nowIso = this.readClock();
+    if (nowIso === null) {
+      return this.refuse('clock', 'RecordOwnerItem the clock could not be read');
     }
 
     // 4. The aggregate validates the full open record. The id is minted
     //    before opening so an unreadable id source is a refusal, not a throw.
-    let itemId: string;
-    try {
-      const minted = this.deps.ids.newItemId();
-      if (typeof minted !== 'string') {
-        return {
-          outcome: 'refused',
-          code: 'store',
-          reason: 'RecordOwnerItem the id source could not be read',
-        };
-      }
-      itemId = minted;
-    } catch {
-      return {
-        outcome: 'refused',
-        code: 'store',
-        reason: 'RecordOwnerItem the id source could not be read',
-      };
+    const itemId = this.mintItemId();
+    if (itemId === null) {
+      return this.refuse('store', 'RecordOwnerItem the id source could not be read');
     }
     const opened = OwnerItem.open(
       {
@@ -125,16 +86,7 @@ export class RecordOwnerItemUseCase implements RecordOwnerItemPort {
     const record = opened.value.toRecord();
 
     // 5. Find-or-create by natural key: the holder wins, whatever its state.
-    let existing: RecordOwnerItemResult | null;
-    try {
-      existing = await this.holderOutcome(record);
-    } catch {
-      return {
-        outcome: 'refused',
-        code: 'store',
-        reason: 'RecordOwnerItem the item store could not be read',
-      };
-    }
+    const existing = await this.holderOrStoreError(record);
     if (existing !== null) {
       return existing;
     }
@@ -142,43 +94,89 @@ export class RecordOwnerItemUseCase implements RecordOwnerItemPort {
     // 6. Save at revision 0. A held key means another writer took it between
     //    steps 5 and 6, so the holder is re-read. A revision conflict means the
     //    minted item id is already taken.
+    return this.saveRecord(record);
+  }
+
+  private refuse(code: RecordOwnerItemRefusalCode, reason: string): RecordOwnerItemResult {
+    return { outcome: 'refused', code, reason };
+  }
+
+  /** The closed record shape, or null when it is not exactly one or is unreadable. */
+  private readBody(body: unknown): Record<string, unknown> | null {
     try {
-      const stored = await this.deps.itemRepo.save(record, 0);
+      return readPlainObject(body, RECORD_BODY_KEYS);
+    } catch {
+      return null;
+    }
+  }
+
+  /** The injected clock's ISO instant, or null when it is unreadable or invalid. */
+  private readClock(): string | null {
+    try {
+      const now = this.deps!.clock.nowIso();
+      if (typeof now !== 'string' || !Number.isFinite(Date.parse(now))) {
+        return null;
+      }
+      return now;
+    } catch {
+      return null;
+    }
+  }
+
+  /** A freshly minted item id, or null when the source is unreadable or invalid. */
+  private mintItemId(): string | null {
+    try {
+      const minted = this.deps!.ids.newItemId();
+      if (typeof minted !== 'string') {
+        return null;
+      }
+      return minted;
+    } catch {
+      return null;
+    }
+  }
+
+  /** The holder outcome, or an unreadable-store refusal when the read fails. */
+  private async holderOrStoreError(record: OwnerItemRecord): Promise<RecordOwnerItemResult | null> {
+    try {
+      return await this.holderOutcome(record);
+    } catch {
+      return this.refuse('store', 'RecordOwnerItem the item store could not be read');
+    }
+  }
+
+  /** Save at revision 0; a key conflict re-reads the holder, a revision conflict is an id-taken refusal. */
+  private async saveRecord(record: OwnerItemRecord): Promise<RecordOwnerItemResult> {
+    try {
+      const stored = await this.deps!.itemRepo.save(record, 0);
       return { outcome: 'recorded', item: stored.item, revision: stored.revision };
     } catch (error) {
       if (error instanceof OwnerItemKeyConflictError) {
-        let holder: RecordOwnerItemResult | null;
-        try {
-          holder = await this.holderOutcome(record);
-        } catch {
-          return {
-            outcome: 'refused',
-            code: 'store',
-            reason: 'RecordOwnerItem the item store could not be read',
-          };
-        }
-        if (holder !== null) {
-          return holder;
-        }
-        return {
-          outcome: 'key-held',
-          heldByItemId: error.heldByItemId,
-          reason: 'RecordOwnerItem another owner item holds this natural key',
-        };
+        return this.keyConflictOutcome(record, error);
       }
       if (error instanceof OwnerItemRevisionConflictError) {
-        return {
-          outcome: 'refused',
-          code: 'id-taken',
-          reason: 'RecordOwnerItem the minted item id is already taken',
-        };
+        return this.refuse('id-taken', 'RecordOwnerItem the minted item id is already taken');
       }
-      return {
-        outcome: 'refused',
-        code: 'store',
-        reason: 'RecordOwnerItem the item store could not be written',
-      };
+      return this.refuse('store', 'RecordOwnerItem the item store could not be written');
     }
+  }
+
+  /** Re-read the holder after a key conflict; a still-free key is reported as key-held. */
+  private async keyConflictOutcome(record: OwnerItemRecord, error: OwnerItemKeyConflictError): Promise<RecordOwnerItemResult> {
+    let holder: RecordOwnerItemResult | null;
+    try {
+      holder = await this.holderOutcome(record);
+    } catch {
+      return this.refuse('store', 'RecordOwnerItem the item store could not be read');
+    }
+    if (holder !== null) {
+      return holder;
+    }
+    return {
+      outcome: 'key-held',
+      heldByItemId: error.heldByItemId,
+      reason: 'RecordOwnerItem another owner item holds this natural key',
+    };
   }
 
   /** The outcome for an item already holding one of `record`'s natural keys, or null when none does. */

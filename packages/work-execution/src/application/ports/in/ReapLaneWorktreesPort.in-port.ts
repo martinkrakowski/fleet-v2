@@ -8,8 +8,15 @@
  */
 
 export interface ReapLaneWorktreesRequest {
-  /** Dry run: scan and list candidates exactly like a real run, but call no `removeLaneWorktree`. */
+  /** Dry run: scan and list candidates exactly like a real run, but call no removal. */
   readonly dryRun: boolean;
+  /**
+   * C2': when true, a candidate whose artifacts were never sealed — or whose
+   * sealed manifest no longer verifies — may still be removed, but only
+   * through a scoped, consumed one-way owner approval. Every git and
+   * activity guard still runs.
+   */
+  readonly forceUnsealed?: boolean;
   /** Clock override for tests; absent falls back to the system clock. */
   readonly nowIso?: string;
 }
@@ -35,20 +42,27 @@ export interface ReapWorktreeJournalFailureEntry {
   readonly reason: string;
 }
 
-export type ReapLaneWorktreesResult = {
-  readonly outcome: 'reaped';
-  readonly dryRun: boolean;
-  /** Worktrees removed (or, on a dry run, that would be removed). */
-  readonly removed: readonly RemovedLaneWorktreeEntry[];
-  /** Worktrees already gone (the path is not listed): nothing to remove. */
-  readonly alreadyRemoved: readonly { readonly runId: string }[];
-  /** Eligible runs whose removal was refused or could not be decided (reason code). */
-  readonly refused: readonly RefusedOrSkippedRunEntry[];
-  /** Runs that are not removable candidates, with why. */
-  readonly skipped: readonly RefusedOrSkippedRunEntry[];
-  /** Removals whose post-removal journal append failed, one entry per removal with the failure reason. */
-  readonly journalFailed: readonly ReapWorktreeJournalFailureEntry[];
-};
+/**
+ * C2': the result is a discriminated union so a malformed request or an
+ * unreadable top-level store is a typed answer, never a throw.
+ */
+export type ReapLaneWorktreesResult =
+  | {
+      readonly outcome: 'reaped';
+      readonly dryRun: boolean;
+      /** Worktrees removed (or, on a dry run, that would be removed). */
+      readonly removed: readonly RemovedLaneWorktreeEntry[];
+      /** Worktrees already gone (the path is not listed): nothing to remove. */
+      readonly alreadyRemoved: readonly { readonly runId: string }[];
+      /** Eligible runs whose removal was refused or could not be decided (reason code). */
+      readonly refused: readonly RefusedOrSkippedRunEntry[];
+      /** Runs that are not removable candidates, with why. */
+      readonly skipped: readonly RefusedOrSkippedRunEntry[];
+      /** Removals whose post-removal journal append failed, one entry per removal with the failure reason. */
+      readonly journalFailed: readonly ReapWorktreeJournalFailureEntry[];
+    }
+  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' }
+  | { readonly outcome: 'unknown'; readonly reason: 'store-unreadable' };
 
 export interface ReapLaneWorktreesPort {
   reapLaneWorktrees(request: ReapLaneWorktreesRequest): Promise<ReapLaneWorktreesResult>;

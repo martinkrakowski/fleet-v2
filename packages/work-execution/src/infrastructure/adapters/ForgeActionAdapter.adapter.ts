@@ -21,9 +21,12 @@ import type {
   ForgeActionResult,
 } from '../../application/ports/out/ForgeActionPort.out-port.js';
 import type {
+  MergeBranchHeadRequest,
+  MergeBranchHeadResult,
   MergeForgeActionPort,
   MergeForgeActionRequest,
   MergeForgeActionResult,
+  MergeForgeCreateBranchRequest,
 } from '../../application/ports/out/MergeForgeActionPort.out-port.js';
 import type {
   ForgeReadPort,
@@ -148,6 +151,49 @@ export function isSafeBranchName(value: string): boolean {
 const NORMAL_FORGE_TIMEOUT_MS = 30_000;
 /** A call with less than this much budget left is not started (plan §3.1). */
 const MIN_REMAINING_TO_START_MS = 2_000;
+
+/** A merge-pass request that is bound to a pull request (every kind but create-branch). */
+type MergePullRequestRequest = Exclude<MergeForgeActionRequest, { readonly kind: 'create-branch' }>;
+
+/** One own data property, read without running a getter; undefined for anything else. */
+function ownData(source: unknown, key: string): unknown {
+  try {
+    if (typeof source !== 'object' || source === null) {
+      return undefined;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    return descriptor === undefined ? undefined : descriptor.value;
+  } catch {
+    // A Proxy trap may throw; the value then reads as absent.
+    return undefined;
+  }
+}
+
+/** A plain copy of a create-branch request's own data properties; absent keys stay absent. */
+function snapshotCreateBranchRequest(request: object): MergeForgeCreateBranchRequest {
+  const repository = ownData(request, 'repository');
+  const copy: Record<string, unknown> = {
+    kind: 'create-branch',
+    actionId: ownData(request, 'actionId'),
+    repository:
+      typeof repository === 'object' && repository !== null
+        ? { owner: ownData(repository, 'owner'), repo: ownData(repository, 'repo') }
+        : repository,
+    branchName: ownData(request, 'branchName'),
+    sourceBranch: ownData(request, 'sourceBranch'),
+    expectedHeadSha: ownData(request, 'expectedHeadSha'),
+    deadlineIso: ownData(request, 'deadlineIso'),
+  };
+  for (const key of ['pullRequestNumber', 'status']) {
+    if (Object.getOwnPropertyDescriptor(request, key) !== undefined) {
+      copy[key] = ownData(request, key) ?? true;
+    }
+  }
+  return copy as unknown as MergeForgeCreateBranchRequest;
+}
+
+/** The largest ref body a branch-head read parses. */
+const MAX_REF_BODY_CHARS = 65_536;
 
 export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort {
   private readonly delegate?: ForgeActionDelegate;
@@ -579,7 +625,26 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
 
   // --- MergeForgeActionPort (repo-scoped merge pass path, DT6a) ---------------
 
-  async performMergeForgeAction(request: MergeForgeActionRequest): Promise<MergeForgeActionResult> {
+  async performMergeForgeAction(rawRequest: MergeForgeActionRequest): Promise<MergeForgeActionResult> {
+    if (typeof rawRequest !== 'object' || rawRequest === null) {
+      return this.mergeRefusedOther('invalid request');
+    }
+    if (ownData(rawRequest, 'kind') === 'create-branch') {
+      // A create-branch request is read through its own data properties once, so no getter runs twice or throws.
+      let snapshot: MergeForgeCreateBranchRequest;
+      try {
+        snapshot = snapshotCreateBranchRequest(rawRequest);
+      } catch {
+        return this.mergeRefusedOther('invalid request');
+      }
+      return this.performCreateBranch(snapshot);
+    }
+    const kind = ownData(rawRequest, 'kind');
+    if (kind !== 'merge-pr' && kind !== 'update-branch' && kind !== 'post-status') {
+      // Includes an accessor `kind`, which would run its getter at the first read below.
+      return this.mergeRefusedOther('invalid request');
+    }
+    const request = rawRequest as MergePullRequestRequest;
     const statusRefusal = this.mergeStatusRefusal(request);
     if (statusRefusal !== null) {
       return statusRefusal;
@@ -646,7 +711,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
   }
 
   /** Attempt-bound validation mirrored for merge requests before any subprocess or read runs. */
-  private mergeValidationRefusal(request: MergeForgeActionRequest): MergeForgeActionResult | null {
+  private mergeValidationRefusal(request: MergePullRequestRequest): MergeForgeActionResult | null {
     if (!Number.isFinite(Date.parse(request.deadlineIso))) {
       return this.mergeRefusedOther('unparseable deadline');
     }
@@ -717,7 +782,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
    * Merger's directory for merge-pr and update-branch, poster's for post-status.
    */
   private mergePullRequestReader(
-    request: MergeForgeActionRequest,
+    request: MergePullRequestRequest,
   ): Pick<ForgeReadPort, 'readPullRequest'> | null {
     const configDir = this.configDirFor(request);
     if (configDir === null) {
@@ -738,7 +803,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
    * reports ambiguous rather than writing.
    */
   private async mergeReadPullRequest(
-    request: MergeForgeActionRequest,
+    request: MergePullRequestRequest,
     timeoutMs: number,
   ): Promise<ReadPullRequestResult | null> {
     const reader = this.mergePullRequestReader(request);
@@ -757,7 +822,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
   }
 
   /** Head guard for every merge-pass request, before any write. */
-  private async mergeReadHeadGuard(request: MergeForgeActionRequest): Promise<MergeForgeActionResult | null> {
+  private async mergeReadHeadGuard(request: MergePullRequestRequest): Promise<MergeForgeActionResult | null> {
     const budget = this.budgetCallTimeoutMs(request.deadlineIso);
     if (!budget.ok) {
       return this.mergeRefusedOther(budget.reason);
@@ -780,7 +845,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     return null;
   }
 
-  private async runMergePr(request: MergeForgeActionRequest): Promise<MergeForgeActionResult> {
+  private async runMergePr(request: MergePullRequestRequest): Promise<MergeForgeActionResult> {
     const configDir = this.mergeConfigDir();
     if (configDir === null) {
       return this.mergeRefusedOther('no merger identity is configured');
@@ -821,7 +886,7 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
    * before any refusal is reported.
    */
   private async confirmMergeAfterRefusalScoped(
-    request: MergeForgeActionRequest,
+    request: MergePullRequestRequest,
     refusalKind: ForgeRefusalKind,
   ): Promise<MergeForgeActionResult> {
     const budget = this.budgetCallTimeoutMs(request.deadlineIso);
@@ -986,5 +1051,227 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
       };
     }
     return { outcome: 'executed', headSha: request.expectedHeadSha };
+  }
+
+  // --- create-branch (lane CO7): chain/<name> from main at a recorded commit ---
+
+  private async performCreateBranch(request: MergeForgeCreateBranchRequest): Promise<MergeForgeActionResult> {
+    const refusal = this.createBranchValidationRefusal(request);
+    if (refusal !== null) {
+      return refusal;
+    }
+    if (this.mergeConfigDir() === null) {
+      return this.mergeRefusedOther('no merger identity is configured');
+    }
+    return this.runCreateBranch(request);
+  }
+
+  /** Validation for create-branch: fixed reasons only, no input value echoed. */
+  private createBranchValidationRefusal(request: MergeForgeCreateBranchRequest): MergeForgeActionResult | null {
+    if ('pullRequestNumber' in request) {
+      return this.mergeRefusedOther('create-branch carries no pull request');
+    }
+    if ('status' in request) {
+      return this.mergeRefusedOther('status is only valid for post-status');
+    }
+    if (typeof request.actionId !== 'string' || request.actionId.length === 0 || request.actionId.length > 256) {
+      return this.mergeRefusedOther('Invalid action id');
+    }
+    if (typeof request.deadlineIso !== 'string' || !Number.isFinite(Date.parse(request.deadlineIso))) {
+      return this.mergeRefusedOther('unparseable deadline');
+    }
+    if (!this.isValidRepositoryRef(request.repository)) {
+      return this.mergeRefusedOther('Invalid repository owner or repo');
+    }
+    if (!this.isChainBranch(request.branchName)) {
+      return this.mergeRefusedOther('create-branch creates only a chain branch');
+    }
+    if (request.sourceBranch !== 'main') {
+      return this.mergeRefusedOther('create-branch creates only from main');
+    }
+    if (typeof request.expectedHeadSha !== 'string' || !HEX_40_PATTERN.test(request.expectedHeadSha)) {
+      return this.mergeRefusedOther('Invalid expected head SHA');
+    }
+    return null;
+  }
+
+  private isValidRepositoryRef(repository: unknown): repository is { readonly owner: string; readonly repo: string } {
+    if (typeof repository !== 'object' || repository === null) {
+      return false;
+    }
+    const owner = ownData(repository, 'owner');
+    const repo = ownData(repository, 'repo');
+    return (
+      typeof owner === 'string' &&
+      typeof repo === 'string' &&
+      owner.length <= 100 &&
+      repo.length <= 100 &&
+      REPOSITORY_PATTERN.test(owner) &&
+      REPOSITORY_PATTERN.test(repo) &&
+      owner !== '.' &&
+      owner !== '..' &&
+      repo !== '.' &&
+      repo !== '..'
+    );
+  }
+
+  /** Only `chain/<lowercase-dashes>` is created here; `main` and every other branch is not. */
+  private isChainBranch(branchName: unknown): branchName is string {
+    return (
+      typeof branchName === 'string' &&
+      branchName.startsWith('chain/') &&
+      parseBaseBranch(branchName) !== undefined &&
+      isSafeBranchName(branchName)
+    );
+  }
+
+  private async runCreateBranch(request: MergeForgeCreateBranchRequest): Promise<MergeForgeActionResult> {
+    const configDir = this.mergeConfigDir();
+    if (configDir === null) {
+      return this.mergeRefusedOther('no merger identity is configured');
+    }
+    const runGh = this.delegate?.runGh;
+    if (runGh === undefined) {
+      return { outcome: 'ambiguous', reason: 'no gh subprocess is configured' };
+    }
+    const budget = this.budgetCallTimeoutMs(request.deadlineIso);
+    if (!budget.ok) {
+      return this.mergeRefusedOther(budget.reason);
+    }
+    const args = [
+      'api',
+      '--method',
+      'POST',
+      `repos/${request.repository.owner}/${request.repository.repo}/git/refs`,
+      '-f',
+      `ref=refs/heads/${request.branchName}`,
+      '-f',
+      `sha=${request.expectedHeadSha}`,
+    ];
+    let gh: GhInvocationResult;
+    try {
+      gh = await runGh(args, configDir, budget.timeoutMs);
+    } catch {
+      return { outcome: 'ambiguous', reason: 'gh api create-branch could not complete' };
+    }
+    if (gh.exitCode === 0) {
+      return { outcome: 'executed', headSha: request.expectedHeadSha };
+    }
+    // A non-zero exit does not prove the branch is absent (it may already exist): read it back.
+    const head = await this.readBranchHead(request);
+    if (head.outcome === 'found') {
+      if (head.headSha === request.expectedHeadSha) {
+        return { outcome: 'executed', headSha: request.expectedHeadSha };
+      }
+      return {
+        outcome: 'refused',
+        reason: 'branch-exists-at-other-commit',
+        refusalKind: 'other',
+      };
+    }
+    if (head.outcome === 'not-found') {
+      return {
+        outcome: 'refused',
+        reason: `gh api create-branch failed (exit ${gh.exitCode})`,
+        refusalKind: classifyGhRefusal(gh.stderr, gh.stdout),
+      };
+    }
+    return { outcome: 'ambiguous', reason: 'create-branch failed and the branch could not be read back' };
+  }
+
+  async readMergeBranchHead(request: MergeBranchHeadRequest): Promise<MergeBranchHeadResult> {
+    if (typeof request !== 'object' || request === null) {
+      return { outcome: 'unavailable', reason: 'invalid request' };
+    }
+    const deadlineIso = ownData(request, 'deadlineIso');
+    const repository = ownData(request, 'repository');
+    const branchName = ownData(request, 'branchName');
+    if (typeof deadlineIso !== 'string' || !Number.isFinite(Date.parse(deadlineIso))) {
+      return { outcome: 'unavailable', reason: 'unparseable deadline' };
+    }
+    if (!this.isValidRepositoryRef(repository) || !this.isChainBranch(branchName)) {
+      return { outcome: 'unavailable', reason: 'invalid request' };
+    }
+    return this.readBranchHead({
+      repository: { owner: ownData(repository, 'owner') as string, repo: ownData(repository, 'repo') as string },
+      branchName,
+      deadlineIso,
+    });
+  }
+
+  /** One `gh api` read of the branch ref (the API, never a local git read), bounded by the budget. */
+  private async readBranchHead(request: MergeBranchHeadRequest): Promise<MergeBranchHeadResult> {
+    const configDir = this.mergeConfigDir();
+    if (configDir === null) {
+      return { outcome: 'unavailable', reason: 'no merger identity is configured' };
+    }
+    const runGh = this.delegate?.runGh;
+    if (runGh === undefined) {
+      return { outcome: 'unavailable', reason: 'no gh subprocess is configured' };
+    }
+    const budget = this.budgetCallTimeoutMs(request.deadlineIso);
+    if (!budget.ok) {
+      return { outcome: 'unavailable', reason: budget.reason };
+    }
+    const args = ['api', `repos/${request.repository.owner}/${request.repository.repo}/git/ref/heads/${request.branchName}`];
+    let gh: GhInvocationResult;
+    try {
+      gh = await runGh(args, configDir, budget.timeoutMs);
+    } catch {
+      return { outcome: 'unavailable', reason: 'gh api branch read could not complete' };
+    }
+    if (gh.exitCode !== 0) {
+      if (/HTTP 404|Not Found/i.test(`${gh.stderr}\n${gh.stdout}`)) {
+        return this.confirmBranchAbsent(request, runGh, configDir);
+      }
+      return { outcome: 'unavailable', reason: 'gh api branch read failed' };
+    }
+    return this.parseBranchHeadBody(gh.stdout, request.branchName);
+  }
+
+  /**
+   * A 404 on the ref read also answers a repository the identity cannot see, so it proves the branch absent
+   * only when the repository itself reads; otherwise the answer stays unavailable, never a guess.
+   */
+  private async confirmBranchAbsent(
+    request: MergeBranchHeadRequest,
+    runGh: NonNullable<ForgeActionDelegate['runGh']>,
+    configDir: string,
+  ): Promise<MergeBranchHeadResult> {
+    const unresolved: MergeBranchHeadResult = { outcome: 'unavailable', reason: 'branch read could not confirm the branch is absent' };
+    const budget = this.budgetCallTimeoutMs(request.deadlineIso);
+    if (!budget.ok) {
+      return unresolved;
+    }
+    try {
+      const probe = await runGh(['api', `repos/${request.repository.owner}/${request.repository.repo}`], configDir, budget.timeoutMs);
+      return probe.exitCode === 0 ? { outcome: 'not-found' } : unresolved;
+    } catch {
+      return unresolved;
+    }
+  }
+
+  private parseBranchHeadBody(stdout: string, branchName: string): MergeBranchHeadResult {
+    const unreadable: MergeBranchHeadResult = { outcome: 'unavailable', reason: 'branch read returned an unreadable body' };
+    if (typeof stdout !== 'string' || stdout.length > MAX_REF_BODY_CHARS) {
+      return unreadable;
+    }
+    try {
+      const body: unknown = JSON.parse(stdout);
+      if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+        return unreadable;
+      }
+      const { ref, object } = body as { readonly ref?: unknown; readonly object?: unknown };
+      if (ref !== `refs/heads/${branchName}`) {
+        return unreadable;
+      }
+      const sha = typeof object === 'object' && object !== null ? (object as { readonly sha?: unknown }).sha : undefined;
+      if (typeof sha !== 'string' || !HEX_40_PATTERN.test(sha)) {
+        return unreadable;
+      }
+      return { outcome: 'found', headSha: sha };
+    } catch {
+      return unreadable;
+    }
   }
 }

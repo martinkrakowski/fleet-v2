@@ -10,7 +10,7 @@
 import { containsSecretShape } from '@fleet/shared';
 import { parseBaseBranch } from './base-branch.js';
 import { isZonedIsoDateTime } from './conductor-halt.js';
-import { readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
+import { readExactPlainRecord, readPlainRecordWithOptionalKeys } from './plain-record-reads.js';
 import { readRecordSchemaVersion } from './record-schema-version.js';
 
 export const CHAIN_RECORD_SCHEMA_VERSION = 1 as const;
@@ -41,8 +41,38 @@ export interface ChainRecord {
   readonly reason: string | null;
   /** Supplied by the caller; never read from a clock. */
   readonly createdAtIso: string;
-  /** Compare-and-set counter: 1 at the intent, plus one per outcome. */
+  /** Compare-and-set counter: 1 at the intent, plus one per outcome or pin. */
   readonly revision: number;
+  /**
+   * The chain tip the combined pre-merge review was started for (lane CO9).
+   * Absent or null: no review was started. Additive: the record stays version 1,
+   * and a record stored without it reads as no pin (`reviewPinOf`).
+   */
+  readonly reviewPin?: ChainReviewPin | null;
+}
+
+/** The pin the combined review is bound to: one per chain record, never overwritten by another. */
+export interface ChainReviewPin {
+  /** 40 lowercase hex: the chain tip the review covers. */
+  readonly headSha: string;
+  /** The review request id, derived from the chain name and the head. */
+  readonly requestId: string;
+  /** `chain-review/<chainName>@<head12>`. */
+  readonly key: string;
+  readonly pinnedAtIso: string;
+}
+
+const REVIEW_PIN_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const REVIEW_PIN_KEYS: readonly string[] = ['headSha', 'requestId', 'key', 'pinnedAtIso'];
+
+/** The review key of a chain at a head: `chain-review/<name>@<head12>`. */
+export function chainReviewKeyOf(chainName: string, headSha: string): string {
+  return `chain-review/${chainName}@${headSha.slice(0, 12)}`;
+}
+
+/** The review request id of a chain at a head: `chain-review:<name>:<head12>`; the pin's requestId must equal it. */
+export function chainReviewRequestIdOf(chainName: string, headSha: string): string {
+  return `chain-review:${chainName}:${headSha.slice(0, 12)}`;
 }
 
 const HEX40_PATTERN = /^[0-9a-f]{40}$/;
@@ -175,7 +205,7 @@ const REQUIRED_KEYS: readonly string[] = [
   'repository', 'chainName', 'branchName', 'sourceBranch', 'expectedHeadSha', 'actionKey', 'state',
   'reason', 'createdAtIso', 'revision',
 ];
-const OPTIONAL_KEYS: readonly string[] = ['schemaVersion'];
+const OPTIONAL_KEYS: readonly string[] = ['schemaVersion', 'reviewPin'];
 
 export type ChainRecordReadResult =
   | { readonly ok: true; readonly record: ChainRecord }
@@ -216,6 +246,10 @@ export function readChainRecord(input: unknown): ChainRecordReadResult {
     if (refused ? !isChainReasonCode(reason) : reason !== null) {
       return MALFORMED;
     }
+    const reviewPin = readChainReviewPin(snapshot.reviewPin, chainName);
+    if (reviewPin === undefined) {
+      return MALFORMED;
+    }
     return {
       ok: true,
       record: Object.freeze({
@@ -230,11 +264,58 @@ export function readChainRecord(input: unknown): ChainRecordReadResult {
         reason: reason as string | null,
         createdAtIso,
         revision,
+        // Omitted when there is no pin, so a record stored without one reads exactly as before.
+        ...(reviewPin === null ? {} : { reviewPin }),
       }),
     };
   } catch {
     return MALFORMED;
   }
+}
+
+/**
+ * A stored review pin: null when absent (or stored as null), the frozen pin when
+ * well formed for this chain, undefined when present but malformed. The key must
+ * be exactly the one the chain name and head give.
+ */
+function readChainReviewPin(value: unknown, chainName: string): ChainReviewPin | null | undefined {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const snapshot = readExactPlainRecord(value, REVIEW_PIN_KEYS);
+  if (snapshot === null) {
+    return undefined;
+  }
+  const { headSha, requestId, key, pinnedAtIso } = snapshot;
+  if (
+    !isChainCommitSha(headSha) ||
+    typeof requestId !== 'string' ||
+    !REVIEW_PIN_REQUEST_ID_PATTERN.test(requestId) ||
+    requestId !== chainReviewRequestIdOf(chainName, headSha) ||
+    key !== chainReviewKeyOf(chainName, headSha) ||
+    !isChainActionKey(key) ||
+    !isZonedIsoDateTime(pinnedAtIso)
+  ) {
+    return undefined;
+  }
+  return Object.freeze({ headSha, requestId, key, pinnedAtIso });
+}
+
+/** The record's review pin; a record without one (every CO7 record) has none. */
+export function reviewPinOf(record: ChainRecord): ChainReviewPin | null {
+  return record.reviewPin ?? null;
+}
+
+/**
+ * The record with its review pin set (pinned at `atIso`) and revision advanced
+ * by one; the pin is not validated here, `readChainRecord` is the gate.
+ */
+export function applyChainReviewPin(record: ChainRecord, pin: ChainReviewPin, atIso: string): ChainRecord {
+  return Object.freeze({
+    ...record,
+    reviewPin: Object.freeze({ headSha: pin.headSha, requestId: pin.requestId, key: pin.key, pinnedAtIso: atIso }),
+    revision: record.revision + 1,
+  });
 }
 
 /** The record after its outcome: state and reason set, revision advanced by one. */

@@ -296,4 +296,54 @@ describe('BuildFactPackUseCase', () => {
       });
     }
   });
+
+  it('refuses a request whose laneId getter throws without running the getter', async () => {
+    const port = new FakeRepositoryFactsPort();
+    let getterRan = false;
+    const request: BuildFactPackRequest = { ...BASE_REQUEST };
+    Object.defineProperty(request, 'laneId', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        getterRan = true;
+        throw new Error('boom');
+      },
+    });
+    const result = await makeUseCase(port).buildFactPack(request);
+    expect(result).toEqual({
+      outcome: 'refused',
+      refusal: { reason: 'invalid-request', label: null, rule: null },
+    });
+    expect(getterRan).toBe(false);
+    expect(port.calls).toEqual([]);
+  });
+
+  it('refuses a request whose fields live only on the prototype', async () => {
+    const port = new FakeRepositoryFactsPort();
+    const request = Object.create({ laneId: 'X' });
+    request.facts = BASE_REQUEST.facts;
+    request.commit = COMMIT;
+    request.repositoryPath = '/srv/fleet-v2';
+    const result = await makeUseCase(port).buildFactPack(request as unknown as BuildFactPackRequest);
+    expect(result).toEqual({
+      outcome: 'refused',
+      refusal: { reason: 'invalid-request', label: null, rule: null },
+    });
+    expect(port.calls).toEqual([]);
+  });
+
+  it('refuses a hostile proxy request instead of throwing', async () => {
+    const port = new FakeRepositoryFactsPort();
+    const request = new Proxy({}, {
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile trap');
+      },
+    });
+    const result = await makeUseCase(port).buildFactPack(request as unknown as BuildFactPackRequest);
+    expect(result).toEqual({
+      outcome: 'refused',
+      refusal: { reason: 'invalid-request', label: null, rule: null },
+    });
+    expect(port.calls).toEqual([]);
+  });
 });

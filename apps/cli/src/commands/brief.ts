@@ -1,8 +1,7 @@
 /** The `brief` command group of the CLI driver; its entries moved verbatim from the command table. */
 
-import { parseSeatTool } from '@fleet/work-execution';
+import { parseSeatTool, unhealthySeatIdsFromCatalog } from '@fleet/work-execution';
 import type { AcceptanceSpecProps, BriefContextDecision, BriefModelAssignment } from '@fleet/work-execution';
-import { unhealthySeatIdsOf } from '../seat-plan.js';
 import { str, optStr, strOrNull, num, strArr, nested, nestedArr, jsonStrArr, jsonObj, derivedV2Model, briefSeatPlan, CliUsageError } from './payload.js';
 import type { CommandHandler } from './payload.js';
 
@@ -42,7 +41,7 @@ export const briefCommands: Readonly<Record<string, CommandHandler>> = {
         );
       }
       const seatPlan = briefSeatPlan(p, rt);
-      const unhealthy = new Set(unhealthySeatIdsOf(derivedV2Model(rt)));
+      const unhealthy = new Set(unhealthySeatIdsFromCatalog(derivedV2Model(rt)));
       const planSeatForAssignment =
         seatPlan !== undefined && nestedAssignment === undefined && optStr(p, 'model') === undefined
           ? seatPlan['first-pass'].find((seat) => !unhealthy.has(seat.id))

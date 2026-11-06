@@ -5,6 +5,7 @@
  * becomes a second dispatch. Entries are append-only facts about status.
  */
 
+import { readJournalPullRequestRef } from '../execution-records.js';
 import type { ActionJournalEntryRecord } from '../execution-records.js';
 
 const ACTIONS: readonly unknown[] = ['dispatch', 'reconcile', 'stop', 'collect', 'forge', 'accept'];
@@ -36,6 +37,11 @@ export class ActionJournalEntry {
     }
     if (!STATUSES.includes(record.status)) {
       throw new Error(`ActionJournalEntry has an invalid status: ${String(record.status)}`);
+    }
+    // The typed pull-request reference (WB5b) is permitted only on `forge`
+    // entries and must carry a valid (repository, number) pair.
+    if (readJournalPullRequestRef(record.action, record.pullRequest).kind === 'invalid') {
+      throw new Error('ActionJournalEntry has an invalid pullRequest reference');
     }
     return new ActionJournalEntry({ ...record });
   }

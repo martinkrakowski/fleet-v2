@@ -13,6 +13,7 @@
  * failure is swallowed.
  */
 
+import { GRANT_RECORD_VERSION } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import { CoordinationKind } from '../../domain/value-objects/CoordinationKind.vo.js';
@@ -66,6 +67,9 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
         reason: 'a decision request requires an expectedHeadSha string or null',
       };
     }
+    if (request.attemptId !== undefined && !isFilled(request.attemptId)) {
+      return { outcome: 'rejected', reason: 'a decision request attemptId must be a non-empty string when given' };
+    }
     const kind = CoordinationKind.create(request.kind);
     if (!kind.success || kind.value === undefined) {
       return {
@@ -100,6 +104,9 @@ export class RequestScopedDecisionUseCase implements RequestScopedDecisionPort {
       revision: 0,
       createdAtIso: nowIso,
       updatedAtIso: nowIso,
+      ...(request.attemptId !== undefined
+        ? { grantRecordVersion: GRANT_RECORD_VERSION, grantAttemptId: request.attemptId.trim() }
+        : {}),
     }).toRecord();
     // The proposal is durable before any decider is asked. A duplicate that
     // raced past the lookup above is refused by the store's revision check and

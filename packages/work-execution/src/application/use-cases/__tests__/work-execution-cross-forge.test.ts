@@ -9,124 +9,132 @@
  * ambiguous forge responses) and all five cross-context/forge adapters.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from "vitest";
 
-import { RequestAttemptAcceptanceUseCase, resolveImplementerSeat } from '../RequestAttemptAcceptanceUseCase.use-case.js';
-import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
-import { ExecuteAuthorizedForgeActionUseCase } from '../ExecuteAuthorizedForgeActionUseCase.use-case.js';
-import { AcceptanceAssessmentAdapter } from '../../../infrastructure/adapters/AcceptanceAssessmentAdapter.adapter.js';
-import { ActionAuthorizationAdapter } from '../../../infrastructure/adapters/ActionAuthorizationAdapter.adapter.js';
-import { AllowedSeatAdapter } from '../../../infrastructure/adapters/AllowedSeatAdapter.adapter.js';
-import { BriefKnowledgeAdapter } from '../../../infrastructure/adapters/BriefKnowledgeAdapter.adapter.js';
-import { ExecutionObservationAdapter } from '../../../infrastructure/adapters/ExecutionObservationAdapter.adapter.js';
-import { ForgeActionAdapter } from '../../../infrastructure/adapters/ForgeActionAdapter.adapter.js';
-import type {
-  ExecuteAuthorizedForgeActionRequest,
-} from '../../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
-import type {
-  RequestAttemptAcceptanceRequest,
-} from '../../ports/in/RequestAttemptAcceptancePort.in-port.js';
+import {
+  RequestAttemptAcceptanceUseCase,
+  resolveImplementerSeat,
+} from "../RequestAttemptAcceptanceUseCase.use-case.js";
+import { simpleDeterministicHexDigest } from "../PrepareBriefPackageUseCase.use-case.js";
+import { ExecuteAuthorizedForgeActionUseCase } from "../ExecuteAuthorizedForgeActionUseCase.use-case.js";
+import { AcceptanceAssessmentAdapter } from "../../../infrastructure/adapters/AcceptanceAssessmentAdapter.adapter.js";
+import { ActionAuthorizationAdapter } from "../../../infrastructure/adapters/ActionAuthorizationAdapter.adapter.js";
+import { AllowedSeatAdapter } from "../../../infrastructure/adapters/AllowedSeatAdapter.adapter.js";
+import { BriefKnowledgeAdapter } from "../../../infrastructure/adapters/BriefKnowledgeAdapter.adapter.js";
+import { ExecutionObservationAdapter } from "../../../infrastructure/adapters/ExecutionObservationAdapter.adapter.js";
+import { ForgeActionAdapter } from "../../../infrastructure/adapters/ForgeActionAdapter.adapter.js";
+import type { ExecuteAuthorizedForgeActionRequest } from "../../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js";
+import type { RequestAttemptAcceptanceRequest } from "../../ports/in/RequestAttemptAcceptancePort.in-port.js";
 import type {
   AcceptanceAssessmentPort,
   AcceptanceAssessmentRequest,
   AcceptanceAssessmentResult,
-} from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
+} from "../../ports/out/AcceptanceAssessmentPort.out-port.js";
 import type {
   ActionAuthorizationPort,
   ConsumeActionAuthorizationRequest,
   ConsumeActionAuthorizationResult,
   ResolveActionAuthorizationRequest,
   ResolveActionAuthorizationResult,
-} from '../../ports/out/ActionAuthorizationPort.out-port.js';
-import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
+} from "../../ports/out/ActionAuthorizationPort.out-port.js";
+import type { AttemptRepositoryPort } from "../../ports/out/AttemptRepositoryPort.out-port.js";
 import type {
   ExecutionJournalPort,
   ReserveCapacityAtomicallyRequest,
-} from '../../ports/out/ExecutionJournalPort.out-port.js';
+} from "../../ports/out/ExecutionJournalPort.out-port.js";
 import type {
   AcceptanceEvidencePort,
   ReadAcceptanceRequest,
   ReadAcceptanceResult,
-} from '../../ports/out/AcceptanceEvidencePort.out-port.js';
+} from "../../ports/out/AcceptanceEvidencePort.out-port.js";
 import type {
   ForgeActionPort,
   ForgeActionRequest,
   ForgeActionResult,
-} from '../../ports/out/ForgeActionPort.out-port.js';
-import type { WorkOrderRepositoryPort } from '../../ports/out/WorkOrderRepositoryPort.out-port.js';
+} from "../../ports/out/ForgeActionPort.out-port.js";
+import type { WorkOrderRepositoryPort } from "../../ports/out/WorkOrderRepositoryPort.out-port.js";
 import type {
   BriefContextProposal,
   ForwardCompletedAttemptNotesRequest,
   RecordContextSelectionRequest,
   RequestBriefContextProposalsRequest,
-} from '../../ports/out/BriefKnowledgePort.out-port.js';
-import type {
-  PublishExecutionObservationRequest,
-} from '../../ports/out/ExecutionObservationPort.out-port.js';
+} from "../../ports/out/BriefKnowledgePort.out-port.js";
+import type { PublishExecutionObservationRequest } from "../../ports/out/ExecutionObservationPort.out-port.js";
 import type {
   ActionJournalEntryRecord,
   AttemptRecord,
   CapacityReservationRecord,
   WorkOrderRecord,
-} from '../../../domain/execution-records.js';
+} from "../../../domain/execution-records.js";
+import { MergeRecordRepositoryAdapter } from "../../../infrastructure/adapters/MergeRecordRepositoryAdapter.adapter.js";
 
-const HEAD_SHA = '0123456789abcdef0123456789abcdef01234567';
-const OTHER_SHA = 'fedcba9876543210fedcba9876543210fedcba98';
-const BASE_COMMIT = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
-const FIXED_NOW = '2026-10-15T08:00:00.000Z';
-const LANE_ID = 'wk-p4-cross-forge';
+const HEAD_SHA = "0123456789abcdef0123456789abcdef01234567";
+const OTHER_SHA = "fedcba9876543210fedcba9876543210fedcba98";
+const BASE_COMMIT = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const FIXED_NOW = "2026-10-15T08:00:00.000Z";
+const LANE_ID = "wk-p4-cross-forge";
 /** The seat the frozen manifest dispatched this attempt on. */
-const SEAT_MODEL = 'nvidia/z-ai/glm-5.3';
+const SEAT_MODEL = "nvidia/z-ai/glm-5.3";
 /** The seatless attempt's frozen brief prose and manifest (SEC-5b-3). */
-const FROZEN_PROSE = '# Frozen brief\n';
-const FROZEN_BRIEF_PATH = '/tmp/opencode/lanes/attempt-1/.lane/brief.md';
-const FROZEN_MANIFEST_PATH = '/tmp/opencode/lanes/attempt-1/.lane/brief-manifest.json';
+const FROZEN_PROSE = "# Frozen brief\n";
+const FROZEN_BRIEF_PATH = "/tmp/opencode/lanes/attempt-1/.lane/brief.md";
+const FROZEN_MANIFEST_PATH =
+  "/tmp/opencode/lanes/attempt-1/.lane/brief-manifest.json";
 const frozenManifestJson = (model: string): string =>
   JSON.stringify({ modelAssignment: { model } });
 const frozenDigestFor = (manifestJson: string): string =>
-  simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + manifestJson);
+  simpleDeterministicHexDigest(FROZEN_PROSE + "\n" + manifestJson);
 
 function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
-    id: 'attempt-1',
+    id: "attempt-1",
     ownerDecisionReferences: [],
-    workOrderId: 'wo-1',
-    kind: 'initial',
+    workOrderId: "wo-1",
+    kind: "initial",
     fixNumber: 0,
     priorAttemptId: null,
-    worktreePath: '/tmp/opencode/lanes/attempt-1',
+    worktreePath: "/tmp/opencode/lanes/attempt-1",
     baseCommit: BASE_COMMIT,
-    state: 'collected',
-    outcome: 'done',
-    briefDigest: 'digest-1',
+    state: "collected",
+    outcome: "done",
+    briefDigest: "digest-1",
     briefPackagePath: null,
-    sessionId: 'session-1',
+    sessionId: "session-1",
     completionReceipt: null,
     artifacts: {
       headCommit: HEAD_SHA,
       commitsSinceBase: [HEAD_SHA],
       collectedArtifactPaths: [],
-      notes: 'present',
+      notes: "present",
     },
-    runner: { kind: 'opencode', remotePort: 4166, host: null, agent: null, model: SEAT_MODEL, variant: null },
+    runner: {
+      kind: "opencode",
+      remotePort: 4166,
+      host: null,
+      agent: null,
+      model: SEAT_MODEL,
+      variant: null,
+    },
     createdAtIso: FIXED_NOW,
     updatedAtIso: FIXED_NOW,
     ...overrides,
   };
 }
 
-function makeWorkOrder(overrides: Partial<WorkOrderRecord> = {}): WorkOrderRecord {
+function makeWorkOrder(
+  overrides: Partial<WorkOrderRecord> = {},
+): WorkOrderRecord {
   return {
-    id: 'wo-1',
-    projectId: 'project-1',
-    taskId: 'task-1',
+    id: "wo-1",
+    projectId: "project-1",
+    taskId: "task-1",
     laneId: LANE_ID,
-    repository: 'github.com/org/repo',
+    repository: "github.com/org/repo",
     baseCommit: BASE_COMMIT,
-    ownedPaths: ['packages/work-execution/src'],
-    policyRevision: 'policy-7',
+    ownedPaths: ["packages/work-execution/src"],
+    policyRevision: "policy-7",
     prerequisiteWorkOrderIds: [],
-    state: 'verifying',
+    state: "verifying",
     revision: 2,
     createdAtIso: FIXED_NOW,
     updatedAtIso: FIXED_NOW,
@@ -151,8 +159,12 @@ class InMemoryAttemptRepository implements AttemptRepositoryPort {
     return this.attempts.get(attemptId) ?? null;
   }
 
-  async listAttemptsByWorkOrder(workOrderId: string): Promise<readonly AttemptRecord[]> {
-    return [...this.attempts.values()].filter((a) => a.workOrderId === workOrderId);
+  async listAttemptsByWorkOrder(
+    workOrderId: string,
+  ): Promise<readonly AttemptRecord[]> {
+    return [...this.attempts.values()].filter(
+      (a) => a.workOrderId === workOrderId,
+    );
   }
 
   async listAllAttempts(): Promise<readonly AttemptRecord[]> {
@@ -175,13 +187,19 @@ class InMemoryWorkOrderRepository implements WorkOrderRepositoryPort {
     this.orders.set(record.id, record);
   }
 
-  async findWorkOrderById(workOrderId: string): Promise<WorkOrderRecord | null> {
+  async findWorkOrderById(
+    workOrderId: string,
+  ): Promise<WorkOrderRecord | null> {
     return this.orders.get(workOrderId) ?? null;
   }
 
-  async listWorkOrdersByProject(projectId?: string): Promise<readonly WorkOrderRecord[]> {
+  async listWorkOrdersByProject(
+    projectId?: string,
+  ): Promise<readonly WorkOrderRecord[]> {
     const all = [...this.orders.values()];
-    return projectId === undefined ? all : all.filter((o) => o.projectId === projectId);
+    return projectId === undefined
+      ? all
+      : all.filter((o) => o.projectId === projectId);
   }
 }
 
@@ -192,54 +210,73 @@ class InMemoryJournal implements ExecutionJournalPort {
     this.entries.push(entry);
   }
 
-  async listJournalEntriesForAttempt(attemptId: string): Promise<readonly ActionJournalEntryRecord[]> {
+  async listJournalEntriesForAttempt(
+    attemptId: string,
+  ): Promise<readonly ActionJournalEntryRecord[]> {
     return this.entries.filter((e) => e.attemptId === attemptId);
   }
 
-  async saveCapacityReservation(reservation: CapacityReservationRecord): Promise<void> {
+  async saveCapacityReservation(
+    reservation: CapacityReservationRecord,
+  ): Promise<void> {
     void reservation;
   }
 
-  async listActiveReservations(_hostId?: string): Promise<readonly CapacityReservationRecord[]> {
+  async listActiveReservations(
+    _hostId?: string,
+  ): Promise<readonly CapacityReservationRecord[]> {
     return [];
   }
 
-  async releaseCapacityReservation(_attemptId: string, _releasedAtIso: string): Promise<boolean> {
+  async releaseCapacityReservation(
+    _attemptId: string,
+    _releasedAtIso: string,
+  ): Promise<boolean> {
     return false;
   }
 
   async reserveCapacityAtomically(request: ReserveCapacityAtomicallyRequest) {
-    const reservation: CapacityReservationRecord = { ...request.record!, slotIndex: 0 };
-    return { outcome: 'reserved' as const, reservation };
+    const reservation: CapacityReservationRecord = {
+      ...request.record!,
+      slotIndex: 0,
+    };
+    return { outcome: "reserved" as const, reservation };
   }
 }
 
 class FakeAcceptanceAssessment implements AcceptanceAssessmentPort {
   readonly requests: AcceptanceAssessmentRequest[] = [];
   result: AcceptanceAssessmentResult = {
-    outcome: 'accepted',
-    receiptId: 'receipt-1',
+    outcome: "accepted",
+    receiptId: "receipt-1",
     assessedHeadSha: HEAD_SHA,
   };
 
-  async assessHeadAcceptance(request: AcceptanceAssessmentRequest): Promise<AcceptanceAssessmentResult> {
+  async assessHeadAcceptance(
+    request: AcceptanceAssessmentRequest,
+  ): Promise<AcceptanceAssessmentResult> {
     this.requests.push(request);
     return this.result;
   }
 
   async assessHeadReceipts(): Promise<never> {
-    throw new Error('assessHeadReceipts is not used by this test');
+    throw new Error("assessHeadReceipts is not used by this test");
   }
 }
 
 class FakeActionAuthorization implements ActionAuthorizationPort {
   readonly consumeRequests: ConsumeActionAuthorizationRequest[] = [];
-  result: ConsumeActionAuthorizationResult = { outcome: 'consumed', actionId: 'action-1' };
+  result: ConsumeActionAuthorizationResult = {
+    outcome: "consumed",
+    actionId: "action-1",
+  };
 
   async resolveActionAuthorization(
     _request: ResolveActionAuthorizationRequest,
   ): Promise<ResolveActionAuthorizationResult> {
-    throw new Error('resolveActionAuthorization is not used by the forge use case');
+    throw new Error(
+      "resolveActionAuthorization is not used by the forge use case",
+    );
   }
 
   async consumeActionAuthorization(
@@ -251,9 +288,12 @@ class FakeActionAuthorization implements ActionAuthorizationPort {
 }
 
 class FakeForge implements ForgeActionPort {
+  boundRepository(): { owner: string; repo: string } | undefined {
+    return { owner: 'org', repo: 'repo' };
+  }
   readonly requests: ForgeActionRequest[] = [];
   journalAtCall: readonly ActionJournalEntryRecord[] = [];
-  result: ForgeActionResult = { outcome: 'executed', headSha: HEAD_SHA };
+  result: ForgeActionResult = { outcome: "executed", headSha: HEAD_SHA };
   configured = true;
 
   constructor(private readonly journal?: InMemoryJournal) {}
@@ -262,18 +302,22 @@ class FakeForge implements ForgeActionPort {
     return this.configured;
   }
 
-  async performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult> {
+  async performForgeAction(
+    request: ForgeActionRequest,
+  ): Promise<ForgeActionResult> {
     this.requests.push(request);
     this.journalAtCall = this.journal ? [...this.journal.entries] : [];
     return this.result;
   }
 }
 
-function acceptanceRequest(overrides: Partial<RequestAttemptAcceptanceRequest> = {}): RequestAttemptAcceptanceRequest {
+function acceptanceRequest(
+  overrides: Partial<RequestAttemptAcceptanceRequest> = {},
+): RequestAttemptAcceptanceRequest {
   return {
-    attemptId: 'attempt-1',
+    attemptId: "attempt-1",
     candidateHeadSha: HEAD_SHA,
-    reviewerModel: 'openrouter/anthropic/claude-sonnet-4.5',
+    reviewerModel: "openrouter/anthropic/claude-sonnet-4.5",
     ...overrides,
   };
 }
@@ -281,46 +325,51 @@ function acceptanceRequest(overrides: Partial<RequestAttemptAcceptanceRequest> =
 class FakeAcceptanceEvidence implements AcceptanceEvidencePort {
   constructor(
     private readonly result: ReadAcceptanceResult = {
-      outcome: 'found',
+      outcome: "found",
       assessment: {
-        state: 'accepted',
+        state: "accepted",
         candidateHeadSha: HEAD_SHA,
-        policyRevision: 'policy-7',
-        acceptanceReceiptId: 'receipt-1',
+        policyRevision: "policy-7",
+        acceptanceReceiptId: "receipt-1",
       },
     },
   ) {}
 
-  async readAcceptance(_request: ReadAcceptanceRequest): Promise<ReadAcceptanceResult> {
+  async readAcceptance(
+    _request: ReadAcceptanceRequest,
+  ): Promise<ReadAcceptanceResult> {
     return this.result;
   }
 }
 
-function forgeRequest(overrides: Partial<ExecuteAuthorizedForgeActionRequest> = {}): ExecuteAuthorizedForgeActionRequest {
+function forgeRequest(
+  overrides: Partial<ExecuteAuthorizedForgeActionRequest> = {},
+): ExecuteAuthorizedForgeActionRequest {
   return {
-    actionId: 'action-1',
-    attemptId: 'attempt-1',
-    workOrderId: 'wo-1',
-    kind: 'merge-pr',
+    actionId: "action-1",
+    attemptId: "attempt-1",
+    workOrderId: "wo-1",
+    kind: "merge-pr",
+    pullRequestNumber: 7,
     expectedHeadSha: HEAD_SHA,
-    authorizationGrantId: 'grant-1',
+    authorizationGrantId: "grant-1",
     ...overrides,
   };
 }
 
-describe('RequestAttemptAcceptanceUseCase', () => {
-  it('throws when unconfigured', async () => {
+describe("RequestAttemptAcceptanceUseCase", () => {
+  it("throws when unconfigured", async () => {
     const useCase = new RequestAttemptAcceptanceUseCase();
 
-    await expect(useCase.requestAttemptAcceptance(acceptanceRequest())).rejects.toThrow(
-      'Not implemented: RequestAttemptAcceptanceUseCase',
-    );
+    await expect(
+      useCase.requestAttemptAcceptance(acceptanceRequest()),
+    ).rejects.toThrow("Not implemented: RequestAttemptAcceptanceUseCase");
     await expect(useCase.execute(acceptanceRequest())).rejects.toThrow(
-      'Not implemented: RequestAttemptAcceptanceUseCase',
+      "Not implemented: RequestAttemptAcceptanceUseCase",
     );
   });
 
-  it('rejects when the attempt is not found', async () => {
+  it("rejects when the attempt is not found", async () => {
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository(),
       acceptancePort: new FakeAcceptanceAssessment(),
@@ -328,27 +377,16 @@ describe('RequestAttemptAcceptanceUseCase', () => {
 
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
-    expect(result).toEqual({ outcome: 'rejected', reason: 'Attempt not found' });
-  });
-
-  it('rejects an attempt that has not ended or been collected', async () => {
-    const useCase = new RequestAttemptAcceptanceUseCase({
-      attemptRepo: new InMemoryAttemptRepository([makeAttempt({ state: 'running' })]),
-      acceptancePort: new FakeAcceptanceAssessment(),
-    });
-
-    const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
-
     expect(result).toEqual({
-      outcome: 'rejected',
-      reason: "Attempt is not ready for acceptance: state is 'running'",
+      outcome: "rejected",
+      reason: "Attempt not found",
     });
   });
 
-  it('rejects an attempt without collected artifacts', async () => {
+  it("rejects an attempt that has not ended or been collected", async () => {
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([
-        makeAttempt({ state: 'ended', artifacts: null }),
+        makeAttempt({ state: "running" }),
       ]),
       acceptancePort: new FakeAcceptanceAssessment(),
     });
@@ -356,12 +394,28 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(result).toEqual({
-      outcome: 'rejected',
-      reason: 'Attempt has no collected artifacts',
+      outcome: "rejected",
+      reason: "Attempt is not ready for acceptance: state is 'running'",
     });
   });
 
-  it('rejects a moved candidate head with the expected and actual heads', async () => {
+  it("rejects an attempt without collected artifacts", async () => {
+    const useCase = new RequestAttemptAcceptanceUseCase({
+      attemptRepo: new InMemoryAttemptRepository([
+        makeAttempt({ state: "ended", artifacts: null }),
+      ]),
+      acceptancePort: new FakeAcceptanceAssessment(),
+    });
+
+    const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
+
+    expect(result).toEqual({
+      outcome: "rejected",
+      reason: "Attempt has no collected artifacts",
+    });
+  });
+
+  it("rejects a moved candidate head with the expected and actual heads", async () => {
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([makeAttempt()]),
       acceptancePort: new FakeAcceptanceAssessment(),
@@ -372,12 +426,12 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     );
 
     expect(result).toEqual({
-      outcome: 'rejected',
+      outcome: "rejected",
       reason: `Candidate head mismatch: expected ${HEAD_SHA}, got ${OTHER_SHA}`,
     });
   });
 
-  it('rejects a reviewer that is the implementer model and never assesses', async () => {
+  it("rejects a reviewer that is the implementer model and never assesses", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([makeAttempt()]),
@@ -388,14 +442,14 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       acceptanceRequest({ reviewerModel: SEAT_MODEL }),
     );
 
-    expect(result.outcome).toBe('rejected');
-    expect(result.outcome === 'rejected' && result.reason).toContain(
+    expect(result.outcome).toBe("rejected");
+    expect(result.outcome === "rejected" && result.reason).toContain(
       `matches implementer model ${SEAT_MODEL}`,
     );
     expect(acceptancePort.requests).toHaveLength(0);
   });
 
-  it('rejects a reviewer on the recorded seat through another provider', async () => {
+  it("rejects a reviewer on the recorded seat through another provider", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([makeAttempt()]),
@@ -405,17 +459,17 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     // The attempt ran on nvidia/z-ai/glm-5.3; a different provider prefix on
     // the same underlying model is not independence.
     const result = await useCase.requestAttemptAcceptance(
-      acceptanceRequest({ reviewerModel: 'openrouter/z-ai/glm-5.3' }),
+      acceptanceRequest({ reviewerModel: "openrouter/z-ai/glm-5.3" }),
     );
 
-    expect(result.outcome).toBe('rejected');
-    expect(result.outcome === 'rejected' && result.reason).toContain(
-      'an independent reviewer is required',
+    expect(result.outcome).toBe("rejected");
+    expect(result.outcome === "rejected" && result.reason).toContain(
+      "an independent reviewer is required",
     );
     expect(acceptancePort.requests).toHaveLength(0);
   });
 
-  it('rejects an attempt that records no implementer seat instead of assuming one', async () => {
+  it("rejects an attempt that records no implementer seat instead of assuming one", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([
@@ -428,21 +482,21 @@ describe('RequestAttemptAcceptanceUseCase', () => {
 
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
-    expect(result.outcome).toBe('rejected');
-    expect(result.outcome === 'rejected' && result.reason).toBe(
+    expect(result.outcome).toBe("rejected");
+    expect(result.outcome === "rejected" && result.reason).toBe(
       "Attempt attempt-1 records no implementer seat: neither the dispatched runner model nor the frozen brief manifest's model assignment is known",
     );
     expect(acceptancePort.requests).toHaveLength(0);
   });
 
-  it('refuses a seatless attempt with no artifact port and never reads a worktree file', async () => {
+  it("refuses a seatless attempt with no artifact port and never reads a worktree file", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     let worktreeReads = 0;
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([
         makeAttempt({
           runner: null,
-          briefPackagePath: '/tmp/opencode/lanes/attempt-1/.lane/brief.md',
+          briefPackagePath: "/tmp/opencode/lanes/attempt-1/.lane/brief.md",
         }),
       ]),
       acceptancePort,
@@ -451,34 +505,40 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       workspace: {
         readWorktreeFile: async () => {
           worktreeReads += 1;
-          return JSON.stringify({ modelAssignment: { model: 'worktree-seat-model' } });
+          return JSON.stringify({
+            modelAssignment: { model: "worktree-seat-model" },
+          });
         },
       },
-    } as unknown as ConstructorParameters<typeof RequestAttemptAcceptanceUseCase>[0]);
+    } as unknown as ConstructorParameters<
+      typeof RequestAttemptAcceptanceUseCase
+    >[0]);
 
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
-    expect(result.outcome).toBe('rejected');
-    expect(result.outcome === 'rejected' && result.reason).toBe(
+    expect(result.outcome).toBe("rejected");
+    expect(result.outcome === "rejected" && result.reason).toBe(
       "Attempt attempt-1 records no implementer seat: neither the dispatched runner model nor the frozen brief manifest's model assignment is known",
     );
     expect(worktreeReads).toBe(0);
     expect(acceptancePort.requests).toHaveLength(0);
   });
 
-  it('falls back to the frozen manifest seat when the attempt records none', async () => {
+  it("falls back to the frozen manifest seat when the attempt records none", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const workOrderRepo = new InMemoryWorkOrderRepository([makeWorkOrder()]);
     const manifestReads: string[] = [];
     const briefReads: string[] = [];
-    const manifestJson = frozenManifestJson('opencode/longcat-2.5-preview-free');
+    const manifestJson = frozenManifestJson(
+      "opencode/longcat-2.5-preview-free",
+    );
     const readManifest = async (
       _worktreePath: string,
       manifestPath?: string,
     ): Promise<string | null> => {
-      manifestReads.push(manifestPath ?? '');
+      manifestReads.push(manifestPath ?? "");
       // Only the manifest file carries a model assignment; the prose brief does not.
-      if (manifestPath === undefined || !manifestPath.endsWith('.json')) {
+      if (manifestPath === undefined || !manifestPath.endsWith(".json")) {
         return null;
       }
       return manifestJson;
@@ -487,8 +547,10 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       _worktreePath: string,
       briefPath?: string,
     ): Promise<string | null> => {
-      briefReads.push(briefPath ?? '');
-      return briefPath === undefined || !briefPath.endsWith('.md') ? null : FROZEN_PROSE;
+      briefReads.push(briefPath ?? "");
+      return briefPath === undefined || !briefPath.endsWith(".md")
+        ? null
+        : FROZEN_PROSE;
     };
     const seatlessAttempt = makeAttempt({
       runner: null,
@@ -499,15 +561,19 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
       workOrderRepo,
       acceptancePort,
-      artifactPort: { readBriefManifest: readManifest, readBriefFile: readBriefFile },
+      artifactPort: {
+        readBriefManifest: readManifest,
+        readBriefFile: readBriefFile,
+      },
     });
 
-    const accepted = await useCase.requestAttemptAcceptance(acceptanceRequest());
+    const accepted =
+      await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(accepted).toEqual({
-      outcome: 'accepted',
+      outcome: "accepted",
       candidateHeadSha: HEAD_SHA,
-      receiptId: 'receipt-1',
+      receiptId: "receipt-1",
     });
     expect(manifestReads).toContain(FROZEN_MANIFEST_PATH);
 
@@ -516,37 +582,45 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
       workOrderRepo,
       acceptancePort: new FakeAcceptanceAssessment(),
-      artifactPort: { readBriefManifest: readManifest, readBriefFile: readBriefFile },
+      artifactPort: {
+        readBriefManifest: readManifest,
+        readBriefFile: readBriefFile,
+      },
     });
 
     const refused = await sameFamily.requestAttemptAcceptance(
-      acceptanceRequest({ reviewerModel: 'other/longcat-2.5-preview-free' }),
+      acceptanceRequest({ reviewerModel: "other/longcat-2.5-preview-free" }),
     );
 
-    expect(refused.outcome).toBe('rejected');
-    expect(refused.outcome === 'rejected' && refused.reason).toContain(
-      'matches implementer model opencode/longcat-2.5-preview-free',
+    expect(refused.outcome).toBe("rejected");
+    expect(refused.outcome === "rejected" && refused.reason).toContain(
+      "matches implementer model opencode/longcat-2.5-preview-free",
     );
   });
 
-  it('rejects a legacy attempt whose only manifest is the worker-writable worktree path', async () => {
+  it("rejects a legacy attempt whose only manifest is the worker-writable worktree path", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const manifestReads: string[] = [];
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([
         makeAttempt({
           runner: null,
-          briefPackagePath: '/tmp/opencode/lanes/attempt-1/.lane/brief.md',
+          briefPackagePath: "/tmp/opencode/lanes/attempt-1/.lane/brief.md",
         }),
       ]),
       acceptancePort,
       artifactPort: {
-        readBriefFile: async () => '# Frozen brief\n',
-        readBriefManifest: async (_worktreePath: string, manifestPath?: string) => {
-          manifestReads.push(manifestPath ?? '');
+        readBriefFile: async () => "# Frozen brief\n",
+        readBriefManifest: async (
+          _worktreePath: string,
+          manifestPath?: string,
+        ) => {
+          manifestReads.push(manifestPath ?? "");
           // A worker-writable worktree manifest would happily "confirm" any seat.
-          if (manifestPath === '.lane/brief-manifest.json') {
-            return JSON.stringify({ modelAssignment: { model: 'opencode/longcat-2.5-preview-free' } });
+          if (manifestPath === ".lane/brief-manifest.json") {
+            return JSON.stringify({
+              modelAssignment: { model: "opencode/longcat-2.5-preview-free" },
+            });
           }
           return null;
         },
@@ -556,25 +630,32 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(result).toEqual({
-      outcome: 'rejected',
-      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+      outcome: "rejected",
+      reason:
+        "Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest",
     });
-    expect(manifestReads).not.toContain('.lane/brief-manifest.json');
+    expect(manifestReads).not.toContain(".lane/brief-manifest.json");
     expect(acceptancePort.requests).toHaveLength(0);
   });
 
-  it('rejects a tampered frozen manifest and never reaches the assessment', async () => {
+  it("rejects a tampered frozen manifest and never reaches the assessment", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const workOrderRepo = new InMemoryWorkOrderRepository([makeWorkOrder()]);
     // The recorded digest covers prose + '\n' + the ORIGINAL manifest whose
     // model assignment matches the reviewer's family; on disk the manifest
     // was rewritten to a different seat.
-    const originalManifestJson = frozenManifestJson('openrouter/anthropic/claude-sonnet-4.5');
-    const rewrittenManifestJson = frozenManifestJson('opencode/longcat-2.5-preview-free');
+    const originalManifestJson = frozenManifestJson(
+      "openrouter/anthropic/claude-sonnet-4.5",
+    );
+    const rewrittenManifestJson = frozenManifestJson(
+      "opencode/longcat-2.5-preview-free",
+    );
     const seatlessAttempt = makeAttempt({
       runner: null,
       briefPackagePath: FROZEN_BRIEF_PATH,
-      briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + originalManifestJson),
+      briefDigest: simpleDeterministicHexDigest(
+        FROZEN_PROSE + "\n" + originalManifestJson,
+      ),
     });
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
@@ -589,12 +670,13 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(result).toEqual({
-      outcome: 'rejected',
-      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+      outcome: "rejected",
+      reason:
+        "Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest",
     });
     expect(acceptancePort.requests).toHaveLength(0);
-    const storedOrder = await workOrderRepo.findWorkOrderById('wo-1');
-    expect(storedOrder?.state).toBe('verifying');
+    const storedOrder = await workOrderRepo.findWorkOrderById("wo-1");
+    expect(storedOrder?.state).toBe("verifying");
     expect(workOrderRepo.saved).toHaveLength(0);
 
     const seat = await resolveImplementerSeat(seatlessAttempt, {
@@ -604,24 +686,29 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       },
     });
     expect(seat).toEqual({
-      outcome: 'unknown',
-      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+      outcome: "unknown",
+      reason:
+        "Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest",
     });
   });
 
-  it('rejects a tampered frozen brief prose file', async () => {
+  it("rejects a tampered frozen brief prose file", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
-    const manifestJson = frozenManifestJson('opencode/longcat-2.5-preview-free');
+    const manifestJson = frozenManifestJson(
+      "opencode/longcat-2.5-preview-free",
+    );
     const seatlessAttempt = makeAttempt({
       runner: null,
       briefPackagePath: FROZEN_BRIEF_PATH,
-      briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + manifestJson),
+      briefDigest: simpleDeterministicHexDigest(
+        FROZEN_PROSE + "\n" + manifestJson,
+      ),
     });
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
       acceptancePort,
       artifactPort: {
-        readBriefFile: async () => '# Altered brief prose\n',
+        readBriefFile: async () => "# Altered brief prose\n",
         readBriefManifest: async () => manifestJson,
       },
     });
@@ -629,18 +716,23 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(result).toEqual({
-      outcome: 'rejected',
-      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+      outcome: "rejected",
+      reason:
+        "Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest",
     });
     expect(acceptancePort.requests).toHaveLength(0);
   });
 
-  it('rejects when the frozen manifest or prose is missing on disk', async () => {
-    const manifestJson = frozenManifestJson('opencode/longcat-2.5-preview-free');
+  it("rejects when the frozen manifest or prose is missing on disk", async () => {
+    const manifestJson = frozenManifestJson(
+      "opencode/longcat-2.5-preview-free",
+    );
     const seatlessAttempt = makeAttempt({
       runner: null,
       briefPackagePath: FROZEN_BRIEF_PATH,
-      briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + manifestJson),
+      briefDigest: simpleDeterministicHexDigest(
+        FROZEN_PROSE + "\n" + manifestJson,
+      ),
     });
     const missingManifestPort = new FakeAcceptanceAssessment();
     const missingProsePort = new FakeAcceptanceAssessment();
@@ -661,28 +753,35 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       },
     });
 
-    const noManifest = await missingManifest.requestAttemptAcceptance(acceptanceRequest());
-    const noProse = await missingProse.requestAttemptAcceptance(acceptanceRequest());
+    const noManifest =
+      await missingManifest.requestAttemptAcceptance(acceptanceRequest());
+    const noProse =
+      await missingProse.requestAttemptAcceptance(acceptanceRequest());
 
     expect(noManifest).toEqual({
-      outcome: 'rejected',
-      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+      outcome: "rejected",
+      reason:
+        "Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest",
     });
     expect(noProse).toEqual({
-      outcome: 'rejected',
-      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+      outcome: "rejected",
+      reason:
+        "Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest",
     });
     expect(missingManifestPort.requests).toHaveLength(0);
     expect(missingProsePort.requests).toHaveLength(0);
   });
 
-  it('fails closed on a missing or empty briefDigest or a port without readBriefFile', async () => {
+  it("fails closed on a missing or empty briefDigest or a port without readBriefFile", async () => {
     const manifestReads: string[] = [];
     const acceptancePort = new FakeAcceptanceAssessment();
     const artifactPort = {
-      readBriefManifest: async (_worktreePath: string, manifestPath?: string) => {
-        manifestReads.push(manifestPath ?? '');
-        return frozenManifestJson('opencode/longcat-2.5-preview-free');
+      readBriefManifest: async (
+        _worktreePath: string,
+        manifestPath?: string,
+      ) => {
+        manifestReads.push(manifestPath ?? "");
+        return frozenManifestJson("opencode/longcat-2.5-preview-free");
       },
     };
     const seatless = (briefDigest: string | null) =>
@@ -698,33 +797,40 @@ describe('RequestAttemptAcceptanceUseCase', () => {
         artifactPort,
       }),
       new RequestAttemptAcceptanceUseCase({
-        attemptRepo: new InMemoryAttemptRepository([seatless('')]),
+        attemptRepo: new InMemoryAttemptRepository([seatless("")]),
         acceptancePort,
         artifactPort,
       }),
       new RequestAttemptAcceptanceUseCase({
-        attemptRepo: new InMemoryAttemptRepository([seatless('digest-1')]),
+        attemptRepo: new InMemoryAttemptRepository([seatless("digest-1")]),
         acceptancePort,
         artifactPort: { readBriefManifest: artifactPort.readBriefManifest },
       }),
     ];
 
     for (const useCase of cases) {
-      await expect(useCase.requestAttemptAcceptance(acceptanceRequest())).resolves.toEqual({
-        outcome: 'rejected',
-        reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+      await expect(
+        useCase.requestAttemptAcceptance(acceptanceRequest()),
+      ).resolves.toEqual({
+        outcome: "rejected",
+        reason:
+          "Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest",
       });
     }
     expect(manifestReads).toHaveLength(0);
     expect(acceptancePort.requests).toHaveLength(0);
   });
 
-  it('fails closed on a throwing manifest read or non-object manifest JSON', async () => {
-    const manifestJson = frozenManifestJson('opencode/longcat-2.5-preview-free');
+  it("fails closed on a throwing manifest read or non-object manifest JSON", async () => {
+    const manifestJson = frozenManifestJson(
+      "opencode/longcat-2.5-preview-free",
+    );
     const seatlessAttempt = makeAttempt({
       runner: null,
       briefPackagePath: FROZEN_BRIEF_PATH,
-      briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + manifestJson),
+      briefDigest: simpleDeterministicHexDigest(
+        FROZEN_PROSE + "\n" + manifestJson,
+      ),
     });
     const throwing = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
@@ -732,7 +838,7 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       artifactPort: {
         readBriefFile: async () => FROZEN_PROSE,
         readBriefManifest: async () => {
-          throw new Error('manifest read failed');
+          throw new Error("manifest read failed");
         },
       },
     });
@@ -741,65 +847,72 @@ describe('RequestAttemptAcceptanceUseCase', () => {
         makeAttempt({
           runner: null,
           briefPackagePath: FROZEN_BRIEF_PATH,
-          briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + '[]'),
+          briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + "\n" + "[]"),
         }),
       ]),
       acceptancePort: new FakeAcceptanceAssessment(),
       artifactPort: {
         readBriefFile: async () => FROZEN_PROSE,
-        readBriefManifest: async () => '[]',
+        readBriefManifest: async () => "[]",
       },
     });
 
-    const thrownResult = await throwing.requestAttemptAcceptance(acceptanceRequest());
-    const arrayResult = await notAnObject.requestAttemptAcceptance(acceptanceRequest());
+    const thrownResult =
+      await throwing.requestAttemptAcceptance(acceptanceRequest());
+    const arrayResult =
+      await notAnObject.requestAttemptAcceptance(acceptanceRequest());
 
     expect(thrownResult).toEqual({
-      outcome: 'rejected',
-      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+      outcome: "rejected",
+      reason:
+        "Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest",
     });
     expect(arrayResult).toEqual({
-      outcome: 'rejected',
-      reason: 'Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest',
+      outcome: "rejected",
+      reason:
+        "Frozen brief manifest for attempt attempt-1 could not be verified against the recorded briefDigest",
     });
   });
 
-  it('rejects a verified manifest that carries no model assignment', async () => {
+  it("rejects a verified manifest that carries no model assignment", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([
         makeAttempt({
           runner: null,
           briefPackagePath: FROZEN_BRIEF_PATH,
-          briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + '\n' + '{}'),
+          briefDigest: simpleDeterministicHexDigest(FROZEN_PROSE + "\n" + "{}"),
         }),
       ]),
       acceptancePort,
       artifactPort: {
         readBriefFile: async () => FROZEN_PROSE,
-        readBriefManifest: async () => '{}',
+        readBriefManifest: async () => "{}",
       },
     });
 
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(result).toEqual({
-      outcome: 'rejected',
-      reason: "Attempt attempt-1 records no implementer seat: neither the dispatched runner model nor the frozen brief manifest's model assignment is known",
+      outcome: "rejected",
+      reason:
+        "Attempt attempt-1 records no implementer seat: neither the dispatched runner model nor the frozen brief manifest's model assignment is known",
     });
     expect(acceptancePort.requests).toHaveLength(0);
   });
 
-  it('forwards a custom computeDigest from the dependencies to seat resolution', async () => {
+  it("forwards a custom computeDigest from the dependencies to seat resolution", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const workOrderRepo = new InMemoryWorkOrderRepository([makeWorkOrder()]);
-    const manifestJson = frozenManifestJson('opencode/longcat-2.5-preview-free');
+    const manifestJson = frozenManifestJson(
+      "opencode/longcat-2.5-preview-free",
+    );
     const customDigest = (content: string): string =>
-      'custom-' + simpleDeterministicHexDigest(content);
+      "custom-" + simpleDeterministicHexDigest(content);
     const seatlessAttempt = makeAttempt({
       runner: null,
       briefPackagePath: FROZEN_BRIEF_PATH,
-      briefDigest: customDigest(FROZEN_PROSE + '\n' + manifestJson),
+      briefDigest: customDigest(FROZEN_PROSE + "\n" + manifestJson),
     });
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([seatlessAttempt]),
@@ -812,16 +925,17 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       computeDigest: customDigest,
     });
 
-    const accepted = await useCase.requestAttemptAcceptance(acceptanceRequest());
+    const accepted =
+      await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(accepted).toEqual({
-      outcome: 'accepted',
+      outcome: "accepted",
       candidateHeadSha: HEAD_SHA,
-      receiptId: 'receipt-1',
+      receiptId: "receipt-1",
     });
   });
 
-  it('prefers the recorded runner seat over a differing frozen manifest', async () => {
+  it("prefers the recorded runner seat over a differing frozen manifest", async () => {
     const manifestReads: string[] = [];
     // The manifest and the recorded seat disagree; the seat dispatch actually
     // ran is the one independence is judged against.
@@ -829,38 +943,41 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       attemptRepo: new InMemoryAttemptRepository([
         makeAttempt({
           runner: {
-            kind: 'opencode',
+            kind: "opencode",
             remotePort: 4166,
             host: null,
             agent: null,
-            model: 'opencode/longcat-2.5-preview-free',
+            model: "opencode/longcat-2.5-preview-free",
             variant: null,
           },
         }),
       ]),
       acceptancePort: new FakeAcceptanceAssessment(),
       artifactPort: {
-        readBriefManifest: async (_worktreePath: string, manifestPath?: string) => {
-          manifestReads.push(manifestPath ?? '');
+        readBriefManifest: async (
+          _worktreePath: string,
+          manifestPath?: string,
+        ) => {
+          manifestReads.push(manifestPath ?? "");
           return JSON.stringify({ modelAssignment: { model: SEAT_MODEL } });
         },
       },
     });
 
     const result = await useCase.requestAttemptAcceptance(
-      acceptanceRequest({ reviewerModel: 'openrouter/z-ai/glm-5.3' }),
+      acceptanceRequest({ reviewerModel: "openrouter/z-ai/glm-5.3" }),
     );
 
     // Independent of the recorded seat, so the request reaches the
     // policy-revision check rather than a false refusal against the manifest.
-    expect(result.outcome).toBe('rejected');
-    expect(result.outcome === 'rejected' && result.reason).toBe(
-      'Acceptance requires the work order policy revision; no work order is available',
+    expect(result.outcome).toBe("rejected");
+    expect(result.outcome === "rejected" && result.reason).toBe(
+      "Acceptance requires the work order policy revision; no work order is available",
     );
     expect(manifestReads).toEqual([]);
   });
 
-  it('rejects when no work order is available to scope the assessment', async () => {
+  it("rejects when no work order is available to scope the assessment", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([makeAttempt()]),
@@ -870,13 +987,14 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(result).toEqual({
-      outcome: 'rejected',
-      reason: 'Acceptance requires the work order policy revision; no work order is available',
+      outcome: "rejected",
+      reason:
+        "Acceptance requires the work order policy revision; no work order is available",
     });
     expect(acceptancePort.requests).toHaveLength(0);
   });
 
-  it('accepts the exact head and propagates the receipt', async () => {
+  it("accepts the exact head and propagates the receipt", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const workOrderRepo = new InMemoryWorkOrderRepository([makeWorkOrder()]);
     const useCase = new RequestAttemptAcceptanceUseCase({
@@ -889,29 +1007,29 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(result).toEqual({
-      outcome: 'accepted',
+      outcome: "accepted",
       candidateHeadSha: HEAD_SHA,
-      receiptId: 'receipt-1',
+      receiptId: "receipt-1",
     });
     expect(acceptancePort.requests).toEqual([
       {
-        attemptId: 'attempt-1',
-        workOrderId: 'wo-1',
+        attemptId: "attempt-1",
+        workOrderId: "wo-1",
         candidateHeadSha: HEAD_SHA,
-        policyRevision: 'policy-7',
+        policyRevision: "policy-7",
       },
     ]);
     expect(workOrderRepo.saved).toEqual([
       expect.objectContaining({
-        id: 'wo-1',
-        state: 'ready-to-merge',
+        id: "wo-1",
+        state: "ready-to-merge",
         revision: 3,
         updatedAtIso: FIXED_NOW,
       }),
     ]);
   });
 
-  it('also accepts through the execute entry point', async () => {
+  it("also accepts through the execute entry point", async () => {
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([makeAttempt()]),
       workOrderRepo: new InMemoryWorkOrderRepository([makeWorkOrder()]),
@@ -922,13 +1040,13 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const result = await useCase.execute(acceptanceRequest());
 
     expect(result).toEqual({
-      outcome: 'accepted',
+      outcome: "accepted",
       candidateHeadSha: HEAD_SHA,
-      receiptId: 'receipt-1',
+      receiptId: "receipt-1",
     });
   });
 
-  it('rejects a free reviewer and accepts a paid one when the flag is off (F5)', async () => {
+  it("rejects a free reviewer and accepts a paid one when the flag is off (F5)", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([makeAttempt()]),
@@ -937,16 +1055,16 @@ describe('RequestAttemptAcceptanceUseCase', () => {
       allowedSeats: new AllowedSeatAdapter({
         seats: [
           {
-            id: 'free-reviewer',
-            tool: 'opencode',
-            model: 'opencode/longcat-2.5-preview-free',
-            costClass: 'free',
+            id: "free-reviewer",
+            tool: "opencode",
+            model: "opencode/longcat-2.5-preview-free",
+            costClass: "free",
           },
           {
-            id: 'paid-reviewer',
-            tool: 'opencode',
-            model: 'openrouter/anthropic/claude-sonnet-4.5',
-            costClass: 'paid',
+            id: "paid-reviewer",
+            tool: "opencode",
+            model: "openrouter/anthropic/claude-sonnet-4.5",
+            costClass: "paid",
           },
         ],
         policy: { useFreeSeats: false },
@@ -954,24 +1072,28 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     });
 
     const free = await useCase.requestAttemptAcceptance(
-      acceptanceRequest({ reviewerModel: 'opencode/longcat-2.5-preview-free' }),
+      acceptanceRequest({ reviewerModel: "opencode/longcat-2.5-preview-free" }),
     );
 
-    expect(free.outcome).toBe('rejected');
-    expect(free.outcome === 'rejected' && free.reason).toContain('is a free seat');
+    expect(free.outcome).toBe("rejected");
+    expect(free.outcome === "rejected" && free.reason).toContain(
+      "is a free seat",
+    );
     expect(acceptancePort.requests).toHaveLength(0);
 
     const paid = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(paid).toEqual({
-      outcome: 'accepted',
+      outcome: "accepted",
       candidateHeadSha: HEAD_SHA,
-      receiptId: 'receipt-1',
+      receiptId: "receipt-1",
     });
   });
 
-  it('never regresses a terminal work order on acceptance', async () => {
-    const workOrderRepo = new InMemoryWorkOrderRepository([makeWorkOrder({ state: 'merged' })]);
+  it("never regresses a terminal work order on acceptance", async () => {
+    const workOrderRepo = new InMemoryWorkOrderRepository([
+      makeWorkOrder({ state: "merged" }),
+    ]);
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([makeAttempt()]),
       workOrderRepo,
@@ -981,15 +1103,15 @@ describe('RequestAttemptAcceptanceUseCase', () => {
 
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
-    expect(result.outcome).toBe('accepted');
+    expect(result.outcome).toBe("accepted");
     expect(workOrderRepo.saved).toHaveLength(0);
   });
 
-  it('rejects a receipt assessed for a different head as stale', async () => {
+  it("rejects a receipt assessed for a different head as stale", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     acceptancePort.result = {
-      outcome: 'accepted',
-      receiptId: 'receipt-1',
+      outcome: "accepted",
+      receiptId: "receipt-1",
       assessedHeadSha: OTHER_SHA,
     };
     const workOrderRepo = new InMemoryWorkOrderRepository([makeWorkOrder()]);
@@ -1003,17 +1125,17 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(result).toEqual({
-      outcome: 'rejected',
+      outcome: "rejected",
       reason: `Stale: assessed head ${OTHER_SHA} does not match candidate head ${HEAD_SHA}`,
     });
     expect(workOrderRepo.saved).toHaveLength(0);
   });
 
-  it('passes a rejected assessment through unchanged', async () => {
+  it("passes a rejected assessment through unchanged", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
     acceptancePort.result = {
-      outcome: 'rejected',
-      reason: 'verification failed on host alpha',
+      outcome: "rejected",
+      reason: "verification failed on host alpha",
     };
     const workOrderRepo = new InMemoryWorkOrderRepository([makeWorkOrder()]);
     const useCase = new RequestAttemptAcceptanceUseCase({
@@ -1025,15 +1147,18 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(result).toEqual({
-      outcome: 'rejected',
-      reason: 'verification failed on host alpha',
+      outcome: "rejected",
+      reason: "verification failed on host alpha",
     });
     expect(workOrderRepo.saved).toHaveLength(0);
   });
 
-  it('rejects an unknown assessment without inventing a pass', async () => {
+  it("rejects an unknown assessment without inventing a pass", async () => {
     const acceptancePort = new FakeAcceptanceAssessment();
-    acceptancePort.result = { outcome: 'unknown', reason: 'evidence still pending' };
+    acceptancePort.result = {
+      outcome: "unknown",
+      reason: "evidence still pending",
+    };
     const useCase = new RequestAttemptAcceptanceUseCase({
       attemptRepo: new InMemoryAttemptRepository([makeAttempt()]),
       workOrderRepo: new InMemoryWorkOrderRepository([makeWorkOrder()]),
@@ -1043,13 +1168,13 @@ describe('RequestAttemptAcceptanceUseCase', () => {
     const result = await useCase.requestAttemptAcceptance(acceptanceRequest());
 
     expect(result).toEqual({
-      outcome: 'rejected',
-      reason: 'Unknown: evidence still pending',
+      outcome: "rejected",
+      reason: "Unknown: evidence still pending",
     });
   });
 });
 
-describe('ExecuteAuthorizedForgeActionUseCase', () => {
+describe("ExecuteAuthorizedForgeActionUseCase", () => {
   function makeDeps(
     overrides: {
       attempt?: AttemptRecord;
@@ -1061,12 +1186,16 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
   ) {
     const journal = new InMemoryJournal();
     const authorization =
-      overrides.authorization ??
-      new FakeActionAuthorization();
+      overrides.authorization ?? new FakeActionAuthorization();
     const forgePort = new FakeForge(journal);
-    forgePort.result = overrides.forgeResult ?? { outcome: 'executed', headSha: HEAD_SHA };
+    forgePort.result = overrides.forgeResult ?? {
+      outcome: "executed",
+      headSha: HEAD_SHA,
+    };
     const workOrderRepo = new InMemoryWorkOrderRepository(
-      overrides.workOrder === null ? [] : [overrides.workOrder ?? makeWorkOrder()],
+      overrides.workOrder === null
+        ? []
+        : [overrides.workOrder ?? makeWorkOrder()],
     );
     // Merges read acceptance through the port; `null` leaves it unwired to
     // exercise the fail-closed unconfigured branch.
@@ -1076,8 +1205,31 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         : overrides.acceptanceEvidence === null
           ? undefined
           : new FakeAcceptanceEvidence(overrides.acceptanceEvidence);
-    const attemptRepo = new InMemoryAttemptRepository([overrides.attempt ?? makeAttempt()]);
+    const attemptRepo = new InMemoryAttemptRepository([
+      overrides.attempt ?? makeAttempt(),
+    ]);
     const useCase = new ExecuteAuthorizedForgeActionUseCase({
+      mergeRecordRepo: new MergeRecordRepositoryAdapter(),
+      // WB5b2: a request-only pull-request number is verified before the grant;
+      // the read answers any number as open on the lane's branch at the head.
+      forgeRead: {
+        async readPullRequest(request) {
+          return {
+            outcome: "found",
+            pullRequest: {
+              number: request.ref.kind === "number" ? request.ref.number : 0,
+              state: "open",
+              mergeState: "clean",
+              headSha: HEAD_SHA,
+              headRef: `feat/${LANE_ID}`,
+              baseRef: "main",
+              mergedAtIso: null,
+              closedAtIso: null,
+              mergeCommitSha: null,
+            },
+          };
+        },
+      },
       attemptRepo,
       workOrderRepo,
       journal,
@@ -1088,15 +1240,21 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         async readAttemptOwnerDecisionReferences({ attemptId }) {
           const record = await attemptRepo.findAttemptById(attemptId);
           if (record === null) {
-            return { outcome: 'unknown', reason: `No attempt is recorded for ${attemptId}` };
+            return {
+              outcome: "unknown",
+              reason: `No attempt is recorded for ${attemptId}`,
+            };
           }
           if (record.ownerDecisionReferences === undefined) {
             return {
-              outcome: 'unknown',
+              outcome: "unknown",
               reason: `attempt ${attemptId} was recorded before owner decision references were frozen`,
             };
           }
-          return { outcome: 'recorded', ownerDecisionReferences: record.ownerDecisionReferences };
+          return {
+            outcome: "recorded",
+            ownerDecisionReferences: record.ownerDecisionReferences,
+          };
         },
       },
       now: () => FIXED_NOW,
@@ -1104,26 +1262,29 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
     return { journal, authorization, forgePort, workOrderRepo, useCase };
   }
 
-  it('throws when unconfigured', async () => {
+  it("throws when unconfigured", async () => {
     const useCase = new ExecuteAuthorizedForgeActionUseCase();
 
-    await expect(useCase.executeAuthorizedForgeAction(forgeRequest())).rejects.toThrow(
-      'Not implemented: ExecuteAuthorizedForgeActionUseCase',
-    );
+    await expect(
+      useCase.executeAuthorizedForgeAction(forgeRequest()),
+    ).rejects.toThrow("Not implemented: ExecuteAuthorizedForgeActionUseCase");
     await expect(useCase.execute(forgeRequest())).rejects.toThrow(
-      'Not implemented: ExecuteAuthorizedForgeActionUseCase',
+      "Not implemented: ExecuteAuthorizedForgeActionUseCase",
     );
   });
 
-  it('refuses when the attempt or work order is missing', async () => {
+  it("refuses when the attempt or work order is missing", async () => {
     const { useCase } = makeDeps({ workOrder: null });
 
     const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
 
-    expect(result).toEqual({ outcome: 'refused', reason: 'Attempt or work order not found' });
+    expect(result).toEqual({
+      outcome: "refused",
+      reason: "Attempt or work order not found",
+    });
   });
 
-  it('refuses a stale expected head before consuming any grant', async () => {
+  it("refuses a stale expected head before consuming any grant", async () => {
     const authorization = new FakeActionAuthorization();
     const { useCase, forgePort } = makeDeps({ authorization });
 
@@ -1132,24 +1293,24 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
     );
 
     expect(result).toEqual({
-      outcome: 'refused',
-      reason: 'Moved head: attempt headCommit does not match expectedHeadSha',
+      outcome: "refused",
+      reason: "Moved head: attempt headCommit does not match expectedHeadSha",
     });
     expect(authorization.consumeRequests).toHaveLength(0);
     expect(forgePort.requests).toHaveLength(0);
   });
 
-  it('refuses a merge when the acceptance assessment is for another head', async () => {
+  it("refuses a merge when the acceptance assessment is for another head", async () => {
     const authorization = new FakeActionAuthorization();
     const { useCase, forgePort } = makeDeps({
       authorization,
       acceptanceEvidence: {
-        outcome: 'found',
+        outcome: "found",
         assessment: {
-          state: 'accepted',
+          state: "accepted",
           candidateHeadSha: OTHER_SHA,
-          policyRevision: 'policy-7',
-          acceptanceReceiptId: 'receipt-other',
+          policyRevision: "policy-7",
+          acceptanceReceiptId: "receipt-other",
         },
       },
     });
@@ -1157,39 +1318,49 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
     const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
 
     expect(result).toEqual({
-      outcome: 'refused',
+      outcome: "refused",
       reason: `Cannot merge: assessment head '${OTHER_SHA}' does not match expectedHeadSha '${HEAD_SHA}'`,
     });
     expect(authorization.consumeRequests).toHaveLength(0);
     expect(forgePort.requests).toHaveLength(0);
   });
 
-  it('refuses a merge when no acceptance evidence port is configured at all', async () => {
+  it("refuses a merge when no acceptance evidence port is configured at all", async () => {
     const authorization = new FakeActionAuthorization();
-    const { useCase, forgePort } = makeDeps({ authorization, acceptanceEvidence: null });
+    const { useCase, forgePort } = makeDeps({
+      authorization,
+      acceptanceEvidence: null,
+    });
 
     const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
 
     expect(result).toEqual({
-      outcome: 'refused',
-      reason: 'Cannot merge without a configured acceptance evidence port',
+      outcome: "refused",
+      reason: "Cannot merge without a configured acceptance evidence port",
     });
     expect(authorization.consumeRequests).toHaveLength(0);
     expect(forgePort.requests).toHaveLength(0);
   });
 
-  it('executes a push-and-open-pr without requiring an acceptance receipt', async () => {
+  it("executes a push-and-open-pr without requiring an acceptance receipt", async () => {
     const { useCase, forgePort, workOrderRepo } = makeDeps({
-      acceptanceEvidence: { outcome: 'not-found', reason: 'no assessment recorded' },
-      forgeResult: { outcome: 'executed', pullRequestNumber: 42, headSha: HEAD_SHA },
+      acceptanceEvidence: {
+        outcome: "not-found",
+        reason: "no assessment recorded",
+      },
+      forgeResult: {
+        outcome: "executed",
+        pullRequestNumber: 42,
+        headSha: HEAD_SHA,
+      },
     });
 
     const result = await useCase.executeAuthorizedForgeAction(
-      forgeRequest({ kind: 'push-and-open-pr' }),
+      forgeRequest({ kind: "push-and-open-pr" }),
     );
 
     expect(result).toEqual({
-      outcome: 'executed',
+      outcome: "executed",
       pullRequestNumber: 42,
       headSha: HEAD_SHA,
     });
@@ -1197,387 +1368,453 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
     expect(workOrderRepo.saved).toHaveLength(0);
   });
 
-  it('refuses an unconsumed grant, journals the refusal and never forges', async () => {
+  it("refuses an unconsumed grant, journals the refusal and never forges", async () => {
     const authorization = new FakeActionAuthorization();
     authorization.result = {
-      outcome: 'refused',
-      reason: 'Authorization grant already consumed by action other-1',
+      outcome: "refused",
+      reason: "Authorization grant already consumed by action other-1",
     };
     const { useCase, journal, forgePort } = makeDeps({ authorization });
 
     const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
 
     expect(result).toEqual({
-      outcome: 'refused',
-      reason: 'Authorization grant already consumed by action other-1',
+      outcome: "refused",
+      reason: "Authorization grant already consumed by action other-1",
     });
     expect(authorization.consumeRequests).toEqual([
       {
-        authorizationGrantId: 'grant-1',
-        actionId: 'action-1',
-        actionKind: 'merge-pr',
+        authorizationGrantId: "grant-1",
+        actionId: "action-1",
+        actionKind: "merge-pr",
         expectedHeadSha: HEAD_SHA,
-        attemptId: 'attempt-1',
+        attemptId: "attempt-1",
       },
     ]);
     expect(forgePort.requests).toHaveLength(0);
-    expect(journal.entries.map((entry) => entry.status)).toEqual(['refused']);
+    expect(journal.entries.map((entry) => entry.status)).toEqual(["refused"]);
     expect(journal.entries[0]).toEqual(
       expect.objectContaining({
-        action: 'forge',
+        action: "forge",
         baseCommit: BASE_COMMIT,
-        detail: 'Authorization grant already consumed by action other-1',
+        detail: "Authorization grant already consumed by action other-1",
         recordedAtIso: FIXED_NOW,
       }),
     );
   });
 
-  it('records forge intent durably before the subprocess runs and completes a merge', async () => {
+  it("records forge intent durably before the subprocess runs and completes a merge", async () => {
     const { useCase, journal, forgePort, workOrderRepo } = makeDeps();
 
     const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
 
-    expect(result).toEqual({ outcome: 'executed', headSha: HEAD_SHA });
+    expect(result).toEqual({ outcome: "executed", headSha: HEAD_SHA });
     // Intent was already durable when the forge port was invoked.
-    expect(forgePort.journalAtCall.map((entry) => entry.status)).toEqual(['intent-recorded']);
+    expect(forgePort.journalAtCall.map((entry) => entry.status)).toEqual([
+      "intent-recorded",
+    ]);
     expect(journal.entries.map((entry) => entry.status)).toEqual([
-      'intent-recorded',
-      'completed',
+      "intent-recorded",
+      "completed",
     ]);
     for (const entry of journal.entries) {
-      expect(entry.action).toBe('forge');
+      expect(entry.action).toBe("forge");
       expect(entry.recordedAtIso).toBe(FIXED_NOW);
     }
     expect(forgePort.requests).toEqual([
       {
-        actionId: 'action-1',
-        attemptId: 'attempt-1',
-        workOrderId: 'wo-1',
-        kind: 'merge-pr',
+        actionId: "action-1",
+        attemptId: "attempt-1",
+        workOrderId: "wo-1",
+        kind: "merge-pr",
         expectedHeadSha: HEAD_SHA,
         branchName: `feat/${LANE_ID}`,
+        pullRequestNumber: 7,
       },
     ]);
     expect(workOrderRepo.saved).toEqual([
       expect.objectContaining({
-        id: 'wo-1',
-        state: 'merged',
+        id: "wo-1",
+        state: "merged",
         revision: 3,
         updatedAtIso: FIXED_NOW,
       }),
     ]);
   });
 
-  it('reports an ambiguous forge response for reconciliation', async () => {
+  it("reports an ambiguous forge response for reconciliation", async () => {
     const { useCase, journal, forgePort } = makeDeps({
-      forgeResult: { outcome: 'ambiguous', reason: 'merge request timed out' },
+      forgeResult: { outcome: "ambiguous", reason: "merge request timed out" },
     });
 
     const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
 
     expect(result).toEqual({
-      outcome: 'refused',
-      reason: 'Ambiguous forge response requires reconciliation: merge request timed out',
+      outcome: "refused",
+      reason:
+        "Ambiguous forge response requires reconciliation: merge request timed out",
       forgeAmbiguous: true,
     });
     expect(journal.entries.map((entry) => entry.status)).toEqual([
-      'intent-recorded',
-      'ambiguous',
+      "intent-recorded",
+      "ambiguous",
     ]);
     expect(forgePort.requests).toHaveLength(1);
   });
 
-  it('reports a refused forge response with its reason', async () => {
+  it("reports a refused forge response with its reason", async () => {
     const { useCase, journal } = makeDeps({
       forgeResult: {
-        outcome: 'refused',
-        reason: 'gh pr merge failed (exit 1)',
-        refusalKind: 'other',
+        outcome: "refused",
+        reason: "gh pr merge failed (exit 1)",
+        refusalKind: "other",
       },
     });
 
     const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
 
     expect(result).toEqual({
-      outcome: 'refused',
-      reason: 'gh pr merge failed (exit 1)',
-      forgeRefusalKind: 'other',
+      outcome: "refused",
+      reason: "gh pr merge failed (exit 1)",
+      forgeRefusalKind: "other",
     });
     expect(journal.entries.map((entry) => entry.status)).toEqual([
-      'intent-recorded',
-      'refused',
+      "intent-recorded",
+      "refused",
     ]);
   });
 
-  it('passes the forge refusal kind through and omits it for pre-forge refusals', async () => {
+  it("passes the forge refusal kind through and omits it for pre-forge refusals", async () => {
     const forged = await makeDeps({
       forgeResult: {
-        outcome: 'refused',
-        reason: 'gh pr merge failed (exit 1): X',
-        refusalKind: 'conflict',
+        outcome: "refused",
+        reason: "gh pr merge failed (exit 1): X",
+        refusalKind: "conflict",
       },
     }).useCase.executeAuthorizedForgeAction(forgeRequest());
 
     expect(forged).toEqual({
-      outcome: 'refused',
-      reason: 'gh pr merge failed (exit 1): X',
-      forgeRefusalKind: 'conflict',
+      outcome: "refused",
+      reason: "gh pr merge failed (exit 1): X",
+      forgeRefusalKind: "conflict",
     });
 
-    const preForge = await makeDeps({ workOrder: null }).useCase.executeAuthorizedForgeAction(
-      forgeRequest(),
-    );
-    expect('forgeRefusalKind' in preForge).toBe(false);
-    expect('forgeAmbiguous' in preForge).toBe(false);
+    const preForge = await makeDeps({
+      workOrder: null,
+    }).useCase.executeAuthorizedForgeAction(forgeRequest());
+    expect("forgeRefusalKind" in preForge).toBe(false);
+    expect("forgeAmbiguous" in preForge).toBe(false);
   });
 
-  it('enforces single grant consumption through the real authorization adapter', async () => {
-    const grants = new Map<string, { expectedHeadSha: string; kind: string; consumedByActionId: string | null }>([
-      ['grant-1', { expectedHeadSha: HEAD_SHA, kind: 'merge-pr', consumedByActionId: null }],
+  it("enforces single grant consumption through the real authorization adapter", async () => {
+    const grants = new Map<
+      string,
+      {
+        expectedHeadSha: string;
+        kind: string;
+        consumedByActionId: string | null;
+      }
+    >([
+      [
+        "grant-1",
+        {
+          expectedHeadSha: HEAD_SHA,
+          kind: "merge-pr",
+          consumedByActionId: null,
+        },
+      ],
     ]);
     const authorization = new ActionAuthorizationAdapter({ grants });
-    const { useCase, forgePort, journal, workOrderRepo } = makeDeps({ authorization });
+    const { useCase, forgePort, journal, workOrderRepo } = makeDeps({
+      authorization,
+    });
 
     const first = await useCase.executeAuthorizedForgeAction(forgeRequest());
     const second = await useCase.executeAuthorizedForgeAction(
-      forgeRequest({ actionId: 'action-2' }),
+      forgeRequest({ actionId: "action-2" }),
     );
 
-    expect(first).toEqual({ outcome: 'executed', headSha: HEAD_SHA });
-    expect(second.outcome).toBe('refused');
-    expect(second.outcome === 'refused' && second.reason).toContain(
-      'Authorization grant already consumed by action action-1',
+    expect(first).toEqual({ outcome: "executed", headSha: HEAD_SHA });
+    expect(second.outcome).toBe("refused");
+    expect(second.outcome === "refused" && second.reason).toContain(
+      "Authorization grant already consumed by action action-1",
     );
     expect(forgePort.requests).toHaveLength(1);
-    expect(journal.entries.at(-1)?.status).toBe('refused');
+    expect(journal.entries.at(-1)?.status).toBe("refused");
     expect(workOrderRepo.saved).toHaveLength(1);
   });
 
-  it('executes a push-to-pr without requiring an acceptance receipt and never merges', async () => {
+  it("executes a push-to-pr without requiring an acceptance receipt and never merges", async () => {
     const authorization = new FakeActionAuthorization();
     const { useCase, forgePort, workOrderRepo } = makeDeps({
       authorization,
-      acceptanceEvidence: { outcome: 'not-found', reason: 'no assessment recorded' },
-      forgeResult: { outcome: 'executed', pullRequestNumber: 42, headSha: HEAD_SHA },
+      acceptanceEvidence: {
+        outcome: "not-found",
+        reason: "no assessment recorded",
+      },
+      forgeResult: {
+        outcome: "executed",
+        pullRequestNumber: 42,
+        headSha: HEAD_SHA,
+      },
     });
 
     const result = await useCase.executeAuthorizedForgeAction(
-      forgeRequest({ kind: 'push-to-pr' }),
+      forgeRequest({ kind: "push-to-pr" }),
     );
 
     expect(result).toEqual({
-      outcome: 'executed',
+      outcome: "executed",
       pullRequestNumber: 42,
       headSha: HEAD_SHA,
     });
     expect(authorization.consumeRequests).toEqual([
-      expect.objectContaining({ actionKind: 'push-to-pr' }),
+      expect.objectContaining({ actionKind: "push-to-pr" }),
     ]);
     expect(workOrderRepo.saved).toHaveLength(0);
     expect(forgePort.requests).toEqual([
       {
-        actionId: 'action-1',
-        attemptId: 'attempt-1',
-        workOrderId: 'wo-1',
-        kind: 'push-to-pr',
+        actionId: "action-1",
+        attemptId: "attempt-1",
+        workOrderId: "wo-1",
+        kind: "push-to-pr",
         expectedHeadSha: HEAD_SHA,
         branchName: `feat/${LANE_ID}`,
+        pullRequestNumber: 7,
       },
     ]);
   });
 
-  it('re-checks one-way doors for push-to-pr before consuming the grant', async () => {
+  it("re-checks one-way doors for push-to-pr before consuming the grant", async () => {
     const authorization = new FakeActionAuthorization();
     const { useCase, forgePort } = makeDeps({
       authorization,
-      attempt: makeAttempt({ ownerDecisionReferences: ['door-1'] }),
+      attempt: makeAttempt({ ownerDecisionReferences: ["door-1"] }),
     });
 
     const result = await useCase.executeAuthorizedForgeAction(
-      forgeRequest({ kind: 'push-to-pr' }),
+      forgeRequest({ kind: "push-to-pr" }),
     );
 
     expect(result).toEqual({
-      outcome: 'refused',
-      reason: "owner decision 'door-1' could not be resolved: no owner decision port is configured",
+      outcome: "refused",
+      reason:
+        "owner decision 'door-1' could not be resolved: no owner decision port is configured",
     });
     expect(authorization.consumeRequests).toHaveLength(0);
     expect(forgePort.requests).toHaveLength(0);
   });
 
-  it('omits authorizedBy when a request does not carry a policy revision', async () => {
+  it("omits authorizedBy when a request does not carry a policy revision", async () => {
     const { useCase, journal } = makeDeps();
     const result = await useCase.executeAuthorizedForgeAction(forgeRequest());
-    expect(result.outcome).toBe('executed');
+    expect(result.outcome).toBe("executed");
     for (const entry of journal.entries) {
-      expect('authorizedBy' in entry).toBe(false);
+      expect("authorizedBy" in entry).toBe(false);
     }
   });
 
-  it('refuses an authorizedBy value that does not name a policy setting revision', async () => {
+  it("refuses an authorizedBy value that does not name a policy setting revision", async () => {
     const authorization = new FakeActionAuthorization();
     const { useCase, journal, forgePort } = makeDeps({ authorization });
-    const result = await useCase.executeAuthorizedForgeAction(forgeRequest({ authorizedBy: 'owner-decision' }));
+    const result = await useCase.executeAuthorizedForgeAction(
+      forgeRequest({ authorizedBy: "owner-decision" }),
+    );
     expect(result).toEqual({
-      outcome: 'refused',
-      reason: 'authorizedBy must name a policy setting revision',
+      outcome: "refused",
+      reason: "authorizedBy must name a policy setting revision",
     });
     expect(authorization.consumeRequests).toHaveLength(0);
     expect(journal.entries).toHaveLength(0);
     expect(forgePort.requests).toHaveLength(0);
   });
 
-  it('drops authorizedBy on the HTTP execute entry point', async () => {
+  it("drops authorizedBy on the HTTP execute entry point", async () => {
     const { useCase, journal } = makeDeps();
-    const result = await useCase.execute({ ...forgeRequest(), authorizedBy: 'policy:autoMerge@0123456789ab' });
-    expect(result.outcome).toBe('executed');
+    const result = await useCase.execute({
+      ...forgeRequest(),
+      authorizedBy: "policy:autoMerge@0123456789ab",
+    });
+    expect(result.outcome).toBe("executed");
     for (const entry of journal.entries) {
-      expect('authorizedBy' in entry).toBe(false);
+      expect("authorizedBy" in entry).toBe(false);
     }
   });
 });
 
-describe('AcceptanceAssessmentAdapter', () => {
-  it('rejects while unconfigured', async () => {
+describe("AcceptanceAssessmentAdapter", () => {
+  it("rejects while unconfigured", async () => {
     const adapter = new AcceptanceAssessmentAdapter();
 
     await expect(
       adapter.assessHeadAcceptance({
-        attemptId: 'attempt-1',
-        workOrderId: 'wo-1',
+        attemptId: "attempt-1",
+        workOrderId: "wo-1",
         candidateHeadSha: HEAD_SHA,
-        policyRevision: 'policy-7',
+        policyRevision: "policy-7",
       }),
-    ).rejects.toThrow('Not implemented: AcceptanceAssessmentAdapter.assessHeadAcceptance');
+    ).rejects.toThrow(
+      "Not implemented: AcceptanceAssessmentAdapter.assessHeadAcceptance",
+    );
   });
 
-  it('delegates to the configured assess function', async () => {
+  it("delegates to the configured assess function", async () => {
     const requests: AcceptanceAssessmentRequest[] = [];
     const adapter = new AcceptanceAssessmentAdapter({
       assess: async (request) => {
         requests.push(request);
-        return { outcome: 'accepted', receiptId: 'receipt-9', assessedHeadSha: request.candidateHeadSha };
+        return {
+          outcome: "accepted",
+          receiptId: "receipt-9",
+          assessedHeadSha: request.candidateHeadSha,
+        };
       },
     });
 
     const result = await adapter.assessHeadAcceptance({
-      attemptId: 'attempt-1',
-      workOrderId: 'wo-1',
+      attemptId: "attempt-1",
+      workOrderId: "wo-1",
       candidateHeadSha: HEAD_SHA,
-      policyRevision: 'policy-7',
+      policyRevision: "policy-7",
     });
 
     expect(result).toEqual({
-      outcome: 'accepted',
-      receiptId: 'receipt-9',
+      outcome: "accepted",
+      receiptId: "receipt-9",
       assessedHeadSha: HEAD_SHA,
     });
     expect(requests).toHaveLength(1);
   });
 });
 
-describe('ActionAuthorizationAdapter', () => {
+describe("ActionAuthorizationAdapter", () => {
   function makeGrants() {
-    return new Map<string, { expectedHeadSha: string; kind: string; consumedByActionId: string | null }>([
-      ['grant-1', { expectedHeadSha: HEAD_SHA, kind: 'merge-pr', consumedByActionId: null }],
+    return new Map<
+      string,
+      {
+        expectedHeadSha: string;
+        kind: string;
+        consumedByActionId: string | null;
+      }
+    >([
+      [
+        "grant-1",
+        {
+          expectedHeadSha: HEAD_SHA,
+          kind: "merge-pr",
+          consumedByActionId: null,
+        },
+      ],
     ]);
   }
 
-  function resolveRequest(overrides: Partial<ResolveActionAuthorizationRequest> = {}): ResolveActionAuthorizationRequest {
+  function resolveRequest(
+    overrides: Partial<ResolveActionAuthorizationRequest> = {},
+  ): ResolveActionAuthorizationRequest {
     return {
-      actionId: 'action-1',
-      projectId: 'project-1',
-      workOrderId: 'wo-1',
-      attemptId: 'attempt-1',
-      actionKind: 'merge-pr',
+      actionId: "action-1",
+      projectId: "project-1",
+      workOrderId: "wo-1",
+      attemptId: "attempt-1",
+      actionKind: "merge-pr",
       expectedHeadSha: HEAD_SHA,
-      policyRevision: 'policy-7',
+      policyRevision: "policy-7",
       ...overrides,
     };
   }
 
-  function consumeRequest(overrides: Partial<ConsumeActionAuthorizationRequest> = {}): ConsumeActionAuthorizationRequest {
+  function consumeRequest(
+    overrides: Partial<ConsumeActionAuthorizationRequest> = {},
+  ): ConsumeActionAuthorizationRequest {
     return {
-      authorizationGrantId: 'grant-1',
-      actionId: 'action-1',
-      actionKind: 'merge-pr',
+      authorizationGrantId: "grant-1",
+      actionId: "action-1",
+      actionKind: "merge-pr",
       expectedHeadSha: HEAD_SHA,
-      attemptId: 'attempt-1',
+      attemptId: "attempt-1",
       ...overrides,
     };
   }
 
-  it('rejects while unconfigured', async () => {
+  it("rejects while unconfigured", async () => {
     const adapter = new ActionAuthorizationAdapter();
 
-    await expect(adapter.resolveActionAuthorization(resolveRequest())).rejects.toThrow(
-      'Not implemented: ActionAuthorizationAdapter.resolveActionAuthorization',
+    await expect(
+      adapter.resolveActionAuthorization(resolveRequest()),
+    ).rejects.toThrow(
+      "Not implemented: ActionAuthorizationAdapter.resolveActionAuthorization",
     );
     await expect(
       adapter.consumeActionAuthorization(consumeRequest()),
-    ).rejects.toThrow('Not implemented: ActionAuthorizationAdapter.consumeActionAuthorization');
+    ).rejects.toThrow(
+      "Not implemented: ActionAuthorizationAdapter.consumeActionAuthorization",
+    );
   });
 
-  it('resolves only an unconsumed grant matching the head and kind', async () => {
+  it("resolves only an unconsumed grant matching the head and kind", async () => {
     const adapter = new ActionAuthorizationAdapter({ grants: makeGrants() });
 
-    const applicable = await adapter.resolveActionAuthorization(resolveRequest());
+    const applicable =
+      await adapter.resolveActionAuthorization(resolveRequest());
     const movedHead = await adapter.resolveActionAuthorization(
       resolveRequest({ expectedHeadSha: OTHER_SHA }),
     );
     const otherKind = await adapter.resolveActionAuthorization(
-      resolveRequest({ actionKind: 'push-and-open-pr' }),
+      resolveRequest({ actionKind: "push-and-open-pr" }),
     );
 
-    expect(applicable).toEqual({ outcome: 'granted', authorizationGrantId: 'grant-1' });
-    expect(movedHead.outcome).toBe('blocked');
-    expect(otherKind.outcome).toBe('blocked');
+    expect(applicable).toEqual({
+      outcome: "granted",
+      authorizationGrantId: "grant-1",
+    });
+    expect(movedHead.outcome).toBe("blocked");
+    expect(otherKind.outcome).toBe("blocked");
   });
 
-  it('blocks resolution once the grant has been consumed', async () => {
+  it("blocks resolution once the grant has been consumed", async () => {
     const grants = makeGrants();
     const adapter = new ActionAuthorizationAdapter({ grants });
     await adapter.consumeActionAuthorization(consumeRequest());
 
     const result = await adapter.resolveActionAuthorization(resolveRequest());
 
-    expect(result.outcome).toBe('blocked');
+    expect(result.outcome).toBe("blocked");
   });
 
-  it('consumes a grant exactly once and stays idempotent for the same action', async () => {
+  it("consumes a grant exactly once and stays idempotent for the same action", async () => {
     const grants = makeGrants();
     const adapter = new ActionAuthorizationAdapter({ grants });
 
     const first = await adapter.consumeActionAuthorization(consumeRequest());
     const retry = await adapter.consumeActionAuthorization(consumeRequest());
 
-    expect(first).toEqual({ outcome: 'consumed', actionId: 'action-1' });
-    expect(retry).toEqual({ outcome: 'consumed', actionId: 'action-1' });
-    expect(grants.get('grant-1')?.consumedByActionId).toBe('action-1');
+    expect(first).toEqual({ outcome: "consumed", actionId: "action-1" });
+    expect(retry).toEqual({ outcome: "consumed", actionId: "action-1" });
+    expect(grants.get("grant-1")?.consumedByActionId).toBe("action-1");
   });
 
-  it('refuses a second unrelated action and an unknown grant', async () => {
+  it("refuses a second unrelated action and an unknown grant", async () => {
     const adapter = new ActionAuthorizationAdapter({ grants: makeGrants() });
     await adapter.consumeActionAuthorization(consumeRequest());
 
     const secondAction = await adapter.consumeActionAuthorization(
-      consumeRequest({ actionId: 'action-2' }),
+      consumeRequest({ actionId: "action-2" }),
     );
     const unknown = await adapter.consumeActionAuthorization(
-      consumeRequest({ authorizationGrantId: 'grant-missing' }),
+      consumeRequest({ authorizationGrantId: "grant-missing" }),
     );
 
     expect(secondAction).toEqual({
-      outcome: 'refused',
-      reason: 'Authorization grant already consumed by action action-1',
+      outcome: "refused",
+      reason: "Authorization grant already consumed by action action-1",
     });
     expect(unknown).toEqual({
-      outcome: 'refused',
-      reason: 'Authorization grant not found: grant-missing',
+      outcome: "refused",
+      reason: "Authorization grant not found: grant-missing",
     });
   });
 
-  it('refuses a local-store consumption whose request omits the head it cannot infer', async () => {
+  it("refuses a local-store consumption whose request omits the head it cannot infer", async () => {
     const grants = makeGrants();
     const adapter = new ActionAuthorizationAdapter({ grants });
 
@@ -1585,244 +1822,293 @@ describe('ActionAuthorizationAdapter', () => {
       consumeRequest({ expectedHeadSha: undefined }),
     );
     const omittedAttempt = await adapter.consumeActionAuthorization(
-      consumeRequest({ actionId: 'action-2', attemptId: undefined }),
+      consumeRequest({ actionId: "action-2", attemptId: undefined }),
     );
 
     expect(omittedHead).toEqual({
-      outcome: 'refused',
+      outcome: "refused",
       reason:
-        'Authorization grant grant-1 requires the expectedHeadSha this local grant store cannot infer',
+        "Authorization grant grant-1 requires the expectedHeadSha this local grant store cannot infer",
     });
     // The head is refused rather than assumed; the attempt id is not what
     // scopes this store, so omitting it still consumes exactly once.
-    expect(omittedAttempt).toEqual({ outcome: 'consumed', actionId: 'action-2' });
-    expect(grants.get('grant-1')?.consumedByActionId).toBe('action-2');
+    expect(omittedAttempt).toEqual({
+      outcome: "consumed",
+      actionId: "action-2",
+    });
+    expect(grants.get("grant-1")?.consumedByActionId).toBe("action-2");
   });
 
-  it('delegates to configured supplier functions when provided', async () => {
+  it("delegates to configured supplier functions when provided", async () => {
     const consumeRequests: ConsumeActionAuthorizationRequest[] = [];
     const adapter = new ActionAuthorizationAdapter({
-      resolveGrant: async () => ({ outcome: 'granted', authorizationGrantId: 'grant-2' }),
+      resolveGrant: async () => ({
+        outcome: "granted",
+        authorizationGrantId: "grant-2",
+      }),
       consumeGrant: async (request) => {
         consumeRequests.push(request);
-        return { outcome: 'consumed', actionId: request.actionId };
+        return { outcome: "consumed", actionId: request.actionId };
       },
     });
 
     const resolved = await adapter.resolveActionAuthorization(resolveRequest());
     const req = consumeRequest({
-      authorizationGrantId: 'grant-2',
-      actionId: 'action-9',
+      authorizationGrantId: "grant-2",
+      actionId: "action-9",
     });
     const consumed = await adapter.consumeActionAuthorization(req);
 
-    expect(resolved).toEqual({ outcome: 'granted', authorizationGrantId: 'grant-2' });
-    expect(consumed).toEqual({ outcome: 'consumed', actionId: 'action-9' });
+    expect(resolved).toEqual({
+      outcome: "granted",
+      authorizationGrantId: "grant-2",
+    });
+    expect(consumed).toEqual({ outcome: "consumed", actionId: "action-9" });
     expect(consumeRequests).toEqual([req]);
   });
 });
 
-describe('BriefKnowledgeAdapter', () => {
+describe("BriefKnowledgeAdapter", () => {
   const proposal: BriefContextProposal = {
-    proposalId: 'proposal-1',
-    knowledgeEntryId: 'entry-1',
-    version: 'v3',
-    proposedBecause: 'ranked for the lane path',
+    proposalId: "proposal-1",
+    knowledgeEntryId: "entry-1",
+    version: "v3",
+    proposedBecause: "ranked for the lane path",
   };
 
-  it('rejects while unconfigured', async () => {
+  it("rejects while unconfigured", async () => {
     const adapter = new BriefKnowledgeAdapter();
 
     await expect(
       adapter.requestBriefContextProposals({
-        projectId: 'project-1',
+        projectId: "project-1",
         laneId: LANE_ID,
-        taskSummary: 'summary',
+        taskSummary: "summary",
       }),
-    ).rejects.toThrow('Not implemented: BriefKnowledgeAdapter.requestBriefContextProposals');
+    ).rejects.toThrow(
+      "Not implemented: BriefKnowledgeAdapter.requestBriefContextProposals",
+    );
     await expect(
-      adapter.recordContextSelection({ attemptId: 'attempt-1', selections: [] }),
-    ).rejects.toThrow('Not implemented: BriefKnowledgeAdapter.recordContextSelection');
+      adapter.recordContextSelection({
+        attemptId: "attempt-1",
+        selections: [],
+      }),
+    ).rejects.toThrow(
+      "Not implemented: BriefKnowledgeAdapter.recordContextSelection",
+    );
     await expect(
       adapter.forwardCompletedAttemptNotes({
-        attemptId: 'attempt-1',
-        workOrderId: 'wo-1',
+        attemptId: "attempt-1",
+        workOrderId: "wo-1",
         headCommit: HEAD_SHA,
         notes: null,
       }),
-    ).rejects.toThrow('Not implemented: BriefKnowledgeAdapter.forwardCompletedAttemptNotes');
+    ).rejects.toThrow(
+      "Not implemented: BriefKnowledgeAdapter.forwardCompletedAttemptNotes",
+    );
   });
 
-  it('delegates proposals, selections and notes to supplier functions', async () => {
+  it("delegates proposals, selections and notes to supplier functions", async () => {
     const proposalsRequests: RequestBriefContextProposalsRequest[] = [];
     const selectionRequests: RecordContextSelectionRequest[] = [];
     const notesRequests: ForwardCompletedAttemptNotesRequest[] = [];
     const adapter = new BriefKnowledgeAdapter({
       propose: async (request) => {
         proposalsRequests.push(request);
-        return { outcome: 'proposed', proposals: [proposal] };
+        return { outcome: "proposed", proposals: [proposal] };
       },
       recordSelection: async (request) => {
         selectionRequests.push(request);
-        return { outcome: 'recorded' };
+        return { outcome: "recorded" };
       },
       forwardNotes: async (request) => {
         notesRequests.push(request);
         return request.notes === null
-          ? { outcome: 'refused', reason: 'no notes collected' }
-          : { outcome: 'forwarded' };
+          ? { outcome: "refused", reason: "no notes collected" }
+          : { outcome: "forwarded" };
       },
     });
 
     const proposed = await adapter.requestBriefContextProposals({
-      projectId: 'project-1',
+      projectId: "project-1",
       laneId: LANE_ID,
-      taskSummary: 'summary',
+      taskSummary: "summary",
     });
     const recorded = await adapter.recordContextSelection({
-      attemptId: 'attempt-1',
-      selections: [{ proposalId: 'proposal-1', knowledgeEntryId: 'entry-1', version: 'v3', accepted: true }],
+      attemptId: "attempt-1",
+      selections: [
+        {
+          proposalId: "proposal-1",
+          knowledgeEntryId: "entry-1",
+          version: "v3",
+          accepted: true,
+        },
+      ],
     });
     const forwarded = await adapter.forwardCompletedAttemptNotes({
-      attemptId: 'attempt-1',
-      workOrderId: 'wo-1',
+      attemptId: "attempt-1",
+      workOrderId: "wo-1",
       headCommit: HEAD_SHA,
-      notes: 'a bounded note',
+      notes: "a bounded note",
     });
 
-    expect(proposed).toEqual({ outcome: 'proposed', proposals: [proposal] });
-    expect(recorded).toEqual({ outcome: 'recorded' });
-    expect(forwarded).toEqual({ outcome: 'forwarded' });
+    expect(proposed).toEqual({ outcome: "proposed", proposals: [proposal] });
+    expect(recorded).toEqual({ outcome: "recorded" });
+    expect(forwarded).toEqual({ outcome: "forwarded" });
     expect(proposalsRequests).toHaveLength(1);
     expect(selectionRequests).toHaveLength(1);
     expect(notesRequests).toEqual([
-      { attemptId: 'attempt-1', workOrderId: 'wo-1', headCommit: HEAD_SHA, notes: 'a bounded note' },
+      {
+        attemptId: "attempt-1",
+        workOrderId: "wo-1",
+        headCommit: HEAD_SHA,
+        notes: "a bounded note",
+      },
     ]);
   });
 
-  it('serves an in-memory store when enabled', async () => {
-    const adapter = new BriefKnowledgeAdapter({ enableInMemory: true, proposals: [proposal] });
+  it("serves an in-memory store when enabled", async () => {
+    const adapter = new BriefKnowledgeAdapter({
+      enableInMemory: true,
+      proposals: [proposal],
+    });
 
     const proposed = await adapter.requestBriefContextProposals({
-      projectId: 'project-1',
+      projectId: "project-1",
       laneId: LANE_ID,
-      taskSummary: 'summary',
+      taskSummary: "summary",
     });
     const recorded = await adapter.recordContextSelection({
-      attemptId: 'attempt-1',
+      attemptId: "attempt-1",
       selections: [],
     });
     const forwarded = await adapter.forwardCompletedAttemptNotes({
-      attemptId: 'attempt-1',
-      workOrderId: 'wo-1',
+      attemptId: "attempt-1",
+      workOrderId: "wo-1",
       headCommit: HEAD_SHA,
       notes: null,
     });
 
-    expect(proposed).toEqual({ outcome: 'proposed', proposals: [proposal] });
-    expect(recorded).toEqual({ outcome: 'recorded' });
-    expect(forwarded).toEqual({ outcome: 'forwarded' });
+    expect(proposed).toEqual({ outcome: "proposed", proposals: [proposal] });
+    expect(recorded).toEqual({ outcome: "recorded" });
+    expect(forwarded).toEqual({ outcome: "forwarded" });
   });
 });
 
-describe('ExecutionObservationAdapter', () => {
+describe("ExecutionObservationAdapter", () => {
   function observationRequest(): PublishExecutionObservationRequest {
     return {
-      projectId: 'project-1',
+      projectId: "project-1",
       entry: {
-        id: 'forge:action-1:intent-recorded:1',
-        attemptId: 'attempt-1',
-        workOrderId: 'wo-1',
-        action: 'forge',
+        id: "forge:action-1:intent-recorded:1",
+        attemptId: "attempt-1",
+        workOrderId: "wo-1",
+        action: "forge",
         baseCommit: BASE_COMMIT,
         recordedAtIso: FIXED_NOW,
-        status: 'intent-recorded',
+        status: "intent-recorded",
         sessionId: null,
         detail: null,
       },
     };
   }
 
-  it('rejects while unconfigured', async () => {
+  it("rejects while unconfigured", async () => {
     const adapter = new ExecutionObservationAdapter();
 
-    await expect(adapter.publishExecutionObservation(observationRequest())).rejects.toThrow(
-      'Not implemented: ExecutionObservationAdapter.publishExecutionObservation',
+    await expect(
+      adapter.publishExecutionObservation(observationRequest()),
+    ).rejects.toThrow(
+      "Not implemented: ExecutionObservationAdapter.publishExecutionObservation",
     );
   });
 
-  it('publishes through the delegate and records the delivery attempt', async () => {
+  it("publishes through the delegate and records the delivery attempt", async () => {
     const requests: PublishExecutionObservationRequest[] = [];
     const adapter = new ExecutionObservationAdapter({
       publish: async (request) => {
         requests.push(request);
-        return { outcome: 'published' };
+        return { outcome: "published" };
       },
       recorded: [],
     });
 
-    const result = await adapter.publishExecutionObservation(observationRequest());
+    const result =
+      await adapter.publishExecutionObservation(observationRequest());
 
-    expect(result).toEqual({ outcome: 'published' });
+    expect(result).toEqual({ outcome: "published" });
     expect(requests).toHaveLength(1);
   });
 
-  it('turns a throwing transport into a delivery gap instead of failing the lane', async () => {
+  it("turns a throwing transport into a delivery gap instead of failing the lane", async () => {
     const recorded: PublishExecutionObservationRequest[] = [];
     const adapter = new ExecutionObservationAdapter({
-      publish: () => Promise.reject(new Error('Waves endpoint unreachable')),
+      publish: () => Promise.reject(new Error("Waves endpoint unreachable")),
       recorded,
     });
 
-    const result = await adapter.publishExecutionObservation(observationRequest());
+    const result =
+      await adapter.publishExecutionObservation(observationRequest());
 
     expect(result).toEqual({
-      outcome: 'delivery-gap',
-      reason: 'Waves endpoint unreachable',
+      outcome: "delivery-gap",
+      reason: "Waves endpoint unreachable",
     });
     expect(recorded).toHaveLength(1);
   });
 
-  it('passes a delegate delivery gap through unchanged', async () => {
+  it("passes a delegate delivery gap through unchanged", async () => {
     const adapter = new ExecutionObservationAdapter({
-      publish: async () => ({ outcome: 'delivery-gap', reason: 'relay backlog' }),
+      publish: async () => ({
+        outcome: "delivery-gap",
+        reason: "relay backlog",
+      }),
     });
 
-    const result = await adapter.publishExecutionObservation(observationRequest());
+    const result =
+      await adapter.publishExecutionObservation(observationRequest());
 
-    expect(result).toEqual({ outcome: 'delivery-gap', reason: 'relay backlog' });
+    expect(result).toEqual({
+      outcome: "delivery-gap",
+      reason: "relay backlog",
+    });
   });
 
-  it('records but reports a delivery gap when only recording is configured', async () => {
+  it("records but reports a delivery gap when only recording is configured", async () => {
     const recorded: PublishExecutionObservationRequest[] = [];
     const adapter = new ExecutionObservationAdapter({ recorded });
 
-    const result = await adapter.publishExecutionObservation(observationRequest());
+    const result =
+      await adapter.publishExecutionObservation(observationRequest());
 
     expect(result).toEqual({
-      outcome: 'delivery-gap',
-      reason: 'No observation transport configured',
+      outcome: "delivery-gap",
+      reason: "No observation transport configured",
     });
     expect(recorded).toHaveLength(1);
   });
 });
 
-describe('ForgeActionAdapter', () => {
+describe("ForgeActionAdapter", () => {
   function forgeActionRequest(
     overrides: Partial<ForgeActionRequest> = {},
   ): ForgeActionRequest {
     return {
-      actionId: 'action-1',
-      attemptId: 'attempt-1',
-      workOrderId: 'wo-1',
-      kind: 'push-and-open-pr',
+      actionId: "action-1",
+      attemptId: "attempt-1",
+      workOrderId: "wo-1",
+      kind: "push-and-open-pr",
       expectedHeadSha: HEAD_SHA,
       branchName: `feat/${LANE_ID}`,
       ...overrides,
     };
   }
 
-  function makeRunGh(result: { exitCode: number; stdout: string; stderr: string }) {
+  function makeRunGh(result: {
+    exitCode: number;
+    stdout: string;
+    stderr: string;
+  }) {
     const calls: string[][] = [];
     const runGh = async (args: readonly string[]) => {
       calls.push([...args]);
@@ -1831,16 +2117,16 @@ describe('ForgeActionAdapter', () => {
     return { calls, runGh };
   }
 
-  it('throws while unconfigured', async () => {
+  it("throws while unconfigured", async () => {
     const adapter = new ForgeActionAdapter();
 
-    await expect(adapter.performForgeAction(forgeActionRequest())).rejects.toThrow(
-      'Not implemented: ForgeActionAdapter.performForgeAction',
-    );
+    await expect(
+      adapter.performForgeAction(forgeActionRequest()),
+    ).rejects.toThrow("Not implemented: ForgeActionAdapter.performForgeAction");
   });
 
-  it('refuses a moved branch head and never runs gh', async () => {
-    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
+  it("refuses a moved branch head and never runs gh", async () => {
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: "", stderr: "" });
     const adapter = new ForgeActionAdapter({
       runGh,
       verifyCurrentHeadSha: async () => OTHER_SHA,
@@ -1849,68 +2135,80 @@ describe('ForgeActionAdapter', () => {
     const result = await adapter.performForgeAction(forgeActionRequest());
 
     expect(result).toEqual({
-      outcome: 'refused',
+      outcome: "refused",
       reason: `Moved head: branch feat/${LANE_ID} is at ${OTHER_SHA}, expected ${HEAD_SHA}`,
-      refusalKind: 'other',
+      refusalKind: "other",
     });
     expect(calls).toHaveLength(0);
   });
 
-  it('treats a failed head verification as ambiguous, not as a refusal', async () => {
+  it("treats a failed head verification as ambiguous, not as a refusal", async () => {
     const adapter = new ForgeActionAdapter({
-      runGh: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
-      verifyCurrentHeadSha: () => Promise.reject(new Error('worktree unreadable')),
+      runGh: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      verifyCurrentHeadSha: () =>
+        Promise.reject(new Error("worktree unreadable")),
     });
 
     const result = await adapter.performForgeAction(forgeActionRequest());
 
-    expect(result.outcome).toBe('ambiguous');
-    expect(result.outcome === 'ambiguous' && result.reason).toContain('Could not verify the current head');
-  });
-
-  it('creates a pull request with allow-listed arguments and parses its number', async () => {
-    const { calls, runGh } = makeRunGh({
-      exitCode: 0,
-      stdout: 'https://github.com/org/repo/pull/123\n',
-      stderr: '',
-    });
-    const adapter = new ForgeActionAdapter({
-      runGh,
-      verifyCurrentHeadSha: async () => HEAD_SHA,
-    });
-
-    const result = await adapter.performForgeAction(forgeActionRequest());
-
-    expect(result).toEqual({
-      outcome: 'executed',
-      pullRequestNumber: 123,
-      headSha: HEAD_SHA,
-    });
-    expect(calls[0]?.slice(0, 4)).toEqual(['pr', 'create', '--head', `feat/${LANE_ID}`]);
-    expect(calls[0]).toContain('--title');
-    expect(calls[0]).toContain('--body');
-  });
-
-  it('reports an unparseable create response as ambiguous', async () => {
-    const { runGh } = makeRunGh({ exitCode: 0, stdout: 'no url in this output', stderr: '' });
-    const adapter = new ForgeActionAdapter({
-      runGh,
-      verifyCurrentHeadSha: async () => HEAD_SHA,
-    });
-
-    const result = await adapter.performForgeAction(forgeActionRequest());
-
-    expect(result.outcome).toBe('ambiguous');
-    expect(result.outcome === 'ambiguous' && result.reason).toContain(
-      'no pull request number was reported',
+    expect(result.outcome).toBe("ambiguous");
+    expect(result.outcome === "ambiguous" && result.reason).toContain(
+      "Could not verify the current head",
     );
   });
 
-  it('refuses a failed create with the command error', async () => {
+  it("creates a pull request with allow-listed arguments and parses its number", async () => {
+    const { calls, runGh } = makeRunGh({
+      exitCode: 0,
+      stdout: "https://github.com/org/repo/pull/123\n",
+      stderr: "",
+    });
+    const adapter = new ForgeActionAdapter({
+      runGh,
+      verifyCurrentHeadSha: async () => HEAD_SHA,
+    });
+
+    const result = await adapter.performForgeAction(forgeActionRequest());
+
+    expect(result).toEqual({
+      outcome: "executed",
+      pullRequestNumber: 123,
+      headSha: HEAD_SHA,
+    });
+    expect(calls[0]?.slice(0, 4)).toEqual([
+      "pr",
+      "create",
+      "--head",
+      `feat/${LANE_ID}`,
+    ]);
+    expect(calls[0]).toContain("--title");
+    expect(calls[0]).toContain("--body");
+  });
+
+  it("reports an unparseable create response as ambiguous", async () => {
+    const { runGh } = makeRunGh({
+      exitCode: 0,
+      stdout: "no url in this output",
+      stderr: "",
+    });
+    const adapter = new ForgeActionAdapter({
+      runGh,
+      verifyCurrentHeadSha: async () => HEAD_SHA,
+    });
+
+    const result = await adapter.performForgeAction(forgeActionRequest());
+
+    expect(result.outcome).toBe("ambiguous");
+    expect(result.outcome === "ambiguous" && result.reason).toContain(
+      "no pull request number was reported",
+    );
+  });
+
+  it("refuses a failed create with the command error", async () => {
     const { runGh } = makeRunGh({
       exitCode: 1,
-      stdout: '',
-      stderr: 'GraphQL: branch protection (organization rules)\n',
+      stdout: "",
+      stderr: "GraphQL: branch protection (organization rules)\n",
     });
     const adapter = new ForgeActionAdapter({
       runGh,
@@ -1920,101 +2218,113 @@ describe('ForgeActionAdapter', () => {
     const result = await adapter.performForgeAction(forgeActionRequest());
 
     expect(result).toEqual({
-      outcome: 'refused',
-      reason: 'gh pr create failed (exit 1): GraphQL: branch protection (organization rules)',
-      refusalKind: 'protection',
+      outcome: "refused",
+      reason:
+        "gh pr create failed (exit 1): GraphQL: branch protection (organization rules)",
+      refusalKind: "protection",
     });
   });
 
-  it('treats a crashing create invocation as ambiguous for reconciliation', async () => {
+  it("treats a crashing create invocation as ambiguous for reconciliation", async () => {
     const adapter = new ForgeActionAdapter({
-      runGh: () => Promise.reject(new Error('gh binary missing')),
+      runGh: () => Promise.reject(new Error("gh binary missing")),
       verifyCurrentHeadSha: async () => HEAD_SHA,
     });
 
     const result = await adapter.performForgeAction(forgeActionRequest());
 
     expect(result).toEqual({
-      outcome: 'ambiguous',
-      reason: 'gh pr create could not complete: gh binary missing',
+      outcome: "ambiguous",
+      reason: "gh pr create could not complete: gh binary missing",
     });
   });
 
-  it('merges pinned to the expected head with --match-head-commit', async () => {
-    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
+  it("merges pinned to the expected head with --match-head-commit", async () => {
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: "", stderr: "" });
     const adapter = new ForgeActionAdapter({
       runGh,
       verifyCurrentHeadSha: async () => HEAD_SHA,
     });
 
-    const result = await adapter.performForgeAction(forgeActionRequest({ kind: 'merge-pr' }));
+    const result = await adapter.performForgeAction(
+      forgeActionRequest({ kind: "merge-pr" }),
+    );
 
-    expect(result).toEqual({ outcome: 'executed', headSha: HEAD_SHA });
+    expect(result).toEqual({ outcome: "executed", headSha: HEAD_SHA });
     expect(calls[0]).toEqual([
-      'pr',
-      'merge',
+      "pr",
+      "merge",
       `feat/${LANE_ID}`,
-      '--match-head-commit',
+      "--match-head-commit",
       HEAD_SHA,
-      '--merge',
+      "--merge",
     ]);
   });
 
-  it('reports a failed merge as ambiguous when no read port is configured', async () => {
-    const { runGh } = makeRunGh({ exitCode: 1, stdout: '', stderr: 'pull request not mergeable\n' });
+  it("reports a failed merge as ambiguous when no read port is configured", async () => {
+    const { runGh } = makeRunGh({
+      exitCode: 1,
+      stdout: "",
+      stderr: "pull request not mergeable\n",
+    });
     const adapter = new ForgeActionAdapter({
       runGh,
       verifyCurrentHeadSha: async () => HEAD_SHA,
     });
 
-    const result = await adapter.performForgeAction(forgeActionRequest({ kind: 'merge-pr' }));
+    const result = await adapter.performForgeAction(
+      forgeActionRequest({ kind: "merge-pr" }),
+    );
 
     expect(result).toEqual({
-      outcome: 'ambiguous',
-      reason: 'gh pr merge exited non-zero and the pull request state could not be read',
+      outcome: "ambiguous",
+      reason:
+        "gh pr merge exited non-zero and the pull request state could not be read",
     });
   });
 
-  it('refuses every invocation when verifyCurrentHeadSha is omitted', async () => {
-    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
+  it("refuses every invocation when verifyCurrentHeadSha is omitted", async () => {
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: "", stderr: "" });
     const adapter = new ForgeActionAdapter({ runGh });
 
     const createResult = await adapter.performForgeAction(forgeActionRequest());
     const mergeResult = await adapter.performForgeAction(
-      forgeActionRequest({ kind: 'merge-pr' }),
+      forgeActionRequest({ kind: "merge-pr" }),
     );
 
     expect(createResult).toEqual({
-      outcome: 'refused',
-      reason: 'Cannot perform forge action without verifyCurrentHeadSha',
-      refusalKind: 'other',
+      outcome: "refused",
+      reason: "Cannot perform forge action without verifyCurrentHeadSha",
+      refusalKind: "other",
     });
     expect(mergeResult).toEqual({
-      outcome: 'refused',
-      reason: 'Cannot perform forge action without verifyCurrentHeadSha',
-      refusalKind: 'other',
+      outcome: "refused",
+      reason: "Cannot perform forge action without verifyCurrentHeadSha",
+      refusalKind: "other",
     });
     expect(calls).toHaveLength(0);
   });
 
-  it('refuses an invalid expected head or branch without running gh', async () => {
-    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
+  it("refuses an invalid expected head or branch without running gh", async () => {
+    const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: "", stderr: "" });
     const adapter = new ForgeActionAdapter({ runGh });
 
     const badHead = await adapter.performForgeAction(
-      forgeActionRequest({ expectedHeadSha: 'not-a-sha' }),
+      forgeActionRequest({ expectedHeadSha: "not-a-sha" }),
     );
-    const badBranch = await adapter.performForgeAction(forgeActionRequest({ branchName: 'bad branch' }));
+    const badBranch = await adapter.performForgeAction(
+      forgeActionRequest({ branchName: "bad branch" }),
+    );
 
     expect(badHead).toEqual({
-      outcome: 'refused',
-      reason: 'Invalid expected head SHA: not-a-sha',
-      refusalKind: 'other',
+      outcome: "refused",
+      reason: "Invalid expected head SHA: not-a-sha",
+      refusalKind: "other",
     });
     expect(badBranch).toEqual({
-      outcome: 'refused',
-      reason: 'Invalid branch name: bad branch',
-      refusalKind: 'other',
+      outcome: "refused",
+      reason: "Invalid branch name: bad branch",
+      refusalKind: "other",
     });
     expect(calls).toHaveLength(0);
   });

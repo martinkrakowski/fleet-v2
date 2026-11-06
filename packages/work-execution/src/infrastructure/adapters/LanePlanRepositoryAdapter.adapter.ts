@@ -20,22 +20,27 @@ import * as path from 'node:path';
 import type {
   LanePlanRecord,
   PlannedLaneRef,
+  PullRequestLinkConflictRecord,
   PullRequestLinkRecord,
 } from '../../domain/lane-plan-records.js';
 import {
   LANE_PLAN_RECORD_VERSION,
+  PULL_REQUEST_LINK_CONFLICT_SCHEMA_VERSION,
   PULL_REQUEST_LINK_RECORD_VERSION,
 } from '../../domain/lane-plan-records.js';
 import { LanePlan } from '../../domain/entities/LanePlan.js';
 import {
   decidePullRequestLink,
   PullRequestLink,
+  pullRequestLinkConflictKey,
   pullRequestLinkKey,
+  readPullRequestLinkConflictRecord,
 } from '../../domain/entities/PullRequestLink.js';
 import { findLanePlanCycle, type LanePlanGraphPlan } from '../../domain/lane-plan-graph.js';
 import type {
   LanePlanRepositoryPort,
   SaveLanePlanResult,
+  SavePullRequestLinkConflictResult,
   SavePullRequestLinkResult,
 } from '../../application/ports/out/LanePlanRepositoryPort.out-port.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
@@ -142,6 +147,42 @@ export function parsePullRequestLinkStateRecord(raw: unknown): PullRequestLinkRe
   return parsed.status === 'ok' ? parsed.record : undefined;
 }
 
+/** The schema-version policy of `link-conflicts.json` (WB5b). */
+export const PULL_REQUEST_LINK_CONFLICT_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy(
+  'link-conflicts.json',
+  {
+    writerVersion: PULL_REQUEST_LINK_CONFLICT_SCHEMA_VERSION,
+    acceptedVersions: [1],
+  },
+);
+
+/**
+ * The versioned reader's record parser for `link-conflicts.json`: the
+ * `schemaVersion` check runs first, then the full domain record validation.
+ * Never throws.
+ */
+export function parseVersionedPullRequestLinkConflictStateRecord(
+  raw: unknown,
+): VersionedRecordParseResult<PullRequestLinkConflictRecord> {
+  const versionCheck = readStoreRecordSchemaVersion(raw, PULL_REQUEST_LINK_CONFLICT_STORE_VERSION_POLICY);
+  if (versionCheck.status !== 'ok') {
+    return versionCheck;
+  }
+  const read = readPullRequestLinkConflictRecord(raw);
+  if (!read.success) {
+    return { status: 'invalid' };
+  }
+  return { status: 'ok', record: read.record, schemaVersion: versionCheck.schemaVersion };
+}
+
+/** The reader's record parser for `link-conflicts.json`. */
+export function parsePullRequestLinkConflictStateRecord(raw: unknown): PullRequestLinkConflictRecord | undefined {
+  const parsed = parseVersionedPullRequestLinkConflictStateRecord(raw);
+  return parsed.status === 'ok' ? parsed.record : undefined;
+}
+
+const PULL_REQUEST_LINK_CONFLICT_LOCK_TIMEOUT_MS = 10_000;
+
 /** The graph plan of a stored record: stored lanes carry their aliases. */
 function lanePlanGraphPlanFromRecord(record: LanePlanRecord): LanePlanGraphPlan {
   return {
@@ -174,6 +215,7 @@ function findCycleAcrossPlans(
 export class LanePlanRepositoryAdapter implements LanePlanRepositoryPort {
   private readonly inMemoryRecords = new Map<string, LanePlanRecord>();
   private readonly inMemoryPullRequestLinks = new Map<string, PullRequestLinkRecord>();
+  private readonly inMemoryPullRequestLinkConflicts = new Map<string, PullRequestLinkConflictRecord>();
   private readonly changeSignal: ChangeSignalPort;
   private signalEmitFailuresCount = 0;
 
@@ -418,6 +460,124 @@ export class LanePlanRepositoryAdapter implements LanePlanRepositoryPort {
       return list;
     }
     return list.filter((record) => record.projectId === projectId);
+  }
+
+  async savePullRequestLinkConflict(
+    record: PullRequestLinkConflictRecord,
+  ): Promise<SavePullRequestLinkConflictResult> {
+    assertStoreWritable(this.options?.readOnly === true, 'LanePlanRepositoryAdapter');
+    const read = readPullRequestLinkConflictRecord(record);
+    if (!read.success) {
+      return { outcome: 'refused', code: 'invalid', message: read.message };
+    }
+    const validRecord = read.record;
+    const key = pullRequestLinkConflictKey(validRecord);
+    const stateDir = this.options?.stateDir;
+    if (stateDir === undefined) {
+      const existing = this.inMemoryPullRequestLinkConflicts.get(key);
+      if (existing !== undefined) {
+        return { outcome: 'unchanged', conflict: existing };
+      }
+      this.inMemoryPullRequestLinkConflicts.set(key, validRecord);
+      this.signal({ kind: 'plan', id: key, stateFile: null, before: null, written: null });
+      return { outcome: 'saved', conflict: validRecord };
+    }
+    return this.savePullRequestLinkConflictFile(validRecord, key, stateDir);
+  }
+
+  private async savePullRequestLinkConflictFile(
+    record: PullRequestLinkConflictRecord,
+    key: string,
+    stateDir: string,
+  ): Promise<SavePullRequestLinkConflictResult> {
+    const target = path.join(stateDir, 'link-conflicts.json');
+    const lockPath = path.join(stateDir, 'link-conflicts.json.lock');
+
+    let before: ChangeSignal['before'] = null;
+    let written: ChangeSignal['written'] = null;
+
+    const outcome = await withFileLock(
+      lockPath,
+      async (): Promise<SavePullRequestLinkConflictResult> => {
+        before = await this.safeStat(target);
+        const conflicts = await this.readPullRequestLinkConflictsFromDisk(target);
+        const existing = conflicts.find((item) => pullRequestLinkConflictKey(item) === key);
+        if (existing !== undefined) {
+          return { outcome: 'unchanged', conflict: existing };
+        }
+        conflicts.push(record);
+        const payload = conflicts.map((conflict) => ({
+          ...conflict,
+          schemaVersion: PULL_REQUEST_LINK_CONFLICT_STORE_VERSION_POLICY.writerVersion,
+        }));
+        await writeJsonAtomically(target, payload);
+        written = await this.safeStat(target);
+        return { outcome: 'saved', conflict: record };
+      },
+      { timeoutMs: PULL_REQUEST_LINK_CONFLICT_LOCK_TIMEOUT_MS },
+    );
+
+    if (outcome.outcome === 'saved') {
+      this.signal({
+        kind: 'plan',
+        id: key,
+        stateFile: path.resolve(target),
+        before,
+        written,
+      });
+    }
+    return outcome;
+  }
+
+  async listPullRequestLinkConflicts(projectId?: string): Promise<readonly PullRequestLinkConflictRecord[]> {
+    const stateDir = this.options?.stateDir;
+    if (stateDir === undefined) {
+      return this.filterPullRequestLinkConflicts([...this.inMemoryPullRequestLinkConflicts.values()], projectId);
+    }
+    const target = path.join(stateDir, 'link-conflicts.json');
+    const conflicts = await this.readPullRequestLinkConflictsFromDisk(target);
+    return this.filterPullRequestLinkConflicts(conflicts, projectId);
+  }
+
+  private filterPullRequestLinkConflicts(
+    conflicts: readonly PullRequestLinkConflictRecord[],
+    projectId?: string,
+  ): readonly PullRequestLinkConflictRecord[] {
+    if (projectId === undefined) {
+      return conflicts;
+    }
+    return conflicts.filter(
+      (conflict) => conflict.linkedLane.projectId === projectId || conflict.refusedLane.projectId === projectId,
+    );
+  }
+
+  private async readPullRequestLinkConflictsFromDisk(
+    target: string,
+  ): Promise<PullRequestLinkConflictRecord[]> {
+    let buffer: Buffer;
+    try {
+      buffer = await fs.readFile(target);
+    } catch (error: unknown) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        (error as { code?: string }).code === 'ENOENT'
+      ) {
+        return [];
+      }
+      throw error;
+    }
+    const inspection = inspectVersionedRecordListBytes(
+      buffer,
+      parseVersionedPullRequestLinkConflictStateRecord,
+    );
+    if (inspection.status === 'unknown-version') {
+      throw new StateFileUnknownVersionError(target, inspection.recordIndex);
+    }
+    if (inspection.status === 'unreadable') {
+      return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
+    }
+    return [...inspection.records];
   }
 
   private async readPullRequestLinksFromDisk(

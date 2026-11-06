@@ -1935,12 +1935,13 @@ export class WorkspaceAdapter implements WorkspacePort {
       return { outcome: 'refused', reason: 'path-refused' };
     }
     //     The requested path itself must be the listed physical path: a
-    //     registered path since replaced by a symlink resolves elsewhere.
+    //     registered path since replaced by a symlink resolves elsewhere, and
+    //     a path that is itself reached through a symlink is refused too.
     const physicalRequestedPath = await resolvePhysicalPath(executor, worktreePath, GIT_TIMEOUT_MS);
     if (physicalRequestedPath === null) {
       return { outcome: 'unknown', reason: 'the worktree path could not be resolved to a physical path' };
     }
-    if (physicalRequestedPath !== entry.path) {
+    if (physicalRequestedPath !== entry.path || physicalRequestedPath !== worktreePath) {
       return { outcome: 'refused', reason: 'path-refused' };
     }
 

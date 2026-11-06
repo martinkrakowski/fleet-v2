@@ -536,6 +536,24 @@ describe('removeWorktree over a fake executor', () => {
     expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
   });
 
+  it('refuses path-refused when the requested path is a symlink to a listed worktree inside the root', async () => {
+    const { result, calls } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList().replace(WORKTREE, `${WORKTREE_ROOT}/real-wt`) },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
+      [PWD_MARKER]: ({ argv }) =>
+        argv[argv.length - 1] === WORKTREE
+          ? { stdout: `${WORKTREE_ROOT}/real-wt\n` }
+          : { stdout: `${argv[argv.length - 1]}\n` },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'path-refused' });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
   it('answers unknown when the worktree root cannot be resolved to a physical path', async () => {
     const { result, calls } = await removeWith({
       [LIST_MARKER]: ({ callIndex }) =>

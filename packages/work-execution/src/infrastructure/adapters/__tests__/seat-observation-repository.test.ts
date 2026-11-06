@@ -198,16 +198,57 @@ describe('SeatObservationRepositoryAdapter (file mode)', () => {
     const target = path.join(stateDir, 'seat-observations.json');
     await fs.symlink(outside, target);
     const adapter = new SeatObservationRepositoryAdapter({ stateDir });
-    await expect(adapter.listSeatObservations()).rejects.toThrow(/regular file/);
+    const live = await adapter.listSeatObservations().catch((error: unknown) => error);
+    expect(live).toBeInstanceOf(StateFileUnreadableError);
+    expect((live as StateFileUnreadableError).quarantinePath).toBeNull();
+    expect((live as StateFileUnreadableError).message).toMatch(/regular file/);
     await fs.unlink(target);
     await fs.symlink(path.join(stateDir, 'nowhere.json'), target);
-    await expect(adapter.listSeatObservations()).rejects.toThrow(/regular file/);
+    const dangling = await adapter.listSeatObservations().catch((error: unknown) => error);
+    expect(dangling).toBeInstanceOf(StateFileUnreadableError);
+    expect((dangling as StateFileUnreadableError).quarantinePath).toBeNull();
+    expect((dangling as StateFileUnreadableError).message).toMatch(/regular file/);
+    await expect(fs.stat(path.join(stateDir, 'quarantine'))).rejects.toThrow();
   });
 
   it('refuses an oversized store file', async () => {
     await fs.writeFile(path.join(stateDir, 'seat-observations.json'), Buffer.alloc(8 * 1024 * 1024 + 1, 32));
     const adapter = new SeatObservationRepositoryAdapter({ stateDir });
-    await expect(adapter.listSeatObservations()).rejects.toThrow(/bytes/);
+    const refused = await adapter.listSeatObservations().catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(StateFileUnreadableError);
+    expect((refused as StateFileUnreadableError).quarantinePath).toBeNull();
+    expect((refused as StateFileUnreadableError).message).toMatch(/bytes/);
+    await expect(fs.stat(path.join(stateDir, 'quarantine'))).rejects.toThrow();
+  });
+
+  it('rejects a null or non-object record with the fixed adapter message, not a raw TypeError', async () => {
+    const adapter = new SeatObservationRepositoryAdapter({ stateDir });
+    for (const bad of [null, undefined, 'x', 7, []]) {
+      await expect(adapter.appendSeatObservation(bad as unknown as SeatObservationRecord)).rejects.toThrow(
+        'SeatObservationRepositoryAdapter refuses an invalid observation record',
+      );
+    }
+    await expect(fs.stat(path.join(stateDir, 'seat-observations.json'))).rejects.toThrow();
+  });
+
+  it('parseVersionedSeatObservationStateRecord returns invalid, never throws, on a throwing getter', () => {
+    const hostile = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('hostile getter');
+        },
+      },
+    );
+    expect(parseVersionedSeatObservationStateRecord(hostile)).toEqual({ status: 'invalid' });
+    const getterRecord = {
+      schemaVersion: 1,
+      version: 1,
+      get observationId(): string {
+        throw new Error('hostile getter');
+      },
+    };
+    expect(parseVersionedSeatObservationStateRecord(getterRecord)).toEqual({ status: 'invalid' });
   });
 
   it('throws StateFileUnknownVersionError on schemaVersion 2 with no quarantine copy', async () => {

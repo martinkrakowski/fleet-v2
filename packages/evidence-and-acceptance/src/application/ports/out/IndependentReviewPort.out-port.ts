@@ -8,6 +8,7 @@ import type { EvidenceResultValue } from '../../../domain/value-objects/Evidence
 import type {
   ReviewFindingRecord,
   ReviewKind,
+  ReviewUnknownReason,
 } from '../../../domain/evidence-records.js';
 
 export interface RunIndependentReviewRequest {
@@ -33,6 +34,7 @@ export const REVIEW_UNAVAILABLE_CODES = [
   'route-unresolved',
   'seat-none', 'seat-ambiguous', 'seat-implementer', 'seat-tool-no-transport', 'seat-variant-unsupported',
   'same-family', 'transport-missing', 'transport-failed',
+  'timeout', 'transport',
 ] as const;
 export type ReviewUnavailableCode = (typeof REVIEW_UNAVAILABLE_CODES)[number];
 
@@ -44,6 +46,8 @@ export type RunIndependentReviewResult =
       readonly findings: readonly ReviewFindingRecord[];
       readonly rawOutput: string;
       readonly completedAtIso: string;
+      /** Fixed cause code when `result === 'unknown'`; absent otherwise. */
+      readonly unknownReason?: ReviewUnknownReason;
     }
   | { readonly outcome: 'unavailable'; readonly reason: string; readonly code: ReviewUnavailableCode };
 

@@ -25,6 +25,15 @@ export type MergeRecordSource = (typeof MERGE_RECORD_SOURCES)[number];
 export const MERGE_RECORD_MERGERS = ['fleet', 'unknown'] as const;
 export type MergeRecordMerger = (typeof MERGE_RECORD_MERGERS)[number];
 
+export const MERGE_RECORD_LIMITS = {
+  maxRepositoryLength: 200,
+  minPullRequestNumber: 1,
+  maxPullRequestNumber: 999_999_999,
+  maxHeadShaLength: 64,
+  maxIsoTimestampLength: 32,
+  maxActionRefLength: 128,
+} as const;
+
 export interface MergeRecordRecord {
   readonly schemaVersion: typeof MERGE_RECORD_SCHEMA_VERSION;
   readonly repository: string;
@@ -100,14 +109,18 @@ function hasForbiddenControlCharacter(text: string): boolean {
 
 const RECORD_SCHEMA: Parameters<typeof readPlainRecord>[1] = {
   schemaVersion: { kind: 'integer', min: 1, max: MERGE_RECORD_SCHEMA_VERSION, optional: true },
-  repository: { kind: 'string', maxLength: 200 },
-  number: { kind: 'integer', min: 1, max: 999999999 },
-  headSha: { kind: 'string', maxLength: 64 },
-  mergedAtIso: { kind: 'string', maxLength: 32 },
-  firstSeenAtIso: { kind: 'string', maxLength: 32 },
+  repository: { kind: 'string', maxLength: MERGE_RECORD_LIMITS.maxRepositoryLength },
+  number: {
+    kind: 'integer',
+    min: MERGE_RECORD_LIMITS.minPullRequestNumber,
+    max: MERGE_RECORD_LIMITS.maxPullRequestNumber,
+  },
+  headSha: { kind: 'string', maxLength: MERGE_RECORD_LIMITS.maxHeadShaLength },
+  mergedAtIso: { kind: 'string', maxLength: MERGE_RECORD_LIMITS.maxIsoTimestampLength },
+  firstSeenAtIso: { kind: 'string', maxLength: MERGE_RECORD_LIMITS.maxIsoTimestampLength },
   source: { kind: 'literal', values: MERGE_RECORD_SOURCES },
   merger: { kind: 'literal', values: MERGE_RECORD_MERGERS },
-  actionRef: { kind: 'string', maxLength: 128, optional: true },
+  actionRef: { kind: 'string', maxLength: MERGE_RECORD_LIMITS.maxActionRefLength, optional: true },
 };
 
 export class MergeRecord {
@@ -249,11 +262,14 @@ function readMergeRecordRecord(
   if (actionRef !== undefined) {
     if (
       typeof actionRef !== 'string' ||
-      actionRef.length > 128 ||
+      actionRef.length > MERGE_RECORD_LIMITS.maxActionRefLength ||
       hasForbiddenControlCharacter(actionRef) ||
       isPlanSecretShaped(actionRef)
     ) {
-      return { ok: false, message: 'MergeRecord actionRef: must be plain text of at most 128 characters' };
+      return {
+        ok: false,
+        message: `MergeRecord actionRef: must be plain text of at most ${MERGE_RECORD_LIMITS.maxActionRefLength} characters`,
+      };
     }
     actionRefValue = actionRef;
   }

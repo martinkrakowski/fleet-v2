@@ -19,13 +19,10 @@ import type {
   SeatTicketRepositoryPort,
   SaveSeatTicketOutcome,
 } from '../../application/ports/out/SeatTicketRepositoryPort.out-port.js';
-import { readSeatStoreBytes } from './seat-store-bytes.js';
 import {
   assertValidSchemaVersionPolicy,
-  inspectVersionedRecordListBytes,
+  readOrQuarantineVersionedRecordList,
   readStoreRecordSchemaVersion,
-  rejectUnreadableStateFile,
-  StateFileUnknownVersionError,
   withFileLock,
   writeJsonAtomically,
   type VersionedRecordParseResult,
@@ -60,37 +57,40 @@ function isParseableIsoDate(value: unknown): value is string {
  * and never throws. The returned record carries no `schemaVersion` key.
  */
 export function parseVersionedSeatTicketStateRecord(raw: unknown): VersionedRecordParseResult<SeatTicketRecord> {
-  const versionCheck = readStoreRecordSchemaVersion(raw, SEAT_TICKET_STORE_VERSION_POLICY);
-  if (versionCheck.status !== 'ok') {
-    return versionCheck;
-  }
-  const candidate = raw as Record<string, unknown>;
-  if (
-    candidate.version !== 1
-  ) {
-    return { status: 'unknown-version' };
-  }
-  if (
-    !isNonEmptyString(candidate.projectId) ||
-    !SEAT_TICKET_ROLES.includes(candidate.role as SeatTicketRole) ||
-    !isNonNegativeSafeInteger(candidate.ticket) ||
-    !isNonNegativeSafeInteger(candidate.revision) ||
-    !isParseableIsoDate(candidate.updatedAtIso)
-  ) {
+  try {
+    const versionCheck = readStoreRecordSchemaVersion(raw, SEAT_TICKET_STORE_VERSION_POLICY);
+    if (versionCheck.status !== 'ok') {
+      return versionCheck;
+    }
+    const candidate = raw as Record<string, unknown>;
+    if (candidate.version !== 1) {
+      return { status: 'unknown-version' };
+    }
+    if (
+      !isNonEmptyString(candidate.projectId) ||
+      !SEAT_TICKET_ROLES.includes(candidate.role as SeatTicketRole) ||
+      !isNonNegativeSafeInteger(candidate.ticket) ||
+      !isNonNegativeSafeInteger(candidate.revision) ||
+      !isParseableIsoDate(candidate.updatedAtIso)
+    ) {
+      return { status: 'invalid' };
+    }
+    return {
+      status: 'ok',
+      record: {
+        version: 1,
+        projectId: candidate.projectId,
+        role: candidate.role as SeatTicketRole,
+        ticket: candidate.ticket,
+        revision: candidate.revision,
+        updatedAtIso: candidate.updatedAtIso,
+      },
+      schemaVersion: versionCheck.schemaVersion,
+    };
+  } catch {
+    // A hostile getter on `raw` must never throw out of the parser.
     return { status: 'invalid' };
   }
-  return {
-    status: 'ok',
-    record: {
-      version: 1,
-      projectId: candidate.projectId,
-      role: candidate.role as SeatTicketRole,
-      ticket: candidate.ticket,
-      revision: candidate.revision,
-      updatedAtIso: candidate.updatedAtIso,
-    },
-    schemaVersion: versionCheck.schemaVersion,
-  };
 }
 
 /** The reader's record parser, shared with `fleet-v2 state check`. */
@@ -108,6 +108,22 @@ const SEAT_TICKET_STORE_NAME = 'seat-tickets.json';
 
 function seatTicketKey(projectId: string, role: SeatTicketRole): string {
   return `${projectId}\u0000${role}`;
+}
+
+/**
+ * Two records for one (project, role) cannot be merged safely: keeping either
+ * could lower a ticket. The file is treated as unreadable.
+ */
+function duplicateSeatTicketKeyError(records: readonly SeatTicketRecord[]): string | undefined {
+  const seen = new Set<string>();
+  for (const item of records) {
+    const itemKey = seatTicketKey(item.projectId, item.role);
+    if (seen.has(itemKey)) {
+      return 'duplicate seat ticket key';
+    }
+    seen.add(itemKey);
+  }
+  return undefined;
 }
 
 function isUnsafeStoreId(value: string): boolean {
@@ -146,6 +162,9 @@ export class SeatTicketRepositoryAdapter implements SeatTicketRepositoryPort {
   }
 
   async saveSeatTicket(input: SeatTicketRecord): Promise<SaveSeatTicketOutcome> {
+    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+      throw new Error('SeatTicketRepositoryAdapter refuses an invalid seat ticket record');
+    }
     // Snapshot first: every check below sees the same plain data that is stored.
     const record = structuredClone(input);
     if (isUnsafeStoreId(record.projectId) || !SEAT_TICKET_ROLES.includes(record.role)) {
@@ -188,7 +207,7 @@ export class SeatTicketRepositoryAdapter implements SeatTicketRepositoryPort {
     const lockPath = path.join(stateDir, `${SEAT_TICKET_STORE_NAME}.lock`);
     let outcome: SaveSeatTicketOutcome = 'saved';
     await withFileLock(lockPath, async () => {
-      const records = await this.readRecordsFromDisk(target);
+      const records = await this.readRecordsFromDisk(target, true);
       const stored = records.get(key);
       if (stored !== undefined && (stored.revision >= record.revision || stored.ticket > record.ticket)) {
         outcome = 'conflict';
@@ -204,27 +223,16 @@ export class SeatTicketRepositoryAdapter implements SeatTicketRepositoryPort {
     return outcome;
   }
 
-  private async readRecordsFromDisk(target: string): Promise<Map<string, SeatTicketRecord>> {
+  private async readRecordsFromDisk(target: string, lockHeld = false): Promise<Map<string, SeatTicketRecord>> {
     const map = new Map<string, SeatTicketRecord>();
-    const buffer = await readSeatStoreBytes(target);
-    if (buffer === null) {
-      return map;
-    }
-    const inspection = inspectVersionedRecordListBytes(buffer, parseVersionedSeatTicketStateRecord);
-    if (inspection.status === 'unknown-version') {
-      throw new StateFileUnknownVersionError(target, inspection.recordIndex);
-    }
-    if (inspection.status === 'unreadable') {
-      return rejectUnreadableStateFile(target, inspection.detail, buffer, false);
-    }
-    for (const item of inspection.records) {
-      const itemKey = seatTicketKey(item.projectId, item.role);
-      if (map.has(itemKey)) {
-        // Two records for one (project, role) cannot be merged safely: keeping
-        // either could lower a ticket. Treat the file as unreadable.
-        return rejectUnreadableStateFile(target, 'duplicate seat ticket key', buffer, false);
-      }
-      map.set(itemKey, item);
+    const records = await readOrQuarantineVersionedRecordList({
+      filePath: target,
+      parseRecord: parseVersionedSeatTicketStateRecord,
+      findListError: duplicateSeatTicketKeyError,
+      lockHeld,
+    });
+    for (const item of records) {
+      map.set(seatTicketKey(item.projectId, item.role), item);
     }
     return map;
   }

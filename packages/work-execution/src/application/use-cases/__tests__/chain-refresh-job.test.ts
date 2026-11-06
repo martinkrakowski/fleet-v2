@@ -54,9 +54,13 @@ class FakeRefresh implements RefreshChainsPort {
 class FakeAttention implements Pick<ChainAttentionPort, 'raiseChainAttention'> {
   readonly raises: ChainAttentionCommand[] = [];
   result: RaiseChainAttentionResult = { outcome: 'raised', reasonCode: null };
+  throwOnRaise = false;
 
   async raiseChainAttention(command: ChainAttentionCommand): Promise<RaiseChainAttentionResult> {
     this.raises.push(command);
+    if (this.throwOnRaise) {
+      throw new Error('attention store exploded');
+    }
     return this.result;
   }
 }
@@ -174,5 +178,49 @@ describe('DaemonJobRegistry chain-refresh invalid mode (CO8a)', () => {
     // The same key both times: the store refreshes one item, never a duplicate.
     expect(attention.raises).toHaveLength(2);
     expect(attention.raises[0]).toEqual(attention.raises[1]);
+  });
+
+  it('the invalid job refuses when the attention store refuses the raise', async () => {
+    const attention = new FakeAttention();
+    attention.result = { outcome: 'refused', reasonCode: 'store-unreadable' };
+    const registry = new DaemonJobRegistry({
+      mergePass: {} as never,
+      chainRefreshMode: 'invalid',
+      chainAttention: attention,
+    });
+    const jobs = registry.instances([repoRef(DIGEST_A)]);
+    const refreshJob = jobs.find((job) => job.jobId === `chain-refresh:${DIGEST_A}`);
+    expect(refreshJob).toBeDefined();
+    const outcome = await refreshJob!.pass({ nowIso: NOW, deadlineIso: DEADLINE });
+    expect(outcome).toEqual({ outcome: 'refused', reasonCode: 'chain-refresh-attention-refused' });
+    expect(attention.raises).toHaveLength(1);
+  });
+
+  it('the invalid job refuses when the attention raise throws', async () => {
+    const attention = new FakeAttention();
+    attention.throwOnRaise = true;
+    const registry = new DaemonJobRegistry({
+      mergePass: {} as never,
+      chainRefreshMode: 'invalid',
+      chainAttention: attention,
+    });
+    const jobs = registry.instances([repoRef(DIGEST_A)]);
+    const refreshJob = jobs.find((job) => job.jobId === `chain-refresh:${DIGEST_A}`);
+    expect(refreshJob).toBeDefined();
+    const outcome = await refreshJob!.pass({ nowIso: NOW, deadlineIso: DEADLINE });
+    expect(outcome).toEqual({ outcome: 'refused', reasonCode: 'chain-refresh-attention-failed' });
+    expect(attention.raises).toHaveLength(1);
+  });
+
+  it('the invalid job refuses when no attention store is wired', async () => {
+    const registry = new DaemonJobRegistry({
+      mergePass: {} as never,
+      chainRefreshMode: 'invalid',
+    });
+    const jobs = registry.instances([repoRef(DIGEST_A)]);
+    const refreshJob = jobs.find((job) => job.jobId === `chain-refresh:${DIGEST_A}`);
+    expect(refreshJob).toBeDefined();
+    const outcome = await refreshJob!.pass({ nowIso: NOW, deadlineIso: DEADLINE });
+    expect(outcome).toEqual({ outcome: 'refused', reasonCode: 'chain-refresh-attention-unavailable' });
   });
 });

@@ -59,7 +59,7 @@ import {
   orderMergeQueue,
   type MergeQueueEntryRecord,
 } from '../../domain/merge-queue-records.js';
-import type { ChainAttentionPort } from '../ports/out/ChainAttentionPort.out-port.js';
+import type { ChainAttentionPort, RaiseChainAttentionResult } from '../ports/out/ChainAttentionPort.out-port.js';
 import type { DaemonJobPort, DaemonJobPassRequest } from '../ports/out/DaemonJobPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { DaemonEventProjectionPort } from '../ports/out/DaemonEventProjectionPort.out-port.js';
@@ -106,8 +106,9 @@ export interface RunDaemonTickDependencies {
   /**
    * The effective chain-refresh mode (CO8a): `shadow` runs the chain-refresh
    * job as before; `invalid` registers a job that is skipped with the typed
-   * outcome `chain-refresh-mode-invalid` and raises one policy-level attention
-   * item. Absent means `shadow` (and no chain-refresh job without `chainRefresh`).
+   * outcome `chain-refresh-mode-invalid` after raising one policy-level
+   * attention item — a failed raise refuses the job instead. Absent means
+   * `shadow` (and no chain-refresh job without `chainRefresh`).
    */
   readonly chainRefreshMode?: 'shadow' | 'invalid';
   /** Raises the channel-level attention item when `chainRefreshMode` is `invalid`. */
@@ -126,7 +127,8 @@ export interface DaemonJobRegistryDependencies {
   readonly chainRefresh?: RefreshChainsPort;
   /**
    * The effective chain-refresh mode (CO8a); see `RunDaemonTickDependencies`.
-   * `invalid` registers the skipped-with-attention job, never a live one.
+   * `invalid` registers the skipped-with-attention job (refused when the
+   * attention raise fails), never a live one.
    */
   readonly chainRefreshMode?: 'shadow' | 'invalid';
   /** Raises the policy-level attention item when `chainRefreshMode` is `invalid`. */
@@ -427,7 +429,9 @@ class ChainRefreshJob implements DaemonJobPort {
  * `invalid`. The job never touches the forge: it raises one policy-level
  * attention item naming the key (refreshed on a repeat, never duplicated) and
  * is skipped with the typed outcome `chain-refresh-mode-invalid`. The merge
- * pass and every other job run normally regardless.
+ * pass and every other job run normally regardless. A failed raise (refused
+ * or throwing) refuses the job, so the tick exits non-zero and the operator is
+ * alerted that the invalid mode was not surfaced.
  */
 class ChainRefreshInvalidJob implements DaemonJobPort {
   constructor(
@@ -438,15 +442,28 @@ class ChainRefreshInvalidJob implements DaemonJobPort {
   ) {}
 
   async pass(_request: DaemonJobPassRequest): Promise<DaemonJobOutcome> {
+    const attention = this.attention;
+    if (attention === undefined) {
+      // Without the attention store no notification is possible: refuse rather
+      // than report a harmless skip.
+      return { outcome: 'refused', reasonCode: 'chain-refresh-attention-unavailable' };
+    }
+    let raised: RaiseChainAttentionResult;
     try {
-      await this.attention?.raiseChainAttention({
+      raised = await attention.raiseChainAttention({
         projectId: this.repository.projectId,
         repository: { owner: this.repository.owner, repo: this.repository.repo },
         kind: 'chain-refresh-mode-invalid',
       });
     } catch {
-      // A refused or failing raise never changes the skip outcome: the mode is
-      // invalid either way, and the item is advisory.
+      // A throwing raise means the operator was not notified: refuse the job so
+      // the tick reports it and exits non-zero.
+      return { outcome: 'refused', reasonCode: 'chain-refresh-attention-failed' };
+    }
+    if (raised.outcome !== 'raised' && raised.outcome !== 'refreshed' && raised.outcome !== 'reopened') {
+      // The store refused the raise: refuse the job so the operator learns the
+      // invalid mode was not surfaced.
+      return { outcome: 'refused', reasonCode: 'chain-refresh-attention-refused' };
     }
     return { outcome: 'skipped', reasonCode: 'chain-refresh-mode-invalid' };
   }

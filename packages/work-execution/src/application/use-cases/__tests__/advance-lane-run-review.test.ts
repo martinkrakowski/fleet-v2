@@ -1783,4 +1783,81 @@ describe('review cause codes reach the run journal (RV2)', () => {
       adapter.recordOutOfScope!(null as never),
     ).resolves.toEqual({ outcome: 'refused' });
   });
+
+  it('RV2 fix (Luna 1): a findingIds array with a hole is refused before any disposition is recorded', async () => {
+    const recorded: unknown[] = [];
+    const adapter = new ReviewRequestAdapter({
+      recordFindingDisposition: async (request) => {
+        recorded.push(request);
+        return { outcome: 'recorded' } as never;
+      },
+    });
+    const holey = new Array(1) as unknown as string[];
+    await expect(
+      adapter.recordOutOfScope!({ attemptId: 'a', candidateHeadSha: COMMIT_A, findingIds: holey }),
+    ).resolves.toEqual({ outcome: 'refused' });
+    const mixed = ['finding-1', 'finding-2'] as unknown as string[];
+    delete (mixed as unknown as Record<string, unknown>)[1];
+    await expect(
+      adapter.recordOutOfScope!({ attemptId: 'a', candidateHeadSha: COMMIT_A, findingIds: mixed }),
+    ).resolves.toEqual({ outcome: 'refused' });
+    await expect(
+      adapter.recordOutOfScope!({ attemptId: 'a', candidateHeadSha: COMMIT_A, findingIds: [7 as never] }),
+    ).resolves.toEqual({ outcome: 'refused' });
+    expect(recorded).toEqual([]);
+  });
+
+  it('RV2 fix (Luna 2): a throwing optional field getter is invalid-request on the attempt and the chain path', async () => {
+    let delegateCalls = 0;
+    const adapter = adapterAnswering(async () => {
+      delegateCalls += 1;
+      return { outcome: 'rejected' as const, reason: 'unused', rejection: 'review-unavailable' as const, code: 'transport-failed' as const };
+    });
+    const throwing = (target: object, key: string): object =>
+      Object.defineProperty(target, key, {
+        get() {
+          throw new Error('boom');
+        },
+        enumerable: true,
+      });
+    const attempt = {
+      requestId: 'req-1', kind: 'brief-check', attemptId: 'a', projectId: 'p', candidateHeadSha: COMMIT_A,
+      policyRevision: 'pol', implementerModel: 'i', reviewerModel: 'r',
+    };
+    const chain = {
+      requestId: 'req-2', kind: 'pre-merge', attemptId: 'a', projectId: 'p', candidateHeadSha: COMMIT_A,
+      policyRevision: 'pol', implementerModel: 'i', reviewerModel: 'r',
+      subject: { kind: 'chain', projectId: 'p', chainName: 'rv2', integrationHeadSha: COMMIT_A },
+    };
+    for (const request of [
+      throwing({ ...attempt }, 'briefText'),
+      throwing({ ...attempt }, 'nowIso'),
+      throwing({ ...chain }, 'diffSummary'),
+      throwing({ ...chain }, 'nowIso'),
+      throwing({ ...chain }, 'policyRevision'),
+    ]) {
+      await expect(adapter.requestReview(request as never)).resolves.toEqual({
+        outcome: 'refused',
+        reason: 'invalid-request',
+        detail: null,
+      });
+    }
+    expect(delegateCalls).toBe(0);
+  });
+
+  it('RV2 fix (Luna 4): a receipt whose findings are not plain objects is a receipt-mismatch', async () => {
+    const adapter = adapterAnswering(async (request) => ({
+      outcome: 'reviewed' as const,
+      receipt: {
+        ...unknownReceipt(request, undefined),
+        result: 'fail' as const,
+        findings: [new Date()] as never,
+      },
+    }));
+    const result = await adapter.requestReview({
+      requestId: 'req-3', kind: 'brief-check', attemptId: 'a', projectId: 'p', candidateHeadSha: COMMIT_A,
+      policyRevision: 'pol', implementerModel: 'i', reviewerModel: 'r',
+    } as never);
+    expect(result).toEqual({ outcome: 'unknown', reason: 'receipt-mismatch' });
+  });
 });

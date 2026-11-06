@@ -2447,6 +2447,21 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     expect(hostile).not.toHaveProperty('unknownReason');
   });
 
+  it('RV2 fix (Luna 3): a thrown Error whose message getter throws is unavailable, never a rejection', async () => {
+    const hostileError = Object.defineProperty(new Error('x'), 'message', {
+      get() {
+        throw new Error('message getter boom');
+      },
+    });
+    const result = await new IndependentReviewAdapter({
+      runReview: async () => {
+        throw hostileError;
+      },
+    }).runIndependentReview(baseRequest);
+    expect(result.outcome).toBe('unavailable');
+    expect(unavailableCodeOf(result)).toBe('transport');
+  });
+
   it('robustness (2): a review cut short by its timeout budget surfaces code timeout and leaves retryable state', async () => {
     for (const spawnResult of [
       { exitCode: null, stdout: '', stderr: '', timedOut: true },

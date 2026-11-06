@@ -112,8 +112,14 @@ export class IndependentReviewAdapter implements IndependentReviewPort {
       if (error instanceof ReviewTransportError) {
         return { outcome: 'unavailable', reason: error.message, code: error.code };
       }
-      const reason =
-        error instanceof Error ? error.message : 'Independent review transport failed';
+      let reason = 'Independent review transport failed';
+      try {
+        if (error instanceof Error && typeof error.message === 'string') {
+          reason = error.message;
+        }
+      } catch {
+        // A hostile message getter keeps the fixed fallback reason.
+      }
       return { outcome: 'unavailable', reason, code: isTimeoutError(error) ? 'timeout' : 'transport' };
     }
 

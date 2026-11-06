@@ -195,6 +195,47 @@ function isReviewKind(value: unknown): boolean {
   return typeof value === 'string' && REVIEW_KIND_VALUES.includes(value);
 }
 
+/**
+ * Snapshot of the named optional own data fields, read once. An accessor (or a
+ * failing descriptor read) makes the whole snapshot null: a hostile request is
+ * an invalid request, and no getter ever runs.
+ */
+function snapshotOptionalFields(request: unknown, keys: readonly string[]): Record<string, unknown> | null {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    const read = ownProperty(request, key);
+    if (read === 'unreadable') {
+      return null;
+    }
+    if (read !== undefined) {
+      out[key] = read.value;
+    }
+  }
+  return out;
+}
+
+/** True when `value` is a non-empty dense array whose every index holds a non-blank string (holes are checked by index; `every` skips them). */
+function isDenseNonEmptyStringArray(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    if (!(index in value) || !isNonEmptyTrimmed(value[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** True for a plain object (prototype Object.prototype or null). */
+function isPlainObject(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
 /** A brief longer than 64 KiB is a refusal, never a truncated forward. */
 function briefTextByteLength(briefText: string): number {
   return Buffer.byteLength(briefText, 'utf8');
@@ -291,7 +332,7 @@ function findingsAreDense(findings: unknown): boolean {
         return false;
       }
       const finding = findings[index];
-      if (typeof finding !== 'object' || finding === null || Array.isArray(finding)) {
+      if (!isPlainObject(finding)) {
         return false;
       }
     }
@@ -416,13 +457,24 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
    * maps its outcome, with a receipt for any other subject treated as unknown.
    */
   private async requestChainReview(request: ReviewRequest, chain: ChainSubject): Promise<ReviewRequestResult> {
-    const diffSummary = request.diffSummary;
+    // Every field is snapshotted once from own data properties: a throwing
+    // getter is an invalid request, never an exception.
+    const optional = snapshotOptionalFields(request, ['diffSummary', 'nowIso']);
+    const requestId = ownValue(request, 'requestId');
+    const policyRevision = ownValue(request, 'policyRevision');
+    const implementerModel = ownValue(request, 'implementerModel');
+    const reviewerModel = ownValue(request, 'reviewerModel');
+    const diffSummary = optional?.diffSummary;
+    const nowIso = optional?.nowIso;
     if (
-      request.kind !== 'pre-merge' ||
-      !REVIEW_REQUEST_ID_PATTERN.test(request.requestId) ||
-      !isNonEmptyTrimmed(request.policyRevision) ||
-      !isNonEmptyTrimmed(request.implementerModel) ||
-      !isNonEmptyTrimmed(request.reviewerModel) ||
+      optional === null ||
+      ownValue(request, 'kind') !== 'pre-merge' ||
+      typeof requestId !== 'string' ||
+      !REVIEW_REQUEST_ID_PATTERN.test(requestId) ||
+      !isNonEmptyTrimmed(policyRevision) ||
+      !isNonEmptyTrimmed(implementerModel) ||
+      !isNonEmptyTrimmed(reviewerModel) ||
+      (nowIso !== undefined && typeof nowIso !== 'string') ||
       (diffSummary !== undefined &&
         (typeof diffSummary !== 'string' || Buffer.byteLength(diffSummary, 'utf8') > DIFF_SUMMARY_MAX_BYTES))
     ) {
@@ -438,24 +490,24 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         projectId: chain.projectId,
         attemptId: attemptIdForChain(chain.projectId, chain.chainName),
         candidateHeadSha: chain.integrationHeadSha,
-        policyRevision: request.policyRevision,
-        implementerModel: request.implementerModel,
-        reviewerModel: request.reviewerModel,
+        policyRevision: policyRevision as string,
+        implementerModel: implementerModel as string,
+        reviewerModel: reviewerModel as string,
         kind: 'pre-merge',
-        requestId: request.requestId,
+        requestId,
         subject: evidenceChainSubject(chain),
         ...(diffSummary !== undefined ? { diffSummary } : {}),
-        ...(request.nowIso !== undefined ? { nowIso: request.nowIso } : {}),
+        ...(nowIso !== undefined ? { nowIso } : {}),
       });
     } catch {
       return { outcome: 'unknown', reason: 'delegate-failed' };
     }
     if (result.outcome === 'reviewed') {
       const receipt = result.receipt;
-      if (receipt.requestId !== request.requestId || !isChainReceiptOf(receipt, chain)) {
+      if (receipt.requestId !== requestId || !isChainReceiptOf(receipt, chain)) {
         return { outcome: 'unknown', reason: 'receipt-mismatch' };
       }
-      const summary = summaryOf(receipt, 'pre-merge', request.requestId);
+      const summary = summaryOf(receipt, 'pre-merge', requestId);
       return summary === null
         ? { outcome: 'unknown', reason: 'receipt-mismatch' }
         : { outcome: 'receipt', receipt: summary };
@@ -474,11 +526,15 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (subject.kind === 'chain') {
       return this.requestChainReview(request, subject.chain);
     }
+    const optional = snapshotOptionalFields(request, ['briefText', 'nowIso']);
+    const briefText = optional?.briefText;
+    const nowIso = optional?.nowIso;
     if (
+      optional === null ||
       !isValidReviewRequest(request) ||
-      (request.briefText !== undefined &&
-        (typeof request.briefText !== 'string' ||
-          briefTextByteLength(request.briefText) > BRIEF_TEXT_MAX_BYTES))
+      (nowIso !== undefined && typeof nowIso !== 'string') ||
+      (briefText !== undefined &&
+        (typeof briefText !== 'string' || briefTextByteLength(briefText) > BRIEF_TEXT_MAX_BYTES))
     ) {
       return { outcome: 'refused', reason: 'invalid-request', detail: null };
     }
@@ -501,10 +557,8 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         requestId: request.requestId,
         // The frozen brief flows through only for a brief-check, so any other
         // kind's transport call carries exactly the fields it carried before.
-        ...(kind === 'brief-check' && request.briefText !== undefined
-          ? { briefText: request.briefText }
-          : {}),
-        ...(request.nowIso !== undefined ? { nowIso: request.nowIso } : {}),
+        ...(kind === 'brief-check' && briefText !== undefined ? { briefText: briefText as string } : {}),
+        ...(nowIso !== undefined ? { nowIso } : {}),
       });
     } catch {
       return { outcome: 'unknown', reason: 'delegate-failed' };
@@ -678,13 +732,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         isNonEmptyTrimmed(request.attemptId) &&
         typeof request.candidateHeadSha === 'string' &&
         HEAD_PATTERN.test(request.candidateHeadSha) &&
-        Array.isArray(request.findingIds) &&
-        request.findingIds.length > 0 &&
-        request.findingIds.every(
-          (findingId, index) =>
-            Object.prototype.hasOwnProperty.call(request.findingIds, index) &&
-            isNonEmptyTrimmed(findingId),
-        );
+        isDenseNonEmptyStringArray(request.findingIds);
     } catch {
       valid = false;
     }

@@ -113,10 +113,11 @@ export interface ExecuteAuthorizedForgeActionDependencies {
    */
   readonly mergeRecordRepo?: MergeRecordRepositoryPort;
   /**
-   * The read-only pull-request read (WB5b2): a merge's pull-request number
-   * that no typed journal entry confirms is verified here (open, the
-   * attempt's branch, the expected head) before the grant is consumed. Absent
-   * or unreadable means unverified, and an unverified number never merges.
+   * The read-only pull-request read (WB5b2): every merge number is read once
+   * here before the grant is consumed, whatever its source — it must be the
+   * attempt's branch at the expected head, on the bound repository, and not a
+   * fork's pull request. Absent or unreadable means unverified, and an
+   * unverified number never merges.
    */
   readonly forgeRead?: Pick<ForgeReadPort, "readPullRequest">;
 }
@@ -252,6 +253,38 @@ function canonicalRepositoryKey(raw: unknown): string | null {
   }
   const parsed = parseGithubRepository(raw);
   return parsed === null ? null : asciiLower(`${parsed.owner}/${parsed.repo}`);
+}
+
+/**
+ * Whether two repository references name the same repository on the canonical
+ * (ASCII-lower-cased) key: stored journal entries and links may carry the
+ * pre-WB5b3 case of `owner/repo`, so the comparison never trusts the raw case.
+ * An unreadable side is never equal to anything.
+ */
+function sameCanonicalRepository(left: unknown, right: unknown): boolean {
+  const leftKey = canonicalRepositoryKey(left);
+  return leftKey !== null && leftKey === canonicalRepositoryKey(right);
+}
+
+/**
+ * The forge port's bound owner, ASCII-lower-cased (WB5b3): the owner a
+ * snapshot's `headRepositoryOwner` must match for the merge to proceed. An
+ * unbound or unreadable port is null — the caller refuses, never assuming
+ * same-repository.
+ */
+function boundRepositoryOwner(
+  deps: ExecuteAuthorizedForgeActionDependencies,
+): string | null {
+  let bound: ReturnType<ExecuteAuthorizedForgeActionDependencies["forgePort"]["boundRepository"]>;
+  try {
+    bound = deps.forgePort.boundRepository();
+  } catch {
+    return null;
+  }
+  if (bound === undefined) {
+    return null;
+  }
+  return canonicalRepositoryKey(`${bound.owner}/x`) === null ? null : asciiLower(bound.owner);
 }
 
 /** The longest `actionId` whose completed journal id still fits the merge record's `actionRef`. */
@@ -397,9 +430,12 @@ function canonicalTimestampIso(now: (() => string) | undefined): string | null {
 }
 
 /**
- * The work order's repository in `owner/repo` form: a leading `github.com/`
- * prefix is stripped, and the result must satisfy the shared pull-request
- * repository rules. Anything else is null (unknown stays unknown).
+ * The work order's repository in canonical `owner/repo` form (WB5b3): the
+ * case is ASCII-lowered so everything written from it — the typed journal
+ * reference, the merge record, the pull-request link — stores the canonical
+ * key, whatever case the work order named. A leading `github.com/` prefix is
+ * stripped, and the result must satisfy the shared pull-request repository
+ * rules. Anything else is null (unknown stays unknown).
  */
 function normalizeWorkOrderRepository(raw: unknown): string | null {
   if (typeof raw !== "string") {
@@ -409,7 +445,7 @@ function normalizeWorkOrderRepository(raw: unknown): string | null {
   if (parsed === null) {
     return null;
   }
-  const candidate = `${parsed.owner}/${parsed.repo}`;
+  const candidate = asciiLower(`${parsed.owner}/${parsed.repo}`);
   if (
     pullRequestRefError("pr", { repository: candidate, number: 1 }) !== null
   ) {
@@ -1166,12 +1202,13 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         entry.action === "forge" &&
         entry.pullRequest !== undefined
       ) {
-        return entry.pullRequest.repository !== normalizedRepository;
+        // A stored entry may name the repository in pre-WB5b3 case; the
+        // comparison is on the canonical key, never the raw string.
+        return !sameCanonicalRepository(entry.pullRequest.repository, normalizedRepository);
       }
     }
     return false;
   }
-
   /** The attempt's latest completed `forge` entry carrying a typed reference. */
   private async typedJournalNumber(
     deps: ExecuteAuthorizedForgeActionDependencies,
@@ -1186,7 +1223,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         entry.action === "forge" &&
         entry.pullRequest !== undefined &&
         (normalizedRepository === null ||
-          entry.pullRequest.repository === normalizedRepository)
+          sameCanonicalRepository(entry.pullRequest.repository, normalizedRepository))
       ) {
         return entry.pullRequest.number;
       }
@@ -1216,7 +1253,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     const links = await lanePlanRepo.listPullRequestLinks(lane.projectId);
     const matches = links.filter(
       (link) =>
-        link.repository === normalizedRepository &&
+        sameCanonicalRepository(link.repository, normalizedRepository) &&
         link.projectId === lane.projectId &&
         link.planId === lane.planId &&
         resolveLaneId(link.laneId) === wantedLaneId,
@@ -1252,6 +1289,18 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       return { reason: "pull-request-unverified" };
     }
     const snapshot = verified.snapshot;
+    // A fork's pull request is refused before the grant and before any forge
+    // write, whatever the source of the number (WB5b3): the head branch name
+    // and head commit of a fork PR can otherwise pass this same verification
+    // and be merged in the target repository. The head owner must also name
+    // the repository the read was made against; an owner that cannot be named
+    // refuses too — never assuming same-repository.
+    if (snapshot.isCrossRepository || verified.readOwner === null) {
+      return { reason: "pull-request-cross-repository" };
+    }
+    if (asciiLower(snapshot.headRepositoryOwner) !== verified.readOwner) {
+      return { reason: "pull-request-cross-repository" };
+    }
     const failure = candidate.linkInvolved
       ? "pull-request-link-stale"
       : "pull-request-unverified";
@@ -1283,7 +1332,12 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     normalizedRepository: string | null,
     number: number,
   ): Promise<
-    | { readonly outcome: "read"; readonly snapshot: PullRequestSnapshot }
+    | {
+        readonly outcome: "read";
+        readonly snapshot: PullRequestSnapshot;
+        /** The ASCII-lower-cased owner of the repository the read targeted; null when it cannot be named. */
+        readonly readOwner: string | null;
+      }
     | { readonly outcome: "unreadable" }
   > {
     const reader = deps.forgeRead;
@@ -1297,6 +1351,10 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       owner !== undefined && repo !== undefined && rest.length === 0
         ? { repository: { owner, repo } }
         : {};
+    const readOwner =
+      owner !== undefined && repo !== undefined && rest.length === 0
+        ? asciiLower(owner)
+        : boundRepositoryOwner(deps);
     try {
       const read = await reader.readPullRequest({
         ref: { kind: "number", number },
@@ -1311,7 +1369,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       ) {
         return { outcome: "unreadable" };
       }
-      return { outcome: "read", snapshot: read.pullRequest };
+      return { outcome: "read", snapshot: read.pullRequest, readOwner };
     } catch {
       return { outcome: "unreadable" };
     }

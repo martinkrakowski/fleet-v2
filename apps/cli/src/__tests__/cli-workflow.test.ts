@@ -94,6 +94,8 @@ function wireOpenPullRequestRead(
         headSha,
         headRef,
         baseRef: 'main',
+        isCrossRepository: false,
+        headRepositoryOwner: 'org',
         mergedAtIso: null,
         closedAtIso: null,
         mergeCommitSha: null,

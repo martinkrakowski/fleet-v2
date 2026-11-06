@@ -90,8 +90,17 @@ function isCanonicalIso(value: unknown): boolean {
   }
 }
 
-function mergeRecordKey(repository: string, number: number): string {
-  return `${repository}#${number}`;
+/**
+ * The ASCII lower-case of a repository string: GitHub owner and repository
+ * names are ASCII, so only ASCII letters ever change case.
+ */
+function asciiLowerRepository(text: string): string {
+  return text.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+}
+
+/** `<repository>#<number>` on the canonical key: the store key of a merge record (one per key), ASCII-lower-cased so a pre-WB5b3 mixed-case stored record is still found (WB5b3). */
+export function mergeRecordKey(repository: string, number: number): string {
+  return `${asciiLowerRepository(repository)}#${number}`;
 }
 
 /** The runtime snapshot of a record under the store's own bounds, or null when it cannot be read. */

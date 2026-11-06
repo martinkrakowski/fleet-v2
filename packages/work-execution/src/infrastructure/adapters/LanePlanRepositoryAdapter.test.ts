@@ -320,6 +320,36 @@ describe('LanePlanRepositoryAdapter file store', () => {
     expect(await reopened.listPullRequestLinks('other-project')).toHaveLength(0);
   });
 
+  it('finds a stored mixed-case link by a lower-case lookup; the same PR in another case is the same link (WB5b3)', async () => {
+    const writer = new LanePlanRepositoryAdapter({ stateDir: tempDir });
+    const mixed = linkRecord({ repository: 'Acme/App' });
+    expect(await writer.savePullRequestLink(mixed)).toEqual({ outcome: 'saved', link: mixed });
+
+    const reader = new LanePlanRepositoryAdapter({ stateDir: tempDir });
+    expect(await reader.findPullRequestLink('acme/app', 251)).toEqual(mixed);
+    expect(await reader.findPullRequestLink('ACME/APP', 251)).toEqual(mixed);
+    // The stored file keeps the case it was written with.
+    const onDisk = JSON.parse(
+      await fs.readFile(path.join(tempDir, 'pull-request-links.json'), 'utf8'),
+    ) as Array<Record<string, unknown>>;
+    expect(onDisk).toHaveLength(1);
+    expect(onDisk[0]!.repository).toBe('Acme/App');
+  });
+
+  it('the same PR sighted again in another case is unchanged, not a new record or a false conflict (WB5b3)', async () => {
+    const adapter = new LanePlanRepositoryAdapter({ stateDir: tempDir });
+    const first = linkRecord({ repository: 'Acme/App' });
+    await adapter.savePullRequestLink(first);
+    const again = await adapter.savePullRequestLink(linkRecord({ repository: 'ACME/APP' }));
+    expect(again.outcome).toBe('unchanged');
+    expect(await adapter.listPullRequestLinks()).toEqual([first]);
+    const otherLane = await adapter.savePullRequestLink(linkRecord({ repository: 'aCmE/aPp', laneId: 'L2' }));
+    expect(otherLane.outcome).toBe('refused');
+    if (otherLane.outcome === 'refused') {
+      expect(otherLane.code).toBe('pr-already-linked');
+    }
+  });
+
   it('a second link save for the same repository#number with another lane is refused pr-already-linked and the file is unchanged', async () => {
     const adapter = new LanePlanRepositoryAdapter({ stateDir: tempDir });
     await adapter.savePullRequestLink(linkRecord());

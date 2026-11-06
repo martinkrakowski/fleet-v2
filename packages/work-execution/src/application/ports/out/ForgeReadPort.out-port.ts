@@ -47,6 +47,15 @@ export interface PullRequestSnapshot {
   readonly headSha: string;
   readonly headRef: string;
   readonly baseRef: string;
+  /**
+   * Whether the pull request's head branch lives in a repository other than
+   * the base repository (a fork). Absent or unreadable is never read from the
+   * forge: the adapter refuses the whole read, so a consumer never assumes
+   * same-repository.
+   */
+  readonly isCrossRepository: boolean;
+  /** The login of the head repository's owner; the same fail-closed rule as `isCrossRepository`. */
+  readonly headRepositoryOwner: string;
   /** Set exactly when `state` is `merged`. */
   readonly mergedAtIso: string | null;
   readonly closedAtIso: string | null;

@@ -553,6 +553,7 @@ export function composeExecution(input: ComposeExecutionInput) {
     workOrderRepository,
     attemptRepository,
     executionJournal,
+    mergeRecordRepository,
     workspace,
     runner,
     runnerForAttempt,

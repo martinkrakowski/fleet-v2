@@ -54,6 +54,7 @@ import {
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
   MergeGrantAdapter,
+  MergeRecordRepositoryAdapter,
   ForgeReadAdapter,
   GhForgeMergeReadAdapter,
   InspectAttemptUseCase,
@@ -715,6 +716,7 @@ export interface FleetCliRuntime {
     readonly workOrderRepository: WorkOrderRepositoryAdapter;
     readonly attemptRepository: AttemptRepositoryAdapter;
     readonly executionJournal: ExecutionJournalAdapter;
+    readonly mergeRecordRepository: MergeRecordRepositoryAdapter;
     readonly workspace: WorkspaceAdapter;
     readonly runner: ExecutionRunnerAdapter;
     /** H9b1: resolves the runner for an attempt's recorded host. */

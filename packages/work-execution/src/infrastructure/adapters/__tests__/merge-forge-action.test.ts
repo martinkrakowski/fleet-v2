@@ -96,7 +96,8 @@ function foundSnapshot(
       mergeState: 'clean',
       headSha: overrides.headSha ?? HEAD_SHA,
       headRef: overrides.headRef ?? BRANCH,
-      baseRef: 'main',
+      isCrossRepository: false,
+      headRepositoryOwner: 'fleet',      baseRef: 'main',
       mergedAtIso: overrides.state === 'merged' ? '2026-11-01T12:00:05.000Z' : null,
       closedAtIso: null,
       mergeCommitSha: overrides.state === 'merged' ? HEAD_SHA : null,
@@ -120,6 +121,8 @@ function snapshotToStdout(pullRequest: PullRequestSnapshot): string {
     closedAt: pullRequest.closedAtIso,
     mergeCommit: pullRequest.mergeCommitSha !== null ? { oid: pullRequest.mergeCommitSha } : null,
     mergeStateStatus: pullRequest.mergeState.toUpperCase(),
+    isCrossRepository: pullRequest.isCrossRepository,
+    headRepositoryOwner: { login: pullRequest.headRepositoryOwner },
   });
 }
 

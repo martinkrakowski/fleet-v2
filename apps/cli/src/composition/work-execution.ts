@@ -27,6 +27,7 @@ import {
   EnqueueMergeUseCase,
   ExecutionObservationAdapter,
   GatePredicateAdapter,
+  GateReceiptReuseAdapter,
   ProcessTreeTerminationAdapter,
   ImportLanePlanUseCase,
   ImportTrainStateUseCase,
@@ -53,6 +54,8 @@ import {
   consumptionId,
   forgeActionScope,
   observationEventKind,
+  readGateDeclaredEnvironmentDigest,
+  readGateToolchainVersions,
   sha256HexDigest,
   type AgyRunnerAdapter,
   type AttemptArtifactAdapter,
@@ -503,6 +506,11 @@ export function composeExecution(input: ComposeExecutionInput) {
     allowedSeats,
     gatePredicates: new GatePredicateAdapter({
       executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+      receiptReuse: {
+        port: new GateReceiptReuseAdapter({ stateDir }),
+        toolchainVersions: readGateToolchainVersions,
+        declaredEnvironmentDigest: readGateDeclaredEnvironmentDigest,
+      },
     }),
     journal: executionJournal,
     computeDigest: sha256HexDigest,

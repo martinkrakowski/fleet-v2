@@ -220,6 +220,13 @@ export class MergeRecordRepositoryAdapter implements MergeRecordRepositoryPort {
 
   async saveMergeRecord(record: MergeRecordRecord): Promise<MergeRecordSaveOutcome> {
     assertStoreWritable(this.options?.readOnly === true, 'MergeRecordRepositoryAdapter');
+    // The store's version check runs on the runtime input before any field is
+    // read: a record carrying an unsupported `schemaVersion` is refused, never
+    // silently accepted and rewritten with the writer's version.
+    const versionCheck = readStoreRecordSchemaVersion(record, MERGE_RECORD_STORE_VERSION_POLICY);
+    if (versionCheck.status !== 'ok') {
+      return REFUSED;
+    }
     const incoming = readMergeRecordFields(record);
     if (incoming === null) {
       return REFUSED;

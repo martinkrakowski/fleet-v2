@@ -273,6 +273,13 @@ describe('MergeRecordRepositoryAdapter', () => {
       }
     });
 
+    it('refuses a record whose schemaVersion is not the store version', async () => {
+      // The runtime input may carry a `schemaVersion` the port's type cannot
+      // express: an unsupported version is refused, never rewritten as 1.
+      await expectRefusedWithoutWrite(asRuntimeInput({ ...mergeRecord(), schemaVersion: 2 }));
+      await expectRefusedWithoutWrite(asRuntimeInput({ ...mergeRecord(), schemaVersion: 0 }));
+    });
+
     it('refuses an unknown source or merger value', async () => {
       await expectRefusedWithoutWrite({ ...mergeRecord(), source: 'webhook' });
       await expectRefusedWithoutWrite({ ...mergeRecord(), merger: 'human' });

@@ -835,4 +835,15 @@ describe('performMergeLiveAction never throws and never acts twice (DT9b fix rou
     expect(journal.entries).toHaveLength(0);
     expect(forgeAction.requests).toHaveLength(0);
   });
+
+  it('refuses a minter that repeats an id before the intent, so the forge never acts with an unjournalable result', async () => {
+    const { journal, forgeAction, deps } = build();
+    const result = await performMergeLiveAction(
+      { ...deps, mintId: () => '01JB0000000000000000000000' },
+      makeRequest(),
+    );
+    expect(result).toEqual({ outcome: 'unavailable', journalKey: KEY_MERGE_PR, reasonCode: 'id-unavailable' });
+    expect(journal.entries).toHaveLength(0);
+    expect(forgeAction.requests).toHaveLength(0);
+  });
 });

@@ -353,13 +353,16 @@ function resultEntry(
   };
 }
 
-/** Mints `count` ids before anything is written; null when the minter throws or answers a non-string. */
+/**
+ * Mints `count` distinct ids before anything is written; null when the minter throws, answers a
+ * non-string or repeats an id (a repeated id would make the result unjournalable after the act).
+ */
 function mintIds(deps: MergeLiveActionDependencies, count: number): readonly string[] | null {
   const ids: string[] = [];
   try {
     for (let index = 0; index < count; index += 1) {
       const id: unknown = deps.mintId();
-      if (typeof id !== 'string' || id.length === 0) {
+      if (typeof id !== 'string' || id.length === 0 || ids.includes(id)) {
         return null;
       }
       ids.push(id);

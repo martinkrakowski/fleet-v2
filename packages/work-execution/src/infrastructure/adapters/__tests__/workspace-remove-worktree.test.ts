@@ -2,7 +2,10 @@
 // §3.10.3): fake-executor tests script a recording CommandExecutorPort and
 // assert the exact argv sequence, the re-read guards and the refusals; a
 // real-git describe proves the removal against actual git in a temporary
-// repository.
+// repository. The guards under test include containment against the resolved
+// physical paths (a symlinked path may not escape the worktree root), the
+// in-progress operation probes (only exit 1 means "absent") and the bounded
+// activity re-check (a write to an ignored file after the read refuses busy).
 
 import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
@@ -36,7 +39,7 @@ type CannedSpec =
  * unscripted argv is never a silent pass. A canned value may be a function of
  * the call index and argv, for commands that repeat with different answers
  * (the re-list after a removal, the post-removal existence probe vs the
- * in-progress probes).
+ * in-progress probes, the physical-path questions, the two stat reads).
  */
 function fakeExecutor(
   canned: Readonly<Record<string, CannedSpec>> = {},
@@ -71,9 +74,13 @@ function fakeExecutor(
 const CLONE = '/srv/fleet/clone';
 const WORKTREE_ROOT = '/srv/fleet/worktrees';
 const WORKTREE = `${WORKTREE_ROOT}/wt1`;
+const LINKED_WORKTREE = '/elsewhere/wt1';
 const BRANCH = 'fleet/run-01ARZ3NDEKTSV4RRFFQ69G5FAV';
 const OTHER_BRANCH = 'fleet/run-02ARZ3NDEKTSV4RRFFQ69G5FAV';
 const HEAD = 'a'.repeat(40);
+
+/** The caller-read activity baseline (KW2 `lastActivity.iso`). */
+const ACTIVITY_ISO = '2026-11-06T00:00:00.000Z';
 
 const RECORDED_HOST: AttemptRunnerRecord = {
   kind: 'opencode',
@@ -92,6 +99,7 @@ function makeRequest(overrides: Partial<RemoveWorktreeRequest> = {}): RemoveWork
     worktreePath: WORKTREE,
     expectedHead: HEAD,
     expectedBranch: BRANCH,
+    expectedLastActivityIso: ACTIVITY_ISO,
     recordedHost: RECORDED_HOST,
     ...overrides,
   };
@@ -128,6 +136,28 @@ const GIT_DIR_MARKER = 'rev-parse --git-dir';
 const TEST_E_MARKER = 'test -e';
 const HEAD_MARKER = 'rev-parse HEAD';
 const REMOVE_MARKER = 'worktree remove';
+const PWD_MARKER = 'pwd -P';
+const REFLOG_MARKER = 'reflog show';
+const FIND_MARKER = 'find';
+const STAT_MARKER = 'stat -c %Y';
+const INDEX_MARKER = 'rev-parse --git-path index';
+
+/**
+ * The canned answers for a quiet activity re-read: the physical-path questions
+ * answer with the path as given, and every activity read answers with an mtime
+ * older than `ACTIVITY_ISO`, so the bounded-activity guard passes. The `find`
+ * marker precedes `stat` so the tree-walk command (which embeds `stat -c %Y`)
+ * matches the walk marker, not the stat marker.
+ */
+function quietActivityCanned(): Readonly<Record<string, CannedSpec>> {
+  return {
+    [PWD_MARKER]: ({ argv }) => ({ stdout: `${argv[argv.length - 1]}\n` }),
+    [REFLOG_MARKER]: { stdout: 'HEAD@{2026-11-05T00:00:00+00:00}\n' },
+    [FIND_MARKER]: { stdout: '1700000000\n' },
+    [STAT_MARKER]: { stdout: '1700000000\n' },
+    [INDEX_MARKER]: { stdout: `${WORKTREE}/.git/index\n` },
+  };
+}
 
 async function removeWith(
   canned: Readonly<Record<string, CannedSpec>>,
@@ -148,12 +178,14 @@ describe('removeWorktree over a fake executor', () => {
       [STATUS_MARKER]: { stdout: '' },
       [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
       [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
       [REMOVE_MARKER]: { exitCode: 0 },
     });
     expect(result).toEqual({ outcome: 'removed', branchTip: HEAD });
     expect(calls.map((call) => call.argv)).toEqual([
       ['git', '-C', CLONE, 'worktree', 'list', '--porcelain'],
       ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', CLONE],
+      ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', WORKTREE_ROOT],
       ['git', '-C', WORKTREE, 'rev-parse', 'HEAD'],
       ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-C', WORKTREE, 'status', '--porcelain', '--untracked-files=all'],
       ['git', '-C', WORKTREE, 'rev-parse', '--git-dir'],
@@ -163,6 +195,11 @@ describe('removeWorktree over a fake executor', () => {
       ['test', '-e', `${WORKTREE}/.git/CHERRY_PICK_HEAD`],
       ['test', '-e', `${WORKTREE}/.git/REVERT_HEAD`],
       ['test', '-e', `${WORKTREE}/.git/BISECT_LOG`],
+      ['git', '-C', WORKTREE, 'reflog', 'show', '-1', '--date=iso-strict', '--format=%gD', 'HEAD'],
+      ['stat', '-c', '%Y', WORKTREE],
+      ['git', '-C', WORKTREE, 'rev-parse', '--git-path', 'index'],
+      ['stat', '-c', '%Y', `${WORKTREE}/.git/index`],
+      ['find', WORKTREE, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y', '{}', '+'],
       ['git', '-C', CLONE, 'worktree', 'remove', WORKTREE],
       ['test', '-e', WORKTREE],
       ['git', '-C', CLONE, 'worktree', 'list', '--porcelain'],
@@ -256,10 +293,33 @@ describe('removeWorktree over a fake executor', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('refuses path-refused when a symlinked path resolves to a worktree outside the root', async () => {
+    const list = worktreeList().replace(
+      `worktree ${WORKTREE}\nHEAD ${HEAD}\nbranch refs/heads/${BRANCH}\n`,
+      `worktree ${LINKED_WORKTREE}\nHEAD ${HEAD}\nbranch refs/heads/${BRANCH}\n`,
+    );
+    const { result, calls } = await removeWith(
+      {
+        [LIST_MARKER]: { stdout: list },
+        [PWD_MARKER]: ({ argv }) => {
+          const target = argv[argv.length - 1];
+          if (target === `${WORKTREE_ROOT}/link`) {
+            return { stdout: `${LINKED_WORKTREE}\n` };
+          }
+          return { stdout: `${target}\n` };
+        },
+      },
+      makeRequest({ worktreePath: `${WORKTREE_ROOT}/link` }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'path-refused' });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
   it.each([
     ['a malformed expectedHead', { expectedHead: 'not-a-sha' }],
     ['an all-zero expectedHead', { expectedHead: '0'.repeat(40) }],
     ['branch main', { expectedBranch: 'main' }],
+    ['an empty expectedLastActivityIso', { expectedLastActivityIso: '' }],
     ['a record without a host name', { recordedHost: { ...RECORDED_HOST, hostName: null } }],
   ])('refuses invalid-request for %s, with no command run', async (_label, overrides) => {
     const { result, calls } = await removeWith({}, makeRequest(overrides));
@@ -284,6 +344,7 @@ describe('removeWorktree over a fake executor', () => {
       [STATUS_MARKER]: { stdout: '' },
       [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
       [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
       [REMOVE_MARKER]: { exitCode: null, signal: 'SIGTERM' },
     });
     expect(result.outcome).toBe('unknown');
@@ -296,6 +357,7 @@ describe('removeWorktree over a fake executor', () => {
       [STATUS_MARKER]: { stdout: '' },
       [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
       [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
       [REMOVE_MARKER]: { exitCode: 128, stderr: 'fatal' },
     });
     expect(result).toEqual({ outcome: 'refused', reason: 'git-refused' });
@@ -309,6 +371,7 @@ describe('removeWorktree over a fake executor', () => {
       [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
       [TEST_E_MARKER]: ({ joined }) =>
         joined === `test -e ${WORKTREE}` ? { exitCode: 0 } : { exitCode: 1 },
+      ...quietActivityCanned(),
       [REMOVE_MARKER]: { exitCode: 0 },
     });
     expect(result).toEqual({ outcome: 'partial', detail: 'directory-present' });
@@ -321,6 +384,7 @@ describe('removeWorktree over a fake executor', () => {
       [STATUS_MARKER]: { stdout: '' },
       [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
       [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
       [REMOVE_MARKER]: { exitCode: 0 },
     });
     expect(result).toEqual({ outcome: 'partial', detail: 'admin-entry-present' });
@@ -334,6 +398,7 @@ describe('removeWorktree over a fake executor', () => {
       [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
       [TEST_E_MARKER]: ({ joined }) =>
         joined === `test -e ${WORKTREE}` ? { exitCode: null } : { exitCode: 1 },
+      ...quietActivityCanned(),
       [REMOVE_MARKER]: { exitCode: 0 },
     });
     expect(result.outcome).toBe('unknown');
@@ -347,6 +412,7 @@ describe('removeWorktree over a fake executor', () => {
       [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
       [TEST_E_MARKER]: ({ joined }) =>
         joined === `test -e ${WORKTREE}` ? { exitCode: 127 } : { exitCode: 1 },
+      ...quietActivityCanned(),
       [REMOVE_MARKER]: { exitCode: 0 },
     });
     expect(result.outcome).toBe('unknown');
@@ -360,6 +426,7 @@ describe('removeWorktree over a fake executor', () => {
       [STATUS_MARKER]: { stdout: '' },
       [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
       [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
       [REMOVE_MARKER]: { exitCode: 0 },
     });
     expect(result.outcome).toBe('unknown');
@@ -373,9 +440,70 @@ describe('removeWorktree over a fake executor', () => {
       [STATUS_MARKER]: { stdout: '' },
       [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
       [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
       [REMOVE_MARKER]: { exitCode: 0 },
     });
     expect(result.outcome).toBe('unknown');
+  });
+
+  it('answers unknown when an in-progress operation probe exits with an unexpected status', async () => {
+    const { result, calls } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 127 },
+    });
+    expect(result.outcome).toBe('unknown');
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
+  it('refuses busy when the newest activity moved past the caller-read baseline', async () => {
+    const { result, calls } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      [REFLOG_MARKER]: { stdout: 'HEAD@{2026-11-05T00:00:00+00:00}\n' },
+      [FIND_MARKER]: { stdout: '1900000000\n' },
+      [STAT_MARKER]: { stdout: '1700000000\n' },
+      [INDEX_MARKER]: { stdout: `${WORKTREE}/.git/index\n` },
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'busy' });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
+  it('refuses busy when the bounded activity walk cannot answer', async () => {
+    const { result, calls } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      [REFLOG_MARKER]: { stdout: 'HEAD@{2026-11-05T00:00:00+00:00}\n' },
+      [FIND_MARKER]: { exitCode: 128 },
+      [STAT_MARKER]: { stdout: '1700000000\n' },
+      [INDEX_MARKER]: { stdout: `${WORKTREE}/.git/index\n` },
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'busy' });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
+  it('refuses busy when no activity baseline was read under the hold', async () => {
+    const { result, calls } = await removeWith(
+      {
+        [LIST_MARKER]: { stdout: worktreeList() },
+        [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+        [STATUS_MARKER]: { stdout: '' },
+        [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+        [TEST_E_MARKER]: { exitCode: 1 },
+        ...quietActivityCanned(),
+      },
+      makeRequest({ expectedLastActivityIso: null }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'busy' });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
   });
 });
 
@@ -433,6 +561,22 @@ describe('removeWorktree against real git', () => {
     };
   }
 
+  /** The activity baseline a caller reads under its hold (KW2 `lastActivity.iso`). */
+  async function lastActivityIso(
+    s: Awaited<ReturnType<typeof setup>>,
+  ): Promise<string | null> {
+    const inspected = await s.adapter.inspectWorktreeForRemoval({
+      repositoryRoot: s.clonePath,
+      worktreePath: s.worktreePath,
+      defaultRef: 'origin/main',
+      recordedHost: RECORDED_HOST,
+    });
+    if (inspected.outcome !== 'inspected') {
+      throw new Error(`inspect for the activity baseline failed: ${inspected.outcome}`);
+    }
+    return inspected.facts.lastActivity.iso;
+  }
+
   async function removeWorktree(
     s: Awaited<ReturnType<typeof setup>>,
     overrides: Partial<RemoveWorktreeRequest> = {},
@@ -444,6 +588,7 @@ describe('removeWorktree against real git', () => {
         worktreePath: s.worktreePath,
         expectedHead: s.head,
         expectedBranch: s.branch,
+        expectedLastActivityIso: await lastActivityIso(s),
         ...overrides,
       }),
     );
@@ -518,6 +663,32 @@ describe('removeWorktree against real git', () => {
     expect(listed.stdout).toContain(s.physicalWorktreePath);
   });
 
+  it('refuses busy for an ignored file written after the read and keeps the worktree listed', async () => {
+    const s = await setup();
+    // Ignore a name through the clone's exclude file so the porcelain status
+    // stays clean: only the bounded-activity re-check can see this write.
+    await fs.appendFile(path.join(s.clonePath, '.git', 'info', 'exclude'), '\nignored-activity.txt\n', 'utf8');
+    const baseline = await lastActivityIso(s);
+    const ignored = path.join(s.worktreePath, 'ignored-activity.txt');
+    await fs.writeFile(ignored, 'x\n', 'utf8');
+    // Force a distinctly newer mtime than the baseline read, so the walk's
+    // second resolution cannot make the comparison vacuous.
+    await fs.utimes(ignored, new Date('2030-01-01T00:00:00Z'), new Date('2030-01-01T00:00:00Z'));
+    const result = await s.adapter.removeWorktree(
+      makeRequest({
+        repositoryRoot: s.clonePath,
+        worktreeRoot: s.worktreeRoot,
+        worktreePath: s.worktreePath,
+        expectedHead: s.head,
+        expectedBranch: s.branch,
+        expectedLastActivityIso: baseline,
+      }),
+    );
+    expect(result).toEqual({ outcome: 'refused', reason: 'busy' });
+    const listed = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: s.clonePath });
+    expect(listed.stdout).toContain(s.physicalWorktreePath);
+  });
+
   it('refuses not-a-linked-worktree for a plain directory and leaves it untouched', async () => {
     const s = await setup();
     const plainDir = path.join(s.worktreeRoot, 'plain');
@@ -530,6 +701,7 @@ describe('removeWorktree against real git', () => {
         worktreePath: plainDir,
         expectedHead: s.head,
         expectedBranch: s.branch,
+        expectedLastActivityIso: null,
       }),
     );
     expect(result).toEqual({ outcome: 'refused', reason: 'not-a-linked-worktree' });

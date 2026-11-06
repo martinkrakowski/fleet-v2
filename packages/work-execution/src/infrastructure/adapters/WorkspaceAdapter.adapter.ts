@@ -289,7 +289,10 @@ export function removeLaneWorktreeRequestIsValid(request: RemoveLaneWorktreeRequ
  * request, before any command runs: all three paths are absolute and
  * normalised, the worktree path sits strictly under the worktree root, and it
  * is neither equal to nor inside the clone. A path problem is refused as
- * `path-refused`.
+ * `path-refused`. This is the lexical pre-command check; containment against
+ * the resolved physical paths is enforced again in `removeCheckedListedWorktree`
+ * after the listed entry is found, so a symlink inside the root pointing at a
+ * worktree outside it is still refused.
  */
 function removeWorktreePathRefusal(request: RemoveWorktreeRequest): boolean {
   const { repositoryRoot, worktreeRoot, worktreePath } = request;
@@ -309,12 +312,13 @@ function removeWorktreePathRefusal(request: RemoveWorktreeRequest): boolean {
 /**
  * KW3' (conductor plan §3.10.3) non-path validation of one `removeWorktree`
  * request: the recorded host is named, `expectedHead` is a real commit sha
- * (40 or 64 lowercase hex, not all zeros) and `expectedBranch` is a non-empty
- * branch that is not `main`. Any other malformed request is refused as
- * `invalid-request`.
+ * (40 or 64 lowercase hex, not all zeros), `expectedBranch` is a non-empty
+ * branch that is not `main`, and `expectedLastActivityIso` is either null (no
+ * activity was readable under the caller's hold) or a non-empty string. Any
+ * other malformed request is refused as `invalid-request`.
  */
 function removeWorktreeRequestIsValid(request: RemoveWorktreeRequest): boolean {
-  const { expectedHead, expectedBranch, recordedHost } = request;
+  const { expectedHead, expectedBranch, expectedLastActivityIso, recordedHost } = request;
   if (!runnerHasHostName(recordedHost)) {
     return false;
   }
@@ -322,6 +326,12 @@ function removeWorktreeRequestIsValid(request: RemoveWorktreeRequest): boolean {
     return false;
   }
   if (typeof expectedBranch !== 'string' || expectedBranch === '' || expectedBranch === 'main') {
+    return false;
+  }
+  if (
+    expectedLastActivityIso !== null &&
+    (typeof expectedLastActivityIso !== 'string' || expectedLastActivityIso === '')
+  ) {
     return false;
   }
   return true;
@@ -1805,16 +1815,16 @@ export class WorkspaceAdapter implements WorkspacePort {
 
   /**
    * KW3' (conductor plan §3.10.3): remove one worktree after re-reading HEAD,
-   * the branch, the porcelain status, the lock and the in-progress operation
-   * files in this one executor call, and only then run
-   * `git worktree remove <path>`. Never `--force`, never a branch command,
-   * never `prune`, never `rm`, never a fetch or a push. The only write is
-   * `git worktree remove <path>` with no flags. Every command runs through the
-   * recorded host's executor — never the configured or legacy executor — and
-   * when the recorded host is not named or no host executor is configured,
-   * nothing runs. A refusal removes nothing; `partial` means the command ran
-   * but the directory or its administrative entry is still there; `unknown`
-   * means the executor did not answer.
+   * the branch, the porcelain status, the lock, the in-progress operation
+   * files and the bounded file walk in this one executor call, and only then
+   * run `git worktree remove <path>`. Never `--force`, never a branch
+   * command, never `prune`, never `rm`, never a fetch or a push. The only
+   * write is `git worktree remove <path>` with no flags. Every command runs
+   * through the recorded host's executor — never the configured or legacy
+   * executor — and when the recorded host is not named or no host executor is
+   * configured, nothing runs. A refusal removes nothing; `partial` means the
+   * command ran but the directory or its administrative entry is still there;
+   * `unknown` means the executor did not answer.
    */
   async removeWorktree(request: RemoveWorktreeRequest): Promise<RemoveWorktreeResult> {
     // 1. Validate before anything runs (no executor call on a bad request).
@@ -1839,16 +1849,17 @@ export class WorkspaceAdapter implements WorkspacePort {
 
   /**
    * Steps 3–6 of `removeWorktree` on a resolved executor: find the worktree in
-   * the clone's list, re-read HEAD, branch, status, lock and in-progress
-   * operations through the same executor, then remove it only when every guard
-   * still holds. The outer try/catch stays in `removeWorktree` and answers
-   * `unknown` on any throw.
+   * the clone's list, re-read HEAD, branch, status, lock, in-progress
+   * operations and the bounded file walk through the same executor, then
+   * remove it only when every guard still holds. The outer try/catch stays in
+   * `removeWorktree` and answers `unknown` on any throw.
    */
   private async removeCheckedListedWorktree(
     request: RemoveWorktreeRequest,
     executor: CommandExecutorPort,
   ): Promise<RemoveWorktreeResult> {
-    const { repositoryRoot, worktreePath, expectedHead, expectedBranch } = request;
+    const { repositoryRoot, worktreeRoot, worktreePath, expectedHead, expectedBranch, expectedLastActivityIso } =
+      request;
 
     // 3. Containment and the listed facts.
     const listRun = await executor.run(
@@ -1868,6 +1879,17 @@ export class WorkspaceAdapter implements WorkspacePort {
     const entry = await this.findLinkedWorktreeEntry(executor, repositoryRoot, worktreePath, listed);
     if (entry === null) {
       return { outcome: 'refused', reason: 'not-a-linked-worktree' };
+    }
+
+    // 3b. Containment against the resolved physical paths. The lexical check
+    //     above cannot see a symlink inside the worktree root pointing at a
+    //     linked worktree outside it; the listed entry's path is the physical
+    //     path git lists, so it is compared against the physical root, and a
+    //     target outside the configured root is refused.
+    const physicalWorktreeRoot = await resolvePhysicalPath(executor, worktreeRoot, GIT_TIMEOUT_MS);
+    const containmentRoot = physicalWorktreeRoot ?? worktreeRoot;
+    if (entry.path === containmentRoot || !entry.path.startsWith(`${containmentRoot}/`)) {
+      return { outcome: 'refused', reason: 'path-refused' };
     }
 
     // 4. Re-read the facts, in this order, through the same executor.
@@ -1914,6 +1936,19 @@ export class WorkspaceAdapter implements WorkspacePort {
       return { outcome: 'unknown', reason: inProgressResult.reason };
     }
     if (inProgressResult.operations.length > 0) {
+      return { outcome: 'refused', reason: 'busy' };
+    }
+
+    //    Bounded activity: the porcelain status cannot see writes to ignored
+    //    files, so the removal re-runs the bounded file walk and refuses busy
+    //    when the newest mtime moved past the value read under the caller's
+    //    hold, or when no baseline was read, or when the walk cannot answer
+    //    (conductor plan §3.10.3).
+    const activity = await this.readLastActivity(executor, worktreePath);
+    if (activity.unknown || expectedLastActivityIso === null) {
+      return { outcome: 'refused', reason: 'busy' };
+    }
+    if (activity.iso !== null && activity.iso > expectedLastActivityIso) {
       return { outcome: 'refused', reason: 'busy' };
     }
 
@@ -2215,6 +2250,11 @@ export class WorkspaceAdapter implements WorkspacePort {
       }
       if (probeRun.exitCode === 0) {
         inProgressOperations.push(name);
+      } else if (probeRun.exitCode !== 1) {
+        // Only `test -e` exit 1 means "file absent". Any other exit is an
+        // unanswered probe: it cannot establish that no operation is in
+        // progress, so it is never treated as absent.
+        return { outcome: 'unknown', reason: 'operation file probe failed with an unexpected exit' };
       }
     }
     return { outcome: 'read', operations: inProgressOperations };

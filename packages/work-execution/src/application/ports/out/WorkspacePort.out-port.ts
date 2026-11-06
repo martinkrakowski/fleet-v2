@@ -186,6 +186,13 @@ export interface RemoveWorktreeRequest {
   readonly expectedHead: string;
   /** The branch the worktree must be checked out on. */
   readonly expectedBranch: string;
+  /**
+   * The activity the caller read under its hold (KW2 `lastActivity.iso`),
+   * or null when none was readable. The removal re-runs the bounded file
+   * walk and refuses `busy` when the newest mtime moved past this value, or
+   * when the walk cannot answer (conductor plan §3.10.3).
+   */
+  readonly expectedLastActivityIso: string | null;
   /** The attempt's recorded runner block: the removal runs on that host's executor. */
   readonly recordedHost?: AttemptRunnerRecord | null;
 }
@@ -456,11 +463,11 @@ export interface WorkspacePort {
 
   /**
    * KW3' (conductor plan §3.10.3): remove one worktree after re-reading HEAD,
-   * the branch, the porcelain status, the lock and the in-progress operation
-   * files in this one executor call, and only then run
-   * `git worktree remove <path>`. Never `--force`, never a branch command,
-   * never `prune`, never `rm`, never a fetch or a push. A refusal removes
-   * nothing; `partial` means the command ran but the directory or its
+   * the branch, the porcelain status, the lock, the in-progress operation
+   * files and the bounded file walk in this one executor call, and only then
+   * run `git worktree remove <path>`. Never `--force`, never a branch
+   * command, never `prune`, never `rm`, never a fetch or a push. A refusal
+   * removes nothing; `partial` means the command ran but the directory or its
    * administrative entry is still there; `unknown` means the executor did not
    * answer. The branch is always kept.
    */

@@ -259,6 +259,9 @@ export class StateFileUnreadableError extends Error {
     this.filePath = filePath;
     this.quarantinePath = quarantinePath;
     this.detail = detail;
+    if (copyError !== undefined) {
+      this.cause = copyError;
+    }
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
@@ -790,7 +793,10 @@ function classifyBoundedStoreRead<T>(
  * the lock, leaving `filePath` in place so later reads/writes still fail
  * closed. A healthy read takes the unlocked fast path and creates no lock file.
  * A read-only store never locks, creates directories or writes quarantine
- * copies; it throws `StateFileUnreadableReadOnlyError`.
+ * copies; it throws `StateFileUnreadableReadOnlyError`. Lock-side failures on
+ * a corrupt read are typed refusals: a lock timeout or an unwritable state
+ * directory throws `StateFileUnreadableError` (with `quarantinePath: null` and
+ * the original error as cause), never a raw errno or `FileLockTimeoutError`.
  */
 export async function readOrQuarantineVersionedRecordList<T>(
   options: ReadOrQuarantineVersionedStoreOptions<T>,
@@ -843,7 +849,46 @@ export async function readOrQuarantineVersionedRecordList<T>(
   if (readOnly) {
     throw new StateFileUnreadableReadOnlyError(options.filePath, fast.detail);
   }
-  return withFileLock(`${options.filePath}.lock`, runUnderLock, { timeoutMs: lockTimeoutMs });
+  if (fast.kind === 'unquarantinable') {
+    // A symlink, oversized or non-regular store is refused without reading or
+    // copying it, so taking the store lock would write nothing. Refuse
+    // directly instead of entering `withFileLock`.
+    throw new StateFileUnreadableError(options.filePath, null, fast.detail);
+  }
+
+  const lockPath = `${options.filePath}.lock`;
+  try {
+    return await withFileLock(lockPath, runUnderLock, { timeoutMs: lockTimeoutMs });
+  } catch (error: unknown) {
+    // Lock-side failures are typed refusals, never raw errnos: a writer's
+    // lock that outlives `lockTimeoutMs` and an unwritable state directory
+    // (EACCES/EROFS/EPERM from `withFileLock`'s mkdir or open('wx')) both
+    // surface as `StateFileUnreadableError` with the original error as cause.
+    // Real I/O failures from reading the store itself (EACCES, EIO, EMFILE
+    // from lstat/open/read) are NOT mapped here and propagate unchanged.
+    if (error instanceof FileLockTimeoutError) {
+      throw new StateFileUnreadableError(
+        options.filePath,
+        null,
+        `timed out waiting for the store lock after ${lockTimeoutMs}ms`,
+        error,
+      );
+    }
+    const code = errorCodeOf(error);
+    if (code === 'EACCES' || code === 'EROFS' || code === 'EPERM') {
+      const failedPath =
+        typeof error === 'object' && error !== null ? (error as { path?: unknown }).path : undefined;
+      if (failedPath === lockPath || failedPath === path.dirname(lockPath)) {
+        throw new StateFileUnreadableError(
+          options.filePath,
+          null,
+          `the state directory is not writable (${code})`,
+          error,
+        );
+      }
+    }
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------

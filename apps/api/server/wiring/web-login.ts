@@ -9,8 +9,9 @@ import { join } from "node:path";
  * happens only with a single-use login code issued by this module at API
  * startup (`issueWebLoginCode`). The operator reads the code file from the
  * state directory; the browser posts the code to `POST /sessions/login`
- * (server-side only), which consumes it and establishes an interactive session
- * scoped to `read` and `message`.
+ * (server-side only), which consumes it, removes the code file from the state
+ * directory (the spent credential must never remain on disk), and establishes
+ * an interactive session scoped to `read` and `message`.
  */
 
 export const WEB_LOGIN_PATH = "/sessions/login";
@@ -22,6 +23,7 @@ export const WEB_LOGIN_CODE_MAX_LENGTH = 128;
 
 let storedCode: string | null = null;
 let consumed = false;
+let codeFilePath: string | null = null;
 
 export function isWebLoginPath(path: string): boolean {
   return path === WEB_LOGIN_PATH;
@@ -38,6 +40,7 @@ export function isWebLoginPath(path: string): boolean {
 export function issueWebLoginCode(stateDir: string): string | null {
   const code = randomBytes(32).toString("base64url");
   const filePath = join(stateDir, WEB_LOGIN_CODE_FILE);
+  codeFilePath = filePath;
   const tempPath = `${filePath}.${process.pid}-${Date.now()}.tmp`;
   try {
     mkdirSync(stateDir, { recursive: true });
@@ -56,6 +59,7 @@ export function issueWebLoginCode(stateDir: string): string | null {
     }
     storedCode = null;
     consumed = false;
+    codeFilePath = null;
     return null;
   }
   storedCode = code;
@@ -87,6 +91,14 @@ export function consumeWebLoginCode(presented: unknown): { ok: true } | { ok: fa
   }
   storedCode = null;
   consumed = true;
+  if (codeFilePath !== null) {
+    try {
+      rmSync(codeFilePath, { force: true });
+    } catch {
+      // ignore removal failure; the code is still consumed in memory
+    }
+    codeFilePath = null;
+  }
   return { ok: true };
 }
 

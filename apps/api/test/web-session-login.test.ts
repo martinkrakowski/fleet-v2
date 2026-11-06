@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -388,6 +388,23 @@ describe("T6a web session login", () => {
     expect(parsed.code).toBe(code);
     expect(typeof parsed.issuedAtIso).toBe("string");
     expect(statSync(filePath).mode & 0o077).toBe(0);
+  });
+
+  it("a consumed login code is removed from the state directory", async () => {
+    const code = issueWebLoginCode(tempDir) as string;
+    const filePath = join(tempDir, WEB_LOGIN_CODE_FILE);
+    expect(existsSync(filePath)).toBe(true);
+    const login = await loginWithCode(code);
+    expect(login.status).toBe(200);
+    expect(existsSync(filePath)).toBe(false);
+  });
+
+  it("a refused login leaves the code file in place", async () => {
+    issueWebLoginCode(tempDir);
+    const filePath = join(tempDir, WEB_LOGIN_CODE_FILE);
+    const refused = await loginWithCode("a-wrong-code");
+    expect(refused.status).toBe(403);
+    expect(existsSync(filePath)).toBe(true);
   });
 
   it("the login code never appears in a response body", async () => {

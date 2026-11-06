@@ -66,9 +66,9 @@ class ScriptedExecutor implements CommandExecutorPort {
     this.calls.push({ argv, options });
     const ok = (stdout: string): CommandRunResult => ({ exitCode: 0, signal: null, stdout, stderr: '' });
     // A receipt-input probe runs inside the worktree through the `cd` wrapper:
-    // its real command starts after the `fleet-probe` marker.
+    // its real command starts after the `--` that ends env's options.
     if (argv[0] === '/usr/bin/env' && argv[1] === '-C') {
-      const inner = argv.slice(3);
+      const inner = argv.slice(4);
       if (this.failingProbes.has(inner.join(' '))) {
         return { exitCode: null, signal: 'SIGKILL', stdout: '', stderr: '', error: 'timed out' };
       }
@@ -272,6 +272,18 @@ describe('gate receipt reuse wiring (KS2c)', () => {
     }
   });
 
+  it('refuses a worktree path that is not absolute as an unusable request, running nothing', async () => {
+    for (const worktreePath of ['-uX', 'rel/dir', '.', '--', './x']) {
+      const executor = new ScriptedExecutor();
+      const result = await adapterOver(executor, new SpyStore()).evaluateGatePredicates({
+        ...requestWith([GATE]),
+        worktreePath,
+      });
+      expect(result).toEqual({ outcome: 'unavailable', reason: 'gate predicate request is malformed' });
+      expect(executor.calls).toEqual([]);
+    }
+  });
+
   it('never throws on runtime input', async () => {
     const store = new SpyStore();
     const adapter = adapterOver(new ScriptedExecutor(), store);
@@ -340,7 +352,7 @@ describe('gate receipt reuse wiring (KS2c)', () => {
     const executor = new ScriptedExecutor();
     await adapterOver(executor, new SpyStore()).evaluateGatePredicates(requestWith([GATE]));
     const probes = executor.calls.filter((call) => {
-      const inner = call.argv[0] === '/usr/bin/env' && call.argv[1] === '-C' ? call.argv.slice(3) : call.argv;
+      const inner = call.argv[0] === '/usr/bin/env' && call.argv[1] === '-C' ? call.argv.slice(4) : call.argv;
       return inner[1] === '--version' || inner[0] === 'cat' || inner[0] === 'printenv';
     });
     expect(probes).toHaveLength(6);

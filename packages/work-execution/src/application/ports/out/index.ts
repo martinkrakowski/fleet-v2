@@ -81,6 +81,7 @@ export * from "./RunnerForAttemptPort.out-port.js";
 export * from "./RunnerSelectorPort.out-port.js";
 export * from "./RunTelemetryMarkPort.out-port.js";
 export * from "./RunTelemetryPort.out-port.js";
+export * from "./SeatCatalogPort.out-port.js";
 export * from "./SeatObservationRepositoryPort.out-port.js";
 export * from "./SeatTicketRepositoryPort.out-port.js";
 export * from "./ShadowEvidencePort.out-port.js";

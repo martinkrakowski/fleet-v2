@@ -30,6 +30,7 @@ const FIXED_HEAD = 'b'.repeat(40);
 const OTHER_HEAD = 'c'.repeat(40);
 const KEY = `pr-feedback/42@${'a'.repeat(12)}`;
 const FIX_ATTEMPT_ID = `pr-feedback-42-${'a'.repeat(12)}`;
+const NONCE = 'a'.repeat(32);
 
 function finding(overrides: Partial<PullRequestFinding> = {}): PullRequestFinding {
   return {
@@ -112,6 +113,7 @@ function setup(options: { findings?: readonly PullRequestFinding[] } = {}) {
     findings,
     prepareFixAttempt: fixAttempts,
     forgeAction: forge,
+    mintNonce: () => NONCE,
   });
   return { findings, fixAttempts, forge, useCase };
 }
@@ -325,9 +327,9 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
       request.expectedHeadSha === prHead
         ? { outcome: 'available', headSha: prHead, findings: [finding()] }
         : { outcome: 'unavailable', code: 'head-moved' };
-    forge.script = (request) => {
-      prHead = request.expectedHeadSha;
-      return { outcome: 'executed', pullRequestNumber: 42, headSha: request.expectedHeadSha };
+    forge.script = (_request) => {
+      prHead = FIXED_HEAD;
+      return { outcome: 'executed', pullRequestNumber: 42, headSha: FIXED_HEAD };
     };
 
     const result = await useCase.pushPullRequestFeedbackFix(pushRequest());
@@ -337,7 +339,7 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
       {
         actionId: KEY,
         kind: 'push-to-pr',
-        expectedHeadSha: FIXED_HEAD,
+        expectedHeadSha: HEAD,
         branchName: 'fleet/lane-co24',
         pullRequestNumber: 42,
         attemptId: FIX_ATTEMPT_ID,
@@ -393,8 +395,8 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
       request.expectedHeadSha === prHead
         ? { outcome: 'available', headSha: prHead, findings: [finding()] }
         : { outcome: 'unavailable', code: 'head-moved' };
-    forge.script = (request) => {
-      prHead = request.expectedHeadSha;
+    forge.script = (_request) => {
+      prHead = FIXED_HEAD;
       return { outcome: 'ambiguous', reason: 'the process stopped before the result was recorded' };
     };
 

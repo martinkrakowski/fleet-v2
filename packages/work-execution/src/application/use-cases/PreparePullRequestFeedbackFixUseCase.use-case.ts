@@ -41,11 +41,8 @@ export interface PreparePullRequestFeedbackFixDependencies {
   readonly prepareFixAttempt: PrepareFixAttemptPort;
   readonly forgeAction: ForgeActionPort;
   readonly nowIso?: () => string;
-  /**
-   * Mints one nonce per wrapped finding (16 to 64 lowercase hex characters).
-   * Absent, the nonce is derived from the thread id.
-   */
-  readonly mintNonce?: () => string;
+  /** Mints one nonce per wrapped finding (16 to 64 lowercase hex characters). */
+  readonly mintNonce: () => string;
 }
 
 /** At most this many findings, UTF-8 bytes per numbered fix, and bytes for the whole handover. */
@@ -173,24 +170,6 @@ function derivedFixAttemptId(pullRequestNumber: number, headSha: string): string
 
 function secretShaped(text: string): boolean {
   return LANE_DIFF_SECRET_PATTERNS.some((entry) => entry.regex.test(text)) || containsSecretShape(text);
-}
-
-/**
- * A deterministic 32-hex nonce from the thread id (four seeded FNV-1a words).
- * The application layer holds no node builtin; `wrapUntrusted` defangs
- * marker-like text whatever the nonce, so a derived nonce only has to be a
- * valid, stable one. A host that wants an unguessable nonce injects `mintNonce`.
- */
-function derivedNonce(threadId: string): string {
-  let nonce = '';
-  for (let seed = 0; seed < 4; seed += 1) {
-    let hash = (0x811c9dc5 ^ Math.imul(seed + 1, 0x9e3779b1)) >>> 0;
-    for (const character of `pr-feedback-nonce:${threadId}`) {
-      hash = Math.imul(hash ^ (character.codePointAt(0) ?? 0), 0x01000193) >>> 0;
-    }
-    nonce += hash.toString(16).padStart(8, '0');
-  }
-  return nonce;
 }
 
 /** The refusal reason from PrepareFixAttempt, reduced to a fixed phrase (never an id, path or text). */
@@ -423,13 +402,14 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
       return refusedPush('forge-unreadable');
     }
 
-    // `push-to-pr` pins the head it is asked to establish: the fixed head.
+    // `push-to-pr` carries the round's starting head as its expected-head
+    // precondition; the probes above already confirmed the PR still sits there.
     let answer: Awaited<ReturnType<ForgeActionPort['performForgeAction']>>;
     try {
       answer = await deps.forgeAction.performForgeAction({
         actionId: key,
         kind: 'push-to-pr',
-        expectedHeadSha: fixedHeadSha,
+        expectedHeadSha: expectedHeadSha,
         branchName,
         pullRequestNumber,
         attemptId,
@@ -569,7 +549,7 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
       const finding = findings[index];
       let nonce: string;
       try {
-        nonce = deps.mintNonce !== undefined ? deps.mintNonce() : derivedNonce(finding.threadId);
+        nonce = deps.mintNonce();
       } catch {
         return refuse('invalid-request');
       }

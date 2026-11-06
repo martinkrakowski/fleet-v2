@@ -881,7 +881,7 @@ const MAX_DECLARED_ENVIRONMENT_NAMES = 16;
 /** The domain's own version rule (`gate-receipt-key.ts`). */
 const TOOLCHAIN_VERSION_TOKEN = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/;
 /** A declared name is passed to `printenv` as an argument, so it can never look like an option or a pattern. */
-const DECLARED_ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const DECLARED_ENVIRONMENT_NAME = /^[A-Za-z_]\w{0,127}$/;
 /**
  * Runs `argv` inside the worktree as a plain argv command: no shell, no `sh -c`.
  * The executor may ignore `cwd` (an ssh transport runs in the login directory),
@@ -920,7 +920,7 @@ async function runReceiptProbe(
 }
 
 function parseToolchainVersion(stdout: string): string | undefined {
-  const token = stdout.split(/\s+/).find((part) => /[0-9]/.test(part));
+  const token = stdout.split(/\s+/).find((part) => /\d/.test(part));
   return token !== undefined && TOOLCHAIN_VERSION_TOKEN.test(token) ? token : undefined;
 }
 
@@ -944,7 +944,7 @@ export async function readGateToolchainVersions(
           ? join(worktreePath, 'node_modules', '.bin', name)
           : name;
       const run = await runReceiptProbe(executor, worktreePath, [binary, '--version'], VERSION_PROBE_MAX_BYTES);
-      if (run === undefined || run.exitCode !== 0) {
+      if (run?.exitCode !== 0) {
         return undefined;
       }
       const version = parseToolchainVersion(run.stdout);
@@ -984,26 +984,39 @@ function declaredEnvironmentNames(turboJson: string): string[] | undefined {
   }
   const names = new Set<string>();
   for (const task of Object.values(tasks)) {
-    // Runtime input: each task is read as a plain record (own data properties only, bounded, never throws).
-    const read = readPlainRecord(task, TURBO_TASK_SCHEMA);
-    if (!read.ok) {
+    if (!collectTaskEnvironmentNames(task, names)) {
       return undefined;
     }
-    const env = read.value['env'];
-    if (env === undefined) {
-      continue;
+  }
+  return names.size === 0 ? undefined : [...names].sort(compareCodeUnits);
+}
+
+/** Bytewise (UTF-16 code unit) order: the sorted names feed the receipt digest, so the order never depends on the locale. */
+function compareCodeUnits(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** Adds one task's declared `env` names to `names`. False when the task is malformed, a name is invalid or there are too many. */
+function collectTaskEnvironmentNames(task: unknown, names: Set<string>): boolean {
+  // Runtime input: each task is read as a plain record (own data properties only, bounded, never throws).
+  const read = readPlainRecord(task, TURBO_TASK_SCHEMA);
+  if (!read.ok) {
+    return false;
+  }
+  const env = read.value['env'];
+  if (env === undefined) {
+    return true;
+  }
+  for (const name of env as readonly string[]) {
+    if (!DECLARED_ENVIRONMENT_NAME.test(name)) {
+      return false;
     }
-    for (const name of env as readonly string[]) {
-      if (!DECLARED_ENVIRONMENT_NAME.test(name)) {
-        return undefined;
-      }
-      names.add(name);
-      if (names.size > MAX_DECLARED_ENVIRONMENT_NAMES) {
-        return undefined;
-      }
+    names.add(name);
+    if (names.size > MAX_DECLARED_ENVIRONMENT_NAMES) {
+      return false;
     }
   }
-  return names.size === 0 ? undefined : [...names].sort();
+  return true;
 }
 
 /**
@@ -1026,7 +1039,7 @@ export async function readGateDeclaredEnvironmentDigest(
       ['cat', join(worktreePath, 'turbo.json')],
       TURBO_JSON_MAX_BYTES,
     );
-    if (turbo === undefined || turbo.exitCode !== 0) {
+    if (turbo?.exitCode !== 0) {
       return undefined;
     }
     const names = declaredEnvironmentNames(turbo.stdout);

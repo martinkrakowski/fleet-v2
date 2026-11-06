@@ -5,3 +5,4 @@ export * from "./AssessmentState.vo.js";
 export * from "./EvidenceResult.vo.js";
 export * from "./EvidenceScope.vo.js";
 export * from "./FindingState.vo.js";
+export * from "./ReceiptSubjectKind.vo.js";

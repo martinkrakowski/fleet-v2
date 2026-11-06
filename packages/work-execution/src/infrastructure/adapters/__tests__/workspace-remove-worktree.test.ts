@@ -193,6 +193,7 @@ describe('removeWorktree over a fake executor', () => {
       ['git', '-C', CLONE, 'worktree', 'list', '--porcelain'],
       ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', CLONE],
       ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', WORKTREE_ROOT],
+      ['sh', '-c', 'cd -- "$1" && pwd -P', 'sh', WORKTREE],
       ['git', '-C', WORKTREE, 'rev-parse', 'HEAD'],
       ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-C', WORKTREE, 'status', '--porcelain', '--untracked-files=all'],
       ['git', '-C', WORKTREE, 'rev-parse', '--git-dir'],
@@ -516,6 +517,22 @@ describe('removeWorktree over a fake executor', () => {
       [REMOVE_MARKER]: { exitCode: 0 },
     });
     expect(result).toEqual({ outcome: 'refused', reason: 'not-a-linked-worktree' });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
+  it('refuses path-refused when the requested path now resolves outside the listed physical path', async () => {
+    const { result, calls } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
+      [PWD_MARKER]: ({ argv }) =>
+        argv[argv.length - 1] === WORKTREE ? { stdout: '/elsewhere/other-worktree\n' } : { stdout: `${argv[argv.length - 1]}\n` },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'path-refused' });
     expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
   });
 

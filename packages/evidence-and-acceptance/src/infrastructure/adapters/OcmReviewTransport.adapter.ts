@@ -464,9 +464,8 @@ function normalizeSeverity(word: string): FindingSeverity | null {
   return Object.prototype.hasOwnProperty.call(SEVERITY_SYNONYMS, key) ? (SEVERITY_SYNONYMS[key] as FindingSeverity) : null;
 }
 
-const BLOCKING_SEVERITY_WORD = /(?<![A-Za-z0-9])(?:blocker|critical|major|high|severe)(?![A-Za-z0-9])/i;
 const FILE_REFERENCE = /[\w./-]+\.\w+:\d+/;
-const LIST_OR_NUMBER_MARKER = /^(?:[-*+•>]\s|\d+[.)]\s)/;
+const LIST_OR_NUMBER_MARKER = /^(?:[-*+•>]\s+|\d+[.)]\s+)/;
 const SEVERITY_TOKEN_SKELETONS: ReadonlySet<string> = new Set([
   'blocker', 'critical', 'major', 'high', 'severe', 'medium', 'minor', 'low', 'nit', 'info', 'trivial',
 ]);
@@ -476,36 +475,41 @@ const LOOKALIKES: Readonly<Record<string, string>> = {
   'α': 'a', 'ε': 'e', 'ι': 'i', 'ο': 'o', 'ρ': 'p', 'ν': 'v', 'κ': 'k', 'τ': 't', 'η': 'n', 'μ': 'm', 'β': 'b', 'χ': 'x', 'υ': 'u',
 };
 
+/** Every markdown emphasis or code character anywhere in the line is removed, whitespace collapsed, then trimmed. */
+function normaliseFindingLine(line: string): string {
+  return line.replace(/[*_`~]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/** True when `token` (punctuation trimmed) is a severity word, spelled with ASCII or look-alike letters. */
+function isSeverityToken(token: string): boolean {
+  const bare = token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+  const folded = [...bare.toLowerCase()].map((ch) => LOOKALIKES[ch] ?? ch).join('');
+  return SEVERITY_TOKEN_SKELETONS.has(folded) || folded === 'sev' || folded === 'severity';
+}
+
 /**
- * RV3 (Luna round 2): true when a line that no finding pattern fully parsed
- * still looks like a finding, so the whole reply must be refused rather than
- * the line skipped. After dropping markdown emphasis and list markers: a
- * `FINDING:` prefix; a blocking-severity ASCII word on a line that also has a
- * `path:line` reference or a leading list/number marker; or a severity word
- * written with look-alike non-ASCII letters on such a line. An ordinary
- * sentence ("no major issues") carries none of those and is left alone.
+ * RV3 (Luna rounds 2-3): true when a line that no finding pattern fully parsed
+ * still looks like a finding, so the whole reply is refused rather than the
+ * line skipped. The line is normalised first (markdown characters removed
+ * everywhere, so `maj**or**` is `major`). It is finding-shaped only when it
+ * starts with `FINDING`, or with a list or number marker followed by a
+ * severity word as the first word, or (no marker) carries a `path:line`
+ * reference after a leading severity word. A `path:line` reference alone never
+ * makes prose finding-shaped.
  */
 function looksLikeUnparsedFinding(trimmedLine: string): boolean {
-  const norm = trimmedLine.replace(/^[\s*_`>+•-]+/, '').replace(/^\d+[.)]\s+/, '').replace(/^[\s*_`>]+/, '');
-  if (/^FINDING\b\s*:/i.test(norm)) {
+  const marker = LIST_OR_NUMBER_MARKER.exec(trimmedLine);
+  const body = normaliseFindingLine(marker === null ? trimmedLine : trimmedLine.slice(marker[0].length));
+  if (/^FINDING\b/i.test(body) || /^FINDING\b/i.test(normaliseFindingLine(trimmedLine))) {
     return true;
   }
-  const findingShaped = FILE_REFERENCE.test(trimmedLine) || LIST_OR_NUMBER_MARKER.test(trimmedLine);
-  if (!findingShaped) {
-    return false;
+  const firstWord = body.split(' ')[0] ?? '';
+  if (isSeverityToken(firstWord)) {
+    return marker !== null || FILE_REFERENCE.test(trimmedLine);
   }
-  if (BLOCKING_SEVERITY_WORD.test(trimmedLine)) {
-    return true;
-  }
-  for (const token of trimmedLine.split(/[^\p{L}\p{N}]+/u)) {
-    if (/\P{ASCII}/u.test(token)) {
-      const folded = [...token.toLowerCase()].map((ch) => LOOKALIKES[ch] ?? ch).join('');
-      if (SEVERITY_TOKEN_SKELETONS.has(folded)) {
-        return true;
-      }
-    }
-  }
-  return false;
+  // The numbered shape: `N. path:line - severity. summary`.
+  const afterTarget = /^\S+ [-–—] (\S+)/.exec(body);
+  return marker !== null && afterTarget !== null && isSeverityToken(afterTarget[1] ?? '');
 }
 
 /** The findings parsed from a reply, and whether any finding line carried an unrecognised severity. */

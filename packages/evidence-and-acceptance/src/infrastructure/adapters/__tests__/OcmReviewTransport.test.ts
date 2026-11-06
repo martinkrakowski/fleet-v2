@@ -2760,6 +2760,9 @@ describe('RV3 Luna round 1: unrecognised finding severities', () => {
       '- _major_ src/a.ts:3 wrong result',
       '- \u0441ritical src/a.ts:3 data loss',
       '1. `src/a.ts:3` - \u0441r\u0456t\u0456c\u0430l. data loss',
+      '- maj**or** src/a.ts:3 unsafe',
+      '- `critical` src/a.ts:3 data loss',
+      '1) Major: src/a.ts:3 wrong result',
     ]) {
       for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
         const parsed = parse(`${line}\nVERDICT: PASS`);
@@ -2774,6 +2777,9 @@ describe('RV3 Luna round 1: unrecognised finding severities', () => {
       'Looks good.\nVERDICT: PASS',
       'There are no major issues and the risk is high only in theory.\nVERDICT: PASS',
       'Résumé of the change: all fine, see src/a.ts for details.\nVERDICT: PASS',
+      'I inspected src/a.ts:3; no major issue was found.\nVERDICT: PASS',
+      '- no major issues in src/a.ts:3\n- confidence in the change is high\nVERDICT: PASS',
+      'Review of the diff against the brief: every step is covered and the tests assert the new behaviour.\n\nVERDICT: PASS',
     ]) {
       const parsed = parseReviewReplyStrict(text);
       expect(parsed.result, text).toBe('pass');

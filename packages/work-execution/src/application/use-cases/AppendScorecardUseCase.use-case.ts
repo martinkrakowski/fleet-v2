@@ -19,7 +19,6 @@ import type { AcceptanceReceiptReadPort, ReadReceiptsForHeadResult } from '../po
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type { LaneRunJournalPort } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunRepositoryPort } from '../ports/out/LaneRunRepositoryPort.out-port.js';
-import type { TelemetryDispositionPort } from '../ports/out/TelemetryDispositionPort.out-port.js';
 import {
   LANE_SCORECARD_ID_PATTERN,
   type LaneScorecardFindings,
@@ -38,14 +37,6 @@ export interface AppendScorecardDependencies {
   readonly attemptRepo: Pick<AttemptRepositoryPort, 'listAttemptsByWorkOrder'>;
   readonly runJournal: Pick<LaneRunJournalPort, 'listForRun'>;
   readonly receipts: Pick<AcceptanceReceiptReadPort, 'readReceiptsForHead'>;
-  /**
-   * The telemetry dispositions are part of the declared read-only input
-   * (manifest contract line 654): the store is read once and an unreadable
-   * disposition store refuses the append, so a row is never recorded while a
-   * required input cannot be accounted for. The counts themselves are not in
-   * the row (that is a later lane).
-   */
-  readonly dispositions: Pick<TelemetryDispositionPort, 'read'>;
   readonly scorecard: Pick<LaneScorecardPort, 'append' | 'read'>;
 }
 
@@ -263,14 +254,6 @@ export class AppendScorecardUseCase implements AppendScorecardPort {
     }
     if (stored.kind === 'present') {
       return { outcome: 'already-present', row: stored.row };
-    }
-
-    // The dispositions are a required read-only input (contract line 654):
-    // an unreadable disposition store refuses before anything is derived, so
-    // the append never ignores an input it could not account for.
-    const dispositionsRead = await guarded(() => deps.dispositions.read());
-    if (!dispositionsRead.ok || dispositionsRead.value.outcome === 'unreadable') {
-      return STORES_UNREADABLE;
     }
 
     const runRead = await guarded(() => deps.runRepo.get(runId));

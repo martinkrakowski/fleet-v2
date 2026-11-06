@@ -3,10 +3,8 @@ import { describe, expect, it } from 'vitest';
 import type { AttemptRecord } from '../../../domain/execution-records.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import { LANE_RUN_ID_PATTERN, type LaneRunRecord } from '../../../domain/lane-run-records.js';
-import { emptyTelemetryDispositionRecord } from '../../../domain/run-telemetry-dispositions.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import type { ReadReceiptsForHeadResult } from '../../ports/out/AcceptanceReceiptReadPort.out-port.js';
-import type { TelemetryDispositionRead } from '../../ports/out/TelemetryDispositionPort.out-port.js';
 import type {
   LaneScorecardAppendResult,
   LaneScorecardReadResult,
@@ -124,7 +122,6 @@ interface HarnessOptions {
   readonly receipt?: (attemptId: string, head: string) => ReadReceiptsForHeadResult | Error;
   readonly stored?: LaneScorecardReadResult;
   readonly appendResult?: LaneScorecardAppendResult | Error;
-  readonly dispositions?: TelemetryDispositionRead | Error;
 }
 
 function harness(options: HarnessOptions = {}): Harness {
@@ -181,14 +178,6 @@ function harness(options: HarnessOptions = {}): Harness {
       readReceiptsForHead: async (attemptId, head) => {
         calls.push('readReceiptsForHead');
         return settle(options.receipt ? options.receipt(attemptId, head) : FOUND);
-      },
-    },
-    dispositions: {
-      read: async () => {
-        calls.push('dispositions.read');
-        return settle(
-          options.dispositions === undefined ? { outcome: 'read', record: emptyTelemetryDispositionRecord() } : options.dispositions,
-        );
       },
     },
     scorecard: {
@@ -253,10 +242,10 @@ describe('AppendScorecardUseCase', () => {
     const h = harness();
     await new AppendScorecardUseCase(h.deps).appendScorecard({ runId: RUN_ID, nowIso: NOW });
     expect([...new Set(h.calls)].sort()).toEqual(
-      ['append', 'dispositions.read', 'get', 'listAttemptsByWorkOrder', 'listForRun', 'read', 'readReceiptsForHead'].sort(),
+      ['append', 'get', 'listAttemptsByWorkOrder', 'listForRun', 'read', 'readReceiptsForHead'].sort(),
     );
     expect(h.calls.filter((call) => call === 'readReceiptsForHead')).toHaveLength(2);
-    for (const store of [h.deps.runRepo, h.deps.attemptRepo, h.deps.runJournal, h.deps.receipts, h.deps.dispositions]) {
+    for (const store of [h.deps.runRepo, h.deps.attemptRepo, h.deps.runJournal, h.deps.receipts]) {
       expect(Object.keys(store)).toHaveLength(1);
     }
     expect(Object.keys(h.deps.scorecard).sort()).toEqual(['append', 'read']);
@@ -385,8 +374,6 @@ describe('AppendScorecardUseCase', () => {
       { attempts: new Error(STORE_MESSAGE) },
       { receipt: () => new Error(STORE_MESSAGE) },
       { receipt: () => ({ outcome: 'unavailable', reason: 'evidence-unreadable' }) },
-      { dispositions: { outcome: 'unreadable' } },
-      { dispositions: new Error(STORE_MESSAGE) },
       { attempts: [attempt('attempt-1')] },
       { run: run({ workOrderId: '/secret/path' }) },
       { run: run({ round: -1 }) },
@@ -398,6 +385,24 @@ describe('AppendScorecardUseCase', () => {
       expect(h.appended).toEqual([]);
       expect(h.calls).not.toContain('append');
     }
+  });
+
+  it('appends although a telemetry dispositions store would be unreadable', async () => {
+    const h = harness();
+    let dispositionReads = 0;
+    const deps = {
+      ...h.deps,
+      dispositions: {
+        read: async () => {
+          dispositionReads += 1;
+          throw new Error(STORE_MESSAGE);
+        },
+      },
+    };
+    const result = await new AppendScorecardUseCase(deps).appendScorecard({ runId: RUN_ID, nowIso: NOW });
+    expect(result.outcome).toBe('appended');
+    expect(h.appended).toHaveLength(1);
+    expect(dispositionReads).toBe(0);
   });
 
   it('refuses a run with more than 64 attempts', async () => {
@@ -417,7 +422,6 @@ describe('AppendScorecardUseCase', () => {
     expect(Object.keys(h.deps.attemptRepo)).toEqual(['listAttemptsByWorkOrder']);
     expect(Object.keys(h.deps.runJournal)).toEqual(['listForRun']);
     expect(Object.keys(h.deps.receipts)).toEqual(['readReceiptsForHead']);
-    expect(Object.keys(h.deps.dispositions)).toEqual(['read']);
   });
 
   it('refuses a malformed request', async () => {

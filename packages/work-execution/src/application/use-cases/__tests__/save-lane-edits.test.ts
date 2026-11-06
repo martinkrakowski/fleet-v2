@@ -1,3 +1,7 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import { CutoverJournalAdapter } from '../../../infrastructure/adapters/CutoverJournalAdapter.adapter.js';
@@ -352,5 +356,32 @@ describe('SaveLaneEditsUseCase', () => {
     expect(await useCase.execute({ ...validRequest(), allowedPathPrefixes: ['x'.repeat(201)] })).toEqual(invalid);
     expect(await useCase.execute({ ...validRequest(), laneId: 'l'.repeat(65) })).toEqual(invalid);
     expect(await useCase.execute({ ...validRequest(), planDigest: 'a'.repeat(65) })).toEqual(invalid);
+  });
+
+  it('coexists in a real file-backed journal with v1 entries and sibling adopt intents carrying a request digest', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'save-lane-edits-'));
+    try {
+      const file = path.join(dir, 'cutover-journal.json');
+      const otherKey = `relaunch/${PLAN}/lane-9/save`;
+      const ulid = (n: number): string => `01HZ${String(n).padStart(22, '0')}`;
+      await writeFile(file, JSON.stringify([
+        { key: otherKey, kind: 'intent', entryId: ulid(901), recordedAtIso: '2026-11-06T09:00:00Z', schemaVersion: 1 },
+        { key: otherKey, kind: 'result', entryId: ulid(902), recordedAtIso: '2026-11-06T09:00:01Z', outcome: 'completed', reasonCode: 'saved', schemaVersion: 1 },
+      ]), 'utf8');
+      const real = new CutoverJournalAdapter({ stateDir: dir });
+      const adoptKey = `relaunch/${PLAN}/lane-1/adopt`;
+      expect(await real.append({ key: adoptKey, kind: 'intent', entryId: ulid(903), recordedAtIso: '2026-11-06T09:30:00Z', digest: 'f'.repeat(64) })).toMatchObject({ outcome: 'appended' });
+      const h = harness(real);
+      expect(await h.useCase.execute(validRequest())).toMatchObject({ outcome: 'saved' });
+      const listed = await new CutoverJournalAdapter({ stateDir: dir }).listByKeyPrefix(`relaunch/${PLAN}/lane-1/`);
+      if (listed.outcome !== 'listed') throw new Error('expected a listing');
+      expect(listed.entries.find((entry) => entry.key === adoptKey)?.digest).toBe('f'.repeat(64));
+      const saveEntries = listed.entries.filter((entry) => entry.key === KEY);
+      expect(saveEntries.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+      expect(saveEntries[0]).not.toHaveProperty('digest');
+      expect(saveEntries[1]).toMatchObject({ outcome: 'completed' });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

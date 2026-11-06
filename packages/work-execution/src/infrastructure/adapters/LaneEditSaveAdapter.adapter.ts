@@ -68,8 +68,15 @@ const MIN_GIT: readonly [number, number] = [2, 40];
 const mentionsFilter = (text: string): boolean =>
   text.split(/\r?\n/).some((line) => !line.trimStart().startsWith('#') && line.includes('filter'));
 
-/** Environment hardening that travels inside every argv so it reaches a remote ssh executor too. */
+/**
+ * Environment hardening that travels inside every argv so it reaches a remote ssh executor too.
+ * `-u GIT_CONFIG` comes first: env stops option parsing at the first NAME=VALUE word. An inherited legacy
+ * `GIT_CONFIG=<file>` makes `git config` read that one file only while `git add` ignores it, so the filter
+ * probe and the add would disagree.
+ */
 const ENV_GUARDS = [
+  '-u',
+  'GIT_CONFIG',
   'GIT_ALLOW_PROTOCOL=none',
   'GIT_NO_LAZY_FETCH=1',
   'GIT_TERMINAL_PROMPT=0',

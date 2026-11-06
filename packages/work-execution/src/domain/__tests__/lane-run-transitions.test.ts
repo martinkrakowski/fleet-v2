@@ -65,7 +65,7 @@ const PARKED_ONE_WAY = { reason: 'one-way-door', qualifier: null, parkedFrom: 'g
 const PARKED_HALTED = { reason: 'halted', qualifier: null, parkedFrom: 'gating', questionId: null };
 
 const EXPECTED_EXITS: Record<LaneRunStateValue, readonly LaneRunStateValue[]> = {
-  ready: ['dispatching'],
+  ready: ['dispatching', 'collecting'],
   dispatching: ['running', 'seat-failed'],
   running: ['collecting', 'seat-failed'],
   'seat-failed': ['dispatching'],
@@ -110,7 +110,11 @@ describe('LaneRun exits', () => {
   it.each(LANE_RUN_STATES)('%s exits match the table and each listed exit is legal', (state) => {
     expect(LANE_RUN_EXITS[state]).toEqual(EXPECTED_EXITS[state]);
     for (const exit of LANE_RUN_EXITS[state]) {
-      expect(canEnterLaneRunState(state, exit)).toBe(true);
+      // `ready → collecting` is the adopted run's entry only (CO28); every other exit needs no provenance.
+      expect(canEnterLaneRunState(state, exit, null, false, 'adopted')).toBe(true);
+      if (!(state === 'ready' && exit === 'collecting')) {
+        expect(canEnterLaneRunState(state, exit)).toBe(true);
+      }
     }
     expect(canEnterLaneRunState(state, FALSE_EXIT[state])).toBe(false);
   });

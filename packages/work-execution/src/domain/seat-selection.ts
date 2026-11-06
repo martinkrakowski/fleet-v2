@@ -768,7 +768,12 @@ export function isDeclaredCatalogTrigger(value: unknown): value is string {
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  try {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+  } catch {
+    // Array.isArray throws on a revoked Proxy: that is not a plain object.
+    return false;
+  }
 }
 
 /** The catalogue's seats as typed records, or the rule-and-position refusal. */
@@ -1012,45 +1017,12 @@ export function unhealthySeatIdsFromCatalog(catalog: unknown): string[] {
     if (!isPlainObject(catalog)) {
       return [];
     }
-    const rawSeats = catalog['seats'];
-    if (!Array.isArray(rawSeats)) {
-      return [];
-    }
     // A malformed catalogue is refused as a whole: never a partial id list.
-    if (rawSeats.length > SEAT_CATALOG_SEAT_BOUND || !catalogChainsWellFormed(catalog)) {
+    const parsed = catalogSeatsOf(catalog);
+    if (!parsed.ok || !catalogChainsWellFormed(catalog)) {
       return [];
     }
-    const ids: string[] = [];
-    for (const rawSeat of rawSeats) {
-      if (!isPlainObject(rawSeat)) {
-        return [];
-      }
-      const id = rawSeat['id'];
-      const variant = rawSeat['variant'];
-      const agent = rawSeat['agent'];
-      const health = rawSeat['health'];
-      if (typeof id !== 'string' || id.trim() === '') {
-        return [];
-      }
-      if (typeof rawSeat['tool'] !== 'string') {
-        return [];
-      }
-      if (typeof rawSeat['model'] !== 'string') {
-        return [];
-      }
-      if (variant !== undefined && typeof variant !== 'string') {
-        return [];
-      }
-      if (agent !== undefined && typeof agent !== 'string') {
-        return [];
-      }
-      if (health !== undefined && !isDeclaredSeatHealth(health)) {
-        return [];
-      }
-      if (health === 'unhealthy') {
-        ids.push(id);
-      }
-    }
+    const ids = parsed.seats.filter((seat) => seat.health === 'unhealthy').map((seat) => seat.id);
     return ids;
   } catch {
     return [];

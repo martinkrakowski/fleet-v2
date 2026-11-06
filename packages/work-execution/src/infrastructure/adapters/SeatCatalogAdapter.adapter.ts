@@ -56,7 +56,15 @@ function copiedSeats(source: Record<string, unknown>): unknown[] | undefined | n
     if (seat['health'] !== undefined && !isDeclaredSeatHealth(seat['health'])) {
       return null;
     }
-    seats.push({ ...seat });
+    // Only the declared fields are copied, so nothing nested aliases the source.
+    seats.push({
+      id: seat['id'],
+      tool: seat['tool'],
+      model: seat['model'],
+      ...(seat['variant'] !== undefined ? { variant: seat['variant'] } : {}),
+      ...(seat['agent'] !== undefined ? { agent: seat['agent'] } : {}),
+      ...(seat['health'] !== undefined ? { health: seat['health'] } : {}),
+    });
   }
   return seats;
 }
@@ -99,7 +107,7 @@ function copiedChains(source: Record<string, unknown>): Record<string, unknown> 
       }
       // The triggers are copied too, so the returned step never aliases the source.
       steps.push({
-        ...step,
+        seatId: step['seatId'],
         ...(Array.isArray(step['triggers']) ? { triggers: [...(step['triggers'] as unknown[])] } : {}),
       });
     }

@@ -142,4 +142,21 @@ describe('SeatCatalogAdapter', () => {
     expect(new SeatCatalogAdapter(source(atBound)).readSeatCatalog().outcome).toBe('ok');
     expect(new SeatCatalogAdapter(source([...atBound, step])).readSeatCatalog().outcome).toBe('unknown');
   });
+
+  it('does not alias a nested extra field of a seat or a step', () => {
+    const roles = ['lane-runner'];
+    const source = {
+      seats: [{ id: 'impl-a', tool: 'opencode', model: 'acme/m', roles }],
+      chains: { implementer: [{ seatId: 'impl-a', note: { deep: true } }] },
+    };
+    const read = new SeatCatalogAdapter(source).readSeatCatalog();
+    expect(read.outcome).toBe('ok');
+    if (read.outcome !== 'ok') {
+      return;
+    }
+    const seat = read.catalog.seats?.[0] as unknown as Record<string, unknown>;
+    expect(seat['roles']).toBeUndefined();
+    expect(roles).toEqual(['lane-runner']);
+    expect(read.catalog.chains?.implementer?.[0]).toEqual({ seatId: 'impl-a' });
+  });
 });

@@ -263,4 +263,11 @@ describe('unhealthySeatIdsFromCatalog refusals', () => {
       }),
     ).toEqual([]);
   });
+
+  it('returns a reason, never a throw, for a revoked proxy', () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    expect(seatPlanFromCatalog(proxy)).toHaveProperty('reason');
+    expect(unhealthySeatIdsFromCatalog(proxy)).toEqual([]);
+  });
 });

@@ -1023,7 +1023,7 @@ describe('ProjectProbeAdapter', () => {
           stdout:
             'schemaVersion: 1\ngenerator:\n' +
             '  name: "@hexagen-monaco/sync"\n' +
-            '  version: "sk-live-abc123DEF456ghi789JKL012"\n',
+            '  version: "^0.16.0"\n',
         },
         'cat /lanes/a/.architecture/generator.config.yaml': { exitCode: 1 },
         'test -e /lanes/a/.architecture/generator.config.yaml': { exitCode: 1 },
@@ -1044,7 +1044,7 @@ describe('ProjectProbeAdapter', () => {
     });
 
     // The block's version scalar is only recorded when it is an exact version;
-    // a credential-shaped token built from allowed characters is dropped.
+    // a non-strict token such as a range is dropped.
     expect(report.generatorState).toEqual({
       state: 'provisioned',
       generatorVersion: null,

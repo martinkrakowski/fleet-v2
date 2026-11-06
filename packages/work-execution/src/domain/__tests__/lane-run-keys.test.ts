@@ -4,6 +4,7 @@ import {
   buildLaneRunStepKey,
   buildMergeKey,
   head12Of,
+  laneRunMergeEnqueueKey,
   laneRunPremergeKey,
   laneRunResumeKey,
   laneRunStopForceKey,
@@ -150,6 +151,15 @@ describe('key builders', () => {
 
     for (const step of LANE_RUN_KEY_STEPS) {
       if (step === 'prepare' || step === 'dispatch' || step === 'collect') continue;
+      if (step === 'merge-enqueue') {
+        expect(buildLaneRunStepKey({
+          runId: RUN_ID, round: 1, step, seatIndex: 0, attemptOrdinal: null, head12: HEAD12, retry: null,
+        })).toEqual({
+          ok: false,
+          error: 'LaneRun key step merge-enqueue has no seat index',
+        });
+        continue;
+      }
       if (step === 'premerge') {
         expect(buildLaneRunStepKey({
           runId: RUN_ID, round: 1, step, seatIndex: 0, attemptOrdinal: 1, head12: HEAD12, retry: null,
@@ -185,6 +195,18 @@ describe('key builders', () => {
   });
 
   it.each(LANE_RUN_KEY_STEPS)('round-trips %s', (step) => {
+    if (step === 'merge-enqueue') {
+      const built = laneRunMergeEnqueueKey(RUN_ID, 1, HEAD12);
+      expect(built).toEqual({ ok: true, key: `${RUN_ID}/r1/merge-enqueue@${HEAD12}` });
+      if (!built.ok) return;
+      expect(parseLaneRunKey(built.key)).toEqual({
+        kind: 'merge-enqueue', runId: RUN_ID, round: 1, head12: HEAD12,
+      });
+      expect(laneRunMergeEnqueueKey(RUN_ID, 1, HEAD12)).toEqual(built);
+      // A seat-index shape is never a merge-enqueue key.
+      expect(parseLaneRunKey(`${RUN_ID}/r0/merge-enqueue/0@0123456789ab`)).toBeNull();
+      return;
+    }
     if (step === 'premerge') {
       const built = laneRunPremergeKey(RUN_ID, 1, HEAD12);
       expect(built.ok).toBe(true);
@@ -874,6 +896,10 @@ describe('parseLaneRunKey', () => {
     'run-1/r0/dispatch/0/a1',
     `${RUN_ID}/r1/gate/0@0123456789ab/`,
     `${RUN_ID}/r0/premerge/0@0123456789ab`,
+    `${RUN_ID}/r0/merge-enqueue/0@0123456789ab`,
+    `${RUN_ID}/r3/merge-enqueue@0123456789ab`,
+    `${RUN_ID}/r0/merge-enqueue@0123456789AB`,
+    `${RUN_ID}/r0/merge-enqueue@0123456789ab@0123456789ab`,
     `${RUN_ID}/r1/gate/0 @0123456789ab`,
     `${RUN_ID}/stop-force@xyz`,
     `${RUN_ID}/stop@`,
@@ -943,5 +969,61 @@ describe('head12Of', () => {
     expect(head12Of('a'.repeat(39))).toBeNull();
     expect(head12Of(null)).toBeNull();
     expect(head12Of(42)).toBeNull();
+  });
+});
+
+
+describe('merge-enqueue key (KS7b)', () => {
+  it('builds <runId>/r<n>/merge-enqueue@<head12> and refuses bad parts without echoing them', () => {
+    expect(laneRunMergeEnqueueKey(RUN_ID, 0, HEAD12)).toEqual({ ok: true, key: `${RUN_ID}/r0/merge-enqueue@${HEAD12}` });
+    expect(laneRunMergeEnqueueKey(RUN_ID, 2, HEAD12).ok).toBe(true);
+    for (const result of [
+      laneRunMergeEnqueueKey('run-bad', 0, HEAD12),
+      laneRunMergeEnqueueKey(RUN_ID, 3, HEAD12),
+      laneRunMergeEnqueueKey(RUN_ID, -1, HEAD12),
+      laneRunMergeEnqueueKey(RUN_ID, 1.5, HEAD12),
+      laneRunMergeEnqueueKey(RUN_ID, 0, 'xyz'),
+      laneRunMergeEnqueueKey(RUN_ID, 0, 'A'.repeat(12)),
+      laneRunMergeEnqueueKey(undefined as unknown as string, 0, HEAD12),
+      laneRunMergeEnqueueKey(RUN_ID, 0, {} as unknown as string),
+    ]) {
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).not.toContain('xyz');
+      }
+    }
+  });
+
+  it('parses to a merge-enqueue key, never a step, premerge or merge key', () => {
+    const built = laneRunMergeEnqueueKey(RUN_ID, 1, HEAD12);
+    if (!built.ok) throw new Error('fixture');
+    expect(parseLaneRunKey(built.key)?.kind).toBe('merge-enqueue');
+    expect(parseLaneRunKey(`${RUN_ID}/r1/premerge@${HEAD12}`)?.kind).toBe('premerge');
+  });
+
+  it('a journal written before KS7b still parses: the one-way merge step key and the premerge key are unchanged', () => {
+    // Keys recorded by the pre-KS7b conductor.
+    const recorded = [
+      `${RUN_ID}/r0/prepare/0/a1`,
+      `${RUN_ID}/r0/dispatch/0/a1`,
+      `${RUN_ID}/r0/collect/0/a1`,
+      `${RUN_ID}/r0/gate/0@${HEAD12}`,
+      `${RUN_ID}/r0/accept/0@${HEAD12}`,
+      `${RUN_ID}/r0/open-pr/0@${HEAD12}`,
+      `${RUN_ID}/r0/premerge@${HEAD12}`,
+      `${RUN_ID}/r0/merge/0@${HEAD12}`,
+    ];
+    expect(recorded.map((key) => parseLaneRunKey(key)?.kind)).toEqual([
+      'step', 'step', 'step', 'step', 'step', 'step', 'premerge', 'step',
+    ]);
+    const merge = parseLaneRunKey(`${RUN_ID}/r0/merge/0@${HEAD12}`);
+    expect(merge).toMatchObject({ kind: 'step', step: 'merge', seatIndex: 0, head12: HEAD12 });
+    for (const key of recorded) {
+      const parsed = parseLaneRunKey(key);
+      expect(parsed).not.toBeNull();
+      if (parsed !== null && parsed.kind === 'step') {
+        expect(buildLaneRunStepKey(parsed)).toEqual({ ok: true, key });
+      }
+    }
   });
 });

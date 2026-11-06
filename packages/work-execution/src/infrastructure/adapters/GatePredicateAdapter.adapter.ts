@@ -51,7 +51,8 @@ import { SshExecutor } from './SshExecutor.adapter.js';
 import { GateSlotBudget, readGateSlotCapacity } from './GateSlotBudget.helper.js';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
-import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
+import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS, readPlainRecord } from '@fleet/shared';
+import type { PlainRecordSchema } from '@fleet/shared';
 import { GATE_RECEIPT_TOOLCHAIN_NAMES, buildGateReceiptKey } from '../../domain/gate-receipt-key.js';
 import type { GateReceiptKey, GateReceiptToolchainVersions } from '../../domain/gate-receipt-key.js';
 import type { GateReceiptReusePort } from '../../application/ports/out/GateReceiptReusePort.out-port.js';
@@ -881,16 +882,15 @@ const MAX_DECLARED_ENVIRONMENT_NAMES = 16;
 const TOOLCHAIN_VERSION_TOKEN = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/;
 /** A declared name is passed to `printenv` as an argument, so it can never look like an option or a pattern. */
 const DECLARED_ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
-/** The marker before the worktree path in a probe's `cd` wrapper; the real command starts after it. */
-const PROBE_SH_MARKER = 'fleet-probe';
 /**
- * Runs `argv` inside the worktree. The executor may ignore `cwd` (an ssh
- * transport runs in the login directory), so every receipt-input probe goes
- * through the same `cd` wrapper the gate commands themselves use: `$1` is the
- * worktree, and the remaining words are exec'd there.
+ * Runs `argv` inside the worktree as a plain argv command: no shell, no `sh -c`.
+ * The executor may ignore `cwd` (an ssh transport runs in the login directory),
+ * so the probe is prefixed with `env -C <worktree>`, which changes directory and
+ * execs the rest as separate words. Every word reaches the program literally.
+ * A host whose `env` has no `-C` fails the probe, which is a receipt miss.
  */
 function inWorktree(worktreePath: string, argv: readonly string[]): string[] {
-  return ['sh', '-c', 'cd -- "$1" && shift && exec "$@"', PROBE_SH_MARKER, worktreePath, ...argv];
+  return ['/usr/bin/env', '-C', worktreePath, ...argv];
 }
 
 /** One guarded receipt-input command, run inside the worktree, with a timeout and an output cap. A throw or a run with no completed exit is undefined. */
@@ -963,6 +963,10 @@ export async function readGateToolchainVersions(
   }
 }
 
+const TURBO_TASK_SCHEMA: PlainRecordSchema = {
+  env: { kind: 'array', items: { kind: 'string', maxLength: 128 }, maxLength: 64, optional: true },
+};
+
 /** The sorted union of the `env` names of `turbo.json`'s tasks, or undefined when absent, malformed or too many. */
 function declaredEnvironmentNames(turboJson: string): string[] | undefined {
   let parsed: unknown;
@@ -980,15 +984,17 @@ function declaredEnvironmentNames(turboJson: string): string[] | undefined {
   }
   const names = new Set<string>();
   for (const task of Object.values(tasks)) {
-    const env = task !== null && typeof task === 'object' ? (task as { env?: unknown }).env : undefined;
+    // Runtime input: each task is read as a plain record (own data properties only, bounded, never throws).
+    const read = readPlainRecord(task, TURBO_TASK_SCHEMA);
+    if (!read.ok) {
+      return undefined;
+    }
+    const env = read.value['env'];
     if (env === undefined) {
       continue;
     }
-    if (!Array.isArray(env)) {
-      return undefined;
-    }
-    for (const name of env) {
-      if (typeof name !== 'string' || !DECLARED_ENVIRONMENT_NAME.test(name)) {
+    for (const name of env as readonly string[]) {
+      if (!DECLARED_ENVIRONMENT_NAME.test(name)) {
         return undefined;
       }
       names.add(name);
@@ -1028,26 +1034,20 @@ export async function readGateDeclaredEnvironmentDigest(
       return undefined;
     }
     const entries: Array<[string, string]> = [];
-    const unset: string[] = [];
     for (const name of names) {
       const run = await runReceiptProbe(executor, worktreePath, ['printenv', name], DECLARED_VALUE_MAX_BYTES);
       if (run === undefined || (run.exitCode !== 0 && run.exitCode !== 1)) {
         return undefined;
       }
-      // printenv exits 1 for a variable that is not set: it is recorded as
-      // unset, never as the empty string, so a gate command can tell
-      // `process.env.NAME === undefined` from `process.env.NAME === ''`.
+      // printenv exits 1 for a variable that is not set: its value is the empty string.
       const value = run.exitCode === 1 ? '' : run.stdout.replace(/\n$/, '');
       if (Buffer.byteLength(value, 'utf8') > DECLARED_VALUE_MAX_BYTES) {
         return undefined;
       }
       entries.push([name, value]);
-      if (run.exitCode === 1) {
-        unset.push(name);
-      }
     }
     return createHash('sha256')
-      .update(JSON.stringify({ names, values: Object.fromEntries(entries), unset }))
+      .update(JSON.stringify({ names, values: Object.fromEntries(entries) }))
       .digest('hex');
   } catch {
     return undefined;

@@ -1,6 +1,7 @@
 // KS2c: the two receipt-input readers (toolchain versions, declared environment digest) over a scripted executor.
 import { describe, expect, it } from 'vitest';
 
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
 import {
@@ -34,8 +35,7 @@ class ProbeExecutor implements CommandExecutorPort {
     this.calls.push({ argv, options });
     // Every probe runs inside the worktree through the `cd` wrapper; answers are
     // keyed by the wrapped command after its `fleet-probe` marker.
-    const marker = argv.indexOf('fleet-probe');
-    const inner = marker >= 0 ? argv.slice(marker + 2) : argv;
+    const inner = argv[0] === '/usr/bin/env' && argv[1] === '-C' ? argv.slice(3) : argv;
     const answer = this.answers[inner.join(' ')];
     if (answer === 'throw') {
       throw new Error('executor died');
@@ -87,10 +87,10 @@ describe('gate receipt input readers (KS2c)', () => {
       turbo: '2.5.4',
     });
     expect(executor.calls.map((call) => call.argv)).toEqual([
-      ['sh', '-c', 'cd -- "$1" && shift && exec "$@"', 'fleet-probe', WORKTREE, 'node', '--version'],
-      ['sh', '-c', 'cd -- "$1" && shift && exec "$@"', 'fleet-probe', WORKTREE, 'yarn', '--version'],
-      ['sh', '-c', 'cd -- "$1" && shift && exec "$@"', 'fleet-probe', WORKTREE, HEXAGEN_BIN, '--version'],
-      ['sh', '-c', 'cd -- "$1" && shift && exec "$@"', 'fleet-probe', WORKTREE, TURBO_BIN, '--version'],
+      ['/usr/bin/env', '-C', WORKTREE, 'node', '--version'],
+      ['/usr/bin/env', '-C', WORKTREE, 'yarn', '--version'],
+      ['/usr/bin/env', '-C', WORKTREE, HEXAGEN_BIN, '--version'],
+      ['/usr/bin/env', '-C', WORKTREE, TURBO_BIN, '--version'],
     ]);
   });
 
@@ -122,13 +122,35 @@ describe('gate receipt input readers (KS2c)', () => {
     expect(first).toMatch(/^[0-9a-f]{64}$/);
     await expect(digestOf({ ...same })).resolves.toBe(first);
     await expect(digestOf({ ...same, DECLARED_TWO: 'changed' })).resolves.not.toBe(first);
-    // An unset variable is never the empty string: a gate command can tell
-    // `process.env.NAME === undefined` from `process.env.NAME === ''`.
+    // An unset variable is hashed as the empty string (the brief's digest is exactly { names, values }).
     const unset = await digestOf({ DECLARED_ONE: 'one', DECLARED_TWO: null });
-    expect(unset).toMatch(/^[0-9a-f]{64}$/);
     expect(unset).not.toBe(first);
-    await expect(digestOf({ DECLARED_ONE: 'one', DECLARED_TWO: '' })).resolves.not.toBe(unset);
-    await expect(digestOf({ DECLARED_ONE: 'one', DECLARED_TWO: '' })).resolves.not.toBe(first);
+    await expect(digestOf({ DECLARED_ONE: 'one', DECLARED_TWO: '' })).resolves.toBe(unset);
+  });
+
+  it('pins the digest to SHA-256 of JSON.stringify({ names, values })', async () => {
+    const digest = await readGateDeclaredEnvironmentDigest(
+      new ProbeExecutor(environment(DECLARED, { DECLARED_ONE: 'one', DECLARED_TWO: null })),
+      WORKTREE,
+    );
+    const expected = createHash('sha256')
+      .update(JSON.stringify({ names: ['DECLARED_ONE', 'DECLARED_TWO'], values: { DECLARED_ONE: 'one', DECLARED_TWO: '' } }))
+      .digest('hex');
+    expect(digest).toBe(expected);
+  });
+
+  it('runs every probe as an argv command with no shell, passing metacharacters literally', async () => {
+    const hostile = '/lanes/a b;$(touch x)`id`|&\'"';
+    const executor = new ProbeExecutor({});
+    await readGateToolchainVersions(executor, hostile);
+    await readGateDeclaredEnvironmentDigest(executor, hostile);
+    expect(executor.calls.length).toBeGreaterThan(0);
+    for (const call of executor.calls) {
+      expect(call.argv.slice(0, 3)).toEqual(['/usr/bin/env', '-C', hostile]);
+      expect(call.argv).not.toContain('sh');
+      expect(call.argv).not.toContain('-c');
+      expect(call.options?.cwd).toBe(hostile);
+    }
   });
 
   it('an unreadable turbo.json is a miss', async () => {
@@ -221,7 +243,7 @@ describe('gate receipt input readers (KS2c)', () => {
     });
     await readGateToolchainVersions(executor, WORKTREE);
     await readGateDeclaredEnvironmentDigest(executor, WORKTREE);
-    const innerCalls = executor.calls.map((call) => call.argv.slice(call.argv.indexOf('fleet-probe') + 2));
+    const innerCalls = executor.calls.map((call) => call.argv.slice(3));
     expect(innerCalls.map((argv) => argv.join(' '))).toEqual([
       'node --version',
       'yarn --version',
@@ -232,7 +254,7 @@ describe('gate receipt input readers (KS2c)', () => {
       'printenv DECLARED_TWO',
     ]);
     for (const call of executor.calls) {
-      const inner = call.argv.slice(call.argv.indexOf('fleet-probe') + 2);
+      const inner = call.argv.slice(3);
       expect(inner[0]).not.toBe('git');
       expect(inner[0]).not.toBe('sh');
       expect(inner.join(' ')).not.toMatch(/curl|wget|ssh|https?:/);

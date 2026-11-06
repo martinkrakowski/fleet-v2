@@ -54,7 +54,7 @@ class ScriptedExecutor implements CommandExecutorPort {
     [TURBO_BIN]: 'turbo 2.5.4',
   };
   turboJson: string | null = JSON.stringify({ tasks: { build: { env: ['DECLARED_ONE'] } } });
-  env: Record<string, string> = { DECLARED_ONE: DECLARED_VALUE };
+  hostValues: Record<string, string> = { DECLARED_ONE: DECLARED_VALUE };
   failingProbes = new Set<string>();
   throwEverything = false;
   gateExit: Record<string, number> = {};
@@ -67,9 +67,8 @@ class ScriptedExecutor implements CommandExecutorPort {
     const ok = (stdout: string): CommandRunResult => ({ exitCode: 0, signal: null, stdout, stderr: '' });
     // A receipt-input probe runs inside the worktree through the `cd` wrapper:
     // its real command starts after the `fleet-probe` marker.
-    const probeMarker = argv.indexOf('fleet-probe');
-    if (probeMarker >= 0) {
-      const inner = argv.slice(probeMarker + 2);
+    if (argv[0] === '/usr/bin/env' && argv[1] === '-C') {
+      const inner = argv.slice(3);
       if (this.failingProbes.has(inner.join(' '))) {
         return { exitCode: null, signal: 'SIGKILL', stdout: '', stderr: '', error: 'timed out' };
       }
@@ -83,7 +82,7 @@ class ScriptedExecutor implements CommandExecutorPort {
           : ok(this.turboJson);
       }
       if (head === 'printenv') {
-        const value = this.env[inner[1] ?? ''];
+        const value = this.hostValues[inner[1] ?? ''];
         return value === undefined
           ? { exitCode: 1, signal: null, stdout: '', stderr: '' }
           : ok(value + '\n');
@@ -212,7 +211,7 @@ describe('gate receipt reuse wiring (KS2c)', () => {
     expect(changedToolchain.gateRuns).toEqual(['gate-a']);
 
     const changedEnvironment = new ScriptedExecutor();
-    changedEnvironment.env.DECLARED_ONE = 'another declared value';
+    changedEnvironment.hostValues["DECLARED_ONE"] = 'another declared value';
     await adapterOver(changedEnvironment, store).evaluateGatePredicates(requestWith([GATE]));
     expect(changedEnvironment.gateRuns).toEqual(['gate-a']);
 
@@ -341,8 +340,7 @@ describe('gate receipt reuse wiring (KS2c)', () => {
     const executor = new ScriptedExecutor();
     await adapterOver(executor, new SpyStore()).evaluateGatePredicates(requestWith([GATE]));
     const probes = executor.calls.filter((call) => {
-      const marker = call.argv.indexOf('fleet-probe');
-      const inner = marker >= 0 ? call.argv.slice(marker + 2) : call.argv;
+      const inner = call.argv[0] === '/usr/bin/env' && call.argv[1] === '-C' ? call.argv.slice(3) : call.argv;
       return inner[1] === '--version' || inner[0] === 'cat' || inner[0] === 'printenv';
     });
     expect(probes).toHaveLength(6);

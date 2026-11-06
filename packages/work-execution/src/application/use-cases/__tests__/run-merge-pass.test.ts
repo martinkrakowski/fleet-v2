@@ -133,6 +133,9 @@ function queueFake(records: readonly MergeQueueEntryRecord[]): MergeQueueReposit
     async retryMergeEntry() {
       throw new Error('not used');
     },
+    async applyMergeTransition() {
+      throw new Error('not used');
+    },
   };
 }
 

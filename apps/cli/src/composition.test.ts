@@ -131,6 +131,17 @@ describe('apps/cli composition', () => {
     });
   });
 
+  describe('WB5b: the merge path saves a merge record', () => {
+    it('the composed forge use case is wired with the merge-record and lane-plan stores', () => {
+      const rt = createFleetCliRuntime();
+      const forgeDeps = (rt.execution.executeAuthorizedForgeAction as unknown as {
+        deps?: { mergeRecordRepo?: unknown; lanePlanRepo?: unknown };
+      }).deps;
+      expect(forgeDeps?.mergeRecordRepo).toBeDefined();
+      expect(forgeDeps?.lanePlanRepo).toBeDefined();
+    });
+  });
+
   describe('H7: end-to-end grant action scope check at consumption', () => {
     it('a grant for push-and-open-pr at head H cannot be consumed for merge-pr at H', async () => {
       const rt = createFleetCliRuntime();
@@ -181,6 +192,7 @@ describe('apps/cli composition', () => {
         attemptId,
         workOrderId,
         kind: 'merge-pr',
+        pullRequestNumber: 7,
         expectedHeadSha: headH,
         authorizationGrantId: grantId,
       });
@@ -246,6 +258,7 @@ describe('apps/cli composition', () => {
         attemptId,
         workOrderId,
         kind: 'merge-pr',
+        pullRequestNumber: 7,
         expectedHeadSha: headH,
         authorizationGrantId: grantId,
       });
@@ -297,6 +310,7 @@ describe('apps/cli composition', () => {
         attemptId,
         workOrderId,
         kind: 'merge-pr',
+        pullRequestNumber: 7,
         expectedHeadSha: headH,
         authorizationGrantId: grantId,
       });

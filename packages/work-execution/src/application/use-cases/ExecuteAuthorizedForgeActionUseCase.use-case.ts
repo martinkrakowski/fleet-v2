@@ -514,19 +514,19 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       }
     }
 
-    // A merge that cannot say which pull request it merges would mark the work
-    // order merged with no merge record: refuse before the grant is consumed
-    // and before any forge call.
-    if (
-      request.kind === "merge-pr" &&
-      deps.mergeRecordRepo !== undefined &&
-      normalizedRepository !== null &&
-      preResolvedPrNumber === undefined
-    ) {
-      return {
-        outcome: "refused",
-        reason: "the pull request number could not be resolved for the merge",
-      };
+    // A merge with nowhere to record it, or one that cannot say which pull
+    // request it merges, would mark the work order merged with no merge
+    // record: refuse before the grant is consumed and before any forge call.
+    if (request.kind === "merge-pr") {
+      if (deps.mergeRecordRepo === undefined) {
+        return { outcome: "refused", reason: "merge-record-store-unavailable" };
+      }
+      if (normalizedRepository === null || preResolvedPrNumber === undefined) {
+        return {
+          outcome: "refused",
+          reason: "the pull request number could not be resolved for the merge",
+        };
+      }
     }
 
     const authorization =

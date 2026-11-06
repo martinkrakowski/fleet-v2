@@ -300,6 +300,20 @@ describe("fleet-v2 attempt gate wiring (GP-wire)", () => {
     });
     await runtime.execution.workOrderRepository.saveWorkOrder(makeWorkOrder());
     await runtime.execution.attemptRepository.saveAttempt(makeAttempt());
+    // The attempt's PR was opened by an earlier forge action; its typed
+    // journal reference is how the merge resolves the pull request (WB5b).
+    await runtime.execution.executionJournal.appendJournalEntry({
+      id: "forge:open-pr:completed:1",
+      attemptId: ATTEMPT_ID,
+      workOrderId: WORK_ORDER_ID,
+      action: "forge",
+      status: "completed",
+      baseCommit: BASE,
+      recordedAtIso: "2026-10-28T09:00:00.000Z",
+      sessionId: null,
+      detail: "pull request #7",
+      pullRequest: { repository: "example-org/example-repo", number: 7 },
+    });
     await runtime.evidence.evidenceAssessmentRepository.saveAssessment(makeAssessment());
 
     const assessIo = collectIo();

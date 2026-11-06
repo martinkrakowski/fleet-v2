@@ -206,7 +206,7 @@ function envelopeOf(payload: unknown): { code: string; result: Record<string, un
 // Pilot identities.
 // ---------------------------------------------------------------------------
 
-const PILOT_HEAD = "0123456789abcdef";
+const PILOT_HEAD = "0123456789abcdef0123456789abcdef01234567";
 const MATRIX_HEAD = "aaaabbbbccccdddd";
 
 const PILOT_PROFILE_REQUEST = {
@@ -911,6 +911,7 @@ describe("restarted API and web client loopback pilot", () => {
       attemptId: "attempt-pilot-1",
       workOrderId: "wo-pilot-1",
       kind: "merge-pr",
+      pullRequestNumber: 7,
       expectedHeadSha: PILOT_HEAD,
       authorizationGrantId: "grant-unknown",
     });
@@ -930,6 +931,7 @@ describe("restarted API and web client loopback pilot", () => {
       attemptId: "attempt-pilot-1",
       workOrderId: "wo-pilot-1",
       kind: "merge-pr",
+      pullRequestNumber: 7,
       expectedHeadSha: PILOT_HEAD,
       authorizationGrantId: "grant-pilot-1",
     });

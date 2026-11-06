@@ -35,6 +35,7 @@ import {
   InspectWorkOrderUseCase,
   LaneDiffCheckAdapter,
   LanePlanRepositoryAdapter,
+  MergeRecordRepositoryAdapter,
   LegacyTrainStateReadAdapter,
   ListMergeQueueUseCase,
   ListUnregisteredProjectsUseCase,
@@ -535,6 +536,9 @@ export function composeExecution(input: ComposeExecutionInput) {
   // stateDir is omitted, lane-plans.json otherwise). Its change signal
   // defaults to a no-op, exactly as the work-order adapter's does.
   const lanePlanRepository = new LanePlanRepositoryAdapter({ stateDir });
+  // WB5b: a completed merge saves its record (merge-records.json) beside the
+  // other work-execution stores; without it `merge-pr` refuses.
+  const mergeRecordRepository = new MergeRecordRepositoryAdapter({ stateDir });
 
   const execution = {
     workOrderRepository,
@@ -690,6 +694,8 @@ export function composeExecution(input: ComposeExecutionInput) {
       // owner-decision resolution acceptance uses.
       ownerDecisionPort: ownerDecision,
       attemptOwnerDecisionPort: attemptOwnerDecision,
+      lanePlanRepo: lanePlanRepository,
+      mergeRecordRepo: mergeRecordRepository,
       // Forge mode `none` (D6) refuses every forge action.
       ...(forgeMode === 'none' ? { forgeMode: 'none' as const } : {}),
     }),

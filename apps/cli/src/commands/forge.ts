@@ -1,6 +1,6 @@
 /** The `forge` command group of the CLI driver; its entries moved verbatim from the command table. */
 
-import { str, CliUsageError } from './payload.js';
+import { str, optNum, CliUsageError } from './payload.js';
 import type { CommandHandler } from './payload.js';
 
 export const forgeCommands: Readonly<Record<string, CommandHandler>> = {
@@ -20,6 +20,11 @@ export const forgeCommands: Readonly<Record<string, CommandHandler>> = {
         kind,
         expectedHeadSha: str(p, 'expectedHeadSha') || attempt?.artifacts?.headCommit || '',
         authorizationGrantId: str(p, 'authorizationGrantId'),
+        // A merge names its pull request unless the attempt's journal already
+        // holds the typed reference from the action that opened it (WB5b).
+        ...(optNum(p, 'pullRequestNumber') !== undefined
+          ? { pullRequestNumber: optNum(p, 'pullRequestNumber') as number }
+          : {}),
       });
     },
 };

@@ -1,63 +1,63 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from "vitest";
 import type {
   ActionJournalEntryRecord,
   AttemptRecord,
   CapacityReservationRecord,
   WorkOrderRecord,
-} from '../../domain/execution-records.js';
+} from "../../domain/execution-records.js";
 import type {
   ActionAuthorizationPort,
   ConsumeActionAuthorizationRequest,
   ConsumeActionAuthorizationResult,
-} from '../ports/out/ActionAuthorizationPort.out-port.js';
-import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
+} from "../ports/out/ActionAuthorizationPort.out-port.js";
+import type { AttemptRepositoryPort } from "../ports/out/AttemptRepositoryPort.out-port.js";
 import type {
   ExecutionJournalPort,
   ReserveCapacityAtomicallyRequest,
-} from '../ports/out/ExecutionJournalPort.out-port.js';
+} from "../ports/out/ExecutionJournalPort.out-port.js";
 import type {
   ForgeActionPort,
   ForgeActionRequest,
   ForgeActionResult,
-} from '../ports/out/ForgeActionPort.out-port.js';
-import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
+} from "../ports/out/ForgeActionPort.out-port.js";
+import type { WorkOrderRepositoryPort } from "../ports/out/WorkOrderRepositoryPort.out-port.js";
 import type {
   AcceptanceEvidencePort,
   ReadAcceptanceRequest,
   ReadAcceptanceResult,
-} from '../ports/out/AcceptanceEvidencePort.out-port.js';
-import type { AttemptOwnerDecisionPort } from '../ports/out/AttemptOwnerDecisionPort.out-port.js';
-import type {
-  OwnerDecisionPort,
-} from '../ports/out/OwnerDecisionPort.out-port.js';
-import { ExecuteAuthorizedForgeActionUseCase } from './ExecuteAuthorizedForgeActionUseCase.use-case.js';
+} from "../ports/out/AcceptanceEvidencePort.out-port.js";
+import type { AttemptOwnerDecisionPort } from "../ports/out/AttemptOwnerDecisionPort.out-port.js";
+import type { OwnerDecisionPort } from "../ports/out/OwnerDecisionPort.out-port.js";
+import { ExecuteAuthorizedForgeActionUseCase } from "./ExecuteAuthorizedForgeActionUseCase.use-case.js";
 import {
   decideMergeRecord,
   type MergeRecordRecord,
-} from '../../domain/entities/MergeRecord.js';
+} from "../../domain/entities/MergeRecord.js";
 import {
   decidePullRequestLink,
   pullRequestLinkConflictKey,
   pullRequestLinkKey,
-} from '../../domain/entities/PullRequestLink.js';
+} from "../../domain/entities/PullRequestLink.js";
 import type {
   LanePlanRecord,
   PullRequestLinkConflictRecord,
   PullRequestLinkRecord,
-} from '../../domain/lane-plan-records.js';
+} from "../../domain/lane-plan-records.js";
 import type {
   LanePlanRepositoryPort,
   SaveLanePlanResult,
   SavePullRequestLinkConflictResult,
   SavePullRequestLinkResult,
-} from '../ports/out/LanePlanRepositoryPort.out-port.js';
-import type { MergeRecordRepositoryPort } from '../ports/out/MergeRecordRepositoryPort.out-port.js';
-import type { MergeRecordSaveOutcome } from '../ports/out/MergeRecordRepositoryPort.out-port.js';
+} from "../ports/out/LanePlanRepositoryPort.out-port.js";
+import type { MergeRecordRepositoryPort } from "../ports/out/MergeRecordRepositoryPort.out-port.js";
+import type { MergeRecordSaveOutcome } from "../ports/out/MergeRecordRepositoryPort.out-port.js";
 
 class InMemoryAcceptanceEvidencePort implements AcceptanceEvidencePort {
   constructor(private readonly result: ReadAcceptanceResult) {}
 
-  async readAcceptance(_request: ReadAcceptanceRequest): Promise<ReadAcceptanceResult> {
+  async readAcceptance(
+    _request: ReadAcceptanceRequest,
+  ): Promise<ReadAcceptanceResult> {
     return this.result;
   }
 }
@@ -71,8 +71,12 @@ class InMemoryAttemptRepo implements AttemptRepositoryPort {
   async saveAttempt(record: AttemptRecord): Promise<void> {
     this.attempt = record;
   }
-  async listAttemptsByWorkOrder(workOrderId: string): Promise<readonly AttemptRecord[]> {
-    return this.attempt && this.attempt.workOrderId === workOrderId ? [this.attempt] : [];
+  async listAttemptsByWorkOrder(
+    workOrderId: string,
+  ): Promise<readonly AttemptRecord[]> {
+    return this.attempt && this.attempt.workOrderId === workOrderId
+      ? [this.attempt]
+      : [];
   }
   async listAllAttempts(): Promise<readonly AttemptRecord[]> {
     return this.attempt ? [this.attempt] : [];
@@ -88,7 +92,9 @@ class InMemoryWorkOrderRepo implements WorkOrderRepositoryPort {
   async saveWorkOrder(record: WorkOrderRecord): Promise<void> {
     this.workOrder = record;
   }
-  async listWorkOrdersByProject(projectId?: string): Promise<readonly WorkOrderRecord[]> {
+  async listWorkOrdersByProject(
+    projectId?: string,
+  ): Promise<readonly WorkOrderRecord[]> {
     if (!this.workOrder) return [];
     if (projectId && this.workOrder.projectId !== projectId) return [];
     return [this.workOrder];
@@ -107,7 +113,9 @@ class InMemoryJournal implements ExecutionJournalPort {
     this.entries.push(entry);
   }
 
-  async listJournalEntriesForAttempt(attemptId: string): Promise<readonly ActionJournalEntryRecord[]> {
+  async listJournalEntriesForAttempt(
+    attemptId: string,
+  ): Promise<readonly ActionJournalEntryRecord[]> {
     return this.entries.filter((e) => e.attemptId === attemptId);
   }
 
@@ -119,78 +127,89 @@ class InMemoryJournal implements ExecutionJournalPort {
     return false;
   }
   async reserveCapacityAtomically(request: ReserveCapacityAtomicallyRequest) {
-    const reservation: CapacityReservationRecord = { ...request.record!, slotIndex: 0 };
-    return { outcome: 'reserved' as const, reservation };
+    const reservation: CapacityReservationRecord = {
+      ...request.record!,
+      slotIndex: 0,
+    };
+    return { outcome: "reserved" as const, reservation };
   }
 }
 
 function makeAttemptRecord(): AttemptRecord {
   return {
-    id: 'att-001',
+    id: "att-001",
     ownerDecisionReferences: [],
-    workOrderId: 'wo-001',
-    kind: 'initial',
+    workOrderId: "wo-001",
+    kind: "initial",
     fixNumber: 0,
     priorAttemptId: null,
-    state: 'collected',
-    outcome: 'done',
-    baseCommit: 'base-000',
-    worktreePath: '/tmp/worktree',
-    briefDigest: 'sha256-brief',
+    state: "collected",
+    outcome: "done",
+    baseCommit: "base-000",
+    worktreePath: "/tmp/worktree",
+    briefDigest: "sha256-brief",
     briefPackagePath: null,
     sessionId: null,
     completionReceipt: null,
     artifacts: {
-      headCommit: '1111111111111111111111111111111111111111',
-      commitsSinceBase: ['1111111111111111111111111111111111111111'],
-      collectedArtifactPaths: ['/tmp/patch.diff'],
-      notes: 'present',
+      headCommit: "1111111111111111111111111111111111111111",
+      commitsSinceBase: ["1111111111111111111111111111111111111111"],
+      collectedArtifactPaths: ["/tmp/patch.diff"],
+      notes: "present",
     },
-    createdAtIso: '2026-10-15T10:00:00Z',
-    updatedAtIso: '2026-10-15T10:30:00Z',
+    createdAtIso: "2026-10-15T10:00:00Z",
+    updatedAtIso: "2026-10-15T10:30:00Z",
   };
 }
 
 /** An attempt-owner-decision port backed by one attempt repository. */
-function attemptDoorsFrom(repo: AttemptRepositoryPort): AttemptOwnerDecisionPort {
+function attemptDoorsFrom(
+  repo: AttemptRepositoryPort,
+): AttemptOwnerDecisionPort {
   return {
     async readAttemptOwnerDecisionReferences({ attemptId }) {
       const record = await repo.findAttemptById(attemptId);
       if (record === null) {
-        return { outcome: 'unknown', reason: `No attempt is recorded for ${attemptId}` };
+        return {
+          outcome: "unknown",
+          reason: `No attempt is recorded for ${attemptId}`,
+        };
       }
       if (record.ownerDecisionReferences === undefined) {
         return {
-          outcome: 'unknown',
+          outcome: "unknown",
           reason: `attempt ${attemptId} was recorded before owner decision references were frozen`,
         };
       }
-      return { outcome: 'recorded', ownerDecisionReferences: record.ownerDecisionReferences };
+      return {
+        outcome: "recorded",
+        ownerDecisionReferences: record.ownerDecisionReferences,
+      };
     },
   };
 }
 
 function makeWorkOrderRecord(): WorkOrderRecord {
   return {
-    id: 'wo-001',
-    projectId: 'proj-001',
-    taskId: 'task-001',
-    laneId: 'lane-auth',
-    repository: 'github.com/org/repo',
-    state: 'approved',
+    id: "wo-001",
+    projectId: "proj-001",
+    taskId: "task-001",
+    laneId: "lane-auth",
+    repository: "github.com/org/repo",
+    state: "approved",
     revision: 1,
-    baseCommit: 'base-000',
-    ownedPaths: ['src/'],
-    policyRevision: 'pol-1',
+    baseCommit: "base-000",
+    ownedPaths: ["src/"],
+    policyRevision: "pol-1",
     prerequisiteWorkOrderIds: [],
-    createdAtIso: '2026-10-15T09:00:00Z',
-    updatedAtIso: '2026-10-15T10:35:00Z',
+    createdAtIso: "2026-10-15T09:00:00Z",
+    updatedAtIso: "2026-10-15T10:35:00Z",
   };
 }
 
-describe('ExecuteAuthorizedForgeActionUseCase', () => {
-  describe('forge mode none (D6)', () => {
-    it('refuses every forge action before any grant is consumed, journalled or executed', async () => {
+describe("ExecuteAuthorizedForgeActionUseCase", () => {
+  describe("forge mode none (D6)", () => {
+    it("refuses every forge action before any grant is consumed, journalled or executed", async () => {
       const journal = new InMemoryJournal();
       const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
@@ -198,42 +217,43 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       let consumed = false;
       const authorizationPort: ActionAuthorizationPort = {
         async resolveActionAuthorization() {
-          return { outcome: 'granted', authorizationGrantId: 'g-1' };
+          return { outcome: "granted", authorizationGrantId: "g-1" };
         },
         async consumeActionAuthorization(
           _req: ConsumeActionAuthorizationRequest,
         ): Promise<ConsumeActionAuthorizationResult> {
           consumed = true;
-          return { outcome: 'consumed', actionId: _req.actionId };
+          return { outcome: "consumed", actionId: _req.actionId };
         },
       };
       const forgePort: ForgeActionPort = {
         isConfigured: () => true,
         async performForgeAction(): Promise<ForgeActionResult> {
-          throw new Error('Should never be called');
+          throw new Error("Should never be called");
         },
       };
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         workOrderRepo,
         journal,
         authorizationPort,
         forgePort,
-        forgeMode: 'none',
+        forgeMode: "none",
       });
 
       const result = await useCase.executeAuthorizedForgeAction({
-        actionId: 'forge-att-001',
-        attemptId: 'att-001',
-        workOrderId: 'wo-001',
-        kind: 'push-and-open-pr',
-        expectedHeadSha: '1111111111111111111111111111111111111111',
-        authorizationGrantId: 'grant-001',
+        actionId: "forge-att-001",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-and-open-pr",
+        expectedHeadSha: "1111111111111111111111111111111111111111",
+        authorizationGrantId: "grant-001",
       });
 
-      expect(result.outcome).toBe('refused');
-      if (result.outcome === 'refused') {
+      expect(result.outcome).toBe("refused");
+      if (result.outcome === "refused") {
         expect(result.reason).toContain("Forge mode is 'none'");
       }
       expect(consumed).toBe(false);
@@ -241,8 +261,8 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
     });
   });
 
-  describe('M7: journal sequence derivation across use case instances', () => {
-    it('two use-case instances on the same journal, the second after a refusal, produce distinct ids and a typed result, no throw', async () => {
+  describe("M7: journal sequence derivation across use case instances", () => {
+    it("two use-case instances on the same journal, the second after a refusal, produce distinct ids and a typed result, no throw", async () => {
       const journal = new InMemoryJournal();
       const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
@@ -250,42 +270,51 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       let consumeCalls = 0;
       const authorizationPort: ActionAuthorizationPort = {
         async resolveActionAuthorization() {
-          return { outcome: 'granted', authorizationGrantId: 'g-1' };
+          return { outcome: "granted", authorizationGrantId: "g-1" };
         },
-        async consumeActionAuthorization(_req: ConsumeActionAuthorizationRequest): Promise<ConsumeActionAuthorizationResult> {
+        async consumeActionAuthorization(
+          _req: ConsumeActionAuthorizationRequest,
+        ): Promise<ConsumeActionAuthorizationResult> {
           consumeCalls++;
-          return { outcome: 'refused', reason: 'grant scope does not match' };
+          return { outcome: "refused", reason: "grant scope does not match" };
         },
       };
 
       const forgePort: ForgeActionPort = {
         isConfigured: () => true,
-        async performForgeAction(_req: ForgeActionRequest): Promise<ForgeActionResult> {
-          return { outcome: 'executed', headSha: '1111111111111111111111111111111111111111' };
+        async performForgeAction(
+          _req: ForgeActionRequest,
+        ): Promise<ForgeActionResult> {
+          return {
+            outcome: "executed",
+            headSha: "1111111111111111111111111111111111111111",
+          };
         },
       };
 
       const req = {
-        actionId: 'forge-att-001',
-        attemptId: 'att-001',
-        workOrderId: 'wo-001',
-        kind: 'merge-pr' as const,
-        expectedHeadSha: '1111111111111111111111111111111111111111',
-        authorizationGrantId: 'grant-001',
+        actionId: "forge-att-001",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "merge-pr" as const,
+        pullRequestNumber: 7,
+        expectedHeadSha: "1111111111111111111111111111111111111111",
+        authorizationGrantId: "grant-001",
       };
 
       // Instance 1 runs and is refused by authorization
       const defaultAcceptancePort = new InMemoryAcceptanceEvidencePort({
-        outcome: 'found',
+        outcome: "found",
         assessment: {
-          candidateHeadSha: '1111111111111111111111111111111111111111',
-          policyRevision: 'pol-1',
-          state: 'accepted',
-          acceptanceReceiptId: 'receipt-001',
+          candidateHeadSha: "1111111111111111111111111111111111111111",
+          policyRevision: "pol-1",
+          state: "accepted",
+          acceptanceReceiptId: "receipt-001",
         },
       });
 
       const instance1 = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -293,18 +322,19 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         authorizationPort,
         forgePort,
         acceptedReceiptByHead: {
-          '1111111111111111111111111111111111111111': 'receipt-001',
+          "1111111111111111111111111111111111111111": "receipt-001",
         },
         acceptanceEvidencePort: defaultAcceptancePort,
       });
       const result1 = await instance1.executeAuthorizedForgeAction(req);
-      expect(result1.outcome).toBe('refused');
+      expect(result1.outcome).toBe("refused");
       expect(consumeCalls).toBe(1);
       expect(journal.entries).toHaveLength(1);
-      expect(journal.entries[0]?.id).toBe('forge:forge-att-001:refused:1');
+      expect(journal.entries[0]?.id).toBe("forge:forge-att-001:refused:1");
 
       // Instance 2 simulates a second process running with a fresh use case instance on the same journal
       const instance2 = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -312,22 +342,22 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         authorizationPort,
         forgePort,
         acceptedReceiptByHead: {
-          '1111111111111111111111111111111111111111': 'receipt-001',
+          "1111111111111111111111111111111111111111": "receipt-001",
         },
         acceptanceEvidencePort: defaultAcceptancePort,
       });
       // This should NOT throw a duplicate key error!
       const result2 = await instance2.executeAuthorizedForgeAction(req);
-      expect(result2.outcome).toBe('refused');
+      expect(result2.outcome).toBe("refused");
       expect(consumeCalls).toBe(2);
       expect(journal.entries).toHaveLength(2);
-      expect(journal.entries[1]?.id).toBe('forge:forge-att-001:refused:2');
+      expect(journal.entries[1]?.id).toBe("forge:forge-att-001:refused:2");
       expect(journal.entries[0]?.id).not.toBe(journal.entries[1]?.id);
     });
   });
 
-  describe('M10: forge readiness before consumption', () => {
-    it('refuses with unavailable and leaves grant unconsumed when forgePort is not configured', async () => {
+  describe("M10: forge readiness before consumption", () => {
+    it("refuses with unavailable and leaves grant unconsumed when forgePort is not configured", async () => {
       const journal = new InMemoryJournal();
       const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
@@ -335,11 +365,13 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       let consumed = false;
       const authorizationPort: ActionAuthorizationPort = {
         async resolveActionAuthorization() {
-          return { outcome: 'granted', authorizationGrantId: 'g-1' };
+          return { outcome: "granted", authorizationGrantId: "g-1" };
         },
-        async consumeActionAuthorization(_req: ConsumeActionAuthorizationRequest): Promise<ConsumeActionAuthorizationResult> {
+        async consumeActionAuthorization(
+          _req: ConsumeActionAuthorizationRequest,
+        ): Promise<ConsumeActionAuthorizationResult> {
           consumed = true;
-          return { outcome: 'consumed', actionId: _req.actionId };
+          return { outcome: "consumed", actionId: _req.actionId };
         },
       };
 
@@ -347,11 +379,12 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       const unconfiguredForgePort: ForgeActionPort = {
         isConfigured: () => false,
         async performForgeAction(): Promise<ForgeActionResult> {
-          throw new Error('Should never be called');
+          throw new Error("Should never be called");
         },
       };
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -359,81 +392,87 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         authorizationPort,
         forgePort: unconfiguredForgePort,
         acceptedReceiptByHead: {
-          '1111111111111111111111111111111111111111': 'receipt-001',
+          "1111111111111111111111111111111111111111": "receipt-001",
         },
         acceptanceEvidencePort: new InMemoryAcceptanceEvidencePort({
-          outcome: 'found',
+          outcome: "found",
           assessment: {
-            candidateHeadSha: '1111111111111111111111111111111111111111',
-            policyRevision: 'pol-1',
-            state: 'accepted',
-            acceptanceReceiptId: 'receipt-001',
+            candidateHeadSha: "1111111111111111111111111111111111111111",
+            policyRevision: "pol-1",
+            state: "accepted",
+            acceptanceReceiptId: "receipt-001",
           },
         }),
       });
 
       const result = await useCase.executeAuthorizedForgeAction({
-        actionId: 'act-1',
-        attemptId: 'att-001',
-        workOrderId: 'wo-001',
-        kind: 'merge-pr',
-        expectedHeadSha: '1111111111111111111111111111111111111111',
-        authorizationGrantId: 'grant-001',
+        actionId: "act-1",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "merge-pr",
+        pullRequestNumber: 7,
+        expectedHeadSha: "1111111111111111111111111111111111111111",
+        authorizationGrantId: "grant-001",
       });
 
-      expect(result).toEqual({ outcome: 'refused', reason: 'unavailable' });
+      expect(result).toEqual({ outcome: "refused", reason: "unavailable" });
       expect(consumed).toBe(false);
       expect(journal.entries).toHaveLength(0);
     });
   });
 
-  describe('M12: acceptance evidence verification before merge-pr', () => {
+  describe("M12: acceptance evidence verification before merge-pr", () => {
     const validAssessment = {
-      candidateHeadSha: '1111111111111111111111111111111111111111',
-      policyRevision: 'pol-1',
-      state: 'accepted' as const,
-      acceptanceReceiptId: 'receipt-001',
+      candidateHeadSha: "1111111111111111111111111111111111111111",
+      policyRevision: "pol-1",
+      state: "accepted" as const,
+      acceptanceReceiptId: "receipt-001",
     };
 
     const mergeReq = {
-      actionId: 'forge-act-1',
-      attemptId: 'att-001',
-      workOrderId: 'wo-001',
-      kind: 'merge-pr' as const,
-      expectedHeadSha: '1111111111111111111111111111111111111111',
-      authorizationGrantId: 'grant-001',
+      actionId: "forge-act-1",
+      attemptId: "att-001",
+      workOrderId: "wo-001",
+      kind: "merge-pr" as const,
+      pullRequestNumber: 7,
+      expectedHeadSha: "1111111111111111111111111111111111111111",
+      authorizationGrantId: "grant-001",
     };
 
     const successfulAuthPort: ActionAuthorizationPort = {
       async resolveActionAuthorization() {
-        return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+        return { outcome: "granted", authorizationGrantId: "grant-001" };
       },
       async consumeActionAuthorization(req) {
-        return { outcome: 'consumed', actionId: req.actionId };
+        return { outcome: "consumed", actionId: req.actionId };
       },
     };
 
     const successfulForgePort: ForgeActionPort = {
       isConfigured: () => true,
       async performForgeAction() {
-        return { outcome: 'executed', headSha: '1111111111111111111111111111111111111111' };
+        return {
+          outcome: "executed",
+          headSha: "1111111111111111111111111111111111111111",
+        };
       },
     };
 
-    it('stale assessment with a receipt in the map -> merge refused', async () => {
+    it("stale assessment with a receipt in the map -> merge refused", async () => {
       const journal = new InMemoryJournal();
       const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
 
       const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
-        outcome: 'found',
+        outcome: "found",
         assessment: {
           ...validAssessment,
-          state: 'stale',
+          state: "stale",
         },
       });
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -441,30 +480,31 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         authorizationPort: successfulAuthPort,
         forgePort: successfulForgePort,
         acceptedReceiptByHead: {
-          '1111111111111111111111111111111111111111': 'receipt-001',
+          "1111111111111111111111111111111111111111": "receipt-001",
         },
         acceptanceEvidencePort,
       });
 
       const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-      expect(result.outcome).toBe('refused');
-      expect((result as { reason: string }).reason).toContain('stale');
+      expect(result.outcome).toBe("refused");
+      expect((result as { reason: string }).reason).toContain("stale");
     });
 
-    it('policy moved -> merge refused', async () => {
+    it("policy moved -> merge refused", async () => {
       const journal = new InMemoryJournal();
       const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord()); // has policyRevision: 'pol-1'
 
       const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
-        outcome: 'found',
+        outcome: "found",
         assessment: {
           ...validAssessment,
-          policyRevision: 'pol-old-0',
+          policyRevision: "pol-old-0",
         },
       });
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -472,30 +512,33 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         authorizationPort: successfulAuthPort,
         forgePort: successfulForgePort,
         acceptedReceiptByHead: {
-          '1111111111111111111111111111111111111111': 'receipt-001',
+          "1111111111111111111111111111111111111111": "receipt-001",
         },
         acceptanceEvidencePort,
       });
 
       const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-      expect(result.outcome).toBe('refused');
-      expect((result as { reason: string }).reason).toContain('policy revision');
+      expect(result.outcome).toBe("refused");
+      expect((result as { reason: string }).reason).toContain(
+        "policy revision",
+      );
     });
 
-    it('blocked assessment -> merge refused', async () => {
+    it("blocked assessment -> merge refused", async () => {
       const journal = new InMemoryJournal();
       const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
 
       const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
-        outcome: 'found',
+        outcome: "found",
         assessment: {
           ...validAssessment,
-          state: 'blocked',
+          state: "blocked",
         },
       });
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -503,27 +546,28 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         authorizationPort: successfulAuthPort,
         forgePort: successfulForgePort,
         acceptedReceiptByHead: {
-          '1111111111111111111111111111111111111111': 'receipt-001',
+          "1111111111111111111111111111111111111111": "receipt-001",
         },
         acceptanceEvidencePort,
       });
 
       const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-      expect(result.outcome).toBe('refused');
-      expect((result as { reason: string }).reason).toContain('blocked');
+      expect(result.outcome).toBe("refused");
+      expect((result as { reason: string }).reason).toContain("blocked");
     });
 
-    it('missing assessment in evidence context -> merge refused', async () => {
+    it("missing assessment in evidence context -> merge refused", async () => {
       const journal = new InMemoryJournal();
       const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
 
       const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
-        outcome: 'not-found',
-        reason: 'no acceptance assessment recorded for the attempt head',
+        outcome: "not-found",
+        reason: "no acceptance assessment recorded for the attempt head",
       });
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -531,30 +575,31 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         authorizationPort: successfulAuthPort,
         forgePort: successfulForgePort,
         acceptedReceiptByHead: {
-          '1111111111111111111111111111111111111111': 'receipt-001',
+          "1111111111111111111111111111111111111111": "receipt-001",
         },
         acceptanceEvidencePort,
       });
 
       const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-      expect(result.outcome).toBe('refused');
-      expect((result as { reason: string }).reason).toContain('not found');
+      expect(result.outcome).toBe("refused");
+      expect((result as { reason: string }).reason).toContain("not found");
     });
 
-    it('assessment head mismatch -> merge refused', async () => {
+    it("assessment head mismatch -> merge refused", async () => {
       const journal = new InMemoryJournal();
       const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
 
       const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
-        outcome: 'found',
+        outcome: "found",
         assessment: {
           ...validAssessment,
-          candidateHeadSha: '2222222222222222222222222222222222222222',
+          candidateHeadSha: "2222222222222222222222222222222222222222",
         },
       });
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -562,23 +607,25 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         authorizationPort: successfulAuthPort,
         forgePort: successfulForgePort,
         acceptedReceiptByHead: {
-          '1111111111111111111111111111111111111111': 'receipt-001',
+          "1111111111111111111111111111111111111111": "receipt-001",
         },
         acceptanceEvidencePort,
       });
 
       const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-      expect(result.outcome).toBe('refused');
-      expect((result as { reason: string }).reason).toContain('does not match expectedHeadSha');
+      expect(result.outcome).toBe("refused");
+      expect((result as { reason: string }).reason).toContain(
+        "does not match expectedHeadSha",
+      );
     });
 
-    it('null acceptance receipt ID -> merge refused', async () => {
+    it("null acceptance receipt ID -> merge refused", async () => {
       const journal = new InMemoryJournal();
       const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
 
       const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
-        outcome: 'found',
+        outcome: "found",
         assessment: {
           ...validAssessment,
           acceptanceReceiptId: null,
@@ -586,6 +633,7 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       });
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -593,17 +641,17 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         authorizationPort: successfulAuthPort,
         forgePort: successfulForgePort,
         acceptedReceiptByHead: {
-          '1111111111111111111111111111111111111111': 'receipt-001',
+          "1111111111111111111111111111111111111111": "receipt-001",
         },
         acceptanceEvidencePort,
       });
 
       const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-      expect(result.outcome).toBe('refused');
-      expect((result as { reason: string }).reason).toContain('no receipt ID');
+      expect(result.outcome).toBe("refused");
+      expect((result as { reason: string }).reason).toContain("no receipt ID");
     });
 
-    it('an acceptance evidence read that throws -> merge refused, never forged', async () => {
+    it("an acceptance evidence read that throws -> merge refused, never forged", async () => {
       const journal = new InMemoryJournal();
       const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
@@ -611,11 +659,11 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       let consumed = false;
       const authorizationPort: ActionAuthorizationPort = {
         async resolveActionAuthorization() {
-          return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+          return { outcome: "granted", authorizationGrantId: "grant-001" };
         },
         async consumeActionAuthorization() {
           consumed = true;
-          return { outcome: 'consumed', actionId: 'act-1' };
+          return { outcome: "consumed", actionId: "act-1" };
         },
       };
 
@@ -624,17 +672,21 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         isConfigured: () => true,
         async performForgeAction() {
           forgeCalls += 1;
-          return { outcome: 'executed', headSha: '1111111111111111111111111111111111111111' };
+          return {
+            outcome: "executed",
+            headSha: "1111111111111111111111111111111111111111",
+          };
         },
       };
 
       const acceptanceEvidencePort: AcceptanceEvidencePort = {
         async readAcceptance(): Promise<ReadAcceptanceResult> {
-          throw new Error('evidence store is unreadable');
+          throw new Error("evidence store is unreadable");
         },
       };
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -645,34 +697,36 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       });
 
       const result = await useCase.executeAuthorizedForgeAction({
-        actionId: 'act-1',
-        attemptId: 'att-001',
-        workOrderId: 'wo-001',
-        kind: 'merge-pr',
-        expectedHeadSha: '1111111111111111111111111111111111111111',
-        authorizationGrantId: 'grant-001',
+        actionId: "act-1",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "merge-pr",
+        pullRequestNumber: 7,
+        expectedHeadSha: "1111111111111111111111111111111111111111",
+        authorizationGrantId: "grant-001",
       });
 
-      expect(result.outcome).toBe('refused');
+      expect(result.outcome).toBe("refused");
       expect((result as { reason: string }).reason).toContain(
-        'acceptance evidence could not be read: evidence store is unreadable',
+        "acceptance evidence could not be read: evidence store is unreadable",
       );
       expect(consumed).toBe(false);
       expect(forgeCalls).toBe(0);
       expect(journal.entries).toHaveLength(0);
     });
 
-    it('executes merge when assessment is accepted, head and policy match, and receipt ID exists', async () => {
+    it("executes merge when assessment is accepted, head and policy match, and receipt ID exists", async () => {
       const journal = new InMemoryJournal();
       const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
 
       const acceptanceEvidencePort = new InMemoryAcceptanceEvidencePort({
-        outcome: 'found',
+        outcome: "found",
         assessment: validAssessment,
       });
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -680,46 +734,49 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         authorizationPort: successfulAuthPort,
         forgePort: successfulForgePort,
         acceptedReceiptByHead: {
-          '1111111111111111111111111111111111111111': 'receipt-001',
+          "1111111111111111111111111111111111111111": "receipt-001",
         },
         acceptanceEvidencePort,
       });
 
       const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-      expect(result.outcome).toBe('executed');
-      expect((result as { headSha: string }).headSha).toBe('1111111111111111111111111111111111111111');
+      expect(result.outcome).toBe("executed");
+      expect((result as { headSha: string }).headSha).toBe(
+        "1111111111111111111111111111111111111111",
+      );
       expect(journal.entries).toHaveLength(2); // intent-recorded + completed
     });
   });
 
-  describe('one-way door re-check at forge time', () => {
-    const HEAD = '1111111111111111111111111111111111111111';
+  describe("one-way door re-check at forge time", () => {
+    const HEAD = "1111111111111111111111111111111111111111";
     const mergeReq = {
-      actionId: 'forge-att-001',
-      attemptId: 'att-001',
-      workOrderId: 'wo-001',
-      kind: 'merge-pr' as const,
+      actionId: "forge-att-001",
+      attemptId: "att-001",
+      workOrderId: "wo-001",
+      kind: "merge-pr" as const,
+      pullRequestNumber: 7,
       expectedHeadSha: HEAD,
-      authorizationGrantId: 'grant-001',
+      authorizationGrantId: "grant-001",
     };
 
     function acceptancePortFound() {
       return new InMemoryAcceptanceEvidencePort({
-        outcome: 'found',
+        outcome: "found",
         assessment: {
           candidateHeadSha: HEAD,
-          policyRevision: 'pol-1',
-          state: 'accepted',
-          acceptanceReceiptId: 'receipt-001',
+          policyRevision: "pol-1",
+          state: "accepted",
+          acceptanceReceiptId: "receipt-001",
         },
       });
     }
 
     function ownerPortWith(
       result:
-        | { outcome: 'approved'; decisionId: string }
-        | { outcome: 'not-approved'; reason: string }
-        | { outcome: 'unknown'; reason: string },
+        | { outcome: "approved"; decisionId: string }
+        | { outcome: "not-approved"; reason: string }
+        | { outcome: "unknown"; reason: string },
       calls: { resolve: number },
     ): OwnerDecisionPort {
       return {
@@ -733,16 +790,16 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
     function baseDeps(attempt: AttemptRecord, ownerPort?: OwnerDecisionPort) {
       const authPort: ActionAuthorizationPort = {
         async resolveActionAuthorization() {
-          return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+          return { outcome: "granted", authorizationGrantId: "grant-001" };
         },
         async consumeActionAuthorization(req) {
-          return { outcome: 'consumed', actionId: req.actionId };
+          return { outcome: "consumed", actionId: req.actionId };
         },
       };
       const forgePort: ForgeActionPort = {
         isConfigured: () => true,
         async performForgeAction() {
-          return { outcome: 'executed', headSha: HEAD };
+          return { outcome: "executed", headSha: HEAD };
         },
       };
       const attemptRepo = new InMemoryAttemptRepo(attempt);
@@ -752,7 +809,8 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         journal: new InMemoryJournal(),
         authorizationPort: authPort,
         forgePort,
-        acceptedReceiptByHead: { [HEAD]: 'receipt-001' },
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
+        acceptedReceiptByHead: { [HEAD]: "receipt-001" },
         acceptanceEvidencePort: acceptancePortFound(),
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         ...(ownerPort !== undefined ? { ownerDecisionPort: ownerPort } : {}),
@@ -772,8 +830,8 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       return { ...record, ownerDecisionReferences: doors };
     }
 
-    it('journals an ambiguous outcome and rethrows when the forge call throws', async () => {
-      const forgeError = new Error('forge subprocess exploded');
+    it("journals an ambiguous outcome and rethrows when the forge call throws", async () => {
+      const forgeError = new Error("forge subprocess exploded");
       const deps = baseDeps(attemptWithDoors([]));
       const throwingForgePort: ForgeActionPort = {
         isConfigured: () => true,
@@ -781,18 +839,23 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
           throw forgeError;
         },
       };
-      const useCase = new ExecuteAuthorizedForgeActionUseCase({ ...deps, forgePort: throwingForgePort });
-      await expect(useCase.executeAuthorizedForgeAction(mergeReq)).rejects.toBe(forgeError);
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        ...deps,
+        forgePort: throwingForgePort,
+      });
+      await expect(useCase.executeAuthorizedForgeAction(mergeReq)).rejects.toBe(
+        forgeError,
+      );
       const statuses = deps.journal.entries.map((entry) => entry.status);
-      expect(statuses).toEqual(['intent-recorded', 'ambiguous']);
+      expect(statuses).toEqual(["intent-recorded", "ambiguous"]);
       const ambiguous = deps.journal.entries[1]!;
-      expect(ambiguous.id).toBe('forge:forge-att-001:ambiguous:2');
-      expect(ambiguous.detail).toBe('forge subprocess exploded');
-      expect(ambiguous).not.toHaveProperty('authorizedBy');
+      expect(ambiguous.id).toBe("forge:forge-att-001:ambiguous:2");
+      expect(ambiguous.detail).toBe("forge subprocess exploded");
+      expect(ambiguous).not.toHaveProperty("authorizedBy");
     });
 
-    it('the ambiguous entry carries authorizedBy when the request names it', async () => {
-      const forgeError = new Error('forge subprocess exploded');
+    it("the ambiguous entry carries authorizedBy when the request names it", async () => {
+      const forgeError = new Error("forge subprocess exploded");
       const deps = baseDeps(attemptWithDoors([]));
       const throwingForgePort: ForgeActionPort = {
         isConfigured: () => true,
@@ -800,17 +863,23 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
           throw forgeError;
         },
       };
-      const useCase = new ExecuteAuthorizedForgeActionUseCase({ ...deps, forgePort: throwingForgePort });
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        ...deps,
+        forgePort: throwingForgePort,
+      });
       await expect(
-        useCase.executeAuthorizedForgeAction({ ...mergeReq, authorizedBy: 'policy:autoMerge@0123456789ab' }),
+        useCase.executeAuthorizedForgeAction({
+          ...mergeReq,
+          authorizedBy: "policy:autoMerge@0123456789ab",
+        }),
       ).rejects.toBe(forgeError);
       const ambiguous = deps.journal.entries[1]!;
-      expect(ambiguous.status).toBe('ambiguous');
-      expect(ambiguous.authorizedBy).toBe('policy:autoMerge@0123456789ab');
+      expect(ambiguous.status).toBe("ambiguous");
+      expect(ambiguous.authorizedBy).toBe("policy:autoMerge@0123456789ab");
     });
 
-    it('rethrows the original forge error even when the ambiguous journal append throws', async () => {
-      const forgeError = new Error('forge subprocess exploded');
+    it("rethrows the original forge error even when the ambiguous journal append throws", async () => {
+      const forgeError = new Error("forge subprocess exploded");
       const deps = baseDeps(attemptWithDoors([]));
       const throwingForgePort: ForgeActionPort = {
         isConfigured: () => true,
@@ -821,87 +890,110 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       const journal = deps.journal as InMemoryJournal;
       const baseAppend = journal.appendJournalEntry.bind(journal);
       journal.appendJournalEntry = async (entry) => {
-        if (entry.status === 'ambiguous') {
-          throw new Error('journal unavailable');
+        if (entry.status === "ambiguous") {
+          throw new Error("journal unavailable");
         }
         await baseAppend(entry);
       };
-      const useCase = new ExecuteAuthorizedForgeActionUseCase({ ...deps, journal, forgePort: throwingForgePort });
-      await expect(useCase.executeAuthorizedForgeAction(mergeReq)).rejects.toBe(forgeError);
-      expect(deps.journal.entries.map((entry) => entry.status)).toEqual(['intent-recorded']);
+      const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        ...deps,
+        journal,
+        forgePort: throwingForgePort,
+      });
+      await expect(useCase.executeAuthorizedForgeAction(mergeReq)).rejects.toBe(
+        forgeError,
+      );
+      expect(deps.journal.entries.map((entry) => entry.status)).toEqual([
+        "intent-recorded",
+      ]);
     });
 
-    it('an approved door does not block the merge', async () => {
+    it("an approved door does not block the merge", async () => {
       const calls = { resolve: 0 };
       const useCase = new ExecuteAuthorizedForgeActionUseCase(
-        baseDeps(attemptWithDoors(['req-door-1']), ownerPortWith({ outcome: 'approved', decisionId: 'req-door-1' }, calls)),
-      );      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-      expect(result.outcome).toBe('executed');
+        baseDeps(
+          attemptWithDoors(["req-door-1"]),
+          ownerPortWith(
+            { outcome: "approved", decisionId: "req-door-1" },
+            calls,
+          ),
+        ),
+      );
+      const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe("executed");
       expect(calls.resolve).toBe(1);
     });
 
-    it('an undecided or declined door refuses before the grant is consumed', async () => {
+    it("an undecided or declined door refuses before the grant is consumed", async () => {
       for (const decision of [
-        { outcome: 'not-approved' as const, reason: 'awaiting decision' },
-        { outcome: 'unknown' as const, reason: 'no recorded decision' },
+        { outcome: "not-approved" as const, reason: "awaiting decision" },
+        { outcome: "unknown" as const, reason: "no recorded decision" },
       ]) {
         const calls = { resolve: 0 };
         const consumed: { value: boolean } = { value: false };
         const authPort: ActionAuthorizationPort = {
           async resolveActionAuthorization() {
-            return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+            return { outcome: "granted", authorizationGrantId: "grant-001" };
           },
           async consumeActionAuthorization(req) {
             consumed.value = true;
-            return { outcome: 'consumed', actionId: req.actionId };
+            return { outcome: "consumed", actionId: req.actionId };
           },
         };
         const deps = {
-          ...baseDeps(attemptWithDoors(['req-door-open']), ownerPortWith(decision, calls)),
+          ...baseDeps(
+            attemptWithDoors(["req-door-open"]),
+            ownerPortWith(decision, calls),
+          ),
           authorizationPort: authPort,
         };
         const useCase = new ExecuteAuthorizedForgeActionUseCase(deps);
         const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-        expect(result.outcome).toBe('refused');
+        expect(result.outcome).toBe("refused");
         expect((result as { reason: string }).reason).toContain(
-          `'req-door-open' is ${decision.outcome === 'not-approved' ? 'not approved' : 'unknown'}`,
+          `'req-door-open' is ${decision.outcome === "not-approved" ? "not approved" : "unknown"}`,
         );
         expect(consumed.value).toBe(false);
         expect(calls.resolve).toBe(1);
       }
     });
 
-    it('an attempt recorded before doors were frozen refuses without resolving anything', async () => {
+    it("an attempt recorded before doors were frozen refuses without resolving anything", async () => {
       const calls = { resolve: 0 };
       const useCase = new ExecuteAuthorizedForgeActionUseCase(
-        baseDeps(attemptWithDoors(undefined), ownerPortWith({ outcome: 'approved', decisionId: 'x' }, calls)),
+        baseDeps(
+          attemptWithDoors(undefined),
+          ownerPortWith({ outcome: "approved", decisionId: "x" }, calls),
+        ),
       );
       const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-      expect(result.outcome).toBe('refused');
-      expect((result as { reason: string }).reason).toContain('are unknown');
+      expect(result.outcome).toBe("refused");
+      expect((result as { reason: string }).reason).toContain("are unknown");
       expect(calls.resolve).toBe(0);
     });
 
-    it('recorded doors with no owner decision port refuse', async () => {
+    it("recorded doors with no owner decision port refuse", async () => {
       const useCase = new ExecuteAuthorizedForgeActionUseCase(
-        baseDeps(attemptWithDoors(['req-door-1'])),
+        baseDeps(attemptWithDoors(["req-door-1"])),
       );
       const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-      expect(result.outcome).toBe('refused');
-      expect((result as { reason: string }).reason).toContain('no owner decision port is configured');
+      expect(result.outcome).toBe("refused");
+      expect((result as { reason: string }).reason).toContain(
+        "no owner decision port is configured",
+      );
     });
 
-    it('an empty door list does not require the port and executes', async () => {
+    it("an empty door list does not require the port and executes", async () => {
       const useCase = new ExecuteAuthorizedForgeActionUseCase(
         baseDeps(attemptWithDoors([])),
       );
       const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-      expect(result.outcome).toBe('executed');
+      expect(result.outcome).toBe("executed");
     });
   });
 
-  describe('PR title and body forwarding (K6-2)', () => {
-    const HEAD = '1111111111111111111111111111111111111111';
+  describe("PR title and body forwarding (K6-2)", () => {
+    const HEAD = "1111111111111111111111111111111111111111";
 
     function capturingDeps() {
       const seen: Array<Record<string, unknown>> = [];
@@ -910,20 +1002,27 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
       const authorizationPort: ActionAuthorizationPort = {
         async resolveActionAuthorization() {
-          return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+          return { outcome: "granted", authorizationGrantId: "grant-001" };
         },
         async consumeActionAuthorization(req) {
-          return { outcome: 'consumed', actionId: req.actionId };
+          return { outcome: "consumed", actionId: req.actionId };
         },
       };
       const forgePort: ForgeActionPort = {
         isConfigured: () => true,
-        async performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult> {
+        async performForgeAction(
+          request: ForgeActionRequest,
+        ): Promise<ForgeActionResult> {
           seen.push({ ...request });
-          return { outcome: 'executed', pullRequestNumber: 42, headSha: request.expectedHeadSha };
+          return {
+            outcome: "executed",
+            pullRequestNumber: 42,
+            headSha: request.expectedHeadSha,
+          };
         },
       };
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -931,105 +1030,106 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         authorizationPort,
         forgePort,
         acceptanceEvidencePort: new InMemoryAcceptanceEvidencePort({
-          outcome: 'found',
+          outcome: "found",
           assessment: {
             candidateHeadSha: HEAD,
-            policyRevision: 'pol-1',
-            state: 'accepted',
-            acceptanceReceiptId: 'receipt-001',
+            policyRevision: "pol-1",
+            state: "accepted",
+            acceptanceReceiptId: "receipt-001",
           },
         }),
       });
       return { useCase, seen };
     }
 
-    it('forwards title and body to the forge only for push-and-open-pr', async () => {
+    it("forwards title and body to the forge only for push-and-open-pr", async () => {
       const { useCase, seen } = capturingDeps();
 
       const result = await useCase.executeAuthorizedForgeAction({
-        actionId: 'act-open',
-        attemptId: 'att-001',
-        workOrderId: 'wo-001',
-        kind: 'push-and-open-pr',
+        actionId: "act-open",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-and-open-pr",
         expectedHeadSha: HEAD,
-        authorizationGrantId: 'grant-001',
-        title: 'My PR title',
-        body: 'My PR body\nwith a second line',
+        authorizationGrantId: "grant-001",
+        title: "My PR title",
+        body: "My PR body\nwith a second line",
       });
 
-      expect(result.outcome).toBe('executed');
+      expect(result.outcome).toBe("executed");
       expect(seen).toHaveLength(1);
       expect(seen[0]).toMatchObject({
-        kind: 'push-and-open-pr',
-        title: 'My PR title',
-        body: 'My PR body\nwith a second line',
+        kind: "push-and-open-pr",
+        title: "My PR title",
+        body: "My PR body\nwith a second line",
       });
     });
 
-    it('omits title and body for push-to-pr even when the request carries them', async () => {
+    it("omits title and body for push-to-pr even when the request carries them", async () => {
       const { useCase, seen } = capturingDeps();
 
       const result = await useCase.executeAuthorizedForgeAction({
-        actionId: 'act-push',
-        attemptId: 'att-001',
-        workOrderId: 'wo-001',
-        kind: 'push-to-pr',
+        actionId: "act-push",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-to-pr",
         expectedHeadSha: HEAD,
-        authorizationGrantId: 'grant-001',
-        title: 'should not forward',
-        body: 'should not forward',
+        authorizationGrantId: "grant-001",
+        title: "should not forward",
+        body: "should not forward",
       });
 
-      expect(result.outcome).toBe('executed');
+      expect(result.outcome).toBe("executed");
       expect(seen).toHaveLength(1);
-      expect(seen[0]).toMatchObject({ kind: 'push-to-pr' });
-      expect(seen[0]).not.toHaveProperty('title');
-      expect(seen[0]).not.toHaveProperty('body');
+      expect(seen[0]).toMatchObject({ kind: "push-to-pr" });
+      expect(seen[0]).not.toHaveProperty("title");
+      expect(seen[0]).not.toHaveProperty("body");
     });
 
-    it('omits title and body for merge-pr', async () => {
+    it("omits title and body for merge-pr", async () => {
       const { useCase, seen } = capturingDeps();
 
       const result = await useCase.executeAuthorizedForgeAction({
-        actionId: 'act-merge',
-        attemptId: 'att-001',
-        workOrderId: 'wo-001',
-        kind: 'merge-pr',
+        actionId: "act-merge",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "merge-pr",
+        pullRequestNumber: 7,
         expectedHeadSha: HEAD,
-        authorizationGrantId: 'grant-001',
-        title: 'should not forward',
-        body: 'should not forward',
+        authorizationGrantId: "grant-001",
+        title: "should not forward",
+        body: "should not forward",
       });
 
-      expect(result.outcome).toBe('executed');
+      expect(result.outcome).toBe("executed");
       expect(seen).toHaveLength(1);
-      expect(seen[0]).toMatchObject({ kind: 'merge-pr' });
-      expect(seen[0]).not.toHaveProperty('title');
-      expect(seen[0]).not.toHaveProperty('body');
+      expect(seen[0]).toMatchObject({ kind: "merge-pr" });
+      expect(seen[0]).not.toHaveProperty("title");
+      expect(seen[0]).not.toHaveProperty("body");
     });
 
-    it('forwards neither title nor body when the push-and-open-pr request omits them', async () => {
+    it("forwards neither title nor body when the push-and-open-pr request omits them", async () => {
       const { useCase, seen } = capturingDeps();
 
       const result = await useCase.executeAuthorizedForgeAction({
-        actionId: 'act-open-2',
-        attemptId: 'att-001',
-        workOrderId: 'wo-001',
-        kind: 'push-and-open-pr',
+        actionId: "act-open-2",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-and-open-pr",
         expectedHeadSha: HEAD,
-        authorizationGrantId: 'grant-001',
+        authorizationGrantId: "grant-001",
       });
 
-      expect(result.outcome).toBe('executed');
+      expect(result.outcome).toBe("executed");
       expect(seen).toHaveLength(1);
-      expect(seen[0]).toMatchObject({ kind: 'push-and-open-pr' });
-      expect(seen[0]).not.toHaveProperty('title');
-      expect(seen[0]).not.toHaveProperty('body');
+      expect(seen[0]).toMatchObject({ kind: "push-and-open-pr" });
+      expect(seen[0]).not.toHaveProperty("title");
+      expect(seen[0]).not.toHaveProperty("body");
     });
   });
 
-  describe('recorded branch name on forge requests (KF-5b)', () => {
-    const HEAD = '1111111111111111111111111111111111111111';
+  describe("recorded branch name on forge requests (KF-5b)", () => {
+    const HEAD = "1111111111111111111111111111111111111111";
 
     function capturingDeps() {
       const seen: Array<Record<string, unknown>> = [];
@@ -1038,20 +1138,27 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
       const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
       const authorizationPort: ActionAuthorizationPort = {
         async resolveActionAuthorization() {
-          return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+          return { outcome: "granted", authorizationGrantId: "grant-001" };
         },
         async consumeActionAuthorization(req) {
-          return { outcome: 'consumed', actionId: req.actionId };
+          return { outcome: "consumed", actionId: req.actionId };
         },
       };
       const forgePort: ForgeActionPort = {
         isConfigured: () => true,
-        async performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult> {
+        async performForgeAction(
+          request: ForgeActionRequest,
+        ): Promise<ForgeActionResult> {
           seen.push({ ...request });
-          return { outcome: 'executed', pullRequestNumber: 42, headSha: request.expectedHeadSha };
+          return {
+            outcome: "executed",
+            pullRequestNumber: 42,
+            headSha: request.expectedHeadSha,
+          };
         },
       };
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
+        mergeRecordRepo: new FakeMergeRecordRepo([]),
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -1059,92 +1166,104 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         authorizationPort,
         forgePort,
         acceptanceEvidencePort: new InMemoryAcceptanceEvidencePort({
-          outcome: 'found',
+          outcome: "found",
           assessment: {
             candidateHeadSha: HEAD,
-            policyRevision: 'pol-1',
-            state: 'accepted',
-            acceptanceReceiptId: 'receipt-001',
+            policyRevision: "pol-1",
+            state: "accepted",
+            acceptanceReceiptId: "receipt-001",
           },
         }),
       });
       return { useCase, seen, journal };
     }
 
-    it('defaults to feat/<laneId> when the request carries no branch name', async () => {
+    it("defaults to feat/<laneId> when the request carries no branch name", async () => {
       const { useCase, seen } = capturingDeps();
 
       const result = await useCase.executeAuthorizedForgeAction({
-        actionId: 'act-open',
-        attemptId: 'att-001',
-        workOrderId: 'wo-001',
-        kind: 'push-and-open-pr',
+        actionId: "act-open",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-and-open-pr",
         expectedHeadSha: HEAD,
-        authorizationGrantId: 'grant-001',
+        authorizationGrantId: "grant-001",
       });
 
-      expect(result.outcome).toBe('executed');
+      expect(result.outcome).toBe("executed");
       expect(seen).toHaveLength(1);
-      expect(seen[0]).toMatchObject({ kind: 'push-and-open-pr', branchName: 'feat/lane-auth' });
+      expect(seen[0]).toMatchObject({
+        kind: "push-and-open-pr",
+        branchName: "feat/lane-auth",
+      });
     });
 
     it("forwards the run's recorded branch when the request carries one", async () => {
       const { useCase, seen } = capturingDeps();
 
       const result = await useCase.executeAuthorizedForgeAction({
-        actionId: 'act-open',
-        attemptId: 'att-001',
-        workOrderId: 'wo-001',
-        kind: 'push-and-open-pr',
+        actionId: "act-open",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-and-open-pr",
         expectedHeadSha: HEAD,
-        authorizationGrantId: 'grant-001',
-        branchName: 'fleet/run-01JB0000000000000000000000',
+        authorizationGrantId: "grant-001",
+        branchName: "fleet/run-01JB0000000000000000000000",
       });
 
-      expect(result.outcome).toBe('executed');
+      expect(result.outcome).toBe("executed");
       expect(seen).toHaveLength(1);
-      expect(seen[0]).toMatchObject({ branchName: 'fleet/run-01JB0000000000000000000000' });
+      expect(seen[0]).toMatchObject({
+        branchName: "fleet/run-01JB0000000000000000000000",
+      });
     });
 
     it("forwards the PR base branch for push-and-open-pr (CB-D2)", async () => {
       const { useCase, seen } = capturingDeps();
 
       const result = await useCase.executeAuthorizedForgeAction({
-        actionId: 'act-open',
-        attemptId: 'att-001',
-        workOrderId: 'wo-001',
-        kind: 'push-and-open-pr',
+        actionId: "act-open",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "push-and-open-pr",
         expectedHeadSha: HEAD,
-        authorizationGrantId: 'grant-001',
-        branchName: 'fleet/run-01JB0000000000000000000000',
-        baseBranch: 'chain/example',
+        authorizationGrantId: "grant-001",
+        branchName: "fleet/run-01JB0000000000000000000000",
+        baseBranch: "chain/example",
       });
 
-      expect(result.outcome).toBe('executed');
+      expect(result.outcome).toBe("executed");
       expect(seen).toHaveLength(1);
-      expect(seen[0]?.baseBranch).toBe('chain/example');
+      expect(seen[0]?.baseBranch).toBe("chain/example");
     });
 
-    it('does not forward baseBranch for merge-pr (CB-D2)', async () => {
+    it("does not forward baseBranch for merge-pr (CB-D2)", async () => {
       const { useCase, seen } = capturingDeps();
 
       const result = await useCase.executeAuthorizedForgeAction({
-        actionId: 'act-merge',
-        attemptId: 'att-001',
-        workOrderId: 'wo-001',
-        kind: 'merge-pr',
+        actionId: "act-merge",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        kind: "merge-pr",
+        pullRequestNumber: 7,
         expectedHeadSha: HEAD,
-        authorizationGrantId: 'grant-001',
-        baseBranch: 'chain/example',
+        authorizationGrantId: "grant-001",
+        baseBranch: "chain/example",
       });
 
-      expect(result.outcome).toBe('executed');
+      expect(result.outcome).toBe("executed");
       expect(seen).toHaveLength(1);
-      expect(seen[0]).not.toHaveProperty('baseBranch');
+      expect(seen[0]).not.toHaveProperty("baseBranch");
     });
 
-    it('refuses an unparsable base branch for push-and-open-pr before any grant is consumed (CB-D2)', async () => {
-      for (const baseBranch of ['release', 'main ', 'chain/example/', 'chain/a--b', 42] as unknown as string[]) {
+    it("refuses an unparsable base branch for push-and-open-pr before any grant is consumed (CB-D2)", async () => {
+      for (const baseBranch of [
+        "release",
+        "main ",
+        "chain/example/",
+        "chain/a--b",
+        42,
+      ] as unknown as string[]) {
         const journal = new InMemoryJournal();
         const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
         const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
@@ -1152,21 +1271,22 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         let forgeCalls = 0;
         const authorizationPort: ActionAuthorizationPort = {
           async resolveActionAuthorization() {
-            return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+            return { outcome: "granted", authorizationGrantId: "grant-001" };
           },
           async consumeActionAuthorization(req) {
             consumed = true;
-            return { outcome: 'consumed', actionId: req.actionId };
+            return { outcome: "consumed", actionId: req.actionId };
           },
         };
         const forgePort: ForgeActionPort = {
           isConfigured: () => true,
           async performForgeAction(): Promise<ForgeActionResult> {
             forgeCalls += 1;
-            return { outcome: 'executed', headSha: HEAD };
+            return { outcome: "executed", headSha: HEAD };
           },
         };
         const useCase = new ExecuteAuthorizedForgeActionUseCase({
+          mergeRecordRepo: new FakeMergeRecordRepo([]),
           attemptRepo,
           attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
           workOrderRepo,
@@ -1174,37 +1294,44 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
           authorizationPort,
           forgePort,
           acceptanceEvidencePort: new InMemoryAcceptanceEvidencePort({
-            outcome: 'found',
+            outcome: "found",
             assessment: {
               candidateHeadSha: HEAD,
-              policyRevision: 'pol-1',
-              state: 'accepted',
-              acceptanceReceiptId: 'receipt-001',
+              policyRevision: "pol-1",
+              state: "accepted",
+              acceptanceReceiptId: "receipt-001",
             },
           }),
         });
 
         const result = await useCase.executeAuthorizedForgeAction({
-          actionId: 'act-1',
-          attemptId: 'att-001',
-          workOrderId: 'wo-001',
-          kind: 'push-and-open-pr',
+          actionId: "act-1",
+          attemptId: "att-001",
+          workOrderId: "wo-001",
+          kind: "push-and-open-pr",
           expectedHeadSha: HEAD,
-          authorizationGrantId: 'grant-001',
+          authorizationGrantId: "grant-001",
           baseBranch,
         });
 
         expect(result).toEqual({
-          outcome: 'refused',
-          reason: 'baseBranch must be main or chain/<lowercase-dashes>',
+          outcome: "refused",
+          reason: "baseBranch must be main or chain/<lowercase-dashes>",
         });
         expect(consumed).toBe(false);
         expect(forgeCalls).toBe(0);
       }
     });
 
-    it('refuses an unsafe branch name before any grant is consumed or forge call runs', async () => {
-      for (const branchName of ['bad branch', '12345', 'a..b', null, ['fleet/x'], 42] as unknown as string[]) {
+    it("refuses an unsafe branch name before any grant is consumed or forge call runs", async () => {
+      for (const branchName of [
+        "bad branch",
+        "12345",
+        "a..b",
+        null,
+        ["fleet/x"],
+        42,
+      ] as unknown as string[]) {
         const journal = new InMemoryJournal();
         const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
         const workOrderRepo = new InMemoryWorkOrderRepo(makeWorkOrderRecord());
@@ -1212,21 +1339,22 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         let forgeCalls = 0;
         const authorizationPort: ActionAuthorizationPort = {
           async resolveActionAuthorization() {
-            return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+            return { outcome: "granted", authorizationGrantId: "grant-001" };
           },
           async consumeActionAuthorization(req) {
             consumed = true;
-            return { outcome: 'consumed', actionId: req.actionId };
+            return { outcome: "consumed", actionId: req.actionId };
           },
         };
         const forgePort: ForgeActionPort = {
           isConfigured: () => true,
           async performForgeAction(): Promise<ForgeActionResult> {
             forgeCalls += 1;
-            return { outcome: 'executed', headSha: HEAD };
+            return { outcome: "executed", headSha: HEAD };
           },
         };
         const useCase = new ExecuteAuthorizedForgeActionUseCase({
+          mergeRecordRepo: new FakeMergeRecordRepo([]),
           attemptRepo,
           attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
           workOrderRepo,
@@ -1234,27 +1362,31 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
           authorizationPort,
           forgePort,
           acceptanceEvidencePort: new InMemoryAcceptanceEvidencePort({
-            outcome: 'found',
+            outcome: "found",
             assessment: {
               candidateHeadSha: HEAD,
-              policyRevision: 'pol-1',
-              state: 'accepted',
-              acceptanceReceiptId: 'receipt-001',
+              policyRevision: "pol-1",
+              state: "accepted",
+              acceptanceReceiptId: "receipt-001",
             },
           }),
         });
 
         const result = await useCase.executeAuthorizedForgeAction({
-          actionId: 'act-1',
-          attemptId: 'att-001',
-          workOrderId: 'wo-001',
-          kind: 'merge-pr',
+          actionId: "act-1",
+          attemptId: "att-001",
+          workOrderId: "wo-001",
+          kind: "merge-pr",
+          pullRequestNumber: 7,
           expectedHeadSha: HEAD,
-          authorizationGrantId: 'grant-001',
+          authorizationGrantId: "grant-001",
           branchName,
         });
 
-        expect(result).toEqual({ outcome: 'refused', reason: 'branchName must be a safe branch name' });
+        expect(result).toEqual({
+          outcome: "refused",
+          reason: "branchName must be a safe branch name",
+        });
         expect(consumed).toBe(false);
         expect(forgeCalls).toBe(0);
         expect(journal.entries).toHaveLength(0);
@@ -1263,27 +1395,27 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
   });
 });
 
-describe('ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link producers', () => {
-  const WB_HEAD = '1111111111111111111111111111111111111111';
-  const WB_OTHER_HEAD = '2222222222222222222222222222222222222222';
+describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link producers", () => {
+  const WB_HEAD = "1111111111111111111111111111111111111111";
+  const WB_OTHER_HEAD = "2222222222222222222222222222222222222222";
 
   const mergeReq = {
-    actionId: 'act-1',
-    attemptId: 'att-001',
-    workOrderId: 'wo-001',
-    kind: 'merge-pr' as const,
+    actionId: "act-1",
+    attemptId: "att-001",
+    workOrderId: "wo-001",
+    kind: "merge-pr" as const,
     expectedHeadSha: WB_HEAD,
-    authorizationGrantId: 'grant-001',
+    authorizationGrantId: "grant-001",
   };
 
   function acceptedAssessment() {
     return new InMemoryAcceptanceEvidencePort({
-      outcome: 'found',
+      outcome: "found",
       assessment: {
         candidateHeadSha: WB_HEAD,
-        policyRevision: 'pol-1',
-        state: 'accepted',
-        acceptanceReceiptId: 'receipt-001',
+        policyRevision: "pol-1",
+        state: "accepted",
+        acceptanceReceiptId: "receipt-001",
       },
     });
   }
@@ -1292,7 +1424,10 @@ describe('ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
     readonly calls: string[];
     private readonly plans = new Map<string, LanePlanRecord>();
     private readonly links = new Map<string, PullRequestLinkRecord>();
-    private readonly conflicts = new Map<string, PullRequestLinkConflictRecord>();
+    private readonly conflicts = new Map<
+      string,
+      PullRequestLinkConflictRecord
+    >();
 
     constructor(order: string[]) {
       this.calls = order;
@@ -1302,12 +1437,17 @@ describe('ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       this.plans.set(`${record.projectId}:${record.planId}`, record);
     }
 
-    async saveLanePlanIfAcyclic(record: LanePlanRecord): Promise<SaveLanePlanResult> {
+    async saveLanePlanIfAcyclic(
+      record: LanePlanRecord,
+    ): Promise<SaveLanePlanResult> {
       await this.saveLanePlan(record);
-      return { outcome: 'saved' };
+      return { outcome: "saved" };
     }
 
-    async findLanePlan(projectId: string, planId: string): Promise<LanePlanRecord | null> {
+    async findLanePlan(
+      projectId: string,
+      planId: string,
+    ): Promise<LanePlanRecord | null> {
       return this.plans.get(`${projectId}:${planId}`) ?? null;
     }
 
@@ -1315,22 +1455,39 @@ describe('ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       return [...this.plans.values()];
     }
 
-    async savePullRequestLink(record: PullRequestLinkRecord): Promise<SavePullRequestLinkResult> {
-      this.calls.push(`link:${record.repository}#${record.number}:${record.laneId}`);
-      const key = pullRequestLinkKey({ repository: record.repository, number: record.number });
+    async savePullRequestLink(
+      record: PullRequestLinkRecord,
+    ): Promise<SavePullRequestLinkResult> {
+      this.calls.push(
+        `link:${record.repository}#${record.number}:${record.laneId}`,
+      );
+      const key = pullRequestLinkKey({
+        repository: record.repository,
+        number: record.number,
+      });
       const existing = this.links.get(key) ?? null;
       const decision = decidePullRequestLink(existing, record);
-      if (decision === 'create') {
+      if (decision === "create") {
         this.links.set(key, record);
-        return { outcome: 'saved', link: record };
+        return { outcome: "saved", link: record };
       }
-      if (decision === 'no-op') {
-        return { outcome: 'unchanged', link: existing as PullRequestLinkRecord };
+      if (decision === "no-op") {
+        return {
+          outcome: "unchanged",
+          link: existing as PullRequestLinkRecord,
+        };
       }
-      return { outcome: 'refused', code: 'pr-already-linked', linkedLaneId: existing!.laneId };
+      return {
+        outcome: "refused",
+        code: "pr-already-linked",
+        linkedLaneId: existing!.laneId,
+      };
     }
 
-    async findPullRequestLink(repository: string, number: number): Promise<PullRequestLinkRecord | null> {
+    async findPullRequestLink(
+      repository: string,
+      number: number,
+    ): Promise<PullRequestLinkRecord | null> {
       return this.links.get(pullRequestLinkKey({ repository, number })) ?? null;
     }
 
@@ -1344,74 +1501,35 @@ describe('ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       const key = pullRequestLinkConflictKey(record);
       const existing = this.conflicts.get(key);
       if (existing !== undefined) {
-        return { outcome: 'unchanged', conflict: existing };
+        return { outcome: "unchanged", conflict: existing };
       }
       this.conflicts.set(key, record);
-      return { outcome: 'saved', conflict: record };
+      return { outcome: "saved", conflict: record };
     }
 
-    async listPullRequestLinkConflicts(): Promise<readonly PullRequestLinkConflictRecord[]> {
+    async listPullRequestLinkConflicts(): Promise<
+      readonly PullRequestLinkConflictRecord[]
+    > {
       return [...this.conflicts.values()];
     }
   }
 
-  class FakeMergeRecordRepo implements MergeRecordRepositoryPort {
-    readonly calls: string[];
-    private readonly records = new Map<string, MergeRecordRecord>();
-
-    constructor(order: string[]) {
-      this.calls = order;
-    }
-
-    async saveMergeRecord(record: MergeRecordRecord): Promise<MergeRecordSaveOutcome> {
-      const key = `${record.repository}#${record.number}`;
-      const decision = decideMergeRecord(this.records.get(key) ?? null, record);
-      if (!decision.success) {
-        return { outcome: 'refused', code: 'invalid' };
-      }
-      if (decision.outcome === 'create') {
-        this.records.set(key, decision.record);
-      } else if (decision.outcome === 'upgrade-merger') {
-        this.records.set(key, decision.record);
-      } else if (decision.outcome === 'integrity-conflict') {
-        // The stored record is kept: the conflict is reported, never overwritten.
-        this.records.set(key, decision.record);
-      }
-      this.calls.push(
-        `merge:${record.repository}#${record.number}:${record.actionRef ?? ''}:${record.merger}:${decision.outcome === 'create' ? 'created' : decision.outcome === 'upgrade-merger' ? 'merger-upgraded' : decision.outcome}`,
-      );
-      return {
-        outcome:
-          decision.outcome === 'create'
-            ? 'created'
-            : decision.outcome === 'upgrade-merger'
-              ? 'merger-upgraded'
-              : decision.outcome,
-        record: decision.record,
-      };
-    }
-
-    async findMergeRecord(repository: string, number: number): Promise<MergeRecordRecord | null> {
-      return this.records.get(`${repository}#${number}`) ?? null;
-    }
-
-    async listMergeRecords(): Promise<readonly MergeRecordRecord[]> {
-      return [...this.records.values()];
-    }
-  }
-
-  function orderedJournal(base: InMemoryJournal, order: string[]): ExecutionJournalPort {
+  function orderedJournal(
+    base: InMemoryJournal,
+    order: string[],
+  ): ExecutionJournalPort {
     return {
       appendJournalEntry: async (entry) => {
         order.push(`journal:${entry.status}:${entry.id}`);
         await base.appendJournalEntry(entry);
       },
-      listJournalEntriesForAttempt: (attemptId) => base.listJournalEntriesForAttempt(attemptId),
+      listJournalEntriesForAttempt: (attemptId) =>
+        base.listJournalEntriesForAttempt(attemptId),
       saveCapacityReservation: async () => {},
       listActiveReservations: async () => [],
       releaseCapacityReservation: async () => false,
       reserveCapacityAtomically: async (request) => ({
-        outcome: 'reserved' as const,
+        outcome: "reserved" as const,
         reservation: { ...request.record!, slotIndex: 0 },
       }),
     };
@@ -1427,7 +1545,9 @@ describe('ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
     const order: string[] = [];
     const journalBase = new InMemoryJournal();
     const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
-    const workOrderRepo = new InMemoryWorkOrderRepo(options.workOrder ?? makeWorkOrderRecord());
+    const workOrderRepo = new InMemoryWorkOrderRepo(
+      options.workOrder ?? makeWorkOrderRecord(),
+    );
     const lanePlanRepo = new FakeLanePlanRepo(order);
     const mergeRecordRepo = new FakeMergeRecordRepo(order);
     const seen: ForgeActionRequest[] = [];
@@ -1437,15 +1557,15 @@ describe('ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
         seen.push(request);
         return options.forge
           ? options.forge(request)
-          : { outcome: 'executed', headSha: request.expectedHeadSha };
+          : { outcome: "executed", headSha: request.expectedHeadSha };
       },
     };
     const authorizationPort: ActionAuthorizationPort = {
       async resolveActionAuthorization() {
-        return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+        return { outcome: "granted", authorizationGrantId: "grant-001" };
       },
       async consumeActionAuthorization(req) {
-        return { outcome: 'consumed', actionId: req.actionId };
+        return { outcome: "consumed", actionId: req.actionId };
       },
     };
     const useCase = new ExecuteAuthorizedForgeActionUseCase({
@@ -1455,399 +1575,499 @@ describe('ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       journal: orderedJournal(journalBase, order),
       authorizationPort,
       forgePort,
-      acceptedReceiptByHead: { [WB_HEAD]: 'receipt-001' },
+      acceptedReceiptByHead: { [WB_HEAD]: "receipt-001" },
       acceptanceEvidencePort: acceptedAssessment(),
       lanePlanRepo,
       mergeRecordRepo,
       ...(options.now ? { now: options.now } : {}),
     });
-    return { useCase, journal: journalBase, order, lanePlanRepo, mergeRecordRepo, seen, workOrderRepo };
+    return {
+      useCase,
+      journal: journalBase,
+      order,
+      lanePlanRepo,
+      mergeRecordRepo,
+      seen,
+      workOrderRepo,
+    };
   }
 
-  it('appends the completed journal entry first and saves the merge record with its id as actionRef', async () => {
-    const now = (): string => '2026-11-05T10:00:00Z';
+  it("appends the completed journal entry first and saves the merge record with its id as actionRef", async () => {
+    const now = (): string => "2026-11-05T10:00:00Z";
     const deps = wb5bDeps({ now });
-    const result = await deps.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
-    expect(result.outcome).toBe('executed');
+    const result = await deps.useCase.executeAuthorizedForgeAction({
+      ...mergeReq,
+      pullRequestNumber: 7,
+    });
+    expect(result.outcome).toBe("executed");
 
-    const completed = deps.journal.entries.find((entry) => entry.status === 'completed')!;
-    expect(completed.id).toBe('forge:act-1:completed:2');
+    const completed = deps.journal.entries.find(
+      (entry) => entry.status === "completed",
+    )!;
+    expect(completed.id).toBe("forge:act-1:completed:2");
     expect(completed.detail).toBeNull();
-    expect(completed.pullRequest).toEqual({ repository: 'org/repo', number: 7 });
+    expect(completed.pullRequest).toEqual({
+      repository: "org/repo",
+      number: 7,
+    });
 
     // Call order: the completed journal entry lands before the link and the
     // merge record; the merge record carries the completed entry's id.
     expect(deps.order).toEqual([
-      'journal:intent-recorded:forge:act-1:intent-recorded:1',
-      'journal:completed:forge:act-1:completed:2',
-      'link:org/repo#7:lane-auth',
-      'merge:org/repo#7:forge:act-1:completed:2:fleet:created',
+      "journal:intent-recorded:forge:act-1:intent-recorded:1",
+      "journal:completed:forge:act-1:completed:2",
+      "link:org/repo#7:lane-auth",
+      "merge:org/repo#7:forge:act-1:completed:2:fleet:created",
     ]);
 
-    const stored = await deps.mergeRecordRepo.findMergeRecord('org/repo', 7);
+    const stored = await deps.mergeRecordRepo.findMergeRecord("org/repo", 7);
     expect(stored).toEqual({
       schemaVersion: 1,
-      repository: 'org/repo',
+      repository: "org/repo",
       number: 7,
       headSha: WB_HEAD,
-      mergedAtIso: '2026-11-05T10:00:00.000Z',
-      firstSeenAtIso: '2026-11-05T10:00:00.000Z',
-      source: 'fleet-forge-action',
-      merger: 'fleet',
+      mergedAtIso: "2026-11-05T10:00:00.000Z",
+      firstSeenAtIso: "2026-11-05T10:00:00.000Z",
+      source: "fleet-forge-action",
+      merger: "fleet",
       actionRef: completed.id,
     });
 
-    const link = await deps.lanePlanRepo.findPullRequestLink('org/repo', 7);
+    const link = await deps.lanePlanRepo.findPullRequestLink("org/repo", 7);
     expect(link).toEqual({
       version: 1,
-      repository: 'org/repo',
+      repository: "org/repo",
       number: 7,
-      projectId: 'proj-001',
+      projectId: "proj-001",
       planId: null,
-      laneId: 'lane-auth',
-      source: 'fleet-forge-action',
-      linkedAtIso: '2026-11-05T10:00:00.000Z',
+      laneId: "lane-auth",
+      source: "fleet-forge-action",
+      linkedAtIso: "2026-11-05T10:00:00.000Z",
     });
 
-    expect((await deps.workOrderRepo.findWorkOrderById('wo-001'))?.state).toBe('merged');
+    expect((await deps.workOrderRepo.findWorkOrderById("wo-001"))?.state).toBe(
+      "merged",
+    );
   });
 
-  it('links the plan lane through an imported alias when the work order has a planRef', async () => {
+  it("links the plan lane through an imported alias when the work order has a planRef", async () => {
     const plan: LanePlanRecord = {
       version: 1,
-      projectId: 'proj-001',
-      planId: 'plan-1',
+      projectId: "proj-001",
+      planId: "plan-1",
       revision: 1,
-      digest: 'a'.repeat(64),
-      doc: 'docs/plan.md',
+      digest: "a".repeat(64),
+      doc: "docs/plan.md",
       lanes: [
         {
-          laneId: 'lane-A',
-          aliases: ['lane-auth'],
-          scope: 'auth lane',
-          packages: ['work-execution'],
+          laneId: "lane-A",
+          aliases: ["lane-auth"],
+          scope: "auth lane",
+          packages: ["work-execution"],
           sharedFiles: [],
           tier: 0,
           after: [],
           decisions: [],
-          status: 'planned',
+          status: "planned",
           brief: null,
           mergedPr: null,
         },
       ],
       decisions: [],
       exclusiveOrder: [],
-      importedAtIso: '2026-11-01T00:00:00.000Z',
+      importedAtIso: "2026-11-01T00:00:00.000Z",
     };
     const deps = wb5bDeps({
       workOrder: {
         ...makeWorkOrderRecord(),
-        planRef: { projectId: 'proj-001', planId: 'plan-1', laneId: 'lane-auth' },
+        planRef: {
+          projectId: "proj-001",
+          planId: "plan-1",
+          laneId: "lane-auth",
+        },
       },
     });
     await deps.lanePlanRepo.saveLanePlan(plan);
-    await deps.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
-    const link = await deps.lanePlanRepo.findPullRequestLink('org/repo', 7);
-    expect(link).toMatchObject({ projectId: 'proj-001', planId: 'plan-1', laneId: 'lane-A' });
+    await deps.useCase.executeAuthorizedForgeAction({
+      ...mergeReq,
+      pullRequestNumber: 7,
+    });
+    const link = await deps.lanePlanRepo.findPullRequestLink("org/repo", 7);
+    expect(link).toMatchObject({
+      projectId: "proj-001",
+      planId: "plan-1",
+      laneId: "lane-A",
+    });
   });
 
-  it('writes neither PullRequestLink nor MergeRecord when appending the completed journal entry fails, leaving recoverable intent-recorded state', async () => {
+  it("writes neither PullRequestLink nor MergeRecord when appending the completed journal entry fails, leaving recoverable intent-recorded state", async () => {
     const deps = wb5bDeps();
     const base = deps.journal;
     const originalAppend = base.appendJournalEntry.bind(base);
     base.appendJournalEntry = async (entry) => {
-      if (entry.status === 'completed') {
-        throw new Error('journal unavailable');
+      if (entry.status === "completed") {
+        throw new Error("journal unavailable");
       }
       await originalAppend(entry);
     };
 
-    await expect(deps.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 })).rejects.toThrow(
-      'journal unavailable',
-    );
-    expect(deps.journal.entries.map((entry) => entry.status)).toEqual(['intent-recorded']);
+    await expect(
+      deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        pullRequestNumber: 7,
+      }),
+    ).rejects.toThrow("journal unavailable");
+    expect(deps.journal.entries.map((entry) => entry.status)).toEqual([
+      "intent-recorded",
+    ]);
     expect(await deps.lanePlanRepo.listPullRequestLinks()).toEqual([]);
     expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
-    expect((await deps.workOrderRepo.findWorkOrderById('wo-001'))?.state).toBe('approved');
+    expect((await deps.workOrderRepo.findWorkOrderById("wo-001"))?.state).toBe(
+      "approved",
+    );
   });
 
   function twoLanePlan(): LanePlanRecord {
     const lane = (laneId: string, aliases: string[]) => ({
       laneId,
       aliases,
-      scope: 'a lane',
-      packages: ['work-execution'],
+      scope: "a lane",
+      packages: ["work-execution"],
       sharedFiles: [],
       tier: 0 as const,
       after: [],
       decisions: [],
-      status: 'planned' as const,
+      status: "planned" as const,
       brief: null,
       mergedPr: null,
     });
     return {
       version: 1,
-      projectId: 'proj-001',
-      planId: 'plan-1',
+      projectId: "proj-001",
+      planId: "plan-1",
       revision: 1,
-      digest: 'a'.repeat(64),
-      doc: 'docs/plan.md',
-      lanes: [lane('lane-A', ['lane-auth']), lane('lane-B', [])],
+      digest: "a".repeat(64),
+      doc: "docs/plan.md",
+      lanes: [lane("lane-A", ["lane-auth"]), lane("lane-B", [])],
       decisions: [],
       exclusiveOrder: [],
-      importedAtIso: '2026-11-01T00:00:00.000Z',
+      importedAtIso: "2026-11-01T00:00:00.000Z",
     } as LanePlanRecord;
   }
 
   const planWorkOrder = (): WorkOrderRecord => ({
     ...makeWorkOrderRecord(),
-    planRef: { projectId: 'proj-001', planId: 'plan-1', laneId: 'lane-auth' },
+    planRef: { projectId: "proj-001", planId: "plan-1", laneId: "lane-auth" },
   });
 
   const prLink = (number: number, laneId: string) => ({
     version: 1 as const,
-    repository: 'org/repo',
+    repository: "org/repo",
     number,
-    projectId: 'proj-001',
-    planId: 'plan-1',
+    projectId: "proj-001",
+    planId: "plan-1",
     laneId,
-    source: 'cli' as const,
-    linkedAtIso: '2026-11-01T00:00:00.000Z',
+    source: "cli" as const,
+    linkedAtIso: "2026-11-01T00:00:00.000Z",
   });
 
-  it('records a conflict when the PR is linked to a different lane of the same plan, and none for a confirmed alias of the same lane', async () => {
+  it("records a conflict when the PR is linked to a different lane of the same plan, and none for a confirmed alias of the same lane", async () => {
     const different = wb5bDeps({ workOrder: planWorkOrder() });
     await different.lanePlanRepo.saveLanePlan(twoLanePlan());
-    await different.lanePlanRepo.savePullRequestLink(prLink(7, 'lane-B'));
-    await different.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
-    const conflicts = await different.lanePlanRepo.listPullRequestLinkConflicts!();
+    await different.lanePlanRepo.savePullRequestLink(prLink(7, "lane-B"));
+    await different.useCase.executeAuthorizedForgeAction({
+      ...mergeReq,
+      pullRequestNumber: 7,
+    });
+    const conflicts =
+      await different.lanePlanRepo.listPullRequestLinkConflicts!();
     expect(conflicts).toHaveLength(1);
     expect(conflicts[0]).toMatchObject({
-      linkedLane: { projectId: 'proj-001', planId: 'plan-1', laneId: 'lane-B' },
-      refusedLane: { projectId: 'proj-001', planId: 'plan-1', laneId: 'lane-A' },
+      linkedLane: { projectId: "proj-001", planId: "plan-1", laneId: "lane-B" },
+      refusedLane: {
+        projectId: "proj-001",
+        planId: "plan-1",
+        laneId: "lane-A",
+      },
     });
-    expect(await different.mergeRecordRepo.findMergeRecord('org/repo', 7)).not.toBeNull();
+    expect(
+      await different.mergeRecordRepo.findMergeRecord("org/repo", 7),
+    ).not.toBeNull();
 
     const alias = wb5bDeps({ workOrder: planWorkOrder() });
     await alias.lanePlanRepo.saveLanePlan(twoLanePlan());
-    await alias.lanePlanRepo.savePullRequestLink(prLink(8, 'lane-auth'));
-    await alias.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 8 });
-    expect(await alias.lanePlanRepo.listPullRequestLinkConflicts!()).toHaveLength(0);
+    await alias.lanePlanRepo.savePullRequestLink(prLink(8, "lane-auth"));
+    await alias.useCase.executeAuthorizedForgeAction({
+      ...mergeReq,
+      pullRequestNumber: 8,
+    });
+    expect(
+      await alias.lanePlanRepo.listPullRequestLinkConflicts!(),
+    ).toHaveLength(0);
   });
 
-  it('resolves an old lane alias against the stored link on a different attempt with no journal reference, and refuses a merge whose PR number cannot be resolved without calling the forge', async () => {
+  it("resolves an old lane alias against the stored link on a different attempt with no journal reference, and refuses a merge whose PR number cannot be resolved without calling the forge", async () => {
     const deps = wb5bDeps({ workOrder: planWorkOrder() });
     await deps.lanePlanRepo.saveLanePlan(twoLanePlan());
     // The link was stored under the plan's current lane id by another attempt;
     // this attempt has no typed journal entry and the work order carries the alias.
-    await deps.lanePlanRepo.savePullRequestLink(prLink(9, 'lane-A'));
+    await deps.lanePlanRepo.savePullRequestLink(prLink(9, "lane-A"));
     const merged = await deps.useCase.executeAuthorizedForgeAction(mergeReq);
-    expect(merged.outcome).toBe('executed');
+    expect(merged.outcome).toBe("executed");
     expect(deps.seen[0]?.pullRequestNumber).toBe(9);
-    expect(await deps.mergeRecordRepo.findMergeRecord('org/repo', 9)).toMatchObject({ merger: 'fleet' });
+    expect(
+      await deps.mergeRecordRepo.findMergeRecord("org/repo", 9),
+    ).toMatchObject({ merger: "fleet" });
 
     const none = wb5bDeps({ workOrder: planWorkOrder() });
     await none.lanePlanRepo.saveLanePlan(twoLanePlan());
     const refused = await none.useCase.executeAuthorizedForgeAction(mergeReq);
-    expect(refused.outcome).toBe('refused');
+    expect(refused.outcome).toBe("refused");
     expect(none.seen).toHaveLength(0);
-    expect(none.journal.entries.filter((entry) => entry.status === 'completed')).toHaveLength(0);
+    expect(
+      none.journal.entries.filter((entry) => entry.status === "completed"),
+    ).toHaveLength(0);
   });
 
-  it('resolves the PR number across steps without parsing detail: a second-attempt merge reads the typed journal entry', async () => {
+  it("resolves the PR number across steps without parsing detail: a second-attempt merge reads the typed journal entry", async () => {
     const deps = wb5bDeps({
       forge: (request) =>
-        request.kind === 'push-and-open-pr'
-          ? { outcome: 'executed', pullRequestNumber: 42, headSha: request.expectedHeadSha }
-          : { outcome: 'executed', headSha: request.expectedHeadSha },
-      now: (): string => '2026-11-05T10:00:00Z',
+        request.kind === "push-and-open-pr"
+          ? {
+              outcome: "executed",
+              pullRequestNumber: 42,
+              headSha: request.expectedHeadSha,
+            }
+          : { outcome: "executed", headSha: request.expectedHeadSha },
+      now: (): string => "2026-11-05T10:00:00Z",
     });
 
     const opened = await deps.useCase.executeAuthorizedForgeAction({
-      actionId: 'act-open',
-      attemptId: 'att-001',
-      workOrderId: 'wo-001',
-      kind: 'push-and-open-pr',
+      actionId: "act-open",
+      attemptId: "att-001",
+      workOrderId: "wo-001",
+      kind: "push-and-open-pr",
       expectedHeadSha: WB_HEAD,
-      authorizationGrantId: 'grant-001',
+      authorizationGrantId: "grant-001",
     });
-    expect(opened.outcome).toBe('executed');
+    expect(opened.outcome).toBe("executed");
 
     const openedCompleted = deps.journal.entries.find(
-      (entry) => entry.status === 'completed' && entry.id.startsWith('forge:act-open'),
+      (entry) =>
+        entry.status === "completed" && entry.id.startsWith("forge:act-open"),
     )!;
-    expect(openedCompleted.detail).toBe('pull request #42');
-    expect(openedCompleted.pullRequest).toEqual({ repository: 'org/repo', number: 42 });
-    expect(await deps.lanePlanRepo.findPullRequestLink('org/repo', 42)).not.toBeNull();
+    expect(openedCompleted.detail).toBe("pull request #42");
+    expect(openedCompleted.pullRequest).toEqual({
+      repository: "org/repo",
+      number: 42,
+    });
+    expect(
+      await deps.lanePlanRepo.findPullRequestLink("org/repo", 42),
+    ).not.toBeNull();
 
     const merged = await deps.useCase.executeAuthorizedForgeAction({
-      actionId: 'act-merge',
-      attemptId: 'att-001',
-      workOrderId: 'wo-001',
-      kind: 'merge-pr',
+      actionId: "act-merge",
+      attemptId: "att-001",
+      workOrderId: "wo-001",
+      kind: "merge-pr",
       expectedHeadSha: WB_HEAD,
-      authorizationGrantId: 'grant-002',
+      authorizationGrantId: "grant-002",
     });
-    expect(merged).toMatchObject({ outcome: 'executed' });
+    expect(merged).toMatchObject({ outcome: "executed" });
 
     const mergeCompleted = deps.journal.entries.find(
-      (entry) => entry.status === 'completed' && entry.id.startsWith('forge:act-merge'),
+      (entry) =>
+        entry.status === "completed" && entry.id.startsWith("forge:act-merge"),
     )!;
     expect(mergeCompleted.detail).toBeNull();
-    expect(mergeCompleted.pullRequest).toEqual({ repository: 'org/repo', number: 42 });
+    expect(mergeCompleted.pullRequest).toEqual({
+      repository: "org/repo",
+      number: 42,
+    });
 
-    const stored = await deps.mergeRecordRepo.findMergeRecord('org/repo', 42);
+    const stored = await deps.mergeRecordRepo.findMergeRecord("org/repo", 42);
     expect(stored).toMatchObject({
-      repository: 'org/repo',
+      repository: "org/repo",
       number: 42,
       headSha: WB_HEAD,
-      source: 'fleet-forge-action',
-      merger: 'fleet',
-      actionRef: 'forge:act-merge:completed:4',
+      source: "fleet-forge-action",
+      merger: "fleet",
+      actionRef: "forge:act-merge:completed:4",
     });
   });
 
-  it('persists a link conflict naming both lanes when the PR is already linked, and still saves the MergeRecord', async () => {
+  it("persists a link conflict naming both lanes when the PR is already linked, and still saves the MergeRecord", async () => {
     const deps = wb5bDeps();
     await deps.lanePlanRepo.savePullRequestLink({
       version: 1,
-      repository: 'org/repo',
+      repository: "org/repo",
       number: 7,
-      projectId: 'proj-1',
+      projectId: "proj-1",
       planId: null,
-      laneId: 'L1',
-      source: 'cli',
-      linkedAtIso: '2026-11-01T00:00:00.000Z',
+      laneId: "L1",
+      source: "cli",
+      linkedAtIso: "2026-11-01T00:00:00.000Z",
     });
 
-    const result = await deps.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
-    expect(result.outcome).toBe('executed');
+    const result = await deps.useCase.executeAuthorizedForgeAction({
+      ...mergeReq,
+      pullRequestNumber: 7,
+    });
+    expect(result.outcome).toBe("executed");
 
     const conflicts = await deps.lanePlanRepo.listPullRequestLinkConflicts!();
     expect(conflicts).toHaveLength(1);
     expect(conflicts[0]).toMatchObject({
       schemaVersion: 1,
-      repository: 'org/repo',
+      repository: "org/repo",
       number: 7,
-      linkedLane: { projectId: 'proj-1', planId: null, laneId: 'L1' },
-      refusedLane: { projectId: 'proj-001', planId: null, laneId: 'lane-auth' },
+      linkedLane: { projectId: "proj-1", planId: null, laneId: "L1" },
+      refusedLane: { projectId: "proj-001", planId: null, laneId: "lane-auth" },
     });
 
-    const stored = await deps.mergeRecordRepo.findMergeRecord('org/repo', 7);
-    expect(stored).toMatchObject({ source: 'fleet-forge-action', merger: 'fleet' });
-    expect(stored?.actionRef).toBe('forge:act-1:completed:2');
+    const stored = await deps.mergeRecordRepo.findMergeRecord("org/repo", 7);
+    expect(stored).toMatchObject({
+      source: "fleet-forge-action",
+      merger: "fleet",
+    });
+    expect(stored?.actionRef).toBe("forge:act-1:completed:2");
   });
 
-  it('both arrival orders against forge-observation converge on one fleet MergeRecord with actionRef and without duplicate writes', async () => {
+  it("both arrival orders against forge-observation converge on one fleet MergeRecord with actionRef and without duplicate writes", async () => {
     // Order 1: the forge observation is stored first, the merge upgrades it.
-    const deps = wb5bDeps({ now: (): string => '2026-11-05T10:00:00Z' });
+    const deps = wb5bDeps({ now: (): string => "2026-11-05T10:00:00Z" });
     await deps.mergeRecordRepo.saveMergeRecord({
       schemaVersion: 1,
-      repository: 'org/repo',
+      repository: "org/repo",
       number: 7,
       headSha: WB_HEAD,
       // The observation's merge instant matches the merge the use case will
       // record, so the later fleet sighting upgrades rather than conflicts.
-      mergedAtIso: '2026-11-05T10:00:00.000Z',
-      firstSeenAtIso: '2026-11-04T00:00:00.000Z',
-      source: 'forge-observation',
-      merger: 'unknown',
+      mergedAtIso: "2026-11-05T10:00:00.000Z",
+      firstSeenAtIso: "2026-11-04T00:00:00.000Z",
+      source: "forge-observation",
+      merger: "unknown",
     });
-    const result = await deps.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
-    expect(result.outcome).toBe('executed');
+    const result = await deps.useCase.executeAuthorizedForgeAction({
+      ...mergeReq,
+      pullRequestNumber: 7,
+    });
+    expect(result.outcome).toBe("executed");
     expect(deps.mergeRecordRepo.listMergeRecords()).resolves.toHaveLength(1);
-    const upgraded = await deps.mergeRecordRepo.findMergeRecord('org/repo', 7);
+    const upgraded = await deps.mergeRecordRepo.findMergeRecord("org/repo", 7);
     expect(upgraded).toMatchObject({
-      merger: 'fleet',
-      source: 'forge-observation',
-      firstSeenAtIso: '2026-11-04T00:00:00.000Z',
-      actionRef: 'forge:act-1:completed:2',
+      merger: "fleet",
+      source: "forge-observation",
+      firstSeenAtIso: "2026-11-04T00:00:00.000Z",
+      actionRef: "forge:act-1:completed:2",
     });
 
     // Order 2: the fleet merge is stored first, a later observation is a no-op.
-    const deps2 = wb5bDeps({ now: (): string => '2026-11-05T10:00:00Z' });
-    await deps2.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
+    const deps2 = wb5bDeps({ now: (): string => "2026-11-05T10:00:00Z" });
+    await deps2.useCase.executeAuthorizedForgeAction({
+      ...mergeReq,
+      pullRequestNumber: 7,
+    });
     const observation = await deps2.mergeRecordRepo.saveMergeRecord({
       schemaVersion: 1,
-      repository: 'org/repo',
+      repository: "org/repo",
       number: 7,
       headSha: WB_HEAD,
-      mergedAtIso: '2026-11-05T10:00:00.000Z',
-      firstSeenAtIso: '2026-11-06T00:00:00.000Z',
-      source: 'forge-observation',
-      merger: 'unknown',
+      mergedAtIso: "2026-11-05T10:00:00.000Z",
+      firstSeenAtIso: "2026-11-06T00:00:00.000Z",
+      source: "forge-observation",
+      merger: "unknown",
     });
-    expect(observation.outcome).toBe('unchanged');
-    expect(await deps2.mergeRecordRepo.findMergeRecord('org/repo', 7)).toMatchObject({
-      merger: 'fleet',
-      source: 'fleet-forge-action',
-      actionRef: 'forge:act-1:completed:2',
+    expect(observation.outcome).toBe("unchanged");
+    expect(
+      await deps2.mergeRecordRepo.findMergeRecord("org/repo", 7),
+    ).toMatchObject({
+      merger: "fleet",
+      source: "fleet-forge-action",
+      actionRef: "forge:act-1:completed:2",
     });
     expect(await deps2.mergeRecordRepo.listMergeRecords()).toHaveLength(1);
 
     // Order 3: a divergent headSha is an integrity finding, never an overwrite.
-    const deps3 = wb5bDeps({ now: (): string => '2026-11-05T10:00:00Z' });
+    const deps3 = wb5bDeps({ now: (): string => "2026-11-05T10:00:00Z" });
     await deps3.mergeRecordRepo.saveMergeRecord({
       schemaVersion: 1,
-      repository: 'org/repo',
+      repository: "org/repo",
       number: 7,
       headSha: WB_OTHER_HEAD,
-      mergedAtIso: '2026-11-04T00:00:00.000Z',
-      firstSeenAtIso: '2026-11-04T00:00:00.000Z',
-      source: 'forge-observation',
-      merger: 'unknown',
+      mergedAtIso: "2026-11-04T00:00:00.000Z",
+      firstSeenAtIso: "2026-11-04T00:00:00.000Z",
+      source: "forge-observation",
+      merger: "unknown",
     });
-    await deps3.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
+    await deps3.useCase.executeAuthorizedForgeAction({
+      ...mergeReq,
+      pullRequestNumber: 7,
+    });
     // First call: the test's own observation save; second: the use case's
     // fleet sighting, decided as an integrity conflict against the stored one.
-    const calls = deps3.mergeRecordRepo.calls.filter((call) => call.includes('merge:org/repo#7'));
+    const calls = deps3.mergeRecordRepo.calls.filter((call) =>
+      call.includes("merge:org/repo#7"),
+    );
     expect(calls).toHaveLength(2);
-    expect(calls[1]).toContain('integrity-conflict');
-    const stillStored = await deps3.mergeRecordRepo.findMergeRecord('org/repo', 7);
-    expect(stillStored).toMatchObject({ headSha: WB_OTHER_HEAD, merger: 'unknown', source: 'forge-observation' });
+    expect(calls[1]).toContain("integrity-conflict");
+    const stillStored = await deps3.mergeRecordRepo.findMergeRecord(
+      "org/repo",
+      7,
+    );
+    expect(stillStored).toMatchObject({
+      headSha: WB_OTHER_HEAD,
+      merger: "unknown",
+      source: "forge-observation",
+    });
   });
 
-  it('refuses null, non-object, sparse-array, wrong-typed, unknown-enum, and throwing-getter requests without throwing', async () => {
+  it("refuses null, non-object, sparse-array, wrong-typed, unknown-enum, and throwing-getter requests without throwing", async () => {
     const deps = wb5bDeps();
     const sparse = new Array(3) as unknown as Record<string, unknown>;
-    sparse.actionId = 'act-1';
-    const throwingGetter = Object.defineProperty({ ...mergeReq }, 'actionId', {
+    sparse.actionId = "act-1";
+    const throwingGetter = Object.defineProperty({ ...mergeReq }, "actionId", {
       configurable: true,
       enumerable: true,
       get() {
-        throw new Error('boom');
+        throw new Error("boom");
       },
     });
     const cases: unknown[] = [
       null,
-      'merge it',
+      "merge it",
       42,
       sparse,
-      { ...mergeReq, kind: 'explode' },
-      { ...mergeReq, expectedHeadSha: 'NOT-A-SHA' },
-      { ...mergeReq, authorizationGrantId: '' },
+      { ...mergeReq, kind: "explode" },
+      { ...mergeReq, expectedHeadSha: "NOT-A-SHA" },
+      { ...mergeReq, authorizationGrantId: "" },
       throwingGetter,
     ];
     for (const input of cases) {
-      const result = await deps.useCase.executeAuthorizedForgeAction(input as never);
-      expect(result.outcome).toBe('refused');
+      const result = await deps.useCase.executeAuthorizedForgeAction(
+        input as never,
+      );
+      expect(result.outcome).toBe("refused");
     }
     expect(deps.journal.entries).toHaveLength(0);
     expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
     expect(await deps.lanePlanRepo.listPullRequestLinks()).toEqual([]);
   });
 
-  it('refuses secret-shaped and path-containing inputs with code/field messages that never echo the offending value or path', async () => {
+  it("refuses secret-shaped and path-containing inputs with code/field messages that never echo the offending value or path", async () => {
     const deps = wb5bDeps();
-    const secret = ['gh', 'p_'].join('') + 'x'.repeat(36);
+    const secret = ["gh", "p_"].join("") + "x".repeat(36);
     for (const [field, value] of [
-      ['actionId', secret],
-      ['workOrderId', 'sub/dir/id'],
-      ['authorizationGrantId', 'grant\\id'],
+      ["actionId", secret],
+      ["workOrderId", "sub/dir/id"],
+      ["authorizationGrantId", "grant\\id"],
     ] as const) {
-      const result = await deps.useCase.executeAuthorizedForgeAction({ ...mergeReq, [field]: value } as never);
-      expect(result.outcome).toBe('refused');
-      if (result.outcome === 'refused') {
+      const result = await deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        [field]: value,
+      } as never);
+      expect(result.outcome).toBe("refused");
+      if (result.outcome === "refused") {
         expect(result.reason).toContain(field);
         expect(JSON.stringify(result)).not.toContain(secret);
         expect(JSON.stringify(result)).not.toContain(value);
@@ -1855,64 +2075,172 @@ describe('ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
     }
   });
 
-  it('refuses oversized request identifiers, out-of-range pullRequestNumber, and overlong actionRef/repository inputs', async () => {
+  it("refuses oversized request identifiers, out-of-range pullRequestNumber, and overlong actionRef/repository inputs", async () => {
     const deps = wb5bDeps();
-    for (const field of ['actionId', 'attemptId', 'workOrderId', 'authorizationGrantId'] as const) {
+    for (const field of [
+      "actionId",
+      "attemptId",
+      "workOrderId",
+      "authorizationGrantId",
+    ] as const) {
       const result = await deps.useCase.executeAuthorizedForgeAction({
         ...mergeReq,
-        [field]: 'a'.repeat(257),
+        [field]: "a".repeat(257),
       } as never);
-      expect(result.outcome).toBe('refused');
+      expect(result.outcome).toBe("refused");
     }
     for (const pullRequestNumber of [0, 1_000_000_000, 1.5]) {
       const result = await deps.useCase.executeAuthorizedForgeAction({
         ...mergeReq,
         pullRequestNumber,
       } as never);
-      expect(result).toEqual({ outcome: 'refused', reason: 'pullRequestNumber must be a positive integer' });
+      expect(result).toEqual({
+        outcome: "refused",
+        reason: "pullRequestNumber must be a positive integer",
+      });
     }
-    // An unresolvable repository stays unknown: the merge runs, but no merge
-    // record can name an overlong repository.
+    // An unresolvable repository stays unknown: a merge that no record can
+    // name is refused before the forge runs.
     const deps2 = wb5bDeps({
-      workOrder: { ...makeWorkOrderRecord(), repository: 'r'.repeat(201) },
+      workOrder: { ...makeWorkOrderRecord(), repository: "r".repeat(201) },
     });
-    const result = await deps2.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
-    expect(result.outcome).toBe('executed');
+    const result = await deps2.useCase.executeAuthorizedForgeAction({
+      ...mergeReq,
+      pullRequestNumber: 7,
+    });
+    expect(result.outcome).toBe("refused");
+    expect(deps2.seen).toHaveLength(0);
     expect(await deps2.mergeRecordRepo.listMergeRecords()).toEqual([]);
     expect(await deps2.lanePlanRepo.listPullRequestLinks()).toEqual([]);
   });
 
-  it('refuses cleanly when the composition clock is unreadable, before consuming the grant', async () => {
+  it("refuses merge-pr with merge-record-store-unavailable when no merge-record store is wired, and refuses an unresolved PR number, never calling the forge", async () => {
+    const seen: ForgeActionRequest[] = [];
+    const journal = new InMemoryJournal();
+    const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+    const useCase = new ExecuteAuthorizedForgeActionUseCase({
+      attemptRepo,
+      attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
+      workOrderRepo: new InMemoryWorkOrderRepo(makeWorkOrderRecord()),
+      journal,
+      authorizationPort: {
+        async resolveActionAuthorization() {
+          return { outcome: "granted", authorizationGrantId: "grant-001" };
+        },
+        async consumeActionAuthorization(req) {
+          return { outcome: "consumed", actionId: req.actionId };
+        },
+      },
+      forgePort: {
+        isConfigured: () => true,
+        async performForgeAction(request) {
+          seen.push(request);
+          return { outcome: "executed", headSha: request.expectedHeadSha };
+        },
+      },
+      acceptedReceiptByHead: { [WB_HEAD]: "receipt-001" },
+      acceptanceEvidencePort: acceptedAssessment(),
+    });
+    expect(
+      await useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        pullRequestNumber: 7,
+      }),
+    ).toEqual({ outcome: "refused", reason: "merge-record-store-unavailable" });
+    const unresolved = await useCase.executeAuthorizedForgeAction(mergeReq);
+    expect(unresolved.outcome).toBe("refused");
+    expect(seen).toHaveLength(0);
+    expect(journal.entries).toHaveLength(0);
+  });
+
+  it("refuses cleanly when the composition clock is unreadable, before consuming the grant", async () => {
     let consumed = 0;
     const deps = wb5bDeps();
     // Rebuild with a throwing clock through the same shape the use case reads.
     const throwingNow = (): string => {
-      throw new Error('clock broken');
+      throw new Error("clock broken");
     };
     const useCase = new ExecuteAuthorizedForgeActionUseCase({
       attemptRepo: new InMemoryAttemptRepo(makeAttemptRecord()),
-      attemptOwnerDecisionPort: attemptDoorsFrom(new InMemoryAttemptRepo(makeAttemptRecord())),
+      attemptOwnerDecisionPort: attemptDoorsFrom(
+        new InMemoryAttemptRepo(makeAttemptRecord()),
+      ),
       workOrderRepo: new InMemoryWorkOrderRepo(makeWorkOrderRecord()),
       journal: deps.journal,
       authorizationPort: {
         async resolveActionAuthorization() {
-          return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+          return { outcome: "granted", authorizationGrantId: "grant-001" };
         },
         async consumeActionAuthorization() {
           consumed += 1;
-          return { outcome: 'consumed', actionId: 'act-1' };
+          return { outcome: "consumed", actionId: "act-1" };
         },
       },
-      forgePort: { isConfigured: () => true, async performForgeAction() { return { outcome: 'executed', headSha: WB_HEAD }; } },
-      acceptedReceiptByHead: { [WB_HEAD]: 'receipt-001' },
+      forgePort: {
+        isConfigured: () => true,
+        async performForgeAction() {
+          return { outcome: "executed", headSha: WB_HEAD };
+        },
+      },
+      acceptedReceiptByHead: { [WB_HEAD]: "receipt-001" },
       acceptanceEvidencePort: acceptedAssessment(),
       lanePlanRepo: deps.lanePlanRepo,
       mergeRecordRepo: deps.mergeRecordRepo,
       now: throwingNow,
     });
     const result = await useCase.executeAuthorizedForgeAction(mergeReq);
-    expect(result.outcome).toBe('refused');
+    expect(result.outcome).toBe("refused");
     expect(consumed).toBe(0);
     expect(deps.journal.entries).toHaveLength(0);
   });
 });
+
+class FakeMergeRecordRepo implements MergeRecordRepositoryPort {
+  readonly calls: string[];
+  private readonly records = new Map<string, MergeRecordRecord>();
+
+  constructor(order: string[]) {
+    this.calls = order;
+  }
+
+  async saveMergeRecord(
+    record: MergeRecordRecord,
+  ): Promise<MergeRecordSaveOutcome> {
+    const key = `${record.repository}#${record.number}`;
+    const decision = decideMergeRecord(this.records.get(key) ?? null, record);
+    if (!decision.success) {
+      return { outcome: "refused", code: "invalid" };
+    }
+    if (decision.outcome === "create") {
+      this.records.set(key, decision.record);
+    } else if (decision.outcome === "upgrade-merger") {
+      this.records.set(key, decision.record);
+    } else if (decision.outcome === "integrity-conflict") {
+      // The stored record is kept: the conflict is reported, never overwritten.
+      this.records.set(key, decision.record);
+    }
+    this.calls.push(
+      `merge:${record.repository}#${record.number}:${record.actionRef ?? ""}:${record.merger}:${decision.outcome === "create" ? "created" : decision.outcome === "upgrade-merger" ? "merger-upgraded" : decision.outcome}`,
+    );
+    return {
+      outcome:
+        decision.outcome === "create"
+          ? "created"
+          : decision.outcome === "upgrade-merger"
+            ? "merger-upgraded"
+            : decision.outcome,
+      record: decision.record,
+    };
+  }
+
+  async findMergeRecord(
+    repository: string,
+    number: number,
+  ): Promise<MergeRecordRecord | null> {
+    return this.records.get(`${repository}#${number}`) ?? null;
+  }
+
+  async listMergeRecords(): Promise<readonly MergeRecordRecord[]> {
+    return [...this.records.values()];
+  }
+}

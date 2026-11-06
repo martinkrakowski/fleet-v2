@@ -40,6 +40,7 @@ import {
   BriefKnowledgeAdapter,
   CiStateAdapter,
   CloseWorkOrderUseCase,
+  AppendScorecardUseCase,
   GateReceiptAdapter,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
@@ -91,6 +92,7 @@ import {
   InspectLaneRunsUseCase,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
+  LaneScorecardFileAdapter,
   ListConductorPassesUseCase,
   ListLaneRunsUseCase,
   ReapLaneWorktreesUseCase,
@@ -761,6 +763,8 @@ export interface FleetCliRuntime {
     readonly inspectMergeReadiness: InspectMergeReadinessUseCase;
     /** CO26: the read-only relaunch inventory per lane host. */
     readonly inventoryRelaunch: InventoryRelaunchUseCase;
+    /** CO19: appends one lane-performance row for one terminal conducted run to the scorecard. */
+    readonly appendScorecard: AppendScorecardUseCase;
   };
   readonly conductor: {
     readonly laneRunRepository: LaneRunRepositoryAdapter;
@@ -1085,6 +1089,20 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     env: process.env,
   });
 
+  // CO19: the scorecard append is wired here, after the conductor composes its
+  // lane-run stores and the telemetry composition its disposition store, so the
+  // row derives from the same read-only stores the other roots read: the run
+  // record, the attempts, the run journal, the acceptance receipts and the
+  // telemetry dispositions. Only the scorecard itself is written.
+  const appendScorecard = new AppendScorecardUseCase({
+    runRepo: conductor.laneRunRepository,
+    attemptRepo: attemptRepository,
+    runJournal: conductor.laneRunJournal,
+    receipts: telemetry.acceptanceReceiptRead,
+    dispositions: telemetry.dispositions,
+    scorecard: new LaneScorecardFileAdapter({ stateDir }),
+  });
+
   // KF-35: the driver's one runner tunnel, aimed at the same target the runner
   // dispatches to: the installation's selected lane-runner host for v2, else the
   // resolved runner settings (which read the runtime's own environment object,
@@ -1119,7 +1137,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     coordination,
     knowledge,
     evidence,
-    execution: { ...execution, closeWorkOrder, listStaleWorkOrders, inspectMergeReadiness, inventoryRelaunch },
+    execution: { ...execution, closeWorkOrder, listStaleWorkOrders, inspectMergeReadiness, inventoryRelaunch, appendScorecard },
     conductor,
     runnerTunnel,
     telemetry,

@@ -68,6 +68,7 @@ import { questionsCommands } from './commands/questions.js';
 import { mergeCommands } from './merge.js';
 import { relaunchCommands } from './relaunch.js';
 import { cutoverCommands } from './commands/cutover.js';
+import { scorecardCommands } from './commands/scorecard.js';
 import { tuiCommand } from './tui/command.js';
 
 export { resolveRunnerSettings };
@@ -271,6 +272,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   merge: mergeCommands,
   relaunch: relaunchCommands,
   cutover: cutoverCommands,
+  scorecard: scorecardCommands,
 };
 
 // ---------------------------------------------------------------------------
@@ -682,6 +684,9 @@ killall halt marker; --lift clears the pause then the marker. Run
 The cutover group reports the shadow comparison of the fleet-v2 merge queue
 against the shell train's recorded queue for one repository (read-only, ids and
 codes only). Run 'fleet-v2 cutover --help'.
+The scorecard group appends one lane-performance row for one terminal
+conducted run to the versioned scorecard (scorecard append --runId <runId>;
+ids, codes, counts and durations only).
 The report group prints the weekly run-journal service report (read-only, one
 JSON document) for the trailing 7 days. Run 'fleet-v2 report --help'.
 
@@ -708,6 +713,7 @@ Commands:
   report weekly
   relaunch inventory [--host <name>]
   cutover shadow report --repository owner/repo --legacy-state-dir <path>
+  scorecard append --runId <runId>
   tui
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]
   capacity reserve

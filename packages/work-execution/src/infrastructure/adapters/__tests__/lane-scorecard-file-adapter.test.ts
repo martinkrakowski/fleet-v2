@@ -111,6 +111,23 @@ describe('LaneScorecardFileAdapter', () => {
     });
   });
 
+  it('refuses an append over a file with a malformed line', async () => {
+    const adapter = new LaneScorecardFileAdapter({ stateDir });
+    await adapter.append(row(RUN_A));
+    // A damaged line that still carries a run id is not a row: an append that
+    // ignored it could record the same run twice. The store refuses instead.
+    const damaged = JSON.stringify({ ...row(RUN_B), attemptCount: 'two' });
+    await fs.appendFile(scorecardFile(), `${damaged}\n`, 'utf8');
+    expect(await adapter.append(row(RUN_B))).toEqual({ outcome: 'refused', reason: 'unreadable-store' });
+    const read = await adapter.read();
+    expect(read.outcome === 'read' ? read.problems : []).toEqual([
+      { lineNumber: 3, reason: 'malformed-line' },
+    ]);
+    // The file is unchanged: the repairable damage stays named, not appended over.
+    const lines = (await fs.readFile(scorecardFile(), 'utf8')).split('\n');
+    expect(lines).toHaveLength(4);
+  });
+
   it('reports an unknown schema version as unreadable', async () => {
     const adapter = new LaneScorecardFileAdapter({ stateDir });
     await fs.mkdir(path.dirname(scorecardFile()), { recursive: true });
@@ -142,14 +159,17 @@ describe('LaneScorecardFileAdapter', () => {
     expect((await fs.readdir(path.dirname(scorecardFile()))).sort()).toEqual(['scorecard.jsonl']);
   });
 
-  it('separates a final line that lost its line feed instead of joining it to the new row', async () => {
+  it('refuses a final line that lost its line feed instead of joining the new row to it', async () => {
     const adapter = new LaneScorecardFileAdapter({ stateDir });
     await adapter.append(row(RUN_A));
     await fs.appendFile(scorecardFile(), '{"runId":"trunc', 'utf8');
-    expect(await adapter.append(row(RUN_B))).toEqual({ outcome: 'appended' });
+    // The truncated tail is a malformed line (line 3), so the append refuses
+    // rather than rewriting the file with the damage still inside it: the
+    // damaged line may already carry the run id the row would record.
+    expect(await adapter.append(row(RUN_B))).toEqual({ outcome: 'refused', reason: 'unreadable-store' });
     expect(await adapter.read()).toEqual({
       outcome: 'read',
-      rows: [row(RUN_A), row(RUN_B)],
+      rows: [row(RUN_A)],
       problems: [{ lineNumber: 3, reason: 'malformed-line' }],
     });
   });

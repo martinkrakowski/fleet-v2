@@ -228,6 +228,13 @@ export class LaneScorecardFileAdapter implements LaneScorecardPort {
           if (parsed.kind === 'unknown-schema-version') {
             return { outcome: 'refused', reason: 'unknown-schema-version' };
           }
+          // A line the store cannot parse is never appended over: the row's
+          // run id may already sit in the damaged line, so an append would
+          // record the run twice. The operator re-reads (the problems name
+          // the lines) and repairs before appending again.
+          if (parsed.problems.length > 0) {
+            return { outcome: 'refused', reason: 'unreadable-store' };
+          }
           if (parsed.rows.some((stored) => stored.runId === checked.runId)) {
             return { outcome: 'refused', reason: 'duplicate-run' };
           }

@@ -12,6 +12,7 @@ import {
 import { registerInteractiveSession } from "../../wiring/session-exchange.js";
 import {
   consumeWebLoginCode,
+  verifyWebLoginCode,
   WEB_LOGIN_ACTOR,
   WEB_LOGIN_HEADER,
   WEB_LOGIN_SCOPES,
@@ -28,8 +29,11 @@ export default defineEventHandler((event) => {
     presented = undefined;
   }
 
-  const consumed = consumeWebLoginCode(presented);
-  if (!consumed.ok) {
+  // Verify the code without spending it: a refused session registration (for
+  // example the live-session limit) must leave the single-use code usable, so
+  // it is consumed only after the session exists, never before (fix round 2).
+  const verified = verifyWebLoginCode(presented);
+  if (!verified.ok) {
     setResponseStatus(event, 403);
     return { error: "Forbidden: the web login code was refused" };
   }
@@ -42,6 +46,11 @@ export default defineEventHandler((event) => {
     setResponseStatus(event, 403);
     return { error: "Forbidden: no interactive session could be established" };
   }
+
+  // The session is registered; only now spend the single-use code. This cannot
+  // fail: nothing can have changed the code since the synchronous verify above,
+  // so the code is spent exactly when a session exists, never before.
+  consumeWebLoginCode(presented);
 
   return {
     sessionId: session.sessionId,

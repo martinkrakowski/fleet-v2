@@ -15,7 +15,10 @@ import {
 } from "../server/wiring/presented-token.js";
 import {
   configureSessionExchange,
+  dropInteractiveSession,
   getInteractiveSession,
+  LIVE_SESSION_LIMIT,
+  registerInteractiveSession,
   SESSION_EXCHANGE_HEADER,
   SESSION_EXCHANGE_PATH,
 } from "../server/wiring/session-exchange.js";
@@ -405,6 +408,34 @@ describe("T6a web session login", () => {
     const refused = await loginWithCode("a-wrong-code");
     expect(refused.status).toBe(403);
     expect(existsSync(filePath)).toBe(true);
+  });
+
+  it("a login refused by the live-session limit leaves the code usable", async () => {
+    const code = issueWebLoginCode(tempDir) as string;
+    const filePath = join(tempDir, WEB_LOGIN_CODE_FILE);
+
+    // Fill every live-session slot so a further registration is refused. The
+    // code must not be spent by that refusal: it stays usable for a later
+    // login once a slot frees up, with no API restart.
+    const sessionIds: string[] = [];
+    for (let i = 0; i < LIVE_SESSION_LIMIT; i += 1) {
+      const session = registerInteractiveSession({ actor: "owner", scopes: ["read", "message"] });
+      expect(session).not.toBeNull();
+      if (session !== null) {
+        sessionIds.push(session.sessionId);
+      }
+    }
+
+    const refused = await loginWithCode(code);
+    expect(refused.status).toBe(403);
+    expect(refused.body).toEqual({ error: "Forbidden: no interactive session could be established" });
+
+    expect(existsSync(filePath)).toBe(true);
+    expect(dropInteractiveSession(sessionIds[0])).toBe(true);
+
+    const login = await loginWithCode(code);
+    expect(login.status).toBe(200);
+    expect(login.body.sessionId).not.toBe(sessionIds[0]);
   });
 
   it("the login code never appears in a response body", async () => {

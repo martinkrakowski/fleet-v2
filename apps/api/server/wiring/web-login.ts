@@ -68,10 +68,12 @@ export function issueWebLoginCode(stateDir: string): string | null {
 }
 
 /**
- * Consume the issued login code. Every refusal reason is a fixed, short,
- * host-free string; the presented value is never included.
+ * Verify the presented code without spending it. Non-mutating: the issued code
+ * stays usable until the caller commits to a login by calling
+ * `consumeWebLoginCode`. Every refusal reason is a fixed, short, host-free
+ * string; the presented value is never included.
  */
-export function consumeWebLoginCode(presented: unknown): { ok: true } | { ok: false; reason: string } {
+export function verifyWebLoginCode(presented: unknown): { ok: true } | { ok: false; reason: string } {
   if (typeof presented !== "string") {
     return { ok: false, reason: "web login code missing" };
   }
@@ -88,6 +90,21 @@ export function consumeWebLoginCode(presented: unknown): { ok: true } | { ok: fa
   const storedBuf = Buffer.from(storedCode, "utf8");
   if (presentedBuf.length !== storedBuf.length || !timingSafeEqual(presentedBuf, storedBuf)) {
     return { ok: false, reason: "web login code refused" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Consume the issued login code: verify (see `verifyWebLoginCode`), then spend
+ * it. The login route calls this only after the interactive session is
+ * registered, so a refused registration never spends the code. Every refusal
+ * reason is a fixed, short, host-free string; the presented value is never
+ * included.
+ */
+export function consumeWebLoginCode(presented: unknown): { ok: true } | { ok: false; reason: string } {
+  const check = verifyWebLoginCode(presented);
+  if (!check.ok) {
+    return check;
   }
   storedCode = null;
   consumed = true;

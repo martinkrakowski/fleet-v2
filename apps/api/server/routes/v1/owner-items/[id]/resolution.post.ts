@@ -24,7 +24,7 @@ export default defineEventHandler(async (event) => {
   const itemId = routeParam(event, "id");
   const operationId = newOperationId();
   try {
-    const body = await readObjectBody(event);
+    const body = await readObjectBody(event, { keepNowIso: true });
     const action = body.action;
     let request: { action: "done"; itemId: string; via: "web" } | { action: "withdraw"; itemId: string; reason: string };
     if (action === "done") {

@@ -261,6 +261,8 @@ describe("owner item resolution route", () => {
       { action: "done", by: "spoofed-actor" },
       { action: "done", actor: "spoofed-actor" },
       { action: "done", sessionId: "web-session-1" },
+      { action: "done", nowIso: "2026-01-01T00:00:00Z" },
+      { action: "withdraw", reason: "duplicate", nowIso: "2026-01-01T00:00:00Z" },
     ];
     for (const body of spoofed) {
       const res = await post(id, body);

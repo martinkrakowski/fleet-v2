@@ -1,6 +1,6 @@
 import { isAbsolute } from 'node:path';
 
-import { isValidHostName } from '@fleet/shared';
+import { containsSecretShape, isValidHostName } from '@fleet/shared';
 
 import { AGY_SECURITY_TEXT_VERSION } from './agy-security.js';
 
@@ -31,6 +31,10 @@ import type {
   HostSection,
   HostRunnerSection,
   LiveTailPolicy,
+  MergeDaemonSection,
+  MergePolicySection,
+  MergeRepositoryPolicy,
+  MergeVetoPolicy,
   PolicySection,
   ProcedureCoverage,
   ReviewerSection,
@@ -55,6 +59,9 @@ import {
   CONDUCTOR_REAPER_DISK_BOUNDS,
   CONDUCTOR_REAPER_REPAIR_KINDS,
   CONDUCTOR_REAPER_WORKTREE_BOUNDS,
+  DEFAULT_MERGE_DAEMON_POLICY,
+  MERGE_POLICY_BOUNDS,
+  parseMergeRepositoryKey,
 } from './policy.js';
 import { readOwnDataProperty } from './policy-read.js';
 import { readTelemetryPolicyBlock } from './telemetry-policy.js';
@@ -183,11 +190,27 @@ const POLICY_KEYS: readonly string[] = [
   'board',
   'telemetry',
   'seats',
+  'merge',
+  'daemon',
 ];
 const FORBIDDEN_ROUTE_KEYS: readonly string[] = ['tool', 'modelPattern'];
 const LIVE_TAIL_KEYS: readonly string[] = ['content'];
 const AUTO_MERGE_KEYS: readonly string[] = ['enabled', 'allowHighRisk', 'onBlocked'];
 const CONDUCTOR_KEYS: readonly string[] = ['enabled', 'stopGraceMinutes', 'reaper'];
+const MERGE_KEYS: readonly string[] = ['repos'];
+const MERGE_REPO_KEYS: readonly string[] = [
+  'projectId',
+  'shadow',
+  'unattended',
+  'requiredContexts',
+  'updateBranch',
+  'macosProcedure',
+  'maxAttempts',
+  'checksGraceMinutes',
+  'veto',
+];
+const MERGE_VETO_KEYS: readonly string[] = ['mode', 'holdConfidence'];
+const POLICY_DAEMON_KEYS: readonly string[] = ['intervalSeconds', 'budgetSeconds', 'settleSeconds'];
 const BOARD_KEYS: readonly string[] = ['forgeStaleMinutes', 'declarationTtlMinutes', 'doneWindowDays', 'forgeSyncMinutes'];
 const CONDUCTOR_REAPER_KEYS: readonly string[] = [
   'enabled',
@@ -1787,6 +1810,8 @@ function parseV2Policy(
   const board = parseBoardPolicy(section, errors);
   const telemetry = parsePolicyBlock(section, 'telemetry', readTelemetryPolicyBlock, errors);
   const seats: SeatsPolicy | undefined = parsePolicyBlock(section, 'seats', readSeatsPolicyBlock, errors);
+  const merge = parseMergePolicy(section, errors);
+  const daemon = parseMergeDaemonPolicy(section, errors);
   return {
     ...(forbiddenRoutes !== undefined ? { forbiddenRoutes } : {}),
     ...(perLaneCostCeiling !== undefined ? { perLaneCostCeiling } : {}),
@@ -1797,6 +1822,8 @@ function parseV2Policy(
     ...(board !== undefined ? { board } : {}),
     ...(telemetry !== undefined ? { telemetry } : {}),
     ...(seats !== undefined ? { seats } : {}),
+    ...(merge !== undefined ? { merge } : {}),
+    ...(daemon !== undefined ? { daemon } : {}),
   };
 }
 
@@ -2218,6 +2245,336 @@ function parseBoardPolicy(
     ...(declarationTtlMinutes !== undefined ? { declarationTtlMinutes } : {}),
     ...(doneWindowDays !== undefined ? { doneWindowDays } : {}),
     ...(forgeSyncMinutes !== undefined ? { forgeSyncMinutes } : {}),
+  };
+}
+
+function mergeRepositoryPath(key: string, index: number): string {
+  const readable = parseMergeRepositoryKey(key) !== undefined && !containsSecretShape(key);
+  const label = readable ? JSON.stringify(key) : `#${index}`;
+  return `policy.merge.repos[${label}]`;
+}
+
+function readMergeText(
+  record: JsonObject,
+  field: string,
+  path: string,
+  bounds: Readonly<{ min: number; max: number }>,
+  errors: string[],
+): string | undefined {
+  const value = record[field];
+  if (typeof value !== 'string') {
+    errors.push(`${path}.${field}: must be a string`);
+    return undefined;
+  }
+  if (containsSecretShape(value)) {
+    errors.push(`${path}.${field}: must not contain secret-shaped text`);
+    return undefined;
+  }
+  if (value.length < bounds.min || value.length > bounds.max || value.trim() === '') {
+    errors.push(
+      `${path}.${field}: must be a non-blank string of ${bounds.min} to ${bounds.max} characters`,
+    );
+    return undefined;
+  }
+  return value;
+}
+
+function readMergeBoolean(
+  record: JsonObject,
+  field: string,
+  path: string,
+  errors: string[],
+): boolean | undefined {
+  const value = record[field];
+  if (typeof value !== 'boolean') {
+    errors.push(`${path}.${field}: must be a boolean`);
+    return undefined;
+  }
+  return value;
+}
+
+function readMergeInteger(
+  record: JsonObject,
+  field: string,
+  path: string,
+  bounds: Readonly<{ min: number; max: number }>,
+  errors: string[],
+): number | undefined {
+  const value = record[field];
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < bounds.min ||
+    value > bounds.max
+  ) {
+    errors.push(`${path}.${field}: must be an integer between ${bounds.min} and ${bounds.max}`);
+    return undefined;
+  }
+  return value;
+}
+
+function readMergeRequiredContexts(
+  record: JsonObject,
+  path: string,
+  errors: string[],
+): readonly string[] | undefined {
+  const value = record.requiredContexts;
+  const bounds = MERGE_POLICY_BOUNDS.requiredContexts;
+  const lengths = MERGE_POLICY_BOUNDS.requiredContextLength;
+  const field = `${path}.requiredContexts`;
+  if (!Array.isArray(value)) {
+    errors.push(`${field}: must be an array`);
+    return undefined;
+  }
+  if (value.length < bounds.min || value.length > bounds.max) {
+    errors.push(`${field}: must hold ${bounds.min} to ${bounds.max} entries`);
+    return undefined;
+  }
+  const contexts: string[] = [];
+  let valid = true;
+  for (let index = 0; index < value.length; index += 1) {
+    const entry: unknown = value[index];
+    if (typeof entry !== 'string') {
+      errors.push(`${field}[${index}]: must be a string`);
+      valid = false;
+    } else if (containsSecretShape(entry)) {
+      errors.push(`${field}[${index}]: must not contain secret-shaped text`);
+      valid = false;
+    } else if (entry.length < lengths.min || entry.length > lengths.max || entry.trim() === '') {
+      errors.push(
+        `${field}[${index}]: must be a non-blank string of ${lengths.min} to ${lengths.max} characters`,
+      );
+      valid = false;
+    } else if (contexts.includes(entry)) {
+      errors.push(`${field}[${index}]: must be unique`);
+      valid = false;
+    } else {
+      contexts.push(entry);
+    }
+  }
+  return valid ? contexts : undefined;
+}
+
+function parseMergeVeto(
+  record: JsonObject,
+  path: string,
+  errors: string[],
+): MergeVetoPolicy | undefined {
+  const value = record.veto;
+  const field = `${path}.veto`;
+  if (!isJsonObject(value)) {
+    errors.push(`${field}: must be an object`);
+    return undefined;
+  }
+  const before = errors.length;
+  collectUnknownKeys(value, MERGE_VETO_KEYS, field, errors);
+  let mode: MergeVetoPolicy['mode'];
+  if (Object.hasOwn(value, 'mode')) {
+    const candidate = value.mode;
+    if (candidate !== 'off' && candidate !== 'shadow' && candidate !== 'live') {
+      errors.push(`${field}.mode: must be one of off, shadow, live`);
+    } else {
+      mode = candidate;
+    }
+  }
+  let holdConfidence: number | undefined;
+  if (Object.hasOwn(value, 'holdConfidence')) {
+    const candidate = value.holdConfidence;
+    const bounds = MERGE_POLICY_BOUNDS.holdConfidence;
+    if (
+      typeof candidate !== 'number' ||
+      !Number.isFinite(candidate) ||
+      candidate < bounds.min ||
+      candidate > bounds.max
+    ) {
+      errors.push(`${field}.holdConfidence: must be a number between ${bounds.min} and ${bounds.max}`);
+    } else {
+      holdConfidence = candidate;
+    }
+  }
+  if (errors.length !== before) {
+    return undefined;
+  }
+  return {
+    ...(mode !== undefined ? { mode } : {}),
+    ...(holdConfidence !== undefined ? { holdConfidence } : {}),
+  };
+}
+
+type MergeRepositoryFields = {
+  readonly [K in keyof Omit<Required<MergeRepositoryPolicy>, 'projectId'>]:
+    | Required<MergeRepositoryPolicy>[K]
+    | undefined;
+};
+
+function ifPresent<T>(entry: JsonObject, field: string, read: () => T): T | undefined {
+  return Object.hasOwn(entry, field) ? read() : undefined;
+}
+
+function checkMergeRepositoryKey(key: string, path: string, errors: string[]): void {
+  if (parseMergeRepositoryKey(key) === undefined) {
+    errors.push(`${path}: key must be <owner>/<repo>`);
+  } else if (containsSecretShape(key)) {
+    errors.push(`${path}: key must not contain secret-shaped text`);
+  }
+}
+
+function readMergeProjectId(entry: JsonObject, path: string, errors: string[]): string | undefined {
+  if (!Object.hasOwn(entry, 'projectId')) {
+    errors.push(`${path}.projectId: required`);
+    return undefined;
+  }
+  return readMergeText(entry, 'projectId', path, MERGE_POLICY_BOUNDS.projectIdLength, errors);
+}
+
+function buildMergeRepositoryPolicy(
+  projectId: string,
+  fields: MergeRepositoryFields,
+): MergeRepositoryPolicy {
+  const { shadow, unattended, requiredContexts, updateBranch } = fields;
+  const { macosProcedure, maxAttempts, checksGraceMinutes, veto } = fields;
+  return {
+    projectId,
+    ...(shadow !== undefined ? { shadow } : {}),
+    ...(unattended !== undefined ? { unattended } : {}),
+    ...(requiredContexts !== undefined ? { requiredContexts } : {}),
+    ...(updateBranch !== undefined ? { updateBranch } : {}),
+    ...(macosProcedure !== undefined ? { macosProcedure } : {}),
+    ...(maxAttempts !== undefined ? { maxAttempts } : {}),
+    ...(checksGraceMinutes !== undefined ? { checksGraceMinutes } : {}),
+    ...(veto !== undefined ? { veto } : {}),
+  };
+}
+
+function parseMergeRepository(
+  key: string,
+  index: number,
+  entry: unknown,
+  errors: string[],
+): MergeRepositoryPolicy | undefined {
+  const path = mergeRepositoryPath(key, index);
+  const before = errors.length;
+  checkMergeRepositoryKey(key, path, errors);
+  if (!isJsonObject(entry)) {
+    errors.push(`${path}: must be an object`);
+    return undefined;
+  }
+  collectUnknownKeys(entry, MERGE_REPO_KEYS, path, errors);
+  const projectId = readMergeProjectId(entry, path, errors);
+  const fields: MergeRepositoryFields = {
+    shadow: ifPresent(entry, 'shadow', () => readMergeBoolean(entry, 'shadow', path, errors)),
+    unattended: ifPresent(entry, 'unattended', () =>
+      readMergeBoolean(entry, 'unattended', path, errors),
+    ),
+    requiredContexts: ifPresent(entry, 'requiredContexts', () =>
+      readMergeRequiredContexts(entry, path, errors),
+    ),
+    updateBranch: ifPresent(entry, 'updateBranch', () =>
+      readMergeBoolean(entry, 'updateBranch', path, errors),
+    ),
+    macosProcedure: ifPresent(entry, 'macosProcedure', () =>
+      readMergeText(entry, 'macosProcedure', path, MERGE_POLICY_BOUNDS.macosProcedureLength, errors),
+    ),
+    maxAttempts: ifPresent(entry, 'maxAttempts', () =>
+      readMergeInteger(entry, 'maxAttempts', path, MERGE_POLICY_BOUNDS.maxAttempts, errors),
+    ),
+    checksGraceMinutes: ifPresent(entry, 'checksGraceMinutes', () =>
+      readMergeInteger(
+        entry,
+        'checksGraceMinutes',
+        path,
+        MERGE_POLICY_BOUNDS.checksGraceMinutes,
+        errors,
+      ),
+    ),
+    veto: ifPresent(entry, 'veto', () => parseMergeVeto(entry, path, errors)),
+  };
+  if (errors.length !== before || projectId === undefined) {
+    return undefined;
+  }
+  return buildMergeRepositoryPolicy(projectId, fields);
+}
+
+function readMergeRepos(
+  written: unknown,
+  errors: string[],
+): Record<string, MergeRepositoryPolicy> | undefined {
+  if (!isJsonObject(written)) {
+    errors.push('policy.merge.repos: must be an object');
+    return undefined;
+  }
+  if (Object.keys(written).length > MERGE_POLICY_BOUNDS.repositories.max) {
+    errors.push(`policy.merge.repos: at most ${MERGE_POLICY_BOUNDS.repositories.max} entries`);
+    return undefined;
+  }
+  const repos: Record<string, MergeRepositoryPolicy> = {};
+  let index = 0;
+  for (const key of Object.keys(written)) {
+    const entry = parseMergeRepository(key, index, written[key], errors);
+    if (entry !== undefined) {
+      repos[key] = entry;
+    }
+    index += 1;
+  }
+  return repos;
+}
+
+function parseMergePolicy(
+  section: JsonObject,
+  errors: string[],
+): MergePolicySection | undefined {
+  if (!Object.hasOwn(section, 'merge')) {
+    return undefined;
+  }
+  const value = section.merge;
+  if (!isJsonObject(value)) {
+    errors.push('policy.merge: must be an object');
+    return undefined;
+  }
+  const before = errors.length;
+  collectUnknownKeys(value, MERGE_KEYS, 'policy.merge', errors);
+  const repos = ifPresent(value, 'repos', () => readMergeRepos(value.repos, errors));
+  if (errors.length !== before) {
+    return undefined;
+  }
+  return repos !== undefined ? { repos } : {};
+}
+
+function parseMergeDaemonPolicy(
+  section: JsonObject,
+  errors: string[],
+): MergeDaemonSection | undefined {
+  if (!Object.hasOwn(section, 'daemon')) {
+    return undefined;
+  }
+  const value = section.daemon;
+  if (!isJsonObject(value)) {
+    errors.push('policy.daemon: must be an object');
+    return undefined;
+  }
+  const before = errors.length;
+  collectUnknownKeys(value, POLICY_DAEMON_KEYS, 'policy.daemon', errors);
+  const read = (field: keyof MergeDaemonSection): number | undefined =>
+    Object.hasOwn(value, field)
+      ? readMergeInteger(value, field, 'policy.daemon', MERGE_POLICY_BOUNDS[field], errors)
+      : undefined;
+  const intervalSeconds = read('intervalSeconds');
+  const budgetSeconds = read('budgetSeconds');
+  const settleSeconds = read('settleSeconds');
+  if (
+    errors.length === before &&
+    (budgetSeconds ?? DEFAULT_MERGE_DAEMON_POLICY.budgetSeconds) >=
+      (intervalSeconds ?? DEFAULT_MERGE_DAEMON_POLICY.intervalSeconds)
+  ) {
+    errors.push('policy.daemon.budgetSeconds: must be less than intervalSeconds');
+  }
+  if (errors.length !== before) {
+    return undefined;
+  }
+  return {
+    ...(intervalSeconds !== undefined ? { intervalSeconds } : {}),
+    ...(budgetSeconds !== undefined ? { budgetSeconds } : {}),
+    ...(settleSeconds !== undefined ? { settleSeconds } : {}),
   };
 }
 

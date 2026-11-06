@@ -406,6 +406,74 @@ export interface BoardPolicySection {
   readonly forgeSyncMinutes?: number;
 }
 
+export type MergeVetoMode = 'off' | 'shadow' | 'live';
+
+/** The `veto` block of a `policy.merge.repos` entry. Every field optional. */
+export interface MergeVetoPolicy {
+  readonly mode?: MergeVetoMode;
+  readonly holdConfidence?: number;
+}
+
+/** One `policy.merge.repos["<owner>/<repo>"]` entry as written; `projectId` is required. */
+export interface MergeRepositoryPolicy {
+  readonly projectId?: string;
+  readonly shadow?: boolean;
+  readonly unattended?: boolean;
+  readonly requiredContexts?: readonly string[];
+  readonly updateBranch?: boolean;
+  readonly macosProcedure?: string;
+  readonly maxAttempts?: number;
+  readonly checksGraceMinutes?: number;
+  readonly veto?: MergeVetoPolicy;
+}
+
+/** The v2 `policy.merge` section as written; read it through `resolveMergePolicy`. */
+export interface MergePolicySection {
+  readonly repos?: Readonly<Record<string, MergeRepositoryPolicy>>;
+}
+
+/** The v2 `policy.daemon` section as written; read it through `resolveMergePolicy`. */
+export interface MergeDaemonSection {
+  readonly intervalSeconds?: number;
+  readonly budgetSeconds?: number;
+  readonly settleSeconds?: number;
+}
+
+/** A merge repository policy with every default applied (`resolveMergePolicy`). */
+export interface ResolvedMergeRepositoryPolicy {
+  readonly owner: string;
+  readonly repo: string;
+  /** `<owner>/<repo>`. */
+  readonly repositoryKey: string;
+  readonly projectId: string;
+  readonly shadow: boolean;
+  readonly unattended: boolean;
+  readonly requiredContexts: readonly string[];
+  readonly updateBranch: boolean;
+  /** Null means none. */
+  readonly macosProcedure: string | null;
+  readonly maxAttempts: number;
+  readonly checksGraceMinutes: number;
+  readonly veto: { readonly mode: MergeVetoMode; readonly holdConfidence: number };
+}
+
+/** The daemon tick settings with every default applied (`resolveMergePolicy`). */
+export interface ResolvedMergeDaemonPolicy {
+  readonly intervalSeconds: number;
+  readonly budgetSeconds: number;
+  readonly settleSeconds: number;
+}
+
+/** The result of `resolveMergePolicy`: the normalized sections at their revision, or a refusal code. */
+export type MergePolicyRead =
+  | {
+      readonly outcome: 'resolved';
+      readonly policyRevision: string;
+      readonly repositories: readonly ResolvedMergeRepositoryPolicy[];
+      readonly daemon: ResolvedMergeDaemonPolicy;
+    }
+  | { readonly outcome: 'invalid'; readonly reason: string };
+
 /**
  * The v2 `policy` section: shape only. The rules are enforced by the loader
  * itself through `validateSeatPolicy` (lane O5) on every v2 file.
@@ -427,6 +495,10 @@ export interface PolicySection {
   readonly telemetry?: TelemetryPolicy;
   /** Absent means no rotation, 60-minute cooling, observations off (`DEFAULT_SEATS_POLICY`); read it through `resolveSeatsPolicy`. */
   readonly seats?: SeatsPolicy;
+  /** Absent means no merge repository is configured; read it through `resolveMergePolicy`. */
+  readonly merge?: MergePolicySection;
+  /** Absent means the D-DT9 defaults 60 / 45 / 20; read it through `resolveMergePolicy`. */
+  readonly daemon?: MergeDaemonSection;
 }
 
 /** The v2 `shelf` section with the local provider (D1, default). */

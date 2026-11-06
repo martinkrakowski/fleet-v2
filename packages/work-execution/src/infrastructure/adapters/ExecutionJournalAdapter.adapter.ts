@@ -25,6 +25,8 @@ import {
 import type {
   CapacityReservationClaim,
   ExecutionJournalPort,
+  ReleaseCapacityReservationIfUnchangedRequest,
+  ReleaseCapacityReservationIfUnchangedResult,
   ReserveCapacityAtomicallyRequest,
   ReserveCapacityAtomicallyResult,
   SelectRecordUnderLockVerdict,
@@ -33,14 +35,18 @@ import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out
 import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
 import {
   assertValidSchemaVersionPolicy,
+  FileLockTimeoutError,
   inspectVersionedRecordListBytes,
   quarantineUnreadable,
   readStoreRecordSchemaVersion,
+  StateFileUnreadableError,
   StateFileUnknownVersionError,
   withFileLock,
   writeJsonAtomically,
   type VersionedRecordParseResult,
 } from './file-store.js';
+import { isCanonicalIso } from '../../domain/lane-activity-records.js';
+import { containsSecretShape } from '@fleet/shared';
 
 /** The schema-version policy of `journal.json` (Q5a, D6). */
 export const JOURNAL_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy('journal.json', {
@@ -75,6 +81,57 @@ function isCapacityReservationRecord(value: unknown): value is CapacityReservati
 
 function isNonEmptyStringField(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
+}
+
+/**
+ * Validation for `releaseCapacityReservationIfUnchanged` (plan §3.9.2). Returns
+ * a detail code only for diagnostics that never carry the offending value.
+ * Every failure — including a property read that throws — is `invalid-request`
+ * and never an exception.
+ */
+const FENCED_RELEASE_REQUEST_KEYS = new Set([
+  'attemptId',
+  'reservationId',
+  'attemptRevision',
+  'releasedAtIso',
+  'readAttemptRevision',
+]);
+
+function validateFencedReleaseRequest(request: ReleaseCapacityReservationIfUnchangedRequest): string | null {
+  try {
+    if (typeof request !== 'object' || request === null || Array.isArray(request)) {
+      return 'not-an-object';
+    }
+    const value = request as unknown as Record<string, unknown>;
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== FENCED_RELEASE_REQUEST_KEYS.size || keys.some((key) => typeof key !== 'string' || !FENCED_RELEASE_REQUEST_KEYS.has(key))) {
+      return 'unknown-or-missing-key';
+    }
+    for (const field of ['attemptId', 'reservationId'] as const) {
+      const candidate = value[field];
+      if (
+        typeof candidate !== 'string' ||
+        candidate.length === 0 ||
+        Buffer.byteLength(candidate, 'utf8') > 256 ||
+        containsSecretShape(candidate)
+      ) {
+        return 'invalid-id';
+      }
+    }
+    const revision = value['attemptRevision'];
+    if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) {
+      return 'invalid-revision';
+    }
+    if (!isCanonicalIso(value['releasedAtIso'])) {
+      return 'invalid-timestamp';
+    }
+    if (typeof value['readAttemptRevision'] !== 'function') {
+      return 'invalid-read-attempt-revision';
+    }
+    return null;
+  } catch {
+    return 'unreadable-object';
+  }
 }
 
 /** A journal entry in canonical stored shape: every writer stamps `schemaVersion` (Q5a, D6). */
@@ -155,6 +212,38 @@ export function parseReservationStateRecord(raw: unknown): CapacityReservationRe
 }
 
 /**
+ * The checks both fenced-release paths share: the attempt's held reservation
+ * must exist and be the requested one, and the attempt's revision must be
+ * readable and unchanged. Anything else answers the release result as is.
+ */
+async function checkFencedReleaseHeld(
+  reservations: Iterable<CapacityReservationRecord>,
+  request: ReleaseCapacityReservationIfUnchangedRequest,
+): Promise<
+  | { readonly outcome: 'held'; readonly held: CapacityReservationRecord }
+  | Exclude<ReleaseCapacityReservationIfUnchangedResult, { outcome: 'released' | 'refused' }>
+> {
+  const held = [...reservations].find(
+    (reservation) => reservation.attemptId === request.attemptId && reservation.held === true,
+  );
+  if (held === undefined) return { outcome: 'not-held' };
+  if (held.id !== request.reservationId) return { outcome: 'changed' };
+  let currentRevision: number | null;
+  try {
+    currentRevision = await request.readAttemptRevision();
+  } catch {
+    return { outcome: 'unknown', reason: 'attempt-unknown' };
+  }
+  if (currentRevision === null) {
+    return { outcome: 'unknown', reason: 'attempt-unknown' };
+  }
+  if (currentRevision !== request.attemptRevision) {
+    return { outcome: 'changed' };
+  }
+  return { outcome: 'held', held };
+}
+
+/**
  * One locked read-modify-write decision over the freshly read held
  * reservations: a claim by an attempt that already holds one is refused, a
  * claim over the host's budget is refused, and only a passing claim is
@@ -193,6 +282,7 @@ function arbitrateReservation(
 export class ExecutionJournalAdapter implements ExecutionJournalPort {
   private readonly inMemoryJournalEntries: ActionJournalEntryRecord[] = [];
   private readonly inMemoryReservationsById = new Map<string, CapacityReservationRecord>();
+  private readonly fencedReleaseChainsByAttemptId = new Map<string, Promise<unknown>>();
   private readonly changeSignal: ChangeSignalPort;
   private signalEmitFailuresCount = 0;
 
@@ -503,6 +593,158 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       });
     }
     return released;
+  }
+
+  async releaseCapacityReservationIfUnchanged(
+    rawRequest: ReleaseCapacityReservationIfUnchangedRequest,
+  ): Promise<ReleaseCapacityReservationIfUnchangedResult> {
+    try {
+      const validated = validateFencedReleaseRequest(rawRequest);
+      if (validated !== null) {
+        return { outcome: 'refused', reason: 'invalid-request' };
+      }
+      // Snapshot once so a getter cannot answer differently after validation.
+      const request: ReleaseCapacityReservationIfUnchangedRequest = {
+        attemptId: rawRequest.attemptId,
+        reservationId: rawRequest.reservationId,
+        attemptRevision: rawRequest.attemptRevision,
+        releasedAtIso: rawRequest.releasedAtIso,
+        readAttemptRevision: rawRequest.readAttemptRevision,
+      };
+
+      const stateDir = this.options?.stateDir;
+      if (stateDir === undefined) {
+        return await this.releaseInMemoryIfUnchanged(request);
+      }
+
+      const target = path.join(stateDir, 'reservations.json');
+      const lockPath = path.join(stateDir, 'reservations.json.lock');
+
+      let before: ChangeSignal['before'] = null;
+      let written: ChangeSignal['written'] = null;
+      let releasedId: string | null = null;
+
+      try {
+        const outcome = await withFileLock(lockPath, async (): Promise<
+          Exclude<ReleaseCapacityReservationIfUnchangedResult, { outcome: 'unknown'; reason: 'lock-timeout' }>
+        > => {
+          try {
+            const stat = await fs.stat(target);
+            before = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+          } catch {
+            before = null;
+          }
+          let reservations: Map<string, CapacityReservationRecord>;
+          try {
+            reservations = await this.readReservationsFromDisk(target);
+          } catch (error) {
+            if (error instanceof StateFileUnreadableError || error instanceof StateFileUnknownVersionError) {
+              return { outcome: 'unknown', reason: 'unreadable' };
+            }
+            throw error;
+          }
+          const check = await checkFencedReleaseHeld(reservations.values(), request);
+          if (check.outcome !== 'held') {
+            return check;
+          }
+          const held = check.held;
+          const priorList = [...reservations.values()];
+          reservations.set(
+            held.id,
+            normalizeReservationRecord({ ...held, held: false, releasedAtIso: request.releasedAtIso }),
+          );
+          await writeJsonAtomically(target, [...reservations.values()]);
+          // The attempt store is not under the reservations lock, so a writer
+          // can save a newer attempt revision between the first read and the
+          // write above. Re-read the revision after the write: if it moved,
+          // restore the prior list (still under the lock) and report `changed`.
+          let verifiedRevision: number | null;
+          try {
+            verifiedRevision = await request.readAttemptRevision();
+          } catch {
+            verifiedRevision = null;
+          }
+          if (verifiedRevision !== request.attemptRevision) {
+            await writeJsonAtomically(target, priorList);
+            return verifiedRevision === null
+              ? { outcome: 'unknown', reason: 'attempt-unknown' }
+              : { outcome: 'changed' };
+          }
+          try {
+            const stat = await fs.stat(target);
+            written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+          } catch {
+            written = null;
+          }
+          releasedId = held.id;
+          return { outcome: 'released', reservationId: held.id };
+        });
+
+        if (outcome.outcome === 'released' && releasedId !== null) {
+          this.signal({
+            kind: 'capacity',
+            id: releasedId,
+            stateFile: path.resolve(target),
+            before,
+            written,
+          });
+        }
+        return outcome;
+      } catch (error) {
+        if (error instanceof FileLockTimeoutError) {
+          return { outcome: 'unknown', reason: 'lock-timeout' };
+        }
+        if (error instanceof StateFileUnreadableError || error instanceof StateFileUnknownVersionError) {
+          return { outcome: 'unknown', reason: 'unreadable' };
+        }
+        return { outcome: 'unknown', reason: 'unreadable' };
+      }
+    } catch {
+      return { outcome: 'unknown', reason: 'unreadable' };
+    }
+  }
+
+  private releaseInMemoryIfUnchanged(
+    request: ReleaseCapacityReservationIfUnchangedRequest,
+  ): Promise<ReleaseCapacityReservationIfUnchangedResult> {
+    // Concurrent releases of the same attempt must not both act on the same
+    // held reservation: each find-check-release runs on a per-attempt chain so
+    // the second caller re-reads the map only after the first has finished.
+    const prior = this.fencedReleaseChainsByAttemptId.get(request.attemptId) ?? Promise.resolve();
+    const run = prior
+      .then(
+        () => this.releaseInMemoryIfUnchangedLocked(request),
+        () => this.releaseInMemoryIfUnchangedLocked(request),
+      );
+    const tail = run.catch(() => undefined);
+    this.fencedReleaseChainsByAttemptId.set(request.attemptId, tail);
+    // The chain exists only to serialise in-flight releases of the same
+    // attempt. Once the latest link settles it has served its purpose; drop it
+    // so a long-lived process does not retain one resolved promise per attempt
+    // forever. A newer link for the same attempt replaces the entry before the
+    // older one settles, so the identity check keeps the newest chain intact.
+    void tail.then(() => {
+      if (this.fencedReleaseChainsByAttemptId.get(request.attemptId) === tail) {
+        this.fencedReleaseChainsByAttemptId.delete(request.attemptId);
+      }
+    });
+    return run;
+  }
+
+  private async releaseInMemoryIfUnchangedLocked(
+    request: ReleaseCapacityReservationIfUnchangedRequest,
+  ): Promise<ReleaseCapacityReservationIfUnchangedResult> {
+    const check = await checkFencedReleaseHeld(this.inMemoryReservationsById.values(), request);
+    if (check.outcome !== 'held') {
+      return check;
+    }
+    const held = check.held;
+    this.inMemoryReservationsById.set(
+      held.id,
+      normalizeReservationRecord({ ...held, held: false, releasedAtIso: request.releasedAtIso }),
+    );
+    this.signal({ kind: 'capacity', id: held.id, stateFile: null, before: null, written: null });
+    return { outcome: 'released', reservationId: held.id };
   }
 
   private async readJournalFromDisk(target: string): Promise<ActionJournalEntryRecord[]> {

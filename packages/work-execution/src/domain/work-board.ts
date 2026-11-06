@@ -780,12 +780,15 @@ function afterRowsFor(lane: BoardPlannedLaneFact, ctx: WaitsCardContext): WaitGu
     const glance: LaneGlance = predecessorCard === undefined
       ? { ref: predecessorRef, label: predecessorLane.laneId, column: 'unresolved' }
       : glanceOf(predecessorCard);
-    if (predecessorCard !== undefined && predecessorCard.done !== null) {
-      rows.push(notDoneRow('after-not-done', glance, predecessorRef, ctx, predecessorCard, true));
-      continue;
-    }
+    // A dropped predecessor is never done for its dependants: the dropped
+    // status is checked before the merge record so it always reads as
+    // `after-dropped` (§3.6).
     if (predecessorLane.status === 'dropped') {
       rows.push(afterDroppedRow(glance, ctx));
+      continue;
+    }
+    if (predecessorCard !== undefined && predecessorCard.done !== null) {
+      rows.push(notDoneRow('after-not-done', glance, predecessorRef, ctx, predecessorCard, true));
       continue;
     }
     rows.push(notDoneRow('after-not-done', glance, predecessorRef, ctx, predecessorCard, true));
@@ -806,12 +809,13 @@ function exclusiveOrderRowsFor(plan: BoardPlanFact, lane: BoardPlannedLaneFact, 
       const glance: LaneGlance = earlierCard === undefined
         ? { ref: earlierRef, label: earlierLane.laneId, column: 'unresolved' }
         : glanceOf(earlierCard);
-      if (earlierCard !== undefined && earlierCard.done !== null) {
-        rows.push(notDoneRow('exclusive-order', glance, earlierRef, ctx, earlierCard, false));
-        continue;
-      }
+      // Same ordering as `after`: dropped beats a merge record (§3.6).
       if (earlierLane.status === 'dropped') {
         rows.push(afterDroppedRow(glance, ctx));
+        continue;
+      }
+      if (earlierCard !== undefined && earlierCard.done !== null) {
+        rows.push(notDoneRow('exclusive-order', glance, earlierRef, ctx, earlierCard, false));
         continue;
       }
       rows.push(notDoneRow('exclusive-order', glance, earlierRef, ctx, earlierCard, false));

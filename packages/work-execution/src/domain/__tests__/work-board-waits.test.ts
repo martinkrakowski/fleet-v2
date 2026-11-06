@@ -263,6 +263,42 @@ describe('WB2b wait guards', () => {
     expect(row.clearedByText).toBe("edit this lane's after and re-import the plan");
   });
 
+  it('a dropped predecessor with a merge record is still after-dropped, never clear', () => {
+    // The dropped status is checked before the merge record, so the
+    // predecessor never counts as done for its dependants.
+    const afterBoard = boardOf(
+      [plan([
+        laneFact('A1', { status: 'dropped' }),
+        laneFact('A2', { after: [after('A1')] }),
+      ])],
+      { links: [link(7, A1)], merges: [merge(7)] },
+    );
+    const a2 = cardOf(afterBoard, A2_KEY);
+    expect(a2.waitsOn.find((r) => r.reason === 'after-not-done')).toBeUndefined();
+    const afterRow = a2.waitsOn.find((r) => r.reason === 'after-dropped');
+    expect(afterRow).toBeDefined();
+    expect(afterRow?.state).toBe('blocked');
+    expect(afterRow?.clearedBy).toEqual({ kind: 'edit', what: 'after' });
+    expect(afterRow?.subject).toMatchObject({
+      kind: 'lane',
+      lane: { ref: A1, label: 'A1', column: 'done' },
+    });
+
+    const exclusiveBoard = boardOf(
+      [plan(
+        [laneFact('A1', { status: 'dropped' }), laneFact('A2')],
+        { exclusiveOrder: [{ file: 'packages/work-execution', lanes: ['A1', 'A2'] }] },
+      )],
+      { links: [link(7, A1)], merges: [merge(7)] },
+    );
+    const a2Exclusive = cardOf(exclusiveBoard, A2_KEY);
+    expect(a2Exclusive.waitsOn.find((r) => r.reason === 'exclusive-order')).toBeUndefined();
+    const droppedRow = a2Exclusive.waitsOn.find((r) => r.reason === 'after-dropped');
+    expect(droppedRow).toBeDefined();
+    expect(droppedRow?.state).toBe('blocked');
+    expect(droppedRow?.clearedBy).toEqual({ kind: 'edit', what: 'after' });
+  });
+
   it('an exclusive-order predecessor that is not done blocks with exclusive-order', () => {
     const board = boardOf([plan(
       [laneFact('A1'), laneFact('A2')],

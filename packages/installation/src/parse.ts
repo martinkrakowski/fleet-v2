@@ -2250,7 +2250,8 @@ function parseBoardPolicy(
 
 function mergeRepositoryPath(key: string, index: number): string {
   const readable = parseMergeRepositoryKey(key) !== undefined && !containsSecretShape(key);
-  return `policy.merge.repos[${readable ? JSON.stringify(key) : `#${index}`}]`;
+  const label = readable ? JSON.stringify(key) : `#${index}`;
+  return `policy.merge.repos[${label}]`;
 }
 
 function readMergeText(
@@ -2400,55 +2401,38 @@ function parseMergeVeto(
   };
 }
 
-function parseMergeRepository(
-  key: string,
-  index: number,
-  entry: unknown,
-  errors: string[],
-): MergeRepositoryPolicy | undefined {
-  const path = mergeRepositoryPath(key, index);
-  const before = errors.length;
+type MergeRepositoryFields = {
+  readonly [K in keyof Omit<Required<MergeRepositoryPolicy>, 'projectId'>]:
+    | Required<MergeRepositoryPolicy>[K]
+    | undefined;
+};
+
+function ifPresent<T>(entry: JsonObject, field: string, read: () => T): T | undefined {
+  return Object.hasOwn(entry, field) ? read() : undefined;
+}
+
+function checkMergeRepositoryKey(key: string, path: string, errors: string[]): void {
   if (parseMergeRepositoryKey(key) === undefined) {
     errors.push(`${path}: key must be <owner>/<repo>`);
   } else if (containsSecretShape(key)) {
     errors.push(`${path}: key must not contain secret-shaped text`);
   }
-  if (!isJsonObject(entry)) {
-    errors.push(`${path}: must be an object`);
-    return undefined;
-  }
-  collectUnknownKeys(entry, MERGE_REPO_KEYS, path, errors);
-  let projectId: string | undefined;
+}
+
+function readMergeProjectId(entry: JsonObject, path: string, errors: string[]): string | undefined {
   if (!Object.hasOwn(entry, 'projectId')) {
     errors.push(`${path}.projectId: required`);
-  } else {
-    projectId = readMergeText(entry, 'projectId', path, MERGE_POLICY_BOUNDS.projectIdLength, errors);
-  }
-  const shadow = Object.hasOwn(entry, 'shadow')
-    ? readMergeBoolean(entry, 'shadow', path, errors)
-    : undefined;
-  const unattended = Object.hasOwn(entry, 'unattended')
-    ? readMergeBoolean(entry, 'unattended', path, errors)
-    : undefined;
-  const requiredContexts = Object.hasOwn(entry, 'requiredContexts')
-    ? readMergeRequiredContexts(entry, path, errors)
-    : undefined;
-  const updateBranch = Object.hasOwn(entry, 'updateBranch')
-    ? readMergeBoolean(entry, 'updateBranch', path, errors)
-    : undefined;
-  const macosProcedure = Object.hasOwn(entry, 'macosProcedure')
-    ? readMergeText(entry, 'macosProcedure', path, MERGE_POLICY_BOUNDS.macosProcedureLength, errors)
-    : undefined;
-  const maxAttempts = Object.hasOwn(entry, 'maxAttempts')
-    ? readMergeInteger(entry, 'maxAttempts', path, MERGE_POLICY_BOUNDS.maxAttempts, errors)
-    : undefined;
-  const checksGraceMinutes = Object.hasOwn(entry, 'checksGraceMinutes')
-    ? readMergeInteger(entry, 'checksGraceMinutes', path, MERGE_POLICY_BOUNDS.checksGraceMinutes, errors)
-    : undefined;
-  const veto = Object.hasOwn(entry, 'veto') ? parseMergeVeto(entry, path, errors) : undefined;
-  if (errors.length !== before || projectId === undefined) {
     return undefined;
   }
+  return readMergeText(entry, 'projectId', path, MERGE_POLICY_BOUNDS.projectIdLength, errors);
+}
+
+function buildMergeRepositoryPolicy(
+  projectId: string,
+  fields: MergeRepositoryFields,
+): MergeRepositoryPolicy {
+  const { shadow, unattended, requiredContexts, updateBranch } = fields;
+  const { macosProcedure, maxAttempts, checksGraceMinutes, veto } = fields;
   return {
     projectId,
     ...(shadow !== undefined ? { shadow } : {}),
@@ -2460,6 +2444,79 @@ function parseMergeRepository(
     ...(checksGraceMinutes !== undefined ? { checksGraceMinutes } : {}),
     ...(veto !== undefined ? { veto } : {}),
   };
+}
+
+function parseMergeRepository(
+  key: string,
+  index: number,
+  entry: unknown,
+  errors: string[],
+): MergeRepositoryPolicy | undefined {
+  const path = mergeRepositoryPath(key, index);
+  const before = errors.length;
+  checkMergeRepositoryKey(key, path, errors);
+  if (!isJsonObject(entry)) {
+    errors.push(`${path}: must be an object`);
+    return undefined;
+  }
+  collectUnknownKeys(entry, MERGE_REPO_KEYS, path, errors);
+  const projectId = readMergeProjectId(entry, path, errors);
+  const fields: MergeRepositoryFields = {
+    shadow: ifPresent(entry, 'shadow', () => readMergeBoolean(entry, 'shadow', path, errors)),
+    unattended: ifPresent(entry, 'unattended', () =>
+      readMergeBoolean(entry, 'unattended', path, errors),
+    ),
+    requiredContexts: ifPresent(entry, 'requiredContexts', () =>
+      readMergeRequiredContexts(entry, path, errors),
+    ),
+    updateBranch: ifPresent(entry, 'updateBranch', () =>
+      readMergeBoolean(entry, 'updateBranch', path, errors),
+    ),
+    macosProcedure: ifPresent(entry, 'macosProcedure', () =>
+      readMergeText(entry, 'macosProcedure', path, MERGE_POLICY_BOUNDS.macosProcedureLength, errors),
+    ),
+    maxAttempts: ifPresent(entry, 'maxAttempts', () =>
+      readMergeInteger(entry, 'maxAttempts', path, MERGE_POLICY_BOUNDS.maxAttempts, errors),
+    ),
+    checksGraceMinutes: ifPresent(entry, 'checksGraceMinutes', () =>
+      readMergeInteger(
+        entry,
+        'checksGraceMinutes',
+        path,
+        MERGE_POLICY_BOUNDS.checksGraceMinutes,
+        errors,
+      ),
+    ),
+    veto: ifPresent(entry, 'veto', () => parseMergeVeto(entry, path, errors)),
+  };
+  if (errors.length !== before || projectId === undefined) {
+    return undefined;
+  }
+  return buildMergeRepositoryPolicy(projectId, fields);
+}
+
+function readMergeRepos(
+  written: unknown,
+  errors: string[],
+): Record<string, MergeRepositoryPolicy> | undefined {
+  if (!isJsonObject(written)) {
+    errors.push('policy.merge.repos: must be an object');
+    return undefined;
+  }
+  if (Object.keys(written).length > MERGE_POLICY_BOUNDS.repositories.max) {
+    errors.push(`policy.merge.repos: at most ${MERGE_POLICY_BOUNDS.repositories.max} entries`);
+    return undefined;
+  }
+  const repos: Record<string, MergeRepositoryPolicy> = {};
+  let index = 0;
+  for (const key of Object.keys(written)) {
+    const entry = parseMergeRepository(key, index, written[key], errors);
+    if (entry !== undefined) {
+      repos[key] = entry;
+    }
+    index += 1;
+  }
+  return repos;
 }
 
 function parseMergePolicy(
@@ -2476,25 +2533,7 @@ function parseMergePolicy(
   }
   const before = errors.length;
   collectUnknownKeys(value, MERGE_KEYS, 'policy.merge', errors);
-  let repos: Record<string, MergeRepositoryPolicy> | undefined;
-  if (Object.hasOwn(value, 'repos')) {
-    const written = value.repos;
-    if (!isJsonObject(written)) {
-      errors.push('policy.merge.repos: must be an object');
-    } else if (Object.keys(written).length > MERGE_POLICY_BOUNDS.repositories.max) {
-      errors.push(`policy.merge.repos: at most ${MERGE_POLICY_BOUNDS.repositories.max} entries`);
-    } else {
-      repos = {};
-      let index = 0;
-      for (const key of Object.keys(written)) {
-        const entry = parseMergeRepository(key, index, written[key], errors);
-        if (entry !== undefined) {
-          repos[key] = entry;
-        }
-        index += 1;
-      }
-    }
-  }
+  const repos = ifPresent(value, 'repos', () => readMergeRepos(value.repos, errors));
   if (errors.length !== before) {
     return undefined;
   }

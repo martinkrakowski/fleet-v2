@@ -46,7 +46,7 @@ const INTERVAL_RANGE = { min: 10, max: 3600 } as const;
 const BUDGET_RANGE = { min: 5, max: 600 } as const;
 const SETTLE_RANGE = { min: 0, max: 600 } as const;
 const REVISION_PATTERN = /^[0-9a-f]{12}$/;
-const VETO_MODES: readonly string[] = ['off', 'shadow', 'live'];
+const VETO_MODES: ReadonlySet<string> = new Set(['off', 'shadow', 'live']);
 const REPOSITORY_KEYS: readonly string[] = [
   'owner',
   'repo',
@@ -185,7 +185,7 @@ function readVeto(
   }
   const mode = ownValue(value, 'mode');
   const holdConfidence = ownValue(value, 'holdConfidence');
-  if (typeof mode !== 'string' || !VETO_MODES.includes(mode)) {
+  if (typeof mode !== 'string' || !VETO_MODES.has(mode)) {
     return undefined;
   }
   if (typeof holdConfidence !== 'number' || !Number.isFinite(holdConfidence)) {

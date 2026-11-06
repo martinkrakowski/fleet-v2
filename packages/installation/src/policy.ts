@@ -780,7 +780,7 @@ const MERGE_REPOSITORY_KEYS: readonly string[] = [
 ];
 const MERGE_KEYS: readonly string[] = ['repos'];
 const MERGE_VETO_KEYS: readonly string[] = ['mode', 'holdConfidence'];
-const MERGE_VETO_MODES: readonly string[] = ['off', 'shadow', 'live'];
+const MERGE_VETO_MODES: ReadonlySet<string> = new Set(['off', 'shadow', 'live']);
 const MERGE_DAEMON_KEYS: readonly string[] = ['intervalSeconds', 'budgetSeconds', 'settleSeconds'];
 const MERGE_REPOSITORY_KEY_PATTERN = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/;
 
@@ -865,7 +865,7 @@ function readMergeVeto(
   let mode: MergeVetoMode = DEFAULT_MERGE_REPOSITORY_SETTINGS.veto.mode;
   if (Object.hasOwn(value, 'mode')) {
     const written = readOwnDataProperty(value, 'mode');
-    if (typeof written !== 'string' || !MERGE_VETO_MODES.includes(written)) {
+    if (typeof written !== 'string' || !MERGE_VETO_MODES.has(written)) {
       return MERGE_INVALID;
     }
     mode = written as MergeVetoMode;
@@ -912,6 +912,39 @@ function readMergeInteger(
   return written === undefined ? MERGE_INVALID : mergeOk(written);
 }
 
+function readMergeContextsField(
+  entry: Record<string, unknown>,
+  fallback: readonly string[],
+): MergeReadResult<readonly string[]> {
+  if (!Object.hasOwn(entry, 'requiredContexts')) {
+    return mergeOk(Object.freeze([...fallback]));
+  }
+  return readMergeRequiredContexts(readOwnDataProperty(entry, 'requiredContexts'));
+}
+
+function readMergeMacosField(
+  entry: Record<string, unknown>,
+  fallback: string | null,
+): MergeReadResult<string | null> {
+  if (!Object.hasOwn(entry, 'macosProcedure')) {
+    return mergeOk(fallback);
+  }
+  return readMergeString(
+    readOwnDataProperty(entry, 'macosProcedure'),
+    MERGE_POLICY_BOUNDS.macosProcedureLength,
+  );
+}
+
+function readMergeVetoField(
+  entry: Record<string, unknown>,
+  fallback: { readonly mode: MergeVetoMode; readonly holdConfidence: number },
+): MergeReadResult<{ readonly mode: MergeVetoMode; readonly holdConfidence: number }> {
+  if (!Object.hasOwn(entry, 'veto')) {
+    return mergeOk(Object.freeze({ ...fallback }));
+  }
+  return readMergeVeto(readOwnDataProperty(entry, 'veto'));
+}
+
 function readMergeRepository(
   repositoryKey: string,
   entry: unknown,
@@ -943,24 +976,13 @@ function readMergeRepository(
   if (!updateBranch.ok) {
     return updateBranch;
   }
-  let requiredContexts: readonly string[] = Object.freeze([...defaults.requiredContexts]);
-  if (Object.hasOwn(entry, 'requiredContexts')) {
-    const read = readMergeRequiredContexts(readOwnDataProperty(entry, 'requiredContexts'));
-    if (!read.ok) {
-      return read;
-    }
-    requiredContexts = read.value;
+  const requiredContexts = readMergeContextsField(entry, defaults.requiredContexts);
+  if (!requiredContexts.ok) {
+    return requiredContexts;
   }
-  let macosProcedure: string | null = defaults.macosProcedure;
-  if (Object.hasOwn(entry, 'macosProcedure')) {
-    const read = readMergeString(
-      readOwnDataProperty(entry, 'macosProcedure'),
-      MERGE_POLICY_BOUNDS.macosProcedureLength,
-    );
-    if (!read.ok) {
-      return read;
-    }
-    macosProcedure = read.value;
+  const macosProcedure = readMergeMacosField(entry, defaults.macosProcedure);
+  if (!macosProcedure.ok) {
+    return macosProcedure;
   }
   const maxAttempts = readMergeInteger(
     entry,
@@ -980,15 +1002,9 @@ function readMergeRepository(
   if (!checksGraceMinutes.ok) {
     return checksGraceMinutes;
   }
-  let veto: { readonly mode: MergeVetoMode; readonly holdConfidence: number } = Object.freeze({
-    ...defaults.veto,
-  });
-  if (Object.hasOwn(entry, 'veto')) {
-    const read = readMergeVeto(readOwnDataProperty(entry, 'veto'));
-    if (!read.ok) {
-      return read;
-    }
-    veto = read.value;
+  const veto = readMergeVetoField(entry, defaults.veto);
+  if (!veto.ok) {
+    return veto;
   }
   return mergeOk(
     Object.freeze({
@@ -998,12 +1014,12 @@ function readMergeRepository(
       projectId: projectId.value,
       shadow: shadow.value,
       unattended: unattended.value,
-      requiredContexts,
+      requiredContexts: requiredContexts.value,
       updateBranch: updateBranch.value,
-      macosProcedure,
+      macosProcedure: macosProcedure.value,
       maxAttempts: maxAttempts.value,
       checksGraceMinutes: checksGraceMinutes.value,
-      veto,
+      veto: veto.value,
     }),
   );
 }
@@ -1090,6 +1106,14 @@ function readDaemonSection(
   );
 }
 
+/** Bytewise (UTF-16 code unit) order: the digest input must not depend on the locale. */
+function compareBytewise(left: string, right: string): number {
+  if (left < right) {
+    return -1;
+  }
+  return left > right ? 1 : 0;
+}
+
 function compareRepositoryKeys(
   left: Pick<ResolvedMergeRepositoryPolicy, 'repositoryKey'>,
   right: Pick<ResolvedMergeRepositoryPolicy, 'repositoryKey'>,
@@ -1151,7 +1175,7 @@ export function canonicalMergePolicyJson(input: {
       macosProcedure: repository.macosProcedure,
       maxAttempts: repository.maxAttempts,
       projectId: repository.projectId,
-      requiredContexts: [...repository.requiredContexts].sort(),
+      requiredContexts: [...repository.requiredContexts].sort(compareBytewise),
       shadow: repository.shadow,
       unattended: repository.unattended,
       updateBranch: repository.updateBranch,

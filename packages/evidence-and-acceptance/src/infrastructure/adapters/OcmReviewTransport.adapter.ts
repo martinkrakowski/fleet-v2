@@ -498,9 +498,13 @@ function isSeverityToken(token: string): boolean {
  * makes prose finding-shaped.
  */
 function looksLikeUnparsedFinding(trimmedLine: string): boolean {
-  const marker = LIST_OR_NUMBER_MARKER.exec(trimmedLine);
-  const body = normaliseFindingLine(marker === null ? trimmedLine : trimmedLine.slice(marker[0].length));
-  if (/^FINDING\b/i.test(body) || /^FINDING\b/i.test(normaliseFindingLine(trimmedLine))) {
+  // Every shape check runs on the normalised line. A bare `*` bullet is the
+  // one marker normalisation would erase, so it is read first.
+  const normalised = normaliseFindingLine(trimmedLine);
+  const starBullet = /^\*\s+/.exec(trimmedLine);
+  const marker = starBullet ?? LIST_OR_NUMBER_MARKER.exec(normalised);
+  const body = marker === null ? normalised : normaliseFindingLine(starBullet !== null ? trimmedLine.slice(marker[0].length) : normalised.slice(marker[0].length));
+  if (/^FINDING\b/i.test(body) || /^FINDING\b/i.test(normalised)) {
     return true;
   }
   const firstWord = body.split(' ')[0] ?? '';

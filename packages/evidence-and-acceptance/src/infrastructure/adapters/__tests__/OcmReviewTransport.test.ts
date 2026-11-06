@@ -2761,6 +2761,8 @@ describe('RV3 Luna round 1: unrecognised finding severities', () => {
       '- \u0441ritical src/a.ts:3 data loss',
       '1. `src/a.ts:3` - \u0441r\u0456t\u0456c\u0430l. data loss',
       '- maj**or** src/a.ts:3 unsafe',
+      '**-** major src/a.ts:3 data loss',
+      '* major src/a.ts:3 data loss',
       '- `critical` src/a.ts:3 data loss',
       '1) Major: src/a.ts:3 wrong result',
     ]) {

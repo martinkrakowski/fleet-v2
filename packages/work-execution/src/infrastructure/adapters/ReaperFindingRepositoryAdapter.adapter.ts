@@ -293,6 +293,18 @@ export function validateFindingInput(finding: ReaperFinding, findingId: string):
       ? 'secret-shaped-subject'
       : 'invalid-subject';
   }
+  if (finding.schemaVersion !== REAPER_FINDING_SCHEMA_VERSION) {
+    return 'invalid-schema-version';
+  }
+  if (!isValidFindingAction(finding.action)) {
+    return 'unknown-action';
+  }
+  if (
+    !isValidSightingIso(finding.firstSightingIso) ||
+    !isValidSightingIso(finding.lastSightingIso)
+  ) {
+    return 'invalid-sighting-time';
+  }
   if (
     typeof finding.sightings !== 'number' ||
     !Number.isFinite(finding.sightings) ||

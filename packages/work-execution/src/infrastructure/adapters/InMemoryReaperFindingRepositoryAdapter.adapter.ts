@@ -145,6 +145,18 @@ function validateFindingInput(finding: ReaperFinding, findingId: string): string
   if (containsSecretShape(finding.subject)) {
     return 'secret-shaped-subject';
   }
+  if (finding.schemaVersion !== REAPER_FINDING_SCHEMA_VERSION) {
+    return 'invalid-schema-version';
+  }
+  if (finding.action !== 'report' && finding.action !== 'repair' && finding.action !== 'wait') {
+    return 'unknown-action';
+  }
+  if (
+    !isValidSightingIso(finding.firstSightingIso) ||
+    !isValidSightingIso(finding.lastSightingIso)
+  ) {
+    return 'invalid-sighting-time';
+  }
   if (
     typeof finding.sightings !== 'number' ||
     !Number.isFinite(finding.sightings) ||
@@ -153,4 +165,15 @@ function validateFindingInput(finding: ReaperFinding, findingId: string): string
     return 'invalid-sightings';
   }
   return null;
+}
+
+/** A sighting timestamp is present and parsable, or absent entirely. */
+function isValidSightingIso(value: unknown): boolean {
+  if (value === null || value === undefined) {
+    return true;
+  }
+  if (typeof value !== 'string') {
+    return false;
+  }
+  return !Number.isNaN(Date.parse(value));
 }

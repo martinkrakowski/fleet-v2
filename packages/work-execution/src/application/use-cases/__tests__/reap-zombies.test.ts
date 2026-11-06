@@ -11,9 +11,12 @@ import { describe, expect, it } from 'vitest';
 
 import { containsSecretShape } from '@fleet/shared';
 
-import type { AttemptRecord, CapacityReservationRecord } from '../../../domain/execution-records.js';
+import type { ActionJournalEntryRecord, AttemptRecord, CapacityReservationRecord } from '../../../domain/execution-records.js';
 import type { AttemptRepositoryPort } from '../../ports/out/AttemptRepositoryPort.out-port.js';
-import type { ExecutionJournalPort } from '../../ports/out/ExecutionJournalPort.out-port.js';
+import type {
+  ExecutionJournalPort,
+  ReleaseCapacityReservationIfUnchangedRequest,
+} from '../../ports/out/ExecutionJournalPort.out-port.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import type { LaneRunJournalPort, LaneRunJournalAppendResult } from '../../ports/out/LaneRunJournalPort.out-port.js';
 import type {
@@ -194,12 +197,13 @@ function makeReconcile(script: ReconcileAttemptResult[] = []): ReconcileAttemptP
 
 interface AttentionState {
   recorded: { body: Record<string, unknown>; actor: string }[];
+  cleared: { request: Record<string, unknown>; via: string; actor: string }[];
 }
 
-function makeAttention(state: AttentionState = { recorded: [] }): ReaperAttentionPort {
+function makeAttention(state: AttentionState = { recorded: [], cleared: [] }, items: unknown[] = []): ReaperAttentionPort {
   const seen = new Map<string, number>();
   return {
-    listAttentionItems: () => Promise.resolve({ items: [] }),
+    listAttentionItems: () => Promise.resolve({ items }),
     recordAttentionItem: (body: unknown, actor: string) => {
       const candidate = body as Record<string, unknown>;
       state.recorded.push({ body: candidate, actor });
@@ -208,7 +212,10 @@ function makeAttention(state: AttentionState = { recorded: [] }): ReaperAttentio
       seen.set(mapKey, previous + 1);
       return Promise.resolve({ outcome: previous === 0 ? 'raised' : 'refreshed' });
     },
-    clearAttentionItem: () => Promise.resolve({ outcome: 'not-found' }),
+    clearAttentionItem: (request: unknown, via: string, actor: string) => {
+      state.cleared.push({ request: request as Record<string, unknown>, via, actor });
+      return Promise.resolve({ outcome: 'cleared' });
+    },
   };
 }
 
@@ -227,8 +234,10 @@ function makeAttemptRepo(attempts: readonly AttemptRecord[] = []): AttemptReposi
   };
 }
 
-const JOURNAL: Pick<ExecutionJournalPort, 'listActiveReservations'> = {
+const JOURNAL: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJournalEntriesForAttempt' | 'releaseCapacityReservationIfUnchanged'> = {
   listActiveReservations: () => Promise.resolve([]),
+  listJournalEntriesForAttempt: () => Promise.resolve([]),
+  releaseCapacityReservationIfUnchanged: undefined,
 };
 
 interface Harness {
@@ -240,6 +249,11 @@ interface Harness {
   runner: ReturnType<typeof makeRunner>;
   attention: AttentionState;
   attentionPort: ReaperAttentionPort;
+  /** Action-journal entries per attempt, keyed by attempt id. */
+  actionJournal?: Map<string, ActionJournalEntryRecord[]>;
+  /** The fenced capacity release; absent means the operation is unavailable. */
+  release?: ExecutionJournalPort['releaseCapacityReservationIfUnchanged'];
+  attentionItems?: unknown[];
   newIdOverride?: () => string;
   reaperFindings?: ReaperFindingRepositoryPort;
   attemptRepo?: AttemptRepositoryPort;
@@ -247,8 +261,13 @@ interface Harness {
 
 function build(harness: Harness): ReapZombiesUseCase {
   const attemptRepo = harness.attemptRepo ?? makeAttemptRepo(harness.attempts);
-  const executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations'> = {
+  const executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJournalEntriesForAttempt' | 'releaseCapacityReservationIfUnchanged'> = {
     listActiveReservations: () => Promise.resolve(harness.reservations),
+    listJournalEntriesForAttempt: (attemptId: string) => {
+      const entries = harness.actionJournal?.get(attemptId);
+      return Promise.resolve(entries ?? []);
+    },
+    releaseCapacityReservationIfUnchanged: harness.release,
   };
   const runnerForAttempt: RunnerForAttemptPort = {
     runnerForAttempt: () => {
@@ -277,7 +296,7 @@ function request(overrides: Partial<ReapZombiesRequest> = {}): ReapZombiesReques
 async function seedOpenFinding(
   store: ReaperFindingRepositoryPort,
   subject: string,
-  kind: 'dead-attempt' | 'leaked-slot' = 'dead-attempt',
+  kind: 'dead-attempt' | 'leaked-slot' | 'stale-attention' = 'dead-attempt',
 ): Promise<ReaperFindingStoreRecord> {
   const upsert = await store.upsertFinding(
     {
@@ -302,7 +321,7 @@ async function runPass(harness: Harness, overrides: Partial<ReapZombiesRequest> 
 }
 
 function baseHarness(overrides: Partial<Harness> = {}): Harness {
-  const attention: AttentionState = { recorded: [] };
+  const attention: AttentionState = { recorded: [], cleared: [] };
   return {
     attempts: [],
     reservations: [],
@@ -311,7 +330,7 @@ function baseHarness(overrides: Partial<Harness> = {}): Harness {
     reconcile: makeReconcile(),
     runner: makeRunner(),
     attention,
-    attentionPort: makeAttention(attention),
+    attentionPort: makeAttention(attention, overrides.attentionItems ?? []),
     ...overrides,
   };
 }
@@ -638,5 +657,193 @@ describe('reap zombies', () => {
     expect(second.attention).toHaveLength(1);
     expect(second.attention[0]?.outcome).toBe('refreshed');
     expect(harness.attention.recorded).toHaveLength(2);
+  });
+
+  it('a subject with a recent stop intent in its action journal is never repaired', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    await seedOpenFinding(store, 'att-1');
+    const actionJournal = new Map<string, ActionJournalEntryRecord[]>();
+    actionJournal.set('att-1', [
+      {
+        id: 'aj-1',
+        attemptId: 'att-1',
+        workOrderId: 'wo-a',
+        action: 'stop',
+        baseCommit: COMMIT,
+        recordedAtIso: YOUNG,
+        status: 'intent-recorded',
+        sessionId: 'ses-att-1',
+        detail: null,
+      },
+    ]);
+    // The attempt record itself is old; only the journal intent is young, so
+    // the no-young-intent rule must wait.
+    const harness = baseHarness({
+      attempts: [attemptFixture('att-1')],
+      store,
+      actionJournal,
+      reconcile: makeReconcile([{ outcome: 'ended', attempt: attemptFixture('att-1'), receipt: receiptFor('att-1') }]),
+    });
+    const result = await runPass(harness);
+    const finding = result.findings.find((entry) => entry.subject === 'att-1');
+    expect(finding?.action).toBe('wait');
+    expect(result.repairs).toEqual([]);
+    expect(harness.reconcile.calls).toEqual([]);
+    expect(harness.journal.state.appendCalls).toEqual([]);
+  });
+
+  it('an open attention item for a terminal attempt is reported as stale-attention', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    // A prior sighting, so the second sighting past the grace period reports.
+    await seedOpenFinding(store, 'att-1', 'stale-attention');
+    const attentionItems = [
+      {
+        itemId: 'attn-1',
+        projectId: PROJECT,
+        kind: 'dead-attempt',
+        subject: { kind: 'attempt', ref: 'att-1' },
+        workOrderId: 'wo-a',
+        summary: 'Reaper finding dead-attempt for attempt att-1; action report; sightings 2',
+        state: 'open',
+        raisedBy: 'reaper',
+        firstRaisedAtIso: BEFORE,
+        lastRaisedAtIso: BEFORE,
+        raisedCount: 1,
+        clearance: null,
+      },
+    ];
+    const harness = baseHarness({
+      attempts: [attemptFixture('att-1', { state: 'ended', sessionId: null })],
+      store,
+      attentionItems,
+    });
+    const result = await runPass(harness);
+    const finding = result.findings.find((entry) => entry.kind === 'stale-attention');
+    expect(finding).toBeDefined();
+    expect(finding?.subject).toBe('att-1');
+    expect(finding?.action).toBe('report');
+    // A stale-attention finding raises nothing new: the item is already open.
+    expect(result.attention).toEqual([]);
+  });
+
+  it('a resolved finding is closed and its attention item cleared on the next pass', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    await seedOpenFinding(store, 'att-1');
+    const attention: AttentionState = { recorded: [], cleared: [] };
+    const harness = baseHarness({
+      // The attempt is no longer running: the zombie resolved.
+      attempts: [attemptFixture('att-1', { state: 'ended', sessionId: null })],
+      store,
+      attention,
+      attentionPort: makeAttention(attention),
+    });
+    const result = await runPass(harness);
+    expect(result.findings).toEqual([]);
+    expect(await store.listOpenFindings()).toHaveLength(0);
+    expect(attention.cleared).toHaveLength(1);
+    expect(attention.cleared[0]?.request).toMatchObject({
+      action: 'resolve',
+      projectId: PROJECT,
+      kind: 'dead-attempt',
+      subject: { kind: 'attempt', ref: 'att-1' },
+      reason: 'stale',
+    });
+  });
+
+  it('a crash after reconcile leaves the next pass to recover via the settle sweep even when the attempt is terminal', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const seeded = await seedOpenFinding(store, 'att-1');
+    const key = `reaper/att-1/dead-attempt@${seeded.findingId}`;
+    const intent: LaneRunJournalEntryRecord = {
+      version: 1,
+      entryId: newId(),
+      kind: 'intent',
+      key,
+      runId: null,
+      recordedAtIso: BEFORE,
+      mode: null,
+      expectedRevision: null,
+      mintedId: seeded.findingId,
+      outcome: null,
+      reasonCode: null,
+      detail: null,
+      grantId: null,
+      state: null,
+    };
+    // The attempt is terminal in the list read: it is omitted from observations,
+    // so the recovery must come from the settle sweep, not the repair loop.
+    const harness = baseHarness({
+      attempts: [attemptFixture('att-1', { state: 'ended', sessionId: null })],
+      store,
+      journal: makeJournal([intent]),
+      attemptRepo: makeAttemptRepo([attemptFixture('att-1', { state: 'ended', sessionId: null })]),
+      reconcile: makeReconcile([{ outcome: 'ended', attempt: attemptFixture('att-1'), receipt: receiptFor('att-1') }]),
+    });
+    await runPass(harness);
+    expect(harness.reconcile.calls).toEqual([]);
+    expect(harness.journal.state.appendCalls).toHaveLength(1);
+    expect(harness.journal.state.appendCalls[0]).toMatchObject({ kind: 'result', key, outcome: 'reconciled' });
+    expect(await store.listOpenFindings()).toHaveLength(0);
+  });
+
+  it('a leaked slot is released through the fenced capacity release when policy enables it', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    const seeded = await seedOpenFinding(store, 'res-1', 'leaked-slot');
+    const releaseCalls: ReleaseCapacityReservationIfUnchangedRequest[] = [];
+    const release: ExecutionJournalPort['releaseCapacityReservationIfUnchanged'] = (request) => {
+      releaseCalls.push(request);
+      return Promise.resolve({ outcome: 'released', reservationId: request.reservationId });
+    };
+    const harness = baseHarness({
+      attempts: [attemptFixture('att-1', { state: 'ended', sessionId: null })],
+      reservations: [reservationFixture('res-1', 'att-1')],
+      store,
+      release,
+    });
+    const policy = { graceMinutes: 5, repairs: { 'dead-attempt': true, 'leaked-slot': true } };
+    const result = await runPass(harness, { policy });
+    const repair = result.repairs.find((entry) => entry.kind === 'leaked-slot');
+    expect(repair).toBeDefined();
+    expect(repair?.outcome).toBe('completed');
+    expect(repair?.key).toBe(`reaper/res-1/leaked-slot@${seeded.findingId}`);
+    expect(releaseCalls).toHaveLength(1);
+    expect(releaseCalls[0]?.attemptId).toBe('att-1');
+    expect(releaseCalls[0]?.reservationId).toBe('res-1');
+    expect(releaseCalls[0]?.attemptRevision).toBe(0);
+    expect(typeof releaseCalls[0]?.readAttemptRevision).toBe('function');
+    expect(harness.journal.state.appendCalls.map((entry) => entry.kind)).toEqual(['intent', 'result']);
+    expect(harness.journal.state.appendCalls[1]?.outcome).toBe('completed');
+  });
+
+  it('a changed fenced release ends the repair ambiguous and keeps the finding reported', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    await seedOpenFinding(store, 'res-1', 'leaked-slot');
+    const release: ExecutionJournalPort['releaseCapacityReservationIfUnchanged'] = () => Promise.resolve({ outcome: 'changed' });
+    const harness = baseHarness({
+      attempts: [attemptFixture('att-1', { state: 'ended', sessionId: null })],
+      reservations: [reservationFixture('res-1', 'att-1')],
+      store,
+      release,
+    });
+    const policy = { graceMinutes: 5, repairs: { 'leaked-slot': true } };
+    const result = await runPass(harness, { policy });
+    const repair = result.repairs.find((entry) => entry.kind === 'leaked-slot');
+    expect(repair?.outcome).toBe('ambiguous');
+    expect(await store.listOpenFindings()).not.toHaveLength(0);
+  });
+
+  it('a leaked-slot repair is skipped when the fenced release is unavailable', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    await seedOpenFinding(store, 'res-1', 'leaked-slot');
+    const harness = baseHarness({
+      attempts: [attemptFixture('att-1', { state: 'ended', sessionId: null })],
+      reservations: [reservationFixture('res-1', 'att-1')],
+      store,
+      release: undefined,
+    });
+    const policy = { graceMinutes: 5, repairs: { 'leaked-slot': true } };
+    const result = await runPass(harness, { policy });
+    const repair = result.repairs.find((entry) => entry.kind === 'leaked-slot');
+    expect(repair).toMatchObject({ outcome: 'skipped', reasonCode: 'repair-not-available' });
   });
 });

@@ -129,6 +129,20 @@ describe.each(adapters())('reaper finding store (%s)', (name, make) => {
     expect(badKind).toMatchObject({ outcome: 'refused' });
     expect(await store.listOpenFindings()).toHaveLength(0);
   });
+
+  it('an unsupported schema version, an invalid action or a bad sighting time is refused', async () => {
+    const store = await make();
+    const badVersion = await store.upsertFinding(finding({ schemaVersion: 2 }), FINDING_ID);
+    expect(badVersion).toMatchObject({ outcome: 'refused', reason: 'invalid-schema-version' });
+    const badAction = await store.upsertFinding(
+      finding({ action: 'nuke' as ReaperFinding['action'] }),
+      FINDING_ID,
+    );
+    expect(badAction).toMatchObject({ outcome: 'refused', reason: 'unknown-action' });
+    const badTime = await store.upsertFinding(finding({ lastSightingIso: 'not-a-time' }), FINDING_ID);
+    expect(badTime).toMatchObject({ outcome: 'refused', reason: 'invalid-sighting-time' });
+    expect(await store.listOpenFindings()).toHaveLength(0);
+  });
 });
 
 describe('reaper finding store: file-specific behaviour', () => {

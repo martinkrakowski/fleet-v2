@@ -265,7 +265,8 @@ describe('LaneEditSaveAdapter', () => {
     expect(gits.length).toBeGreaterThan(8);
     for (const { argv } of gits) {
       const git = argv.indexOf('git');
-      expect(argv.slice(1, 4)).toEqual(['GIT_ALLOW_PROTOCOL=none', 'GIT_NO_LAZY_FETCH=1', 'GIT_TERMINAL_PROMPT=0']);
+      expect(argv.slice(1, 3)).toEqual(['-u', 'GIT_CONFIG']);
+      expect(argv.slice(3, 6)).toEqual(['GIT_ALLOW_PROTOCOL=none', 'GIT_NO_LAZY_FETCH=1', 'GIT_TERMINAL_PROMPT=0']);
       expect(argv).toContain('GIT_ATTR_NOSYSTEM=1');
       for (const guard of ['GIT_CONFIG_NOSYSTEM=1', 'GIT_CONFIG_GLOBAL=/dev/null', 'GIT_CONFIG_SYSTEM=/dev/null', 'GIT_CONFIG_COUNT=0', 'GIT_CONFIG_PARAMETERS=']) {
         expect(argv.slice(0, git)).toContain(guard);
@@ -505,7 +506,6 @@ describe('LaneEditSaveAdapter', () => {
       needGit(context);
       const { clone, worktree } = setup();
       fs.mkdirSync(path.join(clone, '.git', 'info'), { recursive: true });
-      fs.writeFileSync(path.join(clone, '.git', 'info', 'attributes'), '* filter=x\n');
       const marker = path.join(path.dirname(clone), 'filter-ran');
       git(clone, ['config', 'filter.x.clean', `touch ${marker}; cat`]);
       const result = await new LaneEditSaveAdapter(new LocalExecutor()).saveLaneEdits(realRequest(clone, worktree));
@@ -549,6 +549,22 @@ describe('LaneEditSaveAdapter', () => {
       expect(result).toMatchObject({ outcome: 'saved' });
       expect(filterProbes.length).toBe(1);
       expect(/filter\.x\./.test(filterProbes.join(''))).toBe(false);
+      expect(fs.existsSync(marker)).toBe(false);
+    });
+
+    it('an inherited legacy GIT_CONFIG file cannot hide a repository-config filter driver from the probe', async (context) => {
+      needGit(context);
+      const { clone, worktree } = setup();
+      const marker = path.join(path.dirname(clone), 'filter-ran');
+      const emptyConfig = path.join(path.dirname(clone), 'empty-gitconfig');
+      fs.writeFileSync(emptyConfig, '');
+      git(clone, ['config', 'filter.x.clean', `touch ${marker}; cat`]);
+      const local = new LocalExecutor();
+      const wrapped: CommandExecutorPort = {
+        run: (argv, options) => local.run(argv, { ...options, env: { ...process.env, GIT_CONFIG: emptyConfig } as Record<string, string> }),
+      };
+      const result = await new LaneEditSaveAdapter(wrapped).saveLaneEdits(realRequest(clone, worktree));
+      expect(result).toEqual({ outcome: 'refused', reason: 'unreadable-tree' });
       expect(fs.existsSync(marker)).toBe(false);
     });
 

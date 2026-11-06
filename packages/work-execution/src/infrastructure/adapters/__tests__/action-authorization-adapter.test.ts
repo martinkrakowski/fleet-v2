@@ -1031,3 +1031,41 @@ describe('ActionAuthorizationAdapter through the authorised forge path', () => {
     expect(matchGrants.get('grant-1')?.consumedByActionId).toBe(key);
   });
 });
+
+describe('ActionAuthorizationAdapter control and bidi characters (CO24d)', () => {
+  const BAD = [
+    ['a C0 control', 'att\u0001-1'],
+    ['a newline', 'att\n1'],
+    ['DEL', 'att\u007f1'],
+    ['a C1 control', 'att\u00851'],
+    ['a bidi override', 'att‮1'],
+    ['a bidi isolate', 'att⁦1'],
+    ['a left-to-right mark', 'att‎1'],
+  ] as const;
+
+  it.each(BAD)('refuses an attempt id (isSafeId) with %s', async (_label, attemptId) => {
+    const adapter = new ActionAuthorizationAdapter({ grants: grantsOf() });
+    const result = await adapter.resolveActionAuthorization(resolveRequest({ attemptId }));
+    expect(result.outcome).toBe('blocked');
+  });
+
+  it.each(BAD)('refuses a grant id (isSafeId, slash allowed) with %s', async (_label, grantId) => {
+    const adapter = new ActionAuthorizationAdapter({ grants: grantsOf() });
+    const result = await adapter.consumeActionAuthorization(consumeRequest({ authorizationGrantId: grantId }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+  });
+
+  it.each(BAD)('refuses policy revision text (isCleanText) with %s', async (_label, policyRevision) => {
+    const adapter = new ActionAuthorizationAdapter({ grants: grantsOf() });
+    const result = await adapter.resolveActionAuthorization(resolveRequest({ policyRevision }));
+    expect(result).toEqual({ outcome: 'blocked', reason: 'invalid-request' });
+  });
+
+  it('still accepts a plain key-shaped action id', async () => {
+    const adapter = new ActionAuthorizationAdapter({ grants: grantsOf() });
+    const result = await adapter.consumeActionAuthorization(
+      consumeRequest({ actionId: 'pr-feedback/42@abcdef123456' }),
+    );
+    expect(result.outcome).toBe('consumed');
+  });
+});

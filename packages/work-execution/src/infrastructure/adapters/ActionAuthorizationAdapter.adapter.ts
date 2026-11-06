@@ -88,7 +88,30 @@ function containsDisallowedOutputText(value: string): boolean {
 }
 
 /**
- * A bounded, non-blank id with no backslash and no secret or path shape.
+ * True when `value` holds a C0 control, DEL, a C1 control or a Unicode bidi
+ * control (U+200E/U+200F, U+202A-U+202E, U+2066-U+2069). Such characters
+ * can disguise an id or text in a log, a diff or a terminal.
+ */
+function hasControlOrBidiCharacter(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    if (
+      code <= 0x1f ||
+      (code >= 0x7f && code <= 0x9f) ||
+      code === 0x200e ||
+      code === 0x200f ||
+      (code >= 0x202a && code <= 0x202e) ||
+      (code >= 0x2066 && code <= 0x2069)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * A bounded, non-blank id with no backslash, control or bidi character, and
+ * no secret or path shape.
  * Grant and action ids may hold `/` (action ids are keys such as
  * `pr-feedback/42@<head12>`); scope ids (attempt, work order, project) may not.
  */
@@ -97,6 +120,7 @@ function isSafeId(value: unknown, maxLength: number, allowSlash: boolean): value
     typeof value === 'string' &&
     value.length <= maxLength &&
     value.trim().length > 0 &&
+    !hasControlOrBidiCharacter(value) &&
     !value.includes('\\') &&
     (allowSlash ? isKeyShapedSlash(value) : !value.includes('/')) &&
     !containsDisallowedOutputText(value)
@@ -126,6 +150,7 @@ function isCleanText(value: unknown, maxLength: number): value is string {
     typeof value === 'string' &&
     value.length <= maxLength &&
     value.trim().length > 0 &&
+    !hasControlOrBidiCharacter(value) &&
     !containsDisallowedOutputText(value)
   );
 }

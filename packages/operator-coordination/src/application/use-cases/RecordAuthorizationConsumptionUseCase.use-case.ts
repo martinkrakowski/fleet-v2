@@ -94,6 +94,15 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
         `grant ${grantId} was recorded for commit ${recorded.expectedHeadSha ?? 'none'}, not ${request.expectedHeadSha.trim()}`,
       );
     }
+    // A policy grant is issued for one attempt and authorizes no other. (An
+    // owner grant records no attempt; the composition that resolved it binds
+    // the attempt before it calls this port.)
+    if (
+      recorded.policyGrant !== undefined &&
+      recorded.policyGrant.attemptId !== request.attemptId.trim()
+    ) {
+      return refused('grant-attempt-mismatch');
+    }
     const aggregate = CoordinationRequest.fromRecord(recorded);
     // The composition root supplies the clock; no authority depends on it here.
     const consumedAtIso =

@@ -406,8 +406,8 @@ export function composeExecution(input: ComposeExecutionInput) {
         };
       }
       // Coordinates recorded at resolve time bind the grant to its attempt;
-      // a fresh process reloads them from disk before falling back to the
-      // head-matching scan over all recorded attempts.
+      // a fresh process reloads them from disk. A grant with no recorded
+      // coordinates is refused: no attempt is ever picked by head alone.
       if (
         !resolveCoordinates.has(request.authorizationGrantId) &&
         authorizationCoordinatesPath !== undefined
@@ -427,17 +427,14 @@ export function composeExecution(input: ComposeExecutionInput) {
         }
       }
       const coordinates = resolveCoordinates.get(request.authorizationGrantId);
-      const boundAttempt =
-        coordinates === undefined
-          ? null
-          : await attemptRepository.findAttemptById(coordinates.attemptId);
-      const attempt =
-        boundAttempt !== null && boundAttempt.artifacts?.headCommit === request.expectedHeadSha
-          ? boundAttempt
-          : (await attemptRepository.listAllAttempts()).find(
-              (candidate) => candidate.artifacts?.headCommit === request.expectedHeadSha,
-            );
-      if (attempt === undefined) {
+      if (coordinates === undefined) {
+        return { outcome: 'refused', reason: 'grant-attempt-unresolved' };
+      }
+      if (request.attemptId !== undefined && request.attemptId !== coordinates.attemptId) {
+        return { outcome: 'refused', reason: 'grant-attempt-mismatch' };
+      }
+      const attempt = await attemptRepository.findAttemptById(coordinates.attemptId);
+      if (attempt === null || attempt.artifacts?.headCommit !== request.expectedHeadSha) {
         return {
           outcome: 'refused',
           reason:

@@ -96,6 +96,23 @@ describe('MergeRecordRepositoryAdapter', () => {
       ]);
     });
 
+    it('accepts PR numbers above the old store cap, up to the domain maximum', async () => {
+      const aboveOldCap = mergeRecord({ number: 1_000_001 });
+      const domainMax = mergeRecord({ number: 999_999_999 });
+      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+      expect((await store.saveMergeRecord(aboveOldCap)).outcome).toBe('created');
+      expect((await store.saveMergeRecord(domainMax)).outcome).toBe('created');
+
+      const fresh = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+      expect(await fresh.findMergeRecord('acme/app', 1_000_001)).toEqual(aboveOldCap);
+      expect(await fresh.findMergeRecord('acme/app', 999_999_999)).toEqual(domainMax);
+      expect(await fresh.listMergeRecords()).toEqual([aboveOldCap, domainMax]);
+
+      const memory = new MergeRecordRepositoryAdapter();
+      expect((await memory.saveMergeRecord(aboveOldCap)).outcome).toBe('created');
+      expect(await memory.findMergeRecord('acme/app', 1_000_001)).toEqual(aboveOldCap);
+    });
+
     it('reports a conflicting sighting as an integrity conflict carrying the stored record and writes nothing', async () => {
       const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
       await store.saveMergeRecord(mergeRecord());
@@ -308,7 +325,7 @@ describe('MergeRecordRepositoryAdapter', () => {
       await expectRefusedWithoutWrite({ ...mergeRecord(), headSha: 'a'.repeat(65) });
       await expectRefusedWithoutWrite({ ...fleetRecord(), actionRef: 'x'.repeat(201) });
       await expectRefusedWithoutWrite({ ...mergeRecord(), number: 0 });
-      await expectRefusedWithoutWrite({ ...mergeRecord(), number: 1_000_001 });
+      await expectRefusedWithoutWrite({ ...mergeRecord(), number: 1_000_000_000 });
     });
 
     it('the refusal carries a code only: the rejected value and the store path never appear in the outcome', async () => {

@@ -56,7 +56,7 @@ export const MERGE_RECORD_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy(
 
 const MERGE_RECORD_SCHEMA = {
   repository: { kind: 'string', maxLength: 200 },
-  number: { kind: 'integer', min: 1, max: 1_000_000 },
+  number: { kind: 'integer', min: 1, max: 999_999_999 },
   headSha: { kind: 'string', maxLength: 64 },
   mergedAtIso: { kind: 'string', maxLength: 40 },
   firstSeenAtIso: { kind: 'string', maxLength: 40 },

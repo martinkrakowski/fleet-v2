@@ -39,6 +39,7 @@ import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 import { simpleDeterministicHexDigest } from '../PrepareBriefPackageUseCase.use-case.js';
 import type { SessionStartGate } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
+import { SessionStartSpacing } from '../advance-lane-run/session-start-gate.js';
 import type {
   PreserveWorktreeEditsRequest,
   PreserveWorktreeEditsResult,
@@ -52,6 +53,59 @@ function denyingStartGate(): SessionStartGate {
 
 function grantingStartGate(): SessionStartGate {
   return { tryStart: () => ({ ok: true }) };
+}
+
+/** CO13: a gate whose endpoint rule always denies; the global rule grants. */
+function denyingEndpointGate(): SessionStartGate {
+  return {
+    tryStart: () => ({ ok: true }),
+    tryStartForEndpoint: () => ({ ok: false, retryAfterMs: 12_345 }),
+  };
+}
+
+/** CO13: a gate whose endpoint rule always grants; the global rule grants. */
+function grantingEndpointGate(): SessionStartGate {
+  return {
+    tryStart: () => ({ ok: true }),
+    tryStartForEndpoint: () => ({ ok: true }),
+  };
+}
+
+/** Fix round 1: an endpoint rule that denies only when a durable seed exists; it records each seed. */
+function seededEndpointGate() {
+  const seeds: (string | null)[] = [];
+  const gate: SessionStartGate & { readonly seeds: typeof seeds } = {
+    seeds,
+    tryStart: () => ({ ok: true }),
+    tryStartForEndpoint: (_runId, _nowIso, _endpointKey, lastStartIso) => {
+      seeds.push(lastStartIso);
+      return lastStartIso === null ? { ok: true } : { ok: false, retryAfterMs: 12_345 };
+    },
+  };
+  return gate;
+}
+
+/**
+ * Fix round 3: a gate whose endpoint rule grants (holding the start) and
+ * records every endpoint ask and every release; the global rule answers as
+ * given.
+ */
+function recordingEndpointGate(globalOk = true) {
+  const asks: string[] = [];
+  const releases: string[] = [];
+  const gate: SessionStartGate & { readonly asks: typeof asks; readonly releases: typeof releases } = {
+    asks,
+    releases,
+    tryStart: () => (globalOk ? { ok: true } : { ok: false, retryAfterMs: 5_000 }),
+    tryStartForEndpoint: (_runId, _nowIso, endpointKey) => {
+      asks.push(endpointKey);
+      return { ok: true };
+    },
+    releaseStartForEndpoint: (runId) => {
+      releases.push(runId);
+    },
+  };
+  return gate;
 }
 
 const RUN_ID = 'run-01JB0000000000000000000000';
@@ -1198,6 +1252,228 @@ describe('AdvanceLaneRunUseCase dispatch, prepare and cancel acts (K4-5)', () =>
     expect(harness.dispatchRequests).toHaveLength(1);
     const entries = await harness.runJournal.listForRun(RUN_ID);
     expect(entries[0]).toMatchObject({ kind: 'intent', key, mintedId: 'attempt-example-1' });
+  });
+
+  it('CO13: a denying endpoint gate waits session-stagger before the dispatch intent, spends no key and journals one refused dispatch entry', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const result = await advance(harness, { startGate: denyingEndpointGate() });
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(harness.dispatchRequests).toEqual([]);
+    // The wait sits before the one-way intent: nothing is journalled in the run journal.
+    expect(await harness.runJournal.listForRun(RUN_ID)).toEqual([]);
+    // The attempt is untouched.
+    expect((await harness.attemptRepo.findAttemptById('attempt-example-1'))?.state).toBe('intent-recorded');
+    // The execution journal holds exactly one refused dispatch wait entry.
+    const entries = await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1');
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ action: 'dispatch', status: 'refused' });
+    expect(entries[0].detail).toMatch(/^dispatch stagger wait: endpoint opencode:lane-host-example:4166/);
+  });
+
+  it('CO13: a second wait for the same attempt appends no second entry', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    await advance(harness, { startGate: denyingEndpointGate() });
+    await advance(harness, { startGate: denyingEndpointGate() });
+    const entries = await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1');
+    expect(entries.filter((entry) => entry.action === 'dispatch' && entry.status === 'refused')).toHaveLength(1);
+  });
+
+  it('fix round 1: a cancelled attempt that started a session still seeds the endpoint stagger', async () => {
+    const prior = attemptFixture({
+      id: 'attempt-example-0',
+      state: 'cancelled',
+      sessionId: 'session-prior',
+      updatedAtIso: LATER,
+    });
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const result = await advance(harness, { startGate: seededEndpointGate() });
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(harness.dispatchRequests).toEqual([]);
+  });
+
+  it('fix round 1: a cancelled attempt that never started a session does not seed the endpoint stagger', async () => {
+    const prior = attemptFixture({ id: 'attempt-example-0', state: 'cancelled', updatedAtIso: LATER });
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const key = dispatchKey(0, 0, 1);
+    const result = await advance(harness, { startGate: seededEndpointGate() });
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'dispatch',
+      key,
+      result: 'completed',
+      reasonCode: 'dispatch-started',
+    });
+    expect(harness.dispatchRequests).toHaveLength(1);
+  });
+
+  it('CO13: a granting endpoint gate dispatches exactly as test 20 does', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const key = dispatchKey(0, 0, 1);
+    const result = await advance(harness, { startGate: grantingEndpointGate() });
+    expect(result).toEqual({
+      outcome: 'acted',
+      step: 'dispatch',
+      key,
+      result: 'completed',
+      reasonCode: 'dispatch-started',
+    });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries[0]).toMatchObject({ kind: 'intent', key, mintedId: 'attempt-example-1' });
+  });
+
+  it('fix round 3: a started dispatch keeps the held endpoint start (no release)', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const gate = recordingEndpointGate();
+    const result = await advance(harness, { startGate: gate });
+    expect(result).toMatchObject({ outcome: 'acted', step: 'dispatch', reasonCode: 'dispatch-started' });
+    expect(harness.dispatchRequests).toHaveLength(1);
+    expect(gate.asks).toEqual(['opencode:lane-host-example:4166']);
+    expect(gate.releases).toEqual([]);
+  });
+
+  it('fix round 3: an endpoint grant the global gate then blocks is released', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const gate = recordingEndpointGate(false);
+    const result = await advance(harness, { startGate: gate });
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(harness.dispatchRequests).toEqual([]);
+    expect(gate.releases).toEqual([RUN_ID]);
+  });
+
+  it('fix round 3: a runner refusal releases the held endpoint start', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    harness.setDispatchAnswer(async () => ({ outcome: 'refused', reason: 'refused by the example runner' }));
+    await admit(harness, 'attempt-example-1');
+    const gate = recordingEndpointGate();
+    const result = await advance(harness, { startGate: gate });
+    expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    expect(gate.asks).toHaveLength(1);
+    expect(gate.releases).toEqual([RUN_ID]);
+  });
+
+  it('fix round 3: unreadable dispatch inputs refuse at once without asking the endpoint gate', async () => {
+    const harness = await makeHarness(runRecord(), [attemptFixture()]);
+    await harness.setManifest(JSON.stringify({ timeLimitSeconds: 2700 }));
+    await admit(harness, 'attempt-example-1');
+    const gate = recordingEndpointGate();
+    const result = await advance(harness, { startGate: gate });
+    expect(result).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'dispatch' });
+    expect(gate.asks).toEqual([]);
+    const entries = await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1');
+    expect(entries.some((entry) => entry.detail?.startsWith('dispatch stagger wait:') === true)).toBe(false);
+  });
+
+  it('fix round 3: an undated started attempt waits one full interval from its first sighting, then grants', async () => {
+    const prior = attemptFixture({
+      id: 'attempt-example-0',
+      state: 'running',
+      // Created long before: the creation time is never used as a start bound.
+      createdAtIso: '2026-10-27T09:00:00.000Z',
+      updatedAtIso: 'not-a-date',
+    });
+    // The current attempt was prepared just before this dispatch (the cap's anchor).
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture({ updatedAtIso: LATER })]);
+    await admit(harness, 'attempt-example-1');
+    const at = (ms: number): string => new Date(Date.parse(LATER) + ms).toISOString();
+    // A fresh gate per pass, as the conductor builds one.
+    const first = await advance(harness, { startGate: new SessionStartSpacing(20_000, null), nowIso: LATER });
+    expect(first).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    const entries = await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1');
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ action: 'dispatch', status: 'refused', recordedAtIso: LATER });
+    expect(entries[0].detail).toBe(
+      'dispatch stagger wait: endpoint opencode:lane-host-example:4166, retry after 20000 ms, last start undated',
+    );
+    // 10 s later the first sighting still spaces the endpoint (no second entry).
+    const second = await advance(harness, { startGate: new SessionStartSpacing(20_000, null), nowIso: at(10_000) });
+    expect(second).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(await harness.executionJournal.listJournalEntriesForAttempt('attempt-example-1')).toHaveLength(1);
+    // One interval after the first sighting the start is granted: the corrupt record blocks no longer.
+    const third = await advance(harness, { startGate: new SessionStartSpacing(20_000, null), nowIso: at(20_000) });
+    expect(third).toMatchObject({ outcome: 'acted', step: 'dispatch', reasonCode: 'dispatch-started' });
+    expect(harness.dispatchRequests).toHaveLength(1);
+  });
+
+  it('fix round 3: an undated started attempt never hands the gate a malformed seed', async () => {
+    const prior = attemptFixture({
+      id: 'attempt-example-0',
+      state: 'running',
+      createdAtIso: 'not-a-date',
+      updatedAtIso: 'not-a-date',
+    });
+    // The current attempt was prepared just before this dispatch (the cap's anchor).
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture({ updatedAtIso: LATER })]);
+    await admit(harness, 'attempt-example-1');
+    const gate = seededEndpointGate();
+    const result = await advance(harness, { startGate: gate });
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(gate.seeds).toEqual([LATER]);
+  });
+
+  it('fix round 4: a failing journal read with an undated started attempt still waits instead of throwing', async () => {
+    const prior = attemptFixture({
+      id: 'attempt-example-0',
+      state: 'running',
+      updatedAtIso: 'not-a-date',
+    });
+    // The current attempt was prepared just before this dispatch (the cap's anchor).
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture({ updatedAtIso: LATER })]);
+    await admit(harness, 'attempt-example-1');
+    const journal = harness.deps.executionJournal;
+    const original = journal.listJournalEntriesForAttempt.bind(journal);
+    let failReads = true;
+    journal.listJournalEntriesForAttempt = async (attemptId: string) => {
+      if (failReads) {
+        throw new Error('journal read failed');
+      }
+      return original(attemptId);
+    };
+    const gate = seededEndpointGate();
+    const result = await advance(harness, { startGate: gate });
+    failReads = false;
+    expect(result).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    expect(gate.seeds).toEqual([LATER]);
+    expect(harness.dispatchRequests).toEqual([]);
+  });
+
+  it('fix round 5: an undated start with a journal that always fails is still bounded', async () => {
+    const prior = attemptFixture({
+      id: 'attempt-example-0',
+      state: 'running',
+      updatedAtIso: 'not-a-date',
+    });
+    const harness = await makeHarness(runRecord(), [prior, attemptFixture()]);
+    await admit(harness, 'attempt-example-1');
+    const preparedAt = (await harness.attemptRepo.findAttemptById('attempt-example-1'))?.updatedAtIso;
+    if (preparedAt === undefined) {
+      throw new Error('fixture must hold the prepared attempt');
+    }
+    // Every stagger wait append fails, so no sighting is ever recorded.
+    const journal = harness.executionJournal;
+    const append = journal.appendJournalEntry.bind(journal);
+    journal.appendJournalEntry = async (entry: Parameters<typeof append>[0]) => {
+      if (entry.detail?.startsWith('dispatch stagger wait:') === true) {
+        throw new Error('journal append failed');
+      }
+      return append(entry);
+    };
+    const after = (ms: number): string => new Date(Date.parse(preparedAt) + ms).toISOString();
+    // Every pass (a fresh gate each) would re-sight the undated start "now"
+    // for ever; the cap (prepared + 20 s) ends the wait one interval later.
+    const early = await advance(harness, { startGate: new SessionStartSpacing(20_000, null), nowIso: after(10_000) });
+    expect(early).toEqual({ outcome: 'waiting', reason: 'session-stagger' });
+    const late = after(40_000);
+    const result = await advance(harness, { startGate: new SessionStartSpacing(20_000, null), nowIso: late });
+    expect(result).toMatchObject({ outcome: 'acted', step: 'dispatch', reasonCode: 'dispatch-started' });
+    expect(harness.dispatchRequests).toHaveLength(1);
   });
 
   it('test 21 (KF-34a1): a seat-pivot dispatch is denied the same way, before the pivot intent', async () => {

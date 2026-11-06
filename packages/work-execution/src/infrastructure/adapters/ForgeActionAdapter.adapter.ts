@@ -19,6 +19,8 @@ import type {
   ForgeActionPort,
   ForgeActionRequest,
   ForgeActionResult,
+  OpenPullRequestByHead,
+  OpenPullRequestsByHeadResult,
 } from '../../application/ports/out/ForgeActionPort.out-port.js';
 import type {
   MergeBranchHeadRequest,
@@ -196,6 +198,11 @@ function snapshotCreateBranchRequest(request: object): MergeForgeCreateBranchReq
   return copy as unknown as MergeForgeCreateBranchRequest;
 }
 
+/** Bounds for the legacy open-pull-request head lookup. */
+const PR_HEAD_LOOKUP_TIMEOUT_MS = 15_000;
+const PR_HEAD_LOOKUP_PAGE = 20;
+const MAX_PR_LOOKUP_BODY_BYTES = 262_144;
+
 /**
  * A plain copy of a merge-main-into-branch request's own data properties; absent
  * keys stay absent.
@@ -242,6 +249,104 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
 
   isConfigured(): boolean {
     return this.delegate !== undefined && this.delegate.runGh !== undefined;
+  }
+
+  /** The bound repository `gh` runs in, when the installation configured one (WB5b2). */
+  boundRepository(): ForgeRepositoryRef | undefined {
+    return this.delegate?.repository;
+  }
+
+  /**
+   * Read-only lookup of the open pull requests for `<owner>:<branch>` in the
+   * bound repository (WB5b legacy PR-number lookup). The head is always
+   * qualified with the repository's owner and every result's head repository
+   * owner is re-checked, so a fork's branch of the same name never matches.
+   * One bounded `gh api` read; any failure is `unreadable`, never empty.
+   */
+  async findOpenPullRequestsByHead(query: {
+    readonly repository: string;
+    readonly branchName: string;
+  }): Promise<OpenPullRequestsByHeadResult> {
+    const runGh = this.delegate?.runGh;
+    if (runGh === undefined) {
+      return { outcome: 'unreadable', reason: 'no gh subprocess is configured' };
+    }
+    const parts = query.repository.split('/');
+    const owner = parts[0] ?? '';
+    const repo = parts[1] ?? '';
+    const namePattern = /^[A-Za-z0-9_.-]{1,100}$/;
+    if (parts.length !== 2 || !namePattern.test(owner) || !namePattern.test(repo)) {
+      return { outcome: 'unreadable', reason: 'the repository is not owner/repo' };
+    }
+    // The head owner always comes from the bound repository, never from the
+    // query: an unbound adapter refuses, and a query for another repository
+    // refuses.
+    const bound = this.delegate?.repository;
+    if (bound === undefined) {
+      return { outcome: 'unreadable', reason: 'legacy-pr-lookup-unbound-repository' };
+    }
+    if (
+      bound.owner.toLowerCase() !== owner.toLowerCase() ||
+      bound.repo.toLowerCase() !== repo.toLowerCase()
+    ) {
+      return { outcome: 'unreadable', reason: 'legacy-pr-lookup-repository-mismatch' };
+    }
+    if (!isSafeBranchName(query.branchName)) {
+      return { outcome: 'unreadable', reason: 'the branch name is not safe' };
+    }
+    // The bound owner and repo reach the endpoint path and the head filter, so
+    // they are screened like the post-status path screens them (WB5b2).
+    if (!REPOSITORY_PATTERN.test(bound.owner) || !REPOSITORY_PATTERN.test(bound.repo)) {
+      return { outcome: 'unreadable', reason: 'the bound repository owner or repo is invalid' };
+    }
+    const headFilter = encodeURIComponent(`${bound.owner}:${query.branchName}`);
+    const args = [
+      'api',
+      `repos/${bound.owner}/${bound.repo}/pulls?head=${headFilter}&state=open&per_page=${PR_HEAD_LOOKUP_PAGE}`,
+    ];
+    let gh: GhInvocationResult;
+    try {
+      gh = await runGh(args, undefined, PR_HEAD_LOOKUP_TIMEOUT_MS);
+    } catch {
+      return { outcome: 'unreadable', reason: 'the pull request lookup could not complete' };
+    }
+    if (gh.exitCode !== 0 || typeof gh.stdout !== 'string' || Buffer.byteLength(gh.stdout, 'utf8') > MAX_PR_LOOKUP_BODY_BYTES) {
+      return { outcome: 'unreadable', reason: 'the pull request lookup failed' };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(gh.stdout);
+    } catch {
+      return { outcome: 'unreadable', reason: 'the pull request lookup answer was not JSON' };
+    }
+    if (!Array.isArray(parsed) || parsed.length >= PR_HEAD_LOOKUP_PAGE) {
+      // A full page may hide more matches: never guess from a truncated list.
+      return { outcome: 'unreadable', reason: 'the pull request lookup answer was not a complete list' };
+    }
+    const pullRequests: OpenPullRequestByHead[] = [];
+    for (const item of parsed as unknown[]) {
+      const record = item as {
+        number?: unknown;
+        head?: { sha?: unknown; ref?: unknown; repo?: { owner?: { login?: unknown } | null } | null } | null;
+      } | null;
+      const number = record?.number;
+      const sha = record?.head?.sha;
+      const login = record?.head?.repo?.owner?.login;
+      if (
+        typeof number !== 'number' ||
+        !Number.isSafeInteger(number) ||
+        number < 1 ||
+        typeof sha !== 'string' ||
+        record?.head?.ref !== query.branchName ||
+        typeof login !== 'string' ||
+        login.toLowerCase() !== bound.owner.toLowerCase()
+      ) {
+        // A malformed, fork-headed or other-branch entry is ignored.
+        continue;
+      }
+      pullRequests.push({ number, headSha: sha });
+    }
+    return { outcome: 'read', pullRequests };
   }
 
   async performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult> {
@@ -571,11 +676,14 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     request: ForgeActionRequest,
   ): Promise<ForgeActionResult> {
     // The merge is pinned to the expected head; a moved PR head cannot match.
+    // The resolved number is what is merged (WB5b2), so the merged pull request
+    // and the recorded one are the same object; only a caller that resolved no
+    // number falls back to the branch.
     const args = [
       'pr',
       'merge',
       ...this.repositoryArgs(),
-      request.branchName,
+      request.pullRequestNumber !== undefined ? String(request.pullRequestNumber) : request.branchName,
       '--match-head-commit',
       request.expectedHeadSha,
       '--merge',

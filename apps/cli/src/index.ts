@@ -68,6 +68,7 @@ import { coordinationCommands } from './commands/coordination.js';
 import { questionsCommands } from './commands/questions.js';
 import { mergeCommands } from './merge.js';
 import { relaunchCommands } from './relaunch.js';
+import { releaseCommands } from './release.js';
 import { cutoverCommands } from './commands/cutover.js';
 import { tuiCommand } from './tui/command.js';
 
@@ -271,6 +272,7 @@ const COMMANDS: Readonly<Record<string, Readonly<Record<string, CommandHandler>>
   questions: questionsCommands,
   merge: mergeCommands,
   relaunch: relaunchCommands,
+  release: releaseCommands,
   cutover: cutoverCommands,
 };
 
@@ -709,6 +711,7 @@ Commands:
   killall [--lift]
   report weekly
   relaunch inventory [--host <name>]
+  release install|swap|rollback --root <path> [--sha <40 hex>] [--source <path>] [--keep <n>] [--apply --project <id>]
   cutover shadow report --repository owner/repo --legacy-state-dir <path>
   tui
   brief prepare --acceptanceSpec '<json>' [--allowedPathPrefixes '["packages/x/src"]'] [--seatPlan '<json>' | --seatPlanFromInstallation]

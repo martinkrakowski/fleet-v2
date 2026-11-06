@@ -2,7 +2,7 @@
  * The JSON state stores operator-coordination owns, described for `fleet-v2
  * state` (E1b). Each parser is the one the store's reader uses.
  */
-import { describeRecordListStore, type StateFileDescriptor } from './file-store.js';
+import { describeRecordListStore, describeVersionedRecordListStore, type StateFileDescriptor } from './file-store.js';
 import { parseProjectProfileStateRecord } from './ProjectProfileRepositoryAdapter.adapter.js';
 import { parseCoordinationRequestStateRecord } from './CoordinationRequestRepositoryAdapter.adapter.js';
 import { parseOwnerQuestionStateRecord } from './OwnerQuestionRepositoryAdapter.adapter.js';
@@ -12,6 +12,14 @@ import {
   attentionItemListError,
   parseAttentionItemStateRecord,
 } from './AttentionItemRepositoryAdapter.adapter.js';
+import {
+  MAX_ORCHESTRATOR_REQUEST_STORE_BYTES,
+  MAX_ORCHESTRATOR_REQUEST_STORE_RECORDS,
+} from '../../application/ports/out/OrchestratorRequestRepositoryPort.out-port.js';
+import {
+  orchestratorRequestListError,
+  parseVersionedOrchestratorRequestStateRecord,
+} from './OrchestratorRequestRepositoryAdapter.adapter.js';
 
 export const OPERATOR_COORDINATION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('project-profiles.json', parseProjectProfileStateRecord),
@@ -20,4 +28,13 @@ export const OPERATOR_COORDINATION_STATE_FILES: readonly StateFileDescriptor[] =
   describeRecordListStore('orchestrators.json', parseOrchestratorSessionStateRecord),
   describeRecordListStore('owner-items.json', parseOwnerItemStateRecord),
   describeRecordListStore('attention-items.json', parseAttentionItemStateRecord, attentionItemListError),
+  describeVersionedRecordListStore(
+    'orchestrator-requests.json',
+    parseVersionedOrchestratorRequestStateRecord,
+    orchestratorRequestListError,
+    {
+      maxBytes: MAX_ORCHESTRATOR_REQUEST_STORE_BYTES,
+      maxRecords: MAX_ORCHESTRATOR_REQUEST_STORE_RECORDS,
+    },
+  ),
 ];

@@ -936,7 +936,7 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
   });
 
-  it('a code-review fail with only minors keeps review-failed: the override is brief-check only', async () => {
+  it('a code-review fail with only minors journals review-passed with the minor-only detail and enters accepting (RV3)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'code-review', NOW);
     harness.setReviewAnswer(async (request) => receiptWith(request, MINOR_ONLY_FINDINGS));
@@ -946,9 +946,10 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
       step: 'code-review',
       key: reviewKey('code-review', 0, HEAD12_A),
       result: 'completed',
-      reasonCode: 'review-failed',
+      reasonCode: 'review-passed',
+      detail: 'minor-only-findings',
     });
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'accepting' });
   });
 
   it('a brief-check fail carrying a major finding still journals review-failed and enters fixing', async () => {
@@ -968,7 +969,7 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
   });
 
-  it('a failed brief-check receipt with zero findings keeps review-failed (fail closed)', async () => {
+  it('a failed brief-check receipt with zero findings is an unparseable verdict: review-unknown, retried once on the same seat (RV3)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'brief-check', NOW);
     harness.setReviewAnswer(async (request) => receiptWith(request, []));
@@ -978,8 +979,21 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
       step: 'brief-check',
       key: reviewKey('brief-check', 0, HEAD12_A),
       result: 'completed',
-      reasonCode: 'review-failed',
+      reasonCode: 'review-unknown',
+      detail: 'unparseable-verdict',
     });
+    // V7: the unknown verdict retries once on the same seat at the same head —
+    // never `fixing`, never `code-review`.
+    const next = await advance(harness);
+    expect(next).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A) + '/retry1',
+      result: 'completed',
+      reasonCode: 'review-unknown',
+      detail: 'unparseable-verdict',
+    });
+    expect(JSON.stringify(next)).not.toContain('fixing');
   });
 
   it('a brief-check receipt with an unreadable verdict still maps review-unknown (fail closed)', async () => {
@@ -999,13 +1013,14 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
     });
   });
 
-  it('an all-out-of-scope minors-only fail keeps the earlier out-of-scope result untouched', async () => {
+  it('a minor-only fail never records out-of-scope dispositions and journals the minor-only detail (RV3)', async () => {
     const harness = await makeHarness(runRecord(), [collectedAttempt()]);
     await conduct(harness, 'brief-check', NOW);
     harness.setReviewAnswer(async (request) => receiptWith(request, [
       { findingId: 'finding-1', severity: 'minor', summary: 'a minor note', filePath: 'src/ex.ts', line: 4 },
       { findingId: 'finding-2', severity: 'nit', summary: 'a nit', filePath: 'src/ex-2.ts', line: 9 },
     ]));
+    let outOfScopeCalls = 0;
     Object.assign(harness.deps, {
       artifactPort: {
         ...harness.deps.artifactPort,
@@ -1013,7 +1028,10 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
       },
       reviewRequest: {
         ...harness.deps.reviewRequest,
-        recordOutOfScope: async () => ({ outcome: 'recorded' }) as const,
+        recordOutOfScope: async () => {
+          outOfScopeCalls += 1;
+          return { outcome: 'recorded' } as const;
+        },
       },
     });
     const result = await advance(harness);
@@ -1023,8 +1041,10 @@ describe('AdvanceLaneRunUseCase minors-only brief-check override (GB1)', () => {
       key: reviewKey('brief-check', 0, HEAD12_A),
       result: 'completed',
       reasonCode: 'review-passed',
-      detail: 'out-of-scope-findings',
+      detail: 'minor-only-findings',
     });
+    // A minor-only receipt never records any out-of-scope disposition.
+    expect(outOfScopeCalls).toBe(0);
   });
 });
 

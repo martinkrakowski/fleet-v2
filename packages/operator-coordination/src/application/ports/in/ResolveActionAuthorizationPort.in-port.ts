@@ -11,6 +11,11 @@ export interface ResolveActionAuthorizationRequest {
   readonly actionScope: string;
   readonly expectedHeadSha: string;
   readonly authorizationGrantId?: string;
+  /**
+   * The attempt the action is for (CO24e). A grant that records an attempt must match it; an
+   * owner grant that records none is bound to it by this resolve.
+   */
+  readonly attemptId?: string;
   readonly repository?: { readonly owner: string; readonly repo: string } | string;
   readonly pullRequestNumber?: number;
 }

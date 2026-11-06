@@ -352,21 +352,32 @@ function validSuccessor(
  * A live entry of the successor's identity already exists (a retry that
  * minted another id, or an enqueue that raced the pass). It is adopted as the
  * successor and, in the same write, takes the earlier of the two queue
- * positions and the supersedes link, so the update never loses the PR its place.
+ * positions, the supersedes link, the predecessor's run links where it has
+ * none and the higher tier, so the update never loses the PR its place.
  */
 function adoptExistingSuccessor(
   existing: MergeQueueEntryRecord,
   target: MergeQueueEntryRecord,
 ): MergeQueueEntryRecord | null {
-  const earlier = compareMergeQueueEntries(target, existing) < 0 ? target.enqueuedAtIso : existing.enqueuedAtIso;
-  const supersedes = existing.supersedes ?? target.entryId;
-  if (earlier === existing.enqueuedAtIso && supersedes === existing.supersedes) {
-    return existing;
+  const links = ['runId', 'attemptId', 'workOrderId'] as const;
+  if (links.some((key) => existing[key] !== null && target[key] !== null && existing[key] !== target[key])) {
+    return null; // two different runs claim the pull request: not adopted, never merged blindly
   }
+  const earlier = compareMergeQueueEntries(target, existing) < 0 ? target.enqueuedAtIso : existing.enqueuedAtIso;
   const read = readMergeQueueEntryRecord({
-    ...existing, enqueuedAtIso: earlier, supersedes, revision: existing.revision + 1,
+    ...existing,
+    enqueuedAtIso: earlier,
+    supersedes: existing.supersedes ?? target.entryId,
+    runId: existing.runId ?? target.runId,
+    attemptId: existing.attemptId ?? target.attemptId,
+    workOrderId: existing.workOrderId ?? target.workOrderId,
+    tier: Math.max(existing.tier, target.tier),
+    revision: existing.revision + 1,
   });
-  return read.ok ? read.record : null;
+  if (!read.ok) {
+    return null;
+  }
+  return sameMergeEntryContent(read.record, existing) ? existing : read.record;
 }
 
 /**

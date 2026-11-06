@@ -176,6 +176,16 @@ describe('decideMergeTransition', () => {
     });
     expect(adopted.outcome === 'applied' && adopted.entries).toHaveLength(2);
 
+    // The adopted entry inherits the predecessor's run links and the higher tier; a rival run is refused.
+    const linked = entry({ runId: 'run-01JD00000000000000000000AA', tier: 1 });
+    const linkedBuilt = buildSupersession(linked, HEAD_2, id(2));
+    if (!linkedBuilt.ok) throw new Error('fixture');
+    const linkedCommand = { entryId: id(1), expectedRevision: 1, next: linkedBuilt.predecessor, successor: linkedBuilt.successor };
+    const inherit = decideMergeTransition([linked, raced], linkedCommand);
+    expect(inherit).toMatchObject({ outcome: 'applied', successor: { entryId: id(8), runId: linked.runId, tier: 2 } });
+    const rival = entry({ entryId: id(9), headOid: HEAD_2, runId: 'run-01JD00000000000000000000BB' });
+    expect(decideMergeTransition([linked, rival], linkedCommand).outcome).toBe('refused');
+
     // A successor needs a superseded predecessor and a matching link.
     expect(decideMergeTransition([stored], { ...command, next: parked }).outcome).toBe('refused');
     expect(decideMergeTransition([stored], { ...command, successor: { ...built.successor, supersedes: id(5) } }).outcome).toBe('refused');

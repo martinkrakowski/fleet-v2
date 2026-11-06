@@ -814,4 +814,25 @@ describe('performMergeLiveAction never throws and never acts twice (DT9b fix rou
     expect(stateReads).toBe(1);
     expect(forgeAction.requests).toHaveLength(0);
   });
+
+  it('reads the retry ordinal once, so a changing getter cannot key a different ordinal than the one checked', async () => {
+    const { journal, forgeAction, deps } = build();
+    let ordinalReads = 0;
+    const retry = {
+      get ordinal(): number {
+        ordinalReads += 1;
+        return ordinalReads === 1 ? 2 : 1;
+      },
+      proof: null,
+    };
+    const result = await performMergeLiveAction(
+      deps,
+      makeRequest({ retry: retry as unknown as MergeLiveActionRequest['retry'] }),
+    );
+    // Ordinal 2 without its proof is refused by buildMergeKey; a second read must never turn it into ordinal 1.
+    expect(result).toEqual({ outcome: 'invalid-request', reasonCode: 'invalid-key' });
+    expect(ordinalReads).toBe(1);
+    expect(journal.entries).toHaveLength(0);
+    expect(forgeAction.requests).toHaveLength(0);
+  });
 });

@@ -184,11 +184,17 @@ function readRetry(
   if (input === null) {
     return null;
   }
-  if (!isRecord(input) || input['ordinal'] === undefined || input['ordinal'] === null) {
+  if (!isRecord(input)) {
+    return 'invalid';
+  }
+  // Each field is read once: the ordinal that is checked is the ordinal that is keyed.
+  const ordinal = input['ordinal'];
+  const proof = input['proof'];
+  if (ordinal === undefined || ordinal === null) {
     return 'invalid';
   }
   // The ordinal's range and the proof's shape are buildMergeKey's to refuse.
-  return { ordinal: input['ordinal'], proof: (input['proof'] ?? null) as MergeKeyRetryProof | null };
+  return { ordinal, proof: (proof ?? null) as MergeKeyRetryProof | null };
 }
 
 function readExecution(

@@ -993,7 +993,10 @@ function declaredEnvironmentNames(turboJson: string): string[] | undefined {
 
 /** Bytewise (UTF-16 code unit) order: the sorted names feed the receipt digest, so the order never depends on the locale. */
 function compareCodeUnits(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
+  if (a < b) {
+    return -1;
+  }
+  return a > b ? 1 : 0;
 }
 
 /** Adds one task's declared `env` names to `names`. False when the task is malformed, a name is invalid or there are too many. */

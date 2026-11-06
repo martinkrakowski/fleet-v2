@@ -50,6 +50,7 @@ import type {
 import { SshExecutor } from './SshExecutor.adapter.js';
 import { GateSlotBudget, readGateSlotCapacity } from './GateSlotBudget.helper.js';
 import { createHash } from 'node:crypto';
+import { join } from 'node:path';
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
 import { GATE_RECEIPT_TOOLCHAIN_NAMES, buildGateReceiptKey } from '../../domain/gate-receipt-key.js';
 import type { GateReceiptKey, GateReceiptToolchainVersions } from '../../domain/gate-receipt-key.js';
@@ -986,7 +987,15 @@ export async function readGateDeclaredEnvironmentDigest(
   worktreePath: string,
 ): Promise<string | undefined> {
   try {
-    const turbo = await runReceiptProbe(executor, worktreePath, ['cat', 'turbo.json'], TURBO_JSON_MAX_BYTES);
+    // The path is absolute: the executor may ignore `cwd`, so a relative
+    // `turbo.json` could resolve to a different file in the SSH login
+    // directory and its variables would then be missing from the digest.
+    const turbo = await runReceiptProbe(
+      executor,
+      worktreePath,
+      ['cat', join(worktreePath, 'turbo.json')],
+      TURBO_JSON_MAX_BYTES,
+    );
     if (turbo === undefined || turbo.exitCode !== 0) {
       return undefined;
     }
@@ -995,20 +1004,26 @@ export async function readGateDeclaredEnvironmentDigest(
       return undefined;
     }
     const entries: Array<[string, string]> = [];
+    const unset: string[] = [];
     for (const name of names) {
       const run = await runReceiptProbe(executor, worktreePath, ['printenv', name], DECLARED_VALUE_MAX_BYTES);
       if (run === undefined || (run.exitCode !== 0 && run.exitCode !== 1)) {
         return undefined;
       }
-      // printenv exits 1 for a variable that is not set: its value is the empty string.
+      // printenv exits 1 for a variable that is not set: it is recorded as
+      // unset, never as the empty string, so a gate command can tell
+      // `process.env.NAME === undefined` from `process.env.NAME === ''`.
       const value = run.exitCode === 1 ? '' : run.stdout.replace(/\n$/, '');
       if (Buffer.byteLength(value, 'utf8') > DECLARED_VALUE_MAX_BYTES) {
         return undefined;
       }
       entries.push([name, value]);
+      if (run.exitCode === 1) {
+        unset.push(name);
+      }
     }
     return createHash('sha256')
-      .update(JSON.stringify({ names, values: Object.fromEntries(entries) }))
+      .update(JSON.stringify({ names, values: Object.fromEntries(entries), unset }))
       .digest('hex');
   } catch {
     return undefined;

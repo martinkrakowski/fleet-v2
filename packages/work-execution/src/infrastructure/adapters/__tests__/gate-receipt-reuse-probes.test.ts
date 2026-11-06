@@ -1,6 +1,8 @@
 // KS2c: the two receipt-input readers (toolchain versions, declared environment digest) over a scripted executor.
 import { describe, expect, it } from 'vitest';
 
+import { join } from 'node:path';
+
 import {
   readGateDeclaredEnvironmentDigest,
   readGateToolchainVersions,
@@ -57,7 +59,9 @@ function environment(
   document: string,
   values: Record<string, string | null>,
 ): Record<string, Answer> {
-  const answers: Record<string, Answer> = { 'cat turbo.json': { stdout: document } };
+  const answers: Record<string, Answer> = {
+    [`cat ${join(WORKTREE, 'turbo.json')}`]: { stdout: document },
+  };
   for (const [name, value] of Object.entries(values)) {
     answers['printenv ' + name] = value === null ? { exitCode: 1 } : { stdout: value + '\n' };
   }
@@ -111,19 +115,21 @@ describe('gate receipt input readers (KS2c)', () => {
     expect(first).toMatch(/^[0-9a-f]{64}$/);
     await expect(digestOf({ ...same })).resolves.toBe(first);
     await expect(digestOf({ ...same, DECLARED_TWO: 'changed' })).resolves.not.toBe(first);
-    // An unset variable is the empty string, which differs from a set one.
+    // An unset variable is never the empty string: a gate command can tell
+    // `process.env.NAME === undefined` from `process.env.NAME === ''`.
     const unset = await digestOf({ DECLARED_ONE: 'one', DECLARED_TWO: null });
     expect(unset).toMatch(/^[0-9a-f]{64}$/);
     expect(unset).not.toBe(first);
-    await expect(digestOf({ DECLARED_ONE: 'one', DECLARED_TWO: '' })).resolves.toBe(unset);
+    await expect(digestOf({ DECLARED_ONE: 'one', DECLARED_TWO: '' })).resolves.not.toBe(unset);
+    await expect(digestOf({ DECLARED_ONE: 'one', DECLARED_TWO: '' })).resolves.not.toBe(first);
   });
 
   it('an unreadable turbo.json is a miss', async () => {
     const values = { DECLARED_ONE: 'one', DECLARED_TWO: 'two' };
     const cases: Array<Record<string, Answer>> = [
-      { ...environment(DECLARED, values), 'cat turbo.json': { exitCode: 1, stdout: DECLARED } },
-      { ...environment(DECLARED, values), 'cat turbo.json': { error: 'cat failed' } },
-      { ...environment(DECLARED, values), 'cat turbo.json': 'throw' },
+      { ...environment(DECLARED, values), [`cat ${join(WORKTREE, 'turbo.json')}`]: { exitCode: 1, stdout: DECLARED } },
+      { ...environment(DECLARED, values), [`cat ${join(WORKTREE, 'turbo.json')}`]: { error: 'cat failed' } },
+      { ...environment(DECLARED, values), [`cat ${join(WORKTREE, 'turbo.json')}`]: 'throw' },
       environment('{"tasks": ', values),
       environment('not json at all', values),
       environment('[]', values),
@@ -213,7 +219,7 @@ describe('gate receipt input readers (KS2c)', () => {
       'yarn --version',
       'hexagen --version',
       'turbo --version',
-      'cat turbo.json',
+      'cat ' + join(WORKTREE, 'turbo.json'),
       'printenv DECLARED_ONE',
       'printenv DECLARED_TWO',
     ]);

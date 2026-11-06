@@ -1,7 +1,7 @@
 // Covers the KS2 part 2 robustness bar: equal-key reuse, per-component misses, typed refusals,
 // write-once, torn/oversized/other-version stores as misses, crash leftovers, secret and hostile
 // keys, symlinks and bounds. Real temp directories; nothing touches a host.
-import { mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile, utimes } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, readFile, rename, rm, symlink, writeFile, utimes, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
@@ -340,20 +340,59 @@ describe('file store faults', () => {
     expect((await readdir(storeDir)).filter((n) => n.endsWith('.json'))).toHaveLength(1);
   });
 
-  it('never follows a symlinked state directory', async () => {
+  it('resolves a symlinked state directory once at construction and then uses only the resolved root', async () => {
     const elsewhere = path.join(dir, 'elsewhere');
+    const other = path.join(dir, 'other');
     await mkdir(elsewhere);
+    await mkdir(other);
     const link = path.join(dir, 'state-link');
     await symlink(elsewhere, link);
     const adapter = new GateReceiptReuseAdapter({ stateDir: link });
-    expect((await adapter.findGateReceipt(makeKey())).outcome).toBe('miss');
-    expect(await adapter.recordGateReceipt(request(makeKey()))).toEqual({ outcome: 'refused', reason: 'store-unreadable' });
-    expect(await readdir(elsewhere)).toEqual([]);
+    expect(await adapter.recordGateReceipt(request(makeKey()))).toEqual({ outcome: 'recorded' });
+    await rm(link);
+    await symlink(other, link);
+    expect((await adapter.findGateReceipt(makeKey())).outcome).toBe('hit');
+    expect(await readdir(other)).toEqual([]);
+    expect(await readdir(path.join(elsewhere, 'gate-receipts'))).toHaveLength(1);
   });
 
   it('clamps an enormous receipt bound', async () => {
     const adapter = new GateReceiptReuseAdapter({ stateDir: dir, maxRecords: Number.MAX_SAFE_INTEGER });
     expect(await adapter.recordGateReceipt(request(makeKey()))).toEqual({ outcome: 'recorded' });
+  });
+
+  it('follows a symlinked ancestor once, at construction, and ignores a later swap', async () => {
+    const real = path.join(dir, 'real');
+    const evil = path.join(dir, 'evil');
+    await mkdir(real);
+    await mkdir(evil);
+    const link = path.join(dir, 'link');
+    await symlink(real, link);
+    const adapter = new GateReceiptReuseAdapter({ stateDir: path.join(link, 'state') });
+    expect(await adapter.recordGateReceipt(request(makeKey()))).toEqual({ outcome: 'recorded' });
+    await rm(link);
+    await symlink(evil, link);
+    expect(await adapter.recordGateReceipt(request(makeKey({ predicateId: 'later' })))).toEqual({ outcome: 'recorded' });
+    expect(await adapter.findGateReceipt(makeKey())).toMatchObject({ outcome: 'hit' });
+    expect(await readdir(evil)).toEqual([]);
+    expect((await readdir(path.join(await realpath(real), 'state', 'gate-receipts'))).length).toBe(2);
+  });
+
+  it('refuses when the resolved root itself is swapped for a symlink after construction', async () => {
+    const parent = path.join(dir, 'parent');
+    const evil = path.join(dir, 'evil2');
+    await mkdir(parent);
+    await mkdir(evil);
+    const adapter = new GateReceiptReuseAdapter({ stateDir: path.join(parent, 'state') });
+    expect(await adapter.recordGateReceipt(request(makeKey()))).toEqual({ outcome: 'recorded' });
+    await rename(parent, path.join(dir, 'parent-moved'));
+    await symlink(evil, parent);
+    expect(await adapter.findGateReceipt(makeKey())).toEqual({ outcome: 'miss', reason: 'store-unreadable' });
+    expect(await adapter.recordGateReceipt(request(makeKey({ predicateId: 'x' })))).toEqual({
+      outcome: 'refused',
+      reason: 'store-unreadable',
+    });
+    expect(await readdir(evil)).toEqual([]);
   });
 
 });

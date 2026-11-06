@@ -15,14 +15,15 @@
  * Guards: neither method throws and each is bounded by a deadline; a symlink
  * as the state directory, the store directory or a receipt file is never
  * followed; a receipt file over 4 KiB or a store over `maxRecords` receipts is
- * refused; the configured `stateDir` path is the operator's trusted root, so a symlink in its ancestors
- * (for example /tmp or /var on macOS) is accepted, while the state directory itself, the store directory
- * and every receipt file must not be symlinks; a secret-shaped key or reference is refused before anything is
+ * refused; the configured `stateDir` is resolved once, at construction, to a canonical root (a symlinked
+ * ancestor such as /tmp on macOS is followed there, once) and only that root is used afterwards; each call
+ * checks the root still resolves to itself, so a later swap of an ancestor is a refusal, not a redirect;
+ * the root, the store directory and every receipt file must not be symlinks; a secret-shaped key or reference is refused before anything is
  * written and is never echoed (results carry fixed reasons only).
  */
 
 import { createHash, randomBytes } from 'node:crypto';
-import { constants as fsConstants, promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs, realpathSync } from 'node:fs';
 import * as path from 'node:path';
 
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
@@ -206,14 +207,47 @@ async function withDeadline<T>(deadlineMs: number, work: () => Promise<T>, onTim
   }
 }
 
+/**
+ * The canonical form of `stateDir`: the deepest existing ancestor resolved with realpath, the rest appended
+ * as given. Null when it cannot be resolved or a missing part contains `..`. Never throws.
+ */
+function resolveCanonicalRoot(stateDir: unknown): string | null {
+  try {
+    if (typeof stateDir !== 'string' || stateDir.length < 1 || stateDir.includes('\0')) {
+      return null;
+    }
+    let existing = path.resolve(stateDir);
+    const rest: string[] = [];
+    for (;;) {
+      try {
+        return path.join(realpathSync(existing), ...rest);
+      } catch (error: unknown) {
+        if (errorCode(error) !== 'ENOENT') {
+          return null;
+        }
+      }
+      const parent = path.dirname(existing);
+      if (parent === existing) {
+        return null;
+      }
+      rest.unshift(path.basename(existing));
+      existing = parent;
+    }
+  } catch {
+    return null;
+  }
+}
+
 export class GateReceiptReuseAdapter implements GateReceiptReusePort {
   private readonly memory = new Map<string, StoredReceipt>();
   private readonly maxRecords: number;
   private readonly deadlineMs: number;
+  private readonly root: string | null;
   private tempCounter = 0;
   private writeQueue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly options?: GateReceiptReuseAdapterOptions) {
+    this.root = options?.stateDir === undefined ? null : resolveCanonicalRoot(options.stateDir);
     const maxRecords = options?.maxRecords;
     this.maxRecords =
       typeof maxRecords === 'number' && Number.isSafeInteger(maxRecords) && maxRecords >= 1
@@ -284,14 +318,17 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
   }
 
   private async find(key: GateReceiptKey): Promise<FindGateReceiptResult> {
-    const stateDir = this.options?.stateDir;
-    if (stateDir === undefined) {
+    const stateDir = this.options?.stateDir === undefined ? undefined : this.root;
+    if (this.options?.stateDir === undefined) {
       const found = this.memory.get(canonicalKey(key));
       return found === undefined
         ? { outcome: 'miss', reason: 'no-stored-receipt' }
         : { outcome: 'hit', verdict: found.verdict, receiptRef: found.receiptRef };
     }
     try {
+      if (stateDir === null || stateDir === undefined) {
+        return { outcome: 'miss', reason: 'store-unreadable' };
+      }
       const directory = await this.openStoreDirectory(stateDir, false);
       if (directory === null) {
         return { outcome: 'miss', reason: 'no-stored-receipt' };
@@ -315,8 +352,8 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
   }
 
   private async record(key: GateReceiptKey, receipt: StoredReceipt): Promise<RecordGateReceiptResult> {
-    const stateDir = this.options?.stateDir;
-    if (stateDir === undefined) {
+    const stateDir = this.options?.stateDir === undefined ? undefined : this.root;
+    if (this.options?.stateDir === undefined) {
       const canonical = canonicalKey(key);
       if (this.memory.has(canonical)) {
         return { outcome: 'already-recorded' };
@@ -328,6 +365,9 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
       return { outcome: 'recorded' };
     }
     try {
+      if (stateDir === null || stateDir === undefined) {
+        return { outcome: 'refused', reason: 'store-unreadable' };
+      }
       const directory = await this.openStoreDirectory(stateDir, true);
       if (directory === null) {
         return { outcome: 'refused', reason: 'store-failed' };
@@ -360,6 +400,10 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
    * without it an absent store is `null`. Anything that is not a plain directory is a failure.
    */
   private async openStoreDirectory(stateDir: string, create: boolean): Promise<string | null> {
+    // The root must still resolve to itself: a symlink swapped into any ancestor since construction is refused.
+    if (resolveCanonicalRoot(stateDir) !== stateDir) {
+      throw new StoreFailure('store-unreadable');
+    }
     const stateStat = await this.lstatOrNull(stateDir);
     if (stateStat === null) {
       if (!create) {

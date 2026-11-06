@@ -687,3 +687,265 @@ describe("AttemptArtifactAdapter artifact manifest (real filesystem)", () => {
     });
   });
 });
+
+/** SHA-256 of test content, mirroring the adapter's digest function. */
+function hexDigestOf(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+/**
+ * A scripted executor for `checkArtifactManifestForRemoval`: a sealed
+ * manifest at the content-addressed path listing `docs/a.md`, with scenario
+ * flags that break one probe at a time.
+ */
+function makeCheckFake(
+  scenario: {
+    readonly manifestText?: string;
+    readonly manifestAbsent?: boolean;
+    readonly manifestUnanswered?: boolean;
+    readonly manifestThrow?: boolean;
+    readonly artifactSha?: string;
+    readonly artifactAbsent?: boolean;
+    readonly artifactUnanswered?: boolean;
+    readonly artifactThrow?: boolean;
+    readonly oversized?: boolean;
+  } = {},
+): { executor: CommandExecutorPort; calls: RunCall[] } {
+  const text =
+    scenario.manifestText ??
+    serializeArtifactManifest(
+      buildArtifactManifest("attempt-1", [
+        { path: "docs/a.md", size: 6, sha256: hexDigestOf("alpha\n") },
+      ]),
+    );
+  const digest = sha256HexDigest(text);
+  const manifestRel = artifactManifestRelativePath(digest);
+  const targetPath = path.join("/wt", manifestRel);
+  const calls: RunCall[] = [];
+  const unanswered: CommandRunResult = { exitCode: null, signal: null, stdout: "", stderr: "" };
+  const exit0: CommandRunResult = { exitCode: 0, signal: null, stdout: "", stderr: "" };
+  const exit1: CommandRunResult = { exitCode: 1, signal: null, stdout: "", stderr: "" };
+  const executor: CommandExecutorPort = {
+    run: async (argv, options) => {
+      const call: RunCall = { argv, options };
+      calls.push(call);
+      if (scenario.manifestThrow === true) {
+        throw new Error("transport exploded");
+      }
+      const joined = argv.join(" ");
+      if (scenario.artifactThrow === true && joined.includes("docs/a.md")) {
+        throw new Error("artifact transport exploded");
+      }
+      if (argv[0] === "test") {
+        if (scenario.manifestUnanswered === true && joined.includes(manifestRel)) {
+          return unanswered;
+        }
+        if (scenario.artifactUnanswered === true && joined.includes("docs/a.md")) {
+          return unanswered;
+        }
+        if (argv[1] === "-L") {
+          return exit1;
+        }
+        if (joined.includes(manifestRel)) {
+          return scenario.manifestAbsent === true ? exit1 : exit0;
+        }
+        if (joined.includes("docs/a.md")) {
+          return scenario.artifactAbsent === true ? exit1 : exit0;
+        }
+        return exit1;
+      }
+      if (argv[0] === "wc") {
+        const size = joined.includes(manifestRel)
+          ? (scenario.oversized === true ? 600_000 : text.length)
+          : 6;
+        return { exitCode: 0, signal: null, stdout: `${size} ${targetPath}\n`, stderr: "" };
+      }
+      if (argv[0] === "cat") {
+        return { exitCode: 0, signal: null, stdout: text, stderr: "" };
+      }
+      if (argv[0] === "realpath") {
+        return { exitCode: 0, signal: null, stdout: `${argv[argv.length - 1]}\n`, stderr: "" };
+      }
+      if (argv[0] === "sha256sum") {
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: `${scenario.artifactSha ?? hexDigestOf("alpha\n")}  ${path.join("/wt", "docs/a.md")}\n`,
+          stderr: "",
+        };
+      }
+      return exit0;
+    },
+  };
+  return { executor, calls };
+}
+
+describe("checkArtifactManifestForRemoval (C2')", () => {
+  const manifestText = serializeArtifactManifest(
+    buildArtifactManifest("attempt-1", [
+      { path: "docs/a.md", size: 6, sha256: hexDigestOf("alpha\n") },
+    ]),
+  );
+  const manifestSha256 = sha256HexDigest(manifestText);
+  const manifestPath = artifactManifestRelativePath(manifestSha256);
+  type CheckRequest = NonNullable<
+    Parameters<NonNullable<AttemptArtifactPort["checkArtifactManifestForRemoval"]>>[0]
+  >;
+
+  function adapterFor(executor: CommandExecutorPort): AttemptArtifactAdapter {
+    return new AttemptArtifactAdapter({ executor });
+  }
+
+  function request(overrides: Partial<CheckRequest> = {}): CheckRequest {
+    return {
+      attemptId: "attempt-1",
+      worktreePath: "/wt",
+      manifestPath,
+      expectedManifestSha256: manifestSha256,
+      ...overrides,
+    };
+  }
+
+  it("returns sealed for a valid sealed manifest", async () => {
+    const { executor } = makeCheckFake({ manifestText });
+    const verdict = await adapterFor(executor).checkArtifactManifestForRemoval(request());
+    expect(verdict).toMatchObject({ outcome: "sealed" });
+  });
+
+  it("returns missing when the manifest file is absent", async () => {
+    const { executor } = makeCheckFake({ manifestAbsent: true });
+    const verdict = await adapterFor(executor).checkArtifactManifestForRemoval(request());
+    expect(verdict).toEqual({ outcome: "missing" });
+  });
+
+  it("returns mismatch when an artifact digest was modified", async () => {
+    const { executor } = makeCheckFake({ manifestText, artifactSha: "b".repeat(64) });
+    const verdict = await adapterFor(executor).checkArtifactManifestForRemoval(request());
+    expect(verdict).toMatchObject({
+      outcome: "mismatch",
+      mismatches: [{ path: "docs/a.md", kind: "sha256" }],
+    });
+  });
+
+  it("returns mismatch when the manifest text no longer matches its recorded digest", async () => {
+    const { executor } = makeCheckFake({ manifestText });
+    const verdict = await adapterFor(executor).checkArtifactManifestForRemoval(
+      request({ expectedManifestSha256: "c".repeat(64) }),
+    );
+    expect(verdict).toMatchObject({ outcome: "mismatch", mismatches: [{ kind: "manifest-changed" }] });
+  });
+
+  it("reports unknown (never missing or sealed) when probes, wc, cat, realpath, or sha256sum fail to answer or throw", async () => {
+    const unanswered = await adapterFor(
+      makeCheckFake({ manifestUnanswered: true }).executor,
+    ).checkArtifactManifestForRemoval(request());
+    expect(unanswered).toMatchObject({ outcome: "unknown" });
+    expect((unanswered as { outcome: string; reason: string }).reason).not.toMatch(/\/wt|docs/);
+
+    const thrown = await adapterFor(
+      makeCheckFake({ manifestThrow: true }).executor,
+    ).checkArtifactManifestForRemoval(request());
+    expect(thrown).toMatchObject({ outcome: "unknown" });
+
+    const artifactUnanswered = await adapterFor(
+      makeCheckFake({ manifestText, artifactUnanswered: true }).executor,
+    ).checkArtifactManifestForRemoval(request());
+    expect(artifactUnanswered).toEqual({ outcome: "unknown", reason: "artifact-probe-unreadable" });
+
+    const artifactThrown = await adapterFor(
+      makeCheckFake({ manifestText, artifactThrow: true }).executor,
+    ).checkArtifactManifestForRemoval(request());
+    expect(artifactThrown).toEqual({ outcome: "unknown", reason: "artifact-probe-unreadable" });
+  });
+
+  it("refuses an oversized manifest by size without reading unbounded bytes", async () => {
+    const { executor, calls } = makeCheckFake({ manifestText, oversized: true });
+    const verdict = await adapterFor(executor).checkArtifactManifestForRemoval(request());
+    expect(verdict).toMatchObject({ outcome: "mismatch", mismatches: [{ kind: "manifest-invalid" }] });
+    expect(calls.some((call) => call.argv[0] === "cat")).toBe(false);
+  });
+
+  it("never throws on malformed or throwing-getter inputs to checkArtifactManifestForRemoval", async () => {
+    const { executor } = makeCheckFake({ manifestText });
+    const adapter = adapterFor(executor);
+    const throwing = {
+      get attemptId(): string {
+        throw new Error("getter exploded");
+      },
+    } as unknown as CheckRequest;
+    for (const bad of [
+      null,
+      "not-a-request",
+      7,
+      throwing,
+      request({ worktreePath: "relative/path" }),
+      request({ worktreePath: `/wt/${"x".repeat(5000)}` }),
+      request({ attemptId: "" }),
+      request({ attemptId: "has/slash" }),
+      request({ manifestPath: "../escape.json" }),
+      request({ expectedManifestSha256: "NOT-HEX" }),
+    ] as unknown as CheckRequest[]) {
+      const verdict = await adapter.checkArtifactManifestForRemoval(bad);
+      expect(verdict.outcome === "mismatch" || verdict.outcome === "unknown").toBe(true);
+    }
+  });
+
+  it("answers unknown, not missing, when the recorded host cannot resolve to an executor", async () => {
+    const refusing = new AttemptArtifactAdapter({
+      executorForRecordedHost: () => ({ ok: false, reason: "host gone" }),
+    });
+    const verdict = await refusing.checkArtifactManifestForRemoval(
+      request({
+        recordedHost: {
+          kind: "opencode",
+          remotePort: 1,
+          host: "gone",
+          hostName: "gone",
+          agent: null,
+          model: null,
+          variant: null,
+        },
+      }),
+    );
+    expect(verdict).toEqual({ outcome: "unknown", reason: "no-executor-for-recorded-host" });
+  });
+});
+
+describe("parseArtifactManifest bounds (C2')", () => {
+  const base = buildArtifactManifest("attempt-1", [
+    { path: "docs/a.md", size: 6, sha256: hexDigestOf("alpha\n") },
+  ]);
+
+  it("rejects sparse files arrays and oversized manifests", () => {
+    const good = serializeArtifactManifest(base);
+    expect(parseArtifactManifest(good)).not.toBeNull();
+
+    // A sparse array (a hole at index 0) is never a manifest.
+    const parsed = JSON.parse(good) as Record<string, unknown>;
+    const files = parsed["files"] as unknown[];
+    delete files[0];
+    expect(parseArtifactManifest(JSON.stringify(parsed))).toBeNull();
+
+    // An oversized text or an oversized file list is refused.
+    expect(parseArtifactManifest("x".repeat(600_000))).toBeNull();
+    const many = buildArtifactManifest(
+      "attempt-1",
+      Array.from({ length: 2_049 }, (_, index) => ({
+        path: `docs/f${index}.md`,
+        size: 1,
+        sha256: hexDigestOf(String(index)),
+      })),
+    );
+    expect(parseArtifactManifest(serializeArtifactManifest(many))).toBeNull();
+
+    // An attempt id longer than 128 characters, or carrying `/` or NUL, is refused.
+    expect(
+      parseArtifactManifest(serializeArtifactManifest(buildArtifactManifest("a".repeat(129), []))),
+    ).toBeNull();
+    expect(parseArtifactManifest(serializeArtifactManifest(buildArtifactManifest("bad/id", [])))).toBeNull();
+    expect(parseArtifactManifest(serializeArtifactManifest(buildArtifactManifest("bad\0id", [])))).toBeNull();
+
+    expect(parseArtifactManifest("")).toBeNull();
+    expect(parseArtifactManifest(undefined as unknown as string)).toBeNull();
+  });
+});

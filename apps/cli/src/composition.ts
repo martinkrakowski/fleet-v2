@@ -1049,6 +1049,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     evidence,
     profileRead,
     coordination,
+    attemptArtifact,
+    coordinationRequestRepository,
     issuePolicyForgeGrantUseCase,
     autoMergeLoad,
     installation: options?.installation,
@@ -1135,6 +1137,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     forgeMode,
     mergeForgeRead,
     mergeQueueRepository: execution.mergeQueueRepository,
+    chainBranchRead: execution.forgeAction,
     evidence,
     conductor,
     runGh: (args, timeoutMs) =>

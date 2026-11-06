@@ -1525,6 +1525,30 @@ describe('readBoundedStoreBytes and readOrQuarantineVersionedRecordList', () => 
     expect(await fs.readFile(filePath)).toEqual(bytesB);
   });
 
+  it('says no quarantine was attempted when the store becomes a symlink while the reader waits for the lock', async () => {
+    await fs.writeFile(filePath, '{ not json');
+    const outside = path.join(tempDir, 'outside.txt');
+    await fs.writeFile(outside, '{ not json');
+    const release = createLatch();
+    const held = withFileLock(`${filePath}.lock`, () => release.promise);
+    await sleep(50);
+    const reading = readOrQuarantineVersionedRecordList({ filePath, parseRecord, lockTimeoutMs: 5_000 });
+    const settled = reading.catch((error: unknown) => error);
+    await sleep(100);
+    await fs.unlink(filePath);
+    await fs.symlink(outside, filePath);
+    release.resolve();
+    await held;
+    const error = await settled;
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const unreadable = error as StateFileUnreadableError;
+    expect(unreadable.quarantinePath).toBeNull();
+    expect(unreadable.message).toContain('no quarantine was attempted');
+    expect(unreadable.message).not.toContain('could not be copied');
+    expect(unreadable.message).not.toContain('repair it by hand');
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+  });
+
   it('quarantines when lockHeld is true without deadlocking on the already-held store lock', async () => {
     await fs.writeFile(filePath, '{ not json');
     const error = await withFileLock(`${filePath}.lock`, () =>
@@ -1536,16 +1560,27 @@ describe('readBoundedStoreBytes and readOrQuarantineVersionedRecordList', () => 
     expect((error as StateFileUnreadableError).quarantinePath).not.toBeNull();
   });
 
-  it('times out with FileLockTimeoutError within lockTimeoutMs when the store lock is held on an unreadable read, leaving the store unchanged', async () => {
+  it('refuses with StateFileUnreadableError (FileLockTimeoutError as cause) within lockTimeoutMs when the store lock is held on an unreadable read, leaving the store unchanged', async () => {
     const bytes = Buffer.from('{ not json');
     await fs.writeFile(filePath, bytes);
     const release = createLatch();
     const held = withFileLock(`${filePath}.lock`, () => release.promise);
     await sleep(50);
     const started = Date.now();
-    await expect(
-      readOrQuarantineVersionedRecordList({ filePath, parseRecord, lockTimeoutMs: 100 }),
-    ).rejects.toBeInstanceOf(FileLockTimeoutError);
+    const error = await readOrQuarantineVersionedRecordList({
+      filePath,
+      parseRecord,
+      lockTimeoutMs: 100,
+    }).catch((thrown: unknown) => thrown);
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const unreadable = error as StateFileUnreadableError;
+    expect(unreadable.quarantinePath).toBeNull();
+    expect(unreadable.cause).toBeInstanceOf(FileLockTimeoutError);
+    // Quarantine was never attempted on a lock-side refusal, so the message
+    // must not claim the bytes could not be copied nor advise a manual repair.
+    expect(unreadable.message).not.toContain('could not be copied');
+    expect(unreadable.message).not.toContain('repair it by hand');
+    expect(unreadable.message).toContain('no quarantine was attempted');
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(await fs.readFile(filePath)).toEqual(bytes);
     await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
@@ -1553,10 +1588,129 @@ describe('readBoundedStoreBytes and readOrQuarantineVersionedRecordList', () => 
     await held;
   });
 
+  it('maps an unwritable state directory to StateFileUnreadableError with quarantinePath null and the original errno as cause', async () => {
+    await fs.writeFile(filePath, '{ not json');
+    const realOpen = fs.open.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      if (String(args[1]) === 'wx') {
+        throw Object.assign(new Error(`EACCES: permission denied, open '${String(args[0])}'`), {
+          code: 'EACCES',
+          path: args[0],
+        }) as NodeJS.ErrnoException;
+      }
+      return realOpen(...args);
+    });
+
+    const error = await readOrQuarantineVersionedRecordList({ filePath, parseRecord }).catch(
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const unreadable = error as StateFileUnreadableError;
+    expect(unreadable.quarantinePath).toBeNull();
+    expect((unreadable.cause as NodeJS.ErrnoException).code).toBe('EACCES');
+    expect(unreadable.message).not.toContain('could not be copied');
+    expect(unreadable.message).not.toContain('repair it by hand');
+    expect(unreadable.message).toContain('no quarantine was attempted');
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+    expect(await fs.readFile(filePath)).toEqual(Buffer.from('{ not json'));
+  });
+
+  it('echoes neither the lock path nor the store path in a lock-side refusal message, keeping the original error as cause', async () => {
+    await fs.writeFile(filePath, '{ not json');
+    const lockPath = `${filePath}.lock`;
+    const original = Object.assign(new Error(`EACCES: permission denied, open '${lockPath}'`), {
+      code: 'EACCES',
+      path: lockPath,
+    }) as NodeJS.ErrnoException;
+    const realOpen = fs.open.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      if (String(args[1]) === 'wx') {
+        throw original;
+      }
+      return realOpen(...args);
+    });
+
+    const error = await readOrQuarantineVersionedRecordList({ filePath, parseRecord }).catch(
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const unreadable = error as StateFileUnreadableError;
+    expect(unreadable.cause).toBe(original);
+    expect(unreadable.message).not.toContain(lockPath);
+    expect(unreadable.message).not.toContain(filePath);
+    expect(unreadable.message).not.toContain(tempDir);
+    expect(unreadable.message).toContain('EACCES');
+  });
+
+  it('refuses a symlinked store directly without taking the store lock', async () => {
+    const outside = path.join(tempDir, 'outside.txt');
+    await fs.writeFile(outside, '{ not json');
+    await fs.symlink(outside, filePath);
+    const openSpy = vi.spyOn(fs, 'open');
+
+    const error = await readOrQuarantineVersionedRecordList({ filePath, parseRecord }).catch(
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const unreadable = error as StateFileUnreadableError;
+    expect(unreadable.quarantinePath).toBeNull();
+    expect(unreadable.detail).toBe('not a regular file');
+
+    const wxCalls = openSpy.mock.calls.filter(
+      (call) => call[0] === `${filePath}.lock` && String(call[1]) === 'wx',
+    );
+    expect(wxCalls).toHaveLength(0);
+  });
+
+  it('propagates a transient EIO on open unchanged and quarantines nothing', async () => {
+    const bytes = Buffer.from('{ not json');
+    await fs.writeFile(filePath, bytes);
+    const eio = Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }) as NodeJS.ErrnoException;
+
+    vi.spyOn(fs, 'open').mockRejectedValueOnce(eio);
+
+    await expect(readOrQuarantineVersionedRecordList({ filePath, parseRecord })).rejects.toBe(eio);
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+    expect(await fs.readFile(filePath)).toEqual(bytes);
+  });
+
+  it('propagates a transient EIO on the fd read unchanged and quarantines nothing', async () => {
+    const bytes = Buffer.from('{ not json');
+    await fs.writeFile(filePath, bytes);
+    const eio = Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }) as NodeJS.ErrnoException;
+    const realOpen = fs.open.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      const handle = await realOpen(...args);
+      return new Proxy(handle, {
+        get(target, key) {
+          if (key === 'read') {
+            return async () => {
+              throw eio;
+            };
+          }
+          const value = Reflect.get(target, key) as unknown;
+          return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+        },
+      });
+    });
+
+    await expect(readOrQuarantineVersionedRecordList({ filePath, parseRecord })).rejects.toBe(eio);
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+    expect(await fs.readFile(filePath)).toEqual(bytes);
+  });
+
   it('returns records on a healthy read without creating a lock file, and keeps unknown-version and read-only outcomes', async () => {
+    const openSpy = vi.spyOn(fs, 'open');
     expect(await readOrQuarantineVersionedRecordList({ filePath, parseRecord })).toEqual([]);
     await fs.writeFile(filePath, JSON.stringify([{ id: 'a', schemaVersion: 1 }]));
     expect(await readOrQuarantineVersionedRecordList({ filePath, parseRecord })).toEqual([{ id: 'a' }]);
+
+    // A healthy read must never take the store lock: withFileLock would call
+    // fs.open(lockPath, 'wx'), briefly creating a lock file. Assert none did.
+    const wxCalls = openSpy.mock.calls.filter(
+      (call) => call[0] === `${filePath}.lock` && String(call[1]) === 'wx',
+    );
+    expect(wxCalls).toHaveLength(0);
     await expect(fs.stat(`${filePath}.lock`)).rejects.toThrow();
 
     await fs.writeFile(filePath, JSON.stringify([{ id: 'a', schemaVersion: 2 }]));
@@ -1582,6 +1736,11 @@ describe('readBoundedStoreBytes and readOrQuarantineVersionedRecordList', () => 
     expect(symlinked).toBeInstanceOf(StateFileUnreadableError);
     expect((symlinked as StateFileUnreadableError).quarantinePath).toBeNull();
     expect((symlinked as StateFileUnreadableError).detail).toBe('not a regular file');
+    // Quarantine was never attempted for a refused symlink, so the message
+    // must not claim the bytes could not be copied nor advise a manual repair.
+    expect((symlinked as StateFileUnreadableError).message).not.toContain('could not be copied');
+    expect((symlinked as StateFileUnreadableError).message).not.toContain('repair it by hand');
+    expect((symlinked as StateFileUnreadableError).message).toContain('no quarantine was attempted');
     await fs.unlink(filePath);
 
     await fs.writeFile(filePath, Buffer.alloc(STORE_FILE_MAX_BYTES + 1, 0x20));

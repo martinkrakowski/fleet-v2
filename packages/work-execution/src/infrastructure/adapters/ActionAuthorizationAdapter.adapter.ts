@@ -19,6 +19,8 @@ import { LANE_DIFF_SECRET_PATTERNS, readPlainRecord, SECRET_PATTERNS } from '@fl
 
 import type {
   ActionAuthorizationPort,
+  AuthorizeUnsealedWorktreeRemovalRequest,
+  AuthorizeUnsealedWorktreeRemovalResult,
   ConsumeActionAuthorizationRequest,
   ConsumeActionAuthorizationResult,
   ResolveActionAuthorizationRequest,
@@ -64,6 +66,14 @@ export interface ActionAuthorizationDelegate {
   ) => Promise<ConsumeActionAuthorizationResult>;
   /** Local grant store; entries are bound in place on consumption. */
   readonly grants?: Map<string, ActionAuthorizationGrantEntry>;
+  /**
+   * C2': the scoped one-way owner approval for removing one attempt's
+   * unsealed worktree. The composition root binds the owner-question and
+   * coordination-request use cases behind it.
+   */
+  readonly authorizeUnsealedWorktreeRemoval?: (
+    request: AuthorizeUnsealedWorktreeRemovalRequest,
+  ) => Promise<AuthorizeUnsealedWorktreeRemovalResult>;
 }
 
 const FORGE_ACTION_KINDS = ['push-and-open-pr', 'push-to-pr', 'merge-pr', 'post-status'] as const;
@@ -385,6 +395,81 @@ function cleanReason(reason: string, fallback: 'delegate-blocked' | 'delegate-re
   return containsDisallowedOutputText(reason) ? fallback : reason;
 }
 
+/**
+ * C2': a bounded, descriptor-safe read of one unsealed-removal request. A
+ * non-object or a wrong-typed or oversized field is refused, never thrown.
+ */
+function readUnsealedRemovalRequest(
+  request: unknown,
+): Validated<AuthorizeUnsealedWorktreeRemovalRequest> {
+  const read = readPlainRecord(request, {
+    projectId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
+    runId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
+    attemptId: { kind: 'string', maxLength: MAX_SCOPE_ID_LENGTH },
+    worktreePath: { kind: 'string', maxLength: 4096 },
+    expectedHeadSha: { kind: 'string', maxLength: MAX_HEAD_LENGTH },
+    nowIso: { kind: 'string', maxLength: 64 },
+  });
+  if (!read.ok) {
+    return { ok: false, reason: failureOf(read.reason) };
+  }
+  const value = read.value as unknown as AuthorizeUnsealedWorktreeRemovalRequest;
+  if (
+    !isSafeId(value.projectId, MAX_SCOPE_ID_LENGTH, false) ||
+    !isSafeId(value.runId, MAX_SCOPE_ID_LENGTH, false) ||
+    !isSafeId(value.attemptId, MAX_SCOPE_ID_LENGTH, false) ||
+    !isCleanText(value.expectedHeadSha, MAX_HEAD_LENGTH) ||
+    typeof value.nowIso !== 'string' ||
+    value.nowIso.trim().length === 0
+  ) {
+    return { ok: false, reason: 'invalid-request' };
+  }
+  return { ok: true, value: { ...value } };
+}
+
+/**
+ * C2': the delegate's answer. Only an approved answer with a bounded,
+ * path-free, secret-free approval reference is passed on; every other shape
+ * is unknown, so an unreadable authorization is never authority.
+ */
+function readUnsealedRemovalAnswer(answer: unknown): AuthorizeUnsealedWorktreeRemovalResult {
+  const head = readPlainRecord(answer, {
+    outcome: { kind: 'literal', values: ['approved', 'blocked', 'unknown'] },
+  });
+  if (!head.ok) {
+    return { outcome: 'unknown', reason: 'authorization-unreadable' };
+  }
+  if (head.value.outcome === 'approved') {
+    const approved = readPlainRecord(answer, {
+      approvalReference: { kind: 'string', maxLength: 256 },
+    });
+    if (!approved.ok) {
+      return { outcome: 'unknown', reason: 'invalid-approval-reference' };
+    }
+    const reference = approved.value.approvalReference as string;
+    if (
+      reference.length === 0 ||
+      reference.includes('/') ||
+      reference.includes('\\') ||
+      /[\s\p{C}]/u.test(reference) ||
+      containsDisallowedOutputText(reference)
+    ) {
+      return { outcome: 'unknown', reason: 'invalid-approval-reference' };
+    }
+    return { outcome: 'approved', approvalReference: reference };
+  }
+  const withReason = readPlainRecord(answer, {
+    reason: { kind: 'string', maxLength: MAX_REASON_LENGTH },
+  });
+  if (!withReason.ok) {
+    return { outcome: 'unknown', reason: 'authorization-unreadable' };
+  }
+  return {
+    outcome: head.value.outcome as 'blocked' | 'unknown',
+    reason: cleanReason(withReason.value.reason as string, 'delegate-blocked'),
+  };
+}
+
 function readDelegateResolveResult(
   answer: unknown,
 ): ResolveActionAuthorizationResult | null {
@@ -451,6 +536,7 @@ interface ReadDelegate {
   readonly resolveGrant: ActionAuthorizationDelegate['resolveGrant'];
   readonly consumeGrant: ActionAuthorizationDelegate['consumeGrant'];
   readonly grants: Map<string, ActionAuthorizationGrantEntry> | undefined;
+  readonly authorizeUnsealedWorktreeRemoval: ActionAuthorizationDelegate['authorizeUnsealedWorktreeRemoval'];
 }
 
 export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
@@ -468,6 +554,7 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
         resolveGrant: this.delegate?.resolveGrant,
         consumeGrant: this.delegate?.consumeGrant,
         grants: grants instanceof Map ? grants : undefined,
+        authorizeUnsealedWorktreeRemoval: this.delegate?.authorizeUnsealedWorktreeRemoval,
       };
     } catch {
       return null;
@@ -520,6 +607,32 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
     } catch {
       return { outcome: 'refused', reason: 'authorization-unavailable' };
     }
+  }
+
+  /**
+   * C2': the scoped one-way owner approval for one unsealed worktree removal.
+   * A malformed request is blocked; an absent delegate is `not-configured`; a
+   * throwing or unreadable delegate answer is unknown; an approval reference
+   * that is not a bounded, path-free, secret-free token is never trusted.
+   */
+  async authorizeUnsealedWorktreeRemoval(
+    request: AuthorizeUnsealedWorktreeRemovalRequest,
+  ): Promise<AuthorizeUnsealedWorktreeRemovalResult> {
+    const delegate = this.readDelegate();
+    if (delegate === null || typeof delegate.authorizeUnsealedWorktreeRemoval !== 'function') {
+      return { outcome: 'blocked', reason: 'not-configured' };
+    }
+    const validated = readUnsealedRemovalRequest(request);
+    if (!validated.ok) {
+      return { outcome: 'blocked', reason: validated.reason };
+    }
+    let answer: unknown;
+    try {
+      answer = await delegate.authorizeUnsealedWorktreeRemoval(validated.value);
+    } catch {
+      return { outcome: 'unknown', reason: 'authorization-unreadable' };
+    }
+    return readUnsealedRemovalAnswer(answer);
   }
 
   private async resolveThroughDelegate(

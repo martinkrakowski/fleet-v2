@@ -7,6 +7,7 @@ export * from "./CoordinationRequestRepositoryPort.out-port.js";
 export * from "./DecisionTransportPort.out-port.js";
 export * from "./InstallationReferencePort.out-port.js";
 export * from "./ObservationPublicationPort.out-port.js";
+export * from "./OrchestratorRequestRepositoryPort.out-port.js";
 export * from "./OrchestratorSessionRepositoryPort.out-port.js";
 export * from "./OwnerItemRepositoryPort.out-port.js";
 export * from "./OwnerNotificationDeliveryPort.out-port.js";

@@ -1,32 +1,21 @@
-import { defineEventHandler, getHeader, setResponseStatus } from "h3";
+import { defineEventHandler, setResponseStatus } from "h3";
 import { LANE_RUN_ID_PATTERN } from "@fleet/work-execution";
 import { workComposition } from "../../../../wiring/work/composition";
 import { newUlid } from "../../../../wiring/work/ulid";
+import { envelope } from "../../../../wiring/work/errors";
 import {
-  envelope,
-  mapWorkError,
-  newOperationId,
-} from "../../../../wiring/work/errors";
+  busyResponse,
+  failureResponse,
+  refusedResponse,
+  resolveOperationId,
+} from "../../../../wiring/work/run-control-response";
 import { readObjectBody, routeParam } from "../../../../wiring/http-input";
-
-/** The caller's id when it supplied a usable one; else a fresh operation id. */
-function resolveOperationId(body: Record<string, unknown>, header: unknown): string {
-  const fromHeader = typeof header === "string" ? header.trim() : "";
-  if (fromHeader.length > 0 && fromHeader.length <= 128) {
-    return fromHeader;
-  }
-  const fromBody = body.operationId;
-  if (typeof fromBody === "string" && fromBody.trim().length > 0 && fromBody.length <= 128) {
-    return fromBody;
-  }
-  return newOperationId();
-}
 
 export default defineEventHandler(async (event) => {
   // routeParam has fully decoded the id; it is the limiter key and the id the use case receives.
   const runId = routeParam(event, "id");
   const body = await readObjectBody(event);
-  const operationId = resolveOperationId(body, getHeader(event, "idempotency-key"));
+  const operationId = resolveOperationId(body, event);
   // operationId is transport metadata, never part of the stop request.
   const payload = { ...body };
   delete payload.operationId;
@@ -55,17 +44,11 @@ export default defineEventHandler(async (event) => {
       } as Parameters<typeof composition.requestLaneRunStop.requestLaneRunStop>[0]);
     });
     if (!ran.ok) {
-      setResponseStatus(event, ran.reason === "busy-global" ? 429 : 409);
-      return envelope(operationId, "BUSY", { reason: ran.reason });
+      return busyResponse(event, operationId, ran.reason);
     }
     const result = ran.value;
     if (result.outcome === "refused") {
-      if (result.reason === "invalid-request") {
-        setResponseStatus(event, 400);
-        return envelope(operationId, "INVALID_REQUEST", result);
-      }
-      setResponseStatus(event, 409);
-      return envelope(operationId, "CONFLICT", result);
+      return refusedResponse(event, operationId, result);
     }
     if (result.outcome === "not-found") {
       setResponseStatus(event, 404);
@@ -73,17 +56,6 @@ export default defineEventHandler(async (event) => {
     }
     return envelope(operationId, "OK", result);
   } catch (error) {
-    const mapping = mapWorkError(error);
-    if (mapping) {
-      setResponseStatus(event, mapping.status);
-      return envelope(operationId, mapping.code);
-    }
-    // Store errors can name the state directory or file; the caller gets one
-    // fixed reason, never the message.
-    setResponseStatus(event, 503);
-    return envelope(operationId, "STORE_UNAVAILABLE", {
-      outcome: "unknown",
-      reason: "run-store-unavailable",
-    });
+    return failureResponse(event, operationId, error, "run-store-unavailable");
   }
 });

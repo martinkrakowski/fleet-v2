@@ -1,28 +1,17 @@
-import { defineEventHandler, getHeader, setResponseStatus } from "h3";
+import { defineEventHandler } from "h3";
 import { workComposition } from "../../../wiring/work/composition";
+import { envelope } from "../../../wiring/work/errors";
 import {
-  envelope,
-  mapWorkError,
-  newOperationId,
-} from "../../../wiring/work/errors";
+  busyResponse,
+  failureResponse,
+  refusedResponse,
+  resolveOperationId,
+} from "../../../wiring/work/run-control-response";
 import { readObjectBody } from "../../../wiring/http-input";
-
-/** The caller's id when it supplied a usable one; else a fresh operation id. */
-function resolveOperationId(body: Record<string, unknown>, header: unknown): string {
-  const fromHeader = typeof header === "string" ? header.trim() : "";
-  if (fromHeader.length > 0 && fromHeader.length <= 128) {
-    return fromHeader;
-  }
-  const fromBody = body.operationId;
-  if (typeof fromBody === "string" && fromBody.trim().length > 0 && fromBody.length <= 128) {
-    return fromBody;
-  }
-  return newOperationId();
-}
 
 export default defineEventHandler(async (event) => {
   const body = await readObjectBody(event);
-  const operationId = resolveOperationId(body, getHeader(event, "idempotency-key"));
+  const operationId = resolveOperationId(body, event);
   // operationId is transport metadata, never part of the halt request.
   const payload = { ...body };
   delete payload.operationId;
@@ -35,17 +24,11 @@ export default defineEventHandler(async (event) => {
       } as Parameters<typeof composition.setConductorHalt.set>[0]);
     });
     if (!ran.ok) {
-      setResponseStatus(event, ran.reason === "busy-global" ? 429 : 409);
-      return envelope(operationId, "BUSY", { reason: ran.reason });
+      return busyResponse(event, operationId, ran.reason);
     }
     const result = ran.value;
     if (result.outcome === "refused") {
-      if (result.reason === "invalid-request") {
-        setResponseStatus(event, 400);
-        return envelope(operationId, "INVALID_REQUEST", result);
-      }
-      setResponseStatus(event, 409);
-      return envelope(operationId, "CONFLICT", result);
+      return refusedResponse(event, operationId, result);
     }
     return envelope(operationId, "OK", {
       outcome: result.outcome,
@@ -53,17 +36,6 @@ export default defineEventHandler(async (event) => {
       changedAtIso: result.record.changedAtIso,
     });
   } catch (error) {
-    const mapping = mapWorkError(error);
-    if (mapping) {
-      setResponseStatus(event, mapping.status);
-      return envelope(operationId, mapping.code);
-    }
-    // The store's own errors can name paths or the state directory; the caller
-    // gets one fixed reason, never the message.
-    setResponseStatus(event, 503);
-    return envelope(operationId, "STORE_UNAVAILABLE", {
-      outcome: "unknown",
-      reason: "halt-store-unavailable",
-    });
+    return failureResponse(event, operationId, error, "halt-store-unavailable");
   }
 });

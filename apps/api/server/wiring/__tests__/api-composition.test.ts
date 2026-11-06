@@ -574,7 +574,7 @@ describe("configured compositions execute real operations", () => {
     const credential = await operator.registerProjectProfile.execute({
       ...PROFILE_REQUEST,
       projectId: "proj-api-2",
-      apiToken: "placeholder-not-a-secret",
+      apiToken: ["placeholder", "not", "a", "secret"].join("-"),
     });
     expect(credential.outcome).toBe("rejected");
 

@@ -334,6 +334,72 @@ describe('MergePolicyAdapter', () => {
     }
   });
 
+  it('readMergePolicy answers unknown for a repository value outside the contract bounds', async () => {
+    const outOfBounds: readonly Record<string, unknown>[] = [
+      { maxAttempts: 0 },
+      { maxAttempts: 33 },
+      { maxAttempts: 1.5 },
+      { checksGraceMinutes: 0 },
+      { checksGraceMinutes: 1441 },
+      { checksGraceMinutes: 2.5 },
+      { projectId: ' ' },
+      { projectId: 'p'.repeat(129) },
+      { macosProcedure: ' ' },
+      { macosProcedure: 'm'.repeat(201) },
+      { owner: 'own er', repositoryKey: 'own er/widgets' },
+      { owner: 'o'.repeat(101), repositoryKey: `${'o'.repeat(101)}/widgets` },
+      { repo: 'a/b', repositoryKey: 'acme/a/b' },
+      { requiredContexts: [] },
+      { requiredContexts: ['gate', 'gate'] },
+      { requiredContexts: ['gate', ' '] },
+      { requiredContexts: ['c'.repeat(65)] },
+      { requiredContexts: Array.from({ length: 17 }, (_, index) => `ctx-${index}`) },
+    ];
+    for (const override of outOfBounds) {
+      const answer = await adapterFor(() =>
+        resolved({ repositories: [repository(override)] }),
+      ).readMergePolicy();
+      expect([override, answer]).toEqual([override, installationInvalid]);
+    }
+  });
+
+  it('readMergePolicy accepts a repository value exactly on the contract bounds', async () => {
+    const answer = await adapterFor(() =>
+      resolved({
+        repositories: [repository({ maxAttempts: 32, checksGraceMinutes: 1440 })],
+        daemon: { intervalSeconds: 10, budgetSeconds: 5, settleSeconds: 600 },
+      }),
+    ).readMergePolicy();
+    expect(answer.outcome).toBe('known');
+    const lower = await adapterFor(() =>
+      resolved({
+        repositories: [repository({ maxAttempts: 1, checksGraceMinutes: 1 })],
+        daemon: { intervalSeconds: 3600, budgetSeconds: 600, settleSeconds: 0 },
+      }),
+    ).readMergePolicy();
+    expect(lower.outcome).toBe('known');
+  });
+
+  it('readMergePolicy answers unknown for daemon settings outside the contract bounds', async () => {
+    const outOfBounds: readonly Record<string, unknown>[] = [
+      { intervalSeconds: 10, budgetSeconds: 600, settleSeconds: 20 },
+      { intervalSeconds: 9, budgetSeconds: 5, settleSeconds: 20 },
+      { intervalSeconds: 3601, budgetSeconds: 45, settleSeconds: 20 },
+      { intervalSeconds: 60, budgetSeconds: 4, settleSeconds: 20 },
+      { intervalSeconds: 60, budgetSeconds: 601, settleSeconds: 20 },
+      { intervalSeconds: 60, budgetSeconds: 60, settleSeconds: 20 },
+      { intervalSeconds: 60, budgetSeconds: 45, settleSeconds: -1 },
+      { intervalSeconds: 60, budgetSeconds: 45, settleSeconds: 601 },
+      { intervalSeconds: 60.5, budgetSeconds: 45, settleSeconds: 20 },
+      { intervalSeconds: 60, budgetSeconds: 45.5, settleSeconds: 20 },
+      { intervalSeconds: 60, budgetSeconds: 45, settleSeconds: 2.5 },
+    ];
+    for (const daemon of outOfBounds) {
+      const answer = await adapterFor(() => resolved({ daemon })).readMergePolicy();
+      expect([daemon, answer]).toEqual([daemon, installationInvalid]);
+    }
+  });
+
   it('readMergePolicy never echoes a path or a file name', async () => {
     const thrown = new Error('ENOENT: no such file /home/operator/.config/fleet/installation.json');
     const answers = [

@@ -34,7 +34,17 @@ export interface MergePolicyAdapterOptions {
 const MAX_REPOSITORIES = 256;
 const MAX_REQUIRED_CONTEXTS = 16;
 const MAX_CONTEXT_LENGTH = 64;
-const MAX_TEXT_LENGTH = 256;
+const MAX_NAME_LENGTH = 100;
+const MAX_PROJECT_ID_LENGTH = 128;
+const MAX_PROCEDURE_LENGTH = 200;
+const NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+// Contract bounds (installation resolveMergePolicy, lane DTP brief 4.1): a value outside
+// them is refused, never clamped.
+const MAX_ATTEMPTS_RANGE = { min: 1, max: 32 } as const;
+const CHECKS_GRACE_RANGE = { min: 1, max: 1440 } as const;
+const INTERVAL_RANGE = { min: 10, max: 3600 } as const;
+const BUDGET_RANGE = { min: 5, max: 600 } as const;
+const SETTLE_RANGE = { min: 0, max: 600 } as const;
 const REVISION_PATTERN = /^[0-9a-f]{12}$/;
 const VETO_MODES: readonly string[] = ['off', 'shadow', 'live'];
 const REPOSITORY_KEYS: readonly string[] = [
@@ -133,11 +143,20 @@ function readDenseArrayElements(value: unknown, maxLength: number): readonly unk
 }
 
 function isBoundedText(value: unknown, maxLength: number): value is string {
-  return typeof value === 'string' && value.length >= 1 && value.length <= maxLength;
+  return (
+    typeof value === 'string' &&
+    value.length >= 1 &&
+    value.length <= maxLength &&
+    value.trim().length > 0
+  );
 }
 
-function isPositiveInteger(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 1;
+function isName(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= MAX_NAME_LENGTH && NAME_PATTERN.test(value);
+}
+
+function isIntegerInRange(value: unknown, range: { readonly min: number; readonly max: number }): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= range.min && value <= range.max;
 }
 
 function readRequiredContexts(value: unknown): readonly string[] | undefined {
@@ -145,9 +164,12 @@ function readRequiredContexts(value: unknown): readonly string[] | undefined {
   if (elements === undefined) {
     return undefined;
   }
+  if (elements.length === 0) {
+    return undefined;
+  }
   const contexts: string[] = [];
   for (const entry of elements) {
-    if (!isBoundedText(entry, MAX_CONTEXT_LENGTH)) {
+    if (!isBoundedText(entry, MAX_CONTEXT_LENGTH) || contexts.includes(entry)) {
       return undefined;
     }
     contexts.push(entry);
@@ -195,16 +217,15 @@ function readRepository(value: unknown): MergePolicyRepository | undefined {
   const requiredContexts = readRequiredContexts(ownValue(value, 'requiredContexts'));
   const veto = readVeto(ownValue(value, 'veto'));
   if (
-    !isBoundedText(owner, MAX_TEXT_LENGTH) ||
-    !isBoundedText(repo, MAX_TEXT_LENGTH) ||
-    !isBoundedText(repositoryKey, MAX_TEXT_LENGTH) ||
-    !isBoundedText(projectId, MAX_TEXT_LENGTH) ||
+    !isName(owner) ||
+    !isName(repo) ||
+    !isBoundedText(projectId, MAX_PROJECT_ID_LENGTH) ||
     typeof shadow !== 'boolean' ||
     typeof unattended !== 'boolean' ||
     typeof updateBranch !== 'boolean' ||
-    !(macosProcedure === null || isBoundedText(macosProcedure, MAX_TEXT_LENGTH)) ||
-    !isPositiveInteger(maxAttempts) ||
-    !isPositiveInteger(checksGraceMinutes) ||
+    !(macosProcedure === null || isBoundedText(macosProcedure, MAX_PROCEDURE_LENGTH)) ||
+    !isIntegerInRange(maxAttempts, MAX_ATTEMPTS_RANGE) ||
+    !isIntegerInRange(checksGraceMinutes, CHECKS_GRACE_RANGE) ||
     requiredContexts === undefined ||
     veto === undefined ||
     !hasExactlyKeys(value, REPOSITORY_KEYS) ||
@@ -252,15 +273,10 @@ function readDaemon(value: unknown): MergePolicyDaemonSettings | undefined {
   const budgetSeconds = ownValue(value, 'budgetSeconds');
   const settleSeconds = ownValue(value, 'settleSeconds');
   if (
-    typeof intervalSeconds !== 'number' ||
-    typeof budgetSeconds !== 'number' ||
-    typeof settleSeconds !== 'number' ||
-    !Number.isFinite(intervalSeconds) ||
-    !Number.isFinite(budgetSeconds) ||
-    !Number.isFinite(settleSeconds) ||
-    intervalSeconds <= 0 ||
-    budgetSeconds <= 0 ||
-    settleSeconds < 0 ||
+    !isIntegerInRange(intervalSeconds, INTERVAL_RANGE) ||
+    !isIntegerInRange(budgetSeconds, BUDGET_RANGE) ||
+    !isIntegerInRange(settleSeconds, SETTLE_RANGE) ||
+    budgetSeconds >= intervalSeconds ||
     !hasExactlyKeys(value, DAEMON_KEYS)
   ) {
     return undefined;

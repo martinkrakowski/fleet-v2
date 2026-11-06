@@ -108,6 +108,10 @@ export interface ReaperPolicy {
   readonly repairs?: Readonly<Partial<Record<ReaperFindingKind, boolean>>>;
   /** `policy.conductor.reaper.disk.minFreePercent` (§3.10.4). Default 15. */
   readonly minFreePercent?: number;
+  /** `policy.conductor.reaper.worktrees.retentionHours` (D9). Default 24. */
+  readonly retentionHours?: number;
+  /** `policy.conductor.reaper.disk.clearFreePercent` (D9). Default 20; must order above minFreePercent. */
+  readonly clearFreePercent?: number;
 }
 
 export interface ReaperFacts {

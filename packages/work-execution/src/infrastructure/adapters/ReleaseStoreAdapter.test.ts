@@ -157,6 +157,24 @@ describe('ReleaseStoreAdapter', () => {
     expect(await adapter.prune({ root, keep: 1 })).toEqual({ outcome: 'unreadable' });
   });
 
+  it('stops pruning when current moved after the snapshot and never removes the new current', async () => {
+    for (const [digit, day] of [['a', 1], ['b', 2], ['c', 3], ['d', 4]] as const) {
+      await verified(digit, day);
+    }
+    await adapter.repoint({ root, sha: D });
+    // A concurrent repoint to B lands right after the prune listed the store.
+    const realList = adapter.list.bind(adapter);
+    adapter.list = async (input) => {
+      const listing = await realList(input);
+      await fs.symlink(B, path.join(root, '.current.race.tmp'));
+      await fs.rename(path.join(root, '.current.race.tmp'), path.join(root, 'current'));
+      return listing;
+    };
+    expect(await adapter.prune({ root, keep: 2 })).toEqual({ outcome: 'unreadable' });
+    expect((await fs.lstat(path.join(root, B))).isDirectory()).toBe(true);
+    expect(await fs.readFile(path.join(root, 'current', 'apps', 'cli', 'dist', 'bin.js'), 'utf8')).toBe('// cli\n');
+  });
+
   it('removes only an orphan archive file and an orphan home', async () => {
     await verified('a', 1);
     const orphan = `.staging-${B}-${'0'.repeat(16)}`;

@@ -172,6 +172,12 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       if (!doomed.has(build.sha)) {
         continue;
       }
+      // Defense in depth behind the caller's lease: when `current` moved since
+      // the snapshot, the doomed set is stale, so stop before removing anything more.
+      if (!(await currentStill(input.root, listing.current))) {
+        failed = true;
+        break;
+      }
       try {
         await fs.rm(path.join(input.root, build.sha), { recursive: true, force: true });
         removed.push(build.sha);
@@ -254,6 +260,15 @@ async function readRoot(root: string): Promise<Dirent[] | null> {
       return null;
     }
     throw error;
+  }
+}
+
+async function currentStill(root: string, expected: string | null): Promise<boolean> {
+  try {
+    const now = await readCurrent(root);
+    return now.ok && now.sha === expected;
+  } catch {
+    return false;
   }
 }
 

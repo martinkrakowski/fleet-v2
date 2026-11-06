@@ -620,6 +620,20 @@ describe('ManageReleaseUseCase', () => {
     expect(made.store.current).toBe(B);
   });
 
+  it('prunes while the driver lease is still held, so no other release can repoint mid-prune', async () => {
+    const lease = new FakeLease(null);
+    const made = granted(SWAP, A, { lease, store: new FakeStore([build('a', 1), build('b', 2)], B) });
+    const order: string[] = [];
+    const prune = made.store.prune.bind(made.store);
+    made.store.prune = async (input) => {
+      order.push(`prune while held=${lease.held !== null}`);
+      return prune(input);
+    };
+    expect((await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).outcome).toBe('applied');
+    expect(order).toEqual(['prune while held=true']);
+    expect(lease.held).toBeNull();
+  });
+
   it('holds the driver lease around the repoint and releases it after', async () => {
     const lease = new FakeLease(null);
     const made = granted(SWAP, A, { lease, store: new FakeStore([build('a', 1), build('b', 2)], B) });

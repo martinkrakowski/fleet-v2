@@ -46,7 +46,7 @@ import type {
 import type { ActionAuthorizationPort } from '../ports/out/ActionAuthorizationPort.out-port.js';
 import type { CommandExecutorPort, CommandRunOptions } from '../ports/out/CommandExecutorPort.out-port.js';
 import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLeasePort.out-port.js';
-import type { ReleaseBuildRecord, ReleaseStorePort } from '../ports/out/ReleaseStorePort.out-port.js';
+import type { ReleaseBuildRecord, ReleaseStorePort, ReleaseStorePruneResult } from '../ports/out/ReleaseStorePort.out-port.js';
 
 export interface ManageReleaseDependencies {
   readonly store: ReleaseStorePort;
@@ -175,11 +175,11 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       rebuilt = true;
     }
     const repointed = await this.fencedRepoint(request, target, grant);
-    if (repointed !== null) {
-      return refuse(repointed);
+    if ('refusal' in repointed) {
+      return refuse(repointed.refusal);
     }
+    const { pruned } = repointed;
     const afterShas = rebuilt ? [...kept, target] : kept;
-    const pruned = await this.deps.store.prune({ root: request.root, keep: request.keep });
     const removed = pruned.outcome === 'pruned' ? pruned.removed : [];
     const applied: ManageReleaseApplied = {
       outcome: 'applied',
@@ -232,36 +232,36 @@ export class ManageReleaseUseCase implements ManageReleasePort {
   }
 
   /**
-   * Repoint `current` only while this process holds the conductor driver
-   * lease: re-read it, acquire it by CAS, consume the grant, re-check the
-   * lease, repoint, release. null when repointed; the refusal otherwise.
+   * Repoint `current` and prune only while this process holds the conductor
+   * driver lease: re-read it, acquire it by CAS, consume the grant, repoint
+   * behind the store's fence, prune, release. Another release needs the same
+   * lease to repoint, so no repoint can land between this prune's snapshot of
+   * `current` and its removals. The prune result when repointed; the refusal
+   * otherwise.
    */
   private async fencedRepoint(
     request: ValidRequest,
     target: string,
     grantId: string,
-  ): Promise<ManageReleaseRefusal | null> {
+  ): Promise<{ readonly refusal: ManageReleaseRefusal } | { readonly pruned: ReleaseStorePruneResult }> {
     const held = await this.acquireLease(request, target);
     if (typeof held === 'string') {
-      return held;
+      return { refusal: held };
     }
     try {
       const consumed = await this.consumeGrant(request, target, grantId);
       if (consumed !== null) {
-        return consumed;
+        return { refusal: consumed };
       }
       const repointed = await this.deps.store.repoint({
         root: request.root,
         sha: target,
         fence: () => this.stillHolds(held),
       });
-      if (repointed.outcome === 'ok') {
-        return null;
+      if (repointed.outcome !== 'ok') {
+        return { refusal: repointRefusal(repointed.outcome) };
       }
-      if (repointed.outcome === 'fenced') {
-        return 'driver-lease-live';
-      }
-      return repointed.outcome === 'not-found' ? 'not-found' : 'store-unreadable';
+      return { pruned: await this.deps.store.prune({ root: request.root, keep: request.keep }) };
     } finally {
       await this.releaseLease(held);
     }
@@ -437,6 +437,13 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       return false;
     }
   }
+}
+
+function repointRefusal(outcome: 'fenced' | 'not-found' | 'not-verified' | 'unreadable'): ManageReleaseRefusal {
+  if (outcome === 'fenced') {
+    return 'driver-lease-live';
+  }
+  return outcome === 'not-found' ? 'not-found' : 'store-unreadable';
 }
 
 function allowlisted(

@@ -26,6 +26,7 @@ import {
   parseChainRepository,
   reviewPinOf,
 } from '../../domain/chain-records.js';
+import { chainReviewRequestIdOf as chainReviewRequestIdOfDomain } from '../../domain/chain-records.js';
 import type { ChainRecord } from '../../domain/chain-records.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import type { AttemptRecord } from '../../domain/execution-records.js';
@@ -147,7 +148,7 @@ function parseReviewableChainName(value: unknown): string | undefined {
 }
 
 function chainReviewRequestIdOf(chainName: string, headSha: string): string {
-  return `chain-review:${chainName}:${headSha.slice(0, 12)}`;
+  return chainReviewRequestIdOfDomain(chainName, headSha);
 }
 
 /** Zoned instants that are both valid; nothing else is accepted. */
@@ -419,6 +420,73 @@ function isCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
+/** The link's latest `pre-merge` receipt candidate, or undefined when it has none. */
+function latestPreMerge(receipts: readonly unknown[]): ChainLinkReceiptCandidate | undefined {
+  let latest: ChainLinkReceiptCandidate | undefined;
+  for (let at = 0; at < receipts.length; at += 1) {
+    const candidate = Object.getOwnPropertyDescriptor(receipts, String(at))?.value as ChainLinkReceiptCandidate | undefined;
+    if (own(candidate, 'kind') !== 'pre-merge') {
+      continue;
+    }
+    if (latest === undefined || instantMs(own(candidate, 'completedAtIso')) >= instantMs(own(latest, 'completedAtIso'))) {
+      latest = candidate;
+    }
+  }
+  return latest;
+}
+
+/** The link's identity fields, or undefined when any is malformed. */
+function readLinkIdentity(link: unknown): { pullRequestNumber: number; attemptId: string; receipts: readonly unknown[] } | undefined {
+  const pullRequestNumber = own(link, 'pullRequestNumber');
+  const attemptId = own(link, 'attemptId');
+  const receipts = own(link, 'receipts');
+  if (
+    typeof pullRequestNumber !== 'number' || !Number.isSafeInteger(pullRequestNumber) || pullRequestNumber < 1 ||
+    !isBoundedText(attemptId, CHAIN_REVIEW_MAX_ATTEMPT_ID_BYTES) || !Array.isArray(receipts)
+  ) {
+    return undefined;
+  }
+  return { pullRequestNumber, attemptId, receipts };
+}
+
+/** The projection of one link's latest receipt, or the refusal reason. */
+function projectLink(link: unknown): ChainLinkReceiptProjection | 'link-receipt-missing' | 'verdict-unknown' {
+  const identity = readLinkIdentity(link);
+  if (identity === undefined) {
+    return 'link-receipt-missing';
+  }
+  const latest = latestPreMerge(identity.receipts);
+  if (latest === undefined) {
+    return 'link-receipt-missing';
+  }
+  const result = own(latest, 'result');
+  const findings = own(latest, 'findings');
+  const completedAtIso = own(latest, 'completedAtIso');
+  const receiptId = own(latest, 'receiptId') as TelemetryHashInput | undefined;
+  if (result !== 'pass' && result !== 'fail') {
+    return 'verdict-unknown';
+  }
+  const blocker = own(findings, 'blocker');
+  const major = own(findings, 'major');
+  const minor = own(findings, 'minor');
+  const nit = own(findings, 'nit');
+  if (
+    receiptId === undefined || typeof receiptId !== 'object' || receiptId === null || typeof completedAtIso !== 'string' ||
+    !isCount(blocker) || !isCount(major) || !isCount(minor) || !isCount(nit)
+  ) {
+    return 'verdict-unknown';
+  }
+  return Object.freeze({
+    pullRequestNumber: identity.pullRequestNumber,
+    attemptId: identity.attemptId,
+    receiptId,
+    result,
+    kind: 'pre-merge' as const,
+    findings: Object.freeze({ blocker, major, minor, nit }),
+    completedAtIso,
+  });
+}
+
 /**
  * One projection per link, from the link's latest `pre-merge` review receipt. A
  * link with no `pre-merge` receipt is `link-receipt-missing`; a latest receipt
@@ -434,57 +502,14 @@ export function aggregateLinkReceipts(links: readonly ChainLinkReceiptInput[]): 
     }
     const projections: ChainLinkReceiptProjection[] = [];
     for (let index = 0; index < links.length; index += 1) {
-      const link = Object.getOwnPropertyDescriptor(links, String(index))?.value;
-      const pullRequestNumber = own(link, 'pullRequestNumber');
-      const attemptId = own(link, 'attemptId');
-      const receipts = own(link, 'receipts');
-      if (
-        typeof pullRequestNumber !== 'number' || !Number.isSafeInteger(pullRequestNumber) || pullRequestNumber < 1 ||
-        !isBoundedText(attemptId, CHAIN_REVIEW_MAX_ATTEMPT_ID_BYTES) || !Array.isArray(receipts)
-      ) {
+      const projection = projectLink(Object.getOwnPropertyDescriptor(links, String(index))?.value);
+      if (projection === 'link-receipt-missing') {
         return MISSING;
       }
-      let latest: ChainLinkReceiptCandidate | undefined;
-      for (let at = 0; at < receipts.length; at += 1) {
-        const candidate = Object.getOwnPropertyDescriptor(receipts, String(at))?.value as ChainLinkReceiptCandidate | undefined;
-        if (own(candidate, 'kind') !== 'pre-merge') {
-          continue;
-        }
-        if (latest === undefined || instantMs(own(candidate, 'completedAtIso')) >= instantMs(own(latest, 'completedAtIso'))) {
-          latest = candidate;
-        }
-      }
-      if (latest === undefined) {
-        return MISSING;
-      }
-      const result = own(latest, 'result');
-      const findings = own(latest, 'findings');
-      const completedAtIso = own(latest, 'completedAtIso');
-      const receiptId = own(latest, 'receiptId') as TelemetryHashInput | undefined;
-      if (result !== 'pass' && result !== 'fail') {
+      if (projection === 'verdict-unknown') {
         return UNKNOWN_VERDICT;
       }
-      const blocker = own(findings, 'blocker');
-      const major = own(findings, 'major');
-      const minor = own(findings, 'minor');
-      const nit = own(findings, 'nit');
-      if (
-        receiptId === undefined || typeof receiptId !== 'object' || receiptId === null || typeof completedAtIso !== 'string' ||
-        !isCount(blocker) || !isCount(major) || !isCount(minor) || !isCount(nit)
-      ) {
-        return UNKNOWN_VERDICT;
-      }
-      projections.push(
-        Object.freeze({
-          pullRequestNumber,
-          attemptId,
-          receiptId,
-          result,
-          kind: 'pre-merge' as const,
-          findings: Object.freeze({ blocker, major, minor, nit }),
-          completedAtIso,
-        }),
-      );
+      projections.push(projection);
     }
     return Object.freeze({ ok: true as const, links: Object.freeze(projections) });
   } catch {

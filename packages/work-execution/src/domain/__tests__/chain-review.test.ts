@@ -76,6 +76,8 @@ describe('the chain record review pin', () => {
       { ...pinOf(), headSha: TIP.toUpperCase() },
       { ...pinOf(), requestId: 'has space' },
       { ...pinOf(), requestId: '' },
+      { ...pinOf(), requestId: 'chain-review:example:ffffffffffff' },
+      { ...pinOf(), requestId: 'unrelated-request-1' },
       { ...pinOf(), key: 'chain-review/example@000000000000' },
       { ...pinOf(), key: chainReviewKeyOf('other', TIP) },
       { ...pinOf(), pinnedAtIso: 'yesterday' },

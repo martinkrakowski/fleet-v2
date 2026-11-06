@@ -81,13 +81,38 @@ function ownValue(value: unknown, key: string): unknown {
 }
 
 /**
+ * An own property of `value`: undefined when there is none, its data value when
+ * it is a data property, `unreadable` for an accessor or a failing descriptor
+ * read. A getter is never invoked.
+ */
+function ownProperty(value: unknown, key: string): { readonly value: unknown } | 'unreadable' | undefined {
+  try {
+    if (typeof value !== 'object' || value === null) {
+      return undefined;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined) {
+      return undefined;
+    }
+    return 'value' in descriptor ? { value: descriptor.value } : 'unreadable';
+  } catch {
+    return 'unreadable';
+  }
+}
+
+/**
  * The request's subject, read through own properties. An explicit attempt
  * subject must restate the request's own attempt, project and head; it then
  * reads as `absent` (the attempt path). `invalid` is a malformed subject or one
  * that disagrees with the request.
  */
 function readSubject(request: { readonly projectId?: unknown; readonly attemptId?: unknown; readonly candidateHeadSha?: unknown }): SubjectRead {
-  const subject = ownValue(request, 'subject');
+  const subjectProperty = ownProperty(request, 'subject');
+  if (subjectProperty === 'unreadable') {
+    // Present but not a plain data property (an accessor, a hostile object): never "absent".
+    return { kind: 'invalid' };
+  }
+  const subject = subjectProperty === undefined ? undefined : subjectProperty.value;
   if (subject === undefined) {
     return { kind: 'absent' };
   }

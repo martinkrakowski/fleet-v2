@@ -1098,6 +1098,18 @@ describe('ReviewRequestAdapter with a chain subject', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('refuses a request whose subject is an accessor, even one returning a chain subject, and calls no delegate', async () => {
+    const { calls, requestIndependentReview } = makeRequestReviewFake({ outcome: 'reviewed', receipt: chainReceipt() });
+    const adapter = new ReviewRequestAdapter({ requestIndependentReview });
+    const request = { ...chainRequest() } as Record<string, unknown>;
+    delete request.subject;
+    Object.defineProperty(request, 'subject', { enumerable: true, get: () => CHAIN_SUBJECT });
+    expect(await adapter.requestReview(request as unknown as ReviewRequest)).toEqual({
+      outcome: 'refused', reason: 'invalid-request', detail: null,
+    });
+    expect(calls).toHaveLength(0);
+  });
+
   it('refuses the brief subject and the brief-verify kind as subject-not-implemented', async () => {
     const { calls, requestIndependentReview } = makeRequestReviewFake({ outcome: 'reviewed', receipt: chainReceipt() });
     const adapter = new ReviewRequestAdapter({ requestIndependentReview });

@@ -70,6 +70,11 @@ export function chainReviewKeyOf(chainName: string, headSha: string): string {
   return `chain-review/${chainName}@${headSha.slice(0, 12)}`;
 }
 
+/** The review request id of a chain at a head: `chain-review:<name>:<head12>`; the pin's requestId must equal it. */
+export function chainReviewRequestIdOf(chainName: string, headSha: string): string {
+  return `chain-review:${chainName}:${headSha.slice(0, 12)}`;
+}
+
 const HEX40_PATTERN = /^[0-9a-f]{40}$/;
 const SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 const REASON_PATTERN = /^[a-z][a-z0-9-]{0,63}$/;
@@ -286,6 +291,7 @@ function readChainReviewPin(value: unknown, chainName: string): ChainReviewPin |
     !isChainCommitSha(headSha) ||
     typeof requestId !== 'string' ||
     !REVIEW_PIN_REQUEST_ID_PATTERN.test(requestId) ||
+    requestId !== chainReviewRequestIdOf(chainName, headSha) ||
     key !== chainReviewKeyOf(chainName, headSha) ||
     !isChainActionKey(key) ||
     !isZonedIsoDateTime(pinnedAtIso)

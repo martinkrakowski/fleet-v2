@@ -314,8 +314,28 @@ const decisionsAnswerFile = {
   },
 };
 
+/**
+ * A present consumer settings block with every settings key absent must
+ * survive the round trip: the writer keeps the entry as written.
+ */
+const decisionsEmptyConsumerFile = {
+  ...minimalV2File,
+  decisions: {
+    provider: 'answer-file',
+    answerFile: '/etc/fleet/answers.json',
+    consumers: { 'knowledge-ranking': {} },
+  },
+};
+
 /** Every fixture that must satisfy the strict parse/write/parse round trip. */
-const roundTripFixtures = [fullV2File, shelfLocalFile, forgeNoneFile, decisionsNoneFile, decisionsAnswerFile];
+const roundTripFixtures = [
+  fullV2File,
+  shelfLocalFile,
+  forgeNoneFile,
+  decisionsNoneFile,
+  decisionsAnswerFile,
+  decisionsEmptyConsumerFile,
+];
 
 function parseV2(value: unknown): FleetInstallationV2 {
   const result = parseInstallation(value);
@@ -654,6 +674,60 @@ describe('F96 robustness', () => {
     });
     expect(() => writeInstallationV2(installationWithAccessor)).not.toThrow();
     expect(writeInstallationV2(installationWithAccessor)).not.toContain('"container"');
+  });
+
+  it('reads write-time union discriminators through the own-data-property reader, never running a getter', () => {
+    let getterRan = false;
+    const throwingGet = (): never => {
+      getterRan = true;
+      throw new Error('the getter must never run');
+    };
+    const installation = parseV2(minimalV2File);
+    // An accessor on every union discriminator the writer reads to pick a key
+    // list: runner.kind, forge.mode, shelf.provider and decisions.provider.
+    Object.defineProperty(installation.hosts.here.runner, 'kind', {
+      enumerable: true,
+      get: throwingGet,
+    });
+    Object.defineProperty(installation.forge, 'mode', {
+      enumerable: true,
+      get: throwingGet,
+    });
+    // The minimal fixture omits shelf and decisions, so attach throwing ones.
+    const mutable = installation as unknown as Record<string, unknown>;
+    mutable.shelf = Object.defineProperty({}, 'provider', {
+      enumerable: true,
+      get: throwingGet,
+    });
+    mutable.decisions = Object.defineProperty({}, 'provider', {
+      enumerable: true,
+      get: throwingGet,
+    });
+    expect(() => writeInstallationV2(installation)).not.toThrow();
+    expect(getterRan).toBe(false);
+    const text = writeInstallationV2(installation);
+    // Every accessor discriminator is skipped like an absent field, so the
+    // union key itself never reaches the output; the unions fall to their
+    // default branches without crashing.
+    expect(text).not.toContain('"kind"');
+    expect(text).not.toContain('"mode"');
+    expect(text).not.toContain('"provider"');
+    expect(text).not.toContain('agy');
+  });
+
+  it('keeps a present consumer settings block whose settings keys are all absent', () => {
+    const parsed = parseV2(decisionsEmptyConsumerFile);
+    const text = writeInstallationV2(parsed);
+    expect(text).toContain('"knowledge-ranking": {}');
+    // The round trip preserves the entry byte-for-byte.
+    const reparsed = writeInstallationV2(parseV2(JSON.parse(text)));
+    expect(reparsed).toBe(text);
+    const writtenConsumers = block(
+      JSON.parse(reparsed) as Record<string, unknown>,
+      ['decisions', 'consumers'],
+    );
+    expect(Object.keys(writtenConsumers)).toEqual(['knowledge-ranking']);
+    expect(writtenConsumers['knowledge-ranking']).toEqual({});
   });
 
   it('is byte-for-byte idempotent across repeated write and parse passes for every fixture variant', () => {

@@ -173,7 +173,11 @@ function serializeHost(host: HostSection): Record<string, unknown> {
 }
 
 function serializeHostRunner(runner: HostRunnerSection): Record<string, unknown> {
-  const keys = runner.kind === 'agy' ? AGY_HOST_RUNNER_KEYS : HOST_RUNNER_KEYS;
+  // The discriminator goes through the own-data-property reader too: a getter
+  // never runs, and an accessor or absent kind falls to the default (opencode)
+  // branch like any other field rather than throwing.
+  const kind = readOwnDataProperty(runner as unknown as Readonly<Record<string, unknown>>, 'kind');
+  const keys = kind === 'agy' ? AGY_HOST_RUNNER_KEYS : HOST_RUNNER_KEYS;
   return serializeByKeys(runner, keys, {
     capabilities: (capabilities) =>
       serializeByKeys(capabilities as RunnerCapabilityDeclaration, CAPABILITY_KEYS),
@@ -274,13 +278,15 @@ function serializeConductorReaper(
 }
 
 function serializeShelf(shelf: ShelfSectionV2): Record<string, unknown> {
-  return shelf.provider === 'local'
+  // Read the discriminator through the own-data-property reader so an accessor
+  // never runs; an unreadable provider falls to the default branch.
+  return readOwnDataProperty(shelf as unknown as Readonly<Record<string, unknown>>, 'provider') === 'local'
     ? serializeByKeys(shelf, LOCAL_SHELF_KEYS)
     : serializeByKeys(shelf, GIT_SHELF_KEYS);
 }
 
 function serializeForge(forge: ForgeSectionV2): Record<string, unknown> {
-  return forge.mode === 'none'
+  return readOwnDataProperty(forge as unknown as Readonly<Record<string, unknown>>, 'mode') === 'none'
     ? serializeByKeys(forge, NO_FORGE_KEYS)
     : serializeByKeys(forge, GITHUB_FORGE_KEYS);
 }

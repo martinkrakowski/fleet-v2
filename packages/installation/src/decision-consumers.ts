@@ -66,23 +66,30 @@ export function copyDecisionConsumers(consumers: DecisionConsumers): DecisionCon
       name === 'claim-triage'
         ? CLAIM_TRIAGE_CONSUMER_KEYS
         : KNOWLEDGE_RANKING_CONSUMER_KEYS;
-    const copied = copyOwnBlock(settings, keys);
-    if (Object.keys(copied).length > 0) {
-      out[name] = copied;
-    }
+    // A present, valid (plain-record) settings block is written even when
+    // every settings key is absent: dropping the entry would silently change
+    // a valid installation on write.
+    out[name] = copyOwnBlock(settings, keys);
   }
   return out as DecisionConsumers;
 }
 
 /** Copy the decisions block through its key list (D3): no extra key survives. */
 export function copyDecisions(decisions: DecisionsSectionV2): DecisionsSectionV2 {
-  if (decisions.provider === 'none') {
+  // The discriminator goes through the own-data-property reader too: a getter
+  // never runs, and an accessor or absent provider falls to the default (jev)
+  // branch like any other field rather than throwing.
+  const provider = readOwnDataProperty(
+    decisions as unknown as Record<string, unknown>,
+    'provider',
+  );
+  if (provider === 'none') {
     return copyOwnBlock(
       decisions as unknown as Record<string, unknown>,
       NO_DECISIONS_KEYS,
     ) as unknown as NoDecisionsSection;
   }
-  if (decisions.provider === 'answer-file') {
+  if (provider === 'answer-file') {
     return copyOwnBlock(
       decisions as unknown as Record<string, unknown>,
       ANSWER_FILE_DECISIONS_KEYS,

@@ -403,7 +403,8 @@ describe('the host contract fields (P2)', () => {
       },
     });
 
-    // A throwing getter on hosts.<name>.container never runs.
+    // A throwing getter on hosts.<name>.container never runs; the accessor is
+    // refused instead of being treated as an absent optional field.
     const getterHost = {
       ...contractV2.hosts['lane-host'],
       get container(): string {
@@ -414,7 +415,13 @@ describe('the host contract fields (P2)', () => {
       ...contractV2,
       hosts: { ...contractV2.hosts, 'lane-host': getterHost },
     });
-    expect(getterResult.ok).toBe(true);
+    expect(getterResult.ok).toBe(false);
+    if (getterResult.ok) {
+      throw new Error('a container accessor must be refused');
+    }
+    expect(getterResult.errors).toEqual([
+      'hosts.lane-host.container: must be a plain data property',
+    ]);
 
     // A throwing getter on the root schemaVersion never runs.
     const getterRoot = {

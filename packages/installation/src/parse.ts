@@ -1390,12 +1390,21 @@ function parseHostContainer(
   hostPath: string,
   errors: string[],
 ): string | undefined {
-  // Read through the record's own data property so a getter never runs.
-  const value = readOwnDataProperty(entry, 'container');
+  const fieldPath = `${hostPath}.container`;
+  // Read through the record's own data property so a getter never runs. An
+  // accessor property is refused, never treated as an absent optional field.
+  if (!Object.hasOwn(entry, 'container')) {
+    return undefined;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(entry, 'container');
+  if (descriptor === undefined || 'get' in descriptor || 'set' in descriptor) {
+    errors.push(`${fieldPath}: must be a plain data property`);
+    return undefined;
+  }
+  const value = descriptor.value;
   if (value === undefined) {
     return undefined;
   }
-  const fieldPath = `${hostPath}.container`;
   if (typeof value !== 'string' || !isNonEmptyString(value)) {
     errors.push(`${fieldPath}: must be a non-empty string`);
     return undefined;

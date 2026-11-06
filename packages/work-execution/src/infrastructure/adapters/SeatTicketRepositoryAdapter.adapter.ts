@@ -125,7 +125,8 @@ export class SeatTicketRepositoryAdapter implements SeatTicketRepositoryPort {
   async findSeatTicket(projectId: string, role: SeatTicketRole): Promise<SeatTicketRecord | null> {
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
-      return this.inMemoryRecords.get(seatTicketKey(projectId, role)) ?? null;
+      const stored = this.inMemoryRecords.get(seatTicketKey(projectId, role));
+      return stored === undefined ? null : { ...stored };
     }
     const records = await this.readRecordsFromDisk(path.join(stateDir, SEAT_TICKET_STORE_NAME));
     return records.get(seatTicketKey(projectId, role)) ?? null;
@@ -135,7 +136,7 @@ export class SeatTicketRepositoryAdapter implements SeatTicketRepositoryPort {
     const stateDir = this.options?.stateDir;
     const records =
       stateDir === undefined
-        ? [...this.inMemoryRecords.values()]
+        ? [...this.inMemoryRecords.values()].map((item) => ({ ...item }))
         : await this.readRecordsFromDisk(path.join(stateDir, SEAT_TICKET_STORE_NAME));
     const list = [...records.values()];
     if (projectId === undefined) {
@@ -161,7 +162,9 @@ export class SeatTicketRepositoryAdapter implements SeatTicketRepositoryPort {
     if (stored !== undefined && (stored.revision >= record.revision || stored.ticket > record.ticket)) {
       return 'conflict';
     }
-    this.inMemoryRecords.set(key, record);
+    // Store a copy so a caller retaining a mutable alias cannot change the
+    // saved ticket or revision without going through the compare-and-swap.
+    this.inMemoryRecords.set(key, { ...record });
     return 'saved';
   }
 

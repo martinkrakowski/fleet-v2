@@ -38,6 +38,23 @@ describe('SeatTicketRepositoryAdapter (memory mode)', () => {
     expect(await adapter.listSeatTickets()).toEqual([]);
   });
 
+  it('isolates a saved record from a caller-retained mutable alias', async () => {
+    const record = ticket('project-a', 'first-pass');
+    expect(await adapter.saveSeatTicket(record)).toBe('saved');
+    const alias = { ...record } as {
+      -readonly [K in keyof SeatTicketRecord]: SeatTicketRecord[K];
+    };
+    alias.ticket = 0;
+    alias.revision = 99;
+    const stored = await adapter.findSeatTicket('project-a', 'first-pass');
+    expect(stored).toEqual({ ...ticket('project-a', 'first-pass') });
+    expect(await adapter.listSeatTickets()).toEqual([{ ...ticket('project-a', 'first-pass') }]);
+    // A lower ticket through the port itself still conflicts.
+    expect(
+      await adapter.saveSeatTicket(ticket('project-a', 'first-pass', { ticket: 0, revision: 5 })),
+    ).toBe('conflict');
+  });
+
   it('reads back a saved ticket and narrows lists by project', async () => {
     const record = ticket('project-a', 'first-pass');
     expect(await adapter.saveSeatTicket(record)).toBe('saved');

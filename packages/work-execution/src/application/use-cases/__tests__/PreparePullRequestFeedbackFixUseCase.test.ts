@@ -542,7 +542,7 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
     expect(forge.requests).toHaveLength(0);
   });
 
-  it('reports an ambiguous forge answer as ambiguous and does not retry the push', async () => {
+  it('reports an ambiguous forge answer as ambiguous and does not retry the push inside the call', async () => {
     const { forge, useCase } = setup();
     forge.script = () => ({ outcome: 'ambiguous', reason: 'the pull request could not be read at /home/x/path' });
 
@@ -552,14 +552,18 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
     expect(JSON.stringify(result)).not.toContain('/home');
     expect(forge.requests).toHaveLength(1);
 
+    // A later call while the pull request is still at the round head pushes
+    // again under the same action id (the intended retry): one forge call per call.
     forge.script = () => ({ outcome: 'refused', reason: 'denied at /home/x/path', refusalKind: 'permission' });
-    expect(await useCase.pushPullRequestFeedbackFix(pushRequest())).toEqual({
+    const retried = useCase.pushPullRequestFeedbackFix(pushRequest());
+    expect(await retried).toEqual({
       outcome: 'refused',
       key: KEY,
       headSha: FIXED_HEAD,
       code: 'push-refused',
       detail: 'permission',
     });
+    expect(forge.requests).toHaveLength(2);
   });
 
   it('recovers after a crash between the push intent and its result', async () => {
@@ -673,6 +677,9 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
     ).toMatchObject({ outcome: 'refused', code: 'invalid-request' });
     expect(
       await useCase.pushPullRequestFeedbackFix(pushRequest({ grantId: 'grant with spaces' })),
+    ).toMatchObject({ outcome: 'refused', code: 'invalid-request' });
+    expect(
+      await useCase.pushPullRequestFeedbackFix(pushRequest({ grantId: 4 as unknown as string })),
     ).toMatchObject({ outcome: 'refused', code: 'invalid-request' });
     expect(
       await useCase.pushPullRequestFeedbackFix(pushRequest({ fixedHeadSha: 'b'.repeat(12) })),
@@ -799,7 +806,7 @@ describe('PreparePullRequestFeedbackFixUseCase push grant', () => {
   });
 
   it('refuses with code grant-missing and makes no forge read or call when the request carries no grant', async () => {
-    for (const grantId of [undefined, '', '   ', 4]) {
+    for (const grantId of [undefined, '', '   ']) {
       const { findings, forge, grants, useCase } = pushableSetup();
       const request: Record<string, unknown> = { ...pushRequest() };
       if (grantId === undefined) {
@@ -984,5 +991,28 @@ describe('PreparePullRequestFeedbackFixUseCase push grant', () => {
     });
     expect(context.grants.consumeCalls).toHaveLength(0);
     expect(context.forge.requests).toHaveLength(0);
+  });
+
+  it('refuses a push whose fix attempt belongs to another pull request, consuming nothing', async () => {
+    const { findings, forge, grants, useCase } = pushableSetup();
+    // PR 43 sits at the round head on its own branch in the bound repository.
+    findings.handler = (request) =>
+      request.expectedHeadSha === HEAD
+        ? { outcome: 'available', headSha: HEAD, headRefName: 'other', headRepository: REPOSITORY, findings: [finding()] }
+        : { outcome: 'unavailable', code: 'head-moved' };
+
+    const result = await useCase.pushPullRequestFeedbackFix(
+      pushRequest({ pullRequestNumber: 43, branchName: 'other', attemptId: FIX_ATTEMPT_ID }),
+    );
+    const otherRound = await useCase.pushPullRequestFeedbackFix(
+      pushRequest({ expectedHeadSha: OTHER_HEAD, attemptId: FIX_ATTEMPT_ID }),
+    );
+
+    expect(result).toEqual({ outcome: 'refused', key: null, headSha: null, code: 'invalid-request' });
+    expect(otherRound).toEqual({ outcome: 'refused', key: null, headSha: null, code: 'invalid-request' });
+    expect(findings.calls).toHaveLength(0);
+    expect(grants.consumeCalls).toHaveLength(0);
+    expect(grants.grants.get(GRANT_ID)?.consumedByActionId).toBeNull();
+    expect(forge.requests).toHaveLength(0);
   });
 });

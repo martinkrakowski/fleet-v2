@@ -332,8 +332,11 @@ interface PushFields {
 
 /**
  * The push request's fields, or null for an invalid request. A grant id that
- * is absent, empty or not a string reads as missing; one that is present but
- * malformed (too long, unsafe characters) is an invalid request.
+ * is absent or blank reads as missing; one of another type, or malformed (too
+ * long, unsafe characters), is an invalid request. The attempt must be the fix
+ * attempt this round's key derives (`pr-feedback-<pr>-<head12>`), so a grant
+ * scoped to one pull request's fix attempt never authorises a push to another
+ * pull request.
  */
 function readPushFields(request: unknown): PushFields | null {
   const repository = readRepository(request);
@@ -356,8 +359,12 @@ function readPushFields(request: unknown): PushFields | null {
     !isNonEmptyString(attemptId) ||
     authorizedBy === null ||
     nowIso === null ||
-    expectedHeadSha === fixedHeadSha
+    expectedHeadSha === fixedHeadSha ||
+    attemptId !== derivedFixAttemptId(pullRequestNumber, expectedHeadSha)
   ) {
+    return null;
+  }
+  if (rawGrant !== undefined && typeof rawGrant !== 'string') {
     return null;
   }
   const grantId = isNonEmptyString(rawGrant) ? rawGrant : undefined;

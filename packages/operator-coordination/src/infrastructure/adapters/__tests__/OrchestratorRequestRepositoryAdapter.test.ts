@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -311,14 +312,14 @@ describe('OrchestratorRequestRepositoryAdapter', () => {
     }
   });
 
-  it('quarantines a writable oversized store by rename without reading it, then reports unknown for that call only and sees an empty store on the next', async () => {
+  it('quarantines a writable oversized store by rename under the save lock without reading it, then reports unknown for that call only and sees an empty store on the next', async () => {
     const storePath = path.join(tempDir, 'orchestrator-requests.json');
     await fs.writeFile(storePath, '');
     await fs.truncate(storePath, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
     const readSpy = vi.spyOn(fs, 'readFile');
     try {
       const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
-      expect(await adapter.get(R1)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+      expect(await adapter.save(initialRequest(R1), 0)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
       expect(readSpy.mock.calls.filter(([target]) => target === storePath)).toEqual([]);
       const quarantined = await fs.readdir(path.join(tempDir, 'quarantine'));
       expect(quarantined).toHaveLength(1);
@@ -332,19 +333,73 @@ describe('OrchestratorRequestRepositoryAdapter', () => {
     }
   });
 
-  it('reports unknown from list and save on the call that quarantines a writable oversized store, and writes nothing over it', async () => {
-    for (const op of ['list', 'save'] as const) {
-      const dir = await fs.mkdtemp(path.join(tempDir, `oversized-${op}-`));
-      const storePath = path.join(dir, 'orchestrator-requests.json');
-      await fs.writeFile(storePath, '');
-      await fs.truncate(storePath, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
-      const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: dir });
-      const result = op === 'list' ? await adapter.list() : await adapter.save(initialRequest(R1), 0);
-      expect(result).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
-      await expect(fs.stat(storePath)).rejects.toMatchObject({ code: 'ENOENT' });
-      expect(await fs.readdir(path.join(dir, 'quarantine'))).toHaveLength(1);
-      expect(await adapter.list()).toEqual({ outcome: 'ok', requests: [], truncated: false });
+  it('leaves an oversized store in place, unhashed, and reports it unreadable from unlocked get and list (writable adapter)', async () => {
+    const storePath = path.join(tempDir, 'orchestrator-requests.json');
+    await fs.writeFile(storePath, '');
+    await fs.truncate(storePath, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
+    const renameSpy = vi.spyOn(fs, 'rename');
+    const openedForHash = vi.spyOn(fs, 'open');
+    try {
+      const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
+      expect(await adapter.get(R1)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+      expect(await adapter.list()).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+      expect(renameSpy).not.toHaveBeenCalled();
+      expect(openedForHash.mock.calls.filter(([target]) => target === storePath)).toEqual([]);
+      expect((await fs.stat(storePath)).size).toBe(MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
+      await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      renameSpy.mockRestore();
+      openedForHash.mockRestore();
     }
+  });
+
+  it('names the quarantine copy of an oversized store by the digest of the bytes it moved, taken under the save lock', async () => {
+    const storePath = path.join(tempDir, 'orchestrator-requests.json');
+    await fs.writeFile(storePath, '');
+    await fs.truncate(storePath, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
+    const expected = createHash('sha256').update(await fs.readFile(storePath)).digest('hex').slice(0, 12);
+    const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
+    expect(await adapter.save(initialRequest(R1), 0)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+    const [name] = await fs.readdir(path.join(tempDir, 'quarantine'));
+    expect(name!.endsWith(`.${expected}`)).toBe(true);
+    const moved = createHash('sha256')
+      .update(await fs.readFile(path.join(tempDir, 'quarantine', name!)))
+      .digest('hex')
+      .slice(0, 12);
+    expect(moved).toBe(expected);
+  });
+
+  it('never moves a fresh valid store aside when a reader saw the old oversized one (check / rename / save interleave)', async () => {
+    const storePath = path.join(tempDir, 'orchestrator-requests.json');
+    await fs.writeFile(storePath, '');
+    await fs.truncate(storePath, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
+    const reader = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
+    const other = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
+    const realStat = fs.stat.bind(fs);
+    let interleaved = false;
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation((async (...args: Parameters<typeof fs.stat>) => {
+      const result = await realStat(...args);
+      if (!interleaved && args[0] === storePath) {
+        interleaved = true;
+        // B has just seen the oversized store. A quarantines it, then C saves a fresh valid store.
+        expect(await other.save(initialRequest(R2), 0)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+        expect((await other.save(initialRequest(R1), 0)).outcome).toBe('saved');
+      }
+      return result;
+    }) as typeof fs.stat);
+    try {
+      await reader.get(R1);
+    } finally {
+      statSpy.mockRestore();
+    }
+    expect(interleaved).toBe(true);
+    const quarantined = await fs.readdir(path.join(tempDir, 'quarantine'));
+    expect(quarantined).toHaveLength(1);
+    for (const name of quarantined) {
+      expect((await fs.stat(path.join(tempDir, 'quarantine', name))).size).toBe(MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
+    }
+    const found = await new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir }).get(R1);
+    expect(found.outcome).toBe('found');
   });
 
   it('refuses a provided blank or whitespace stateDir instead of selecting in-memory storage, and a null save options object', async () => {
@@ -744,7 +799,7 @@ describe('OrchestratorRequestRepositoryAdapter', () => {
     await fs.writeFile(storePath, '');
     await fs.truncate(storePath, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
     const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
-    expect(await adapter.get(R1)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+    expect(await adapter.save(initialRequest(R1), 0)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
     const [name] = await fs.readdir(path.join(tempDir, 'quarantine'));
     expect(descriptor.isQuarantineCopyName(name!)).toBe(true);
     const check = await descriptor.check(tempDir);

@@ -17,7 +17,9 @@
  * zero signals, while a competing write at the same `expectedRevision` is
  * `revision-conflict`. A newly queued request and every state/claim/outcome
  * transition emits a `request` change signal; claim lease renewals emit
- * nothing. With `readOnly` the store never writes and never quarantines.
+ * nothing. With `readOnly` the store never writes and never quarantines. An
+ * oversized store is moved aside only by the locked reload of a save; get,
+ * list and the unlocked save probe report it unreadable and touch nothing.
  */
 
 import { createHash } from 'node:crypto';
@@ -325,12 +327,47 @@ async function streamDigest12(target: string): Promise<string> {
   return hash.digest('hex').slice(0, 12);
 }
 
-/** Move an oversized store into `<dir>/quarantine/` by rename, named as `fleet-v2 state check` and `restore` expect. */
-async function quarantineOversizedStore(target: string): Promise<void> {
-  const dir = join(dirname(target), 'quarantine');
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const name = nextQuarantineCopyName(basename(target), await streamDigest12(target));
-  await fs.rename(target, join(dir, name));
+/**
+ * Move an oversized store into `<dir>/quarantine/` by rename, named as
+ * `fleet-v2 state check` and `restore` expect. Call ONLY while holding the
+ * store's lock. The file is re-stat'ed under the lock and moved only while it
+ * is still over `maxBytes`; the digest in the name is taken from the very file
+ * identity that is renamed (stat before and after the hash must agree, else the
+ * decision is made again), so the name always matches the moved bytes and a
+ * valid store written in the meantime is never moved aside.
+ * Returns `moved`, `not-oversized` (gone or back under the cap: nothing moved),
+ * or `unstable` (kept changing; nothing moved).
+ */
+async function quarantineOversizedStoreLocked(
+  target: string,
+  maxBytes: number,
+): Promise<'moved' | 'not-oversized' | 'unstable'> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let first;
+    try {
+      first = await fs.stat(target);
+    } catch {
+      return 'not-oversized';
+    }
+    if (first.size <= maxBytes) {
+      return 'not-oversized';
+    }
+    const digest = await streamDigest12(target);
+    let second;
+    try {
+      second = await fs.stat(target);
+    } catch {
+      return 'not-oversized';
+    }
+    if (second.ino !== first.ino || second.size !== first.size || second.mtimeMs !== first.mtimeMs) {
+      continue;
+    }
+    const dir = join(dirname(target), 'quarantine');
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    await fs.rename(target, join(dir, nextQuarantineCopyName(basename(target), digest)));
+    return 'moved';
+  }
+  return 'unstable';
 }
 
 /** Extract only a fixed POSIX error code; never a path or free-form message. */
@@ -363,6 +400,8 @@ type LoadResult =
   | { readonly kind: 'loaded'; readonly records: Map<string, OrchestratorRequestRecord> }
   | { readonly kind: 'unknown-version' }
   | { readonly kind: 'unreadable' }
+  /** Over the byte cap, seen WITHOUT the store lock: nothing was touched on disk. */
+  | { readonly kind: 'oversized' }
   | { readonly kind: 'io-error'; readonly errorCode: string };
 
 type ParsedListQuery = {
@@ -629,19 +668,28 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
    * an unsupported `schemaVersion` touches nothing and reports unknown, and a
    * non-`ENOENT` read failure reports `io-error` with a sanitized code.
    */
-  private async loadRecords(target: string): Promise<LoadResult> {
+  private async loadRecords(target: string, locked: boolean = false): Promise<LoadResult> {
     let buffer: Buffer;
     try {
       const stat = await fs.stat(target);
       if (stat.size > MAX_ORCHESTRATOR_REQUEST_STORE_BYTES) {
-        // Never read an oversized file into memory. Read-only: refuse. Writable: quarantine by rename, then report unknown for this call.
+        // Never read an oversized file into memory. Only the locked reload of a writable store may move it aside;
+        // every unlocked caller (get, list, the save probe) reports it and touches nothing (no rename, no hash).
+        if (!locked) {
+          return { kind: 'oversized' };
+        }
         if (this.options?.readOnly === true) {
           return { kind: 'unreadable' };
         }
+        let moved: 'moved' | 'not-oversized' | 'unstable';
         try {
-          await quarantineOversizedStore(target);
+          moved = await quarantineOversizedStoreLocked(target, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES);
         } catch {
           return { kind: 'unreadable' };
+        }
+        if (moved === 'not-oversized') {
+          // The store changed under us (a writer that ignores the lock): decide again from its current state.
+          return this.loadRecords(target, true);
         }
         // The quarantining call itself reports unknown (brief recovery rule); the next call finds the file gone and sees an empty store.
         return { kind: 'unreadable' };
@@ -781,7 +829,8 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
     lockTimeoutMs: number,
   ): Promise<SaveOrchestratorRequestResult> {
     const probe = await this.loadRecords(target);
-    if (probe.kind !== 'loaded') {
+    // An oversized store is not refused here: the locked reload below decides (and may quarantine) under the lock.
+    if (probe.kind !== 'loaded' && probe.kind !== 'oversized') {
       if (probe.kind === 'unknown-version') {
         return { outcome: 'unknown', code: 'unknown-schema-version' };
       }
@@ -800,12 +849,12 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
         `${target}.lock`,
         async (): Promise<SaveOrchestratorRequestResult> => {
           before = await this.safeStat(target);
-          const reload = await this.loadRecords(target);
+          const reload = await this.loadRecords(target, true);
           if (reload.kind !== 'loaded') {
             if (reload.kind === 'unknown-version') {
               return { outcome: 'unknown', code: 'unknown-schema-version' };
             }
-            if (reload.kind === 'unreadable') {
+            if (reload.kind === 'unreadable' || reload.kind === 'oversized') {
               return { outcome: 'unknown', code: 'unreadable-store' };
             }
             return { outcome: 'unknown', code: 'io-error', errorCode: reload.errorCode };
@@ -920,7 +969,7 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
       if (load.kind === 'unknown-version') {
         return { outcome: 'unknown', code: 'unknown-schema-version' };
       }
-      if (load.kind === 'unreadable') {
+      if (load.kind === 'unreadable' || load.kind === 'oversized') {
         return { outcome: 'unknown', code: 'unreadable-store' };
       }
       return { outcome: 'unknown', code: 'io-error', errorCode: load.errorCode };
@@ -965,7 +1014,7 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
         if (load.kind === 'unknown-version') {
           return { outcome: 'unknown', code: 'unknown-schema-version' };
         }
-        if (load.kind === 'unreadable') {
+        if (load.kind === 'unreadable' || load.kind === 'oversized') {
           return { outcome: 'unknown', code: 'unreadable-store' };
         }
         return { outcome: 'unknown', code: 'io-error', errorCode: load.errorCode };

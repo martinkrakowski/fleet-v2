@@ -19,6 +19,14 @@ export type Validated = typeof VALIDATED_SERVER | typeof VALIDATED_SCHEMA_ONLY;
 
 const HEX_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 
+/** UTF-16 code-unit order, the default string sort order. */
+function compareKeys(a: string, b: string): number {
+  if (a === b) {
+    return 0;
+  }
+  return a < b ? -1 : 1;
+}
+
 /**
  * Rebuild `value` so that JSON.stringify of it is canonical: object keys are
  * sorted with the default string sort at every level, arrays keep their
@@ -36,7 +44,7 @@ function canonicalize(value: unknown): unknown {
     const entries = Object.entries(value as Record<string, unknown>)
       .filter(([, entry]) => entry !== undefined)
       .map(([key, entry]) => [key, canonicalize(entry)] as const)
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+      .sort(([a], [b]) => compareKeys(a, b));
     return Object.fromEntries(entries);
   }
   return value;

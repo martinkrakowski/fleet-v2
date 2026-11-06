@@ -120,4 +120,29 @@ describe("per-tool rate limiter (D13)", () => {
     });
     expect(client.calls.length).toBe(READ_RATE_PER_MINUTE);
   });
+
+  it("a clock that steps backwards does not re-credit elapsed time", () => {
+    let now = 60_000;
+    const limiter = createToolRateLimiter({ now: () => now });
+    for (let i = 0; i < 6; i += 1) {
+      expect(limiter.allow("fleet_request", "mutating")).toBe(true);
+    }
+    expect(limiter.allow("fleet_request", "mutating")).toBe(false);
+    now = 0;
+    expect(limiter.allow("fleet_request", "mutating")).toBe(false);
+    now = 60_000;
+    expect(limiter.allow("fleet_request", "mutating")).toBe(false);
+  });
+
+  it("a partial refill is not enough for a call", () => {
+    let now = 0;
+    const limiter = createToolRateLimiter({ now: () => now });
+    for (let i = 0; i < 60; i += 1) {
+      limiter.allow("fleet_attempt", "read");
+    }
+    now = 999;
+    expect(limiter.allow("fleet_attempt", "read")).toBe(false);
+    now = 1000;
+    expect(limiter.allow("fleet_attempt", "read")).toBe(true);
+  });
 });

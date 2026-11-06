@@ -54,4 +54,16 @@ describe("dry-run digest helper (D11)", () => {
     expect(VALIDATED_SCHEMA_ONLY).toBe("schema-only");
     expect(DRY_RUN_DEFAULT).toBe(true);
   });
+
+  it("arrays keep their order and undefined members are dropped", () => {
+    expect(canonicalRequestBody({ b: [2, 1], a: undefined })).toBe('{"b":[2,1]}');
+    expect(previewDigest([1, 2])).not.toBe(previewDigest([2, 1]));
+    expect(canonicalRequestBody(undefined)).toBe("null");
+  });
+
+  it("digestMatches refuses an uppercase copy and a malformed expected digest", () => {
+    const digest = previewDigest({ a: 1 });
+    expect(digestMatches(digest, digest.toUpperCase())).toBe(false);
+    expect(digestMatches("abc", "abc")).toBe(false);
+  });
 });

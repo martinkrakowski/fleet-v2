@@ -50,7 +50,8 @@ export function createToolRateLimiter(options?: { now?: () => number }): ToolRat
         return false;
       }
       bucket.tokens = refilled - 1;
-      bucket.last = current;
+      // Never move `last` back: a clock that steps backwards must not re-credit elapsed time.
+      bucket.last = Math.max(bucket.last, current);
       return true;
     },
   };

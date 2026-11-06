@@ -137,7 +137,7 @@ export function implementerRoleFor(round: number, state: LaneRunStateValue): Imp
   return 'first-pass';
 }
 
-export type LaneRunFailureCause = 'gate' | 'brief-check' | 'code-review' | 'pre-merge' | 'ci';
+export type LaneRunFailureCause = 'gate' | 'brief-check' | 'code-review' | 'pre-merge' | 'ci' | 'merge-queue';
 export type LaneRunFailureOutcome =
   | { readonly kind: 'enter'; readonly to: 'fixing'; readonly nextRound: number }
   | { readonly kind: 'park'; readonly reason: 'blocker-after-round-2' | 'ci-failed-no-rounds' };

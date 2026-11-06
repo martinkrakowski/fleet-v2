@@ -4,19 +4,306 @@
  * brief file when one is provided, falls back to orchestrator prose registered
  * per work order, and reports absence explicitly. No provider inference and no
  * synthesis happen here.
+ *
+ * Lane CO17 adds `authorBriefSession`: one read-only seat session per brief, an
+ * argv array through the executor (never a shell) in a checkout pinned at the
+ * base commit. Only `<stem>.intent.json`, `.prompt.md` and `.answer.md` are
+ * written (plus a short-lived `.intent.json.lock`), inside the briefs directory. A repeat returns the recorded answer;
+ * a cut-short session leaves its intent and no answer, so the next call re-runs.
+ * Results carry codes only: never a path, the answer or a secret.
  */
 
-import { promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs } from 'node:fs';
+import path from 'node:path';
 
 import type {
   AuthoredBriefRequest,
   AuthoredBriefResult,
   BriefAuthoringPort,
+  BriefAuthorSessionRequest,
+  BriefAuthorSessionResult,
+  BriefAuthorSessionUnavailable,
 } from '../../application/ports/out/BriefAuthoringPort.out-port.js';
+import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
+import { withFileLock } from './file-store.js';
 
 export interface BriefAuthoringAdapterOptions {
   /** Reviewed orchestrator prose keyed by work order id. */
   readonly defaultProseByWorkOrder?: Readonly<Record<string, string>>;
+  /** Reviewed seat argv template; contains `{promptFile}` exactly once. */
+  readonly seatCommand?: readonly string[];
+  /** Seat session budget in ms. Default 900 000, hard cap 3 600 000. */
+  readonly timeoutMs?: number;
+  /** Largest accepted answer in bytes. Default 262 144. */
+  readonly maxAnswerBytes?: number;
+  /** The command transport for the pinned-commit check and the seat run. */
+  readonly executor?: CommandExecutorPort;
+}
+
+const DEFAULT_TIMEOUT_MS = 900_000;
+const MAX_TIMEOUT_MS = 3_600_000;
+const DEFAULT_MAX_ANSWER_BYTES = 262_144;
+/** Room for the seat's stderr inside the executor's stdout+stderr cap. */
+const STDERR_HEADROOM_BYTES = 65_536;
+/** Slack added to the session timeout when judging an intent claim stale. */
+const INTENT_CLAIM_SLACK_MS = 60_000;
+const GIT_TIMEOUT_MS = 30_000;
+/** Mirrors the fact pack's prompt cap. */
+const MAX_PROMPT_BYTES = 300_000;
+const MAX_STEM_LENGTH = 120;
+const COMMIT_PATTERN = /^[0-9a-f]{40,64}$/;
+const PLACEHOLDER_PATTERN = /\{([^{}]*)\}/g;
+const ALLOWED_PLACEHOLDERS: ReadonlySet<string> = new Set([
+  'promptFile', 'model', 'variant', 'agent', 'workOrderId', 'laneId', 'baseCommit',
+]);
+
+/** Hardened read-only git prefix: no network, no hooks, no lazy fetch, no replace refs. */
+const GIT_ARGV_PREFIX = [
+  'env', 'GIT_NO_LAZY_FETCH=1', 'GIT_ALLOW_PROTOCOL=none', 'GIT_TERMINAL_PROMPT=0',
+  'GIT_NO_REPLACE_OBJECTS=1', 'GIT_GRAFT_FILE=/nonexistent/fleet-v2-brief-author-no-grafts',
+  'git', '--no-replace-objects',
+  '-c', 'core.pager=cat', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+  '-c', 'core.attributesFile=/dev/null', '-c', 'protocol.allow=never', '-C',
+] as const;
+
+const unavailable = (reason: BriefAuthorSessionUnavailable): BriefAuthorSessionResult =>
+  ({ outcome: 'unavailable', reason });
+
+function isNonEmpty(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function safeSegment(value: string): string {
+  return value.replace(/[^A-Za-z0-9._@-]/g, '_');
+}
+
+/** Substitute placeholders into the template; null when the template or a value is unsafe. */
+function renderSeatArgv(
+  template: readonly string[],
+  values: Readonly<Record<string, string | undefined>>,
+): string[] | null {
+  if (!Array.isArray(template) || template.length === 0 || template.some((part) => typeof part !== 'string')
+    || template[0].includes('{')) {
+    return null;
+  }
+  let promptFileCount = 0;
+  const argv: string[] = [];
+  for (const part of template) {
+    let invalid = false;
+    const rendered = part.replace(PLACEHOLDER_PATTERN, (_match: string, name: string) => {
+      const value = values[name];
+      if (!ALLOWED_PLACEHOLDERS.has(name) || value === undefined || value.length === 0
+        || hasControlCharacter(value) || value.startsWith('-')) {
+        invalid = true;
+        return '';
+      }
+      if (name === 'promptFile') {
+        promptFileCount += 1;
+      }
+      return value;
+    });
+    if (invalid || rendered.includes('{') || rendered.includes('}')) {
+      return null;
+    }
+    argv.push(rendered);
+  }
+  return promptFileCount === 1 ? argv : null;
+}
+
+function resolveTimeout(requested: number | undefined): number {
+  if (requested === undefined || !Number.isFinite(requested) || requested <= 0) {
+    return DEFAULT_TIMEOUT_MS;
+  }
+  return Math.min(requested, MAX_TIMEOUT_MS);
+}
+
+/** The safe file stem for a valid request, or null; the key must match the ids and commit. */
+function sessionStem(request: BriefAuthorSessionRequest): string | null {
+  const { sessionKey, workOrderId, laneId, baseCommit, checkoutPath, briefsDir, prompt, model } = request;
+  if (![sessionKey, workOrderId, laneId, checkoutPath, briefsDir, prompt, model].every(isNonEmpty)
+    || !COMMIT_PATTERN.test(baseCommit) || !path.isAbsolute(briefsDir)
+    || Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES
+    || sessionKey !== `brief-author/${workOrderId}/${laneId}@${baseCommit.slice(0, 12)}`) {
+    return null;
+  }
+  const stem = `brief-author__${safeSegment(workOrderId)}__${safeSegment(laneId)}@${baseCommit.slice(0, 12)}`;
+  return stem.length > MAX_STEM_LENGTH ? null : stem;
+}
+
+/** True when the path is a symlink; a link may point outside the briefs directory. */
+async function isSymbolicLink(filePath: string): Promise<boolean> {
+  return fs.lstat(filePath).then((stat) => stat.isSymbolicLink(), () => false);
+}
+
+/**
+ * Read a regular file without following a symlink at the final component. The
+ * open itself refuses a link (O_NOFOLLOW), so a link planted between an earlier
+ * lstat and this read cannot redirect the read outside the briefs directory.
+ */
+async function readFileNoFollow(filePath: string): Promise<string> {
+  const handle = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    return await handle.readFile('utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Create or truncate a file for writing; the open refuses a symlink at the final component (O_NOFOLLOW). */
+async function writeFileNoFollow(filePath: string, data: string): Promise<void> {
+  const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
+  const handle = await fs.open(filePath, flags, 0o600);
+  try {
+    await handle.writeFile(data, 'utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * True when any existing component of the absolute path is a symlink, or the
+ * path cannot be inspected safely. Each component is inspected with lstat from
+ * the root down and never followed; the first missing component ends the walk
+ * because nothing below it exists yet. A parent-directory (dot-dot) segment is refused: the kernel
+ * would resolve it through a link while path.join resolves it lexically.
+ */
+async function pathCrossesSymbolicLink(absolutePath: string): Promise<boolean> {
+  const segments = absolutePath.split(path.sep).filter((segment) => segment.length > 0);
+  if (segments.includes('..')) {
+    return true;
+  }
+  let current = path.parse(absolutePath).root;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    try {
+      if ((await fs.lstat(current)).isSymbolicLink()) {
+        return true;
+      }
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+    }
+  }
+  return false;
+}
+
+/**
+ * The recorded answer, or null when none exists, or 'too-large' when the
+ * recorded answer itself exceeds the answer limit. A symlinked answer file is
+ * refused like any other unreadable answer: it may point outside the briefs
+ * directory.
+ */
+async function readRecordedAnswer(
+  answerPath: string,
+  maxAnswerBytes: number,
+): Promise<string | null | 'too-large'> {
+  const stat = await fs.lstat(answerPath).catch(() => null);
+  if (stat === null) {
+    return null;
+  }
+  if (stat.isSymbolicLink()) {
+    throw new Error('recorded brief answer is unreadable');
+  }
+  let text: string;
+  try {
+    text = await readFileNoFollow(answerPath);
+  } catch {
+    throw new Error('recorded brief answer is unreadable');
+  }
+  if (text.trim().length === 0) {
+    throw new Error('recorded brief answer is unreadable');
+  }
+  return Buffer.byteLength(text, 'utf8') > maxAnswerBytes ? 'too-large' : text;
+}
+
+/** Write the answer and read it back; a failed record is removed so it is never reused. */
+async function recordAnswer(answerPath: string, answer: string): Promise<boolean> {
+  if (await isSymbolicLink(answerPath)) {
+    return false;
+  }
+  const recorded = await writeFileNoFollow(answerPath, answer)
+    .then(() => readFileNoFollow(answerPath))
+    .then((text) => text === answer, () => false);
+  if (!recorded) {
+    await fs.rm(answerPath, { force: true }).catch(() => undefined);
+  }
+  return recorded;
+}
+
+/**
+ * True when the intent file records this key and a start time inside the claim
+ * window. The path is inspected with lstat first: a symlink is never followed,
+ * so a planted link cannot redirect the read outside the briefs directory.
+ */
+async function intentIsLive(intentPath: string, sessionKey: string, windowMs: number): Promise<boolean> {
+  const stat = await fs.lstat(intentPath).catch(() => null);
+  if (stat === null || !stat.isFile()) {
+    return false;
+  }
+  const text = await readFileNoFollow(intentPath).catch(() => null);
+  if (text === null) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(text) as { sessionKey?: unknown; startedAt?: unknown };
+    if (parsed.sessionKey !== sessionKey || typeof parsed.startedAt !== 'string') {
+      return false;
+    }
+    const startedAt = Date.parse(parsed.startedAt);
+    return Number.isFinite(startedAt) && Date.now() - startedAt < windowMs;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Claim the session by creating the intent file exclusively. When one already
+ * exists without an answer, it is another call's session while it is fresh for
+ * this key; a stale or foreign intent is replaced so an interrupted session
+ * stays recoverable on the next call. The whole check-and-set runs under the
+ * store's exclusive file lock, so concurrent retries can never both replace
+ * the same stale intent and both run the seat.
+ */
+async function claimIntent(
+  briefsDir: string,
+  intentPath: string,
+  sessionKey: string,
+  windowMs: number,
+): Promise<boolean> {
+  const intent = `${JSON.stringify({ sessionKey, startedAt: new Date().toISOString() })}\n`;
+  return withFileLock(`${intentPath}.lock`, async () => {
+    try {
+      await fs.mkdir(briefsDir, { recursive: true });
+      await fs.writeFile(intentPath, intent, { encoding: 'utf8', flag: 'wx' });
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        return false;
+      }
+    }
+    if (await intentIsLive(intentPath, sessionKey, windowMs)) {
+      return false;
+    }
+    // Stale, foreign or planted (symlinked) intent: clear the entry and
+    // re-claim exclusively. Unlink removes only the directory entry, never a
+    // linked target, so a planted symlink is neutralised, not followed.
+    try {
+      await fs.rm(intentPath, { force: true });
+      await fs.writeFile(intentPath, intent, { encoding: 'utf8', flag: 'wx' });
+      return true;
+    } catch {
+      return false;
+    }
+  }).catch(() => false);
 }
 
 export class BriefAuthoringAdapter implements BriefAuthoringPort {
@@ -57,5 +344,98 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
       outcome: 'unavailable',
       reason: 'No hand-written brief path or orchestrator brief provided',
     };
+  }
+
+  /**
+   * A recorded answer that cannot be read back rejects: the use case reports
+   * that as an unknown outcome, never as an empty brief.
+   */
+  async authorBriefSession(request: BriefAuthorSessionRequest): Promise<BriefAuthorSessionResult> {
+    const stem = sessionStem(request);
+    if (stem === null) {
+      return unavailable('session-command-invalid');
+    }
+    // A symlink anywhere along briefsDir (the leaf or any parent) redirects every
+    // read and write outside the intended directory; refuse before touching the
+    // filesystem through the link.
+    if (await pathCrossesSymbolicLink(request.briefsDir)) {
+      return unavailable('session-command-invalid');
+    }
+    const base = path.join(request.briefsDir, stem);
+    const answerPath = `${base}.answer.md`;
+    const maxAnswerBytes = this.options?.maxAnswerBytes ?? DEFAULT_MAX_ANSWER_BYTES;
+    // Recorded outcome first: a completed session replays without any seat
+    // configuration, executor or checkout check.
+    const recorded = await readRecordedAnswer(answerPath, maxAnswerBytes);
+    if (recorded === 'too-large') {
+      return unavailable('session-output-too-large');
+    }
+    if (recorded !== null) {
+      return { outcome: 'answered', answer: recorded };
+    }
+    const { seatCommand, executor } = this.options ?? {};
+    if (seatCommand === undefined || executor === undefined) {
+      return unavailable('seat-command-not-configured');
+    }
+    const promptPath = `${base}.prompt.md`;
+    const argv = renderSeatArgv(seatCommand, {
+      promptFile: promptPath, model: request.model, variant: request.variant, agent: request.agent,
+      workOrderId: request.workOrderId, laneId: request.laneId, baseCommit: request.baseCommit,
+    });
+    if (argv === null) return unavailable('session-command-invalid');
+    const timeoutMs = resolveTimeout(request.timeoutMs ?? this.options?.timeoutMs);
+    // The exclusive intent claim is what grants the seat run: a concurrent
+    // call sees a fresh claim for the same key and refuses instead of also
+    // running the seat.
+    const claimWindowMs = timeoutMs + INTENT_CLAIM_SLACK_MS;
+    if (!(await claimIntent(request.briefsDir, `${base}.intent.json`, request.sessionKey, claimWindowMs))) {
+      return unavailable('session-failed');
+    }
+    const pinned = await this.checkPinnedCheckout(executor, request);
+    if (pinned !== null) return unavailable(pinned);
+    if (await isSymbolicLink(promptPath)
+      || !(await writeFileNoFollow(promptPath, request.prompt).then(() => true, () => false))) {
+      return unavailable('session-failed');
+    }
+    const run = await executor.run(argv, {
+      cwd: request.checkoutPath,
+      timeoutMs,
+      maxBufferBytes: maxAnswerBytes + STDERR_HEADROOM_BYTES,
+    }).catch(() => null);
+    if (run === null || (run.error === undefined && run.exitCode !== 0)) {
+      return unavailable('session-failed');
+    }
+    if (run.error !== undefined) {
+      return unavailable(/timeout|maxBufferBytes/.test(run.error) ? 'session-timeout' : 'session-failed');
+    }
+    if (run.stdout.trim().length === 0) {
+      return unavailable('session-empty');
+    }
+    if (Buffer.byteLength(run.stdout, 'utf8') > maxAnswerBytes) {
+      return unavailable('session-output-too-large');
+    }
+    return (await recordAnswer(answerPath, run.stdout))
+      ? { outcome: 'answered', answer: run.stdout }
+      : unavailable('session-failed');
+  }
+
+  /** One read-only git call: null when the checkout exists and is at the base commit. */
+  private async checkPinnedCheckout(
+    executor: CommandExecutorPort,
+    request: BriefAuthorSessionRequest,
+  ): Promise<'checkout-unavailable' | 'checkout-not-pinned' | null> {
+    const stat = await fs.stat(request.checkoutPath).catch(() => null);
+    if (stat === null || !stat.isDirectory()) {
+      return 'checkout-unavailable';
+    }
+    const head = await executor.run(
+      [...GIT_ARGV_PREFIX, request.checkoutPath, 'rev-parse', 'HEAD'],
+      { cwd: request.checkoutPath, timeoutMs: GIT_TIMEOUT_MS },
+    ).catch(() => null);
+    if (head === null || head.error !== undefined || head.exitCode !== 0
+      || head.stdout.trim() !== request.baseCommit) {
+      return 'checkout-not-pinned';
+    }
+    return null;
   }
 }

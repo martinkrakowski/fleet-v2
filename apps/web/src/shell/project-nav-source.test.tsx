@@ -86,6 +86,8 @@ describe("ProjectNav is fed by the server layout and stays client-bound", () => 
     expect(layout).toContain('export const dynamic = "force-dynamic"');
     expect(layout).toContain("export default async function RootLayout");
     expect(layout).toContain("loadProjectNav()");
-    expect(layout).toContain("<Sidebar nav={nav} openQuestions={openQuestions} />");
+    // The Sidebar call is matched on its props, not one line of source: a comment cannot satisfy it (TD5a review minor).
+    const sidebarCall = /<Sidebar\s+nav=\{nav\}\s+openQuestions=\{openQuestions\}\s+openTodos=\{openTodos\}\s*\/>/;
+    expect(layout.replace(/\{\/\*[\s\S]*?\*\/\}/g, '')).toMatch(sidebarCall);
   });
 });

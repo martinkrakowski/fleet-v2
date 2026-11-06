@@ -697,5 +697,5 @@ export function configureFleetApiRuntime(options?: FleetApiRuntimeOptions | null
   configureKnowledgeComposition(knowledge);
   configureEvidenceUseCases(evidence);
   configureWorkComposition(work);
-  configureTelemetryReadComposition({ stateDir });
+  configureTelemetryReadComposition({ stateDir, installation });
 }

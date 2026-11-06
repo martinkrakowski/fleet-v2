@@ -6,7 +6,9 @@
  * correctly set up? An unreachable host is `unknown`; a failing check carries
  * the command that would fix it; nothing is ever run to fix it. No command
  * output that could carry a credential (stderr, a remote URL) is ever copied
- * into a `detail`.
+ * into a `detail`. It also reads the project's generator state from files
+ * only — manifest, side-car, `package.json` and adoption markers — with `cat`
+ * and `test`; it never runs any of the project's own tooling.
  */
 
 import type {
@@ -15,6 +17,8 @@ import type {
   CommandRunResult,
 } from "../../application/ports/out/CommandExecutorPort.out-port.js";
 import type {
+  ProjectGeneratorState,
+  ProjectGeneratorStateValue,
   ProjectProbeCheck,
   ProjectProbeClone,
   ProjectProbePort,
@@ -169,12 +173,17 @@ export class ProjectProbeAdapter implements ProjectProbePort {
       }
     }
 
+    const detectedScripts = scriptsSource === null ? [] : await this.detectScripts(scriptsSource);
+    const generatorState =
+      scriptsSource === null ? undefined : await this.readGeneratorState(scriptsSource);
+
     return {
       probedAtIso: this.now().toISOString(),
       probedFrom: "orchestrator",
       checks,
       defaultBranch,
-      detectedScripts: scriptsSource === null ? [] : await this.detectScripts(scriptsSource),
+      detectedScripts,
+      ...(generatorState === undefined ? {} : { generatorState }),
     };
   }
 
@@ -389,6 +398,148 @@ export class ProjectProbeAdapter implements ProjectProbePort {
     return this.check("agent-instructions-tracked", host, "fail", "no AGENTS.md or CLAUDE.md is tracked");
   }
 
+  /**
+   * The project's generator state, read from files only: the manifest, the
+   * generator side-car and package.json are read with `cat`; the adoption
+   * markers are tested with `test`. No project code ever runs and nothing is
+   * written.
+   */
+  private async readGeneratorState(source: {
+    path: string;
+    executor: CommandExecutorPort;
+  }): Promise<ProjectGeneratorState | undefined> {
+    const root = source.path;
+    const architecture = `${root}/.architecture`;
+    // Absence is only believable when every directory above the path can be
+    // searched; `test -e` answers false for a path under an unsearchable one.
+    const rootDir = await this.directoryAccess(source.executor, root);
+    const architectureDir: DirectoryAccess =
+      rootDir !== "searchable"
+        ? rootDir
+        : await this.directoryAccess(source.executor, architecture);
+    const manifest = await this.readFile(
+      source.executor,
+      `${architecture}/manifest.yaml`,
+      architectureDir,
+    );
+    const sidecar = await this.readFile(
+      source.executor,
+      `${architecture}/generator.config.yaml`,
+      architectureDir,
+    );
+    const packageJson = await this.readFile(source.executor, `${root}/package.json`, rootDir);
+    const layoutPresent = await this.pathPresence(
+      source.executor,
+      `${architecture}/layout.yaml`,
+      false,
+      architectureDir,
+    );
+    const generatorDirectoryPresent = await this.pathPresence(
+      source.executor,
+      `${root}/.hexagen`,
+      true,
+      rootDir,
+    );
+    return (
+      decideGeneratorState({
+        manifest,
+        sidecar,
+        packageJson,
+        layoutPresent,
+        generatorDirectoryPresent,
+      }) ?? undefined
+    );
+  }
+
+  /**
+   * Whether a directory can be searched, is absent, or cannot be judged. A
+   * symlinked directory is never followed: it may point outside the clone.
+   */
+  private async directoryAccess(
+    executor: CommandExecutorPort,
+    path: string,
+  ): Promise<DirectoryAccess> {
+    const link = await this.runCommand(executor, ["test", "-L", path]);
+    if (this.unreachable(link) || link.exitCode !== 1) {
+      return "unknown";
+    }
+    const searchable = await this.runCommand(executor, ["test", "-d", path, "-a", "-x", path]);
+    if (this.unreachable(searchable)) {
+      return "unknown";
+    }
+    if (searchable.exitCode === 0) {
+      return "searchable";
+    }
+    const exists = await this.runCommand(executor, ["test", "-e", path]);
+    if (this.unreachable(exists)) {
+      return "unknown";
+    }
+    return exists.exitCode === 1 ? "absent" : "unknown";
+  }
+
+  /**
+   * One file's content, distinguishing absence from an unreadable answer: a
+   * file that exists but cannot be read must not count as absent, or an
+   * unreadable governed project would be recorded as holding no generator. A
+   * symlink is never read: `cat` would follow it to a file outside the clone.
+   */
+  private async readFile(
+    executor: CommandExecutorPort,
+    path: string,
+    parent: DirectoryAccess,
+  ): Promise<ProbeFileRead> {
+    if (parent === "absent") {
+      return { kind: "absent" };
+    }
+    if (parent !== "searchable") {
+      return { kind: "unknown" };
+    }
+    const link = await this.runCommand(executor, ["test", "-L", path]);
+    if (this.unreachable(link) || link.exitCode !== 1) {
+      // A symlink (exit 0) or an unjudgeable answer: never read through it.
+      return { kind: "unknown" };
+    }
+    const run = await this.runCommand(executor, ["cat", path], { maxBufferBytes: 1_048_576 });
+    if (this.unreachable(run)) {
+      return { kind: "unknown" };
+    }
+    if (run.exitCode === 0) {
+      return { kind: "read", text: run.stdout };
+    }
+    const exists = await this.runCommand(executor, ["test", "-e", path]);
+    if (this.unreachable(exists)) {
+      return { kind: "unknown" };
+    }
+    return exists.exitCode === 1 ? { kind: "absent" } : { kind: "unknown" };
+  }
+
+  /**
+   * Whether one path exists (or is a directory), distinguishing absence from
+   * an unreadable answer for the same reason as `readFile`: only exit code 1
+   * under a searchable parent is a confirmed absence.
+   */
+  private async pathPresence(
+    executor: CommandExecutorPort,
+    path: string,
+    directory: boolean,
+    parent: DirectoryAccess,
+  ): Promise<ProbePathPresence> {
+    if (parent === "absent") {
+      return "absent";
+    }
+    if (parent !== "searchable") {
+      return "unknown";
+    }
+    const run = await this.runCommand(executor, ["test", directory ? "-d" : "-e", path]);
+    if (this.unreachable(run)) {
+      return "unknown";
+    }
+    if (run.exitCode === 0) {
+      return "present";
+    }
+    return run.exitCode === 1 ? "absent" : "unknown";
+  }
+
   /** Script names of the clone's HEAD `package.json`; any failure → `[]`. */
   private async detectScripts(source: {
     host: string;
@@ -451,3 +602,182 @@ export class ProjectProbeAdapter implements ProjectProbePort {
     return { name, host, result, detail };
   }
 }
+
+/** One YAML scalar, with a trailing comment and quotes stripped. */
+function yamlScalar(text: string): string | null {
+  const trimmed = text.replace(/\s+#.*$/, "").trim();
+  if (trimmed === "") {
+    return null;
+  }
+  const unquoted = trimmed.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1").trim();
+  return unquoted === "" ? null : unquoted;
+}
+
+/** The value of a root-level (unindented) `key: value` line, or null. */
+function readRootScalar(text: string, key: string): string | null {
+  for (const line of text.split(/\r?\n/)) {
+    if (line.trim() === "" || line.trimStart().startsWith("#") || /^\s/.test(line)) {
+      continue;
+    }
+    const match = /^([A-Za-z0-9_.-]+):[ \t]*(.*)$/.exec(line);
+    if (match !== null && match[1] === key) {
+      return yamlScalar(match[2]);
+    }
+  }
+  return null;
+}
+
+/** The value of a `key: value` line directly inside the block after `start`. */
+function readBlockScalar(lines: readonly string[], start: number, key: string): string | null {
+  let childIndent: number | null = null;
+  for (let index = start; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.trim() === "") {
+      continue;
+    }
+    if (!/^\s/.test(line)) {
+      break;
+    }
+    const indent = line.length - line.trimStart().length;
+    if (childIndent === null) {
+      childIndent = indent;
+    }
+    if (indent !== childIndent) {
+      continue;
+    }
+    const match = /^([A-Za-z0-9_.-]+):[ \t]*(.*)$/.exec(line.trim());
+    if (match !== null && match[1] === key) {
+      return yamlScalar(match[2]);
+    }
+  }
+  return null;
+}
+
+/** The root `generator:` block of a manifest-like text, or null. */
+function readGeneratorBlock(text: string): { name: string | null; version: string | null } | null {
+  const lines = text.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.trim() === "" || line.trimStart().startsWith("#") || /^\s/.test(line)) {
+      continue;
+    }
+    const match = /^([A-Za-z0-9_.-]+):[ \t]*(.*)$/.exec(line);
+    if (match === null || match[1] !== "generator") {
+      continue;
+    }
+    return {
+      name: readBlockScalar(lines, index + 1, "name"),
+      version: readBlockScalar(lines, index + 1, "version"),
+    };
+  }
+  return null;
+}
+
+/** The hexagen pin a package.json states, or null when it states none. */
+function readGeneratorPin(text: string | null): { version: string } | null {
+  if (text === null) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return null;
+  }
+  const record = parsed as Record<string, unknown>;
+  for (const section of ["devDependencies", "dependencies"] as const) {
+    const dependencies = record[section];
+    if (typeof dependencies !== "object" || dependencies === null || Array.isArray(dependencies)) {
+      continue;
+    }
+    const entries = Object.entries(dependencies as Record<string, unknown>);
+    const pinned =
+      entries.find(([name]) => name === "@hexagen-monaco/sync") ??
+      entries.find(([name]) => name.startsWith("@hexagen-monaco/"));
+    if (pinned !== undefined && typeof pinned[1] === "string") {
+      return { version: pinned[1].trim() };
+    }
+  }
+  return null;
+}
+
+/** An exact version only: a range is not a pin the plan accepts. */
+const EXACT_VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta|rc|next|canary)(?:\.[0-9]+)*)?$/;
+
+/**
+ * The state the plan's §3 table gives for the files that were read. The
+ * manifest's `generator` block wins; the side-car is the fallback. A file that
+ * is confirmed absent counts as absent; a file that exists but could not be
+ * read (or whose presence could not be established) leaves the whole state
+ * unknown, so an unreadable governed project is never recorded as unmanaged.
+ */
+function decideGeneratorState(input: {
+  readonly manifest: ProbeFileRead;
+  readonly sidecar: ProbeFileRead;
+  readonly packageJson: ProbeFileRead;
+  readonly layoutPresent: ProbePathPresence;
+  readonly generatorDirectoryPresent: ProbePathPresence;
+}): ProjectGeneratorState | null {
+  if (
+    input.manifest.kind === "unknown" ||
+    input.sidecar.kind === "unknown" ||
+    input.packageJson.kind === "unknown" ||
+    input.layoutPresent === "unknown" ||
+    input.generatorDirectoryPresent === "unknown"
+  ) {
+    return null;
+  }
+  const manifest = input.manifest.kind === "read" ? input.manifest.text : null;
+  const sidecar = input.sidecar.kind === "read" ? input.sidecar.text : null;
+  const packageJson = input.packageJson.kind === "read" ? input.packageJson.text : null;
+  const layoutPresent = input.layoutPresent === "present";
+  const generatorDirectoryPresent = input.generatorDirectoryPresent === "present";
+  const manifestBlock = manifest === null ? null : readGeneratorBlock(manifest);
+  const sidecarBlock = sidecar === null ? null : readGeneratorBlock(sidecar);
+  const block = manifestBlock ?? sidecarBlock;
+  const name = block?.name ?? null;
+  const rawGeneratorVersion = block?.version ?? null;
+  // The recorded version must be a strict version: any other scalar the block
+  // carries — including a credential-shaped token built from allowed
+  // characters — is dropped, never persisted on the profile.
+  const generatorVersion =
+    rawGeneratorVersion !== null && EXACT_VERSION_PATTERN.test(rawGeneratorVersion)
+      ? rawGeneratorVersion
+      : null;
+  const schemaVersionText =
+    (manifest === null ? null : readRootScalar(manifest, "schemaVersion")) ??
+    (sidecar === null ? null : readRootScalar(sidecar, "schemaVersion"));
+  const schemaVersion =
+    schemaVersionText !== null && /^[0-9]+$/.test(schemaVersionText)
+      ? Number(schemaVersionText)
+      : null;
+  const pin = readGeneratorPin(packageJson);
+  const pinnedVersion = pin !== null && EXACT_VERSION_PATTERN.test(pin.version) ? pin.version : null;
+
+  let state: ProjectGeneratorStateValue;
+  if (name !== null && name.startsWith("@hexagen-monaco/") && schemaVersion !== null) {
+    state = "provisioned";
+  } else if (manifest !== null && name === null && pin !== null) {
+    state = "provisioned-legacy";
+  } else if (manifest === null && (layoutPresent || generatorDirectoryPresent)) {
+    state = "adopting";
+  } else {
+    state = "none";
+  }
+  return { state, generatorVersion, pinnedVersion };
+}
+
+/** One file read: its text, a confirmed absence, or an unreadable answer. */
+type ProbeFileRead =
+  | { readonly kind: "read"; readonly text: string }
+  | { readonly kind: "absent" }
+  | { readonly kind: "unknown" };
+
+/** One path's presence: confirmed present, confirmed absent, or unknown. */
+type ProbePathPresence = "present" | "absent" | "unknown";
+
+/** A directory above a probed path: searchable, confirmed absent, or unknown. */
+type DirectoryAccess = "searchable" | "absent" | "unknown";

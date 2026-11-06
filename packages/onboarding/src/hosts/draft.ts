@@ -298,11 +298,43 @@ export type ApplyHostDraftResult =
 export type ApplyHostDraftMode = 'add' | 'edit';
 
 /**
+ * In `edit` mode merge the drafted entry over the existing one, one level
+ * deep: a host field the draft carries wins, a field it does not carry
+ * (such as `container` or `roleAliases`) survives, and the `runner` block
+ * merges the same way so a field the drafted runner does not carry (such as
+ * `tunnelOffset`) survives. In `add` mode there is no existing entry, so
+ * nothing is merged.
+ */
+function mergeDraftedHost(
+  existing: HostSection,
+  drafted: HostSection,
+): HostSection {
+  const merged = { ...existing } as unknown as Record<string, unknown>;
+  for (const key of Object.keys(drafted)) {
+    if (key === 'runner') {
+      continue;
+    }
+    merged[key] = (drafted as unknown as Record<string, unknown>)[key];
+  }
+  if (drafted.runner !== undefined) {
+    const existingRunner = existing.runner;
+    merged.runner =
+      existingRunner === undefined
+        ? drafted.runner
+        : { ...existingRunner, ...drafted.runner };
+  }
+  // When the draft carries no runner block, the existing one survives.
+  return merged as unknown as HostSection;
+}
+
+/**
  * Apply one draft to a copy of the current installation value and return the
  * candidate file. The current value is never mutated: the candidate is a new
  * object whose `hosts` record is the current one plus the drafted entry. In
  * `add` mode a name already in the file is refused with `reason: "exists"`;
- * in `edit` mode a name that is not there is refused with `reason: "missing"`.
+ * in `edit` mode a name that is not there is refused with `reason: "missing"`
+ * and the drafted entry merges over the existing one, so a field the draft
+ * does not manage survives.
  * A file of schema version 1 carries no hosts and converting one is a mapping
  * step of its own (the conversion forces the isolation acknowledgement), so
  * it is refused here rather than half-done.
@@ -343,6 +375,15 @@ export function applyHostDraft(
   }
   return {
     ok: true,
-    candidate: { ...base, hosts: { ...base.hosts, [draft.name]: draft.host } },
+    candidate: {
+      ...base,
+      hosts: {
+        ...base.hosts,
+        [draft.name]:
+          mode === 'edit'
+            ? mergeDraftedHost(base.hosts[draft.name], draft.host)
+            : draft.host,
+      },
+    },
   };
 }

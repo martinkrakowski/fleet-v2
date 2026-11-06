@@ -395,4 +395,20 @@ describe('file store faults', () => {
     expect(await readdir(evil)).toEqual([]);
   });
 
+  it('does not let a record that reported a timeout take effect later', async () => {
+    const adapter = new GateReceiptReuseAdapter({ stateDir: dir, deadlineMs: 30 });
+    // Hold the write queue so the second record waits past its deadline.
+    const slow = (adapter as unknown as { serialized: (w: () => Promise<unknown>) => Promise<unknown> }).serialized(
+      () => new Promise((resolve) => setTimeout(resolve, 150)),
+    );
+    const late = await adapter.recordGateReceipt(request(makeKey()));
+    expect(late).toEqual({ outcome: 'refused', reason: 'store-timeout' });
+    await slow;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(await new GateReceiptReuseAdapter({ stateDir: dir }).findGateReceipt(makeKey())).toEqual({
+      outcome: 'miss',
+      reason: 'no-stored-receipt',
+    });
+  });
+
 });

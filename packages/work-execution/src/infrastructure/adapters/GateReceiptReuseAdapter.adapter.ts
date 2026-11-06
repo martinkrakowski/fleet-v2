@@ -18,7 +18,8 @@
  * refused; the configured `stateDir` is resolved once, at construction, to a canonical root (a symlinked
  * ancestor such as /tmp on macOS is followed there, once) and only that root is used afterwards; each call
  * checks the root still resolves to itself, so a later swap of an ancestor is a refusal, not a redirect;
- * the root, the store directory and every receipt file must not be symlinks; a secret-shaped key or reference is refused before anything is
+ * the root, the store directory and every receipt file must not be symlinks (Node has no openat, so a swap
+ * in the instant between a check and the next path operation is not closed; the checks narrow it); a secret-shaped key or reference is refused before anything is
  * written and is never echoed (results carry fixed reasons only).
  */
 
@@ -193,10 +194,18 @@ function serializeReceipt(key: GateReceiptKey, receipt: StoredReceipt): string {
 }
 
 /** Run `work` against a deadline; the late result of an overrun is discarded and never throws. */
-async function withDeadline<T>(deadlineMs: number, work: () => Promise<T>, onTimeout: T): Promise<T> {
+async function withDeadline<T>(
+  deadlineMs: number,
+  work: () => Promise<T>,
+  onTimeout: T,
+  onExpire?: () => void,
+): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<T>((resolve) => {
-    timer = setTimeout(() => resolve(onTimeout), deadlineMs);
+    timer = setTimeout(() => {
+      onExpire?.();
+      resolve(onTimeout);
+    }, deadlineMs);
   });
   try {
     return await Promise.race([work(), timeout]);
@@ -296,10 +305,16 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
       if (this.options?.readOnly === true) {
         return { outcome: 'refused', reason: 'store-read-only' };
       }
+      // A call that reports a timeout must not take effect later: the deadline marks the call expired, and
+      // the work checks the mark before it starts and immediately before the one step that publishes.
+      const call = { expired: false };
       return await withDeadline<RecordGateReceiptResult>(
         this.deadlineMs,
-        () => this.serialized(() => this.record(read.key, { verdict, receiptRef })),
+        () => this.serialized(() => this.record(read.key, { verdict, receiptRef }, call)),
         { outcome: 'refused', reason: 'store-timeout' },
+        () => {
+          call.expired = true;
+        },
       );
     } catch {
       return { outcome: 'refused', reason: 'store-failed' };
@@ -351,7 +366,14 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
     }
   }
 
-  private async record(key: GateReceiptKey, receipt: StoredReceipt): Promise<RecordGateReceiptResult> {
+  private async record(
+    key: GateReceiptKey,
+    receipt: StoredReceipt,
+    call: { expired: boolean },
+  ): Promise<RecordGateReceiptResult> {
+    if (call.expired) {
+      return { outcome: 'refused', reason: 'store-timeout' };
+    }
     const stateDir = this.options?.stateDir === undefined ? undefined : this.root;
     if (this.options?.stateDir === undefined) {
       const canonical = canonicalKey(key);
@@ -360,6 +382,9 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
       }
       if (this.memory.size >= this.maxRecords) {
         return { outcome: 'refused', reason: 'store-full' };
+      }
+      if (call.expired) {
+        return { outcome: 'refused', reason: 'store-timeout' };
       }
       this.memory.set(canonical, receipt);
       return { outcome: 'recorded' };
@@ -387,7 +412,7 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
       if (!replacing && (await this.storeIsFull(directory))) {
         return { outcome: 'refused', reason: 'store-full' };
       }
-      return await this.writeOnce(directory, target, key, serializeReceipt(key, receipt), replacing);
+      return await this.writeOnce(directory, target, key, serializeReceipt(key, receipt), replacing, call);
     } catch (error: unknown) {
       const reason: RecordGateReceiptRefusalReason =
         error instanceof StoreFailure ? error.reason : 'store-failed';
@@ -536,6 +561,7 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
     key: GateReceiptKey,
     content: string,
     replacing: boolean,
+    call: { expired: boolean },
   ): Promise<RecordGateReceiptResult> {
     this.tempCounter += 1;
     const temp = path.join(
@@ -553,6 +579,9 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
       await handle.sync();
       await handle.close();
       handle = null;
+      if (call.expired) {
+        return { outcome: 'refused', reason: 'store-timeout' };
+      }
       if (replacing) {
         // Replace an unreadable file only by removing it and then publishing exclusively, so two writers
         // repairing one key cannot both win: the second link finds the name taken. The file is read again
@@ -572,6 +601,9 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
           }
           await fs.rm(target, { force: true });
         }
+      }
+      if (call.expired) {
+        return { outcome: 'refused', reason: 'store-timeout' };
       }
       try {
         await fs.link(temp, target);

@@ -114,7 +114,7 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       readonly forge: MergeForgeActionPort;
       readonly attention: ChainAttentionPort;
       readonly now?: () => string;
-      /** `shadow` observes only: no intent, no forge write, no attention. Default `live`. */
+      /** `live` writes and is accepted only when passed explicitly; an omitted or unknown mode is `shadow` (observe only: no intent, no forge write, no attention). */
       readonly mode?: 'shadow' | 'live';
     },
   ) {}
@@ -159,7 +159,7 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
     if (head.outcome === 'unavailable') {
       return { outcome: 'skipped', reasonCode: 'main-unreadable', chains: [] };
     }
-    if (this.deps.mode === 'shadow') {
+    if (this.deps.mode !== 'live') {
       return this.observe(listed.records, head.headSha);
     }
     const chains: RefreshChainsChainReport[] = [];

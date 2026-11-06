@@ -198,7 +198,7 @@ function harness(script: {
     forge,
     attention,
     now: script.nowFn ?? (() => NOW),
-    ...(script.mode !== undefined ? { mode: script.mode } : {}),
+    mode: script.mode ?? 'live',
   });
   return { useCase, chains, forge, attention, trace };
 }
@@ -287,6 +287,22 @@ describe('RefreshChainsUseCase', () => {
     expect(h.forge.calls).toEqual(['head']);
     expect(h.attention.raises).toHaveLength(0);
     expect(h.attention.clears).toHaveLength(0);
+  });
+
+  it('a construction with no mode, or an unknown mode, makes zero forge writes', async () => {
+    for (const extra of [{}, { mode: 'bogus' as never }]) {
+      const trace: string[] = [];
+      const chains = new FakeChains([startedRecord()], trace);
+      const forge = new FakeForge(trace);
+      const attention = new FakeAttention();
+      const useCase = new RefreshChainsUseCase({ chains, forge, attention, now: () => NOW, ...extra });
+      const result = await useCase.runRefreshChains(command());
+      expect(result.reasonCode).toBe('shadow-would-refresh-1');
+      expect(trace).toEqual(['list', 'head']);
+      expect(forge.calls).toEqual(['head']);
+      expect(attention.raises).toHaveLength(0);
+      expect(attention.clears).toHaveLength(0);
+    }
   });
 
   it('shadow mode reports a chain already refreshed at this main head as nothing to do', async () => {

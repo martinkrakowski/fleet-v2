@@ -968,6 +968,43 @@ describe('ManageReleaseUseCase', () => {
     expect(store.current).toBe(A);
   });
 
+  it('refuses current-moved when another release repointed before this one took the lease', async () => {
+    const builds = [build('a', 1), build('b', 2), build('c', 3)];
+    for (const [action, sha, target, kind] of [
+      ['rollback', null, B, ROLLBACK],
+      ['swap', A, A, SWAP],
+    ] as const) {
+      const lease = new FakeLease(null);
+      const store = new FakeStore(builds, C);
+      const made = granted(kind, target, { lease, store });
+      const acquire = lease.acquire.bind(lease);
+      lease.acquire = async (input) => {
+        store.current = B; // a concurrent release (holding the lease before us) repointed to B
+        return acquire(input);
+      };
+      expect(
+        await manage(made.useCase, applyRequest({ action, sha, source: null })),
+      ).toEqual({ outcome: 'refused', reason: 'current-moved' });
+      expect(store.current).toBe(B);
+      expect(store.calls).not.toContain(`repoint ${target}`);
+      expect(made.authorization.consumes).toEqual([]);
+      expect(lease.held).toBeNull();
+    }
+  });
+
+  it('an unfinished prune still reports the builds it removed, never as kept', async () => {
+    const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4), build('e', 5)], E);
+    store.prune = async () => ({ outcome: 'unreadable', removed: [A] });
+    const { useCase } = granted(SWAP, D, { store });
+    expect(await manage(useCase, applyRequest({ action: 'swap', sha: D, source: null, keep: 2 }))).toMatchObject({
+      outcome: 'applied',
+      current: D,
+      pruned: [A],
+      kept: [B, C, D, E],
+      pruneOutcome: 'unreadable',
+    });
+  });
+
   it('reports an unreadable prune instead of a false success', async () => {
     const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4), build('e', 5)], E);
     store.pruneUnreadable = true;

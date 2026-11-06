@@ -176,7 +176,7 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     const orphansClean = await removeOrphans(input.root);
     return removal.complete && orphansClean
       ? { outcome: 'pruned', removed: removal.removed }
-      : { outcome: 'unreadable' };
+      : { outcome: 'unreadable', removed: removal.removed };
   }
 
   async discard(input: { readonly root: string; readonly buildId: string }): Promise<ReleaseStoreWriteResult> {

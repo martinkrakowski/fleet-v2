@@ -154,14 +154,14 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     if (live) {
       return refuse('driver-lease-live');
     }
-    return this.apply(request, target, kept, alreadyBuilt);
+    return this.apply(request, target, current, alreadyBuilt);
   }
 
   /** The apply path: grant, build when needed, the fenced repoint, then prune. */
   private async apply(
     request: ValidRequest,
     target: string,
-    kept: readonly string[],
+    plannedCurrent: string | null,
     alreadyBuilt: boolean,
   ): Promise<ManageReleaseResult> {
     const grant = await this.resolveGrant(request, target);
@@ -176,19 +176,19 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       }
       rebuilt = true;
     }
-    const repointed = await this.fencedRepoint(request, target, grant);
+    const repointed = await this.fencedRepoint(request, target, plannedCurrent, grant);
     if ('refusal' in repointed) {
       return refuse(repointed.refusal);
     }
-    const { pruned } = repointed;
-    const afterShas = rebuilt ? [...kept, target] : kept;
-    const removed = pruned.outcome === 'pruned' ? pruned.removed : [];
+    const { pruned, kept } = repointed;
+    // An unfinished prune still reports what it did remove, so `kept` never lists a deleted build.
+    const removed = pruned.removed ?? [];
     const applied: ManageReleaseApplied = {
       outcome: 'applied',
       action: request.action,
       target,
       current: target,
-      kept: afterShas.filter((sha) => !removed.includes(sha)),
+      kept: kept.filter((sha) => !removed.includes(sha)),
       pruned: [...removed],
       pruneOutcome: pruned.outcome === 'pruned' ? 'pruned' : 'unreadable',
       rebuilt,
@@ -244,13 +244,28 @@ export class ManageReleaseUseCase implements ManageReleasePort {
   private async fencedRepoint(
     request: ValidRequest,
     target: string,
+    plannedCurrent: string | null,
     grantId: string,
-  ): Promise<{ readonly refusal: ManageReleaseRefusal } | { readonly pruned: ReleaseStorePruneResult }> {
+  ): Promise<
+    | { readonly refusal: ManageReleaseRefusal }
+    | { readonly pruned: ReleaseStorePruneResult; readonly kept: readonly string[] }
+  > {
     const held = await this.acquireLease(request, target);
     if (typeof held === 'string') {
       return { refusal: held };
     }
     try {
+      // Revalidate under the lease: another release may have repointed while
+      // this one resolved its grant or built, so the target must still be what
+      // the plan named against the same `current`.
+      const fresh = await this.deps.store.list({ root: request.root });
+      if (fresh.outcome !== 'read') {
+        return { refusal: 'store-unreadable' };
+      }
+      if (!stillTargets(request.action, fresh.builds, fresh.current, plannedCurrent, target)) {
+        return { refusal: 'current-moved' };
+      }
+      const kept = fresh.builds.map((build) => build.sha);
       const consumed = await this.consumeGrant(request, target, grantId);
       if (consumed !== null) {
         return { refusal: consumed };
@@ -267,6 +282,7 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       // prune of an applied release, never a refusal a caller would retry.
       try {
         return {
+          kept,
           pruned: await this.deps.store.prune({
             root: request.root,
             keep: request.keep,
@@ -274,7 +290,7 @@ export class ManageReleaseUseCase implements ManageReleasePort {
           }),
         };
       } catch {
-        return { pruned: { outcome: 'unreadable' } };
+        return { kept, pruned: { outcome: 'unreadable' } };
       }
     } finally {
       await this.releaseLease(held);
@@ -458,6 +474,23 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       return false;
     }
   }
+}
+
+/** The fresh listing still has `current` where the plan saw it, and the target is still the action's target. */
+function stillTargets(
+  action: ReleaseAction,
+  builds: readonly ReleaseBuildRecord[],
+  current: string | null,
+  plannedCurrent: string | null,
+  target: string,
+): boolean {
+  if (current !== plannedCurrent) {
+    return false;
+  }
+  if (action === 'rollback') {
+    return previousBuild(builds, current) === target;
+  }
+  return builds.some((build) => build.sha === target);
 }
 
 function repointRefusal(outcome: 'fenced' | 'not-found' | 'not-verified' | 'unreadable'): ManageReleaseRefusal {

@@ -37,6 +37,7 @@ export type ManageReleaseRefusal =
   | 'authority-required'
   | 'authority-refused'
   | 'authority-unknown'
+  | 'current-moved'
   | 'driver-lease-live'
   | 'lease-unknown'
   | 'not-found'

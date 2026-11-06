@@ -31,7 +31,8 @@ export type ReleaseStoreWriteResult =
 
 export type ReleaseStorePruneResult =
   | { readonly outcome: 'pruned'; readonly removed: readonly string[] }
-  | { readonly outcome: 'unreadable' };
+  /** An unfinished prune; `removed` names any builds it did take out first. */
+  | { readonly outcome: 'unreadable'; readonly removed?: readonly string[] };
 
 /** A fresh staging directory created by this `prepare` call; the paths stay inside the application. */
 export type ReleaseStagingResult =

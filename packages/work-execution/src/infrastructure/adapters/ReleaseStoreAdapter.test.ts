@@ -170,7 +170,7 @@ describe('ReleaseStoreAdapter', () => {
       await fs.rename(path.join(root, '.current.race.tmp'), path.join(root, 'current'));
       return listing;
     };
-    expect(await adapter.prune({ root, keep: 2 })).toEqual({ outcome: 'unreadable' });
+    expect(await adapter.prune({ root, keep: 2 })).toEqual({ outcome: 'unreadable', removed: [] });
     expect((await fs.lstat(path.join(root, B))).isDirectory()).toBe(true);
     expect(await fs.readFile(path.join(root, 'current', 'apps', 'cli', 'dist', 'bin.js'), 'utf8')).toBe('// cli\n');
   });
@@ -185,7 +185,7 @@ describe('ReleaseStoreAdapter', () => {
       calls += 1;
       return calls === 1;
     };
-    expect(await adapter.prune({ root, keep: 2, fence })).toEqual({ outcome: 'unreadable' });
+    expect(await adapter.prune({ root, keep: 2, fence })).toEqual({ outcome: 'unreadable', removed: [A] });
     expect(calls).toBe(2);
     expect((await fs.readdir(root)).sort()).toEqual([B, C, D, E, 'current'].sort());
     expect(await adapter.prune({ root, keep: 2, fence: async () => true })).toEqual({ outcome: 'pruned', removed: [B, C] });

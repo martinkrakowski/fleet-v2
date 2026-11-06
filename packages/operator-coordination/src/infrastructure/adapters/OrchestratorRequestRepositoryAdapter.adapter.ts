@@ -589,7 +589,7 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
     try {
       const stat = await fs.stat(target);
       if (stat.size > MAX_ORCHESTRATOR_REQUEST_STORE_BYTES) {
-        // Never read an oversized file into memory. Read-only: refuse. Writable: quarantine by rename, then treat as absent.
+        // Never read an oversized file into memory. Read-only: refuse. Writable: quarantine by rename, then report unknown for this call.
         if (this.options?.readOnly === true) {
           return { kind: 'unreadable' };
         }
@@ -598,7 +598,8 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
         } catch {
           return { kind: 'unreadable' };
         }
-        return { kind: 'loaded', records: new Map<string, OrchestratorRequestRecord>() };
+        // The quarantining call itself reports unknown (brief recovery rule); the next call finds the file gone and sees an empty store.
+        return { kind: 'unreadable' };
       }
       buffer = await fs.readFile(target);
     } catch (error: unknown) {

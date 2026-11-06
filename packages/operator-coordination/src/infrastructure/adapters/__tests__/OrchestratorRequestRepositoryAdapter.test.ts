@@ -308,23 +308,39 @@ describe('OrchestratorRequestRepositoryAdapter', () => {
     }
   });
 
-  it('quarantines a writable oversized store by rename without reading it, then treats the store as absent', async () => {
+  it('quarantines a writable oversized store by rename without reading it, then reports unknown for that call only and sees an empty store on the next', async () => {
     const storePath = path.join(tempDir, 'orchestrator-requests.json');
     await fs.writeFile(storePath, '');
     await fs.truncate(storePath, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
     const readSpy = vi.spyOn(fs, 'readFile');
     try {
       const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
-      expect(await adapter.get(R1)).toEqual({ outcome: 'missing' });
+      expect(await adapter.get(R1)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
       expect(readSpy.mock.calls.filter(([target]) => target === storePath)).toEqual([]);
       const quarantined = await fs.readdir(path.join(tempDir, 'quarantine'));
       expect(quarantined).toHaveLength(1);
       expect((await fs.stat(path.join(tempDir, 'quarantine', quarantined[0]!))).size).toBe(
         MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1,
       );
+      expect(await adapter.get(R1)).toEqual({ outcome: 'missing' });
       expect((await adapter.save(initialRequest(R1), 0)).outcome).toBe('saved');
     } finally {
       readSpy.mockRestore();
+    }
+  });
+
+  it('reports unknown from list and save on the call that quarantines a writable oversized store, and writes nothing over it', async () => {
+    for (const op of ['list', 'save'] as const) {
+      const dir = await fs.mkdtemp(path.join(tempDir, `oversized-${op}-`));
+      const storePath = path.join(dir, 'orchestrator-requests.json');
+      await fs.writeFile(storePath, '');
+      await fs.truncate(storePath, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
+      const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: dir });
+      const result = op === 'list' ? await adapter.list() : await adapter.save(initialRequest(R1), 0);
+      expect(result).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+      await expect(fs.stat(storePath)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await fs.readdir(path.join(dir, 'quarantine'))).toHaveLength(1);
+      expect(await adapter.list()).toEqual({ outcome: 'ok', requests: [], truncated: false });
     }
   });
 

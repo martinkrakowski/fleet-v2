@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, readdir, readFile, rename, rm, symlink, writeFile, utim
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { GateReceiptKey } from '../../../domain/gate-receipt-key.js';
 import {
@@ -409,6 +409,23 @@ describe('file store faults', () => {
       outcome: 'miss',
       reason: 'no-stored-receipt',
     });
+  });
+
+  it('lets a record that is already publishing finish and report its own result', async () => {
+    const adapter = new GateReceiptReuseAdapter({ stateDir: dir, deadlineMs: 20 });
+    const fsMod = await import('node:fs');
+    const original = fsMod.promises.link;
+    const spy = vi.spyOn(fsMod.promises, 'link').mockImplementation(async (a, b) => {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      return original(a, b);
+    });
+    try {
+      const result = await adapter.recordGateReceipt(request(makeKey()));
+      expect(result).toEqual({ outcome: 'recorded' });
+    } finally {
+      spy.mockRestore();
+    }
+    expect((await adapter.findGateReceipt(makeKey())).outcome).toBe('hit');
   });
 
 });

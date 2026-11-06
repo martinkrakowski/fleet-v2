@@ -84,6 +84,13 @@ type StoredRead =
   | { readonly status: 'version-unknown' }
   | { readonly status: 'failed' };
 
+interface RecordCall {
+  /** Set by the deadline: nothing may be published any more. */
+  expired: boolean;
+  /** Set just before the first step that changes the store: the deadline then lets the call finish. */
+  committing: boolean;
+}
+
 class StoreFailure extends Error {
   constructor(readonly reason: 'store-unreadable' | 'store-failed') {
     super(reason);
@@ -198,13 +205,15 @@ async function withDeadline<T>(
   deadlineMs: number,
   work: () => Promise<T>,
   onTimeout: T,
-  onExpire?: () => void,
+  onExpire?: () => boolean,
 ): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<T>((resolve) => {
     timer = setTimeout(() => {
-      onExpire?.();
-      resolve(onTimeout);
+      // true: the call is already publishing, so it is left to finish and report its own result.
+      if (onExpire?.() !== true) {
+        resolve(onTimeout);
+      }
     }, deadlineMs);
   });
   try {
@@ -307,13 +316,17 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
       }
       // A call that reports a timeout must not take effect later: the deadline marks the call expired, and
       // the work checks the mark before it starts and immediately before the one step that publishes.
-      const call = { expired: false };
+      const call: RecordCall = { expired: false, committing: false };
       return await withDeadline<RecordGateReceiptResult>(
         this.deadlineMs,
         () => this.serialized(() => this.record(read.key, { verdict, receiptRef }, call)),
         { outcome: 'refused', reason: 'store-timeout' },
         () => {
+          if (call.committing) {
+            return true;
+          }
           call.expired = true;
+          return false;
         },
       );
     } catch {
@@ -366,47 +379,26 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
     }
   }
 
-  private async record(
-    key: GateReceiptKey,
-    receipt: StoredReceipt,
-    call: { expired: boolean },
-  ): Promise<RecordGateReceiptResult> {
+  private async record(key: GateReceiptKey, receipt: StoredReceipt, call: RecordCall): Promise<RecordGateReceiptResult> {
     if (call.expired) {
       return { outcome: 'refused', reason: 'store-timeout' };
     }
-    const stateDir = this.options?.stateDir === undefined ? undefined : this.root;
     if (this.options?.stateDir === undefined) {
-      const canonical = canonicalKey(key);
-      if (this.memory.has(canonical)) {
-        return { outcome: 'already-recorded' };
-      }
-      if (this.memory.size >= this.maxRecords) {
-        return { outcome: 'refused', reason: 'store-full' };
-      }
-      if (call.expired) {
-        return { outcome: 'refused', reason: 'store-timeout' };
-      }
-      this.memory.set(canonical, receipt);
-      return { outcome: 'recorded' };
+      return this.recordInMemory(key, receipt, call);
     }
     try {
-      if (stateDir === null || stateDir === undefined) {
+      if (this.root === null) {
         return { outcome: 'refused', reason: 'store-unreadable' };
       }
-      const directory = await this.openStoreDirectory(stateDir, true);
+      const directory = await this.openStoreDirectory(this.root, true);
       if (directory === null) {
         return { outcome: 'refused', reason: 'store-failed' };
       }
       const target = path.join(directory, `${keyDigest(key)}.json`);
       const existing = await this.readStored(target, key);
-      if (existing.status === 'ok') {
-        return { outcome: 'already-recorded' };
-      }
-      if (existing.status === 'version-unknown') {
-        return { outcome: 'refused', reason: 'store-version-unknown' };
-      }
-      if (existing.status === 'failed') {
-        return { outcome: 'refused', reason: 'store-failed' };
+      const refusal = this.refusalFor(existing);
+      if (refusal !== null) {
+        return refusal;
       }
       const replacing = existing.status === 'unreadable';
       if (!replacing && (await this.storeIsFull(directory))) {
@@ -418,6 +410,35 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
         error instanceof StoreFailure ? error.reason : 'store-failed';
       return { outcome: 'refused', reason };
     }
+  }
+
+  /** The result that ends a record early for what is already stored, or null when the record goes on. */
+  private refusalFor(existing: StoredRead): RecordGateReceiptResult | null {
+    switch (existing.status) {
+      case 'ok':
+        return { outcome: 'already-recorded' };
+      case 'version-unknown':
+        return { outcome: 'refused', reason: 'store-version-unknown' };
+      case 'failed':
+        return { outcome: 'refused', reason: 'store-failed' };
+      default:
+        return null;
+    }
+  }
+
+  private recordInMemory(key: GateReceiptKey, receipt: StoredReceipt, call: RecordCall): RecordGateReceiptResult {
+    const canonical = canonicalKey(key);
+    if (this.memory.has(canonical)) {
+      return { outcome: 'already-recorded' };
+    }
+    if (this.memory.size >= this.maxRecords) {
+      return { outcome: 'refused', reason: 'store-full' };
+    }
+    if (call.expired) {
+      return { outcome: 'refused', reason: 'store-timeout' };
+    }
+    this.memory.set(canonical, receipt);
+    return { outcome: 'recorded' };
   }
 
   /**
@@ -561,7 +582,7 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
     key: GateReceiptKey,
     content: string,
     replacing: boolean,
-    call: { expired: boolean },
+    call: RecordCall,
   ): Promise<RecordGateReceiptResult> {
     this.tempCounter += 1;
     const temp = path.join(
@@ -582,6 +603,8 @@ export class GateReceiptReuseAdapter implements GateReceiptReusePort {
       if (call.expired) {
         return { outcome: 'refused', reason: 'store-timeout' };
       }
+      // From here the call changes the store (remove and/or link); the deadline no longer abandons it.
+      call.committing = true;
       if (replacing) {
         // Replace an unreadable file only by removing it and then publishing exclusively, so two writers
         // repairing one key cannot both win: the second link finds the name taken. The file is read again

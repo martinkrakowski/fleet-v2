@@ -110,6 +110,7 @@ const STEP_SPAN_KINDS: Readonly<Record<LaneRunKeyStep, TelemetrySpanKind>> = Obj
   push: 'TOOL',
   merge: 'TOOL',
   premerge: 'TOOL',
+  'merge-enqueue': 'TOOL',
   ci: 'GUARDRAIL', // GB4: a CI check is a guardrail, like the gate
 });
 
@@ -481,7 +482,7 @@ function buildStepSpan(
   // A premerge step key never builds a step span: it parses as kind
   // 'premerge' (never kind 'step'), so this guard is unreachable at runtime
   // and only keeps the span name within the fixed span-name union.
-  if (parsed.step === 'premerge') {
+  if (parsed.step === 'premerge' || parsed.step === 'merge-enqueue') {
     return;
   }
   const final = finalResultOf(group.results);

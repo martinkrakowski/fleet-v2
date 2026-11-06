@@ -9,6 +9,9 @@
  * the key, `<runId>/park/<n>/resume@<via>` (with via web or cli), the request channel's
  * `request/<requestId>`, the reaper's `reaper/<subjectId>/<kind>@<findingId>`,
  * the premerge receipt key `<runId>/r<round>/premerge@<head12>` (KS7a-1, PR #571),
+ * the merge-enqueue key `<runId>/r<round>/merge-enqueue@<head12>` (KS7b; the two-way
+ * hand-off to the merge queue that replaces the one-way `merge` step key, which is still
+ * parsed so a journal written before KS7b replays),
  * and the `merge/` family: `merge/<repoDigest>/<pr>/<head12>/<action>[/r<n>]`
  * for one-way actions with proof-gated retry, and
  * `merge/<repoDigest>/<pr>/<head12>/<action>/a<n>` for two-way actions
@@ -143,6 +146,12 @@ export type ParsedLaneRunKey =
       readonly round: number;
       readonly head12: string;
     }
+  | {
+      readonly kind: 'merge-enqueue';
+      readonly runId: string;
+      readonly round: number;
+      readonly head12: string;
+    }
   | ({ readonly kind: 'merge' } & ParsedMergeKeyParts)
   | {
       readonly kind: 'reaper';
@@ -233,6 +242,12 @@ export function buildLaneRunStepKey(parts: LaneRunStepKeyParts): LaneRunKeyResul
       head12: read('head12'),
       retry: read('retry'),
     };
+
+    // The merge-enqueue step has no seat-index key shape either: its key is built
+    // by laneRunMergeEnqueueKey (`<runId>/r<round>/merge-enqueue@<head12>`).
+    if (snapshot.step === 'merge-enqueue') {
+      return { ok: false, error: 'LaneRun key step merge-enqueue has no seat index' };
+    }
 
     // The premerge step has no seat-index key shape: its key is built by
     // laneRunPremergeKey instead (`<runId>/r<round>/premerge@<head12>`).
@@ -351,6 +366,24 @@ export function laneRunPremergeKey(runId: string, round: number, head12: string)
     return { ok: false, error: 'LaneRun key head12 must be 12 lowercase hex characters' };
   }
   return { ok: true, key: runId + '/r' + round + '/premerge@' + head12 };
+}
+
+/**
+ * The merge-enqueue key `<runId>/r<round>/merge-enqueue@<head12>` (KS7b): the
+ * conducted run's hand-off to the daemon's merge queue, one per round and head.
+ * No seat index, no attempt ordinal, no retry. Never throws.
+ */
+export function laneRunMergeEnqueueKey(runId: string, round: number, head12: string): LaneRunKeyResult {
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+    return { ok: false, error: 'LaneRun key runId must be run- followed by a ULID' };
+  }
+  if (!Number.isInteger(round) || round < 0 || round > 2) {
+    return { ok: false, error: 'LaneRun key round must be 0, 1 or 2' };
+  }
+  if (typeof head12 !== 'string' || !HEAD12_PATTERN.test(head12)) {
+    return { ok: false, error: 'LaneRun key head12 must be 12 lowercase hex characters' };
+  }
+  return { ok: true, key: runId + '/r' + round + '/merge-enqueue@' + head12 };
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -655,6 +688,31 @@ function parsePremergeKeySegments(segments: string[], key: string): ParsedLaneRu
   return { kind: 'premerge', runId: segments[0], round, head12 };
 }
 
+/** The three-segment merge-enqueue key `<runId>/r<round>/merge-enqueue@<head12>`; null for any other shape. */
+function parseMergeEnqueueKeySegments(segments: string[], key: string): ParsedLaneRunKey | null {
+  if (segments[0] === 'reaper') {
+    return null;
+  }
+  if (!ROUND_SEGMENT_PATTERN.test(segments[1])) {
+    return null;
+  }
+  const tail = segments[2];
+  const atIndex = tail.indexOf('@');
+  if (atIndex === -1 || tail.indexOf('@', atIndex + 1) !== -1) {
+    return null;
+  }
+  if (tail.slice(0, atIndex) !== 'merge-enqueue') {
+    return null;
+  }
+  const round = Number(segments[1].slice(1));
+  const head12 = tail.slice(atIndex + 1);
+  const built = laneRunMergeEnqueueKey(segments[0], round, head12);
+  if (!built.ok || built.key !== key) {
+    return null;
+  }
+  return { kind: 'merge-enqueue', runId: segments[0], round, head12 };
+}
+
 function parseReaperKeySegments(segments: string[], key: string): ParsedLaneRunKey | null {
   if (segments[0] !== 'reaper') {
     return null;
@@ -771,6 +829,10 @@ export function parseLaneRunKey(key: unknown): ParsedLaneRunKey | null {
     const premerge = parsePremergeKeySegments(segments, key);
     if (premerge !== null) {
       return premerge;
+    }
+    const mergeEnqueue = parseMergeEnqueueKeySegments(segments, key);
+    if (mergeEnqueue !== null) {
+      return mergeEnqueue;
     }
     return parseReaperKeySegments(segments, key);
   }

@@ -620,11 +620,28 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
           if (currentRevision !== request.attemptRevision) {
             return { outcome: 'changed' };
           }
+          const priorList = [...reservations.values()];
           reservations.set(
             held.id,
             normalizeReservationRecord({ ...held, held: false, releasedAtIso: request.releasedAtIso }),
           );
           await writeJsonAtomically(target, [...reservations.values()]);
+          // The attempt store is not under the reservations lock, so a writer
+          // can save a newer attempt revision between the first read and the
+          // write above. Re-read the revision after the write: if it moved,
+          // restore the prior list (still under the lock) and report `changed`.
+          let verifiedRevision: number | null;
+          try {
+            verifiedRevision = await request.readAttemptRevision();
+          } catch {
+            verifiedRevision = null;
+          }
+          if (verifiedRevision !== request.attemptRevision) {
+            await writeJsonAtomically(target, priorList);
+            return verifiedRevision === null
+              ? { outcome: 'unknown', reason: 'attempt-unknown' }
+              : { outcome: 'changed' };
+          }
           try {
             const stat = await fs.stat(target);
             written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };

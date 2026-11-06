@@ -97,6 +97,21 @@ describe('ExecutionJournalAdapter fenced capacity release (plan §3.9.2)', () =>
     expect(await fileSha256(target)).toBe(before);
   });
 
+  it('reports changed and restores the reservation when the attempt revision moves during the release', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await adapter.saveCapacityReservation(heldReservation());
+    let reads = 0;
+
+    const result = await adapter.releaseCapacityReservationIfUnchanged(
+      fencedRequest({ readAttemptRevision: () => Promise.resolve(++reads === 1 ? 3 : 4) }),
+    );
+
+    expect(result).toEqual({ outcome: 'changed' });
+    const active = await adapter.listActiveReservations();
+    expect(active.map((r) => r.id)).toEqual(['res-1']);
+    expect(active[0]?.releasedAtIso).toBeNull();
+  });
+
   it('reports changed when the observed reservation is not the held one', async () => {
     const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
     await adapter.saveCapacityReservation(heldReservation());

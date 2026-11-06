@@ -3,8 +3,8 @@
  * §4.4, third property). Once the run's projected state is terminal (`merged`
  * or `stopped`), the conductor never leaves it: every later pass decides
  * `done` and writes nothing — the journal length and the record's revision
- * stay unchanged. The transition table itself must have no exit from a
- * terminal state.
+ * stay unchanged, and no acting port is called. The transition table itself
+ * must have no exit from a terminal state.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -26,8 +26,22 @@ describe('Q4b: a terminal lane-run state is absorbing', () => {
       const before = await scenario.journal();
       const recordBefore = await scenario.record();
       for (let pass = 0; pass < 3; pass += 1) {
+        // A terminal pass calls no acting port: capture every wired port's
+        // call count before the pass and refuse any increase after it — a
+        // pass that called dispatch (or the forge or merge port) without
+        // changing the journal or the record would otherwise pass.
+        const callsBefore = [
+          scenario.dispatchCalls(),
+          scenario.reconcileCalls(),
+          scenario.forgeActionCalls(),
+          scenario.mergeCalls(),
+        ];
         const result = await scenario.advance();
         expect(result).toEqual({ outcome: 'done' });
+        expect(scenario.dispatchCalls()).toBe(callsBefore[0]);
+        expect(scenario.reconcileCalls()).toBe(callsBefore[1]);
+        expect(scenario.forgeActionCalls()).toBe(callsBefore[2]);
+        expect(scenario.mergeCalls()).toBe(callsBefore[3]);
       }
       const after = await scenario.journal();
       expect(after.length).toBe(before.length);

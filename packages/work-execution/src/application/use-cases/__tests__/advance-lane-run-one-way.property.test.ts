@@ -4,8 +4,11 @@
  * once a one-way step key is settled — the journal holds a `result` entry for
  * it whose outcome is final (`ambiguous` is the only non-final outcome) — the
  * conductor performs no further act under that key: no new journal entry, and
- * no further call of the acting port. The fixture holds exactly one attempt
- * and one dispatch key, so a single dispatch-call counter covers property (b).
+ * no further call of the acting port. Each acting port is counted: dispatch
+ * (`DispatchAttemptPort`), the forge (`ExecuteAuthorizedForgeActionPort`,
+ * the acting port of `open-pr` and `push`) and merge (`AutoMergeAttemptPort`),
+ * so a duplicate act after a settled result fails the property with or
+ * without a new journal entry.
  */
 
 import fc from 'fast-check';
@@ -18,6 +21,7 @@ import {
   FakePortThrowError,
   makeLaneRunScenario,
   portOutcomeSequenceArb,
+  type LaneRunScenario,
 } from './lane-run-property-generators.js';
 
 function settledOneWayKeys(entries: readonly LaneRunJournalEntryRecord[]): Set<string> {
@@ -38,14 +42,40 @@ function settledOneWayKeys(entries: readonly LaneRunJournalEntryRecord[]): Set<s
   return settled;
 }
 
-function hasSettledDispatchKey(settled: ReadonlySet<string>): boolean {
+/** The distinct one-way steps of the settled keys. */
+function settledOneWaySteps(settled: ReadonlySet<string>): Set<string> {
+  const steps = new Set<string>();
   for (const key of settled) {
     const parsed = parseLaneRunKey(key);
-    if (parsed !== null && parsed.kind === 'step' && parsed.step === 'dispatch') {
-      return true;
+    if (parsed !== null && parsed.kind === 'step') {
+      steps.add(parsed.step);
     }
   }
-  return false;
+  return steps;
+}
+
+/**
+ * The acting-port counter each one-way step maps to: `dispatch` calls
+ * `DispatchAttemptPort`, `open-pr` and `push` both act through the forge
+ * (`ExecuteAuthorizedForgeActionPort`), and `merge` acts through
+ * `AutoMergeAttemptPort`. A settled key whose step has a counter refuses any
+ * further call of that port — a duplicate act without a new journal entry
+ * still fails the property.
+ */
+function actingPortCallsOf(
+  step: string,
+  scenario: LaneRunScenario,
+): (() => number) | null {
+  if (step === 'dispatch') {
+    return scenario.dispatchCalls;
+  }
+  if (step === 'open-pr' || step === 'push') {
+    return scenario.forgeActionCalls;
+  }
+  if (step === 'merge') {
+    return scenario.mergeCalls;
+  }
+  return null;
 }
 
 describe('Q4b: a one-way key is never acted on twice', () => {
@@ -56,7 +86,16 @@ describe('Q4b: a one-way key is never acted on twice', () => {
         for (let pass = 0; pass < 4; pass += 1) {
           const before = await scenario.journal();
           const settled = settledOneWayKeys(before);
-          const callsBefore = scenario.dispatchCalls();
+          // (b) snapshot: each settled one-way step's acting-port call count,
+          // taken before the pass, so a duplicate act after settlement — with
+          // or without a new journal entry — fails the property.
+          const callsBefore = new Map<string, number>();
+          for (const step of settledOneWaySteps(settled)) {
+            const portCalls = actingPortCallsOf(step, scenario);
+            if (portCalls !== null) {
+              callsBefore.set(step, portCalls());
+            }
+          }
           try {
             await scenario.advance();
           } catch (error) {
@@ -74,9 +113,15 @@ describe('Q4b: a one-way key is never acted on twice', () => {
               throw new Error('a settled one-way key was acted on again');
             }
           }
-          // (b) the dispatch port is not called again once the dispatch key is settled
-          if (hasSettledDispatchKey(settled)) {
-            expect(scenario.dispatchCalls()).toBe(callsBefore);
+          // (b) no acting port is called again once its step's key is settled:
+          // a duplicate open-pr, push or merge call without a new journal
+          // entry must still fail this property.
+          for (const [step, countBefore] of callsBefore) {
+            const portCalls = actingPortCallsOf(step, scenario);
+            if (portCalls === null) {
+              continue;
+            }
+            expect(portCalls()).toBe(countBefore);
           }
         }
       }),

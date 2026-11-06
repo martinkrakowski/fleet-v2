@@ -24,6 +24,8 @@ import {
 } from '../../../domain/lane-run-step-facts.js';
 import type { DispatchAttemptResult } from '../../ports/in/DispatchAttemptPort.in-port.js';
 import type { ReconcileAttemptResult } from '../../ports/in/ReconcileAttemptPort.in-port.js';
+import type { ExecuteAuthorizedForgeActionResult } from '../../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
+import type { AutoMergeAttemptResult } from '../../ports/in/AutoMergeAttemptPort.in-port.js';
 import type { AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import {
   AdvanceLaneRunUseCase,
@@ -174,6 +176,12 @@ export interface LaneRunScenario {
   record(): Promise<LaneRunRecord | null>;
   /** How many times the fake dispatch port has been called so far. */
   dispatchCalls(): number;
+  /** How many times the fake reconcile port has been called so far. */
+  reconcileCalls(): number;
+  /** How many times the fake forge-action port has been called so far (the `open-pr`/`push` acting port). */
+  forgeActionCalls(): number;
+  /** How many times the fake auto-merge port has been called so far (the `merge` acting port). */
+  mergeCalls(): number;
 }
 
 export interface LaneRunScenarioOptions {
@@ -200,6 +208,9 @@ export async function makeLaneRunScenario(
 
   let cursor = 0;
   let dispatchCallCount = 0;
+  let reconcileCallCount = 0;
+  let forgeActionCallCount = 0;
+  let mergeCallCount = 0;
   const nextOutcome = (): PortOutcome => {
     const outcome = outcomes[cursor];
     cursor += 1;
@@ -257,6 +268,7 @@ export async function makeLaneRunScenario(
 
   const reconcileAttempt = {
     reconcileAttempt: async (): Promise<ReconcileAttemptResult> => {
+      reconcileCallCount += 1;
       const outcome = nextOutcome();
       if (outcome === 'thrown') {
         throw new FakePortThrowError('reconcile threw');
@@ -273,6 +285,26 @@ export async function makeLaneRunScenario(
     },
   };
 
+  // The `open-pr`/`push` acting port and the `merge` acting port. In this
+  // fixture the run never reaches those one-way acts — the collect act is
+  // unwired and parks the pipeline — so wiring them changes no behaviour;
+  // the counters let the property tests refuse a duplicate call of either
+  // acting port after its step key is settled (the one-way property's (b)
+  // beyond dispatch), and the terminal property's no-port-call guard.
+  const executeForgeAction = {
+    executeAuthorizedForgeAction: async (): Promise<ExecuteAuthorizedForgeActionResult> => {
+      forgeActionCallCount += 1;
+      return { outcome: 'refused', reason: 'forge refused' };
+    },
+  };
+
+  const autoMergeAttempt = {
+    autoMergeAttempt: async (): Promise<AutoMergeAttemptResult> => {
+      mergeCallCount += 1;
+      return { outcome: 'off' };
+    },
+  };
+
   const deps: AdvanceLaneRunDependencies = {
     runRepo,
     runJournal,
@@ -284,6 +316,8 @@ export async function makeLaneRunScenario(
       admit: async () => ({ outcome: 'admitted' }),
     },
     dispatchAttempt,
+    executeForgeAction,
+    autoMergeAttempt,
     newUlid,
   };
 
@@ -365,6 +399,9 @@ export async function makeLaneRunScenario(
     journal: () => runJournal.listForRun(RUN_ID),
     record: () => runRepo.get(RUN_ID),
     dispatchCalls: () => dispatchCallCount,
+    reconcileCalls: () => reconcileCallCount,
+    forgeActionCalls: () => forgeActionCallCount,
+    mergeCalls: () => mergeCallCount,
   };
 }
 

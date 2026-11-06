@@ -279,8 +279,18 @@ function checkAdoptLaneText(request: AdoptLaneRequest): AdoptLaneRefusalReason |
   const strings: string[] = [
     request.brief.briefText, request.workOrder.taskId, request.workOrder.repository,
     request.brief.prosePath, request.brief.manifestPath, request.brief.reviewerModel,
+    request.brief.briefId, request.workOrder.workOrderId, request.workOrder.policyRevision,
+    request.run.runPolicyRevision, ...(request.workOrder.prerequisiteWorkOrderIds ?? []),
     ...request.workOrder.ownedPaths,
   ];
+  // Every string `attemptRecord` persists: the session id and the runner's text fields.
+  const { sessionId, runner } = request.attempt;
+  if (typeof sessionId === 'string') strings.push(sessionId);
+  if (runner !== undefined) {
+    for (const field of [runner.host, runner.agent, runner.model, runner.variant]) {
+      if (typeof field === 'string') strings.push(field);
+    }
+  }
   if (request.run.branchName !== undefined) strings.push(request.run.branchName);
   if (request.source.kind === 'save-ref') strings.push(request.source.saveRef);
   else strings.push(request.source.branchName);
@@ -337,6 +347,9 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     return this.execute(request);
   }
 
+  /** The call being served (a per-call instance, so overlapping calls never share it). */
+  private context: { request: AdoptLaneRequest; completed: AdoptLaneStep[]; current: AdoptLaneStep } | null = null;
+
   async execute(input: unknown): Promise<AdoptLaneResult> {
     try {
       const request = readAdoptLaneRequest(input);
@@ -344,7 +357,9 @@ export class AdoptLaneUseCase implements AdoptLanePort {
       const secret = checkAdoptLaneText(request);
       if (secret !== null) return { outcome: 'refused', reason: secret };
       this.verifyBrief(request);
-      return await this.adopt(request);
+      const call = new AdoptLaneUseCase(this.deps);
+      call.context = { request, completed: [], current: 'work-order' };
+      return await call.adopt(request);
     } catch (error) {
       return error instanceof Halt ? error.result : { outcome: 'unknown', reason: 'adoption-unknown' };
     }
@@ -376,10 +391,15 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     if (!pkg.success) throw refuse('invalid-brief');
   }
 
-  private async adopt(request: AdoptLaneRequest): Promise<AdoptLaneResult> {
-    if (this.exhausted(request)) {
-      throw new Halt({ outcome: 'budget-exhausted', completedSteps: [], nextStep: 'work-order' });
+  /** Before every outbound operation: past the deadline, stop with the steps done so far. */
+  private checkDeadline(): void {
+    const context = this.context;
+    if (context !== null && this.exhausted(context.request)) {
+      throw new Halt({ outcome: 'budget-exhausted', completedSteps: [...context.completed], nextStep: context.current });
     }
+  }
+
+  private async adopt(request: AdoptLaneRequest): Promise<AdoptLaneResult> {
     const journal = await this.readJournal(request);
     const states = new Map<AdoptLaneStep, StepState>();
     for (const step of ADOPT_LANE_STEPS) states.set(step, stepState(journal, adoptLaneStepKey(request.planDigest, request.laneId, step)));
@@ -391,16 +411,14 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     }
     this.checkSource(request, journal);
     await this.checkNoRun(request, states.get('run')?.hasIntent === true);
-    const completed: AdoptLaneStep[] = [];
+    const completed = this.context?.completed ?? [];
     for (const step of ADOPT_LANE_STEPS) {
       const state = states.get(step) as StepState;
       if (state.final?.outcome === 'completed') {
         completed.push(step);
         continue;
       }
-      if (this.exhausted(request)) {
-        throw new Halt({ outcome: 'budget-exhausted', completedSteps: completed, nextStep: step });
-      }
+      if (this.context !== null) this.context.current = step;
       await this.runStep(request, step, state);
       completed.push(step);
     }
@@ -435,6 +453,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
   }
 
   private async readJournal(request: AdoptLaneRequest): Promise<Journal> {
+    this.checkDeadline();
     let listed;
     try {
       listed = await this.deps.cutoverJournal.listByKeyPrefix(`relaunch/${request.planDigest}/${request.laneId}/`);
@@ -488,7 +507,10 @@ export class AdoptLaneUseCase implements AdoptLanePort {
       if (source.commitOnBranch === 'unknown') throw unknown('branch-fact-unknown');
       if (source.dirtyCount !== 0) throw refuse('worktree-dirty');
       const since = source.commitsSinceBase;
+      // The commit must be on THIS run's branch, not on some other branch of the repository.
+      const laneBranch = request.run.branchName ?? `fleet/${request.run.runId}`;
       if (
+        source.branchName !== laneBranch ||
         source.commitOnBranch !== true || source.commitOid === request.workOrder.baseCommit ||
         (since !== undefined && (since.length === 0 || !since.includes(source.commitOid)))
       ) {
@@ -738,6 +760,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
   }
 
   private async append(entry: CutoverJournalEntry): Promise<string> {
+    this.checkDeadline();
     try {
       const appended = await this.deps.cutoverJournal.append({ ...entry, entryId: this.deps.mintEntryId() });
       return appended.outcome === 'appended' ? 'appended' : appended.reason;
@@ -748,6 +771,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
 
   /** A store call whose throw is `unknown`, never a pass. */
   private async guard<T>(reason: AdoptLaneUnknownReason, call: () => Promise<T>): Promise<T> {
+    this.checkDeadline();
     try {
       return await call();
     } catch {

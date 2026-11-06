@@ -70,11 +70,24 @@ describe('adopted-run transition table (CO28)', () => {
   });
 
   it('canEnterLaneRunState allows ready to collecting and keeps the other rows', () => {
-    expect(canEnterLaneRunState('ready', 'collecting')).toBe(true);
+    expect(canEnterLaneRunState('ready', 'collecting', null, false, 'adopted')).toBe(true);
     expect(canEnterLaneRunState('ready', 'dispatching')).toBe(true);
     expect(canEnterLaneRunState('ready', 'gating')).toBe(false);
     expect(canEnterLaneRunState('ready', 'running')).toBe(false);
     expect(canEnterLaneRunState('dispatching', 'collecting')).toBe(false);
+  });
+
+  it('refuses ready to collecting for a started, provenance-absent or unreadable run (the transition itself)', () => {
+    for (const provenance of ['started', undefined, null, 'unknown', '', 'Adopted', 1, {}, ['adopted']]) {
+      expect(canEnterLaneRunState('ready', 'collecting', null, false, provenance)).toBe(false);
+    }
+    expect(canEnterLaneRunState('ready', 'collecting')).toBe(false);
+    expect(canEnterLaneRunState('ready', 'dispatching', null, false, 'started')).toBe(true);
+    // The adopted entry does not widen any other row.
+    expect(canEnterLaneRunState('dispatching', 'collecting', null, false, 'adopted')).toBe(false);
+    expect(canEnterLaneRunState('ready', 'gating', null, false, 'adopted')).toBe(false);
+    expect(canEnterLaneRunState('ready', 'collecting', null, false, resolveLaneRunProvenance({}))).toBe(false);
+    expect(canEnterLaneRunState('ready', 'collecting', null, false, resolveLaneRunProvenance({ provenance: 'adopted' }))).toBe(true);
   });
 
   it('an initial collecting conduct entry is accepted by the journal and projects collecting', () => {

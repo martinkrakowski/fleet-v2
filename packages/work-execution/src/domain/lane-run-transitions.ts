@@ -106,18 +106,26 @@ export const LANE_RUN_REVIEWS_IN_FLIGHT = {
  * `parkedFrom` (pass the record's `parked.parkedFrom`; `null`/absent → false), when `to` is `merged`
  * (CT-2a), or when `to` is `watching-ci` and `settledOpenPrPark` is true (R4a / G3b0: an `ambiguous`
  * `open-pr` park whose spent key the resume adopted leaves by itself; the `opening-pr` parkedFrom exit
- * would decide `open-pr` again on its spent key). Otherwise the table. Unknown strings → false.
+ * would decide `open-pr` again on its spent key). Otherwise the table, except that `ready → collecting`
+ * needs `provenance === 'adopted'` (CO28; `resolveLaneRunProvenance(record)`). Unknown strings → false.
  */
 export function canEnterLaneRunState(
   from: string,
   to: string,
   parkedFrom?: string | null,
   settledOpenPrPark?: boolean,
+  provenance?: unknown,
 ): boolean {
   if (!(LANE_RUN_STATES as readonly string[]).includes(from)) {
     return false;
   }
   const state = from as LaneRunStateValue;
+  // CO28: `ready → collecting` is the adopted run's entry only. A started run, a legacy record without
+  // provenance and an unreadable provenance keep the old `ready` exits (`dispatching`), so dispatch
+  // cannot be skipped.
+  if (state === 'ready' && to === LANE_RUN_ADOPTED_ENTRY_STATE && provenance !== 'adopted') {
+    return false;
+  }
   if ((LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state)) {
     return false;
   }

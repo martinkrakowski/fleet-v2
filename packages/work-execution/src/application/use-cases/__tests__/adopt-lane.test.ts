@@ -204,7 +204,7 @@ function request(extra: Record<string, unknown> = {}): Record<string, unknown> {
 }
 
 const clean = (extra: Record<string, unknown> = {}): Record<string, unknown> => ({
-  kind: 'clean-commit', commitOid: COMMIT, branchName: 'fleet/run-x', commitOnBranch: true, dirtyCount: 0, ...extra,
+  kind: 'clean-commit', commitOid: COMMIT, branchName: `fleet/${RUN_ID}`, commitOnBranch: true, dirtyCount: 0, ...extra,
 });
 
 async function adopt(w: World, req: unknown = request()): Promise<AdoptLaneResult> {
@@ -307,6 +307,8 @@ describe('AdoptLaneUseCase refusals', () => {
     ['commit absent from commits since base', clean({ commitsSinceBase: ['9'.repeat(40)] }), 'commit-not-on-branch'],
     ['empty commits since base', clean({ commitsSinceBase: [] }), 'commit-not-on-branch'],
     ['dirty worktree', clean({ dirtyCount: 2 }), 'worktree-dirty'],
+    ['clean commit on an unrelated branch', clean({ branchName: 'fleet/run-unrelated' }), 'commit-not-on-branch'],
+    ['clean commit on main', clean({ branchName: 'main' }), 'commit-not-on-branch'],
   ])('refuses a clean commit: %s', async (_name, source, reason) => {
     const w = world();
     expect(await adopt(w, request({ source }))).toEqual({ outcome: 'refused', reason });
@@ -436,15 +438,10 @@ describe('AdoptLaneUseCase robustness', () => {
     const w = savedWorld();
     const req = request({ deadlineIso: '2026-11-06T10:05:00.000Z' });
     // Time passes after the work-order and brief steps have run.
-    let calls = 0;
-    const base = w.deps.now as () => string;
     const deps: AdoptLaneDependencies = {
       ...w.deps,
-      now: () => {
-        calls += 1;
-        // initial check, then one check per step: work-order (2), brief (3), attempt (4) expires.
-        return calls >= 4 ? '2026-11-06T10:06:00.000Z' : base();
-      },
+      // Work-order and brief leave five trace lines; the attempt step's first operation is past the deadline.
+      now: () => (w.trace.length >= 5 ? '2026-11-06T10:06:00.000Z' : '2026-11-06T10:00:00.000Z'),
     };
     const first = await new AdoptLaneUseCase(deps).execute(req);
     expect(first).toEqual({ outcome: 'budget-exhausted', completedSteps: ['work-order', 'brief'], nextStep: 'attempt' });
@@ -460,6 +457,33 @@ describe('AdoptLaneUseCase robustness', () => {
       outcome: 'budget-exhausted', completedSteps: [], nextStep: 'work-order',
     });
     expect(none.trace).toEqual([]);
+  });
+
+  it('checks the deadline before each outbound operation: expiry during a step\'s reads leaves no intent or write', async () => {
+    const w = savedWorld();
+    const req = request({ deadlineIso: '2026-11-06T10:05:00.000Z' });
+    // The attempt step reads the attempt store first; time runs out during that read.
+    const readAttempt = w.deps.attemptRepo.findAttemptById.bind(w.deps.attemptRepo);
+    const clock = { late: false };
+    const deps: AdoptLaneDependencies = {
+      ...w.deps,
+      attemptRepo: {
+        ...w.deps.attemptRepo,
+        async findAttemptById(attemptId) {
+          clock.late = true;
+          return readAttempt(attemptId);
+        },
+      },
+      now: () => (clock.late ? '2026-11-06T10:06:00.000Z' : '2026-11-06T10:00:00.000Z'),
+    };
+    const first = await new AdoptLaneUseCase(deps).execute(req);
+    expect(first).toEqual({ outcome: 'budget-exhausted', completedSteps: ['work-order', 'brief'], nextStep: 'attempt' });
+    expect(w.trace.filter((line) => line.includes('adopt/attempt'))).toEqual([]);
+    expect(w.attempts.size).toBe(0);
+    expect(w.runs.size).toBe(0);
+    expect(w.runEntries).toHaveLength(0);
+    const second = await adopt(w, req);
+    expect(second).toMatchObject({ outcome: 'adopted' });
   });
 
   it('is idempotent on repeat call under relaunch/<planDigest>/<lane>/adopt/<step> without duplicate writes or intents', async () => {
@@ -571,6 +595,16 @@ describe('AdoptLaneUseCase robustness', () => {
     const runBranch = request();
     (runBranch.run as Record<string, unknown>).branchName = `fleet/${key}`;
     attempts.push(runBranch);
+    const sessionLeak = request();
+    (sessionLeak.attempt as Record<string, unknown>).sessionId = key;
+    attempts.push(sessionLeak);
+    for (const field of ['host', 'agent', 'model', 'variant']) {
+      const leak = request();
+      (leak.attempt as Record<string, unknown>).runner = {
+        kind: 'opencode', remotePort: 4106, host: 'sol', agent: 'lane', model: 'm', variant: null, [field]: key,
+      };
+      attempts.push(leak);
+    }
     const ref = request({ source: { kind: 'save-ref', saveRef: `refs/fleet/saved/${key}`, commitOid: COMMIT, treeDigest: TREE } });
     attempts.push(ref);
     for (const req of attempts) {

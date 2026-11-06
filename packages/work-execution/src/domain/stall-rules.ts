@@ -36,14 +36,15 @@ export type StallRunState = LaneRunStateValue;
 const TERMINAL_RUN_STATES: readonly string[] = LANE_RUN_TERMINAL_STATES;
 
 /** Every declared lane-run state that is not terminal, derived so a new state is never missed. */
-const NON_TERMINAL_RUN_STATES: readonly string[] = LANE_RUN_STATES.filter(
-  (state) => !TERMINAL_RUN_STATES.includes(state),
+const NON_TERMINAL_RUN_STATES: ReadonlySet<string> = new Set(
+  LANE_RUN_STATES.filter((state) => !TERMINAL_RUN_STATES.includes(state)),
 );
 
 /** One run in the snapshot. Ids and codes only; no free text. */
 export interface StallRun {
   readonly id: string;
-  readonly state: StallRunState | string;
+  /** A `StallRunState`; an undeclared value is carried as is and fires no state rule. */
+  readonly state: string;
   readonly parkedAtIso?: string;
   readonly parkReason?: string;
   readonly prNumber?: number;
@@ -68,7 +69,8 @@ export interface StallAdmissionRefusal {
 /** One provider error. */
 export interface StallProviderError {
   readonly provider: string;
-  readonly class: 'payment-required' | 'rate-limited' | 'usage-limit' | string;
+  /** For example `payment-required`, `rate-limited` or `usage-limit`; other classes fire nothing. */
+  readonly class: string;
   readonly atIso?: string;
 }
 
@@ -111,15 +113,15 @@ export interface StallFinding {
 export const STALL_FINDINGS_MAX = 200;
 
 /** The review journal codes that count as a failing review. */
-const FAILING_REVIEW_CODES: readonly string[] = [
+const FAILING_REVIEW_CODES: ReadonlySet<string> = new Set([
   'review-no-receipt',
   'seat-busy',
   'review-unknown',
   'unparseable-verdict',
-];
+]);
 
 /** The provider error classes that count as a provider limit. */
-const LIMITING_PROVIDER_CLASSES: readonly string[] = ['payment-required', 'rate-limited', 'usage-limit'];
+const LIMITING_PROVIDER_CLASSES: ReadonlySet<string> = new Set(['payment-required', 'rate-limited', 'usage-limit']);
 
 /** Milliseconds of one minute and of one hour. */
 const MINUTE_MS = 60_000;
@@ -200,6 +202,17 @@ function bytewiseLess(a: string, b: string): boolean {
   return false;
 }
 
+/** `Array#sort` order from `bytewiseLess`: deterministic and locale-free. */
+function bytewiseCompare(a: string, b: string): number {
+  if (bytewiseLess(a, b)) {
+    return -1;
+  }
+  if (bytewiseLess(b, a)) {
+    return 1;
+  }
+  return 0;
+}
+
 /** The deterministic order: `page` first, then rule, then key, all bytewise. */
 function compareFindings(a: StallFinding, b: StallFinding): number {
   const aRank = a.severity === 'page' ? 0 : 1;
@@ -256,7 +269,7 @@ function invalidFinding(field: string, reason: string): StallFinding {
 
 /** Whether a run's state is a known non-terminal state. Unknown stays unknown. */
 function isNonTerminal(state: unknown): boolean {
-  return typeof state === 'string' && NON_TERMINAL_RUN_STATES.includes(state);
+  return typeof state === 'string' && NON_TERMINAL_RUN_STATES.has(state);
 }
 
 /** The runtime schema of one run entry. */
@@ -392,7 +405,7 @@ function reviewFailingFindings(runs: readonly Row[], ctx: StallContext, out: Sta
   for (const run of runs) {
     const codes: readonly unknown[] = Array.isArray(run.recentReviewCodes) ? run.recentReviewCodes : [];
     const failures = codes.filter(
-      (code) => typeof code === 'string' && FAILING_REVIEW_CODES.includes(code),
+      (code) => typeof code === 'string' && FAILING_REVIEW_CODES.has(code),
     ).length;
     if (failures >= ctx.reviewFailures) {
       out.push(finding('review-failing', 'digest', [String(run.id)], {
@@ -418,12 +431,12 @@ function providerFindings(providerErrors: readonly Row[], out: StallFinding[]): 
       out.push(invalidFinding(`providerErrors[${i}].atIso`, 'invalid-time'));
     }
     const provider = String(error.provider);
-    if (typeof error.class === 'string' && LIMITING_PROVIDER_CLASSES.includes(error.class)
+    if (typeof error.class === 'string' && LIMITING_PROVIDER_CLASSES.has(error.class)
       && !limitedProviders.has(provider)) {
       limitedProviders.set(provider, error);
     }
   }
-  for (const provider of Array.from(limitedProviders.keys()).sort()) {
+  for (const provider of Array.from(limitedProviders.keys()).sort(bytewiseCompare)) {
     const error = limitedProviders.get(provider) as Row;
     out.push(finding('provider-limit', 'page', [provider], {
       provider: safeId(provider),

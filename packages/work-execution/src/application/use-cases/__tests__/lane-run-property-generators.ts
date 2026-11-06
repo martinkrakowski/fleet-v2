@@ -302,6 +302,7 @@ function laterActDeps(): Partial<AdvanceLaneRunDependencies> {
         },
       }),
       isConfigured: () => true,
+      listOpenPullRequestsByBase: async () => ({ outcome: "unavailable" as const, reason: "not-used" }),
     },
     autoMergeEnabled: true,
   };

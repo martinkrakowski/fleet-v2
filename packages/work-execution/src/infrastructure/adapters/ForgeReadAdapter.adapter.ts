@@ -10,6 +10,9 @@
 
 import type {
   ForgeReadPort,
+  ListOpenPullRequestsByBaseRequest,
+  ListOpenPullRequestsByBaseResult,
+  OpenPullRequestSummary,
   PullRequestRef,
   PullRequestSnapshot,
   ReadPullRequestRequest,
@@ -17,6 +20,7 @@ import type {
 } from '../../application/ports/out/ForgeReadPort.out-port.js';
 import type { ContainsCommitRequest, ContainsCommitResult } from '../../application/ports/out/ForgeAncestryPort.out-port.js';
 import type { ForgeAncestryPort } from '../../application/ports/out/ForgeAncestryPort.out-port.js';
+import { parseBaseBranch } from '../../domain/base-branch.js';
 import type { GhInvocationResult } from './ForgeActionAdapter.adapter.js';
 import { isSafeBranchName } from './ForgeActionAdapter.adapter.js';
 
@@ -193,6 +197,75 @@ export function parseCompareStatus(stdout: string): ContainsCommitResult {
   return UNAVAILABLE_UNREADABLE_COMPARE;
 }
 
+/**
+ * The jq program that reduces every page to one line per pull request with
+ * only the three fields the port returns, so no title, body, author or label
+ * ever reaches this process.
+ */
+export const OPEN_PULL_REQUESTS_JQ = '.[] | {number: .number, head: {sha: .head.sha}, base: {ref: .base.ref}}';
+
+const UNAVAILABLE_UNREADABLE_LIST: ListOpenPullRequestsByBaseResult = {
+  outcome: 'unavailable',
+  reason: 'gh api pulls returned an unreadable answer',
+};
+
+/** One line of the open-pull-request listing; `null` when it is not exactly the requested shape. */
+function parseOpenPullRequestLine(line: string, base: string): OpenPullRequestSummary | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return null;
+  }
+  const record = parsed as Record<string, unknown>;
+  const head = record.head;
+  const baseRecord = record.base;
+  const number = parseSafeInteger(record.number);
+  const headSha =
+    head !== null && typeof head === 'object' && !Array.isArray(head)
+      ? parseHex40((head as Record<string, unknown>).sha)
+      : null;
+  const baseRef =
+    baseRecord !== null && typeof baseRecord === 'object' && !Array.isArray(baseRecord)
+      ? (baseRecord as Record<string, unknown>).ref
+      : undefined;
+  if (number === null || headSha === null || baseRef !== base) {
+    return null;
+  }
+  return { number, headSha, baseRef: base };
+}
+
+/**
+ * Pure parse of the `gh api --paginate --jq OPEN_PULL_REQUESTS_JQ` stdout: one
+ * JSON object per line, from every page. Every line must be an object with an
+ * integer `number`, a 40-hex `head.sha` and exactly the requested `base.ref`;
+ * one line that is not (a partial page, another base, anything else) makes the
+ * whole answer unavailable, never a shorter list. Empty stdout is the forge's
+ * answer of no open pull request; a failed or cut-short call never reaches here
+ * because its exit code is not zero.
+ */
+export function parseOpenPullRequests(stdout: string, base: string): ListOpenPullRequestsByBaseResult {
+  const seen = new Set<number>();
+  const pullRequests: OpenPullRequestSummary[] = [];
+  for (const line of stdout.split('\n')) {
+    if (line.trim().length === 0) {
+      continue;
+    }
+    const summary = parseOpenPullRequestLine(line, base);
+    if (summary === null) {
+      return UNAVAILABLE_UNREADABLE_LIST;
+    }
+    if (!seen.has(summary.number)) {
+      seen.add(summary.number);
+      pullRequests.push(summary);
+    }
+  }
+  return { outcome: 'listed', pullRequests };
+}
+
 export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
   private readonly owner?: string;
   private readonly repo?: string;
@@ -261,6 +334,46 @@ export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
       };
     }
     return parsePullRequestView(gh.stdout, ref);
+  }
+
+  async listOpenPullRequestsByBase(request: ListOpenPullRequestsByBaseRequest): Promise<ListOpenPullRequestsByBaseResult> {
+    try {
+      const base = parseBaseBranch(request.base);
+      if (base === undefined) {
+        return { outcome: 'unavailable', reason: 'invalid-request' };
+      }
+      if (this.runGh === undefined) {
+        return { outcome: 'unavailable', reason: 'forge read is not configured' };
+      }
+      const repository = request.repository ?? { owner: this.owner, repo: this.repo };
+      if (!isValidRepository(repository)) {
+        return { outcome: 'unavailable', reason: 'forge repository is not configured or not valid' };
+      }
+      const args = [
+        'api',
+        '--paginate',
+        `repos/${repository.owner}/${repository.repo}/pulls?state=open&base=${encodeURIComponent(base)}&per_page=100`,
+        '--jq',
+        OPEN_PULL_REQUESTS_JQ,
+      ];
+      const raced = await this.runGhWithinDeadline(args, request.timeoutMs);
+      if (raced.kind === 'timed-out') {
+        return { outcome: 'unavailable', reason: READ_TIMED_OUT };
+      }
+      if (raced.kind === 'failed') {
+        return { outcome: 'unavailable', reason: 'gh api pulls could not complete' };
+      }
+      const gh = raced.gh;
+      if (gh.exitCode !== 0) {
+        return { outcome: 'unavailable', reason: `gh api pulls failed (exit ${gh.exitCode})` };
+      }
+      if (typeof gh.stdout !== 'string' || Buffer.byteLength(gh.stdout, 'utf8') > READ_MAX_STDOUT_BYTES) {
+        return { outcome: 'unavailable', reason: 'gh api pulls output too large' };
+      }
+      return parseOpenPullRequests(gh.stdout, base);
+    } catch {
+      return { outcome: 'unavailable', reason: 'gh api pulls could not complete' };
+    }
   }
 
   /**

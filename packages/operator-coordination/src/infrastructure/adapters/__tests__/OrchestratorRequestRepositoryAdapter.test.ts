@@ -9,7 +9,7 @@ import {
 } from '../../../domain/entities/OrchestratorRequest.js';
 import type { OrchestratorRequestRecord } from '../../../domain/orchestrator-request-records.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../../application/ports/out/ChangeSignalPort.out-port.js';
-import type { OrchestratorRequestListQuery } from '../../../application/ports/out/OrchestratorRequestRepositoryPort.out-port.js';
+import type { OrchestratorRequestListQuery, SaveOrchestratorRequestOptions } from '../../../application/ports/out/OrchestratorRequestRepositoryPort.out-port.js';
 import {
   MAX_ORCHESTRATOR_REQUEST_STORE_BYTES,
   MAX_ORCHESTRATOR_REQUEST_STORE_RECORDS,
@@ -292,20 +292,67 @@ describe('OrchestratorRequestRepositoryAdapter', () => {
     expect(after.request.claim!.orchestratorId).toBe('orch-example-1');
   });
 
-  it('refuses an oversized store on its stat alone, before any read, with the unreadable-store outcome', async () => {
+  it('refuses a read-only oversized store on its stat alone, before any read, and keeps the file', async () => {
+    const storePath = path.join(tempDir, 'orchestrator-requests.json');
+    await fs.writeFile(storePath, '');
+    await fs.truncate(storePath, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
+    const readSpy = vi.spyOn(fs, 'readFile');
+    try {
+      const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir, readOnly: true });
+      expect(await adapter.get(R1)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+      expect(await adapter.list()).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+      expect(readSpy.mock.calls.filter(([target]) => target === storePath)).toEqual([]);
+      expect((await fs.stat(storePath)).size).toBe(MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it('quarantines a writable oversized store by rename without reading it, then treats the store as absent', async () => {
     const storePath = path.join(tempDir, 'orchestrator-requests.json');
     await fs.writeFile(storePath, '');
     await fs.truncate(storePath, MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1);
     const readSpy = vi.spyOn(fs, 'readFile');
     try {
       const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
-      expect(await adapter.get(R1)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
-      expect(await adapter.list()).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
-      expect(await adapter.save(initialRequest(R1), 0)).toEqual({ outcome: 'unknown', code: 'unreadable-store' });
+      expect(await adapter.get(R1)).toEqual({ outcome: 'missing' });
       expect(readSpy.mock.calls.filter(([target]) => target === storePath)).toEqual([]);
+      const quarantined = await fs.readdir(path.join(tempDir, 'quarantine'));
+      expect(quarantined).toHaveLength(1);
+      expect((await fs.stat(path.join(tempDir, 'quarantine', quarantined[0]!))).size).toBe(
+        MAX_ORCHESTRATOR_REQUEST_STORE_BYTES + 1,
+      );
+      expect((await adapter.save(initialRequest(R1), 0)).outcome).toBe('saved');
     } finally {
       readSpy.mockRestore();
     }
+  });
+
+  it('refuses a provided blank or whitespace stateDir instead of selecting in-memory storage, and a null save options object', async () => {
+    for (const stateDir of ['', '   ']) {
+      const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir });
+      expect(await adapter.save(initialRequest(R1), 0)).toEqual({
+        outcome: 'refused',
+        code: 'invalid-store-config',
+        requestId: null,
+      });
+    }
+    const memory = new OrchestratorRequestRepositoryAdapter({});
+    expect((await memory.save(initialRequest(R1), 0)).outcome).toBe('saved');
+    expect(
+      await memory.save(initialRequest(R2), 0, null as unknown as SaveOrchestratorRequestOptions),
+    ).toEqual({ outcome: 'refused', code: 'invalid-input', requestId: null });
+  });
+
+  it('treats a next-revision save that changes only updatedAtIso as a change that signals, not a lease renewal', async () => {
+    const signalPort = new RecordingChangeSignalPort();
+    const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir, changeSignal: signalPort });
+    await adapter.save(initialRequest(R1), 0);
+    const next = claimed(initialRequest(R1));
+    await adapter.save(next, 1);
+    expect(signalPort.emitted).toHaveLength(2);
+    await adapter.save({ ...next, revision: 3, updatedAtIso: '2026-10-27T10:03:00.000Z' }, 2);
+    expect(signalPort.emitted).toHaveLength(3);
   });
 
   it('returns a sanitized unknown io-error, never a throw or the fs error, when acquiring the lock fails for a non-timeout reason', async () => {

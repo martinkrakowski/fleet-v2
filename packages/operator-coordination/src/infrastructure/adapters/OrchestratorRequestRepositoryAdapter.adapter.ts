@@ -21,7 +21,7 @@
  */
 
 import { promises as fs } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 import { containsSecretShape } from '@fleet/shared';
 
@@ -287,12 +287,28 @@ function isClaimLeaseRenewal(
   if (before.claim === null || after.claim === null) {
     return false;
   }
-  return (
-    before.claim.orchestratorId === after.claim.orchestratorId &&
-    before.claim.fence === after.claim.fence &&
-    before.claimCount === after.claimCount &&
-    before.fence === after.fence
-  );
+  if (before.claim.leaseUntilIso === after.claim.leaseUntilIso) {
+    return false;
+  }
+  // Renewal only when nothing but the lease horizon and updatedAtIso moved (the revision bump is the save itself).
+  const normalised: OrchestratorRequestRecord = {
+    ...after,
+    revision: before.revision,
+    updatedAtIso: before.updatedAtIso,
+    claim: { ...after.claim, leaseUntilIso: before.claim.leaseUntilIso },
+  };
+  return recordsDeepEqual(before, normalised);
+}
+
+let oversizedQuarantineCounter = 0;
+
+/** Move an oversized store into `<dir>/quarantine/` by rename, without reading it. */
+async function quarantineOversizedStore(target: string): Promise<void> {
+  const dir = join(dirname(target), 'quarantine');
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('.', '.');
+  oversizedQuarantineCounter += 1;
+  await fs.rename(target, join(dir, `${basename(target)}.${stamp}-oversized-${process.pid}-${oversizedQuarantineCounter}`));
 }
 
 /** Extract only a fixed POSIX error code; never a path or free-form message. */
@@ -459,8 +475,8 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
   /**
    * Validate the adapter options descriptor-safely without throwing. A
    * non-plain or throwing options object, a non-string stateDir, or an
-   * unsafe/colliding fileName is `invalid-config`; a missing or blank
-   * stateDir is the in-memory store.
+   * unsafe/colliding fileName is `invalid-config`; a blank or
+   * whitespace stateDir is refused, and only an omitted stateDir is the in-memory store.
    */
   private resolveStoreConfig():
     | { readonly kind: 'memory'; readonly readOnly: boolean }
@@ -491,10 +507,10 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
         values[key] = descriptor.value;
       }
       const stateDir = values.stateDir;
-      if (stateDir === undefined || (typeof stateDir === 'string' && stateDir.trim().length === 0)) {
+      if (stateDir === undefined) {
         return { kind: 'memory', readOnly: values.readOnly === true };
       }
-      if (typeof stateDir !== 'string') {
+      if (typeof stateDir !== 'string' || stateDir.trim().length === 0) {
         return { kind: 'invalid-config' };
       }
       const name = values.fileName === undefined ? DEFAULT_FILE_NAME : values.fileName;
@@ -516,10 +532,10 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
   /** The per-call save options: a plain object with a closed, bounded `lockTimeoutMs`. */
   private parseSaveOptions(options?: SaveOrchestratorRequestOptions): number | null {
     try {
-      if (options === undefined || options === null) {
+      if (options === undefined) {
         return DEFAULT_ORCHESTRATOR_REQUEST_LOCK_TIMEOUT_MS;
       }
-      if (typeof options !== 'object' || Array.isArray(options)) {
+      if (options === null || typeof options !== 'object' || Array.isArray(options)) {
         return null;
       }
       const proto = Object.getPrototypeOf(options);
@@ -573,8 +589,16 @@ export class OrchestratorRequestRepositoryAdapter implements OrchestratorRequest
     try {
       const stat = await fs.stat(target);
       if (stat.size > MAX_ORCHESTRATOR_REQUEST_STORE_BYTES) {
-        // Refuse on the stat alone: never read an oversized file into memory (nothing is quarantined either).
-        return { kind: 'unreadable' };
+        // Never read an oversized file into memory. Read-only: refuse. Writable: quarantine by rename, then treat as absent.
+        if (this.options?.readOnly === true) {
+          return { kind: 'unreadable' };
+        }
+        try {
+          await quarantineOversizedStore(target);
+        } catch {
+          return { kind: 'unreadable' };
+        }
+        return { kind: 'loaded', records: new Map<string, OrchestratorRequestRecord>() };
       }
       buffer = await fs.readFile(target);
     } catch (error: unknown) {

@@ -11,5 +11,6 @@ export * from "./OrchestratorSessionRepositoryPort.out-port.js";
 export * from "./OwnerItemRepositoryPort.out-port.js";
 export * from "./OwnerNotificationDeliveryPort.out-port.js";
 export * from "./OwnerQuestionRepositoryPort.out-port.js";
+export * from "./PermissionRequestRepositoryPort.out-port.js";
 export * from "./ProjectProfileRepositoryPort.out-port.js";
 export * from "./RelayTransportPort.out-port.js";

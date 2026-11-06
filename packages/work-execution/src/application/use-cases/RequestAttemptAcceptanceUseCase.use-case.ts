@@ -49,7 +49,7 @@ import type { AttemptRecord, WorkOrderRecord, ActionJournalEntryRecord } from '.
 import { WorkOrder } from '../../domain/entities/WorkOrder.js';
 import { isSameModelFamily, underlyingModelFamily } from '@fleet/evidence-and-acceptance';
 import type { AllowedSeatPort } from '../ports/out/AllowedSeatPort.out-port.js';
-import { AcceptanceSpec } from '../../domain/value-objects/AcceptanceSpec.vo.js';
+import { AcceptanceSpec, gateCommandPredicateName } from '../../domain/value-objects/AcceptanceSpec.vo.js';
 import { simpleDeterministicHexDigest } from './PrepareBriefPackageUseCase.use-case.js';
 import { readFrozenManifestAtHostVerified } from './advance-lane-run/frozen-manifest.js';
 import type {
@@ -169,7 +169,7 @@ function expectedGatePredicates(spec: AcceptanceSpec): readonly ExpectedGatePred
     { name: 'commit', kind: 'commit' },
     { name: 'diff-check', kind: 'diff-check' },
     ...spec.getCommands().map((command, index) => ({
-      name: ('command ' + String(index + 1) + ': ' + command.argv.join(' ')).slice(0, 120),
+      name: gateCommandPredicateName(command.argv, index),
       kind: 'command' as const,
     })),
   ];
@@ -189,12 +189,14 @@ function resultsMatchExpectedPredicates(
 }
 
 /**
- * The typed verdict for one evaluated head: a mismatch is `unknown`, a
- * `fail` anywhere is `failed`, and otherwise the first non-`pass` result
- * decides (`unknown` or `skipped` → `unknown`, since a skipped predicate
- * before any failure means the gate did not finish), and all pass is
- * `passed`. When nothing failed and every non-pass result is a gate-slot
- * congestion (KF-30c), the `unknown` verdict carries `congested: true`.
+ * The typed verdict for one evaluated head: a mismatch is `unknown`, and
+ * otherwise the first non-`pass`, non-`skipped` result IN DECLARED ORDER decides (KS3: the
+ * commands may have run concurrently, so a later predicate's real outcome
+ * never overrides an earlier non-pass): a `fail` there is `failed`, an
+ * `unknown` or `skipped` there is `unknown` (a skipped predicate before any
+ * failure means the gate did not finish), and all pass is `passed`. When
+ * that first non-pass is a gate-slot congestion (KF-30c), the `unknown`
+ * verdict carries `congested: true`.
  */
 function gateVerdictForResults(
   results: readonly GatePredicateResult[],
@@ -209,25 +211,17 @@ function gateVerdictForResults(
       'Gate predicate ' + result.name + ' ' + result.verdict + exitText + ': ' + result.detail
     );
   };
-  const failed = results.find((result) => result.verdict === 'fail');
-  if (failed !== undefined) {
-    return gateFailed(reasonFor(failed), results);
-  }
   const nonPassing = results.filter((result) => result.verdict !== 'pass');
-  // The adapter skips every command after the first non-pass, so skipped
-  // results are neutral: the gate is congested when at least one result is a
-  // gate-slot wait limit and every other non-pass result is skipped.
-  const notSkipped = nonPassing.filter((result) => result.verdict !== 'skipped');
-  const congested =
-    notSkipped.length > 0 &&
-    notSkipped.every(
-      (result) => result.verdict === 'unknown' && result.cause === 'gate-slot-wait-limit',
-    );
-  const first = nonPassing[0];
+  // A skipped result is neutral: it never hides a real non-pass that sits beside it.
+  const first = nonPassing.find((result) => result.verdict !== 'skipped') ?? nonPassing[0];
   if (first === undefined) {
     return gatePassed(results);
   }
+  if (first.verdict === 'fail') {
+    return gateFailed(reasonFor(first), results);
+  }
   const reason = reasonFor(first);
+  const congested = first.verdict === 'unknown' && first.cause === 'gate-slot-wait-limit';
   return congested ? { verdict: 'unknown', reason, congested: true } : gateUnknown(reason);
 }
 

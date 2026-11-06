@@ -27,6 +27,7 @@ import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
 import { composeExecution } from './composition/work-execution.js';
 import { composeConductor } from './composition/conductor.js';
+import { composeDaemon, type ComposedDaemon } from './composition/daemon.js';
 import { composeTelemetry, type TelemetryConfiguredState, type TelemetryPolicyView } from './composition/telemetry.js';
 
 import {
@@ -209,6 +210,16 @@ export interface FleetCliRuntimeOptions {
    * Defaults to the real `loadInstallation()`; tests inject a temp file.
    */
   readonly loadInstallationForAutoMerge?: () => LoadResult;
+  /**
+   * Fresh installation loader for the daemon's merge-policy binding (DT10b).
+   * Takes precedence over `installation`; tests inject a temp file and the
+   * `daemon` command injects an already-loaded (possibly invalid) result.
+   */
+  readonly loadInstallationForMergePolicy?: () => LoadResult;
+  /** The daemon clock (tests only); production reads the system clock. */
+  readonly daemonNow?: () => string;
+  /** The daemon wake-settle sleep (tests only); production waits with a timer. */
+  readonly daemonSleep?: (ms: number) => Promise<void>;
   /** Agent, model and variant handed to the live runner subprocess. */
   readonly runnerAgent?: string;
   readonly runnerModel?: string;
@@ -621,6 +632,8 @@ function runGitCommand(args: readonly string[]): Promise<string> {
 export interface FleetCliRuntime {
   /** The parsed installation the runtime was composed with, if any. */
   readonly installation?: FleetInstallation;
+  /** DT10b: the daemon stores, tick and status use cases, pause port and forge probe. */
+  readonly daemon: ComposedDaemon;
   readonly coordination: {
     readonly projectProfileRepository: ProjectProfileRepositoryAdapter;
     readonly coordinationRequestRepository: CoordinationRequestRepositoryAdapter;
@@ -1036,6 +1049,8 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     evidence,
     profileRead,
     coordination,
+    attemptArtifact,
+    coordinationRequestRepository,
     issuePolicyForgeGrantUseCase,
     autoMergeLoad,
     installation: options?.installation,
@@ -1114,8 +1129,28 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     nowIso: () => new Date().toISOString(),
   });
 
+  // DT10b: the daemon stack (merge pass, tick, status, pause, forge probe).
+  const daemon = composeDaemon({
+    stateDir,
+    options,
+    installationModel,
+    forgeMode,
+    mergeForgeRead,
+    mergeQueueRepository: execution.mergeQueueRepository,
+    chainBranchRead: execution.forgeAction,
+    evidence,
+    conductor,
+    runGh: (args, timeoutMs) =>
+      (
+        options?.forgeGhRunner ??
+        ((ghArgs: readonly string[], ghTimeoutMs?: number) =>
+          runGhSubprocess(ghArgs, ghBinaryCandidates, undefined, ghTimeoutMs))
+      )(args, timeoutMs),
+  });
+
   return {
     installation: options?.installation,
+    daemon,
     coordination,
     knowledge,
     evidence,

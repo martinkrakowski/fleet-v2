@@ -602,6 +602,26 @@ describe('the parsed installation', () => {
     }
   });
 
+  it('policy.daemon.chainRefresh: shadow is accepted and the default, live is refused as not enabled, an unknown value is refused', () => {
+    const shadow = parsePolicy({ daemon: { chainRefresh: 'shadow' } });
+    expect(shadow).toMatchObject({ ok: true });
+    expectResolved(resolveMergePolicy(policyWith(undefined, { chainRefresh: 'shadow' })));
+    expectResolved(resolveMergePolicy(policyWith(undefined, {})));
+
+    const live = parsePolicy({ daemon: { chainRefresh: 'live' } });
+    expect(live.ok ? [] : live.errors).toEqual(['policy.daemon.chainRefresh: live is not enabled']);
+    expectInvalid(
+      resolveMergePolicy(policyWith(undefined, { chainRefresh: 'live' })),
+      'policy-chain-refresh-not-enabled',
+    );
+
+    for (const value of ['sometimes', 1, null, true, '']) {
+      const unknown = parsePolicy({ daemon: { chainRefresh: value } });
+      expect(unknown.ok ? [] : unknown.errors).toEqual(['policy.daemon.chainRefresh: must be shadow or live']);
+      expectInvalid(resolveMergePolicy(policyWith(undefined, { chainRefresh: value })), 'policy-daemon-invalid');
+    }
+  });
+
   it('the parser never echoes a secret-shaped repository key or value', () => {
     const secret = `sk-${'a1'.repeat(15)}`;
     const keyed = parsePolicy({ merge: { repos: { [`${secret}/repo`]: { projectId: 'p' } } } });

@@ -22,6 +22,7 @@ import {
   DAEMON_MAX_BUDGET_SECONDS,
   DAEMON_REPO_DIGEST_PATTERN,
   DAEMON_TICK_ID_PATTERN,
+  chainRefreshJobId,
   computeCallBudget,
   computeTickDeadlineIso,
   decideDaemonJobLease,
@@ -74,8 +75,16 @@ import type {
   RunDaemonTickResult,
 } from '../ports/in/RunDaemonTickPort.in-port.js';
 import type { RunMergePassPort, RunMergePassResult } from '../ports/in/RunMergePassPort.in-port.js';
+import type { RefreshChainsPort, RefreshChainsResult } from '../ports/in/RefreshChainsPort.in-port.js';
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
+
+/** Input bounds: a larger or sparse input is refused before any port is called. */
+const MAX_REPOSITORIES = 64;
+const MAX_JOB_FILTER_ITEMS = 64;
+const MAX_JOB_ID_LENGTH = 64;
+const MAX_INTERVAL_SECONDS = 3_600;
+const MAX_SETTLE_SECONDS = 600;
 
 /** The production sleep: a `setTimeout` promise. Tests inject a fake instead. */
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -91,6 +100,8 @@ export interface RunDaemonTickDependencies {
   /** Reads back the journal entries the merge passes appended, for the projection (plan §3.1). */
   readonly journal: Pick<LaneRunJournalPort, 'listForKey'>;
   readonly mergePass: RunMergePassPort;
+  /** The chain-refresh use case; absent registers no chain-refresh job (lane CO8). */
+  readonly chainRefresh?: RefreshChainsPort;
   /** The tick clock; production real time, tests a fake. Absent means the system clock. */
   readonly now?: () => string;
   /** The tick sleep, awaited for the wake settle delay. Absent means a `setTimeout` promise. */
@@ -101,6 +112,8 @@ export interface RunDaemonTickDependencies {
 
 export interface DaemonJobRegistryDependencies {
   readonly mergePass: RunMergePassPort;
+  /** The chain-refresh use case; absent registers no chain-refresh job (lane CO8). */
+  readonly chainRefresh?: RefreshChainsPort;
 }
 
 /** One journal key a merge pass reported as journalled, with the queue entry it acts on. */
@@ -347,11 +360,60 @@ class MergePassJob implements DaemonJobPort {
   }
 }
 
+/** CO8's pass result → the DaemonJobOutcome the tick records; a malformed result is refused. */
+function toChainRefreshJobOutcome(result: RefreshChainsResult): DaemonJobOutcome {
+  if (!isRecord(result)) {
+    return { outcome: 'refused', reasonCode: 'chain-refresh-malformed' };
+  }
+  switch (result.outcome) {
+    case 'completed':
+      return { outcome: 'completed', progressed: Array.isArray(result.chains) && result.chains.length > 0 };
+    case 'budget-exhausted':
+      return { outcome: 'budget-exhausted', progressed: false };
+    case 'skipped':
+      return {
+        outcome: 'skipped',
+        reasonCode: isSafeReasonCode(result.reasonCode) ? result.reasonCode : 'job-skipped',
+      };
+    case 'refused':
+      return {
+        outcome: 'refused',
+        reasonCode: isSafeReasonCode(result.reasonCode) ? result.reasonCode : 'job-failed',
+      };
+    default:
+      return { outcome: 'refused', reasonCode: 'chain-refresh-malformed' };
+  }
+}
+
+/** One chain-refresh job instance: wraps the refresh use case for one repository (lane CO8). */
+class ChainRefreshJob implements DaemonJobPort {
+  constructor(
+    private readonly repository: DaemonRepositoryRef,
+    private readonly refresh: RefreshChainsPort,
+    readonly jobId: string,
+    readonly leaseScope: string,
+  ) {}
+
+  async pass(request: DaemonJobPassRequest): Promise<DaemonJobOutcome> {
+    const result = await this.refresh.runRefreshChains({
+      repository: { owner: this.repository.owner, repo: this.repository.repo },
+      projectId: this.repository.projectId,
+      nowIso: request.nowIso,
+      deadlineIso: request.deadlineIso,
+    });
+    return toChainRefreshJobOutcome(result);
+  }
+}
+
 /** The registry that expands the configured repositories into one merge-pass job instance each. */
 export class DaemonJobRegistry {
   constructor(private readonly deps: DaemonJobRegistryDependencies) {}
 
-  /** One merge-pass job instance per valid repository, in request order; a repeated digest keeps the first. */
+  /**
+   * One merge-pass job instance per valid repository, in request order; a repeated
+   * digest keeps the first. When the chain-refresh use case is present, one
+   * chain-refresh job instance per valid repository follows the merge-pass jobs.
+   */
   instances(repositories: readonly DaemonRepositoryRef[]): readonly DaemonJobPort[] {
     const instances: DaemonJobPort[] = [];
     const seen = new Set<string>();
@@ -366,6 +428,20 @@ export class DaemonJobRegistry {
       seen.add(repository.repoDigest);
       instances.push(new MergePassJob(repository, this.deps.mergePass, parsed.jobId, parsed.leaseScope));
     }
+    if (this.deps.chainRefresh !== undefined) {
+      const refreshSeen = new Set<string>();
+      for (const repository of repositories) {
+        if (!isUsableRepository(repository) || refreshSeen.has(repository.repoDigest)) {
+          continue;
+        }
+        const parsed = parseDaemonJobId(chainRefreshJobId(repository.repoDigest));
+        if (parsed === null || parsed.kind !== 'chain-refresh') {
+          continue;
+        }
+        refreshSeen.add(repository.repoDigest);
+        instances.push(new ChainRefreshJob(repository, this.deps.chainRefresh, parsed.jobId, parsed.leaseScope));
+      }
+    }
     return instances;
   }
 }
@@ -375,6 +451,9 @@ interface ValidTickRequest {
   readonly tickId: string;
   readonly repositories: readonly DaemonRepositoryRef[];
   readonly budgetSeconds: number;
+  readonly deadlineIso: string | undefined;
+  readonly intervalSeconds: number | undefined;
+  readonly settleSeconds: number | undefined;
   readonly jobFilter: readonly string[] | undefined;
   readonly forgeReachable: boolean;
 }
@@ -384,12 +463,16 @@ type TickRequestCheck =
   | { readonly ok: false; readonly tickId: string; readonly reasonCode: string };
 
 function checkRepositories(value: unknown): string | null {
-  if (!Array.isArray(value)) {
+  if (!Array.isArray(value) || value.length > MAX_REPOSITORIES) {
     return 'invalid-repositories';
   }
   const digests = new Set<string>();
   const names = new Set<string>();
-  for (const repository of value as readonly unknown[]) {
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.hasOwn(value, index)) {
+      return 'invalid-repository';
+    }
+    const repository: unknown = value[index];
     if (!isUsableRepository(repository)) {
       return 'invalid-repository';
     }
@@ -409,8 +492,28 @@ function isValidBudgetSeconds(value: unknown): value is number {
   );
 }
 
+function isValidInterval(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= MAX_INTERVAL_SECONDS;
+}
+
+function isValidSettle(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= MAX_SETTLE_SECONDS;
+}
+
 function isValidJobFilter(value: unknown): value is readonly string[] | undefined {
-  return value === undefined || (Array.isArray(value) && value.every((item) => typeof item === 'string'));
+  if (value === undefined) {
+    return true;
+  }
+  if (!Array.isArray(value) || value.length > MAX_JOB_FILTER_ITEMS) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const item: unknown = Object.hasOwn(value, index) ? value[index] : undefined;
+    if (typeof item !== 'string' || item.length === 0 || item.length > MAX_JOB_ID_LENGTH) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Validates the whole runtime request; the first failing field names the refusal. */
@@ -431,6 +534,15 @@ function checkTickRequest(raw: unknown): TickRequestCheck {
   if (repositoryProblem !== null) {
     return refuse(repositoryProblem);
   }
+  if (raw.deadlineIso !== undefined && (typeof raw.deadlineIso !== 'string' || !isZonedIsoDateTime(raw.deadlineIso))) {
+    return refuse('invalid-deadline');
+  }
+  if (raw.intervalSeconds !== undefined && !isValidInterval(raw.intervalSeconds)) {
+    return refuse('invalid-interval');
+  }
+  if (raw.settleSeconds !== undefined && !isValidSettle(raw.settleSeconds)) {
+    return refuse('invalid-settle');
+  }
   if (!isValidJobFilter(raw.jobFilter)) {
     return refuse('invalid-job-filter');
   }
@@ -443,6 +555,9 @@ function checkTickRequest(raw: unknown): TickRequestCheck {
       tickId,
       repositories: raw.repositories as readonly DaemonRepositoryRef[],
       budgetSeconds,
+      deadlineIso: raw.deadlineIso as string | undefined,
+      intervalSeconds: raw.intervalSeconds as number | undefined,
+      settleSeconds: raw.settleSeconds as number | undefined,
       jobFilter: raw.jobFilter,
       forgeReachable: raw.forgeReachable,
     },
@@ -474,6 +589,8 @@ interface TickContext {
   readonly previousStatus: DaemonStatusRecord | null;
   /** The tick clock after the start: a throwing or malformed reading falls back to the last good one. */
   readonly clock: () => string;
+  /** Set when a deadline-sensitive fresh read failed: the budget is then treated as exhausted. */
+  readonly state: { budgetSpent: boolean };
 }
 
 export class RunDaemonTickUseCase implements RunDaemonTickPort {
@@ -498,7 +615,8 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
     }
     const request = checked.request;
     const nowIso = this.readClock();
-    const deadlineIso = nowIso === null ? null : computeTickDeadlineIso(nowIso, request.budgetSeconds);
+    const deadlineIso =
+      nowIso === null ? null : (request.deadlineIso ?? computeTickDeadlineIso(nowIso, request.budgetSeconds));
     if (nowIso === null || deadlineIso === null) {
       return refused(request.tickId, 'invalid-clock');
     }
@@ -513,13 +631,15 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       deadlineIso,
       previousStatus: previous,
       clock: this.tickClock(nowIso),
+      state: { budgetSpent: false },
     };
 
-    const jobs = new DaemonJobRegistry({ mergePass: this.deps.mergePass }).instances(request.repositories);
+    const jobs = new DaemonJobRegistry({
+      mergePass: this.deps.mergePass,
+      ...(this.deps.chainRefresh !== undefined ? { chainRefresh: this.deps.chainRefresh } : {}),
+    }).instances(request.repositories);
     const plan = await this.plan(ctx, jobs);
-    if (plan.settleDelayMs > 0) {
-      await (this.deps.sleep ?? defaultSleep)(plan.settleDelayMs);
-    }
+    await this.settle(ctx, plan.settleDelayMs);
     if (plan.paused) {
       return this.finishPaused(ctx, plan);
     }
@@ -565,8 +685,31 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       halt,
       forgeReachable,
       nowIso: ctx.nowIso,
+      intervalSeconds: ctx.request.intervalSeconds,
+      settleSeconds: ctx.request.settleSeconds,
       jobFilter: ctx.request.jobFilter,
     });
+  }
+
+  /**
+   * The settle never outlasts the tick: cap it to the time left before the deadline, measured at the moment of
+   * the sleep (the status, pause and halt reads before it already spent part of the budget), skip it when none is left.
+   * Fail closed: when the fresh clock read throws or is malformed the time left is unknown, so the settle is skipped
+   * and the budget counts as exhausted (every job then ends `budget-exhausted`), never measured from the start time.
+   */
+  private async settle(ctx: TickContext, settleDelayMs: number): Promise<void> {
+    if (settleDelayMs <= 0) {
+      return;
+    }
+    const freshNow = this.readClock();
+    if (freshNow === null) {
+      ctx.state.budgetSpent = true;
+      return;
+    }
+    const settleMs = Math.min(settleDelayMs, Math.max(0, Date.parse(ctx.deadlineIso) - Date.parse(freshNow)));
+    if (settleMs > 0) {
+      await (this.deps.sleep ?? defaultSleep)(settleMs);
+    }
   }
 
   /** A paused tick writes a paused status carrying the previous repositories and runs nothing. */
@@ -735,6 +878,9 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
 
   /** D-DT9: a call whose remaining time is under 2 s is not started. */
   private hasBudget(ctx: TickContext, nowIso: string): boolean {
+    if (ctx.state.budgetSpent) {
+      return false;
+    }
     return computeCallBudget({
       nowIso,
       deadlineIso: ctx.deadlineIso,

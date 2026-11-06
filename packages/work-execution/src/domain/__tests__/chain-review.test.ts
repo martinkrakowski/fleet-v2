@@ -51,6 +51,7 @@ describe('the chain record review pin', () => {
     expect(read.record).toEqual({
       schemaVersion: 1, repository: REPO, chainName: 'example', branchName: 'chain/example', sourceBranch: 'main',
       expectedHeadSha: SHA, actionKey: 'chain-start-1', state: 'started', reason: null, createdAtIso: NOW, revision: 2,
+      refresh: null, conflictMark: null,
     });
   });
 
@@ -123,6 +124,7 @@ describe('the chain record review pin', () => {
     expect(record).toEqual({
       schemaVersion: 1, repository: REPO, chainName: 'example', branchName: 'chain/example', sourceBranch: 'main',
       expectedHeadSha: SHA, actionKey: 'chain-start-1', state: 'started', reason: null, createdAtIso: NOW, revision: 2,
+      refresh: null, conflictMark: null,
     });
   });
 });

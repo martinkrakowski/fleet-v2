@@ -412,15 +412,20 @@ describe('file store faults', () => {
   });
 
   it('lets a record that is already publishing finish and report its own result', async () => {
-    const adapter = new GateReceiptReuseAdapter({ stateDir: dir, deadlineMs: 20 });
+    // The deadline must outlast the work before publishing (mkdir, temp write) even on a loaded CI runner, and the
+    // publish delay must outlast the deadline by a wide margin; 20 ms before publish refused intermittently (F131).
+    const adapter = new GateReceiptReuseAdapter({ stateDir: dir, deadlineMs: 250 });
     const fsMod = await import('node:fs');
     const original = fsMod.promises.link;
+    let publishing = false;
     const spy = vi.spyOn(fsMod.promises, 'link').mockImplementation(async (a, b) => {
-      await new Promise((resolve) => setTimeout(resolve, 80));
+      publishing = true;
+      await new Promise((resolve) => setTimeout(resolve, 600));
       return original(a, b);
     });
     try {
       const result = await adapter.recordGateReceipt(request(makeKey()));
+      expect(publishing).toBe(true);
       expect(result).toEqual({ outcome: 'recorded' });
     } finally {
       spy.mockRestore();

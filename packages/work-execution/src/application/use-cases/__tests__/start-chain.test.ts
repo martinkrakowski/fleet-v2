@@ -71,6 +71,15 @@ function harness(script: Script = {}) {
     async recordChainReviewPin() {
       throw new Error("not used");
     },
+    async listChains() {
+      throw new Error("not used");
+    },
+    async recordChainRefreshIntent() {
+      throw new Error("not used");
+    },
+    async recordChainRefreshOutcome() {
+      throw new Error("not used");
+    },
   };
   const forge: MergeForgeActionPort = {
     isConfigured: () => true,

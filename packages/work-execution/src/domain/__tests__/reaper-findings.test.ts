@@ -664,3 +664,35 @@ describe('classifyZombies — never throws', () => {
     expect(() => classifyZombies({ observations: [observation], openFindings: [] }, NOW, policy)).not.toThrow();
   });
 });
+
+describe('classifyZombies — the new reaper policy fields', () => {
+  it('reads the new reaper policy fields without changing the classifier', () => {
+    const merged: ReaperObservation = {
+      kind: 'merged-worktree',
+      subject: WORKTREE,
+      youngActivity: false,
+      facts: MERGED_PR_FACTS,
+    };
+    const disk: ReaperObservation = {
+      kind: 'disk-pressure',
+      subject: HOST,
+      youngActivity: false,
+      freePercent: 10,
+    };
+    const withFields: ReaperPolicy = { retentionHours: 48, clearFreePercent: 30 };
+
+    // merged-worktree: report without the opt-in, repair with it, no finding
+    // on unknown evidence — exactly as without the new fields.
+    expect(classify(merged, undefined, withFields)?.action).toBe('report');
+    expect(classify(merged, undefined, { ...withFields, repairs: { 'merged-worktree': true } })?.action).toBe('repair');
+    expect(classify({ ...merged, facts: mergedFacts({ evidence: 'unknown' }) }, undefined, withFields)).toBeNull();
+    expect(classify({ ...merged, facts: mergedFacts({ clean: 'no' }) }, undefined, withFields)).toBeNull();
+
+    // disk-pressure: a finding below minFreePercent, none at or above it,
+    // and never a repair — exactly as without the new fields.
+    const diskPolicy: ReaperPolicy = { ...withFields, minFreePercent: 15 };
+    expect(classify(disk, undefined, diskPolicy)?.action).toBe('report');
+    expect(classify({ ...disk, freePercent: 15 }, undefined, diskPolicy)).toBeNull();
+    expect(classify({ ...disk, freePercent: null }, undefined, diskPolicy)).toBeNull();
+  });
+});

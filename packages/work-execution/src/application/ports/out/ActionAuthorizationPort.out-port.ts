@@ -54,4 +54,29 @@ export interface ActionAuthorizationPort {
   consumeActionAuthorization(
     request: ConsumeActionAuthorizationRequest,
   ): Promise<ConsumeActionAuthorizationResult>;
+
+  /**
+   * C2': the scoped, one-way owner approval for removing one attempt's
+   * unsealed worktree. Approved only through a signed owner decision on a
+   * coordination request bound to the exact attempt, head and worktree-path
+   * scope, consumed once via the authorization store. Pending or absent
+   * authority blocks; an unreadable authorization answers unknown.
+   */
+  authorizeUnsealedWorktreeRemoval?(
+    request: AuthorizeUnsealedWorktreeRemovalRequest,
+  ): Promise<AuthorizeUnsealedWorktreeRemovalResult>;
 }
+
+export interface AuthorizeUnsealedWorktreeRemovalRequest {
+  readonly projectId: string;
+  readonly runId: string;
+  readonly attemptId: string;
+  readonly worktreePath: string;
+  readonly expectedHeadSha: string;
+  readonly nowIso: string;
+}
+
+export type AuthorizeUnsealedWorktreeRemovalResult =
+  | { readonly outcome: 'approved'; readonly approvalReference: string }
+  | { readonly outcome: 'blocked'; readonly reason: string }
+  | { readonly outcome: 'unknown'; readonly reason: string };

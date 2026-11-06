@@ -6,7 +6,7 @@
 
 import { readFileSync } from 'node:fs';
 
-import { SeatPlan, sha256HexDigest, type SeatPlanProps } from '@fleet/work-execution';
+import { SeatPlan, sha256HexDigest, seatPlanFromCatalog, type SeatPlanProps } from '@fleet/work-execution';
 import { resolveImplementerSeat } from '@fleet/work-execution/use-cases';
 import { assessmentIdForAttempt } from '@fleet/evidence-and-acceptance';
 import type { RankingTrialContextFigures, TrialFigure } from '@fleet/brief-knowledge';
@@ -18,7 +18,6 @@ import {
 } from '@fleet/installation';
 
 import type { FleetCliRuntime } from '../composition.js';
-import { seatPlanFromInstallation } from '../seat-plan.js';
 
 /** Signalled for argument-shape problems; reported as exit code 2. */
 export class CliUsageError extends Error {}
@@ -402,7 +401,7 @@ export function briefSeatPlan(p: Payload, rt: FleetCliRuntime): SeatPlanProps | 
   if (model === undefined) {
     throw new CliUsageError("'--seatPlanFromInstallation' needs a v2 installation");
   }
-  const built = seatPlanFromInstallation(model);
+  const built = seatPlanFromCatalog(model);
   if ('reason' in built) {
     throw new CliUsageError(built.reason);
   }

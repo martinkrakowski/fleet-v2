@@ -16,6 +16,7 @@ import {
   type McpResourceResult,
   type McpToolResult,
 } from "./envelope.js";
+import { createToolRateLimiter, rateLimitedResult } from "./rate-limit.js";
 import {
   projectAttemptList,
   projectAttemptResult,
@@ -356,6 +357,8 @@ const TELEMETRY_STATUS_ROUTE = "/v1/telemetry/status";
 
 /** Build the registry. The tool/resource set never depends on runtime input. */
 export function buildRegistry(client: FleetApiClient): FleetRegistry {
+  // One limiter per registry, one registry per MCP process (plan §3.7, D13).
+  const limiter = createToolRateLimiter();
   /**
    * Call one /v1 route and project its envelope result (§3.7): a client failure
    * goes to `toToolResult` unchanged; an envelope's result is replaced by its
@@ -634,5 +637,16 @@ export function buildRegistry(client: FleetApiClient): FleetRegistry {
     },
   ];
 
-  return { tools, resources };
+  return {
+    tools: tools.map((tool) => ({
+      ...tool,
+      handler: async (input: unknown): Promise<McpToolResult> => {
+        if (!limiter.allow(tool.name, tool.kind)) {
+          return rateLimitedResult(tool.name);
+        }
+        return tool.handler(input);
+      },
+    })),
+    resources,
+  };
 }

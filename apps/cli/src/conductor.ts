@@ -62,6 +62,7 @@ import {
 
 import type { FleetCliRuntime } from './composition.js';
 import {
+  CONDUCTOR_HEARTBEAT_GAP_CAP_MS,
   heartbeatConductorOrchestrator,
   pollDelayWhileRegistered,
   registerConductorOrchestrator,
@@ -1043,6 +1044,22 @@ async function runCommand(
   let registrationAttempted = false;
   // One stderr line per distinct non-renewed heartbeat code per process.
   const seenHeartbeatCodes = new Set<string>();
+  // O9 fix: the heartbeat used both during a pass and before the sleep. It
+  // no-ops until a session id is registered and never stops the loop.
+  const beatNow = async (): Promise<void> => {
+    if (registeredOrchestratorId === null) {
+      return;
+    }
+    const heartbeat = await heartbeatConductorOrchestrator(
+      runtime.coordination.orchestratorSessionRepository,
+      { nowIso: () => nowIsoOf(options) },
+      registeredOrchestratorId,
+    );
+    if (heartbeat.code !== 'renewed' && !seenHeartbeatCodes.has(heartbeat.code)) {
+      seenHeartbeatCodes.add(heartbeat.code);
+      io.stderr(`${JSON.stringify({ orchestrator: heartbeat.code })}\n`);
+    }
+  };
   try {
     const startPromise = tunnel.ensureTunnel({
       onEarlyExit: () => {
@@ -1101,6 +1118,7 @@ async function runCommand(
       once: flags.once,
       wake,
       releaseTunnel: () => tunnel.release(),
+      heartbeatDuringPass: beatNow,
       eachPass: async (pass, result, nowIso) => {
         io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
         if (result.outcome === 'refused') {
@@ -1126,15 +1144,7 @@ async function runCommand(
               )}\n`,
             );
           } else if (registeredOrchestratorId !== null) {
-            const heartbeat = await heartbeatConductorOrchestrator(
-              runtime.coordination.orchestratorSessionRepository,
-              { nowIso: () => nowIsoOf(options) },
-              registeredOrchestratorId,
-            );
-            if (heartbeat.code !== 'renewed' && !seenHeartbeatCodes.has(heartbeat.code)) {
-              seenHeartbeatCodes.add(heartbeat.code);
-              io.stderr(`${JSON.stringify({ orchestrator: heartbeat.code })}\n`);
-            }
+            await beatNow();
           }
         }
         await recordPassTrace(io, driver.passTrace, {
@@ -1261,6 +1271,67 @@ async function sleepBetweenPasses(options: {
 }
 
 /**
+ * O9 fix: run one pass while heartbeating the registered orchestrator session
+ * in the background. A pass can outlive the 90-second session lease; the beat
+ * fires every 60 seconds until the pass settles, so a live conductor never
+ * appears detached while it is still running. Without a registered session
+ * (or before registration) the pass runs unchanged. The beat loop ends when
+ * the pass settles or the stop signal fires; the pass result is always the
+ * one returned, and the loop can never end it early.
+ */
+async function runPassWithHeartbeat(
+  options: {
+    readonly driver: ConductorDriver;
+    readonly stopSignal?: AbortSignal;
+    readonly heartbeatDuringPass?: () => Promise<void>;
+  },
+  passRequest: { readonly holderId: string; readonly nowIso: string },
+): Promise<RunConductorPassResult> {
+  const heartbeat = options.heartbeatDuringPass;
+  const passPromise = options.driver.pass.runPass(passRequest);
+  if (heartbeat === undefined) {
+    return await passPromise;
+  }
+  const iteration = new AbortController();
+  const onStop = (): void => iteration.abort();
+  const signal = options.stopSignal;
+  if (signal !== undefined) {
+    signal.addEventListener('abort', onStop, { once: true });
+    if (signal.aborted) {
+      iteration.abort();
+    }
+  }
+  try {
+    return await Promise.race([
+      passPromise,
+      (async () => {
+        while (!iteration.signal.aborted) {
+          // The beat interval uses the raw real-timer sleep, never the
+          // poll-loop sleep: a test-recorded poll sleep must not see these
+          // 60-second gaps, and the poll back-off owns that recording.
+          await defaultSleep(CONDUCTOR_HEARTBEAT_GAP_CAP_MS, iteration.signal);
+          if (iteration.signal.aborted) {
+            break;
+          }
+          try {
+            await heartbeat();
+          } catch {
+            // A thrown beat can never settle the race; the pass result owns it.
+            break;
+          }
+        }
+        return await passPromise;
+      })(),
+    ]);
+  } finally {
+    if (signal !== undefined) {
+      signal.removeEventListener('abort', onStop);
+    }
+    iteration.abort(); // ends a pending beat sleep; the pass promise always settles
+  }
+}
+
+/**
  * The shared poll loop of `conductor run`: one pass at a time under the
  * driver lease, printing one line per pass through `eachPass`, polling with
  * back-off from 30 seconds to 2 minutes, with a 10-second floor while a run
@@ -1285,6 +1356,12 @@ async function pollConductorPasses(options: {
    */
   readonly releaseTunnel?: () => Promise<void>;
   readonly eachPass: (pass: number, result: RunConductorPassResult, nowIso: string) => Promise<PollPassOutcome>;
+  /**
+   * O9 fix: heartbeats the registered orchestrator session while a pass runs.
+   * A pass can outlive the 90 s lease, so the live conductor renews during the
+   * pass, not only after it completes; a no-op until an id is registered.
+   */
+  readonly heartbeatDuringPass?: () => Promise<void>;
 }): Promise<number> {
   const controller = new AbortController();
   const signal = options.stopSignal ?? controller.signal;
@@ -1302,7 +1379,7 @@ async function pollConductorPasses(options: {
   try {
     for (let pass = 1; ; pass += 1) {
       const passNowIso = options.nowIso();
-      const result = await options.driver.pass.runPass({
+      const result = await runPassWithHeartbeat(options, {
         holderId: options.holderId,
         nowIso: passNowIso,
       });

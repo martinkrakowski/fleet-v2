@@ -28,8 +28,8 @@ const CONDUCTOR_REGISTERED_SCOPES = ['orchestrate'] as const;
 const CONDUCTOR_CLAIMS = ['start-lane-run'] as const;
 const CONDUCTOR_CLI_KIND = 'conductor';
 const CONDUCTOR_MODEL: string | null = null;
-/** Heartbeat gap cap, under the 90 s lease. */
-const CONDUCTOR_HEARTBEAT_GAP_CAP_MS = 60_000;
+/** Heartbeat gap cap, under the 90 s lease; also the during-pass beat interval. */
+export const CONDUCTOR_HEARTBEAT_GAP_CAP_MS = 60_000;
 /** At most this many lapsed conductor-driver sessions are retired before registering. */
 const CONDUCTOR_LAPSED_SCAN_CAP = 64;
 /** A longer stored-session list is unknown and writes nothing. */

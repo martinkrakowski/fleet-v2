@@ -561,6 +561,8 @@ type BuiltBriefPackage =
       readonly plan: SeatPlan | undefined;
       readonly decisions: readonly BriefContextDecision[];
       readonly selectedKnowledgeVersions: readonly SelectedKnowledgeVersion[];
+      /** The validated private copy of the request; the only source for everything after the build. */
+      readonly request: PrepareBriefPackageUseCaseRequest;
     };
 
 /**
@@ -601,10 +603,18 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
    * write. A rejection reason here is the same reason a prepare would give.
    */
   private async build(
-    request: PrepareBriefPackageUseCaseRequest,
+    callerRequest: PrepareBriefPackageUseCaseRequest,
     deps: PrepareBriefPackageDependencies,
     forPreview = false,
   ): Promise<BuiltBriefPackage> {
+    // CO28b: the caller's request is copied once, synchronously, before any
+    // validation or outbound call. Every check and every later read (the
+    // manifest, the digest, `BriefPackage.create`, the placement) uses this
+    // private copy only, so a caller mutating its own arrays or objects
+    // while authoring or ignored-path verification is awaited cannot change
+    // what was validated. A request that cannot be copied (a throwing
+    // getter, a function value) is refused by the callers' catch.
+    const request: PrepareBriefPackageUseCaseRequest = structuredClone(callerRequest);
     const fieldsError = validateBriefFields(request);
     if (fieldsError !== null) {
       return { reason: fieldsError };
@@ -766,6 +776,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       plan: reviewerCheck.plan,
       decisions,
       selectedKnowledgeVersions,
+      request,
     };
   }
 
@@ -800,7 +811,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       worktreePath: built.worktreePath,
       proseMarkdown: built.authored.brief.proseMarkdown,
       manifestJson: built.manifestJson,
-      ...(request.recordedHost !== undefined ? { recordedHost: request.recordedHost } : {}),
+      ...(built.request.recordedHost !== undefined ? { recordedHost: built.request.recordedHost } : {}),
     });
     if (placed.outcome === 'refused') {
       return { outcome: 'rejected', reason: placed.reason };
@@ -869,9 +880,9 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       attemptId: built.attemptId,
       briefDigest: built.briefDigest,
       modelAssignment: {
-        model: request.modelAssignment.model,
-        variant: request.modelAssignment.variant,
-        seatTool: request.modelAssignment.seatTool,
+        model: built.request.modelAssignment.model,
+        variant: built.request.modelAssignment.variant,
+        seatTool: built.request.modelAssignment.seatTool,
       },
       seatPlan: built.plan?.toJSON() ?? null,
       acceptance: {
@@ -880,7 +891,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
         commandCount: commands.length,
         commandDigests,
       },
-      prNotesPresent: request.prNotes !== undefined,
+      prNotesPresent: built.request.prNotes !== undefined,
       selectedKnowledgeVersions: built.selectedKnowledgeVersions,
     };
     return { outcome: 'previewed', preview };

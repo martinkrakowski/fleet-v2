@@ -915,4 +915,41 @@ describe('PrepareBriefPackageUseCase CO28b schemaVersion 2 and frozen inputs', (
     expect(captured.placedRequests).toHaveLength(0);
     expect(captured.verifyIgnoredPathsRequests).toHaveLength(0);
   });
+
+  it('builds from the validated snapshot when the caller mutates the request during the awaited authoring call', async () => {
+    const captured = makeCapturingArtifactPort();
+    const request = validRequest({ ownerDecisionReferences: ['decision-1'] });
+    const nulRef = 'decision' + String.fromCharCode(0) + '-evil';
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: {
+        async authorBrief() {
+          // The request passed preflight; now the caller changes it mid-flight.
+          (request.ownerDecisionReferences as string[]).push(nulRef);
+          (request.ownedPaths as string[]).push('outside/**');
+          (request as { baseCommit: string }).baseCommit = 'mutated-base';
+          return { outcome: 'authored', brief: { proseMarkdown: '# Frozen brief prose', provenance: 'orchestrator' } };
+        },
+      },
+      artifactPort: captured.port,
+      worktreePath: '/wt',
+    });
+
+    const result = await useCase.prepareBriefPackage(request);
+
+    expect(result.outcome).toBe('prepared');
+    expect(captured.placedRequests).toHaveLength(1);
+    const manifestJson = captured.placedRequests[0]?.manifestJson ?? '';
+    expect(manifestJson).not.toContain(String.fromCharCode(0));
+    expect(manifestJson).not.toContain('\\u0000');
+    expect(manifestJson).not.toContain('mutated-base');
+    expect(manifestJson).not.toContain('outside/**');
+    const manifest = JSON.parse(manifestJson) as {
+      ownerDecisionReferences: string[];
+      ownedPaths: string[];
+      baseCommit: string;
+    };
+    expect(manifest.ownerDecisionReferences).toEqual(['decision-1']);
+    expect(manifest.ownedPaths).toEqual(['packages/app-a/**']);
+    expect(manifest.baseCommit).toBe('abc123');
+  });
 });

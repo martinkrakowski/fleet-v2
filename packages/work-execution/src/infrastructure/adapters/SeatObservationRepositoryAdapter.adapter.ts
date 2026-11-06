@@ -94,7 +94,9 @@ export function parseVersionedSeatObservationStateRecord(
       seatId: candidate.seatId,
       outcome: candidate.outcome as SeatObservationRecord['outcome'],
       observedAtIso: candidate.observedAtIso,
-      subject: candidate.subject as SeatObservationRecord['subject'],
+      // A fresh object, never the caller's: a later mutation of the nested
+      // subject cannot change what the adapter validated and writes.
+      subject: { ...(candidate.subject as Record<string, unknown>) } as SeatObservationRecord['subject'],
       via: candidate.via,
     },
     schemaVersion: versionCheck.schemaVersion,

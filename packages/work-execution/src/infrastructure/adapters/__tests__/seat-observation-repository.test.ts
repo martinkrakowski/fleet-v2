@@ -89,6 +89,16 @@ describe('SeatObservationRepositoryAdapter (memory mode)', () => {
     expect(await adapter.listSeatObservations()).toEqual([]);
   });
 
+  it('parses into a record whose subject is a fresh object, not the caller\'s', () => {
+    const input = { ...observation('obs-1'), schemaVersion: 1 };
+    const parsed = parseVersionedSeatObservationStateRecord(input);
+    expect(parsed.status).toBe('ok');
+    if (parsed.status === 'ok') {
+      expect(parsed.record.subject).toEqual(input.subject);
+      expect(parsed.record.subject).not.toBe(input.subject);
+    }
+  });
+
   it('refuses an unknown outcome or via', async () => {
     await expect(
       adapter.appendSeatObservation({ ...observation('obs-1'), outcome: 'bogus' as SeatObservationRecord['outcome'] }),

@@ -248,7 +248,7 @@ describe('ExecutionJournalAdapter fenced capacity release (plan §3.9.2)', () =>
     );
     expect(second).toEqual({ outcome: 'not-held' });
     expect(await first).toEqual({ outcome: 'released', reservationId: 'res-mem' });
-    expect(signals.filter((signal) => signal.kind === 'capacity').length).toBe(1);
+    expect(signals.filter((signal) => signal.kind === 'capacity')).toHaveLength(1);
   });
 
   it('retains no serialisation entry once releases of many distinct attempts settle', async () => {
@@ -399,7 +399,7 @@ describe('ExecutionJournalAdapter fenced capacity release (plan §3.9.2)', () =>
     expect(released).toEqual({ outcome: 'released', reservationId: 'res-1' });
 
     const capacitySignals = signals.filter((signal) => signal.kind === 'capacity');
-    expect(capacitySignals.length).toBe(1);
+    expect(capacitySignals).toHaveLength(1);
     expect(capacitySignals[0]?.id).toBe('res-1');
   });
 });

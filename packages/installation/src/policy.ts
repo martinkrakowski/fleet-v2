@@ -775,6 +775,11 @@ const MERGE_INVALID: MergeReadFailure = Object.freeze({ ok: false, reason: 'poli
 const MERGE_SECRET: MergeReadFailure = Object.freeze({ ok: false, reason: 'policy-secret-shape' });
 const MERGE_TOO_LARGE: MergeReadFailure = Object.freeze({ ok: false, reason: 'policy-too-large' });
 const DAEMON_INVALID: MergeReadFailure = Object.freeze({ ok: false, reason: 'policy-daemon-invalid' });
+/** `policy.daemon.chainRefresh: 'live'` is refused until live chain refresh is enabled. */
+const CHAIN_REFRESH_NOT_ENABLED: MergeReadFailure = Object.freeze({
+  ok: false,
+  reason: 'policy-chain-refresh-not-enabled',
+});
 
 function mergeOk<T>(value: T): MergeReadResult<T> {
   return { ok: true, value };
@@ -1059,6 +1064,15 @@ function readDaemonSection(
   );
   if (!intervalSeconds.ok || !budgetSeconds.ok || !settleSeconds.ok) {
     return DAEMON_INVALID;
+  }
+  if (Object.hasOwn(block, 'chainRefresh')) {
+    const chainRefresh = readOwnDataProperty(block, 'chainRefresh');
+    if (chainRefresh === 'live') {
+      return CHAIN_REFRESH_NOT_ENABLED;
+    }
+    if (chainRefresh !== 'shadow') {
+      return DAEMON_INVALID;
+    }
   }
   if (budgetSeconds.value >= intervalSeconds.value) {
     return DAEMON_INVALID;

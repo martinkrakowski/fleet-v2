@@ -2612,13 +2612,20 @@ function parseMergeDaemonPolicy(
   }
   const before = errors.length;
   collectUnknownKeys(value, POLICY_DAEMON_KEYS, 'policy.daemon', errors);
-  const read = (field: keyof MergeDaemonSection): number | undefined =>
+  const read = (field: 'intervalSeconds' | 'budgetSeconds' | 'settleSeconds'): number | undefined =>
     Object.hasOwn(value, field)
       ? readMergeInteger(value, field, 'policy.daemon', MERGE_POLICY_BOUNDS[field], errors)
       : undefined;
   const intervalSeconds = read('intervalSeconds');
   const budgetSeconds = read('budgetSeconds');
   const settleSeconds = read('settleSeconds');
+  if (Object.hasOwn(value, 'chainRefresh')) {
+    if (value.chainRefresh === 'live') {
+      errors.push('policy.daemon.chainRefresh: live is not enabled');
+    } else if (value.chainRefresh !== 'shadow') {
+      errors.push('policy.daemon.chainRefresh: must be shadow or live');
+    }
+  }
   if (
     errors.length === before &&
     (budgetSeconds ?? DEFAULT_MERGE_DAEMON_POLICY.budgetSeconds) >=
@@ -2633,6 +2640,7 @@ function parseMergeDaemonPolicy(
     ...(intervalSeconds !== undefined ? { intervalSeconds } : {}),
     ...(budgetSeconds !== undefined ? { budgetSeconds } : {}),
     ...(settleSeconds !== undefined ? { settleSeconds } : {}),
+    ...(Object.hasOwn(value, 'chainRefresh') ? { chainRefresh: 'shadow' as const } : {}),
   };
 }
 

@@ -28,6 +28,7 @@ import {
 } from "@fleet/work-execution";
 
 import { runCli, type CliIo } from "../index.js";
+import { hostsCommand } from "../hosts.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures and helpers
@@ -920,5 +921,517 @@ describe("fleet-v2 hosts usage", () => {
     expect(badRole.stderr).toContain(
       "--role must be one of: orchestrator, lane-runner, verifier",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hosts show and the P2 host-draft fixes
+// ---------------------------------------------------------------------------
+
+describe("fleet-v2 hosts show and the P2 host-draft fixes", () => {
+  it("drops roleAliases['lane-runner'] on the stripped host when moving lane-runner so the loader accepts the write", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+        },
+        oldhost: {
+          transport: "ssh",
+          sshAlias: "old",
+          worktreeRoot: path.join(dir, "oldhost"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: {
+            "lane-runner": "old-lr",
+            verifier: "old-v",
+          },
+          runner: { kind: "opencode", port: 4200 },
+        },
+      },
+    });
+    const added = await runHosts(
+      [
+        "add",
+        "newhost",
+        "--worktree-root",
+        path.join(dir, "newhost"),
+        "--role",
+        "lane-runner",
+        "--port",
+        "5000",
+        "--yes",
+      ],
+      file,
+    );
+    expect(added.code).toBe(0);
+    const reloaded = readFileSync(file, "utf8");
+    expect(reloaded).toContain('"verifier": "old-v"');
+    expect(reloaded).not.toContain("old-lr");
+    expect(() => readInstallationFile(file)).not.toThrow();
+    // The sole-key case: the whole roleAliases map drops off.
+    const soleDir = makeTempDir();
+    const soleFile = path.join(soleDir, "fleet.json");
+    writeJsonFile(soleFile, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(soleDir, "wt"),
+          roles: ["orchestrator"],
+        },
+        oldhost: {
+          transport: "ssh",
+          sshAlias: "old",
+          worktreeRoot: path.join(soleDir, "oldhost"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: { "lane-runner": "old-lr" },
+          runner: { kind: "opencode", port: 4200 },
+        },
+      },
+    });
+    const sole = await runHosts(
+      [
+        "add",
+        "newhost",
+        "--worktree-root",
+        path.join(soleDir, "newhost"),
+        "--role",
+        "lane-runner",
+        "--port",
+        "5000",
+        "--yes",
+      ],
+      soleFile,
+    );
+    expect(sole.code).toBe(0);
+    const soleReloaded = JSON.parse(readFileSync(soleFile, "utf8")) as {
+      hosts: Record<string, { roleAliases?: unknown }>;
+    };
+    expect(soleReloaded.hosts.oldhost.roleAliases).toBeUndefined();
+    expect(() => readInstallationFile(soleFile)).not.toThrow();
+  });
+
+  it("prints one line under --yes naming any role alias dropped by an edit", async () => {
+    // An edit that drops a role drops that role's alias.
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+        },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          worktreeRoot: path.join(dir, "lanehost"),
+          roles: ["lane-runner", "verifier"],
+          roleAliases: {
+            "lane-runner": "moved-lr",
+            verifier: "old-v",
+          },
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    });
+    const edited = await runHosts(["edit", "lanehost", "--role", "lane-runner", "--yes"], file);
+    expect(edited.code).toBe(0);
+    const noticeLines = edited.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("dropped role alias:"));
+    expect(noticeLines).toEqual(["dropped role alias: hosts.lanehost.roleAliases.verifier"]);
+    expect(noticeLines.join("\n")).not.toContain("old-v");
+    // A lane-runner move drops the alias on the host it moved from.
+    const moveDir = makeTempDir();
+    const moveFile = path.join(moveDir, "fleet.json");
+    writeJsonFile(moveFile, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(moveDir, "wt"),
+          roles: ["orchestrator"],
+        },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          worktreeRoot: path.join(moveDir, "lanehost"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: {
+            "lane-runner": "moved-lr",
+            verifier: "old-v",
+          },
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    });
+    const moved = await runHosts(
+      [
+        "add",
+        "newhost",
+        "--worktree-root",
+        path.join(moveDir, "newhost"),
+        "--role",
+        "lane-runner",
+        "--port",
+        "5001",
+        "--yes",
+      ],
+      moveFile,
+    );
+    expect(moved.code).toBe(0);
+    const movedNotices = moved.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("dropped role alias:"));
+    expect(movedNotices).toEqual([
+      "dropped role alias: hosts.lanehost.roleAliases.lane-runner",
+    ]);
+    expect(movedNotices.join("\n")).not.toContain("moved-lr");
+  });
+
+  it("renders the role-ambiguous refusal as operator text naming the role and telling the operator to name the host", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator", "verifier"],
+        },
+        second: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "second"),
+          roles: ["verifier"],
+        },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          worktreeRoot: path.join(dir, "lanehost"),
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    });
+    const shown = await runHosts(["show", "--role", "verifier"], file);
+    expect(shown.code).toBe(1);
+    expect(shown.stdout).toBe("");
+    expect(shown.stderr).toContain("verifier");
+    expect(shown.stderr).toContain("name the host");
+    expect(shown.stderr).not.toContain("fleet.json");
+  });
+
+  it("hosts show prints the generated port, tunnel, container, role-alias and auth-presence table for all hosts, one named host or one unambiguous --role", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+          runner: { kind: "opencode", port: 4100 },
+        },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          container: "lane-box",
+          roleAliases: { "lane-runner": "m" },
+          worktreeRoot: path.join(dir, "lanehost"),
+          roles: ["lane-runner"],
+          runner: {
+            kind: "opencode",
+            port: 4166,
+            authFile: path.join(dir, "auth.json"),
+          },
+        },
+      },
+    });
+    const all = await runHosts(["show"], file);
+    expect(all.code).toBe(0);
+    for (const column of [
+      "HOST",
+      "TRANSPORT",
+      "SSH",
+      "CONTAINER",
+      "ROLES",
+      "ROLE_ALIASES",
+      "RUNNER",
+      "TUNNEL_OFFSET",
+      "DIAL_PORT",
+      "AUTH",
+    ]) {
+      expect(all.stdout).toContain(column);
+    }
+    expect(all.stdout.indexOf("lanehost")).toBeLessThan(all.stdout.indexOf("mac"));
+    expect(all.stdout).toContain("lane-box");
+    expect(all.stdout).toContain("lane-runner=m");
+    expect(all.stdout).toContain("4167");
+    expect(all.stdout).toContain("configured");
+    expect(all.stdout).not.toContain("auth.json");
+    const one = await runHosts(["show", "lanehost"], file);
+    expect(one.code).toBe(0);
+    expect(one.stdout).toContain("4167");
+    expect(one.stdout).not.toContain("mac");
+    const local = await runHosts(["show", "mac"], file);
+    expect(local.code).toBe(0);
+    expect(local.stdout).toContain("4100");
+    const byRole = await runHosts(["show", "--role", "orchestrator"], file);
+    expect(byRole.code).toBe(0);
+    expect(byRole.stdout).toContain("mac");
+    expect(byRole.stdout).not.toContain("lanehost");
+    const unknown = await runHosts(["show", "nosuchhost"], file);
+    expect(unknown.code).toBe(1);
+    const both = await runHosts(["show", "mac", "--role", "orchestrator"], file);
+    expect(both.code).toBe(2);
+  });
+
+  it("hosts edit updates container and role-alias over existing host values; the loader bounds tunnel offset to 1", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+        },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          container: "lane-box",
+          roleAliases: { "lane-runner": "m" },
+          worktreeRoot: path.join(dir, "lanehost"),
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    });
+    const edited = await runHosts(
+      [
+        "edit",
+        "lanehost",
+        "--container",
+        "newc",
+        "--role-alias",
+        "lane-runner=nl",
+        "--yes",
+      ],
+      file,
+    );
+    expect(edited.code).toBe(0);
+    const reloaded = readFileSync(file, "utf8");
+    expect(reloaded).toContain('"container": "newc"');
+    expect(reloaded).toContain('"lane-runner": "nl"');
+    expect(reloaded).not.toContain('"lane-box"');
+    expect(() => readInstallationFile(file)).not.toThrow();
+    // The frozen runner dials port + 1, so the loader refuses any other offset.
+    const refused = await runHosts(
+      ["edit", "lanehost", "--tunnel-offset", "3", "--yes"],
+      file,
+    );
+    expect(refused.code).toBe(1);
+    expect(refused.stderr).toContain("tunnelOffset");
+    expect(readFileSync(file, "utf8")).toBe(reloaded);
+  });
+
+  it("hostsCommand never throws on malformed runtime argv/options, sparse arrays, unknown role enums or throwing getters", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
+    const hostileOptions = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error("no access");
+        },
+      },
+    );
+    const cases: readonly (readonly [
+      string,
+      () => Promise<number>,
+      number,
+    ])[] = [
+      ["null argv", () => hostsCommand(null as never, mockIo().io), 2],
+      ["string argv", () => hostsCommand("show" as never, mockIo().io), 2],
+      [
+        "sparse argv",
+        () => {
+          const sparse = ["show"] as unknown as string[];
+          sparse[3] = "x";
+          return hostsCommand(sparse, mockIo().io);
+        },
+        2,
+      ],
+      [
+        "hostile options",
+        () => hostsCommand(["show"], mockIo().io, hostileOptions as never),
+        1,
+      ],
+    ];
+    for (const [label, run, expected] of cases) {
+      const code = await run();
+      expect(code, label).toBe(expected);
+    }
+    void file;
+  });
+
+  it("leaves the installation file untouched when a probe fails or confirmation is declined on an edit with P2 fields", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
+    const before = readFileSync(file, "utf8");
+    const failed = await runHosts(
+      ["edit", "lanehost", "--container", "newc", "--yes"],
+      file,
+      { failWhen: () => true },
+    );
+    expect(failed.code).toBe(1);
+    expect(failed.stderr).toContain("refused: a probe reported FAIL");
+    expect(readFileSync(file, "utf8")).toBe(before);
+    const declined = await runHosts(
+      ["edit", "lanehost", "--container", "newc"],
+      file,
+      {},
+      async () => false,
+    );
+    expect(declined.code).toBe(1);
+    expect(declined.stderr).toContain("not confirmed");
+    expect(readFileSync(file, "utf8")).toBe(before);
+  });
+
+  it("hosts show reports an unreadable installation as unknown and exits 1 instead of empty or 0", async () => {
+    const dir = makeTempDir();
+    const shown = await runHosts(["show"], dir);
+    expect(shown.code).toBe(1);
+    expect(shown.stderr).toContain("installation: unknown (unreadable)");
+    expect(shown.stdout).toBe("");
+  });
+
+  it("hosts show, dropped-alias notice and refusals never echo paths or secret-shaped text", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const token = ["ghp", "_" + "a".repeat(24)].join("");
+    const sk = ["sk", "-" + "b".repeat(24)].join("");
+    const aws = ["AKIA", "C".repeat(16)].join("");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: "/srv/secret/worktrees",
+          tmpDir: "/srv/secret/" + sk,
+          roles: ["orchestrator", "verifier"],
+        },
+        lanehost: {
+          transport: "ssh",
+          sshAlias: "m",
+          worktreeRoot: path.join(dir, "lanehost"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: {
+            verifier: "m-v",
+            "lane-runner": "m-lr",
+          },
+          runner: {
+            kind: "opencode",
+            port: 4166,
+            authFile: "/srv/secret/" + token,
+          },
+        },
+      },
+    });
+    const shown = await runHosts(["show"], file);
+    expect(shown.code).toBe(0);
+    expect(shown.stdout).not.toContain("/srv/secret");
+    expect(shown.stdout).not.toContain(token);
+    expect(shown.stdout).not.toContain(sk);
+    expect(shown.stdout).not.toContain(aws);
+    const unknown = await runHosts(["show", "nosuchhost"], file);
+    expect(unknown.code).toBe(1);
+    expect(unknown.stderr).not.toContain("/srv/secret");
+    expect(unknown.stderr).not.toContain(token);
+    // A lane-runner move drops the alias on the host it moved from; the notice
+    // and the diff name ids and roles only, never the secret paths.
+    const moved = await runHosts(
+      ["add", "newhost", "--worktree-root", path.join(dir, "newhost"), "--role", "lane-runner", "--port", "5000", "--yes"],
+      file,
+    );
+    expect(moved.code).toBe(0);
+    expect(moved.stdout).not.toContain("/srv/secret");
+    expect(moved.stdout).not.toContain(token);
+    expect(moved.stdout).not.toContain(sk);
+    expect(moved.stdout).not.toContain(aws);
+  });
+
+  it("hosts show invokes no subprocess or probe executor", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, v2Installation(path.join(dir, "worktrees")));
+    const { io } = mockIo();
+    const throwing = {
+      run: () => {
+        throw new Error("no subprocess");
+      },
+    } as unknown as HostProbeExecutor;
+    const code = await hostsCommand(["show"], io, {
+      installationFile: file,
+      probeExecutor: throwing,
+    });
+    expect(code).toBe(0);
+  });
+
+  it("bounds argv length, flag value length and hosts show table row count", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const longArgv = await runHosts(["show", ...Array.from({ length: 129 }, () => "x")], file);
+    expect(longArgv.code).toBe(2);
+    const longToken = await runHosts(["show", "x".repeat(1025)], file);
+    expect(longToken.code).toBe(2);
+    const hosts: Record<string, unknown> = {
+      mac: {
+        transport: "local",
+        worktreeRoot: path.join(dir, "wt"),
+        roles: ["orchestrator"],
+      },
+      lanehost: {
+        transport: "ssh",
+        sshAlias: "m",
+        worktreeRoot: path.join(dir, "lanehost"),
+        roles: ["lane-runner"],
+        runner: { kind: "opencode", port: 4166 },
+      },
+    };
+    for (let index = 0; index < 256; index += 1) {
+      hosts[`verifier${index}`] = {
+        transport: "local",
+        worktreeRoot: path.join(dir, `verifier${index}`),
+        roles: ["verifier"],
+      };
+    }
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts,
+    });
+    const crowded = await runHosts(["show"], file);
+    expect(crowded.code).toBe(1);
+    expect(crowded.stderr).toContain("host count exceeds maximum (256)");
   });
 });

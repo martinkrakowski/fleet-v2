@@ -41,11 +41,91 @@ const HOST_ROLES: readonly HostRole[] = [
   'verifier',
 ];
 
+/** Size bounds the loader's own host rules hold; the draft refuses early. */
+const MAX_ROLES = 16;
+const MAX_ROLE_ALIASES = 16;
+const MAX_PATH_LENGTH = 1024;
+const MAX_ALIAS_LENGTH = 255;
+const MAX_CONTAINER_NAME_LENGTH = 64;
+const MAX_TUNNEL_OFFSET = 1024;
+const CONTAINER_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+
+/**
+ * A plain data record: an object whose prototype is `Object.prototype` or
+ * `null`. Everything a draft reads off a hostile runtime value is read through
+ * this check first, so a class instance or a falsy value is refused, never run.
+ */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  try {
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read one own data property of a plain record without running a getter: an
+ * accessor property reads as absent. Wrapped in `try/catch` so a hostile
+ * `Object.getOwnPropertyDescriptor` can never throw through the draft.
+ */
+function ownDataValue(record: object, key: string): unknown {
+  try {
+    if (!Object.hasOwn(record, key)) {
+      return undefined;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    if (descriptor === undefined) {
+      return undefined;
+    }
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      // An accessor is never run: a getter's value is untrusted by definition.
+      return undefined;
+    }
+    return descriptor.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Copy a plain record's own data properties, skipping accessors. A hostile
+ * value never throws and never runs a getter; what it carries as plain data
+ * survives, everything else is omitted.
+ */
+function copyOwnData(record: unknown): Record<string, unknown> | undefined {
+  if (!isPlainRecord(record)) {
+    return undefined;
+  }
+  try {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(record)) {
+      if (Object.hasOwn(record, key)) {
+        const descriptor = Object.getOwnPropertyDescriptor(record, key);
+        if (descriptor !== undefined && descriptor.get === undefined) {
+          out[key] = descriptor.value;
+        }
+      }
+    }
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
 /** An opencode runner as the operator described it. */
 export interface OpencodeHostRunnerDraft {
   readonly kind: 'opencode';
   /** The opencode server's port on its own host, 1..65535. */
   readonly port: number;
+  /**
+   * How far above the port the bundled runner program dials the server; absent
+   * means 1. The loader owns the exact value the bundled program implements.
+   */
+  readonly tunnelOffset?: number;
   /** Absolute path of the auth file on the orchestrator. */
   readonly authFile?: string;
   readonly maxLanes?: number;
@@ -61,6 +141,8 @@ export interface AgyHostRunnerDraft {
   /** The acknowledgement the security text was confirmed with, when `full`. */
   readonly agyAcknowledgement?: AgyAcknowledgement;
   readonly port: number;
+  /** How far above the port the bundled runner program dials; absent means 1. */
+  readonly tunnelOffset?: number;
   readonly authFile?: string;
   readonly maxLanes?: number;
   readonly capabilities?: RunnerCapabilityDeclaration;
@@ -78,6 +160,14 @@ export interface HostDraftInput {
   readonly transport: HostTransport;
   /** Required for an `ssh` transport, absent for a `local` one. */
   readonly sshAlias?: string;
+  /** Optional lowercase container name the host's runner runs in. */
+  readonly container?: string;
+  /**
+   * Optional one-ssh-alias-per-held-role map: an ssh host may give a role a
+   * different alias than the host's own. Every key must be a role the host
+   * holds, and every value passes the loader's safe-host rule.
+   */
+  readonly roleAliases?: Readonly<Partial<Record<HostRole, string>>>;
   readonly worktreeRoot: string;
   readonly tmpDir?: string;
   readonly roles: readonly HostRole[];
@@ -133,41 +223,70 @@ function copyCapabilityDeclaration(
 /**
  * Build the `runner` block in the key order the v2 writer emits, or record
  * why it cannot be built. The `agy` fields appear only on an agy runner, so
- * the union stays exact.
+ * the union stays exact. The runner is read through own-data guards, so a
+ * hostile runtime value is refused, never run and never a throw.
  */
 function buildHostRunner(
-  input: HostRunnerDraft,
+  input: unknown,
   path: string,
   errors: string[],
 ): HostRunnerSection | undefined {
-  if (!isValidPort(input.port)) {
+  const fields = copyOwnData(input);
+  if (fields === undefined) {
+    errors.push(`${path}: must be plain data`);
+    return undefined;
+  }
+  const port = fields.port;
+  if (typeof port !== 'number' || !isValidPort(port)) {
     errors.push(`${path}.port: must be an integer 1..65535`);
   }
-  if (input.authFile !== undefined && !isAbsolute(input.authFile)) {
+  const tunnelOffset = fields.tunnelOffset;
+  if (
+    tunnelOffset !== undefined &&
+    (typeof tunnelOffset !== 'number' ||
+      !Number.isInteger(tunnelOffset) ||
+      tunnelOffset < 0 ||
+      tunnelOffset > MAX_TUNNEL_OFFSET)
+  ) {
+    errors.push(
+      `${path}.tunnelOffset: must be an integer from 0 to ${MAX_TUNNEL_OFFSET}`,
+    );
+  }
+  const rawAuthFile = fields.authFile;
+  const authFile =
+    typeof rawAuthFile === 'string' && isAbsolute(rawAuthFile)
+      ? rawAuthFile
+      : undefined;
+  if (rawAuthFile !== undefined && authFile === undefined) {
     errors.push(`${path}.authFile: must be an absolute path`);
   }
   const capabilities =
-    input.capabilities === undefined
+    fields.capabilities === undefined
       ? undefined
       : copyCapabilityDeclaration(
-          input.capabilities,
+          fields.capabilities as RunnerCapabilityDeclaration,
           `${path}.capabilities`,
           errors,
         );
   const common = {
-    port: input.port,
-    ...(input.authFile !== undefined ? { authFile: input.authFile } : {}),
+    port: port as number,
+    ...(tunnelOffset !== undefined ? { tunnelOffset: tunnelOffset as number } : {}),
+    ...(authFile !== undefined ? { authFile } : {}),
     ...(capabilities !== undefined ? { capabilities } : {}),
-    ...(input.maxLanes !== undefined ? { maxLanes: input.maxLanes } : {}),
-    ...(input.gateSlot !== undefined ? { gateSlot: input.gateSlot } : {}),
+    ...(fields.maxLanes !== undefined
+      ? { maxLanes: fields.maxLanes as number }
+      : {}),
+    ...(fields.gateSlot !== undefined
+      ? { gateSlot: fields.gateSlot as GateSlotSection }
+      : {}),
   };
-  if (input.kind === 'agy') {
+  if (fields.kind === 'agy') {
     return {
       kind: 'agy',
       ...common,
-      agyMode: input.agyMode,
-      ...(input.agyAcknowledgement !== undefined
-        ? { agyAcknowledgement: input.agyAcknowledgement }
+      agyMode: fields.agyMode as 'edit-only' | 'full',
+      ...(fields.agyAcknowledgement !== undefined
+        ? { agyAcknowledgement: fields.agyAcknowledgement as AgyAcknowledgement }
         : {}),
     };
   }
@@ -177,66 +296,184 @@ function buildHostRunner(
 /**
  * Draft one host entry from collected answers.
  *
- * Refused here, before any probe runs: an alias that is not a safe ssh host
- * (the rule above), an alias on a `local` transport or a missing one on an
- * `ssh` transport, a relative worktree root or tmp dir, an empty or unknown
- * role list, and a runner port outside 1..65535. Everything else the file
- * format says — the loader's host rules, the dial-port collision rule, the
- * agy isolation floor — is the loader's answer, not this function's.
+ * Refused here, before any probe runs: an input that is not plain data, an
+ * alias that is not a safe ssh host, an alias on a `local` transport or a
+ * missing one on an `ssh` transport, relative or oversized paths, sparse or
+ * unknown roles, malformed container and role-alias maps, and runner ports or
+ * tunnel offsets outside their bounds. Nothing hostile ever runs and no
+ * operator value is echoed in a refusal. Everything else the file format
+ * says — the loader's host rules, the dial-port collision rule, the agy
+ * isolation floor — is the loader's answer, not this function's.
  */
-export function draftHost(input: HostDraftInput): HostDraftResult {
-  const path = `hosts.${input.name}`;
+export function draftHost(rawInput: unknown): HostDraftResult {
+  // Hostile runtime input is refused, never run: no getter is invoked and
+  // nothing throws, whatever the caller hands over.
+  const fields = copyOwnData(rawInput);
+  if (fields === undefined) {
+    return {
+      ok: false,
+      errors: ['hosts: the host description must be plain data'],
+    };
+  }
+  const name = fields.name;
+  if (typeof name !== 'string' || name === '') {
+    return {
+      ok: false,
+      errors: ['hosts: the host name must be a non-empty string'],
+    };
+  }
+  const path = `hosts.${name}`;
   const errors: string[] = [];
 
-  if (input.transport === 'ssh') {
-    if (input.sshAlias === undefined) {
+  const transport = fields.transport;
+  if (transport !== 'ssh' && transport !== 'local') {
+    errors.push(`${path}.transport: must be "local" or "ssh"`);
+  }
+
+  const sshAlias = fields.sshAlias;
+  if (transport === 'ssh') {
+    if (sshAlias === undefined) {
       errors.push(`${path}.sshAlias: required when transport is "ssh"`);
-    } else if (!isSafeSshHost(input.sshAlias)) {
+    } else if (
+      typeof sshAlias !== 'string' ||
+      !isSafeSshHost(sshAlias) ||
+      sshAlias.length > MAX_ALIAS_LENGTH
+    ) {
       // The value never appears in the message: an alias is operator input.
       errors.push(
         `${path}.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option`,
       );
     }
-  } else if (input.sshAlias !== undefined) {
+  } else if (sshAlias !== undefined) {
     errors.push(`${path}.sshAlias: must be absent when transport is "local"`);
   }
 
-  if (!isAbsolute(input.worktreeRoot)) {
+  const worktreeRoot = fields.worktreeRoot;
+  if (typeof worktreeRoot !== 'string' || !isAbsolute(worktreeRoot)) {
     errors.push(`${path}.worktreeRoot: must be an absolute path`);
+  } else if (worktreeRoot.length > MAX_PATH_LENGTH) {
+    errors.push(
+      `${path}.worktreeRoot: must be at most ${MAX_PATH_LENGTH} characters`,
+    );
   }
-  if (input.tmpDir !== undefined && !isAbsolute(input.tmpDir)) {
-    errors.push(`${path}.tmpDir: must be an absolute path`);
+  const tmpDir = fields.tmpDir;
+  if (tmpDir !== undefined) {
+    if (typeof tmpDir !== 'string' || !isAbsolute(tmpDir)) {
+      errors.push(`${path}.tmpDir: must be an absolute path`);
+    } else if (tmpDir.length > MAX_PATH_LENGTH) {
+      errors.push(
+        `${path}.tmpDir: must be at most ${MAX_PATH_LENGTH} characters`,
+      );
+    }
   }
 
-  if (input.roles.length === 0) {
-    errors.push(`${path}.roles: at least one role is required`);
+  const rolesField = fields.roles;
+  const validRoles: HostRole[] = [];
+  if (!Array.isArray(rolesField)) {
+    errors.push(`${path}.roles: must be an array of host roles`);
+  } else {
+    if (rolesField.length === 0) {
+      errors.push(`${path}.roles: at least one role is required`);
+    }
+    if (rolesField.length > MAX_ROLES) {
+      errors.push(`${path}.roles: must hold at most ${MAX_ROLES} roles`);
+    }
+    for (let index = 0; index < rolesField.length; index += 1) {
+      if (!Object.hasOwn(rolesField, index)) {
+        // A sparse array is refused: a hole would draft a silent undefined role.
+        errors.push(
+          `${path}.roles[${index}]: must be a dense array of known host roles`,
+        );
+        continue;
+      }
+      const role = rolesField[index];
+      if (typeof role !== 'string' || !HOST_ROLES.includes(role as HostRole)) {
+        errors.push(`${path}.roles[${index}]: must be a known host role`);
+        continue;
+      }
+      validRoles.push(role as HostRole);
+    }
   }
-  for (const [index, role] of input.roles.entries()) {
-    if (!HOST_ROLES.includes(role)) {
-      errors.push(`${path}.roles[${index}]: must be a known host role`);
+
+  const container = fields.container;
+  if (container !== undefined) {
+    if (
+      typeof container !== 'string' ||
+      container === '' ||
+      container !== container.trim()
+    ) {
+      errors.push(
+        `${path}.container: must be a non-empty lowercase container name without leading or trailing whitespace`,
+      );
+    } else if (container.length > MAX_CONTAINER_NAME_LENGTH) {
+      errors.push(
+        `${path}.container: must be at most ${MAX_CONTAINER_NAME_LENGTH} characters`,
+      );
+    } else if (!CONTAINER_NAME_PATTERN.test(container)) {
+      errors.push(
+        `${path}.container: must be a lowercase container name matching ^[a-z0-9][a-z0-9-]*$`,
+      );
+    }
+  }
+
+  const roleAliasesField = fields.roleAliases;
+  const aliases = copyOwnData(roleAliasesField);
+  if (roleAliasesField !== undefined && aliases === undefined) {
+    errors.push(
+      `${path}.roleAliases: must be an object mapping held roles to safe ssh hosts`,
+    );
+  } else if (aliases !== undefined) {
+    if (transport !== 'ssh') {
+      errors.push(
+        `${path}.roleAliases: must be absent when transport is "local"`,
+      );
+    }
+    const aliasKeys = Object.keys(aliases);
+    if (aliasKeys.length > MAX_ROLE_ALIASES) {
+      errors.push(
+        `${path}.roleAliases: must hold at most ${MAX_ROLE_ALIASES} role aliases`,
+      );
+    }
+    for (const key of aliasKeys) {
+      if (!HOST_ROLES.includes(key as HostRole)) {
+        errors.push(`${path}.roleAliases: every key must be a known host role`);
+        continue;
+      }
+      if (!validRoles.includes(key as HostRole)) {
+        errors.push(`${path}.roleAliases.${key}: the host does not hold that role`);
+        continue;
+      }
+      const alias = aliases[key];
+      if (typeof alias !== 'string' || !isSafeSshHost(alias)) {
+        errors.push(
+          `${path}.roleAliases: every value must match the loader's safe ssh host rule`,
+        );
+      }
     }
   }
 
   const runner =
-    input.runner === undefined
+    fields.runner === undefined
       ? undefined
-      : buildHostRunner(input.runner, `${path}.runner`, errors);
+      : buildHostRunner(fields.runner, `${path}.runner`, errors);
 
   if (errors.length > 0) {
     return { ok: false, errors };
   }
 
   const host: HostSection = {
-    transport: input.transport,
-    ...(input.transport === 'ssh' && input.sshAlias !== undefined
-      ? { sshAlias: input.sshAlias }
+    transport: transport as HostTransport,
+    ...(transport === 'ssh' ? { sshAlias: sshAlias as string } : {}),
+    ...(container !== undefined ? { container: container as string } : {}),
+    ...(aliases !== undefined
+      ? { roleAliases: aliases as Partial<Record<HostRole, string>> }
       : {}),
-    worktreeRoot: input.worktreeRoot,
-    ...(input.tmpDir !== undefined ? { tmpDir: input.tmpDir } : {}),
-    roles: [...input.roles],
+    worktreeRoot: worktreeRoot as string,
+    ...(tmpDir !== undefined ? { tmpDir: tmpDir as string } : {}),
+    roles: [...(rolesField as HostRole[])],
     ...(runner !== undefined ? { runner } : {}),
   };
-  return { ok: true, draft: { name: input.name, host } };
+  return { ok: true, draft: { name, host } };
 }
 
 /**
@@ -253,7 +490,11 @@ export interface HostDraftCandidate {
   readonly [section: string]: unknown;
 }
 
-/** An installation value whose hosts may receive a draft. */
+/**
+ * An installation value whose hosts may receive a draft. A hostile `current`
+ * (accessor-carrying or non-plain fields) is read through own-data guards, so
+ * no getter ever runs and nothing throws.
+ */
 export function baseV2File(current: unknown): HostDraftCandidate | undefined {
   if (current === undefined || current === null) {
     return { schemaVersion: 2, hosts: {} };
@@ -261,18 +502,17 @@ export function baseV2File(current: unknown): HostDraftCandidate | undefined {
   if (typeof current !== 'object' || Array.isArray(current)) {
     return undefined;
   }
-  const record = current as { readonly schemaVersion?: unknown };
-  if (record.schemaVersion !== 2) {
+  // Read through the own data properties: an accessor never runs, so a
+  // throwing getter is refused, not executed.
+  if (ownDataValue(current, 'schemaVersion') !== 2) {
     return undefined;
   }
-  const hosts = (current as { readonly hosts?: unknown }).hosts;
+  const hostsField = ownDataValue(current, 'hosts');
+  const hosts = copyOwnData(hostsField) ?? {};
   return {
-    ...(current as Readonly<Record<string, unknown>>),
+    ...copyOwnData(current),
     schemaVersion: 2,
-    hosts:
-      typeof hosts === 'object' && hosts !== null && !Array.isArray(hosts)
-        ? (hosts as Readonly<Record<string, HostSection>>)
-        : {},
+    hosts: hosts as Readonly<Record<string, HostSection>>,
   };
 }
 
@@ -299,35 +539,84 @@ export type ApplyHostDraftMode = 'add' | 'edit';
 
 /**
  * In `edit` mode carry the contract fields the draft does not manage over to
- * the drafted entry: `container`, `roleAliases` and `runner.tunnelOffset`.
+ * the drafted entry, with drafted-precedence: a field the draft supplies
+ * wins, and a field the draft omits keeps the existing entry's value.
+ * `roleAliases` are the one exception when the draft omits them: the
+ * inherited map is pruned to the roles the drafted host still holds, so an
+ * edit that drops a role drops that role's alias too.
  * Every other field is the draft's: one the draft omits is dropped, so an
- * edit that moves a host to `local` does not keep the old `sshAlias`. A role
- * alias survives only while the drafted host is an ssh host that still holds
- * that role, and a tunnel offset only while the drafted host has a runner.
- * In `add` mode there is no existing entry, so nothing is carried.
+ * edit that moves a host to `local` does not keep the old `sshAlias`.
+ * A role alias survives only while the drafted host is an ssh host that
+ * still holds that role, and a tunnel offset only while the drafted host
+ * has a runner. In `add` mode there is no existing entry, so nothing is
+ * carried.
+ * Every read goes through own-data guards: a base file carrying
+ * `roleAliases: null`, arrays, primitives, non-plain prototypes or throwing
+ * getters yields `undefined` and never throws.
  */
 function mergeDraftedHost(
   existing: HostSection,
   drafted: HostSection,
 ): HostSection {
-  const aliases: Partial<Record<HostRole, string>> = {};
-  if (drafted.transport === 'ssh' && existing.roleAliases !== undefined) {
+  const guardedExisting = copyOwnData(existing);
+  const guardedContainer =
+    guardedExisting === undefined
+      ? undefined
+      : ownDataValue(guardedExisting, 'container');
+  const guardedRunner =
+    guardedExisting === undefined
+      ? undefined
+      : copyOwnData(ownDataValue(guardedExisting, 'runner'));
+  const guardedTunnelOffset =
+    guardedRunner === undefined
+      ? undefined
+      : ownDataValue(guardedRunner, 'tunnelOffset');
+  const guardedAliases =
+    guardedExisting === undefined
+      ? undefined
+      : copyOwnData(ownDataValue(guardedExisting, 'roleAliases'));
+
+  const container = drafted.container ?? readGuardedString(guardedContainer);
+  const tunnelOffset =
+    drafted.runner?.tunnelOffset ?? readGuardedNumber(guardedTunnelOffset);
+
+  let roleAliases: Partial<Record<HostRole, string>> | undefined;
+  if (drafted.roleAliases !== undefined) {
+    // The draft's own alias map wins as supplied.
+    roleAliases = drafted.roleAliases;
+  } else if (guardedAliases !== undefined && drafted.transport === 'ssh') {
+    const pruned: Partial<Record<HostRole, string>> = {};
     for (const role of drafted.roles) {
-      const alias = existing.roleAliases[role];
-      if (alias !== undefined) {
-        aliases[role] = alias;
+      const alias = guardedAliases[role];
+      if (typeof alias === 'string') {
+        pruned[role] = alias;
       }
     }
+    if (Object.keys(pruned).length > 0) {
+      roleAliases = pruned;
+    }
   }
-  const tunnelOffset = existing.runner?.tunnelOffset;
+
   return {
     ...drafted,
-    ...(existing.container !== undefined ? { container: existing.container } : {}),
-    ...(Object.keys(aliases).length > 0 ? { roleAliases: aliases } : {}),
+    ...(container !== undefined ? { container } : {}),
+    ...(roleAliases !== undefined ? { roleAliases } : {}),
     ...(drafted.runner !== undefined && tunnelOffset !== undefined
       ? { runner: { ...drafted.runner, tunnelOffset } }
       : {}),
   };
+}
+
+/**
+ * The guarded scalar reads over a copied own-data record: a value that is not
+ * the expected plain type is absent, never carried.
+ */
+function readGuardedString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function readGuardedNumber(value: unknown): number | undefined {
+  return typeof value === 'number' ? value : undefined;
 }
 
 /**
@@ -341,12 +630,29 @@ function mergeDraftedHost(
  * A file of schema version 1 carries no hosts and converting one is a mapping
  * step of its own (the conversion forces the isolation acknowledgement), so
  * it is refused here rather than half-done.
+ * A hostile draft (null, a primitive, a missing name, a non-plain host entry)
+ * is refused, never thrown on, and never runs a getter.
  */
 export function applyHostDraft(
   current: unknown,
   draft: HostDraft,
   mode: ApplyHostDraftMode,
 ): ApplyHostDraftResult {
+  const draftFields = copyOwnData(draft);
+  const name = readGuardedString(
+    draftFields === undefined ? undefined : draftFields.name,
+  );
+  const host =
+    draftFields === undefined ? undefined : copyOwnData(draftFields.host);
+  if (name === undefined || host === undefined) {
+    return {
+      ok: false,
+      reason: 'not-v2',
+      errors: [
+        'hosts: the draft must carry a name and a plain host entry',
+      ],
+    };
+  }
   const base = baseV2File(current);
   if (base === undefined) {
     return {
@@ -357,13 +663,13 @@ export function applyHostDraft(
       ],
     };
   }
-  const exists = Object.hasOwn(base.hosts, draft.name);
+  const exists = Object.hasOwn(base.hosts, name);
   if (mode === 'add' && exists) {
     return {
       ok: false,
       reason: 'exists',
       errors: [
-        `hosts.${draft.name}: already in the installation file; editing is a separate mode`,
+        `hosts.${name}: already in the installation file; editing is a separate mode`,
       ],
     };
   }
@@ -372,21 +678,20 @@ export function applyHostDraft(
       ok: false,
       reason: 'missing',
       errors: [
-        `hosts.${draft.name}: not in the installation file; adding is a separate mode`,
+        `hosts.${name}: not in the installation file; adding is a separate mode`,
       ],
     };
   }
+  const hostsRecord = { ...base.hosts };
+  hostsRecord[name] =
+    mode === 'edit'
+      ? mergeDraftedHost(base.hosts[name], host as unknown as HostSection)
+      : (host as unknown as HostSection);
   return {
     ok: true,
     candidate: {
       ...base,
-      hosts: {
-        ...base.hosts,
-        [draft.name]:
-          mode === 'edit'
-            ? mergeDraftedHost(base.hosts[draft.name], draft.host)
-            : draft.host,
-      },
+      hosts: hostsRecord,
     },
   };
 }

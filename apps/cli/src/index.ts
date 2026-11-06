@@ -697,7 +697,7 @@ The tui group opens the shared terminal shell: screens are read in-process from 
 Commands:
   work-order register|inspect|close|stale|rerun
   doctor [--probe-seats] [--host <name>] [--json]
-  hosts list|add|edit|remove|daemon
+  hosts list|add|edit|remove|daemon|show
   seats list|check|free-tier [status|on|off] [--yes]
   policy auto-merge [status|on|off] [--allow-high-risk true|false] [--on-blocked ask-owner|hold] [--yes]
   projects list|show|probe|add|adopt|edit|retire

@@ -10,6 +10,11 @@
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS, readPlainRecord } from '@fleet/shared';
 import { isCanonicalIso } from './lane-activity-records.js';
 import { REAPER_SUBJECT_ID_PATTERN } from './lane-run-keys.js';
+import {
+  LANE_RUN_STATES,
+  LANE_RUN_TERMINAL_STATES,
+  type LaneRunStateValue,
+} from './value-objects/LaneRunState.vo.js';
 
 /** The severities a stall finding may carry. */
 export type StallSeverity = 'page' | 'digest';
@@ -25,33 +30,15 @@ export type StallRule =
   | 'snapshot-invalid'
   | 'truncated';
 
-/** The run states the snapshot carries; the terminal ones end every rule. */
-export type StallRunState =
-  | 'queued'
-  | 'ready'
-  | 'dispatching'
-  | 'running'
-  | 'parked'
-  | 'review'
-  | 'fixing'
-  | 'watching-ci'
-  | 'merging'
-  | 'succeeded'
-  | 'failed'
-  | 'cancelled'
-  | 'merged';
+/** The run states the snapshot carries: the conductor's own lane-run states. */
+export type StallRunState = LaneRunStateValue;
 
-const NON_TERMINAL_RUN_STATES: readonly string[] = [
-  'queued',
-  'ready',
-  'dispatching',
-  'running',
-  'parked',
-  'review',
-  'fixing',
-  'watching-ci',
-  'merging',
-];
+const TERMINAL_RUN_STATES: readonly string[] = LANE_RUN_TERMINAL_STATES;
+
+/** Every declared lane-run state that is not terminal, derived so a new state is never missed. */
+const NON_TERMINAL_RUN_STATES: readonly string[] = LANE_RUN_STATES.filter(
+  (state) => !TERMINAL_RUN_STATES.includes(state),
+);
 
 /** One run in the snapshot. Ids and codes only; no free text. */
 export interface StallRun {
@@ -419,6 +406,14 @@ function detectStallsInner(
     }
   }
 
+  // A provider error whose `atIso` is not a canonical ISO time is named by
+  // one `snapshot-invalid` finding; its provider-limit evidence carries null.
+  for (let i = 0; i < providerErrors.length; i += 1) {
+    if (!isCanonicalIso(providerErrors[i].atIso)) {
+      findings.push(invalidFinding(`providerErrors[${i}].atIso`, 'invalid-time'));
+    }
+  }
+
   // The provider-limit rule: one finding per provider; not time-based.
   const limitedProviders = new Map<string, Record<string, unknown>>();
   for (const error of providerErrors) {
@@ -471,8 +466,9 @@ function detectStallsInner(
       && run.prNumber === undefined && run.handOwned === false) {
       const parkedMs = msOf(run.parkedAtIso);
       if (parkedMs !== null && nowMs !== null) {
-        const minutes = Math.floor((nowMs - parkedMs) / MINUTE_MS);
-        if (minutes > parkedMinutes) {
+        const elapsedMs = nowMs - parkedMs;
+        const minutes = Math.floor(elapsedMs / MINUTE_MS);
+        if (elapsedMs > parkedMinutes * MINUTE_MS) {
           findings.push(finding('unowned-park', 'digest', [runId], {
             runId: safeId(runId),
             parkedAtIso: String(run.parkedAtIso),
@@ -484,8 +480,9 @@ function detectStallsInner(
     if (nonTerminal && !parked && advancedValid && nowValid) {
       const advancedMs = msOf(run.lastAdvancedAtIso);
       if (advancedMs !== null && nowMs !== null) {
-        const minutes = Math.floor((nowMs - advancedMs) / MINUTE_MS);
-        if (minutes > unadvancedMinutes) {
+        const elapsedMs = nowMs - advancedMs;
+        const minutes = Math.floor(elapsedMs / MINUTE_MS);
+        if (elapsedMs > unadvancedMinutes * MINUTE_MS) {
           findings.push(finding('driver-not-adopting', 'page', [runId], {
             runId: safeId(runId),
             lastAdvancedAtIso: String(run.lastAdvancedAtIso),

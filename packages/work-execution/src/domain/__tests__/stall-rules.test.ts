@@ -95,7 +95,7 @@ describe('detectStalls', () => {
       const findings = detectStalls(
         snapshot({
           runs: [parkedRun({ parkedAtIso: NOW }),
-            { id: 'run-2', state: 'succeeded', handOwned: false }],
+            { id: 'run-2', state: 'merged', handOwned: false }],
           driverLease: { present: false },
         }),
         DEFAULT_STALL_THRESHOLDS,
@@ -116,7 +116,7 @@ describe('detectStalls', () => {
       expect(rulesOf(live)).not.toContain('driver-absent');
       const terminalOnly = detectStalls(
         snapshot({
-          runs: [{ id: 'run-9', state: 'succeeded', handOwned: false }],
+          runs: [{ id: 'run-9', state: 'merged', handOwned: false }],
           driverLease: { present: false },
         }),
         DEFAULT_STALL_THRESHOLDS,
@@ -325,7 +325,7 @@ describe('detectStalls', () => {
       // A terminal run needs neither timestamp.
       const terminal = detectStalls(
         snapshot({
-          runs: [{ id: 'run-t', state: 'succeeded', handOwned: false }],
+          runs: [{ id: 'run-t', state: 'merged', handOwned: false }],
         }),
         DEFAULT_STALL_THRESHOLDS,
         NOW,
@@ -435,6 +435,55 @@ describe('detectStalls', () => {
         NOW,
       );
       expect(rulesOf(findings)).toEqual([]);
+    });
+  });
+
+  describe('review round 3 fixes', () => {
+    it('treats every declared non-terminal lane-run state as active', () => {
+      for (const state of ['collecting', 'gating', 'brief-check', 'code-review', 'accepting', 'opening-pr'] as const) {
+        const findings = detectStalls(
+          snapshot({ runs: [{ id: 'run-s', state, handOwned: false, lastAdvancedAtIso: '2026-11-06T11:30:00.000Z' }] }),
+          DEFAULT_STALL_THRESHOLDS,
+          NOW,
+        );
+        expect(rulesOf(findings)).toEqual(['driver-not-adopting']);
+      }
+      const absent = detectStalls(
+        snapshot({
+          runs: [{ id: 'run-g', state: 'gating', handOwned: false, lastAdvancedAtIso: NOW }],
+          driverLease: { present: false },
+        }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(absent)).toContain('driver-absent');
+    });
+
+    it('fires one second past the threshold, without waiting for the next whole minute', () => {
+      const parked = detectStalls(
+        snapshot({ runs: [parkedRun({ parkedAtIso: '2026-11-06T11:29:59.000Z' })] }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(parked)).toEqual(['unowned-park']);
+      expect(parked[0]?.evidence.minutes).toBe(30);
+      const advanced = detectStalls(
+        snapshot({ runs: [{ id: 'run-3', state: 'running', handOwned: false, lastAdvancedAtIso: '2026-11-06T11:44:59.000Z' }] }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(advanced)).toEqual(['driver-not-adopting']);
+    });
+
+    it('names a provider error with an invalid atIso and keeps its provider-limit page', () => {
+      const findings = detectStalls(
+        snapshot({ providerErrors: [{ provider: 'prov-1', class: 'rate-limited', atIso: 'not-a-time' }] }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(keysOf(findings)).toEqual(['provider-limit:prov-1', 'snapshot-invalid:providerErrors[0].atIso']);
+      expect(findings[0]?.evidence.atIso).toBeNull();
+      expect(findings[1]?.evidence.reason).toBe('invalid-time');
     });
   });
 });

@@ -15,7 +15,11 @@ export default defineEventHandler(async (event) => {
     setResponseStatus(event, 501);
     return envelope(operationId, "NOT_IMPLEMENTED", null);
   }
-  const read = await composition.dispositions.read();
+  // A filesystem error (EACCES, EIO) rejects instead of answering
+  // "unreadable"; it is reported as an unreadable store, never a 500.
+  const read = await composition.dispositions.read().catch(() => ({
+    outcome: "unreadable" as const,
+  }));
   const record = read.outcome === "read" ? read.record : null;
   const result = {
     outcome: record === null ? "store-unreadable" : "status",

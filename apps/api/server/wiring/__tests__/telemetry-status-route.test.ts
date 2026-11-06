@@ -7,7 +7,7 @@ import "./nitro-globals.js";
 
 import { createHmac } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -75,20 +75,23 @@ beforeAll(async () => {
 
 afterAll(async () => {
   apiServer.closeAllConnections();
-  await new Promise<void>((resolve, reject) => {
-    apiServer.close((error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      apiServer.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
     });
-  });
-  await Promise.all(
-    [...createdDirs].map((directory) =>
-      rm(directory, { recursive: true, force: true }),
-    ),
-  );
+  } finally {
+    await Promise.all(
+      [...createdDirs].map((directory) =>
+        rm(directory, { recursive: true, force: true }),
+      ),
+    );
+  }
 });
 
 afterEach(() => {
@@ -225,6 +228,24 @@ describe("GET /v1/telemetry/status", () => {
     expect(response.status).toBe(200);
     const after = await snapshotStateNames(stateDir);
     expect(after).toEqual(before);
+  });
+
+  it("reports an unreadable store when the read rejects", async () => {
+    const stateDir = await makeTempDir();
+    // A directory where the file belongs makes the read fail with EISDIR.
+    await mkdir(join(stateDir, "telemetry-dispositions.json"));
+    configureTelemetryReadComposition({
+      stateDir,
+      installation: ENABLED_INSTALLATION,
+    });
+
+    const response = await callStatus();
+    expect(response.status).toBe(200);
+    const envelope = response.payload as TelemetryStatusEnvelope;
+    expect(envelope.code).toBe("OK");
+    expect(envelope.result.outcome).toBe("store-unreadable");
+    expect(envelope.result.spans).toEqual({});
+    expect(envelope.result.counters).toEqual({});
   });
 
   it("never carries the salt, the endpoint or a token", async () => {

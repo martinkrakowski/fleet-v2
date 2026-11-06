@@ -407,25 +407,25 @@ export class ProjectProbeAdapter implements ProjectProbePort {
   private async readGeneratorState(source: {
     path: string;
     executor: CommandExecutorPort;
-  }): Promise<ProjectGeneratorState> {
-    const manifest = await this.readTextFile(
+  }): Promise<ProjectGeneratorState | undefined> {
+    const manifest = await this.readFile(
       source.executor,
       `${source.path}/.architecture/manifest.yaml`,
     );
-    const sidecar = await this.readTextFile(
+    const sidecar = await this.readFile(
       source.executor,
       `${source.path}/.architecture/generator.config.yaml`,
     );
-    const packageJson = await this.readTextFile(
+    const packageJson = await this.readFile(
       source.executor,
       `${source.path}/package.json`,
     );
-    const layoutPresent = await this.pathExists(
+    const layoutPresent = await this.pathPresence(
       source.executor,
       `${source.path}/.architecture/layout.yaml`,
       false,
     );
-    const generatorDirectoryPresent = await this.pathExists(
+    const generatorDirectoryPresent = await this.pathPresence(
       source.executor,
       `${source.path}/.hexagen`,
       true,
@@ -436,29 +436,43 @@ export class ProjectProbeAdapter implements ProjectProbePort {
       packageJson,
       layoutPresent,
       generatorDirectoryPresent,
-    });
+    }) ?? undefined;
   }
 
-  /** One file's text, or null when it is absent or unreadable. */
-  private async readTextFile(executor: CommandExecutorPort, path: string): Promise<string | null> {
+  /**
+   * One file's content, distinguishing absence from an unreadable answer: a
+   * file that exists but cannot be read must not count as absent, or an
+   * unreadable governed project would be recorded as holding no generator.
+   */
+  private async readFile(executor: CommandExecutorPort, path: string): Promise<ProbeFileRead> {
     const run = await this.runCommand(executor, ["cat", path], { maxBufferBytes: 1_048_576 });
-    if (this.unreachable(run) || run.exitCode !== 0) {
-      return null;
+    if (this.unreachable(run)) {
+      return { kind: "unknown" };
     }
-    return run.stdout;
+    if (run.exitCode === 0) {
+      return { kind: "read", text: run.stdout };
+    }
+    const exists = await this.runCommand(executor, ["test", "-e", path]);
+    if (this.unreachable(exists)) {
+      return { kind: "unknown" };
+    }
+    return exists.exitCode === 0 ? { kind: "unknown" } : { kind: "absent" };
   }
 
-  /** Whether one path exists (or is a directory); an unreadable answer is false. */
-  private async pathExists(
+  /**
+   * Whether one path exists (or is a directory), distinguishing absence from
+   * an unreadable answer for the same reason as `readFile`.
+   */
+  private async pathPresence(
     executor: CommandExecutorPort,
     path: string,
     directory: boolean,
-  ): Promise<boolean> {
+  ): Promise<ProbePathPresence> {
     const run = await this.runCommand(executor, ["test", directory ? "-d" : "-e", path]);
     if (this.unreachable(run)) {
-      return false;
+      return "unknown";
     }
-    return run.exitCode === 0;
+    return run.exitCode === 0 ? "present" : "absent";
   }
 
   /** Script names of the clone's HEAD `package.json`; any failure → `[]`. */
@@ -631,39 +645,71 @@ const EXACT_VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/;
 /**
  * The state the plan's §3 table gives for the files that were read. The
  * manifest's `generator` block wins; the side-car is the fallback. A file that
- * could not be read counts as absent.
+ * is confirmed absent counts as absent; a file that exists but could not be
+ * read (or whose presence could not be established) leaves the whole state
+ * unknown, so an unreadable governed project is never recorded as unmanaged.
  */
 function decideGeneratorState(input: {
-  readonly manifest: string | null;
-  readonly sidecar: string | null;
-  readonly packageJson: string | null;
-  readonly layoutPresent: boolean;
-  readonly generatorDirectoryPresent: boolean;
-}): ProjectGeneratorState {
-  const manifestBlock = input.manifest === null ? null : readGeneratorBlock(input.manifest);
-  const sidecarBlock = input.sidecar === null ? null : readGeneratorBlock(input.sidecar);
+  readonly manifest: ProbeFileRead;
+  readonly sidecar: ProbeFileRead;
+  readonly packageJson: ProbeFileRead;
+  readonly layoutPresent: ProbePathPresence;
+  readonly generatorDirectoryPresent: ProbePathPresence;
+}): ProjectGeneratorState | null {
+  if (
+    input.manifest.kind === "unknown" ||
+    input.sidecar.kind === "unknown" ||
+    input.packageJson.kind === "unknown" ||
+    input.layoutPresent === "unknown" ||
+    input.generatorDirectoryPresent === "unknown"
+  ) {
+    return null;
+  }
+  const manifest = input.manifest.kind === "read" ? input.manifest.text : null;
+  const sidecar = input.sidecar.kind === "read" ? input.sidecar.text : null;
+  const packageJson = input.packageJson.kind === "read" ? input.packageJson.text : null;
+  const layoutPresent = input.layoutPresent === "present";
+  const generatorDirectoryPresent = input.generatorDirectoryPresent === "present";
+  const manifestBlock = manifest === null ? null : readGeneratorBlock(manifest);
+  const sidecarBlock = sidecar === null ? null : readGeneratorBlock(sidecar);
   const block = manifestBlock ?? sidecarBlock;
   const name = block?.name ?? null;
-  const generatorVersion = block?.version ?? null;
+  const rawGeneratorVersion = block?.version ?? null;
+  // The recorded version must be a strict version: any other scalar the block
+  // carries — including a credential-shaped token built from allowed
+  // characters — is dropped, never persisted on the profile.
+  const generatorVersion =
+    rawGeneratorVersion !== null && EXACT_VERSION_PATTERN.test(rawGeneratorVersion)
+      ? rawGeneratorVersion
+      : null;
   const schemaVersionText =
-    (input.manifest === null ? null : readRootScalar(input.manifest, "schemaVersion")) ??
-    (input.sidecar === null ? null : readRootScalar(input.sidecar, "schemaVersion"));
+    (manifest === null ? null : readRootScalar(manifest, "schemaVersion")) ??
+    (sidecar === null ? null : readRootScalar(sidecar, "schemaVersion"));
   const schemaVersion =
     schemaVersionText !== null && /^[0-9]+$/.test(schemaVersionText)
       ? Number(schemaVersionText)
       : null;
-  const pin = readGeneratorPin(input.packageJson);
+  const pin = readGeneratorPin(packageJson);
   const pinnedVersion = pin !== null && EXACT_VERSION_PATTERN.test(pin.version) ? pin.version : null;
 
   let state: ProjectGeneratorStateValue;
   if (name !== null && name.startsWith("@hexagen-monaco/") && schemaVersion !== null) {
     state = "provisioned";
-  } else if (input.manifest !== null && name === null && pin !== null) {
+  } else if (manifest !== null && name === null && pin !== null) {
     state = "provisioned-legacy";
-  } else if (input.manifest === null && (input.layoutPresent || input.generatorDirectoryPresent)) {
+  } else if (manifest === null && (layoutPresent || generatorDirectoryPresent)) {
     state = "adopting";
   } else {
     state = "none";
   }
   return { state, generatorVersion, pinnedVersion };
 }
+
+/** One file read: its text, a confirmed absence, or an unreadable answer. */
+type ProbeFileRead =
+  | { readonly kind: "read"; readonly text: string }
+  | { readonly kind: "absent" }
+  | { readonly kind: "unknown" };
+
+/** One path's presence: confirmed present, confirmed absent, or unknown. */
+type ProbePathPresence = "present" | "absent" | "unknown";

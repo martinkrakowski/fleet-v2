@@ -49,8 +49,8 @@ const GENERATOR_STATES: readonly ProjectGeneratorStateValue[] = [
   'adopting',
   'none',
 ];
-/** A version is a short token: no spaces, no slashes, no URL. */
-const VERSION_PATTERN = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/;
+/** A version is an exact version: digits first, never a free-form token. */
+const VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]{1,48})?$/;
 
 /** One configured capability: supported, explicitly unsupported, or not known. */
 export type CapabilityStatus = 'supported' | 'missing' | 'unknown';

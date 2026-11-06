@@ -408,43 +408,97 @@ export class ProjectProbeAdapter implements ProjectProbePort {
     path: string;
     executor: CommandExecutorPort;
   }): Promise<ProjectGeneratorState | undefined> {
+    const root = source.path;
+    const architecture = `${root}/.architecture`;
+    // Absence is only believable when every directory above the path can be
+    // searched; `test -e` answers false for a path under an unsearchable one.
+    const rootDir = await this.directoryAccess(source.executor, root);
+    const architectureDir: DirectoryAccess =
+      rootDir !== "searchable"
+        ? rootDir
+        : await this.directoryAccess(source.executor, architecture);
     const manifest = await this.readFile(
       source.executor,
-      `${source.path}/.architecture/manifest.yaml`,
+      `${architecture}/manifest.yaml`,
+      architectureDir,
     );
     const sidecar = await this.readFile(
       source.executor,
-      `${source.path}/.architecture/generator.config.yaml`,
+      `${architecture}/generator.config.yaml`,
+      architectureDir,
     );
-    const packageJson = await this.readFile(
-      source.executor,
-      `${source.path}/package.json`,
-    );
+    const packageJson = await this.readFile(source.executor, `${root}/package.json`, rootDir);
     const layoutPresent = await this.pathPresence(
       source.executor,
-      `${source.path}/.architecture/layout.yaml`,
+      `${architecture}/layout.yaml`,
       false,
+      architectureDir,
     );
     const generatorDirectoryPresent = await this.pathPresence(
       source.executor,
-      `${source.path}/.hexagen`,
+      `${root}/.hexagen`,
       true,
+      rootDir,
     );
-    return decideGeneratorState({
-      manifest,
-      sidecar,
-      packageJson,
-      layoutPresent,
-      generatorDirectoryPresent,
-    }) ?? undefined;
+    return (
+      decideGeneratorState({
+        manifest,
+        sidecar,
+        packageJson,
+        layoutPresent,
+        generatorDirectoryPresent,
+      }) ?? undefined
+    );
+  }
+
+  /**
+   * Whether a directory can be searched, is absent, or cannot be judged. A
+   * symlinked directory is never followed: it may point outside the clone.
+   */
+  private async directoryAccess(
+    executor: CommandExecutorPort,
+    path: string,
+  ): Promise<DirectoryAccess> {
+    const link = await this.runCommand(executor, ["test", "-L", path]);
+    if (this.unreachable(link) || link.exitCode !== 1) {
+      return "unknown";
+    }
+    const searchable = await this.runCommand(executor, ["test", "-d", path, "-a", "-x", path]);
+    if (this.unreachable(searchable)) {
+      return "unknown";
+    }
+    if (searchable.exitCode === 0) {
+      return "searchable";
+    }
+    const exists = await this.runCommand(executor, ["test", "-e", path]);
+    if (this.unreachable(exists)) {
+      return "unknown";
+    }
+    return exists.exitCode === 1 ? "absent" : "unknown";
   }
 
   /**
    * One file's content, distinguishing absence from an unreadable answer: a
    * file that exists but cannot be read must not count as absent, or an
-   * unreadable governed project would be recorded as holding no generator.
+   * unreadable governed project would be recorded as holding no generator. A
+   * symlink is never read: `cat` would follow it to a file outside the clone.
    */
-  private async readFile(executor: CommandExecutorPort, path: string): Promise<ProbeFileRead> {
+  private async readFile(
+    executor: CommandExecutorPort,
+    path: string,
+    parent: DirectoryAccess,
+  ): Promise<ProbeFileRead> {
+    if (parent === "absent") {
+      return { kind: "absent" };
+    }
+    if (parent !== "searchable") {
+      return { kind: "unknown" };
+    }
+    const link = await this.runCommand(executor, ["test", "-L", path]);
+    if (this.unreachable(link) || link.exitCode !== 1) {
+      // A symlink (exit 0) or an unjudgeable answer: never read through it.
+      return { kind: "unknown" };
+    }
     const run = await this.runCommand(executor, ["cat", path], { maxBufferBytes: 1_048_576 });
     if (this.unreachable(run)) {
       return { kind: "unknown" };
@@ -456,23 +510,34 @@ export class ProjectProbeAdapter implements ProjectProbePort {
     if (this.unreachable(exists)) {
       return { kind: "unknown" };
     }
-    return exists.exitCode === 0 ? { kind: "unknown" } : { kind: "absent" };
+    return exists.exitCode === 1 ? { kind: "absent" } : { kind: "unknown" };
   }
 
   /**
    * Whether one path exists (or is a directory), distinguishing absence from
-   * an unreadable answer for the same reason as `readFile`.
+   * an unreadable answer for the same reason as `readFile`: only exit code 1
+   * under a searchable parent is a confirmed absence.
    */
   private async pathPresence(
     executor: CommandExecutorPort,
     path: string,
     directory: boolean,
+    parent: DirectoryAccess,
   ): Promise<ProbePathPresence> {
+    if (parent === "absent") {
+      return "absent";
+    }
+    if (parent !== "searchable") {
+      return "unknown";
+    }
     const run = await this.runCommand(executor, ["test", directory ? "-d" : "-e", path]);
     if (this.unreachable(run)) {
       return "unknown";
     }
-    return run.exitCode === 0 ? "present" : "absent";
+    if (run.exitCode === 0) {
+      return "present";
+    }
+    return run.exitCode === 1 ? "absent" : "unknown";
   }
 
   /** Script names of the clone's HEAD `package.json`; any failure → `[]`. */
@@ -713,3 +778,6 @@ type ProbeFileRead =
 
 /** One path's presence: confirmed present, confirmed absent, or unknown. */
 type ProbePathPresence = "present" | "absent" | "unknown";
+
+/** A directory above a probed path: searchable, confirmed absent, or unknown. */
+type DirectoryAccess = "searchable" | "absent" | "unknown";

@@ -610,6 +610,30 @@ describe('ProjectProfile', () => {
   });
 });
 
+describe('ProjectProfile generator versions', () => {
+  it.each(['password', 'api-key', 'abc.def.ghi'])(
+    'refuses the credential-shaped generator version %s',
+    (version) => {
+      expect(() =>
+        ProjectProfile.fromRecord(
+          profileRecord({
+            lastProbe: {
+              probedAtIso: '2026-10-15T09:00:00.000Z',
+              probedFrom: 'host-1',
+              checks: [],
+              generatorState: {
+                state: 'provisioned',
+                generatorVersion: null,
+                pinnedVersion: version,
+              },
+            },
+          }),
+        ),
+      ).toThrow('ProjectProfile requires lastProbe to be null or a probe receipt');
+    },
+  );
+});
+
 describe('AuthorizationConsumption', () => {
   it('refuses a consumption with an unbound grant or action', () => {
     expect(() => AuthorizationConsumption.fromRecord(consumptionRecord({ grantId: '' }))).toThrow(

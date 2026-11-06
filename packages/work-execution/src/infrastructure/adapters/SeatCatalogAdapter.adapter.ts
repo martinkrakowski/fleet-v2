@@ -32,6 +32,21 @@ function copiedSeats(source: Record<string, unknown>): unknown[] | undefined | n
     if (!isPlainObject(seat)) {
       return null;
     }
+    if (typeof seat['id'] !== 'string' || (seat['id'] as string).trim() === '') {
+      return null;
+    }
+    if (typeof seat['tool'] !== 'string' || typeof seat['model'] !== 'string') {
+      return null;
+    }
+    if (seat['variant'] !== undefined && typeof seat['variant'] !== 'string') {
+      return null;
+    }
+    if (seat['agent'] !== undefined && typeof seat['agent'] !== 'string') {
+      return null;
+    }
+    if (seat['health'] !== undefined && typeof seat['health'] !== 'string') {
+      return null;
+    }
     seats.push({ ...seat });
   }
   return seats;
@@ -59,6 +74,19 @@ function copiedChains(source: Record<string, unknown>): Record<string, unknown> 
     for (const step of rawSteps) {
       if (!isPlainObject(step)) {
         return null;
+      }
+      if (typeof step['seatId'] !== 'string' || (step['seatId'] as string).trim() === '') {
+        return null;
+      }
+      if (step['triggers'] !== undefined) {
+        if (!Array.isArray(step['triggers'])) {
+          return null;
+        }
+        for (const trigger of step['triggers'] as unknown[]) {
+          if (typeof trigger !== 'string') {
+            return null;
+          }
+        }
       }
       steps.push({ ...step });
     }

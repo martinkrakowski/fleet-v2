@@ -750,6 +750,9 @@ const CATALOG_TRIGGER_TO_STOP_REASON: Readonly<Record<string, StopReasonValue>> 
   'no-commit': 'no-commit',
 };
 
+/** The operator-declared seat health values (S1); absent means healthy. */
+const CATALOG_SEAT_HEALTH_VALUES = new Set(['healthy', 'unhealthy']);
+
 const CATALOG_CHAIN_ROLES = ['implementer', 'fix', 'reviewer'] as const;
 
 type CatalogChainRole = (typeof CATALOG_CHAIN_ROLES)[number];
@@ -792,13 +795,22 @@ function catalogSeatsOf(
     const variant = rawSeat['variant'];
     const agent = rawSeat['agent'];
     const health = rawSeat['health'];
+    if (variant !== undefined && typeof variant !== 'string') {
+      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries a variant that is not a string' };
+    }
+    if (agent !== undefined && typeof agent !== 'string') {
+      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries an agent that is not a string' };
+    }
+    if (health !== undefined && (typeof health !== 'string' || !CATALOG_SEAT_HEALTH_VALUES.has(health))) {
+      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries a health that is not a declared seat health' };
+    }
     seats.push({
       id,
       tool,
       model,
-      ...(typeof variant === 'string' ? { variant } : {}),
-      ...(typeof agent === 'string' ? { agent } : {}),
-      ...(typeof health === 'string' ? { health } : {}),
+      ...(variant !== undefined ? { variant } : {}),
+      ...(agent !== undefined ? { agent } : {}),
+      ...(health !== undefined ? { health } : {}),
     });
   }
   return { ok: true, seats };
@@ -964,13 +976,38 @@ export function unhealthySeatIdsFromCatalog(catalog: unknown): string[] {
     if (!Array.isArray(rawSeats)) {
       return [];
     }
+    // A malformed catalogue is refused as a whole: never a partial id list.
+    if (rawSeats.length > SEAT_CATALOG_SEAT_BOUND) {
+      return [];
+    }
     const ids: string[] = [];
     for (const rawSeat of rawSeats) {
       if (!isPlainObject(rawSeat)) {
-        continue;
+        return [];
       }
       const id = rawSeat['id'];
-      if (typeof id === 'string' && rawSeat['health'] === 'unhealthy') {
+      const variant = rawSeat['variant'];
+      const agent = rawSeat['agent'];
+      const health = rawSeat['health'];
+      if (typeof id !== 'string' || id.trim() === '') {
+        return [];
+      }
+      if (typeof rawSeat['tool'] !== 'string') {
+        return [];
+      }
+      if (typeof rawSeat['model'] !== 'string') {
+        return [];
+      }
+      if (variant !== undefined && typeof variant !== 'string') {
+        return [];
+      }
+      if (agent !== undefined && typeof agent !== 'string') {
+        return [];
+      }
+      if (health !== undefined && (typeof health !== 'string' || !CATALOG_SEAT_HEALTH_VALUES.has(health))) {
+        return [];
+      }
+      if (health === 'unhealthy') {
         ids.push(id);
       }
     }

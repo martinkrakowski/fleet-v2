@@ -115,6 +115,25 @@ describe('seatPlanFromCatalog refusals', () => {
     expect('reason' in result).toBe(true);
   });
 
+  it('returns a reason for a wrong-typed optional field on a seat', () => {
+    for (const seat of [
+      { id: 'impl-a', tool: 'opencode', model: 'acme/mercury-3', variant: 7 },
+      { id: 'impl-a', tool: 'opencode', model: 'acme/mercury-3', agent: 7 },
+      { id: 'impl-a', tool: 'opencode', model: 'acme/mercury-3', health: 7 },
+    ]) {
+      const result = seatPlanFromCatalog({ seats: [seat], chains: { implementer: [{ seatId: 'impl-a' }] } });
+      expect('reason' in result).toBe(true);
+    }
+  });
+
+  it('returns a reason for an unknown seat health value', () => {
+    const result = seatPlanFromCatalog({
+      seats: [{ id: 'impl-a', tool: 'opencode', model: 'acme/mercury-3', health: 'sick' }],
+      chains: { implementer: [{ seatId: 'impl-a' }] },
+    });
+    expect('reason' in result).toBe(true);
+  });
+
   it('returns a reason for a null seat in the seats list', () => {
     const result = seatPlanFromCatalog({
       seats: [{ id: 'impl-a', tool: 'opencode', model: 'acme/mercury-3' }, null],
@@ -200,5 +219,29 @@ describe('unhealthySeatIdsFromCatalog refusals', () => {
       },
     });
     expect(unhealthySeatIdsFromCatalog(throwing)).toEqual([]);
+  });
+
+  it('yields [] rather than a partial list when a seat in the list is malformed', () => {
+    expect(
+      unhealthySeatIdsFromCatalog({
+        seats: [
+          { id: 'seat-two', tool: 'opencode', model: 'acme/argon-4', health: 'unhealthy' },
+          { id: 'seat-broken', tool: 'opencode' },
+        ],
+      }),
+    ).toEqual([]);
+    expect(
+      unhealthySeatIdsFromCatalog({
+        seats: [
+          { id: 'seat-two', tool: 'opencode', model: 'acme/argon-4', health: 'unhealthy' },
+          null,
+        ],
+      }),
+    ).toEqual([]);
+    expect(
+      unhealthySeatIdsFromCatalog({
+        seats: [{ id: 'seat-two', tool: 'opencode', model: 'acme/argon-4', health: 'sick' }],
+      }),
+    ).toEqual([]);
   });
 });

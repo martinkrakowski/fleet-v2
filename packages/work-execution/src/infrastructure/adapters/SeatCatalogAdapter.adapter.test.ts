@@ -78,4 +78,14 @@ describe('SeatCatalogAdapter', () => {
     const plan = new SeatCatalogAdapter(malformed).readSeatPlan();
     expect('reason' in plan).toBe(true);
   });
+
+  it('reports unknown for a seat missing its model, never ok', () => {
+    const malformed = {
+      seats: [{ id: 'impl-a', tool: 'opencode', model: 'acme/mercury-3' }, { id: 'impl-b', tool: 'opencode' }],
+    };
+    const read = new SeatCatalogAdapter(malformed).readSeatCatalog();
+    expect(read.outcome).toBe('unknown');
+    const plan = new SeatCatalogAdapter(malformed).readSeatPlan();
+    expect('reason' in plan).toBe(true);
+  });
 });

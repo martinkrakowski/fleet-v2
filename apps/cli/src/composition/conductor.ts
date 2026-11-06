@@ -6,7 +6,9 @@ import { newUlid } from '../ulid.js';
 import { autoMergeSettingsFromLoad } from '../auto-merge-settings.js';
 
 import {
+  ActionAuthorizationAdapter,
   AttemptRepositoryAdapter,
+  AttemptArtifactAdapter,
   ConductorForgeGrantAdapter,
   LaneRunParkNoticeAdapter,
   CiStateAdapter,
@@ -28,10 +30,17 @@ import {
   ReviewRequestAdapter,
   WorkspaceAdapter,
   WorkOrderRepositoryAdapter,
+  sha256HexDigest,
+  unsealedWorktreeRemovalActionId,
+  unsealedWorktreeRemovalScope,
+  consumptionId,
+  type AuthorizeUnsealedWorktreeRemovalRequest,
+  type AuthorizeUnsealedWorktreeRemovalResult,
   type ForgeReadAdapter,
   type ProjectProfileReadPort,
   type RunnerForAttemptPort,
 } from '@fleet/work-execution';
+import type { CoordinationRequestRepositoryAdapter } from '@fleet/operator-coordination';
 
 import { conductorRevision, resolveConductorPolicy } from '@fleet/installation';
 import { assessmentIdForAttempt } from '@fleet/evidence-and-acceptance';
@@ -48,7 +57,19 @@ export interface ComposeConductorInput {
   readonly evidence: FleetCliRuntime['evidence'];
   readonly profileRead: ProjectProfileReadPort;
   /** The attention and owner-question use cases the park notices delegate to (K6-3). */
-  readonly coordination: Pick<FleetCliRuntime['coordination'], 'recordAttentionItem' | 'askOwnerQuestion'>;
+  readonly coordination: Pick<
+    FleetCliRuntime['coordination'],
+    | 'recordAttentionItem'
+    | 'askOwnerQuestion'
+    | 'syncOneWayOwnerQuestions'
+    | 'listOwnerQuestions'
+    | 'resolveActionAuthorization'
+    | 'recordAuthorizationConsumption'
+  >;
+  /** C2': the artifact adapter whose fail-closed manifest check backs the reap. */
+  readonly attemptArtifact: AttemptArtifactAdapter;
+  /** C2': the coordination requests the `--force-unsealed` approval binds to. */
+  readonly coordinationRequestRepository: CoordinationRequestRepositoryAdapter;
   /** The policy grant issuer behind the conductor's own push grants (K6-2). */
   readonly issuePolicyForgeGrantUseCase: IssuePolicyForgeGrantUseCase;
   /** A fresh installation loader for the auto-merge setting read (AM5-3). */
@@ -72,6 +93,8 @@ export function composeConductor(input: ComposeConductorInput) {
     evidence,
     profileRead,
     coordination,
+    attemptArtifact,
+    coordinationRequestRepository,
     issuePolicyForgeGrantUseCase,
     autoMergeLoad,
     installation,
@@ -116,6 +139,15 @@ export function composeConductor(input: ComposeConductorInput) {
       evidence.recordFindingDisposition.recordFindingDisposition(request),
   });
 
+  // C2': the scoped one-way owner approval behind the reap's
+  // `--force-unsealed`, built from the coordination stack.
+  const unsealedRemovalAuthorization = new ActionAuthorizationAdapter({
+    authorizeUnsealedWorktreeRemoval: unsealedWorktreeRemovalAuthorizer({
+      coordination,
+      coordinationRequestRepository,
+    }),
+  });
+
   const conductor = {
     laneRunRepository,
     laneRunJournal,
@@ -153,7 +185,9 @@ export function composeConductor(input: ComposeConductorInput) {
       attemptRepo: attemptRepository,
     }),
     // EX-2b: the operator-opt-in worktree reap, built beside the lane-run
-    // stores it scans and the execution stores it journals to.
+    // stores it scans and the execution stores it journals to. C2': the
+    // removal is gated on the sealed artifact manifest, and `--force-unsealed`
+    // consumes a scoped one-way owner approval through the coordination stack.
     reapLaneWorktrees: new ReapLaneWorktreesUseCase({
       workOrderRepo: workOrderRepository,
       attemptRepo: attemptRepository,
@@ -162,6 +196,8 @@ export function composeConductor(input: ComposeConductorInput) {
       executionJournal,
       profileRead,
       workspace,
+      attemptArtifact,
+      actionAuthorization: unsealedRemovalAuthorization,
     }),
     // EX-4: the operator-opt-in orphan-session reap, built beside the worktree
     // reap from the execution stores it scans and the per-host runner resolver.
@@ -208,4 +244,111 @@ export function composeConductor(input: ComposeConductorInput) {
   };
 
   return { conductor };
+}
+
+/** The coordination surface the `--force-unsealed` approval is built from. */
+export interface UnsealedRemovalAuthorizerDeps {
+  readonly coordination: Pick<
+    FleetCliRuntime['coordination'],
+    | 'syncOneWayOwnerQuestions'
+    | 'listOwnerQuestions'
+    | 'resolveActionAuthorization'
+    | 'recordAuthorizationConsumption'
+  >;
+  readonly coordinationRequestRepository: CoordinationRequestRepositoryAdapter;
+}
+
+/**
+ * C2': the scoped one-way owner approval behind the reap's
+ * `--force-unsealed`. The delegate matches an answered one-way owner question
+ * to a coordination request bound to the exact project, action scope
+ * (attempt + worktree-path digest) and head, then consumes its grant exactly
+ * once; a prior consumption of the same action id and attempt is the crash
+ * recovery, not a second authorization. Nothing here logs a request, grant or
+ * filesystem path.
+ */
+export function unsealedWorktreeRemovalAuthorizer(
+  deps: UnsealedRemovalAuthorizerDeps,
+): (
+  request: AuthorizeUnsealedWorktreeRemovalRequest,
+) => Promise<AuthorizeUnsealedWorktreeRemovalResult> {
+  const { coordination, coordinationRequestRepository } = deps;
+  return async (request) => {
+    const { projectId, runId, attemptId, worktreePath, expectedHeadSha, nowIso } = request;
+    const actionScope = unsealedWorktreeRemovalScope(attemptId, sha256HexDigest(worktreePath));
+    const actionId = unsealedWorktreeRemovalActionId(runId, attemptId);
+    try {
+      await coordination.syncOneWayOwnerQuestions.syncOneWayOwnerQuestions();
+      const listed = await coordination.listOwnerQuestions.listOwnerQuestions();
+      const questions = Array.isArray(listed?.questions) ? listed.questions : [];
+      for (const question of questions) {
+        if (
+          question.doorKind !== 'one-way' ||
+          question.state !== 'answered' ||
+          question.linkedRequestId === null ||
+          question.answer === null ||
+          question.answer.shape !== 'accept' ||
+          question.answer.answeredVia !== 'signed-decision'
+        ) {
+          continue;
+        }
+        const coordReq = await coordinationRequestRepository.findRequestById(
+          question.linkedRequestId,
+        );
+        if (
+          coordReq === null ||
+          coordReq.projectId !== projectId ||
+          coordReq.actionScope !== actionScope ||
+          coordReq.expectedHeadSha !== expectedHeadSha ||
+          coordReq.policyGrant !== undefined
+        ) {
+          continue;
+        }
+        // Crash recovery: a grant already consumed by exactly this action id
+        // and attempt re-answers approved without a second owner signature.
+        const consumption = coordReq.consumptions[0];
+        if (
+          coordReq.consumptions.length === 1 &&
+          consumption !== undefined &&
+          consumption.actionId === actionId &&
+          consumption.attemptId === attemptId &&
+          coordReq.grantId !== null
+        ) {
+          return {
+            outcome: 'approved',
+            approvalReference: `${question.questionId}:${coordReq.id}:${coordReq.grantId}`,
+          };
+        }
+        const resolved = await coordination.resolveActionAuthorization.resolveActionAuthorization({
+          projectId,
+          actionScope,
+          expectedHeadSha,
+        });
+        if (resolved.outcome !== 'authorized' || resolved.requestId !== coordReq.id) {
+          continue;
+        }
+        const consumed = await coordination.recordAuthorizationConsumption.recordAuthorizationConsumption(
+          {
+            consumptionId: consumptionId(actionId),
+            grantId: resolved.grantId,
+            actionId,
+            actionScope,
+            attemptId,
+            expectedHeadSha,
+            nowIso,
+          },
+        );
+        if (consumed.outcome !== 'consumed') {
+          return { outcome: 'blocked', reason: 'consumption-refused' };
+        }
+        return {
+          outcome: 'approved',
+          approvalReference: `${question.questionId}:${coordReq.id}:${resolved.grantId}`,
+        };
+      }
+      return { outcome: 'blocked', reason: 'no-scoped-owner-approval' };
+    } catch {
+      return { outcome: 'unknown', reason: 'owner-question-sync-failed' };
+    }
+  };
 }

@@ -96,6 +96,16 @@ export interface VerifyArtifactManifestRequest {
 
 export type VerifyArtifactManifestResult = ArtifactManifestVerdict;
 
+/**
+ * C2': the answer of the fail-closed removal check. It is the plain verify
+ * verdict (`sealed` / `missing` / `mismatch`) or, when the executor, probes or
+ * reads could not answer, `{ outcome: 'unknown', reason }` — unknown is never
+ * collapsed into missing or sealed.
+ */
+export type ArtifactManifestRemovalCheckResult =
+  | ArtifactManifestVerdict
+  | { readonly outcome: 'unknown'; readonly reason: string };
+
 export interface AttemptArtifactPort {
   /** Verify candidate paths are ignored before placing anything in the worktree. */
   verifyIgnoredPaths(request: VerifyIgnoredPathsRequest): Promise<VerifyIgnoredPathsResult>;
@@ -143,4 +153,16 @@ export interface AttemptArtifactPort {
 
   /** Re-hash every file the manifest lists: sealed, missing (no manifest) or mismatch. */
   verifyArtifactManifest?(request: VerifyArtifactManifestRequest): Promise<VerifyArtifactManifestResult>;
+
+  /**
+   * C2': the fail-closed removal check. Answers `sealed` only when the
+   * manifest file is present, byte-identical to its recorded digest and every
+   * listed artifact still matches; `missing` when there is no manifest at
+   * all; `mismatch` for a rewritten manifest or a changed artifact; and
+   * `unknown` (never missing, never sealed) whenever a probe, read, hash or
+   * the executor itself fails to answer.
+   */
+  checkArtifactManifestForRemoval?(
+    request: VerifyArtifactManifestRequest,
+  ): Promise<ArtifactManifestRemovalCheckResult>;
 }

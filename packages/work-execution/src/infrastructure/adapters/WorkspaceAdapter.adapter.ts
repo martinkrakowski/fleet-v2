@@ -52,6 +52,8 @@ import type {
   ReadFilesystemSpaceResult,
   RemoveLaneWorktreeRequest,
   RemoveLaneWorktreeResult,
+  RemoveWorktreeRequest,
+  RemoveWorktreeResult,
   ResetWorktreeToHeadRequest,
   ResetWorktreeToHeadResult,
   VerifySavedPatchRequest,
@@ -280,6 +282,67 @@ export function removeLaneWorktreeRequestIsValid(request: RemoveLaneWorktreeRequ
     return false;
   }
   return LANE_RUN_BRANCH_PATTERN.test(branch);
+}
+
+/**
+ * KW3' (conductor plan §3.10.3) path validation of one `removeWorktree`
+ * request, before any command runs: all three paths are absolute and
+ * normalised, the worktree path sits strictly under the worktree root, and it
+ * is neither equal to nor inside the clone. A path problem is refused as
+ * `path-refused`. This is the lexical pre-command check; containment against
+ * the resolved physical paths is enforced again in `removeCheckedListedWorktree`
+ * after the listed entry is found, so a symlink inside the root pointing at a
+ * worktree outside it is still refused.
+ */
+function removeWorktreePathRefusal(request: RemoveWorktreeRequest): boolean {
+  const { repositoryRoot, worktreeRoot, worktreePath } = request;
+  if (
+    !isAbsoluteNormalisedPath(repositoryRoot) ||
+    !isAbsoluteNormalisedPath(worktreeRoot) ||
+    !isAbsoluteNormalisedPath(worktreePath)
+  ) {
+    return true;
+  }
+  if (!worktreePath.startsWith(`${worktreeRoot}/`)) {
+    return true;
+  }
+  return worktreePath === repositoryRoot || worktreePath.startsWith(`${repositoryRoot}/`);
+}
+
+/**
+ * KW3' (conductor plan §3.10.3) non-path validation of one `removeWorktree`
+ * request: the recorded host is named, `expectedHead` is a real commit sha
+ * (40 or 64 lowercase hex, not all zeros), `expectedBranch` is a non-empty
+ * branch that is not `main`, and `expectedLastActivityIso` is either null (no
+ * activity was readable under the caller's hold) or an ISO-8601 UTC instant with milliseconds (the form `toISOString` writes). Any
+ * other malformed request is refused as `invalid-request`.
+ */
+/** True when `value` is exactly what `toISOString` writes, so no calendar date was normalised. */
+function isCanonicalIsoInstant(value: string): boolean {
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function removeWorktreeRequestIsValid(request: RemoveWorktreeRequest): boolean {
+  const { expectedHead, expectedBranch, expectedLastActivityIso, recordedHost } = request;
+  if (!runnerHasHostName(recordedHost)) {
+    return false;
+  }
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(expectedHead) || /^0+$/.test(expectedHead)) {
+    return false;
+  }
+  if (typeof expectedBranch !== 'string' || expectedBranch === '' || expectedBranch === 'main') {
+    return false;
+  }
+  if (
+    expectedLastActivityIso !== null &&
+    (typeof expectedLastActivityIso !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(expectedLastActivityIso) ||
+      !isCanonicalIsoInstant(expectedLastActivityIso))
+  ) {
+    return false;
+  }
+  return true;
 }
 
 /** One entry of `git worktree list --porcelain`, as far as this adapter reads it. */
@@ -824,6 +887,40 @@ function parseReflogTimestamp(stdout: string): number | null {
   return Number.isNaN(ms) ? null : ms;
 }
 
+/**
+ * One `stat` answer as milliseconds. The first token is the whole-second epoch
+ * (`%Y` / `%m`); the sub-second part comes from the same line when the host
+ * prints it (GNU `%y`: `2026-01-01 00:00:00.123456789 +0000`, BSD `%Fm`:
+ * `1767225600.123456`). A host that prints only whole seconds yields whole
+ * seconds and `fractional: false`; the removal re-check treats such a reading
+ * as too coarse to prove quiet. Whole-second readings alone cannot tell a write made in the same
+ * second as the caller's inspection from the inspected state, so the removal
+ * re-check compares at millisecond precision.
+ */
+function parseStatMtime(line: string): { readonly ms: number; readonly fractional: boolean } | null {
+  const tokens = line.trim().split(/\s+/);
+  const first = tokens[0];
+  if (first === undefined || !/^\d+$/.test(first)) {
+    return null;
+  }
+  const seconds = Number.parseInt(first, 10);
+  if (!Number.isSafeInteger(seconds)) {
+    return null;
+  }
+  let millis = 0;
+  let fractional = false;
+  for (const token of tokens.slice(1)) {
+    const fraction = /^(?:\d{2}:\d{2}:\d{2}|\d+)\.(\d+)$/.exec(token);
+    if (fraction !== null) {
+      millis = Number.parseInt(fraction[1]!.padEnd(3, '0').slice(0, 3), 10);
+      // An all-zero fraction is a filesystem that stores whole seconds.
+      fractional = /[1-9]/.test(fraction[1]!);
+      break;
+    }
+  }
+  return { ms: seconds * 1000 + millis, fractional };
+}
+
 async function readReflogActivityMs(
   executor: CommandExecutorPort,
   worktreePath: string,
@@ -861,7 +958,7 @@ async function readIndexActivityMs(
   executor: CommandExecutorPort,
   worktreePath: string,
   flavour: 'gnu' | 'bsd',
-): Promise<number | null> {
+): Promise<{ readonly ms: number; readonly fractional: boolean } | null> {
   const indexPathRun = await executor.run(
     ['git', '-C', worktreePath, 'rev-parse', '--git-path', 'index'],
     { timeoutMs: GIT_TIMEOUT_MS },
@@ -874,7 +971,7 @@ async function readIndexActivityMs(
     indexPath = path.join(worktreePath, indexPath);
   }
   const indexStatRun = await executor.run(
-    flavour === 'gnu' ? ['stat', '-c', '%Y', indexPath] : ['stat', '-f', '%m', indexPath],
+    flavour === 'gnu' ? ['stat', '-c', '%Y %y', indexPath] : ['stat', '-f', '%m %Fm', indexPath],
     { timeoutMs: GIT_TIMEOUT_MS },
   );
   if (
@@ -884,34 +981,33 @@ async function readIndexActivityMs(
   ) {
     return null;
   }
-  const seconds = Number.parseInt(indexStatRun.stdout.trim(), 10);
-  if (!Number.isSafeInteger(seconds)) {
-    return null;
-  }
-  return seconds * 1000;
+  return parseStatMtime(indexStatRun.stdout.trim());
 }
 
 async function walkTreeActivity(
   executor: CommandExecutorPort,
   worktreePath: string,
   flavour: 'gnu' | 'bsd',
-): Promise<{ newestMs: number | null; unknown: boolean }> {
+): Promise<{ newestMs: number | null; unknown: boolean; coarse: boolean }> {
   const walkArgv =
     flavour === 'gnu'
-      ? ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y', '{}', '+']
-      : ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-f', '%m', '{}', '+'];
+      ? ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y %y', '{}', '+']
+      : ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-f', '%m %Fm', '{}', '+'];
   const walkRun = await executor.run(walkArgv, { timeoutMs: GIT_TIMEOUT_MS });
   let newestMs: number | null = null;
+  let coarse = false;
   for (const line of walkRun.stdout.split('\n')) {
     const trimmed = line.trim();
     if (trimmed === '') continue;
-    const seconds = Number.parseInt(trimmed, 10);
-    if (Number.isSafeInteger(seconds) && (newestMs === null || seconds * 1000 > newestMs)) {
-      newestMs = seconds * 1000;
+    const lineMtime = parseStatMtime(trimmed);
+    if (lineMtime === null) continue;
+    if (!lineMtime.fractional) coarse = true;
+    if (newestMs === null || lineMtime.ms > newestMs) {
+      newestMs = lineMtime.ms;
     }
   }
   const unknown = walkRun.exitCode === null || walkRun.error !== undefined || walkRun.exitCode !== 0;
-  return { newestMs, unknown };
+  return { newestMs, unknown, coarse };
 }
 
 export class WorkspaceAdapter implements WorkspacePort {
@@ -1759,6 +1855,223 @@ export class WorkspaceAdapter implements WorkspacePort {
   }
 
   /**
+   * KW3' (conductor plan §3.10.3): remove one worktree after re-reading HEAD,
+   * the branch, the porcelain status, the lock, the in-progress operation
+   * files and the bounded file walk in this one executor call, and only then
+   * run `git worktree remove <path>`. Never `--force`, never a branch
+   * command, never `prune`, never `rm`, never a fetch or a push. The only
+   * write is `git worktree remove <path>` with no flags. Every command runs
+   * through the recorded host's executor — never the configured or legacy
+   * executor — and when the recorded host is not named or no host executor is
+   * configured, nothing runs. A refusal removes nothing; `partial` means the
+   * command ran but the directory or its administrative entry is still there;
+   * `unknown` means the executor did not answer.
+   */
+  async removeWorktree(request: RemoveWorktreeRequest): Promise<RemoveWorktreeResult> {
+    // 1. Validate before anything runs (no executor call on a bad request).
+    if (removeWorktreePathRefusal(request)) {
+      return { outcome: 'refused', reason: 'path-refused' };
+    }
+    if (!removeWorktreeRequestIsValid(request)) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+
+    // 2. The removal runs on the recorded host's executor and nowhere else.
+    const executor = this.recordedHostExecutor(request.recordedHost);
+    if (executor === null) {
+      return { outcome: 'unknown', reason: 'no executor for the recorded host' };
+    }
+    try {
+      return await this.removeCheckedListedWorktree(request, executor);
+    } catch {
+      return { outcome: 'unknown', reason: 'the removal did not report' };
+    }
+  }
+
+  /**
+   * Steps 3–6 of `removeWorktree` on a resolved executor: find the worktree in
+   * the clone's list, re-read HEAD, branch, status, lock, in-progress
+   * operations and the bounded file walk through the same executor, then
+   * remove it only when every guard still holds. The outer try/catch stays in
+   * `removeWorktree` and answers `unknown` on any throw.
+   */
+  private async removeCheckedListedWorktree(
+    request: RemoveWorktreeRequest,
+    executor: CommandExecutorPort,
+  ): Promise<RemoveWorktreeResult> {
+    const { repositoryRoot, worktreeRoot, worktreePath, expectedHead, expectedBranch, expectedLastActivityIso } =
+      request;
+
+    // 3. Containment and the listed facts.
+    const listRun = await executor.run(
+      ['git', '-C', repositoryRoot, 'worktree', 'list', '--porcelain'],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (listRun.exitCode === null || listRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'git worktree list did not report an exit code' };
+    }
+    if (listRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'git worktree list failed' };
+    }
+    const listed = parseWorktreeList(listRun.stdout);
+    if (listed === null) {
+      return { outcome: 'unknown', reason: 'git worktree list output could not be parsed' };
+    }
+    const entry = await this.findLinkedWorktreeEntry(executor, repositoryRoot, worktreePath, listed, true);
+    if (entry === null) {
+      return { outcome: 'refused', reason: 'not-a-linked-worktree' };
+    }
+
+    // 3b. Containment against the resolved physical paths. The lexical check
+    //     above cannot see a symlink inside the worktree root pointing at a
+    //     linked worktree outside it; the listed entry's path is the physical
+    //     path git lists, so it is compared against the physical root, and a
+    //     target outside the configured root is refused.
+    const physicalWorktreeRoot = await resolvePhysicalPath(executor, worktreeRoot, GIT_TIMEOUT_MS);
+    if (physicalWorktreeRoot === null) {
+      return { outcome: 'unknown', reason: 'the worktree root could not be resolved to a physical path' };
+    }
+    const containmentRoot = physicalWorktreeRoot;
+    if (entry.path === containmentRoot || !entry.path.startsWith(`${containmentRoot}/`)) {
+      return { outcome: 'refused', reason: 'path-refused' };
+    }
+    //     The requested path itself must be the listed physical path: a
+    //     registered path since replaced by a symlink resolves elsewhere, and
+    //     a path that is itself reached through a symlink is refused too.
+    const physicalRequestedPath = await resolvePhysicalPath(executor, worktreePath, GIT_TIMEOUT_MS);
+    if (physicalRequestedPath === null) {
+      return { outcome: 'unknown', reason: 'the worktree path could not be resolved to a physical path' };
+    }
+    if (physicalRequestedPath !== entry.path || physicalRequestedPath !== worktreePath) {
+      return { outcome: 'refused', reason: 'path-refused' };
+    }
+    //     A worktree inside the clone itself (reached through an alias of the
+    //     repository root) is refused as well.
+    const physicalRepositoryRoot = await resolvePhysicalPath(executor, repositoryRoot, GIT_TIMEOUT_MS);
+    if (
+      physicalRepositoryRoot === null ||
+      physicalRequestedPath === physicalRepositoryRoot ||
+      physicalRequestedPath.startsWith(`${physicalRepositoryRoot}/`)
+    ) {
+      return { outcome: 'refused', reason: 'path-refused' };
+    }
+
+    // 4. Re-read the facts, in this order, through the same executor.
+    //    HEAD first: a moved HEAD refuses before anything else is read.
+    const headRun = await executor.run(['git', '-C', worktreePath, 'rev-parse', 'HEAD'], {
+      timeoutMs: GIT_TIMEOUT_MS,
+    });
+    if (headRun.exitCode === null || headRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'git rev-parse HEAD did not report an exit code' };
+    }
+    if (headRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'git rev-parse HEAD failed' };
+    }
+    const head = headRun.stdout.trim();
+    if (head !== expectedHead) {
+      return { outcome: 'refused', reason: 'head-moved' };
+    }
+
+    //    Branch, from the listed entry.
+    if (entry.branch === null) {
+      return { outcome: 'refused', reason: 'detached' };
+    }
+    if (entry.branch !== expectedBranch) {
+      return { outcome: 'refused', reason: 'branch-mismatch' };
+    }
+
+    //    Status: a read that did not answer is never a refusal.
+    const statusResult = await this.readWorktreeStatus(executor, worktreePath);
+    if (statusResult.outcome === 'unknown') {
+      return { outcome: 'unknown', reason: statusResult.reason };
+    }
+    if (statusResult.status.tracked + statusResult.status.untracked + statusResult.status.unmerged > 0) {
+      return { outcome: 'refused', reason: 'dirty' };
+    }
+
+    //    Lock.
+    if (entry.locked) {
+      return { outcome: 'refused', reason: 'locked' };
+    }
+
+    //    In-progress operations.
+    const inProgressResult = await this.readInProgressOperations(executor, worktreePath);
+    if (inProgressResult.outcome === 'unknown') {
+      return { outcome: 'unknown', reason: inProgressResult.reason };
+    }
+    if (inProgressResult.operations.length > 0) {
+      return { outcome: 'refused', reason: 'busy' };
+    }
+
+    //    Bounded activity: the porcelain status cannot see writes to ignored
+    //    files, so the removal re-runs the bounded file walk and refuses busy
+    //    when the newest mtime moved past the value read under the caller's
+    //    hold, or when no baseline was read, or when the walk cannot answer
+    //    (conductor plan §3.10.3).
+    //    Instants are compared as parsed times, never as strings, and a
+    //    reading without a sub-second part is too coarse to prove quiet.
+    const activity = await this.readLastActivityDetailed(executor, worktreePath);
+    if (activity.unknown || activity.coarse || expectedLastActivityIso === null) {
+      return { outcome: 'refused', reason: 'busy' };
+    }
+    if (
+      activity.iso !== null &&
+      Date.parse(activity.iso) > Date.parse(expectedLastActivityIso)
+    ) {
+      return { outcome: 'refused', reason: 'busy' };
+    }
+
+    // 5. Remove: exactly these five argv entries, no flags at all.
+    const removeRun = await executor.run(
+      ['git', '-C', repositoryRoot, 'worktree', 'remove', worktreePath],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (removeRun.exitCode === null || removeRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'the remove did not report an exit code' };
+    }
+    if (removeRun.exitCode !== 0) {
+      return { outcome: 'refused', reason: 'git-refused' };
+    }
+
+    // 6. Post-conditions, only after exit 0.
+    const existsRun = await executor.run(['test', '-e', worktreePath], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    // `test -e` answers 1 when the directory is gone; a missing exit code, a
+    // reported error or any other exit is an unanswered probe, never a proof
+    // of removal.
+    if (existsRun.exitCode === null || existsRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'the existence probe did not report an exit code' };
+    }
+    if (existsRun.exitCode === 0) {
+      return { outcome: 'partial', detail: 'directory-present' };
+    }
+    if (existsRun.exitCode !== 1) {
+      return { outcome: 'unknown', reason: 'the existence probe failed' };
+    }
+    const relistRun = await executor.run(
+      ['git', '-C', repositoryRoot, 'worktree', 'list', '--porcelain'],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    // A failed or unparseable relist cannot confirm that the administrative
+    // entry is gone, so it must not be reported as `removed`.
+    if (relistRun.exitCode === null || relistRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'the post-removal worktree list did not report an exit code' };
+    }
+    if (relistRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'the post-removal worktree list failed' };
+    }
+    const relisted = parseWorktreeList(relistRun.stdout);
+    if (relisted === null) {
+      return { outcome: 'unknown', reason: 'the post-removal worktree list output could not be parsed' };
+    }
+    if (listedWorktreeAt(relisted, entry.path) !== null) {
+      return { outcome: 'partial', detail: 'admin-entry-present' };
+    }
+    return { outcome: 'removed', branchTip: head };
+  }
+
+  /**
    * Step 4 of `removeListedLaneWorktree`: the branch is the record of the
    * run (D17) — a detached entry, or one on another branch, is refused,
    * never removed.
@@ -1919,6 +2232,7 @@ export class WorkspaceAdapter implements WorkspacePort {
     repositoryRoot: string,
     worktreePath: string,
     listed: readonly ListedWorktreeEntry[],
+    requirePhysicalRepositoryRoot = false,
   ): Promise<ListedWorktreeEntry | null> {
     let entry = listedWorktreeAt(listed, worktreePath);
     if (entry === null) {
@@ -1932,6 +2246,11 @@ export class WorkspaceAdapter implements WorkspacePort {
     }
     const physicalRepositoryRoot = await resolvePhysicalPath(executor, repositoryRoot, GIT_TIMEOUT_MS);
     if (physicalRepositoryRoot !== null && entry.path === physicalRepositoryRoot) {
+      return null;
+    }
+    // A removal must prove the entry is not the main checkout; when the
+    // physical repository root cannot be resolved it cannot, so it refuses.
+    if (physicalRepositoryRoot === null && requirePhysicalRepositoryRoot) {
       return null;
     }
     return entry;
@@ -2006,6 +2325,11 @@ export class WorkspaceAdapter implements WorkspacePort {
       }
       if (probeRun.exitCode === 0) {
         inProgressOperations.push(name);
+      } else if (probeRun.exitCode !== 1) {
+        // Only `test -e` exit 1 means "file absent". Any other exit is an
+        // unanswered probe: it cannot establish that no operation is in
+        // progress, so it is never treated as absent.
+        return { outcome: 'unknown', reason: 'operation file probe failed with an unexpected exit' };
       }
     }
     return { outcome: 'read', operations: inProgressOperations };
@@ -2067,6 +2391,19 @@ export class WorkspaceAdapter implements WorkspacePort {
     executor: CommandExecutorPort,
     worktreePath: string,
   ): Promise<WorktreeLastActivity> {
+    const { iso, unknown } = await this.readLastActivityDetailed(executor, worktreePath);
+    return { iso, unknown };
+  }
+
+  /**
+   * `readLastActivity` plus `coarse`: true when any file or index reading
+   * carried no sub-second part, so an equal-to-baseline answer cannot prove
+   * that nothing was written later in the same second.
+   */
+  private async readLastActivityDetailed(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+  ): Promise<{ iso: string | null; unknown: boolean; coarse: boolean }> {
     // reflog: the newest reflog entry's timestamp; a non-zero exit or empty
     // stdout contributes nothing.
     let newestMs: number | null = null;
@@ -2074,6 +2411,8 @@ export class WorkspaceAdapter implements WorkspacePort {
     if (reflogMs !== null) {
       newestMs = reflogMs;
     }
+    // An unreadable reflog is an unreadable activity source: too coarse to prove quiet.
+    let coarse = reflogMs === null;
 
     // Detect the `stat` flavour once: GNU (`-c %Y`) or BSD (`-f %m`).
     const flavour = await detectStatFlavour(executor, worktreePath);
@@ -2084,9 +2423,15 @@ export class WorkspaceAdapter implements WorkspacePort {
       unknown = true;
     } else {
       // Index mtime: resolve the index path, then stat it with the detected flavour.
-      const indexMs = await readIndexActivityMs(executor, worktreePath, flavour);
-      if (indexMs !== null && (newestMs === null || indexMs > newestMs)) {
-        newestMs = indexMs;
+      const indexMtime = await readIndexActivityMs(executor, worktreePath, flavour);
+      if (indexMtime === null) {
+        // An unreadable index is an unreadable activity source: too coarse to prove quiet.
+        coarse = true;
+      } else {
+        if (!indexMtime.fractional) coarse = true;
+        if (newestMs === null || indexMtime.ms > newestMs) {
+          newestMs = indexMtime.ms;
+        }
       }
 
       // Bounded tree walk: newest file mtime under the worktree, skipping .git.
@@ -2094,15 +2439,18 @@ export class WorkspaceAdapter implements WorkspacePort {
       if (walk.newestMs !== null && (newestMs === null || walk.newestMs > newestMs)) {
         newestMs = walk.newestMs;
       }
+      if (walk.coarse) {
+        coarse = true;
+      }
       if (walk.unknown) {
         unknown = true;
       }
     }
 
     if (newestMs === null) {
-      return { iso: null, unknown: true };
+      return { iso: null, unknown: true, coarse };
     }
-    return { iso: new Date(newestMs).toISOString(), unknown };
+    return { iso: new Date(newestMs).toISOString(), unknown, coarse };
   }
 
   /**

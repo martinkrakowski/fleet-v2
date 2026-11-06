@@ -1140,6 +1140,29 @@ describe('RecordProjectProbeUseCase', () => {
     expect(repo.saves).toEqual([result.profile]);
   });
 
+  it('records a receipt that carries the generator state', async () => {
+    const seeded = profileRecord({ revision: 4 });
+    const repo = new StubProfileRepository({ 'project-atlas': seeded });
+    const receiptWithState: ProjectProbeReceiptRecord = {
+      ...receipt,
+      generatorState: {
+        state: 'provisioned-legacy',
+        generatorVersion: '0.14.0',
+        pinnedVersion: '0.16.0',
+      },
+    };
+    const result = await new RecordProjectProbeUseCase({ profileRepo: repo }).execute({
+      projectId: 'project-atlas',
+      expectedRevision: 4,
+      receipt: receiptWithState,
+    });
+    expect(result.outcome).toBe('recorded');
+    if (result.outcome !== 'recorded') {
+      throw new Error('expected a recorded probe');
+    }
+    expect(result.profile.lastProbe).toEqual(receiptWithState);
+  });
+
   it('refuses an unregistered project', async () => {
     const repo = new StubProfileRepository();
     const result = await new RecordProjectProbeUseCase({ profileRepo: repo }).execute({

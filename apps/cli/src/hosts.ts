@@ -142,49 +142,56 @@ const HOST_ROLES: readonly HostRole[] = [
  * dependency of the CLI, so the mirror lives here.
  */
 const SECRET_SHAPES: readonly RegExp[] = [
-  new RegExp(["-----BEGIN [A-Z ]*PRIVATE KEY-----"].join("")),
-  new RegExp(["\\bgh[pousr]_[A-Za-z0-9]{20,}\\b"].join("")),
-  new RegExp(["\\bsk-[A-Za-z0-9_-]{20,}\\b"].join("")),
-  new RegExp(["\\bAKIA[0-9A-Z]{16}\\b"].join("")),
-  new RegExp(["\\bxox[abprs]-[A-Za-z0-9-]{10,}\\b"].join("")),
+  // Every pattern is global: `sanitizeToken` must replace every match in one
+  // rendered field, not only the first, so several secret-shaped values in
+  // one value cannot leave the later ones visible.
+  new RegExp(["-----BEGIN [A-Z ]*PRIVATE KEY-----"].join(""), "g"),
+  new RegExp(["\\bgh[pousr]_[A-Za-z0-9]{20,}\\b"].join(""), "g"),
+  new RegExp(["\\bsk-[A-Za-z0-9_-]{20,}\\b"].join(""), "g"),
+  new RegExp(["\\bAKIA[0-9A-Z]{16}\\b"].join(""), "g"),
+  new RegExp(["\\bxox[abprs]-[A-Za-z0-9-]{10,}\\b"].join(""), "g"),
   new RegExp([
     "\\beyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\b",
-  ].join("")),
-  new RegExp(["AKIA[0-9A-Z]{16}"].join("")),
-  new RegExp(["gh[pousr]_[A-Za-z0-9]{20,}"].join("")),
-  new RegExp(["github_pat_[A-Za-z0-9_]{20,}"].join("")),
-  new RegExp(["BEGIN [A-Z ]*PRIVATE KEY"].join("")),
-  new RegExp(["ya29\\.[A-Za-z0-9_-]{20,}"].join("")),
-  new RegExp(["AIza[0-9A-Za-z_-]{30,}"].join("")),
-  new RegExp(["sk-or-v1-[0-9a-f]{20,}"].join("")),
-  new RegExp(["xox[abpr]-[A-Za-z0-9-]{10,}"].join("")),
+  ].join(""), "g"),
+  new RegExp(["AKIA[0-9A-Z]{16}"].join(""), "g"),
+  new RegExp(["gh[pousr]_[A-Za-z0-9]{20,}"].join(""), "g"),
+  new RegExp(["github_pat_[A-Za-z0-9_]{20,}"].join(""), "g"),
+  new RegExp(["BEGIN [A-Z ]*PRIVATE KEY"].join(""), "g"),
+  new RegExp(["ya29\\.[A-Za-z0-9_-]{20,}"].join(""), "g"),
+  new RegExp(["AIza[0-9A-Za-z_-]{30,}"].join(""), "g"),
+  new RegExp(["sk-or-v1-[0-9a-f]{20,}"].join(""), "g"),
+  new RegExp(["xox[abpr]-[A-Za-z0-9-]{10,}"].join(""), "g"),
   new RegExp([
     "eyJ[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}",
-  ].join("")),
-  new RegExp(["ssh-(rsa|ed25519|dss|ecdsa) AAAA[A-Za-z0-9+/]{20,}"].join("")),
+  ].join(""), "g"),
+  new RegExp(["ssh-(rsa|ed25519|dss|ecdsa) AAAA[A-Za-z0-9+/]{20,}"].join(""), "g"),
   new RegExp([
     "OPENCODE_SERVER_PASSWORD[ \\t\\v\\f\\r]*=[ \\t\\v\\f\\r]*[^ \\t\\v\\f\\r]+",
-  ].join("")),
-  new RegExp(["antigravity", "oauth", "token"].join("-")),
+  ].join(""), "g"),
+  new RegExp(["antigravity", "oauth", "token"].join("-"), "g"),
   new RegExp([
     "\\/home\\/[a-z]+\\/.(",
     "ssh|config\\/gh|gemini|aws|docker\\/config\\.json)",
-  ].join("")),
+  ].join(""), "g"),
   new RegExp([
     "[Pp]assword[ \\t\\v\\f\\r]*[:=][ \\t\\v\\f\\r]*[\"'][^\"']{6,}[\"']",
-  ].join("")),
+  ].join(""), "g"),
   new RegExp([
     "[Tt]oken[ \\t\\v\\f\\r]*[:=][ \\t\\v\\f\\r]*[\"'][A-Za-z0-9_./+=-]{16,}[\"']",
-  ].join("")),
+  ].join(""), "g"),
   new RegExp([
     "https?:\\/\\/[^/:@ \\t\\v\\f\\r]+:[^/@ \\t\\v\\f\\r]{6,}@",
-  ].join("")),
-  /[\\/\\]/,
+  ].join(""), "g"),
+  /[\\/\\]/g,
 ];
 
 /** True when `text` contains a secret shape or a filesystem separator. */
 export function hasSecretShape(text: string): boolean {
-  return SECRET_SHAPES.some((pattern) => pattern.test(text));
+  return SECRET_SHAPES.some((pattern) => {
+    // Global patterns are stateful across `test` calls; each test starts clean.
+    pattern.lastIndex = 0;
+    return pattern.test(text);
+  });
 }
 
 /** Replace every secret-shaped span and separator in `text` with `<redacted>`. */
@@ -276,7 +283,7 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
   if (allowed === undefined) {
     return {
       ok: false,
-      error: `Unknown hosts subcommand: ${subcommand === "" ? "(none)" : subcommand}\n${HOSTS_HELP}`,
+      error: `Unknown hosts subcommand: ${subcommand === "" ? "(none)" : sanitizeToken(subcommand)}\n${HOSTS_HELP}`,
     };
   }
   const args: {
@@ -302,7 +309,7 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
       if (args.name !== undefined) {
         return {
           ok: false,
-          error: `Unexpected argument: ${token}\n${HOSTS_HELP}`,
+          error: `Unexpected argument: ${sanitizeToken(token)}\n${HOSTS_HELP}`,
         };
       }
       args.name = token;
@@ -316,7 +323,7 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
     if (!allowed.has(flag)) {
       return {
         ok: false,
-        error: `Unknown hosts ${subcommand} option: --${flag}\n${HOSTS_HELP}`,
+        error: `Unknown hosts ${sanitizeToken(subcommand)} option: --${sanitizeToken(flag)}\n${HOSTS_HELP}`,
       };
     }
     if (flag === "yes") {
@@ -388,7 +395,7 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
       if (!/^\d+$/.test(value)) {
         return {
           ok: false,
-          error: `--port must be an integer, not '${value}'\n${HOSTS_HELP}`,
+          error: `--port must be an integer\n${HOSTS_HELP}`,
         };
       }
       args.port = Number(value);
@@ -423,7 +430,7 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
         if (role === "") {
           return {
             ok: false,
-            error: `--role requires role names, not '${value}'\n${HOSTS_HELP}`,
+            error: `--role requires role names\n${HOSTS_HELP}`,
           };
         }
         if (!HOST_ROLES.includes(role as HostRole)) {
@@ -525,14 +532,73 @@ function convertV1File(installation: FleetInstallation): HostDraftCandidate {
   };
 }
 
-function hostsOf(value: unknown): Record<string, HostSection> | undefined {
-  if (typeof value !== "object" || value === null) {
+/**
+ * A plain data record: an object whose prototype is `Object.prototype` or
+ * `null`. Everything a hosts command reads off a runtime value is read
+ * through this check first, so a class instance or a falsy value is refused,
+ * never run.
+ */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  try {
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read one own data property of a plain record without running a getter: an
+ * accessor property reads as absent. Wrapped in `try/catch` so a hostile
+ * value can never throw through the command.
+ */
+function ownData(record: object, key: string): unknown {
+  try {
+    if (!Object.hasOwn(record, key)) {
+      return undefined;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    if (descriptor === undefined || descriptor.get !== undefined) {
+      return undefined;
+    }
+    return descriptor.value;
+  } catch {
     return undefined;
   }
-  const hosts = (value as { readonly hosts?: unknown }).hosts;
-  return typeof hosts === "object" && hosts !== null && !Array.isArray(hosts)
-    ? (hosts as Record<string, HostSection>)
-    : undefined;
+}
+
+/**
+ * Copy a plain record's own data properties, skipping accessors; `undefined`
+ * for anything that is not a plain record. A hostile value never throws and
+ * never runs a getter.
+ */
+function copyOwnDataOf(record: unknown): Record<string, unknown> | undefined {
+  if (!isPlainObject(record)) {
+    return undefined;
+  }
+  try {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(record)) {
+      const value = ownData(record, key);
+      if (value !== undefined) {
+        out[key] = value;
+      }
+    }
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
+function hostsOf(value: unknown): Record<string, unknown> | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+  const hosts = ownData(value, "hosts");
+  return isPlainObject(hosts) ? hosts : undefined;
 }
 
 /**
@@ -543,44 +609,71 @@ function hostsOf(value: unknown): Record<string, HostSection> | undefined {
  * alias: the loader refuses an alias for a role the host does not hold, so
  * leaving it would turn every role move into a refused write.
  */
-function moveLaneRunnerRole(
+export function moveLaneRunnerRole(
   current: unknown,
   name: string,
 ): { readonly value: unknown; readonly movedFrom: readonly string[] } {
-  const hosts = hostsOf(current) ?? {};
+  const hosts = hostsOf(current);
+  if (hosts === undefined) {
+    return { value: current, movedFrom: [] };
+  }
   const movedFrom: string[] = [];
-  let nextHosts: Record<string, HostSection> | undefined;
-  for (const [hostName, host] of Object.entries(hosts)) {
-    if (
-      hostName === name ||
-      typeof host !== "object" ||
-      host === null ||
-      !Array.isArray(host.roles) ||
-      !host.roles.includes("lane-runner")
-    ) {
+  let nextHosts: Record<string, unknown> | undefined;
+  for (const [hostName, rawHost] of Object.entries(hosts)) {
+    if (hostName === name || !isPlainObject(rawHost)) {
+      continue;
+    }
+    // Roles are read through own-data guards: a sparse array or an
+    // element-carrying getter is skipped, never invoked and never a throw.
+    const rawRoles = ownData(rawHost, "roles");
+    if (!Array.isArray(rawRoles)) {
+      continue;
+    }
+    const roles: string[] = [];
+    let holdsLaneRunner = false;
+    let dense = true;
+    for (let index = 0; index < rawRoles.length; index += 1) {
+      const role = ownData(rawRoles, String(index));
+      if (typeof role !== "string") {
+        dense = false;
+        break;
+      }
+      roles.push(role);
+      if (role === "lane-runner") {
+        holdsLaneRunner = true;
+      }
+    }
+    if (!dense || !holdsLaneRunner) {
       continue;
     }
     movedFrom.push(hostName);
     nextHosts ??= { ...hosts };
-    const roles = host.roles.filter((role) => role !== "lane-runner");
-    const roleAliases =
-      host.roleAliases === undefined
+    const kept = roles.filter((role) => role !== "lane-runner");
+    const rawAliases = ownData(rawHost, "roleAliases");
+    const aliasData = copyOwnDataOf(rawAliases);
+    const keptAliases =
+      aliasData === undefined
         ? undefined
         : Object.fromEntries(
-            Object.entries(host.roleAliases).filter(
+            Object.entries(aliasData).filter(
               ([role]) => role !== "lane-runner",
             ),
           );
     // Drop the host's original alias map and re-add only what survives the
     // role move; when nothing survives, the key is omitted entirely rather
-    // than left naming a role the host no longer holds.
-    const { roleAliases: _rawAliases, ...hostWithoutAliases } = host;
+    // than left naming a role the host no longer holds. The host's other
+    // fields are carried through the own-data copy, so a getter never runs.
+    const hostData = copyOwnDataOf(rawHost);
+    if (hostData === undefined) {
+      continue;
+    }
+    const { roleAliases: _rawAliases, ...hostWithoutAliases } = hostData;
     void _rawAliases;
-    const nextHost: HostSection = {
+    const nextHost: Record<string, unknown> = {
       ...hostWithoutAliases,
-      roles,
-      ...(roleAliases !== undefined && Object.keys(roleAliases).length > 0
-        ? { roleAliases }
+      roles: kept,
+      ...(keptAliases !== undefined && Object.keys(keptAliases).length > 0
+        ? { roleAliases: keptAliases }
         : {}),
     };
     nextHosts[hostName] = nextHost;
@@ -590,7 +683,7 @@ function moveLaneRunnerRole(
   }
   return {
     value: {
-      ...(current as Readonly<Record<string, unknown>>),
+      ...(copyOwnDataOf(current) ?? {}),
       hosts: nextHosts,
     },
     movedFrom,
@@ -1415,7 +1508,7 @@ function parseDaemonArgs(tokens: readonly string[]): ParsedDaemonArgs {
   if (action !== "install" && action !== "show" && action !== "uninstall") {
     return {
       ok: false,
-      error: `Unknown hosts daemon action: ${action === undefined ? "(none)" : action}\n${HOSTS_HELP}`,
+      error: `Unknown hosts daemon action: ${action === undefined ? "(none)" : sanitizeToken(action)}\n${HOSTS_HELP}`,
     };
   }
   let scheduler: string | undefined;
@@ -1455,7 +1548,7 @@ function parseDaemonArgs(tokens: readonly string[]): ParsedDaemonArgs {
     }
     return {
       ok: false,
-      error: `Unknown hosts daemon option: --${flag}\n${HOSTS_HELP}`,
+      error: `Unknown hosts daemon option: --${sanitizeToken(flag)}\n${HOSTS_HELP}`,
     };
   }
   if (scheduler === undefined) {

@@ -206,18 +206,33 @@ function copyCapabilityDeclaration(
     );
     return undefined;
   }
-  const {
-    networkEgressRestricted,
-    cpuAndMemoryLimited,
-    processTreeTermination,
-    filesystemScope,
-  } = declaration;
+  // The declaration is read through own-data guards: a hostile value (a
+  // getter-carrying field, a non-plain object) is refused, never run and
+  // never a throw.
+  const fields = copyOwnData(declaration);
+  if (fields === undefined) {
+    errors.push(`${path}: must be plain data`);
+    return undefined;
+  }
+  const networkEgressRestricted = ownDataValue(fields, 'networkEgressRestricted');
+  const cpuAndMemoryLimited = ownDataValue(fields, 'cpuAndMemoryLimited');
+  const processTreeTermination = ownDataValue(fields, 'processTreeTermination');
+  const filesystemScope = ownDataValue(fields, 'filesystemScope');
+  if (
+    networkEgressRestricted === undefined ||
+    cpuAndMemoryLimited === undefined ||
+    processTreeTermination === undefined ||
+    filesystemScope === undefined
+  ) {
+    errors.push(`${path}: must carry the four capability fields`);
+    return undefined;
+  }
   return {
     networkEgressRestricted,
     cpuAndMemoryLimited,
     processTreeTermination,
     filesystemScope,
-  };
+  } as RunnerCapabilityDeclaration;
 }
 
 /**
@@ -386,7 +401,7 @@ export function draftHost(rawInput: unknown): HostDraftResult {
         );
         continue;
       }
-      const role = rolesField[index];
+      const role = ownDataValue(rolesField, String(index));
       if (typeof role !== 'string' || !HOST_ROLES.includes(role as HostRole)) {
         errors.push(`${path}.roles[${index}]: must be a known host role`);
         continue;
@@ -470,7 +485,7 @@ export function draftHost(rawInput: unknown): HostDraftResult {
       : {}),
     worktreeRoot: worktreeRoot as string,
     ...(tmpDir !== undefined ? { tmpDir: tmpDir as string } : {}),
-    roles: [...(rolesField as HostRole[])],
+    roles: [...validRoles],
     ...(runner !== undefined ? { runner } : {}),
   };
   return { ok: true, draft: { name, host } };
@@ -576,9 +591,20 @@ function mergeDraftedHost(
       ? undefined
       : copyOwnData(ownDataValue(guardedExisting, 'roleAliases'));
 
+  // The draft's nested fields are the caller's runtime values, not copies:
+  // the runner and the roles array are read through own-data guards so a
+  // getter is never invoked and nothing throws.
+  const guardedDraftedRunner =
+    drafted.runner === undefined
+      ? undefined
+      : copyOwnData(drafted.runner);
+  const draftedTunnelOffset =
+    guardedDraftedRunner === undefined
+      ? undefined
+      : ownDataValue(guardedDraftedRunner, 'tunnelOffset');
+
   const container = drafted.container ?? readGuardedString(guardedContainer);
-  const tunnelOffset =
-    drafted.runner?.tunnelOffset ?? readGuardedNumber(guardedTunnelOffset);
+  const tunnelOffset = draftedTunnelOffset ?? readGuardedNumber(guardedTunnelOffset);
 
   let roleAliases: Partial<Record<HostRole, string>> | undefined;
   if (drafted.roleAliases !== undefined) {
@@ -586,10 +612,21 @@ function mergeDraftedHost(
     roleAliases = drafted.roleAliases;
   } else if (guardedAliases !== undefined && drafted.transport === 'ssh') {
     const pruned: Partial<Record<HostRole, string>> = {};
-    for (const role of drafted.roles) {
-      const alias = guardedAliases[role];
-      if (typeof alias === 'string') {
-        pruned[role] = alias;
+    const draftedRoles = drafted.roles;
+    const draftedRolesLength =
+      Array.isArray(draftedRoles)
+        ? (ownDataValue(draftedRoles, 'length') as number | undefined)
+        : undefined;
+    if (typeof draftedRolesLength === 'number') {
+      for (let index = 0; index < draftedRolesLength; index += 1) {
+        const role = ownDataValue(draftedRoles as unknown as object, String(index));
+        if (typeof role !== 'string') {
+          continue;
+        }
+        const alias = guardedAliases[role];
+        if (typeof alias === 'string') {
+          pruned[role as HostRole] = alias;
+        }
       }
     }
     if (Object.keys(pruned).length > 0) {
@@ -602,7 +639,12 @@ function mergeDraftedHost(
     ...(container !== undefined ? { container } : {}),
     ...(roleAliases !== undefined ? { roleAliases } : {}),
     ...(drafted.runner !== undefined && tunnelOffset !== undefined
-      ? { runner: { ...drafted.runner, tunnelOffset } }
+      ? {
+          runner: {
+            ...(guardedDraftedRunner ?? {}),
+            tunnelOffset,
+          } as HostSection['runner'],
+        }
       : {}),
   };
 }

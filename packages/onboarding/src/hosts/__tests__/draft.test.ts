@@ -668,6 +668,101 @@ describe('mergeDraftedHost precedence (P2-cli)', () => {
     ).toBe(false);
   });
 
+  it('never runs a getter on role-array elements or capability-declaration fields (fix round 1, item 4)', () => {
+    // A getter on a role-array element is never invoked; the element reads
+    // as absent and the array is refused as sparse/unknown.
+    const getterRoles = [] as unknown as HostRole[];
+    Object.defineProperty(getterRoles, 0, {
+      get() {
+        throw new Error('hostile');
+      },
+      enumerable: true,
+    });
+    getterRoles[1] = 'lane-runner';
+    expect(() => draftHost(sshInput({ roles: getterRoles }))).not.toThrow();
+    expect(draftHost(sshInput({ roles: getterRoles })).ok).toBe(false);
+
+    // An accessor on a capability-declaration field is never invoked and an
+    // incomplete declaration is refused, never carried half-read.
+    const hostileCapabilities = {
+      get networkEgressRestricted() {
+        throw new Error('hostile');
+      },
+      cpuAndMemoryLimited: true,
+      processTreeTermination: true,
+      filesystemScope: 'scoped-worktree',
+    };
+    expect(() =>
+      draftHost(
+        sshInput({
+          runner: {
+            kind: 'opencode',
+            port: 4166,
+            capabilities: hostileCapabilities as never,
+          },
+        }),
+      ),
+    ).not.toThrow();
+    expect(
+      draftHost(
+        sshInput({
+          runner: {
+            kind: 'opencode',
+            port: 4166,
+            capabilities: hostileCapabilities as never,
+          },
+        }),
+      ).ok,
+    ).toBe(false);
+
+    // A capability declaration that is not plain data at all is refused.
+    class HostileCapabilities {}
+    expect(
+      draftHost(
+        sshInput({
+          runner: {
+            kind: 'opencode',
+            port: 4166,
+            capabilities: new HostileCapabilities() as never,
+          },
+        }),
+      ).ok,
+    ).toBe(false);
+  });
+
+  it('never runs a getter through mergeDraftedHost on hostile nested draft fields', () => {
+    const hostileRunner = {
+      get tunnelOffset() {
+        throw new Error('hostile');
+      },
+      kind: 'opencode',
+      port: 46000,
+    };
+    const hostileRoles: HostRole[] = ['orchestrator'];
+    Object.defineProperty(hostileRoles, 0, {
+      get() {
+        throw new Error('hostile');
+      },
+      enumerable: true,
+    });
+    expect(() =>
+      applyHostDraft(
+        hereFile(hereExisting),
+        {
+          name: 'here',
+          host: {
+            transport: 'ssh',
+            sshAlias: 'here',
+            worktreeRoot: '/srv/worktrees',
+            roles: hostileRoles,
+            runner: hostileRunner as never,
+          },
+        },
+        'edit',
+      ),
+    ).not.toThrow();
+  });
+
   it('applyHostDraft in edit mode is idempotent when re-applied with the same host draft', () => {
     const first = applyHostDraft(hereFile(hereExisting), hereDraft, 'edit');
     expect(first.ok).toBe(true);

@@ -28,7 +28,11 @@ import {
 } from "@fleet/work-execution";
 
 import { runCli, type CliIo } from "../index.js";
-import { hostsCommand } from "../hosts.js";
+import {
+  hostsCommand,
+  moveLaneRunnerRole,
+  sanitizeToken,
+} from "../hosts.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures and helpers
@@ -1433,5 +1437,137 @@ describe("fleet-v2 hosts show and the P2 host-draft fixes", () => {
     const crowded = await runHosts(["show"], file);
     expect(crowded.code).toBe(1);
     expect(crowded.stderr).toContain("host count exceeds maximum (256)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 1: global redaction, usage-refusal echo and move-role guards
+// ---------------------------------------------------------------------------
+
+describe("fix round 1: redaction, usage echo and moveLaneRunnerRole guards", () => {
+  it("sanitizeToken replaces every secret-shaped span and separator, not only the first", () => {
+    const first = ["ghp", "_" + "a".repeat(24)].join("");
+    const second = ["sk", "-" + "b".repeat(24)].join("");
+    const third = ["AKIA", "C".repeat(16)].join("");
+    const text = `${first} ${second} ${third} ${first}`;
+    const sanitized = sanitizeToken(text);
+    expect(sanitized).not.toContain(first);
+    expect(sanitized).not.toContain(second);
+    expect(sanitized).not.toContain(third);
+    expect(sanitized).toBe(
+      "<redacted> <redacted> <redacted> <redacted>",
+    );
+    // The separator pattern removes every slash and backslash, not one.
+    expect(sanitizeToken("/srv/a\\/b")).not.toContain("/");
+    expect(sanitizeToken("/srv/a\\/b")).not.toContain("\\");
+  });
+
+  it("usage refusals never echo raw operator values", async () => {
+    const token = ["sk", "-" + "c".repeat(24)].join("");
+    const path = "/srv/secret/fleet.json";
+    const { io, stderr } = mockIo();
+    expect(await hostsCommand(["add", "x", "--port", token], io)).toBe(2);
+    expect(await hostsCommand(["add", "x", "--role", token], io)).toBe(2);
+    expect(await hostsCommand([token], io)).toBe(2);
+    const out = stderr.join("");
+    expect(out).not.toContain(token);
+    expect(out).not.toContain(path);
+  });
+
+  it("moveLaneRunnerRole guards hostile runtime hosts without throwing", () => {
+    // A null roleAliases map on the stripped host is omitted, not a throw.
+    const withNullAliases = {
+      schemaVersion: 2,
+      hosts: {
+        other: {
+          transport: "local",
+          worktreeRoot: "/w",
+          roles: ["lane-runner"],
+          roleAliases: null,
+        },
+      },
+    };
+    const nulled = moveLaneRunnerRole(withNullAliases, "new");
+    expect(nulled.movedFrom).toEqual(["other"]);
+    const nulledHosts = (nulled.value as { hosts: Record<string, Record<string, unknown>> }).hosts;
+    expect(nulledHosts.other.roles).toEqual([]);
+    expect(nulledHosts.other).not.toHaveProperty("roleAliases");
+
+    // A throwing getter on current.hosts never runs.
+    const hostileHosts = {
+      get hosts() {
+        throw new Error("hostile");
+      },
+    };
+    expect(() => moveLaneRunnerRole(hostileHosts, "new")).not.toThrow();
+    expect(moveLaneRunnerRole(hostileHosts, "new").movedFrom).toEqual([]);
+
+    // A throwing getter on a roles element never runs; the host is skipped.
+    const roles = ["lane-runner"];
+    Object.defineProperty(roles, 0, {
+      get() {
+        throw new Error("hostile");
+      },
+      enumerable: true,
+    });
+    const getterRoles = {
+      schemaVersion: 2,
+      hosts: { other: { transport: "local", worktreeRoot: "/w", roles } },
+    };
+    expect(() => moveLaneRunnerRole(getterRoles, "new")).not.toThrow();
+    expect(moveLaneRunnerRole(getterRoles, "new").movedFrom).toEqual([]);
+
+    // A throwing getter on roleAliases never runs; the alias map is omitted.
+    const hostileAliases = {
+      transport: "local",
+      worktreeRoot: "/w",
+      roles: ["lane-runner"],
+      get roleAliases() {
+        throw new Error("hostile");
+      },
+    };
+    const getterAliases = { schemaVersion: 2, hosts: { other: hostileAliases } };
+    const guarded = moveLaneRunnerRole(getterAliases, "new");
+    expect(guarded.movedFrom).toEqual(["other"]);
+    const guardedHosts = (guarded.value as { hosts: Record<string, Record<string, unknown>> }).hosts;
+    expect(guardedHosts.other).not.toHaveProperty("roleAliases");
+
+    // A non-plain host entry is skipped, never spread.
+    class HostileHost {
+      roles = ["lane-runner"];
+    }
+    const classHosts = {
+      schemaVersion: 2,
+      hosts: { other: new HostileHost() },
+    };
+    expect(() => moveLaneRunnerRole(classHosts, "new")).not.toThrow();
+    expect(moveLaneRunnerRole(classHosts, "new").movedFrom).toEqual([]);
+  });
+
+  it("moveLaneRunnerRole keeps the plain path: aliases prune and empty maps drop", () => {
+    const current = {
+      schemaVersion: 2,
+      hosts: {
+        other: {
+          transport: "local",
+          worktreeRoot: "/w",
+          roles: ["orchestrator", "lane-runner"],
+          roleAliases: { orchestrator: "o", "lane-runner": "l" },
+        },
+        sole: {
+          transport: "local",
+          worktreeRoot: "/w",
+          roles: ["lane-runner"],
+          roleAliases: { "lane-runner": "only" },
+        },
+      },
+    };
+    const moved = moveLaneRunnerRole(current, "new");
+    expect(moved.movedFrom).toEqual(["other", "sole"]);
+    const hosts = (moved.value as { hosts: Record<string, Record<string, unknown>> }).hosts;
+    expect(hosts.other.roles).toEqual(["orchestrator"]);
+    expect(hosts.other.roleAliases).toEqual({ orchestrator: "o" });
+    expect(hosts.sole.roles).toEqual([]);
+    expect(hosts.sole).not.toHaveProperty("roleAliases");
   });
 });

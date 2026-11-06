@@ -1179,6 +1179,30 @@ function parseGateSlot(
 }
 
 /**
+ * Read one optional own property without ever running a getter. An accessor
+ * property is reported as `accessor`, never treated as an absent field, so
+ * the caller refuses it with a typed message instead of accepting the file.
+ */
+function readOptionalDataField(
+  record: JsonObject,
+  key: string,
+):
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'accessor' }
+  | { readonly kind: 'value'; readonly value: unknown } {
+  if (!Object.hasOwn(record, key)) {
+    return { kind: 'absent' };
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(record, key);
+  if (descriptor === undefined || 'get' in descriptor || 'set' in descriptor) {
+    return { kind: 'accessor' };
+  }
+  return descriptor.value === undefined
+    ? { kind: 'absent' }
+    : { kind: 'value', value: descriptor.value };
+}
+
+/**
  * The optional `hosts.<name>.runner.tunnelOffset` field: how far above
  * `runner.port` the bundled runner program dials the server. The frozen
  * `bin/ocm-run` dials `port + 1` and refuses a different `OCM_PORT`, so the
@@ -1190,11 +1214,16 @@ function parseRunnerTunnelOffset(
   errors: string[],
 ): number | undefined {
   const fieldPath = `${runnerPath}.tunnelOffset`;
-  // Read through the record's own data property so a getter never runs.
-  const value = readOwnDataProperty(runner, 'tunnelOffset');
-  if (value === undefined) {
+  // Read without running a getter; an accessor is refused, not absent.
+  const field = readOptionalDataField(runner, 'tunnelOffset');
+  if (field.kind === 'absent') {
     return undefined;
   }
+  if (field.kind === 'accessor') {
+    errors.push(`${fieldPath}: must be a plain data property`);
+    return undefined;
+  }
+  const value = field.value;
   if (
     typeof value !== 'number' ||
     !Number.isInteger(value) ||
@@ -1391,25 +1420,25 @@ function parseHostContainer(
   errors: string[],
 ): string | undefined {
   const fieldPath = `${hostPath}.container`;
-  // Read through the record's own data property so a getter never runs. An
-  // accessor property is refused, never treated as an absent optional field.
-  if (!Object.hasOwn(entry, 'container')) {
+  // An accessor property is refused, never treated as an absent field.
+  const field = readOptionalDataField(entry, 'container');
+  if (field.kind === 'absent') {
     return undefined;
   }
-  const descriptor = Object.getOwnPropertyDescriptor(entry, 'container');
-  if (descriptor === undefined || 'get' in descriptor || 'set' in descriptor) {
+  if (field.kind === 'accessor') {
     errors.push(`${fieldPath}: must be a plain data property`);
     return undefined;
   }
-  const value = descriptor.value;
-  if (value === undefined) {
-    return undefined;
-  }
+  const value = field.value;
   if (typeof value !== 'string' || !isNonEmptyString(value)) {
     errors.push(`${fieldPath}: must be a non-empty string`);
     return undefined;
   }
-  const name = value.trim();
+  if (value !== value.trim()) {
+    errors.push(`${fieldPath}: must not have leading or trailing whitespace`);
+    return undefined;
+  }
+  const name = value;
   if (name.length > MAX_CONTAINER_NAME_LENGTH) {
     errors.push(`${fieldPath}: must be at most 64 characters`);
     return undefined;
@@ -1444,12 +1473,17 @@ function parseHostRoleAliases(
   roles: readonly HostRole[] | undefined,
   errors: string[],
 ): Partial<Record<HostRole, string>> | undefined {
-  // Read through the record's own data property so a getter never runs.
-  const value = readOwnDataProperty(entry, 'roleAliases');
-  if (value === undefined) {
+  const fieldPath = `${hostPath}.roleAliases`;
+  // An accessor property is refused, never treated as an absent field.
+  const field = readOptionalDataField(entry, 'roleAliases');
+  if (field.kind === 'absent') {
     return undefined;
   }
-  const fieldPath = `${hostPath}.roleAliases`;
+  if (field.kind === 'accessor') {
+    errors.push(`${fieldPath}: must be a plain data property`);
+    return undefined;
+  }
+  const value = field.value;
   if (!isJsonObject(value)) {
     errors.push(`${fieldPath}: must be an object`);
     return undefined;

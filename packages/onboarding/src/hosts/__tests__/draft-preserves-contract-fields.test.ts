@@ -72,4 +72,47 @@ describe('applyHostDraft keeps the contract fields', () => {
     // The drafted fields are there as drafted.
     expect(host.runner?.port).toBe(47000);
   });
+  it('an edit to a local host drops the old ssh alias and the aliases that need it', () => {
+    const localDraft: HostDraft = {
+      name: 'lane-host',
+      host: {
+        transport: 'local',
+        worktreeRoot: '/srv/fleet/worktrees',
+        roles: ['lane-runner'],
+        runner: { kind: 'opencode', port: 47000 },
+      },
+    };
+    const result = applyHostDraft(current, localDraft, 'edit');
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error('the edit draft must apply');
+    }
+    const host = result.candidate.hosts['lane-host'];
+    expect(host.sshAlias).toBeUndefined();
+    expect(host.roleAliases).toBeUndefined();
+    // The container and the tunnel offset are not alias-bound and survive.
+    expect(host.container).toBe('fleet-runner');
+    expect(host.runner?.tunnelOffset).toBe(1);
+  });
+
+  it('an edit keeps a role alias only for a role the drafted host still holds', () => {
+    const multi = {
+      schemaVersion: 2,
+      hosts: {
+        'lane-host': {
+          ...existingHost,
+          roles: ['lane-runner', 'verifier'],
+          roleAliases: { 'lane-runner': 'lane-alias', verifier: 'verifier-alias' },
+        },
+      },
+    };
+    const result = applyHostDraft(multi, draft, 'edit');
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error('the edit draft must apply');
+    }
+    expect(result.candidate.hosts['lane-host'].roleAliases).toEqual({
+      'lane-runner': 'lane-alias',
+    });
+  });
 });

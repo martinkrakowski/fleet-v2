@@ -298,33 +298,36 @@ export type ApplyHostDraftResult =
 export type ApplyHostDraftMode = 'add' | 'edit';
 
 /**
- * In `edit` mode merge the drafted entry over the existing one, one level
- * deep: a host field the draft carries wins, a field it does not carry
- * (such as `container` or `roleAliases`) survives, and the `runner` block
- * merges the same way so a field the drafted runner does not carry (such as
- * `tunnelOffset`) survives. In `add` mode there is no existing entry, so
- * nothing is merged.
+ * In `edit` mode carry the contract fields the draft does not manage over to
+ * the drafted entry: `container`, `roleAliases` and `runner.tunnelOffset`.
+ * Every other field is the draft's: one the draft omits is dropped, so an
+ * edit that moves a host to `local` does not keep the old `sshAlias`. A role
+ * alias survives only while the drafted host is an ssh host that still holds
+ * that role, and a tunnel offset only while the drafted host has a runner.
+ * In `add` mode there is no existing entry, so nothing is carried.
  */
 function mergeDraftedHost(
   existing: HostSection,
   drafted: HostSection,
 ): HostSection {
-  const merged = { ...existing } as unknown as Record<string, unknown>;
-  for (const key of Object.keys(drafted)) {
-    if (key === 'runner') {
-      continue;
+  const aliases: Partial<Record<HostRole, string>> = {};
+  if (drafted.transport === 'ssh' && existing.roleAliases !== undefined) {
+    for (const role of drafted.roles) {
+      const alias = existing.roleAliases[role];
+      if (alias !== undefined) {
+        aliases[role] = alias;
+      }
     }
-    merged[key] = (drafted as unknown as Record<string, unknown>)[key];
   }
-  if (drafted.runner !== undefined) {
-    const existingRunner = existing.runner;
-    merged.runner =
-      existingRunner === undefined
-        ? drafted.runner
-        : { ...existingRunner, ...drafted.runner };
-  }
-  // When the draft carries no runner block, the existing one survives.
-  return merged as unknown as HostSection;
+  const tunnelOffset = existing.runner?.tunnelOffset;
+  return {
+    ...drafted,
+    ...(existing.container !== undefined ? { container: existing.container } : {}),
+    ...(Object.keys(aliases).length > 0 ? { roleAliases: aliases } : {}),
+    ...(drafted.runner !== undefined && tunnelOffset !== undefined
+      ? { runner: { ...drafted.runner, tunnelOffset } }
+      : {}),
+  };
 }
 
 /**
@@ -333,8 +336,8 @@ function mergeDraftedHost(
  * object whose `hosts` record is the current one plus the drafted entry. In
  * `add` mode a name already in the file is refused with `reason: "exists"`;
  * in `edit` mode a name that is not there is refused with `reason: "missing"`
- * and the drafted entry merges over the existing one, so a field the draft
- * does not manage survives.
+ * and the contract fields the draft does not manage survive from the existing
+ * entry.
  * A file of schema version 1 carries no hosts and converting one is a mapping
  * step of its own (the conversion forces the isolation acknowledgement), so
  * it is refused here rather than half-done.

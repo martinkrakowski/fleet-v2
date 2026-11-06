@@ -11,6 +11,7 @@ import type { FleetInstallationModel, HostModel, HostRole } from './types.js';
 
 export type RunnerDefaultsRefusal =
   | 'host-not-found'
+  | 'role-ambiguous'
   | 'no-runner'
   | 'no-port'
   | 'dial-port-out-of-range';
@@ -94,16 +95,29 @@ export function resolveRunnerDefaults(
   return buildDefaults(hostName, host, host.transport === 'local' ? undefined : host.sshAlias);
 }
 
-/** The runner defaults for the host that holds `role`, using that role's alias. */
+/**
+ * The runner defaults for the host that holds `role`, using that role's alias.
+ * When more than one host holds the role the choice is not the file's to
+ * make silently: the answer is `role-ambiguous`, and the caller names the
+ * host with `resolveRunnerDefaults` or `resolveRoleAlias`.
+ */
 export function resolveRoleRunnerDefaults(
   model: FleetInstallationModel,
   role: HostRole,
 ): RunnerDefaultsResult {
-  for (const hostName of Object.keys(model.hosts)) {
-    const host = model.hosts[hostName];
-    if (host.roles.includes(role)) {
-      return buildDefaults(hostName, host, resolveRoleAlias(model, hostName, role));
-    }
+  const holders = Object.keys(model.hosts).filter((hostName) =>
+    model.hosts[hostName].roles.includes(role),
+  );
+  if (holders.length === 0) {
+    return { ok: false, reason: 'host-not-found' };
   }
-  return { ok: false, reason: 'host-not-found' };
+  if (holders.length > 1) {
+    return { ok: false, reason: 'role-ambiguous' };
+  }
+  const hostName = holders[0];
+  return buildDefaults(
+    hostName,
+    model.hosts[hostName],
+    resolveRoleAlias(model, hostName, role),
+  );
 }

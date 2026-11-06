@@ -437,3 +437,80 @@ describe('the host contract fields (P2)', () => {
     }
   });
 });
+
+describe('round-2 review fixes', () => {
+  it('refuses a padded container name instead of normalising it', () => {
+    const result = parseInstallation({
+      ...contractV2,
+      hosts: {
+        ...contractV2.hosts,
+        'lane-host': { ...contractV2.hosts['lane-host'], container: ' fleet-runner ' },
+      },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['hosts.lane-host.container: must not have leading or trailing whitespace'],
+    });
+  });
+
+  it('refuses an accessor roleAliases and an accessor tunnelOffset without running them', () => {
+    const aliasHost = {
+      ...contractV2.hosts['verifier-host'],
+      get roleAliases(): Record<string, string> {
+        throw new Error('the getter must never run');
+      },
+    };
+    expect(
+      parseInstallation({
+        ...contractV2,
+        hosts: { ...contractV2.hosts, 'verifier-host': aliasHost },
+      }),
+    ).toEqual({
+      ok: false,
+      errors: ['hosts.verifier-host.roleAliases: must be a plain data property'],
+    });
+
+    const runner = {
+      ...contractV2.hosts['verifier-host'].runner,
+      get tunnelOffset(): number {
+        throw new Error('the getter must never run');
+      },
+    };
+    expect(
+      parseInstallation({
+        ...contractV2,
+        hosts: {
+          ...contractV2.hosts,
+          'verifier-host': { ...contractV2.hosts['verifier-host'], runner },
+        },
+      }),
+    ).toEqual({
+      ok: false,
+      errors: ['hosts.verifier-host.runner.tunnelOffset: must be a plain data property'],
+    });
+  });
+
+  it('refuses a role that two hosts hold instead of picking the first', () => {
+    const model = contractModel({
+        ...contractV2,
+        hosts: {
+          ...contractV2.hosts,
+          'second-verifier': {
+            transport: 'ssh',
+            sshAlias: 'second.fleet.example',
+            worktreeRoot: '/srv/fleet/worktrees',
+            roles: ['verifier'],
+            runner: { kind: 'opencode', port: 46200, capabilities: declaredCapabilities },
+          },
+        },
+    });
+    expect(resolveRoleRunnerDefaults(model, 'verifier')).toEqual({
+      ok: false,
+      reason: 'role-ambiguous',
+    });
+    // A named host still resolves.
+    expect(resolveRunnerDefaults(model, 'second-verifier').ok).toBe(true);
+    // A role one host holds still resolves.
+    expect(resolveRoleRunnerDefaults(model, 'orchestrator').ok).toBe(true);
+  });
+});

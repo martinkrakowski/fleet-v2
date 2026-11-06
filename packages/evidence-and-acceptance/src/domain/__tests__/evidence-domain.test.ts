@@ -11,6 +11,7 @@ import { ReviewReceipt, isSameModelFamily, underlyingModelFamily } from '../enti
 import type { ReviewReceiptProps } from '../entities/ReviewReceipt.js';
 import { VerificationReceipt } from '../entities/VerificationReceipt.js';
 import type { VerificationReceiptProps } from '../entities/VerificationReceipt.js';
+import { decideReviewReceiptOutcome } from '../review-selection.js';
 import { AcceptanceReceipt } from '../value-objects/AcceptanceReceipt.vo.js';
 import { AssessmentState } from '../value-objects/AssessmentState.vo.js';
 import { EvidenceResult } from '../value-objects/EvidenceResult.vo.js';
@@ -105,8 +106,7 @@ function assessmentProps(overrides: Partial<EvidenceAssessmentProps> = {}): Evid
   };
 }
 
-describe('AssessmentState', () => {
-  it('accepts every manifest enum value', () => {
+describe('AssessmentState', () => {  it('accepts every manifest enum value', () => {
     for (const value of ['pending', 'blocked', 'accepted', 'rejected', 'stale'] as const) {
       expect(requireValue(AssessmentState.create(value)).getValue()).toBe(value);
     }
@@ -528,5 +528,79 @@ describe('EvidenceAssessment', () => {
     expect(
       requireFailure(EvidenceAssessment.create(assessmentProps({ state: 'running' as never }))).message,
     ).toContain('Invalid assessment state');
+  });
+});
+
+describe('EvidenceAssessment severity-derived review outcomes (RV3)', () => {
+  it('a blocker or major finding on a pass receipt still blocks and is never carried', () => {
+    const assessment = requireValue(
+      EvidenceAssessment.create(
+        assessmentProps({
+          requiredChecks: [],
+          reviewReceipts: [
+            requireValue(
+              ReviewReceipt.create(
+                reviewReceiptProps({ result: 'pass', findings: [finding('f-1', { severity: 'blocker' })] }),
+              ),
+            ).toRecord(),
+          ],
+        }),
+      ),
+    );
+    expect(assessment.unresolvedFindingIds()).toEqual(['f-1']);
+    expect(assessment.collectBlockers()).toContain("finding 'f-1' is unresolved");
+    expect(assessment.carriedMinorFindings()).toEqual([]);
+  });
+
+  it('minor and nit findings on a pass and a fail receipt both pass and populate carriedMinorFindings', () => {
+    const minors = [finding('f-1', { severity: 'minor' }), finding('f-2', { severity: 'nit' })];
+    for (const result of ['pass', 'fail'] as const) {
+      const assessment = requireValue(
+        EvidenceAssessment.create(
+          assessmentProps({
+            requiredChecks: [],
+            reviewReceipts: [
+              requireValue(ReviewReceipt.create(reviewReceiptProps({ result, findings: minors }))).toRecord(),
+            ],
+          }),
+        ),
+      );
+      expect(assessment.unresolvedFindingIds()).toEqual([]);
+      expect(assessment.collectBlockers()).toEqual([]);
+      expect(assessment.carriedMinorFindings().map((entry) => entry.findingId)).toEqual(['f-1', 'f-2']);
+    }
+  });
+
+  it('a resolved minor is not carried and a minor with a disposition is excluded from unresolved ids anyway', () => {
+    const minors = [finding('f-1', { severity: 'minor' })];
+    const assessment = requireValue(
+      EvidenceAssessment.create(
+        assessmentProps({
+          requiredChecks: [],
+          reviewReceipts: [
+            requireValue(ReviewReceipt.create(reviewReceiptProps({ result: 'fail', findings: minors }))).toRecord(),
+          ],
+          findingDispositions: [
+            {
+              id: 'fd-1',
+              assessmentId: 'ea-1',
+              findingId: 'f-1',
+              candidateHeadSha: 'sha-1',
+              state: 'out-of-scope',
+              reason: 'not this lane',
+              evidenceRef: 'evidence://fd-1',
+              recordedBy: 'conductor',
+              recordedAtIso: '2026-10-15T00:04:00.000Z',
+            },
+          ],
+        }),
+      ),
+    );
+    expect(assessment.carriedMinorFindings()).toEqual([]);
+  });
+
+  it('a fail receipt with zero findings is an unknown verdict in decideReviewReceiptOutcome', () => {
+    const decision = decideReviewReceiptOutcome(reviewReceiptProps({ findings: [] }));
+    expect(decision).toEqual({ outcome: 'unknown', unknownReason: 'unparseable-verdict' });
   });
 });

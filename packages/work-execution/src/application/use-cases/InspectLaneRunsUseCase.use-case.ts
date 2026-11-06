@@ -24,7 +24,8 @@ import type { ReviewRequestPort } from '../ports/out/ReviewRequestPort.out-port.
 import type { LaneRunLeaseRecord, LaneRunRecord } from '../../domain/lane-run-records.js';
 import type { AttemptRecord, CapacityReservationRecord } from '../../domain/execution-records.js';
 import type { LaneRunParkFindingView } from '../../domain/park-findings-view.js';
-import { boundedFindingsView } from '../../domain/park-findings-view.js';
+import { boundedFindingsView, causingParkFindingsView } from '../../domain/park-findings-view.js';
+import { decideConductorReviewOutcome } from '../../domain/lane-run-decider.js';
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
 import { laneRunJournalPendingIntent, laneRunJournalState, laneRunJournalStopFacts } from '../../domain/lane-run-journal.js';
 import { parseLaneRunKey } from '../../domain/lane-run-keys.js';
@@ -79,21 +80,38 @@ async function fallbackReviewFindings(
     if (attempt === null || head === undefined) {
       return [];
     }
-    const found = await reviewReceipts.findLatestReceiptOfKind({
-      attemptId,
-      candidateHeadSha: head,
-      kind: 'code-review',
-    });
-    if (found.outcome !== 'found' || found.receipt.verdict !== 'failed') {
-      return [];
+    // RV3: the kinds are ordered by the park's `parkedFrom`, and a receipt
+    // counts only when its severity outcome is `failed` (an unresolved
+    // blocking finding); its causing findings are bounded through
+    // `causingParkFindingsView`, so colon-scoped ids project as stored.
+    const parkedFrom = record.parked?.parkedFrom;
+    const kinds: readonly ('code-review' | 'brief-check' | 'pre-merge')[] =
+      parkedFrom === 'brief-check'
+        ? ['brief-check', 'code-review', 'pre-merge']
+        : parkedFrom === 'awaiting-premerge' || parkedFrom === 'merging'
+          ? ['pre-merge', 'code-review', 'brief-check']
+          : ['code-review', 'brief-check', 'pre-merge'];
+    for (const kind of kinds) {
+      const found = await reviewReceipts.findLatestReceiptOfKind({ attemptId, candidateHeadSha: head, kind });
+      if (found.outcome === 'unavailable') {
+        return [];
+      }
+      if (found.outcome === 'found' && decideConductorReviewOutcome(found.receipt).outcome === 'failed') {
+        return causingParkFindingsView(found.receipt.findings);
+      }
     }
-    return boundedFindingsView(found.receipt.findings);
+    return [];
   } catch {
     return [];
   }
 }
 
-/** The bounded findings of the parked head's failed code review; `null` when not a blocker park. A stored null snapshot is an unread snapshot and falls back to the receipts. */
+/**
+ * The bounded findings of the parked head's failed review (RV3): `null` when
+ * not a blocker park. A stored snapshot that is null, absent or EMPTY is an
+ * unpopulated snapshot and falls back to the receipts — a finding-caused park
+ * record never legitimately carries `[]` (req (d)).
+ */
 async function blockedReviewFindings(
   deps: InspectLaneRunsDependencies,
   record: LaneRunRecord,
@@ -102,7 +120,7 @@ async function blockedReviewFindings(
   if (parked === null || parked.reason !== 'blocker-after-round-2') {
     return null;
   }
-  if (parked.findings === undefined || parked.findings === null) {
+  if (parked.findings === undefined || parked.findings === null || parked.findings.length === 0) {
     return fallbackReviewFindings(deps, record);
   }
   return boundedFindingsView(parked.findings);

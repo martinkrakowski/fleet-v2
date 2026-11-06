@@ -589,6 +589,33 @@ describe('ActionAuthorizationAdapter attempt coordinate', () => {
     });
   });
 
+  it('refuses a slash-bearing id that embeds an absolute path instead of echoing it', async () => {
+    const embedded = ['grant-', 'var', 'tmp', 'private'].join('/');
+    const actionEmbedded = ['act-', 'etc', 'passwd'].join('/');
+    const adapter = new ActionAuthorizationAdapter({ grants: grantsOf() });
+
+    for (const result of [
+      await adapter.consumeActionAuthorization(consumeRequest({ authorizationGrantId: embedded })),
+      await adapter.consumeActionAuthorization(consumeRequest({ actionId: actionEmbedded })),
+      await adapter.resolveActionAuthorization(resolveRequest({ actionId: actionEmbedded })),
+    ]) {
+      expect(result).toMatchObject({ reason: 'invalid-request' });
+      expectNoDisallowedText(result);
+      expect(JSON.stringify(result)).not.toContain('private');
+      expect(JSON.stringify(result)).not.toContain('passwd');
+    }
+
+    const poisoned = new ActionAuthorizationAdapter({ grants: grantsOf(grantEntry({ consumedByActionId: actionEmbedded })) });
+    const consumed = await poisoned.consumeActionAuthorization(consumeRequest());
+    expect(consumed).toEqual({ outcome: 'refused', reason: 'invalid-grant-record' });
+
+    // The production key form stays valid: one slash between alphanumerics.
+    const keyed = await new ActionAuthorizationAdapter({ grants: grantsOf() }).consumeActionAuthorization(
+      consumeRequest({ actionId: 'pr-feedback/42@0123456789ab' }),
+    );
+    expect(keyed).toEqual({ outcome: 'consumed', actionId: 'pr-feedback/42@0123456789ab' });
+  });
+
   it('never echoes secret-shaped text or filesystem paths from requests, stored grants, or delegates', async () => {
     const token = syntheticToken();
     const path = syntheticPath();

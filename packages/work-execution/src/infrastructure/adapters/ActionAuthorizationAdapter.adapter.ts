@@ -98,8 +98,26 @@ function isSafeId(value: unknown, maxLength: number, allowSlash: boolean): value
     value.length <= maxLength &&
     value.trim().length > 0 &&
     !value.includes('\\') &&
-    (allowSlash || !value.includes('/')) &&
+    (allowSlash ? isKeyShapedSlash(value) : !value.includes('/')) &&
     !containsDisallowedOutputText(value)
+  );
+}
+
+/**
+ * A slash-bearing id is a key such as `pr-feedback/42@<head12>`: at most one `/`,
+ * between two alphanumerics. Anything with more slashes, or a slash after a
+ * separator (`grant-/var/tmp/x`), could carry a filesystem path past the
+ * path-shape check, so it is not an id.
+ */
+function isKeyShapedSlash(value: string): boolean {
+  const first = value.indexOf('/');
+  if (first === -1) {
+    return true;
+  }
+  return (
+    first === value.lastIndexOf('/') &&
+    /[A-Za-z0-9]/.test(value.charAt(first - 1)) &&
+    /[A-Za-z0-9]/.test(value.charAt(first + 1))
   );
 }
 

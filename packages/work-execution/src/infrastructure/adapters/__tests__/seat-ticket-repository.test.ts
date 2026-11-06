@@ -7,7 +7,10 @@ import {
   StateFileUnreadableError,
   StateFileUnknownVersionError,
 } from '../file-store.js';
-import { SeatTicketRepositoryAdapter } from '../SeatTicketRepositoryAdapter.adapter.js';
+import {
+  parseVersionedSeatTicketStateRecord,
+  SeatTicketRepositoryAdapter,
+} from '../SeatTicketRepositoryAdapter.adapter.js';
 import { SEAT_TICKET_ROLES, type SeatTicketRecord } from '../../../domain/execution-records.js';
 
 function ticket(
@@ -178,16 +181,57 @@ describe('SeatTicketRepositoryAdapter (file mode)', () => {
     const target = path.join(stateDir, 'seat-tickets.json');
     await fs.symlink(outside, target);
     const adapter = new SeatTicketRepositoryAdapter({ stateDir });
-    await expect(adapter.listSeatTickets()).rejects.toThrow(/regular file/);
+    const live = await adapter.listSeatTickets().catch((error: unknown) => error);
+    expect(live).toBeInstanceOf(StateFileUnreadableError);
+    expect((live as StateFileUnreadableError).quarantinePath).toBeNull();
+    expect((live as StateFileUnreadableError).message).toMatch(/regular file/);
     await fs.unlink(target);
     await fs.symlink(path.join(stateDir, 'nowhere.json'), target);
-    await expect(adapter.findSeatTicket('project-a', 'first-pass')).rejects.toThrow(/regular file/);
+    const dangling = await adapter.findSeatTicket('project-a', 'first-pass').catch((error: unknown) => error);
+    expect(dangling).toBeInstanceOf(StateFileUnreadableError);
+    expect((dangling as StateFileUnreadableError).quarantinePath).toBeNull();
+    expect((dangling as StateFileUnreadableError).message).toMatch(/regular file/);
+    await expect(fs.stat(path.join(stateDir, 'quarantine'))).rejects.toThrow();
   });
 
   it('refuses an oversized store file', async () => {
     await fs.writeFile(path.join(stateDir, 'seat-tickets.json'), Buffer.alloc(8 * 1024 * 1024 + 1, 32));
     const adapter = new SeatTicketRepositoryAdapter({ stateDir });
-    await expect(adapter.listSeatTickets()).rejects.toThrow(/bytes/);
+    const refused = await adapter.listSeatTickets().catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(StateFileUnreadableError);
+    expect((refused as StateFileUnreadableError).quarantinePath).toBeNull();
+    expect((refused as StateFileUnreadableError).message).toMatch(/bytes/);
+    await expect(fs.stat(path.join(stateDir, 'quarantine'))).rejects.toThrow();
+  });
+
+  it('rejects a null or non-object record with the fixed adapter message, not a raw TypeError', async () => {
+    const adapter = new SeatTicketRepositoryAdapter({ stateDir });
+    for (const bad of [null, undefined, 'x', 7, []]) {
+      await expect(adapter.saveSeatTicket(bad as unknown as SeatTicketRecord)).rejects.toThrow(
+        'SeatTicketRepositoryAdapter refuses an invalid seat ticket record',
+      );
+    }
+    await expect(fs.stat(path.join(stateDir, 'seat-tickets.json'))).rejects.toThrow();
+  });
+
+  it('parseVersionedSeatTicketStateRecord returns invalid, never throws, on a throwing getter', () => {
+    const hostile = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('hostile getter');
+        },
+      },
+    );
+    expect(parseVersionedSeatTicketStateRecord(hostile)).toEqual({ status: 'invalid' });
+    const getterRecord = {
+      schemaVersion: 1,
+      version: 1,
+      get projectId(): string {
+        throw new Error('hostile getter');
+      },
+    };
+    expect(parseVersionedSeatTicketStateRecord(getterRecord)).toEqual({ status: 'invalid' });
   });
 
   it('throws StateFileUnknownVersionError on schemaVersion 2 and writes no quarantine copy', async () => {

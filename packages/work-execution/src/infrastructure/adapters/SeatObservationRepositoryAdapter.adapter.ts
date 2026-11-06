@@ -21,13 +21,10 @@ import type {
   AppendSeatObservationOutcome,
   SeatObservationRepositoryPort,
 } from '../../application/ports/out/SeatObservationRepositoryPort.out-port.js';
-import { readSeatStoreBytes } from './seat-store-bytes.js';
 import {
   assertValidSchemaVersionPolicy,
-  inspectVersionedRecordListBytes,
+  readOrQuarantineVersionedRecordList,
   readStoreRecordSchemaVersion,
-  rejectUnreadableStateFile,
-  StateFileUnknownVersionError,
   withFileLock,
   writeJsonAtomically,
   type VersionedRecordParseResult,
@@ -56,51 +53,56 @@ function isParseableIsoDate(value: unknown): value is string {
 export function parseVersionedSeatObservationStateRecord(
   raw: unknown,
 ): VersionedRecordParseResult<SeatObservationRecord> {
-  const versionCheck = readStoreRecordSchemaVersion(raw, SEAT_OBSERVATION_STORE_VERSION_POLICY);
-  if (versionCheck.status !== 'ok') {
-    return versionCheck;
-  }
-  const candidate = raw as Record<string, unknown>;
-  if (
-    candidate.version !== 1
-  ) {
-    return { status: 'unknown-version' };
-  }
-  const subject =
-    typeof candidate.subject === 'object' && candidate.subject !== null
-      ? (candidate.subject as Record<string, unknown>)
-      : undefined;
-  const subjectKeys = subject === undefined ? [] : Object.keys(subject);
-  const subjectValid =
-    subject !== undefined &&
-    subjectKeys.length === 1 &&
-    ((subjectKeys[0] === 'attemptId' && isNonEmptyString(subject.attemptId)) ||
-      (subjectKeys[0] === 'reviewRequestId' && isNonEmptyString(subject.reviewRequestId)));
-  if (
-    !isNonEmptyString(candidate.observationId) ||
-    !isNonEmptyString(candidate.seatId) ||
-    !SEAT_OBSERVATION_OUTCOMES.includes(candidate.outcome as never) ||
-    !isParseableIsoDate(candidate.observedAtIso) ||
-    !subjectValid ||
-    (candidate.via !== 'cli' && candidate.via !== 'mcp')
-  ) {
+  try {
+    const versionCheck = readStoreRecordSchemaVersion(raw, SEAT_OBSERVATION_STORE_VERSION_POLICY);
+    if (versionCheck.status !== 'ok') {
+      return versionCheck;
+    }
+    const candidate = raw as Record<string, unknown>;
+    if (
+      candidate.version !== 1
+    ) {
+      return { status: 'unknown-version' };
+    }
+    const subject =
+      typeof candidate.subject === 'object' && candidate.subject !== null
+        ? (candidate.subject as Record<string, unknown>)
+        : undefined;
+    const subjectKeys = subject === undefined ? [] : Object.keys(subject);
+    const subjectValid =
+      subject !== undefined &&
+      subjectKeys.length === 1 &&
+      ((subjectKeys[0] === 'attemptId' && isNonEmptyString(subject.attemptId)) ||
+        (subjectKeys[0] === 'reviewRequestId' && isNonEmptyString(subject.reviewRequestId)));
+    if (
+      !isNonEmptyString(candidate.observationId) ||
+      !isNonEmptyString(candidate.seatId) ||
+      !SEAT_OBSERVATION_OUTCOMES.includes(candidate.outcome as never) ||
+      !isParseableIsoDate(candidate.observedAtIso) ||
+      !subjectValid ||
+      (candidate.via !== 'cli' && candidate.via !== 'mcp')
+    ) {
+      return { status: 'invalid' };
+    }
+    return {
+      status: 'ok',
+      record: {
+        version: 1,
+        observationId: candidate.observationId,
+        seatId: candidate.seatId,
+        outcome: candidate.outcome as SeatObservationRecord['outcome'],
+        observedAtIso: candidate.observedAtIso,
+        // A fresh object, never the caller's: a later mutation of the nested
+        // subject cannot change what the adapter validated and writes.
+        subject: { ...(candidate.subject as Record<string, unknown>) } as SeatObservationRecord['subject'],
+        via: candidate.via,
+      },
+      schemaVersion: versionCheck.schemaVersion,
+    };
+  } catch {
+    // A hostile getter on `raw` must never throw out of the parser.
     return { status: 'invalid' };
   }
-  return {
-    status: 'ok',
-    record: {
-      version: 1,
-      observationId: candidate.observationId,
-      seatId: candidate.seatId,
-      outcome: candidate.outcome as SeatObservationRecord['outcome'],
-      observedAtIso: candidate.observedAtIso,
-      // A fresh object, never the caller's: a later mutation of the nested
-      // subject cannot change what the adapter validated and writes.
-      subject: { ...(candidate.subject as Record<string, unknown>) } as SeatObservationRecord['subject'],
-      via: candidate.via,
-    },
-    schemaVersion: versionCheck.schemaVersion,
-  };
 }
 
 /** The reader's record parser, shared with `fleet-v2 state check`. */
@@ -129,6 +131,9 @@ export class SeatObservationRepositoryAdapter implements SeatObservationReposito
   }
 
   async appendSeatObservation(input: SeatObservationRecord): Promise<AppendSeatObservationOutcome> {
+    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+      throw new Error('SeatObservationRepositoryAdapter refuses an invalid observation record');
+    }
     // Snapshot first (structuredClone reads every property, getters included,
     // exactly once), so validation and storage see the same plain data.
     const record = structuredClone(input);
@@ -190,7 +195,7 @@ export class SeatObservationRepositoryAdapter implements SeatObservationReposito
     const lockPath = path.join(stateDir, `${SEAT_OBSERVATION_STORE_NAME}.lock`);
     let outcome: AppendSeatObservationOutcome = 'appended';
     await withFileLock(lockPath, async () => {
-      const records = await this.readRecordsFromDisk(target);
+      const records = await this.readRecordsFromDisk(target, true);
       if (records.some((stored) => stored.observationId === record.observationId)) {
         outcome = 'duplicate';
         return;
@@ -205,21 +210,12 @@ export class SeatObservationRepositoryAdapter implements SeatObservationReposito
     return outcome;
   }
 
-  private async readRecordsFromDisk(target: string): Promise<SeatObservationRecord[]> {
-    const buffer = await readSeatStoreBytes(target);
-    if (buffer === null) {
-      return [];
-    }
-    const inspection = inspectVersionedRecordListBytes(
-      buffer,
-      parseVersionedSeatObservationStateRecord,
-    );
-    if (inspection.status === 'unknown-version') {
-      throw new StateFileUnknownVersionError(target, inspection.recordIndex);
-    }
-    if (inspection.status === 'unreadable') {
-      return rejectUnreadableStateFile(target, inspection.detail, buffer, false);
-    }
-    return [...inspection.records];
+  private async readRecordsFromDisk(target: string, lockHeld = false): Promise<SeatObservationRecord[]> {
+    const records = await readOrQuarantineVersionedRecordList({
+      filePath: target,
+      parseRecord: parseVersionedSeatObservationStateRecord,
+      lockHeld,
+    });
+    return [...records];
   }
 }

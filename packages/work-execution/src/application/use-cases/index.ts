@@ -39,6 +39,7 @@ export * from "./ListUnregisteredProjectsUseCase.use-case.js";
 export * from "./ManageCutoverUseCase.use-case.js";
 export * from "./ManageDaemonSchedulerUseCase.use-case.js";
 export * from "./ManageReleaseUseCase.use-case.js";
+export * from "./merge-pass/index.js";
 export * from "./PlanRelaunchUseCase.use-case.js";
 export * from "./PrepareBriefPackageUseCase.use-case.js";
 export * from "./PrepareFixAttemptUseCase.use-case.js";

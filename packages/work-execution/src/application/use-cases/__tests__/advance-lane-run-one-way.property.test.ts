@@ -7,12 +7,15 @@
  * no further call of the acting port. Every one-way step's act is counted:
  * prepare (its intent append through the journal), dispatch
  * (`DispatchAttemptPort`), the forge (`ExecuteAuthorizedForgeActionPort`,
- * the acting port of `open-pr` and `push`) and merge (`AutoMergeAttemptPort`),
- * so a duplicate act after a settled result fails the property with or
- * without a new journal entry. The open-pr/push/merge steps are exercised by
- * seeded scenarios that place the run into `opening-pr`, `pushing` or
- * `merging` with the step's key already settled — the states the random
- * pipeline never reaches because it parks before those acts.
+ * the acting port of `open-pr` and `push`) and the legacy `merge` step's counter
+ * (the merge-queue enqueue port; KS7b made the merge hand-off two-way, so the
+ * conductor no longer acts a one-way `merge`, and the counter guards that it
+ * is never called under a settled key), so a duplicate act after a settled
+ * result fails the property with or without a new journal entry. The
+ * open-pr/push steps are exercised by seeded scenarios that place the run
+ * into `opening-pr` or `pushing` with the step's key already settled — the
+ * states the random pipeline never reaches because it parks before those
+ * acts.
  */
 
 import fc from 'fast-check';
@@ -21,7 +24,6 @@ import { describe, expect, it } from 'vitest';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import {
   buildLaneRunStepKey,
-  laneRunPremergeKey,
   parseLaneRunKey,
 } from '../../../domain/lane-run-keys.js';
 import { LANE_RUN_ONE_WAY_STEPS } from '../../../domain/lane-run-records.js';
@@ -86,8 +88,8 @@ function settledOneWaySteps(settled: ReadonlySet<string>): Set<string> {
  * The acting-port counter each one-way step maps to: `prepare` counts its
  * intent append through the journal (`scenario.prepareCalls`), `dispatch`
  * calls `DispatchAttemptPort`, `open-pr` and `push` both act through the forge
- * (`ExecuteAuthorizedForgeActionPort`), and `merge` acts through
- * `AutoMergeAttemptPort`. A settled key whose step has a counter refuses any
+ * (`ExecuteAuthorizedForgeActionPort`), and the legacy `merge` step maps to the
+ * merge-queue enqueue port (`EnqueueMergePort`, KS7b). A settled key whose step has a counter refuses any
  * further call of that port — a duplicate act without a new journal entry
  * still fails the property.
  */
@@ -132,16 +134,15 @@ async function appendSettledStep(
 }
 
 /**
- * Put the run into `opening-pr`, `pushing` or `merging` with the step's key
+ * Put the run into `opening-pr` or `pushing` with the step's key
  * already settled: the attempt is collected at the lane head, acceptance at
- * the head is settled, the merge case also settles the premerge post at the
- * head (KS7a-2), and a single conduct entry projects the target state. The
+ * the head is settled, and a single conduct entry projects the target state. The
  * decider then decides the one-way act on that spent key, so the pass must
  * perform no second act. Returns the settled step key.
  */
 async function seedSettledOneWayStep(
   scenario: LaneRunScenario,
-  step: 'open-pr' | 'push' | 'merge',
+  step: 'open-pr' | 'push',
 ): Promise<string> {
   const attemptId = 'attempt-example-1';
   const stored = await scenario.deps.attemptRepo.findAttemptById(attemptId);
@@ -174,7 +175,7 @@ async function seedSettledOneWayStep(
   }
   await appendSettledStep(scenario, acceptBuilt.key, 'accepted');
 
-  let conduct: 'opening-pr' | 'pushing' | 'merging';
+  let conduct: 'opening-pr' | 'pushing';
   let stepKey: string;
   if (step === 'open-pr') {
     conduct = 'opening-pr';
@@ -192,7 +193,7 @@ async function seedSettledOneWayStep(
     }
     stepKey = built.key;
     await appendSettledStep(scenario, stepKey, 'pr-opened');
-  } else if (step === 'push') {
+  } else {
     conduct = 'pushing';
     const built = buildLaneRunStepKey({
       runId: RUN_ID,
@@ -208,27 +209,6 @@ async function seedSettledOneWayStep(
     }
     stepKey = built.key;
     await appendSettledStep(scenario, stepKey, 'pushed');
-  } else {
-    conduct = 'merging';
-    const premerge = laneRunPremergeKey(RUN_ID, 0, HEAD12);
-    if (!premerge.ok) {
-      throw new Error('seed: the premerge key must build');
-    }
-    await appendSettledStep(scenario, premerge.key, 'premerge-success');
-    const built = buildLaneRunStepKey({
-      runId: RUN_ID,
-      round: 0,
-      step: 'merge',
-      seatIndex: 0,
-      attemptOrdinal: null,
-      head12: HEAD12,
-      retry: null,
-    });
-    if (!built.ok) {
-      throw new Error('seed: the merge key must build');
-    }
-    stepKey = built.key;
-    await appendSettledStep(scenario, stepKey, 'merged');
   }
 
   const appendedConduct = await scenario.deps.runJournal.append(
@@ -243,7 +223,7 @@ async function seedSettledOneWayStep(
 /** One advance of a seeded scenario; the pushing PR is read from a different head. */
 function advanceSeeded(
   scenario: LaneRunScenario,
-  step: 'open-pr' | 'push' | 'merge',
+  step: 'open-pr' | 'push',
 ): Promise<AdvanceLaneRunResult> {
   const deps: AdvanceLaneRunDependencies =
     step === 'push'
@@ -313,7 +293,7 @@ describe('Q4b: a one-way key is never acted on twice', () => {
             }
           }
           // (b) no acting port is called again once its step's key is settled:
-          // a duplicate prepare, open-pr, push or merge call without a new
+          // a duplicate prepare, open-pr or push call without a new
           // journal entry must still fail this property.
           for (const [step, countBefore] of callsBefore) {
             const portCalls = actingPortCallsOf(step, scenario);
@@ -328,8 +308,8 @@ describe('Q4b: a one-way key is never acted on twice', () => {
     );
   });
 
-  it('a settled open-pr, push or merge key gets no second act', async () => {
-    for (const step of ['open-pr', 'push', 'merge'] as const) {
+  it('a settled open-pr or push key gets no second act', async () => {
+    for (const step of ['open-pr', 'push'] as const) {
       const scenario = await makeLaneRunScenario([], { laterActs: true });
       const settledKey = await seedSettledOneWayStep(scenario, step);
       const before = await scenario.journal();

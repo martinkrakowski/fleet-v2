@@ -25,7 +25,7 @@ import {
 import type { DispatchAttemptResult } from '../../ports/in/DispatchAttemptPort.in-port.js';
 import type { ReconcileAttemptResult } from '../../ports/in/ReconcileAttemptPort.in-port.js';
 import type { ExecuteAuthorizedForgeActionResult } from '../../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
-import type { AutoMergeAttemptResult } from '../../ports/in/AutoMergeAttemptPort.in-port.js';
+import type { MergeEnqueueDecision } from '../../../domain/merge-queue-operations.js';
 import type { AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
 import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
 import type { ConductorForgeGrantResult } from '../../ports/out/ConductorForgeGrantPort.out-port.js';
@@ -212,7 +212,7 @@ export interface LaneRunScenario {
   reconcileCalls(): number;
   /** How many times the fake forge-action port has been called so far (the `open-pr`/`push` acting port). */
   forgeActionCalls(): number;
-  /** How many times the fake auto-merge port has been called so far (the `merge` acting port). */
+  /** How many times the fake merge-queue enqueue port has been called so far (the `merge-enqueue` acting port). */
   mergeCalls(): number;
 }
 
@@ -439,10 +439,10 @@ export async function makeLaneRunScenario(
     },
   };
 
-  const autoMergeAttempt = {
-    autoMergeAttempt: async (): Promise<AutoMergeAttemptResult> => {
+  const enqueueMerge = {
+    enqueue: async (): Promise<MergeEnqueueDecision> => {
       mergeCallCount += 1;
-      return { outcome: 'off' };
+      return { outcome: 'refused', reason: 'invalid-head' };
     },
   };
 
@@ -458,7 +458,7 @@ export async function makeLaneRunScenario(
     },
     dispatchAttempt,
     executeForgeAction,
-    autoMergeAttempt,
+    enqueueMerge,
     ...(options.laterActs === true ? laterActDeps() : {}),
     newUlid,
   };

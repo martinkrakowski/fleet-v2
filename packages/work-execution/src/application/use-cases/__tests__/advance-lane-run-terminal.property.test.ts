@@ -44,7 +44,7 @@ describe('Q4b: a terminal lane-run state is absorbing', () => {
         expect(scenario.mergeCalls()).toBe(callsBefore[3]);
       }
       const after = await scenario.journal();
-      expect(after.length).toBe(before.length);
+      expect(after).toHaveLength(before.length);
       const recordAfter = await scenario.record();
       expect(recordAfter?.revision).toBe(recordBefore?.revision);
       const conducts = after.filter((entry) => entry.kind === 'conduct');

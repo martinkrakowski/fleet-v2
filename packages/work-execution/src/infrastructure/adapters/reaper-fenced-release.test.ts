@@ -112,6 +112,34 @@ describe('ExecutionJournalAdapter fenced capacity release (plan §3.9.2)', () =>
     expect(active[0]?.releasedAtIso).toBeNull();
   });
 
+  it('stays typed in memory when a request getter throws after validation', async () => {
+    const adapter = new ExecutionJournalAdapter();
+    await adapter.saveCapacityReservation(heldReservation());
+    let reads = 0;
+    const request = fencedRequest();
+    Object.defineProperty(request, 'attemptId', {
+      enumerable: true,
+      get: () => {
+        if (++reads > 1) throw new Error('boom');
+        return 'att-1';
+      },
+    });
+
+    const result = await adapter.releaseCapacityReservationIfUnchanged(request);
+
+    expect(result).toEqual({ outcome: 'unknown', reason: 'unreadable' });
+  });
+
+  it('refuses a request carrying an extra symbol key', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    const request = { ...fencedRequest(), [Symbol('extra')]: 1 };
+
+    await expect(adapter.releaseCapacityReservationIfUnchanged(request)).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'invalid-request',
+    });
+  });
+
   it('reports changed when the observed reservation is not the held one', async () => {
     const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
     await adapter.saveCapacityReservation(heldReservation());

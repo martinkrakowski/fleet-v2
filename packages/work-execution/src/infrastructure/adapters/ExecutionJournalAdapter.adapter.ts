@@ -103,8 +103,8 @@ function validateFencedReleaseRequest(request: ReleaseCapacityReservationIfUncha
       return 'not-an-object';
     }
     const value = request as unknown as Record<string, unknown>;
-    const keys = Object.keys(value);
-    if (keys.length !== FENCED_RELEASE_REQUEST_KEYS.size || keys.some((key) => !FENCED_RELEASE_REQUEST_KEYS.has(key))) {
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== FENCED_RELEASE_REQUEST_KEYS.size || keys.some((key) => typeof key !== 'string' || !FENCED_RELEASE_REQUEST_KEYS.has(key))) {
       return 'unknown-or-missing-key';
     }
     for (const field of ['attemptId', 'reservationId'] as const) {
@@ -564,17 +564,25 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
   }
 
   async releaseCapacityReservationIfUnchanged(
-    request: ReleaseCapacityReservationIfUnchangedRequest,
+    rawRequest: ReleaseCapacityReservationIfUnchangedRequest,
   ): Promise<ReleaseCapacityReservationIfUnchangedResult> {
     try {
-      const validated = validateFencedReleaseRequest(request);
+      const validated = validateFencedReleaseRequest(rawRequest);
       if (validated !== null) {
         return { outcome: 'refused', reason: 'invalid-request' };
       }
+      // Snapshot once so a getter cannot answer differently after validation.
+      const request: ReleaseCapacityReservationIfUnchangedRequest = {
+        attemptId: rawRequest.attemptId,
+        reservationId: rawRequest.reservationId,
+        attemptRevision: rawRequest.attemptRevision,
+        releasedAtIso: rawRequest.releasedAtIso,
+        readAttemptRevision: rawRequest.readAttemptRevision,
+      };
 
       const stateDir = this.options?.stateDir;
       if (stateDir === undefined) {
-        return this.releaseInMemoryIfUnchanged(request);
+        return await this.releaseInMemoryIfUnchanged(request);
       }
 
       const target = path.join(stateDir, 'reservations.json');

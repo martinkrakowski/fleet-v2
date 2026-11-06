@@ -737,10 +737,10 @@ export type SeatPlanFromCatalogResult =
   | { readonly reason: string };
 
 /** The catalogue may hold at most this many seats; a larger one is refused, never truncated. */
-const SEAT_CATALOG_SEAT_BOUND = 256;
+export const SEAT_CATALOG_SEAT_BOUND = 256;
 
 /** Each chain may hold at most this many steps; a larger one is refused, never truncated. */
-const SEAT_CATALOG_CHAIN_STEP_BOUND = 64;
+export const SEAT_CATALOG_CHAIN_STEP_BOUND = 64;
 
 const CATALOG_TRIGGER_TO_STOP_REASON: Readonly<Record<string, StopReasonValue>> = {
   '429': 'rate-limited',

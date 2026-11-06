@@ -13,6 +13,8 @@
 import {
   isDeclaredCatalogTrigger,
   isDeclaredSeatHealth,
+  SEAT_CATALOG_CHAIN_STEP_BOUND,
+  SEAT_CATALOG_SEAT_BOUND,
   seatPlanFromCatalog,
   type SeatCatalog,
   type SeatPlanFromCatalogResult,
@@ -30,7 +32,8 @@ function copiedSeats(source: Record<string, unknown>): unknown[] | undefined | n
   if (raw === undefined) {
     return undefined;
   }
-  if (!Array.isArray(raw)) {
+  if (!Array.isArray(raw) || raw.length > SEAT_CATALOG_SEAT_BOUND) {
+    // Above the bound is unknown, never a truncated or unbounded catalogue.
     return null;
   }
   const seats: Record<string, unknown>[] = [];
@@ -73,7 +76,7 @@ function copiedChains(source: Record<string, unknown>): Record<string, unknown> 
     if (rawSteps === undefined) {
       continue;
     }
-    if (!Array.isArray(rawSteps)) {
+    if (!Array.isArray(rawSteps) || rawSteps.length > SEAT_CATALOG_CHAIN_STEP_BOUND) {
       return null;
     }
     const steps: Record<string, unknown>[] = [];
@@ -94,7 +97,11 @@ function copiedChains(source: Record<string, unknown>): Record<string, unknown> 
           }
         }
       }
-      steps.push({ ...step });
+      // The triggers are copied too, so the returned step never aliases the source.
+      steps.push({
+        ...step,
+        ...(Array.isArray(step['triggers']) ? { triggers: [...(step['triggers'] as unknown[])] } : {}),
+      });
     }
     chains[role] = steps;
   }

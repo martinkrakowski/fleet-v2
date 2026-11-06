@@ -43,6 +43,7 @@ interface QueueEntryView {
   readonly reason: string | null;
   readonly supersedes: string | null;
   readonly headOid: string;
+  readonly runId: string | null;
 }
 
 const TERMINAL_STATES: readonly string[] = ['merged', 'dropped', 'superseded'];
@@ -62,7 +63,8 @@ function viewOfEntry(raw: unknown, repository: { readonly owner: string; readonl
       typeof entry.entryId !== 'string' || typeof entry.state !== 'string' ||
       typeof entry.headOid !== 'string' ||
       (entry.reason !== null && typeof entry.reason !== 'string') ||
-      (entry.supersedes !== null && typeof entry.supersedes !== 'string')
+      (entry.supersedes !== null && typeof entry.supersedes !== 'string') ||
+      (entry.runId !== null && typeof entry.runId !== 'string')
     ) {
       return null;
     }
@@ -72,6 +74,7 @@ function viewOfEntry(raw: unknown, repository: { readonly owner: string; readonl
       reason: entry.reason as string | null,
       supersedes: entry.supersedes as string | null,
       headOid: entry.headOid,
+      runId: entry.runId as string | null,
     };
   } catch {
     return null;
@@ -79,13 +82,15 @@ function viewOfEntry(raw: unknown, repository: { readonly owner: string; readonl
 }
 
 /**
- * The run's entry: the one the intent minted, else the live entry at the run's head (a
+ * The run's entry: the one the intent minted (at this head, enqueued by this run), else the live entry at the run's head (a
  * duplicate someone else enqueued), then followed along its `supersedes` successors to the
  * tip. Null when the queue holds neither. Total; the walk is bounded and cycle-safe.
  */
-function tipOfRunEntry(views: readonly QueueEntryView[], mintedId: string, headSha: string): QueueEntryView | null {
+function tipOfRunEntry(views: readonly QueueEntryView[], mintedId: string, headSha: string, runId: string): QueueEntryView | null {
+  // The minted entry counts only when it is this run's own at this head: a row that carries the id but
+  // another head or run is stale or foreign and is never followed.
   let current: QueueEntryView | undefined =
-    views.find((view) => view.entryId === mintedId) ??
+    views.find((view) => view.entryId === mintedId && view.headOid === headSha && view.runId === runId) ??
     views.find((view) => view.headOid === headSha && !TERMINAL_STATES.includes(view.state));
   if (current === undefined) {
     return null;
@@ -306,7 +311,7 @@ export async function reconcileMergeEnqueue(
       views.push(view);
     }
   }
-  const tip = tipOfRunEntry(views, mintedId, inputs.headSha);
+  const tip = tipOfRunEntry(views, mintedId, inputs.headSha, record.runId);
   if (tip === null) {
     return enqueueEntry(ctx, record, decision, request, inputs, mintedId);
   }

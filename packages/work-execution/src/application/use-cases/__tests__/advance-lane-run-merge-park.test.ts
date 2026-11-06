@@ -1115,6 +1115,19 @@ describe('AdvanceLaneRunUseCase merge-enqueue (KS7b)', () => {
     expect(await resultsOf(harness, enqueueKey())).toEqual([]);
   });
 
+  it('a row that carries the minted id but another head or run is stale or foreign: it is never followed', async () => {
+    for (const foreign of [{ headOid: MOVED_COMMIT }, { runId: 'run-01JB0000000000000000000001' }, { runId: null }] as const) {
+      const harness = await queueHarness();
+      await advance(harness);
+      const own = harness.queue[0]!;
+      harness.queue[0] = queueEntry({ ...foreign, entryId: own.entryId, state: 'dropped', reason: 'checks' });
+      // Not the run's entry: the reconcile enqueues again under the same id and waits; no drop is journalled.
+      expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+      expect(await resultsOf(harness, enqueueKey())).toEqual([]);
+      expect(harness.enqueueRequests).toHaveLength(2);
+    }
+  });
+
   it('follows a superseded entry to its successor and reads the successor state', async () => {
     const harness = await queueHarness();
     await advance(harness);

@@ -1,0 +1,69 @@
+/* To-do view layout — colours come from globals.css custom properties only. */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.muted {
+  color: var(--text-faint);
+}
+
+.groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.groupTitle {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-card);
+  padding: var(--space-3);
+}
+
+.subject {
+  font-weight: 500;
+}
+
+.rowMeta {
+  color: var(--text-faint);
+  font-size: 0.8rem;
+  margin: 0;
+}
+
+.commands {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.command {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}

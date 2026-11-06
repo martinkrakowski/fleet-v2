@@ -21,6 +21,23 @@ export function forgeActionPushesBranch(kind: ForgeActionKind): boolean {
 export const FORGE_REFUSAL_KINDS = ['conflict', 'protection', 'permission', 'other'] as const;
 export type ForgeRefusalKind = (typeof FORGE_REFUSAL_KINDS)[number];
 
+/**
+ * Release actions an owner grant may authorize (cutover row CO14). Each is its
+ * own coordination scope (`release:install`, `release:swap`,
+ * `release:rollback`), never a forge scope, so a forge grant never authorizes a
+ * release and a grant for one release action never authorizes another.
+ */
+export const RELEASE_ACTION_KINDS = ['release-install', 'release-swap', 'release-rollback'] as const;
+export type ReleaseActionKind = (typeof RELEASE_ACTION_KINDS)[number];
+
+/** Every action kind an `ActionAuthorizationPort` grant may be resolved for. */
+export type AuthorizedActionKind = ForgeActionKind | ReleaseActionKind;
+
+/** The coordination scope of one release action kind; null for any other kind. */
+export function releaseActionScope(kind: string): string | null {
+  return (RELEASE_ACTION_KINDS as readonly string[]).includes(kind) ? `release:${kind.slice('release-'.length)}` : null;
+}
+
 /** Deterministic coordination action scope for one forge action kind. */
 export function forgeActionScope(kind: ForgeActionKind | string): string {
   return `forge:${kind}`;

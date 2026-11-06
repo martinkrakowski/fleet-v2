@@ -250,6 +250,7 @@ function arbitrateReservation(
 export class ExecutionJournalAdapter implements ExecutionJournalPort {
   private readonly inMemoryJournalEntries: ActionJournalEntryRecord[] = [];
   private readonly inMemoryReservationsById = new Map<string, CapacityReservationRecord>();
+  private readonly fencedReleaseChainsByAttemptId = new Map<string, Promise<unknown>>();
   private readonly changeSignal: ChangeSignalPort;
   private signalEmitFailuresCount = 0;
 
@@ -613,7 +614,10 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
           } catch {
             return { outcome: 'unknown', reason: 'attempt-unknown' };
           }
-          if (currentRevision === null || currentRevision !== request.attemptRevision) {
+          if (currentRevision === null) {
+            return { outcome: 'unknown', reason: 'attempt-unknown' };
+          }
+          if (currentRevision !== request.attemptRevision) {
             return { outcome: 'changed' };
           }
           reservations.set(
@@ -658,25 +662,48 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
   private releaseInMemoryIfUnchanged(
     request: ReleaseCapacityReservationIfUnchangedRequest,
   ): Promise<ReleaseCapacityReservationIfUnchangedResult> {
+    // Concurrent releases of the same attempt must not both act on the same
+    // held reservation: each find-check-release runs on a per-attempt chain so
+    // the second caller re-reads the map only after the first has finished.
+    const prior = this.fencedReleaseChainsByAttemptId.get(request.attemptId) ?? Promise.resolve();
+    const run = prior
+      .then(
+        () => this.releaseInMemoryIfUnchangedLocked(request),
+        () => this.releaseInMemoryIfUnchangedLocked(request),
+      );
+    this.fencedReleaseChainsByAttemptId.set(
+      request.attemptId,
+      run.catch(() => undefined),
+    );
+    return run;
+  }
+
+  private async releaseInMemoryIfUnchangedLocked(
+    request: ReleaseCapacityReservationIfUnchangedRequest,
+  ): Promise<ReleaseCapacityReservationIfUnchangedResult> {
     const held = [...this.inMemoryReservationsById.values()].find(
       (reservation) => reservation.attemptId === request.attemptId && reservation.held === true,
     );
-    if (held === undefined) return Promise.resolve({ outcome: 'not-held' });
-    if (held.id !== request.reservationId) return Promise.resolve({ outcome: 'changed' });
-    return request
-      .readAttemptRevision()
-      .then((currentRevision) => {
-        if (currentRevision === null || currentRevision !== request.attemptRevision) {
-          return { outcome: 'changed' } as const;
-        }
-        this.inMemoryReservationsById.set(
-          held.id,
-          normalizeReservationRecord({ ...held, held: false, releasedAtIso: request.releasedAtIso }),
-        );
-        this.signal({ kind: 'capacity', id: held.id, stateFile: null, before: null, written: null });
-        return { outcome: 'released', reservationId: held.id } as const;
-      })
-      .catch(() => ({ outcome: 'unknown', reason: 'attempt-unknown' }) as const);
+    if (held === undefined) return { outcome: 'not-held' };
+    if (held.id !== request.reservationId) return { outcome: 'changed' };
+    let currentRevision: number | null;
+    try {
+      currentRevision = await request.readAttemptRevision();
+    } catch {
+      return { outcome: 'unknown', reason: 'attempt-unknown' };
+    }
+    if (currentRevision === null) {
+      return { outcome: 'unknown', reason: 'attempt-unknown' };
+    }
+    if (currentRevision !== request.attemptRevision) {
+      return { outcome: 'changed' };
+    }
+    this.inMemoryReservationsById.set(
+      held.id,
+      normalizeReservationRecord({ ...held, held: false, releasedAtIso: request.releasedAtIso }),
+    );
+    this.signal({ kind: 'capacity', id: held.id, stateFile: null, before: null, written: null });
+    return { outcome: 'released', reservationId: held.id };
   }
 
   private async readJournalFromDisk(target: string): Promise<ActionJournalEntryRecord[]> {

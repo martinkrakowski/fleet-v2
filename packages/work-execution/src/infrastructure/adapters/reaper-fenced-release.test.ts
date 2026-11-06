@@ -139,6 +139,75 @@ describe('ExecutionJournalAdapter fenced capacity release (plan §3.9.2)', () =>
     expect(active.map((r) => r.id)).toEqual(['res-1']);
   });
 
+  it('reports unknown when the attempt reads back as null (file backed)', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await adapter.saveCapacityReservation(heldReservation());
+    const target = path.join(tempDir, 'reservations.json');
+    const before = await fileSha256(target);
+
+    const result = await adapter.releaseCapacityReservationIfUnchanged(
+      fencedRequest({ readAttemptRevision: () => Promise.resolve(null) }),
+    );
+
+    expect(result).toEqual({ outcome: 'unknown', reason: 'attempt-unknown' });
+    expect((await adapter.listActiveReservations()).map((r) => r.id)).toEqual(['res-1']);
+    expect(await fileSha256(target)).toBe(before);
+  });
+
+  it('reports unknown when the attempt reads back as null in memory', async () => {
+    const adapter = new ExecutionJournalAdapter();
+    await adapter.saveCapacityReservation(heldReservation({ id: 'res-mem', attemptId: 'att-mem' }));
+
+    const result = await adapter.releaseCapacityReservationIfUnchanged(
+      fencedRequest({
+        attemptId: 'att-mem',
+        reservationId: 'res-mem',
+        readAttemptRevision: () => Promise.resolve(null),
+      }),
+    );
+
+    expect(result).toEqual({ outcome: 'unknown', reason: 'attempt-unknown' });
+    expect((await adapter.listActiveReservations()).map((r) => r.id)).toEqual(['res-mem']);
+  });
+
+  it('serialises concurrent in-memory releases so exactly one reports released', async () => {
+    const signals: ChangeSignal[] = [];
+    const signalPort: ChangeSignalPort = {
+      emit(signal: ChangeSignal): void {
+        signals.push(signal);
+      },
+    };
+    const adapter = new ExecutionJournalAdapter({ changeSignal: signalPort });
+    await adapter.saveCapacityReservation(heldReservation({ id: 'res-mem', attemptId: 'att-mem' }));
+    signals.length = 0;
+
+    // The first caller's callback is still pending when the second call starts,
+    // so the second must wait for the chain instead of acting on the same held
+    // reservation.
+    let releaseFirst: (revision: number) => void = () => {};
+    const firstGate = new Promise<number>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const first = adapter.releaseCapacityReservationIfUnchanged(
+      fencedRequest({
+        attemptId: 'att-mem',
+        reservationId: 'res-mem',
+        readAttemptRevision: () => firstGate,
+      }),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    // Resolving the gate and issuing the second call in the same synchronous
+    // block: the second call joins the per-attempt chain before the first's
+    // release continuation has run, which is exactly the reported race window.
+    releaseFirst(3);
+    const second = await adapter.releaseCapacityReservationIfUnchanged(
+      fencedRequest({ attemptId: 'att-mem', reservationId: 'res-mem' }),
+    );
+    expect(second).toEqual({ outcome: 'not-held' });
+    expect(await first).toEqual({ outcome: 'released', reservationId: 'res-mem' });
+    expect(signals.filter((signal) => signal.kind === 'capacity').length).toBe(1);
+  });
+
   it('reports unknown when the reservations store is unreadable', async () => {
     const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
     await adapter.saveCapacityReservation(heldReservation());

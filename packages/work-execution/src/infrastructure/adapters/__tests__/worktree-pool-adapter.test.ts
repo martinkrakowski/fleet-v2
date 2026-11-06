@@ -512,6 +512,34 @@ describe('WorktreePoolAdapter refillAfterMerge', () => {
     expect(host.claims.has(`${CLAIMS}/w1`)).toBe(true);
   });
 
+  it('a stale reaper cannot remove a claim another process created after its snapshot', async () => {
+    const host = new FakeHost();
+    host.claims.set(`${CLAIMS}/w1`, 'run-gone'); // dangling at snapshot time
+    let reads = 0;
+    host.override = (t) => {
+      // Between the reaper's snapshot and its guarded recheck, another process replaces the claim.
+      if (t[0] === 'readlink' && (reads += 1) === 2) host.claims.set(`${CLAIMS}/w1`, 'prepare-new');
+      return undefined;
+    };
+    await make(host, { maxEntries: 1 }).refillAfterMerge({ projectId: 'proj', mergedBaseCommit: BASE, recordedHost: HOST });
+    expect(host.claims.get(`${CLAIMS}/w1`)).toBe('prepare-new');
+    expect(host.claims.has(`${CLAIMS}/w1.reset`)).toBe(false);
+  });
+
+  it('a reset whose claim snapshot went stale under the guard does nothing', async () => {
+    const host = new FakeHost();
+    host.add(1);
+    host.claims.set(`${CLAIMS}/w1`, 'run-A');
+    let tests = 0;
+    host.override = (t) => {
+      if (t[0] === 'test' && t[1] === '-L' && (tests += 1) === 1) host.claims.delete(`${CLAIMS}/w1`);
+      return undefined;
+    };
+    const result = await make(host).resetToBase({ worktreePath: `${POOL}/w1`, baseCommit: NEXT, recordedHost: HOST });
+    expect(result).toEqual({ outcome: 'unknown' });
+    expect(host.worktrees.get(`${POOL}/w1`)!.head).toBe(BASE);
+  });
+
   it('leaves a fresh prepare claim alone even while its worktree is not yet listed', async () => {
     const host = new FakeHost();
     host.claims.set(`${CLAIMS}/w1`, 'prepare-fresh');

@@ -330,6 +330,16 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     return claims;
   }
 
+  /** The slot's claim now: its owner, 'absent' (proved), or 'unknown'. */
+  private async claimOf(view: PoolView, index: number, deadline: number): Promise<string | 'absent' | 'unknown'> {
+    const present = await this.call(view, ['test', '-L', this.linkPath(view, index)], deadline);
+    if (present.kind === 'unknown') return 'unknown';
+    if (present.kind === 'fail') return 'absent';
+    const target = await this.call(view, ['readlink', '--', this.linkPath(view, index)], deadline);
+    if (target.kind === 'unknown') return 'unknown';
+    return target.kind === 'ok' && target.stdout.trim() !== '' ? target.stdout.trim() : '?';
+  }
+
   /** Atomically create the claim; true only when this call created it. */
   private async claim(view: PoolView, index: number, owner: string, deadline: number): Promise<boolean> {
     const made = await this.call(view, ['mkdir', '-p', '--', view.claimsDir], deadline);
@@ -481,6 +491,13 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     base: string,
     deadline: number,
   ): Promise<ResetWorktreeToBaseResult> {
+    // Under the guard the claim state is final for this slot (every other
+    // change to it also holds the guard or is an exclusive create), so the
+    // snapshot is proved again before it is relied on.
+    const current = await this.claimOf(view, index, deadline);
+    if (current === 'unknown' || (current === 'absent' ? holder !== undefined : current !== holder)) {
+      return { outcome: 'unknown' };
+    }
     if (holder === undefined && !(await this.claim(view, index, `prepare-${randomUUID()}`, deadline))) {
       return { outcome: 'unknown' };
     }
@@ -584,17 +601,40 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
       const isPrepare = owner.startsWith('prepare-');
       const gone = slot === undefined || slot.prunable;
       if (owner === '?' || (isPrepare ? !stale.has(index) : !gone)) continue; // an unreadable owner is never reaped
-      if (slot !== undefined && !slot.prunable) {
-        const removed = await this.git(view, view.config.repositoryPath, ['worktree', 'remove', '--force', slot.path], deadline);
-        if (removed.kind !== 'ok') continue;
-      }
-      await this.release(view, index, deadline);
+      await this.reapClaim(view, index, owner, slot, deadline);
     }
     if (claims.size === 0) return { slots, claims };
     await this.git(view, view.config.repositoryPath, ['worktree', 'prune'], deadline);
     const freshSlots = await this.listSlots(view, deadline);
     const freshClaims = freshSlots === null ? null : await this.readClaims(view, deadline);
     return freshSlots === null || freshClaims === null ? null : { slots: freshSlots, claims: freshClaims };
+  }
+
+  /**
+   * Reap one claim under the slot's exclusive guard, after proving it still
+   * has the observed owner: a concurrent reaper or creator cannot have its
+   * fresh claim removed by a stale snapshot.
+   */
+  private async reapClaim(
+    view: PoolView,
+    index: number,
+    owner: string,
+    slot: ListedWorktree | undefined,
+    deadline: number,
+  ): Promise<void> {
+    const guard = `${view.claimsDir}/w${index}.reset`;
+    const held = await this.call(view, ['ln', '-s', '--', 'reap', guard], deadline);
+    if (held.kind !== 'ok') return;
+    try {
+      if ((await this.claimOf(view, index, deadline)) !== owner) return;
+      if (slot !== undefined && !slot.prunable) {
+        const removed = await this.git(view, view.config.repositoryPath, ['worktree', 'remove', '--force', slot.path], deadline);
+        if (removed.kind !== 'ok') return;
+      }
+      await this.release(view, index, deadline);
+    } finally {
+      await this.call(view, ['rm', '-f', '--', guard], Math.max(deadline, this.now() + 5000));
+    }
   }
 
   /** Move idle warm entries to the merged base; true when one could not be proved warm. */

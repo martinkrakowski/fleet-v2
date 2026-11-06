@@ -25,6 +25,7 @@ import type {
   BriefAuthorSessionUnavailable,
 } from '../../application/ports/out/BriefAuthoringPort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
+import { withFileLock } from './file-store.js';
 
 export interface BriefAuthoringAdapterOptions {
   /** Reviewed orchestrator prose keyed by work order id. */
@@ -187,8 +188,16 @@ async function recordAnswer(answerPath: string, answer: string): Promise<boolean
   return recorded;
 }
 
-/** True when the intent file records this key and a start time inside the claim window. */
+/**
+ * True when the intent file records this key and a start time inside the claim
+ * window. The path is inspected with lstat first: a symlink is never followed,
+ * so a planted link cannot redirect the read outside the briefs directory.
+ */
 async function intentIsLive(intentPath: string, sessionKey: string, windowMs: number): Promise<boolean> {
+  const stat = await fs.lstat(intentPath).catch(() => null);
+  if (stat === null || !stat.isFile()) {
+    return false;
+  }
   const text = await fs.readFile(intentPath, 'utf8').catch(() => null);
   if (text === null) {
     return false;
@@ -208,8 +217,10 @@ async function intentIsLive(intentPath: string, sessionKey: string, windowMs: nu
 /**
  * Claim the session by creating the intent file exclusively. When one already
  * exists without an answer, it is another call's session while it is fresh for
- * this key; a stale or foreign intent is replaced atomically so an interrupted
- * session stays recoverable on the next call.
+ * this key; a stale or foreign intent is replaced so an interrupted session
+ * stays recoverable on the next call. The whole check-and-set runs under the
+ * store's exclusive file lock, so concurrent retries can never both replace
+ * the same stale intent and both run the seat.
  */
 async function claimIntent(
   briefsDir: string,
@@ -218,27 +229,30 @@ async function claimIntent(
   windowMs: number,
 ): Promise<boolean> {
   const intent = `${JSON.stringify({ sessionKey, startedAt: new Date().toISOString() })}\n`;
-  try {
-    await fs.mkdir(briefsDir, { recursive: true });
-    await fs.writeFile(intentPath, intent, { encoding: 'utf8', flag: 'wx' });
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+  return withFileLock(`${intentPath}.lock`, async () => {
+    try {
+      await fs.mkdir(briefsDir, { recursive: true });
+      await fs.writeFile(intentPath, intent, { encoding: 'utf8', flag: 'wx' });
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        return false;
+      }
+    }
+    if (await intentIsLive(intentPath, sessionKey, windowMs)) {
       return false;
     }
-  }
-  if (await intentIsLive(intentPath, sessionKey, windowMs)) {
-    return false;
-  }
-  const tempPath = `${intentPath}.takeover`;
-  try {
-    await fs.writeFile(tempPath, intent, 'utf8');
-    await fs.rename(tempPath, intentPath);
-    return true;
-  } catch {
-    await fs.rm(tempPath, { force: true }).catch(() => undefined);
-    return false;
-  }
+    // Stale, foreign or planted (symlinked) intent: clear the entry and
+    // re-claim exclusively. Unlink removes only the directory entry, never a
+    // linked target, so a planted symlink is neutralised, not followed.
+    try {
+      await fs.rm(intentPath, { force: true });
+      await fs.writeFile(intentPath, intent, { encoding: 'utf8', flag: 'wx' });
+      return true;
+    } catch {
+      return false;
+    }
+  }).catch(() => false);
 }
 
 export class BriefAuthoringAdapter implements BriefAuthoringPort {
@@ -288,6 +302,11 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
   async authorBriefSession(request: BriefAuthorSessionRequest): Promise<BriefAuthorSessionResult> {
     const stem = sessionStem(request);
     if (stem === null) {
+      return unavailable('session-command-invalid');
+    }
+    // A symlinked briefsDir redirects every read and write outside the intended
+    // directory; refuse before touching the filesystem through the link.
+    if (await isSymbolicLink(request.briefsDir)) {
       return unavailable('session-command-invalid');
     }
     const base = path.join(request.briefsDir, stem);

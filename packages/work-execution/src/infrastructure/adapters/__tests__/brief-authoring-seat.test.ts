@@ -207,4 +207,50 @@ describe('BriefAuthoringAdapter seat session', () => {
     const unconfigured = await new BriefAuthoringAdapter({ executor: s.executor }).authorBriefSession(s.request);
     expect(unconfigured).toEqual({ outcome: 'unavailable', reason: 'seat-command-not-configured' });
   });
+
+  it('a pre-existing symlink at the intent-file path is never followed', async () => {
+    const s = await setup();
+    await fs.mkdir(s.briefsDir, { recursive: true });
+    const decoy = path.join(s.root, 'decoy-intent.json');
+    // Live-looking intent planted outside the briefs directory. Following the
+    // symlink would make the claim look live and refuse instead of running.
+    const decoyContent = `${JSON.stringify({ sessionKey: SESSION_KEY, startedAt: new Date().toISOString() })}\n`;
+    await fs.writeFile(decoy, decoyContent, 'utf8');
+    await fs.symlink(decoy, path.join(s.briefsDir, `${STEM}.intent.json`));
+    const result = await adapterFor(s.executor).authorBriefSession(s.request);
+    expect(result).toEqual({ outcome: 'answered', answer: s.executor.seat.stdout });
+    expect(s.executor.seatCalls).toHaveLength(1);
+    expect(await fs.readFile(decoy, 'utf8')).toBe(decoyContent);
+    const intent = JSON.parse(await fs.readFile(path.join(s.briefsDir, `${STEM}.intent.json`), 'utf8')) as Record<string, unknown>;
+    expect(intent.sessionKey).toBe(SESSION_KEY);
+  });
+
+  it('a symlinked briefsDir is refused and nothing is written through the link', async () => {
+    const s = await setup();
+    const realBriefs = path.join(s.root, 'real-briefs');
+    await fs.mkdir(realBriefs);
+    await fs.symlink(realBriefs, s.briefsDir);
+    const result = await adapterFor(s.executor).authorBriefSession(s.request);
+    expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
+    expect(s.executor.calls).toHaveLength(0);
+    expect(await fs.readdir(realBriefs)).toEqual([]);
+  });
+
+  it('concurrent retries on a stale intent run the seat exactly once', async () => {
+    const s = await setup();
+    await fs.mkdir(s.briefsDir, { recursive: true });
+    await fs.writeFile(path.join(s.briefsDir, `${STEM}.intent.json`), '{"sessionKey":"x","startedAt":"t"}\n', 'utf8');
+    const adapter = adapterFor(s.executor);
+    const results = await Promise.all([
+      adapter.authorBriefSession(s.request),
+      adapter.authorBriefSession(s.request),
+    ]);
+    expect(results.filter((r) => r.outcome === 'answered')).toEqual([
+      { outcome: 'answered', answer: s.executor.seat.stdout },
+    ]);
+    expect(results.filter((r) => r.outcome === 'unavailable')).toEqual([
+      { outcome: 'unavailable', reason: 'session-failed' },
+    ]);
+    expect(s.executor.seatCalls).toHaveLength(1);
+  });
 });

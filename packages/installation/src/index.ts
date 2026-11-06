@@ -8,4 +8,5 @@ export * from './policy.js';
 export * from './telemetry-policy.js';
 export * from './seats-policy.js';
 export * from './auto-merge-revision.js';
+export * from './runner-defaults.js';
 export * from './conductor-revision.js';

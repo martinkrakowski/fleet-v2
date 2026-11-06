@@ -15,11 +15,15 @@
  * a transport failure or timeout is `unknown`, a failed read is
  * `unreadable-tree`, never a guessed digest. Attribute lookups during `add`
  * are pinned to the empty tree, written with `hash-object -w`
- * (`GIT_ATTR_SOURCE`), so no repository-configured `.gitattributes` clean
- * filter runs on untrusted worktree content; the one higher-precedence source
- * left, `$GIT_DIR/info/attributes`, is scanned and the save is refused
- * (`unreadable-tree`) if it assigns the `filter` attribute or cannot be read; one
- * `sh` probe separates confirmed-absent from probe-failed.
+ * (`GIT_ATTR_SOURCE`, honoured from git 2.40: an older or unparseable `git --version`
+ * refuses the save as `unreadable-tree`), so no repository-configured
+ * `.gitattributes` clean filter runs on untrusted worktree content; the one
+ * higher-precedence source left, `info/attributes` in the COMMON git dir (found
+ * with `rev-parse --git-path`, which is right for a linked worktree), is read with
+ * `cat` and scanned in TypeScript, immediately before `add`: the save is refused
+ * (`unreadable-tree`) if it assigns the `filter` attribute or cannot be read;
+ * only an ENOENT answer counts as confirmed absence. Argv commands only, no shell.
+ * Git config is pinned too (no system or global config).
  * The `update-ref` carries the all-zeros expected old value, so a concurrent
  * save's ref can never be overwritten: a lost race re-reads the ref and
  * reports `already-saved` or `save-ref-conflict` instead. Nothing returned or
@@ -50,26 +54,16 @@ const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MESSAGE_PATTERN = /^[A-Za-z0-9 ._:-]{1,200}$/;
 const SECRET_SHAPED_RUN = /[A-Za-z0-9_-]{32,}/;
 
-/** A gitattributes token that selects a clean/smudge/process filter. */
-const ATTR_FILTER_PATTERN = '(^|[[:space:]])filter([[:space:]=]|$)';
+/** A gitattributes line token that selects (or unsets) the filter attribute. */
+const ATTR_FILTER = /(^|\s)[-!]?filter(\s|=|$)/;
+const MIN_GIT: readonly [number, number] = [2, 40];
 
-/**
- * One probe whose exit status tells the cases apart (`$1` the attributes file,
- * `$2` the filter pattern, `$3` the git dir): 10 a filter is assigned, 11 the
- * file is readable and assigns none, 20 the file is CONFIRMED absent (its
- * parent is searchable and holds no such entry). Anything else, a failed grep or
- * an unsearchable parent, is "unknown" and the save is refused.
- */
-const ATTR_PROBE_SCRIPT = [
-  'if [ -e "$1" ] || [ -L "$1" ]; then',
-  '  grep -Eq "$2" "$1"; r=$?',
-  '  if [ "$r" -eq 0 ]; then exit 10; fi',
-  '  if [ "$r" -eq 1 ]; then exit 11; fi',
-  '  exit 12',
-  'fi',
-  'if [ -x "$3" ] && { [ -x "$3/info" ] || { [ ! -e "$3/info" ] && [ ! -L "$3/info" ]; }; }; then exit 20; fi',
-  'exit 21',
-].join('\n');
+/** True when the attributes text assigns, unsets or resets `filter` on any non-comment line. */
+const assignsFilter = (text: string): boolean =>
+  text.split(/\r?\n/).some((line) => {
+    const trimmed = line.trim();
+    return trimmed !== '' && !trimmed.startsWith('#') && ATTR_FILTER.test(trimmed);
+  });
 
 /** Environment hardening that travels inside every argv so it reaches a remote ssh executor too. */
 const ENV_GUARDS = [
@@ -77,6 +71,9 @@ const ENV_GUARDS = [
   'GIT_NO_LAZY_FETCH=1',
   'GIT_TERMINAL_PROMPT=0',
   'GIT_ATTR_NOSYSTEM=1',
+  'GIT_CONFIG_NOSYSTEM=1',
+  'GIT_CONFIG_GLOBAL=/dev/null',
+  'GIT_CONFIG_SYSTEM=/dev/null',
 ] as const;
 const IDENTITY_ENV = [
   'GIT_AUTHOR_NAME=fleet-v2',
@@ -116,6 +113,7 @@ const unknown = (reason: string): Stop => new Stop({ outcome: 'unknown', reason 
 interface Ran {
   readonly exitCode: number;
   readonly stdout: string;
+  readonly stderr: string;
 }
 
 const isAbsolute = (value: unknown): value is string =>
@@ -160,7 +158,7 @@ export class LaneEditSaveAdapter implements LaneEditSavePort {
         throw unknown('command-failed');
       }
       if (result.error !== undefined || result.exitCode === null) throw unknown('command-failed');
-      return { exitCode: result.exitCode, stdout: result.stdout.trim() };
+      return { exitCode: result.exitCode, stdout: result.stdout.trim(), stderr: result.stderr };
     };
     const git = (dir: string, args: readonly string[], env: readonly string[] = []): readonly string[] => [
       'env', ...ENV_GUARDS, ...env, 'git', ...GIT_CONFIG_ARGS, '-C', dir, ...args,
@@ -194,17 +192,32 @@ export class LaneEditSaveAdapter implements LaneEditSavePort {
     const worktreeCommon = await commonDir(worktree);
     if (cloneCommon !== worktreeCommon) throw refuse('worktree-not-in-clone');
 
+    // `GIT_ATTR_SOURCE` is honoured only from git 2.40; an older git would ignore it
+    // silently and run a lane-written `.gitattributes` clean filter. Refuse instead.
+    const versionRan = await run(git(worktree, ['--version']));
+    const versionMatch = /^git version (\d+)\.(\d+)/.exec(versionRan.stdout);
+    if (versionRan.exitCode !== 0 || versionMatch === null) throw refuse('unreadable-tree');
+    const major = Number(versionMatch[1]);
+    const minor = Number(versionMatch[2]);
+    if (major < MIN_GIT[0] || (major === MIN_GIT[0] && minor < MIN_GIT[1])) throw refuse('unreadable-tree');
+
     // The only attribute source still able to select a clean filter is the
-    // higher-precedence `$GIT_DIR/info/attributes`: `GIT_ATTR_SOURCE` covers the
-    // worktree's `.gitattributes`, `core.attributesFile=/dev/null` the global file
-    // and `GIT_ATTR_NOSYSTEM=1` the system file. Refuse the save if it assigns the
-    // `filter` attribute — or if it cannot be inspected (fail closed, never a guess).
-    const gitDirRan = await run(git(worktree, ['rev-parse', '--absolute-git-dir']));
-    if (gitDirRan.exitCode !== 0 || !isAbsolute(gitDirRan.stdout)) throw refuse('unreadable-tree');
-    const infoAttributes = path.posix.join(gitDirRan.stdout, 'info', 'attributes');
-    const probe = await run(['sh', '-c', ATTR_PROBE_SCRIPT, 'sh', infoAttributes, ATTR_FILTER_PATTERN, gitDirRan.stdout]);
-    // Only a confirmed absence (20) or a readable file without a filter (11) goes on.
-    if (probe.exitCode !== 20 && probe.exitCode !== 11) throw refuse('unreadable-tree');
+    // higher-precedence `info/attributes` of the COMMON git dir (a linked worktree's
+    // own git dir is not read for it): `GIT_ATTR_SOURCE` covers the worktree's
+    // `.gitattributes`, `core.attributesFile=/dev/null` the global file and
+    // `GIT_ATTR_NOSYSTEM=1` the system file. Run immediately before `add` (the
+    // residual window between this read and `add` is the executor round trip).
+    const checkInfoAttributes = async (): Promise<void> => {
+      const where = await run(git(worktree, ['rev-parse', '--path-format=absolute', '--git-path', 'info/attributes']));
+      if (where.exitCode !== 0 || !isAbsolute(where.stdout)) throw refuse('unreadable-tree');
+      const read = await run(['env', 'LC_ALL=C', 'cat', '--', where.stdout]);
+      if (read.exitCode === 0) {
+        if (assignsFilter(read.stdout)) throw refuse('unreadable-tree');
+        return;
+      }
+      // Only a plain "no such file" is confirmed absence; any other failure is unknown.
+      if (!/No such file or directory/.test(read.stderr)) throw refuse('unreadable-tree');
+    };
 
     // A per-save random name: concurrent saves for the same ref never share an index.
     const index = `${worktreeCommon}/fleet-save-index-${crypto.randomBytes(16).toString('hex')}`;
@@ -222,6 +235,7 @@ export class LaneEditSaveAdapter implements LaneEditSavePort {
       } else {
         await step(git(worktree, ['read-tree', '--empty'], indexEnv));
       }
+      await checkInfoAttributes();
       await step(git(worktree, ['add', '-A', '--', '.'], indexEnv));
       worktreeTree = await readId(worktree, ['write-tree'], indexEnv);
     } catch (error: unknown) {

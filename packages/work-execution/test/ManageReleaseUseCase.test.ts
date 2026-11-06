@@ -113,10 +113,17 @@ class FakeStore implements ReleaseStorePort {
     return { outcome: 'ok' };
   }
 
-  async repoint(input: { root: string; sha: string }): Promise<ReleaseStoreWriteResult> {
+  async repoint(input: {
+    root: string;
+    sha: string;
+    fence?: () => Promise<boolean>;
+  }): Promise<ReleaseStoreWriteResult | { outcome: 'fenced' }> {
     this.calls.push(`repoint ${input.sha}`);
     if (!this.builds.some((entry) => entry.sha === input.sha)) {
       return { outcome: 'not-found' };
+    }
+    if (input.fence !== undefined && !(await input.fence())) {
+      return { outcome: 'fenced' };
     }
     this.current = input.sha;
     return { outcome: 'ok' };
@@ -172,6 +179,8 @@ class FakeLease implements ConductorDriverLeasePort {
   reads: Array<ConductorDriverLeaseRecord | null | Error>;
   held: ConductorDriverLeaseRecord | null = null;
   takeOverOnAcquire = false;
+  /** The store grants less time than asked (as a clamped or slow store would). */
+  grantedMs: number | null = null;
   checkRefusal: LeaseRefusal | null = null;
   private readCount = 0;
 
@@ -193,7 +202,9 @@ class FakeLease implements ConductorDriverLeasePort {
     if (this.takeOverOnAcquire) {
       return { outcome: 'refused', reason: 'lease-held' };
     }
-    this.held = { version: 1, holderId: request.holderId, fence: request.observedFence + 1, leaseUntilIso: request.leaseUntilIso };
+    const leaseUntilIso =
+      this.grantedMs === null ? request.leaseUntilIso : new Date(Date.parse(request.nowIso) + this.grantedMs).toISOString();
+    this.held = { version: 1, holderId: request.holderId, fence: request.observedFence + 1, leaseUntilIso };
     return { outcome: 'ok', lease: this.held };
   }
 
@@ -323,7 +334,14 @@ function make(
     authorization,
     executor,
     nowIso: () => NOW,
-    env: () => ({ PATH: '/usr/bin', HOME: '/home/example', UNSET: undefined }),
+    env: () => ({
+      PATH: '/usr/bin',
+      HOME: '/home/example',
+      UNSET: undefined,
+      YARN_NM_MODE: 'classic',
+      GH_TOKEN: 'ghp_operatorSecretValue000000000000000',
+      FLEET_NTFY_TOKEN: 'tk_operator',
+    }),
   });
   return { useCase, store, executor, lease, authorization };
 }
@@ -571,17 +589,30 @@ describe('ManageReleaseUseCase', () => {
     expect(lease.events).toEqual(['acquire 0', 'check 1', 'release 1']);
   });
 
+  it('refuses driver-lease-live when too little lease time is left at the rename and repoints nothing', async () => {
+    const lease = new FakeLease(null);
+    lease.grantedMs = 30_000;
+    const made = granted(SWAP, A, { lease, store: new FakeStore([build('a', 1), build('b', 2)], B) });
+    expect(await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).toEqual({
+      outcome: 'refused',
+      reason: 'driver-lease-live',
+    });
+    expect(made.store.current).toBe(B);
+    expect(lease.held).toBeNull();
+  });
+
   it('holds the driver lease around the repoint and releases it after', async () => {
     const lease = new FakeLease(null);
     const made = granted(SWAP, A, { lease, store: new FakeStore([build('a', 1), build('b', 2)], B) });
     const order: string[] = [];
     const repoint = made.store.repoint.bind(made.store);
     made.store.repoint = async (input) => {
-      order.push(`repoint while held=${lease.held !== null}`);
+      order.push(`repoint while held=${lease.held !== null} fenced=${input.fence !== undefined}`);
       return repoint(input);
     };
     expect((await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).outcome).toBe('applied');
-    expect(order).toEqual(['repoint while held=true']);
+    expect(order).toEqual(['repoint while held=true fenced=true']);
+    expect(lease.events).toEqual(['acquire 0', 'check 1', 'release 1']);
     expect(lease.held).toBeNull();
   });
 
@@ -849,6 +880,18 @@ describe('ManageReleaseUseCase', () => {
     const env = executor.runs[0].options?.env ?? {};
     for (const key of Object.keys(env)) {
       expect(['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ', 'GIT_CONFIG_NOSYSTEM', 'GIT_ALLOW_PROTOCOL', 'GIT_NO_LAZY_FETCH', 'GIT_TERMINAL_PROMPT']).toContain(key);
+    }
+  });
+
+  it('the tar, install and build children never see an operator token', async () => {
+    const { useCase, executor } = granted(INSTALL, A);
+    await manage(useCase, applyRequest());
+    expect(executor.runs).toHaveLength(4);
+    for (const run of executor.runs.slice(1)) {
+      expect(run.options?.env).toEqual({ PATH: '/usr/bin', HOME: '/home/example', YARN_NM_MODE: 'classic' });
+    }
+    for (const run of executor.runs) {
+      expect(JSON.stringify(run.options?.env)).not.toContain('operator');
     }
   });
 

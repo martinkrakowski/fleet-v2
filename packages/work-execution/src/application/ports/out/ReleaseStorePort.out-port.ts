@@ -63,8 +63,18 @@ export interface ReleaseStorePort {
     readonly buildId: string;
     readonly builtAtIso: string;
   }): Promise<ReleaseStoreWriteResult>;
-  /** Atomically repoint <root>/current at <sha>. */
-  repoint(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStoreWriteResult>;
+  /**
+   * Atomically repoint <root>/current at <sha>. Every check and the temporary
+   * link come first; `fence` is awaited last, and only when it answers true
+   * does the one rename run, with nothing awaited in between. A false or
+   * throwing fence is `fenced`: the temporary link is removed and `current`
+   * is untouched.
+   */
+  repoint(input: {
+    readonly root: string;
+    readonly sha: string;
+    readonly fence?: () => Promise<boolean>;
+  }): Promise<ReleaseStoreWriteResult | { readonly outcome: 'fenced' }>;
   /** Keep the newest `keep` verified builds; never remove current or previous. */
   prune(input: { readonly root: string; readonly keep: number }): Promise<ReleaseStorePruneResult>;
   /** Remove an incomplete build: this run's staging directory and its archive. */

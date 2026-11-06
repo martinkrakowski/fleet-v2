@@ -14,7 +14,8 @@
  * - The driver: a live lease refuses before any write; the build then runs
  *   outside any lock, and the repoint runs only while this process holds the
  *   conductor driver lease itself (acquired by CAS just before the repoint,
- *   re-checked immediately before it, released after it). A driver that took
+ *   re-checked by the store's fence immediately before its one rename, with a
+ *   margin of lease time left, and released after it). A driver that took
  *   the lease meanwhile makes the acquire fail, and nothing is repointed.
  * - Stale trees: the build runs in a staging directory the store creates
  *   exclusively for this run; only that directory is verified and moved to
@@ -22,9 +23,9 @@
  *   will reuse.
  *
  * The build is four reviewed argv steps through the command executor (no
- * shell); the git step is a local read with no hooks and no network, on a
- * filtered environment that never hands the operator's full environment to the
- * child. Nothing is echoed from a command, and no result carries a path or a
+ * shell); the git step is a local read with no hooks and no network, and every
+ * step runs on a filtered environment that never hands the operator's full
+ * environment (tokens, credentials) to a child. Nothing is echoed from a command, and no result carries a path or a
  * grant id; an unfinished prune is reported, never smoothed over.
  */
 
@@ -72,14 +73,30 @@ const YARN_STEP_TIMEOUT_MS = 900_000;
 const YARN_STEP_MAX_BUFFER_BYTES = 4_194_304;
 /** How long the release holds the driver lease around the repoint; well inside the lease maximum. */
 const REPOINT_FENCE_MS = 120_000;
+/** The lease time that must remain when the fence passes; the rename after it is one local syscall. */
+const REPOINT_MARGIN_MS = 60_000;
 /** The only operator variables the git child may see; everything else (tokens, credentials) stays out. */
 const GIT_ENV_ALLOWLIST: readonly string[] = ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ'];
+/**
+ * The only operator variables the tar, install and build children may see:
+ * the git set plus the yarn and corepack placement settings. No token,
+ * credential or forge variable reaches the commit's own scripts.
+ */
+const BUILD_ENV_ALLOWLIST: readonly string[] = [
+  ...GIT_ENV_ALLOWLIST,
+  'YARN_NM_MODE',
+  'YARN_CACHE_FOLDER',
+  'YARN_ENABLE_GLOBAL_CACHE',
+  'COREPACK_HOME',
+  'COREPACK_ENABLE_DOWNLOAD_PROMPT',
+];
 
 type ValidRequest = ManageReleaseRequest;
 
 interface HeldLease {
   readonly holderId: string;
   readonly fence: number;
+  readonly leaseUntilIso: string;
 }
 
 export class ManageReleaseUseCase implements ManageReleasePort {
@@ -221,18 +238,32 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       if (consumed !== null) {
         return consumed;
       }
-      const stillHeld = await this.deps.lease.check({ ...held, nowIso: this.deps.nowIso() });
-      if (stillHeld !== null) {
-        return 'driver-lease-live';
-      }
-      const repointed = await this.deps.store.repoint({ root: request.root, sha: target });
+      const repointed = await this.deps.store.repoint({
+        root: request.root,
+        sha: target,
+        fence: () => this.stillHolds(held),
+      });
       if (repointed.outcome === 'ok') {
         return null;
+      }
+      if (repointed.outcome === 'fenced') {
+        return 'driver-lease-live';
       }
       return repointed.outcome === 'not-found' ? 'not-found' : 'store-unreadable';
     } finally {
       await this.releaseLease(held);
     }
+  }
+
+  /**
+   * The repoint fence, awaited by the store right before its one rename: this
+   * process still holds the lease, and the lease has at least
+   * REPOINT_MARGIN_MS left, far more than one local rename takes.
+   */
+  private async stillHolds(held: HeldLease): Promise<boolean> {
+    const nowIso = this.deps.nowIso();
+    const refusal = await this.deps.lease.check({ holderId: held.holderId, fence: held.fence, nowIso });
+    return refusal === null && Date.parse(held.leaseUntilIso) - Date.parse(nowIso) >= REPOINT_MARGIN_MS;
   }
 
   private async acquireLease(request: ValidRequest, target: string): Promise<HeldLease | ManageReleaseRefusal> {
@@ -254,7 +285,9 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         leaseUntilIso: new Date(Date.parse(nowIso) + REPOINT_FENCE_MS).toISOString(),
         nowIso,
       });
-      return acquired.outcome === 'ok' ? { holderId, fence: acquired.lease.fence } : 'driver-lease-live';
+      return acquired.outcome === 'ok'
+        ? { holderId, fence: acquired.lease.fence, leaseUntilIso: acquired.lease.leaseUntilIso }
+        : 'driver-lease-live';
     } catch {
       return 'lease-unknown';
     }
@@ -263,7 +296,7 @@ export class ManageReleaseUseCase implements ManageReleasePort {
   /** Best effort: a release that fails leaves a lease that lapses on its own within the fence window. */
   private async releaseLease(held: HeldLease): Promise<void> {
     try {
-      await this.deps.lease.release({ ...held, nowIso: this.deps.nowIso() });
+      await this.deps.lease.release({ holderId: held.holderId, fence: held.fence, nowIso: this.deps.nowIso() });
     } catch {
       // The lease expires by itself; the repoint result stands.
     }
@@ -312,17 +345,13 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     const { buildId, buildDir, archivePath } = staging;
     const baseEnv = this.deps.env();
     const env: Record<string, string> = {
+      ...allowlisted(baseEnv, GIT_ENV_ALLOWLIST),
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_ALLOW_PROTOCOL: 'none',
       GIT_NO_LAZY_FETCH: '1',
       GIT_TERMINAL_PROMPT: '0',
     };
-    for (const key of GIT_ENV_ALLOWLIST) {
-      const value = baseEnv[key];
-      if (typeof value === 'string' && value !== '') {
-        env[key] = value;
-      }
-    }
+    const buildEnv = allowlisted(baseEnv, BUILD_ENV_ALLOWLIST);
     const gitBudget = { timeoutMs: GIT_STEP_TIMEOUT_MS, maxBufferBytes: GIT_STEP_MAX_BUFFER_BYTES, killProcessTree: true };
     const yarnBudget = { timeoutMs: YARN_STEP_TIMEOUT_MS, maxBufferBytes: YARN_STEP_MAX_BUFFER_BYTES, killProcessTree: true };
     const steps: ReadonlyArray<{ argv: readonly string[]; options: CommandRunOptions }> = [
@@ -343,9 +372,9 @@ export class ManageReleaseUseCase implements ManageReleasePort {
         ],
         options: { cwd: source, env, ...gitBudget },
       },
-      { argv: ['tar', '-xf', archivePath, '-C', buildDir], options: { cwd: request.root, ...gitBudget } },
-      { argv: ['yarn', 'install', '--immutable'], options: { cwd: buildDir, ...yarnBudget } },
-      { argv: ['yarn', 'build'], options: { cwd: buildDir, ...yarnBudget } },
+      { argv: ['tar', '-xf', archivePath, '-C', buildDir], options: { cwd: request.root, env: buildEnv, ...gitBudget } },
+      { argv: ['yarn', 'install', '--immutable'], options: { cwd: buildDir, env: buildEnv, ...yarnBudget } },
+      { argv: ['yarn', 'build'], options: { cwd: buildDir, env: buildEnv, ...yarnBudget } },
     ];
     for (const step of steps) {
       if (!(await this.stepSucceeds(step.argv, step.options))) {
@@ -390,6 +419,20 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       return false;
     }
   }
+}
+
+function allowlisted(
+  source: Record<string, string | undefined>,
+  keys: readonly string[],
+): Record<string, string> {
+  const picked: Record<string, string> = {};
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === 'string' && value !== '') {
+      picked[key] = value;
+    }
+  }
+  return picked;
 }
 
 /** The release action kind and the deterministic action id one grant is bound to. */

@@ -59,6 +59,37 @@ describe('ReleaseStoreAdapter', () => {
     expect(await fs.readFile(path.join(root, 'current', 'apps', 'cli', 'dist', 'bin.js'), 'utf8')).toBe('// cli\n');
   });
 
+  it('repoints only when the fence passes, and leaves current untouched otherwise', async () => {
+    await verified('a', 1);
+    await verified('b', 2);
+    expect(await adapter.repoint({ root, sha: A })).toEqual({ outcome: 'ok' });
+    let calls = 0;
+    expect(
+      await adapter.repoint({
+        root,
+        sha: B,
+        fence: async () => {
+          calls += 1;
+          return false;
+        },
+      }),
+    ).toEqual({ outcome: 'fenced' });
+    expect(
+      await adapter.repoint({
+        root,
+        sha: B,
+        fence: async () => {
+          throw new Error('lease unreadable');
+        },
+      }),
+    ).toEqual({ outcome: 'fenced' });
+    expect(calls).toBe(1);
+    expect(await fs.readlink(path.join(root, 'current'))).toBe(A);
+    expect((await fs.readdir(root)).sort()).toEqual([A, B, 'current']);
+    expect(await adapter.repoint({ root, sha: B, fence: async () => true })).toEqual({ outcome: 'ok' });
+    expect(await fs.readlink(path.join(root, 'current'))).toBe(B);
+  });
+
   it('refuses to repoint to a sha that is not a kept build', async () => {
     await verified('a', 1);
     await fs.mkdir(path.join(root, B));

@@ -118,7 +118,11 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     }
   }
 
-  async repoint(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStoreWriteResult> {
+  async repoint(input: {
+    readonly root: string;
+    readonly sha: string;
+    readonly fence?: () => Promise<boolean>;
+  }): Promise<ReleaseStoreWriteResult | { readonly outcome: 'fenced' }> {
     if (!SHA_PATTERN.test(input.sha)) {
       return { outcome: 'not-found' };
     }
@@ -136,6 +140,11 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
         return { outcome: 'unreadable' };
       }
       await fs.symlink(input.sha, temp);
+      if (input.fence !== undefined && !(await passesFence(input.fence))) {
+        await fs.rm(temp, { force: true }).catch(() => undefined);
+        return { outcome: 'fenced' };
+      }
+      // Nothing is awaited between the fence and this one atomic rename.
       await fs.rename(temp, path.join(input.root, CURRENT_NAME));
       return { outcome: 'ok' };
     } catch {
@@ -195,6 +204,14 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     } catch {
       return { outcome: 'unreadable' };
     }
+  }
+}
+
+async function passesFence(fence: () => Promise<boolean>): Promise<boolean> {
+  try {
+    return (await fence()) === true;
+  } catch {
+    return false;
   }
 }
 

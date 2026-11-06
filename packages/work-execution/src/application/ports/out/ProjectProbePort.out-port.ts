@@ -32,6 +32,25 @@ export interface ProjectProbeRequest {
   readonly clones: Readonly<Record<string, ProjectProbeClone>>;
 }
 
+/**
+ * The project's generator state, read from files only. `state` is fleet-v2's
+ * own vocabulary; the versions are the ones the project records and pins. A
+ * version the project does not state is null, never a guess.
+ */
+export type ProjectGeneratorStateValue =
+  | 'provisioned'
+  | 'provisioned-legacy'
+  | 'adopting'
+  | 'none';
+
+export interface ProjectGeneratorState {
+  readonly state: ProjectGeneratorStateValue;
+  /** The generator version the project records, or null when it records none. */
+  readonly generatorVersion: string | null;
+  /** The exact version the project pins, or null when it pins no exact one. */
+  readonly pinnedVersion: string | null;
+}
+
 export interface ProjectProbeReport {
   readonly probedAtIso: string;
   readonly probedFrom: 'orchestrator';
@@ -40,6 +59,13 @@ export interface ProjectProbeReport {
   readonly defaultBranch: string | null;
   /** `package.json` script NAMES from the first clone that answered; never their values. */
   readonly detectedScripts: readonly string[];
+  /**
+   * The project's generator state, read from files only. Absent when no clone
+   * answered, so a project that could not be read is never recorded as
+   * governed; `state: 'none'` means the clone answered and holds no generator
+   * markers.
+   */
+  readonly generatorState?: ProjectGeneratorState;
 }
 
 export interface ProjectProbePort {

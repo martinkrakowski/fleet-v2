@@ -60,7 +60,7 @@ import {
   type ReaperObservation,
   type ReaperPolicy,
 } from '../../domain/reaper-findings.js';
-import { REAPER_FINDING_KINDS, REQUEST_ID_PATTERN, reaperRepairKey } from '../../domain/lane-run-keys.js';
+import { REAPER_FINDING_KINDS, REAPER_SUBJECT_ID_PATTERN, REQUEST_ID_PATTERN, reaperRepairKey } from '../../domain/lane-run-keys.js';
 
 /**
  * The attention surface the reaper needs, declared locally so application
@@ -122,8 +122,43 @@ interface SettleContext {
   readonly attemptsById: ReadonlyMap<string, AttemptRecord>;
   readonly reservationById: ReadonlyMap<string, CapacityReservationRecord>;
   readonly attentionItems: readonly unknown[];
-  readonly staleAttentionBySubject: ReadonlyMap<string, { readonly kind: string; readonly subjectKind: string }>;
+  readonly staleAttentionBySubject: ReadonlyMap<string, StaleAttentionTarget>;
   readonly unknown: ReaperUnknownView[];
+}
+
+/**
+ * The open attention item behind one stale-attention finding. The finding's
+ * subject is `<attempt ref>:<item kind>`, so two open items of different kinds
+ * on one terminal attempt are two findings, each repaired and journalled on its
+ * own key.
+ */
+interface StaleAttentionTarget {
+  readonly ref: string;
+  readonly kind: string;
+  readonly subjectKind: string;
+}
+
+const STALE_ATTENTION_DEFAULT_KIND = 'stale-attention';
+const ATTENTION_KIND_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+
+function staleAttentionSubject(ref: string, kind: string): string {
+  return ref + ':' + kind;
+}
+
+/** The (ref, kind) a stale-attention subject names: the pass's map first, else parse it; a bare id is the legacy form. */
+function staleAttentionTarget(
+  subject: string,
+  known: ReadonlyMap<string, StaleAttentionTarget>,
+): StaleAttentionTarget {
+  const mapped = known.get(subject);
+  if (mapped !== undefined) {
+    return mapped;
+  }
+  const split = subject.lastIndexOf(':');
+  if (split > 0 && ATTENTION_KIND_PATTERN.test(subject.slice(split + 1))) {
+    return { ref: subject.slice(0, split), kind: subject.slice(split + 1), subjectKind: 'attempt' };
+  }
+  return { ref: subject, kind: STALE_ATTENTION_DEFAULT_KIND, subjectKind: 'attempt' };
 }
 
 type ClearAttentionShapeResult = { readonly outcome?: string };
@@ -331,7 +366,7 @@ interface ObservationBuild {
   /** Subjects skipped by the per-pass cap: their open findings are never closed. */
   readonly cappedKeys: Set<string>;
   /** The attention item behind each stale-attention subject, so a clear targets it. */
-  readonly staleAttentionBySubject: Map<string, { kind: string; subjectKind: string }>;
+  readonly staleAttentionBySubject: Map<string, StaleAttentionTarget>;
   readonly unknown: ReaperUnknownView[];
   subjects: number;
 }
@@ -401,7 +436,10 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     let findings: ReaperFinding[] = [];
     if (facts.attempts !== null) {
       await this.buildObservations(built, facts, nowMs, graceMs);
-      findings = [...classifyZombies({ observations: built.observations, openFindings: openRecords.map((r) => r.finding) }, nowIso, policy)];
+      findings = classifyZombies({ observations: built.observations, openFindings: openRecords.map((r) => r.finding) }, nowIso, policy).map(
+        // The reaper never releases capacity: a leaked slot is report-only whatever the policy says.
+        (finding) => (finding.kind === 'leaked-slot' && finding.action === 'repair' ? { ...finding, action: 'report' as const } : finding),
+      );
     }
 
     // 5. Upsert under reused or freshly minted ids.
@@ -466,7 +504,7 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       attemptsById: new Map<string, AttemptRecord>(),
       reservationById: new Map<string, CapacityReservationRecord>(),
       cappedKeys: new Set<string>(),
-      staleAttentionBySubject: new Map<string, { kind: string; subjectKind: string }>(),
+      staleAttentionBySubject: new Map<string, StaleAttentionTarget>(),
       unknown,
       subjects: 0,
     };
@@ -602,21 +640,27 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     if (attempt === undefined || !TERMINAL_ATTEMPT_STATES.has(attempt.state)) {
       return;
     }
-    if (!screenSubject(build, subj.ref) || !claimSubjectSlot(build, 'stale-attention', subj.ref)) {
+    if (!screenSubject(build, subj.ref)) {
+      return;
+    }
+    const itemKind = typeof raw.kind === 'string' ? raw.kind : STALE_ATTENTION_DEFAULT_KIND;
+    const subject = staleAttentionSubject(subj.ref, itemKind);
+    if (!ATTENTION_KIND_PATTERN.test(itemKind) || !REAPER_SUBJECT_ID_PATTERN.test(subject) || !isSafeSubject(subject)) {
+      pushBounded(build.unknown, { subject: '', reason: 'subject-unsafe' });
+      return;
+    }
+    if (build.staleAttentionBySubject.has(subject) || !claimSubjectSlot(build, 'stale-attention', subject)) {
       return;
     }
     build.observations.push({
       kind: 'stale-attention',
-      subject: subj.ref,
+      subject,
       youngActivity: false,
       attentionOpen: true,
       questionUnanswered: false,
       runTerminal: true,
     });
-    build.staleAttentionBySubject.set(subj.ref, {
-      kind: typeof raw.kind === 'string' ? raw.kind : 'stale-attention',
-      subjectKind: 'attempt',
-    });
+    build.staleAttentionBySubject.set(subject, { ref: subj.ref, kind: itemKind, subjectKind: 'attempt' });
   }
 
   /**
@@ -902,8 +946,9 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
 
   /**
    * The keyed record-only repair of one stale-attention finding: clear the
-   * underlying open attention item. The finding's subject is the item's
-   * subject ref; the item's own kind is reused so the clear targets it.
+   * underlying open attention item. The finding's subject names the item's
+   * attempt ref and kind, so the clear targets exactly that item and the
+   * journal key is its own.
    */
   private async repairStaleAttention(
     nowIso: string,
@@ -912,66 +957,59 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     findingId: string,
     unknown: ReaperUnknownView[],
     attentionItems: readonly unknown[],
-    staleAttentionBySubject: ReadonlyMap<string, { kind: string; subjectKind: string }>,
+    staleAttentionBySubject: ReadonlyMap<string, StaleAttentionTarget>,
   ): Promise<ReaperRepairView> {
     const keyResult = reaperRepairKey(finding.subject, finding.kind, findingId);
     if (!keyResult.ok) {
-      return { key: '', kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'key-refused' };
+      return repairView('', finding, 'skipped', 'key-refused');
     }
     const key = keyResult.key;
+    const target = staleAttentionTarget(finding.subject, staleAttentionBySubject);
 
     const entries = await this.safeListForKey(key, unknown, finding.subject, finding.kind);
     if (entries === null) {
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'journal-unreadable' };
+      return repairView(key, finding, 'skipped', 'journal-unreadable');
     }
-
-    const finalResult = entries.find((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous');
-    if (finalResult !== undefined) {
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'already-repaired' };
+    if (entries.some((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous')) {
+      return repairView(key, finding, 'skipped', 'already-repaired');
     }
-
-    const intent = entries.find((entry) => entry.kind === 'intent');
-    if (intent !== undefined) {
-      if (!this.isAttentionItemOpen(finding.subject, attentionItems)) {
-        const journaled = await this.journalResult(key, nowIso, 'reconciled', null, unknown, finding.subject, finding.kind);
-        if (!journaled) {
-          return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
-        }
-        return { key, kind: finding.kind, subject: finding.subject, outcome: 'reconciled' };
+    if (entries.some((entry) => entry.kind === 'intent')) {
+      if (this.isAttentionItemOpen(target.ref, target.kind, attentionItems)) {
+        return repairView(key, finding, 'skipped', 'intent-without-result');
       }
-      return {
-        key,
-        kind: finding.kind,
-        subject: finding.subject,
-        outcome: 'skipped',
-        reasonCode: 'intent-without-result',
-      };
+      return await this.journalStaleAttention(key, nowIso, finding, 'reconciled', unknown);
     }
 
     const appended = await this.appendIntent(key, nowIso, findingId, unknown, finding.subject, finding.kind);
     if (appended === 'duplicate-key') {
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'already-intended' };
+      return repairView(key, finding, 'skipped', 'already-intended');
     }
     if (appended !== 'appended') {
-      return {
-        key,
-        kind: finding.kind,
-        subject: finding.subject,
-        outcome: 'skipped',
-        reasonCode: appended === 'refused' ? 'journal-refused' : 'journal-unwritable',
-      };
+      return repairView(key, finding, 'skipped', appended === 'refused' ? 'journal-refused' : 'journal-unwritable');
     }
 
-    const attentionMeta = staleAttentionBySubject.get(finding.subject);
-    const attentionKind = attentionMeta?.kind ?? 'stale-attention';
+    const outcome = await this.clearStaleAttentionItem(projectId, finding, target, unknown);
+    if (outcome === null) {
+      return repairView(key, finding, 'skipped', 'attention-unclearable');
+    }
+    return await this.journalStaleAttention(key, nowIso, finding, outcome, unknown);
+  }
+
+  /** Clear the one open item; its outcome as a journal outcome, or null when the clear threw. */
+  private async clearStaleAttentionItem(
+    projectId: string,
+    finding: ReaperFinding,
+    target: StaleAttentionTarget,
+    unknown: ReaperUnknownView[],
+  ): Promise<'completed' | 'reconciled' | 'refused' | null> {
     let clear: ClearAttentionShapeResult;
     try {
       clear = (await this.deps.attention.clearAttentionItem(
         {
           action: 'resolve',
           projectId,
-          kind: attentionKind,
-          subject: { kind: 'attempt', ref: finding.subject },
+          kind: target.kind,
+          subject: { kind: 'attempt', ref: target.ref },
           reason: 'stale',
         },
         'machine',
@@ -979,29 +1017,28 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       )) as ClearAttentionShapeResult;
     } catch {
       unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'attention-unclearable' });
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'attention-unclearable' };
+      return null;
     }
-
     const outcome = clear?.outcome;
     if (outcome === 'cleared') {
-      const journaled = await this.journalResult(key, nowIso, 'completed', null, unknown, finding.subject, finding.kind);
-      if (!journaled) {
-        return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
-      }
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'completed' };
+      return 'completed';
     }
-    if (outcome === 'unchanged' || outcome === 'not-found') {
-      const journaled = await this.journalResult(key, nowIso, 'reconciled', null, unknown, finding.subject, finding.kind);
-      if (!journaled) {
-        return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
-      }
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'reconciled' };
-    }
-    const journaled = await this.journalResult(key, nowIso, 'refused', null, unknown, finding.subject, finding.kind);
+    return outcome === 'unchanged' || outcome === 'not-found' ? 'reconciled' : 'refused';
+  }
+
+  /** Journal the final result of one stale-attention repair and answer its view. */
+  private async journalStaleAttention(
+    key: string,
+    nowIso: string,
+    finding: ReaperFinding,
+    outcome: 'completed' | 'reconciled' | 'refused',
+    unknown: ReaperUnknownView[],
+  ): Promise<ReaperRepairView> {
+    const journaled = await this.journalResult(key, nowIso, outcome, null, unknown, finding.subject, finding.kind);
     if (!journaled) {
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
+      return repairView(key, finding, 'skipped', 'result-unwritten');
     }
-    return { key, kind: finding.kind, subject: finding.subject, outcome: 'refused' };
+    return repairView(key, finding, outcome);
   }
 
   /** Append one intent entry; a failure is recorded and answered, never thrown. */
@@ -1183,7 +1220,8 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
         return false;
       }
       if (kind === 'stale-attention') {
-        if (!this.isAttentionItemOpen(subject, ctx.attentionItems)) {
+        const target = staleAttentionTarget(subject, ctx.staleAttentionBySubject);
+        if (!this.isAttentionItemOpen(target.ref, target.kind, ctx.attentionItems)) {
           return await this.journalResult(key, ctx.nowIso, 'reconciled', null, ctx.unknown, subject, kind);
         }
         return false;
@@ -1213,7 +1251,8 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       return !TERMINAL_ATTEMPT_STATES.has(attempt.state);
     }
     if (kind === 'stale-attention') {
-      return !this.isAttentionItemOpen(subject, ctx.attentionItems);
+      const target = staleAttentionTarget(subject, ctx.staleAttentionBySubject);
+      return !this.isAttentionItemOpen(target.ref, target.kind, ctx.attentionItems);
     }
     return false;
   }
@@ -1233,18 +1272,18 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     } catch {
       return;
     }
+    const stale = record.finding.kind === 'stale-attention';
+    const target = stale ? staleAttentionTarget(record.finding.subject, ctx.staleAttentionBySubject) : null;
     const subjectKind = record.finding.kind === 'leaked-slot' ? 'reservation' : 'attempt';
-    const attentionKind =
-      record.finding.kind === 'stale-attention'
-        ? (ctx.staleAttentionBySubject.get(record.finding.subject)?.kind ?? 'stale-attention')
-        : record.finding.kind;
+    const attentionKind = target?.kind ?? record.finding.kind;
+    const attentionRef = target?.ref ?? record.finding.subject;
     try {
       await this.deps.attention.clearAttentionItem(
         {
           action: 'resolve',
           projectId: ctx.projectId,
           kind: attentionKind,
-          subject: { kind: subjectKind, ref: record.finding.subject },
+          subject: { kind: subjectKind, ref: attentionRef },
           reason: 'stale',
         },
         'machine',
@@ -1255,14 +1294,14 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     }
   }
 
-  /** Whether an open attention item references `ref`. */
-  private isAttentionItemOpen(ref: string, attentionItems: readonly unknown[]): boolean {
+  /** Whether an open attention item of `kind` references `ref`. */
+  private isAttentionItemOpen(ref: string, kind: string, attentionItems: readonly unknown[]): boolean {
     for (const raw of attentionItems) {
       if (!isPlainObject(raw)) {
         continue;
       }
-      const item = raw as { state?: unknown; subject?: unknown };
-      if (item.state !== 'open') {
+      const item = raw as { state?: unknown; subject?: unknown; kind?: unknown };
+      if (item.state !== 'open' || (typeof item.kind === 'string' ? item.kind : STALE_ATTENTION_DEFAULT_KIND) !== kind) {
         continue;
       }
       const subj = item.subject as { ref?: unknown } | null;
@@ -1289,6 +1328,12 @@ function isReaperAttentionOutcome(value: unknown): value is ReaperAttentionOutco
 
 function truncate(summary: string): string {
   return summary.length <= MAX_SUMMARY_LENGTH ? summary : summary.slice(0, MAX_SUMMARY_LENGTH);
+}
+
+function repairView(key: string, finding: ReaperFinding, outcome: ReaperRepairView['outcome'], reasonCode?: string): ReaperRepairView {
+  return reasonCode === undefined
+    ? { key, kind: finding.kind, subject: finding.subject, outcome }
+    : { key, kind: finding.kind, subject: finding.subject, outcome, reasonCode };
 }
 
 function keyOf(subject: string, kind: string, findingId: string): string {

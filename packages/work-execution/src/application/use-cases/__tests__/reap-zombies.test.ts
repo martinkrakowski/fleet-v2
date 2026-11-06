@@ -692,7 +692,7 @@ describe('reap zombies', () => {
   it('an open attention item for a terminal attempt is reported as stale-attention', async () => {
     const store = new InMemoryReaperFindingRepositoryAdapter();
     // A prior sighting, so the second sighting past the grace period reports.
-    await seedOpenFinding(store, 'att-1', 'stale-attention');
+    await seedOpenFinding(store, 'att-1:dead-attempt', 'stale-attention');
     const attentionItems = [
       {
         itemId: 'attn-1',
@@ -717,7 +717,7 @@ describe('reap zombies', () => {
     const result = await runPass(harness);
     const finding = result.findings.find((entry) => entry.kind === 'stale-attention');
     expect(finding).toBeDefined();
-    expect(finding?.subject).toBe('att-1');
+    expect(finding?.subject).toBe('att-1:dead-attempt');
     expect(finding?.action).toBe('report');
     // A stale-attention finding raises nothing new: the item is already open.
     expect(result.attention).toEqual([]);
@@ -800,9 +800,66 @@ describe('reap zombies', () => {
     const result = await runPass(harness, { policy });
     expect(releaseCalls).toBe(0);
     expect(result.findings.find((entry) => entry.kind === 'leaked-slot')?.subject).toBe('res-1');
-    const repair = result.repairs.find((entry) => entry.kind === 'leaked-slot');
-    expect(repair).toMatchObject({ outcome: 'skipped', reasonCode: 'repair-not-available' });
+    // Report-only: the stored finding, the view and the attention summary never say `repair`.
+    expect(result.findings.find((entry) => entry.kind === 'leaked-slot')?.action).toBe('report');
+    expect((await store.listOpenFindings()).find((record) => record.finding.kind === 'leaked-slot')?.finding.action).toBe('report');
+    expect(result.repairs.find((entry) => entry.kind === 'leaked-slot')).toBeUndefined();
+    expect(harness.attention.recorded.some((entry) => String(entry.body.summary).includes('action repair'))).toBe(false);
     expect(harness.journal.state.appendCalls).toEqual([]);
+  });
+
+  it('two open attention items of different kinds on one terminal attempt are each cleared and journalled', async () => {
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    await seedOpenFinding(store, 'att-1:approval', 'stale-attention');
+    await seedOpenFinding(store, 'att-1:question', 'stale-attention');
+    const item = (kind: string): Record<string, unknown> => ({
+      itemId: `attn-${kind}`,
+      projectId: PROJECT,
+      kind,
+      subject: { kind: 'attempt', ref: 'att-1' },
+      workOrderId: 'wo-a',
+      summary: 's',
+      state: 'open',
+      raisedBy: 'reaper',
+      firstRaisedAtIso: BEFORE,
+      lastRaisedAtIso: BEFORE,
+      raisedCount: 1,
+      clearance: null,
+    });
+    const attention: AttentionState = { recorded: [], cleared: [] };
+    const base = makeAttention(attention, [item('approval'), item('question')]);
+    let failApproval = true;
+    const attentionPort: ReaperAttentionPort = {
+      ...base,
+      clearAttentionItem: (request: unknown, via: string, actor: string) => {
+        if (failApproval && (request as { kind: string }).kind === 'approval') {
+          attention.cleared.push({ request: request as Record<string, unknown>, via, actor });
+          return Promise.reject(new Error('clear failed'));
+        }
+        return base.clearAttentionItem(request, via, actor);
+      },
+    };
+    const harness = baseHarness({
+      attempts: [attemptFixture('att-1', { state: 'ended', sessionId: null })],
+      store,
+      attention,
+      attentionPort,
+    });
+    const first = await runPass(harness, { policy: { graceMinutes: 5, repairs: { 'stale-attention': true } } });
+    const repairs = first.repairs.filter((entry) => entry.kind === 'stale-attention');
+    expect(repairs.map((entry) => entry.subject).sort()).toEqual(['att-1:approval', 'att-1:question']);
+    expect(repairs.find((entry) => entry.subject === 'att-1:question')?.outcome).toBe('completed');
+    expect(repairs.find((entry) => entry.subject === 'att-1:approval')).toMatchObject({ outcome: 'skipped', reasonCode: 'attention-unclearable' });
+    expect(attention.cleared.map((entry) => (entry.request as { kind: string }).kind).sort()).toEqual(['approval', 'question']);
+    const results = harness.journal.state.appendCalls.filter((entry) => entry.kind === 'result');
+    expect(results).toHaveLength(1);
+    expect(results[0]?.key).toMatch(/^reaper\/att-1:question\/stale-attention@/);
+    // A second pass does not clear the finished kind again.
+    failApproval = false;
+    attention.cleared.length = 0;
+    const second = await build(harness).reapZombies(request({ nowIso: '2026-11-06T12:30:00.000Z', policy: { graceMinutes: 5, repairs: { 'stale-attention': true } } }));
+    expect(second.repairs.find((entry) => entry.subject === 'att-1:question')).toMatchObject({ outcome: 'skipped', reasonCode: 'already-repaired' });
+    expect(attention.cleared.filter((entry) => (entry.request as { kind: string }).kind === 'question')).toHaveLength(0);
   });
 
   it('a fractional graceMinutes is accepted and used', async () => {

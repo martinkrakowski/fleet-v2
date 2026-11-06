@@ -25,6 +25,8 @@ import {
 import type {
   CapacityReservationClaim,
   ExecutionJournalPort,
+  ReleaseCapacityReservationIfUnchangedRequest,
+  ReleaseCapacityReservationIfUnchangedResult,
   ReserveCapacityAtomicallyRequest,
   ReserveCapacityAtomicallyResult,
   SelectRecordUnderLockVerdict,
@@ -33,14 +35,18 @@ import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out
 import { NoopChangeSignalAdapter } from './NoopChangeSignalAdapter.adapter.js';
 import {
   assertValidSchemaVersionPolicy,
+  FileLockTimeoutError,
   inspectVersionedRecordListBytes,
   quarantineUnreadable,
   readStoreRecordSchemaVersion,
+  StateFileUnreadableError,
   StateFileUnknownVersionError,
   withFileLock,
   writeJsonAtomically,
   type VersionedRecordParseResult,
 } from './file-store.js';
+import { isCanonicalIso } from '../../domain/lane-activity-records.js';
+import { containsSecretShape } from '@fleet/shared';
 
 /** The schema-version policy of `journal.json` (Q5a, D6). */
 export const JOURNAL_STORE_VERSION_POLICY = assertValidSchemaVersionPolicy('journal.json', {
@@ -75,6 +81,57 @@ function isCapacityReservationRecord(value: unknown): value is CapacityReservati
 
 function isNonEmptyStringField(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
+}
+
+/**
+ * Validation for `releaseCapacityReservationIfUnchanged` (plan §3.9.2). Returns
+ * a detail code only for diagnostics that never carry the offending value.
+ * Every failure — including a property read that throws — is `invalid-request`
+ * and never an exception.
+ */
+const FENCED_RELEASE_REQUEST_KEYS = new Set([
+  'attemptId',
+  'reservationId',
+  'attemptRevision',
+  'releasedAtIso',
+  'readAttemptRevision',
+]);
+
+function validateFencedReleaseRequest(request: ReleaseCapacityReservationIfUnchangedRequest): string | null {
+  try {
+    if (typeof request !== 'object' || request === null || Array.isArray(request)) {
+      return 'not-an-object';
+    }
+    const value = request as unknown as Record<string, unknown>;
+    const keys = Object.keys(value);
+    if (keys.length !== FENCED_RELEASE_REQUEST_KEYS.size || keys.some((key) => !FENCED_RELEASE_REQUEST_KEYS.has(key))) {
+      return 'unknown-or-missing-key';
+    }
+    for (const field of ['attemptId', 'reservationId'] as const) {
+      const candidate = value[field];
+      if (
+        typeof candidate !== 'string' ||
+        candidate.length === 0 ||
+        Buffer.byteLength(candidate, 'utf8') > 256 ||
+        containsSecretShape(candidate)
+      ) {
+        return 'invalid-id';
+      }
+    }
+    const revision = value['attemptRevision'];
+    if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) {
+      return 'invalid-revision';
+    }
+    if (!isCanonicalIso(value['releasedAtIso'])) {
+      return 'invalid-timestamp';
+    }
+    if (typeof value['readAttemptRevision'] !== 'function') {
+      return 'invalid-read-attempt-revision';
+    }
+    return null;
+  } catch {
+    return 'unreadable-object';
+  }
 }
 
 /** A journal entry in canonical stored shape: every writer stamps `schemaVersion` (Q5a, D6). */
@@ -503,6 +560,123 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
       });
     }
     return released;
+  }
+
+  async releaseCapacityReservationIfUnchanged(
+    request: ReleaseCapacityReservationIfUnchangedRequest,
+  ): Promise<ReleaseCapacityReservationIfUnchangedResult> {
+    try {
+      const validated = validateFencedReleaseRequest(request);
+      if (validated !== null) {
+        return { outcome: 'refused', reason: 'invalid-request' };
+      }
+
+      const stateDir = this.options?.stateDir;
+      if (stateDir === undefined) {
+        return this.releaseInMemoryIfUnchanged(request);
+      }
+
+      const target = path.join(stateDir, 'reservations.json');
+      const lockPath = path.join(stateDir, 'reservations.json.lock');
+
+      let before: ChangeSignal['before'] = null;
+      let written: ChangeSignal['written'] = null;
+      let releasedId: string | null = null;
+
+      try {
+        const outcome = await withFileLock(lockPath, async (): Promise<
+          Exclude<ReleaseCapacityReservationIfUnchangedResult, { outcome: 'unknown'; reason: 'lock-timeout' }>
+        > => {
+          try {
+            const stat = await fs.stat(target);
+            before = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+          } catch {
+            before = null;
+          }
+          let reservations: Map<string, CapacityReservationRecord>;
+          try {
+            reservations = await this.readReservationsFromDisk(target);
+          } catch (error) {
+            if (error instanceof StateFileUnreadableError || error instanceof StateFileUnknownVersionError) {
+              return { outcome: 'unknown', reason: 'unreadable' };
+            }
+            throw error;
+          }
+          const held = [...reservations.values()].find(
+            (reservation) => reservation.attemptId === request.attemptId && reservation.held === true,
+          );
+          if (held === undefined) return { outcome: 'not-held' };
+          if (held.id !== request.reservationId) return { outcome: 'changed' };
+          let currentRevision: number | null;
+          try {
+            currentRevision = await request.readAttemptRevision();
+          } catch {
+            return { outcome: 'unknown', reason: 'attempt-unknown' };
+          }
+          if (currentRevision === null || currentRevision !== request.attemptRevision) {
+            return { outcome: 'changed' };
+          }
+          reservations.set(
+            held.id,
+            normalizeReservationRecord({ ...held, held: false, releasedAtIso: request.releasedAtIso }),
+          );
+          await writeJsonAtomically(target, [...reservations.values()]);
+          try {
+            const stat = await fs.stat(target);
+            written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+          } catch {
+            written = null;
+          }
+          releasedId = held.id;
+          return { outcome: 'released', reservationId: held.id };
+        });
+
+        if (outcome.outcome === 'released' && releasedId !== null) {
+          this.signal({
+            kind: 'capacity',
+            id: releasedId,
+            stateFile: path.resolve(target),
+            before,
+            written,
+          });
+        }
+        return outcome;
+      } catch (error) {
+        if (error instanceof FileLockTimeoutError) {
+          return { outcome: 'unknown', reason: 'lock-timeout' };
+        }
+        if (error instanceof StateFileUnreadableError || error instanceof StateFileUnknownVersionError) {
+          return { outcome: 'unknown', reason: 'unreadable' };
+        }
+        return { outcome: 'unknown', reason: 'unreadable' };
+      }
+    } catch {
+      return { outcome: 'unknown', reason: 'unreadable' };
+    }
+  }
+
+  private releaseInMemoryIfUnchanged(
+    request: ReleaseCapacityReservationIfUnchangedRequest,
+  ): Promise<ReleaseCapacityReservationIfUnchangedResult> {
+    const held = [...this.inMemoryReservationsById.values()].find(
+      (reservation) => reservation.attemptId === request.attemptId && reservation.held === true,
+    );
+    if (held === undefined) return Promise.resolve({ outcome: 'not-held' });
+    if (held.id !== request.reservationId) return Promise.resolve({ outcome: 'changed' });
+    return request
+      .readAttemptRevision()
+      .then((currentRevision) => {
+        if (currentRevision === null || currentRevision !== request.attemptRevision) {
+          return { outcome: 'changed' } as const;
+        }
+        this.inMemoryReservationsById.set(
+          held.id,
+          normalizeReservationRecord({ ...held, held: false, releasedAtIso: request.releasedAtIso }),
+        );
+        this.signal({ kind: 'capacity', id: held.id, stateFile: null, before: null, written: null });
+        return { outcome: 'released', reservationId: held.id } as const;
+      })
+      .catch(() => ({ outcome: 'unknown', reason: 'attempt-unknown' }) as const);
   }
 
   private async readJournalFromDisk(target: string): Promise<ActionJournalEntryRecord[]> {

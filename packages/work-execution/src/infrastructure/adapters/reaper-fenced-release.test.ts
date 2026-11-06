@@ -1,0 +1,270 @@
+import { createHash } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import type { CapacityReservationRecord } from '../../domain/execution-records.js';
+import type {
+  ReleaseCapacityReservationIfUnchangedRequest,
+} from '../../application/ports/out/ExecutionJournalPort.out-port.js';
+import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
+import { ExecutionJournalAdapter } from './ExecutionJournalAdapter.adapter.js';
+
+function heldReservation(overrides: Partial<CapacityReservationRecord> = {}): CapacityReservationRecord {
+  return {
+    id: 'res-1',
+    attemptId: 'att-1',
+    hostId: 'host-1',
+    slotIndex: 0,
+    held: true,
+    seatTool: 'opencode',
+    reservedAtIso: '2026-11-06T10:00:00.000Z',
+    releasedAtIso: null,
+    ...overrides,
+  };
+}
+
+function fencedRequest(
+  overrides: Partial<ReleaseCapacityReservationIfUnchangedRequest> = {},
+): ReleaseCapacityReservationIfUnchangedRequest {
+  return {
+    attemptId: 'att-1',
+    reservationId: 'res-1',
+    attemptRevision: 3,
+    releasedAtIso: '2026-11-06T11:00:00.000Z',
+    readAttemptRevision: () => Promise.resolve(3),
+    ...overrides,
+  };
+}
+
+async function fileSha256(filePath: string): Promise<string> {
+  return createHash('sha256').update(await fs.readFile(filePath)).digest('hex');
+}
+
+/**
+ * Secret-shaped fakes are assembled at runtime from inert pieces so this file
+ * never contains a credential-shaped literal; the scanner still recognises the
+ * shape, which is the point under test.
+ */
+function fakeSecretShape(): string {
+  return `gh${'p_'}${'A'.repeat(30)}`;
+}
+
+describe('ExecutionJournalAdapter fenced capacity release (plan §3.9.2)', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-reaper-release-test-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('releases the reservation while the attempt still reads at the observed revision', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await adapter.saveCapacityReservation(heldReservation());
+
+    const result = await adapter.releaseCapacityReservationIfUnchanged(fencedRequest());
+
+    expect(result).toEqual({ outcome: 'released', reservationId: 'res-1' });
+    const active = await adapter.listActiveReservations();
+    expect(active.map((r) => r.id)).toEqual([]);
+    const stored = JSON.parse(await fs.readFile(path.join(tempDir, 'reservations.json'), 'utf8')) as Array<{
+      id: string;
+      held: boolean;
+      releasedAtIso: string | null;
+    }>;
+    const released = stored.find((r) => r.id === 'res-1');
+    expect(released?.held).toBe(false);
+    expect(released?.releasedAtIso).toBe('2026-11-06T11:00:00.000Z');
+  });
+
+  it('reports changed and writes nothing when the attempt revision moved', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await adapter.saveCapacityReservation(heldReservation());
+    const target = path.join(tempDir, 'reservations.json');
+    const before = await fileSha256(target);
+
+    const result = await adapter.releaseCapacityReservationIfUnchanged(
+      fencedRequest({ readAttemptRevision: () => Promise.resolve(4) }),
+    );
+
+    expect(result).toEqual({ outcome: 'changed' });
+    const active = await adapter.listActiveReservations();
+    expect(active.map((r) => r.id)).toEqual(['res-1']);
+    expect(await fileSha256(target)).toBe(before);
+  });
+
+  it('reports changed when the observed reservation is not the held one', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await adapter.saveCapacityReservation(heldReservation());
+
+    const result = await adapter.releaseCapacityReservationIfUnchanged(
+      fencedRequest({ reservationId: 'res-other' }),
+    );
+
+    expect(result).toEqual({ outcome: 'changed' });
+    const active = await adapter.listActiveReservations();
+    expect(active.map((r) => r.id)).toEqual(['res-1']);
+  });
+
+  it('is idempotent: a second fenced release finds nothing held and writes nothing', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await adapter.saveCapacityReservation(heldReservation());
+    const first = await adapter.releaseCapacityReservationIfUnchanged(fencedRequest());
+    expect(first).toEqual({ outcome: 'released', reservationId: 'res-1' });
+    const target = path.join(tempDir, 'reservations.json');
+    const before = await fileSha256(target);
+
+    const second = await adapter.releaseCapacityReservationIfUnchanged(fencedRequest());
+
+    expect(second).toEqual({ outcome: 'not-held' });
+    expect(await fileSha256(target)).toBe(before);
+  });
+
+  it('reports unknown and holds the reservation when the attempt revision cannot be read', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await adapter.saveCapacityReservation(heldReservation());
+
+    const result = await adapter.releaseCapacityReservationIfUnchanged(
+      fencedRequest({
+        readAttemptRevision: () => Promise.reject(new Error('attempt store unavailable')),
+      }),
+    );
+
+    expect(result).toEqual({ outcome: 'unknown', reason: 'attempt-unknown' });
+    const active = await adapter.listActiveReservations();
+    expect(active.map((r) => r.id)).toEqual(['res-1']);
+  });
+
+  it('reports unknown when the reservations store is unreadable', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    await adapter.saveCapacityReservation(heldReservation());
+    const target = path.join(tempDir, 'reservations.json');
+    await fs.writeFile(target, '{ corrupt reservations', 'utf8');
+    const corruptBytes = await fileSha256(target);
+
+    const result = await adapter.releaseCapacityReservationIfUnchanged(fencedRequest());
+
+    expect(result).toEqual({ outcome: 'unknown', reason: 'unreadable' });
+    // An unreadable store is never `not-held` and never `released`: nothing
+    // was written and the next pass can still complete on the same file.
+    expect(await fileSha256(target)).toBe(corruptBytes);
+  });
+
+  it('refuses a malformed request without throwing', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    const badInputs: Array<{ label: string; value: unknown }> = [
+      { label: 'null', value: null },
+      { label: 'non-object', value: 'release' },
+      { label: 'sparse array', value: [] },
+      { label: 'missing field', value: { attemptId: 'att-1', reservationId: 'res-1', attemptRevision: 3 } },
+      {
+        label: 'wrong-typed field',
+        value: {
+          attemptId: 'att-1',
+          reservationId: 'res-1',
+          attemptRevision: '3',
+          releasedAtIso: '2026-11-06T11:00:00.000Z',
+          readAttemptRevision: () => Promise.resolve(3),
+        },
+      },
+      {
+        label: 'unknown key',
+        value: {
+          attemptId: 'att-1',
+          reservationId: 'res-1',
+          attemptRevision: 3,
+          releasedAtIso: '2026-11-06T11:00:00.000Z',
+          readAttemptRevision: () => Promise.resolve(3),
+          outcome: 'released',
+        },
+      },
+      {
+        label: 'getter throws',
+        value: Object.defineProperties(
+          {},
+          {
+            attemptId: {
+              get() {
+                throw new Error('getter refused');
+              },
+              enumerable: true,
+            },
+          },
+        ),
+      },
+    ];
+
+    for (const bad of badInputs) {
+      const result = await adapter.releaseCapacityReservationIfUnchanged(
+        bad.value as ReleaseCapacityReservationIfUnchangedRequest,
+      );
+      expect(result, bad.label).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+    }
+  });
+
+  it('never echoes a path or a secret-shaped value', async () => {
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir });
+    const secretAttempt = fakeSecretShape();
+    const refused = await adapter.releaseCapacityReservationIfUnchanged(
+      fencedRequest({ attemptId: secretAttempt }),
+    );
+    expect(refused).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+
+    await adapter.saveCapacityReservation(heldReservation());
+    const unknown = await adapter.releaseCapacityReservationIfUnchanged(
+      fencedRequest({
+        readAttemptRevision: () => Promise.reject(new Error(`/private/${tempDir}/secrets ${secretAttempt}`)),
+      }),
+    );
+    expect(unknown).toEqual({ outcome: 'unknown', reason: 'attempt-unknown' });
+
+    const serialised = JSON.stringify([refused, unknown]);
+    expect(serialised).not.toContain('fleet-reaper-release-test');
+    expect(serialised).not.toContain(fakeSecretShape());
+    expect(serialised.startsWith('[{"outcome":')).toBe(true);
+  });
+
+  it('releases the held reservation in memory and reports changed when the attempt moved', async () => {
+    const adapter = new ExecutionJournalAdapter();
+    await adapter.saveCapacityReservation(heldReservation({ id: 'res-mem', attemptId: 'att-mem' }));
+
+    const changed = await adapter.releaseCapacityReservationIfUnchanged(
+      fencedRequest({
+        attemptId: 'att-mem',
+        reservationId: 'res-mem',
+        readAttemptRevision: () => Promise.resolve(7),
+      }),
+    );
+    expect(changed).toEqual({ outcome: 'changed' });
+    expect((await adapter.listActiveReservations()).map((r) => r.id)).toEqual(['res-mem']);
+
+    const released = await adapter.releaseCapacityReservationIfUnchanged(
+      fencedRequest({ attemptId: 'att-mem', reservationId: 'res-mem' }),
+    );
+    expect(released).toEqual({ outcome: 'released', reservationId: 'res-mem' });
+    expect((await adapter.listActiveReservations()).map((r) => r.id)).toEqual([]);
+  });
+
+  it('emits exactly one capacity change signal for a released reservation', async () => {
+    const signals: ChangeSignal[] = [];
+    const signalPort: ChangeSignalPort = {
+      emit(signal: ChangeSignal): void {
+        signals.push(signal);
+      },
+    };
+    const adapter = new ExecutionJournalAdapter({ stateDir: tempDir, changeSignal: signalPort });
+    await adapter.saveCapacityReservation(heldReservation());
+    signals.length = 0;
+
+    const released = await adapter.releaseCapacityReservationIfUnchanged(fencedRequest());
+    expect(released).toEqual({ outcome: 'released', reservationId: 'res-1' });
+
+    const capacitySignals = signals.filter((signal) => signal.kind === 'capacity');
+    expect(capacitySignals.length).toBe(1);
+    expect(capacitySignals[0]?.id).toBe('res-1');
+  });
+});

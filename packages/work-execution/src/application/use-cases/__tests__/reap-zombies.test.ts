@@ -328,7 +328,7 @@ interface WorkspaceOptions {
   throwSpace?: boolean;
   /** Answer overrides: an `unknown` inspection or a filesystem answer. */
   inspectAnswer?: () => InspectWorktreeForRemovalResult;
-  spaceAnswer?: () => ReadFilesystemSpaceResult;
+  spaceAnswer?: (request: ReadFilesystemSpaceRequest) => ReadFilesystemSpaceResult;
 }
 
 /**
@@ -373,7 +373,7 @@ function makeWorkspace(options: WorkspaceOptions = {}): WorkspacePort & Workspac
         return Promise.reject(new Error('space failed'));
       }
       if (options.spaceAnswer !== undefined) {
-        return Promise.resolve(options.spaceAnswer());
+        return Promise.resolve(options.spaceAnswer(request));
       }
       return Promise.resolve({ outcome: 'read', freeBytes: 200, totalBytes: 1000 } satisfies ReadFilesystemSpaceResult);
     },
@@ -1409,12 +1409,13 @@ describe('reap zombies', () => {
     expect(cappedWorkspace.requests.filter((entry) => entry.inspect !== undefined)).toHaveLength(64);
 
     // More than 16 clones: only the first 16 are read.
-    const cloneProfiles = Array.from({ length: 20 }, (_, index) =>
+    const cloneProfiles = [
       profileView({
-        projectId: `proj-${index}`,
-        clones: { [`host-${index}`]: { path: `/srv/clone-${index}`, worktreeRoot: `/srv/clone-${index}/.worktrees` } },
+        clones: Object.fromEntries(
+          Array.from({ length: 20 }, (_, index) => [`host-${index}`, { path: `/srv/clone-${index}`, worktreeRoot: `/srv/clone-${index}/.worktrees` }]),
+        ),
       }),
-    );
+    ];
     const cloneWorkspace = makeWorkspace({ entries: [] });
     const cloneHarness = gatherHarness({ workspace: cloneWorkspace, profiles: makeProfiles(cloneProfiles) });
     await runPass(cloneHarness, { policy: DISK_POLICY });
@@ -1531,5 +1532,57 @@ describe('reap zombies', () => {
     await runPass(harness, { nowIso: LATER });
     expect(harness.journal.state.appendCalls).toEqual([]);
     expect(harness.journal.state.entries.size).toBe(0);
+  });
+  it('skips a retired profile even when the port returns it despite the active filter', async () => {
+    const retiredClone = { path: '/srv/retired', worktreeRoot: '/srv/retired/.worktrees' };
+    const workspace = makeWorkspace();
+    const profiles = makeProfiles([
+      profileView({ status: 'retired', clones: { 'host-retired': retiredClone } }),
+    ]);
+    const harness = gatherHarness({ workspace, profiles });
+    await runPass(harness);
+    expect(workspace.calls).toEqual([]);
+  });
+
+  it('records findings and attention under the request project and never scans another project clone', async () => {
+    const workspace = makeWorkspace();
+    const profiles = makeProfiles([
+      profileView(),
+      profileView({ projectId: 'proj-2', clones: { 'host-2': { path: '/srv/other', worktreeRoot: '/srv/other/.worktrees' } } }),
+    ]);
+    const harness = gatherHarness({ workspace, profiles });
+    await runPass(harness);
+    const roots = workspace.requests.flatMap((entry) => (entry.list === undefined ? [] : [entry.list.repositoryRoot]));
+    expect(roots).toEqual([CLONE]);
+    const spaces = workspace.requests.flatMap((entry) => (entry.space === undefined ? [] : [entry.space.path]));
+    expect(spaces).toEqual([ROOT]);
+  });
+
+  it('measures every clone on a host and reports the worst filesystem', async () => {
+    const second = { path: '/srv/clone2', worktreeRoot: '/srv/clone2/.worktrees' };
+    const workspace = makeWorkspace({
+      spaceAnswer: (req) => ({ outcome: 'read', freeBytes: req.path === second.worktreeRoot ? 100 : 200, totalBytes: 1000 }),
+    });
+    const profiles = makeProfiles([
+      profileView({ clones: { [HOST_NAME]: { path: CLONE, worktreeRoot: ROOT } } }),
+      profileView({ clones: { [HOST_NAME]: second } }),
+    ]);
+    const harness = gatherHarness({ workspace, profiles });
+    await runPass(harness, { policy: DISK_POLICY });
+    const result = await runPass(harness, { nowIso: LATER, policy: DISK_POLICY });
+    const spaces = workspace.requests.flatMap((entry) => (entry.space === undefined ? [] : [entry.space.path]));
+    expect(spaces).toContain(second.worktreeRoot);
+    expect(result.findings.find((entry) => entry.kind === 'disk-pressure')).toMatchObject({ subject: subjectOfFixtureHost(), action: 'report' });
+  });
+
+  it('uses the default clear threshold of 20 without reporting it as unordered', async () => {
+    const subject = subjectOfFixtureHost();
+    const store = new InMemoryReaperFindingRepositoryAdapter();
+    await seedOpenFinding(store, subject, 'disk-pressure');
+    const workspace = makeWorkspace({ spaceAnswer: () => ({ outcome: 'read', freeBytes: 250, totalBytes: 1000 }) });
+    const harness = gatherHarness({ workspace, store });
+    const result = await runPass(harness, { policy: { graceMinutes: 5, minFreePercent: 15 } });
+    expect(result.unknown.some((entry) => entry.reason === 'disk-thresholds-unordered')).toBe(false);
+    expect((await store.listOpenFindings()).some((record) => record.finding.kind === 'disk-pressure')).toBe(false);
   });
 });

@@ -43,6 +43,7 @@ import type { ReconcileAttemptPort, ReconcileAttemptResult } from '../ports/in/R
 import type {
   ListWorktreesResult,
   InspectWorktreeForRemovalResult,
+  WorktreeRemovalFacts,
   ReadFilesystemSpaceResult,
 } from '../ports/out/WorkspacePort.out-port.js';
 import type { ForgeReadPort } from '../ports/out/ForgeReadPort.out-port.js';
@@ -353,7 +354,7 @@ function effectiveRetentionHours(policy: ReaperPolicy): number {
 function effectiveClearPercent(policy: ReaperPolicy, unknown: ReaperUnknownView[]): number {
   const minRaw = policy.minFreePercent;
   const min = typeof minRaw === 'number' && Number.isFinite(minRaw) && minRaw >= 0 ? minRaw : 15;
-  const clearRaw = policy.clearFreePercent;
+  const clearRaw = policy.clearFreePercent === undefined ? 20 : policy.clearFreePercent;
   if (typeof clearRaw === 'number' && Number.isFinite(clearRaw) && clearRaw > min) {
     return clearRaw;
   }
@@ -571,7 +572,7 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       // their observations before the classification, so the two-sightings
       // rule, the grace, the precedence and the store all apply unchanged.
       // Report only (D6): no worktree is removed, no branch is touched.
-      gather = await this.gatherWorktreeAndDisk(built, facts, nowMs, graceMs, policy);
+      gather = await this.gatherWorktreeAndDisk(built, projectId, facts, nowMs, graceMs, policy);
       findings = classifyZombies({ observations: built.observations, openFindings: openRecords.map((r) => r.finding) }, nowIso, policy).map(
         // The reaper never releases capacity: a leaked slot is report-only whatever the policy says.
         // The reaper never repairs a worktree (D6): a merged-worktree repair is report-only too.
@@ -833,6 +834,7 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
    */
   private async gatherWorktreeAndDisk(
     build: ObservationBuild,
+    projectId: string,
     facts: PassFacts,
     nowMs: number,
     graceMs: number,
@@ -852,18 +854,17 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       digestByPath: new Map(),
       readsComplete: true,
     };
-    const clones = await this.readActiveProfiles(build, wk, profiles);
+    const clones = await this.readActiveProfiles(build, wk, profiles, projectId);
     if (clones === null) {
       return wk;
     }
     const journalCache = new Map<string, readonly ActionJournalEntryRecord[] | null>();
-    const hostsRead = new Set<string>();
+    const diskByHost = new Map<string, number>();
     for (const clone of clones) {
-      // D8: one disk read per clone, deduped per host digest.
+      // D8: one disk read per clone; the host's reading is its worst clone.
       const hostDigest = this.hostDigestOf(clone.hostName, computeDigest, build.unknown);
-      if (hostDigest !== null && !hostsRead.has(hostDigest)) {
-        hostsRead.add(hostDigest);
-        await this.buildDiskObservation(build, wk, clone, hostDigest, workspace);
+      if (hostDigest !== null) {
+        await this.readCloneDisk(build, wk, clone, hostDigest, workspace, diskByHost);
       }
       const listed = await this.listCloneWorktrees(build, wk, clone, workspace);
       if (listed === null) {
@@ -887,6 +888,10 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
         );
       }
     }
+    for (const [hostDigest, freePercent] of diskByHost) {
+      wk.diskFreePercentByHost.set(hostDigest, freePercent);
+      build.observations.push({ kind: 'disk-pressure', subject: hostDigest, youngActivity: false, freePercent });
+    }
     return wk;
   }
 
@@ -902,6 +907,7 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     build: ObservationBuild,
     wk: WorktreeBuild,
     profiles: ReaperProjectProfilesPort,
+    requestProjectId: string,
   ): Promise<readonly CloneRef[] | null> {
     let answer: Awaited<ReturnType<ReaperProjectProfilesPort['listProjectProfiles']>>;
     try {
@@ -924,6 +930,12 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       const projectId = readField(profile, 'projectId');
       const cloneRecord = readField(profile, 'clones');
       if (typeof projectId !== 'string' || projectId === '' || !isPlainObject(cloneRecord)) {
+        continue;
+      }
+      // D3: only an active profile is read, whatever the port answered; and
+      // only the request's own project, so every finding and attention item
+      // is recorded under the project of the clone it came from.
+      if (readField(profile, 'status') !== 'active' || projectId !== requestProjectId) {
         continue;
       }
       const defaultBranchValue = readField(profile, 'defaultBranch');
@@ -1029,12 +1041,13 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
   }
 
   /** D8: one disk reading per clone, as a `disk-pressure` observation on the host digest. */
-  private async buildDiskObservation(
+  private async readCloneDisk(
     build: ObservationBuild,
     wk: WorktreeBuild,
     clone: CloneRef,
     hostDigest: string,
     workspace: NonNullable<ReapZombiesDependencies['workspace']>,
+    diskByHost: Map<string, number>,
   ): Promise<void> {
     if (workspace.readFilesystemSpace === undefined) {
       wk.readsComplete = false;
@@ -1060,8 +1073,8 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       pushBounded(build.unknown, { subject: hostDigest, kind: 'disk-pressure', reason: 'disk-unreadable' });
       return;
     }
-    wk.diskFreePercentByHost.set(hostDigest, freePercent);
-    build.observations.push({ kind: 'disk-pressure', subject: hostDigest, youngActivity: false, freePercent });
+    const previous = diskByHost.get(hostDigest);
+    diskByHost.set(hostDigest, previous === undefined ? freePercent : Math.min(previous, freePercent));
   }
 
   /**
@@ -1084,13 +1097,46 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     forgeRead: ReaperForgeReadPort | undefined,
     workspace: NonNullable<ReapZombiesDependencies['workspace']>,
   ): Promise<void> {
-    const fail = (reason: string): void => {
+    const facts0 = await this.inspectWorktree(build, wk, clone, worktreePath, subject, workspace);
+    if (facts0 === null) {
+      return;
+    }
+    wk.sizeBySubject.set(subject, typeof facts0.sizeBytes === 'number' && Number.isFinite(facts0.sizeBytes) ? facts0.sizeBytes : null);
+    const ten = await this.deriveWorktreeFacts(build, clone, worktreePath, subject, facts0, facts, nowMs, graceMs, policy, journalCache);
+
+    // A busy worktree is reported, not classified (D7).
+    if (ten.notBusy === 'no') {
+      wk.busySubjects.add(subject);
+      wk.busyReports.set(subject, { evidence: 'unknown', sizeBytes: wk.sizeBySubject.get(subject) ?? null });
+      return;
+    }
+
+    // D5: the evidence read only when the other ten facts are already yes.
+    const evidence = Object.values(ten).every((fact) => fact === 'yes')
+      ? await this.readMergeEvidence(build, wk, forgeRead, subject, facts0)
+      : 'unknown';
+    wk.mergedEvidence.set(subject, evidence);
+    wk.inspectedWorktrees.set(subject, { headOnDefault: ten.headOnDefault, branch: facts0.branch, evidence });
+
+    build.observations.push({ kind: 'merged-worktree', subject, youngActivity: false, facts: { ...ten, evidence } });
+  }
+
+  /** The inspection read of one worktree: its removal facts, or null (refused, or an unknown recorded). */
+  private async inspectWorktree(
+    build: ObservationBuild,
+    wk: WorktreeBuild,
+    clone: CloneRef,
+    worktreePath: string,
+    subject: string,
+    workspace: NonNullable<ReapZombiesDependencies['workspace']>,
+  ): Promise<WorktreeRemovalFacts | null> {
+    const fail = (reason: string): null => {
       wk.readsComplete = false;
       pushBounded(build.unknown, { subject, kind: 'merged-worktree', reason });
+      return null;
     };
     if (workspace.inspectWorktreeForRemoval === undefined) {
-      fail('worktree-read-unconfigured');
-      return;
+      return fail('worktree-read-unconfigured');
     }
     let inspected: InspectWorktreeForRemovalResult;
     try {
@@ -1101,66 +1147,50 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
         recordedHost: clone.recordedHost,
       });
     } catch {
-      fail('worktree-unreadable');
-      return;
+      return fail('worktree-unreadable');
     }
-    if (inspected === null) {
-      fail('worktree-unreadable');
-      return;
+    if (inspected === null || inspected.outcome === 'unknown') {
+      return fail('worktree-unreadable');
     }
-    if (inspected.outcome === 'unknown') {
-      fail('worktree-unreadable');
-      return;
-    }
-    if (inspected.outcome !== 'inspected') {
-      return; // refused: not a linked worktree, no unknown
-    }
-    const facts0 = inspected.facts;
-    wk.sizeBySubject.set(subject, typeof facts0.sizeBytes === 'number' && Number.isFinite(facts0.sizeBytes) ? facts0.sizeBytes : null);
+    return inspected.outcome === 'inspected' ? inspected.facts : null; // refused: not a linked worktree, no unknown
+  }
 
+  /** D4: the ten facts that need no forge read. */
+  private async deriveWorktreeFacts(
+    build: ObservationBuild,
+    clone: CloneRef,
+    worktreePath: string,
+    subject: string,
+    facts0: WorktreeRemovalFacts,
+    facts: PassFacts,
+    nowMs: number,
+    graceMs: number,
+    policy: ReaperPolicy,
+    journalCache: Map<string, readonly ActionJournalEntryRecord[] | null>,
+  ): Promise<Record<'headOnDefault' | 'clean' | 'unlocked' | 'onBranch' | 'notBusy' | 'notPrimary' | 'quiet' | 'noLiveRecord' | 'runnerIdle' | 'noYoungIntent', ReaperFact>> {
     const naming = this.attemptsNamingWorktree(facts, worktreePath);
     const held = this.heldReservationsNamingWorktree(facts, worktreePath, naming);
     const routing = this.worktreeRouting(clone, naming);
     const retentionMs = effectiveRetentionHours(policy) * 3_600_000;
-
-    const headOnDefault: ReaperFact = facts0.headOnDefault === true ? 'yes' : facts0.headOnDefault === false ? 'no' : 'unknown';
-    const clean: ReaperFact = facts0.status.tracked === 0 && facts0.status.untracked === 0 && facts0.status.unmerged === 0 ? 'yes' : 'no';
-    const unlocked: ReaperFact = facts0.locked ? 'no' : 'yes';
-    const onBranch: ReaperFact = facts0.detached || facts0.branch === null ? 'no' : 'yes';
-    const notBusy: ReaperFact = facts0.inProgressOperations.length === 0 ? 'yes' : 'no';
-    const notPrimary: ReaperFact = 'yes';
     const activityMs = msOfSafe(facts0.lastActivity.iso);
     const quiet: ReaperFact = facts0.lastActivity.unknown || activityMs === null
       ? 'unknown'
       : nowMs - activityMs >= retentionMs ? 'yes' : 'no';
     const journal = await this.worktreeJournalFacts(naming, journalCache, build.unknown, subject, nowMs, graceMs);
     const { noLiveRecord, noYoungIntent } = this.worktreeRecordFacts(naming, held, facts.reservations, nowMs, graceMs, journal.unreadable, journal.youngIntent);
-
     const runnerIdle = await this.worktreeRunnerIdle(naming, routing, worktreePath);
-
-    // A busy worktree is reported, not classified (D7).
-    if (notBusy === 'no') {
-      wk.busySubjects.add(subject);
-      wk.busyReports.set(subject, { evidence: 'unknown', sizeBytes: wk.sizeBySubject.get(subject) ?? null });
-      return;
-    }
-
-    // D5: the evidence read only when the other ten facts are already yes.
-    const tenFacts: readonly ReaperFact[] = [headOnDefault, clean, unlocked, onBranch, notBusy, notPrimary, quiet, noLiveRecord, runnerIdle, noYoungIntent];
-    const evidence = tenFacts.every((fact) => fact === 'yes')
-      ? await this.readMergeEvidence(build, wk, forgeRead, subject, facts0)
-      : 'unknown';
-    wk.mergedEvidence.set(subject, evidence);
-    wk.inspectedWorktrees.set(subject, { headOnDefault, branch: facts0.branch, evidence });
-
-    build.observations.push({
-      kind: 'merged-worktree',
-      subject,
-      youngActivity: false,
-      facts: {
-        headOnDefault, clean, unlocked, onBranch, notBusy, notPrimary, quiet, noLiveRecord, runnerIdle, noYoungIntent, evidence,
-      },
-    });
+    return {
+      headOnDefault: facts0.headOnDefault === true ? 'yes' : facts0.headOnDefault === false ? 'no' : 'unknown',
+      clean: facts0.status.tracked === 0 && facts0.status.untracked === 0 && facts0.status.unmerged === 0 ? 'yes' : 'no',
+      unlocked: facts0.locked ? 'no' : 'yes',
+      onBranch: facts0.detached || facts0.branch === null ? 'no' : 'yes',
+      notBusy: facts0.inProgressOperations.length === 0 ? 'yes' : 'no',
+      notPrimary: 'yes',
+      quiet,
+      noLiveRecord,
+      runnerIdle,
+      noYoungIntent,
+    };
   }
 
   /** The attempts that name a worktree path, in record order. */

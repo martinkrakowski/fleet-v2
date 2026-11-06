@@ -2585,6 +2585,51 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       expect(unreadable.seen).toHaveLength(0);
     });
 
+    it("refuses a pull request merged at the expected head but on another branch, recording nothing", async () => {
+      const deps = wb5bDeps({
+        read: async (request) => ({
+          outcome: "found",
+          pullRequest: snapshot(
+            request.ref.kind === "number" ? request.ref.number : 0,
+            {
+              state: "merged",
+              headRef: "feat/other-lane",
+              mergedAtIso: "2026-11-05T09:00:00.000Z",
+              mergeCommitSha: WB_HEAD,
+            },
+          ),
+        }),
+      });
+      await deps.journal.appendJournalEntry(typedCompletedEntry(42));
+      expect(await deps.useCase.executeAuthorizedForgeAction(mergeReq)).toEqual({
+        outcome: "refused",
+        reason: "pull-request-unverified",
+      });
+      expect(deps.consumed).toEqual([]);
+      expect(deps.seen).toHaveLength(0);
+      expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
+      expect(
+        (await deps.workOrderRepo.findWorkOrderById("wo-001"))?.state,
+      ).toBe("approved");
+    });
+
+    it("treats a typed journal reference for another repository as a disagreement, never merging the request's number", async () => {
+      const deps = wb5bDeps();
+      await deps.journal.appendJournalEntry({
+        ...typedCompletedEntry(42),
+        pullRequest: { repository: "other/repo", number: 42 },
+      });
+      expect(
+        await deps.useCase.executeAuthorizedForgeAction({
+          ...mergeReq,
+          pullRequestNumber: 43,
+        }),
+      ).toEqual({ outcome: "refused", reason: "pull-request-sources-disagree" });
+      expect(deps.consumed).toEqual([]);
+      expect(deps.seen).toHaveLength(0);
+      expect(deps.reads).toHaveLength(0);
+    });
+
     it("a throwing merge-record store is merge-record-not-saved, and the next pass completes the record without merging again", async () => {
       let state: "open" | "merged" = "open";
       const deps = wb5bDeps({

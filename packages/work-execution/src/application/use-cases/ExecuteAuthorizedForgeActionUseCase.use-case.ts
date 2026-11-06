@@ -973,6 +973,13 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
           (await this.storedLinkNumber(deps, workOrder, normalizedRepository)),
       };
     }
+    // The attempt's latest typed reference naming another repository is a
+    // disagreement, never silently skipped (WB5b2).
+    if (
+      await this.journalNamesOtherRepository(deps, attempt, normalizedRepository)
+    ) {
+      return { reason: "pull-request-sources-disagree" };
+    }
     const journalNumber = await this.typedJournalNumber(
       deps,
       attempt,
@@ -998,6 +1005,30 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       confirmedBySource: journalNumber !== undefined || linkNumber !== undefined,
       linkInvolved: linkNumber !== undefined,
     });
+  }
+
+  /** Whether the attempt's latest completed typed `forge` reference is for a repository other than this one. */
+  private async journalNamesOtherRepository(
+    deps: ExecuteAuthorizedForgeActionDependencies,
+    attempt: AttemptRecord,
+    normalizedRepository: string | null,
+  ): Promise<boolean> {
+    if (normalizedRepository === null) {
+      return false;
+    }
+    const entries = await deps.journal.listJournalEntriesForAttempt(attempt.id);
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (
+        entry !== undefined &&
+        entry.status === "completed" &&
+        entry.action === "forge" &&
+        entry.pullRequest !== undefined
+      ) {
+        return entry.pullRequest.repository !== normalizedRepository;
+      }
+    }
+    return false;
   }
 
   /** The attempt's latest completed `forge` entry carrying a typed reference. */
@@ -1084,14 +1115,19 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     const failure = candidate.linkInvolved
       ? "pull-request-link-stale"
       : "pull-request-unverified";
-    if (snapshot.headSha !== request.expectedHeadSha) {
+    const branch = request.branchName ?? `feat/${workOrder.laneId}`;
+    // Open or merged, the pull request must be the attempt's branch at the
+    // expected head; the read itself was made against the bound repository.
+    if (
+      snapshot.headSha !== request.expectedHeadSha ||
+      snapshot.headRef !== branch
+    ) {
       return { reason: failure };
     }
     if (snapshot.state === "merged" && candidate.confirmedBySource) {
       return { number: candidate.number, alreadyMerged: true };
     }
-    const branch = request.branchName ?? `feat/${workOrder.laneId}`;
-    return snapshot.state === "open" && snapshot.headRef === branch
+    return snapshot.state === "open"
       ? { number: candidate.number }
       : { reason: failure };
   }

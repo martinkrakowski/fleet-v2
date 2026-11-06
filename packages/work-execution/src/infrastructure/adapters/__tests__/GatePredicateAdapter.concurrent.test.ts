@@ -262,6 +262,26 @@ describe('GatePredicateAdapter concurrency (KS3)', () => {
     expect(boundedCoverage(ran)).toBe(ran);
   });
 
+  it('keys the budget by the recorded host alias when no host name is recorded', async () => {
+    const executor = new RecordingExecutor({ a: { delayMs: 10 } });
+    const adapter = makeAdapter(executor, 1);
+    const runner = (host: string) =>
+      ({ kind: 'opencode', remotePort: 4096, host, hostName: null }) as unknown as EvaluateGatePredicatesRequest['runner'];
+    await Promise.all([
+      adapter.evaluateGatePredicates({ ...requestWith(['a1'], '/lanes/h1'), runner: runner('host-one') }),
+      adapter.evaluateGatePredicates({ ...requestWith(['a2'], '/lanes/h2'), runner: runner('host-two') }),
+    ]);
+    // Two hosts, one slot each: they may overlap; one host's two requests may not.
+    expect(executor.peak).toBe(2);
+    const same = new RecordingExecutor({ a: { delayMs: 10 } });
+    const sameAdapter = makeAdapter(same, 1);
+    await Promise.all([
+      sameAdapter.evaluateGatePredicates({ ...requestWith(['a1'], '/lanes/h1'), runner: runner('host-one') }),
+      sameAdapter.evaluateGatePredicates({ ...requestWith(['a2'], '/lanes/h2'), runner: runner('host-one') }),
+    ]);
+    expect(same.peak).toBe(1);
+  });
+
   it('refuses a request with more commands or arguments than an acceptance spec allows', async () => {
     const executor = new RecordingExecutor();
     const adapter = makeAdapter(executor, 4);

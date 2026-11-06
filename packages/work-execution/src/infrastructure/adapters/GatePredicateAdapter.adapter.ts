@@ -340,7 +340,13 @@ export class GatePredicateAdapter implements GatePredicatePort {
     const capacity =
       this.maxConcurrentPredicates === undefined ? declared : Math.min(declared, this.maxConcurrentPredicates);
     const hostName = request.runner?.hostName;
-    const id = typeof hostName === 'string' && hostName.length > 0 ? hostName : 'legacy';
+    const alias = request.runner?.host;
+    const id =
+      typeof hostName === 'string' && hostName.length > 0
+        ? 'name:' + hostName
+        : typeof alias === 'string' && alias.length > 0
+          ? 'alias:' + alias
+          : 'legacy';
     const existing = this.budgets.get(id);
     if (existing !== undefined) {
       existing.reconcile(capacity);

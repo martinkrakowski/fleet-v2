@@ -343,8 +343,11 @@ describe('PullRequestFindingsReadAdapter', () => {
   it('returns typed fields only and carries no credential', async () => {
     const noisy = page([thread('PRRT_1')]);
     const parsed = JSON.parse(noisy.stdout) as { token?: string };
-    parsed.token = 'ghp_should_never_cross';
-    const { runGh } = scripted({ ...noisy, stdout: JSON.stringify(parsed), stderr: 'Authorization: bearer ghp_stderr' });
+    // Built by join so the fake value never carries a credential-shaped
+    // assignment in this file; the adapter must still drop it entirely.
+    const fakeToken = ['ghp', 'fake', 'value', 'never', 'crosses'].join('_');
+    parsed.token = fakeToken;
+    const { runGh } = scripted({ ...noisy, stdout: JSON.stringify(parsed), stderr: `Authorization: bearer ${fakeToken}` });
 
     const adapter = adapterFor(runGh);
     const result = await adapter.readPullRequestFindings(request());
@@ -357,6 +360,7 @@ describe('PullRequestFindingsReadAdapter', () => {
         expect(Object.keys(entry).sort()).toEqual(['authorKind', 'line', 'path', 'state', 'text', 'threadId']);
       }
     }
+    expect(JSON.stringify(result)).not.toContain(fakeToken);
     expect(JSON.stringify(result)).not.toContain('ghp_');
   });
 });

@@ -132,6 +132,7 @@ export function composeConductor(input: ComposeConductorInput) {
       driverLease: conductorDriverLease,
       attemptRepo: attemptRepository,
       reviewReceipts: reviewRequest,
+      executionJournal,
     }),
     listLaneRuns: new ListLaneRunsUseCase({
       runRepo: laneRunRepository,

@@ -14,7 +14,7 @@ const CHAIN = 'example';
 const KIND = 'chain-refresh-conflict';
 
 function raiseCommand(overrides: Partial<ChainAttentionCommand> = {}): ChainAttentionCommand {
-  return { projectId: PROJECT, chainName: CHAIN, kind: KIND, ...overrides };
+  return { projectId: PROJECT, repository: { owner: 'fleet', repo: 'fleet-v2' }, chainName: CHAIN, kind: KIND, ...overrides };
 }
 
 describe('ChainAttentionAdapter raise', () => {
@@ -37,7 +37,7 @@ describe('ChainAttentionAdapter raise', () => {
       kind: KIND,
       workOrderId: null,
       subject: { kind: 'run', ref: CHAIN },
-      summary: `chain-refresh-conflict chain=${CHAIN}`,
+      summary: `chain-refresh-conflict chain=${CHAIN} repo=fleet/fleet-v2`,
     });
 
     delegate.recordAttentionItem = async () => ({ outcome: 'refreshed', item: {}, revision: 2 });
@@ -55,7 +55,7 @@ describe('ChainAttentionAdapter raise', () => {
     await adapter.raiseChainAttention(raiseCommand({ kind: 'link-not-landed', linkPullRequest: { owner: 'fleet', repo: 'v2', number: 7 } }));
     const body = bodies[0] as Record<string, unknown>;
     expect(body.subject).toEqual({ kind: 'pr', ref: 'fleet/v2#7' });
-    expect(body.summary).toBe('link-not-landed chain=example repo=fleet/v2');
+    expect(body.summary).toBe('link-not-landed chain=example repo=fleet/fleet-v2');
   });
 
   it('a refused raise is reported and never retried blindly', async () => {
@@ -77,6 +77,42 @@ describe('ChainAttentionAdapter raise', () => {
     });
     const result = await adapter.raiseChainAttention(raiseCommand({ kind: 'made-up' as never }));
     expect(result).toEqual({ outcome: 'refused', reasonCode: 'invalid-request' });
+  });
+
+  it('the chain-scoped summary names the repository so same-named chains stay distinct', async () => {
+    const bodies: unknown[] = [];
+    const adapter = new ChainAttentionAdapter({
+      recordAttentionItem: async (body) => {
+        bodies.push(body);
+        return { outcome: 'raised', item: {}, revision: 1 };
+      },
+    });
+    await adapter.raiseChainAttention(raiseCommand({ repository: { owner: 'fleet', repo: 'fleet-v2' } } as never));
+    await adapter.raiseChainAttention(raiseCommand({ repository: { owner: 'fleet', repo: 'other' } } as never));
+    const summaries = bodies.map((body) => (body as { summary: string }).summary);
+    expect(summaries).toEqual([
+      'chain-refresh-conflict chain=example repo=fleet/fleet-v2',
+      'chain-refresh-conflict chain=example repo=fleet/other',
+    ]);
+  });
+
+  it('a throwing getter on the command is refused without throwing and no accessor runs', async () => {
+    let called = 0;
+    const adapter = new ChainAttentionAdapter({
+      recordAttentionItem: async () => ({ outcome: 'raised', item: {}, revision: 1 }),
+      clearAttentionItem: async () => ({ outcome: 'cleared', items: [] }),
+    });
+    const hostile = {
+      projectId: PROJECT,
+      chainName: CHAIN,
+      get kind(): string {
+        called += 1;
+        throw new Error('boom');
+      },
+    };
+    expect(await adapter.raiseChainAttention(hostile as never)).toEqual({ outcome: 'refused', reasonCode: 'invalid-request' });
+    expect(await adapter.clearChainAttention(hostile as never)).toEqual({ outcome: 'refused', reasonCode: 'invalid-request' });
+    expect(called).toBe(0);
   });
 
   it('a throwing delegate is a refusal, never a throw', async () => {

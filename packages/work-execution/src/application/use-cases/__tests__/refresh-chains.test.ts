@@ -236,7 +236,7 @@ describe('RefreshChainsUseCase', () => {
     expect(h.trace).toEqual(['list', 'head', 'intent', 'read', 'forge', 'outcome']);
     expect(h.attention.raises).toHaveLength(0);
     expect(h.attention.clears).toHaveLength(1);
-    expect(h.attention.clears[0]).toEqual({ projectId: PROJECT, chainName: 'example', kind: 'chain-refresh-conflict' });
+    expect(h.attention.clears[0]).toEqual({ projectId: PROJECT, repository: REPO, chainName: 'example', kind: 'chain-refresh-conflict' });
   });
 
   it('a repeated chain-refresh key returns the recorded result without a second forge call', async () => {
@@ -254,9 +254,21 @@ describe('RefreshChainsUseCase', () => {
     const result = await h.useCase.runRefreshChains(command());
     expect(result.chains).toEqual([{ chainName: 'example', key: KEY, outcome: 'conflict' }]);
     expect(h.attention.raises).toHaveLength(1);
-    expect(h.attention.raises[0]).toEqual({ projectId: PROJECT, chainName: 'example', kind: 'chain-refresh-conflict' });
+    expect(h.attention.raises[0]).toEqual({ projectId: PROJECT, repository: REPO, chainName: 'example', kind: 'chain-refresh-conflict' });
     expect(h.attention.clears).toHaveLength(0);
     expect(h.chains.records[0]!.conflictMark).toBe('chain-refresh-conflict');
+  });
+
+  it('a refused attention raise is named in the result and the chain still reads conflict', async () => {
+    const h = harness({
+      forge: { outcome: 'refused', reason: 'x', refusalKind: 'conflict' },
+      raise: { outcome: 'refused', reasonCode: 'store-unreadable' },
+    });
+    const result = await h.useCase.runRefreshChains(command());
+    expect(result.chains).toEqual([
+      { chainName: 'example', key: KEY, outcome: 'conflict', attentionRefused: 'store-unreadable' },
+    ]);
+    expect(h.attention.raises).toHaveLength(1);
   });
 
   it('a merged chain clears the conflict mark and clears the attention item', async () => {
@@ -265,7 +277,7 @@ describe('RefreshChainsUseCase', () => {
     const result = await h.useCase.runRefreshChains(command());
     expect(result.chains).toEqual([{ chainName: 'example', key: KEY, outcome: 'merged' }]);
     expect(h.attention.clears).toHaveLength(1);
-    expect(h.attention.clears[0]).toEqual({ projectId: PROJECT, chainName: 'example', kind: 'chain-refresh-conflict' });
+    expect(h.attention.clears[0]).toEqual({ projectId: PROJECT, repository: REPO, chainName: 'example', kind: 'chain-refresh-conflict' });
     expect(h.attention.raises).toHaveLength(0);
     expect(h.chains.records[0]!.conflictMark).toBeNull();
   });

@@ -163,6 +163,16 @@ describe('ChainRepositoryAdapter refresh size bounds', () => {
     expect(listed.status === 'unreadable' && listed.reason).toBe('record-too-large');
   });
 
+  it('a store full of other repositories records is refused with record-limit, not unbounded work', async () => {
+    const body = JSON.stringify(recordOf('example', { owner: 'fleet', repo: 'other' }));
+    const dir = path.join(stateDir, 'chains');
+    await fs.mkdir(dir, { recursive: true });
+    for (let i = 0; i < CHAIN_RECORD_MAX_COUNT + 1; i += 1) {
+      await fs.writeFile(path.join(dir, `${String(i).padStart(64, '0')}.json`), body);
+    }
+    expect(await adapter.listChains(listCmd())).toEqual({ status: 'unreadable', reason: 'record-limit' });
+  }, 30_000);
+
   it('an over-long list is refused, not truncated', async () => {
     const body = JSON.stringify(recordOf());
     const dir = path.join(stateDir, 'chains');

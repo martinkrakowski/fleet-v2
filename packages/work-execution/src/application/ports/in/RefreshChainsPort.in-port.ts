@@ -25,6 +25,8 @@ export interface RefreshChainsChainReport {
   readonly chainName: string;
   readonly key: string;
   readonly outcome: 'merged' | 'up-to-date' | 'conflict' | 'branch-gone' | 'skipped';
+  /** Set only when the attention port refused the raise or the clear: the delegate's reason code. */
+  readonly attentionRefused?: string;
 }
 
 export interface RefreshChainsResult {

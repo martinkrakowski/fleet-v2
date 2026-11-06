@@ -33,7 +33,7 @@ import type {
 } from '../ports/in/RefreshChainsPort.in-port.js';
 import type { ChainAttentionPort } from '../ports/out/ChainAttentionPort.out-port.js';
 import type { ChainRepositoryPort } from '../ports/out/ChainRepositoryPort.out-port.js';
-import type { MergeBranchHeadResult, MergeForgeActionPort } from '../ports/out/MergeForgeActionPort.out-port.js';
+import type { MergeBranchHeadResult, MergeForgeActionPort, MergeForgeActionResult } from '../ports/out/MergeForgeActionPort.out-port.js';
 
 const PROJECT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 
@@ -81,6 +81,29 @@ function validate(raw: unknown): Validation {
     return { ok: true, command: { repository, projectId, nowIso, deadlineIso } };
   } catch {
     return { ok: false, reason: 'invalid-request' };
+  }
+}
+
+type RefreshOutcome = 'merged' | 'up-to-date' | 'conflict' | 'branch-gone';
+
+type Prepared =
+  | { readonly kind: 'skip' }
+  | { readonly kind: 'terminal'; readonly outcome: RefreshOutcome }
+  | { readonly kind: 'ready'; readonly revision: number };
+
+/** Map a forge answer to the recorded outcome, or null when the answer is unknown. */
+function refreshOutcomeOf(forge: MergeForgeActionResult): RefreshOutcome | null {
+  switch (forge.outcome) {
+    case 'executed':
+      return 'merged';
+    case 'already-applied':
+      return 'up-to-date';
+    case 'branch-gone':
+      return 'branch-gone';
+    case 'refused':
+      return forge.refusalKind === 'conflict' ? 'conflict' : null;
+    default:
+      return null;
   }
 }
 
@@ -189,6 +212,38 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       chains.push({ chainName: record.chainName, key, outcome: stored.outcome });
       return 'done';
     }
+    const prepared = await this.prepare(command, record, key, mainSha);
+    if (prepared.kind === 'skip') {
+      this.skip(chains, record.chainName, key);
+      return 'done';
+    }
+    if (prepared.kind === 'terminal') {
+      chains.push({ chainName: record.chainName, key, outcome: prepared.outcome });
+      return 'done';
+    }
+    if (!this.hasBudget(command.deadlineIso)) {
+      return 'budget-exhausted';
+    }
+    const forge = await this.forgeCall(command, record, key, mainSha);
+    if (forge === 'budget-exhausted') {
+      return 'budget-exhausted';
+    }
+    const outcome = refreshOutcomeOf(forge);
+    if (outcome === null) {
+      // Ambiguous or any other refusal is unknown: skipped, never retried as a merge.
+      this.skip(chains, record.chainName, key);
+      return 'done';
+    }
+    await this.settle(command, record, key, prepared.revision, outcome, chains);
+    return 'done';
+  }
+
+  /**
+   * Record the keyed intent, then re-read once: an `already-recorded` intent returns the
+   * recorded outcome when terminal; a fresh intent advances the revision the outcome CAS must
+   * expect; a crash between the intent and the result is recovered by re-issuing the merge.
+   */
+  private async prepare(command: ValidCommand, record: ChainRecord, key: string, mainSha: string): Promise<Prepared> {
     const intent = await this.deps.chains.recordChainRefreshIntent({
       repository: command.repository,
       chainName: record.chainName,
@@ -199,81 +254,65 @@ export class RefreshChainsUseCase implements RefreshChainsPort {
       deadlineIso: command.deadlineIso,
     });
     if (intent.outcome === 'refused') {
-      this.skip(chains, record.chainName, key);
-      return 'done';
+      return { kind: 'skip' };
     }
-    // Re-read once: an `already-recorded` intent returns the recorded outcome when terminal;
-    // a fresh intent advances the revision the outcome CAS must expect; a crash between the
-    // intent and the result is recovered here by re-issuing the convergent merge.
     const reread = await this.deps.chains.readChain({
       repository: command.repository,
       chainName: record.chainName,
       deadlineIso: command.deadlineIso,
     });
     if (reread.status !== 'ok') {
-      this.skip(chains, record.chainName, key);
-      return 'done';
+      return { kind: 'skip' };
     }
-    const freshest = reread.record;
-    const recordedEntry = chainRefreshOf(freshest);
+    const recordedEntry = chainRefreshOf(reread.record);
     if (recordedEntry !== null && recordedEntry.key === key && recordedEntry.outcome !== 'in-flight') {
-      chains.push({ chainName: record.chainName, key, outcome: recordedEntry.outcome });
-      return 'done';
+      return { kind: 'terminal', outcome: recordedEntry.outcome };
     }
-    if (!this.hasBudget(command.deadlineIso)) {
-      return 'budget-exhausted';
-    }
-    const forge = await this.forgeCall(command, record, key, mainSha);
-    if (forge === 'budget-exhausted') {
-      return 'budget-exhausted';
-    }
-    if (forge.outcome === 'ambiguous') {
-      this.skip(chains, record.chainName, key);
-      return 'done';
-    }
-    let outcome: 'merged' | 'up-to-date' | 'conflict' | 'branch-gone';
-    if (forge.outcome === 'executed') {
-      outcome = 'merged';
-    } else if (forge.outcome === 'already-applied') {
-      outcome = 'up-to-date';
-    } else if (forge.outcome === 'branch-gone') {
-      outcome = 'branch-gone';
-    } else if (forge.outcome === 'refused' && forge.refusalKind === 'conflict') {
-      outcome = 'conflict';
-    } else {
-      // Any other refusal is unknown: reported as skipped, never retried as a merge.
-      this.skip(chains, record.chainName, key);
-      return 'done';
-    }
+    return { kind: 'ready', revision: reread.record.revision };
+  }
+
+  /** Record the outcome by CAS, then raise or clear the attention item and report any refusal. */
+  private async settle(
+    command: ValidCommand,
+    record: ChainRecord,
+    key: string,
+    expectedRevision: number,
+    outcome: RefreshOutcome,
+    chains: RefreshChainsChainReport[],
+  ): Promise<void> {
     const recorded = await this.deps.chains.recordChainRefreshOutcome({
       repository: command.repository,
       chainName: record.chainName,
       key,
-      expectedRevision: freshest.revision,
+      expectedRevision,
       outcome,
       atIso: command.nowIso,
       deadlineIso: command.deadlineIso,
     });
     if (recorded.outcome !== 'recorded') {
       this.skip(chains, record.chainName, key);
-      return 'done';
+      return;
     }
+    const attentionCommand = {
+      projectId: command.projectId,
+      repository: command.repository,
+      chainName: record.chainName,
+      kind: 'chain-refresh-conflict' as const,
+    };
+    let answer: { readonly outcome: string; readonly reasonCode: string | null } | null = null;
     if (outcome === 'conflict') {
-      // A refused raise is reported by the adapter and never retried blindly.
-      await this.deps.attention.raiseChainAttention({
-        projectId: command.projectId,
-        chainName: record.chainName,
-        kind: 'chain-refresh-conflict',
-      });
+      // A refused raise is reported in the result and never retried blindly.
+      answer = await this.deps.attention.raiseChainAttention(attentionCommand);
     } else if (outcome === 'merged' || outcome === 'up-to-date') {
-      await this.deps.attention.clearChainAttention({
-        projectId: command.projectId,
-        chainName: record.chainName,
-        kind: 'chain-refresh-conflict',
-      });
+      answer = await this.deps.attention.clearChainAttention(attentionCommand);
     }
-    chains.push({ chainName: record.chainName, key, outcome });
-    return 'done';
+    const refused = answer !== null && answer.outcome === 'refused';
+    chains.push({
+      chainName: record.chainName,
+      key,
+      outcome,
+      ...(refused ? { attentionRefused: answer?.reasonCode ?? 'refused' } : {}),
+    });
   }
 
   private async forgeCall(

@@ -52,61 +52,82 @@ function subjectOf(command: ChainAttentionCommand): { readonly kind: string; rea
   return { kind: 'run', ref: command.chainName };
 }
 
-/** The fixed summary: the kind and ids, composed here, never caller text. */
+/** The fixed summary: the kind, the chain and its repository, composed here, never caller text. */
 function summaryOf(command: ChainAttentionCommand): string {
-  const link = command.linkPullRequest;
-  return link === undefined
-    ? `${command.kind} chain=${command.chainName}`
-    : `${command.kind} chain=${command.chainName} repo=${link.owner}/${link.repo}`;
+  return `${command.kind} chain=${command.chainName} repo=${command.repository.owner}/${command.repository.repo}`;
+}
+
+/** An own data property only: an accessor reads as undefined and never runs. */
+function ownValue(source: unknown, key: string): unknown {
+  if (typeof source !== 'object' || source === null) {
+    return undefined;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(source, key);
+  return descriptor === undefined ? undefined : descriptor.value;
+}
+
+function isSegment(value: unknown): value is string {
+  return typeof value === 'string' && REPOSITORY_SEGMENT_PATTERN.test(value) && value !== '.' && value !== '..';
+}
+
+function snapshotRepository(raw: unknown): { readonly owner: string; readonly repo: string } | null {
+  const owner = ownValue(raw, 'owner');
+  const repo = ownValue(raw, 'repo');
+  return isSegment(owner) && isSegment(repo) ? { owner, repo } : null;
+}
+
+function snapshotLink(raw: unknown): ChainAttentionCommand['linkPullRequest'] | null | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  const target = snapshotRepository(raw);
+  const number = ownValue(raw, 'number');
+  if (target === null || typeof number !== 'number' || !Number.isSafeInteger(number) || number < 1) {
+    return null;
+  }
+  return { owner: target.owner, repo: target.repo, number };
+}
+
+/**
+ * Copy the command from its own data properties into a plain value, or null when it is
+ * malformed. Never throws and never runs an accessor.
+ */
+function snapshotCommand(raw: unknown): ChainAttentionCommand | null {
+  try {
+    if (!isPlainObject(raw)) {
+      return null;
+    }
+    const projectId = ownValue(raw, 'projectId');
+    const chainName = ownValue(raw, 'chainName');
+    const kind = ownValue(raw, 'kind');
+    const repository = snapshotRepository(ownValue(raw, 'repository'));
+    const link = snapshotLink(ownValue(raw, 'linkPullRequest'));
+    if (
+      typeof projectId !== 'string' ||
+      projectId.length === 0 ||
+      typeof chainName !== 'string' ||
+      parseChainName(chainName) === undefined ||
+      typeof kind !== 'string' ||
+      !CHAIN_ATTENTION_KINDS.includes(kind) ||
+      repository === null ||
+      link === null
+    ) {
+      return null;
+    }
+    const base = { projectId, repository, chainName, kind: kind as ChainAttentionKind };
+    return link === undefined ? base : { ...base, linkPullRequest: link };
+  } catch {
+    return null;
+  }
 }
 
 export class ChainAttentionAdapter implements ChainAttentionPort {
   constructor(private readonly delegate?: ChainAttentionDelegate) {}
 
-  /** A fixed refusal code, or null when the command may proceed; never echoes a value. */
-  private validate(command: ChainAttentionCommand): string | null {
-    if (!isPlainObject(command)) {
-      return 'invalid-request';
-    }
-    if (typeof command.projectId !== 'string' || command.projectId.length === 0) {
-      return 'invalid-request';
-    }
-    if (parseChainName(command.chainName) === undefined) {
-      return 'invalid-request';
-    }
-    if (!CHAIN_ATTENTION_KINDS.includes(command.kind)) {
-      return 'invalid-request';
-    }
-    const link = command.linkPullRequest;
-    if (link !== undefined) {
-      if (!isPlainObject(link)) {
-        return 'invalid-request';
-      }
-      const owner = link.owner;
-      const repo = link.repo;
-      const number = link.number;
-      if (
-        typeof owner !== 'string' ||
-        !REPOSITORY_SEGMENT_PATTERN.test(owner) ||
-        owner === '.' ||
-        owner === '..' ||
-        typeof repo !== 'string' ||
-        !REPOSITORY_SEGMENT_PATTERN.test(repo) ||
-        repo === '.' ||
-        repo === '..' ||
-        !Number.isSafeInteger(number) ||
-        number < 1
-      ) {
-        return 'invalid-request';
-      }
-    }
-    return null;
-  }
-
-  async raiseChainAttention(command: ChainAttentionCommand): Promise<RaiseChainAttentionResult> {
-    const invalid = this.validate(command);
-    if (invalid !== null) {
-      return { outcome: 'refused', reasonCode: invalid };
+  async raiseChainAttention(raw: ChainAttentionCommand): Promise<RaiseChainAttentionResult> {
+    const command = snapshotCommand(raw);
+    if (command === null) {
+      return { outcome: 'refused', reasonCode: 'invalid-request' };
     }
     const recordAttentionItem = this.delegate?.recordAttentionItem;
     if (recordAttentionItem === undefined) {
@@ -136,10 +157,10 @@ export class ChainAttentionAdapter implements ChainAttentionPort {
     }
   }
 
-  async clearChainAttention(command: ChainAttentionCommand): Promise<ClearChainAttentionResult> {
-    const invalid = this.validate(command);
-    if (invalid !== null) {
-      return { outcome: 'refused', reasonCode: invalid };
+  async clearChainAttention(raw: ChainAttentionCommand): Promise<ClearChainAttentionResult> {
+    const command = snapshotCommand(raw);
+    if (command === null) {
+      return { outcome: 'refused', reasonCode: 'invalid-request' };
     }
     const clearAttentionItem = this.delegate?.clearAttentionItem;
     if (clearAttentionItem === undefined) {

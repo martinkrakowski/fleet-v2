@@ -628,17 +628,33 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
       count: async () => (await fs.readdir(dir)).filter((name) => name.endsWith('.json')).length,
       write: (record, id) => this.writeFile(dir, id, record),
       list: async (repository) => {
-        let names: string[];
+        // Bound the scan itself: entries read and record files opened, whichever repository
+        // they belong to; past either cap the listing is refused, never truncated.
+        const names: string[] = [];
+        let entries = 0;
         try {
-          names = await fs.readdir(dir);
+          const handle = await fs.opendir(dir);
+          try {
+            for await (const entry of handle) {
+              entries += 1;
+              if (entries > CHAIN_RECORD_MAX_COUNT * 2) {
+                return { ok: false, reason: 'record-limit' };
+              }
+              if (entry.name.endsWith('.json')) {
+                names.push(entry.name);
+                if (names.length > CHAIN_RECORD_MAX_COUNT) {
+                  return { ok: false, reason: 'record-limit' };
+                }
+              }
+            }
+          } finally {
+            await handle.close().catch(() => undefined);
+          }
         } catch {
           return { ok: false, reason: 'store-unavailable' };
         }
         const records: ChainRecord[] = [];
         for (const name of names) {
-          if (!name.endsWith('.json')) {
-            continue;
-          }
           const read = await this.readRecordFile(join(dir, name));
           if (read === 'not-found') {
             continue;

@@ -11,6 +11,7 @@ export type ChainAttentionKind = 'chain-refresh-conflict' | 'link-not-landed' | 
 
 export interface ChainAttentionCommand {
   readonly projectId: string;
+  readonly repository: { readonly owner: string; readonly repo: string };
   readonly chainName: string;
   readonly kind: ChainAttentionKind;
   readonly linkPullRequest?: { readonly owner: string; readonly repo: string; readonly number: number };

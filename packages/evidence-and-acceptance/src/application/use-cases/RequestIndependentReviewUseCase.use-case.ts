@@ -195,6 +195,326 @@ async function openChainAssessment(
   return record;
 }
 
+type Step<T> = { readonly result: RequestIndependentReviewResult } | { readonly value: T };
+
+type CompletedReview = Extract<Awaited<ReturnType<IndependentReviewPort['runIndependentReview']>>, { outcome: 'completed' }>;
+
+/**
+ * The request-shape refusals, in their order: non-empty fields, a known kind with
+ * a well-formed requestId, the brief text of a brief-check, and a distinct
+ * underlying reviewer model. Null when the request is well-formed.
+ */
+function requestShapeRefusal(request: RequestIndependentReviewRequest): RequestIndependentReviewResult | null {
+  if (
+    !isNonEmptyTrimmedString(request.assessmentId) ||
+    !isNonEmptyTrimmedString(request.projectId) ||
+    !isNonEmptyTrimmedString(request.attemptId) ||
+    !isNonEmptyTrimmedString(request.candidateHeadSha) ||
+    !isNonEmptyTrimmedString(request.policyRevision) ||
+    !isNonEmptyTrimmedString(request.implementerModel) ||
+    !isNonEmptyTrimmedString(request.reviewerModel)
+  ) {
+    return rejectedFor(
+      request,
+      'invalid-request',
+      'Independent review requires non-empty assessmentId, projectId, attemptId, candidateHeadSha, policyRevision, implementerModel and reviewerModel',
+    );
+  }
+  if (
+    (request.kind !== undefined && !REVIEW_KINDS.includes(request.kind)) ||
+    (request.requestId !== undefined &&
+      (typeof request.requestId !== 'string' || !REVIEW_REQUEST_ID_PATTERN.test(request.requestId))) ||
+    (request.requestId !== undefined && request.kind === undefined)
+  ) {
+    return rejectedFor(
+      request,
+      'invalid-request',
+      'Independent review requires a known kind and a well-formed requestId together',
+    );
+  }
+  // A brief-check review answers against the frozen brief; without the brief
+  // text it must never reach a reviewer or become evidence (SEC-4).
+  if (request.kind === 'brief-check' && !isNonEmptyTrimmedString(request.briefText)) {
+    return rejectedFor(request, 'invalid-request', 'A brief-check review requires the brief text');
+  }
+  if (sharesUnderlyingModel(request.implementerModel, request.reviewerModel)) {
+    return rejectedFor(
+      request,
+      'not-independent',
+      `Independent review requires a distinct underlying model: ${request.reviewerModel} and ${request.implementerModel} share the same underlying model`,
+    );
+  }
+  return null;
+}
+
+/** The identity and seat checks of an existing assessment against the request, in their order. */
+function assessmentIdentityRefusal(
+  existing: EvidenceAssessmentRecord,
+  request: RequestIndependentReviewRequest,
+): RequestIndependentReviewResult | null {
+  if (
+    existing.projectId !== request.projectId ||
+    existing.attemptId !== request.attemptId ||
+    existing.policyRevision !== request.policyRevision
+  ) {
+    return rejectedFor(
+      request,
+      'assessment-mismatch',
+      'Assessment identity mismatch (projectId, attemptId, or policyRevision does not match existing assessment)',
+    );
+  }
+  if (existing.implementerModel !== request.implementerModel) {
+    return rejectedFor(
+      request,
+      'assessment-mismatch',
+      `Assessment '${existing.id}' was implemented on seat '${existing.implementerModel}', not '${request.implementerModel}'`,
+    );
+  }
+  return null;
+}
+
+function noAssessmentRejection(request: RequestIndependentReviewRequest): RequestIndependentReviewResult {
+  return rejectedFor(
+    request,
+    'no-assessment',
+    `No assessment exists for assessmentId '${request.assessmentId}'`,
+  );
+}
+
+/** True when a stored receipt with the request's id was recorded for a different review. */
+function isRequestIdReused(
+  found: ReviewReceiptRecord,
+  request: RequestIndependentReviewRequest,
+  chain: ReceiptSubject | undefined,
+): boolean {
+  return (
+    found.reviewerModel.trim() !== request.reviewerModel.trim() ||
+    found.kind !== request.kind ||
+    found.candidateHeadSha !== request.candidateHeadSha ||
+    (chain !== undefined && !isChainReceiptOf(found, chain))
+  );
+}
+
+/**
+ * A replayed request id never runs a second review (§3.5): the recorded receipt answers when reviewer,
+ * kind and head match and the assessment still matches the request. Replay runs before the seat policy —
+ * a stored receipt needs no new seat — and before the head and identity checks so a reused id always gets
+ * its typed code. Any other reuse (a different head included) is request-id-reused. Only a request carrying
+ * a requestId reads the assessment here; a new review checks the seat policy first (FS3b).
+ */
+async function replayStep(
+  deps: RequestIndependentReviewDependencies,
+  request: RequestIndependentReviewRequest,
+  chain: ReceiptSubject | undefined,
+): Promise<Step<EvidenceAssessmentRecord | null>> {
+  if (request.requestId === undefined) {
+    return { value: null };
+  }
+  let existing = await deps.repo.findAssessmentById(request.assessmentId);
+  if (existing === null && chain !== undefined) {
+    existing = await openChainAssessment(deps, request, nowIsoOf(request));
+  }
+  if (existing === null) {
+    return { result: noAssessmentRejection(request) };
+  }
+  const found = existing.reviewReceipts.find((receipt) => receipt.requestId === request.requestId);
+  if (found === undefined) {
+    return { value: existing };
+  }
+  if (isRequestIdReused(found, request, chain)) {
+    return {
+      result: rejectedFor(
+        request,
+        'request-id-reused',
+        'Review request id ' + request.requestId + ' was already used for another review',
+      ),
+    };
+  }
+  const mismatch = assessmentIdentityRefusal(existing, request);
+  if (mismatch !== null) {
+    return { result: mismatch };
+  }
+  return { result: { outcome: 'reviewed', receipt: found } };
+}
+
+/** The seat policy, the assessment read, and the head, identity and terminal-state checks, in their order. */
+async function loadReviewableAssessment(
+  deps: RequestIndependentReviewDependencies,
+  request: RequestIndependentReviewRequest,
+  replayed: EvidenceAssessmentRecord | null,
+): Promise<Step<EvidenceAssessmentRecord>> {
+  if (deps.seatPolicy) {
+    const check = await deps.seatPolicy.checkReviewerSeat({ reviewerModel: request.reviewerModel });
+    if (check.outcome === 'refused') {
+      return { result: rejectedFor(request, 'seat-refused', check.reason) };
+    }
+  }
+  const existing = replayed ?? (await deps.repo.findAssessmentById(request.assessmentId));
+  if (existing === null) {
+    return { result: noAssessmentRejection(request) };
+  }
+  if (existing.candidateHeadSha !== request.candidateHeadSha) {
+    return {
+      result: rejectedFor(
+        request,
+        'assessment-mismatch',
+        `Assessment '${request.assessmentId}' exists for candidate head '${existing.candidateHeadSha}', not '${request.candidateHeadSha}'`,
+      ),
+    };
+  }
+  const mismatch = assessmentIdentityRefusal(existing, request);
+  if (mismatch !== null) {
+    return { result: mismatch };
+  }
+  if (AssessmentState.create(existing.state).value?.isTerminal()) {
+    return {
+      result: rejectedFor(
+        request,
+        'assessment-terminal',
+        `Assessment '${existing.id}' is in terminal state '${existing.state}'`,
+      ),
+    };
+  }
+  return { value: existing };
+}
+
+/** An unavailable review: the requested reviewer is recorded on the assessment, a lost revision race is tolerated. */
+async function unavailableRejection(
+  deps: RequestIndependentReviewDependencies,
+  request: RequestIndependentReviewRequest,
+  existing: EvidenceAssessmentRecord,
+  run: { readonly reason: string; readonly code: ReviewUnavailableCode },
+  nowIso: string,
+): Promise<RequestIndependentReviewResult> {
+  try {
+    await deps.repo.saveAssessment({
+      ...existing,
+      requestedReviewerModel: request.reviewerModel.trim(),
+      revision: existing.revision + 1,
+      updatedAtIso: nowIso,
+    });
+  } catch (error) {
+    if (error instanceof EvidenceAssessmentRevisionConflictError) {
+      return rejectedFor(request, 'review-unavailable', run.reason, run.code);
+    }
+    throw error;
+  }
+  return rejectedFor(request, 'review-unavailable', run.reason, run.code);
+}
+
+/** The receipt record a completed review would store; findings are stored unresolved. */
+function receiptCandidateOf(
+  request: RequestIndependentReviewRequest,
+  run: CompletedReview,
+  evidenceRef: string,
+  chain: ReceiptSubject | undefined,
+  existing: EvidenceAssessmentRecord,
+): ReviewReceiptRecord {
+  const kindFields: Partial<ReviewReceiptRecord> =
+    request.kind !== undefined ? { kind: request.kind } : {};
+  const requestIdFields: Partial<ReviewReceiptRecord> =
+    request.requestId !== undefined ? { requestId: request.requestId } : {};
+  const subjectFields: Partial<ReviewReceiptRecord> = chain !== undefined ? { subject: chain } : {};
+  const receiptId =
+    request.requestId !== undefined
+      ? 'rr-' + request.assessmentId + '-' + request.candidateHeadSha.slice(0, 8) + '-' + request.requestId
+      : manualReceiptIdOf(request.assessmentId, request.candidateHeadSha, existing);
+  return {
+    id: receiptId,
+    assessmentId: request.assessmentId,
+    projectId: request.projectId,
+    attemptId: request.attemptId,
+    candidateHeadSha: request.candidateHeadSha,
+    reviewerModel: request.reviewerModel,
+    implementerModel: request.implementerModel,
+    readOnlyVerified: run.readOnlyVerified,
+    result: run.result,
+    // A reviewer-reported state is not a disposition: findings are stored
+    // unresolved, and only RecordFindingDispositionUseCase resolves them.
+    findings: scopeFindingIdsToReceipt(
+      receiptId,
+      run.findings.map((finding) => ({
+        ...finding,
+        state: 'unresolved' as const,
+        dispositionReason: null,
+        dispositionEvidenceRef: null,
+      })),
+    ),
+    evidenceRef,
+    policyRevision: request.policyRevision,
+    completedAtIso: run.completedAtIso,
+    ...kindFields,
+    ...requestIdFields,
+    ...subjectFields,
+  };
+}
+
+/** Validate a candidate receipt: the placeholder check, then the entity's own invariants. */
+function validatedReceipt(
+  request: RequestIndependentReviewRequest,
+  candidate: ReviewReceiptRecord,
+): Step<ReviewReceiptRecord> {
+  // New writes only (plan §3.1, D1): stored receipts are not re-checked on load.
+  const placeholderField = placeholderReviewReceiptField(candidate);
+  if (placeholderField !== null) {
+    return {
+      result: rejectedFor(
+        request,
+        'invalid-receipt',
+        placeholderEvidenceRefusal('Independent review receipt', placeholderField),
+        'invalid-receipt',
+      ),
+    };
+  }
+  const validated = ReviewReceipt.create(candidate);
+  if (!validated.success || validated.value === undefined) {
+    return {
+      result: rejectedFor(
+        request,
+        'invalid-receipt',
+        validated.error?.message ?? 'Independent review produced an invalid receipt',
+        'invalid-receipt',
+      ),
+    };
+  }
+  return { value: validated.value.toRecord() };
+}
+
+/** Append the receipt to the assessment, re-collect its blockers and save it. */
+async function appendAndSaveReceipt(
+  deps: RequestIndependentReviewDependencies,
+  request: RequestIndependentReviewRequest,
+  existing: EvidenceAssessmentRecord,
+  receipt: ReviewReceiptRecord,
+  nowIso: string,
+): Promise<RequestIndependentReviewResult> {
+  const assessment = EvidenceAssessment.fromRecord({
+    ...existing,
+    requestedReviewerModel: request.reviewerModel.trim(),
+  });
+  // KF-33b2: a duplicate receipt id is refused (never appended); the
+  // message text is a fixed template over stored ids, never reviewer text.
+  try {
+    assessment.appendReviewReceipt(receipt, nowIso);
+  } catch (error) {
+    return rejectedFor(
+      request,
+      'invalid-receipt',
+      error instanceof Error ? error.message : 'The review receipt could not be appended',
+      'invalid-receipt',
+    );
+  }
+  const merged = assessment.toRecord();
+  const blockers = EvidenceAssessment.fromRecord(merged).collectBlockers();
+  const updated: EvidenceAssessmentRecord = {
+    ...merged,
+    state: blockers.length > 0 ? 'blocked' : 'pending',
+    blockers: [...blockers],
+  };
+  await deps.repo.saveAssessment(updated);
+  return { outcome: 'reviewed', receipt };
+}
+
 export class RequestIndependentReviewUseCase implements RequestIndependentReviewPort {
   constructor(private readonly deps?: RequestIndependentReviewDependencies) {}
 
@@ -246,162 +566,22 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
     if (chain === 'invalid') {
       return rejectedFor(request, 'invalid-request', 'The review subject is not valid for this request');
     }
-
-    if (
-      !isNonEmptyTrimmedString(request.assessmentId) ||
-      !isNonEmptyTrimmedString(request.projectId) ||
-      !isNonEmptyTrimmedString(request.attemptId) ||
-      !isNonEmptyTrimmedString(request.candidateHeadSha) ||
-      !isNonEmptyTrimmedString(request.policyRevision) ||
-      !isNonEmptyTrimmedString(request.implementerModel) ||
-      !isNonEmptyTrimmedString(request.reviewerModel)
-    ) {
-      return rejectedFor(
-        request,
-        'invalid-request',
-        'Independent review requires non-empty assessmentId, projectId, attemptId, candidateHeadSha, policyRevision, implementerModel and reviewerModel',
-      );
-    }
-    if (
-      (request.kind !== undefined && !REVIEW_KINDS.includes(request.kind)) ||
-      (request.requestId !== undefined &&
-        (typeof request.requestId !== 'string' || !REVIEW_REQUEST_ID_PATTERN.test(request.requestId))) ||
-      (request.requestId !== undefined && request.kind === undefined)
-    ) {
-      return rejectedFor(
-        request,
-        'invalid-request',
-        'Independent review requires a known kind and a well-formed requestId together',
-      );
-    }
-    // A brief-check review answers against the frozen brief; without the brief
-    // text it must never reach a reviewer or become evidence (SEC-4).
-    if (request.kind === 'brief-check' && !isNonEmptyTrimmedString(request.briefText)) {
-      return rejectedFor(
-        request,
-        'invalid-request',
-        'A brief-check review requires the brief text',
-      );
-    }
-    if (sharesUnderlyingModel(request.implementerModel, request.reviewerModel)) {
-      return rejectedFor(
-        request,
-        'not-independent',
-        `Independent review requires a distinct underlying model: ${request.reviewerModel} and ${request.implementerModel} share the same underlying model`,
-      );
-    }
-    // A new review checks the seat policy before any assessment read (FS3b). Only a request carrying a
-    // requestId reads the assessment first, to replay a stored receipt without consulting the seat.
-    let existing: Awaited<ReturnType<typeof deps.repo.findAssessmentById>> = null;
-    // A replayed request id never runs a second review (§3.5): the recorded receipt answers when reviewer,
-    // kind and head match and the assessment still matches the request. Replay runs before the seat policy —
-    // a stored receipt needs no new seat — and before the head and identity checks so a reused id always gets
-    // its typed code. Any other reuse (a different head included) is request-id-reused.
-    if (request.requestId !== undefined) {
-      existing = await deps.repo.findAssessmentById(request.assessmentId);
-      if (existing === null && chain !== undefined) {
-        existing = await openChainAssessment(deps, request, nowIsoOf(request));
-      }
-      if (existing === null) {
-        return rejectedFor(
-          request,
-          'no-assessment',
-          `No assessment exists for assessmentId '${request.assessmentId}'`,
-        );
-      }
-      const found = existing.reviewReceipts.find(
-        (receipt) => receipt.requestId === request.requestId,
-      );
-      if (found !== undefined) {
-        if (
-          found.reviewerModel.trim() !== request.reviewerModel.trim() ||
-          found.kind !== request.kind ||
-          found.candidateHeadSha !== request.candidateHeadSha ||
-          (chain !== undefined && !isChainReceiptOf(found, chain))
-        ) {
-          return rejectedFor(
-            request,
-            'request-id-reused',
-            'Review request id ' + request.requestId + ' was already used for another review',
-          );
-        }
-        if (
-          existing.projectId !== request.projectId ||
-          existing.attemptId !== request.attemptId ||
-          existing.policyRevision !== request.policyRevision
-        ) {
-          return rejectedFor(
-            request,
-            'assessment-mismatch',
-            'Assessment identity mismatch (projectId, attemptId, or policyRevision does not match existing assessment)',
-          );
-        }
-        if (existing.implementerModel !== request.implementerModel) {
-          return rejectedFor(
-            request,
-            'assessment-mismatch',
-            `Assessment '${existing.id}' was implemented on seat '${existing.implementerModel}', not '${request.implementerModel}'`,
-          );
-        }
-        return { outcome: 'reviewed', receipt: found };
-      }
+    const shapeRefusal = requestShapeRefusal(request);
+    if (shapeRefusal !== null) {
+      return shapeRefusal;
     }
 
-    if (deps.seatPolicy) {
-      const check = await deps.seatPolicy.checkReviewerSeat({
-        reviewerModel: request.reviewerModel,
-      });
-      if (check.outcome === 'refused') {
-        return rejectedFor(request, 'seat-refused', check.reason);
-      }
+    const replay = await replayStep(deps, request, chain);
+    if ('result' in replay) {
+      return replay.result;
     }
+    const loaded = await loadReviewableAssessment(deps, request, replay.value);
+    if ('result' in loaded) {
+      return loaded.result;
+    }
+    const existing = loaded.value;
 
-    if (existing === null) {
-      existing = await deps.repo.findAssessmentById(request.assessmentId);
-      if (existing === null) {
-        return rejectedFor(
-          request,
-          'no-assessment',
-          `No assessment exists for assessmentId '${request.assessmentId}'`,
-        );
-      }
-    }
-
-    if (existing.candidateHeadSha !== request.candidateHeadSha) {
-      return rejectedFor(
-        request,
-        'assessment-mismatch',
-        `Assessment '${request.assessmentId}' exists for candidate head '${existing.candidateHeadSha}', not '${request.candidateHeadSha}'`,
-      );
-    }
-    if (
-      existing.projectId !== request.projectId ||
-      existing.attemptId !== request.attemptId ||
-      existing.policyRevision !== request.policyRevision
-    ) {
-      return rejectedFor(
-        request,
-        'assessment-mismatch',
-        'Assessment identity mismatch (projectId, attemptId, or policyRevision does not match existing assessment)',
-      );
-    }
-    if (existing.implementerModel !== request.implementerModel) {
-      return rejectedFor(
-        request,
-        'assessment-mismatch',
-        `Assessment '${existing.id}' was implemented on seat '${existing.implementerModel}', not '${request.implementerModel}'`,
-      );
-    }
-
-    if (AssessmentState.create(existing.state).value?.isTerminal()) {
-      return rejectedFor(
-        request,
-        'assessment-terminal',
-        `Assessment '${existing.id}' is in terminal state '${existing.state}'`,
-      );
-    }
-
-    const nowIso = isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
+    const nowIso = nowIsoOf(request);
     const run = await deps.reviewer.runIndependentReview({
       attemptId: request.attemptId,
       candidateHeadSha: request.candidateHeadSha,
@@ -414,20 +594,7 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       ...(request.briefText !== undefined ? { briefText: request.briefText } : {}),
     });
     if (run.outcome === 'unavailable') {
-      try {
-        await deps.repo.saveAssessment({
-          ...existing,
-          requestedReviewerModel: request.reviewerModel.trim(),
-          revision: existing.revision + 1,
-          updatedAtIso: nowIso,
-        });
-      } catch (error) {
-        if (error instanceof EvidenceAssessmentRevisionConflictError) {
-          return rejectedFor(request, 'review-unavailable', run.reason, run.code);
-        }
-        throw error;
-      }
-      return rejectedFor(request, 'review-unavailable', run.reason, run.code);
+      return unavailableRejection(deps, request, existing, run, nowIso);
     }
     if (!run.readOnlyVerified) {
       return rejectedFor(
@@ -443,90 +610,11 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       candidateHeadSha: request.candidateHeadSha,
       content: run.rawOutput,
     });
-
-    const kindFields: Partial<ReviewReceiptRecord> =
-      request.kind !== undefined ? { kind: request.kind } : {};
-    const requestIdFields: Partial<ReviewReceiptRecord> =
-      request.requestId !== undefined ? { requestId: request.requestId } : {};
-    const subjectFields: Partial<ReviewReceiptRecord> = chain !== undefined ? { subject: chain } : {};
-    const receiptId =
-      request.requestId !== undefined
-        ? 'rr-' + request.assessmentId + '-' + request.candidateHeadSha.slice(0, 8) + '-' + request.requestId
-        : manualReceiptIdOf(request.assessmentId, request.candidateHeadSha, existing);
-    const candidate: ReviewReceiptRecord = {
-      id: receiptId,
-      assessmentId: request.assessmentId,
-      projectId: request.projectId,
-      attemptId: request.attemptId,
-      candidateHeadSha: request.candidateHeadSha,
-      reviewerModel: request.reviewerModel,
-      implementerModel: request.implementerModel,
-      readOnlyVerified: run.readOnlyVerified,
-      result: run.result,
-      // A reviewer-reported state is not a disposition: findings are stored
-      // unresolved, and only RecordFindingDispositionUseCase resolves them.
-      findings: scopeFindingIdsToReceipt(
-        receiptId,
-        run.findings.map((finding) => ({
-          ...finding,
-          state: 'unresolved' as const,
-          dispositionReason: null,
-          dispositionEvidenceRef: null,
-        })),
-      ),
-      evidenceRef: archived.evidenceRef,
-      policyRevision: request.policyRevision,
-      completedAtIso: run.completedAtIso,
-      ...kindFields,
-      ...requestIdFields,
-      ...subjectFields,
-    };
-    // New writes only (plan §3.1, D1): stored receipts are not re-checked on load.
-    const placeholderField = placeholderReviewReceiptField(candidate);
-    if (placeholderField !== null) {
-      return rejectedFor(
-        request,
-        'invalid-receipt',
-        placeholderEvidenceRefusal('Independent review receipt', placeholderField),
-        'invalid-receipt',
-      );
+    const candidate = receiptCandidateOf(request, run, archived.evidenceRef, chain, existing);
+    const validated = validatedReceipt(request, candidate);
+    if ('result' in validated) {
+      return validated.result;
     }
-    const validated = ReviewReceipt.create(candidate);
-    if (!validated.success || validated.value === undefined) {
-      return rejectedFor(
-        request,
-        'invalid-receipt',
-        validated.error?.message ?? 'Independent review produced an invalid receipt',
-        'invalid-receipt',
-      );
-    }
-    const receipt = validated.value.toRecord();
-
-    const assessment = EvidenceAssessment.fromRecord({
-      ...existing,
-      requestedReviewerModel: request.reviewerModel.trim(),
-    });
-    // KF-33b2: a duplicate receipt id is refused (never appended); the
-    // message text is a fixed template over stored ids, never reviewer text.
-    try {
-      assessment.appendReviewReceipt(receipt, nowIso);
-    } catch (error) {
-      return rejectedFor(
-        request,
-        'invalid-receipt',
-        error instanceof Error ? error.message : 'The review receipt could not be appended',
-        'invalid-receipt',
-      );
-    }
-    const merged = assessment.toRecord();
-    const blockers = EvidenceAssessment.fromRecord(merged).collectBlockers();
-    const updated: EvidenceAssessmentRecord = {
-      ...merged,
-      state: blockers.length > 0 ? 'blocked' : 'pending',
-      blockers: [...blockers],
-    };
-    await deps.repo.saveAssessment(updated);
-
-    return { outcome: 'reviewed', receipt };
+    return appendAndSaveReceipt(deps, request, existing, validated.value, nowIso);
   }
 }

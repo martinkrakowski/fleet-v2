@@ -168,6 +168,30 @@ function nonEmptyOrNull(value: unknown): string | null | undefined {
 }
 
 /**
+ * Exactly the fields of the subject's own kind are set: a field of another kind
+ * is never tolerated. An unlisted kind reads as the third (brief) shape.
+ */
+function hasExactlyKindFields(
+  kind: string,
+  fields: {
+    readonly attemptId: string | null;
+    readonly chainName: string | null;
+    readonly integrationHeadSha: string | null;
+    readonly briefPackageDigest: string | null;
+    readonly baseCommit: string | null;
+  },
+): boolean {
+  const { attemptId, chainName, integrationHeadSha, briefPackageDigest, baseCommit } = fields;
+  if (kind === 'attempt') {
+    return attemptId !== null && chainName === null && integrationHeadSha === null && briefPackageDigest === null && baseCommit === null;
+  }
+  if (kind === 'chain') {
+    return chainName !== null && integrationHeadSha !== null && attemptId === null && briefPackageDigest === null && baseCommit === null;
+  }
+  return briefPackageDigest !== null && baseCommit !== null && attemptId === null && chainName === null && integrationHeadSha === null;
+}
+
+/**
  * The subject of a stored receipt, read through own data properties only (no
  * getter runs). A receipt recorded without a subject reads as an attempt
  * subject. A stored subject of an unknown kind, or one missing the fields of its
@@ -219,10 +243,9 @@ export function receiptSubjectOf(record: {
       return null;
     }
     // Exactly the fields of the subject's own kind are set: a field of another kind is never tolerated.
-    const complete =
-      kind === 'attempt' ? attemptId !== null && chainName === null && integrationHeadSha === null && briefPackageDigest === null && baseCommit === null
-      : kind === 'chain' ? chainName !== null && integrationHeadSha !== null && attemptId === null && briefPackageDigest === null && baseCommit === null
-      : briefPackageDigest !== null && baseCommit !== null && attemptId === null && chainName === null && integrationHeadSha === null;
+    const complete = hasExactlyKindFields(kind, {
+      attemptId, chainName, integrationHeadSha, briefPackageDigest, baseCommit,
+    });
     if (!complete) {
       return null;
     }

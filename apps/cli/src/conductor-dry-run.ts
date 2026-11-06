@@ -469,9 +469,7 @@ export function createDryRunFakes(
     },
     isConfigured: () => true,
     // The dry run lists no open pull requests by design: it never reads a forge.
-    listOpenPullRequestsByBase: async () => {
-      return { outcome: 'listed', pullRequests: [] };
-    },
+    listOpenPullRequestsByBase: () => Promise.resolve({ outcome: 'listed', pullRequests: [] }),
   };
 
   const conductorForgeGrant: ConductorForgeGrantPort = {

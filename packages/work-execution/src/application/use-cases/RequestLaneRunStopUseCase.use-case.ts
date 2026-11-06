@@ -12,7 +12,6 @@
 
 import type {
   RequestLaneRunStopPort,
-  RequestLaneRunStopRefusal,
   RequestLaneRunStopRequest,
   RequestLaneRunStopResult,
 } from '../ports/in/RequestLaneRunStopPort.in-port.js';
@@ -22,13 +21,15 @@ import type {
   LaneRunJournalAppendResult,
 } from '../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunJournalEntryRecord } from '../../domain/lane-run-journal.js';
-import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';import {
-  LANE_RUN_KEY_VIAS,
+import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
+import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
+import {
   laneRunStopForceKey,
   laneRunStopKey,
+  REQUEST_ID_PATTERN,
 } from '../../domain/lane-run-keys.js';
+import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import { LANE_RUN_JOURNAL_ENTRY_VERSION } from '../../domain/lane-run-journal.js';
-import { RUN_STOP_MODES } from '../../domain/lane-run-transitions.js';
 import { LANE_RUN_TERMINAL_STATES } from '../../domain/value-objects/LaneRunState.vo.js';
 import type { LaneRunStateValue } from '../../domain/value-objects/LaneRunState.vo.js';
 import { laneRunJournalState } from '../../domain/lane-run-journal.js';
@@ -38,24 +39,71 @@ export interface RequestLaneRunStopDependencies {
   readonly runJournal: LaneRunJournalPort;
 }
 
-function isPositiveSafeInteger(value: number | undefined): boolean {
-  return value !== undefined && Number.isSafeInteger(value) && value >= 1;
-}
+/** The exact own keys a stop request may carry; anything else refuses. */
+const REQUEST_KEYS: readonly string[] = ['runId', 'mode', 'via', 'expectedRevision', 'entryId', 'nowIso'];
 
-function stopRequestError(request: RequestLaneRunStopRequest): RequestLaneRunStopRefusal | null {
-  if (!RUN_STOP_MODES.includes(request.mode)) {
-    return 'invalid-request';
+/**
+ * Snapshot the caller's input and validate every field before any store is
+ * touched, so a malformed request never reaches `formatLaneRunStopKey` (which
+ * could throw) and no refusal ever echoes an unvalidated string (F96). A
+ * value present but `undefined` reads as omitted, exactly as the typed port
+ * documents for `expectedRevision`.
+ */
+function validatedRequest(
+  request: RequestLaneRunStopRequest,
+): { readonly ok: true; readonly request: RequestLaneRunStopRequest } | { readonly ok: false } {
+  let snapshot: Record<string, unknown> | null;
+  try {
+    snapshot = snapshotPlainDataRecord(request);
+  } catch {
+    return { ok: false };
   }
-  if (!LANE_RUN_KEY_VIAS.includes(request.via)) {
-    return 'invalid-request';
+  if (snapshot === null) {
+    return { ok: false };
   }
-  if (request.expectedRevision !== undefined && !isPositiveSafeInteger(request.expectedRevision)) {
-    return 'invalid-request';
+  const keys = Object.keys(snapshot);
+  const required = REQUEST_KEYS.filter((key) => key !== 'expectedRevision');
+  if (!keys.every((key) => REQUEST_KEYS.includes(key)) || !required.every((key) => Object.hasOwn(snapshot!, key))) {
+    return { ok: false };
   }
-  if (!isZonedIsoDateTime(request.nowIso)) {
-    return 'invalid-request';
+  const runId = snapshot.runId;
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+    return { ok: false };
   }
-  return null;
+  const mode = snapshot.mode;
+  if (mode !== 'graceful' && mode !== 'force') {
+    return { ok: false };
+  }
+  const via = snapshot.via;
+  if (via !== 'cli' && via !== 'web') {
+    return { ok: false };
+  }
+  const expectedRevision = snapshot.expectedRevision;
+  if (
+    expectedRevision !== undefined &&
+    (typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1)
+  ) {
+    return { ok: false };
+  }
+  const entryId = snapshot.entryId;
+  if (typeof entryId !== 'string' || !REQUEST_ID_PATTERN.test(entryId)) {
+    return { ok: false };
+  }
+  const nowIso = snapshot.nowIso;
+  if (typeof nowIso !== 'string' || nowIso.length > 64 || !isZonedIsoDateTime(nowIso)) {
+    return { ok: false };
+  }
+  return {
+    ok: true,
+    request: {
+      runId,
+      mode,
+      via,
+      ...(expectedRevision === undefined ? {} : { expectedRevision: expectedRevision as number }),
+      entryId,
+      nowIso,
+    },
+  };
 }
 
 /** The journal entry of a stop intent: every field null except the stop's own. */
@@ -100,41 +148,46 @@ function appendOutcome(
 }
 
 export class RequestLaneRunStopUseCase implements RequestLaneRunStopPort {
-  constructor(private readonly deps: RequestLaneRunStopDependencies) {}
+  constructor(private readonly deps?: RequestLaneRunStopDependencies) {}
 
   async requestLaneRunStop(request: RequestLaneRunStopRequest): Promise<RequestLaneRunStopResult> {
-    const invalid = stopRequestError(request);
-    if (invalid !== null) {
-      return { outcome: 'refused', reason: invalid };
+    if (!this.deps) {
+      throw new Error('Not implemented: RequestLaneRunStopUseCase');
     }
 
-    const record = await this.deps.runRepo.get(request.runId);
+    const validated = validatedRequest(request);
+    if (!validated.ok) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+    const stopRequest = validated.request;
+
+    const record = await this.deps.runRepo.get(stopRequest.runId);
     if (record === null) {
-      return { outcome: 'not-found', runId: request.runId };
+      return { outcome: 'not-found', runId: stopRequest.runId };
     }
 
-    const entries = await this.deps.runJournal.listForRun(request.runId);
-    const state: LaneRunStateValue = laneRunJournalState(entries, request.runId);
+    const entries = await this.deps.runJournal.listForRun(stopRequest.runId);
+    const state: LaneRunStateValue = laneRunJournalState(entries, stopRequest.runId);
     if ((LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state)) {
       return { outcome: 'refused', reason: 'run-terminal' };
     }
 
-    const expected = request.expectedRevision ?? record.revision;
+    const expected = stopRequest.expectedRevision ?? record.revision;
     if (expected !== record.revision) {
       return { outcome: 'refused', reason: 'stale-revision' };
     }
 
-    const built = request.mode === 'force'
-      ? laneRunStopForceKey(request.runId, request.via)
-      : laneRunStopKey(request.runId, request.via);
+    const built = stopRequest.mode === 'force'
+      ? laneRunStopForceKey(stopRequest.runId, stopRequest.via)
+      : laneRunStopKey(stopRequest.runId, stopRequest.via);
     if (!built.ok) {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
     const key = built.key;
 
     const appended = await this.deps.runJournal.append(
-      stopIntentEntry(request, key, expected),
+      stopIntentEntry(stopRequest, key, expected),
     );
-    return appendOutcome(request, appended, key);
+    return appendOutcome(stopRequest, appended, key);
   }
 }

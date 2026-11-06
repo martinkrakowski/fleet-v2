@@ -45,7 +45,41 @@ export type ForgeActionResult =
   | { readonly outcome: 'ambiguous'; readonly reason: string }
   | { readonly outcome: 'refused'; readonly reason: string; readonly refusalKind: ForgeRefusalKind };
 
+/** One open pull request found by a head lookup. */
+export interface OpenPullRequestByHead {
+  readonly number: number;
+  readonly headSha: string;
+}
+
+/**
+ * The answer of a read-only head lookup: the open pull requests whose head is
+ * exactly `<repository owner>:<branch>` (a fork's branch of the same name is
+ * never included). Any unreadable answer is `unreadable`, never an empty list.
+ */
+export type OpenPullRequestsByHeadResult =
+  | { readonly outcome: 'read'; readonly pullRequests: readonly OpenPullRequestByHead[] }
+  | { readonly outcome: 'unreadable'; readonly reason: string };
+
 export interface ForgeActionPort {
+  /**
+   * Read-only, bounded lookup of the open pull requests for one branch of the
+   * bound repository (the legacy PR-number lookup, WB5b). Optional: a port
+   * without it cannot resolve a legacy attempt's pull request.
+   */
+  findOpenPullRequestsByHead?(query: {
+    readonly repository: string;
+    readonly branchName: string;
+  }): Promise<OpenPullRequestsByHeadResult>;
+
+  /**
+   * The repository this port acts in (WB5b2), or undefined when none is bound.
+   * A merge refuses unless it is the work order's repository, so the verifying
+   * read, the merge and the record all name one repository. Required: a port
+   * that cannot name one answers undefined, and the merge refuses
+   * `repository-unbound`.
+   */
+  boundRepository(): { readonly owner: string; readonly repo: string } | undefined;
+
   /** Perform one forge action only against the expected head. */
   performForgeAction(request: ForgeActionRequest): Promise<ForgeActionResult>;
 

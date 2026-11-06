@@ -15,6 +15,12 @@ export interface ExecuteAuthorizedForgeActionRequest {
   readonly expectedHeadSha: string;
   readonly authorizationGrantId: string;
   /**
+   * A known pull-request number (WB5b): forwarded to the forge for PR
+   * actions and used to resolve the merge's (repository, number) without
+   * parsing journal text. Must be a positive integer when present.
+   */
+  readonly pullRequestNumber?: number;
+  /**
    * Who authorised the action (auto-merge plan A8): `policy:autoMerge@<rev>` or
    * `policy:conductor@<rev>` for a policy grant. Absent means an owner grant.
    * Set only by in-process policy callers; the HTTP entry point drops it.

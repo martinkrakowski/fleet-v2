@@ -9,11 +9,12 @@
 
 import { resolveLaneRunBaseBranch } from './base-branch.js';
 import type { BaseBranchValue } from './base-branch.js';
-import { laneRunJournalPendingIntent, laneRunJournalState } from './lane-run-journal.js';
+import { laneRunJournalPendingIntent, laneRunJournalState, laneRunJournalStopFacts } from './lane-run-journal.js';
 import type { LaneRunJournalEntryRecord } from './lane-run-journal.js';
 import { laneRunPackageKeys, laneRunOwnedPathsOverlap } from './lane-run-packages.js';
 import { isLeaseLapsed } from './lane-run-lease.js';
 import { parseLaneRunKey } from './lane-run-keys.js';
+import type { LaneRunStopKeyMode } from './lane-run-keys.js';
 import type {
   LaneRunKeyStep,
   LaneRunLeaseRecord,
@@ -55,6 +56,12 @@ export interface ConductorScheduleRow {
   readonly tier: LaneRunTier;
   readonly state: LaneRunStateValue;
   readonly round: number;
+  /** The run record's revision: the token a stop request carries as `expectedRevision`. */
+  readonly revision: number;
+  /** Strongest stop intent over the run's journal; null when none was requested. */
+  readonly stopMode: LaneRunStopKeyMode | null;
+  /** `recordedAtIso` of the run's first stop intent; null when none was requested. */
+  readonly stopRequestedAtIso: string | null;
   readonly placement: ConductorSchedulePlacement;
   readonly pendingStep: { readonly step: LaneRunKeyStep; readonly reconciliation: 'unread' | 'ambiguous' } | null;
   readonly park: { readonly reason: LaneRunParkReason; readonly qualifier: string | null } | null;
@@ -114,6 +121,9 @@ interface ScheduleRow {
   tier: LaneRunTier;
   state: LaneRunStateValue;
   round: number;
+  revision: number;
+  stopMode: LaneRunStopKeyMode | null;
+  stopRequestedAtIso: string | null;
   placement: ConductorSchedulePlacement;
   pendingStep: ConductorScheduleRow['pendingStep'];
   park: ConductorScheduleRow['park'];
@@ -228,7 +238,7 @@ interface BuildRowContext {
 }
 
 function buildRowEntry(run: LaneRunRecord, context: BuildRowContext): RowWithOrder | null {
-  const { runId, workOrderId, tier, round, attemptIds, parked, lease } = run;
+  const { runId, workOrderId, tier, round, attemptIds, parked, lease, revision } = run;
   const entries = context.journals.get(runId) ?? [];
   const state = laneRunJournalState(entries, runId);
   if ((LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state)) {
@@ -236,6 +246,7 @@ function buildRowEntry(run: LaneRunRecord, context: BuildRowContext): RowWithOrd
   }
   const slot = resolveSlot(attemptIds, context.heldByAttempt);
   const pending = laneRunJournalPendingIntent(entries, runId);
+  const stop = laneRunJournalStopFacts(entries, runId);
   const workOrder = context.readWorkOrder(workOrderId);
   const row: ScheduleRow = {
     runId,
@@ -244,6 +255,9 @@ function buildRowEntry(run: LaneRunRecord, context: BuildRowContext): RowWithOrd
     tier,
     state,
     round,
+    revision,
+    stopMode: stop.stopMode,
+    stopRequestedAtIso: stop.stopRequestedAtIso,
     placement: computePlacement(state, context.halt, slot),
     pendingStep:
       pending === null ? null : { step: pending.step, reconciliation: pending.reconciliation },

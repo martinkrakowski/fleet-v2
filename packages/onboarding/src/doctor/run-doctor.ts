@@ -16,6 +16,10 @@ import type {
   SeatModel,
 } from '@fleet/installation';
 import type { ToolId } from '@fleet/tooling';
+import {
+  CLAUDE_CODE_PERMISSION_HOOK_MINIMUM_VERSION,
+  claudeCodeSupportsPermissionHookBlock,
+} from '@fleet/tooling';
 
 import { renderAutoMergeStatus, summariseAutoMerge } from '../policy/auto-merge.js';
 
@@ -362,9 +366,43 @@ async function toolLines(
             : `version ${version}`,
         ),
       );
+      if (toolId === 'claude-code') {
+        lines.push(claudeCodeHookLine(name, version));
+      }
     }
   }
   return lines;
+}
+
+/**
+ * The start-up check of the Claude Code permission-hook recipe (plan section
+ * 4.3): the doctor is the operator's gate before any orchestrated session
+ * starts, so a host whose `claude --version` output cannot be confirmed at or
+ * above the pinned minimum FAILs here — an older client ignores
+ * `onFailure: "block"` on a hook and fails open, and the recipe is unsafe
+ * there. The refusal is the pinned rule's own: an unreadable version refuses
+ * too, never a guess.
+ */
+function claudeCodeHookLine(hostName: string, version: string | undefined): DoctorLine {
+  if (version === undefined) {
+    return line(
+      'tool',
+      `${hostName}/claude-code`,
+      'permission-hook-version',
+      'FAIL',
+      `the claude --version output is absent or unparsable, so the pinned minimum ${CLAUDE_CODE_PERMISSION_HOOK_MINIMUM_VERSION} cannot be confirmed and the permission-hook recipe is unsafe on this host`,
+    );
+  }
+  const supported = claudeCodeSupportsPermissionHookBlock(version);
+  return line(
+    'tool',
+    `${hostName}/claude-code`,
+    'permission-hook-version',
+    supported ? 'PASS' : 'FAIL',
+    supported
+      ? `version ${version} supports the pinned minimum ${CLAUDE_CODE_PERMISSION_HOOK_MINIMUM_VERSION}`
+      : `version ${version} is below the pinned minimum ${CLAUDE_CODE_PERMISSION_HOOK_MINIMUM_VERSION}; the permission-hook recipe is unsafe on this host`,
+  );
 }
 
 /** Credential files: mode only, never contents. Group/world-readable or missing is FAIL. */

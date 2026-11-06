@@ -68,6 +68,7 @@ import { questionsCommands } from './commands/questions.js';
 import { mergeCommands } from './merge.js';
 import { cutoverCommands } from './commands/cutover.js';
 import { tuiCommand } from './tui/command.js';
+import { guardCommand, type GuardCliOptions } from './commands/guard.js';
 
 export { resolveRunnerSettings };
 
@@ -675,6 +676,10 @@ The killall group stops every running lane, pauses the merge train and sets the
 killall halt marker; --lift clears the pause then the marker. Run
 'fleet-v2 killall --help'.
 
+The guard group is the settings recipe's PreToolUse outward-tool filter:
+'guard outward-tool' reads the hook JSON from stdin and answers the deny
+decision Claude Code's PreToolUse hook applies. Run 'fleet-v2 guard --help'.
+
 The cutover group reports the shadow comparison of the fleet-v2 merge queue
 against the shell train's recorded queue for one repository (read-only, ids and
 codes only). Run 'fleet-v2 cutover --help'.
@@ -740,6 +745,7 @@ export async function runCli(
   telemetryOptions?: TelemetryCliOptions,
   reportOptions?: ReportCliOptions,
   killallOptions?: KillallCliOptions,
+  guardOptions?: GuardCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -797,6 +803,11 @@ export async function runCli(
         ...killallOptions,
         stateDir: killallOptions?.stateDir ?? stateDir,
       });
+    }
+    // The guard is the settings recipe's PreToolUse filter: it reads the hook
+    // JSON from stdin and composes no runtime, installation or state store.
+    if (group === 'guard') {
+      return await guardCommand(restArgv.slice(1), io, guardOptions);
     }
     // An explicitly injected runtime stays authoritative; only a call without
     // one composes a fresh runtime bound to the resolved state directory.

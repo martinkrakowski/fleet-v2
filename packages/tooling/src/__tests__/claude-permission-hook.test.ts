@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   CLAUDE_CODE_OUTWARD_TOOL_DENY_RULES,
+  claudeCodeOutwardToolDenyReason,
   claudeCodeSupportsPermissionHookBlock,
 } from '../claude-code.js';
 
@@ -65,6 +66,92 @@ describe('claudeCodeSupportsPermissionHookBlock', () => {
   });
 });
 
+describe('claudeCodeOutwardToolDenyReason', () => {
+  const bashInput = (command: string): unknown => ({
+    session_id: 'test-session',
+    tool_name: 'Bash',
+    tool_input: { command },
+  });
+
+  it('denies a plain outward command', () => {
+    const reason = claudeCodeOutwardToolDenyReason(bashInput('git push origin main'));
+    expect(reason).toContain('Bash(git push:*)');
+  });
+
+  it('denies an outward command chained after another command', () => {
+    const reason = claudeCodeOutwardToolDenyReason(bashInput('cd /repo && git push origin main'));
+    expect(reason).toContain('Bash(git push:*)');
+  });
+
+  it('denies an outward command run in the background', () => {
+    const reason = claudeCodeOutwardToolDenyReason(bashInput('build.sh & git push origin main'));
+    expect(reason).toContain('Bash(git push:*)');
+  });
+
+  it('denies an outward command inside command substitution', () => {
+    const reason = claudeCodeOutwardToolDenyReason(bashInput('echo $(git push origin main)'));
+    expect(reason).toContain('Bash(git push:*)');
+  });
+
+  it('denies an outward command behind an environment assignment', () => {
+    const reason = claudeCodeOutwardToolDenyReason(bashInput("FOO='a b' git push origin main"));
+    expect(reason).toContain('Bash(git push:*)');
+  });
+
+  it('denies an outward command behind sudo and its flags', () => {
+    const reason = claudeCodeOutwardToolDenyReason(bashInput('sudo -u root git push origin main'));
+    expect(reason).toContain('Bash(git push:*)');
+  });
+
+  it('denies an outward command behind a timeout wrapper', () => {
+    const reason = claudeCodeOutwardToolDenyReason(bashInput('timeout 30 npm publish'));
+    expect(reason).toContain('Bash(npm publish:*)');
+  });
+
+  it('denies an outward command inside a quoted shell script', () => {
+    const reason = claudeCodeOutwardToolDenyReason(bashInput("sh -c 'git push origin main'"));
+    expect(reason).toContain('Bash(git push:*)');
+  });
+
+  it('denies an outward command inside a shell script run through another program', () => {
+    const reason = claudeCodeOutwardToolDenyReason(bashInput("docker exec box sh -c 'git push origin main'"));
+    expect(reason).toContain('Bash(git push:*)');
+  });
+
+  it('denies the fleet-v2 outward commands', () => {
+    const reason = claudeCodeOutwardToolDenyReason(bashInput('fleet-v2 merge enqueue --runId r1'));
+    expect(reason).toContain('Bash(fleet-v2 merge enqueue:*)');
+  });
+
+  it('stays out of the way when the command carries no outward action', () => {
+    expect(claudeCodeOutwardToolDenyReason(bashInput('git status && yarn typecheck'))).toBeUndefined();
+  });
+
+  it('keeps a word boundary, so a longer word is not an outward command', () => {
+    expect(claudeCodeOutwardToolDenyReason(bashInput('git pushup'))).toBeUndefined();
+  });
+
+  it('has no opinion on other tools', () => {
+    expect(
+      claudeCodeOutwardToolDenyReason({
+        tool_name: 'Edit',
+        tool_input: { file_path: '/tmp/x', command: 'git push origin main' },
+      }),
+    ).toBeUndefined();
+  });
+
+  it('fails closed on an unreadable hook input', () => {
+    expect(claudeCodeOutwardToolDenyReason('not json')).toContain('could not be read');
+    expect(claudeCodeOutwardToolDenyReason({})).toContain('could not be read');
+    expect(claudeCodeOutwardToolDenyReason({ tool_name: 'Bash', tool_input: {} })).toContain(
+      'could not be read',
+    );
+    expect(claudeCodeOutwardToolDenyReason({ tool_name: 'Bash', tool_input: 'git push' })).toContain(
+      'could not be read',
+    );
+  });
+});
+
 describe('the settings example', () => {
   it('denies exactly the outward-tool deny rules, in the same order', () => {
     expect(example.permissions.deny).toEqual(CLAUDE_CODE_OUTWARD_TOOL_DENY_RULES);
@@ -76,7 +163,7 @@ describe('the settings example', () => {
     expect(preToolUse[0].matcher).toBe('Bash');
     expect(preToolUse[0].hooks).toHaveLength(1);
     expect(preToolUse[0].hooks[0].onFailure).toBe('block');
-    expect(preToolUse[0].hooks[0].command).toBeTruthy();
+    expect(preToolUse[0].hooks[0].command).toContain('guard outward-tool');
   });
 
   it('routes edit approvals through a blocking PermissionRequest hook that excludes Bash', () => {

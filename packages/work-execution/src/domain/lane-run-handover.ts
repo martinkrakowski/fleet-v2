@@ -139,6 +139,11 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
   const included = includedFindings(input.findings);
   const rawLines: { readonly text: string }[] = [];
 
+  // KS6: the findings and the gate lines are additive — a gate failure whose
+  // review receipt carried findings renders both groups, findings first, then
+  // the gate lines (the predicates when there are any, otherwise the reason
+  // codes). The render refuses `nothing-to-fix` only when both groups are
+  // empty.
   if (included.length > 0) {
     for (const finding of included) {
       const rendered = renderFindingLine(finding);
@@ -147,7 +152,8 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
       }
       rawLines.push({ text: rendered.text });
     }
-  } else if (input.source === 'gate' && input.gatePredicates.length > 0) {
+  }
+  if (input.source === 'gate' && input.gatePredicates.length > 0) {
     for (const predicate of input.gatePredicates) {
       if (containsSecretShape(predicate.name)) {
         return { ok: false, reason: 'secret-shaped-input' };
@@ -165,7 +171,8 @@ export function renderHandoverBrief(input: RenderHandoverBriefInput): RenderHand
       }
       rawLines.push({ text: `[gate] ${code}` });
     }
-  } else {
+  }
+  if (rawLines.length === 0) {
     return { ok: false, reason: 'nothing-to-fix' };
   }
   if (input.uncommittedHandover === true) {

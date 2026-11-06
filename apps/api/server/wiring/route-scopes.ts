@@ -29,6 +29,7 @@ const GET_ROUTE_PATTERNS: readonly string[] = [
   "/v1/attention",
   "/v1/capabilities",
   "/v1/snapshots",
+  "/v1/telemetry/status",
   "/v1/projects",
   "/v1/projects/unregistered",
   "/v1/projects/:id",

@@ -59,3 +59,12 @@ export { isValidHostName } from './host-name.js';
 
 export { SEAT_BILLINGS, billingOf } from './billing.js';
 export type { SeatBilling } from './billing.js';
+
+export { readPlainRecord } from './plain-record.js';
+export type {
+  PlainFieldSchema,
+  PlainRecordSchema,
+  PlainRecordFailureReason,
+  PlainRecordRead,
+} from './plain-record.js';
+export { MAX_SCHEMA_FIELDS, MAX_DEPTH } from './plain-record.js';

@@ -500,6 +500,15 @@
     ]
   },
   {
+    "method": "GET",
+    "path": "/v1/telemetry/status",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
     "method": "POST",
     "path": "/v1/verifications",
     "envelope": [

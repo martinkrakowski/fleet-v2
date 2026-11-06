@@ -22,13 +22,19 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
     loadQuestionSummary(),
   ]);
   const openQuestions = openQuestionCount(questions);
+  // TD5a-w reads GET /v1/todo and passes counts.total
+  const openTodos: number | null = null;
 
   return (
     <html lang="en" suppressHydrationWarning>
       <body>
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
         <div className="app-shell">
-          <Sidebar nav={nav} openQuestions={openQuestions} />
+          <Sidebar
+            nav={nav}
+            openQuestions={openQuestions}
+            openTodos={openTodos}
+          />
           <div className="main">
             <Topbar />
             <div className="page-wrapper">

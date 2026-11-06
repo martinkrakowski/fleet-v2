@@ -16,7 +16,7 @@ import type { HandoverFinding, RenderHandoverBriefInput } from '../../../domain/
 import { originalBriefOf, renderHandoverBrief } from '../../../domain/lane-run-handover.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import { laneRunReviewFact } from '../../../domain/lane-run-review-facts.js';
-import { head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision, LaneRunReviewFact, LaneRunSeatFact } from '../../../domain/lane-run-decider.js';
 import type { LaneRunResultReasonCode } from '../../../domain/lane-run-step-facts.js';
@@ -509,6 +509,89 @@ export async function performReview(
 }
 
 /**
+ * KS6: one review starts beside the gate. The gate body calls this for the
+ * brief-check only, so it is requested on the sealed diff (the collected
+ * head) while the gate runs, and the brief-check state later reads the
+ * recorded receipt instead of requesting a second review. Failure-tolerant by design — an unwired port, missing facts, an
+ * existing intent of the kind, an unavailable seat or a built-key failure
+ * starts nothing, and a throw from the journal read or `performReview` is
+ * swallowed — because a review that cannot start must never block or change
+ * the gate's own result: the state keeps behaving exactly as it does without
+ * the in-flight start. The session-start gate inside `performReview` still
+ * sits before its one-way intent, so a staggered refusal writes nothing here.
+ */
+async function startReviewInFlight(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  request: AdvanceLaneRunRequest,
+  kind: ReviewKind,
+): Promise<void> {
+  if (
+    ctx.deps.reviewRequest === undefined ||
+    ctx.deps.reviewAssessment === undefined ||
+    ctx.deps.workOrderRepo === undefined
+  ) {
+    return;
+  }
+  const head12 = gathered.facts.head12;
+  if (gathered.latestAttempt === null || gathered.latestAttempt.artifacts === null || head12 === null) {
+    return;
+  }
+  const fact = kind === 'brief-check' ? gathered.facts.briefCheck : gathered.facts.codeReview;
+  if (fact.verdict !== 'none') {
+    return;
+  }
+  try {
+    const entries = await ctx.deps.runJournal.listForRun(record.runId);
+    const seat = reviewSeatOf(ctx, record, kind, entries, gathered.attemptRecords);
+    if (!seat.ok) {
+      return;
+    }
+    const key = buildLaneRunStepKey({
+      runId: record.runId,
+      round: record.round,
+      step: kind,
+      seatIndex: seat.seatIndex,
+      attemptOrdinal: null,
+      head12,
+      retry: null,
+    });
+    if (!key.ok) {
+      return;
+    }
+    const decision: ActDecision = {
+      kind: 'act',
+      step: kind,
+      key: key.key,
+      round: record.round,
+      seatIndex: seat.seatIndex,
+      head12,
+      retry: null,
+    };
+    await performReview(ctx, record, gathered, decision, request);
+  } catch {
+    // A review that cannot start — a journal read, a seat, a key or the
+    // request itself — never blocks the gate.
+  }
+}
+
+/**
+ * KS6: the brief-check starts beside the gate. It runs on the sealed diff
+ * while the gate evaluates. The code-review is NOT started here: it starts
+ * from its own state, exactly as today. A brief-check that cannot start here
+ * starts later from its own state too.
+ */
+export async function startReviewsInFlight(
+  ctx: AdvanceStepContext,
+  record: LaneRunRecord,
+  gathered: GatheredLaneRunFacts,
+  request: AdvanceLaneRunRequest,
+): Promise<void> {
+  await startReviewInFlight(ctx, record, gathered, request, 'brief-check');
+}
+
+/**
  * The review reconcile (§3.5): an intent without a final result — after a
  * crash, or a review whose `requestReview` left nothing established — is
  * answered from the evidence receipt of the journalled request id, never by
@@ -599,6 +682,48 @@ function reviewResultKeysAtHead(
     if (parsed.step !== 'brief-check' && parsed.step !== 'code-review') {
       continue;
     }
+    candidates.push({ key: entry.key, step: parsed.step });
+  }
+  return candidates;
+}
+
+/**
+ * KS6: every review key of this run at `head12`, latest first (journal order)
+ * — final result keys AND pending intent keys. A review whose outcome was
+ * `unknown` leaves its intent without a result (K5-4b reconciles it later),
+ * yet its receipt may already be recorded; the gate-failure fix scan reads
+ * such a receipt too. Which candidate actually carries the unresolved
+ * findings is decided by its receipt, not by the journal result alone.
+ */
+function reviewKeysAtHead(
+  entries: readonly LaneRunJournalEntryRecord[],
+  runId: string,
+  head12: string,
+): { readonly key: string; readonly step: ReviewKind }[] {
+  const candidates: { key: string; step: ReviewKind }[] = [];
+  const seen = new Set<string>();
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index]!;
+    if (entry.key === null || entry.runId !== runId) {
+      continue;
+    }
+    if (entry.kind !== 'result' && entry.kind !== 'intent') {
+      continue;
+    }
+    if (entry.kind === 'result' && entry.outcome === 'ambiguous') {
+      continue;
+    }
+    const parsed = parseLaneRunKey(entry.key);
+    if (parsed === null || parsed.kind !== 'step' || parsed.head12 !== head12) {
+      continue;
+    }
+    if (parsed.step !== 'brief-check' && parsed.step !== 'code-review') {
+      continue;
+    }
+    if (seen.has(entry.key)) {
+      continue;
+    }
+    seen.add(entry.key);
     candidates.push({ key: entry.key, step: parsed.step });
   }
   return candidates;
@@ -1203,6 +1328,38 @@ async function fixPrepareGatePredicatesStep(
 }
 
 /**
+ * KS6: a gate failure's fix brief also carries the in-scope findings of the
+ * review receipts already recorded at the failed head (the brief-check and
+ * code-review that ran beside the gate). The changed set is read once, the
+ * run's review keys at the head — final results and pending intents whose
+ * receipt may already be recorded — are walked latest first, and the walk
+ * stops at the first candidate whose receipt carries at least one in-scope
+ * finding. No new refusals: a missing or unreadable receipt, a receipt with
+ * no findings or a receipt whose findings are all out of scope simply adds
+ * nothing — the gate's own deltas still make the brief.
+ */
+async function fixPrepareGateReviewFindingsStep(
+  shared: FixPrepareWired,
+  context: FixPrepareContext,
+): Promise<FixPrepareStepOutcome<readonly HandoverFinding[]>> {
+  if (context.failure.source !== 'gate') {
+    return { status: 'ok', value: [] };
+  }
+  const changed = await changedPathsOf(shared.ctx, shared.gathered, context.prior, context.prior.artifacts.headCommit);
+  for (const candidate of reviewKeysAtHead(context.entries, shared.record.runId, context.head)) {
+    const found = await candidateReceiptOf(shared.ctx, context.prior, candidate);
+    if (found === null) {
+      continue;
+    }
+    const inScope = inScopeFindingsOf(found.findings, changed, context.prior.worktreePath);
+    if (inScope.length > 0) {
+      return { status: 'ok', value: handoverFindingsOf({ findings: inScope }) };
+    }
+  }
+  return { status: 'ok', value: [] };
+}
+
+/**
  * Step 14: the frozen acceptance spec's argv, trusted only through the
  * value object; an invalid spec refuses the prepare.
  */
@@ -1432,6 +1589,13 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
   if (gate.status === 'refused') {
     return gate.result;
   }
+  // KS6: beside the gate's own deltas, the review receipts already recorded at
+  // the failed head join the fix brief — the first in-scope findings win, and a
+  // missing, unreadable or finding-free receipt adds nothing.
+  const gateFindings = await fixPrepareGateReviewFindingsStep(wired, context);
+  if (gateFindings.status === 'refused') {
+    return gateFindings.result;
+  }
   const proof = await fixPrepareProofCommandsStep(wired, verified.value.manifest);
   if (proof.status === 'refused') {
     return proof.result;
@@ -1446,7 +1610,7 @@ export async function performFixPrepare(ctx: AdvanceStepContext,
     round: context.round,
     head: context.head,
     failure: context.failure,
-    findings: review.value,
+    findings: [...review.value, ...gateFindings.value],
     gatePredicates: gate.value,
     proofCommands: proof.value,
     originalBrief: original.value,

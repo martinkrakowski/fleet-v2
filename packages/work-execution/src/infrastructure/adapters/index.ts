@@ -65,6 +65,7 @@ export * from "./MergeGrantAdapter.adapter.js";
 export * from "./MergeNotificationAdapter.adapter.js";
 export * from "./MergePolicyAdapter.adapter.js";
 export * from "./MergeQueueRepositoryAdapter.adapter.js";
+export * from "./MergeRecordRepositoryAdapter.adapter.js";
 export * from "./MergeVerificationAdapter.adapter.js";
 export * from "./NoopChangeSignalAdapter.adapter.js";
 export * from "./NoopRunTelemetryAdapter.adapter.js";

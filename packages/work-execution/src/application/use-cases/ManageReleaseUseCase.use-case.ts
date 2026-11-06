@@ -532,7 +532,10 @@ function compareBuilds(a: ReleaseBuildRecord, b: ReleaseBuildRecord): number {
   if (byTime !== 0) {
     return byTime;
   }
-  return a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0;
+  if (a.sha < b.sha) {
+    return -1;
+  }
+  return a.sha > b.sha ? 1 : 0;
 }
 
 /** The kept build immediately older than `current`; null when current is not a kept build or is the oldest. */

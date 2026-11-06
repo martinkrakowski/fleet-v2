@@ -127,7 +127,7 @@ export async function manageReleaseFromPayload(
     nowIso: deps.nowIso,
     env: deps.env,
   });
-  return useCase.manageRelease(request);
+  return await useCase.manageRelease(request);
 }
 
 function parseRequest(payload: Payload): ManageReleaseRequest {
@@ -184,11 +184,18 @@ function parseSource(action: ReleaseAction, value: unknown): string | null {
   return source;
 }
 
+function keepCandidate(value: unknown): number {
+  if (typeof value === 'number') {
+    return value;
+  }
+  return typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : Number.NaN;
+}
+
 function parseKeep(value: unknown): number {
   if (value === undefined) {
     return DEFAULT_KEEP;
   }
-  const parsed = typeof value === 'number' ? value : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN;
+  const parsed = keepCandidate(value);
   if (!Number.isInteger(parsed) || parsed < MIN_KEEP || parsed > MAX_KEEP) {
     throw new CliUsageError(`--keep must be an integer from ${MIN_KEEP} to ${MAX_KEEP}`);
   }

@@ -262,15 +262,23 @@ async function removeDoomed(
     if (fence !== undefined && !(await passesFence(fence))) {
       return { complete: false, removed };
     }
-    try {
-      await fs.rename(path.join(root, sha), trash);
-    } catch {
+    if (!(await trashBuild(path.join(root, sha), trash))) {
       return { complete: false, removed };
     }
     removed.push(sha);
-    await fs.rm(trash, { recursive: true, force: true }).catch(() => undefined);
   }
   return { complete: true, removed };
+}
+
+/** Rename a build to its trash name, then delete it best-effort; false when the rename fails. */
+async function trashBuild(buildDir: string, trash: string): Promise<boolean> {
+  try {
+    await fs.rename(buildDir, trash);
+  } catch {
+    return false;
+  }
+  await fs.rm(trash, { recursive: true, force: true }).catch(() => undefined);
+  return true;
 }
 
 /** Orphan archives, homes and trash: never a staging directory an install still uses. */
@@ -278,11 +286,14 @@ async function removeOrphans(root: string): Promise<boolean> {
   try {
     const entries = await fs.readdir(root, { withFileTypes: true });
     const dirs = new Set(entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name));
-    for (const entry of entries) {
-      if (isOrphan(entry, dirs)) {
-        await fs.rm(path.join(root, entry.name), { recursive: true, force: true });
-      }
-    }
+    // One delete after another, stopping at the first failure.
+    await entries
+      .filter((entry) => isOrphan(entry, dirs))
+      .reduce(
+        (previous, entry) =>
+          previous.then(() => fs.rm(path.join(root, entry.name), { recursive: true, force: true })),
+        Promise.resolve(),
+      );
     return true;
   } catch {
     return false;
@@ -340,8 +351,21 @@ async function readBuilds(root: string, entries: readonly Dirent[]): Promise<Bui
     }
     builds.push(marker);
   }
-  builds.sort((a, b) => Date.parse(a.builtAtIso) - Date.parse(b.builtAtIso) || (a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0));
+  builds.sort(compareBuildRecords);
   return { ok: true, builds };
+}
+
+/** Bytewise (UTF-16 code unit) order, locale independent. */
+function compareBytewise(a: string, b: string): number {
+  if (a < b) {
+    return -1;
+  }
+  return a > b ? 1 : 0;
+}
+
+/** Oldest build first; equal times order by sha. */
+function compareBuildRecords(a: ReleaseBuildRecord, b: ReleaseBuildRecord): number {
+  return Date.parse(a.builtAtIso) - Date.parse(b.builtAtIso) || compareBytewise(a.sha, b.sha);
 }
 
 /** The marker's record, 'absent' when there is no marker, null when it cannot be read or parsed. */
@@ -363,7 +387,7 @@ async function readMarker(file: string, sha: string): Promise<ReleaseBuildRecord
     return null;
   }
   const record = parsed as Record<string, unknown>;
-  const keys = Object.keys(record).sort().join(',');
+  const keys = Object.keys(record).sort(compareBytewise).join(',');
   if (keys !== 'builtAtIso,sha,version' || record['version'] !== 1 || record['sha'] !== sha) {
     return null;
   }

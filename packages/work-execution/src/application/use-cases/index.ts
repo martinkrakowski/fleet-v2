@@ -31,6 +31,7 @@ export * from "./ListMergeQueueUseCase.use-case.js";
 export * from "./ListStaleWorkOrdersUseCase.use-case.js";
 export * from "./ListUnregisteredProjectsUseCase.use-case.js";
 export * from "./ManageDaemonSchedulerUseCase.use-case.js";
+export * from "./merge-pass/index.js";
 export * from "./PrepareBriefPackageUseCase.use-case.js";
 export * from "./PrepareFixAttemptUseCase.use-case.js";
 export * from "./ProbeProjectUseCase.use-case.js";

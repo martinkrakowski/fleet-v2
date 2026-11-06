@@ -76,18 +76,20 @@ const REPOINT_FENCE_MS = 120_000;
 /** The lease time that must remain when the fence passes; the rename after it is one local syscall. */
 const REPOINT_MARGIN_MS = 60_000;
 /** The only operator variables the git child may see; everything else (tokens, credentials) stays out. */
-const GIT_ENV_ALLOWLIST: readonly string[] = ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ'];
 /**
- * The only operator variables the tar, install and build children may see:
- * the git set plus the yarn and corepack placement settings. No token,
- * credential or forge variable reaches the commit's own scripts.
+ * The only operator variables any build child (git, tar, yarn) may see: none
+ * of them a credential, a token or a home directory. HOME is never passed:
+ * every child gets this run's own empty home from the store, so neither an
+ * operator dotfile (`.npmrc`, `.yarnrc.yml`, `.gitconfig`, `.netrc`) nor an
+ * operator cache reaches the commit's own install and build scripts.
  */
-const BUILD_ENV_ALLOWLIST: readonly string[] = [
-  ...GIT_ENV_ALLOWLIST,
+const CHILD_ENV_ALLOWLIST: readonly string[] = [
+  'PATH',
+  'TMPDIR',
+  'LANG',
+  'LC_ALL',
+  'TZ',
   'YARN_NM_MODE',
-  'YARN_CACHE_FOLDER',
-  'YARN_ENABLE_GLOBAL_CACHE',
-  'COREPACK_HOME',
   'COREPACK_ENABLE_DOWNLOAD_PROMPT',
 ];
 
@@ -150,6 +152,16 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     if (live) {
       return refuse('driver-lease-live');
     }
+    return this.apply(request, target, kept, alreadyBuilt);
+  }
+
+  /** The apply path: grant, build when needed, the fenced repoint, then prune. */
+  private async apply(
+    request: ValidRequest,
+    target: string,
+    kept: readonly string[],
+    alreadyBuilt: boolean,
+  ): Promise<ManageReleaseResult> {
     const grant = await this.resolveGrant(request, target);
     if (typeof grant !== 'string') {
       return refuse(grant.refusal);
@@ -257,13 +269,19 @@ export class ManageReleaseUseCase implements ManageReleasePort {
 
   /**
    * The repoint fence, awaited by the store right before its one rename: this
-   * process still holds the lease, and the lease has at least
-   * REPOINT_MARGIN_MS left, far more than one local rename takes.
+   * process still holds the lease, and, on the clock after that check, the
+   * lease has at least REPOINT_MARGIN_MS left, far more than one rename takes.
    */
   private async stillHolds(held: HeldLease): Promise<boolean> {
-    const nowIso = this.deps.nowIso();
-    const refusal = await this.deps.lease.check({ holderId: held.holderId, fence: held.fence, nowIso });
-    return refusal === null && Date.parse(held.leaseUntilIso) - Date.parse(nowIso) >= REPOINT_MARGIN_MS;
+    const refusal = await this.deps.lease.check({
+      holderId: held.holderId,
+      fence: held.fence,
+      nowIso: this.deps.nowIso(),
+    });
+    // The margin is measured on a clock read after the check returned, so a
+    // slow check can never leave a stale "time left" behind it.
+    const afterCheck = Date.parse(this.deps.nowIso());
+    return refusal === null && Date.parse(held.leaseUntilIso) - afterCheck >= REPOINT_MARGIN_MS;
   }
 
   private async acquireLease(request: ValidRequest, target: string): Promise<HeldLease | ManageReleaseRefusal> {
@@ -342,16 +360,16 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     if (staging.outcome !== 'prepared') {
       return 'store-unreadable';
     }
-    const { buildId, buildDir, archivePath } = staging;
+    const { buildId, buildDir, archivePath, homeDir } = staging;
     const baseEnv = this.deps.env();
+    const buildEnv = { ...allowlisted(baseEnv, CHILD_ENV_ALLOWLIST), HOME: homeDir };
     const env: Record<string, string> = {
-      ...allowlisted(baseEnv, GIT_ENV_ALLOWLIST),
+      ...buildEnv,
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_ALLOW_PROTOCOL: 'none',
       GIT_NO_LAZY_FETCH: '1',
       GIT_TERMINAL_PROMPT: '0',
     };
-    const buildEnv = allowlisted(baseEnv, BUILD_ENV_ALLOWLIST);
     const gitBudget = { timeoutMs: GIT_STEP_TIMEOUT_MS, maxBufferBytes: GIT_STEP_MAX_BUFFER_BYTES, killProcessTree: true };
     const yarnBudget = { timeoutMs: YARN_STEP_TIMEOUT_MS, maxBufferBytes: YARN_STEP_MAX_BUFFER_BYTES, killProcessTree: true };
     const steps: ReadonlyArray<{ argv: readonly string[]; options: CommandRunOptions }> = [
@@ -475,45 +493,47 @@ function shasToPrune(builds: readonly ReleaseBuildRecord[], current: string, kee
 
 function readRequest(raw: unknown): ValidRequest | null {
   const snapshot = snapshotPlainDataRecord(raw);
-  if (snapshot === null) {
-    return null;
-  }
-  const keys = Object.keys(snapshot);
-  if (keys.length !== REQUEST_KEYS.length || !REQUEST_KEYS.every((key) => keys.includes(key))) {
+  if (snapshot === null || !hasExactlyRequestKeys(snapshot)) {
     return null;
   }
   const { action, root, sha, source, keep, apply, projectId } = snapshot;
-  if (typeof action !== 'string' || !(ACTIONS as readonly string[]).includes(action)) {
+  if (
+    !isAction(action) ||
+    !isAbsolutePath(root) ||
+    typeof apply !== 'boolean' ||
+    !isKeep(keep) ||
+    !isNullOr(sha, isSha) ||
+    !isNullOr(source, isAbsolutePath) ||
+    !isNullOr(projectId, isProjectId)
+  ) {
     return null;
   }
-  if (!isAbsolutePath(root) || typeof apply !== 'boolean') {
+  // install and swap name a sha, rollback never does; only install takes a source.
+  if ((sha === null) !== (action === 'rollback') || (source === null) === (action === 'install')) {
     return null;
   }
-  if (typeof keep !== 'number' || !Number.isInteger(keep) || keep < MIN_KEEP || keep > MAX_KEEP) {
-    return null;
-  }
-  if (sha !== null && (typeof sha !== 'string' || !SHA_PATTERN.test(sha))) {
-    return null;
-  }
-  if (source !== null && !isAbsolutePath(source)) {
-    return null;
-  }
-  if (projectId !== null && !isProjectId(projectId)) {
-    return null;
-  }
-  const needsSha = action !== 'rollback';
-  if ((sha === null) === needsSha || (source === null) === (action === 'install')) {
-    return null;
-  }
-  return {
-    action: action as ReleaseAction,
-    root,
-    sha: sha as string | null,
-    source: source as string | null,
-    keep,
-    apply,
-    projectId: projectId as string | null,
-  };
+  return { action, root, sha, source, keep, apply, projectId };
+}
+
+function hasExactlyRequestKeys(snapshot: Record<string, unknown>): boolean {
+  const keys = Object.keys(snapshot);
+  return keys.length === REQUEST_KEYS.length && REQUEST_KEYS.every((key) => keys.includes(key));
+}
+
+function isAction(value: unknown): value is ReleaseAction {
+  return typeof value === 'string' && (ACTIONS as readonly string[]).includes(value);
+}
+
+function isKeep(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= MIN_KEEP && value <= MAX_KEEP;
+}
+
+function isSha(value: unknown): value is string {
+  return typeof value === 'string' && SHA_PATTERN.test(value);
+}
+
+function isNullOr<T>(value: unknown, guard: (candidate: unknown) => candidate is T): value is T | null {
+  return value === null || guard(value);
 }
 
 function isBoundedString(value: unknown, maxBytes: number): value is string {

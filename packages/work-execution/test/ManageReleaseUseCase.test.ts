@@ -84,7 +84,7 @@ class FakeStore implements ReleaseStorePort {
     const buildId = `${input.sha}-${String(this.prepared).padStart(16, '0')}`;
     this.preparedIds.push(buildId);
     const buildDir = `${input.root}/.staging-${buildId}`;
-    return { outcome: 'prepared', buildId, buildDir, archivePath: `${buildDir}.tar` };
+    return { outcome: 'prepared', buildId, buildDir, archivePath: `${buildDir}.tar`, homeDir: `${buildDir}.home` };
   }
 
   async list(): Promise<ReleaseStoreListing> {
@@ -182,6 +182,8 @@ class FakeLease implements ConductorDriverLeasePort {
   /** The store grants less time than asked (as a clamped or slow store would). */
   grantedMs: number | null = null;
   checkRefusal: LeaseRefusal | null = null;
+  /** Called after each check returns, before the caller reads its clock again. */
+  onCheck: (() => void) | null = null;
   private readCount = 0;
 
   constructor(lease: ConductorDriverLeaseRecord | null | Error) {
@@ -221,6 +223,7 @@ class FakeLease implements ConductorDriverLeasePort {
 
   async check(request: LeaseHoldRequest): Promise<LeaseRefusal | null> {
     this.events.push(`check ${request.fence}`);
+    this.onCheck?.();
     return this.checkRefusal;
   }
 }
@@ -322,6 +325,7 @@ function make(
     lease?: ConductorDriverLeaseRecord | null | Error | FakeLease;
     executor?: FakeExecutor;
     authorization?: FakeAuthorization;
+    clock?: () => string;
   } = {},
 ): Made {
   const store = options.store ?? new FakeStore();
@@ -333,7 +337,7 @@ function make(
     lease,
     authorization,
     executor,
-    nowIso: () => NOW,
+    nowIso: options.clock ?? (() => NOW),
     env: () => ({
       PATH: '/usr/bin',
       HOME: '/home/example',
@@ -601,6 +605,21 @@ describe('ManageReleaseUseCase', () => {
     expect(lease.held).toBeNull();
   });
 
+  it('refuses driver-lease-live when the lease check itself runs past the margin', async () => {
+    let now = NOW;
+    const lease = new FakeLease(null);
+    // The check answers "held", but by the time it returns 90 s of the 120 s lease are gone.
+    lease.onCheck = () => {
+      now = new Date(Date.parse(NOW) + 90_000).toISOString();
+    };
+    const made = granted(SWAP, A, { lease, clock: () => now, store: new FakeStore([build('a', 1), build('b', 2)], B) });
+    expect(await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).toEqual({
+      outcome: 'refused',
+      reason: 'driver-lease-live',
+    });
+    expect(made.store.current).toBe(B);
+  });
+
   it('holds the driver lease around the repoint and releases it after', async () => {
     const lease = new FakeLease(null);
     const made = granted(SWAP, A, { lease, store: new FakeStore([build('a', 1), build('b', 2)], B) });
@@ -857,14 +876,15 @@ describe('ManageReleaseUseCase', () => {
   });
 
   it('the git step runs with GIT_ALLOW_PROTOCOL none, GIT_NO_LAZY_FETCH 1 and no hooks path', async () => {
-    const { useCase, executor } = granted(INSTALL, A);
+    const { useCase, executor, store } = granted(INSTALL, A);
     await manage(useCase, applyRequest());
     const git = executor.runs[0];
     expect(git.argv).toContain('core.hooksPath=/dev/null');
     expect(git.argv).toContain('core.fsmonitor=false');
     expect(git.options?.env).toEqual({
       PATH: '/usr/bin',
-      HOME: '/home/example',
+      HOME: `${ROOT}/.staging-${store.preparedIds[0]}.home`,
+      YARN_NM_MODE: 'classic',
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_ALLOW_PROTOCOL: 'none',
       GIT_NO_LAZY_FETCH: '1',
@@ -879,19 +899,22 @@ describe('ManageReleaseUseCase', () => {
     await manage(useCase, applyRequest());
     const env = executor.runs[0].options?.env ?? {};
     for (const key of Object.keys(env)) {
-      expect(['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ', 'GIT_CONFIG_NOSYSTEM', 'GIT_ALLOW_PROTOCOL', 'GIT_NO_LAZY_FETCH', 'GIT_TERMINAL_PROMPT']).toContain(key);
+      expect(['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ', 'YARN_NM_MODE', 'COREPACK_ENABLE_DOWNLOAD_PROMPT', 'GIT_CONFIG_NOSYSTEM', 'GIT_ALLOW_PROTOCOL', 'GIT_NO_LAZY_FETCH', 'GIT_TERMINAL_PROMPT']).toContain(key);
     }
   });
 
-  it('the tar, install and build children never see an operator token', async () => {
-    const { useCase, executor } = granted(INSTALL, A);
+  it('the tar, install and build children never see an operator token or the operator home', async () => {
+    const { useCase, executor, store } = granted(INSTALL, A);
     await manage(useCase, applyRequest());
     expect(executor.runs).toHaveLength(4);
+    const home = `${ROOT}/.staging-${store.preparedIds[0]}.home`;
     for (const run of executor.runs.slice(1)) {
-      expect(run.options?.env).toEqual({ PATH: '/usr/bin', HOME: '/home/example', YARN_NM_MODE: 'classic' });
+      expect(run.options?.env).toEqual({ PATH: '/usr/bin', HOME: home, YARN_NM_MODE: 'classic' });
     }
     for (const run of executor.runs) {
-      expect(JSON.stringify(run.options?.env)).not.toContain('operator');
+      const text = JSON.stringify(run.options?.env);
+      expect(text).not.toContain('operator');
+      expect(text).not.toContain('/home/example');
     }
   });
 

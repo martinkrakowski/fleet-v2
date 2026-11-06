@@ -5,10 +5,11 @@
  * Layout: <root>/<sha>/ holds one verified built tree, <root>/<sha>/.fleet-release-verified
  * marks it verified, <root>/current is a relative symlink to <sha>. A build is
  * made in <root>/.staging-<sha>-<16 hex>/ (created exclusively by `prepare` for
- * one run, with its transient <root>/.staging-<sha>-<16 hex>.tar archive) and
+ * one run, with its transient <root>/.staging-<sha>-<16 hex>.tar archive and
+ * the empty .home directory its build children get as HOME) and
  * reaches <root>/<sha> only by one rename after its marker is written, so a
  * staging directory a failed cleanup left is never reused, and prune removes
- * only orphan archives. A missing root is
+ * only orphan archives and homes. A missing root is
  * an empty store (a first install starts there); any other read failure, an
  * unparseable marker or a `current` that is not a link into the root is
  * `unreadable`, never an empty or shorter store. A partial prune is
@@ -34,6 +35,7 @@ const SHA_PATTERN = /^[0-9a-f]{40}$/;
 const STAGING_PREFIX = '.staging-';
 const BUILD_ID_PATTERN = /^[0-9a-f]{40}-[0-9a-f]{16}$/;
 const TAR_PATTERN = /^\.staging-[0-9a-f]{40}-[0-9a-f]{16}\.tar$/;
+const HOME_PATTERN = /^\.staging-[0-9a-f]{40}-[0-9a-f]{16}\.home$/;
 const ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const MARKER_NAME = '.fleet-release-verified';
 const CLI_ENTRY = ['apps', 'cli', 'dist', 'bin.js'];
@@ -59,7 +61,8 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       const buildDir = stagingDir(input.root, buildId);
       // Not recursive: the mkdir fails when the name exists, so this run alone created it.
       await fs.mkdir(buildDir);
-      return { outcome: 'prepared', buildId, buildDir, archivePath: `${buildDir}.tar` };
+      await fs.mkdir(`${buildDir}.home`);
+      return { outcome: 'prepared', buildId, buildDir, archivePath: `${buildDir}.tar`, homeDir: `${buildDir}.home` };
     } catch {
       return { outcome: 'unreadable' };
     }
@@ -112,6 +115,7 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       await writeAtomically(buildDir, MARKER_NAME, marker);
       await fs.rename(buildDir, target);
       await fs.rm(`${buildDir}.tar`, { force: true }).catch(() => undefined);
+      await fs.rm(`${buildDir}.home`, { recursive: true, force: true }).catch(() => undefined);
       return { outcome: 'ok' };
     } catch {
       return { outcome: 'unreadable' };
@@ -184,6 +188,9 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
         if (entry.isFile() && TAR_PATTERN.test(entry.name) && !stagingDirs.has(entry.name.slice(0, -'.tar'.length))) {
           await fs.rm(path.join(input.root, entry.name), { force: true });
         }
+        if (entry.isDirectory() && HOME_PATTERN.test(entry.name) && !stagingDirs.has(entry.name.slice(0, -'.home'.length))) {
+          await fs.rm(path.join(input.root, entry.name), { recursive: true, force: true });
+        }
       }
     } catch {
       failed = true;
@@ -200,6 +207,7 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     try {
       await fs.rm(buildDir, { recursive: true, force: true });
       await fs.rm(`${buildDir}.tar`, { force: true });
+      await fs.rm(`${buildDir}.home`, { recursive: true, force: true });
       return { outcome: 'ok' };
     } catch {
       return { outcome: 'unreadable' };

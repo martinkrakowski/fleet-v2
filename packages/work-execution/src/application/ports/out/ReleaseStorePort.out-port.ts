@@ -41,6 +41,8 @@ export type ReleaseStagingResult =
       readonly buildId: string;
       readonly buildDir: string;
       readonly archivePath: string;
+      /** An empty home directory for this run's build children, never the operator's. */
+      readonly homeDir: string;
     }
   | { readonly outcome: 'unreadable' };
 
@@ -77,6 +79,6 @@ export interface ReleaseStorePort {
   }): Promise<ReleaseStoreWriteResult | { readonly outcome: 'fenced' }>;
   /** Keep the newest `keep` verified builds; never remove current or previous. */
   prune(input: { readonly root: string; readonly keep: number }): Promise<ReleaseStorePruneResult>;
-  /** Remove an incomplete build: this run's staging directory and its archive. */
+  /** Remove an incomplete build: this run's staging directory, its archive and its home. */
   discard(input: { readonly root: string; readonly buildId: string }): Promise<ReleaseStoreWriteResult>;
 }

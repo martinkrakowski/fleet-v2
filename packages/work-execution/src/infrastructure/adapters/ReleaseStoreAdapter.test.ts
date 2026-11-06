@@ -28,7 +28,9 @@ describe('ReleaseStoreAdapter', () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  async function staged(id: string): Promise<{ buildId: string; buildDir: string; archivePath: string }> {
+  async function staged(
+    id: string,
+  ): Promise<{ buildId: string; buildDir: string; archivePath: string; homeDir: string }> {
     const prepared = await adapter.prepare({ root, sha: id });
     if (prepared.outcome !== 'prepared') {
       throw new Error(`prepare refused for ${id}`);
@@ -155,16 +157,17 @@ describe('ReleaseStoreAdapter', () => {
     expect(await adapter.prune({ root, keep: 1 })).toEqual({ outcome: 'unreadable' });
   });
 
-  it('removes only an orphan archive file', async () => {
+  it('removes only an orphan archive file and an orphan home', async () => {
     await verified('a', 1);
-    const orphan = `.staging-${B}-${'0'.repeat(16)}.tar`;
-    await fs.writeFile(path.join(root, orphan), 'tar');
+    const orphan = `.staging-${B}-${'0'.repeat(16)}`;
+    await fs.writeFile(path.join(root, `${orphan}.tar`), 'tar');
+    await fs.mkdir(path.join(root, `${orphan}.home`, '.yarn'), { recursive: true });
     const live = await staged(C);
     await fs.writeFile(live.archivePath, 'tar');
     await fs.writeFile(path.join(root, 'notes.tar'), 'keep');
     expect(await adapter.prune({ root, keep: 2 })).toEqual({ outcome: 'pruned', removed: [] });
     expect((await fs.readdir(root)).sort()).toEqual(
-      [A, path.basename(live.buildDir), path.basename(live.archivePath), 'notes.tar'].sort(),
+      [A, path.basename(live.buildDir), path.basename(live.archivePath), path.basename(live.homeDir), 'notes.tar'].sort(),
     );
   });
 
@@ -182,6 +185,8 @@ describe('ReleaseStoreAdapter', () => {
     expect(first.buildId).not.toBe(second.buildId);
     expect(first.buildId.startsWith(`${A}-`)).toBe(true);
     expect((await fs.lstat(first.buildDir)).isDirectory()).toBe(true);
+    expect(await fs.readdir(first.homeDir)).toEqual([]);
+    expect(first.homeDir).not.toBe(second.homeDir);
     expect((await fs.lstat(second.buildDir)).isDirectory()).toBe(true);
     expect(await fs.readdir(second.buildDir)).toEqual([]);
     expect(await adapter.list({ root })).toEqual({ outcome: 'read', current: null, builds: [] });
@@ -215,8 +220,9 @@ describe('ReleaseStoreAdapter', () => {
   });
 
   it('discards an incomplete staging dir and its archive', async () => {
-    const { buildId, buildDir, archivePath } = await staged(A);
+    const { buildId, buildDir, archivePath, homeDir } = await staged(A);
     await fs.writeFile(path.join(buildDir, 'partial.txt'), 'stale');
+    await fs.writeFile(path.join(homeDir, '.npmrc'), 'cache');
     await fs.writeFile(archivePath, 'tar');
     expect(await adapter.discard({ root, buildId })).toEqual({ outcome: 'ok' });
     expect(await fs.readdir(root)).toEqual([]);

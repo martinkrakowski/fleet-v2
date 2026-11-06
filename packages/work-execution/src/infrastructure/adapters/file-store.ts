@@ -868,7 +868,7 @@ export async function readOrQuarantineVersionedRecordList<T>(
     // A symlink, oversized or non-regular store is refused without reading or
     // copying it, so taking the store lock would write nothing. Refuse
     // directly instead of entering `withFileLock`.
-    throw new StateFileUnreadableError(options.filePath, null, fast.detail);
+    throw new StateFileUnreadableError(options.filePath, null, fast.detail, undefined, undefined, false);
   }
 
   const lockPath = `${options.filePath}.lock`;

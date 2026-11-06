@@ -1685,6 +1685,11 @@ describe('readBoundedStoreBytes and readOrQuarantineVersionedRecordList', () => 
     expect(symlinked).toBeInstanceOf(StateFileUnreadableError);
     expect((symlinked as StateFileUnreadableError).quarantinePath).toBeNull();
     expect((symlinked as StateFileUnreadableError).detail).toBe('not a regular file');
+    // Quarantine was never attempted for a refused symlink, so the message
+    // must not claim the bytes could not be copied nor advise a manual repair.
+    expect((symlinked as StateFileUnreadableError).message).not.toContain('could not be copied');
+    expect((symlinked as StateFileUnreadableError).message).not.toContain('repair it by hand');
+    expect((symlinked as StateFileUnreadableError).message).toContain('no quarantine was attempted');
     await fs.unlink(filePath);
 
     await fs.writeFile(filePath, Buffer.alloc(STORE_FILE_MAX_BYTES + 1, 0x20));

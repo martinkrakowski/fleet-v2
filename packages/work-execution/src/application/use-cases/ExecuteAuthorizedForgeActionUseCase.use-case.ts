@@ -161,9 +161,22 @@ const REPOSITORY_SEGMENT = /^[A-Za-z0-9_.-]+$/;
 
 /** Lower-cases ASCII letters only: no Unicode folding (the Kelvin sign stays itself). */
 function asciiLower(value: string): string {
-  return value.replace(/[A-Z]/g, (letter) =>
-    String.fromCharCode(letter.charCodeAt(0) + 32),
-  );
+  return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
+/** The completed-entry detail: the pull request number, the legacy-lookup marker, or none. */
+function completedDetail(
+  request: ExecuteAuthorizedForgeActionRequest,
+  forgeResult: { readonly pullRequestNumber?: number | undefined },
+  legacyLookup: boolean,
+): string | null {
+  if (
+    request.kind !== "merge-pr" &&
+    forgeResult.pullRequestNumber !== undefined
+  ) {
+    return `pull request #${forgeResult.pullRequestNumber}`;
+  }
+  return legacyLookup ? "prSource=legacy-head-lookup" : null;
 }
 
 /** The part of `rest` after `separator`, when the part before it is exactly the GitHub host. */
@@ -295,53 +308,9 @@ function readForgeActionRequest(raw: unknown): ForgeActionRequestRead {
       }
       snapshot[key] = descriptor.value;
     }
-    for (const field of REQUEST_ID_FIELDS) {
-      const value = snapshot[field];
-      // A `push-to-pr` run key is a valid action id and contains `/`; a
-      // backslash path separator is refused on every id.
-      const separators = field === "actionId" ? ["\\"] : ["/", "\\"];
-      if (
-        typeof value !== "string" ||
-        value.trim().length === 0 ||
-        value.length > MAX_REQUEST_TEXT_CHARS ||
-        separators.some((separator) => value.includes(separator)) ||
-        isPlanSecretShaped(value)
-      ) {
-        return refuse(
-          `${field} must be non-empty plain text of at most ${MAX_REQUEST_TEXT_CHARS} characters`,
-        );
-      }
-    }
-    const expectedHeadSha = snapshot["expectedHeadSha"];
-    if (
-      typeof expectedHeadSha !== "string" ||
-      !EXPECTED_HEAD_SHA_PATTERN.test(expectedHeadSha)
-    ) {
-      return refuse("expectedHeadSha must be a 40-character lowercase sha");
-    }
-    if (
-      !(FORGE_ACTION_KINDS as readonly unknown[]).includes(snapshot["kind"])
-    ) {
-      return refuse(
-        "kind must be one of push-and-open-pr, push-to-pr, merge-pr, post-status",
-      );
-    }
-    for (const field of OPTIONAL_TEXT_FIELDS) {
-      const value = snapshot[field];
-      // Only a string is checked here; a non-string value falls through to
-      // the field's own rule (branch name, base branch, authorizedBy).
-      if (typeof value === "string" && isPlanSecretShaped(value)) {
-        return refuse(`${field} must be plain text`);
-      }
-    }
-    const pullRequestNumber = snapshot["pullRequestNumber"];
-    if (
-      pullRequestNumber !== undefined &&
-      (!Number.isSafeInteger(pullRequestNumber) ||
-        (pullRequestNumber as number) < 1 ||
-        (pullRequestNumber as number) > MAX_PULL_REQUEST_NUMBER)
-    ) {
-      return refuse("pullRequestNumber must be a positive integer");
+    const refusal = requestSnapshotRefusal(snapshot);
+    if (refusal !== null) {
+      return refuse(refusal);
     }
     return {
       ok: true,
@@ -350,6 +319,62 @@ function readForgeActionRequest(raw: unknown): ForgeActionRequestRead {
   } catch {
     return refuse("request could not be read");
   }
+}
+
+/** The first refusal reason for a request snapshot, in the original check order; null when valid. */
+function requestSnapshotRefusal(snapshot: Record<string, unknown>): string | null {
+  const idRefusal = requestIdFieldsRefusal(snapshot);
+  if (idRefusal !== null) {
+    return idRefusal;
+  }
+  const expectedHeadSha = snapshot["expectedHeadSha"];
+  if (
+    typeof expectedHeadSha !== "string" ||
+    !EXPECTED_HEAD_SHA_PATTERN.test(expectedHeadSha)
+  ) {
+    return "expectedHeadSha must be a 40-character lowercase sha";
+  }
+  if (!(FORGE_ACTION_KINDS as readonly unknown[]).includes(snapshot["kind"])) {
+    return "kind must be one of push-and-open-pr, push-to-pr, merge-pr, post-status";
+  }
+  for (const field of OPTIONAL_TEXT_FIELDS) {
+    const value = snapshot[field];
+    // Only a string is checked here; a non-string value falls through to
+    // the field's own rule (branch name, base branch, authorizedBy).
+    if (typeof value === "string" && isPlanSecretShaped(value)) {
+      return `${field} must be plain text`;
+    }
+  }
+  const pullRequestNumber = snapshot["pullRequestNumber"];
+  if (
+    pullRequestNumber !== undefined &&
+    (!Number.isSafeInteger(pullRequestNumber) ||
+      (pullRequestNumber as number) < 1 ||
+      (pullRequestNumber as number) > MAX_PULL_REQUEST_NUMBER)
+  ) {
+    return "pullRequestNumber must be a positive integer";
+  }
+  return null;
+}
+
+/** The refusal for the first request id field that is not safe plain text; null when all are. */
+function requestIdFieldsRefusal(snapshot: Record<string, unknown>): string | null {
+  for (const field of REQUEST_ID_FIELDS) {
+    const value = snapshot[field];
+    // A `push-to-pr` run key is a valid action id and contains `/`; a
+    // backslash path separator is refused on every id.
+    const separators = field === "actionId" ? ["\\"] : ["/", "\\"];
+    if (
+      typeof value !== "string" ||
+      value.trim().length === 0 ||
+      value.length > MAX_REQUEST_TEXT_CHARS ||
+      separators.some((separator) => value.includes(separator)) ||
+      isPlanSecretShaped(value)
+    ) {
+      return `${field} must be non-empty plain text of at most ${MAX_REQUEST_TEXT_CHARS} characters`;
+    }
+  }
+  return null;
 }
 
 /**
@@ -809,12 +834,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         request,
         attempt,
         "completed",
-        request.kind !== "merge-pr" &&
-          forgeResult.pullRequestNumber !== undefined
-          ? `pull request #${forgeResult.pullRequestNumber}`
-          : legacyLookup
-            ? "prSource=legacy-head-lookup"
-            : null,
+        completedDetail(request, forgeResult, legacyLookup),
         pullRequestRef,
       );
 
@@ -1142,8 +1162,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const entry = entries[index];
       if (
-        entry !== undefined &&
-        entry.status === "completed" &&
+        entry?.status === "completed" &&
         entry.action === "forge" &&
         entry.pullRequest !== undefined
       ) {
@@ -1163,8 +1182,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const entry = entries[index];
       if (
-        entry !== undefined &&
-        entry.status === "completed" &&
+        entry?.status === "completed" &&
         entry.action === "forge" &&
         entry.pullRequest !== undefined &&
         (normalizedRepository === null ||
@@ -1340,7 +1358,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       return { reason: "legacy-pr-lookup-ambiguous" };
     }
     const only = answer.pullRequests[0];
-    if (only === undefined || only.headSha !== request.expectedHeadSha) {
+    if (only?.headSha !== request.expectedHeadSha) {
       return { reason: "legacy-pr-lookup-head-mismatch" };
     }
     return { number: only.number };

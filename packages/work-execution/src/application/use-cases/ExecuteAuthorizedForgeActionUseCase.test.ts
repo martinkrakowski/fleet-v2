@@ -2133,7 +2133,7 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       pullRequestNumber: 7,
     });
     expect(result.outcome).toBe("executed");
-    expect(deps.mergeRecordRepo.listMergeRecords()).resolves.toHaveLength(1);
+    await expect(deps.mergeRecordRepo.listMergeRecords()).resolves.toHaveLength(1);
     const upgraded = await deps.mergeRecordRepo.findMergeRecord("org/repo", 7);
     expect(upgraded).toMatchObject({
       merger: "fleet",

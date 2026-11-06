@@ -444,7 +444,7 @@ export interface ActionJournalEntryRecord {
 }
 
 /** The exact own keys a typed journal pull-request reference may carry. */
-const JOURNAL_PULL_REQUEST_KEYS: readonly string[] = ['repository', 'number'];
+const JOURNAL_PULL_REQUEST_KEYS: ReadonlySet<string> = new Set(['repository', 'number']);
 
 /** The upper bound of a pull-request number, shared with the merge record's bound. */
 const MAX_JOURNAL_PULL_REQUEST_NUMBER = 999_999_999;
@@ -478,13 +478,13 @@ export function readJournalPullRequestRef(
     return { kind: 'invalid' };
   }
   const keys = Reflect.ownKeys(value);
-  if (keys.length !== JOURNAL_PULL_REQUEST_KEYS.length) {
+  if (keys.length !== JOURNAL_PULL_REQUEST_KEYS.size) {
     return { kind: 'invalid' };
   }
   // Values are copied through their own descriptors, so no getter ever runs.
   const copy: Record<string, unknown> = {};
   for (const key of keys) {
-    if (typeof key !== 'string' || !JOURNAL_PULL_REQUEST_KEYS.includes(key)) {
+    if (typeof key !== 'string' || !JOURNAL_PULL_REQUEST_KEYS.has(key)) {
       return { kind: 'invalid' };
     }
     const descriptor = Object.getOwnPropertyDescriptor(value, key);

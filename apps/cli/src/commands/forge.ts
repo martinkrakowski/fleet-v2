@@ -13,12 +13,12 @@ function strictPullRequestNumber(p: Payload): number | undefined {
   if (value === undefined) {
     return undefined;
   }
-  const parsed =
-    typeof value === 'number'
-      ? value
-      : typeof value === 'string' && /^[1-9][0-9]*$/.test(value)
-        ? Number(value)
-        : Number.NaN;
+  let parsed = Number.NaN;
+  if (typeof value === 'number') {
+    parsed = value;
+  } else if (typeof value === 'string' && /^[1-9]\d*$/.test(value)) {
+    parsed = Number(value);
+  }
   if (!Number.isSafeInteger(parsed) || parsed < 1) {
     throw new CliUsageError('forge pullRequestNumber must be a positive integer');
   }

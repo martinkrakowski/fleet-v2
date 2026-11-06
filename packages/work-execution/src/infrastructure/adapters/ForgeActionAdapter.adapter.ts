@@ -299,9 +299,10 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     if (!REPOSITORY_PATTERN.test(bound.owner) || !REPOSITORY_PATTERN.test(bound.repo)) {
       return { outcome: 'unreadable', reason: 'the bound repository owner or repo is invalid' };
     }
+    const headFilter = encodeURIComponent(`${bound.owner}:${query.branchName}`);
     const args = [
       'api',
-      `repos/${bound.owner}/${bound.repo}/pulls?head=${encodeURIComponent(`${bound.owner}:${query.branchName}`)}&state=open&per_page=${PR_HEAD_LOOKUP_PAGE}`,
+      `repos/${bound.owner}/${bound.repo}/pulls?head=${headFilter}&state=open&per_page=${PR_HEAD_LOOKUP_PAGE}`,
     ];
     let gh: GhInvocationResult;
     try {

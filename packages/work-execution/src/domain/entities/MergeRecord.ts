@@ -377,29 +377,17 @@ export function decideMergeRecord(stored: unknown, incoming: unknown): MergeReco
     return invalidDecision('MergeRecord fleet-forge-action requires actionRef');
   }
 
-  let storedRecord: MergeRecordRecord | null = null;
-  if (stored !== null && stored !== undefined) {
-    // A stored record loads through `fromStored`: a pre-`actionRef`
-    // `fleet-forge-action` record still participates in a decision, while any
-    // corrupt stored record fails closed.
-    const storedRead = MergeRecord.fromStored(stored);
-    if (!storedRead.success) {
-      return invalidDecision('MergeRecord stored record could not be read');
-    }
-    storedRecord = storedRead.value.toRecord();
+  const storedLoad = loadStoredForDecision(stored);
+  if (!storedLoad.ok) {
+    return invalidDecision('MergeRecord stored record could not be read');
   }
+  const storedRecord = storedLoad.record;
 
   if (storedRecord === null) {
     return { success: true, outcome: 'create', record: incomingRecord, finding: null };
   }
 
-  const differingFields: Array<'head-sha' | 'merged-at'> = [];
-  if (incomingRecord.headSha !== storedRecord.headSha) {
-    differingFields.push('head-sha');
-  }
-  if (incomingRecord.mergedAtIso !== storedRecord.mergedAtIso) {
-    differingFields.push('merged-at');
-  }
+  const differingFields = differingMergeFields(incomingRecord, storedRecord);
   if (differingFields.length > 0) {
     return {
       success: true,
@@ -431,6 +419,39 @@ export function decideMergeRecord(stored: unknown, incoming: unknown): MergeReco
   }
 
   return { success: true, outcome: 'unchanged', record: storedRecord, finding: null };
+}
+
+/**
+ * A stored record loads through `fromStored`: a pre-`actionRef`
+ * `fleet-forge-action` record still participates in a decision, while any
+ * corrupt stored record fails closed. Absent stored data is a null record.
+ */
+function loadStoredForDecision(
+  stored: unknown,
+): { readonly ok: true; readonly record: MergeRecordRecord | null } | { readonly ok: false } {
+  if (stored === null || stored === undefined) {
+    return { ok: true, record: null };
+  }
+  const storedRead = MergeRecord.fromStored(stored);
+  if (!storedRead.success) {
+    return { ok: false };
+  }
+  return { ok: true, record: storedRead.value.toRecord() };
+}
+
+/** The fields on which the incoming and stored records disagree, head first. */
+function differingMergeFields(
+  incomingRecord: MergeRecordRecord,
+  storedRecord: MergeRecordRecord,
+): Array<'head-sha' | 'merged-at'> {
+  const differingFields: Array<'head-sha' | 'merged-at'> = [];
+  if (incomingRecord.headSha !== storedRecord.headSha) {
+    differingFields.push('head-sha');
+  }
+  if (incomingRecord.mergedAtIso !== storedRecord.mergedAtIso) {
+    differingFields.push('merged-at');
+  }
+  return differingFields;
 }
 
 function invalidDecision(message: string): MergeRecordDecision {

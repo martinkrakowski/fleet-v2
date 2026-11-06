@@ -132,7 +132,7 @@ describe('ActionAuthorizationAdapter attempt coordinate', () => {
     expect(own).toEqual({ outcome: 'granted', authorizationGrantId: 'grant-1' });
   });
 
-  it('keeps the other fixed refusal codes for kind, head, missing head and unknown grant', async () => {
+  it('refuses on kind mismatch, missing head, mismatched head and unknown grant with the established wording', async () => {
     const adapter = new ActionAuthorizationAdapter({ grants: grantsOf() });
 
     expect(await adapter.consumeActionAuthorization(consumeRequest({ actionKind: 'merge-pr' }))).toEqual({
@@ -141,7 +141,7 @@ describe('ActionAuthorizationAdapter attempt coordinate', () => {
     });
     expect(await adapter.consumeActionAuthorization(consumeRequest({ expectedHeadSha: undefined }))).toEqual({
       outcome: 'refused',
-      reason: 'grant-head-required',
+      reason: 'Authorization grant grant-1 requires the expectedHeadSha this local grant store cannot infer',
     });
     expect(await adapter.consumeActionAuthorization(consumeRequest({ expectedHeadSha: OTHER_SHA }))).toEqual({
       outcome: 'refused',
@@ -149,7 +149,7 @@ describe('ActionAuthorizationAdapter attempt coordinate', () => {
     });
     expect(await adapter.consumeActionAuthorization(consumeRequest({ authorizationGrantId: 'grant-9' }))).toEqual({
       outcome: 'refused',
-      reason: 'grant-not-found',
+      reason: 'Authorization grant not found: grant-9',
     });
   });
 
@@ -492,7 +492,7 @@ describe('ActionAuthorizationAdapter attempt coordinate', () => {
     expect(stored?.consumedByActionId).toBe('action-1');
     expect(await adapter.consumeActionAuthorization(consumeRequest({ actionId: 'action-2' }))).toEqual({
       outcome: 'refused',
-      reason: 'grant-already-consumed',
+      reason: 'Authorization grant already consumed by action action-1',
     });
     expect(await adapter.consumeActionAuthorization(consumeRequest({ attemptId: 'att-2' }))).toEqual({
       outcome: 'refused',
@@ -677,7 +677,7 @@ describe('ActionAuthorizationAdapter attempt coordinate', () => {
     expectNoDisallowedText([echoedResolve, echoedConsume]);
 
     const missingGrants = await adapter.consumeActionAuthorization(consumeRequest({ authorizationGrantId: 'grant-9' }));
-    expect(missingGrants).toEqual({ outcome: 'refused', reason: 'grant-not-found' });
+    expect(missingGrants).toEqual({ outcome: 'refused', reason: 'Authorization grant not found: grant-9' });
   });
 
   it('refuses oversized request fields, oversized grant maps, and oversized delegate outputs', async () => {

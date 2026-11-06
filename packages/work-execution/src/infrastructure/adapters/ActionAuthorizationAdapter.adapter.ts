@@ -528,7 +528,11 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
       return { outcome: 'refused', reason: 'too-large' };
     }
     if (!grants.has(request.authorizationGrantId)) {
-      return { outcome: 'refused', reason: 'grant-not-found' };
+      // Keep the pre-CO24b reason wording the cross-forge coverage pins.
+      return {
+        outcome: 'refused',
+        reason: `Authorization grant not found: ${request.authorizationGrantId}`,
+      };
     }
     const parsed = parseActionAuthorizationGrantEntry(grants.get(request.authorizationGrantId));
     if (!parsed.ok) {
@@ -544,7 +548,10 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
     if (request.expectedHeadSha === undefined) {
       // The local grant store keeps no resolve-time coordinates beyond the
       // grant's own, so a consume request that omits the head cannot be verified.
-      return { outcome: 'refused', reason: 'grant-head-required' };
+      return {
+        outcome: 'refused',
+        reason: `Authorization grant ${request.authorizationGrantId} requires the expectedHeadSha this local grant store cannot infer`,
+      };
     }
     if (grant.expectedHeadSha !== request.expectedHeadSha) {
       return { outcome: 'refused', reason: 'grant-head-mismatch' };
@@ -573,6 +580,9 @@ export class ActionAuthorizationAdapter implements ActionAuthorizationPort {
       // Idempotent: the same action may observe its own consumption.
       return { outcome: 'consumed', actionId: request.actionId };
     }
-    return { outcome: 'refused', reason: 'grant-already-consumed' };
+    return {
+      outcome: 'refused',
+      reason: `Authorization grant already consumed by action ${grant.consumedByActionId}`,
+    };
   }
 }

@@ -1345,7 +1345,9 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
 
     expect(first).toEqual({ outcome: 'executed', headSha: HEAD_SHA });
     expect(second.outcome).toBe('refused');
-    expect(second.outcome === 'refused' && second.reason).toBe('grant-already-consumed');
+    expect(second.outcome === 'refused' && second.reason).toContain(
+      'Authorization grant already consumed by action action-1',
+    );
     expect(forgePort.requests).toHaveLength(1);
     expect(journal.entries.at(-1)?.status).toBe('refused');
     expect(workOrderRepo.saved).toHaveLength(1);
@@ -1567,11 +1569,11 @@ describe('ActionAuthorizationAdapter', () => {
 
     expect(secondAction).toEqual({
       outcome: 'refused',
-      reason: 'grant-already-consumed',
+      reason: 'Authorization grant already consumed by action action-1',
     });
     expect(unknown).toEqual({
       outcome: 'refused',
-      reason: 'grant-not-found',
+      reason: 'Authorization grant not found: grant-missing',
     });
   });
 
@@ -1588,10 +1590,11 @@ describe('ActionAuthorizationAdapter', () => {
 
     expect(omittedHead).toEqual({
       outcome: 'refused',
-      reason: 'grant-head-required',
+      reason:
+        'Authorization grant grant-1 requires the expectedHeadSha this local grant store cannot infer',
     });
-    // The head is refused rather than assumed; the grant is still an
-    // unbound legacy record, so omitting attemptId still consumes it once.
+    // The head is refused rather than assumed; the attempt id is not what
+    // scopes this store, so omitting it still consumes exactly once.
     expect(omittedAttempt).toEqual({ outcome: 'consumed', actionId: 'action-2' });
     expect(grants.get('grant-1')?.consumedByActionId).toBe('action-2');
   });

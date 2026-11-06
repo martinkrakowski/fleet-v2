@@ -1933,18 +1933,36 @@ export class WorkspaceAdapter implements WorkspacePort {
     const existsRun = await executor.run(['test', '-e', worktreePath], {
       timeoutMs: PROBE_TIMEOUT_MS,
     });
+    // `test -e` answers 1 when the directory is gone; a missing exit code, a
+    // reported error or any other exit is an unanswered probe, never a proof
+    // of removal.
+    if (existsRun.exitCode === null || existsRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'the existence probe did not report an exit code' };
+    }
     if (existsRun.exitCode === 0) {
       return { outcome: 'partial', detail: 'directory-present' };
+    }
+    if (existsRun.exitCode !== 1) {
+      return { outcome: 'unknown', reason: 'the existence probe failed' };
     }
     const relistRun = await executor.run(
       ['git', '-C', repositoryRoot, 'worktree', 'list', '--porcelain'],
       { timeoutMs: GIT_TIMEOUT_MS },
     );
-    if (relistRun.exitCode === 0 && relistRun.error === undefined) {
-      const relisted = parseWorktreeList(relistRun.stdout);
-      if (relisted !== null && listedWorktreeAt(relisted, entry.path) !== null) {
-        return { outcome: 'partial', detail: 'admin-entry-present' };
-      }
+    // A failed or unparseable relist cannot confirm that the administrative
+    // entry is gone, so it must not be reported as `removed`.
+    if (relistRun.exitCode === null || relistRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'the post-removal worktree list did not report an exit code' };
+    }
+    if (relistRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'the post-removal worktree list failed' };
+    }
+    const relisted = parseWorktreeList(relistRun.stdout);
+    if (relisted === null) {
+      return { outcome: 'unknown', reason: 'the post-removal worktree list output could not be parsed' };
+    }
+    if (listedWorktreeAt(relisted, entry.path) !== null) {
+      return { outcome: 'partial', detail: 'admin-entry-present' };
     }
     return { outcome: 'removed', branchTip: head };
   }

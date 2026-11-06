@@ -325,6 +325,58 @@ describe('removeWorktree over a fake executor', () => {
     });
     expect(result).toEqual({ outcome: 'partial', detail: 'admin-entry-present' });
   });
+
+  it('answers unknown when the existence probe never reports an exit code', async () => {
+    const { result } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: ({ joined }) =>
+        joined === `test -e ${WORKTREE}` ? { exitCode: null } : { exitCode: 1 },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result.outcome).toBe('unknown');
+  });
+
+  it('answers unknown when the existence probe fails with an unexpected exit', async () => {
+    const { result } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: ({ joined }) =>
+        joined === `test -e ${WORKTREE}` ? { exitCode: 127 } : { exitCode: 1 },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result.outcome).toBe('unknown');
+  });
+
+  it('answers unknown when the post-removal worktree list fails', async () => {
+    const { result } = await removeWith({
+      [LIST_MARKER]: ({ callIndex }) =>
+        callIndex === 0 ? { stdout: worktreeList() } : { exitCode: 128 },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result.outcome).toBe('unknown');
+  });
+
+  it('answers unknown when the post-removal worktree list cannot be parsed', async () => {
+    const { result } = await removeWith({
+      [LIST_MARKER]: ({ callIndex }) =>
+        callIndex === 0 ? { stdout: worktreeList() } : { stdout: 'not porcelain' },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result.outcome).toBe('unknown');
+  });
 });
 
 describe('removeWorktree against real git', () => {

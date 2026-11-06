@@ -24,7 +24,8 @@
  * and ids and codes only ever cross its boundary.
  */
 
-import { containsSecretShape } from '@fleet/shared';
+import { containsSecretShape, readPlainRecord } from '@fleet/shared';
+import type { PlainFieldSchema, PlainRecordSchema } from '@fleet/shared';
 
 import type { ActionJournalEntryRecord, AttemptRecord, CapacityReservationRecord } from '../../domain/execution-records.js';
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
@@ -60,7 +61,7 @@ import {
   type ReaperObservation,
   type ReaperPolicy,
 } from '../../domain/reaper-findings.js';
-import { REQUEST_ID_PATTERN, reaperRepairKey } from '../../domain/lane-run-keys.js';
+import { REAPER_FINDING_KINDS, REQUEST_ID_PATTERN, reaperRepairKey } from '../../domain/lane-run-keys.js';
 
 /**
  * The attention surface the reaper needs, declared locally so application
@@ -217,6 +218,129 @@ function actionJournalHasYoungIntent(entries: readonly ActionJournalEntryRecord[
   return false;
 }
 
+
+/** At most this many unknown entries of one bounded reason (`pass-cap`, `subject-unsafe`) per pass. */
+const MAX_BOUNDED_UNKNOWNS = 64;
+
+function repairFlagSchema(): PlainRecordSchema {
+  const flags: Record<string, PlainFieldSchema> = {};
+  for (const kind of REAPER_FINDING_KINDS) {
+    flags[kind] = { kind: 'boolean', optional: true };
+  }
+  return flags;
+}
+
+/** The policy fields the pass and the classifier read; anything else is dropped, a getter is refused. */
+const POLICY_SCHEMA: PlainRecordSchema = {
+  graceMinutes: { kind: 'integer', optional: true },
+  staleStopMinutes: { kind: 'integer', optional: true },
+  minFreePercent: { kind: 'integer', optional: true },
+  repairs: { kind: 'record', schema: repairFlagSchema(), optional: true },
+};
+
+/** Snapshot the policy through the shared plain-record reader; a hostile policy is a refusal (null). */
+function readPolicy(value: unknown): ReaperPolicy | null {
+  if (value === undefined) {
+    return {};
+  }
+  const read = readPlainRecord(value, POLICY_SCHEMA);
+  return read.ok ? (read.value as ReaperPolicy) : null;
+}
+
+interface ParsedRequest {
+  readonly projectId: string;
+  readonly nowIso: string;
+  readonly nowMs: number;
+  readonly graceMs: number;
+  readonly policy: ReaperPolicy;
+}
+
+/** Validate the request; null is the `request-invalid` refusal. Never throws. */
+function parseRequest(request: unknown): ParsedRequest | null {
+  if (!isPlainObject(request)) {
+    return null;
+  }
+  const projectId = readField(request, 'projectId');
+  if (typeof projectId !== 'string' || projectId === '' || containsSecretShape(projectId)) {
+    return null;
+  }
+  const nowIso = parseNowIso(readField(request, 'nowIso'));
+  const policy = readPolicy(readField(request, 'policy'));
+  if (nowIso === null || policy === null) {
+    return null;
+  }
+  const grace = policy.graceMinutes;
+  const graceMinutes = typeof grace === 'number' && Number.isFinite(grace) && grace >= 0 ? grace : DEFAULT_GRACE_MINUTES;
+  return { projectId, nowIso, nowMs: Date.parse(nowIso), graceMs: graceMinutes * MINUTE_MS, policy };
+}
+
+/** A subject id that may appear in output: a string that is not secret-shaped. */
+function isSafeSubject(id: unknown): id is string {
+  return typeof id === 'string' && !containsSecretShape(id);
+}
+
+/** Push an unknown whose reason is bounded: past the cap the entry is dropped, never grown without limit. */
+function pushBounded(unknown: ReaperUnknownView[], entry: ReaperUnknownView): void {
+  let count = 0;
+  for (const existing of unknown) {
+    if (existing.reason === entry.reason) {
+      count += 1;
+    }
+  }
+  if (count < MAX_BOUNDED_UNKNOWNS) {
+    unknown.push(entry);
+  }
+}
+
+/** Run one read; a throw is an unknown (never an empty read) and yields null. */
+async function safeRead<T>(read: () => Promise<T>, reason: string, unknown: ReaperUnknownView[]): Promise<T | null> {
+  try {
+    return await read();
+  } catch {
+    unknown.push({ subject: '', reason });
+    return null;
+  }
+}
+
+/** Everything the observation builders fill in for one pass. */
+interface ObservationBuild {
+  readonly observations: ReaperObservation[];
+  readonly attemptsById: Map<string, AttemptRecord>;
+  readonly reservationById: Map<string, CapacityReservationRecord>;
+  /** Subjects skipped by the per-pass cap: their open findings are never closed. */
+  readonly cappedKeys: Set<string>;
+  /** The attention item behind each stale-attention subject, so a clear targets it. */
+  readonly staleAttentionBySubject: Map<string, { kind: string; subjectKind: string }>;
+  readonly unknown: ReaperUnknownView[];
+  subjects: number;
+}
+
+/** Claim one of the per-pass subject slots; past the cap the subject is an unknown, never silently dropped. */
+function claimSubjectSlot(build: ObservationBuild, kind: string, subject: string): boolean {
+  if (build.subjects >= MAX_SUBJECTS_PER_PASS) {
+    pushBounded(build.unknown, { subject, kind, reason: 'pass-cap' });
+    build.cappedKeys.add(kind + '\u0000' + subject);
+    return false;
+  }
+  build.subjects += 1;
+  return true;
+}
+
+/** A subject id that is secret-shaped is redacted: skipped with an id-free unknown. */
+function screenSubject(build: ObservationBuild, id: unknown): id is string {
+  if (isSafeSubject(id)) {
+    return true;
+  }
+  pushBounded(build.unknown, { subject: '', reason: 'subject-unsafe' });
+  return false;
+}
+
+interface PassFacts {
+  readonly attempts: readonly AttemptRecord[] | null;
+  readonly reservations: Awaited<ReturnType<ExecutionJournalPort['listActiveReservations']>> | null;
+  readonly attentionItems: readonly unknown[] | null;
+}
+
 export class ReapZombiesUseCase implements ReapZombiesPort {
   private readonly deps: ReapZombiesDependencies;
 
@@ -226,60 +350,19 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
 
   async reapZombies(request: ReapZombiesRequest): Promise<ReapZombiesResult> {
     // 1. Validate. Never throw on runtime input.
-    if (!isPlainObject(request)) {
+    const parsed = parseRequest(request);
+    if (parsed === null) {
       return refused('request-invalid');
     }
-    const projectId = readField(request, 'projectId');
-    if (typeof projectId !== 'string' || projectId === '' || containsSecretShape(projectId)) {
-      return refused('request-invalid');
-    }
-    const nowIso = parseNowIso(readField(request, 'nowIso'));
-    if (nowIso === null) {
-      return refused('request-invalid');
-    }
-    const policyValue = readField(request, 'policy');
-    const policy: ReaperPolicy = isPlainObject(policyValue) ? (policyValue as ReaperPolicy) : {};
-    const graceMinutes =
-      typeof policy.graceMinutes === 'number' && Number.isFinite(policy.graceMinutes) && policy.graceMinutes >= 0
-        ? policy.graceMinutes
-        : DEFAULT_GRACE_MINUTES;
-    const graceMs = graceMinutes * MINUTE_MS;
-    const nowMs = Date.parse(nowIso);
+    const { projectId, nowIso, nowMs, graceMs, policy } = parsed;
 
     // 2. Read the facts. A read that throws is an unknown; the affected part
-    // of the pass is skipped — never substituted with an empty read, and an
+    // of the pass is skipped, never substituted with an empty read, and an
     // unreadable findings store writes nothing at all.
     const unknown: ReaperUnknownView[] = [];
-    let attempts: readonly AttemptRecord[] = [];
-    let attemptsUnreadable = false;
-    try {
-      attempts = await this.deps.attemptRepo.listAllAttempts();
-    } catch {
-      attemptsUnreadable = true;
-      unknown.push({ subject: '', reason: 'attempts-unreadable' });
-    }
-    let reservations: Awaited<ReturnType<ExecutionJournalPort['listActiveReservations']>> = [];
-    let reservationsUnreadable = false;
-    try {
-      reservations = await this.deps.executionJournal.listActiveReservations();
-    } catch {
-      reservationsUnreadable = true;
-      unknown.push({ subject: '', reason: 'reservations-unreadable' });
-    }
-    let attentionItems: readonly unknown[] = [];
-    let attentionUnreadable = false;
-    try {
-      const attentionResult = await this.deps.attention.listAttentionItems({ projectId });
-      attentionItems = Array.isArray(attentionResult?.items) ? attentionResult.items : [];
-    } catch {
-      attentionUnreadable = true;
-      unknown.push({ subject: '', reason: 'attention-unreadable' });
-    }
-    let openRecords: readonly ReaperFindingStoreRecord[];
-    try {
-      openRecords = await this.deps.reaperFindings.listOpenFindings();
-    } catch {
-      // An unreadable findings store writes nothing at all — never treated as empty.
+    const facts = await this.readFacts(projectId, unknown);
+    const openRecords = await this.readOpenFindings();
+    if (openRecords === null) {
       return {
         outcome: 'completed',
         findings: [],
@@ -288,210 +371,264 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
         unknown: [...unknown, { subject: '', reason: 'findings-unreadable' }],
       };
     }
-    const readsComplete = !attemptsUnreadable && !reservationsUnreadable && !attentionUnreadable;
+    const readsComplete = facts.attempts !== null && facts.reservations !== null && facts.attentionItems !== null;
 
-    // 3. Build the observations, one per subject, for every kind the read
-    // ports can establish. When the attempts read failed, no observation is
-    // built at all: a reservation whose attempt could not be read is not
-    // classified as `absent`, and no finding, attention item or repair follows
-    // from a read this pass could not make.
-    const observations: ReaperObservation[] = [];
-    const findings: ReaperFinding[] = [];
-    const attemptsById = new Map<string, AttemptRecord>();
-    const reservationById = new Map<string, CapacityReservationRecord>();
-    /** Subjects skipped by the per-pass cap: their open findings are never closed. */
-    const cappedKeys = new Set<string>();
-    /** The attention item behind each stale-attention subject, so a clear targets it. */
-    const staleAttentionBySubject = new Map<string, { kind: string; subjectKind: string }>();
-
-    if (!attemptsUnreadable) {
-      let subjects = 0;
-      for (const entry of attempts) {
-        if (isPlainObject(entry) && typeof (entry as { id?: unknown }).id === 'string') {
-          attemptsById.set((entry as { id: string }).id, entry as AttemptRecord);
-        }
-      }
-      for (const attempt of attempts) {
-        if (!isPlainObject(attempt)) {
-          continue; // a sparse or malformed entry is skipped, never thrown on
-        }
-        if (attempt.state !== 'running' || typeof attempt.sessionId !== 'string') {
-          continue;
-        }
-        if (subjects >= MAX_SUBJECTS_PER_PASS) {
-          unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'pass-cap' });
-          cappedKeys.add('dead-attempt\u0000' + attempt.id);
-          continue;
-        }
-        subjects += 1;
-        const resolved = this.deps.runnerForAttempt.runnerForAttempt({ runner: attempt.runner ?? null });
-        if (!resolved.ok) {
-          unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'runner-unresolved' });
-          continue;
-        }
-        let status: RunnerSessionStatus;
-        try {
-          status = await resolved.runner.inspectSession({
-            attemptId: attempt.id,
-            sessionId: attempt.sessionId,
-            runner: attempt.runner ?? null,
-          });
-        } catch {
-          unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'runner-unreadable' });
-          continue;
-        }
-        if (status.runnerReachable === 'unknown') {
-          unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'runner-unknown' });
-          continue;
-        }
-        if (status.runnerReachable === 'unreachable') {
-          // Unreachability does not establish that the session ended; the
-          // subject stays an unknown instead of a dead-attempt observation.
-          unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'runner-unreachable' });
-          continue;
-        }
-        let actionEntries: readonly ActionJournalEntryRecord[];
-        try {
-          actionEntries = await this.deps.executionJournal.listJournalEntriesForAttempt(attempt.id);
-        } catch {
-          unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'journal-unreadable' });
-          continue;
-        }
-        const sessionEndedOrMissing =
-          status.workerCommand === 'not-started' ||
-          status.workerCommand === 'ended';
-        observations.push({
-          kind: 'dead-attempt',
-          subject: attempt.id,
-          youngActivity:
-            attemptYoungActivity(attempt, nowMs, graceMs) ||
-            actionJournalHasYoungIntent(actionEntries, nowMs, graceMs),
-          recordSaysRunning: true,
-          sessionEndedOrMissing,
-        });
-      }
-      if (!reservationsUnreadable) {
-        for (const reservation of reservations) {
-          if (!isPlainObject(reservation) || (reservation as { held?: unknown }).held !== true) {
-            continue;
-          }
-          const record = reservation as { id: string; attemptId: string; reservedAtIso: string };
-          if (typeof record.id !== 'string' || record.id === '') {
-            continue;
-          }
-          reservationById.set(record.id, reservation as CapacityReservationRecord);
-          if (subjects >= MAX_SUBJECTS_PER_PASS) {
-            unknown.push({ subject: record.id, kind: 'leaked-slot', reason: 'pass-cap' });
-            cappedKeys.add('leaked-slot\u0000' + record.id);
-            continue;
-          }
-          subjects += 1;
-          const attempt = attemptsById.get(record.attemptId);
-          const state = attempt === undefined ? 'absent' : attemptStateOf(attempt.state);
-          observations.push({
-            kind: 'leaked-slot',
-            subject: record.id,
-            youngActivity: reservationsYoungActivity(record.reservedAtIso, nowMs, graceMs),
-            attemptState: state,
-          });
-        }
-      }
-      if (!attentionUnreadable) {
-        for (const raw of attentionItems) {
-          if (!isPlainObject(raw)) {
-            continue;
-          }
-          const item = raw as { state?: unknown; kind?: unknown; subject?: unknown };
-          if (item.state !== 'open') {
-            continue;
-          }
-          const subj = item.subject as { kind?: unknown; ref?: unknown } | null;
-          if (!isPlainObject(subj) || subj.kind !== 'attempt') {
-            continue;
-          }
-          if (typeof subj.ref !== 'string' || subj.ref === '') {
-            continue;
-          }
-          const attempt = attemptsById.get(subj.ref);
-          if (attempt === undefined || !TERMINAL_ATTEMPT_STATES.has(attempt.state)) {
-            continue;
-          }
-          if (subjects >= MAX_SUBJECTS_PER_PASS) {
-            unknown.push({ subject: subj.ref, kind: 'stale-attention', reason: 'pass-cap' });
-            cappedKeys.add('stale-attention\u0000' + subj.ref);
-            continue;
-          }
-          subjects += 1;
-          observations.push({
-            kind: 'stale-attention',
-            subject: subj.ref,
-            youngActivity: false,
-            attentionOpen: true,
-            questionUnanswered: false,
-            runTerminal: true,
-          });
-          staleAttentionBySubject.set(subj.ref, {
-            kind: typeof item.kind === 'string' ? item.kind : 'stale-attention',
-            subjectKind: 'attempt',
-          });
-        }
-      }
-
-      // 4. Classify. The classifier never throws.
-      findings.push(
-        ...classifyZombies(
-          { observations, openFindings: openRecords.map((record) => record.finding) },
-          nowIso,
-          policy,
-        ),
-      );
+    // 3-4. Observe and classify. When the attempts read failed, no
+    // observation is built at all: a reservation whose attempt could not be
+    // read is not classified as `absent`.
+    const built = this.newBuild(unknown);
+    let findings: ReaperFinding[] = [];
+    if (facts.attempts !== null) {
+      await this.buildObservations(built, facts, nowMs, graceMs);
+      findings = [...classifyZombies({ observations: built.observations, openFindings: openRecords.map((r) => r.finding) }, nowIso, policy)];
     }
 
-    // 5. Upsert. Reuse the stored finding id for (kind, subject); mint only
-    // for a first sighting, and validate every minted id before any write.
-    const findingIds = new Map<number, string>();
-    for (let index = 0; index < findings.length; index += 1) {
-      const finding = findings[index];
+    // 5. Upsert under reused or freshly minted ids.
+    const stored = await this.storeFindings(findings, openRecords, unknown);
+    if (stored === null) {
+      return { ...refused('id-source-invalid'), unknown };
+    }
+
+    const ctx: SettleContext = {
+      projectId,
+      nowIso,
+      attemptsById: built.attemptsById,
+      reservationById: built.reservationById,
+      attentionItems: facts.attentionItems ?? [],
+      staleAttentionBySubject: built.staleAttentionBySubject,
+      unknown,
+    };
+
+    // 6. Raise or refresh attention (skipped when the attention read failed).
+    const attention = facts.attentionItems === null ? [] : await this.raiseAttention(findings, stored.storedIds, ctx);
+
+    // 7. Repair: record-only, keyed, per kind.
+    const repairs = await this.runRepairs(findings, stored.storedIds, ctx);
+
+    // 8. Close findings the pass no longer sees, only when every read succeeded.
+    if (readsComplete) {
+      await this.settleUnseenFindings(openRecords, findings, built.cappedKeys, ctx);
+    }
+
+    return { outcome: 'completed', findings: stored.views, attention, repairs, unknown };
+  }
+
+  private async readFacts(projectId: string, unknown: ReaperUnknownView[]): Promise<PassFacts> {
+    const attempts = await safeRead(() => this.deps.attemptRepo.listAllAttempts(), 'attempts-unreadable', unknown);
+    const reservations = await safeRead(
+      () => this.deps.executionJournal.listActiveReservations(),
+      'reservations-unreadable',
+      unknown,
+    );
+    const attentionItems = await safeRead(
+      async () => {
+        const result = await this.deps.attention.listAttentionItems({ projectId });
+        return Array.isArray(result?.items) ? result.items : [];
+      },
+      'attention-unreadable',
+      unknown,
+    );
+    return { attempts, reservations, attentionItems };
+  }
+
+  private async readOpenFindings(): Promise<readonly ReaperFindingStoreRecord[] | null> {
+    try {
+      return await this.deps.reaperFindings.listOpenFindings();
+    } catch {
+      return null;
+    }
+  }
+
+  private newBuild(unknown: ReaperUnknownView[]): ObservationBuild {
+    return {
+      observations: [],
+      attemptsById: new Map<string, AttemptRecord>(),
+      reservationById: new Map<string, CapacityReservationRecord>(),
+      cappedKeys: new Set<string>(),
+      staleAttentionBySubject: new Map<string, { kind: string; subjectKind: string }>(),
+      unknown,
+      subjects: 0,
+    };
+  }
+
+  /** Observations for every kind the read ports can establish, in the order attempts, reservations, attention. */
+  private async buildObservations(
+    build: ObservationBuild,
+    facts: PassFacts,
+    nowMs: number,
+    graceMs: number,
+  ): Promise<void> {
+    const attempts = facts.attempts ?? [];
+    for (const entry of attempts) {
+      if (isPlainObject(entry) && typeof (entry as { id?: unknown }).id === 'string') {
+        build.attemptsById.set((entry as { id: string }).id, entry);
+      }
+    }
+    for (const attempt of attempts) {
+      if (isPlainObject(attempt)) {
+        await this.observeDeadAttempt(build, attempt, nowMs, graceMs);
+      } // a sparse or malformed entry is skipped, never thrown on
+    }
+    if (facts.reservations !== null) {
+      for (const reservation of facts.reservations) {
+        this.observeLeakedSlot(build, reservation, nowMs, graceMs);
+      }
+    }
+    if (facts.attentionItems !== null) {
+      for (const raw of facts.attentionItems) {
+        this.observeStaleAttention(build, raw);
+      }
+    }
+  }
+
+  private async observeDeadAttempt(
+    build: ObservationBuild,
+    attempt: AttemptRecord,
+    nowMs: number,
+    graceMs: number,
+  ): Promise<void> {
+    if (attempt.state !== 'running' || typeof attempt.sessionId !== 'string') {
+      return;
+    }
+    if (!screenSubject(build, attempt.id) || !claimSubjectSlot(build, 'dead-attempt', attempt.id)) {
+      return;
+    }
+    const inspected = await this.inspectAttempt(attempt, build.unknown);
+    if (inspected === null) {
+      return;
+    }
+    build.observations.push({
+      kind: 'dead-attempt',
+      subject: attempt.id,
+      youngActivity:
+        attemptYoungActivity(attempt, nowMs, graceMs) ||
+        actionJournalHasYoungIntent(inspected.actionEntries, nowMs, graceMs),
+      recordSaysRunning: true,
+      sessionEndedOrMissing: inspected.status.workerCommand === 'not-started' || inspected.status.workerCommand === 'ended',
+    });
+  }
+
+  /** The runner's view and the action journal of one running attempt; null (with an unknown) when either is not established. */
+  private async inspectAttempt(
+    attempt: AttemptRecord,
+    unknown: ReaperUnknownView[],
+  ): Promise<{ status: RunnerSessionStatus; actionEntries: readonly ActionJournalEntryRecord[] } | null> {
+    const fail = (reason: string): null => {
+      unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason });
+      return null;
+    };
+    const resolved = this.deps.runnerForAttempt.runnerForAttempt({ runner: attempt.runner ?? null });
+    if (!resolved.ok) {
+      return fail('runner-unresolved');
+    }
+    let status: RunnerSessionStatus;
+    try {
+      status = await resolved.runner.inspectSession({
+        attemptId: attempt.id,
+        sessionId: attempt.sessionId as string,
+        runner: attempt.runner ?? null,
+      });
+    } catch {
+      return fail('runner-unreadable');
+    }
+    if (status.runnerReachable === 'unknown') {
+      return fail('runner-unknown');
+    }
+    if (status.runnerReachable === 'unreachable') {
+      // Unreachability does not establish that the session ended.
+      return fail('runner-unreachable');
+    }
+    try {
+      return { status, actionEntries: await this.deps.executionJournal.listJournalEntriesForAttempt(attempt.id) };
+    } catch {
+      return fail('journal-unreadable');
+    }
+  }
+
+  private observeLeakedSlot(build: ObservationBuild, reservation: unknown, nowMs: number, graceMs: number): void {
+    if (!isPlainObject(reservation) || reservation.held !== true) {
+      return;
+    }
+    const record = reservation as unknown as CapacityReservationRecord;
+    if (typeof record.id !== 'string' || record.id === '') {
+      return;
+    }
+    if (!screenSubject(build, record.id)) {
+      return;
+    }
+    build.reservationById.set(record.id, record);
+    if (!claimSubjectSlot(build, 'leaked-slot', record.id)) {
+      return;
+    }
+    const attempt = build.attemptsById.get(record.attemptId);
+    build.observations.push({
+      kind: 'leaked-slot',
+      subject: record.id,
+      youngActivity: reservationsYoungActivity(record.reservedAtIso, nowMs, graceMs),
+      attemptState: attempt === undefined ? 'absent' : attemptStateOf(attempt.state),
+    });
+  }
+
+  private observeStaleAttention(build: ObservationBuild, raw: unknown): void {
+    if (!isPlainObject(raw) || raw.state !== 'open') {
+      return;
+    }
+    const subj = raw.subject as { kind?: unknown; ref?: unknown } | null;
+    if (!isPlainObject(subj) || subj.kind !== 'attempt' || typeof subj.ref !== 'string' || subj.ref === '') {
+      return;
+    }
+    const attempt = build.attemptsById.get(subj.ref);
+    if (attempt === undefined || !TERMINAL_ATTEMPT_STATES.has(attempt.state)) {
+      return;
+    }
+    if (!screenSubject(build, subj.ref) || !claimSubjectSlot(build, 'stale-attention', subj.ref)) {
+      return;
+    }
+    build.observations.push({
+      kind: 'stale-attention',
+      subject: subj.ref,
+      youngActivity: false,
+      attentionOpen: true,
+      questionUnanswered: false,
+      runTerminal: true,
+    });
+    build.staleAttentionBySubject.set(subj.ref, {
+      kind: typeof raw.kind === 'string' ? raw.kind : 'stale-attention',
+      subjectKind: 'attempt',
+    });
+  }
+
+  /**
+   * Upsert every finding under its stored id (reused for an open
+   * `(kind, subject)`, else a validated ULID). Null when the id source is
+   * invalid. Only a stored finding is exposed or repaired.
+   */
+  private async storeFindings(
+    findings: readonly ReaperFinding[],
+    openRecords: readonly ReaperFindingStoreRecord[],
+    unknown: ReaperUnknownView[],
+  ): Promise<{ views: ReaperFindingView[]; storedIds: Map<number, string> } | null> {
+    const candidateIds: string[] = [];
+    for (const finding of findings) {
       const existing = openRecords.find(
         (record) => record.finding.kind === finding.kind && record.finding.subject === finding.subject,
       );
-      if (existing !== undefined) {
-        findingIds.set(index, existing.findingId);
-        continue;
+      const id = existing !== undefined ? existing.findingId : mintedUlid(this.deps.newId);
+      if (id === null) {
+        return null;
       }
-      const minted = mintedUlid(this.deps.newId);
-      if (minted === null) {
-        return { ...refused('id-source-invalid'), unknown };
-      }
-      findingIds.set(index, minted);
+      candidateIds.push(id);
     }
-    const findingViews: ReaperFindingView[] = [];
-    /** The authoritative finding id per finding index; only a stored finding has one. */
+    const views: ReaperFindingView[] = [];
     const storedIds = new Map<number, string>();
     for (let index = 0; index < findings.length; index += 1) {
       const finding = findings[index];
-      const candidateId = findingIds.get(index) as string;
-      let storedId: string | null = null;
-      try {
-        const upsert = await this.deps.reaperFindings.upsertFinding(finding, candidateId);
-        if (upsert.outcome === 'stored') {
-          // The stored record's id is authoritative, including when the store
-          // found an existing open record for this (subject, kind): concurrent
-          // passes share one finding id and therefore one repair key.
-          storedId = upsert.record.findingId;
-        } else {
-          unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'finding-store-refused' });
-        }
-      } catch {
-        unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'finding-store-unwritable' });
-      }
+      const storedId = await this.upsertOne(finding, candidateIds[index], unknown);
       if (storedId === null) {
-        // A finding that was not stored is not exposed: no view, no attention
-        // item, and no repair may run on a locally minted candidate id.
-        continue;
+        continue; // not stored: no view, no attention item, no repair on a candidate id
       }
       storedIds.set(index, storedId);
-      findingViews.push({
+      views.push({
         findingId: storedId,
         kind: finding.kind,
         subject: finding.subject,
@@ -499,88 +636,94 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
         sightings: finding.sightings,
       });
     }
+    return { views, storedIds };
+  }
 
-    // 6. Raise or refresh attention for report and repair findings. When the
-    // attention read failed, this part of the pass is skipped entirely. A
-    // stale-attention finding is about an item that is already open: it raises
-    // nothing, and its repair clears the underlying item instead.
-    const attention: ReaperAttentionView[] = [];
-    if (!attentionUnreadable) {
-      let raised = 0;
-      for (let index = 0; index < findings.length; index += 1) {
-        const finding = findings[index];
-        if (!storedIds.has(index) || finding.action === 'wait' || finding.kind === 'stale-attention') {
-          continue;
-        }
-        if (raised >= MAX_ATTENTION_PER_PASS) {
-          unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'pass-cap' });
-          continue;
-        }
-        raised += 1;
-        const outcome = await this.recordAttention(projectId, finding, attemptsById);
-        attention.push({ kind: finding.kind, subject: finding.subject, outcome });
-        if (outcome === 'refused') {
-          // Recorded, never retried in the same pass.
-        }
+  /** The stored record's id is authoritative: concurrent passes share one finding id and one repair key. */
+  private async upsertOne(finding: ReaperFinding, candidateId: string, unknown: ReaperUnknownView[]): Promise<string | null> {
+    try {
+      const upsert = await this.deps.reaperFindings.upsertFinding(finding, candidateId);
+      if (upsert.outcome === 'stored') {
+        return upsert.record.findingId;
       }
+      unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'finding-store-refused' });
+    } catch {
+      unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'finding-store-unwritable' });
     }
+    return null;
+  }
 
-    // 7. Repair: record-only, keyed, per kind. Only a successfully stored
-    // finding participates, and only under its authoritative id.
+  /**
+   * Attention for report and repair findings. A stale-attention finding is
+   * about an item that is already open: it raises nothing, and its repair
+   * clears the underlying item instead.
+   */
+  private async raiseAttention(
+    findings: readonly ReaperFinding[],
+    storedIds: ReadonlyMap<number, string>,
+    ctx: SettleContext,
+  ): Promise<ReaperAttentionView[]> {
+    const attention: ReaperAttentionView[] = [];
+    let raised = 0;
+    for (let index = 0; index < findings.length; index += 1) {
+      const finding = findings[index];
+      if (!storedIds.has(index) || finding.action === 'wait' || finding.kind === 'stale-attention') {
+        continue;
+      }
+      if (raised >= MAX_ATTENTION_PER_PASS) {
+        pushBounded(ctx.unknown, { subject: finding.subject, kind: finding.kind, reason: 'pass-cap' });
+        continue;
+      }
+      raised += 1;
+      // A refusal is recorded in the view, never retried in the same pass.
+      const outcome = await this.recordAttention(ctx.projectId, finding, ctx.attemptsById);
+      attention.push({ kind: finding.kind, subject: finding.subject, outcome });
+    }
+    return attention;
+  }
+
+  /** Only a successfully stored finding participates, and only under its authoritative id. */
+  private async runRepairs(
+    findings: readonly ReaperFinding[],
+    storedIds: ReadonlyMap<number, string>,
+    ctx: SettleContext,
+  ): Promise<ReaperRepairView[]> {
     const repairs: ReaperRepairView[] = [];
     for (let index = 0; index < findings.length; index += 1) {
       const finding = findings[index];
-      if (finding.action !== 'repair') {
-        continue;
-      }
       const storedId = storedIds.get(index);
-      if (storedId === undefined) {
-        continue; // never repaired and never surfaced under the candidate id
+      if (finding.action === 'repair' && storedId !== undefined) {
+        repairs.push(await this.repairOne(finding, storedId, ctx));
       }
-      if (finding.kind === 'dead-attempt') {
-        repairs.push(await this.repairDeadAttempt(nowIso, finding, storedId, unknown));
-      } else if (finding.kind === 'leaked-slot') {
-        repairs.push(
-          await this.repairLeakedSlot(nowIso, finding, storedId, unknown, reservationById, attemptsById),
+    }
+    return repairs;
+  }
+
+  private async repairOne(finding: ReaperFinding, storedId: string, ctx: SettleContext): Promise<ReaperRepairView> {
+    switch (finding.kind) {
+      case 'dead-attempt':
+        return await this.repairDeadAttempt(ctx.nowIso, finding, storedId, ctx.unknown);
+      case 'leaked-slot':
+        return await this.repairLeakedSlot(ctx.nowIso, finding, storedId, ctx.unknown, ctx.reservationById, ctx.attemptsById);
+      case 'stale-attention':
+        return await this.repairStaleAttention(
+          ctx.nowIso,
+          ctx.projectId,
+          finding,
+          storedId,
+          ctx.unknown,
+          ctx.attentionItems,
+          ctx.staleAttentionBySubject,
         );
-      } else if (finding.kind === 'stale-attention') {
-        repairs.push(
-          await this.repairStaleAttention(nowIso, projectId, finding, storedId, unknown, attentionItems, staleAttentionBySubject),
-        );
-      } else {
-        repairs.push({
+      default:
+        return {
           key: keyOf(finding.subject, finding.kind, storedId),
           kind: finding.kind,
           subject: finding.subject,
           outcome: 'skipped',
           reasonCode: 'repair-not-available',
-        });
-      }
+        };
     }
-
-    // 8. Close findings the pass no longer sees: on positive evidence the
-    // condition ended, close the finding and clear its attention item; a
-    // repair intent without a result is reconciled read-only, never repeated.
-    // This never runs when a read failed — unknown stays unknown.
-    if (readsComplete) {
-      await this.settleUnseenFindings(openRecords, findings, cappedKeys, {
-        projectId,
-        nowIso,
-        attemptsById,
-        reservationById,
-        attentionItems,
-        staleAttentionBySubject,
-        unknown,
-      });
-    }
-
-    return {
-      outcome: 'completed',
-      findings: findingViews,
-      attention,
-      repairs,
-      unknown,
-    };
   }
 
   /** One attention item per (project, subject, kind); ids and codes only, at most 1024 characters. */

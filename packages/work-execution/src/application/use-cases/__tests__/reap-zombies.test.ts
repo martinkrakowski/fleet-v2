@@ -257,6 +257,7 @@ interface Harness {
   newIdOverride?: () => string;
   reaperFindings?: ReaperFindingRepositoryPort;
   attemptRepo?: AttemptRepositoryPort;
+  runnerForAttempt?: RunnerForAttemptPort;
 }
 
 function build(harness: Harness): ReapZombiesUseCase {
@@ -269,7 +270,7 @@ function build(harness: Harness): ReapZombiesUseCase {
     },
     releaseCapacityReservationIfUnchanged: harness.release,
   };
-  const runnerForAttempt: RunnerForAttemptPort = {
+  const runnerForAttempt: RunnerForAttemptPort = harness.runnerForAttempt ?? {
     runnerForAttempt: () => {
       const runner = harness.runner;
       return { ok: true, runner };
@@ -845,5 +846,51 @@ describe('reap zombies', () => {
     const result = await runPass(harness, { policy });
     const repair = result.repairs.find((entry) => entry.kind === 'leaked-slot');
     expect(repair).toMatchObject({ outcome: 'skipped', reasonCode: 'repair-not-available' });
+  });
+
+  it('a secret-shaped attempt id is never copied into an unknown subject', async () => {
+    const token = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8';
+    expect(containsSecretShape(token)).toBe(true);
+    const harness = baseHarness({
+      attempts: [attemptFixture(token)],
+      runnerForAttempt: { runnerForAttempt: () => ({ ok: false, reason: 'host-unknown' }) },
+    });
+    const result = await runPass(harness);
+    expect(JSON.stringify(result).includes(token)).toBe(false);
+    expect(result.unknown).toContainEqual({ subject: '', reason: 'subject-unsafe' });
+    expect(harness.runner.inspectCalls).toEqual([]);
+  });
+
+  it('a secret-shaped reservation id is never copied into an unknown subject', async () => {
+    const token = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8';
+    const harness = baseHarness({ reservations: [reservationFixture(token, 'att-1')] });
+    const result = await runPass(harness);
+    expect(JSON.stringify(result).includes(token)).toBe(false);
+    expect(result.findings).toEqual([]);
+  });
+
+  it('pass-cap unknowns are capped at the 64-item output cap', async () => {
+    const attempts: AttemptRecord[] = [];
+    for (let index = 0; index < 200; index += 1) {
+      attempts.push(attemptFixture(`att-${index}`));
+    }
+    const result = await runPass(baseHarness({ attempts }));
+    const capped = result.unknown.filter((entry) => entry.reason === 'pass-cap');
+    expect(capped).toHaveLength(64);
+    expect(result.findings.length).toBeLessThanOrEqual(64);
+  });
+
+  it('a throwing policy getter is refused without throwing', async () => {
+    const policy = {};
+    Object.defineProperty(policy, 'graceMinutes', {
+      enumerable: true,
+      get: () => {
+        throw new Error('boom');
+      },
+    });
+    const harness = baseHarness({ attempts: [attemptFixture('att-1')] });
+    const result = await runPass(harness, { policy });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'request-invalid' });
+    expect(harness.journal.state.appendCalls).toEqual([]);
   });
 });

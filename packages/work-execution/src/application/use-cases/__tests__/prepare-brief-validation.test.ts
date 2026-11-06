@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   PrepareBriefPackageUseCase,
+  simpleDeterministicHexDigest,
   type PrepareBriefPackageUseCaseRequest,
 } from '../PrepareBriefPackageUseCase.use-case.js';
+import { readBriefPackageManifest } from '../../../domain/value-objects/BriefPackage.vo.js';
 import type { GateCoverageReader } from '../../../domain/value-objects/AcceptanceSpec.vo.js';
 import type { BriefAuthoringPort } from '../../ports/out/BriefAuthoringPort.out-port.js';
 import type { AttemptArtifactPort } from '../../ports/out/AttemptArtifactPort.out-port.js';
@@ -746,5 +748,150 @@ describe('PrepareBriefPackageUseCase runner agent (KF-7)', () => {
           'Model assignment agent must be a non-empty string of at most 64 characters matching [A-Za-z0-9][A-Za-z0-9._-]*',
       });
     }
+  });
+});
+
+describe('PrepareBriefPackageUseCase CO28b schemaVersion 2 and frozen inputs', () => {
+  const PROSE = '# CO28b frozen prose';
+  const seatPlan = {
+    version: 1 as const,
+    'first-pass': [{ id: 'fp-1', model: 'implementer-model', tool: 'opencode' }],
+    fix: [{ id: 'fx-1', model: 'implementer-model', tool: 'opencode' }],
+    review: [],
+  };
+  const prNotes = { hardToUndo: 'undo-a', assumptions: 'assume-b', challengeThis: 'challenge-c' };
+
+  it('prepares a schemaVersion 2 manifest that round-trips through readBriefPackageManifest', async () => {
+    const captured = makeCapturingArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring(),
+      artifactPort: captured.port,
+      worktreePath: '/wt',
+    });
+
+    const result = await useCase.prepareBriefPackage(
+      validRequest({ proseMarkdown: PROSE, seatPlan, prNotes }),
+    );
+    expect(result.outcome).toBe('prepared');
+    if (result.outcome !== 'prepared') return;
+
+    expect(captured.placedManifestJsons).toHaveLength(1);
+    const manifestRaw = captured.placedManifestJsons[0];
+    expect(JSON.parse(manifestRaw)).toMatchObject({ schemaVersion: 2 });
+    expect(simpleDeterministicHexDigest(PROSE + '\n' + manifestRaw)).toBe(result.prepared.briefDigest);
+
+    const read = readBriefPackageManifest(
+      {
+        manifestRaw,
+        prose: PROSE,
+        expectedBriefDigest: result.prepared.briefDigest,
+        attemptId: result.prepared.attemptId,
+        prosePath: result.prepared.prosePath,
+        manifestPath: result.prepared.manifestPath,
+        baseCommit: 'abc123',
+        policyRevision: 'policy-7',
+        independentReviewer: 'reviewer-model',
+        ownedPaths: ['packages/app-a/**'],
+      },
+      { computeDigest: simpleDeterministicHexDigest },
+    );
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.schemaVersion).toBe(2);
+    expect(read.explicitSchemaVersion).toBe(true);
+    const pkg = read.value;
+    expect(pkg.getBriefDigest()).toBe(result.prepared.briefDigest);
+    expect(pkg.getLimits()!.getStepLimit()).toBe(40);
+    expect(pkg.getLimits()!.getTimeLimitSeconds()).toBe(3600);
+    expect(pkg.getLimits()!.getResourceBounds()).toEqual({ cpu: '2' });
+    expect(pkg.getSelectedContextVersions()).toEqual([{ knowledgeEntryId: 'ke-1', version: 'v1' }]);
+    expect(pkg.getOwnerDecisionReferences()).toEqual(['decision-1']);
+    expect(pkg.getSeatPlan()).not.toBeNull();
+    expect(pkg.getPrNotes()).toEqual(prNotes);
+  });
+
+  it('rejects null, non-object, sparse array, and throwing-getter requests without throwing', async () => {
+    const useCase = makeUseCase();
+    const plainObjectReason = { outcome: 'rejected', reason: 'Brief request must be a plain object' };
+
+    expect(await useCase.prepareBriefPackage(null as unknown as PrepareBriefPackageUseCaseRequest)).toEqual(plainObjectReason);
+    expect(await useCase.prepareBriefPackage('text' as unknown as PrepareBriefPackageUseCaseRequest)).toEqual(plainObjectReason);
+    expect(await useCase.prepareBriefPackage(42 as unknown as PrepareBriefPackageUseCaseRequest)).toEqual(plainObjectReason);
+    expect(await useCase.prepareBriefPackage([] as unknown as PrepareBriefPackageUseCaseRequest)).toEqual(plainObjectReason);
+    expect(await useCase.previewBriefPackage(null as unknown as PrepareBriefPackageUseCaseRequest)).toEqual(plainObjectReason);
+
+    const hostile: Record<string, unknown> = {};
+    Object.defineProperty(hostile, 'workOrderId', { enumerable: true, get() { throw new Error('boom'); } });
+    const hostileResult = await useCase.prepareBriefPackage(hostile as unknown as PrepareBriefPackageUseCaseRequest);
+    expect(hostileResult).toEqual({ outcome: 'rejected', reason: 'Brief request could not be read safely' });
+  });
+
+  it('refuses invalid frozen inputs before invoking placeFrozenBrief', async () => {
+    const captured = makeCapturingArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring(),
+      artifactPort: captured.port,
+      worktreePath: '/wt',
+    });
+
+    const badBounds = await useCase.prepareBriefPackage(validRequest({ resourceBounds: 'cpu' as unknown as Record<string, string> }));
+    expect(badBounds).toEqual({ outcome: 'rejected', reason: 'resourceBounds must be an object of string values' });
+
+    const tooManyBounds: Record<string, string> = {};
+    for (let index = 0; index < 33; index += 1) {
+      tooManyBounds['k' + index] = 'v';
+    }
+    const countResult = await useCase.prepareBriefPackage(validRequest({ resourceBounds: tooManyBounds }));
+    expect(countResult).toEqual({ outcome: 'rejected', reason: 'resourceBounds must hold at most 32 entries' });
+
+    const badStepLimit = await useCase.prepareBriefPackage(validRequest({ stepLimit: 100_001 }));
+    expect(badStepLimit).toEqual({ outcome: 'rejected', reason: 'stepLimit must be a whole number between 1 and 100000' });
+
+    const tooManyDecisions = Array.from({ length: 129 }, (_, index) => 'd' + index);
+    const decisionsResult = await useCase.prepareBriefPackage(
+      validRequest({ ownerDecisionReferences: tooManyDecisions }),
+    );
+    expect(decisionsResult).toEqual({ outcome: 'rejected', reason: 'ownerDecisionReferences must hold at most 128 entries' });
+
+    const sparseResult = await useCase.prepareBriefPackage(
+      validRequest({ ownerDecisionReferences: new Array(2) as unknown as string[] }),
+    );
+    expect(sparseResult).toEqual({ outcome: 'rejected', reason: 'ownerDecisionReferences must be a dense array of strings' });
+
+    expect(captured.placedRequests).toHaveLength(0);
+    expect(captured.verifyIgnoredPathsRequests).toHaveLength(0);
+  });
+
+  it('refuses secret-shaped resourceBounds and ownerDecisionReferences without echoing values or paths', async () => {
+    const captured = makeCapturingArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring(),
+      artifactPort: captured.port,
+      worktreePath: '/wt',
+    });
+
+    const awsToken = ['AK', 'IA', '1'.repeat(16)].join('');
+    const githubToken = ['github', 'pat', 'A'.repeat(24)].join('_');
+
+    const boundsResult = await useCase.prepareBriefPackage(
+      validRequest({ resourceBounds: { cpu: awsToken } }),
+    );
+    expect(boundsResult).toEqual({
+      outcome: 'rejected',
+      reason: 'resourceBounds contains a secret-shaped value and was refused',
+    });
+
+    const decisionsResult = await useCase.prepareBriefPackage(
+      validRequest({ ownerDecisionReferences: [githubToken] }),
+    );
+    expect(decisionsResult).toEqual({
+      outcome: 'rejected',
+      reason: 'ownerDecisionReferences contains a secret-shaped value and was refused',
+    });
+
+    expect(captured.placedRequests).toHaveLength(0);
+    if (boundsResult.outcome === 'rejected') expect(boundsResult.reason).not.toContain(awsToken);
+    if (decisionsResult.outcome === 'rejected') expect(decisionsResult.reason).not.toContain(githubToken);
+    expect(JSON.stringify(boundsResult)).not.toContain('/wt');
   });
 });

@@ -22,7 +22,21 @@ import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
 import { validateAllowedPathPrefix } from '../../domain/lane-diff-check.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import { isPlanSecretShaped } from '../../domain/lane-plan-sidecar.js';
+import { isPlainRecordObject } from '../../domain/record-schema-version.js';
+import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 import { AcceptanceSpec, isAcceptanceSpecShellError } from '../../domain/value-objects/AcceptanceSpec.vo.js';
+import { ExecutionLimits } from '../../domain/value-objects/ExecutionLimits.vo.js';
+import {
+  BRIEF_PACKAGE_SCHEMA_VERSION,
+  BRIEF_PACKAGE_MAX_STEP_LIMIT,
+  BRIEF_PACKAGE_MAX_TIME_LIMIT_SECONDS,
+  BRIEF_PACKAGE_MAX_RESOURCE_BOUNDS,
+  BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS,
+  BRIEF_PACKAGE_MAX_RESOURCE_VALUE_CHARS,
+  BRIEF_PACKAGE_MAX_DECISION_REFS,
+  BRIEF_PACKAGE_MAX_PATH_CHARS,
+  BriefPackage,
+} from '../../domain/value-objects/BriefPackage.vo.js';
 import type {
   BriefContextDecision,
   PrepareBriefPackagePort,
@@ -134,6 +148,73 @@ function prNotesError(notes: unknown): string | null {
     }
     if (isPlanSecretShaped(value)) {
       return `prNotes.${key} contains a secret-shaped value and was refused`;
+    }
+  }
+  return null;
+}
+
+/**
+ * CO28b: the structured frozen inputs are validated before any outbound call
+ * (authoring, ignored-path verification or placement), so a rejected freeze
+ * writes nothing to the worktree. Returns a fixed, path-free and value-free
+ * reason or null.
+ */
+function validateFrozenInputs(request: PrepareBriefPackageRequest): string | null {
+  if (
+    typeof request.stepLimit !== 'number' ||
+    typeof request.timeLimitSeconds !== 'number' ||
+    !Number.isFinite(request.stepLimit) ||
+    !Number.isFinite(request.timeLimitSeconds) ||
+    request.stepLimit <= 0 ||
+    request.timeLimitSeconds <= 0
+  ) {
+    return 'stepLimit and timeLimitSeconds must be positive';
+  }
+  if (!Number.isSafeInteger(request.stepLimit) || request.stepLimit > BRIEF_PACKAGE_MAX_STEP_LIMIT) {
+    return `stepLimit must be a whole number between 1 and ${BRIEF_PACKAGE_MAX_STEP_LIMIT}`;
+  }
+  if (
+    !Number.isSafeInteger(request.timeLimitSeconds) ||
+    request.timeLimitSeconds > BRIEF_PACKAGE_MAX_TIME_LIMIT_SECONDS
+  ) {
+    return `timeLimitSeconds must be a whole number between 1 and ${BRIEF_PACKAGE_MAX_TIME_LIMIT_SECONDS}`;
+  }
+  const boundsSnapshot = snapshotPlainDataRecord(request.resourceBounds);
+  if (boundsSnapshot === null) {
+    return 'resourceBounds must be an object of string values';
+  }
+  if (Object.keys(boundsSnapshot).length > BRIEF_PACKAGE_MAX_RESOURCE_BOUNDS) {
+    return `resourceBounds must hold at most ${BRIEF_PACKAGE_MAX_RESOURCE_BOUNDS} entries`;
+  }
+  for (const [key, value] of Object.entries(boundsSnapshot)) {
+    if (key.trim().length === 0 || key.length > BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS) {
+      return `resourceBounds keys must be non-empty strings of at most ${BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS} characters`;
+    }
+    if (typeof value !== 'string' || value.includes('\u0000') || value.length > BRIEF_PACKAGE_MAX_RESOURCE_VALUE_CHARS) {
+      return `resourceBounds values must be strings of at most ${BRIEF_PACKAGE_MAX_RESOURCE_VALUE_CHARS} characters`;
+    }
+    if (isPlanSecretShaped(key) || isPlanSecretShaped(value)) {
+      return 'resourceBounds contains a secret-shaped value and was refused';
+    }
+  }
+  const decisions = request.ownerDecisionReferences;
+  if (!Array.isArray(decisions)) {
+    return 'ownerDecisionReferences must be an array of strings';
+  }
+  if (decisions.length > BRIEF_PACKAGE_MAX_DECISION_REFS) {
+    return `ownerDecisionReferences must hold at most ${BRIEF_PACKAGE_MAX_DECISION_REFS} entries`;
+  }
+  for (let index = 0; index < decisions.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(decisions, index);
+    if (descriptor === undefined || !descriptor.enumerable || descriptor.get !== undefined) {
+      return 'ownerDecisionReferences must be a dense array of strings';
+    }
+    const entry = decisions[index];
+    if (typeof entry !== 'string' || entry.trim().length === 0 || entry.length > BRIEF_PACKAGE_MAX_PATH_CHARS) {
+      return `ownerDecisionReferences entries must be non-empty strings of at most ${BRIEF_PACKAGE_MAX_PATH_CHARS} characters`;
+    }
+    if (isPlanSecretShaped(entry)) {
+      return 'ownerDecisionReferences contains a secret-shaped value and was refused';
     }
   }
   return null;
@@ -480,6 +561,10 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     if (fieldsError !== null) {
       return { reason: fieldsError };
     }
+    const frozenError = validateFrozenInputs(request);
+    if (frozenError !== null) {
+      return { reason: frozenError };
+    }
     const pathsCheck = validatePathsAndSpec(request);
     if ('reason' in pathsCheck) {
       return {
@@ -543,8 +628,14 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       .filter((decision) => decision.accepted)
       .map((decision) => ({ knowledgeEntryId: decision.knowledgeEntryId, version: decision.version }));
 
+    const sortedResourceBounds: Record<string, string> = {};
+    for (const key of Object.keys(request.resourceBounds).sort()) {
+      sortedResourceBounds[key] = (request.resourceBounds as Record<string, string>)[key];
+    }
+
     const manifestJson = JSON.stringify(
       {
+        schemaVersion: BRIEF_PACKAGE_SCHEMA_VERSION,
         attemptId,
         workOrderId: request.workOrderId,
         projectId: request.projectId,
@@ -563,7 +654,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
         acceptanceSpec: pathsCheck.acceptanceSpec.toJSON(),
         stepLimit: request.stepLimit,
         timeLimitSeconds: request.timeLimitSeconds,
-        resourceBounds: request.resourceBounds,
+        resourceBounds: sortedResourceBounds,
         expectedArtifacts: request.expectedArtifacts,
         ownerDecisionReferences: request.ownerDecisionReferences,
         ...(request.prNotes !== undefined
@@ -586,6 +677,41 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       ? deps.computeDigest(briefContent)
       : simpleDeterministicHexDigest(briefContent);
 
+    // CO28b: the frozen package must pass domain validation before any
+    // placement; a refusal here leaves the worktree untouched.
+    const limitsCreated = ExecutionLimits.create({
+      stepLimit: request.stepLimit,
+      timeLimitSeconds: request.timeLimitSeconds,
+      resourceBounds: sortedResourceBounds,
+    });
+    const pkg = BriefPackage.create({
+      schemaVersion: BRIEF_PACKAGE_SCHEMA_VERSION,
+      attemptId,
+      briefDigest,
+      prosePath: '.lane/brief.md',
+      manifestPath: '.lane/brief-manifest.json',
+      baseCommit: request.baseCommit,
+      policyRevision: request.policyRevision,
+      independentReviewer: request.independentReviewer,
+      ownedPaths: request.ownedPaths,
+      acceptanceSpec: pathsCheck.acceptanceSpec,
+      limits: limitsCreated.success && limitsCreated.value !== undefined ? limitsCreated.value : null,
+      selectedContextVersions: selectedKnowledgeVersions,
+      ownerDecisionReferences: request.ownerDecisionReferences,
+      seatPlan: reviewerCheck.plan ?? null,
+      prNotes:
+        request.prNotes !== undefined
+          ? {
+              hardToUndo: request.prNotes.hardToUndo,
+              assumptions: request.prNotes.assumptions,
+              challengeThis: request.prNotes.challengeThis,
+            }
+          : null,
+    });
+    if (!pkg.success) {
+      return { reason: 'Brief package failed domain validation' };
+    }
+
     return {
       authored,
       attemptId,
@@ -605,8 +731,18 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     if (!this.deps) {
       throw new Error('Not implemented: PrepareBriefPackageUseCase');
     }
+    // CO28b: a runtime request that is not a plain object (null, primitive,
+    // array or hostile record) is refused, never thrown on.
+    if (!isPlainRecordObject(request)) {
+      return { outcome: 'rejected', reason: 'Brief request must be a plain object' };
+    }
 
-    const built = await this.build(request, this.deps);
+    let built;
+    try {
+      built = await this.build(request, this.deps);
+    } catch {
+      return { outcome: 'rejected', reason: 'Brief request could not be read safely' };
+    }
     if ('reason' in built) {
       return {
         outcome: 'rejected',
@@ -659,10 +795,21 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       throw new Error('Not implemented: PrepareBriefPackageUseCase');
     }
 
+    // CO28b: a runtime request that is not a plain object (null, primitive,
+    // array or hostile record) is refused, never thrown on.
+    if (!isPlainRecordObject(request)) {
+      return { outcome: 'rejected', reason: 'Brief request must be a plain object' };
+    }
+
     // Preview rejections never echo artifact or offending paths: the preview
     // result must contain no path, so build maps path-bearing rejections to
     // fixed reasons when forPreview is set.
-    const built = await this.build(request, this.deps, true);
+    let built;
+    try {
+      built = await this.build(request, this.deps, true);
+    } catch {
+      return { outcome: 'rejected', reason: 'Brief request could not be read safely' };
+    }
     if ('reason' in built) {
       return {
         outcome: 'rejected',

@@ -61,7 +61,7 @@ import {
 import type { DaemonJobPort, DaemonJobPassRequest } from '../ports/out/DaemonJobPort.out-port.js';
 import type { ConductorHaltPort } from '../ports/out/ConductorHaltPort.out-port.js';
 import type { DaemonEventProjectionPort } from '../ports/out/DaemonEventProjectionPort.out-port.js';
-import type { DaemonLeasePort, DaemonLeaseResult } from '../ports/out/DaemonLeasePort.out-port.js';
+import type { DaemonLeasePort } from '../ports/out/DaemonLeasePort.out-port.js';
 import type { DaemonPausePort } from '../ports/out/DaemonPausePort.out-port.js';
 import type { DaemonStatusFileRead, DaemonStatusPort } from '../ports/out/DaemonStatusPort.out-port.js';
 import type { ForgeMergeReadPort } from '../ports/out/ForgeMergeReadPort.out-port.js';
@@ -281,6 +281,34 @@ function isExpectedLease(actual: unknown, expected: DaemonLeaseRecord): boolean 
     actual.fence === expected.fence &&
     actual.leaseUntilIso === expected.leaseUntilIso
   );
+}
+
+/** What an acquire answer means for the decided lease. */
+type AcquireAnswer =
+  | { readonly kind: 'held' }
+  | { readonly kind: 'not-written'; readonly outcome: DaemonJobOutcome }
+  | { readonly kind: 'may-have-written' };
+
+/**
+ * Classify the port's acquire answer: exactly the decided lease is held; a
+ * well-formed CAS refusal wrote nothing; anything else may have written.
+ * May throw on a hostile answer; the caller treats a throw as "may have written".
+ */
+function classifyAcquire(acquired: unknown, decided: DaemonLeaseRecord): AcquireAnswer {
+  if (!isRecord(acquired)) {
+    return { kind: 'may-have-written' };
+  }
+  if (acquired.outcome === 'ok') {
+    return isExpectedLease(acquired.lease, decided) ? { kind: 'held' } : { kind: 'may-have-written' };
+  }
+  if (acquired.outcome !== 'refused') {
+    return { kind: 'may-have-written' };
+  }
+  const reason = acquired.reason;
+  if (reason === 'lease-held' || reason === 'lease-moved') {
+    return { kind: 'not-written', outcome: { outcome: 'skipped', reasonCode: reason } };
+  }
+  return { kind: 'not-written', outcome: { outcome: 'refused', reasonCode: 'invalid-lease-request' } };
 }
 
 /** A status record the domain reader accepts, or null for anything malformed. */
@@ -743,30 +771,23 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
     if (decision.action !== 'acquired') {
       return { ok: false, outcome: decision.outcome };
     }
-    let acquired: DaemonLeaseResult;
+    let answer: AcquireAnswer;
     try {
-      acquired = await this.deps.lease.acquire({ scope, ...acquireRequest });
+      // The call and every read of its answer sit in one guard: a throwing port
+      // or a throwing getter on its answer is "may have written".
+      answer = classifyAcquire(await this.deps.lease.acquire({ scope, ...acquireRequest }), decision.lease);
     } catch {
-      // The write may have landed before the failure: release the fence the domain expected.
-      await this.releaseLease(ctx, scope, decision.lease.fence);
-      return unreadable;
+      answer = { kind: 'may-have-written' };
     }
-    if (isRecord(acquired) && acquired.outcome === 'ok') {
-      if (isExpectedLease(acquired.lease, decision.lease)) {
-        return { ok: true, fence: decision.lease.fence };
-      }
-      // A success that is not exactly the lease the domain decided: it may still be held, so release the expected fence.
-      await this.releaseLease(ctx, scope, decision.lease.fence);
-      return unreadable;
+    if (answer.kind === 'held') {
+      return { ok: true, fence: decision.lease.fence };
     }
-    if (!isRecord(acquired) || acquired.outcome !== 'refused') {
-      await this.releaseLease(ctx, scope, decision.lease.fence);
-      return unreadable;
+    if (answer.kind === 'not-written') {
+      return { ok: false, outcome: answer.outcome };
     }
-    if (acquired.reason === 'lease-held' || acquired.reason === 'lease-moved') {
-      return { ok: false, outcome: { outcome: 'skipped', reasonCode: acquired.reason } };
-    }
-    return { ok: false, outcome: { outcome: 'refused', reasonCode: 'invalid-lease-request' } };
+    // Not exactly the decided lease, yet the write may have landed: release the fence the domain expected.
+    await this.releaseLease(ctx, scope, decision.lease.fence);
+    return unreadable;
   }
 
   /**
@@ -845,32 +866,44 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       if (!this.hasBudget(ctx, ctx.clock())) {
         break;
       }
-      let entries: readonly unknown[];
-      try {
-        entries = await this.deps.journal.listForKey(journalled.key);
-      } catch {
-        continue;
-      }
-      for (const entry of Array.isArray(entries) ? entries : []) {
-        if (!appendedAfter(entry, run.startedAtIso)) {
-          continue;
-        }
-        if (!this.hasBudget(ctx, ctx.clock())) {
-          return records;
-        }
-        const event = projectJournalEntryToDaemonEvent({
-          eventId: this.deps.newUlid(),
-          tickId: ctx.request.tickId,
-          jobId: run.jobId,
-          journalEntry: entry as Parameters<typeof projectJournalEntryToDaemonEvent>[0]['journalEntry'],
-          queueEntryId: journalled.entryId,
-        });
-        if (event.ok) {
-          records.push(event.record);
-        }
+      const complete = await this.projectKey(ctx, run, journalled, records);
+      if (!complete) {
+        break;
       }
     }
     return records;
+  }
+
+  /** One key's lines appended during the tick, each under the budget; false when the budget ran out. */
+  private async projectKey(
+    ctx: TickContext,
+    run: JobRun,
+    journalled: JournalledKey,
+    records: DaemonEventRecord[],
+  ): Promise<boolean> {
+    let entries: readonly unknown[];
+    try {
+      entries = await this.deps.journal.listForKey(journalled.key);
+    } catch {
+      return true;
+    }
+    const fresh = (Array.isArray(entries) ? entries : []).filter((entry) => appendedAfter(entry, run.startedAtIso));
+    for (const entry of fresh) {
+      if (!this.hasBudget(ctx, ctx.clock())) {
+        return false;
+      }
+      const event = projectJournalEntryToDaemonEvent({
+        eventId: this.deps.newUlid(),
+        tickId: ctx.request.tickId,
+        jobId: run.jobId,
+        journalEntry: entry as Parameters<typeof projectJournalEntryToDaemonEvent>[0]['journalEntry'],
+        queueEntryId: journalled.entryId,
+      });
+      if (event.ok) {
+        records.push(event.record);
+      }
+    }
+    return true;
   }
 
   /** One DaemonJobStatusRecord per run, in the order the jobs ran. */

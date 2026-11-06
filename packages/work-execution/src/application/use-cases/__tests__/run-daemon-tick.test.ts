@@ -743,13 +743,22 @@ describe('RunDaemonTickUseCase (DT10a)', () => {
     });
     const garbage = makeHarness();
     garbage.lease.acquire = async () => 'ok' as unknown as DaemonLeaseResult;
+    const hostile = makeHarness();
+    hostile.lease.acquire = async () =>
+      ({
+        get outcome(): string {
+          throw new Error('getter exploded');
+        },
+      }) as unknown as DaemonLeaseResult;
 
     const foreignResult = await foreign.run({ repositories: [repoRef(DIGEST_A)] });
     const garbageResult = await garbage.run({ repositories: [repoRef(DIGEST_A)] });
+    const hostileResult = await hostile.run({ repositories: [repoRef(DIGEST_A)] });
 
     for (const [harness, outcome] of [
       [foreign, foreignResult],
       [garbage, garbageResult],
+      [hostile, hostileResult],
     ] as const) {
       expect(outcome.status?.jobs[0]).toMatchObject({ outcome: 'refused', reasonCode: 'lease-unreadable' });
       expect(harness.mergePass.requests).toHaveLength(0);

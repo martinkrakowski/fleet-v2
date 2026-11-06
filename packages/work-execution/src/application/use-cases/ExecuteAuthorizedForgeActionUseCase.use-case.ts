@@ -26,10 +26,18 @@ import type { ForgeActionPort } from '../ports/out/ForgeActionPort.out-port.js';
 import type { WorkOrderRepositoryPort } from '../ports/out/WorkOrderRepositoryPort.out-port.js';
 import type {
   ActionJournalEntryRecord,
+  ActionJournalPullRequestRef,
   AttemptRecord,
   WorkOrderRecord,
 } from '../../domain/execution-records.js';
 import { WorkOrder } from '../../domain/entities/WorkOrder.js';
+import { MergeRecord } from '../../domain/entities/MergeRecord.js';
+import { PullRequestLink } from '../../domain/entities/PullRequestLink.js';
+import type { PullRequestLinkConflictRecord } from '../../domain/lane-plan-records.js';
+import { isPlanSecretShaped, pullRequestRefError } from '../../domain/lane-plan-sidecar.js';
+import { FORGE_ACTION_KINDS } from '../../domain/coordination-keys.js';
+import type { LanePlanRepositoryPort } from '../ports/out/LanePlanRepositoryPort.out-port.js';
+import type { MergeRecordRepositoryPort } from '../ports/out/MergeRecordRepositoryPort.out-port.js';
 import { AUTHORIZED_BY_PATTERN } from '../../domain/auto-merge.js';
 import { BASE_BRANCH_INVALID_MESSAGE, parseBaseBranch } from '../../domain/base-branch.js';
 
@@ -79,18 +87,191 @@ export interface ExecuteAuthorizedForgeActionDependencies {
    * wall-clock default is a scaffold convenience, not an authority source.
    */
   readonly now?: () => string;
+  /**
+   * The lane-plan store (WB5b): pull-request links are recorded on executed
+   * PR actions and `pr-already-linked` conflicts are persisted where the
+   * board reads them. Optional so existing callers keep working.
+   */
+  readonly lanePlanRepo?: LanePlanRepositoryPort;
+  /**
+   * The merge-record store (WB5b): a completed `merge-pr` writes the merge
+   * fact through `saveMergeRecord` only after the `completed` journal entry
+   * exists. Optional so existing callers keep working.
+   */
+  readonly mergeRecordRepo?: MergeRecordRepositoryPort;
+}
+
+/** The forge action kinds that act on a pull request (WB5b pre-flight resolution). */
+const PULL_REQUEST_ACTION_KINDS: readonly string[] = ['push-and-open-pr', 'push-to-pr', 'merge-pr'];
+
+/** Request ids are bounded plain text with no secret shape and no path separators. */
+const REQUEST_ID_FIELDS: readonly string[] = [
+  'actionId',
+  'attemptId',
+  'workOrderId',
+  'authorizationGrantId',
+];
+
+const OPTIONAL_TEXT_FIELDS: readonly string[] = [
+  'authorizedBy',
+  'branchName',
+  'baseBranch',
+  'title',
+  'body',
+];
+
+const MAX_REQUEST_TEXT_CHARS = 256;
+const MAX_PULL_REQUEST_NUMBER = 999_999_999;
+const EXPECTED_HEAD_SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+type ForgeActionRequestRead =
+  | { readonly ok: true; readonly request: ExecuteAuthorizedForgeActionRequest }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Descriptor-safe runtime validation of an authorized forge action request.
+ * Every own key is read through its property descriptor, so no getter ever
+ * runs; `null`, primitives, arrays (including sparse ones) and any accessor
+ * property are a typed refusal, never a throw. Refusal reasons name the field
+ * only, never the offending value.
+ */
+function readForgeActionRequest(raw: unknown): ForgeActionRequestRead {
+  const refuse = (reason: string): ForgeActionRequestRead => ({ ok: false, reason });
+  try {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      return refuse('request must be a plain object');
+    }
+    const snapshot: Record<string, unknown> = {};
+    for (const key of Reflect.ownKeys(raw)) {
+      if (typeof key !== 'string') {
+        continue;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(raw, key);
+      if (descriptor === undefined) {
+        continue;
+      }
+      if (descriptor.get !== undefined || descriptor.set !== undefined) {
+        return refuse('request fields must be plain data properties');
+      }
+      if (!descriptor.enumerable) {
+        continue;
+      }
+      snapshot[key] = descriptor.value;
+    }
+    for (const field of REQUEST_ID_FIELDS) {
+      const value = snapshot[field];
+      // A `push-to-pr` run key is a valid action id and contains `/`; a
+      // backslash path separator is refused on every id.
+      const separators = field === 'actionId' ? ['\\'] : ['/', '\\'];
+      if (
+        typeof value !== 'string' ||
+        value.trim().length === 0 ||
+        value.length > MAX_REQUEST_TEXT_CHARS ||
+        separators.some((separator) => value.includes(separator)) ||
+        isPlanSecretShaped(value)
+      ) {
+        return refuse(`${field} must be non-empty plain text of at most ${MAX_REQUEST_TEXT_CHARS} characters`);
+      }
+    }
+    const expectedHeadSha = snapshot['expectedHeadSha'];
+    if (typeof expectedHeadSha !== 'string' || !EXPECTED_HEAD_SHA_PATTERN.test(expectedHeadSha)) {
+      return refuse('expectedHeadSha must be a 40-character lowercase sha');
+    }
+    if (!(FORGE_ACTION_KINDS as readonly unknown[]).includes(snapshot['kind'])) {
+      return refuse('kind must be one of push-and-open-pr, push-to-pr, merge-pr, post-status');
+    }
+    for (const field of OPTIONAL_TEXT_FIELDS) {
+      const value = snapshot[field];
+      // Only a string is checked here; a non-string value falls through to
+      // the field's own rule (branch name, base branch, authorizedBy).
+      if (typeof value === 'string' && isPlanSecretShaped(value)) {
+        return refuse(`${field} must be plain text`);
+      }
+    }
+    const pullRequestNumber = snapshot['pullRequestNumber'];
+    if (
+      pullRequestNumber !== undefined &&
+      (!Number.isSafeInteger(pullRequestNumber) ||
+        (pullRequestNumber as number) < 1 ||
+        (pullRequestNumber as number) > MAX_PULL_REQUEST_NUMBER)
+    ) {
+      return refuse('pullRequestNumber must be a positive integer');
+    }
+    return { ok: true, request: snapshot as unknown as ExecuteAuthorizedForgeActionRequest };
+  } catch {
+    return refuse('request could not be read');
+  }
+}
+
+/**
+ * The canonical UTC instant for link and merge records: the composition
+ * clock's value, parsed and reformatted, so `2026-10-15T10:00:00Z` becomes
+ * `2026-10-15T10:00:00.000Z`. Null when the clock throws or names an
+ * unparseable instant; the caller refuses rather than guessing.
+ */
+function canonicalTimestampIso(now: (() => string) | undefined): string | null {
+  try {
+    const raw = now ? now() : new Date().toISOString();
+    const ms = Date.parse(raw);
+    if (!Number.isFinite(ms)) {
+      return null;
+    }
+    return new Date(ms).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The work order's repository in `owner/repo` form: a leading `github.com/`
+ * prefix is stripped, and the result must satisfy the shared pull-request
+ * repository rules. Anything else is null (unknown stays unknown).
+ */
+function normalizeWorkOrderRepository(raw: unknown): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const prefix = 'github.com/';
+  const candidate = raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+  if (pullRequestRefError('pr', { repository: candidate, number: 1 }) !== null) {
+    return null;
+  }
+  return candidate;
+}
+
+/** The work order's own lane tuple: its plan lane, or its project lane with no plan. */
+function workOrderLane(workOrder: WorkOrderRecord): {
+  readonly projectId: string;
+  readonly planId: string | null;
+  readonly laneId: string;
+} {
+  const planRef = workOrder.planRef;
+  if (planRef !== undefined) {
+    return { projectId: planRef.projectId, planId: planRef.planId, laneId: planRef.laneId };
+  }
+  return { projectId: workOrder.projectId, planId: null, laneId: workOrder.laneId };
 }
 
 export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedForgeActionPort {
   constructor(private readonly deps?: ExecuteAuthorizedForgeActionDependencies) {}
 
   async executeAuthorizedForgeAction(
-    request: ExecuteAuthorizedForgeActionRequest,
+    rawRequest: ExecuteAuthorizedForgeActionRequest,
   ): Promise<ExecuteAuthorizedForgeActionResult> {
     const deps = this.deps;
     if (!deps) {
       throw new Error('Not implemented: ExecuteAuthorizedForgeActionUseCase');
     }
+
+    // The request is untrusted runtime input (WB5b): it is read through its
+    // own property descriptors and refused, never thrown on, when it is not a
+    // plain object of known shape. This runs before anything is consumed,
+    // journalled or executed.
+    const requestRead = readForgeActionRequest(rawRequest);
+    if (!requestRead.ok) {
+      return { outcome: 'refused', reason: requestRead.reason };
+    }
+    const request = requestRead.request;
 
     // Forge mode `none` (D6) is an explicit installation choice: every forge
     // action refuses before anything is consumed, journalled or executed.
@@ -235,6 +416,34 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       };
     }
 
+    // The canonical instant for link and merge records (WB5b): an unreadable
+    // clock refuses before a grant is consumed.
+    const canonicalNowIso = canonicalTimestampIso(deps.now);
+    if (canonicalNowIso === null) {
+      return { outcome: 'refused', reason: 'the internal clock could not be read' };
+    }
+
+    const normalizedRepository = normalizeWorkOrderRepository(workOrder.repository);
+
+    // The PR number is resolved structurally before the forge runs (WB5b):
+    // from the request, from the attempt's typed journal entries, or from the
+    // lane's single stored link — never by parsing journal text, never
+    // guessed. A thrown pre-flight read refuses before the grant is consumed.
+    let preResolvedPrNumber: number | undefined;
+    if ((PULL_REQUEST_ACTION_KINDS as readonly string[]).includes(request.kind)) {
+      try {
+        preResolvedPrNumber = await this.preResolvePullRequestNumber(
+          deps,
+          request,
+          attempt,
+          workOrder,
+          normalizedRepository,
+        );
+      } catch {
+        return { outcome: 'refused', reason: 'a pre-flight pull-request read failed' };
+      }
+    }
+
     const authorization = await deps.authorizationPort.consumeActionAuthorization({
       authorizationGrantId: request.authorizationGrantId,
       actionId: request.actionId,
@@ -283,6 +492,8 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         ...(request.kind === 'post-status' && request.status !== undefined
           ? { status: request.status }
           : {}),
+        // The structurally pre-resolved PR number (WB5b) is forwarded when known.
+        ...(preResolvedPrNumber !== undefined ? { pullRequestNumber: preResolvedPrNumber } : {}),
       });
     } catch (error) {
       // The intent is durable but the forge outcome was not recorded; journal
@@ -302,18 +513,84 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     }
 
     if (forgeResult.outcome === 'executed') {
-      await this.appendJournal(
+      const resolvedPrNumber = forgeResult.pullRequestNumber ?? preResolvedPrNumber;
+      // The typed pull-request reference rides on the completed entry (WB5b):
+      // merge and PR producers read it structurally, never from `detail`.
+      // Note `detail` keeps the executor's rule: a merge entry never says
+      // "pull request", or the auto-merge path would misread it.
+      const pullRequestRef: ActionJournalPullRequestRef | undefined =
+        request.kind !== 'post-status' && normalizedRepository !== null && resolvedPrNumber !== undefined
+          ? { repository: normalizedRepository, number: resolvedPrNumber }
+          : undefined;
+
+      // Coordinator entry condition (a): the `completed` journal entry is
+      // durably appended FIRST. If this throws, neither the pull-request
+      // link, nor the merge record, nor `markMerged` may run.
+      const completedEntry = await this.appendJournal(
         deps,
         request,
         attempt,
         'completed',
-        forgeResult.pullRequestNumber !== undefined
+        request.kind !== 'merge-pr' && forgeResult.pullRequestNumber !== undefined
           ? `pull request #${forgeResult.pullRequestNumber}`
           : null,
+        pullRequestRef,
       );
+
+      // SECOND: the pull request's one lane. A refused link (the PR is
+      // already linked to another lane) is persisted as a conflict record,
+      // and the merge fact is still written below — a link conflict never
+      // erases the merge.
+      let lanePlanFailure: unknown;
+      if (
+        deps.lanePlanRepo !== undefined &&
+        request.kind !== 'post-status' &&
+        normalizedRepository !== null &&
+        resolvedPrNumber !== undefined
+      ) {
+        try {
+          await this.recordPullRequestLink(
+            deps,
+            workOrder,
+            normalizedRepository,
+            resolvedPrNumber,
+            canonicalNowIso,
+          );
+        } catch (error: unknown) {
+          lanePlanFailure = error;
+        }
+      }
+
+      // THIRD (merge only): the merge record, written exclusively through
+      // `saveMergeRecord` — and therefore always through the domain's
+      // `decideMergeRecord` — with the completed journal entry's id as the
+      // `actionRef`.
       if (request.kind === 'merge-pr') {
+        if (deps.mergeRecordRepo !== undefined && normalizedRepository !== null && resolvedPrNumber !== undefined) {
+          const created = MergeRecord.create({
+            schemaVersion: 1,
+            repository: normalizedRepository,
+            number: resolvedPrNumber,
+            headSha: forgeResult.headSha,
+            mergedAtIso: canonicalNowIso,
+            firstSeenAtIso: canonicalNowIso,
+            source: 'fleet-forge-action',
+            merger: 'fleet',
+            actionRef: completedEntry.id,
+          });
+          if (!created.success) {
+            throw new Error('the completed merge could not be recorded');
+          }
+          await deps.mergeRecordRepo.saveMergeRecord(created.value.toRecord());
+        }
+        // FOURTH: a completed merge advances the work order.
         await this.markMerged(deps, workOrder);
       }
+
+      if (lanePlanFailure !== undefined) {
+        throw lanePlanFailure;
+      }
+
       return forgeResult.pullRequestNumber !== undefined
         ? {
             outcome: 'executed',
@@ -349,17 +626,35 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     if (!input || typeof input !== 'object') {
       throw new Error('Not implemented: ExecuteAuthorizedForgeActionUseCase');
     }
-    // The HTTP entry point copies the six known fields and drops `authorizedBy`
-    // so a body can never label a merge as a policy merge (A8).
-    const record = input as ExecuteAuthorizedForgeActionRequest;
-    return this.executeAuthorizedForgeAction({
-      actionId: record.actionId,
-      attemptId: record.attemptId,
-      workOrderId: record.workOrderId,
-      kind: record.kind,
-      expectedHeadSha: record.expectedHeadSha,
-      authorizationGrantId: record.authorizationGrantId,
-    });
+    // An array body is a refusal, never an attempt to read indexed fields.
+    if (Array.isArray(input)) {
+      return { outcome: 'refused', reason: 'request must be a plain object' };
+    }
+    // The HTTP entry point copies every own data property and drops
+    // `authorizedBy` so a body can never label a merge as a policy merge
+    // (A8). Values are read through their own descriptors, so no getter ever
+    // runs; accessor and non-enumerable keys are skipped, not invoked.
+    const snapshot: Record<string, unknown> = {};
+    try {
+      for (const key of Reflect.ownKeys(input)) {
+        if (typeof key !== 'string' || key === 'authorizedBy' || key === '__proto__') {
+          continue;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(input, key);
+        if (
+          descriptor === undefined ||
+          !descriptor.enumerable ||
+          descriptor.get !== undefined ||
+          descriptor.set !== undefined
+        ) {
+          continue;
+        }
+        snapshot[key] = descriptor.value;
+      }
+    } catch {
+      return { outcome: 'refused', reason: 'request could not be read' };
+    }
+    return this.executeAuthorizedForgeAction(snapshot as unknown as ExecuteAuthorizedForgeActionRequest);
   }
 
   /** A completed merge advances the work order to the terminal 'merged' state. */
@@ -382,7 +677,8 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     attempt: AttemptRecord,
     status: ActionJournalEntryRecord['status'],
     detail: string | null,
-  ): Promise<void> {
+    pullRequest?: ActionJournalPullRequestRef,
+  ): Promise<ActionJournalEntryRecord> {
     const priorEntries = await deps.journal.listJournalEntriesForAttempt(request.attemptId);
     const sequence = priorEntries.length + 1;
     const entry: ActionJournalEntryRecord = {
@@ -396,8 +692,139 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       sessionId: null,
       detail,
       ...(request.authorizedBy === undefined ? {} : { authorizedBy: request.authorizedBy }),
+      ...(pullRequest !== undefined ? { pullRequest } : {}),
     };
     await deps.journal.appendJournalEntry(entry);
+    return entry;
+  }
+
+  /**
+   * Resolve the pull-request number structurally before the forge runs
+   * (WB5b): the request's own number wins; then the attempt's latest
+   * completed `forge` journal entry carrying a typed reference (matching the
+   * normalized repository when it is known); then the lane's single stored
+   * link in that repository. Zero or several stored links are never guessed
+   * between. Any thrown read propagates: the caller refuses before a grant
+   * is consumed.
+   */
+  private async preResolvePullRequestNumber(
+    deps: ExecuteAuthorizedForgeActionDependencies,
+    request: ExecuteAuthorizedForgeActionRequest,
+    attempt: AttemptRecord,
+    workOrder: WorkOrderRecord,
+    normalizedRepository: string | null,
+  ): Promise<number | undefined> {
+    if (request.pullRequestNumber !== undefined) {
+      return request.pullRequestNumber;
+    }
+    const entries = await deps.journal.listJournalEntriesForAttempt(attempt.id);
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (
+        entry !== undefined &&
+        entry.status === 'completed' &&
+        entry.action === 'forge' &&
+        entry.pullRequest !== undefined &&
+        (normalizedRepository === null || entry.pullRequest.repository === normalizedRepository)
+      ) {
+        return entry.pullRequest.number;
+      }
+    }
+    const lanePlanRepo = deps.lanePlanRepo;
+    if (lanePlanRepo === undefined || normalizedRepository === null) {
+      return undefined;
+    }
+    const lane = workOrderLane(workOrder);
+    const links = await lanePlanRepo.listPullRequestLinks(lane.projectId);
+    const matches = links.filter(
+      (link) =>
+        link.repository === normalizedRepository &&
+        link.projectId === lane.projectId &&
+        link.planId === lane.planId &&
+        link.laneId === lane.laneId,
+    );
+    return matches.length === 1 ? matches[0]?.number : undefined;
+  }
+
+  /**
+   * Record the pull request's one lane (WB5b). A work order with a plan
+   * resolves any lane alias to the plan's current lane id; a work order
+   * without a plan links its own project lane with a null plan id. When the
+   * PR is already linked to a different lane, the conflict is persisted for
+   * the board and the caller still writes the merge record.
+   */
+  private async recordPullRequestLink(
+    deps: ExecuteAuthorizedForgeActionDependencies,
+    workOrder: WorkOrderRecord,
+    repository: string,
+    number: number,
+    linkedAtIso: string,
+  ): Promise<void> {
+    const lanePlanRepo = deps.lanePlanRepo;
+    if (lanePlanRepo === undefined) {
+      return;
+    }
+    const lane = workOrderLane(workOrder);
+    let laneId = lane.laneId;
+    if (lane.planId !== null) {
+      const plan = await lanePlanRepo.findLanePlan(lane.projectId, lane.planId);
+      if (plan !== null) {
+        const match = plan.lanes.find(
+          (candidate) => candidate.laneId === lane.laneId || candidate.aliases.includes(lane.laneId),
+        );
+        if (match !== undefined) {
+          laneId = match.laneId;
+        }
+      }
+    }
+    const created = PullRequestLink.create({
+      version: 1,
+      repository,
+      number,
+      projectId: lane.projectId,
+      planId: lane.planId,
+      laneId,
+      source: 'fleet-forge-action',
+      linkedAtIso,
+    });
+    if (!created.success) {
+      // The lane identity could not form a valid link; the merge fact is
+      // still recorded downstream, so this never blocks the merge itself.
+      return;
+    }
+    const saved = await lanePlanRepo.savePullRequestLink(created.value.toRecord());
+    if (!(saved.outcome === 'refused' && saved.code === 'pr-already-linked')) {
+      return;
+    }
+    const existing = await lanePlanRepo.findPullRequestLink(repository, number);
+    if (existing === null) {
+      // The refusal could not be corroborated by a stored link; nothing is
+      // invented and no conflict is recorded.
+      return;
+    }
+    const sameLane = existing.projectId === lane.projectId && existing.planId === lane.planId;
+    if (sameLane) {
+      // The stored link names the same plan lane under another (alias) lane
+      // id; that is the same lane, not a conflict.
+      return;
+    }
+    const conflictRecord: PullRequestLinkConflictRecord = {
+      schemaVersion: 1,
+      repository,
+      number,
+      linkedLane: {
+        projectId: existing.projectId,
+        planId: existing.planId,
+        laneId: existing.laneId,
+      },
+      refusedLane: {
+        projectId: lane.projectId,
+        planId: lane.planId,
+        laneId,
+      },
+      recordedAtIso: linkedAtIso,
+    };
+    await lanePlanRepo.savePullRequestLinkConflict?.(conflictRecord);
   }
 
   /**

@@ -129,12 +129,14 @@ export class MergeRecord {
   }
 
   /**
-   * The only way in; also used to read a stored record. Never throws. This
-   * loader is deliberately relaxed (it accepts a stored upgraded
-   * `forge-observation`/`fleet` record), so the store lane must create a new
-   * record through `decideMergeRecord`, never through `MergeRecord.create`
-   * directly: only the decision function applies the strict pairing to a new
-   * sighting.
+   * The only way in for a NEW record; never throws. A `fleet-forge-action`
+   * source requires a non-empty `actionRef` (the fleet path's typed journal
+   * entry id), so a fleet claim without one is refused. This loader is
+   * deliberately relaxed about the source/merger pairing (it accepts a stored
+   * upgraded `forge-observation`/`fleet` record), so the store lane must
+   * create a new record through `decideMergeRecord`, never through
+   * `MergeRecord.create` directly: only the decision function applies the
+   * strict pairing to a new sighting.
    */
   static create(input: unknown): MergeRecordResult {
     try {
@@ -147,6 +149,31 @@ export class MergeRecord {
       // `forge-observation` source may carry either merger — `unknown` on the
       // first sighting and `fleet` after the merger upgrade, which is persisted
       // and loaded back through this same path.
+      if (!mergeSourceMergerAgree(read.record.source, read.record.merger)) {
+        return invalid('MergeRecord source and merger disagree');
+      }
+      if (read.record.source === 'fleet-forge-action' && read.record.actionRef === undefined) {
+        return invalid('MergeRecord fleet-forge-action requires actionRef');
+      }
+      return { success: true, value: new MergeRecord(read.record) };
+    } catch {
+      return invalid('MergeRecord input could not be read');
+    }
+  }
+
+  /**
+   * The loader for a STORED record; never throws. It is exactly `create`
+   * without the `actionRef` requirement: `schemaVersion: 1`
+   * `fleet-forge-action` records written before the `actionRef` rule existed
+   * still load cleanly, while a stored `fleet-forge-action`/`unknown` pair or
+   * a malformed record still fails closed.
+   */
+  static fromStored(input: unknown): MergeRecordResult {
+    try {
+      const read = readMergeRecordRecord(input);
+      if (!read.ok) {
+        return invalid(read.message);
+      }
       if (!mergeSourceMergerAgree(read.record.source, read.record.merger)) {
         return invalid('MergeRecord source and merger disagree');
       }
@@ -262,6 +289,7 @@ function readMergeRecordRecord(
   if (actionRef !== undefined) {
     if (
       typeof actionRef !== 'string' ||
+      actionRef.trim().length === 0 ||
       actionRef.length > MERGE_RECORD_LIMITS.maxActionRefLength ||
       hasForbiddenControlCharacter(actionRef) ||
       isPlanSecretShaped(actionRef)
@@ -330,6 +358,9 @@ export type MergeRecordDecision =
   | { readonly success: false; readonly error: Error; readonly code: 'invalid' };
 
 export function decideMergeRecord(stored: unknown, incoming: unknown): MergeRecordDecision {
+  // The incoming record is a NEW record: it must satisfy the same creation
+  // rule `MergeRecord.create` enforces, including the `actionRef` requirement
+  // on a `fleet-forge-action` claim.
   const incomingRead = readMergeRecordRecord(incoming);
   if (!incomingRead.ok) {
     return invalidDecision('MergeRecord incoming record could not be read');
@@ -342,14 +373,20 @@ export function decideMergeRecord(stored: unknown, incoming: unknown): MergeReco
   if (!mergeSourceMergerPaired(incomingRecord.source, incomingRecord.merger)) {
     return invalidDecision('MergeRecord source and merger disagree');
   }
+  if (incomingRecord.source === 'fleet-forge-action' && incomingRecord.actionRef === undefined) {
+    return invalidDecision('MergeRecord fleet-forge-action requires actionRef');
+  }
 
   let storedRecord: MergeRecordRecord | null = null;
   if (stored !== null && stored !== undefined) {
-    const storedRead = readMergeRecordRecord(stored);
-    if (!storedRead.ok) {
+    // A stored record loads through `fromStored`: a pre-`actionRef`
+    // `fleet-forge-action` record still participates in a decision, while any
+    // corrupt stored record fails closed.
+    const storedRead = MergeRecord.fromStored(stored);
+    if (!storedRead.success) {
       return invalidDecision('MergeRecord stored record could not be read');
     }
-    storedRecord = storedRead.record;
+    storedRecord = storedRead.value.toRecord();
   }
 
   if (storedRecord === null) {
@@ -384,7 +421,11 @@ export function decideMergeRecord(stored: unknown, incoming: unknown): MergeReco
     return {
       success: true,
       outcome: 'upgrade-merger',
-      record: Object.freeze({ ...storedRecord, merger: 'fleet' as const }),
+      record: Object.freeze({
+        ...storedRecord,
+        merger: 'fleet' as const,
+        ...(incomingRecord.actionRef !== undefined ? { actionRef: incomingRecord.actionRef } : {}),
+      }),
       finding: null,
     };
   }

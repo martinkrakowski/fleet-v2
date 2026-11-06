@@ -31,6 +31,28 @@ import type {
   OwnerDecisionPort,
 } from '../ports/out/OwnerDecisionPort.out-port.js';
 import { ExecuteAuthorizedForgeActionUseCase } from './ExecuteAuthorizedForgeActionUseCase.use-case.js';
+import {
+  decideMergeRecord,
+  type MergeRecordRecord,
+} from '../../domain/entities/MergeRecord.js';
+import {
+  decidePullRequestLink,
+  pullRequestLinkConflictKey,
+  pullRequestLinkKey,
+} from '../../domain/entities/PullRequestLink.js';
+import type {
+  LanePlanRecord,
+  PullRequestLinkConflictRecord,
+  PullRequestLinkRecord,
+} from '../../domain/lane-plan-records.js';
+import type {
+  LanePlanRepositoryPort,
+  SaveLanePlanResult,
+  SavePullRequestLinkConflictResult,
+  SavePullRequestLinkResult,
+} from '../ports/out/LanePlanRepositoryPort.out-port.js';
+import type { MergeRecordRepositoryPort } from '../ports/out/MergeRecordRepositoryPort.out-port.js';
+import type { MergeRecordSaveOutcome } from '../ports/out/MergeRecordRepositoryPort.out-port.js';
 
 class InMemoryAcceptanceEvidencePort implements AcceptanceEvidencePort {
   constructor(private readonly result: ReadAcceptanceResult) {}
@@ -1238,5 +1260,576 @@ describe('ExecuteAuthorizedForgeActionUseCase', () => {
         expect(journal.entries).toHaveLength(0);
       }
     });
+  });
+});
+
+describe('ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link producers', () => {
+  const WB_HEAD = '1111111111111111111111111111111111111111';
+  const WB_OTHER_HEAD = '2222222222222222222222222222222222222222';
+
+  const mergeReq = {
+    actionId: 'act-1',
+    attemptId: 'att-001',
+    workOrderId: 'wo-001',
+    kind: 'merge-pr' as const,
+    expectedHeadSha: WB_HEAD,
+    authorizationGrantId: 'grant-001',
+  };
+
+  function acceptedAssessment() {
+    return new InMemoryAcceptanceEvidencePort({
+      outcome: 'found',
+      assessment: {
+        candidateHeadSha: WB_HEAD,
+        policyRevision: 'pol-1',
+        state: 'accepted',
+        acceptanceReceiptId: 'receipt-001',
+      },
+    });
+  }
+
+  class FakeLanePlanRepo implements LanePlanRepositoryPort {
+    readonly calls: string[];
+    private readonly plans = new Map<string, LanePlanRecord>();
+    private readonly links = new Map<string, PullRequestLinkRecord>();
+    private readonly conflicts = new Map<string, PullRequestLinkConflictRecord>();
+
+    constructor(order: string[]) {
+      this.calls = order;
+    }
+
+    async saveLanePlan(record: LanePlanRecord): Promise<void> {
+      this.plans.set(`${record.projectId}:${record.planId}`, record);
+    }
+
+    async saveLanePlanIfAcyclic(record: LanePlanRecord): Promise<SaveLanePlanResult> {
+      await this.saveLanePlan(record);
+      return { outcome: 'saved' };
+    }
+
+    async findLanePlan(projectId: string, planId: string): Promise<LanePlanRecord | null> {
+      return this.plans.get(`${projectId}:${planId}`) ?? null;
+    }
+
+    async listLanePlans(): Promise<readonly LanePlanRecord[]> {
+      return [...this.plans.values()];
+    }
+
+    async savePullRequestLink(record: PullRequestLinkRecord): Promise<SavePullRequestLinkResult> {
+      this.calls.push(`link:${record.repository}#${record.number}:${record.laneId}`);
+      const key = pullRequestLinkKey({ repository: record.repository, number: record.number });
+      const existing = this.links.get(key) ?? null;
+      const decision = decidePullRequestLink(existing, record);
+      if (decision === 'create') {
+        this.links.set(key, record);
+        return { outcome: 'saved', link: record };
+      }
+      if (decision === 'no-op') {
+        return { outcome: 'unchanged', link: existing as PullRequestLinkRecord };
+      }
+      return { outcome: 'refused', code: 'pr-already-linked', linkedLaneId: existing!.laneId };
+    }
+
+    async findPullRequestLink(repository: string, number: number): Promise<PullRequestLinkRecord | null> {
+      return this.links.get(pullRequestLinkKey({ repository, number })) ?? null;
+    }
+
+    async listPullRequestLinks(): Promise<readonly PullRequestLinkRecord[]> {
+      return [...this.links.values()];
+    }
+
+    async savePullRequestLinkConflict(
+      record: PullRequestLinkConflictRecord,
+    ): Promise<SavePullRequestLinkConflictResult> {
+      const key = pullRequestLinkConflictKey(record);
+      const existing = this.conflicts.get(key);
+      if (existing !== undefined) {
+        return { outcome: 'unchanged', conflict: existing };
+      }
+      this.conflicts.set(key, record);
+      return { outcome: 'saved', conflict: record };
+    }
+
+    async listPullRequestLinkConflicts(): Promise<readonly PullRequestLinkConflictRecord[]> {
+      return [...this.conflicts.values()];
+    }
+  }
+
+  class FakeMergeRecordRepo implements MergeRecordRepositoryPort {
+    readonly calls: string[];
+    private readonly records = new Map<string, MergeRecordRecord>();
+
+    constructor(order: string[]) {
+      this.calls = order;
+    }
+
+    async saveMergeRecord(record: MergeRecordRecord): Promise<MergeRecordSaveOutcome> {
+      const key = `${record.repository}#${record.number}`;
+      const decision = decideMergeRecord(this.records.get(key) ?? null, record);
+      if (!decision.success) {
+        return { outcome: 'refused', code: 'invalid' };
+      }
+      if (decision.outcome === 'create') {
+        this.records.set(key, decision.record);
+      } else if (decision.outcome === 'upgrade-merger') {
+        this.records.set(key, decision.record);
+      } else if (decision.outcome === 'integrity-conflict') {
+        // The stored record is kept: the conflict is reported, never overwritten.
+        this.records.set(key, decision.record);
+      }
+      this.calls.push(
+        `merge:${record.repository}#${record.number}:${record.actionRef ?? ''}:${record.merger}:${decision.outcome === 'create' ? 'created' : decision.outcome === 'upgrade-merger' ? 'merger-upgraded' : decision.outcome}`,
+      );
+      return {
+        outcome:
+          decision.outcome === 'create'
+            ? 'created'
+            : decision.outcome === 'upgrade-merger'
+              ? 'merger-upgraded'
+              : decision.outcome,
+        record: decision.record,
+      };
+    }
+
+    async findMergeRecord(repository: string, number: number): Promise<MergeRecordRecord | null> {
+      return this.records.get(`${repository}#${number}`) ?? null;
+    }
+
+    async listMergeRecords(): Promise<readonly MergeRecordRecord[]> {
+      return [...this.records.values()];
+    }
+  }
+
+  function orderedJournal(base: InMemoryJournal, order: string[]): ExecutionJournalPort {
+    return {
+      appendJournalEntry: async (entry) => {
+        order.push(`journal:${entry.status}:${entry.id}`);
+        await base.appendJournalEntry(entry);
+      },
+      listJournalEntriesForAttempt: (attemptId) => base.listJournalEntriesForAttempt(attemptId),
+      saveCapacityReservation: async () => {},
+      listActiveReservations: async () => [],
+      releaseCapacityReservation: async () => false,
+      reserveCapacityAtomically: async (request) => ({
+        outcome: 'reserved' as const,
+        reservation: { ...request.record!, slotIndex: 0 },
+      }),
+    };
+  }
+
+  function wb5bDeps(
+    options: {
+      workOrder?: WorkOrderRecord;
+      forge?: (request: ForgeActionRequest) => ForgeActionResult;
+      now?: () => string;
+    } = {},
+  ) {
+    const order: string[] = [];
+    const journalBase = new InMemoryJournal();
+    const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
+    const workOrderRepo = new InMemoryWorkOrderRepo(options.workOrder ?? makeWorkOrderRecord());
+    const lanePlanRepo = new FakeLanePlanRepo(order);
+    const mergeRecordRepo = new FakeMergeRecordRepo(order);
+    const seen: ForgeActionRequest[] = [];
+    const forgePort: ForgeActionPort = {
+      isConfigured: () => true,
+      async performForgeAction(request) {
+        seen.push(request);
+        return options.forge
+          ? options.forge(request)
+          : { outcome: 'executed', headSha: request.expectedHeadSha };
+      },
+    };
+    const authorizationPort: ActionAuthorizationPort = {
+      async resolveActionAuthorization() {
+        return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+      },
+      async consumeActionAuthorization(req) {
+        return { outcome: 'consumed', actionId: req.actionId };
+      },
+    };
+    const useCase = new ExecuteAuthorizedForgeActionUseCase({
+      attemptRepo,
+      attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
+      workOrderRepo,
+      journal: orderedJournal(journalBase, order),
+      authorizationPort,
+      forgePort,
+      acceptedReceiptByHead: { [WB_HEAD]: 'receipt-001' },
+      acceptanceEvidencePort: acceptedAssessment(),
+      lanePlanRepo,
+      mergeRecordRepo,
+      ...(options.now ? { now: options.now } : {}),
+    });
+    return { useCase, journal: journalBase, order, lanePlanRepo, mergeRecordRepo, seen, workOrderRepo };
+  }
+
+  it('appends the completed journal entry first and saves the merge record with its id as actionRef', async () => {
+    const now = (): string => '2026-11-05T10:00:00Z';
+    const deps = wb5bDeps({ now });
+    const result = await deps.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
+    expect(result.outcome).toBe('executed');
+
+    const completed = deps.journal.entries.find((entry) => entry.status === 'completed')!;
+    expect(completed.id).toBe('forge:act-1:completed:2');
+    expect(completed.detail).toBeNull();
+    expect(completed.pullRequest).toEqual({ repository: 'org/repo', number: 7 });
+
+    // Call order: the completed journal entry lands before the link and the
+    // merge record; the merge record carries the completed entry's id.
+    expect(deps.order).toEqual([
+      'journal:intent-recorded:forge:act-1:intent-recorded:1',
+      'journal:completed:forge:act-1:completed:2',
+      'link:org/repo#7:lane-auth',
+      'merge:org/repo#7:forge:act-1:completed:2:fleet:created',
+    ]);
+
+    const stored = await deps.mergeRecordRepo.findMergeRecord('org/repo', 7);
+    expect(stored).toEqual({
+      schemaVersion: 1,
+      repository: 'org/repo',
+      number: 7,
+      headSha: WB_HEAD,
+      mergedAtIso: '2026-11-05T10:00:00.000Z',
+      firstSeenAtIso: '2026-11-05T10:00:00.000Z',
+      source: 'fleet-forge-action',
+      merger: 'fleet',
+      actionRef: completed.id,
+    });
+
+    const link = await deps.lanePlanRepo.findPullRequestLink('org/repo', 7);
+    expect(link).toEqual({
+      version: 1,
+      repository: 'org/repo',
+      number: 7,
+      projectId: 'proj-001',
+      planId: null,
+      laneId: 'lane-auth',
+      source: 'fleet-forge-action',
+      linkedAtIso: '2026-11-05T10:00:00.000Z',
+    });
+
+    expect((await deps.workOrderRepo.findWorkOrderById('wo-001'))?.state).toBe('merged');
+  });
+
+  it('links the plan lane through an imported alias when the work order has a planRef', async () => {
+    const plan: LanePlanRecord = {
+      version: 1,
+      projectId: 'proj-001',
+      planId: 'plan-1',
+      revision: 1,
+      digest: 'a'.repeat(64),
+      doc: 'docs/plan.md',
+      lanes: [
+        {
+          laneId: 'lane-A',
+          aliases: ['lane-auth'],
+          scope: 'auth lane',
+          packages: ['work-execution'],
+          sharedFiles: [],
+          tier: 0,
+          after: [],
+          decisions: [],
+          status: 'planned',
+          brief: null,
+          mergedPr: null,
+        },
+      ],
+      decisions: [],
+      exclusiveOrder: [],
+      importedAtIso: '2026-11-01T00:00:00.000Z',
+    };
+    const deps = wb5bDeps({
+      workOrder: {
+        ...makeWorkOrderRecord(),
+        planRef: { projectId: 'proj-001', planId: 'plan-1', laneId: 'lane-auth' },
+      },
+    });
+    await deps.lanePlanRepo.saveLanePlan(plan);
+    await deps.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
+    const link = await deps.lanePlanRepo.findPullRequestLink('org/repo', 7);
+    expect(link).toMatchObject({ projectId: 'proj-001', planId: 'plan-1', laneId: 'lane-A' });
+  });
+
+  it('writes neither PullRequestLink nor MergeRecord when appending the completed journal entry fails, leaving recoverable intent-recorded state', async () => {
+    const deps = wb5bDeps();
+    const base = deps.journal;
+    const originalAppend = base.appendJournalEntry.bind(base);
+    base.appendJournalEntry = async (entry) => {
+      if (entry.status === 'completed') {
+        throw new Error('journal unavailable');
+      }
+      await originalAppend(entry);
+    };
+
+    await expect(deps.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 })).rejects.toThrow(
+      'journal unavailable',
+    );
+    expect(deps.journal.entries.map((entry) => entry.status)).toEqual(['intent-recorded']);
+    expect(await deps.lanePlanRepo.listPullRequestLinks()).toEqual([]);
+    expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
+    expect((await deps.workOrderRepo.findWorkOrderById('wo-001'))?.state).toBe('approved');
+  });
+
+  it('resolves the PR number across steps without parsing detail: a second-attempt merge reads the typed journal entry', async () => {
+    const deps = wb5bDeps({
+      forge: (request) =>
+        request.kind === 'push-and-open-pr'
+          ? { outcome: 'executed', pullRequestNumber: 42, headSha: request.expectedHeadSha }
+          : { outcome: 'executed', headSha: request.expectedHeadSha },
+      now: (): string => '2026-11-05T10:00:00Z',
+    });
+
+    const opened = await deps.useCase.executeAuthorizedForgeAction({
+      actionId: 'act-open',
+      attemptId: 'att-001',
+      workOrderId: 'wo-001',
+      kind: 'push-and-open-pr',
+      expectedHeadSha: WB_HEAD,
+      authorizationGrantId: 'grant-001',
+    });
+    expect(opened.outcome).toBe('executed');
+
+    const openedCompleted = deps.journal.entries.find(
+      (entry) => entry.status === 'completed' && entry.id.startsWith('forge:act-open'),
+    )!;
+    expect(openedCompleted.detail).toBe('pull request #42');
+    expect(openedCompleted.pullRequest).toEqual({ repository: 'org/repo', number: 42 });
+    expect(await deps.lanePlanRepo.findPullRequestLink('org/repo', 42)).not.toBeNull();
+
+    const merged = await deps.useCase.executeAuthorizedForgeAction({
+      actionId: 'act-merge',
+      attemptId: 'att-001',
+      workOrderId: 'wo-001',
+      kind: 'merge-pr',
+      expectedHeadSha: WB_HEAD,
+      authorizationGrantId: 'grant-002',
+    });
+    expect(merged).toMatchObject({ outcome: 'executed' });
+
+    const mergeCompleted = deps.journal.entries.find(
+      (entry) => entry.status === 'completed' && entry.id.startsWith('forge:act-merge'),
+    )!;
+    expect(mergeCompleted.detail).toBeNull();
+    expect(mergeCompleted.pullRequest).toEqual({ repository: 'org/repo', number: 42 });
+
+    const stored = await deps.mergeRecordRepo.findMergeRecord('org/repo', 42);
+    expect(stored).toMatchObject({
+      repository: 'org/repo',
+      number: 42,
+      headSha: WB_HEAD,
+      source: 'fleet-forge-action',
+      merger: 'fleet',
+      actionRef: 'forge:act-merge:completed:4',
+    });
+  });
+
+  it('persists a link conflict naming both lanes when the PR is already linked, and still saves the MergeRecord', async () => {
+    const deps = wb5bDeps();
+    await deps.lanePlanRepo.savePullRequestLink({
+      version: 1,
+      repository: 'org/repo',
+      number: 7,
+      projectId: 'proj-1',
+      planId: null,
+      laneId: 'L1',
+      source: 'cli',
+      linkedAtIso: '2026-11-01T00:00:00.000Z',
+    });
+
+    const result = await deps.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
+    expect(result.outcome).toBe('executed');
+
+    const conflicts = await deps.lanePlanRepo.listPullRequestLinkConflicts!();
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]).toMatchObject({
+      schemaVersion: 1,
+      repository: 'org/repo',
+      number: 7,
+      linkedLane: { projectId: 'proj-1', planId: null, laneId: 'L1' },
+      refusedLane: { projectId: 'proj-001', planId: null, laneId: 'lane-auth' },
+    });
+
+    const stored = await deps.mergeRecordRepo.findMergeRecord('org/repo', 7);
+    expect(stored).toMatchObject({ source: 'fleet-forge-action', merger: 'fleet' });
+    expect(stored?.actionRef).toBe('forge:act-1:completed:2');
+  });
+
+  it('both arrival orders against forge-observation converge on one fleet MergeRecord with actionRef and without duplicate writes', async () => {
+    // Order 1: the forge observation is stored first, the merge upgrades it.
+    const deps = wb5bDeps({ now: (): string => '2026-11-05T10:00:00Z' });
+    await deps.mergeRecordRepo.saveMergeRecord({
+      schemaVersion: 1,
+      repository: 'org/repo',
+      number: 7,
+      headSha: WB_HEAD,
+      // The observation's merge instant matches the merge the use case will
+      // record, so the later fleet sighting upgrades rather than conflicts.
+      mergedAtIso: '2026-11-05T10:00:00.000Z',
+      firstSeenAtIso: '2026-11-04T00:00:00.000Z',
+      source: 'forge-observation',
+      merger: 'unknown',
+    });
+    const result = await deps.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
+    expect(result.outcome).toBe('executed');
+    expect(deps.mergeRecordRepo.listMergeRecords()).resolves.toHaveLength(1);
+    const upgraded = await deps.mergeRecordRepo.findMergeRecord('org/repo', 7);
+    expect(upgraded).toMatchObject({
+      merger: 'fleet',
+      source: 'forge-observation',
+      firstSeenAtIso: '2026-11-04T00:00:00.000Z',
+      actionRef: 'forge:act-1:completed:2',
+    });
+
+    // Order 2: the fleet merge is stored first, a later observation is a no-op.
+    const deps2 = wb5bDeps({ now: (): string => '2026-11-05T10:00:00Z' });
+    await deps2.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
+    const observation = await deps2.mergeRecordRepo.saveMergeRecord({
+      schemaVersion: 1,
+      repository: 'org/repo',
+      number: 7,
+      headSha: WB_HEAD,
+      mergedAtIso: '2026-11-05T10:00:00.000Z',
+      firstSeenAtIso: '2026-11-06T00:00:00.000Z',
+      source: 'forge-observation',
+      merger: 'unknown',
+    });
+    expect(observation.outcome).toBe('unchanged');
+    expect(await deps2.mergeRecordRepo.findMergeRecord('org/repo', 7)).toMatchObject({
+      merger: 'fleet',
+      source: 'fleet-forge-action',
+      actionRef: 'forge:act-1:completed:2',
+    });
+    expect(await deps2.mergeRecordRepo.listMergeRecords()).toHaveLength(1);
+
+    // Order 3: a divergent headSha is an integrity finding, never an overwrite.
+    const deps3 = wb5bDeps({ now: (): string => '2026-11-05T10:00:00Z' });
+    await deps3.mergeRecordRepo.saveMergeRecord({
+      schemaVersion: 1,
+      repository: 'org/repo',
+      number: 7,
+      headSha: WB_OTHER_HEAD,
+      mergedAtIso: '2026-11-04T00:00:00.000Z',
+      firstSeenAtIso: '2026-11-04T00:00:00.000Z',
+      source: 'forge-observation',
+      merger: 'unknown',
+    });
+    await deps3.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
+    // First call: the test's own observation save; second: the use case's
+    // fleet sighting, decided as an integrity conflict against the stored one.
+    const calls = deps3.mergeRecordRepo.calls.filter((call) => call.includes('merge:org/repo#7'));
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toContain('integrity-conflict');
+    const stillStored = await deps3.mergeRecordRepo.findMergeRecord('org/repo', 7);
+    expect(stillStored).toMatchObject({ headSha: WB_OTHER_HEAD, merger: 'unknown', source: 'forge-observation' });
+  });
+
+  it('refuses null, non-object, sparse-array, wrong-typed, unknown-enum, and throwing-getter requests without throwing', async () => {
+    const deps = wb5bDeps();
+    const sparse = new Array(3) as unknown as Record<string, unknown>;
+    sparse.actionId = 'act-1';
+    const throwingGetter = Object.defineProperty({ ...mergeReq }, 'actionId', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        throw new Error('boom');
+      },
+    });
+    const cases: unknown[] = [
+      null,
+      'merge it',
+      42,
+      sparse,
+      { ...mergeReq, kind: 'explode' },
+      { ...mergeReq, expectedHeadSha: 'NOT-A-SHA' },
+      { ...mergeReq, authorizationGrantId: '' },
+      throwingGetter,
+    ];
+    for (const input of cases) {
+      const result = await deps.useCase.executeAuthorizedForgeAction(input as never);
+      expect(result.outcome).toBe('refused');
+    }
+    expect(deps.journal.entries).toHaveLength(0);
+    expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
+    expect(await deps.lanePlanRepo.listPullRequestLinks()).toEqual([]);
+  });
+
+  it('refuses secret-shaped and path-containing inputs with code/field messages that never echo the offending value or path', async () => {
+    const deps = wb5bDeps();
+    const secret = ['gh', 'p_'].join('') + 'x'.repeat(36);
+    for (const [field, value] of [
+      ['actionId', secret],
+      ['workOrderId', 'sub/dir/id'],
+      ['authorizationGrantId', 'grant\\id'],
+    ] as const) {
+      const result = await deps.useCase.executeAuthorizedForgeAction({ ...mergeReq, [field]: value } as never);
+      expect(result.outcome).toBe('refused');
+      if (result.outcome === 'refused') {
+        expect(result.reason).toContain(field);
+        expect(JSON.stringify(result)).not.toContain(secret);
+        expect(JSON.stringify(result)).not.toContain(value);
+      }
+    }
+  });
+
+  it('refuses oversized request identifiers, out-of-range pullRequestNumber, and overlong actionRef/repository inputs', async () => {
+    const deps = wb5bDeps();
+    for (const field of ['actionId', 'attemptId', 'workOrderId', 'authorizationGrantId'] as const) {
+      const result = await deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        [field]: 'a'.repeat(257),
+      } as never);
+      expect(result.outcome).toBe('refused');
+    }
+    for (const pullRequestNumber of [0, 1_000_000_000, 1.5]) {
+      const result = await deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        pullRequestNumber,
+      } as never);
+      expect(result).toEqual({ outcome: 'refused', reason: 'pullRequestNumber must be a positive integer' });
+    }
+    // An unresolvable repository stays unknown: the merge runs, but no merge
+    // record can name an overlong repository.
+    const deps2 = wb5bDeps({
+      workOrder: { ...makeWorkOrderRecord(), repository: 'r'.repeat(201) },
+    });
+    const result = await deps2.useCase.executeAuthorizedForgeAction({ ...mergeReq, pullRequestNumber: 7 });
+    expect(result.outcome).toBe('executed');
+    expect(await deps2.mergeRecordRepo.listMergeRecords()).toEqual([]);
+    expect(await deps2.lanePlanRepo.listPullRequestLinks()).toEqual([]);
+  });
+
+  it('refuses cleanly when the composition clock is unreadable, before consuming the grant', async () => {
+    let consumed = 0;
+    const deps = wb5bDeps();
+    // Rebuild with a throwing clock through the same shape the use case reads.
+    const throwingNow = (): string => {
+      throw new Error('clock broken');
+    };
+    const useCase = new ExecuteAuthorizedForgeActionUseCase({
+      attemptRepo: new InMemoryAttemptRepo(makeAttemptRecord()),
+      attemptOwnerDecisionPort: attemptDoorsFrom(new InMemoryAttemptRepo(makeAttemptRecord())),
+      workOrderRepo: new InMemoryWorkOrderRepo(makeWorkOrderRecord()),
+      journal: deps.journal,
+      authorizationPort: {
+        async resolveActionAuthorization() {
+          return { outcome: 'granted', authorizationGrantId: 'grant-001' };
+        },
+        async consumeActionAuthorization() {
+          consumed += 1;
+          return { outcome: 'consumed', actionId: 'act-1' };
+        },
+      },
+      forgePort: { isConfigured: () => true, async performForgeAction() { return { outcome: 'executed', headSha: WB_HEAD }; } },
+      acceptedReceiptByHead: { [WB_HEAD]: 'receipt-001' },
+      acceptanceEvidencePort: acceptedAssessment(),
+      lanePlanRepo: deps.lanePlanRepo,
+      mergeRecordRepo: deps.mergeRecordRepo,
+      now: throwingNow,
+    });
+    const result = await useCase.executeAuthorizedForgeAction(mergeReq);
+    expect(result.outcome).toBe('refused');
+    expect(consumed).toBe(0);
+    expect(deps.journal.entries).toHaveLength(0);
   });
 });

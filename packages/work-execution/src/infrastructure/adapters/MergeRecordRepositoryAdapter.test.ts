@@ -134,14 +134,25 @@ describe('MergeRecordRepositoryAdapter', () => {
       const upgraded = await store.saveMergeRecord(
         fleetRecord({ firstSeenAtIso: '2026-11-05T13:00:00.000Z' }),
       );
-      expect(upgraded).toEqual({ outcome: 'merger-upgraded', record: mergeRecord({ merger: 'fleet' }) });
-      expect(await store.findMergeRecord('acme/app', 7)).toEqual(mergeRecord({ merger: 'fleet' }));
+      expect(upgraded).toEqual({
+        outcome: 'merger-upgraded',
+        record: mergeRecord({ merger: 'fleet', actionRef: 'action-7' }),
+      });
+      expect(await store.findMergeRecord('acme/app', 7)).toEqual(
+        mergeRecord({ merger: 'fleet', actionRef: 'action-7' }),
+      );
 
       const afterUpgrade = await readBytes();
       const downgrade = await store.saveMergeRecord(mergeRecord());
       const again = await store.saveMergeRecord(fleetRecord());
-      expect(downgrade).toEqual({ outcome: 'unchanged', record: mergeRecord({ merger: 'fleet' }) });
-      expect(again).toEqual({ outcome: 'unchanged', record: mergeRecord({ merger: 'fleet' }) });
+      expect(downgrade).toEqual({
+        outcome: 'unchanged',
+        record: mergeRecord({ merger: 'fleet', actionRef: 'action-7' }),
+      });
+      expect(again).toEqual({
+        outcome: 'unchanged',
+        record: mergeRecord({ merger: 'fleet', actionRef: 'action-7' }),
+      });
       expect(await readBytes()).toBe(afterUpgrade);
     });
 
@@ -169,6 +180,23 @@ describe('MergeRecordRepositoryAdapter', () => {
       expect(JSON.parse(before)).toEqual([stored]);
     });
 
+    it('loads a pre-WB5b fleet-forge-action record without actionRef but refuses a new one (WB5b)', async () => {
+      const legacy: Record<string, unknown> = { ...mergeRecord(), source: 'fleet-forge-action', merger: 'fleet' };
+      delete legacy.actionRef;
+      await fs.writeFile(target, JSON.stringify([legacy]));
+      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+
+      expect(parseVersionedMergeRecordStateRecord(asRuntimeInput(legacy))).toMatchObject({ status: 'ok' });
+      expect(await store.findMergeRecord('acme/app', 7)).toEqual(legacy);
+      expect(await store.listMergeRecords()).toEqual([legacy]);
+
+      // A new incoming fleet-forge-action record without (or with a blank)
+      // actionRef is refused by the creation rule, never written.
+      expect(await store.saveMergeRecord(asRuntimeInput(legacy))).toEqual(REFUSED);
+      expect(await store.saveMergeRecord(asRuntimeInput({ ...legacy, actionRef: '  ' }))).toEqual(REFUSED);
+      expect(await store.listMergeRecords()).toEqual([legacy]);
+    });
+
     it('accepts a stored forge-observation/fleet record: the upgraded shape is a valid stored record', async () => {
       await fs.writeFile(target, JSON.stringify([mergeRecord({ merger: 'fleet' })]));
       const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
@@ -185,9 +213,13 @@ describe('MergeRecordRepositoryAdapter', () => {
       expect((await store.saveMergeRecord(mergeRecord())).outcome).toBe('unchanged');
       expect((await store.saveMergeRecord(mergeRecord({ headSha: HEAD_B }))).outcome).toBe('integrity-conflict');
       expect((await store.saveMergeRecord(fleetRecord())).outcome).toBe('merger-upgraded');
-      expect(await store.findMergeRecord('acme/app', 7)).toEqual(mergeRecord({ merger: 'fleet' }));
+      expect(await store.findMergeRecord('acme/app', 7)).toEqual(
+        mergeRecord({ merger: 'fleet', actionRef: 'action-7' }),
+      );
       expect(await store.findMergeRecord('acme/app', 9)).toBeNull();
-      expect(await store.listMergeRecords()).toEqual([mergeRecord({ merger: 'fleet' })]);
+      expect(await store.listMergeRecords()).toEqual([
+        mergeRecord({ merger: 'fleet', actionRef: 'action-7' }),
+      ]);
     });
 
     it('a read-only store refuses every write and writes nothing', async () => {

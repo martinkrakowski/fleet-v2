@@ -11,6 +11,7 @@ import type { StopReasonValue } from './value-objects/StopReason.vo.js';
 import type { SeatPlanProps, SeatPlanRole } from './value-objects/SeatPlan.vo.js';
 import type { BaseBranchValue } from './base-branch.js';
 import { INITIAL_RECORD_SCHEMA_VERSION } from './record-schema-version.js';
+import { pullRequestRefError } from './lane-plan-sidecar.js';
 
 /** Record schema version for stored attempt records on disk (Q5a, D6); absent reads as 1. */
 export const ATTEMPT_RECORD_SCHEMA_VERSION = INITIAL_RECORD_SCHEMA_VERSION;
@@ -399,6 +400,16 @@ export interface CapacityReservationRecord {
   readonly releasedAtIso: string | null;
 }
 
+/**
+ * The pull request a forge action produced or acted on, typed so merge and PR
+ * producers never parse free-text `detail` fields. Permitted only on `forge`
+ * journal entries.
+ */
+export interface ActionJournalPullRequestRef {
+  readonly repository: string;
+  readonly number: number;
+}
+
 /** Journal entry: intent is durable before the subprocess runs. */
 export interface ActionJournalEntryRecord {
   /** Record schema version on disk (Q5a, D6); absent reads as 1. */
@@ -424,4 +435,73 @@ export interface ActionJournalEntryRecord {
    * `policy:conductor@<rev>` for a policy grant. Absent means an owner grant.
    */
   readonly authorizedBy?: string;
+  /**
+   * The pull request the forge action produced or acted on (WB5b), typed so
+   * merge and PR producers never parse free-text `detail`. Present only on
+   * `forge` entries.
+   */
+  readonly pullRequest?: ActionJournalPullRequestRef;
+}
+
+/** The exact own keys a typed journal pull-request reference may carry. */
+const JOURNAL_PULL_REQUEST_KEYS: readonly string[] = ['repository', 'number'];
+
+/** The upper bound of a pull-request number, shared with the merge record's bound. */
+const MAX_JOURNAL_PULL_REQUEST_NUMBER = 999_999_999;
+
+export type JournalPullRequestRead =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'valid'; readonly ref: ActionJournalPullRequestRef }
+  | { readonly kind: 'invalid' };
+
+/**
+ * Read the optional typed `pullRequest` field of an action-journal entry.
+ * Absent stays absent; a value on a non-`forge` entry, any non-plain shape, a
+ * getter, an extra or missing key, a malformed repository or number, or an
+ * out-of-range number is `invalid` — never a throw, never a getter invocation.
+ */
+export function readJournalPullRequestRef(
+  action: ActionJournalEntryRecord['action'],
+  value: unknown,
+): JournalPullRequestRead {
+  if (value === undefined) {
+    return { kind: 'absent' };
+  }
+  if (action !== 'forge') {
+    return { kind: 'invalid' };
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { kind: 'invalid' };
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return { kind: 'invalid' };
+  }
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== JOURNAL_PULL_REQUEST_KEYS.length) {
+    return { kind: 'invalid' };
+  }
+  // Values are copied through their own descriptors, so no getter ever runs.
+  const copy: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (typeof key !== 'string' || !JOURNAL_PULL_REQUEST_KEYS.includes(key)) {
+      return { kind: 'invalid' };
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      return { kind: 'invalid' };
+    }
+    copy[key] = descriptor.value;
+  }
+  if (pullRequestRefError('pullRequest', copy) !== null) {
+    return { kind: 'invalid' };
+  }
+  const number = copy.number;
+  if (!Number.isSafeInteger(number) || (number as number) > MAX_JOURNAL_PULL_REQUEST_NUMBER) {
+    return { kind: 'invalid' };
+  }
+  return {
+    kind: 'valid',
+    ref: Object.freeze({ repository: copy.repository as string, number: number as number }),
+  };
 }

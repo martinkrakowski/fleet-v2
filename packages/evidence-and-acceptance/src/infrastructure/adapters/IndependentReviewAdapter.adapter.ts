@@ -110,7 +110,12 @@ export class IndependentReviewAdapter implements IndependentReviewPort {
       review = await runReview(request);
     } catch (error) {
       if (error instanceof ReviewTransportError) {
-        return { outcome: 'unavailable', reason: error.message, code: error.code };
+        return {
+          outcome: 'unavailable',
+          reason: error.message,
+          code: error.code,
+          ...(error.diagnostic !== undefined ? { diagnostic: error.diagnostic } : {}),
+        };
       }
       let reason = 'Independent review transport failed';
       try {

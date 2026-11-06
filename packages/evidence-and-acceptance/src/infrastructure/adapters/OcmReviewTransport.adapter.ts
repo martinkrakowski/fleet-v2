@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { BRIEF_INPUT_RULE, UNTRUSTED_INPUT_RULE, wrapUntrusted } from '../../domain/untrusted-input.js';
 import type { FindingSeverity, ReviewFindingRecord, ReviewUnknownReason } from '../../domain/evidence-records.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
-import type { ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
+import type { ReviewTransportDiagnostic, ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
 import type { ReviewRunnerRoute } from './ReviewTransportRouter.js';
 import { runSpawnOutcome, DEFAULT_MAX_BUFFER_BYTES } from './spawn-run.js';
@@ -37,12 +37,68 @@ export function isTimeoutError(error: unknown): boolean {
 
 export class ReviewTransportError extends Error {
   readonly code: ReviewUnavailableCode;
+  /** The bounded transport diagnostic (RV4); absent when the failure carried none. */
+  readonly diagnostic?: ReviewTransportDiagnostic;
 
-  constructor(message: string, code: ReviewUnavailableCode) {
+  constructor(message: string, code: ReviewUnavailableCode, diagnostic?: ReviewTransportDiagnostic) {
     super(message);
     this.name = 'ReviewTransportError';
     this.code = code;
+    if (diagnostic !== undefined) {
+      this.diagnostic = diagnostic;
+    }
   }
+}
+
+/** The bound on stderr that leaves the transport (RV4): 2048 bytes. */
+export const MAX_TRANSPORT_STDERR_BYTES = 2048;
+
+/** A data read that never throws: a throwing getter reads as `null`. */
+function safeRead<T>(read: () => T): T | null {
+  try {
+    return read();
+  } catch {
+    return null;
+  }
+}
+
+/** Cap a string at `maxBytes` UTF-8 bytes without throwing. */
+function capUtf8Bytes(text: string, maxBytes: number): string {
+  try {
+    if (Buffer.byteLength(text, 'utf8') <= maxBytes) {
+      return text;
+    }
+    return Buffer.from(text, 'utf8').subarray(0, maxBytes).toString('utf8');
+  } catch {
+    return text.slice(0, maxBytes);
+  }
+}
+
+/** The bounded diagnostic of a spawn result; a throwing getter reads as null. */
+function spawnDiagnosticOf(result: OcmReviewTransportSpawnResult): ReviewTransportDiagnostic {
+  const exitCode = safeRead(() => result.exitCode);
+  const timedOut = safeRead(() => result.timedOut === true) === true;
+  const stderr = safeRead(() => result.stderr);
+  const stdout = safeRead(() => result.stdout);
+  return {
+    exitCode: exitCode ?? null,
+    timedOut,
+    stderr: stderr === null ? null : capUtf8Bytes(stderr, MAX_TRANSPORT_STDERR_BYTES),
+    stdoutEmpty: stdout === null ? null : stdout.trim() === '',
+  };
+}
+
+/** The timed-out classification of a spawn result, read without throwing. */
+function spawnTimedOut(result: OcmReviewTransportSpawnResult): boolean {
+  if (safeRead(() => result.timedOut === true) === true) {
+    return true;
+  }
+  const exitCode = safeRead(() => result.exitCode);
+  const stderr = safeRead(() => result.stderr);
+  if (exitCode === null && typeof stderr === 'string') {
+    return /timed?\s*out|timeout/i.test(stderr);
+  }
+  return false;
 }
 
 export interface OcmReviewTransportSpawnResult {
@@ -1181,7 +1237,46 @@ export function createOcmReviewTransport(
       );
     }
 
-    // 4. Build argv and sanitized environment. A kind review embeds the
+    // 4. RV4: before the review, prove the worktree is idle with
+    // `ocm-run --wait --dir <dir>` under the review budget. `--wait` exits 0
+    // when idle (two reads) and 75 when a session still runs past
+    // `OCM_WAIT_MAX`; a cut-short wait (a timeout) writes no review intent, so
+    // the next pass can dispatch. Exit 75 or `timedOut` is `seat-busy`; any
+    // other non-zero exit, an unreadable exit code or a thrown spawn is the
+    // existing `transport`/`timeout` code. None of these spawn the review.
+    const timeoutMs = options.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
+    const reviewEnv = buildReviewerEnv(options);
+    const waitSpawnFn = options.spawn ?? defaultSpawn;
+    let waitResult: OcmReviewTransportSpawnResult;
+    try {
+      waitResult = await waitSpawnFn(options.ocmRunBin, ['--wait', '--dir', dir], {
+        ...reviewEnv,
+        OCM_WAIT_MAX: String(Math.max(1, Math.ceil(timeoutMs / 1000))),
+      }, { timeoutMs });
+    } catch (error) {
+      if (error instanceof ReviewTransportError) {
+        throw error;
+      }
+      const message =
+        error instanceof Error && typeof error.message === 'string'
+          ? error.message
+          : 'reviewer process failed';
+      throw new ReviewTransportError(message, isTimeoutError(error) ? 'timeout' : 'transport');
+    }
+    const waitExitCode = safeRead(() => waitResult.exitCode);
+    if (waitExitCode === 75 || safeRead(() => waitResult.timedOut === true) === true) {
+      throw new ReviewTransportError('review seat busy', 'seat-busy', spawnDiagnosticOf(waitResult));
+    }
+    if (waitExitCode !== 0) {
+      const waitTimedOut = spawnTimedOut(waitResult);
+      throw new ReviewTransportError(
+        `reviewer process failed with exit code ${String(waitExitCode)}`,
+        waitTimedOut ? 'timeout' : 'transport',
+        spawnDiagnosticOf(waitResult),
+      );
+    }
+
+    // 5. Build argv and sanitized environment. A kind review embeds the
     // base..head diff read after the pre-review head read, so the reviewer
     // does not need a shell to see the change.
     const nonce = (options.makeNonce ?? defaultNonce)();
@@ -1238,14 +1333,12 @@ export function createOcmReviewTransport(
       'json',
       prompt,
     ];
-    const env = buildReviewerEnv(options);
-
-    // 5. Spawn runner process; non-zero or null exit throws
+    // 6. Spawn runner process; non-zero or null exit throws
     const spawnFn = options.spawn ?? defaultSpawn;
     let spawnResult: OcmReviewTransportSpawnResult;
     try {
-      spawnResult = await spawnFn(options.ocmRunBin, argv, env, {
-        timeoutMs: options.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS,
+      spawnResult = await spawnFn(options.ocmRunBin, argv, reviewEnv, {
+        timeoutMs,
       });
     } catch (error) {
       // A typed transport refusal travels as-is; any other throw is classified:
@@ -1259,17 +1352,23 @@ export function createOcmReviewTransport(
           : 'reviewer process failed';
       throw new ReviewTransportError(message, isTimeoutError(error) ? 'timeout' : 'transport');
     }
-    if (spawnResult.exitCode !== 0) {
-      const timedOut =
-        spawnResult.timedOut === true ||
-        (spawnResult.exitCode === null && /timed?\s*out|timeout/i.test(spawnResult.stderr));
+    const spawnExitCode = safeRead(() => spawnResult.exitCode);
+    if (spawnExitCode !== 0) {
+      const timedOut = spawnTimedOut(spawnResult);
+      const diagnostic = spawnDiagnosticOf(spawnResult);
+      if (spawnExitCode === 75 && !timedOut) {
+        // RV4: an exit 75 from the review spawn that is not a timeout means the
+        // worktree is busy too. The fixed message carries no stderr and no path.
+        throw new ReviewTransportError('review seat busy', 'seat-busy', diagnostic);
+      }
       throw new ReviewTransportError(
-        `reviewer process failed with exit code ${String(spawnResult.exitCode)}: ${spawnResult.stderr || spawnResult.stdout}`,
+        `reviewer process failed with exit code ${String(spawnExitCode)}`,
         timedOut ? 'timeout' : 'transport',
+        diagnostic,
       );
     }
 
-    // 6. Parse stdout JSON lines for text and tool parts
+    // 7. Parse stdout JSON lines for text and tool parts
     let readOnlyVoided = false;
     let hasStepStart = false;
     const textParts: string[] = [];
@@ -1330,7 +1429,7 @@ export function createOcmReviewTransport(
       }
     }
 
-    // 7. Verify head after review and compute readOnlyVerified
+    // 8. Verify head after review and compute readOnlyVerified
     const after = await options.readHead(dir);
     const readOnlyVerified =
       !readOnlyVoided &&
@@ -1338,7 +1437,7 @@ export function createOcmReviewTransport(
       before === request.candidateHeadSha &&
       after === request.candidateHeadSha;
 
-    // 8. Parse verdict, findings, and rawOutput
+    // 9. Parse verdict, findings, and rawOutput
     // Each text part is a whole message part; a part that does not end in a newline must not glue its last line onto the next part's first.
     const finalText = textParts.join('\n');
     // A conductor request (a kind) is validated strictly; a manual request keeps today's parse.

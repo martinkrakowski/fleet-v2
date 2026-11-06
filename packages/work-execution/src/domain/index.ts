@@ -47,6 +47,7 @@ export * from "./plain-record-reads.js";
 export * from "./reaper-findings.js";
 export * from "./record-schema-version.js";
 export * from "./review-finding-scope.js";
+export * from "./review-transport-screen.js";
 export * from "./run-telemetry.js";
 export * from "./run-telemetry-attributes.js";
 export * from "./run-telemetry-dispositions.js";

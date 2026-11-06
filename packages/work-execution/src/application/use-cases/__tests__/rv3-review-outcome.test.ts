@@ -6,11 +6,16 @@
  * subprocess, no network.
  */
 
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import {
   AssessHeadAcceptanceUseCase,
   decideReviewReceiptOutcome,
+  EvidenceArchiveAdapter,
   EvidenceAssessment,
   type EvidenceAssessmentRecord,
   type EvidenceAssessmentRepositoryPort,
@@ -1262,5 +1267,78 @@ describe('RV3: the WB5a-store-c saved minor-only FAIL receipt end to end', () =>
     const prBody = (productionHarness.forgeRequests[0] as unknown as { body?: string }).body ?? '';
     expect(prBody).toContain(`- [minor] ${WB5A_FILE_PATH}:840`);
     expect(prBody).not.toContain('symlink or oversized file');
+  });
+
+  it('RV4 production path: the composed ReviewRequestAdapter archives a screened seat-busy diagnostic under the request id', async () => {
+    // The conductor composition (apps/cli/src/composition/conductor.ts) hands
+    // AdvanceLaneRunUseCase a real ReviewRequestAdapter whose archiveEvidence is
+    // the evidence context's EvidenceArchiveAdapter. Here the same adapter sits
+    // over the same delegates with a real archive on a temp dir, so the screen
+    // and archive both run exactly as production wires them.
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    const archiveDir = mkdtempSync(join(tmpdir(), 'fleet-rv4-prod-'));
+    try {
+      const archive = new EvidenceArchiveAdapter({ archiveDir });
+      let archivedRef: string | null = null;
+      const adapter = new ReviewRequestAdapter({
+        requestIndependentReview: async () => ({
+          outcome: 'rejected',
+          reason: 'review seat busy',
+          rejection: 'review-unavailable',
+          code: 'seat-busy',
+          diagnostic: {
+            exitCode: 75,
+            timedOut: false,
+            stderr: `ghp_${'a'.repeat(36)} ${WORKTREE}/secret.txt`,
+            stdoutEmpty: false,
+          },
+        }),
+        inspectAcceptanceEvidence: async () =>
+          ({
+            outcome: 'found',
+            assessment: assessmentRecord({
+              attemptId: 'attempt-example-1',
+              candidateHeadSha: COMMIT_A,
+            }),
+          }) as never,
+        archiveEvidence: async (request) => {
+          const result = await archive.archiveEvidence(request);
+          archivedRef = result.evidenceRef;
+          return result;
+        },
+      });
+      const productionHarness = { ...harness, deps: { ...harness.deps, reviewRequest: adapter } };
+      await conduct(productionHarness, 'brief-check', NOW);
+      const result = await advance(productionHarness);
+      expect(result).toEqual({
+        outcome: 'acted',
+        step: 'brief-check',
+        key: reviewKey('brief-check', 0, HEAD12_A),
+        result: 'completed',
+        reasonCode: 'seat-busy',
+        detail: 'seat-busy',
+      });
+
+      // The artifact id is the minted request id, and the archived content is
+      // only the screened fields: no secret text, no absolute path.
+      const entries = await harness.runJournal.listForRun(RUN_ID);
+      const intent = entries.find(
+        (entry) => entry.kind === 'intent' && entry.key === reviewKey('brief-check', 0, HEAD12_A),
+      );
+      expect(intent?.mintedId).toMatch(/^review-/);
+      expect(archivedRef).not.toBeNull();
+      expect(archivedRef!.startsWith(`evidence://review-transport-${intent?.mintedId}@`)).toBe(true);
+      const content = await archive.readArchivedEvidence(archivedRef!);
+      expect(JSON.parse(content ?? '{}')).toEqual({
+        exitCode: 75,
+        timedOut: false,
+        stdoutEmpty: false,
+        stderr: '[redacted] [path]',
+      });
+      expect(content).not.toContain('ghp_');
+      expect(content).not.toContain('/tmp/opencode');
+    } finally {
+      rmSync(archiveDir, { recursive: true, force: true });
+    }
   });
 });

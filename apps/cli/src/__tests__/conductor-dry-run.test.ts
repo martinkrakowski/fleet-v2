@@ -532,19 +532,16 @@ describe('conductor run --dry-run (K7-8)', () => {
     // reads the PR merged and the run ends.
     expect(allSteps.some((step) => step.outcome === 'waiting' && step.reason === 'merge-train')).toBe(true);
 
-    // Each review first inspects the worktree through the runner (RV4), then
-    // opens the evidence assessment and issues its request, under a minted
-    // request id the act journalled first.
+    // Each review opened the evidence assessment and then issued its request,
+    // in that order, under a minted request id the act journalled first.
     const fakes = capturedFakes.current as DryRunFakes | null;
     expect(fakes).not.toBeNull();
     const calls = fakes!.recorder.calls;
     const ports = calls.map((call) => call.port);
     const gateIndex = ports.indexOf('gate');
-    expect(ports.slice(gateIndex + 1, gateIndex + 7)).toEqual([
-      'runnerForAttempt',
+    expect(ports.slice(gateIndex + 1, gateIndex + 5)).toEqual([
       'reviewAssessment',
       'reviewRequest',
-      'runnerForAttempt',
       'reviewAssessment',
       'reviewRequest',
     ]);

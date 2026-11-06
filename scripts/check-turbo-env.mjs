@@ -74,9 +74,6 @@ const RUNTIME_ONLY = new Set([
   "OCM_REMOTE_PORT",
   "OCM_PORT",
   "OCM_START_MAX",
-  // RV4: the review budget passed into the ocm-run --wait child; read back by
-  // tests, never a build input.
-  "OCM_WAIT_MAX",
   "AGY_BIN",
   // The API's listen host (Nitro runtime).
   "NITRO_HOST",

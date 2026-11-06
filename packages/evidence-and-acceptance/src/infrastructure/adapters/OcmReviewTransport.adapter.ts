@@ -1256,12 +1256,10 @@ export function createOcmReviewTransport(
         OCM_WAIT_MAX: String(Math.max(1, Math.ceil(timeoutMs / 1000))),
       }, { timeoutMs });
     } catch (error) {
-      if (error instanceof ReviewTransportError) {
-        throw error;
-      }
-      // RV4 round 1: a thrown spawn error's message is never passed through —
-      // it may carry a secret or a path. The fixed message travels instead;
-      // the capped diagnostic (screened downstream) carries the data.
+      // RV4: a thrown spawn always classifies as `timeout` or `transport`. Its
+      // message is never passed through — it may carry a secret or a path —
+      // and a typed ReviewTransportError thrown by the spawn is classified like
+      // any other throw, never rethrown with its own code or message.
       throw new ReviewTransportError('reviewer process failed', isTimeoutError(error) ? 'timeout' : 'transport');
     }
     const waitExitCode = safeRead(() => waitResult.exitCode);
@@ -1342,14 +1340,11 @@ export function createOcmReviewTransport(
         timeoutMs,
       });
     } catch (error) {
-      // A typed transport refusal travels as-is; any other throw is classified:
-      // a timeout shape is a `timeout`, anything else a `transport` failure.
-      if (error instanceof ReviewTransportError) {
-        throw error;
-      }
-      // RV4 round 1: a thrown spawn error's message is never passed through —
-      // it may carry a secret or a path. The fixed message travels instead;
-      // the capped diagnostic (screened downstream) carries the data.
+      // Every throw from the review spawn is classified: a timeout shape is a
+      // `timeout`, anything else a `transport` failure. A typed
+      // ReviewTransportError thrown by the spawn does not travel as-is — its
+      // message could expose a secret or a path, and its code would bypass the
+      // thrown-spawn classification; the fixed message travels instead.
       throw new ReviewTransportError('reviewer process failed', isTimeoutError(error) ? 'timeout' : 'transport');
     }
     const spawnExitCode = safeRead(() => spawnResult.exitCode);

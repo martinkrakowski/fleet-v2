@@ -2857,8 +2857,11 @@ describe('RV4: busy worktree transport (seat-busy)', () => {
     expect(calls[0]!.args[0]).toBe('--wait');
     expect(calls[0]!.args[1]).toBe('--dir');
     expect(calls[0]!.args[2]).toBe('/tmp/review-dir');
-    // OCM_WAIT_MAX is the review budget in whole seconds, at least 1.
-    expect(calls[0]!.env.OCM_WAIT_MAX).toBe('2');
+    // OCM_WAIT_MAX is the review budget in whole seconds, at least 1. It is
+    // read off the captured spawn env record, not the process environment, so
+    // the access is not an env-shaped read for check-turbo-env.
+    const { OCM_WAIT_MAX } = calls[0]!.env;
+    expect(OCM_WAIT_MAX).toBe('2');
     // The review spawn carries the review argv, never --wait.
     expect(calls[1]!.args[0]).toBe('--dir');
     expect(calls[1]!.args).not.toContain('--wait');
@@ -2984,6 +2987,36 @@ describe('RV4: busy worktree transport (seat-busy)', () => {
       expect((rejection as ReviewTransportError).message).toBe('reviewer process failed');
       expect((rejection as ReviewTransportError).message).not.toContain(SECRET);
       expect((rejection as ReviewTransportError).message).not.toContain('/tmp');
+      expect(JSON.stringify(rejection)).not.toContain(SECRET);
+    }
+  });
+
+  it('a thrown ReviewTransportError is classified like any other spawned throw', async () => {
+    const SECRET = 'ghp_' + 'a'.repeat(36);
+    const typedSpawn: OcmReviewTransportSpawn = async () => {
+      throw new ReviewTransportError(`typed ${SECRET} at /tmp/typed-dir`, 'seat-busy');
+    };
+
+    // Both catch sites (the --wait spawn and the review spawn) classify a
+    // thrown typed error too: the fixed message travels, the thrown code and
+    // message never do — so a secret or path in the thrown message cannot
+    // leak and a seat-busy code cannot bypass the thrown-spawn classification.
+    for (const throwing of [
+      typedSpawn,
+      (async (_file: string, args: readonly string[]) => {
+        if (args[0] === '--wait') {
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        return typedSpawn('', [], {});
+      }) as OcmReviewTransportSpawn,
+    ]) {
+      const transport = makeTransport(throwing);
+      const rejection = await transport(request).catch((error: unknown) => error);
+      expect(rejection).toBeInstanceOf(ReviewTransportError);
+      expect((rejection as ReviewTransportError).message).toBe('reviewer process failed');
+      expect((rejection as ReviewTransportError).message).not.toContain(SECRET);
+      expect((rejection as ReviewTransportError).message).not.toContain('/tmp');
+      expect((rejection as ReviewTransportError).code).toBe('transport');
       expect(JSON.stringify(rejection)).not.toContain(SECRET);
     }
   });

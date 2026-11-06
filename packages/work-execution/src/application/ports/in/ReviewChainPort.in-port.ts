@@ -44,7 +44,7 @@ export const REVIEW_CHAIN_REASONS = [
   'integration-pr-open', 'implementer-models-unknown', 'reviewer-not-independent', 'review-not-configured',
   'review-refused', 'review-no-receipt', 'review-unknown', 'chain-tip-moved', 'receipt-missing',
   'link-receipt-missing', 'verdict-unknown', 'subject-not-implemented', 'budget-exhausted', 'store-unavailable',
-  'forge-unavailable',
+  'forge-unavailable', 'too-many-links',
 ] as const;
 export type ReviewChainReason = (typeof REVIEW_CHAIN_REASONS)[number];
 

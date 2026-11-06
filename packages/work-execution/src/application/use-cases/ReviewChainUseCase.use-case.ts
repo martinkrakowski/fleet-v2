@@ -745,7 +745,7 @@ export class ReviewChainUseCase implements ReviewChainPort {
     readonly repository: { readonly owner: string; readonly repo: string };
     readonly branchName: string;
     readonly deadlineIso: string;
-  }): Promise<GatheredLinks | null> {
+  }): Promise<GatheredLinks | 'too-many-links' | null> {
     let runs: readonly LaneRunRecord[];
     let entries: readonly MergeQueueEntryRecord[];
     try {
@@ -756,6 +756,10 @@ export class ReviewChainUseCase implements ReviewChainPort {
       });
     } catch {
       return null;
+    }
+    // The same bound `aggregateLinkReceipts` enforces: refuse before anything is pinned or requested.
+    if (runs.length > CHAIN_REVIEW_MAX_LINKS) {
+      return 'too-many-links';
     }
     const links: ChainLink[] = [];
     const allAttempts: AttemptRecord[] = [];
@@ -810,6 +814,9 @@ export class ReviewChainUseCase implements ReviewChainPort {
     }
 
     const gathered = await this.gatherLinks(command);
+    if (gathered === 'too-many-links') {
+      return refusedWith('too-many-links');
+    }
     const linkFacts = gathered === null ? ('unreadable' as const) : gathered.links.map((link) => ({ settled: link.settled }));
     // The pull-request read is skipped when the links already decide (unreadable or one unsettled).
     if (gathered === null || gathered.links.some((link) => !link.settled)) {
@@ -1092,6 +1099,9 @@ export class ReviewChainUseCase implements ReviewChainPort {
     }
 
     const gathered = await this.gatherLinks(command);
+    if (gathered === 'too-many-links') {
+      return refusedWith('too-many-links');
+    }
     if (gathered === null) {
       return unknownWith('store-unavailable');
     }

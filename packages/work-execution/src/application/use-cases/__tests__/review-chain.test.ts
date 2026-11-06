@@ -339,6 +339,19 @@ describe('start refuses while a link is queued or in progress', () => {
     expect(pins).toHaveLength(0);
   });
 
+  it('too-many-links: 51 settled links refuse before any pin or review; 50 proceed', async () => {
+    const many = (count: number) =>
+      Array.from({ length: count }, (_, i) => link({ runId: `run-${i}`, attemptId: `attempt-${i}`, pr: 100 + i }));
+    const over = harness({ links: many(51) });
+    expect(await over.useCase.startChainReview(startCommand())).toEqual({ outcome: 'refused', reason: 'too-many-links' });
+    expect(over.calls).not.toContain('list-open');
+    expect(over.calls).not.toContain('request-review');
+    expect(over.pins).toHaveLength(0);
+    expect(over.reviews).toHaveLength(0);
+    const at = harness({ links: many(50) });
+    expect((await at.useCase.startChainReview(startCommand())).outcome).toBe('started');
+  });
+
   it('treats a merged entry next to a dropped or superseded one as settled', async () => {
     const { useCase } = harness({ links: [link({ queue: ['superseded', 'dropped', 'merged'] })] });
     expect((await useCase.startChainReview(startCommand())).outcome).toBe('started');

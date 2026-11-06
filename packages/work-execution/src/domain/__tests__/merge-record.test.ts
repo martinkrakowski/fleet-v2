@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { decideMergeRecord, MergeRecord } from '../entities/MergeRecord.js';
+import {
+  decideMergeRecord,
+  MERGE_RECORD_LIMITS,
+  MergeRecord,
+} from '../entities/MergeRecord.js';
 import type { MergeRecordRecord } from '../entities/MergeRecord.js';
 
 /**
@@ -389,5 +393,47 @@ describe('decideMergeRecord', () => {
   it('refuses an unreadable incoming record with a typed reason', () => {
     expect(decideError(VALID, null)).toBe('MergeRecord incoming record could not be read');
     expect(decideError(VALID, {})).toBe('MergeRecord incoming record could not be read');
+  });
+});
+
+describe('MERGE_RECORD_LIMITS', () => {
+  it('exports MERGE_RECORD_LIMITS matching MergeRecord.create and decideMergeRecord field bounds', () => {
+    expect(MERGE_RECORD_LIMITS).toEqual({
+      maxRepositoryLength: 200,
+      minPullRequestNumber: 1,
+      maxPullRequestNumber: 999_999_999,
+      maxHeadShaLength: 64,
+      maxIsoTimestampLength: 32,
+      maxActionRefLength: 128,
+    });
+
+    const make = (overrides: Partial<MergeRecordRecord> = {}): MergeRecordRecord => ({ ...VALID, ...overrides });
+
+    // actionRef: 128 accepted, 129 refused (create and decide both).
+    const actionRef128 = make({ actionRef: 'x'.repeat(MERGE_RECORD_LIMITS.maxActionRefLength) });
+    expect(MergeRecord.create(actionRef128).success).toBe(true);
+    expect(decideMergeRecord(VALID, actionRef128).success).toBe(true);
+
+    const actionRef129 = { ...actionRef128, actionRef: 'x'.repeat(MERGE_RECORD_LIMITS.maxActionRefLength + 1) };
+    expect(MergeRecord.create(actionRef129).success).toBe(false);
+    expect(decideMergeRecord(VALID, actionRef129).success).toBe(false);
+
+    // repository: 200 accepted, 201 refused.
+    const repository200 = make({ repository: 'r'.repeat(MERGE_RECORD_LIMITS.maxRepositoryLength) });
+    expect(MergeRecord.create(repository200).success).toBe(true);
+    const repository201 = make({ repository: 'r'.repeat(MERGE_RECORD_LIMITS.maxRepositoryLength + 1) });
+    expect(MergeRecord.create(repository201).success).toBe(false);
+
+    // number: 1 and 999_999_999 accepted, 0 and 1_000_000_000 refused.
+    for (const accepted of [MERGE_RECORD_LIMITS.minPullRequestNumber, MERGE_RECORD_LIMITS.maxPullRequestNumber]) {
+      const record = make({ number: accepted });
+      expect(MergeRecord.create(record).success).toBe(true);
+      expect(decideMergeRecord(null, record).success).toBe(true);
+    }
+    for (const refused of [0, 1_000_000_000]) {
+      const record = make({ number: refused });
+      expect(MergeRecord.create(record).success).toBe(false);
+      expect(decideMergeRecord(null, record).success).toBe(false);
+    }
   });
 });

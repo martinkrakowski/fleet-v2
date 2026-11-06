@@ -730,6 +730,122 @@ export function inspectVersionedRecordListBytes<T>(
   };
 }
 
+export interface ReadOrQuarantineVersionedStoreOptions<T> {
+  readonly filePath: string;
+  readonly parseRecord: (raw: unknown) => VersionedRecordParseResult<T>;
+  readonly findListError?: (records: readonly T[]) => string | undefined;
+  readonly readOnly?: boolean;
+  /** True when the caller already holds `${filePath}.lock` (prevents re-entrant deadlock). */
+  readonly lockHeld?: boolean;
+  readonly lockTimeoutMs?: number;
+  readonly maxBytes?: number;
+  readonly fsImpl?: QuarantineFs;
+}
+
+type BoundedStoreClassified<T> =
+  | { readonly kind: 'ok'; readonly records: readonly T[] }
+  | { readonly kind: 'unknown-version'; readonly recordIndex: number }
+  | { readonly kind: 'unquarantinable'; readonly detail: string }
+  | { readonly kind: 'invalid-bytes'; readonly detail: string; readonly bytes: Buffer };
+
+/** Pure: classify one bounded store read into the shared reader's outcomes. */
+function classifyBoundedStoreRead<T>(
+  read: BoundedStoreReadResult,
+  parseRecord: (raw: unknown) => VersionedRecordParseResult<T>,
+  findListError: ((records: readonly T[]) => string | undefined) | undefined,
+  maxBytes: number,
+): BoundedStoreClassified<T> {
+  switch (read.status) {
+    case 'missing':
+      return { kind: 'ok', records: [] };
+    case 'not-regular-file':
+      return { kind: 'unquarantinable', detail: 'not a regular file' };
+    case 'too-large':
+      return { kind: 'unquarantinable', detail: `exceeds ${maxBytes} bytes` };
+    case 'ok': {
+      const inspection = inspectVersionedRecordListBytes(read.bytes, parseRecord);
+      if (inspection.status === 'unknown-version') {
+        return { kind: 'unknown-version', recordIndex: inspection.recordIndex };
+      }
+      if (inspection.status === 'unreadable') {
+        return { kind: 'invalid-bytes', detail: inspection.detail, bytes: read.bytes };
+      }
+      if (findListError !== undefined) {
+        const listError = findListError(inspection.records);
+        if (listError !== undefined) {
+          return { kind: 'invalid-bytes', detail: listError, bytes: read.bytes };
+        }
+      }
+      return { kind: 'ok', records: inspection.records };
+    }
+  }
+}
+
+/**
+ * The shared locked read-or-quarantine path for the versioned record-list
+ * stores: read the store bounded to `maxBytes`, refuse symlinks and oversized
+ * files without reading or copying them, throw `StateFileUnknownVersionError`
+ * for an unsupported `schemaVersion` (never quarantined), and under the store
+ * lock re-stat and re-read before quarantining the exact bytes observed under
+ * the lock, leaving `filePath` in place so later reads/writes still fail
+ * closed. A healthy read takes the unlocked fast path and creates no lock file.
+ * A read-only store never locks, creates directories or writes quarantine
+ * copies; it throws `StateFileUnreadableReadOnlyError`.
+ */
+export async function readOrQuarantineVersionedRecordList<T>(
+  options: ReadOrQuarantineVersionedStoreOptions<T>,
+): Promise<readonly T[]> {
+  const maxBytes = options.maxBytes ?? STORE_FILE_MAX_BYTES;
+  const readOnly = options.readOnly === true;
+  const lockHeld = options.lockHeld === true;
+  const lockTimeoutMs = options.lockTimeoutMs ?? 10_000;
+  const fsImpl = options.fsImpl ?? fs;
+
+  const classify = (read: BoundedStoreReadResult): BoundedStoreClassified<T> =>
+    classifyBoundedStoreRead(read, options.parseRecord, options.findListError, maxBytes);
+
+  const runUnderLock = async (): Promise<readonly T[]> => {
+    const locked = classify(await readBoundedStoreBytes(options.filePath, maxBytes));
+    if (locked.kind === 'ok') {
+      return locked.records;
+    }
+    if (locked.kind === 'unknown-version') {
+      throw new StateFileUnknownVersionError(options.filePath, locked.recordIndex);
+    }
+    if (readOnly) {
+      throw new StateFileUnreadableReadOnlyError(options.filePath, locked.detail);
+    }
+    if (locked.kind === 'unquarantinable') {
+      throw new StateFileUnreadableError(options.filePath, null, locked.detail);
+    }
+    if (!(await isAbsentOrRealDirectory(path.join(path.dirname(options.filePath), 'quarantine')))) {
+      throw new StateFileUnreadableError(
+        options.filePath,
+        null,
+        locked.detail,
+        new Error('quarantine directory is not a real directory'),
+      );
+    }
+    return quarantineUnreadable(options.filePath, locked.detail, locked.bytes, fsImpl);
+  };
+
+  if (lockHeld) {
+    return runUnderLock();
+  }
+
+  const fast = classify(await readBoundedStoreBytes(options.filePath, maxBytes));
+  if (fast.kind === 'ok') {
+    return fast.records;
+  }
+  if (fast.kind === 'unknown-version') {
+    throw new StateFileUnknownVersionError(options.filePath, fast.recordIndex);
+  }
+  if (readOnly) {
+    throw new StateFileUnreadableReadOnlyError(options.filePath, fast.detail);
+  }
+  return withFileLock(`${options.filePath}.lock`, runUnderLock, { timeoutMs: lockTimeoutMs });
+}
+
 // ---------------------------------------------------------------------------
 // State-file inspection (E1b): the one parser every store reader and
 // `fleet-v2 state check` share, so a check and a read can never disagree.
@@ -1307,6 +1423,103 @@ export async function readStoreBytes(target: string): Promise<Buffer | null> {
       return null;
     }
     throw error;
+  }
+}
+
+/** The hard cap on any single store file this package will read (8 MiB). */
+export const STORE_FILE_MAX_BYTES = 8 * 1024 * 1024;
+
+/** The outcome of one bounded store-file read: never follows a symlink, never reads past `maxBytes`. */
+export type BoundedStoreReadResult =
+  | { readonly status: 'missing' }
+  | { readonly status: 'not-regular-file' }
+  | { readonly status: 'too-large' }
+  | { readonly status: 'ok'; readonly bytes: Buffer };
+
+/**
+ * Read a store file without following a symlink out of the state directory,
+ * without opening or reading a non-regular file or a file already larger than
+ * `maxBytes`, and without reading more than `maxBytes` bytes even when the file
+ * grows while being read. A missing file is `'missing'`; a symlink (dangling
+ * or not), a non-regular file or an oversized file is a distinct refused status,
+ * never mistaken for "absent". Unknown read failures are rethrown, never
+ * reported as `'missing'`.
+ */
+export async function readBoundedStoreBytes(
+  target: string,
+  maxBytes: number = STORE_FILE_MAX_BYTES,
+): Promise<BoundedStoreReadResult> {
+  if (!Number.isInteger(maxBytes) || maxBytes < 1) {
+    return { status: 'too-large' };
+  }
+
+  let stat;
+  try {
+    stat = await fs.lstat(target);
+  } catch (error: unknown) {
+    const code = errorCodeOf(error);
+    if (code === 'ENOENT') {
+      return { status: 'missing' };
+    }
+    if (code === 'ELOOP' || code === 'ENOTDIR') {
+      return { status: 'not-regular-file' };
+    }
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    return { status: 'not-regular-file' };
+  }
+  if (stat.size > maxBytes) {
+    return { status: 'too-large' };
+  }
+
+  let handle: fs.FileHandle;
+  try {
+    handle = await fs.open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  } catch (error: unknown) {
+    const code = errorCodeOf(error);
+    if (code === 'ENOENT') {
+      return { status: 'missing' };
+    }
+    if (code === 'ELOOP' || code === 'EMLINK' || code === 'EISDIR' || code === 'ENXIO') {
+      return { status: 'not-regular-file' };
+    }
+    throw error;
+  }
+
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile()) {
+      return { status: 'not-regular-file' };
+    }
+    if (opened.size > maxBytes) {
+      return { status: 'too-large' };
+    }
+
+    // Bound the bytes actually read, not just the size seen at stat time: a
+    // file that grows in between is refused rather than read whole. Chunks are
+    // at most 64 KiB, so a small file never pre-allocates an 8 MiB buffer.
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (true) {
+      const remaining = Math.min(65_536, maxBytes + 1 - total);
+      if (remaining <= 0) {
+        break;
+      }
+      const chunk = Buffer.allocUnsafe(remaining);
+      const { bytesRead } = await handle.read(chunk, 0, remaining, total);
+      if (bytesRead === 0) {
+        break;
+      }
+      chunks.push(chunk.subarray(0, bytesRead));
+      total += bytesRead;
+    }
+    if (total > maxBytes) {
+      return { status: 'too-large' };
+    }
+    return { status: 'ok', bytes: Buffer.concat(chunks, total) };
+  } finally {
+    await handle.close();
   }
 }
 

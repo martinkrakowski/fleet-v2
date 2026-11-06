@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { MergeRecordRecord } from '../../domain/entities/MergeRecord.js';
+import { MERGE_RECORD_LIMITS, type MergeRecordRecord } from '../../domain/entities/MergeRecord.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../application/ports/out/ChangeSignalPort.out-port.js';
 import {
   MergeRecordRepositoryAdapter,
@@ -13,6 +13,7 @@ import {
 import {
   FileLockTimeoutError,
   ReadOnlyStateStoreError,
+  STORE_FILE_MAX_BYTES,
   StateFileUnreadableError,
   StateFileUnreadableReadOnlyError,
   StateFileUnknownVersionError,
@@ -343,6 +344,40 @@ describe('MergeRecordRepositoryAdapter', () => {
       await expectRefusedWithoutWrite({ ...mergeRecord(), number: 1_000_000_000 });
     });
 
+    it('uses MERGE_RECORD_LIMITS in the adapter pre-filter (actionRef 128 accepted, 129 refused; timestamp > 32 refused)', async () => {
+      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+
+      const accepted = await store.saveMergeRecord(
+        fleetRecord({ actionRef: 'x'.repeat(MERGE_RECORD_LIMITS.maxActionRefLength) }),
+      );
+      expect(accepted.outcome).toBe('created');
+
+      const before = await readBytes();
+      const statBefore = await fs.stat(target);
+
+      const tooLongActionRef = await store.saveMergeRecord(
+        fleetRecord({ actionRef: 'x'.repeat(MERGE_RECORD_LIMITS.maxActionRefLength + 1) }),
+      );
+      expect(tooLongActionRef).toEqual(REFUSED);
+
+      const tooLongMergedAt = await store.saveMergeRecord(
+        mergeRecord({
+          mergedAtIso: '2026-11-05T10:00:00.000Z'.padEnd(MERGE_RECORD_LIMITS.maxIsoTimestampLength + 1, '0'),
+        }),
+      );
+      expect(tooLongMergedAt).toEqual(REFUSED);
+
+      const tooLongFirstSeenAt = await store.saveMergeRecord(
+        mergeRecord({
+          firstSeenAtIso: '2026-11-05T10:01:00.000Z'.padEnd(MERGE_RECORD_LIMITS.maxIsoTimestampLength + 1, '0'),
+        }),
+      );
+      expect(tooLongFirstSeenAt).toEqual(REFUSED);
+
+      expect(await readBytes()).toBe(before);
+      expect((await fs.stat(target)).ino).toBe(statBefore.ino);
+    });
+
     it('the refusal carries a code only: the rejected value and the store path never appear in the outcome', async () => {
       const secret = `ghp_${'a1B2c3D4e5'.repeat(4)}`;
       const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
@@ -482,6 +517,65 @@ describe('MergeRecordRepositoryAdapter', () => {
       await fs.writeFile(target, JSON.stringify([withoutVersion]));
       const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
       expect(await store.listMergeRecords()).toEqual([mergeRecord()]);
+    });
+
+    it('refuses an oversized merge-records.json with StateFileUnreadableError and writes no quarantine copy', async () => {
+      await fs.writeFile(target, Buffer.alloc(STORE_FILE_MAX_BYTES + 1, 0x20));
+      const readFileSpy = vi.spyOn(fs, 'readFile');
+
+      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+      for (const attempt of [
+        () => store.listMergeRecords(),
+        () => store.findMergeRecord('acme/app', 7),
+        () => store.saveMergeRecord(mergeRecord()),
+      ]) {
+        await expect(attempt()).rejects.toMatchObject({
+          name: 'StateFileUnreadableError',
+          quarantinePath: null,
+        });
+      }
+
+      const readOnlyStore = new MergeRecordRepositoryAdapter({ stateDir: tempDir, readOnly: true });
+      await expect(readOnlyStore.listMergeRecords()).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
+
+      await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+
+      // The oversized file was never read whole through fs.readFile.
+      expect(readFileSpy.mock.calls.map((call) => call[0])).not.toContain(target);
+    });
+
+    it('refuses a symlinked merge-records.json (live or dangling) with StateFileUnreadableError without reading the target or creating a quarantine copy', async () => {
+      const outsideTarget = path.join(tempDir, 'outside-secret.txt');
+      await fs.writeFile(outsideTarget, '{ not json');
+      await fs.symlink(outsideTarget, target);
+      const readFileSpy = vi.spyOn(fs, 'readFile');
+
+      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+      for (const attempt of [
+        () => store.listMergeRecords(),
+        () => store.findMergeRecord('acme/app', 7),
+        () => store.saveMergeRecord(mergeRecord()),
+      ]) {
+        await expect(attempt()).rejects.toMatchObject({
+          name: 'StateFileUnreadableError',
+          quarantinePath: null,
+          detail: 'not a regular file',
+        });
+      }
+
+      const readOnlyStore = new MergeRecordRepositoryAdapter({ stateDir: tempDir, readOnly: true });
+      await expect(readOnlyStore.listMergeRecords()).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
+
+      await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+      expect(readFileSpy.mock.calls.map((call) => call[0])).not.toContain(outsideTarget);
+      expect(readFileSpy.mock.calls.map((call) => call[0])).not.toContain(target);
+
+      await fs.unlink(target);
+      await fs.symlink(path.join(tempDir, 'missing-target.json'), target);
+      await expect(store.listMergeRecords()).rejects.toMatchObject({
+        name: 'StateFileUnreadableError',
+        quarantinePath: null,
+      });
     });
   });
 });

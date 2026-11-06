@@ -4,6 +4,7 @@ import type { AdvanceLaneRunRequest, AdvanceLaneRunResult } from '../../ports/in
 import type { PrepareFixAttemptRequest, PrepareFixAttemptResult } from '../../ports/in/PrepareFixAttemptPort.in-port.js';
 import type { PrepareBriefPackageResult } from '../../ports/in/PrepareBriefPackagePort.in-port.js';
 import type { PrepareBriefPackageUseCaseRequest } from '../PrepareBriefPackageUseCase.use-case.js';
+import { REVIEW_UNKNOWN_REASONS } from '@fleet/evidence-and-acceptance';
 import type {
   FindReviewReceiptResult,
   ReviewRequestFinding,
@@ -15,6 +16,7 @@ import type { AttemptRecord, AttemptRunnerRecord, WorkOrderRecord } from '../../
 import type { HandoverFinding, RenderHandoverBriefInput } from '../../../domain/lane-run-handover.js';
 import { originalBriefOf, renderHandoverBrief } from '../../../domain/lane-run-handover.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
+import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../../domain/lane-run-journal.js';
 import { laneRunReviewFact } from '../../../domain/lane-run-review-facts.js';
 import { buildLaneRunStepKey, head12Of, parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
@@ -198,6 +200,28 @@ function reviewResultOfVerdict(verdict: ReviewVerdict): { readonly result: 'comp
   return { result: 'completed', reasonCode: verdict === 'failed' ? 'review-failed' : 'review-unknown' };
 }
 
+/** The fixed cause codes of an unknown review answer; only these may journal. */
+const REVIEW_UNKNOWN_REASON_CODES: ReadonlySet<string> = new Set(REVIEW_UNKNOWN_REASONS);
+
+/**
+ * The fixed cause code of an unknown receipt (`empty`, `unparseable-verdict`,
+ * `no-findings-on-fail`): the code only when the verdict is unknown and the
+ * code is one of the declared tokens that also matches the run-journal
+ * pattern. Reviewer prose, paths and secrets never reach the journal; a
+ * pass/fail receipt or an undeclared token is null.
+ */
+function unknownReceiptDetailOf(receipt: {
+  readonly verdict: ReviewVerdict;
+  readonly unknownReason?: string | null;
+}): string | null {
+  return receipt.verdict === 'unknown' &&
+    typeof receipt.unknownReason === 'string' &&
+    REVIEW_UNKNOWN_REASON_CODES.has(receipt.unknownReason) &&
+    LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(receipt.unknownReason)
+    ? receipt.unknownReason
+    : null;
+}
+
 /** The journal result for a review port outcome; null when nothing is established. */
 function reviewResultOf(
   outcome: ReviewRequestResult,
@@ -210,7 +234,7 @@ function reviewResultOf(
     case 'refused':
       return { result: 'refused', reasonCode: 'review-refused', detail: outcome.detail };
     default:
-      return { ...reviewResultOfVerdict(outcome.receipt.verdict), detail: null };
+      return { ...reviewResultOfVerdict(outcome.receipt.verdict), detail: unknownReceiptDetailOf(outcome.receipt) };
   }
 }
 
@@ -314,13 +338,13 @@ function minorOnlyOverrideOf(
  */
 function reconciledReviewOf(
   step: ReviewKind,
-  receipt: { readonly verdict: ReviewVerdict; readonly findings: readonly ReviewRequestFinding[] },
+  receipt: { readonly verdict: ReviewVerdict; readonly unknownReason?: string | null; readonly findings: readonly ReviewRequestFinding[] },
   mapped: { readonly result: 'completed'; readonly reasonCode: LaneRunResultReasonCode },
 ): { readonly result: 'completed'; readonly reasonCode: LaneRunResultReasonCode; readonly detail: string | null } {
   if (mapped.reasonCode === 'review-failed' && step === 'brief-check' && isMinorOnlyBriefCheckReceipt(step, receipt)) {
     return { ...MINOR_ONLY_OVERRIDE };
   }
-  return { ...mapped, detail: null };
+  return { ...mapped, detail: unknownReceiptDetailOf(receipt) };
 }
 
 /**
@@ -645,7 +669,14 @@ export async function reconcileReview(
     if (resultRefusal !== null) {
       return refusedResult(resultRefusal);
     }
-    return { outcome: 'acted', step: decision.step, key: decision.key, result: 'reconciled', reasonCode: resolved.reasonCode };
+    return {
+      outcome: 'acted',
+      step: decision.step,
+      key: decision.key,
+      result: 'reconciled',
+      reasonCode: resolved.reasonCode,
+      ...(resolved.detail !== null ? { detail: resolved.detail } : {}),
+    };
   }
   const ambiguous = found.outcome === 'unavailable';
   const reasonCode = ambiguous ? 'review-unknown' : 'review-no-receipt';

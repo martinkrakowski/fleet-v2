@@ -70,6 +70,7 @@ const STORE_ORDER = [
   'killall-train-pause.json',
   'seat-tickets.json',
   'seat-observations.json',
+  'merge-records.json',
   'assessments.json',
   'knowledge-entries.json',
   'context-selections.json',

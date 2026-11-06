@@ -46,6 +46,7 @@ describe('createChainRecord', () => {
       record: {
         schemaVersion: 1, repository: REPO, chainName: 'example', branchName: 'chain/example', sourceBranch: 'main',
         expectedHeadSha: SHA, actionKey: 'chain-start-1', state: 'intent-recorded', reason: null, createdAtIso: NOW, revision: 1,
+        refresh: null, conflictMark: null,
       },
     });
   });

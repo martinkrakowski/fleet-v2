@@ -139,9 +139,16 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
       ...(runnerRemoteHost !== undefined ? { remoteHost: runnerRemoteHost } : {}),
     },
   });
+  // C2': the artifact adapter is built before the workspace adapter so the
+  // removal's fail-closed manifest gate reads through the same executors.
+  const attemptArtifact = new AttemptArtifactAdapter({
+    executor: roleExecutors.worktree,
+    executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+  });
   const workspace = new WorkspaceAdapter({
     executor: roleExecutors.worktree,
     executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
+    checkArtifactManifest: (request) => attemptArtifact.checkArtifactManifestForRemoval(request),
   });
   // Wraps the reviewed `ocm-run` runner subprocess. The bundled repository
   // script is the default; the worktree locator is resolved from the recorded
@@ -226,10 +233,6 @@ export function composeExecutionHosts(input: ComposeExecutionHostsInput) {
   const runnerSelector = new RunnerSelectorAdapter({
     hosts: installationModel?.hosts,
     implementedRunnerKinds: agyRunner === undefined ? ['opencode'] : ['opencode', 'agy'],
-  });
-  const attemptArtifact = new AttemptArtifactAdapter({
-    executor: roleExecutors.worktree,
-    executorForRecordedHost: (recorded) => executorForHost.executorForRecordedHost(recorded),
   });
   // KF-15b: the usage read asks the opencode server that ran the session
   // (`ocm-run --usage`) over the route a review of the same attempt dials: the

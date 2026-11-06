@@ -208,10 +208,16 @@ describe('daemon tick (DT10b)', () => {
 
     expect(result.code).toBe(0);
     const json = lastJson(result.out);
-    expect(json).toMatchObject({ outcome: 'completed', exitCode: 0, paused: false, forgeReachable: true, jobCount: 2, repositoryCount: 2 });
+    expect(json).toMatchObject({ outcome: 'completed', exitCode: 0, paused: false, forgeReachable: true, jobCount: 4, repositoryCount: 2 });
     expect(String(json.tickId)).toMatch(TICK_OK);
+    // CO8: each repository also gets its shadow chain-refresh job.
     expect((json.jobs as Array<{ jobId: string }>).map((job) => job.jobId).sort()).toEqual(
-      [`merge-pass:${digestOf(REPO_A)}`, `merge-pass:${digestOf(REPO_B)}`].sort(),
+      [
+        `merge-pass:${digestOf(REPO_A)}`,
+        `merge-pass:${digestOf(REPO_B)}`,
+        `chain-refresh:${digestOf(REPO_A)}`,
+        `chain-refresh:${digestOf(REPO_B)}`,
+      ].sort(),
     );
     // The leases were taken and released: nothing is held afterwards.
     for (const repo of [REPO_A, REPO_B]) {
@@ -459,7 +465,7 @@ describe('daemon pause and resume (DT10b)', () => {
     const resumed = await run(h.runtime, ['daemon', 'resume']);
     expect(lastJson(resumed.out)).toMatchObject({ outcome: 'recorded', paused: false });
     const again = await run(h.runtime, ['daemon', 'tick']);
-    expect(lastJson(again.out)).toMatchObject({ paused: false, jobCount: 2 });
+    expect(lastJson(again.out)).toMatchObject({ paused: false, jobCount: 4 });
   });
 
   it('pause and resume still succeed when FLEET_INSTALLATION_FILE is invalid, and nothing echoes the path', async () => {

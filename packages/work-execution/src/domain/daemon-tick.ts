@@ -57,6 +57,13 @@ export type ParsedDaemonJobId =
       readonly touchesForge: true;
     }
   | {
+      readonly kind: 'chain-refresh';
+      readonly jobId: string;
+      readonly repoDigest: string;
+      readonly leaseScope: string;
+      readonly touchesForge: true;
+    }
+  | {
       readonly kind: 'notifier';
       readonly jobId: 'notifier';
       readonly leaseScope: 'notifier';
@@ -302,6 +309,14 @@ export function mergePassJobId(repoDigest: string): string | null {
   return `merge-pass:${repoDigest}`;
 }
 
+/** The chain-refresh job id of a repository digest (lane CO8): `chain-refresh:<repoDigest>`. */
+export function chainRefreshJobId(repoDigest: string): string | null {
+  if (!DAEMON_REPO_DIGEST_PATTERN.test(repoDigest)) {
+    return null;
+  }
+  return `chain-refresh:${repoDigest}`;
+}
+
 const NOTIFIER_JOB: ParsedDaemonJobId = Object.freeze({
   kind: 'notifier',
   jobId: 'notifier',
@@ -323,26 +338,43 @@ export function parseDaemonJobId(jobId: unknown): ParsedDaemonJobId | null {
   if (jobId === 'replan-digest') {
     return REPLAN_JOB;
   }
-  if (typeof jobId !== 'string' || !jobId.startsWith('merge-pass:')) {
+  if (typeof jobId !== 'string') {
     return null;
   }
-  const repoDigest = jobId.slice('merge-pass:'.length);
-  if (!DAEMON_REPO_DIGEST_PATTERN.test(repoDigest)) {
-    return null;
+  if (jobId.startsWith('merge-pass:')) {
+    const repoDigest = jobId.slice('merge-pass:'.length);
+    if (!DAEMON_REPO_DIGEST_PATTERN.test(repoDigest)) {
+      return null;
+    }
+    return Object.freeze({
+      kind: 'merge-pass',
+      jobId,
+      repoDigest,
+      leaseScope: `merge/${repoDigest}`,
+      touchesForge: true,
+    });
   }
-  return Object.freeze({
-    kind: 'merge-pass',
-    jobId,
-    repoDigest,
-    leaseScope: `merge/${repoDigest}`,
-    touchesForge: true,
-  });
+  if (jobId.startsWith('chain-refresh:')) {
+    const repoDigest = jobId.slice('chain-refresh:'.length);
+    if (!DAEMON_REPO_DIGEST_PATTERN.test(repoDigest)) {
+      return null;
+    }
+    return Object.freeze({
+      kind: 'chain-refresh',
+      jobId,
+      repoDigest,
+      leaseScope: `chain-refresh/${repoDigest}`,
+      touchesForge: true,
+    });
+  }
+  return null;
 }
 
 /**
- * True for `notifier`, `replan-digest`, `merge/<12 lowercase hex>`, or a cloud
- * `<org>/<repo>` scope whose segments are not `.` or `..` and which carries no
- * secret-shaped text. Never throws.
+ * True for `notifier`, `replan-digest`, `merge/<12 lowercase hex>`,
+ * `chain-refresh/<12 lowercase hex>`, or a cloud `<org>/<repo>` scope whose
+ * segments are not `.` or `..` and which carries no secret-shaped text. Never
+ * throws.
  */
 export function isValidDaemonLeaseScope(scope: unknown): scope is string {
   try {
@@ -353,6 +385,12 @@ export function isValidDaemonLeaseScope(scope: unknown): scope is string {
       return false;
     }
     if (scope.startsWith('merge/') && DAEMON_REPO_DIGEST_PATTERN.test(scope.slice('merge/'.length))) {
+      return true;
+    }
+    if (
+      scope.startsWith('chain-refresh/') &&
+      DAEMON_REPO_DIGEST_PATTERN.test(scope.slice('chain-refresh/'.length))
+    ) {
       return true;
     }
     if (!CLOUD_SCOPE_PATTERN.test(scope)) {
@@ -417,8 +455,8 @@ function compareMergePassJobs(
 /**
  * Deterministic tick order (plan §3.1): merge-pass jobs by `lastServedAtIso`
  * ascending from the previous status (never-served first, ties by digest),
- * then `notifier`, then `replan-digest`. Duplicates keep the first; unknown
- * ids drop; a given filter keeps only listed ids.
+ * then chain-refresh jobs by digest, then `notifier`, then `replan-digest`.
+ * Duplicates keep the first; unknown ids drop; a given filter keeps only listed ids.
  */
 export function orderDaemonJobs(
   candidates: readonly string[],
@@ -428,6 +466,7 @@ export function orderDaemonJobs(
   const filter = jobFilter === undefined ? null : new Set<string>(jobFilter);
   const seen = new Set<string>();
   const mergePass: Extract<ParsedDaemonJobId, { kind: 'merge-pass' }>[] = [];
+  const chainRefresh: Extract<ParsedDaemonJobId, { kind: 'chain-refresh' }>[] = [];
   let notifier: ParsedDaemonJobId | null = null;
   let replanDigest: ParsedDaemonJobId | null = null;
   for (const candidate of candidates) {
@@ -441,6 +480,8 @@ export function orderDaemonJobs(
     seen.add(parsed.jobId);
     if (parsed.kind === 'merge-pass') {
       mergePass.push(parsed);
+    } else if (parsed.kind === 'chain-refresh') {
+      chainRefresh.push(parsed);
     } else if (parsed.kind === 'notifier' && notifier === null) {
       notifier = parsed;
     } else if (parsed.kind === 'replan-digest' && replanDigest === null) {
@@ -449,6 +490,7 @@ export function orderDaemonJobs(
   }
   const lastServed = lastServedMap(previousStatus);
   const ordered: ParsedDaemonJobId[] = mergePass.sort((a, b) => compareMergePassJobs(a, b, lastServed));
+  ordered.push(...chainRefresh.sort((a, b) => byCodeUnit(a.repoDigest, b.repoDigest)));
   if (notifier !== null) {
     ordered.push(notifier);
   }

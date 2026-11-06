@@ -58,13 +58,63 @@ import {
   BOARD_BOUNDS,
   CONDUCTOR_MINUTE_BOUNDS,
   CONDUCTOR_REAPER_DISK_BOUNDS,
-  CONDUCTOR_REAPER_REPAIR_KINDS,
   CONDUCTOR_REAPER_WORKTREE_BOUNDS,
   DEFAULT_MERGE_DAEMON_POLICY,
   MERGE_POLICY_BOUNDS,
   parseMergeRepositoryKey,
 } from './policy.js';
 import { readOwnDataProperty } from './policy-read.js';
+import {
+  AGY_ACKNOWLEDGEMENT_KEYS,
+  AGY_HOST_RUNNER_KEYS,
+  AGY_ONLY_RUNNER_KEYS,
+  ANSWER_FILE_DECISIONS_KEYS,
+  AUTO_MERGE_KEYS,
+  BOARD_KEYS,
+  CAPABILITY_KEYS,
+  CHAIN_KEYS,
+  CHAIN_STEP_KEYS,
+  CLAIM_TRIAGE_CONSUMER_KEYS,
+  CONDUCTOR_KEYS,
+  CONDUCTOR_REAPER_DISK_KEYS,
+  CONDUCTOR_REAPER_KEYS,
+  CONDUCTOR_REAPER_REPAIR_KINDS,
+  CONDUCTOR_REAPER_WORKTREE_KEYS,
+  DAEMON_KEYS,
+  DECISION_CONSUMERS_KEYS,
+  FORBIDDEN_ROUTE_KEYS,
+  FORGE_KEYS,
+  GATE_SLOT_KEYS,
+  GITHUB_FORGE_KEYS,
+  GIT_SHELF_KEYS,
+  HOST_KEYS,
+  HOST_ROLES,
+  JEV_DECISIONS_KEYS,
+  KNOWLEDGE_RANKING_CONSUMER_KEYS,
+  LIVE_TAIL_KEYS,
+  LOCAL_SHELF_KEYS,
+  MERGE_KEYS,
+  MERGE_REPO_KEYS,
+  MERGE_VETO_KEYS,
+  NO_DECISIONS_KEYS,
+  NO_FORGE_KEYS,
+  POLICY_DAEMON_KEYS,
+  POLICY_KEYS,
+  PROCEDURE_COVERAGE_KEYS,
+  PROCEDURE_KEYS,
+  RUNNER_KEYS,
+  SEAT_KEYS,
+  SHELF_KEYS,
+  V1_ROOT_KEYS,
+  V2_ROOT_KEYS,
+  V2_SEAT_KEYS,
+  V2_VERIFICATION_KEYS,
+  VERIFICATION_KEYS,
+  WAVES_KEYS,
+  WORKTREE_KEYS,
+} from './keys.js';
+
+export { POLICY_KEYS };
 import { readTelemetryPolicyBlock } from './telemetry-policy.js';
 import { readSeatsPolicyBlock } from './seats-policy.js';
 
@@ -75,220 +125,15 @@ export type ParseResult =
 type JsonObject = { readonly [key: string]: unknown };
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 
-const V1_ROOT_KEYS: readonly string[] = [
-  'schemaVersion',
-  'runner',
-  'worktree',
-  'verification',
-  'forge',
-  'reviewer',
-  'waves',
-  'shelf',
-];
-const V2_ROOT_KEYS: readonly string[] = [
-  'schemaVersion',
-  'hosts',
-  'tools',
-  'seats',
-  'chains',
-  'policy',
-  'shelf',
-  'forge',
-  'verification',
-  'waves',
-  'decisions',
-  'daemon',
-];
-const RUNNER_KEYS: readonly string[] = [
-  'agent',
-  'model',
-  'variant',
-  'remotePort',
-  'host',
-  'ocmRunBin',
-  'fallbackChain',
-];
-const WORKTREE_KEYS: readonly string[] = ['sshHost'];
-const VERIFICATION_KEYS: readonly string[] = ['sshHost', 'procedures'];
-const V2_VERIFICATION_KEYS: readonly string[] = ['procedures'];
-const PROCEDURE_KEYS: readonly string[] = ['command', 'args', 'coverage'];
-const PROCEDURE_COVERAGE_KEYS: readonly string[] = [
-  'reader',
-  'unitKind',
-  'minUnits',
-];
 const READER_UNIT_KINDS: Readonly<Record<CoverageReaderName, CoverageUnitKind>> = {
   'vitest-summary': 'tests',
   'hexagen-lint-json': 'files',
   'eslint-json': 'files',
 };
-const FORGE_KEYS: readonly string[] = ['owner', 'repo'];
-const SEAT_KEYS: readonly string[] = ['agent', 'model', 'variant'];
-const WAVES_KEYS: readonly string[] = [
-  'baseUrl',
-  'tokenFile',
-  'caFile',
-  'ownerPublicKey',
-];
-const SHELF_KEYS: readonly string[] = ['baseUrl', 'keyFile'];
-const HOST_KEYS: readonly string[] = [
-  'transport',
-  'sshAlias',
-  'container',
-  'roleAliases',
-  'worktreeRoot',
-  'tmpDir',
-  'roles',
-  'runner',
-];
-const HOST_RUNNER_KEYS: readonly string[] = [
-  'kind',
-  'port',
-  'tunnelOffset',
-  'authFile',
-  'capabilities',
-  'maxLanes',
-  'gateSlot',
-];
-const GATE_SLOT_KEYS: readonly string[] = ['path', 'slots'];
-// An agy runner carries the mode and, for `full`, the security acknowledgement (D7).
-const AGY_HOST_RUNNER_KEYS: readonly string[] = [
-  ...HOST_RUNNER_KEYS,
-  'agyMode',
-  'agyAcknowledgement',
-];
-const AGY_ACKNOWLEDGEMENT_KEYS: readonly string[] = [
-  'textVersion',
-  'acceptedAt',
-];
-const CAPABILITY_KEYS: readonly string[] = [
-  'networkEgressRestricted',
-  'cpuAndMemoryLimited',
-  'processTreeTermination',
-  'filesystemScope',
-];
-const V2_SEAT_KEYS: readonly string[] = [
-  'id',
-  'tool',
-  'model',
-  'variant',
-  'agent',
-  'roles',
-  'costClass',
-  'health',
-];
-const CHAIN_KEYS: readonly (keyof ChainsSection)[] = [
-  'implementer',
-  'reviewer',
-  'high-risk-reviewer',
-  'fix',
-];
-const CHAIN_STEP_KEYS: readonly string[] = ['seatId', 'triggers'];
-export const POLICY_KEYS: readonly string[] = [
-  'forbiddenRoutes',
-  'perLaneCostCeiling',
-  'useFreeSeats',
-  'liveTail',
-  'autoMerge',
-  'conductor',
-  'board',
-  'telemetry',
-  'seats',
-  'merge',
-  'daemon',
-];
-const FORBIDDEN_ROUTE_KEYS: readonly string[] = ['tool', 'modelPattern'];
-const LIVE_TAIL_KEYS: readonly string[] = ['content'];
-const AUTO_MERGE_KEYS: readonly string[] = ['enabled', 'allowHighRisk', 'onBlocked'];
-const CONDUCTOR_KEYS: readonly string[] = ['enabled', 'stopGraceMinutes', 'reaper'];
-const MERGE_KEYS: readonly string[] = ['repos'];
-const MERGE_REPO_KEYS: readonly string[] = [
-  'projectId',
-  'shadow',
-  'unattended',
-  'requiredContexts',
-  'updateBranch',
-  'macosProcedure',
-  'maxAttempts',
-  'checksGraceMinutes',
-  'veto',
-];
-const MERGE_VETO_KEYS: readonly string[] = ['mode', 'holdConfidence'];
-const POLICY_DAEMON_KEYS: readonly string[] = ['intervalSeconds', 'budgetSeconds', 'settleSeconds'];
-const BOARD_KEYS: readonly string[] = ['forgeStaleMinutes', 'declarationTtlMinutes', 'doneWindowDays', 'forgeSyncMinutes'];
-const CONDUCTOR_REAPER_KEYS: readonly string[] = [
-  'enabled',
-  'intervalMinutes',
-  'graceMinutes',
-  'staleStopMinutes',
-  'repairs',
-  'worktrees',
-  'disk',
-];
-const CONDUCTOR_REAPER_WORKTREE_KEYS: readonly string[] = [
-  'retentionHours',
-  'maxRemovalsPerPass',
-  'passBudgetSeconds',
-];
-const CONDUCTOR_REAPER_DISK_KEYS: readonly string[] = [
-  'minFreePercent',
-  'clearFreePercent',
-];
-const GIT_SHELF_KEYS: readonly string[] = [
-  'provider',
-  'repoDir',
-  'branch',
-  'pathPrefix',
-];
-const GITHUB_FORGE_KEYS: readonly string[] = ['mode', 'owner', 'repo'];
-const NO_DECISIONS_KEYS: readonly string[] = ['provider'];
-const JEV_DECISIONS_KEYS: readonly string[] = [
-  'provider',
-  'model',
-  'keyFile',
-  'minConfidence',
-  'monthlyBudgetUsd',
-  'assumedCostPerCallUsd',
-  'acknowledgeProseLeavesHost',
-  'disabledProjects',
-  'consumers',
-];
-const ANSWER_FILE_DECISIONS_KEYS: readonly string[] = [
-  'provider',
-  'answerFile',
-  'consumers',
-];
-const DAEMON_KEYS: readonly string[] = [
-  'nodePath',
-  'cliPath',
-  'stateDir',
-  'unitDir',
-  'installationFile',
-];
 // Credential shapes a daemon field never carries: the raw string is checked
 // (the value is never echoed), so a prefix anywhere in it refuses the path.
 const DAEMON_CREDENTIAL_PATTERN =
   /ghp_|github_pat_|sk-|AKIA|PRIVATE KEY|xox[barps]-/;
-// Per-consumer settings (K3): two known consumers, each with its own keys.
-const DECISION_CONSUMERS_KEYS: readonly (keyof DecisionConsumers)[] = [
-  'knowledge-ranking',
-  'claim-triage',
-];
-const KNOWLEDGE_RANKING_CONSUMER_KEYS: readonly string[] = [
-  'minConfidence',
-  'monthlyBudgetUsd',
-];
-const CLAIM_TRIAGE_CONSUMER_KEYS: readonly string[] = [
-  'minConfidence',
-  'monthlyBudgetUsd',
-  'acknowledgeCandidateClaimsLeaveHost',
-];
-
-const HOST_ROLES: readonly HostRole[] = [
-  'orchestrator',
-  'lane-runner',
-  'verifier',
-];
 const SEAT_ROLES: readonly SeatRole[] = [
   'implementer',
   'reviewer',
@@ -1258,7 +1103,7 @@ function parseHostRunner(
   );
   // The agy-only fields are unknown keys on an opencode runner (D7).
   if (kind === 'opencode') {
-    for (const agyOnlyKey of ['agyMode', 'agyAcknowledgement']) {
+    for (const agyOnlyKey of AGY_ONLY_RUNNER_KEYS) {
       if (Object.hasOwn(runner, agyOnlyKey)) {
         errors.push(`${runnerPath}: unknown key`);
       }
@@ -2543,7 +2388,10 @@ function readMergeRequiredContexts(
   const contexts: string[] = [];
   let valid = true;
   for (let index = 0; index < value.length; index += 1) {
-    const entry: unknown = value[index];
+    const entry: unknown = readOwnDataProperty(
+      value as unknown as Record<string, unknown>,
+      String(index),
+    );
     if (typeof entry !== 'string') {
       errors.push(`${field}[${index}]: must be a string`);
       valid = false;
@@ -2824,7 +2672,7 @@ function parseV2Shelf(
   }
   const provider = section.provider;
   if (provider === 'local') {
-    collectUnknownKeys(section, ['provider'], 'shelf', errors);
+    collectUnknownKeys(section, LOCAL_SHELF_KEYS, 'shelf', errors);
     return { provider: 'local' };
   }
   if (provider === 'git') {
@@ -2883,7 +2731,7 @@ function parseV2Forge(
   }
   const mode = section.mode;
   if (mode === 'none') {
-    collectUnknownKeys(section, ['mode'], 'forge', errors);
+    collectUnknownKeys(section, NO_FORGE_KEYS, 'forge', errors);
     return { mode: 'none' };
   }
   if (mode === 'github') {
@@ -3309,16 +3157,20 @@ function parseV2Verification(
  * D6) hold.
  */
 export function parseInstallation(value: unknown): ParseResult {
-  if (!isJsonObject(value)) {
-    return { ok: false, errors: ['installation: must be an object'] };
+  try {
+    if (!isJsonObject(value)) {
+      return { ok: false, errors: ['installation: must be an object'] };
+    }
+    // Read the discriminator through the record's own data property so a
+    // getter never runs.
+    const version = readOwnDataProperty(value, 'schemaVersion');
+    if (version === 2) {
+      return parseInstallationV2(value);
+    }
+    return parseInstallationV1(value);
+  } catch {
+    return { ok: false, errors: ['installation: unreadable'] };
   }
-  // Read the discriminator through the record's own data property so a
-  // getter never runs.
-  const version = readOwnDataProperty(value, 'schemaVersion');
-  if (version === 2) {
-    return parseInstallationV2(value);
-  }
-  return parseInstallationV1(value);
 }
 
 function parseInstallationV1(value: JsonObject): ParseResult {

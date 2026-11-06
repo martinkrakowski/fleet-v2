@@ -42,6 +42,10 @@ import {
   duplicateMergeQueueIdentityListError,
   parseMergeQueueStateRecord,
 } from './MergeQueueRepositoryAdapter.adapter.js';
+import {
+  mergeRecordListError,
+  parseVersionedMergeRecordStateRecord,
+} from './MergeRecordRepositoryAdapter.adapter.js';
 
 /** A single-record inspection that preserves the daemon readers' unknown-version refusal. */
 function inspectSingleDaemonStatusRecord(raw: unknown): SingleRecordInspection<DaemonStatusRecord> {
@@ -114,4 +118,5 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
     duplicateSeatTicketKeyListError,
   ),
   describeVersionedRecordListStore('seat-observations.json', parseVersionedSeatObservationStateRecord),
+  describeVersionedRecordListStore('merge-records.json', parseVersionedMergeRecordStateRecord, mergeRecordListError),
 ];

@@ -113,6 +113,26 @@ function passingHostCanned(
   };
 }
 
+/**
+ * Canned responses for a host clone that answers, plus the generator files.
+ * The specific `cat`/`test` markers must come before the generic `test -d`
+ * marker: the fake matches the first marker that is a substring of the argv.
+ */
+function generatorHostCanned(
+  path: string,
+  files: Readonly<Record<string, Partial<CommandRunResult>>>,
+): Readonly<Record<string, Partial<CommandRunResult>>> {
+  return {
+    'rev-parse --show-toplevel': { exitCode: 0, stdout: `${path}\n` },
+    'remote get-url origin': { exitCode: 0, stdout: `${REPO}.git\n` },
+    'check-ignore -q .lane/probe.md': { exitCode: 0 },
+    'ls-files --error-unmatch AGENTS.md': { exitCode: 0 },
+    'cat-file blob HEAD:package.json': { exitCode: 0, stdout: '{}' },
+    ...files,
+    'test -d': { exitCode: 0 },
+  };
+}
+
 function makeAdapter(
   orchestrator: CommandExecutorPort,
   hosts: HostExecutorMap,
@@ -198,6 +218,11 @@ describe('ProjectProbeAdapter', () => {
       ['git', ...EXPECTED_GIT_HARDENING, '-C', '--git-dir=/x', 'check-ignore', '-q', '.lane/probe.md'],
       ['git', ...EXPECTED_GIT_HARDENING, '-C', '--git-dir=/x', 'ls-files', '--error-unmatch', 'AGENTS.md'],
       ['git', ...EXPECTED_GIT_HARDENING, '-C', '--git-dir=/x', 'cat-file', 'blob', 'HEAD:package.json'],
+      ['cat', '--git-dir=/x/.architecture/manifest.yaml'],
+      ['cat', '--git-dir=/x/.architecture/generator.config.yaml'],
+      ['cat', '--git-dir=/x/package.json'],
+      ['test', '-e', '--git-dir=/x/.architecture/layout.yaml'],
+      ['test', '-d', '--git-dir=/x/.hexagen'],
     ]);
   });
 
@@ -764,8 +789,20 @@ describe('ProjectProbeAdapter', () => {
           );
         } else if (call.argv[0] === 'sh') {
           expect(call.argv).toEqual(physicalPathArgv(call.argv[4]!));
+        } else if (call.argv[0] === 'cat') {
+          // The generator-state file reads: paths under the clone.
+          expect(call.argv[1]).toMatch(/^\/lanes\/[ab]\//);
+        } else if (call.argv[0] === 'test') {
+          const target = call.argv[2]!;
+          expect(
+            target === worktreeRoot ||
+              target === '/lanes/a/.hexagen' ||
+              target === '/lanes/b/.hexagen' ||
+              target === '/lanes/a/.architecture/layout.yaml' ||
+              target === '/lanes/b/.architecture/layout.yaml',
+          ).toBe(true);
         } else {
-          expect(call.argv).toEqual(['test', '-d', worktreeRoot]);
+          throw new Error(`unexpected command ${call.argv[0]}`);
         }
         expect(call.options?.env).toBeUndefined();
       }
@@ -794,4 +831,146 @@ describe('ProjectProbeAdapter', () => {
       expect(orch.calls.some((c) => c.argv.includes('ls-remote'))).toBe(true);
     },
   );
+
+  it('records a legacy generator state from the manifest and the package pin', async () => {
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
+    });
+    const hostA = fakeExecutor(
+      generatorHostCanned('/lanes/a', {
+        'cat /lanes/a/.architecture/manifest.yaml': {
+          exitCode: 0,
+          stdout: 'schemaVersion: 1\nversion: "0.1.0"\ngenerator:\n  version: "0.14.0"\n',
+        },
+        'cat /lanes/a/.architecture/generator.config.yaml': { exitCode: 1 },
+        'cat /lanes/a/package.json': {
+          exitCode: 0,
+          stdout: '{"devDependencies":{"@hexagen-monaco/sync":"0.16.0"}}',
+        },
+        'test -e /lanes/a/.architecture/layout.yaml': { exitCode: 1 },
+        'test -d /lanes/a/.hexagen': { exitCode: 1 },
+      }),
+    );
+    const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
+
+    const report = await adapter.probe({
+      repository: REPO,
+      clones: { a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' } },
+    });
+
+    expect(report.generatorState).toEqual({
+      state: 'provisioned-legacy',
+      generatorVersion: '0.14.0',
+      pinnedVersion: '0.16.0',
+    });
+    const calls = hostA.calls.map((call) => call.argv);
+    expect(calls).toContainEqual(['cat', '/lanes/a/.architecture/manifest.yaml']);
+    expect(calls).toContainEqual(['cat', '/lanes/a/.architecture/generator.config.yaml']);
+    expect(calls).toContainEqual(['cat', '/lanes/a/package.json']);
+    expect(calls).toContainEqual(['test', '-e', '/lanes/a/.architecture/layout.yaml']);
+    expect(calls).toContainEqual(['test', '-d', '/lanes/a/.hexagen']);
+    expect(calls.join(' ')).not.toContain('hexagen ');
+  });
+
+  it('records a provisioned state when the manifest names the generator and carries a schema version', async () => {
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
+    });
+    const hostA = fakeExecutor(
+      generatorHostCanned('/lanes/a', {
+        'cat /lanes/a/.architecture/manifest.yaml': {
+          exitCode: 0,
+          stdout: 'schemaVersion: 1\ngenerator:\n  name: "@hexagen-monaco/sync"\n  version: "0.16.0"\n',
+        },
+        'cat /lanes/a/.architecture/generator.config.yaml': { exitCode: 1 },
+        'cat /lanes/a/package.json': {
+          exitCode: 0,
+          stdout: '{"devDependencies":{"@hexagen-monaco/sync":"0.16.0"}}',
+        },
+        'test -e /lanes/a/.architecture/layout.yaml': { exitCode: 1 },
+        'test -d /lanes/a/.hexagen': { exitCode: 1 },
+      }),
+    );
+    const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
+
+    const report = await adapter.probe({
+      repository: REPO,
+      clones: { a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' } },
+    });
+
+    expect(report.generatorState).toEqual({
+      state: 'provisioned',
+      generatorVersion: '0.16.0',
+      pinnedVersion: '0.16.0',
+    });
+  });
+
+  it('records an adopting state when there is no manifest but an adoption marker is present', async () => {
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
+    });
+    const hostA = fakeExecutor(
+      generatorHostCanned('/lanes/a', {
+        cat: { exitCode: 1 },
+        'test -e /lanes/a/.architecture/layout.yaml': { exitCode: 0 },
+      }),
+    );
+    const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
+
+    const report = await adapter.probe({
+      repository: REPO,
+      clones: { a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' } },
+    });
+
+    expect(report.generatorState).toEqual({
+      state: 'adopting',
+      generatorVersion: null,
+      pinnedVersion: null,
+    });
+  });
+
+  it('records a none state for a clone that holds no generator markers', async () => {
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
+    });
+    const hostA = fakeExecutor({
+      'rev-parse --show-toplevel': { exitCode: 0, stdout: '/lanes/a\n' },
+      'remote get-url origin': { exitCode: 0, stdout: `${REPO}.git\n` },
+      'check-ignore -q .lane/probe.md': { exitCode: 0 },
+      'ls-files --error-unmatch AGENTS.md': { exitCode: 0 },
+      'cat-file blob HEAD:package.json': { exitCode: 0, stdout: '{}' },
+      cat: { exitCode: 1 },
+      test: { exitCode: 1 },
+    });
+    const adapter = makeAdapter(orch.executor, { a: { executor: hostA.executor } });
+
+    const report = await adapter.probe({
+      repository: REPO,
+      clones: { a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' } },
+    });
+
+    expect(report.generatorState).toEqual({
+      state: 'none',
+      generatorVersion: null,
+      pinnedVersion: null,
+    });
+  });
+
+  it('leaves the state absent when no clone answered', async () => {
+    const orch = fakeExecutor({
+      'ls-remote --symref': { exitCode: 0, stdout: SYMREF_STDOUT },
+    });
+    const adapter = new ProjectProbeAdapter({
+      orchestrator: orch.executor,
+      executorForHost: () => ({ ok: false, reason: 'host not installed' }),
+      now: () => NOW,
+    });
+
+    const report = await adapter.probe({
+      repository: REPO,
+      clones: { a: { path: '/lanes/a', worktreeRoot: '/lanes/a-root' } },
+    });
+
+    expect(report.generatorState).toBeUndefined();
+  });
 });

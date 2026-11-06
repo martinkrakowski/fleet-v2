@@ -942,3 +942,95 @@ describe('RunDaemonTickUseCase (DT10a)', () => {
     expect(malformed.status?.jobs[0]).toMatchObject({ outcome: 'refused', reasonCode: 'merge-pass-malformed' });
   });
 });
+
+describe('RunDaemonTickUseCase (DT10b): interval, settle and input bounds', () => {
+  function staleStatus(finishedAtIso: string): DaemonStatusRecord {
+    const built = buildDaemonStatusRecord({
+      tickId: TICK_A,
+      startedAtIso: finishedAtIso,
+      finishedAtIso,
+      paused: false,
+      halted: false,
+      forgeReachable: true,
+      jobs: [],
+      repositories: [],
+      notifierCursor: null,
+    });
+    if (!built.ok) {
+      throw new Error('fixture status must build');
+    }
+    return built.record;
+  }
+
+  it('settleSeconds is forwarded: a stale status settles for settleSeconds, 0 skips the sleep', async () => {
+    // 10 minutes before NOW is far beyond three 60 s intervals.
+    const previous = staleStatus('2026-11-01T11:50:00.000Z');
+    const withSettle = makeHarness({ previousStatus: previous });
+    await withSettle.run({ repositories: [repoRef(DIGEST_A)], settleSeconds: 7 });
+    expect(withSettle.sleeps).toEqual([7_000]);
+
+    const zero = makeHarness({ previousStatus: previous });
+    const result = await zero.run({ repositories: [repoRef(DIGEST_A)], settleSeconds: 0 });
+    expect(result.outcome).toBe('completed');
+    expect(zero.sleeps).toEqual([]);
+  });
+
+  it('intervalSeconds governs staleness: 120 s keeps a 5-minute-old status fresh, the default does not', async () => {
+    const previous = staleStatus('2026-11-01T11:55:00.000Z');
+    const wide = makeHarness({ previousStatus: previous });
+    await wide.run({ repositories: [repoRef(DIGEST_A)], intervalSeconds: 120, settleSeconds: 9 });
+    expect(wide.sleeps).toEqual([]);
+
+    const narrow = makeHarness({ previousStatus: previous });
+    await narrow.run({ repositories: [repoRef(DIGEST_A)], settleSeconds: 9 });
+    expect(narrow.sleeps).toEqual([9_000]);
+  });
+
+  it('refuses an invalid interval or settle without calling any port', async () => {
+    for (const bad of [0, 3601, 1.5, Number.NaN, '60' as unknown as number]) {
+      const h = makeHarness();
+      const result = await h.run({ intervalSeconds: bad });
+      expect(result).toMatchObject({ outcome: 'refused', reasonCode: 'invalid-interval' });
+      expect(h.status.writes).toHaveLength(0);
+    }
+    for (const bad of [-1, 601, 0.5, Number.POSITIVE_INFINITY, '5' as unknown as number]) {
+      const h = makeHarness();
+      const result = await h.run({ settleSeconds: bad });
+      expect(result).toMatchObject({ outcome: 'refused', reasonCode: 'invalid-settle' });
+      expect(h.status.writes).toHaveLength(0);
+    }
+  });
+
+  it('refuses sparse or oversized repositories and job filters cleanly', async () => {
+    // eslint-disable-next-line no-sparse-arrays
+    const sparseRepositories = [repoRef(DIGEST_A), , repoRef(DIGEST_B)] as unknown as DaemonRepositoryRef[];
+    const sparse = await makeHarness().run({ repositories: sparseRepositories });
+    expect(sparse).toMatchObject({ outcome: 'refused', reasonCode: 'invalid-repository' });
+
+    const many = Array.from({ length: 65 }, (_, index) =>
+      repoRef(index.toString(16).padStart(12, '0'), { repo: `repo-${index}` }),
+    );
+    const tooMany = await makeHarness().run({ repositories: many });
+    expect(tooMany).toMatchObject({ outcome: 'refused', reasonCode: 'invalid-repositories' });
+
+    // eslint-disable-next-line no-sparse-arrays
+    const sparseFilter = [`merge-pass:${DIGEST_A}`, , `merge-pass:${DIGEST_B}`] as unknown as string[];
+    expect(await makeHarness().run({ jobFilter: sparseFilter })).toMatchObject({
+      outcome: 'refused',
+      reasonCode: 'invalid-job-filter',
+    });
+    const bigFilter = Array.from({ length: 65 }, () => `merge-pass:${DIGEST_A}`);
+    expect(await makeHarness().run({ jobFilter: bigFilter })).toMatchObject({
+      outcome: 'refused',
+      reasonCode: 'invalid-job-filter',
+    });
+    expect(await makeHarness().run({ jobFilter: ['x'.repeat(65)] })).toMatchObject({
+      outcome: 'refused',
+      reasonCode: 'invalid-job-filter',
+    });
+    expect(await makeHarness().run({ jobFilter: [''] })).toMatchObject({
+      outcome: 'refused',
+      reasonCode: 'invalid-job-filter',
+    });
+  });
+});

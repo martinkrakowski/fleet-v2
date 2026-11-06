@@ -77,6 +77,13 @@ import type { RunMergePassPort, RunMergePassResult } from '../ports/in/RunMergeP
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 
+/** Input bounds: a larger or sparse input is refused before any port is called. */
+const MAX_REPOSITORIES = 64;
+const MAX_JOB_FILTER_ITEMS = 64;
+const MAX_JOB_ID_LENGTH = 64;
+const MAX_INTERVAL_SECONDS = 3_600;
+const MAX_SETTLE_SECONDS = 600;
+
 /** The production sleep: a `setTimeout` promise. Tests inject a fake instead. */
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -375,6 +382,8 @@ interface ValidTickRequest {
   readonly tickId: string;
   readonly repositories: readonly DaemonRepositoryRef[];
   readonly budgetSeconds: number;
+  readonly intervalSeconds: number | undefined;
+  readonly settleSeconds: number | undefined;
   readonly jobFilter: readonly string[] | undefined;
   readonly forgeReachable: boolean;
 }
@@ -384,12 +393,16 @@ type TickRequestCheck =
   | { readonly ok: false; readonly tickId: string; readonly reasonCode: string };
 
 function checkRepositories(value: unknown): string | null {
-  if (!Array.isArray(value)) {
+  if (!Array.isArray(value) || value.length > MAX_REPOSITORIES) {
     return 'invalid-repositories';
   }
   const digests = new Set<string>();
   const names = new Set<string>();
-  for (const repository of value as readonly unknown[]) {
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.hasOwn(value, index)) {
+      return 'invalid-repository';
+    }
+    const repository: unknown = value[index];
     if (!isUsableRepository(repository)) {
       return 'invalid-repository';
     }
@@ -409,8 +422,28 @@ function isValidBudgetSeconds(value: unknown): value is number {
   );
 }
 
+function isValidInterval(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= MAX_INTERVAL_SECONDS;
+}
+
+function isValidSettle(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= MAX_SETTLE_SECONDS;
+}
+
 function isValidJobFilter(value: unknown): value is readonly string[] | undefined {
-  return value === undefined || (Array.isArray(value) && value.every((item) => typeof item === 'string'));
+  if (value === undefined) {
+    return true;
+  }
+  if (!Array.isArray(value) || value.length > MAX_JOB_FILTER_ITEMS) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const item: unknown = Object.hasOwn(value, index) ? value[index] : undefined;
+    if (typeof item !== 'string' || item.length === 0 || item.length > MAX_JOB_ID_LENGTH) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Validates the whole runtime request; the first failing field names the refusal. */
@@ -431,6 +464,12 @@ function checkTickRequest(raw: unknown): TickRequestCheck {
   if (repositoryProblem !== null) {
     return refuse(repositoryProblem);
   }
+  if (raw.intervalSeconds !== undefined && !isValidInterval(raw.intervalSeconds)) {
+    return refuse('invalid-interval');
+  }
+  if (raw.settleSeconds !== undefined && !isValidSettle(raw.settleSeconds)) {
+    return refuse('invalid-settle');
+  }
   if (!isValidJobFilter(raw.jobFilter)) {
     return refuse('invalid-job-filter');
   }
@@ -443,6 +482,8 @@ function checkTickRequest(raw: unknown): TickRequestCheck {
       tickId,
       repositories: raw.repositories as readonly DaemonRepositoryRef[],
       budgetSeconds,
+      intervalSeconds: raw.intervalSeconds as number | undefined,
+      settleSeconds: raw.settleSeconds as number | undefined,
       jobFilter: raw.jobFilter,
       forgeReachable: raw.forgeReachable,
     },
@@ -565,6 +606,8 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       halt,
       forgeReachable,
       nowIso: ctx.nowIso,
+      intervalSeconds: ctx.request.intervalSeconds,
+      settleSeconds: ctx.request.settleSeconds,
       jobFilter: ctx.request.jobFilter,
     });
   }

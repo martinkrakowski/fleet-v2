@@ -28,6 +28,10 @@ export interface RunDaemonTickRequest {
   readonly repositories: readonly DaemonRepositoryRef[];
   /** The tick's budget in seconds (default 45). */
   readonly budgetSeconds?: number;
+  /** The tick interval in seconds, `1..3600` (default 60); it governs when a status counts as stale and a wake settles. */
+  readonly intervalSeconds?: number;
+  /** The wake settle delay in seconds, `0..600` (default 20). */
+  readonly settleSeconds?: number;
   /** Only these job ids run (`--job`); absent runs every job. */
   readonly jobFilter?: readonly string[];
   /**
@@ -59,7 +63,7 @@ export interface RunDaemonTickResult {
    * The refusal reason when `outcome` is `refused`: `invalid-request`,
    * `invalid-tick-id`, `invalid-budget`, `invalid-repositories`,
    * `invalid-repository`, `duplicate-repository`, `invalid-job-filter`,
-   * `forge-probe-missing`, `invalid-clock`, `status-unreadable`,
+   * `invalid-interval`, `invalid-settle`, `forge-probe-missing`, `invalid-clock`, `status-unreadable`,
    * `status-write-failed`, or `tick-failed` (the last-resort guard).
    */
   readonly reasonCode?: string;

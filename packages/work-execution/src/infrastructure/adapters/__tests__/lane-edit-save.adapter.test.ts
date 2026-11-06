@@ -267,7 +267,7 @@ describe('LaneEditSaveAdapter', () => {
       const git = argv.indexOf('git');
       expect(argv.slice(1, 4)).toEqual(['GIT_ALLOW_PROTOCOL=none', 'GIT_NO_LAZY_FETCH=1', 'GIT_TERMINAL_PROMPT=0']);
       expect(argv).toContain('GIT_ATTR_NOSYSTEM=1');
-      for (const guard of ['GIT_CONFIG_NOSYSTEM=1', 'GIT_CONFIG_GLOBAL=/dev/null', 'GIT_CONFIG_SYSTEM=/dev/null']) {
+      for (const guard of ['GIT_CONFIG_NOSYSTEM=1', 'GIT_CONFIG_GLOBAL=/dev/null', 'GIT_CONFIG_SYSTEM=/dev/null', 'GIT_CONFIG_COUNT=0', 'GIT_CONFIG_PARAMETERS=']) {
         expect(argv.slice(0, git)).toContain(guard);
       }
       const config = argv.slice(git + 1, argv.indexOf('-C'));
@@ -522,6 +522,33 @@ describe('LaneEditSaveAdapter', () => {
       git(clone, ['config', 'filter.x.clean', `touch ${marker}; cat`]);
       const result = await new LaneEditSaveAdapter(new LocalExecutor()).saveLaneEdits(realRequest(clone, worktree));
       expect(result).toEqual({ outcome: 'refused', reason: 'unreadable-tree' });
+      expect(fs.existsSync(marker)).toBe(false);
+    });
+
+    it('an inherited GIT_CONFIG_COUNT filter driver is neutralised: git never sees it, so it never runs', async (context) => {
+      needGit(context);
+      const { clone, worktree } = setup();
+      const marker = path.join(path.dirname(clone), 'filter-ran');
+      const filterProbes: string[] = [];
+      const local = new LocalExecutor();
+      const recording: CommandExecutorPort = {
+        async run(argv, options) {
+          // The executor's environment carries a command-scope filter driver, as an ssh executor's login shell could.
+          const inherited = {
+            ...process.env,
+            GIT_CONFIG_COUNT: '1',
+            GIT_CONFIG_KEY_0: 'filter.x.clean',
+            GIT_CONFIG_VALUE_0: `touch ${marker}; cat`,
+          } as Record<string, string>;
+          const result = await local.run(argv, { ...options, env: inherited });
+          if (argv.includes('--get-regexp')) filterProbes.push(result.stdout);
+          return result;
+        },
+      };
+      const result = await new LaneEditSaveAdapter(recording).saveLaneEdits(realRequest(clone, worktree));
+      expect(result).toMatchObject({ outcome: 'saved' });
+      expect(filterProbes.length).toBe(1);
+      expect(/filter\.x\./.test(filterProbes.join(''))).toBe(false);
       expect(fs.existsSync(marker)).toBe(false);
     });
 

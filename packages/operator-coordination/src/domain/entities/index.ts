@@ -7,5 +7,6 @@ export * from "./OrchestratorRequest.js";
 export * from "./OrchestratorSession.js";
 export * from "./OwnerItem.js";
 export * from "./OwnerQuestion.js";
+export * from "./PermissionRequest.js";
 export * from "./ProjectProfile.js";
 export * from "./RelayAcknowledgement.js";

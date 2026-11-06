@@ -506,6 +506,7 @@ describe('LaneEditSaveAdapter', () => {
       needGit(context);
       const { clone, worktree } = setup();
       fs.mkdirSync(path.join(clone, '.git', 'info'), { recursive: true });
+      fs.writeFileSync(path.join(clone, '.git', 'info', 'attributes'), '* filter=x\n');
       const marker = path.join(path.dirname(clone), 'filter-ran');
       git(clone, ['config', 'filter.x.clean', `touch ${marker}; cat`]);
       const result = await new LaneEditSaveAdapter(new LocalExecutor()).saveLaneEdits(realRequest(clone, worktree));

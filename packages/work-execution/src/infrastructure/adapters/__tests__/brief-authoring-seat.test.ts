@@ -264,7 +264,7 @@ describe('BriefAuthoringAdapter seat session', () => {
 
   it('a briefsDir with a dot-dot segment is refused', async () => {
     const s = await setup();
-    const request = { ...s.request, briefsDir: path.join(s.root, 'elsewhere', '..', 'briefs') };
+    const request = { ...s.request, briefsDir: `${s.root}/elsewhere/../briefs` };
     const result = await adapterFor(s.executor).authorBriefSession(request);
     expect(result).toEqual({ outcome: 'unavailable', reason: 'session-command-invalid' });
     expect(s.executor.calls).toHaveLength(0);

@@ -3,7 +3,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { withFileLock } from './file-store.js';
+import {
+  ReadOnlyStateStoreError,
+  withFileLock,
+} from './file-store.js';
 import { emptyTelemetryDispositionRecord } from '../../domain/run-telemetry-dispositions.js';
 import {
   TelemetryDispositionAdapter,
@@ -284,6 +287,54 @@ describe('TelemetryDispositionAdapter file mode details', () => {
     await release;
 
     expect(await fs.readFile(file, 'utf8')).toBe(before);
+  });
+
+  it('a read-only store never writes, locks or quarantines anything', async () => {
+    const garbage = '{not json CANARY-bytes';
+    const file = path.join(tempDir, 'telemetry-dispositions.json');
+    await fs.writeFile(file, garbage, 'utf8');
+    const before = await fs.readdir(tempDir, { recursive: true });
+    const readOnly = new TelemetryDispositionAdapter({ stateDir: tempDir, readOnly: true });
+
+    // An unreadable file reads `unreadable` with no quarantine copy: the
+    // state dir keeps its exact bytes and names, nothing is created.
+    expect(await readOnly.read()).toEqual({ outcome: 'unreadable' });
+    expect(await fs.readFile(file, 'utf8')).toBe(garbage);
+    expect(await fs.readdir(tempDir, { recursive: true })).toEqual(before);
+
+    // A writable store still quarantines the same bytes.
+    const writable = new TelemetryDispositionAdapter({ stateDir: tempDir });
+    expect(await writable.read()).toEqual({ outcome: 'unreadable' });
+    const quarantineDir = path.join(tempDir, 'quarantine');
+    expect((await fs.readdir(quarantineDir)).length).toBeGreaterThanOrEqual(1);
+    expect(await fs.readFile(file, 'utf8')).toBe(garbage);
+  });
+
+  it('a read-only store reads a valid record and refuses every write', async () => {
+    const writer = new TelemetryDispositionAdapter({ stateDir: tempDir });
+    await writer.write(finalWrite(TRACE_A, [spanId(SPAN_PREFIX_A, 0)], { state: 'exported', route: 'collector' }));
+    const before = await fs.readdir(tempDir, { recursive: true });
+
+    const readOnly = new TelemetryDispositionAdapter({ stateDir: tempDir, readOnly: true });
+    const read = await readOnly.read();
+    if (read.outcome !== 'read') {
+      expect.fail('the read must succeed');
+    }
+    expect(read.record.spans[TRACE_A]![spanId(SPAN_PREFIX_A, 0)]).toBe('exported@collector');
+
+    await expect(readOnly.write(pendingWrite(TRACE_A, spanId(SPAN_PREFIX_A, 1)))).rejects.toBeInstanceOf(
+      ReadOnlyStateStoreError,
+    );
+    expect(await fs.readdir(tempDir, { recursive: true })).toEqual(before);
+
+    const readOnlyMemory = new TelemetryDispositionAdapter({ readOnly: true });
+    await expect(readOnlyMemory.write(pendingWrite(TRACE_A, spanId(SPAN_PREFIX_A, 1)))).rejects.toBeInstanceOf(
+      ReadOnlyStateStoreError,
+    );
+    expect(await readOnlyMemory.read()).toEqual({
+      outcome: 'read',
+      record: emptyTelemetryDispositionRecord(),
+    });
   });
 
   it('refuses file names that collide with another store or are unsafe', async () => {

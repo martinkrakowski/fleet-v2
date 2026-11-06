@@ -74,7 +74,13 @@ export function createTelemetryReadComposition(options?: {
     acceptanceReceiptRead: new AcceptanceReceiptReadAdapter({ inspector }),
     runTelemetry: new NoopRunTelemetryAdapter(),
     runTelemetryMark: new NoopRunTelemetryMarkAdapter(),
-    dispositions: new TelemetryDispositionAdapter({ stateDir: options?.stateDir }),
+    // The API's telemetry route is a GET: it must never mutate the state
+    // directory, so the dispositions port is opened read-only (an unreadable
+    // store reads `unreadable` with no quarantine copy; a write is refused).
+    dispositions: new TelemetryDispositionAdapter({
+      stateDir: options?.stateDir,
+      readOnly: true,
+    }),
     status: {
       enabled: policy.enabled,
       saltFingerprint,

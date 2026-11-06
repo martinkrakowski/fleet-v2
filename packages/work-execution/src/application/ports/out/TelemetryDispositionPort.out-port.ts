@@ -6,7 +6,9 @@
  * write merges per span under an exclusive lock with a 500 ms give-up; a
  * pending never replaces a final disposition unless a rejected one is
  * reopened (an exported one is never reopened), and a different
- * salt fingerprint is refused.
+ * salt fingerprint is refused. A read-only store never writes, locks or
+ * quarantines anything (the API's telemetry status route uses it, so a GET
+ * cannot mutate the state directory).
  */
 
 import type {
@@ -24,7 +26,7 @@ export type TelemetryDispositionWriteResult =
   | { readonly outcome: 'refused'; readonly reason: 'invalid-request' | 'salt-mismatch' | 'store-unreadable' };
 
 export interface TelemetryDispositionPort {
-  /** Never throws for an unreadable file: it reads `unreadable`. Absent file or in-memory nothing → the empty record. */
+  /** Never throws for an unreadable file: it reads `unreadable`. A writable store quarantines the bytes; a read-only store keeps no copy and writes nothing. Absent file or in-memory nothing → the empty record. */
   read(): Promise<TelemetryDispositionRead>;
   /**
    * Under the store's lock: the request is validated in full, the file is

@@ -756,7 +756,9 @@ function notDoneRow(
 }
 
 function afterDroppedRow(glance: LaneGlance, ctx: WaitsCardContext): WaitGuard {
-  return makeRow('after-dropped', 'blocked', { kind: 'lane', lane: glance }, { kind: 'edit', what: 'after' },
+  // A dropped predecessor reads as dropped in the glance, whatever its card's placement (a merge record would place it in done).
+  const droppedGlance: LaneGlance = { ...glance, column: 'dropped' };
+  return makeRow('after-dropped', 'blocked', { kind: 'lane', lane: droppedGlance }, { kind: 'edit', what: 'after' },
     "edit this lane's after and re-import the plan", plansSources(ctx));
 }
 

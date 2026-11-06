@@ -281,7 +281,7 @@ describe('WB2b wait guards', () => {
     expect(afterRow?.clearedBy).toEqual({ kind: 'edit', what: 'after' });
     expect(afterRow?.subject).toMatchObject({
       kind: 'lane',
-      lane: { ref: A1, label: 'A1', column: 'done' },
+      lane: { ref: A1, label: 'A1', column: 'dropped' },
     });
 
     const exclusiveBoard = boardOf(
@@ -297,6 +297,7 @@ describe('WB2b wait guards', () => {
     expect(droppedRow).toBeDefined();
     expect(droppedRow?.state).toBe('blocked');
     expect(droppedRow?.clearedBy).toEqual({ kind: 'edit', what: 'after' });
+    expect(droppedRow?.subject).toMatchObject({ kind: 'lane', lane: { column: 'dropped' } });
   });
 
   it('an exclusive-order predecessor that is not done blocks with exclusive-order', () => {

@@ -70,10 +70,12 @@ export function parseVersionedSeatObservationStateRecord(
     typeof candidate.subject === 'object' && candidate.subject !== null
       ? (candidate.subject as Record<string, unknown>)
       : undefined;
+  const subjectKeys = subject === undefined ? [] : Object.keys(subject);
   const subjectValid =
     subject !== undefined &&
-    ((isNonEmptyString(subject.attemptId) && subject.reviewRequestId === undefined) ||
-      (isNonEmptyString(subject.reviewRequestId) && subject.attemptId === undefined));
+    subjectKeys.length === 1 &&
+    ((subjectKeys[0] === 'attemptId' && isNonEmptyString(subject.attemptId)) ||
+      (subjectKeys[0] === 'reviewRequestId' && isNonEmptyString(subject.reviewRequestId)));
   if (
     !isNonEmptyString(candidate.observationId) ||
     !isNonEmptyString(candidate.seatId) ||
@@ -145,7 +147,7 @@ export class SeatObservationRepositoryAdapter implements SeatObservationReposito
     const stateDir = this.options?.stateDir;
     const records =
       stateDir === undefined
-        ? [...this.inMemoryRecords]
+        ? this.inMemoryRecords.map((record) => structuredClone(record))
         : await this.readRecordsFromDisk(path.join(stateDir, SEAT_OBSERVATION_STORE_NAME));
     if (seatId === undefined) {
       return records;
@@ -157,7 +159,10 @@ export class SeatObservationRepositoryAdapter implements SeatObservationReposito
     if (this.inMemoryRecords.some((stored) => stored.observationId === record.observationId)) {
       return 'duplicate';
     }
-    this.inMemoryRecords.push(record);
+    // Store a deep copy so a caller retaining a mutable alias (including the
+    // nested `subject` object) cannot change a stored observation without
+    // going through the append path.
+    this.inMemoryRecords.push(structuredClone(record));
     return 'appended';
   }
 

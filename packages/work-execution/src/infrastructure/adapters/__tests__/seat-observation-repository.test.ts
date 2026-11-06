@@ -7,7 +7,10 @@ import {
   StateFileUnreadableError,
   StateFileUnknownVersionError,
 } from '../file-store.js';
-import { SeatObservationRepositoryAdapter } from '../SeatObservationRepositoryAdapter.adapter.js';
+import {
+  parseVersionedSeatObservationStateRecord,
+  SeatObservationRepositoryAdapter,
+} from '../SeatObservationRepositoryAdapter.adapter.js';
 import type { SeatObservationRecord } from '../../../domain/execution-records.js';
 
 function observation(
@@ -83,6 +86,19 @@ describe('SeatObservationRepositoryAdapter (memory mode)', () => {
       adapter.appendSeatObservation({ ...observation('obs-1'), via: 'web' as SeatObservationRecord['via'] }),
     ).rejects.toThrow();
   });
+
+  it('isolates stored records from caller-retained aliases', async () => {
+    const record = observation('obs-1');
+    await adapter.appendSeatObservation(record);
+    // Mutating the original object after append must not change the store.
+    (record.subject as { attemptId: string }).attemptId = 'mutated';
+    let list = await adapter.listSeatObservations();
+    expect(list[0]).toEqual(observation('obs-1'));
+    // Mutating a listed object must not change the store either.
+    (list[0].subject as { attemptId: string }).attemptId = 'mutated-via-list';
+    list = await adapter.listSeatObservations();
+    expect(list[0]).toEqual(observation('obs-1'));
+  });
 });
 
 describe('SeatObservationRepositoryAdapter (file mode)', () => {
@@ -124,5 +140,51 @@ describe('SeatObservationRepositoryAdapter (file mode)', () => {
     await expect(adapter.listSeatObservations()).rejects.toBeInstanceOf(StateFileUnreadableError);
     const quarantine = await fs.readdir(path.join(stateDir, 'quarantine'));
     expect(quarantine.length).toBeGreaterThan(0);
+  });
+});
+
+describe('parseVersionedSeatObservationStateRecord subject validation', () => {
+  const base = {
+    version: 1,
+    observationId: 'obs-1',
+    seatId: 'seat-1',
+    outcome: 'rate-limited',
+    observedAtIso: '2026-11-06T00:00:00.000Z',
+    via: 'cli',
+  } as const;
+
+  it('accepts exactly { attemptId } or { reviewRequestId }', () => {
+    expect(
+      parseVersionedSeatObservationStateRecord({ ...base, subject: { attemptId: 'a1' } }).status,
+    ).toBe('ok');
+    expect(
+      parseVersionedSeatObservationStateRecord({ ...base, subject: { reviewRequestId: 'rr1' } }).status,
+    ).toBe('ok');
+  });
+
+  it('rejects subjects with extra properties', () => {
+    expect(
+      parseVersionedSeatObservationStateRecord({ ...base, subject: { attemptId: 'a1', extra: true } })
+        .status,
+    ).toBe('invalid');
+    expect(
+      parseVersionedSeatObservationStateRecord({ ...base, subject: { reviewRequestId: 'rr1', extra: true } })
+        .status,
+    ).toBe('invalid');
+    expect(
+      parseVersionedSeatObservationStateRecord({ ...base, subject: { attemptId: 'a1', reviewRequestId: undefined } })
+        .status,
+    ).toBe('invalid');
+  });
+
+  it('rejects empty or both-key subjects', () => {
+    expect(parseVersionedSeatObservationStateRecord({ ...base, subject: { attemptId: '' } }).status).toBe(
+      'invalid',
+    );
+    expect(
+      parseVersionedSeatObservationStateRecord({ ...base, subject: { attemptId: 'a1', reviewRequestId: 'rr1' } })
+        .status,
+    ).toBe('invalid');
+    expect(parseVersionedSeatObservationStateRecord({ ...base, subject: {} }).status).toBe('invalid');
   });
 });

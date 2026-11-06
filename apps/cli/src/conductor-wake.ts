@@ -223,7 +223,7 @@ class ChangeWakeReaderImpl implements ChangeWakeReader {
     }
     this.state = 'closed';
     this.fetchAbort.abort();
-    // cancel() reports an already-cancelled stream as a rejection, never a throw
+    // cancel() reports failure through its promise, never a synchronous throw
     void this.reader.cancel().catch(() => undefined);
     this.settleWaiters(false);
   }

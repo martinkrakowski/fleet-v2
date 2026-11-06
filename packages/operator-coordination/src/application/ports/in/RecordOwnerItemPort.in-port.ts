@@ -24,7 +24,7 @@ export interface RecordOwnerItemBody {
   readonly blocks: readonly unknown[];
 }
 
-export type RecordOwnerItemRefusalCode = 'request' | 'clock' | 'id-taken' | OwnerItemRefusalCode;
+export type RecordOwnerItemRefusalCode = 'request' | 'clock' | 'store' | 'id-taken' | OwnerItemRefusalCode;
 
 export type RecordOwnerItemResult =
   | { readonly outcome: 'recorded'; readonly item: OwnerItemRecord; readonly revision: number }

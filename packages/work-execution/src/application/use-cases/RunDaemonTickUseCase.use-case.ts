@@ -29,6 +29,7 @@ import {
   nextConsecutiveBudgetExhausted,
   parseDaemonJobId,
   planDaemonTick,
+  readDaemonStatusRecord,
   resolveRepoLastServedAtIso,
   tickExitCodeForJobs,
   type BuildDaemonStatusInput,
@@ -270,14 +271,22 @@ function appendedAfter(entry: unknown, sinceIso: string): boolean {
   );
 }
 
-/** True when the port's acquired lease is exactly the one the domain decided: same scope, holder and fence. */
+/** True when the port's acquired lease is exactly the one the domain decided, field by field. */
 function isExpectedLease(actual: unknown, expected: DaemonLeaseRecord): boolean {
   return (
     isRecord(actual) &&
+    actual.version === expected.version &&
     actual.scope === expected.scope &&
     actual.holderId === expected.holderId &&
-    actual.fence === expected.fence
+    actual.fence === expected.fence &&
+    actual.leaseUntilIso === expected.leaseUntilIso
   );
+}
+
+/** A status record the domain reader accepts, or null for anything malformed. */
+function validStatusRecord(value: unknown): DaemonStatusRecord | null {
+  const read = readDaemonStatusRecord(value);
+  return read.ok ? read.record : null;
 }
 
 /** One merge-pass job instance: wraps the merge pass for one repository. */
@@ -584,8 +593,8 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
     if (isRecord(read) && read.status === 'missing') {
       return null;
     }
-    if (isRecord(read) && read.status === 'ok' && isRecord(read.record)) {
-      return read.record;
+    if (isRecord(read) && read.status === 'ok') {
+      return validStatusRecord(read.record) ?? 'unreadable';
     }
     return 'unreadable';
   }
@@ -614,7 +623,11 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
     }
   }
 
-  /** The status write; null when the store refuses, answers malformed or fails. */
+  /**
+   * The status write; null when the store refuses, answers malformed or fails.
+   * A failure after the store persisted is indistinguishable from one before,
+   * so null means "no confirmed write", not "nothing on disk".
+   */
   private async writeStatus(input: BuildDaemonStatusInput): Promise<DaemonStatusRecord | null> {
     let written: DaemonStatusRead;
     try {
@@ -622,7 +635,7 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
     } catch {
       return null;
     }
-    return isRecord(written) && written.ok === true && isRecord(written.record) ? written.record : null;
+    return isRecord(written) && written.ok === true ? validStatusRecord(written.record) : null;
   }
 
   /** Every planned entry in order: a forge skip is recorded without a lease; a run goes through runOneJob. */
@@ -769,7 +782,7 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
         fence,
         nowIso: ctx.clock(),
       });
-      return isRecord(released) && released.outcome === 'ok';
+      return isRecord(released) && released.outcome === 'ok' && isRecord(released.lease);
     } catch {
       return false;
     }

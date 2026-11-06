@@ -41,12 +41,17 @@ export interface RunDaemonTickRequest {
 }
 
 export interface RunDaemonTickResult {
-  /** `refused` when the tick could not run at all: a malformed request, a bad clock, an unreadable status store or a refused status write. Nothing is written before a refusal, except that a refused status write may follow jobs that ran. */
+  /** `refused` when the tick could not run at all: a malformed request, a bad clock, an unreadable status store or a refused status write. Nothing is written before a refusal, except that a refused or unconfirmed status write may follow jobs that ran. */
   readonly outcome: 'completed' | 'refused';
   /** 0 completed (including every skipped job and `budget-exhausted`); 1 a refused job or an unreadable status store. */
   readonly exitCode: 0 | 1;
   readonly tickId: string;
-  /** The status record the tick wrote, or null when it refused before writing. */
+  /**
+   * The status record the tick wrote and the store confirmed, or null when it
+   * refused before writing or the store gave no valid confirmation (a store
+   * that throws after persisting cannot be told apart, so null is "no
+   * confirmed write").
+   */
   readonly status: DaemonStatusRecord | null;
   /** One record per job instance, in the order the jobs ran. */
   readonly jobs: readonly DaemonJobStatusRecord[];

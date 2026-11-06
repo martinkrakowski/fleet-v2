@@ -21,6 +21,7 @@ import {
   type BuildDaemonStatusInput,
   type DaemonLeaseRecord,
   type DaemonPauseState,
+  type DaemonStatusRead,
   type DaemonStatusRecord,
 } from '../../../domain/daemon-tick.js';
 import type { ConductorHaltState } from '../../../domain/conductor-halt.js';
@@ -765,6 +766,59 @@ describe('RunDaemonTickUseCase (DT10a)', () => {
     expect(failed.status?.jobs[0]).toMatchObject({ outcome: 'refused', reasonCode: 'lease-unreadable' });
     expect(failing.lease.releases).toHaveLength(1);
     expect(failing.mergePass.requests).toHaveLength(0);
+  });
+
+  it('an acquired lease that differs in any field from the decided one is refused and released', async () => {
+    const h = makeHarness();
+    h.lease.acquire = async (request) => ({
+      outcome: 'ok',
+      lease: {
+        version: DAEMON_RECORD_VERSION,
+        scope: request.scope,
+        holderId: request.holderId,
+        fence: 1,
+        leaseUntilIso: '2099-01-01T00:00:00.000Z',
+      },
+    });
+
+    const result = await h.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(result.status?.jobs[0]).toMatchObject({ outcome: 'refused', reasonCode: 'lease-unreadable' });
+    expect(h.mergePass.requests).toHaveLength(0);
+    expect(h.lease.releases).toHaveLength(1);
+  });
+
+  it('a release answered ok without a lease record is not a confirmed release', async () => {
+    const h = makeHarness();
+    h.lease.release = async (request) => {
+      h.lease.releases.push(request);
+      return { outcome: 'ok' } as unknown as DaemonLeaseResult;
+    };
+
+    const result = await h.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.status?.jobs[0]).toMatchObject({ outcome: 'refused', reasonCode: 'lease-release-failed' });
+  });
+
+  it('a malformed status write answer or previous record is a typed refusal', async () => {
+    const h = makeHarness();
+    h.status.write = async (input) => {
+      h.status.writes.push(input);
+      return { ok: true, record: {} } as unknown as DaemonStatusRead;
+    };
+
+    const written = await h.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(written).toMatchObject({ outcome: 'refused', reasonCode: 'status-write-failed', status: null });
+
+    const previous = makeHarness();
+    previous.status.readValue = { status: 'ok', record: {} as unknown as DaemonStatusRecord };
+
+    const read = await previous.run();
+
+    expect(read).toMatchObject({ outcome: 'refused', reasonCode: 'status-unreadable' });
+    expect(previous.mergePass.requests).toHaveLength(0);
   });
 
   it('a failing status write refuses the tick as status-write-failed', async () => {

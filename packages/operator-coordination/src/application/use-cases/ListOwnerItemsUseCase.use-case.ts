@@ -2,20 +2,31 @@
  * ListOwnerItemsUseCase implements ListOwnerItemsPort. It is a thin read over
  * the owner item repository, optionally narrowed by project, state and kind,
  * one entry per item id. Gating and gated blocks are derived from the record,
- * never stored. An invalid filter returns an empty list. Reading writes
+ * never stored. An invalid filter, a non-object filter or an unreadable filter
+ * is refused; an unreadable store is reported as unknown. Reading writes
  * nothing.
  */
 
 import { isOwnerItemGating, ownerItemGatedBlocks } from '../../domain/entities/OwnerItem.js';
-import { OWNER_ITEM_KINDS } from '../../domain/value-objects/OwnerItemKind.vo.js';
-import { OWNER_ITEM_STATES } from '../../domain/owner-item-records.js';
-import type { OwnerItemRepositoryPort } from '../ports/out/OwnerItemRepositoryPort.out-port.js';
+import { OWNER_ITEM_KINDS, type OwnerItemKindValue } from '../../domain/value-objects/OwnerItemKind.vo.js';
+import { OWNER_ITEM_STATES, type OwnerItemState } from '../../domain/owner-item-records.js';
+import type { OwnerItemRepositoryPort, StoredOwnerItem } from '../ports/out/OwnerItemRepositoryPort.out-port.js';
+import { LIST_OWNER_ITEMS_LIMIT } from '../ports/in/ListOwnerItemsPort.in-port.js';
 import type {
   ListOwnerItemsEntry,
   ListOwnerItemsPort,
   ListOwnerItemsRequest,
   ListOwnerItemsResult,
 } from '../ports/in/ListOwnerItemsPort.in-port.js';
+
+/** A plain object: prototype Object.prototype or null (e.g. Object.create(null)); arrays and class instances are not filters. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** The only keys a filter may carry; any other key is a malformed filter, never an unfiltered read. */
+const FILTER_KEYS: readonly (string | symbol)[] = ['projectId', 'state', 'kind'];
 
 export interface ListOwnerItemsDependencies {
   readonly itemRepo: OwnerItemRepositoryPort;
@@ -33,18 +44,71 @@ export class ListOwnerItemsUseCase implements ListOwnerItemsPort {
     if (!this.deps) {
       throw new Error('Not implemented: ListOwnerItemsUseCase');
     }
-    const request = typeof input === 'object' && input !== null ? (input as ListOwnerItemsRequest) : {};
-    const projectId = request.projectId;
-    const state = request.state;
-    const kind = request.kind;
+    let request: ListOwnerItemsRequest;
+    try {
+      if (input === undefined) {
+        input = {};
+      }
+      if (input === null || typeof input !== 'object' || Array.isArray(input) || !isPlainObject(input)) {
+        return {
+          outcome: 'refused',
+          code: 'request',
+          reason: 'ListOwnerItems requires a filter object or no argument',
+        };
+      }
+      request = input as ListOwnerItemsRequest;
+    } catch {
+      // A revoked proxy throws even on the shape checks above.
+      return {
+        outcome: 'refused',
+        code: 'request',
+        reason: 'ListOwnerItems requires a filter object or no argument',
+      };
+    }
+    let projectId: unknown;
+    let state: unknown;
+    let kind: unknown;
+    let unknownKey = false;
+    try {
+      unknownKey = Reflect.ownKeys(request).some((key) => !FILTER_KEYS.includes(key));
+      projectId = request.projectId;
+      state = request.state;
+      kind = request.kind;
+    } catch {
+      return {
+        outcome: 'refused',
+        code: 'request',
+        reason: 'ListOwnerItems the filter could not be read',
+      };
+    }
+    if (unknownKey) {
+      return {
+        outcome: 'refused',
+        code: 'request',
+        reason: 'ListOwnerItems the filter has an unknown key',
+      };
+    }
     if (
       (projectId !== undefined && (typeof projectId !== 'string' || projectId.length === 0)) ||
-      (state !== undefined && !OWNER_ITEM_STATES.includes(state)) ||
-      (kind !== undefined && !OWNER_ITEM_KINDS.includes(kind))
+      (state !== undefined && !OWNER_ITEM_STATES.includes(state as never)) ||
+      (kind !== undefined && !OWNER_ITEM_KINDS.includes(kind as never))
     ) {
-      return { items: [] };
+      return {
+        outcome: 'refused',
+        code: 'request',
+        reason: 'ListOwnerItems a filter field is invalid',
+      };
     }
-    const stored = await this.deps.itemRepo.list({ projectId, state, kind });
+    let stored: readonly StoredOwnerItem[];
+    try {
+      stored = await this.deps.itemRepo.list({
+        projectId: projectId as string | undefined,
+        state: state as OwnerItemState | undefined,
+        kind: kind as OwnerItemKindValue | undefined,
+      });
+    } catch {
+      return { outcome: 'unknown', reason: 'ListOwnerItems the owner item store could not be read' };
+    }
     const seen = new Set<string>();
     const items: ListOwnerItemsEntry[] = [];
     for (const { item, revision } of stored) {
@@ -59,6 +123,10 @@ export class ListOwnerItemsUseCase implements ListOwnerItemsPort {
         gatedBlocks: ownerItemGatedBlocks(item),
       });
     }
-    return { items };
+    return {
+      outcome: 'listed',
+      items: items.slice(0, LIST_OWNER_ITEMS_LIMIT),
+      truncated: items.length > LIST_OWNER_ITEMS_LIMIT,
+    };
   }
 }

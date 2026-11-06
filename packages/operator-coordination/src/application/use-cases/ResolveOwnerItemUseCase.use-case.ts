@@ -124,18 +124,22 @@ export class ResolveOwnerItemUseCase implements ResolveOwnerItemPort {
     }
     let nowIso: string | undefined;
     if (action === 'plan-decision' || action === 'done' || action === 'withdraw') {
-      nowIso = this.deps.clock.nowIso();
-      if (!Number.isFinite(Date.parse(nowIso))) {
+      try {
+        nowIso = this.deps.clock.nowIso();
+      } catch {
+        return this.refuse('clock-read', 'ResolveOwnerItem the clock could not be read');
+      }
+      if (typeof nowIso !== 'string' || !Number.isFinite(Date.parse(nowIso))) {
         return this.refuse('clock-read', 'ResolveOwnerItem the clock could not be read');
       }
     }
 
     // 4. One attempt; a lost race is retried once.
-    const first = await this.attemptOnce(action, parsed, actorId, nowIso);
+    const first = await this.attemptSafely(action, parsed, actorId, nowIso);
     if (first !== 'conflict') {
       return first;
     }
-    const second = await this.attemptOnce(action, parsed, actorId, nowIso);
+    const second = await this.attemptSafely(action, parsed, actorId, nowIso);
     if (second !== 'conflict') {
       return second;
     }
@@ -152,7 +156,8 @@ export class ResolveOwnerItemUseCase implements ResolveOwnerItemPort {
     actor: string | undefined,
     nowIso: string | undefined,
   ): Promise<ResolveOwnerItemResult | 'conflict'> {
-    // 1. Find the stored item by the table in the Goal.
+    // 1. Find the stored item by the table in the Goal. An unreadable store
+    //    propagates to attemptSafely.
     const stored = await this.findStored(action, parsed);
     if (stored === null) {
       return { outcome: 'not-found' };
@@ -183,7 +188,8 @@ export class ResolveOwnerItemUseCase implements ResolveOwnerItemPort {
       return { outcome: 'unchanged', item: stored.item, revision: stored.revision };
     }
 
-    // 6. Save at the revision read; a lost race returns 'conflict'.
+    // 6. Save at the revision read; a lost race is retried once and an
+    //    unreadable store propagates to attemptSafely.
     try {
       const saved = await this.deps!.itemRepo.save(transition.value.toRecord(), stored.revision);
       return { outcome: 'resolved', item: saved.item, revision: saved.revision };
@@ -192,6 +198,20 @@ export class ResolveOwnerItemUseCase implements ResolveOwnerItemPort {
         return 'conflict';
       }
       throw error;
+    }
+  }
+
+  /** attemptOnce inside a try: an unreadable store is a refusal, never a retried conflict. */
+  private async attemptSafely(
+    action: ActionKind,
+    parsed: Record<string, unknown>,
+    actor: string | undefined,
+    nowIso: string | undefined,
+  ): Promise<ResolveOwnerItemResult | 'conflict'> {
+    try {
+      return await this.attemptOnce(action, parsed, actor, nowIso);
+    } catch {
+      return this.refuse('store', 'ResolveOwnerItem the owner item store could not be read or written');
     }
   }
 

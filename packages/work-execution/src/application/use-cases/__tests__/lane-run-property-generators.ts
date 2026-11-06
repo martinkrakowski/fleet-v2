@@ -14,7 +14,7 @@ import fc from 'fast-check';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import { parseLaneRunKey } from '../../../domain/lane-run-keys.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
-import type { AttemptRecord } from '../../../domain/execution-records.js';
+import type { AttemptRecord, WorkOrderRecord } from '../../../domain/execution-records.js';
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
 import {
@@ -27,6 +27,13 @@ import type { ReconcileAttemptResult } from '../../ports/in/ReconcileAttemptPort
 import type { ExecuteAuthorizedForgeActionResult } from '../../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
 import type { AutoMergeAttemptResult } from '../../ports/in/AutoMergeAttemptPort.in-port.js';
 import type { AdvanceLaneRunResult } from '../../ports/in/AdvanceLaneRunPort.in-port.js';
+import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
+import type { ConductorForgeGrantResult } from '../../ports/out/ConductorForgeGrantPort.out-port.js';
+import type {
+  AcceptanceAssessmentResult,
+  AcceptanceReceiptsResult,
+} from '../../ports/out/AcceptanceAssessmentPort.out-port.js';
+import type { ReadPullRequestResult } from '../../ports/out/ForgeReadPort.out-port.js';
 import {
   AdvanceLaneRunUseCase,
   type AdvanceLaneRunDependencies,
@@ -73,6 +80,24 @@ const MANIFEST_JSON = JSON.stringify({
   expectedArtifacts: ['notes.md'],
 });
 const DIGEST = simpleDeterministicHexDigest(PROSE + '\n' + MANIFEST_JSON);
+
+/** The work order the `laterActs` fakes answer, matching `BASE_RECORD.workOrderId`. */
+const LATER_ACT_WORK_ORDER: WorkOrderRecord = {
+  id: 'wo-example-1',
+  projectId: 'project-example',
+  taskId: 'task-example-1',
+  laneId: 'lane-example',
+  repository: 'repo-example',
+  baseCommit: COMMIT,
+  ownedPaths: ['src/example.ts'],
+  policyRevision: 'policy-example-1',
+  prerequisiteWorkOrderIds: [],
+  state: 'ready-to-merge',
+  revision: 1,
+  createdAtIso: NOW,
+  updatedAtIso: NOW,
+  risk: 'standard',
+};
 
 const SEAT_PLAN = {
   version: 1 as const,
@@ -176,6 +201,13 @@ export interface LaneRunScenario {
   record(): Promise<LaneRunRecord | null>;
   /** How many times the fake dispatch port has been called so far. */
   dispatchCalls(): number;
+  /**
+   * How many times the conductor has acted `prepare` so far: every attempt to
+   * append a prepare intent through the run journal (landed or refused as a
+   * duplicate) counts, so a duplicate prepare act without a new journal entry
+   * is still observable.
+   */
+  prepareCalls(): number;
   /** How many times the fake reconcile port has been called so far. */
   reconcileCalls(): number;
   /** How many times the fake forge-action port has been called so far (the `open-pr`/`push` acting port). */
@@ -187,6 +219,92 @@ export interface LaneRunScenario {
 export interface LaneRunScenarioOptions {
   /** When set, the fixture appends one terminal conduct entry at setup, so the run starts terminal. */
   readonly terminalState?: 'merged' | 'stopped';
+  /**
+   * When set, the fixture wires the open-pr/push/merge ports with benign
+   * fakes: the conductor forge grant, the acceptance assessment, the work
+   * order read, the pre-merge receipt read, the PR read (an open PR at the
+   * lane head, merge state clean) and auto-merge enabled. These are only
+   * read by the later acts and their facts, so the Q4a random scenario keeps
+   * behaving exactly as before; the seeded one-way scenarios use them to put
+   * the run into `opening-pr`, `pushing` or `merging`.
+   */
+  readonly laterActs?: boolean;
+}
+
+/**
+ * The benign open-pr/push/merge fakes for `options.laterActs`. They are read
+ * only by the later acts and their facts (`opening-pr` / `pushing` /
+ * `merging` states), which the Q4a random scenario never reaches, so wiring
+ * them changes no behaviour there. The PR fake answers an open PR at the lane
+ * head with a clean merge state; a seeded pushing scenario overrides
+ * `forgeRead` to a different head. `acceptanceAssessment` answers a receipts
+ * pass and an acceptance at the exact head; `reviewRequest` answers a passed
+ * pre-merge receipt (and nothing for the review kinds); `workOrderRepo`
+ * answers the run's work order; `autoMergeEnabled` is true.
+ */
+function laterActDeps(): Partial<AdvanceLaneRunDependencies> {
+  return {
+    conductorForgeGrant: {
+      issueConductorForgeGrant: async (): Promise<ConductorForgeGrantResult> => ({
+        outcome: 'issued',
+        grantId: 'grant-conductor-example-1',
+        decisionRevision: 'policy:conductor@0123456789ab',
+      }),
+    },
+    acceptanceAssessment: {
+      assessHeadAcceptance: async (): Promise<AcceptanceAssessmentResult> => ({
+        outcome: 'accepted',
+        receiptId: 'rcp-example-1',
+        assessedHeadSha: COMMIT,
+      }),
+      assessHeadReceipts: async (): Promise<AcceptanceReceiptsResult> => ({
+        outcome: 'passed',
+        receiptsId: 'rcp-example-1',
+        assessedHeadSha: COMMIT,
+      }),
+    },
+    workOrderRepo: {
+      findWorkOrderById: async () => LATER_ACT_WORK_ORDER,
+    },
+    reviewRequest: {
+      requestReview: async () => ({ outcome: 'no-receipt', reason: 'review-unavailable', detail: null }),
+      findReviewReceipt: async () => ({ outcome: 'not-found' }),
+      findLatestReceiptOfKind: async (request) =>
+        request.kind === 'pre-merge'
+          ? {
+              outcome: 'found',
+              receipt: {
+                receiptId: 'rcp-example-1',
+                requestId: null,
+                kind: 'pre-merge',
+                reviewerModel: 'model-example-1',
+                candidateHeadSha: COMMIT,
+                verdict: 'passed',
+                findings: [],
+              },
+            }
+          : { outcome: 'not-found' },
+      recordOutOfScope: async () => ({ outcome: 'recorded' }),
+    },
+    forgeRead: {
+      readPullRequest: async (): Promise<ReadPullRequestResult> => ({
+        outcome: 'found',
+        pullRequest: {
+          number: 1,
+          state: 'open',
+          mergeState: 'clean',
+          headSha: COMMIT,
+          headRef: 'wt-example-1',
+          baseRef: 'main',
+          mergedAtIso: null,
+          closedAtIso: null,
+          mergeCommitSha: null,
+        },
+      }),
+      isConfigured: () => true,
+    },
+    autoMergeEnabled: true,
+  };
 }
 
 /**
@@ -211,6 +329,29 @@ export async function makeLaneRunScenario(
   let reconcileCallCount = 0;
   let forgeActionCallCount = 0;
   let mergeCallCount = 0;
+  let prepareCallCount = 0;
+
+  // Count prepare acts through the journal: the conductor's `act prepare`
+  // writes its intent through `runJournal.append`, so every attempt to append
+  // a prepare intent — whether it lands or is refused as a duplicate — is one
+  // observable prepare act. The setup's own prepare entry is appended through
+  // the raw `runJournal` below, so the count starts at zero for the first pass.
+  const instrumentedRunJournal: LaneRunJournalPort = {
+    append: async (entry) => {
+      const parsed =
+        entry.kind === 'intent' && entry.key !== null ? parseLaneRunKey(entry.key) : null;
+      if (parsed !== null && parsed.kind === 'step' && parsed.step === 'prepare') {
+        prepareCallCount += 1;
+      }
+      return runJournal.append(entry);
+    },
+    listForRun: (runId) => runJournal.listForRun(runId),
+    ...(runJournal.listForRuns !== undefined
+      ? { listForRuns: (runIds) => runJournal.listForRuns!(runIds) }
+      : {}),
+    listForKey: (key) => runJournal.listForKey(key),
+  };
+
   const nextOutcome = (): PortOutcome => {
     const outcome = outcomes[cursor];
     cursor += 1;
@@ -307,7 +448,7 @@ export async function makeLaneRunScenario(
 
   const deps: AdvanceLaneRunDependencies = {
     runRepo,
-    runJournal,
+    runJournal: instrumentedRunJournal,
     attemptRepo,
     executionJournal,
     artifactPort,
@@ -318,6 +459,7 @@ export async function makeLaneRunScenario(
     dispatchAttempt,
     executeForgeAction,
     autoMergeAttempt,
+    ...(options.laterActs === true ? laterActDeps() : {}),
     newUlid,
   };
 
@@ -399,6 +541,7 @@ export async function makeLaneRunScenario(
     journal: () => runJournal.listForRun(RUN_ID),
     record: () => runRepo.get(RUN_ID),
     dispatchCalls: () => dispatchCallCount,
+    prepareCalls: () => prepareCallCount,
     reconcileCalls: () => reconcileCallCount,
     forgeActionCalls: () => forgeActionCallCount,
     mergeCalls: () => mergeCallCount,

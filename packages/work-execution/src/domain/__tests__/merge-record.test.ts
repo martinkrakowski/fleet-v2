@@ -347,9 +347,9 @@ describe('decideMergeRecord', () => {
 
   it('refuses an incoming record whose source and merger disagree', () => {
     // A fleet-forge-action claim with an unknown merger is impossible and is
-    // refused both with nothing stored and against a stored record. A
-    // `forge-observation` sighting with a `fleet` merger is a legitimate
-    // upgraded record and is accepted.
+    // refused both with nothing stored and against a stored record. (An
+    // incoming forge-observation/fleet sighting is refused too, see the next
+    // test; only a stored upgraded record loads, through `MergeRecord.create`.)
     const journal = { ...VALID, source: 'fleet-forge-action', merger: 'unknown' } as MergeRecordRecord;
     expect(decideError(null, journal)).toBe('MergeRecord source and merger disagree');
     expect(decideError(undefined, journal)).toBe('MergeRecord source and merger disagree');

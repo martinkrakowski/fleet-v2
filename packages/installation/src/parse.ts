@@ -1514,7 +1514,8 @@ function parseHostRoleAliases(
       errors.push(`${fieldPath}.${key}: must be a non-empty string`);
       continue;
     }
-    const alias = rawAlias.trim();
+    // Validated as supplied: a padded alias is refused, never trimmed.
+    const alias = rawAlias;
     if (!isSafeSshHost(alias)) {
       // The value never appears in the message: an alias is operator input.
       errors.push(

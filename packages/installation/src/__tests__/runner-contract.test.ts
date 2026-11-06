@@ -531,4 +531,23 @@ describe('round-2 review fixes', () => {
       errors: ['hosts.verifier-host.roleAliases: every key must be a known host role'],
     });
   });
+
+  it('refuses a padded role alias instead of trimming it', () => {
+    const result = parseInstallation({
+      ...contractV2,
+      hosts: {
+        ...contractV2.hosts,
+        'verifier-host': {
+          ...contractV2.hosts['verifier-host'],
+          roleAliases: { verifier: ' verifier-alias ' },
+        },
+      },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]).toContain('hosts.verifier-host.roleAliases.verifier: must match');
+      expect(result.errors[0]).not.toContain('verifier-alias');
+    }
+  });
 });

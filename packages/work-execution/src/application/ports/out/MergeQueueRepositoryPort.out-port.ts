@@ -5,6 +5,7 @@ import type {
   MergeDropDecision,
   MergeRetryDecision,
 } from '../../../domain/merge-queue-operations.js';
+import type { MergeTransition, MergeTransitionDecision } from '../../../domain/merge-pass-transitions.js';
 
 export interface MergeQueueEnqueueCommand {
   readonly repository: { readonly owner: string; readonly repo: string };
@@ -36,10 +37,16 @@ export interface MergeQueueListQuery {
   readonly deadlineIso: string;
 }
 
+export interface MergeQueueTransitionCommand extends MergeTransition {
+  readonly deadlineIso: string;
+}
+
 /** Persist merge-queue entries v1 by identity; known absence is an empty list. */
 export interface MergeQueueRepositoryPort {
   enqueueMergeEntry(command: MergeQueueEnqueueCommand): Promise<MergeEnqueueDecision>;
   dropMergeEntry(command: MergeQueueDropCommand): Promise<MergeDropDecision>;
   retryMergeEntry(command: MergeQueueRetryCommand): Promise<MergeRetryDecision>;
   listMergeEntries(query: MergeQueueListQuery): Promise<readonly MergeQueueEntryRecord[]>;
+  /** Compare-and-set one entry on its revision; a successor is appended in the same write (DT9c). */
+  applyMergeTransition(command: MergeQueueTransitionCommand): Promise<MergeTransitionDecision>;
 }

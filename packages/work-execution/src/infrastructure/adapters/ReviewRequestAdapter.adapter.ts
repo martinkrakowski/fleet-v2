@@ -319,8 +319,10 @@ function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
 }
 
 /**
- * True when `findings` is a dense array of plain objects: a sparse array, a
- * non-array or a hole is invalid transport output, never a summary.
+ * True when `findings` is a dense array of plain objects whose every finding
+ * carries one of the four declared severities: a sparse array, a non-array, a
+ * hole or a corrupt severity is invalid transport output, never a summary
+ * (RV3: a corrupt severity never maps to a verdict).
  */
 function findingsAreDense(findings: unknown): boolean {
   try {
@@ -333,6 +335,15 @@ function findingsAreDense(findings: unknown): boolean {
       }
       const finding = findings[index];
       if (!isPlainObject(finding)) {
+        return false;
+      }
+      const severity = (finding as { severity?: unknown }).severity;
+      if (
+        severity !== 'blocker' &&
+        severity !== 'major' &&
+        severity !== 'minor' &&
+        severity !== 'nit'
+      ) {
         return false;
       }
     }
@@ -361,7 +372,9 @@ function receiptOfKindSummaryOf(
     kind,
     reviewerModel: receipt.reviewerModel,
     candidateHeadSha: receipt.candidateHeadSha,
-    verdict: mapVerdict(receipt.result),
+    // RV3: an unverified stored receipt never maps to a verdict; it reads
+    // `unknown` so every downstream decider keeps it unknown (fail closed).
+    verdict: receipt.readOnlyVerified === true ? mapVerdict(receipt.result) : 'unknown',
     findings: receipt.findings.map((finding) => ({
       findingId: finding.findingId,
       severity: finding.severity,

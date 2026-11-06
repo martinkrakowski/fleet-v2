@@ -204,24 +204,44 @@ export interface AdvanceLaneRunDependencies {
 
 /** The request shape the pure readers take for granted; anything else is a usage error. */
 function requestShapeError(request: AdvanceLaneRunRequest): AdvanceLaneRunRefusal | null {
-  if (typeof request.runId !== 'string' || request.runId.trim().length === 0) {
+  try {
+    // F96 (1): null, primitives, arrays and non-plain objects are typed
+    // refusals, never throws; own data properties only, so a throwing or
+    // accessor-shaped getter reads as absent.
+    if (typeof request !== 'object' || request === null || Array.isArray(request)) {
+      return 'invalid-request';
+    }
+    const read = (key: string): unknown => Object.getOwnPropertyDescriptor(request, key)?.value;
+    const runId = read('runId');
+    if (typeof runId !== 'string' || runId.trim().length === 0) {
+      return 'invalid-request';
+    }
+    // The port is reached from the CLI and the driver; a missing lease is refused, never thrown on.
+    const lease: unknown = read('lease');
+    if (typeof lease !== 'object' || lease === null || Array.isArray(lease)) {
+      return 'invalid-request';
+    }
+    const readLease = (key: string): unknown => Object.getOwnPropertyDescriptor(lease, key)?.value;
+    const holderId = readLease('holderId');
+    if (typeof holderId !== 'string' || holderId.trim().length === 0) {
+      return 'invalid-request';
+    }
+    const fence = readLease('fence');
+    if (!Number.isSafeInteger(fence) || (fence as number) < 1) {
+      return 'invalid-request';
+    }
+    const halted = read('halted');
+    if (halted !== undefined && typeof halted !== 'boolean') {
+      return 'invalid-request';
+    }
+    const nowIso = read('nowIso');
+    if (typeof nowIso !== 'string' || !isCalendarDateTime(nowIso)) {
+      return 'invalid-request';
+    }
+    return null;
+  } catch {
     return 'invalid-request';
   }
-  // The port is reached from the CLI and the driver; a missing lease is refused, never thrown on.
-  const lease: unknown = request.lease;
-  if (typeof lease !== 'object' || lease === null) {
-    return 'invalid-request';
-  }
-  if (typeof request.lease.holderId !== 'string' || request.lease.holderId.trim().length === 0) {
-    return 'invalid-request';
-  }
-  if (!Number.isSafeInteger(request.lease.fence) || request.lease.fence < 1) {
-    return 'invalid-request';
-  }
-  if (typeof request.nowIso !== 'string' || !isCalendarDateTime(request.nowIso)) {
-    return 'invalid-request';
-  }
-  return null;
 }
 
 /** `checkLeaseHeld`'s three outcomes mapped onto the advance refusals. */

@@ -314,7 +314,7 @@ function removeWorktreePathRefusal(request: RemoveWorktreeRequest): boolean {
  * request: the recorded host is named, `expectedHead` is a real commit sha
  * (40 or 64 lowercase hex, not all zeros), `expectedBranch` is a non-empty
  * branch that is not `main`, and `expectedLastActivityIso` is either null (no
- * activity was readable under the caller's hold) or a non-empty string. Any
+ * activity was readable under the caller's hold) or an ISO-8601 UTC instant with milliseconds (the form `toISOString` writes). Any
  * other malformed request is refused as `invalid-request`.
  */
 function removeWorktreeRequestIsValid(request: RemoveWorktreeRequest): boolean {
@@ -330,7 +330,9 @@ function removeWorktreeRequestIsValid(request: RemoveWorktreeRequest): boolean {
   }
   if (
     expectedLastActivityIso !== null &&
-    (typeof expectedLastActivityIso !== 'string' || expectedLastActivityIso === '')
+    (typeof expectedLastActivityIso !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(expectedLastActivityIso) ||
+      Number.isNaN(Date.parse(expectedLastActivityIso)))
   ) {
     return false;
   }
@@ -884,11 +886,12 @@ function parseReflogTimestamp(stdout: string): number | null {
  * (`%Y` / `%m`); the sub-second part comes from the same line when the host
  * prints it (GNU `%y`: `2026-01-01 00:00:00.123456789 +0000`, BSD `%Fm`:
  * `1767225600.123456`). A host that prints only whole seconds yields whole
- * seconds. Whole-second readings alone cannot tell a write made in the same
+ * seconds and `fractional: false`; the removal re-check treats such a reading
+ * as too coarse to prove quiet. Whole-second readings alone cannot tell a write made in the same
  * second as the caller's inspection from the inspected state, so the removal
  * re-check compares at millisecond precision.
  */
-function parseStatMtimeMs(line: string): number | null {
+function parseStatMtime(line: string): { readonly ms: number; readonly fractional: boolean } | null {
   const tokens = line.trim().split(/\s+/);
   const first = tokens[0];
   if (first === undefined || !/^\d+$/.test(first)) {
@@ -899,14 +902,16 @@ function parseStatMtimeMs(line: string): number | null {
     return null;
   }
   let millis = 0;
+  let fractional = false;
   for (const token of tokens.slice(1)) {
     const fraction = /^(?:\d{2}:\d{2}:\d{2}|\d+)\.(\d+)$/.exec(token);
     if (fraction !== null) {
       millis = Number.parseInt(fraction[1]!.padEnd(3, '0').slice(0, 3), 10);
+      fractional = true;
       break;
     }
   }
-  return seconds * 1000 + millis;
+  return { ms: seconds * 1000 + millis, fractional };
 }
 
 async function readReflogActivityMs(
@@ -946,7 +951,7 @@ async function readIndexActivityMs(
   executor: CommandExecutorPort,
   worktreePath: string,
   flavour: 'gnu' | 'bsd',
-): Promise<number | null> {
+): Promise<{ readonly ms: number; readonly fractional: boolean } | null> {
   const indexPathRun = await executor.run(
     ['git', '-C', worktreePath, 'rev-parse', '--git-path', 'index'],
     { timeoutMs: GIT_TIMEOUT_MS },
@@ -969,30 +974,33 @@ async function readIndexActivityMs(
   ) {
     return null;
   }
-  return parseStatMtimeMs(indexStatRun.stdout.trim());
+  return parseStatMtime(indexStatRun.stdout.trim());
 }
 
 async function walkTreeActivity(
   executor: CommandExecutorPort,
   worktreePath: string,
   flavour: 'gnu' | 'bsd',
-): Promise<{ newestMs: number | null; unknown: boolean }> {
+): Promise<{ newestMs: number | null; unknown: boolean; coarse: boolean }> {
   const walkArgv =
     flavour === 'gnu'
       ? ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y %y', '{}', '+']
       : ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-f', '%m %Fm', '{}', '+'];
   const walkRun = await executor.run(walkArgv, { timeoutMs: GIT_TIMEOUT_MS });
   let newestMs: number | null = null;
+  let coarse = false;
   for (const line of walkRun.stdout.split('\n')) {
     const trimmed = line.trim();
     if (trimmed === '') continue;
-    const lineMs = parseStatMtimeMs(trimmed);
-    if (lineMs !== null && (newestMs === null || lineMs > newestMs)) {
-      newestMs = lineMs;
+    const lineMtime = parseStatMtime(trimmed);
+    if (lineMtime === null) continue;
+    if (!lineMtime.fractional) coarse = true;
+    if (newestMs === null || lineMtime.ms > newestMs) {
+      newestMs = lineMtime.ms;
     }
   }
   const unknown = walkRun.exitCode === null || walkRun.error !== undefined || walkRun.exitCode !== 0;
-  return { newestMs, unknown };
+  return { newestMs, unknown, coarse };
 }
 
 export class WorkspaceAdapter implements WorkspacePort {
@@ -1913,7 +1921,10 @@ export class WorkspaceAdapter implements WorkspacePort {
     //     path git lists, so it is compared against the physical root, and a
     //     target outside the configured root is refused.
     const physicalWorktreeRoot = await resolvePhysicalPath(executor, worktreeRoot, GIT_TIMEOUT_MS);
-    const containmentRoot = physicalWorktreeRoot ?? worktreeRoot;
+    if (physicalWorktreeRoot === null) {
+      return { outcome: 'unknown', reason: 'the worktree root could not be resolved to a physical path' };
+    }
+    const containmentRoot = physicalWorktreeRoot;
     if (entry.path === containmentRoot || !entry.path.startsWith(`${containmentRoot}/`)) {
       return { outcome: 'refused', reason: 'path-refused' };
     }
@@ -1970,11 +1981,16 @@ export class WorkspaceAdapter implements WorkspacePort {
     //    when the newest mtime moved past the value read under the caller's
     //    hold, or when no baseline was read, or when the walk cannot answer
     //    (conductor plan §3.10.3).
-    const activity = await this.readLastActivity(executor, worktreePath);
-    if (activity.unknown || expectedLastActivityIso === null) {
+    //    Instants are compared as parsed times, never as strings, and a
+    //    reading without a sub-second part is too coarse to prove quiet.
+    const activity = await this.readLastActivityDetailed(executor, worktreePath);
+    if (activity.unknown || activity.coarse || expectedLastActivityIso === null) {
       return { outcome: 'refused', reason: 'busy' };
     }
-    if (activity.iso !== null && activity.iso > expectedLastActivityIso) {
+    if (
+      activity.iso !== null &&
+      Date.parse(activity.iso) > Date.parse(expectedLastActivityIso)
+    ) {
       return { outcome: 'refused', reason: 'busy' };
     }
 
@@ -2342,6 +2358,19 @@ export class WorkspaceAdapter implements WorkspacePort {
     executor: CommandExecutorPort,
     worktreePath: string,
   ): Promise<WorktreeLastActivity> {
+    const { iso, unknown } = await this.readLastActivityDetailed(executor, worktreePath);
+    return { iso, unknown };
+  }
+
+  /**
+   * `readLastActivity` plus `coarse`: true when any file or index reading
+   * carried no sub-second part, so an equal-to-baseline answer cannot prove
+   * that nothing was written later in the same second.
+   */
+  private async readLastActivityDetailed(
+    executor: CommandExecutorPort,
+    worktreePath: string,
+  ): Promise<{ iso: string | null; unknown: boolean; coarse: boolean }> {
     // reflog: the newest reflog entry's timestamp; a non-zero exit or empty
     // stdout contributes nothing.
     let newestMs: number | null = null;
@@ -2354,14 +2383,18 @@ export class WorkspaceAdapter implements WorkspacePort {
     const flavour = await detectStatFlavour(executor, worktreePath);
 
     let unknown = false;
+    let coarse = false;
     if (flavour === null) {
       // Neither stat answered: the index mtime and the walk are unknown.
       unknown = true;
     } else {
       // Index mtime: resolve the index path, then stat it with the detected flavour.
-      const indexMs = await readIndexActivityMs(executor, worktreePath, flavour);
-      if (indexMs !== null && (newestMs === null || indexMs > newestMs)) {
-        newestMs = indexMs;
+      const indexMtime = await readIndexActivityMs(executor, worktreePath, flavour);
+      if (indexMtime !== null) {
+        if (!indexMtime.fractional) coarse = true;
+        if (newestMs === null || indexMtime.ms > newestMs) {
+          newestMs = indexMtime.ms;
+        }
       }
 
       // Bounded tree walk: newest file mtime under the worktree, skipping .git.
@@ -2369,15 +2402,18 @@ export class WorkspaceAdapter implements WorkspacePort {
       if (walk.newestMs !== null && (newestMs === null || walk.newestMs > newestMs)) {
         newestMs = walk.newestMs;
       }
+      if (walk.coarse) {
+        coarse = true;
+      }
       if (walk.unknown) {
         unknown = true;
       }
     }
 
     if (newestMs === null) {
-      return { iso: null, unknown: true };
+      return { iso: null, unknown: true, coarse };
     }
-    return { iso: new Date(newestMs).toISOString(), unknown };
+    return { iso: new Date(newestMs).toISOString(), unknown, coarse };
   }
 
   /**

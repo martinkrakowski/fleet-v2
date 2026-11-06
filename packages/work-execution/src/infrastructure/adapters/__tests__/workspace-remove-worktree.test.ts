@@ -142,6 +142,8 @@ const FIND_MARKER = 'find';
 const STAT_MARKER = 'stat -c %Y';
 /** 2026-11-06T00:00:00Z, the epoch second of `ACTIVITY_ISO`. */
 const ACTIVITY_EPOCH = 1793923200;
+/** A stat answer with a sub-second part, older than `ACTIVITY_ISO`. */
+const QUIET_STAT = '1700000000 2023-11-14 22:13:20.000000000 +0000\n';
 const INDEX_MARKER = 'rev-parse --git-path index';
 
 /**
@@ -155,8 +157,8 @@ function quietActivityCanned(): Readonly<Record<string, CannedSpec>> {
   return {
     [PWD_MARKER]: ({ argv }) => ({ stdout: `${argv[argv.length - 1]}\n` }),
     [REFLOG_MARKER]: { stdout: 'HEAD@{2026-11-05T00:00:00+00:00}\n' },
-    [FIND_MARKER]: { stdout: '1700000000\n' },
-    [STAT_MARKER]: { stdout: '1700000000\n' },
+    [FIND_MARKER]: { stdout: QUIET_STAT },
+    [STAT_MARKER]: { stdout: QUIET_STAT },
     [INDEX_MARKER]: { stdout: `${WORKTREE}/.git/index\n` },
   };
 }
@@ -165,7 +167,10 @@ async function removeWith(
   canned: Readonly<Record<string, CannedSpec>>,
   request: RemoveWorktreeRequest = makeRequest(),
 ): Promise<{ result: Awaited<ReturnType<WorkspaceAdapter['removeWorktree']>>; calls: RunCall[] }> {
-  const { executor, calls } = fakeExecutor(canned);
+  const { executor, calls } = fakeExecutor({
+    [PWD_MARKER]: ({ argv }) => ({ stdout: `${argv[argv.length - 1]}\n` }),
+    ...canned,
+  });
   const adapter = new WorkspaceAdapter({ executorForRecordedHost: executorForRecordedHost(executor) });
   const result = await adapter.removeWorktree(request);
   return { result, calls };
@@ -322,6 +327,8 @@ describe('removeWorktree over a fake executor', () => {
     ['an all-zero expectedHead', { expectedHead: '0'.repeat(40) }],
     ['branch main', { expectedBranch: 'main' }],
     ['an empty expectedLastActivityIso', { expectedLastActivityIso: '' }],
+    ['a non-timestamp expectedLastActivityIso', { expectedLastActivityIso: 'zz' }],
+    ['a whole-second expectedLastActivityIso', { expectedLastActivityIso: '2026-11-06T00:00:00Z' }],
     ['a record without a host name', { recordedHost: { ...RECORDED_HOST, hostName: null } }],
   ])('refuses invalid-request for %s, with no command run', async (_label, overrides) => {
     const { result, calls } = await removeWith({}, makeRequest(overrides));
@@ -478,6 +485,38 @@ describe('removeWorktree over a fake executor', () => {
     expect(later.calls.some((call) => call.argv.includes('remove'))).toBe(false);
     const same = await removeWith(canned('200000000'), baseline);
     expect(same.result).toEqual({ outcome: 'removed', branchTip: HEAD });
+  });
+
+  it('refuses busy when the activity readings carry no sub-second part', async () => {
+    const { result, calls } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
+      [FIND_MARKER]: { stdout: '1700000000\n' },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'busy' });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
+  it('answers unknown when the worktree root cannot be resolved to a physical path', async () => {
+    const { result, calls } = await removeWith({
+      [LIST_MARKER]: ({ callIndex }) =>
+        callIndex === 0 ? { stdout: worktreeList() } : { stdout: listWithoutWorktree() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
+      [PWD_MARKER]: ({ argv }) =>
+        argv[argv.length - 1] === WORKTREE_ROOT ? { exitCode: 1 } : { stdout: `${argv[argv.length - 1]}\n` },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result.outcome).toBe('unknown');
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
   });
 
   it('refuses busy when the newest activity moved past the caller-read baseline', async () => {

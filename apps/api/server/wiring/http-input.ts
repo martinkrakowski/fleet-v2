@@ -128,9 +128,13 @@ export async function readBoundedRawBody(event: H3Event, limit: number): Promise
  * configured runtime answers the use case's own validation; a non-object body
  * (primitive or array) or a body that is not valid JSON is a client error (400),
  * never a silent empty request. A body
- * over `MAX_JSON_BODY_BYTES` is refused with 413 before it is parsed.
+ * over `MAX_JSON_BODY_BYTES` is refused with 413 before it is parsed. `nowIso` is stripped unless
+ * `options.keepNowIso` is set.
  */
-export async function readObjectBody(event: H3Event): Promise<Record<string, unknown>> {
+export async function readObjectBody(
+  event: H3Event,
+  options: { readonly keepNowIso?: boolean } = {},
+): Promise<Record<string, unknown>> {
   const raw = await readBoundedRawBody(event, MAX_JSON_BODY_BYTES);
   if (raw === undefined || raw.byteLength === 0) {
     return {};
@@ -148,7 +152,10 @@ export async function readObjectBody(event: H3Event): Promise<Record<string, unk
   }
   if (isPlainObject(body)) {
     const rest = { ...body };
-    delete rest.nowIso;
+    // A route with a closed body contract (`keepNowIso`) must see `nowIso` to refuse it as an extra field.
+    if (options.keepNowIso !== true) {
+      delete rest.nowIso;
+    }
     return rest;
   }
   throw createError({ statusCode: 400, statusMessage: "Invalid JSON object body" });

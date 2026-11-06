@@ -1332,6 +1332,8 @@ function printDryRunAppendedLines(io: CliIo, appended: readonly LaneRunJournalEn
         step = parsed.step;
       } else if (parsed !== null && parsed.kind === 'premerge') {
         step = 'premerge';
+      } else if (parsed !== null && parsed.kind === 'merge-enqueue') {
+        step = 'merge-enqueue';
       }
       const result = resultsByKey.get(entry.key);
       io.stdout(

@@ -151,6 +151,24 @@ export function conductorGateOf(runtime: FleetCliRuntime): FleetCliRuntime['exec
   return runtime.execution.attemptGate;
 }
 
+/**
+ * The forge repository the merge queue keys its entries by (KS7b): the installation's
+ * GitHub owner and repo, v1 or v2. Absent for forge mode `none` or no forge section, so the
+ * `merge-enqueue` step stays `not-wired` rather than guessing a repository.
+ */
+function forgeRepositoryOf(
+  installation: FleetCliRuntime['installation'],
+): { readonly owner: string; readonly repo: string } | undefined {
+  const forge = installation?.forge;
+  if (forge === undefined) {
+    return undefined;
+  }
+  if ('mode' in forge) {
+    return forge.mode === 'github' ? { owner: forge.owner, repo: forge.repo } : undefined;
+  }
+  return { owner: forge.owner, repo: forge.repo };
+}
+
 export function buildLiveConductorDriver(
   runtime: FleetCliRuntime,
   options: { readonly maxActiveRuns: number; readonly passConcurrency?: number; readonly stateDir?: string },
@@ -219,7 +237,9 @@ export function buildLiveConductorDriver(
     forgeAncestry: execution.forgeRead,
     conductorForgeGrant: conductor.conductorForgeGrant,
     executeForgeAction: execution.executeAuthorizedForgeAction,
-    autoMergeAttempt: execution.autoMergeAttempt,
+    enqueueMerge: execution.enqueueMerge,
+    mergeQueue: execution.mergeQueueRepository,
+    forgeRepository: forgeRepositoryOf(runtime.installation),
     parkNotice: conductor.parkNotice,
     autoMergeEnabled: conductor.autoMergeEnabled,
   });
@@ -331,7 +351,9 @@ export function buildDryRunConductorDriver(
     forgeRead: fakes.forgeRead,
     conductorForgeGrant: fakes.conductorForgeGrant,
     executeForgeAction: fakes.executeForgeAction,
-    autoMergeAttempt: fakes.autoMergeAttempt,
+    enqueueMerge: fakes.enqueueMerge,
+    mergeQueue: fakes.mergeQueue,
+    forgeRepository: fakes.forgeRepository,
     parkNotice: fakes.parkNotice,
     autoMergeEnabled: true,
   });

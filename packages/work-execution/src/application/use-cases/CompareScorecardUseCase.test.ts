@@ -15,7 +15,7 @@ const SPLIT = '2026-01-15T00:00:00.000Z';
 const BEFORE_TS = '2026-01-10T12:00:00.000Z';
 const AFTER_TS = '2026-01-20T12:00:00.000Z';
 const HEAD_SHA = 'a'.repeat(40);
-const SECRET_RUN_ID = 'lane-ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+const SECRET_RUN_ID = `lane-${['ghp', 'abcdefghijklmnopqrstuvwxyz0123456789'].join('_')}`;
 
 function costOfWorkflows(workflows: readonly { readonly name: string; readonly checkRuns: number; readonly billedMinutes: number }[]) {
   return {

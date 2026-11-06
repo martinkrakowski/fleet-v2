@@ -165,7 +165,11 @@ function actionIdFitsActionRef(actionId: string): boolean {
 }
 
 type PullRequestNumberResolution =
-  | { readonly number: number | undefined }
+  | {
+      readonly number: number | undefined;
+      /** Set when the forge read shows the pull request already merged at the expected head. */
+      readonly alreadyMerged?: true;
+    }
   | { readonly reason: string };
 const EXPECTED_HEAD_SHA_PATTERN = /^[0-9a-f]{40}$/;
 
@@ -538,6 +542,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     // lane's single stored link — never by parsing journal text, never
     // guessed. A thrown pre-flight read refuses before the grant is consumed.
     let preResolvedPrNumber: number | undefined;
+    let alreadyMerged = false;
     let legacyLookup = false;
     // A merge with nowhere to record it refuses first, before any forge read.
     if (request.kind === "merge-pr" && deps.mergeRecordRepo === undefined) {
@@ -565,6 +570,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         return { outcome: "refused", reason: resolution.reason };
       }
       preResolvedPrNumber = resolution.number;
+      alreadyMerged = resolution.alreadyMerged === true;
     }
 
     // A merge with nowhere to record it, or one that cannot say which pull
@@ -631,7 +637,12 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       ReturnType<typeof deps.forgePort.performForgeAction>
     >;
     try {
-      forgeResult = await deps.forgePort.performForgeAction({
+      // A pull request the read shows merged at the expected head is never
+      // merged again (WB5b2): a pass that only lost its merge record completes
+      // the record from the typed journal reference.
+      forgeResult = alreadyMerged
+        ? { outcome: "executed", headSha: request.expectedHeadSha }
+        : await deps.forgePort.performForgeAction({
         actionId: request.actionId,
         attemptId: request.attemptId,
         workOrderId: request.workOrderId,
@@ -756,29 +767,34 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
             merger: "fleet",
             actionRef: completedEntry.id,
           });
-          let saved: Awaited<
-            ReturnType<MergeRecordRepositoryPort["saveMergeRecord"]>
-          > | null = null;
+          // The record is the merge's durable fact (WB5b2): a refused,
+          // conflicting or thrown save never advances the work order. The
+          // completed entry above carries the typed pull-request reference, and
+          // the ambiguous entry below marks the merge for a pass to complete
+          // (that pass reads the pull request as merged and never merges again).
+          let saveFailure: string | null = created.success ? null : "invalid";
           if (created.success) {
-            saved = await deps.mergeRecordRepo.saveMergeRecord(
-              created.value.toRecord(),
-            );
+            try {
+              const saved = await deps.mergeRecordRepo.saveMergeRecord(
+                created.value.toRecord(),
+              );
+              if (
+                saved.outcome === "refused" ||
+                saved.outcome === "integrity-conflict"
+              ) {
+                saveFailure = saved.outcome;
+              }
+            } catch {
+              saveFailure = "unavailable";
+            }
           }
-          // The record is the merge's durable fact (WB5b2): a refused or
-          // conflicting save never advances the work order. The completed
-          // entry above carries the typed pull-request reference, and the
-          // ambiguous entry below marks the merge for a pass to complete.
-          if (
-            saved === null ||
-            saved.outcome === "refused" ||
-            saved.outcome === "integrity-conflict"
-          ) {
+          if (saveFailure !== null) {
             await this.appendJournal(
               deps,
               request,
               attempt,
               "ambiguous",
-              `merge-record-not-saved:${saved === null ? "invalid" : saved.outcome}`,
+              `merge-record-not-saved:${saveFailure}`,
               pullRequestRef,
             );
             return {
@@ -928,17 +944,12 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
   /**
    * Resolve the pull-request number structurally before the forge runs
    * (WB5b): the request's own number, the attempt's latest completed `forge`
-   * journal entry carrying a typed reference (matching the normalized
-   * repository when it is known), and the lane's single stored link in that
-   * repository. Zero or several stored links are never guessed between. Any
-   * thrown read propagates: the caller refuses before a grant is consumed.
+   * journal entry carrying a typed reference, and the lane's single stored
+   * link. A thrown read propagates: the caller refuses before a grant is
+   * consumed. The other kinds keep the first source in that order.
    *
-   * A merge (WB5b2) collects every source present and refuses when two name
-   * different numbers. A number no typed journal entry confirms is read from
-   * the forge before the grant: a request-only number must be the open pull
-   * request of the attempt's branch at the expected head, and a stored link
-   * must not be closed or merged at another head. The other kinds keep the
-   * first source in that order.
+   * A merge (WB5b2) collects every source and refuses when two differ, then
+   * verifies the resolved number on the forge before the grant.
    */
   private async preResolvePullRequestNumber(
     deps: ExecuteAuthorizedForgeActionDependencies,
@@ -947,11 +958,54 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     workOrder: WorkOrderRecord,
     normalizedRepository: string | null,
   ): Promise<PullRequestNumberResolution> {
-    const isMerge = request.kind === "merge-pr";
-    if (!isMerge && request.pullRequestNumber !== undefined) {
-      return { number: request.pullRequestNumber };
+    if (request.kind !== "merge-pr") {
+      if (request.pullRequestNumber !== undefined) {
+        return { number: request.pullRequestNumber };
+      }
+      const fromJournal = await this.typedJournalNumber(
+        deps,
+        attempt,
+        normalizedRepository,
+      );
+      return {
+        number:
+          fromJournal ??
+          (await this.storedLinkNumber(deps, workOrder, normalizedRepository)),
+      };
     }
-    let journalNumber: number | undefined;
+    const journalNumber = await this.typedJournalNumber(
+      deps,
+      attempt,
+      normalizedRepository,
+    );
+    const linkNumber = await this.storedLinkNumber(
+      deps,
+      workOrder,
+      normalizedRepository,
+    );
+    const present = [request.pullRequestNumber, journalNumber, linkNumber].filter(
+      (value): value is number => value !== undefined,
+    );
+    const resolved = present[0];
+    if (resolved === undefined) {
+      return { number: undefined };
+    }
+    if (present.some((value) => value !== resolved)) {
+      return { reason: "pull-request-sources-disagree" };
+    }
+    return this.verifyMergeNumber(deps, request, workOrder, normalizedRepository, {
+      number: resolved,
+      confirmedBySource: journalNumber !== undefined || linkNumber !== undefined,
+      linkInvolved: linkNumber !== undefined,
+    });
+  }
+
+  /** The attempt's latest completed `forge` entry carrying a typed reference. */
+  private async typedJournalNumber(
+    deps: ExecuteAuthorizedForgeActionDependencies,
+    attempt: AttemptRecord,
+    normalizedRepository: string | null,
+  ): Promise<number | undefined> {
     const entries = await deps.journal.listJournalEntriesForAttempt(attempt.id);
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const entry = entries[index];
@@ -963,76 +1017,83 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         (normalizedRepository === null ||
           entry.pullRequest.repository === normalizedRepository)
       ) {
-        journalNumber = entry.pullRequest.number;
-        break;
+        return entry.pullRequest.number;
       }
     }
-    if (!isMerge && journalNumber !== undefined) {
-      return { number: journalNumber };
-    }
-    let linkNumber: number | undefined;
+    return undefined;
+  }
+
+  /** The lane's single stored link in the repository; zero or several are never guessed between. */
+  private async storedLinkNumber(
+    deps: ExecuteAuthorizedForgeActionDependencies,
+    workOrder: WorkOrderRecord,
+    normalizedRepository: string | null,
+  ): Promise<number | undefined> {
     const lanePlanRepo = deps.lanePlanRepo;
-    if (lanePlanRepo !== undefined && normalizedRepository !== null) {
-      const lane = workOrderLane(workOrder);
-      // A stored link carries the plan's current lane id while the work order
-      // may carry an old alias: both sides are resolved before comparing.
-      const resolveLaneId = await laneAliasResolver(
-        lanePlanRepo,
-        lane.projectId,
-        lane.planId,
-      );
-      const wantedLaneId = resolveLaneId(lane.laneId);
-      const links = await lanePlanRepo.listPullRequestLinks(lane.projectId);
-      const matches = links.filter(
-        (link) =>
-          link.repository === normalizedRepository &&
-          link.projectId === lane.projectId &&
-          link.planId === lane.planId &&
-          resolveLaneId(link.laneId) === wantedLaneId,
-      );
-      linkNumber = matches.length === 1 ? matches[0]?.number : undefined;
+    if (lanePlanRepo === undefined || normalizedRepository === null) {
+      return undefined;
     }
-    if (!isMerge) {
-      return { number: linkNumber };
-    }
-    const requestNumber = request.pullRequestNumber;
-    const present = [requestNumber, journalNumber, linkNumber].filter(
-      (value): value is number => value !== undefined,
+    const lane = workOrderLane(workOrder);
+    // A stored link carries the plan's current lane id while the work order
+    // may carry an old alias: both sides are resolved before comparing.
+    const resolveLaneId = await laneAliasResolver(
+      lanePlanRepo,
+      lane.projectId,
+      lane.planId,
     );
-    if (present.length === 0) {
-      return { number: undefined };
-    }
-    const resolved = present[0] as number;
-    if (present.some((value) => value !== resolved)) {
-      return { reason: "pull-request-sources-disagree" };
-    }
-    if (journalNumber !== undefined) {
-      // A typed completed journal entry is the fleet's own record of this
-      // attempt's pull request; the forge's head match guards the merge.
-      return { number: resolved };
-    }
-    const requestOnly = linkNumber === undefined;
+    const wantedLaneId = resolveLaneId(lane.laneId);
+    const links = await lanePlanRepo.listPullRequestLinks(lane.projectId);
+    const matches = links.filter(
+      (link) =>
+        link.repository === normalizedRepository &&
+        link.projectId === lane.projectId &&
+        link.planId === lane.planId &&
+        resolveLaneId(link.laneId) === wantedLaneId,
+    );
+    return matches.length === 1 ? matches[0]?.number : undefined;
+  }
+
+  /**
+   * Verify the merge's resolved number on the forge (WB5b2), whatever its
+   * source: it must be open, on the attempt's branch, at the expected head. A
+   * number a journal entry or a stored link already names may instead be
+   * merged at the expected head (a pass that lost its record): that completes
+   * the record without merging again. Anything else refuses, as stale when a
+   * stored link is involved; an unreadable answer refuses too.
+   */
+  private async verifyMergeNumber(
+    deps: ExecuteAuthorizedForgeActionDependencies,
+    request: ExecuteAuthorizedForgeActionRequest,
+    workOrder: WorkOrderRecord,
+    normalizedRepository: string | null,
+    candidate: {
+      readonly number: number;
+      readonly confirmedBySource: boolean;
+      readonly linkInvolved: boolean;
+    },
+  ): Promise<PullRequestNumberResolution> {
     const verified = await this.verifyPullRequest(
       deps,
       normalizedRepository,
-      resolved,
+      candidate.number,
     );
     if (verified.outcome === "unreadable") {
       return { reason: "pull-request-unverified" };
     }
     const snapshot = verified.snapshot;
-    if (requestOnly) {
-      return snapshot.state === "open" &&
-        snapshot.headRef === (request.branchName ?? `feat/${workOrder.laneId}`) &&
-        snapshot.headSha === request.expectedHeadSha
-        ? { number: resolved }
-        : { reason: "pull-request-unverified" };
+    const failure = candidate.linkInvolved
+      ? "pull-request-link-stale"
+      : "pull-request-unverified";
+    if (snapshot.headSha !== request.expectedHeadSha) {
+      return { reason: failure };
     }
-    const stale =
-      snapshot.state === "closed" ||
-      (snapshot.state === "merged" &&
-        snapshot.headSha !== request.expectedHeadSha);
-    return stale ? { reason: "pull-request-link-stale" } : { number: resolved };
+    if (snapshot.state === "merged" && candidate.confirmedBySource) {
+      return { number: candidate.number, alreadyMerged: true };
+    }
+    const branch = request.branchName ?? `feat/${workOrder.laneId}`;
+    return snapshot.state === "open" && snapshot.headRef === branch
+      ? { number: candidate.number }
+      : { reason: failure };
   }
 
   /**
@@ -1053,14 +1114,17 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     if (reader === undefined || normalizedRepository === null) {
       return { outcome: "unreadable" };
     }
-    const [owner, repo] = normalizedRepository.split("/");
-    if (owner === undefined || repo === undefined) {
-      return { outcome: "unreadable" };
-    }
+    // A repository that is not `owner/repo` leaves the reader's own bound
+    // repository in charge.
+    const [owner, repo, ...rest] = normalizedRepository.split("/");
+    const repository =
+      owner !== undefined && repo !== undefined && rest.length === 0
+        ? { repository: { owner, repo } }
+        : {};
     try {
       const read = await reader.readPullRequest({
         ref: { kind: "number", number },
-        repository: { owner, repo },
+        ...repository,
         timeoutMs: PULL_REQUEST_VERIFY_TIMEOUT_MS,
       });
       if (

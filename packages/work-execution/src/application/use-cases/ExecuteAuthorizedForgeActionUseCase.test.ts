@@ -1653,6 +1653,8 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
         | "none";
       /** Overrides the merge-record store's answer to `saveMergeRecord` (WB5b2). */
       saveOutcome?: MergeRecordSaveOutcome;
+      /** The first N `saveMergeRecord` calls throw (a disk or lock failure). */
+      failSaves?: number;
     } = {},
   ) {
     const order: string[] = [];
@@ -1666,12 +1668,20 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
     );
     const lanePlanRepo = new FakeLanePlanRepo(order);
     const mergeRecordRepo = new FakeMergeRecordRepo(order);
+    let failuresLeft = options.failSaves ?? 0;
     const mergeStore: MergeRecordRepositoryPort =
-      options.saveOutcome === undefined
+      options.saveOutcome === undefined && options.failSaves === undefined
         ? mergeRecordRepo
         : {
-            saveMergeRecord: async () =>
-              options.saveOutcome as MergeRecordSaveOutcome,
+            saveMergeRecord: async (record) => {
+              if (failuresLeft > 0) {
+                failuresLeft -= 1;
+                throw new Error("disk full");
+              }
+              return options.saveOutcome === undefined
+                ? mergeRecordRepo.saveMergeRecord(record)
+                : options.saveOutcome;
+            },
             findMergeRecord: (repository, number) =>
               mergeRecordRepo.findMergeRecord(repository, number),
             listMergeRecords: () => mergeRecordRepo.listMergeRecords(),
@@ -2529,15 +2539,101 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       ).toMatchObject({ number: 7, headSha: WB_HEAD });
     });
 
-    it("needs no read when the request agrees with the typed journal reference", async () => {
-      const deps = wb5bDeps({ read: "none" });
+    it("verifies a number the typed journal names too: one read, then the merge by that number", async () => {
+      const deps = wb5bDeps();
       await deps.journal.appendJournalEntry(typedCompletedEntry(42));
       const result = await deps.useCase.executeAuthorizedForgeAction({
         ...mergeReq,
         pullRequestNumber: 42,
       });
       expect(result.outcome).toBe("executed");
+      expect(deps.reads).toHaveLength(1);
       expect(deps.seen[0]?.pullRequestNumber).toBe(42);
+    });
+
+    it("refuses when the journal and the stored link agree on a pull request the forge shows closed", async () => {
+      const closed = async (request: ReadPullRequestRequest) => ({
+        outcome: "found" as const,
+        pullRequest: snapshot(
+          request.ref.kind === "number" ? request.ref.number : 0,
+          { state: "closed", closedAtIso: "2026-11-05T09:00:00.000Z" },
+        ),
+      });
+      const both = wb5bDeps({ read: closed });
+      await both.journal.appendJournalEntry(typedCompletedEntry(42));
+      await both.lanePlanRepo.savePullRequestLink(storedLink(42));
+      expect(await both.useCase.executeAuthorizedForgeAction(mergeReq)).toEqual({
+        outcome: "refused",
+        reason: "pull-request-link-stale",
+      });
+      expect(both.consumed).toEqual([]);
+      expect(both.seen).toHaveLength(0);
+
+      const journalOnly = wb5bDeps({ read: closed });
+      await journalOnly.journal.appendJournalEntry(typedCompletedEntry(42));
+      expect(
+        await journalOnly.useCase.executeAuthorizedForgeAction(mergeReq),
+      ).toEqual({ outcome: "refused", reason: "pull-request-unverified" });
+      expect(journalOnly.consumed).toEqual([]);
+      expect(journalOnly.seen).toHaveLength(0);
+
+      const unreadable = wb5bDeps({ read: "none" });
+      await unreadable.journal.appendJournalEntry(typedCompletedEntry(42));
+      expect(
+        await unreadable.useCase.executeAuthorizedForgeAction(mergeReq),
+      ).toEqual({ outcome: "refused", reason: "pull-request-unverified" });
+      expect(unreadable.seen).toHaveLength(0);
+    });
+
+    it("a throwing merge-record store is merge-record-not-saved, and the next pass completes the record without merging again", async () => {
+      let state: "open" | "merged" = "open";
+      const deps = wb5bDeps({
+        failSaves: 1,
+        read: async (request) => ({
+          outcome: "found",
+          pullRequest: snapshot(
+            request.ref.kind === "number" ? request.ref.number : 0,
+            state === "merged"
+              ? {
+                  state: "merged",
+                  mergedAtIso: "2026-11-05T09:00:00.000Z",
+                  mergeCommitSha: WB_HEAD,
+                }
+              : {},
+          ),
+        }),
+      });
+      const first = await deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        pullRequestNumber: 7,
+      });
+      expect(first).toEqual({
+        outcome: "refused",
+        reason: "merge-record-not-saved",
+        forgeAmbiguous: true,
+      });
+      expect(
+        (await deps.workOrderRepo.findWorkOrderById("wo-001"))?.state,
+      ).toBe("approved");
+      expect(
+        deps.journal.entries.find((entry) => entry.status === "ambiguous")
+          ?.detail,
+      ).toBe("merge-record-not-saved:unavailable");
+      expect(deps.seen).toHaveLength(1);
+
+      state = "merged";
+      const second = await deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        actionId: "act-2",
+      });
+      expect(second.outcome).toBe("executed");
+      expect(deps.seen).toHaveLength(1);
+      expect(
+        await deps.mergeRecordRepo.findMergeRecord("org/repo", 7),
+      ).toMatchObject({ number: 7, headSha: WB_HEAD, merger: "fleet" });
+      expect(
+        (await deps.workOrderRepo.findWorkOrderById("wo-001"))?.state,
+      ).toBe("merged");
     });
 
     it.each([

@@ -231,6 +231,24 @@ function passingGhRunner(): (args: readonly string[]) => Promise<GhResult> {
         stderr: "",
       };
     }
+    if (args[0] === "pr" && args[1] === "view") {
+      // WB5b2: the merge verifies its pull request on the forge before the grant.
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          number: Number(args[2]),
+          state: "OPEN",
+          headRefOid: HEAD,
+          headRefName: "feat/lane-example-1",
+          baseRefName: "main",
+          mergedAt: null,
+          closedAt: null,
+          mergeCommit: null,
+          mergeStateStatus: "CLEAN",
+        }),
+        stderr: "",
+      };
+    }
     if (args[0] === "pr") {
       return { exitCode: 0, stdout: JSON.stringify([{ bucket: "pass" }]), stderr: "" };
     }

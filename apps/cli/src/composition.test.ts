@@ -200,6 +200,22 @@ describe('apps/cli composition', () => {
         detail: null,
         pullRequest: { repository: 'org/repo', number: 7 },
       });
+      (rt.execution.executeAuthorizedForgeAction as unknown as { deps: { forgeRead?: unknown } }).deps.forgeRead = {
+        readPullRequest: async () => ({
+          outcome: 'found',
+          pullRequest: {
+            number: 7,
+            state: 'open',
+            mergeState: 'clean',
+            headSha: headH,
+            headRef: 'feat/lane-cli-test',
+            baseRef: 'main',
+            mergedAtIso: null,
+            closedAtIso: null,
+            mergeCommitSha: null,
+          },
+        }),
+      };
 
       // Attempt to execute merge-pr at head H using the push grant
       const mergeResult = await rt.execution.executeAuthorizedForgeAction.executeAuthorizedForgeAction({

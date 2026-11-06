@@ -442,6 +442,25 @@ function buildWithRealForge(
   const acceptanceEvidencePort = new FakeAcceptanceEvidence();
   const forgeUseCase = new ExecuteAuthorizedForgeActionUseCase({
     mergeRecordRepo: new MergeRecordRepositoryAdapter(),
+    // WB5b2: the journal's pull request is verified on the forge before the grant.
+    forgeRead: {
+      async readPullRequest(request) {
+        return {
+          outcome: "found",
+          pullRequest: {
+            number: request.ref.kind === "number" ? request.ref.number : 0,
+            state: "open",
+            mergeState: "clean",
+            headSha: HEAD,
+            headRef: "feat/lane-example",
+            baseRef: "main",
+            mergedAtIso: null,
+            closedAtIso: null,
+            mergeCommitSha: null,
+          },
+        };
+      },
+    },
     attemptRepo,
     workOrderRepo,
     journal,

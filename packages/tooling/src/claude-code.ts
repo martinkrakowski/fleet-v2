@@ -75,22 +75,16 @@ export const CLAUDE_CODE_OUTWARD_TOOL_DENY_RULES: readonly string[] = [
   'Bash(fleet-v2 merge enqueue:*)',
 ];
 
-interface VersionTriple {
-  major: number;
-  minor: number;
-  patch: number;
-}
+type VersionTriple = readonly [number, number, number];
 
+// Anchored: only output that begins with a version counts, so diagnostic text
+// that merely mentions one (a failed probe) never passes the check.
 function firstVersionTriple(text: string): VersionTriple | undefined {
-  const match = /(\d+)\.(\d+)\.(\d+)/.exec(text);
+  const match = /^\s*v?(\d+)\.(\d+)\.(\d+)(?=\s|$)/.exec(text);
   if (!match) {
     return undefined;
   }
-  return {
-    major: Number(match[1]),
-    minor: Number(match[2]),
-    patch: Number(match[3]),
-  };
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
 }
 
 /**
@@ -107,11 +101,10 @@ export function claudeCodeSupportsPermissionHookBlock(
   if (!observed || !minimum) {
     return false;
   }
-  if (observed.major !== minimum.major) {
-    return observed.major > minimum.major;
+  for (let i = 0; i < 3; i += 1) {
+    if (observed[i] !== minimum[i]) {
+      return observed[i]! > minimum[i]!;
+    }
   }
-  if (observed.minor !== minimum.minor) {
-    return observed.minor > minimum.minor;
-  }
-  return observed.patch >= minimum.patch;
+  return true;
 }

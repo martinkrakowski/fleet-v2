@@ -40,6 +40,12 @@ describe('claudeCodeSupportsPermissionHookBlock', () => {
     expect(claudeCodeSupportsPermissionHookBlock('2.14.0 (Claude Code)', '2.1.0')).toBe(true);
   });
 
+  it('refuses diagnostic text that merely mentions a high version', () => {
+    expect(
+      claudeCodeSupportsPermissionHookBlock('error: cannot read config 99.0.0 missing', '2.1.0'),
+    ).toBe(false);
+  });
+
   it('accepts the exact minimum', () => {
     expect(claudeCodeSupportsPermissionHookBlock('2.1.0', '2.1.0')).toBe(true);
   });

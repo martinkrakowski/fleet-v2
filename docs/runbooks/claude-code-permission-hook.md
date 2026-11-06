@@ -98,11 +98,11 @@ inert until they land.
    no `apps/api/server/routes/v1/threads/` directory and no `/v1/threads`
    rule in `apps/api/server/wiring/route-scopes.ts`.
 2. **The `PreToolUse` guard program.** Nothing in the tree inspects a tool
-   input and emits `permissionDecision: "deny"`. The settings example's
+   input and emits `permissionDecision: "deny"`; it would be a new command registered in `apps/cli/src/index.ts`. The settings example's
    `command` stays a placeholder.
 3. **The enforced start-up check.** There is no orchestrator start-up path to
    refuse an old client: no `orchestrator attach` anywhere under `apps/`, and
-   no `fleet_thread_read` / `fleet_thread_post` MCP tools.
+   no `fleet_thread_read` / `fleet_thread_post` MCP tools in `apps/mcp/src/registry.ts`.
 4. **The hook-scoped token's source.** `registerInteractiveSession`
    (`apps/api/server/wiring/session-exchange.ts`) has no production caller —
    the web/TUI login lanes have not landed — so no operator can mint a

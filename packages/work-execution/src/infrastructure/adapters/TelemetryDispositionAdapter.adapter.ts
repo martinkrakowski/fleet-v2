@@ -8,10 +8,7 @@
  * is the repo's one-adapter, two-modes pattern (`ConductorHaltAdapter`): with
  * a `stateDir` it uses the file, without one it holds the state in memory.
  * A lock that cannot be taken within `lockTimeoutMs` (default 500) skips the
- * write and changes nothing. With `readOnly` the store never writes: an
- * unreadable file is a read error with no quarantine copy and a write throws
- * `ReadOnlyStateStoreError` (the same read-only pattern as
- * `AttemptRepositoryAdapter`). The file joins `fleet-v2 state check` and
+ * write and changes nothing. The file joins `fleet-v2 state check` and
  * `state restore`.
  */
 
@@ -33,10 +30,8 @@ import type {
 import {
   FileLockTimeoutError,
   StateFileUnreadableError,
-  StateFileUnreadableReadOnlyError,
-  assertStoreWritable,
   inspectRecordListBytes,
-  rejectUnreadableStateFile,
+  quarantineUnreadable,
   withFileLock,
   writeJsonAtomically,
 } from './file-store.js';
@@ -47,8 +42,6 @@ export interface TelemetryDispositionAdapterOptions {
   readonly fileName?: string;
   /** The lock give-up of every write (plan §3.3 "Single writer"). */
   readonly lockTimeoutMs?: number;
-  /** A read-only store never writes, locks or quarantines anything. */
-  readonly readOnly?: boolean;
 }
 
 const DEFAULT_FILE_NAME = 'telemetry-dispositions.json';
@@ -104,11 +97,7 @@ export class TelemetryDispositionAdapter implements TelemetryDispositionPort {
     try {
       return { outcome: 'read', record: currentRecordOf(await this.readRecordsFromDisk(target)) };
     } catch (error: unknown) {
-      // A read-only store signals an unreadable file without touching disk.
-      if (
-        error instanceof StateFileUnreadableError ||
-        error instanceof StateFileUnreadableReadOnlyError
-      ) {
+      if (error instanceof StateFileUnreadableError) {
         return { outcome: 'unreadable' };
       }
       throw error;
@@ -116,7 +105,6 @@ export class TelemetryDispositionAdapter implements TelemetryDispositionPort {
   }
 
   async write(request: TelemetryDispositionWriteRequest): Promise<TelemetryDispositionWriteResult> {
-    assertStoreWritable(this.options?.readOnly === true, 'TelemetryDispositionAdapter');
     const target = this.statePath;
     if (target === null) {
       return this.mutateInMemory(request);
@@ -150,10 +138,7 @@ export class TelemetryDispositionAdapter implements TelemetryDispositionPort {
           try {
             current = currentRecordOf(await this.readRecordsFromDisk(target));
           } catch (error: unknown) {
-            if (
-              error instanceof StateFileUnreadableError ||
-              error instanceof StateFileUnreadableReadOnlyError
-            ) {
+            if (error instanceof StateFileUnreadableError) {
               return { outcome: 'refused', reason: 'store-unreadable' };
             }
             throw error;
@@ -168,10 +153,7 @@ export class TelemetryDispositionAdapter implements TelemetryDispositionPort {
         { timeoutMs: this.options.lockTimeoutMs ?? 500 },
       );
     } catch (error: unknown) {
-      if (
-        error instanceof StateFileUnreadableError ||
-        error instanceof StateFileUnreadableReadOnlyError
-      ) {
+      if (error instanceof StateFileUnreadableError) {
         return { outcome: 'refused', reason: 'store-unreadable' };
       }
       if (error instanceof FileLockTimeoutError) {
@@ -212,7 +194,7 @@ export class TelemetryDispositionAdapter implements TelemetryDispositionPort {
     }
     const inspection = inspectRecordListBytes(buffer, parseTelemetryDispositionStateRecord);
     if (inspection.status === 'unreadable') {
-      return rejectUnreadableStateFile(target, inspection.detail, buffer, this.options?.readOnly === true);
+      return quarantineUnreadable(target, inspection.detail, buffer);
     }
     return inspection.records;
   }

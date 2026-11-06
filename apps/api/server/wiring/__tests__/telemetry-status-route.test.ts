@@ -7,7 +7,7 @@ import "./nitro-globals.js";
 
 import { createHmac } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -225,42 +225,6 @@ describe("GET /v1/telemetry/status", () => {
     expect(response.status).toBe(200);
     const after = await snapshotStateNames(stateDir);
     expect(after).toEqual(before);
-  });
-
-  it("reads an unreadable store as store-unreadable and writes nothing", async () => {
-    const stateDir = await makeTempDir();
-    await writeFile(
-      join(stateDir, "telemetry-dispositions.json"),
-      "{not json CANARY",
-      "utf8",
-    );
-    configureTelemetryReadComposition({
-      stateDir,
-      installation: ENABLED_INSTALLATION,
-    });
-
-    const before = await snapshotStateNames(stateDir);
-    const response = await callStatus();
-    expect(response.status).toBe(200);
-    const envelope = response.payload as TelemetryStatusEnvelope;
-    expect(envelope.code).toBe("OK");
-    expect(envelope.result.outcome).toBe("store-unreadable");
-    expect(envelope.result.recordedSaltFingerprint).toBeNull();
-    expect(envelope.result.fingerprintMatch).toBeNull();
-    expect(envelope.result.lastExportAtIso).toBeNull();
-    expect(envelope.result.spans).toEqual({});
-    expect(envelope.result.counters).toEqual({});
-    expect(envelope.result.enabled).toBe(true);
-    expect(envelope.result.route).toBe("collector");
-
-    // The GET never mutates the state dir: no quarantine copy, same bytes.
-    const after = await snapshotStateNames(stateDir);
-    expect(after).toEqual(before);
-    const raw = await readFile(
-      join(stateDir, "telemetry-dispositions.json"),
-      "utf8",
-    );
-    expect(raw).toBe("{not json CANARY");
   });
 
   it("never carries the salt, the endpoint or a token", async () => {

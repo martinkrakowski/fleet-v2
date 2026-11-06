@@ -551,6 +551,87 @@ describe('ProjectProfile', () => {
     expect(second.defaultAllowedPathPrefixes).toEqual(['src']);
     expect(second.lastProbe!.checks[0].detail).toBe('ok');
   });
+
+  it('keeps the generator state of a probe receipt and copies it on toRecord', () => {
+    const generatorState = {
+      state: 'provisioned-legacy' as const,
+      generatorVersion: '0.14.0',
+      pinnedVersion: '0.16.0',
+    };
+    const profile = ProjectProfile.fromRecord(
+      profileRecord({
+        lastProbe: {
+          probedAtIso: '2026-10-15T09:00:00.000Z',
+          probedFrom: 'host-1',
+          checks: [{ name: 'git-fetch', host: 'host-1', result: 'pass', detail: 'ok' }],
+          generatorState,
+        },
+      }),
+    );
+    expect(profile.toRecord().lastProbe?.generatorState).toEqual(generatorState);
+  });
+
+  it('refuses a probe receipt whose generator state is not one of the four states', () => {
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({
+          lastProbe: {
+            probedAtIso: '2026-10-15T09:00:00.000Z',
+            probedFrom: 'host-1',
+            checks: [],
+            generatorState: {
+              state: 'governed' as never,
+              generatorVersion: null,
+              pinnedVersion: null,
+            },
+          },
+        }),
+      ),
+    ).toThrow('ProjectProfile requires lastProbe to be null or a probe receipt');
+  });
+
+  it('refuses a generator version that is not a version-shaped token', () => {
+    expect(() =>
+      ProjectProfile.fromRecord(
+        profileRecord({
+          lastProbe: {
+            probedAtIso: '2026-10-15T09:00:00.000Z',
+            probedFrom: 'host-1',
+            checks: [],
+            generatorState: {
+              state: 'provisioned-legacy',
+              generatorVersion: 'https://example.com/x',
+              pinnedVersion: null,
+            },
+          },
+        }),
+      ),
+    ).toThrow('ProjectProfile requires lastProbe to be null or a probe receipt');
+  });
+});
+
+describe('ProjectProfile generator versions', () => {
+  it.each(['password', 'api-key', 'abc.def.ghi', '1.2.3-password', '1.2.3-api-key', '1.2.3+secret'])(
+    'refuses the credential-shaped generator version %s',
+    (version) => {
+      expect(() =>
+        ProjectProfile.fromRecord(
+          profileRecord({
+            lastProbe: {
+              probedAtIso: '2026-10-15T09:00:00.000Z',
+              probedFrom: 'host-1',
+              checks: [],
+              generatorState: {
+                state: 'provisioned',
+                generatorVersion: null,
+                pinnedVersion: version,
+              },
+            },
+          }),
+        ),
+      ).toThrow('ProjectProfile requires lastProbe to be null or a probe receipt');
+    },
+  );
 });
 
 describe('AuthorizationConsumption', () => {

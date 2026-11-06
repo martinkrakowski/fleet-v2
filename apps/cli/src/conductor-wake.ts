@@ -172,6 +172,10 @@ class ChangeWakeReaderImpl implements ChangeWakeReader {
   constructor(body: ReadableStream<Uint8Array>, fetchAbort: AbortController) {
     this.reader = body.getReader();
     this.fetchAbort = fetchAbort;
+  }
+
+  /** Starts the read loop (kept out of the constructor: no async work while constructing). */
+  start(): void {
     void this.pump();
   }
 
@@ -219,11 +223,8 @@ class ChangeWakeReaderImpl implements ChangeWakeReader {
     }
     this.state = 'closed';
     this.fetchAbort.abort();
-    try {
-      void this.reader.cancel().catch(() => undefined);
-    } catch {
-      // the stream is already cancelled
-    }
+    // cancel() reports an already-cancelled stream as a rejection, never a throw
+    void this.reader.cancel().catch(() => undefined);
     this.settleWaiters(false);
   }
 
@@ -333,7 +334,9 @@ export async function openChangeWakeReader(options: {
     return null;
   }
   try {
-    return new ChangeWakeReaderImpl(response.body, fetchAbort);
+    const reader = new ChangeWakeReaderImpl(response.body, fetchAbort);
+    reader.start();
+    return reader;
   } catch {
     return null;
   }

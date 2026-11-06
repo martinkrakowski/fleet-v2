@@ -1151,6 +1151,47 @@ async function recordPassTrace(
 }
 
 /**
+ * The between-passes sleep of the poll loop. K9: a change signal ends the sleep
+ * early, so the next pass runs at once; a stream that closes without a signal
+ * keeps the back-off for the rest of this sleep.
+ */
+async function sleepBetweenPasses(options: {
+  readonly delayMs: number;
+  readonly signal: AbortSignal;
+  readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+  readonly wake: ChangeWakeReader | undefined;
+}): Promise<void> {
+  const { signal, wake } = options;
+  let sleepSettled = false;
+  const iteration = new AbortController();
+  const onStop = (): void => iteration.abort();
+  signal.addEventListener('abort', onStop, { once: true });
+  if (signal.aborted) {
+    iteration.abort();
+  }
+  try {
+    const slept = options.sleep(options.delayMs, iteration.signal).then(() => {
+      sleepSettled = true;
+    });
+    if (wake === undefined) {
+      await slept;
+      return;
+    }
+    const arrived = await Promise.race([
+      slept.then(() => false),
+      wake.waitForSignal(iteration.signal),
+    ]);
+    if (!arrived && !sleepSettled) {
+      // The stream closed without a signal: keep the back-off.
+      await slept;
+    }
+  } finally {
+    signal.removeEventListener('abort', onStop);
+    iteration.abort(); // ends a pending sleep timer and a pending waiter
+  }
+}
+
+/**
  * The shared poll loop of `conductor run`: one pass at a time under the
  * driver lease, printing one line per pass through `eachPass`, polling with
  * back-off from 30 seconds to 2 minutes, with a 10-second floor while a run
@@ -1210,36 +1251,12 @@ async function pollConductorPasses(options: {
         previousDelay = nextPollDelayMs(previousDelay, result.progressed);
       }
       const delayMs = pollSleepMs(previousDelay ?? MIN_POLL_MS, result);
-      // K9: a change signal ends the sleep, so the next pass runs at once.
-      let wake = options.wake;
-      let sleepSettled = false;
-      const iteration = new AbortController();
-      const onStop = (): void => iteration.abort();
-      signal.addEventListener('abort', onStop, { once: true });
-      if (signal.aborted) {
-        iteration.abort();
-      }
-      try {
-        const slept = options.sleep(delayMs, iteration.signal).then(() => {
-          sleepSettled = true;
-        });
-        if (wake === undefined) {
-          await slept;
-        } else {
-          const arrived = await Promise.race([
-            slept.then(() => false),
-            wake.waitForSignal(iteration.signal),
-          ]);
-          if (!arrived && !sleepSettled) {
-            // The stream closed without a signal: keep the back-off.
-            wake = undefined;
-            await slept;
-          }
-        }
-      } finally {
-        signal.removeEventListener('abort', onStop);
-        iteration.abort(); // ends a pending sleep timer and a pending waiter
-      }
+      await sleepBetweenPasses({
+        delayMs,
+        signal,
+        sleep: options.sleep,
+        wake: options.wake,
+      });
       if (signal.aborted) {
         break;
       }

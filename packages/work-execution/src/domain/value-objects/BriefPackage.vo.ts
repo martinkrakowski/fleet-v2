@@ -18,6 +18,7 @@ import { SeatPlan } from './SeatPlan.vo.js';
 import {
   INITIAL_RECORD_SCHEMA_VERSION,
   isAcceptedRecordSchemaVersion,
+  isPlainRecordObject,
   readRecordSchemaVersion,
 } from '../record-schema-version.js';
 import { snapshotPlainDataRecord } from '../plain-record-reads.js';
@@ -105,6 +106,46 @@ function byteLength(text: string): number {
   return new TextEncoder().encode(text).byteLength;
 }
 
+/**
+ * Proxy-trap-safe plain-record read: `snapshotPlainDataRecord` is
+ * getter-safe, but inspecting any object — through `getPrototypeOf`,
+ * `Reflect.ownKeys` or `Object.getOwnPropertyDescriptor` — exercises the
+ * corresponding traps of a Proxy in front of it, and a hostile trap can
+ * answer inconsistently between calls. Reading the record twice and refusing
+ * anything that does not answer identically both times (same keys, same
+ * `Object.is` values) means a trap can never feed one value into validation
+ * and a different value into the frozen result; a trap that throws surfaces
+ * through the enclosing guards as a typed refusal, never as an escape.
+ */
+function snapshotsEqual(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+  return leftKeys.every(
+    (key) => Object.hasOwn(right, key) && Object.is(left[key], right[key]),
+  );
+}
+
+function stableSnapshot(value: unknown): Record<string, unknown> | null {
+  if (!isPlainRecordObject(value)) {
+    return null;
+  }
+  const first = snapshotPlainDataRecord(value);
+  if (first === null) {
+    return null;
+  }
+  const second = snapshotPlainDataRecord(value);
+  if (second === null || !snapshotsEqual(first, second)) {
+    return null;
+  }
+  return first;
+}
+
 /** Validates one bounded identifier-like string; the refusal code or null. */
 function scalarError(value: unknown, maxChars: number): BriefPackageRefusalCode | null {
   if (typeof value !== 'string' || value.trim().length === 0 || value.includes('\u0000')) {
@@ -119,18 +160,30 @@ function scalarError(value: unknown, maxChars: number): BriefPackageRefusalCode 
   return null;
 }
 
-/** True when `arr` holds a data property at every index from 0 to length-1. */
-function isDenseArray(value: unknown): value is unknown[] {
+/**
+ * The copied values of a dense array: every index from `0` to `length - 1`
+ * must hold an enumerable data property, read through its descriptor (so no
+ * `get` trap or getter ever runs) and read twice (so a hostile trap cannot
+ * show one value to validation and hand a different one to the package).
+ * `null` for anything else — sparse arrays, accessor indices, non-arrays.
+ */
+function denseArrayValues(value: unknown): unknown[] | null {
   if (!Array.isArray(value)) {
-    return false;
+    return null;
   }
+  const out: unknown[] = [];
   for (let index = 0; index < value.length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(value, index);
     if (descriptor === undefined || !descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
-      return false;
+      return null;
     }
+    const confirmed = Object.getOwnPropertyDescriptor(value, index);
+    if (confirmed === undefined || !Object.is(confirmed.value, descriptor.value)) {
+      return null;
+    }
+    out.push(descriptor.value);
   }
-  return true;
+  return out;
 }
 
 /** Validates one execution-limits instance and clones it with sorted resourceBounds keys. */
@@ -154,7 +207,7 @@ function validateLimitsInstance(value: unknown): { ok: true; limits: ExecutionLi
   if (bounds === null || typeof bounds !== 'object' || Array.isArray(bounds)) {
     return { ok: false, code: 'invalid-limits' };
   }
-  const snapshot = snapshotPlainDataRecord(bounds);
+  const snapshot = stableSnapshot(bounds);
   if (snapshot === null) {
     return { ok: false, code: 'invalid-limits' };
   }
@@ -188,15 +241,16 @@ function validateLimitsInstance(value: unknown): { ok: true; limits: ExecutionLi
 
 /** Validates the selected context versions and returns a deep-frozen clone. */
 function validateContextVersions(value: unknown): { ok: true; versions: readonly BriefSelectedContextVersion[] } | { ok: false; code: BriefPackageRefusalCode } {
-  if (!isDenseArray(value)) {
+  const entries = denseArrayValues(value);
+  if (entries === null) {
     return { ok: false, code: 'invalid-context-versions' };
   }
-  if (value.length > BRIEF_PACKAGE_MAX_CONTEXT_VERSIONS) {
+  if (entries.length > BRIEF_PACKAGE_MAX_CONTEXT_VERSIONS) {
     return { ok: false, code: 'oversized' };
   }
   const versions: BriefSelectedContextVersion[] = [];
-  for (const entry of value) {
-    const snapshot = snapshotPlainDataRecord(entry);
+  for (const entry of entries) {
+    const snapshot = stableSnapshot(entry);
     if (snapshot === null || Object.keys(snapshot).length !== 2 || !Object.hasOwn(snapshot, 'knowledgeEntryId') || !Object.hasOwn(snapshot, 'version')) {
       return { ok: false, code: 'invalid-context-versions' };
     }
@@ -218,14 +272,15 @@ function validateContextVersions(value: unknown): { ok: true; versions: readonly
 
 /** Validates the owner decision references and returns a frozen clone. */
 function validateDecisionRefs(value: unknown): { ok: true; refs: readonly string[] } | { ok: false; code: BriefPackageRefusalCode } {
-  if (!isDenseArray(value)) {
+  const entries = denseArrayValues(value);
+  if (entries === null) {
     return { ok: false, code: 'invalid-owner-decisions' };
   }
-  if (value.length > BRIEF_PACKAGE_MAX_DECISION_REFS) {
+  if (entries.length > BRIEF_PACKAGE_MAX_DECISION_REFS) {
     return { ok: false, code: 'oversized' };
   }
   const refs: string[] = [];
-  for (const entry of value) {
+  for (const entry of entries) {
     const entryError = scalarError(entry, BRIEF_PACKAGE_MAX_PATH_CHARS);
     if (entryError !== null) {
       return { ok: false, code: entryError };
@@ -259,7 +314,7 @@ function deepScanError(value: unknown, maxChars: number): BriefPackageRefusalCod
     return null;
   }
   if (value !== null && typeof value === 'object') {
-    const snapshot = snapshotPlainDataRecord(value);
+    const snapshot = stableSnapshot(value);
     if (snapshot === null) {
       return 'malformed';
     }
@@ -295,7 +350,7 @@ function validateSeatPlanValue(value: unknown): { ok: true; plan: SeatPlan } | {
 
 /** Validates one PR-notes record and returns a frozen clone. */
 function validatePrNotes(value: unknown): { ok: true; notes: BriefPrNotes } | { ok: false; code: BriefPackageRefusalCode } {
-  const snapshot = snapshotPlainDataRecord(value);
+  const snapshot = stableSnapshot(value);
   if (
     snapshot === null ||
     Object.keys(snapshot).length !== 3 ||
@@ -354,7 +409,7 @@ export class BriefPackage {
   }
 
   private static createUnchecked(rawProps: unknown): BriefPackageCreateResult {
-    const snapshot = snapshotPlainDataRecord(rawProps);
+    const snapshot = stableSnapshot(rawProps);
     if (snapshot === null) {
       return {
         success: false,
@@ -364,22 +419,23 @@ export class BriefPackage {
     }
 
     let schemaVersion: number;
-    const schemaDescriptor = Object.getOwnPropertyDescriptor(rawProps, 'schemaVersion');
-    if (schemaDescriptor === undefined) {
+    // The snapshot already refuses accessor and non-enumerable properties, so
+    // the schema version is read from it rather than through another trap on
+    // the raw input.
+    const hasSchemaVersionKey = Object.hasOwn(snapshot, 'schemaVersion');
+    if (!hasSchemaVersionKey) {
       const hasStructured = FROZEN_INPUT_KEYS.some((key) => snapshot[key] !== undefined && snapshot[key] !== null);
       schemaVersion = hasStructured ? BRIEF_PACKAGE_SCHEMA_VERSION : INITIAL_RECORD_SCHEMA_VERSION;
     } else {
-      if (!schemaDescriptor.enumerable || schemaDescriptor.get !== undefined || schemaDescriptor.set !== undefined) {
-        return { success: false, code: 'malformed', error: new Error('BriefPackage input is malformed') };
-      }
-      if (!isAcceptedRecordSchemaVersion(schemaDescriptor.value, BRIEF_PACKAGE_SCHEMA_VERSION)) {
+      const declared = snapshot.schemaVersion;
+      if (!isAcceptedRecordSchemaVersion(declared, BRIEF_PACKAGE_SCHEMA_VERSION)) {
         return {
           success: false,
           code: 'unknown-schema-version',
           error: new Error('BriefPackage schemaVersion is outside the accepted window'),
         };
       }
-      schemaVersion = schemaDescriptor.value;
+      schemaVersion = declared as number;
     }
 
     for (const field of STRING_FIELDS) {
@@ -396,8 +452,8 @@ export class BriefPackage {
       }
     }
 
-    const ownedPaths = snapshot.ownedPaths;
-    if (!Array.isArray(ownedPaths)) {
+    const ownedPaths = denseArrayValues(snapshot.ownedPaths);
+    if (ownedPaths === null) {
       return { success: false, code: 'invalid-owned-path', error: new Error('BriefPackage requires owned paths') };
     }
     if (ownedPaths.length === 0) {
@@ -405,9 +461,6 @@ export class BriefPackage {
     }
     if (ownedPaths.length > BRIEF_PACKAGE_MAX_OWNED_PATHS) {
       return { success: false, code: 'oversized', error: new Error('BriefPackage owned paths are over their size bound') };
-    }
-    if (!isDenseArray(ownedPaths)) {
-      return { success: false, code: 'invalid-owned-path', error: new Error('BriefPackage owned paths must be a dense array') };
     }
     for (const path of ownedPaths) {
       if (typeof path !== 'string' || path.trim().length === 0 || path.includes('\u0000')) {
@@ -533,7 +586,18 @@ export class BriefPackage {
   }
 
   getLimits(): ExecutionLimits | null {
-    return this.props.limits ?? null;
+    const limits = this.props.limits;
+    if (limits === null || limits === undefined) {
+      return null;
+    }
+    // Re-validate into a fresh instance: the stored value object's resource
+    // bounds are its own mutable record, and no caller may reach them.
+    try {
+      const checked = validateLimitsInstance(limits);
+      return checked.ok ? checked.limits : null;
+    } catch {
+      return null;
+    }
   }
 
   getSelectedContextVersions(): readonly BriefSelectedContextVersion[] | null {
@@ -549,7 +613,18 @@ export class BriefPackage {
   }
 
   getSeatPlan(): SeatPlan | null {
-    return this.props.seatPlan ?? null;
+    const plan = this.props.seatPlan;
+    if (plan === null || plan === undefined) {
+      return null;
+    }
+    // Recreate from the serialized form so the stored instance's internal
+    // plan data is never handed to a caller.
+    try {
+      const recreated = SeatPlan.create(plan.toJSON());
+      return recreated.success && recreated.value !== undefined ? recreated.value : null;
+    } catch {
+      return null;
+    }
   }
 
   getPrNotes(): BriefPrNotes | null {
@@ -565,8 +640,21 @@ export class BriefPackage {
     );
   }
 
+  /** A frozen defensive copy; the internal props object is never exposed. */
   getProps(): BriefPackageProps {
-    return this.props;
+    const props = this.props;
+    const notes = this.getPrNotes();
+    const contextVersions = this.getSelectedContextVersions();
+    const decisionRefs = this.getOwnerDecisionReferences();
+    return Object.freeze({
+      ...props,
+      ownedPaths: Object.freeze([...props.ownedPaths]),
+      limits: this.getLimits(),
+      selectedContextVersions: contextVersions === null ? null : Object.freeze([...contextVersions]),
+      ownerDecisionReferences: decisionRefs === null ? null : Object.freeze([...decisionRefs]),
+      seatPlan: this.getSeatPlan(),
+      prNotes: notes === null ? null : Object.freeze(notes),
+    });
   }
 
   equals(other: BriefPackage | null | undefined): boolean {
@@ -648,13 +736,31 @@ function prNotesEqual(left: BriefPrNotes | null, right: BriefPrNotes | null): bo
 export function canonicalizeBriefFrozenInputs(
   inputs: BriefFrozenInputs,
 ): { ok: true; json: string | null } | { ok: false; code: BriefPackageRefusalCode } {
-  if (FROZEN_INPUT_KEYS.every((key) => inputs[key] === undefined || inputs[key] === null)) {
+  // Nothing here may throw past the caller: the fields are read through a
+  // descriptor-safe snapshot (a throwing getter on `inputs` — top level or
+  // nested — becomes a typed `'malformed'` refusal, never an escape), and any
+  // hostile value object accessor hit while validating is caught below.
+  try {
+    return canonicalizeBriefFrozenInputsUnchecked(inputs);
+  } catch {
+    return { ok: false, code: 'malformed' };
+  }
+}
+
+function canonicalizeBriefFrozenInputsUnchecked(
+  inputs: BriefFrozenInputs,
+): { ok: true; json: string | null } | { ok: false; code: BriefPackageRefusalCode } {
+  const snapshot = stableSnapshot(inputs);
+  if (snapshot === null) {
+    return { ok: false, code: 'malformed' };
+  }
+  if (FROZEN_INPUT_KEYS.every((key) => snapshot[key] === undefined || snapshot[key] === null)) {
     return { ok: true, json: null };
   }
 
   let limits: ExecutionLimits | null = null;
-  if (inputs.limits !== undefined && inputs.limits !== null) {
-    const checked = validateLimitsInstance(inputs.limits);
+  if (snapshot.limits !== undefined && snapshot.limits !== null) {
+    const checked = validateLimitsInstance(snapshot.limits);
     if (!checked.ok) {
       return { ok: false, code: checked.code };
     }
@@ -662,8 +768,8 @@ export function canonicalizeBriefFrozenInputs(
   }
 
   let selectedContextVersions: readonly BriefSelectedContextVersion[] | null = null;
-  if (inputs.selectedContextVersions !== undefined && inputs.selectedContextVersions !== null) {
-    const checked = validateContextVersions(inputs.selectedContextVersions);
+  if (snapshot.selectedContextVersions !== undefined && snapshot.selectedContextVersions !== null) {
+    const checked = validateContextVersions(snapshot.selectedContextVersions);
     if (!checked.ok) {
       return { ok: false, code: checked.code };
     }
@@ -671,8 +777,8 @@ export function canonicalizeBriefFrozenInputs(
   }
 
   let ownerDecisionReferences: readonly string[] | null = null;
-  if (inputs.ownerDecisionReferences !== undefined && inputs.ownerDecisionReferences !== null) {
-    const checked = validateDecisionRefs(inputs.ownerDecisionReferences);
+  if (snapshot.ownerDecisionReferences !== undefined && snapshot.ownerDecisionReferences !== null) {
+    const checked = validateDecisionRefs(snapshot.ownerDecisionReferences);
     if (!checked.ok) {
       return { ok: false, code: checked.code };
     }
@@ -680,8 +786,8 @@ export function canonicalizeBriefFrozenInputs(
   }
 
   let seatPlan: SeatPlan | null = null;
-  if (inputs.seatPlan !== undefined && inputs.seatPlan !== null) {
-    const checked = validateSeatPlanValue(inputs.seatPlan);
+  if (snapshot.seatPlan !== undefined && snapshot.seatPlan !== null) {
+    const checked = validateSeatPlanValue(snapshot.seatPlan);
     if (!checked.ok) {
       return { ok: false, code: checked.code };
     }
@@ -689,8 +795,8 @@ export function canonicalizeBriefFrozenInputs(
   }
 
   let prNotes: BriefPrNotes | null = null;
-  if (inputs.prNotes !== undefined && inputs.prNotes !== null) {
-    const checked = validatePrNotes(inputs.prNotes);
+  if (snapshot.prNotes !== undefined && snapshot.prNotes !== null) {
+    const checked = validatePrNotes(snapshot.prNotes);
     if (!checked.ok) {
       return { ok: false, code: checked.code };
     }
@@ -742,6 +848,18 @@ function fallbackDigest(content: string): string {
   return DIGEST_SEEDS.map((seed) => fnv1a32(content, seed).toString(16).padStart(8, '0')).join('');
 }
 
+/** Runs the digest function inside a guard: a throwing digest is `malformed`, never an escape. */
+function safeDigest(
+  digestFn: (content: string) => string,
+  content: string,
+): { ok: true; digest: string } | { ok: false } {
+  try {
+    return { ok: true, digest: digestFn(content) };
+  } catch {
+    return { ok: false };
+  }
+}
+
 function proseTextError(value: unknown, maxBytes: number): BriefPackageRefusalCode | null {
   if (typeof value !== 'string' || value.trim().length === 0) {
     return 'invalid-field';
@@ -767,7 +885,7 @@ export function computeBriefPackageDigest(
   computeDigest?: (content: string) => string,
 ): { readonly ok: true; readonly briefDigest: string; readonly coversStructuredInputs: boolean } | { readonly ok: false; readonly code: BriefPackageRefusalCode } {
   const digestFn = computeDigest ?? fallbackDigest;
-  const snapshot = snapshotPlainDataRecord(input);
+  const snapshot = stableSnapshot(input);
   if (snapshot === null) {
     return { ok: false, code: 'malformed' };
   }
@@ -798,7 +916,10 @@ export function computeBriefPackageDigest(
     if (hasSecretShape(manifestRaw)) {
       return { ok: false, code: 'secret-shaped' };
     }
-    return { ok: true, briefDigest: digestFn(prose + '\n' + manifestRaw), coversStructuredInputs: true };
+    const digested = safeDigest(digestFn, prose + '\n' + manifestRaw);
+    return digested.ok
+      ? { ok: true, briefDigest: digested.digest, coversStructuredInputs: true }
+      : { ok: false, code: 'malformed' };
   }
 
   if (frozenInputs !== undefined && frozenInputs !== null) {
@@ -807,11 +928,17 @@ export function computeBriefPackageDigest(
       return { ok: false, code: canonical.code };
     }
     if (canonical.json !== null) {
-      return { ok: true, briefDigest: digestFn(prose + '\n' + canonical.json), coversStructuredInputs: true };
+      const digested = safeDigest(digestFn, prose + '\n' + canonical.json);
+      return digested.ok
+        ? { ok: true, briefDigest: digested.digest, coversStructuredInputs: true }
+        : { ok: false, code: 'malformed' };
     }
   }
 
-  return { ok: true, briefDigest: digestFn(prose), coversStructuredInputs: false };
+  const proseOnly = safeDigest(digestFn, prose);
+  return proseOnly.ok
+    ? { ok: true, briefDigest: proseOnly.digest, coversStructuredInputs: false }
+    : { ok: false, code: 'malformed' };
 }
 
 const READER_ALLOWED_KEYS: readonly string[] = [
@@ -844,7 +971,7 @@ function limitsFromPlain(
   ) {
     return { ok: false, code: 'invalid-limits' };
   }
-  const snapshot = snapshotPlainDataRecord(resourceBounds);
+  const snapshot = stableSnapshot(resourceBounds);
   if (snapshot === null) {
     return { ok: false, code: 'invalid-limits' };
   }
@@ -903,7 +1030,7 @@ function readBriefPackageManifestUnchecked(
   options?: { readonly currentVersion?: number; readonly computeDigest?: (content: string) => string },
 ): { readonly ok: true; readonly value: BriefPackage; readonly schemaVersion: number; readonly explicitSchemaVersion: boolean } | { readonly ok: false; readonly code: BriefPackageRefusalCode } {
   const digestFn = options?.computeDigest ?? fallbackDigest;
-  const snapshot = snapshotPlainDataRecord(input);
+  const snapshot = stableSnapshot(input);
   if (snapshot === null) {
     return { ok: false, code: 'malformed' };
   }
@@ -974,7 +1101,7 @@ function readBriefPackageManifestUnchecked(
   if (!versionRead.ok) {
     return { ok: false, code: versionRead.reason };
   }
-  const snap = snapshotPlainDataRecord(parsed);
+  const snap = stableSnapshot(parsed);
   if (snap === null) {
     return { ok: false, code: 'malformed' };
   }

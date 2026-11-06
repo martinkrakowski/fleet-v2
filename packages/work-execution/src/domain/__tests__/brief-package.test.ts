@@ -526,4 +526,78 @@ describe('readBriefPackageManifest', () => {
       'prNotes',
     ]);
   });
+
+  it('never hands out the internal limits, seat plan or props object', () => {
+    const storedLimits = limitsValue();
+    const storedPlan = seatPlanValue();
+    const result = BriefPackage.create(
+      baseProps(frozenInputs({ limits: storedLimits, seatPlan: storedPlan })),
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const pkg = result.value;
+
+    // The getters return fresh clones, so mutating the returned bounds or
+    // plan cannot touch the package's validated frozen inputs.
+    const returnedLimits = pkg.getLimits()!;
+    expect(returnedLimits).not.toBe(storedLimits);
+    (returnedLimits.getResourceBounds() as Record<string, string>).cpu = '999';
+    expect(pkg.getLimits()!.getResourceBounds()).toEqual({ cpu: '2' });
+
+    const returnedPlan = pkg.getSeatPlan()!;
+    expect(returnedPlan).not.toBe(storedPlan);
+    expect(returnedPlan.equals(storedPlan)).toBe(true);
+
+    // getProps is a frozen defensive copy; nothing on it aliases the package.
+    const props = pkg.getProps();
+    expect(Object.isFrozen(props)).toBe(true);
+    expect(Object.isFrozen(props.ownedPaths)).toBe(true);
+    expect(props.limits).not.toBe(storedLimits);
+    (props.limits!.getResourceBounds() as Record<string, string>).cpu = '999';
+    expect(pkg.getLimits()!.getResourceBounds()).toEqual({ cpu: '2' });
+  });
+
+  it('refuses a hostile Proxy whose traps answer inconsistently between reads', () => {
+    let descriptorReads = 0;
+    const target = baseProps(frozenInputs()) as Record<string, unknown>;
+    const hostile = new Proxy(target, {
+      getOwnPropertyDescriptor(t, key) {
+        descriptorReads += 1;
+        const descriptor = Reflect.getOwnPropertyDescriptor(t, key);
+        if (descriptor !== undefined && key === 'attemptId' && descriptorReads > 4) {
+          return { ...descriptor, value: 'tampered-attempt' };
+        }
+        return descriptor;
+      },
+    });
+    const result = BriefPackage.create(hostile);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(['non-object', 'malformed']).toContain(result.code);
+
+    let proseDescriptorReads = 0;
+    const digestHostile = new Proxy({ prose: 'hello', frozenInputs: {} } as Record<string, unknown>, {
+      getOwnPropertyDescriptor(t, key) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(t, key);
+        if (key === 'prose' && descriptor !== undefined) {
+          proseDescriptorReads += 1;
+          return { ...descriptor, value: proseDescriptorReads % 2 === 1 ? 'one' : 'two' };
+        }
+        return descriptor;
+      },
+    });
+    expect(computeBriefPackageDigest(digestHostile).ok).toBe(false);
+  });
+
+  it('returns a typed refusal for throwing getters on frozenInputs instead of throwing', () => {
+    const hostileInputs: Record<string, unknown> = {};
+    Object.defineProperty(hostileInputs, 'limits', { enumerable: true, get() { throw new Error('boom'); } });
+    expect(canonicalizeBriefFrozenInputs(hostileInputs as BriefFrozenInputs)).toEqual({
+      ok: false,
+      code: 'malformed',
+    });
+
+    const digestRead = computeBriefPackageDigest({ prose: 'hello', frozenInputs: hostileInputs });
+    expect(digestRead).toEqual({ ok: false, code: 'malformed' });
+  });
 });

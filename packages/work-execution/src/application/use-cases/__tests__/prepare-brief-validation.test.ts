@@ -894,4 +894,25 @@ describe('PrepareBriefPackageUseCase CO28b schemaVersion 2 and frozen inputs', (
     if (decisionsResult.outcome === 'rejected') expect(decisionsResult.reason).not.toContain(githubToken);
     expect(JSON.stringify(boundsResult)).not.toContain('/wt');
   });
+
+  it('refuses NUL-bearing owner decision references before any outbound call', async () => {
+    const captured = makeCapturingArtifactPort();
+    const useCase = new PrepareBriefPackageUseCase({
+      briefAuthoring: makeBriefAuthoring(),
+      artifactPort: captured.port,
+      worktreePath: '/wt',
+    });
+
+    const nulRef = 'decision' + String.fromCharCode(0) + '-1';
+    const result = await useCase.prepareBriefPackage(
+      validRequest({ ownerDecisionReferences: [nulRef] }),
+    );
+    expect(result).toEqual({
+      outcome: 'rejected',
+      reason:
+        'ownerDecisionReferences entries must be non-empty strings of at most 256 characters',
+    });
+    expect(captured.placedRequests).toHaveLength(0);
+    expect(captured.verifyIgnoredPathsRequests).toHaveLength(0);
+  });
 });

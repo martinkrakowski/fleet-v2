@@ -154,12 +154,16 @@ function prNotesError(notes: unknown): string | null {
 }
 
 /**
- * CO28b: the structured frozen inputs are validated before any outbound call
- * (authoring, ignored-path verification or placement), so a rejected freeze
- * writes nothing to the worktree. Returns a fixed, path-free and value-free
- * reason or null.
+ * CO28b: the structured frozen inputs are validated — and the typed
+ * `ExecutionLimits` is constructed — before any outbound call (authoring,
+ * ignored-path verification or placement), so a rejected freeze writes
+ * nothing to the worktree and a failing `ExecutionLimits.create` can never
+ * be quietly downgraded to `null` limits on the frozen package. Returns the
+ * validated limits or a fixed, path-free and value-free reason.
  */
-function validateFrozenInputs(request: PrepareBriefPackageRequest): string | null {
+function validateFrozenInputs(
+  request: PrepareBriefPackageRequest,
+): { readonly ok: true; readonly limits: ExecutionLimits } | { readonly ok: false; readonly reason: string } {
   if (
     typeof request.stepLimit !== 'number' ||
     typeof request.timeLimitSeconds !== 'number' ||
@@ -168,56 +172,100 @@ function validateFrozenInputs(request: PrepareBriefPackageRequest): string | nul
     request.stepLimit <= 0 ||
     request.timeLimitSeconds <= 0
   ) {
-    return 'stepLimit and timeLimitSeconds must be positive';
+    return { ok: false, reason: 'stepLimit and timeLimitSeconds must be positive' };
   }
   if (!Number.isSafeInteger(request.stepLimit) || request.stepLimit > BRIEF_PACKAGE_MAX_STEP_LIMIT) {
-    return `stepLimit must be a whole number between 1 and ${BRIEF_PACKAGE_MAX_STEP_LIMIT}`;
+    return {
+      ok: false,
+      reason: `stepLimit must be a whole number between 1 and ${BRIEF_PACKAGE_MAX_STEP_LIMIT}`,
+    };
   }
   if (
     !Number.isSafeInteger(request.timeLimitSeconds) ||
     request.timeLimitSeconds > BRIEF_PACKAGE_MAX_TIME_LIMIT_SECONDS
   ) {
-    return `timeLimitSeconds must be a whole number between 1 and ${BRIEF_PACKAGE_MAX_TIME_LIMIT_SECONDS}`;
+    return {
+      ok: false,
+      reason: `timeLimitSeconds must be a whole number between 1 and ${BRIEF_PACKAGE_MAX_TIME_LIMIT_SECONDS}`,
+    };
   }
   const boundsSnapshot = snapshotPlainDataRecord(request.resourceBounds);
   if (boundsSnapshot === null) {
-    return 'resourceBounds must be an object of string values';
+    return { ok: false, reason: 'resourceBounds must be an object of string values' };
   }
   if (Object.keys(boundsSnapshot).length > BRIEF_PACKAGE_MAX_RESOURCE_BOUNDS) {
-    return `resourceBounds must hold at most ${BRIEF_PACKAGE_MAX_RESOURCE_BOUNDS} entries`;
+    return {
+      ok: false,
+      reason: `resourceBounds must hold at most ${BRIEF_PACKAGE_MAX_RESOURCE_BOUNDS} entries`,
+    };
   }
-  for (const [key, value] of Object.entries(boundsSnapshot)) {
-    if (key.trim().length === 0 || key.length > BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS) {
-      return `resourceBounds keys must be non-empty strings of at most ${BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS} characters`;
+  // The bounds are sorted here once, so the manifest, the digest input and
+  // the frozen `ExecutionLimits` all carry the same deterministic key order.
+  const sortedBounds: Record<string, string> = {};
+  for (const key of Object.keys(boundsSnapshot).sort()) {
+    if (key.trim().length === 0 || key.includes('\u0000') || key.length > BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS) {
+      return {
+        ok: false,
+        reason: `resourceBounds keys must be non-empty strings of at most ${BRIEF_PACKAGE_MAX_RESOURCE_KEY_CHARS} characters`,
+      };
     }
+    const value = boundsSnapshot[key];
     if (typeof value !== 'string' || value.includes('\u0000') || value.length > BRIEF_PACKAGE_MAX_RESOURCE_VALUE_CHARS) {
-      return `resourceBounds values must be strings of at most ${BRIEF_PACKAGE_MAX_RESOURCE_VALUE_CHARS} characters`;
+      return {
+        ok: false,
+        reason: `resourceBounds values must be strings of at most ${BRIEF_PACKAGE_MAX_RESOURCE_VALUE_CHARS} characters`,
+      };
     }
     if (isPlanSecretShaped(key) || isPlanSecretShaped(value)) {
-      return 'resourceBounds contains a secret-shaped value and was refused';
+      return { ok: false, reason: 'resourceBounds contains a secret-shaped value and was refused' };
     }
+    sortedBounds[key] = value;
   }
   const decisions = request.ownerDecisionReferences;
   if (!Array.isArray(decisions)) {
-    return 'ownerDecisionReferences must be an array of strings';
+    return { ok: false, reason: 'ownerDecisionReferences must be an array of strings' };
   }
   if (decisions.length > BRIEF_PACKAGE_MAX_DECISION_REFS) {
-    return `ownerDecisionReferences must hold at most ${BRIEF_PACKAGE_MAX_DECISION_REFS} entries`;
+    return {
+      ok: false,
+      reason: `ownerDecisionReferences must hold at most ${BRIEF_PACKAGE_MAX_DECISION_REFS} entries`,
+    };
   }
   for (let index = 0; index < decisions.length; index += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(decisions, index);
     if (descriptor === undefined || !descriptor.enumerable || descriptor.get !== undefined) {
-      return 'ownerDecisionReferences must be a dense array of strings';
+      return { ok: false, reason: 'ownerDecisionReferences must be a dense array of strings' };
     }
     const entry = decisions[index];
-    if (typeof entry !== 'string' || entry.trim().length === 0 || entry.length > BRIEF_PACKAGE_MAX_PATH_CHARS) {
-      return `ownerDecisionReferences entries must be non-empty strings of at most ${BRIEF_PACKAGE_MAX_PATH_CHARS} characters`;
+    if (
+      typeof entry !== 'string' ||
+      entry.trim().length === 0 ||
+      // A NUL-bearing reference must be refused here, before authoring and
+      // ignored-path verification run against an input the domain would
+      // reject only at the very end of the pipeline.
+      entry.includes('\u0000') ||
+      entry.length > BRIEF_PACKAGE_MAX_PATH_CHARS
+    ) {
+      return {
+        ok: false,
+        reason: `ownerDecisionReferences entries must be non-empty strings of at most ${BRIEF_PACKAGE_MAX_PATH_CHARS} characters`,
+      };
     }
     if (isPlanSecretShaped(entry)) {
-      return 'ownerDecisionReferences contains a secret-shaped value and was refused';
+      return { ok: false, reason: 'ownerDecisionReferences contains a secret-shaped value and was refused' };
     }
   }
-  return null;
+  // The typed limits are created up front: a failure here is a request
+  // rejection, never a silent `null` limits field on the frozen package.
+  const limitsCreated = ExecutionLimits.create({
+    stepLimit: request.stepLimit,
+    timeLimitSeconds: request.timeLimitSeconds,
+    resourceBounds: sortedBounds,
+  });
+  if (!limitsCreated.success || limitsCreated.value === undefined) {
+    return { ok: false, reason: 'Execution limits are invalid for a frozen brief' };
+  }
+  return { ok: true, limits: limitsCreated.value };
 }
 
 /** Fail-closed model-family comparison (owner rule 2026-10-16). */
@@ -561,9 +609,9 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
     if (fieldsError !== null) {
       return { reason: fieldsError };
     }
-    const frozenError = validateFrozenInputs(request);
-    if (frozenError !== null) {
-      return { reason: frozenError };
+    const frozenCheck = validateFrozenInputs(request);
+    if (!frozenCheck.ok) {
+      return { reason: frozenCheck.reason };
     }
     const pathsCheck = validatePathsAndSpec(request);
     if ('reason' in pathsCheck) {
@@ -628,10 +676,9 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       .filter((decision) => decision.accepted)
       .map((decision) => ({ knowledgeEntryId: decision.knowledgeEntryId, version: decision.version }));
 
-    const sortedResourceBounds: Record<string, string> = {};
-    for (const key of Object.keys(request.resourceBounds).sort()) {
-      sortedResourceBounds[key] = (request.resourceBounds as Record<string, string>)[key];
-    }
+    // The bounds were validated and sorted before any outbound call; the
+    // limits instance owns its own copy, so the manifest reads from it.
+    const sortedResourceBounds: Readonly<Record<string, string>> = frozenCheck.limits.getResourceBounds();
 
     const manifestJson = JSON.stringify(
       {
@@ -678,12 +725,9 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       : simpleDeterministicHexDigest(briefContent);
 
     // CO28b: the frozen package must pass domain validation before any
-    // placement; a refusal here leaves the worktree untouched.
-    const limitsCreated = ExecutionLimits.create({
-      stepLimit: request.stepLimit,
-      timeLimitSeconds: request.timeLimitSeconds,
-      resourceBounds: sortedResourceBounds,
-    });
+    // placement; a refusal here leaves the worktree untouched. The typed
+    // limits were already validated before any outbound call, so a valid
+    // package can never carry `null` limits.
     const pkg = BriefPackage.create({
       schemaVersion: BRIEF_PACKAGE_SCHEMA_VERSION,
       attemptId,
@@ -695,7 +739,7 @@ export class PrepareBriefPackageUseCase implements PrepareBriefPackagePort {
       independentReviewer: request.independentReviewer,
       ownedPaths: request.ownedPaths,
       acceptanceSpec: pathsCheck.acceptanceSpec,
-      limits: limitsCreated.success && limitsCreated.value !== undefined ? limitsCreated.value : null,
+      limits: frozenCheck.limits,
       selectedContextVersions: selectedKnowledgeVersions,
       ownerDecisionReferences: request.ownerDecisionReferences,
       seatPlan: reviewerCheck.plan ?? null,

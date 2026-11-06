@@ -101,12 +101,29 @@ function serializeHost(host: HostSection): Record<string, unknown> {
   if (host.tmpDir !== undefined) {
     out.tmpDir = host.tmpDir;
   }
+  if (host.container !== undefined) {
+    out.container = host.container;
+  }
+  if (host.roleAliases !== undefined) {
+    const roleAliases: Record<string, unknown> = {};
+    // The file's stable role order, so serialisation is deterministic.
+    for (const role of ['orchestrator', 'lane-runner', 'verifier'] as const) {
+      const alias = host.roleAliases[role];
+      if (alias !== undefined) {
+        roleAliases[role] = alias;
+      }
+    }
+    out.roleAliases = roleAliases;
+  }
   out.roles = [...host.roles];
   if (host.runner !== undefined) {
     const runner: Record<string, unknown> = {
       kind: host.runner.kind,
       port: host.runner.port,
     };
+    if (host.runner.tunnelOffset !== undefined) {
+      runner.tunnelOffset = host.runner.tunnelOffset;
+    }
     if (host.runner.authFile !== undefined) {
       runner.authFile = host.runner.authFile;
     }

@@ -45,6 +45,9 @@ import {
   type ChangeSignalPort,
   type OwnerDecisionDelegate,
   type AttemptOwnerDecisionDelegate,
+  type ConductorHaltPort,
+  type RequestLaneRunStopPort,
+  type StopAttemptRequest,
 } from "@fleet/work-execution";
 import { requireValidInstallationModel, type FleetInstallation } from "@fleet/installation";
 import {
@@ -65,6 +68,7 @@ import {
   ReconcileAttemptUseCase,
   RegisterWorkOrderUseCase,
   RequestAttemptAcceptanceUseCase,
+  RequestLaneRunStopUseCase,
   ReserveExecutionCapacityUseCase,
   StopAttemptUseCase,
   resolveImplementerSeat,
@@ -73,6 +77,7 @@ import {
 import { ProbeLimiter } from "./probe-limiter";
 import { withPendingFixLimit } from "./pending-fix-guard";
 import { withRunActiveRefusal, type GuardedCancelPreparedResult } from "./cancel-prepared-guard";
+import { withRunOwnedStopRefusal, type GuardedStopAttemptResult } from "./stop-attempt-guard";
 
 /**
  * Reads the seat an attempt was actually implemented on. Absent on a
@@ -111,7 +116,20 @@ export interface WorkComposition {
   reserveExecutionCapacity: ReserveExecutionCapacityUseCase;
   dispatchAttempt: DispatchAttemptUseCase;
   reconcileAttempt: ReconcileAttemptUseCase;
-  stopAttempt: StopAttemptUseCase;
+  stopAttempt: {
+    stopAttempt(request: StopAttemptRequest): Promise<GuardedStopAttemptResult>;
+    execute(input?: unknown): Promise<GuardedStopAttemptResult>;
+  };
+  // POST /v1/runs/halt: the durable conductor halt marker write (A-C)
+  setConductorHalt: Pick<ConductorHaltPort, "set">;
+  // POST /v1/runs/:id/stop: the keyed run-journal stop intent write (A-C)
+  requestLaneRunStop: RequestLaneRunStopPort;
+  /**
+   * Throttles HTTP run-control actions (halt, stop): one in-flight action per
+   * run id (or the shared halt key) and a small global cap. Owned by this
+   * composition root, not the route.
+   */
+  runControlLimiter: ProbeLimiter;
   collectAttemptArtifacts: CollectAttemptArtifactsUseCase;
   prepareFixAttempt: Pick<PrepareFixAttemptUseCase, "execute">;
   requestAttemptAcceptance: RequestAttemptAcceptanceUseCase;
@@ -274,6 +292,16 @@ function unconfiguredWorkComposition(): WorkComposition {
     dispatchAttempt: new DispatchAttemptUseCase(),
     reconcileAttempt: new ReconcileAttemptUseCase(),
     stopAttempt: new StopAttemptUseCase(),
+    // Unconfigured, the halt write throws Not implemented (501) and the stop
+    // use case refuses every request with invalid-request: an API without a
+    // runtime never reports a durable write.
+    setConductorHalt: {
+      set() {
+        return Promise.reject(new Error("Not implemented: ConductorHaltPort"));
+      },
+    },
+    requestLaneRunStop: new RequestLaneRunStopUseCase(),
+    runControlLimiter: new ProbeLimiter(4),
     collectAttemptArtifacts: new CollectAttemptArtifactsUseCase(),
     prepareFixAttempt: new PrepareFixAttemptUseCase(),
     requestAttemptAcceptance: new RequestAttemptAcceptanceUseCase(),
@@ -320,6 +348,9 @@ export function createConfiguredWorkComposition(
   crossContext?: WorkCrossContextDelegates,
 ): WorkComposition {
   const stateDir = options?.stateDir;
+  // A durable halt or stop write exists only when the runtime was given a
+  // real state directory; in-memory state is disposable by definition.
+  const hasDurableStateDir = typeof stateDir === "string" && stateDir.trim().length > 0;
 
   const {
     worktreeSshHost,
@@ -535,12 +566,36 @@ export function createConfiguredWorkComposition(
       runner,
       runnerForAttempt,
     }),
-    stopAttempt: new StopAttemptUseCase({
-      attemptRepo,
-      journal,
-      runner,
-      runnerForAttempt,
-    }),
+    stopAttempt: withRunOwnedStopRefusal(
+      new StopAttemptUseCase({
+        attemptRepo,
+        journal,
+        runner,
+        runnerForAttempt,
+      }),
+      laneRunRepo,
+    ),
+    // A-C: the run-control writes go through the same durable state directory
+    // as the conductor driver's own files, so a web stop or halt is exactly
+    // the record the driver reads on its next pass. An API without a durable
+    // stateDir stays refusing (disposable memory is never a durable halt).
+    ...(hasDurableStateDir
+      ? {
+          setConductorHalt: new ConductorHaltAdapter({ stateDir: stateDir as string }),
+          requestLaneRunStop: new RequestLaneRunStopUseCase({
+            runRepo: laneRunRepo,
+            runJournal: new LaneRunJournalAdapter({ stateDir: stateDir as string }),
+          }),
+        }
+      : {
+          setConductorHalt: {
+            set() {
+              return Promise.reject(new Error("Not implemented: ConductorHaltPort"));
+            },
+          },
+          requestLaneRunStop: new RequestLaneRunStopUseCase(),
+        }),
+    runControlLimiter: new ProbeLimiter(4),
     collectAttemptArtifacts: new CollectAttemptArtifactsUseCase({
       attemptRepo,
       journal,

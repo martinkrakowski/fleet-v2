@@ -2725,3 +2725,67 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
     expect(transported.findings).toHaveLength(MAX_PARSED_FINDINGS);
   });
 });
+
+describe('RV3 Luna round 1: unrecognised finding severities', () => {
+  it('maps critical to blocker and high to major on FINDING and numbered lines', () => {
+    const text = [
+      'FINDING: critical src/a.ts:3 data loss',
+      'FINDING: HIGH src/b.ts:4 wrong result',
+      '1. `src/c.ts:5` - **critical**. unsafe',
+      '2. `src/d.ts:6` - high: broken',
+      'VERDICT: PASS',
+    ].join('\n');
+    const parsed = parseReviewReplyStrict(text);
+    expect(parsed.findings.map((entry) => entry.severity)).toEqual(['blocker', 'major', 'blocker', 'major']);
+    expect(parsed.result).toBe('fail');
+  });
+
+  it('an unrecognised severity refuses the whole reply as unparseable-verdict, never dropping the finding', () => {
+    for (const reply of [
+      'FINDING: catastrophic src/a.ts:3 data loss\nVERDICT: PASS',
+      '1. `src/a.ts:3` - **showstopper**. data loss\nVERDICT: PASS',
+    ]) {
+      for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
+        const parsed = parse(reply);
+        expect(parsed.result).toBe('unknown');
+        expect(parsed.unknownReason).toBe('unparseable-verdict');
+      }
+    }
+  });
+  it('Luna round 2: finding-shaped lines that do not fully parse refuse the whole reply', () => {
+    for (const line of [
+      'FINDING:  Critical: src/a.ts:3 data loss',
+      'sev: critical src/a.ts:3 data loss',
+      '**Critical**: src/a.ts:3 data loss',
+      '- _major_ src/a.ts:3 wrong result',
+      '- \u0441ritical src/a.ts:3 data loss',
+      '1. `src/a.ts:3` - \u0441r\u0456t\u0456c\u0430l. data loss',
+      '- maj**or** src/a.ts:3 unsafe',
+      '**-** major src/a.ts:3 data loss',
+      '* major src/a.ts:3 data loss',
+      '- `critical` src/a.ts:3 data loss',
+      '1) Major: src/a.ts:3 wrong result',
+    ]) {
+      for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
+        const parsed = parse(`${line}\nVERDICT: PASS`);
+        expect(parsed.result, line).toBe('unknown');
+        expect(parsed.unknownReason, line).toBe('unparseable-verdict');
+      }
+    }
+  });
+
+  it('Luna round 2: a clean PASS reply and ordinary severity prose still pass', () => {
+    for (const text of [
+      'Looks good.\nVERDICT: PASS',
+      'There are no major issues and the risk is high only in theory.\nVERDICT: PASS',
+      'Résumé of the change: all fine, see src/a.ts for details.\nVERDICT: PASS',
+      'I inspected src/a.ts:3; no major issue was found.\nVERDICT: PASS',
+      '- no major issues in src/a.ts:3\n- confidence in the change is high\nVERDICT: PASS',
+      'Review of the diff against the brief: every step is covered and the tests assert the new behaviour.\n\nVERDICT: PASS',
+    ]) {
+      const parsed = parseReviewReplyStrict(text);
+      expect(parsed.result, text).toBe('pass');
+      expect(parsed.findings).toEqual([]);
+    }
+  });
+});

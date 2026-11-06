@@ -298,7 +298,7 @@ describe('parkFindingsSnapshotOf and isParkFindingView', () => {
     expect(parkFindingsSnapshotOf([finding({ summary: 'a\u2028b' })])).toBeNull();
   });
 
-  it('accepts the explicit empty snapshot', () => {
-    expect(parkFindingsSnapshotOf([])).toEqual([]);
+  it('refuses the empty snapshot: a finding-caused park never carries [] (RV3)', () => {
+    expect(parkFindingsSnapshotOf([])).toBeNull();
   });
 });

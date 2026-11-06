@@ -14,6 +14,7 @@ export * from '../evidence-records.js';
 import type {
   EvidenceAssessmentRecord,
   FindingDispositionRecord,
+  ReviewFindingRecord,
   ReviewReceiptRecord,
   VerificationReceiptRecord,
 } from '../evidence-records.js';
@@ -21,6 +22,7 @@ import type { AssessmentStateValue } from '../value-objects/AssessmentState.vo.j
 import { AssessmentState } from '../value-objects/AssessmentState.vo.js';
 import { EvidenceResult } from '../value-objects/EvidenceResult.vo.js';
 import { FindingState } from '../value-objects/FindingState.vo.js';
+import { decideReviewReceiptOutcome, isMinorOrNitSeverity } from '../review-selection.js';
 import { FindingDisposition } from './FindingDisposition.js';
 import { ReviewReceipt } from './ReviewReceipt.js';
 import { VerificationReceipt } from './VerificationReceipt.js';
@@ -218,16 +220,22 @@ export class EvidenceAssessment {
   }
 
   /**
-   * Unresolved findings still block acceptance; fixed and refuted do not.
-   * A disposition resolves a finding id only while exactly one receipt holds
-   * that id: finding ids are numbered per receipt, so a later receipt on the
-   * same head may raise the same id, and an earlier disposition for that id
-   * must not silently resolve the new, in-scope finding.
+   * Unresolved blocking findings still block acceptance (RV3): fixed and
+   * refuted do not, and a `minor` or `nit` finding never blocks at all — it is
+   * carried (`carriedMinorFindings`), never dispositioned. A disposition
+   * resolves a finding id only while exactly one receipt holds that id:
+   * finding ids are numbered per receipt, so a later receipt on the same head
+   * may raise the same id, and an earlier disposition for that id must not
+   * silently resolve the new, in-scope finding. An unrecognized severity fails
+   * closed to blocking.
    */
   unresolvedFindingIds(): readonly string[] {
     const receiptHoldCounts = new Map<string, number>();
     for (const receipt of this.record.reviewReceipts) {
       for (const finding of receipt.findings) {
+        if (isMinorOrNitSeverity(finding.severity)) {
+          continue;
+        }
         receiptHoldCounts.set(finding.findingId, (receiptHoldCounts.get(finding.findingId) ?? 0) + 1);
       }
     }
@@ -238,6 +246,48 @@ export class EvidenceAssessment {
         .map((disposition) => disposition.findingId),
     );
     return [...receiptHoldCounts.keys()].filter((findingId) => !resolved.has(findingId));
+  }
+
+  /**
+   * The `minor`/`nit` findings (RV3) carried from the verified receipts of the
+   * candidate head whose severity-derived outcome is `pass`: each collected
+   * finding has no resolved disposition (`fixed`/`refuted`/`out-of-scope`) in
+   * `findingDispositions`. Receipt order is preserved; the returned records
+   * are fresh frozen copies.
+   */
+  carriedMinorFindings(): readonly ReviewFindingRecord[] {
+    const resolved = new Set(
+      this.record.findingDispositions
+        .filter((disposition) => !FindingState.create(disposition.state).value?.isBlocking())
+        .map((disposition) => disposition.findingId),
+    );
+    // Same sets the acceptance use case passes: a major resolved out-of-scope
+    // must not demote its receipt, or the receipt's unresolved minors drop.
+    const outOfScopeResolvedFindingIds = new Set(
+      this.record.findingDispositions
+        .filter((disposition) => disposition.state === 'out-of-scope')
+        .map((disposition) => disposition.findingId),
+    );
+    const unresolvedFindingIds = new Set(this.unresolvedFindingIds());
+    const carried: ReviewFindingRecord[] = [];
+    for (const receipt of this.record.reviewReceipts) {
+      if (
+        receipt.candidateHeadSha !== this.record.candidateHeadSha ||
+        receipt.readOnlyVerified !== true
+      ) {
+        continue;
+      }
+      if (decideReviewReceiptOutcome(receipt, outOfScopeResolvedFindingIds, unresolvedFindingIds).outcome !== 'pass') {
+        continue;
+      }
+      for (const finding of receipt.findings) {
+        if (!isMinorOrNitSeverity(finding.severity) || resolved.has(finding.findingId)) {
+          continue;
+        }
+        carried.push(Object.freeze({ ...finding }));
+      }
+    }
+    return Object.freeze(carried);
   }
 
   /**

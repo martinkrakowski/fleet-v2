@@ -686,10 +686,26 @@ describe('AssessHeadAcceptanceUseCase review dissent (R1)', () => {
     return { repo, useCase };
   }
 
-  it('reviewer A pass plus reviewer B fail (no findings) blocks with a dissent blocker and an opposing tally', async () => {
+  it('reviewer A pass plus reviewer B fail (a blocking finding) blocks with a dissent blocker and an opposing tally', async () => {
     const { repo, useCase } = useCaseFor([
       reviewReceipt({ id: 'review-a-pass', reviewerModel: 'reviewer-a', result: 'pass' }),
-      reviewReceipt({ id: 'review-b-fail', reviewerModel: 'reviewer-b', result: 'fail' }),
+      reviewReceipt({
+        id: 'review-b-fail',
+        reviewerModel: 'reviewer-b',
+        result: 'fail',
+        findings: [
+          {
+            findingId: 'rr-review-b:f-1',
+            severity: 'major',
+            summary: 'a blocking dissent finding',
+            filePath: 'src/a.ts',
+            line: 1,
+            state: 'unresolved',
+            dispositionReason: null,
+            dispositionEvidenceRef: null,
+          },
+        ],
+      }),
     ]);
 
     const result = await useCase.assessHeadAcceptance(request);
@@ -703,6 +719,104 @@ describe('AssessHeadAcceptanceUseCase review dissent (R1)', () => {
       ).toBe(true);
       expect(result.reviewTally).toEqual({ pass: 1, fail: 1, unknown: 0, disagreement: true });
     }
+    expect(repo.assessment?.state).toBe('blocked');
+  });
+
+  it('a zero-finding fail receipt is an unparseable verdict: it blocks as review-missing and tallies unknown, never as a dissenting fail', async () => {
+    const { repo, useCase } = useCaseFor([
+      reviewReceipt({ id: 'review-a-pass', reviewerModel: 'reviewer-a', result: 'pass' }),
+      reviewReceipt({ id: 'review-b-fail', reviewerModel: 'reviewer-b', result: 'fail' }),
+    ]);
+
+    const result = await useCase.assessHeadAcceptance(request);
+
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(
+        result.blockers.some((blocker) =>
+          blocker.includes(
+            "review by 'reviewer-b' failed for this head with no findings (unparseable-verdict",
+          ),
+        ),
+      ).toBe(true);
+      expect(result.reviewTally).toEqual({ pass: 1, fail: 0, unknown: 1, disagreement: false });
+    }
+    expect(repo.assessment?.state).toBe('blocked');
+  });
+
+  it('RV3: a minor-only fail code-review passes both assessments with the minor carried', async () => {
+    const minorFinding = {
+      findingId: 'rr-review-a:f-1',
+      severity: 'minor' as const,
+      summary: 'a carried minor finding',
+      filePath: 'src/a.ts',
+      line: 1,
+      state: 'unresolved' as const,
+      dispositionReason: null,
+      dispositionEvidenceRef: null,
+    };
+    const repo = new InMemoryEvidenceAssessmentRepo(
+      makePassingAssessmentRecord({
+        requiredChecks: [],
+        reviewReceipts: [
+          reviewReceipt({
+            id: 'review-minor-fail',
+            result: 'fail',
+            findings: [minorFinding],
+          }),
+        ],
+      }),
+    );
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: [],
+      }),
+    });
+
+    const receipts = await useCase.assessHeadReceipts(request);
+    expect(receipts.outcome).toBe('receipts-passed');
+    if (receipts.outcome === 'receipts-passed') {
+      expect(receipts.reviewTally).toEqual({ pass: 1, fail: 0, unknown: 0, disagreement: false });
+      expect((receipts.carriedMinors ?? []).map((finding) => finding.findingId)).toEqual(['rr-review-a:f-1']);
+    }
+
+    const accepted = await useCase.assessHeadAcceptance(request);
+    expect(accepted.outcome).toBe('accepted');
+    if (accepted.outcome === 'accepted') {
+      expect((accepted.carriedMinors ?? []).map((finding) => finding.findingId)).toEqual(['rr-review-a:f-1']);
+      expect(accepted.assessment.state).toBe('accepted');
+    }
+  });
+
+  it('RV3: a zero-finding fail code-review never accepts and blocks with review-missing and unparseable-verdict', async () => {
+    const repo = new InMemoryEvidenceAssessmentRepo(
+      makePassingAssessmentRecord({
+        requiredChecks: [],
+        reviewReceipts: [reviewReceipt({ id: 'review-zero-fail', result: 'fail' })],
+      }),
+    );
+    const useCase = new AssessHeadAcceptanceUseCase({
+      repo,
+      attemptOwnerDecisionPort: new InMemoryAttemptOwnerDecisionPort({
+        outcome: 'recorded',
+        ownerDecisionReferences: [],
+      }),
+    });
+
+    const receipts = await useCase.assessHeadReceipts(request);
+    expect(receipts.outcome).toBe('blocked');
+    if (receipts.outcome === 'blocked') {
+      expect(
+        receipts.blockerDetails.some(
+          (blocker) => blocker.kind === 'review-missing' && blocker.text.includes('unparseable-verdict'),
+        ),
+      ).toBe(true);
+    }
+
+    const accepted = await useCase.assessHeadAcceptance(request);
+    expect(accepted.outcome).toBe('blocked');
     expect(repo.assessment?.state).toBe('blocked');
   });
 

@@ -103,7 +103,7 @@ export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
        fleet-v2 conductor start --brief-request <file.json> --tier 1|2 [--run-id <id> --attempt-id <id>] [--max-active-runs <n>]
        fleet-v2 conductor start --abandon --run-id <id> --attempt-id <id>
        fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>] [--pass-concurrency <n>]
-       fleet-v2 conductor reap --worktrees|--sessions [--dry-run] [--yes]
+       fleet-v2 conductor reap --worktrees|--sessions [--dry-run] [--yes] [--force-unsealed]
 
 Read-only status of one lane run (or every run) with its projected state,
 the halt marker and the driver lease; a kill-switch halt the driver checks
@@ -122,7 +122,11 @@ worktree of every finished lane run (terminal run, terminal work order,
 every attempt cancelled or collected, no held reservation) on explicit
 request: --dry-run lists the candidates and removes nothing, and without it
 --yes is required; the branch fleet/<runId> is kept — no branch, run record
-or evidence is removed. conductor reap --sessions lists and, on request,
+or evidence is removed. Since C2' the removal is gated on the attempt's
+sealed artifact manifest: an uncollected or tampered worktree is refused.
+--force-unsealed (with --worktrees only) removes an uncollected or tampered
+worktree only through a scoped, one-way owner approval consumed from the
+coordination store; every clean, unlocked and idle check still runs. conductor reap --sessions lists and, on request,
 aborts sessions with no live attempt: worktrees whose every attempt is
 finished (cancelled, collected or ended) and none holds a reservation, but
 where the runner still reports a running session; --dry-run lists them and
@@ -1476,6 +1480,7 @@ interface ReapFlags {
   readonly sessions: boolean;
   readonly dryRun: boolean;
   readonly yes: boolean;
+  readonly forceUnsealed: boolean;
 }
 
 /**
@@ -1488,6 +1493,7 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
   let sessions = false;
   let dryRun = false;
   let yes = false;
+  let forceUnsealed = false;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index]!;
     if (token === '--worktrees') {
@@ -1522,14 +1528,28 @@ function readReapFlags(argv: readonly string[], io: CliIo): ReapFlags | null {
       yes = true;
       continue;
     }
+    if (token === '--force-unsealed') {
+      // C2': given at most once; a secret-shaped or path-shaped token is
+      // never echoed, so the message names the flag, not the argv value.
+      if (forceUnsealed) {
+        io.stderr(`conductor reap: --force-unsealed given more than once\n${CONDUCTOR_HELP}\n`);
+        return null;
+      }
+      forceUnsealed = true;
+      continue;
+    }
     if (token.startsWith('--')) {
-      io.stderr(`Unknown conductor reap flag: ${token}\n${CONDUCTOR_HELP}\n`);
+      io.stderr(`conductor reap: unknown or unsupported flag\n${CONDUCTOR_HELP}\n`);
       return null;
     }
     io.stderr(`conductor reap takes no positional arguments\n${CONDUCTOR_HELP}\n`);
     return null;
   }
-  return { worktrees, sessions, dryRun, yes };
+  if (forceUnsealed && sessions) {
+    io.stderr(`conductor reap: --force-unsealed applies only to --worktrees\n${CONDUCTOR_HELP}\n`);
+    return null;
+  }
+  return { worktrees, sessions, dryRun, yes, forceUnsealed };
 }
 
 /**
@@ -1593,9 +1613,14 @@ async function reapCommand(
   }
   const result = await runtime.conductor.reapLaneWorktrees.reapLaneWorktrees({
     dryRun: flags.dryRun,
+    forceUnsealed: flags.forceUnsealed,
     nowIso: nowIsoOf(options),
   });
   io.stdout(`${JSON.stringify(result)}\n`);
+  // A refused or unknown top-level outcome is a failure too (C2').
+  if (result.outcome !== 'reaped') {
+    return 1;
+  }
   // Refusals and unknowns both land in `refused`; a failed post-removal
   // journal append lands in `journalFailed`. Nothing refused, unknown or
   // un-journalled exits 0.

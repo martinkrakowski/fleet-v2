@@ -5,9 +5,30 @@
 // shapes and validates JSON text (ADR-0054 forbids Node builtins in the
 // domain, so hashing and file reads live in the infrastructure adapter).
 
+import { snapshotPlainDataRecord } from './plain-record-reads.js';
 import { validateWorktreeRelativePath } from './worktree-path.js';
 
 export const ARTIFACT_MANIFEST_SCHEMA_VERSION = 1;
+
+/** C2': the reap refusal reason when no artifact manifest was ever sealed. */
+export const ARTIFACTS_NOT_COLLECTED_REASON = 'artifacts not collected' as const;
+
+/** C2': the reap refusal reason when collected artifacts changed after sealing. */
+export const ARTIFACTS_CHANGED_REASON = 'artifacts changed since collection' as const;
+
+/** C2': the largest manifest text (characters) any read or parse will accept. */
+export const MAX_ARTIFACT_MANIFEST_CHARS = 524_288 as const;
+
+/** C2': the largest number of file entries a manifest may list. */
+export const MAX_ARTIFACT_MANIFEST_FILES = 2_048 as const;
+
+/**
+ * C2': the content-addressed sealed-manifest worktree-relative path, the exact
+ * form `artifactManifestRelativePath` writes: the embedded 16-hex slice is the
+ * first 16 characters of the manifest's SHA-256 digest, so the path is bound
+ * to the recorded digest without any free-text path in coordination state.
+ */
+export const SEALED_MANIFEST_PATH_PATTERN = /^\.lane\/artifacts-manifest-([0-9a-f]{16})\.json$/;
 
 export const ARTIFACT_MANIFEST_RELATIVE_PATH = '.lane/artifacts-manifest.json';
 
@@ -139,6 +160,9 @@ export function serializeArtifactManifest(manifest: ArtifactManifest): string {
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 export function parseArtifactManifest(text: string): ArtifactManifest | null {
+  if (typeof text !== 'string' || text.length === 0 || text.length > MAX_ARTIFACT_MANIFEST_CHARS) {
+    return null;
+  }
   let raw: unknown;
   try {
     raw = JSON.parse(text);
@@ -152,11 +176,24 @@ export function parseArtifactManifest(text: string): ArtifactManifest | null {
   if (obj.schemaVersion !== ARTIFACT_MANIFEST_SCHEMA_VERSION) {
     return null;
   }
-  if (typeof obj.attemptId !== 'string' || obj.attemptId.length === 0) {
+  if (
+    typeof obj.attemptId !== 'string' ||
+    obj.attemptId.length === 0 ||
+    obj.attemptId.length > 128 ||
+    obj.attemptId.includes('/') ||
+    obj.attemptId.includes('\0')
+  ) {
     return null;
   }
-  if (!Array.isArray(obj.files)) {
+  if (!Array.isArray(obj.files) || obj.files.length > MAX_ARTIFACT_MANIFEST_FILES) {
     return null;
+  }
+  // A sparse array (holes) is not a manifest: an indexed loop proves every
+  // index is an own property, so a hole can never masquerade as an entry.
+  for (let index = 0; index < obj.files.length; index += 1) {
+    if (!Object.hasOwn(obj.files, index)) {
+      return null;
+    }
   }
   const entries: ArtifactManifestEntry[] = [];
   const seenPaths = new Set<string>();
@@ -228,4 +265,46 @@ export function compareArtifactManifest(
     return { outcome: 'sealed', manifest };
   }
   return { outcome: 'mismatch', mismatches };
+}
+
+/**
+ * C2': where the sealed manifest of an attempt lives and which digest it must
+ * still carry, read from the attempt's collected-artifact record. Pure: every
+ * property is snapshotted through `snapshotPlainDataRecord`, so throwing
+ * getters or hostile Proxy traps answer `uncollected` instead of throwing.
+ * `sealed` requires a content-addressed `manifestPath` whose embedded digest
+ * slice matches `manifestSha256` (a 64-lowercase-hex digest); anything else
+ * — including a missing field — is `uncollected`.
+ */
+export type AttemptManifestCoordinates =
+  | {
+      readonly kind: 'sealed';
+      readonly manifestPath: string;
+      readonly expectedManifestSha256: string;
+    }
+  | { readonly kind: 'uncollected' };
+
+export function attemptManifestCoordinates(artifacts: unknown): AttemptManifestCoordinates {
+  let snapshot: Record<string, unknown> | null;
+  try {
+    snapshot = snapshotPlainDataRecord(artifacts);
+  } catch {
+    return { kind: 'uncollected' };
+  }
+  if (snapshot === null) {
+    return { kind: 'uncollected' };
+  }
+  const manifestPath = snapshot['manifestPath'];
+  const manifestSha256 = snapshot['manifestSha256'];
+  if (typeof manifestPath !== 'string' || typeof manifestSha256 !== 'string') {
+    return { kind: 'uncollected' };
+  }
+  if (!/^[0-9a-f]{64}$/.test(manifestSha256)) {
+    return { kind: 'uncollected' };
+  }
+  const match = SEALED_MANIFEST_PATH_PATTERN.exec(manifestPath);
+  if (match === null || match[1] !== manifestSha256.slice(0, 16)) {
+    return { kind: 'uncollected' };
+  }
+  return { kind: 'sealed', manifestPath, expectedManifestSha256: manifestSha256 };
 }

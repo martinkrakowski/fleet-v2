@@ -19,6 +19,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import * as path from 'node:path';
 
 import type {
+  ArtifactManifestRemovalCheckResult,
   AttemptArtifactPort,
   CollectCompletedAttemptArtifactsRequest,
   CollectCompletedAttemptArtifactsResult,
@@ -32,7 +33,9 @@ import type {
   VerifyIgnoredPathsResult,
 } from '../../application/ports/out/AttemptArtifactPort.out-port.js';
 import type { CommandExecutorPort } from '../../application/ports/out/CommandExecutorPort.out-port.js';
+import type { CommandRunResult } from '../../application/ports/out/CommandExecutorPort.out-port.js';
 import {
+  MAX_ARTIFACT_MANIFEST_CHARS,
   artifactManifestRelativePath,
   artifactManifestTempRelativePath,
   buildArtifactManifest,
@@ -43,6 +46,7 @@ import {
   type ObservedArtifact,
 } from '../../domain/artifact-manifest.js';
 import type { AttemptRunnerRecord } from '../../domain/execution-records.js';
+import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 import { validateWorktreeRelativePath } from '../../domain/worktree-path.js';
 import type { ExecutorForRecordedHostResult } from './ExecutorForHost.helper.js';
 import { resolveWorktreeTarget, worktreeRootRefusal } from './WorkspaceAdapter.adapter.js';
@@ -760,6 +764,359 @@ export class AttemptArtifactAdapter implements AttemptArtifactPort {
       ),
     );
     return compareArtifactManifest(parsed, observed);
+  }
+
+  /**
+   * C2': the executor for one removal check. Unlike `executorFor` this never
+   * throws and never falls back from a refused recorded host to the local
+   * executor: a recorded host that cannot resolve leaves the check unknown,
+   * because a missing remote answer is not a missing manifest.
+   */
+  private removalExecutorFor(
+    recordedHost?: AttemptRunnerRecord | null,
+  ): CommandExecutorPort | null {
+    try {
+      if (
+        this.options?.executorForRecordedHost !== undefined &&
+        recordedHost !== null &&
+        recordedHost !== undefined
+      ) {
+        const resolved = this.options.executorForRecordedHost(recordedHost);
+        if (!resolved.ok) {
+          return null;
+        }
+        return resolved.executor;
+      }
+      return this.options?.executor ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * C2': the fail-closed removal check of one sealed artifact manifest. Every
+   * executor call runs inside `try/catch` with an explicit budget and a
+   * bounded output buffer; nothing throws, no reason ever embeds a path or
+   * stderr, and an unanswered probe is `unknown` — never missing, never
+   * sealed.
+   */
+  async checkArtifactManifestForRemoval(
+    request: VerifyArtifactManifestRequest,
+  ): Promise<ArtifactManifestRemovalCheckResult> {
+    // 1. Snapshot the request without running any getter; a non-object, a
+    //    malformed field or an unreadable shape is a mismatch, not a throw.
+    let snap: Record<string, unknown> | null;
+    try {
+      snap = snapshotPlainDataRecord(request);
+    } catch {
+      snap = null;
+    }
+    const invalid: ArtifactManifestRemovalCheckResult = {
+      outcome: 'mismatch',
+      mismatches: [{ path: '', kind: 'manifest-invalid' }],
+    };
+    if (snap === null) {
+      return invalid;
+    }
+    const attemptId = snap['attemptId'];
+    const worktreePath = snap['worktreePath'];
+    const manifestPath = snap['manifestPath'];
+    const expectedManifestSha256 = snap['expectedManifestSha256'];
+    if (
+      typeof attemptId !== 'string' ||
+      attemptId.length === 0 ||
+      attemptId.length > 128 ||
+      attemptId.includes('/') ||
+      attemptId.includes('\0')
+    ) {
+      return invalid;
+    }
+    if (
+      typeof worktreePath !== 'string' ||
+      worktreePath.length > 4096 ||
+      worktreeRootRefusal(worktreePath) !== null
+    ) {
+      return invalid;
+    }
+    if (
+      (manifestPath !== undefined && manifestPath !== null && typeof manifestPath !== 'string') ||
+      (expectedManifestSha256 !== undefined &&
+        expectedManifestSha256 !== null &&
+        typeof expectedManifestSha256 !== 'string')
+    ) {
+      return invalid;
+    }
+    const manifestRelativePath =
+      typeof manifestPath === 'string' && manifestPath !== ''
+        ? manifestPath
+        : artifactManifestRelativePath(
+            typeof expectedManifestSha256 === 'string' ? expectedManifestSha256 : undefined,
+          );
+    if (!MANIFEST_PATH_PATTERN.test(manifestRelativePath)) {
+      return invalid;
+    }
+    if (
+      expectedManifestSha256 !== undefined &&
+      expectedManifestSha256 !== null &&
+      !(typeof expectedManifestSha256 === 'string' && SHA256_HEX.test(expectedManifestSha256))
+    ) {
+      return invalid;
+    }
+    // 2. The recorded host is the truth; an unresolvable one stays unknown.
+    const executor = this.removalExecutorFor(
+      snap['recordedHost'] as AttemptRunnerRecord | null | undefined,
+    );
+    if (executor === null) {
+      return { outcome: 'unknown', reason: 'no-executor-for-recorded-host' };
+    }
+    // 3. Probe the manifest with bounded, answered-or-unknown subprocesses.
+    const targetPath = resolveWorktreeTarget(worktreePath, manifestRelativePath);
+    const laneLinkProbe = await this.boundedRun(
+      executor,
+      ['test', '-L', path.dirname(targetPath)],
+      PROBE_TIMEOUT_MS,
+      65_536,
+    );
+    if (laneLinkProbe === null) {
+      return { outcome: 'unknown', reason: 'lane-dir-probe-unreadable' };
+    }
+    if (laneLinkProbe.exitCode === null || laneLinkProbe.error !== undefined) {
+      return { outcome: 'unknown', reason: 'lane-dir-probe-unreadable' };
+    }
+    if (laneLinkProbe.exitCode !== 0 && laneLinkProbe.exitCode !== 1) {
+      return { outcome: 'unknown', reason: 'lane-dir-probe-unreadable' };
+    }
+    if (laneLinkProbe.exitCode === 0) {
+      return invalid;
+    }
+    let existsProbe: CommandRunResult;
+    let symlinkProbe: CommandRunResult;
+    try {
+      [existsProbe, symlinkProbe] = await Promise.all([
+        executor.run(['test', '-e', targetPath], { timeoutMs: PROBE_TIMEOUT_MS, maxBufferBytes: 65_536 }),
+        executor.run(['test', '-L', targetPath], { timeoutMs: PROBE_TIMEOUT_MS, maxBufferBytes: 65_536 }),
+      ]);
+    } catch {
+      return { outcome: 'unknown', reason: 'manifest-probe-unreadable' };
+    }
+    if (
+      (existsProbe.exitCode === null || existsProbe.error !== undefined || (existsProbe.exitCode !== 0 && existsProbe.exitCode !== 1)) ||
+      (symlinkProbe.exitCode === null || symlinkProbe.error !== undefined || (symlinkProbe.exitCode !== 0 && symlinkProbe.exitCode !== 1))
+    ) {
+      return { outcome: 'unknown', reason: 'manifest-probe-unreadable' };
+    }
+    if (existsProbe.exitCode === 1 && symlinkProbe.exitCode === 1) {
+      return { outcome: 'missing' };
+    }
+    if (symlinkProbe.exitCode === 0) {
+      return invalid;
+    }
+    const regularProbe = await this.boundedRun(
+      executor,
+      ['test', '-f', targetPath],
+      PROBE_TIMEOUT_MS,
+      65_536,
+    );
+    if (regularProbe === null) {
+      return { outcome: 'unknown', reason: 'manifest-regular-probe-unreadable' };
+    }
+    if (regularProbe.exitCode === null || regularProbe.error !== undefined) {
+      return { outcome: 'unknown', reason: 'manifest-regular-probe-unreadable' };
+    }
+    if (regularProbe.exitCode !== 0 && regularProbe.exitCode !== 1) {
+      return { outcome: 'unknown', reason: 'manifest-regular-probe-unreadable' };
+    }
+    if (regularProbe.exitCode === 1) {
+      return invalid;
+    }
+    // 4. Size first, so an oversized manifest is refused without reading it.
+    const sizeRun = await this.boundedRun(executor, ['wc', '-c', targetPath], HASH_TIMEOUT_MS, 65_536);
+    if (sizeRun === null) {
+      return { outcome: 'unknown', reason: 'manifest-size-unreadable' };
+    }
+    if (sizeRun.exitCode === null || sizeRun.error !== undefined || sizeRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'manifest-size-unreadable' };
+    }
+    const byteCount = Number(sizeRun.stdout.trim().split(/\s+/)[0]);
+    if (!Number.isSafeInteger(byteCount) || byteCount < 0) {
+      return { outcome: 'unknown', reason: 'manifest-size-unreadable' };
+    }
+    if (byteCount > MAX_ARTIFACT_MANIFEST_CHARS) {
+      return invalid;
+    }
+    const readResult = await this.boundedRun(
+      executor,
+      ['cat', targetPath],
+      CAT_TIMEOUT_MS,
+      MAX_ARTIFACT_MANIFEST_CHARS + 1024,
+    );
+    if (readResult === null) {
+      return { outcome: 'unknown', reason: 'manifest-read-failed' };
+    }
+    if (readResult.exitCode !== 0 || readResult.error !== undefined) {
+      return { outcome: 'unknown', reason: 'manifest-read-failed' };
+    }
+    const text = readResult.stdout;
+    if (
+      typeof expectedManifestSha256 === 'string' &&
+      expectedManifestSha256 !== '' &&
+      sha256HexDigest(text) !== expectedManifestSha256
+    ) {
+      return {
+        outcome: 'mismatch',
+        mismatches: [{ path: manifestRelativePath, kind: 'manifest-changed' }],
+      };
+    }
+    const parsed = parseArtifactManifest(text);
+    if (parsed === null) {
+      return invalid;
+    }
+    if (parsed.attemptId !== attemptId) {
+      return {
+        outcome: 'mismatch',
+        mismatches: [{ path: manifestRelativePath, kind: 'attempt-id' }],
+      };
+    }
+    // 5. The canonical worktree path, then every listed file, bounded.
+    let canonicalWorktreePath: string | null;
+    try {
+      canonicalWorktreePath = await this.resolveCanonicalWorktreePath(worktreePath, executor);
+    } catch {
+      canonicalWorktreePath = null;
+    }
+    if (canonicalWorktreePath === null) {
+      return { outcome: 'unknown', reason: 'worktree-realpath-unreadable' };
+    }
+    const observed: ObservedArtifact[] = [];
+    for (const entry of parsed.files) {
+      const measured = await this.measureArtifactForRemoval(
+        worktreePath,
+        canonicalWorktreePath,
+        entry.path,
+        executor,
+      );
+      if (measured === 'unknown') {
+        return { outcome: 'unknown', reason: 'artifact-probe-unreadable' };
+      }
+      observed.push(measured);
+    }
+    return compareArtifactManifest(parsed, observed);
+  }
+
+  /**
+   * C2': one `executor.run` inside `try/catch`; a thrown rejection (transport
+   * failure) is a null answer the caller reports as unknown, never a throw.
+   */
+  private async boundedRun(
+    executor: CommandExecutorPort,
+    argv: readonly string[],
+    timeoutMs: number,
+    maxBufferBytes: number,
+  ): Promise<CommandRunResult | null> {
+    try {
+      return await executor.run(argv, { timeoutMs, maxBufferBytes });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * C2': measure one listed artifact with bounded probes. Answers
+   * `'unknown'` when a probe fails to answer or errors, and a plain
+   * `ObservedArtifact` for the genuine facts (absent, not-a-file, measured).
+   */
+  private async measureArtifactForRemoval(
+    worktreePath: string,
+    canonicalWorktreePath: string,
+    relativePath: string,
+    executor: CommandExecutorPort,
+  ): Promise<ObservedArtifact | 'unknown'> {
+    const target = resolveWorktreeTarget(worktreePath, relativePath);
+    const existsProbe = await this.boundedRun(executor, ['test', '-e', target], PROBE_TIMEOUT_MS, 65_536);
+    if (existsProbe === null) {
+      return 'unknown';
+    }
+    if (existsProbe.exitCode === null || existsProbe.error !== undefined) {
+      return 'unknown';
+    }
+    if (existsProbe.exitCode !== 0 && existsProbe.exitCode !== 1) {
+      return 'unknown';
+    }
+    if (existsProbe.exitCode === 1) {
+      return { path: relativePath, state: 'absent' };
+    }
+    const symlinkProbe = await this.boundedRun(executor, ['test', '-L', target], PROBE_TIMEOUT_MS, 65_536);
+    if (symlinkProbe === null) {
+      return 'unknown';
+    }
+    if (symlinkProbe.exitCode === null || symlinkProbe.error !== undefined) {
+      return 'unknown';
+    }
+    if (symlinkProbe.exitCode === 0) {
+      return { path: relativePath, state: 'not-a-file' };
+    }
+    if (symlinkProbe.exitCode !== 1) {
+      return 'unknown';
+    }
+    const regularProbe = await this.boundedRun(executor, ['test', '-f', target], PROBE_TIMEOUT_MS, 65_536);
+    if (regularProbe === null) {
+      return 'unknown';
+    }
+    if (regularProbe.exitCode === null || regularProbe.error !== undefined) {
+      return 'unknown';
+    }
+    if (regularProbe.exitCode === 1) {
+      return { path: relativePath, state: 'not-a-file' };
+    }
+    if (regularProbe.exitCode !== 0) {
+      return 'unknown';
+    }
+    const canonicalProbe = await this.boundedRun(executor, ['realpath', '--', target], PROBE_TIMEOUT_MS, 65_536);
+    if (canonicalProbe === null) {
+      return 'unknown';
+    }
+    if (canonicalProbe.exitCode === null || canonicalProbe.error !== undefined) {
+      return 'unknown';
+    }
+    if (canonicalProbe.exitCode !== 0) {
+      return { path: relativePath, state: 'not-a-file' };
+    }
+    const canonicalTarget = canonicalProbe.stdout.replace(/\r?\n$/, '');
+    const expectedCanonical = resolveWorktreeTarget(canonicalWorktreePath, relativePath);
+    if (canonicalTarget !== expectedCanonical) {
+      return { path: relativePath, state: 'not-a-file' };
+    }
+    const sizeRun = await this.boundedRun(executor, ['wc', '-c', target], HASH_TIMEOUT_MS, 65_536);
+    if (
+      sizeRun === null ||
+      sizeRun.exitCode === null ||
+      sizeRun.error !== undefined ||
+      sizeRun.exitCode !== 0
+    ) {
+      return 'unknown';
+    }
+    const size = Number(sizeRun.stdout.trim().split(/\s+/)[0]);
+    if (!Number.isSafeInteger(size) || size < 0) {
+      return 'unknown';
+    }
+    const digestRun = await this.boundedRun(executor, ['sha256sum', target], HASH_TIMEOUT_MS, 65_536);
+    if (
+      digestRun === null ||
+      digestRun.exitCode === null ||
+      digestRun.error !== undefined ||
+      digestRun.exitCode !== 0
+    ) {
+      return 'unknown';
+    }
+    let digestText = digestRun.stdout.trim();
+    if (digestText.startsWith('\\')) {
+      digestText = digestText.slice(1);
+    }
+    const sha256 = digestText.slice(0, 64);
+    if (!SHA256_HEX.test(sha256)) {
+      return 'unknown';
+    }
+    return { path: relativePath, state: 'file', size, sha256 };
   }
 
   async readBriefManifest(

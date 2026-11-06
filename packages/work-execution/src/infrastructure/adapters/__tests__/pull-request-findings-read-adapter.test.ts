@@ -24,7 +24,15 @@ function thread(id: string, overrides: Node = {}): Node {
 
 function page(
   nodes: readonly unknown[],
-  options: { head?: string; state?: unknown; total?: number; hasNextPage?: boolean; endCursor?: string | null } = {},
+  options: {
+    head?: string;
+    state?: unknown;
+    headRefName?: unknown;
+    headRepository?: unknown;
+    total?: number;
+    hasNextPage?: boolean;
+    endCursor?: string | null;
+  } = {},
 ): GhInvocationResult {
   return {
     exitCode: 0,
@@ -35,6 +43,9 @@ function page(
           pullRequest: {
             state: options.state === undefined ? 'OPEN' : options.state,
             headRefOid: options.head ?? HEAD,
+            headRefName: options.headRefName === undefined ? 'fleet/lane-co24' : options.headRefName,
+            headRepository:
+              options.headRepository === undefined ? { name: 'v2', owner: { login: 'fleet' } } : options.headRepository,
             reviewThreads: {
               totalCount: options.total ?? nodes.length,
               pageInfo: {
@@ -91,6 +102,8 @@ describe('PullRequestFindingsReadAdapter', () => {
     expect(result).toEqual({
       outcome: 'available',
       headSha: HEAD,
+      headRefName: 'fleet/lane-co24',
+      headRepository: { owner: 'fleet', repo: 'v2' },
       findings: [
         {
           threadId: 'PRRT_a',
@@ -120,6 +133,8 @@ describe('PullRequestFindingsReadAdapter', () => {
     const query = args.find((arg) => arg.startsWith('query=')) ?? '';
     expect(query).toContain('reviewThreads(first: 100, after: $after)');
     expect(query).toContain('headRefOid');
+    expect(query).toContain('headRefName');
+    expect(query).toContain('headRepository { name owner { login } }');
     expect(query).toMatch(/pullRequest\(number: \$number\) \{\s+state/);
     expect(query).toContain('totalCount');
     expect(calls[0].timeoutMs).toBe(30_000);
@@ -194,6 +209,26 @@ describe('PullRequestFindingsReadAdapter', () => {
       });
     }
     expect(calls).toHaveLength(0);
+  });
+
+  it('reports the head branch and head repository, and refuses a branch that changes between pages', async () => {
+    const fork = adapterFor(scripted(page([thread('PRRT_1')], { headRepository: null })).runGh);
+    expect(await fork.readPullRequestFindings(request())).toMatchObject({ outcome: 'available', headRepository: null });
+
+    for (const options of [{ headRefName: '' }, { headRefName: 7 }, { headRepository: { name: 'v2' } }, { headRepository: { name: 'bad name', owner: { login: 'x' } } }]) {
+      expect(await adapterFor(scripted(page([thread('PRRT_1')], options)).runGh).readPullRequestFindings(request())).toMatchObject({
+        outcome: 'unavailable',
+        code: 'unreadable',
+      });
+    }
+
+    const branchMoved = adapterFor(
+      scripted(
+        page([thread('PRRT_1')], { total: 2, hasNextPage: true, endCursor: 'c1' }),
+        page([thread('PRRT_2')], { total: 2, headRefName: 'other' }),
+      ).runGh,
+    );
+    expect(await branchMoved.readPullRequestFindings(request())).toEqual({ outcome: 'unavailable', code: 'head-moved' });
   });
 
   it('reports a closed or merged pull request as unavailable with code not-open', async () => {
@@ -395,7 +430,7 @@ describe('PullRequestFindingsReadAdapter', () => {
     expect(adapter.isConfigured()).toBe(true);
     expect(result.outcome).toBe('available');
     if (result.outcome === 'available') {
-      expect(Object.keys(result).sort()).toEqual(['findings', 'headSha', 'outcome']);
+      expect(Object.keys(result).sort()).toEqual(['findings', 'headRefName', 'headRepository', 'headSha', 'outcome']);
       for (const entry of result.findings) {
         expect(Object.keys(entry).sort()).toEqual(['authorKind', 'line', 'path', 'state', 'text', 'threadId']);
       }

@@ -59,6 +59,8 @@ const FINDINGS_QUERY = `
       pullRequest(number: $number) {
         state
         headRefOid
+        headRefName
+        headRepository { name owner { login } }
         reviewThreads(first: ${PAGE_SIZE}, after: $after) {
           totalCount
           pageInfo { hasNextPage endCursor }
@@ -149,11 +151,16 @@ function validateRequest(
 interface Page {
   readonly open: boolean;
   readonly headRefOid: string;
+  readonly headRefName: string;
+  readonly headRepository: { readonly owner: string; readonly repo: string } | null;
   readonly totalCount: number;
   readonly hasNextPage: boolean;
   readonly endCursor: string | null;
   readonly nodes: readonly unknown[];
 }
+
+type PullRequestHead = Pick<Page, 'open' | 'headRefOid' | 'headRefName' | 'headRepository'>;
+type ThreadsPage = Pick<Page, 'totalCount' | 'hasNextPage' | 'endCursor' | 'nodes'>;
 
 function parsePage(stdout: string): Page | Unavailable {
   const unreadable = unavailable('unreadable', 'answer is not readable');
@@ -172,42 +179,70 @@ function parsePage(stdout: string): Page | Unavailable {
   if (!isRecord(pullRequest)) {
     return unreadable;
   }
+  const head = parsePullRequestHead(pullRequest);
+  const threads = parseThreadsPage(pullRequest.reviewThreads);
+  return head === null || threads === null ? unreadable : { ...head, ...threads };
+}
+
+/** The pull request's state, head commit, head branch and head repository; null when any is malformed. */
+function parsePullRequestHead(pullRequest: Record<string, unknown>): PullRequestHead | null {
   const state = pullRequest.state;
   if (state !== 'OPEN' && state !== 'CLOSED' && state !== 'MERGED') {
-    return unreadable;
+    return null;
   }
   const headRefOid = pullRequest.headRefOid;
   if (typeof headRefOid !== 'string' || !FULL_COMMIT_PATTERN.test(headRefOid)) {
-    return unreadable;
+    return null;
   }
-  const threads = pullRequest.reviewThreads;
+  const headRefName = pullRequest.headRefName;
+  if (typeof headRefName !== 'string' || headRefName.length === 0) {
+    return null;
+  }
+  const headRepository = parseHeadRepository(pullRequest.headRepository);
+  if (headRepository === undefined) {
+    return null;
+  }
+  return { open: state === 'OPEN', headRefOid, headRefName, headRepository };
+}
+
+/** One page of review threads with its count and cursor; null when malformed. */
+function parseThreadsPage(threads: unknown): ThreadsPage | null {
   if (!isRecord(threads)) {
-    return unreadable;
+    return null;
   }
   const totalCount = threads.totalCount;
   if (typeof totalCount !== 'number' || !Number.isSafeInteger(totalCount) || totalCount < 0) {
-    return unreadable;
+    return null;
   }
   const pageInfo = threads.pageInfo;
   if (!isRecord(pageInfo) || typeof pageInfo.hasNextPage !== 'boolean') {
-    return unreadable;
+    return null;
   }
   const rawCursor = pageInfo.endCursor;
   if (rawCursor !== null && rawCursor !== undefined && typeof rawCursor !== 'string') {
-    return unreadable;
+    return null;
+  }
+  if (!Array.isArray(threads.nodes)) {
+    return null;
   }
   const endCursor = typeof rawCursor === 'string' && rawCursor.trim().length > 0 ? rawCursor : null;
-  if (!Array.isArray(threads.nodes)) {
-    return unreadable;
+  return { totalCount, hasNextPage: pageInfo.hasNextPage, endCursor, nodes: threads.nodes };
+}
+
+/** The head repository as owner/repo, null when the forge reports none, undefined when malformed. */
+function parseHeadRepository(raw: unknown): { owner: string; repo: string } | null | undefined {
+  if (raw === null) {
+    return null;
   }
-  return {
-    open: state === 'OPEN',
-    headRefOid,
-    totalCount,
-    hasNextPage: pageInfo.hasNextPage,
-    endCursor,
-    nodes: threads.nodes,
-  };
+  if (!isRecord(raw) || !isRecord(raw.owner)) {
+    return undefined;
+  }
+  const owner = raw.owner.login;
+  const repo = raw.name;
+  if (typeof owner !== 'string' || typeof repo !== 'string' || !REPOSITORY_PATTERN.test(owner) || !REPOSITORY_PATTERN.test(repo)) {
+    return undefined;
+  }
+  return { owner, repo };
 }
 
 function authorKindOf(typename: unknown): PullRequestAuthorKind | null {
@@ -265,6 +300,66 @@ function toFinding(id: string, node: Record<string, unknown>, resolved: boolean)
   return { threadId: id, path, line, authorKind, state: 'unresolved', text: first.body };
 }
 
+interface ReadState {
+  readonly findings: PullRequestFinding[];
+  readonly seen: Set<string>;
+  fetched: number;
+  firstTotal: number | null;
+  /** The first page; every later page must report the same pull request head. */
+  first: Page | null;
+}
+
+/** Checks one page against the request and the first page; null when it may be read. */
+function acceptPage(state: ReadState, page: Page, expectedHeadSha: string): Unavailable | null {
+  if (!page.open) {
+    return unavailable('not-open');
+  }
+  const first = state.first;
+  if (
+    page.headRefOid !== expectedHeadSha ||
+    (first !== null && (page.headRefOid !== first.headRefOid || page.headRefName !== first.headRefName))
+  ) {
+    return unavailable('head-moved');
+  }
+  if (first === null) {
+    state.first = page;
+    state.firstTotal = page.totalCount;
+    return page.totalCount > MAX_THREADS ? unavailable('too-large', 'too many threads') : null;
+  }
+  return page.totalCount === state.firstTotal ? null : unavailable('partial-page', 'thread count changed between pages');
+}
+
+/** Takes one page's nodes into the state; the unavailable answer for any malformed, repeated or oversized node. */
+function intakeNodes(state: ReadState, nodes: readonly unknown[]): Unavailable | null {
+  for (const raw of nodes) {
+    const node = identifyNode(raw);
+    if (node === null) {
+      return unavailable('unreadable', 'a thread is malformed');
+    }
+    if (state.seen.has(node.id)) {
+      return unavailable('partial-page', 'a thread repeated between pages');
+    }
+    state.seen.add(node.id);
+    state.fetched += 1;
+    if (state.fetched > MAX_THREADS) {
+      return unavailable('too-large', 'too many threads');
+    }
+    // A resolved thread is validated like an unresolved one (an unknown or
+    // missing author makes the whole answer unreadable), then dropped.
+    const finding = toFinding(node.id, node.record, node.resolved);
+    if (finding === null) {
+      return unavailable('unreadable', 'a thread is malformed');
+    }
+    if (finding === 'too-large') {
+      return unavailable('too-large', 'a thread body is too large');
+    }
+    if (!node.resolved) {
+      state.findings.push(finding);
+    }
+  }
+  return null;
+}
+
 export class PullRequestFindingsReadAdapter implements PullRequestFindingsReadPort {
   private readonly runGh?: (args: readonly string[], timeoutMs?: number) => Promise<GhInvocationResult>;
   private readonly repository?: PullRequestFindingsRepositoryRef;
@@ -299,88 +394,20 @@ export class PullRequestFindingsReadAdapter implements PullRequestFindingsReadPo
       return valid;
     }
 
-    const findings: PullRequestFinding[] = [];
-    const seen = new Set<string>();
-    let fetched = 0;
+    const state: ReadState = { findings: [], seen: new Set<string>(), fetched: 0, firstTotal: null, first: null };
     let cursor: string | null = null;
-    let firstTotal: number | null = null;
-    let headSha: string | null = null;
-
     for (let pageNumber = 1; ; pageNumber += 1) {
       if (pageNumber > MAX_PAGES) {
         return unavailable('too-large', 'too many pages');
       }
-      const timeoutMs = this.callBudget(valid.deadlineMs);
-      if (timeoutMs === null) {
-        return unavailable('forge-error', 'deadline');
-      }
-      const raced = await this.runWithinTimeout(this.graphqlArgs(valid, cursor), timeoutMs);
-      if (raced.kind === 'timed-out') {
-        return unavailable('forge-error', 'timeout');
-      }
-      if (raced.kind === 'failed') {
-        return unavailable('forge-error', 'call failed');
-      }
-      const gh = raced.gh;
-      if (!isRecord(gh) || typeof gh.exitCode !== 'number' || typeof gh.stdout !== 'string') {
-        return unavailable('unreadable', 'answer is not readable');
-      }
-      if (gh.exitCode !== 0) {
-        return unavailable('forge-error', `exit ${gh.exitCode}`);
-      }
-      if (gh.stdout.trim() === '') {
-        return unavailable('forge-error', 'no output');
-      }
-      if (Buffer.byteLength(gh.stdout, 'utf8') > MAX_STDOUT_BYTES) {
-        return unavailable('too-large', 'page output too large');
-      }
-      const page = parsePage(gh.stdout);
+      const page = await this.fetchPage(valid, cursor);
       if ('outcome' in page) {
         return page;
       }
-      if (!page.open) {
-        return unavailable('not-open');
+      const refused = acceptPage(state, page, valid.expectedHeadSha) ?? intakeNodes(state, page.nodes);
+      if (refused !== null) {
+        return refused;
       }
-      if (page.headRefOid !== valid.expectedHeadSha || (headSha !== null && page.headRefOid !== headSha)) {
-        return unavailable('head-moved');
-      }
-      headSha = page.headRefOid;
-      if (firstTotal === null) {
-        firstTotal = page.totalCount;
-        if (firstTotal > MAX_THREADS) {
-          return unavailable('too-large', 'too many threads');
-        }
-      } else if (page.totalCount !== firstTotal) {
-        return unavailable('partial-page', 'thread count changed between pages');
-      }
-
-      for (const raw of page.nodes) {
-        const node = identifyNode(raw);
-        if (node === null) {
-          return unavailable('unreadable', 'a thread is malformed');
-        }
-        if (seen.has(node.id)) {
-          return unavailable('partial-page', 'a thread repeated between pages');
-        }
-        seen.add(node.id);
-        fetched += 1;
-        if (fetched > MAX_THREADS) {
-          return unavailable('too-large', 'too many threads');
-        }
-        // A resolved thread is validated like an unresolved one (an unknown
-        // or missing author makes the whole answer unreadable), then dropped.
-        const finding = toFinding(node.id, node.record, node.resolved);
-        if (finding === null) {
-          return unavailable('unreadable', 'a thread is malformed');
-        }
-        if (finding === 'too-large') {
-          return unavailable('too-large', 'a thread body is too large');
-        }
-        if (!node.resolved) {
-          findings.push(finding);
-        }
-      }
-
       if (!page.hasNextPage) {
         break;
       }
@@ -390,10 +417,45 @@ export class PullRequestFindingsReadAdapter implements PullRequestFindingsReadPo
       cursor = page.endCursor;
     }
 
-    if (fetched !== firstTotal || headSha === null) {
+    if (state.first === null || state.fetched !== state.firstTotal) {
       return unavailable('partial-page', 'fewer threads were read than the forge reports');
     }
-    return { outcome: 'available', headSha, findings };
+    return {
+      outcome: 'available',
+      headSha: state.first.headRefOid,
+      headRefName: state.first.headRefName,
+      headRepository: state.first.headRepository,
+      findings: state.findings,
+    };
+  }
+
+  /** One page: the budget rule, one read-only call, then a parsed page or the unavailable answer. */
+  private async fetchPage(valid: ValidRequest, cursor: string | null): Promise<Page | Unavailable> {
+    const timeoutMs = this.callBudget(valid.deadlineMs);
+    if (timeoutMs === null) {
+      return unavailable('forge-error', 'deadline');
+    }
+    const raced = await this.runWithinTimeout(this.graphqlArgs(valid, cursor), timeoutMs);
+    if (raced.kind === 'timed-out') {
+      return unavailable('forge-error', 'timeout');
+    }
+    if (raced.kind === 'failed') {
+      return unavailable('forge-error', 'call failed');
+    }
+    const gh = raced.gh;
+    if (!isRecord(gh) || typeof gh.exitCode !== 'number' || typeof gh.stdout !== 'string') {
+      return unavailable('unreadable', 'answer is not readable');
+    }
+    if (gh.exitCode !== 0) {
+      return unavailable('forge-error', `exit ${gh.exitCode}`);
+    }
+    if (gh.stdout.trim() === '') {
+      return unavailable('forge-error', 'no output');
+    }
+    if (Buffer.byteLength(gh.stdout, 'utf8') > MAX_STDOUT_BYTES) {
+      return unavailable('too-large', 'page output too large');
+    }
+    return parsePage(gh.stdout);
   }
 
   /**

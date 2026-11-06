@@ -43,6 +43,10 @@ export type PullRequestFindingsResult =
   | {
       readonly outcome: 'available';
       readonly headSha: string;
+      /** The pull request's head branch name, as the forge reports it. */
+      readonly headRefName: string;
+      /** The repository the head branch lives in; null when the forge has none (a deleted fork). */
+      readonly headRepository: { readonly owner: string; readonly repo: string } | null;
       readonly findings: readonly PullRequestFinding[];
     }
   | {

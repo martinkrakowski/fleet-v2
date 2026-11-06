@@ -44,6 +44,7 @@ const KEY = `pr-feedback/42@${'a'.repeat(12)}`;
 const FIX_ATTEMPT_ID = `pr-feedback-42-${'a'.repeat(12)}`;
 const NONCE = 'a'.repeat(32);
 const GRANT_ID = 'grant-1';
+const BRANCH = 'fleet/lane-co24';
 
 function finding(overrides: Partial<PullRequestFinding> = {}): PullRequestFinding {
   return {
@@ -271,7 +272,7 @@ function authorizedForge(forge: ForgeActionPort, grants: FakeGrants, attempt: At
 function atHead(head: string, findings: readonly PullRequestFinding[] = [finding()]) {
   return (request: PullRequestFindingsRequest): PullRequestFindingsResult =>
     request.expectedHeadSha === head
-      ? { outcome: 'available', headSha: head, findings }
+      ? { outcome: 'available', headSha: head, headRefName: BRANCH, headRepository: REPOSITORY, findings }
       : { outcome: 'unavailable', code: 'head-moved' };
 }
 
@@ -375,7 +376,7 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
     expect(result).toEqual({ outcome: 'refused', code: 'head-moved' });
     expect(fixAttempts.calls).toHaveLength(0);
 
-    findings.handler = () => ({ outcome: 'available', headSha: OTHER_HEAD, findings: [finding()] });
+    findings.handler = () => ({ outcome: 'available', headSha: OTHER_HEAD, headRefName: BRANCH, headRepository: REPOSITORY, findings: [finding()] });
     expect(await useCase.preparePullRequestFeedbackFix(prepareRequest())).toEqual({
       outcome: 'refused',
       code: 'head-moved',
@@ -499,7 +500,7 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
     let prHead = HEAD;
     findings.handler = (request) =>
       request.expectedHeadSha === prHead
-        ? { outcome: 'available', headSha: prHead, findings: [finding()] }
+        ? { outcome: 'available', headSha: prHead, headRefName: BRANCH, headRepository: REPOSITORY, findings: [finding()] }
         : { outcome: 'unavailable', code: 'head-moved' };
     forge.script = (_request) => {
       prHead = FIXED_HEAD;
@@ -566,7 +567,7 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
     let prHead = HEAD;
     findings.handler = (request) =>
       request.expectedHeadSha === prHead
-        ? { outcome: 'available', headSha: prHead, findings: [finding()] }
+        ? { outcome: 'available', headSha: prHead, headRefName: BRANCH, headRepository: REPOSITORY, findings: [finding()] }
         : { outcome: 'unavailable', code: 'head-moved' };
     forge.script = (_request) => {
       prHead = FIXED_HEAD;
@@ -708,6 +709,8 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
       findings.handler = () => ({
         outcome: 'available',
         headSha: HEAD,
+        headRefName: BRANCH,
+        headRepository: REPOSITORY,
         findings: [finding(overrides as Partial<PullRequestFinding>)],
       });
       expect(await useCase.preparePullRequestFeedbackFix(prepareRequest())).toEqual({
@@ -762,7 +765,7 @@ function pushableSetup() {
   let prHead = HEAD;
   context.findings.handler = (request) =>
     request.expectedHeadSha === prHead
-      ? { outcome: 'available', headSha: prHead, findings: [finding()] }
+      ? { outcome: 'available', headSha: prHead, headRefName: BRANCH, headRepository: REPOSITORY, findings: [finding()] }
       : { outcome: 'unavailable', code: 'head-moved' };
   context.forge.script = (request) => {
     prHead = request.expectedHeadSha;
@@ -855,7 +858,7 @@ describe('PreparePullRequestFeedbackFixUseCase push grant', () => {
     }
   });
 
-  it('refuses with code grant-refused and consumes nothing when the fix attempt did not produce the pushed head', async () => {
+  it('refuses with code head-moved and consumes nothing when the fix attempt did not produce the pushed head', async () => {
     const context = pushableSetup();
     const { execute } = authorizedForge(context.forge, context.grants, fixAttemptRecord(OTHER_HEAD));
     const useCase = new PreparePullRequestFeedbackFixUseCase({
@@ -868,7 +871,7 @@ describe('PreparePullRequestFeedbackFixUseCase push grant', () => {
 
     const result = await useCase.pushPullRequestFeedbackFix(pushRequest());
 
-    expect(result).toEqual({ outcome: 'refused', key: KEY, headSha: FIXED_HEAD, code: 'grant-refused' });
+    expect(result).toEqual({ outcome: 'refused', key: KEY, headSha: FIXED_HEAD, code: 'head-moved' });
     expect(context.grants.consumeCalls).toHaveLength(0);
     expect(context.forge.requests).toHaveLength(0);
   });
@@ -908,5 +911,78 @@ describe('PreparePullRequestFeedbackFixUseCase push grant', () => {
     expect(grants.consumeCalls).toHaveLength(0);
     expect(forge.requests).toHaveLength(0);
     expect(fixAttempts.calls).toHaveLength(0);
+  });
+
+  it('refuses with code branch-mismatch when the probed pull request is on another branch, a fork or no head repository', async () => {
+    const variants = [
+      { headRefName: 'other-branch', headRepository: REPOSITORY },
+      { headRefName: BRANCH, headRepository: { owner: 'attacker', repo: 'v2' } },
+      { headRefName: BRANCH, headRepository: null },
+    ];
+    for (const variant of variants) {
+      const { findings, forge, grants, fixAttempts, useCase } = pushableSetup();
+      const inner = findings.handler;
+      findings.handler = (request) => {
+        const answer = inner(request);
+        return answer.outcome === 'available' ? { ...answer, ...variant } : answer;
+      };
+
+      expect(await useCase.pushPullRequestFeedbackFix(pushRequest())).toEqual({
+        outcome: 'refused',
+        key: KEY,
+        headSha: FIXED_HEAD,
+        code: 'branch-mismatch',
+      });
+      expect(await useCase.preparePullRequestFeedbackFix(prepareRequest())).toEqual({
+        outcome: 'refused',
+        code: 'branch-mismatch',
+      });
+      expect(grants.consumeCalls).toHaveLength(0);
+      expect(forge.requests).toHaveLength(0);
+      expect(fixAttempts.calls).toHaveLength(0);
+    }
+  });
+
+  it('never replays a consumed grant to push another branch after an ambiguous push', async () => {
+    const { findings, forge, grants, useCase } = pushableSetup();
+    forge.script = () => ({ outcome: 'ambiguous', reason: 'no answer' });
+
+    const first = await useCase.pushPullRequestFeedbackFix(pushRequest());
+    const replay = await useCase.pushPullRequestFeedbackFix(pushRequest({ branchName: 'other' }));
+
+    expect(first.outcome).toBe('ambiguous');
+    expect(grants.grants.get(GRANT_ID)?.consumedByActionId).toBe(KEY);
+    expect(replay).toEqual({ outcome: 'refused', key: KEY, headSha: FIXED_HEAD, code: 'branch-mismatch' });
+    expect(forge.requests).toHaveLength(1);
+    expect(forge.requests[0].branchName).toBe(BRANCH);
+    expect(findings.calls.length).toBeGreaterThan(0);
+  });
+
+  it('refuses with code not-configured when the installation forge mode is none, consuming nothing', async () => {
+    const context = pushableSetup();
+    const execute = new ExecuteAuthorizedForgeActionUseCase({
+      attemptRepo: { async findAttemptById() { return fixAttemptRecord(); }, async saveAttempt() {}, async listAttemptsByWorkOrder() { return []; }, async listAllAttempts() { return []; } },
+      workOrderRepo: { async findWorkOrderById() { return workOrderRecord(); }, async saveWorkOrder() {}, async listWorkOrdersByProject() { return []; } },
+      journal: new MemoryJournal(),
+      authorizationPort: context.grants,
+      forgePort: context.forge,
+      forgeMode: 'none',
+    });
+    const useCase = new PreparePullRequestFeedbackFixUseCase({
+      findings: context.findings,
+      prepareFixAttempt: context.fixAttempts,
+      executeForgeAction: execute,
+      repository: REPOSITORY,
+      mintNonce: () => NONCE,
+    });
+
+    expect(await useCase.pushPullRequestFeedbackFix(pushRequest())).toEqual({
+      outcome: 'refused',
+      key: KEY,
+      headSha: FIXED_HEAD,
+      code: 'not-configured',
+    });
+    expect(context.grants.consumeCalls).toHaveLength(0);
+    expect(context.forge.requests).toHaveLength(0);
   });
 });

@@ -10,8 +10,9 @@
  * ExecuteAuthorizedForgeAction, which durably consumes that grant for this
  * one action before any forge call, so a missing, unknown, already-consumed or
  * mismatched grant refuses and nothing is pushed. A moved head, an unreadable
- * forge, a pull request that is not open or no unresolved thread refuses with
- * a reason code. It never resolves a thread. Commits are full 40-character
+ * forge, a pull request that is not open, a pull request whose head branch
+ * is not the request's branch in the bound repository, or no unresolved
+ * thread refuses with a reason code. It never resolves a thread. Commits are full 40-character
  * shas. Results carry ids, codes and counts only.
  */
 
@@ -26,6 +27,7 @@ export type PreparePullRequestFeedbackFixCode =
   | 'too-large'
   | 'fix-attempt-refused'
   | 'pull-request-not-open'
+  | 'branch-mismatch'
   | 'repository-mismatch'
   | 'grant-missing'
   | 'grant-refused'

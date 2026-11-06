@@ -74,6 +74,9 @@ const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const GRANT_ID_PATTERN = /^[A-Za-z0-9_.:@/-]{1,200}$/;
 /** The forge path's refusal when no forge transport is bound (ExecuteAuthorizedForgeActionUseCase). */
 const FORGE_UNCONFIGURED_REASON = 'unavailable';
+/** ExecuteAuthorizedForgeActionUseCase's refusal prefixes for forge mode `none` and an attempt whose head is not the pushed head. */
+const FORGE_MODE_NONE_PREFIX = "Forge mode is 'none'";
+const ATTEMPT_HEAD_MOVED_PREFIX = 'Moved head:';
 const NONCE_PATTERN = /^[0-9a-f]{16,64}$/;
 const THREAD_ID_PATTERN = /^[A-Za-z0-9_=-]{1,128}$/;
 const FINDING_LABEL = 'review finding';
@@ -251,6 +254,69 @@ function sameRepository(
   );
 }
 
+interface ReadTarget {
+  readonly repository: { owner: string; repo: string };
+  readonly pullRequestNumber: number;
+  readonly headSha: string;
+  readonly branchName: string;
+}
+
+type ProbeAnswer = 'at-head' | 'moved' | 'not-open' | 'branch-mismatch' | 'unknown';
+
+/** A probe answer that stops the push, as its refusal code. */
+function probeRefusal(answer: Exclude<ProbeAnswer, 'at-head' | 'moved'>): PreparePullRequestFeedbackFixCode {
+  if (answer === 'not-open') {
+    return 'pull-request-not-open';
+  }
+  return answer === 'branch-mismatch' ? 'branch-mismatch' : 'forge-unreadable';
+}
+
+interface PrepareFields {
+  readonly repository: { owner: string; repo: string };
+  readonly pullRequestNumber: number;
+  readonly headSha: string;
+  readonly branchName: string;
+  readonly workOrderId: string;
+  readonly priorAttemptId: string;
+  readonly fixAttemptId: string;
+  readonly unhealthySeatIds: readonly string[] | undefined;
+  readonly nowIso: string | undefined;
+}
+
+/** The prepare request's fields, or null for an invalid request (including a fix attempt id the key does not imply). */
+function readPrepareFields(request: unknown): PrepareFields | null {
+  const repository = readRepository(request);
+  const pullRequestNumber = readPullRequestNumber(request);
+  const headSha = readCommit(request, 'headSha');
+  const branchName = ownData(request, 'branchName');
+  const workOrderId = ownData(request, 'workOrderId');
+  const priorAttemptId = ownData(request, 'priorAttemptId');
+  const fixAttemptIdField = readOptionalId(request, 'fixAttemptId');
+  const grantId = readOptionalId(request, 'grantId');
+  const unhealthySeatIds = readOptionalStrings(request, 'unhealthySeatIds');
+  const nowIso = readOptionalIso(request);
+  if (
+    repository === null ||
+    pullRequestNumber === null ||
+    headSha === null ||
+    !isSafeBranchName(branchName) ||
+    !isNonEmptyString(workOrderId) ||
+    !isNonEmptyString(priorAttemptId) ||
+    fixAttemptIdField === null ||
+    grantId === null ||
+    unhealthySeatIds === null ||
+    nowIso === null
+  ) {
+    return null;
+  }
+  const derivedId = derivedFixAttemptId(pullRequestNumber, headSha);
+  const fixAttemptId = fixAttemptIdField ?? derivedId;
+  if (fixAttemptId === priorAttemptId || fixAttemptId !== derivedId) {
+    return null;
+  }
+  return { repository, pullRequestNumber, headSha, branchName, workOrderId, priorAttemptId, fixAttemptId, unhealthySeatIds, nowIso };
+}
+
 interface PushFields {
   readonly repository: { owner: string; repo: string };
   readonly pullRequestNumber: number;
@@ -340,8 +406,12 @@ function pushOutcome(
   if (forgeRefusalKind !== undefined) {
     return refusedPush('push-refused', refusalKindWord(forgeRefusalKind));
   }
-  if (ownData(answer, 'reason') === FORGE_UNCONFIGURED_REASON) {
+  const reason = ownData(answer, 'reason');
+  if (reason === FORGE_UNCONFIGURED_REASON || (typeof reason === 'string' && reason.startsWith(FORGE_MODE_NONE_PREFIX))) {
     return refusedPush('not-configured');
+  }
+  if (typeof reason === 'string' && reason.startsWith(ATTEMPT_HEAD_MOVED_PREFIX)) {
+    return refusedPush('head-moved');
   }
   return refusedPush('grant-refused');
 }
@@ -390,37 +460,12 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
     deps: PreparePullRequestFeedbackFixDependencies,
     request: unknown,
   ): Promise<PreparePullRequestFeedbackFixResult> {
-    const repository = readRepository(request);
-    const pullRequestNumber = readPullRequestNumber(request);
-    const headSha = readCommit(request, 'headSha');
-    const branchName = ownData(request, 'branchName');
-    const workOrderId = ownData(request, 'workOrderId');
-    const priorAttemptId = ownData(request, 'priorAttemptId');
-    const fixAttemptIdField = readOptionalId(request, 'fixAttemptId');
-    const grantId = readOptionalId(request, 'grantId');
-    const unhealthySeatIds = readOptionalStrings(request, 'unhealthySeatIds');
-    const nowIso = readOptionalIso(request);
-    if (
-      repository === null ||
-      pullRequestNumber === null ||
-      headSha === null ||
-      !isSafeBranchName(branchName) ||
-      !isNonEmptyString(workOrderId) ||
-      !isNonEmptyString(priorAttemptId) ||
-      fixAttemptIdField === null ||
-      grantId === null ||
-      unhealthySeatIds === null ||
-      nowIso === null
-    ) {
+    const fields = readPrepareFields(request);
+    if (fields === null) {
       return refuse('invalid-request');
     }
-
+    const { repository, pullRequestNumber, headSha, branchName, workOrderId, priorAttemptId, fixAttemptId } = fields;
     const key = keyOf(pullRequestNumber, headSha);
-    const derivedId = derivedFixAttemptId(pullRequestNumber, headSha);
-    const fixAttemptId = fixAttemptIdField ?? derivedId;
-    if (fixAttemptId === priorAttemptId || fixAttemptId !== derivedId) {
-      return refuse('invalid-request');
-    }
     if (!this.isBoundRepository(deps, repository)) {
       return refuse('repository-mismatch');
     }
@@ -429,7 +474,7 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
       return refuse('not-configured');
     }
 
-    const read = await this.readFindings(deps, repository, pullRequestNumber, headSha);
+    const read = await this.readFindings(deps, { repository, pullRequestNumber, headSha, branchName });
     if (read.kind === 'refused') {
       return read.refusal;
     }
@@ -446,7 +491,7 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
       return built;
     }
 
-    const effectiveNow = nowIso ?? this.clock(deps);
+    const effectiveNow = fields.nowIso ?? this.clock(deps);
     let answer: Awaited<ReturnType<PrepareFixAttemptPort['prepareFixAttempt']>>;
     try {
       answer = await deps.prepareFixAttempt.prepareFixAttempt({
@@ -454,7 +499,7 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
         workOrderId,
         priorAttemptId,
         numberedFixes: built.fixes,
-        ...(unhealthySeatIds !== undefined ? { unhealthySeatIds } : {}),
+        ...(fields.unhealthySeatIds !== undefined ? { unhealthySeatIds: fields.unhealthySeatIds } : {}),
         ...(effectiveNow !== undefined ? { nowIso: effectiveNow } : {}),
       });
     } catch {
@@ -505,29 +550,12 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
       return refusedPush('not-configured');
     }
 
-    // Probe 1: a pull request already at the fixed head needs no push (and a
-    // crash between an earlier push and its result lands here).
-    const atFixed = await this.probe(deps, repository, pullRequestNumber, fixedHeadSha);
-    if (atFixed === 'at-head') {
+    const precheck = await this.pushPrecheck(deps, fields);
+    if (precheck === 'already-pushed') {
       return { outcome: 'already-pushed', key, headSha: fixedHeadSha };
     }
-    if (atFixed === 'not-open') {
-      return refusedPush('pull-request-not-open');
-    }
-    if (atFixed !== 'moved') {
-      return refusedPush('forge-unreadable');
-    }
-
-    // Probe 2: the pull request must still be at the round's head.
-    const atRound = await this.probe(deps, repository, pullRequestNumber, expectedHeadSha);
-    if (atRound === 'moved') {
-      return refusedPush('head-moved');
-    }
-    if (atRound === 'not-open') {
-      return refusedPush('pull-request-not-open');
-    }
-    if (atRound !== 'at-head') {
-      return refusedPush('forge-unreadable');
+    if (precheck !== 'push') {
+      return refusedPush(precheck);
     }
 
     // The push runs only through the authorised forge path, which consumes
@@ -550,6 +578,33 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
       return { outcome: 'ambiguous', key, headSha: fixedHeadSha, code: 'forge-ambiguous' };
     }
     return pushOutcome(answer, key, fixedHeadSha, refusedPush);
+  }
+
+  /**
+   * The two head probes before a push. Probe 1: a pull request already at the
+   * fixed head needs no push (a crash between an earlier push and its result
+   * lands here). Probe 2: the pull request must still be at the round's head.
+   * Both require the probed pull request's head branch to be the request's
+   * branch in the bound repository, so the branch the forge pushes is the
+   * pull request that was probed.
+   */
+  private async pushPrecheck(
+    deps: PreparePullRequestFeedbackFixDependencies,
+    fields: PushFields,
+  ): Promise<'push' | 'already-pushed' | PreparePullRequestFeedbackFixCode> {
+    const target = { repository: fields.repository, pullRequestNumber: fields.pullRequestNumber, branchName: fields.branchName };
+    const atFixed = await this.probe(deps, { ...target, headSha: fields.fixedHeadSha });
+    if (atFixed === 'at-head') {
+      return 'already-pushed';
+    }
+    if (atFixed !== 'moved') {
+      return probeRefusal(atFixed);
+    }
+    const atRound = await this.probe(deps, { ...target, headSha: fields.expectedHeadSha });
+    if (atRound === 'at-head') {
+      return 'push';
+    }
+    return atRound === 'moved' ? 'head-moved' : probeRefusal(atRound);
   }
 
   /** Whether the request names the repository the bound forge path acts on. */
@@ -609,19 +664,20 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
     }
   }
 
-  /** Whether the pull request is at `headSha`, moved to another head, or unknown. */
+  /** Whether the pull request is at `headSha` on the expected branch, moved, not open, on another branch, or unknown. */
   private async probe(
     deps: PreparePullRequestFeedbackFixDependencies,
-    repository: { owner: string; repo: string },
-    pullRequestNumber: number,
-    headSha: string,
-  ): Promise<'at-head' | 'moved' | 'not-open' | 'unknown'> {
-    const result = await this.callFindings(deps, repository, pullRequestNumber, headSha);
+    target: ReadTarget,
+  ): Promise<ProbeAnswer> {
+    const result = await this.callFindings(deps, target.repository, target.pullRequestNumber, target.headSha);
     if (result === null) {
       return 'unknown';
     }
     if (result.outcome === 'available') {
-      return headMatches(result.headSha, headSha) ? 'at-head' : 'unknown';
+      if (!headMatches(result.headSha, target.headSha)) {
+        return 'unknown';
+      }
+      return this.isExpectedBranch(deps, result, target.branchName) ? 'at-head' : 'branch-mismatch';
     }
     if (result.outcome === 'unavailable' && result.code === 'head-moved') {
       return 'moved';
@@ -632,13 +688,29 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
     return 'unknown';
   }
 
+  /** The probed pull request's head branch is `branchName` in the bound repository (never a fork). */
+  private isExpectedBranch(
+    deps: PreparePullRequestFeedbackFixDependencies,
+    result: unknown,
+    branchName: string,
+  ): boolean {
+    const headRepository = ownData(result, 'headRepository');
+    return (
+      ownData(result, 'headRefName') === branchName &&
+      typeof headRepository === 'object' &&
+      headRepository !== null &&
+      this.isBoundRepository(deps, {
+        owner: String(ownData(headRepository, 'owner')),
+        repo: String(ownData(headRepository, 'repo')),
+      })
+    );
+  }
+
   private async readFindings(
     deps: PreparePullRequestFeedbackFixDependencies,
-    repository: { owner: string; repo: string },
-    pullRequestNumber: number,
-    headSha: string,
+    target: ReadTarget,
   ): Promise<ReadOutcome> {
-    const result = await this.callFindings(deps, repository, pullRequestNumber, headSha);
+    const result = await this.callFindings(deps, target.repository, target.pullRequestNumber, target.headSha);
     if (result === null) {
       return { kind: 'refused', refusal: refuse('forge-unreadable') };
     }
@@ -664,8 +736,11 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
     if (result.outcome !== 'available' || !Array.isArray(result.findings)) {
       return { kind: 'refused', refusal: refuse('invalid-request') };
     }
-    if (!headMatches(result.headSha, headSha)) {
+    if (!headMatches(result.headSha, target.headSha)) {
       return { kind: 'refused', refusal: refuse('head-moved') };
+    }
+    if (!this.isExpectedBranch(deps, result, target.branchName)) {
+      return { kind: 'refused', refusal: refuse('branch-mismatch') };
     }
     const findings: PullRequestFinding[] = [];
     for (const finding of result.findings) {

@@ -34,6 +34,8 @@ import { parseWorkOrderStateRecord } from './WorkOrderRepositoryAdapter.adapter.
 import { parseVersionedLaneRunStateRecord } from './LaneRunRepositoryAdapter.adapter.js';
 import { parseVersionedLaneRunJournalStateRecord } from './LaneRunJournalAdapter.adapter.js';
 import { parseVersionedLanePlanStateRecord } from './LanePlanRepositoryAdapter.adapter.js';
+import { parseVersionedSeatTicketStateRecord } from './SeatTicketRepositoryAdapter.adapter.js';
+import { parseVersionedSeatObservationStateRecord } from './SeatObservationRepositoryAdapter.adapter.js';
 import { parseTelemetryDispositionStateRecord } from './TelemetryDispositionAdapter.adapter.js';
 import {
   duplicateMergeQueueIdentityListError,
@@ -92,4 +94,6 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('merge-queue.json', parseMergeQueueStateRecord, duplicateMergeQueueIdentityListError),
   describeRecordListStore('killall-halt.json', parseKillallHaltMarkerStateRecord),
   describeRecordListStore('killall-train-pause.json', parseKillallTrainPauseStateRecord),
+  describeVersionedRecordListStore('seat-tickets.json', parseVersionedSeatTicketStateRecord),
+  describeVersionedRecordListStore('seat-observations.json', parseVersionedSeatObservationStateRecord),
 ];

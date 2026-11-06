@@ -530,6 +530,8 @@ describe('work-execution state file descriptors match the store readers', () => 
       'merge-queue.json',
       'killall-halt.json',
       'killall-train-pause.json',
+      'seat-tickets.json',
+      'seat-observations.json',
     ]);
   });
 });

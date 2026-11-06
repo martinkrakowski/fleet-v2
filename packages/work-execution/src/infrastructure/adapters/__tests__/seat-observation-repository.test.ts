@@ -1,0 +1,128 @@
+import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import {
+  StateFileUnreadableError,
+  StateFileUnknownVersionError,
+} from '../file-store.js';
+import { SeatObservationRepositoryAdapter } from '../SeatObservationRepositoryAdapter.adapter.js';
+import type { SeatObservationRecord } from '../../../domain/execution-records.js';
+
+function observation(
+  observationId: string,
+  overrides: Partial<SeatObservationRecord> = {},
+): SeatObservationRecord {
+  return {
+    version: 1,
+    observationId,
+    seatId: 'seat-1',
+    outcome: 'rate-limited',
+    observedAtIso: '2026-11-06T00:00:00.000Z',
+    subject: { attemptId: 'attempt-1' },
+    via: 'cli',
+    ...overrides,
+  };
+}
+
+describe('SeatObservationRepositoryAdapter (memory mode)', () => {
+  let adapter: SeatObservationRepositoryAdapter;
+
+  beforeEach(() => {
+    adapter = new SeatObservationRepositoryAdapter();
+  });
+
+  it('appends and lists in append order, narrowed by seatId', async () => {
+    expect(await adapter.listSeatObservations()).toEqual([]);
+    const first = observation('obs-1', { seatId: 'seat-1' });
+    const second = observation('obs-2', { seatId: 'seat-2', subject: { reviewRequestId: 'rr-1' } });
+    expect(await adapter.appendSeatObservation(first)).toBe('appended');
+    expect(await adapter.appendSeatObservation(second)).toBe('appended');
+    expect(await adapter.listSeatObservations()).toEqual([first, second]);
+    expect(await adapter.listSeatObservations('seat-1')).toEqual([first]);
+    expect(await adapter.listSeatObservations('other-seat')).toEqual([]);
+  });
+
+  it('is append-only: stored records are never rewritten or removed', async () => {
+    const first = observation('obs-1');
+    await adapter.appendSeatObservation(first);
+    await adapter.appendSeatObservation(observation('obs-2', { outcome: 'timeout' }));
+    const list = await adapter.listSeatObservations();
+    expect(list[0]).toEqual(first);
+    expect(list).toHaveLength(2);
+  });
+
+  it('refuses a repeated observationId as duplicate without writing', async () => {
+    const first = observation('obs-1', { outcome: 'rate-limited' });
+    expect(await adapter.appendSeatObservation(first)).toBe('appended');
+    expect(await adapter.appendSeatObservation(observation('obs-1', { outcome: 'timeout' }))).toBe('duplicate');
+    const list = await adapter.listSeatObservations();
+    expect(list).toHaveLength(1);
+    expect(list[0]).toEqual(first);
+  });
+
+  it('refuses an unsafe observation id or seat id', async () => {
+    for (const observationId of ['.', '..', '']) {
+      await expect(adapter.appendSeatObservation(observation(observationId))).rejects.toThrow(
+        'SeatObservationRepositoryAdapter refuses an unsafe observation id or seat id',
+      );
+    }
+    for (const seatId of ['.', '..', '']) {
+      await expect(adapter.appendSeatObservation(observation('obs-1', { seatId }))).rejects.toThrow(
+        'SeatObservationRepositoryAdapter refuses an unsafe observation id or seat id',
+      );
+    }
+  });
+
+  it('refuses an unknown outcome or via', async () => {
+    await expect(
+      adapter.appendSeatObservation({ ...observation('obs-1'), outcome: 'bogus' as SeatObservationRecord['outcome'] }),
+    ).rejects.toThrow();
+    await expect(
+      adapter.appendSeatObservation({ ...observation('obs-1'), via: 'web' as SeatObservationRecord['via'] }),
+    ).rejects.toThrow();
+  });
+});
+
+describe('SeatObservationRepositoryAdapter (file mode)', () => {
+  let stateDir: string;
+
+  beforeEach(async () => {
+    stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-sr3-seat-observations-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('persists to seat-observations.json with schemaVersion 1 and re-reads from a second adapter', async () => {
+    const adapter = new SeatObservationRepositoryAdapter({ stateDir });
+    const record = observation('obs-1');
+    expect(await adapter.appendSeatObservation(record)).toBe('appended');
+    const onDisk: unknown[] = JSON.parse(await fs.readFile(path.join(stateDir, 'seat-observations.json'), 'utf8'));
+    expect(onDisk).toHaveLength(1);
+    expect((onDisk[0] as Record<string, unknown>).schemaVersion).toBe(1);
+
+    const second = new SeatObservationRepositoryAdapter({ stateDir });
+    expect(await second.listSeatObservations()).toEqual([record]);
+  });
+
+  it('throws StateFileUnknownVersionError on schemaVersion 2 with no quarantine copy', async () => {
+    await fs.writeFile(
+      path.join(stateDir, 'seat-observations.json'),
+      JSON.stringify([{ ...observation('obs-1'), schemaVersion: 2 }]),
+    );
+    const adapter = new SeatObservationRepositoryAdapter({ stateDir });
+    await expect(adapter.listSeatObservations()).rejects.toBeInstanceOf(StateFileUnknownVersionError);
+    await expect(fs.readdir(path.join(stateDir, 'quarantine'))).rejects.toThrow();
+  });
+
+  it('throws StateFileUnreadableError on invalid JSON and keeps a quarantine copy', async () => {
+    await fs.writeFile(path.join(stateDir, 'seat-observations.json'), '{ not json');
+    const adapter = new SeatObservationRepositoryAdapter({ stateDir });
+    await expect(adapter.listSeatObservations()).rejects.toBeInstanceOf(StateFileUnreadableError);
+    const quarantine = await fs.readdir(path.join(stateDir, 'quarantine'));
+    expect(quarantine.length).toBeGreaterThan(0);
+  });
+});

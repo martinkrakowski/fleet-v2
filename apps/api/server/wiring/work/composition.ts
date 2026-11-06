@@ -9,6 +9,8 @@ import {
   BriefKnowledgeAdapter,
   ExecutionJournalAdapter,
   ExecutionObservationAdapter,
+  LanePlanRepositoryAdapter,
+  MergeRecordRepositoryAdapter,
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
   ConductorHaltAdapter,
@@ -357,6 +359,10 @@ export function createConfiguredWorkComposition(
     stateDir,
     ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
   });
+  // WB5b: the stores a completed merge writes to (merge-records.json and the
+  // pull-request link files), opened on the same state dir as the others.
+  const lanePlanRepo = new LanePlanRepositoryAdapter({ stateDir });
+  const mergeRecordRepo = new MergeRecordRepositoryAdapter({ stateDir });
   // EX-1c: the cancel-prepared guard reads lane runs and their journal; the
   // route only ever reads them, so both adapters are opened read-only.
   const laneRunRepo = new LaneRunRepositoryAdapter({ stateDir, readOnly: true });
@@ -566,6 +572,13 @@ export function createConfiguredWorkComposition(
       // owner-decision resolution acceptance uses.
       ownerDecisionPort,
       attemptOwnerDecisionPort,
+      lanePlanRepo,
+      mergeRecordRepo,
+      // WB5b2: a merge's unconfirmed pull-request number is verified through
+      // the host's read-only pull-request read; absent, it stays unverified.
+      ...(crossContext?.forge?.pullRequestRead !== undefined
+        ? { forgeRead: crossContext.forge.pullRequestRead }
+        : {}),
       // Forge mode `none` (D6) refuses every forge action.
       ...(forgeMode === "none" ? { forgeMode: "none" as const } : {}),
     }),

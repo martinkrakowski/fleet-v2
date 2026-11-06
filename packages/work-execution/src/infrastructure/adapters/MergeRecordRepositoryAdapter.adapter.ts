@@ -120,7 +120,10 @@ export function parseVersionedMergeRecordStateRecord(raw: unknown): VersionedRec
   if (fields === null) {
     return { status: 'invalid' };
   }
-  const result = MergeRecord.create(fields);
+  // A stored record loads through `fromStored`: a pre-`actionRef`
+  // `fleet-forge-action` record still loads, while a corrupt record or a
+  // `fleet-forge-action`/`unknown` pair still fails closed.
+  const result = MergeRecord.fromStored(fields);
   if (!result.success) {
     return { status: 'invalid' };
   }
@@ -146,8 +149,8 @@ type MergeRecordDecided =
 
 /**
  * One decision through the domain. A stored record is loaded through
- * `MergeRecord.create` first, so a stored record the domain refuses to load is
- * never decided against. Never throws.
+ * `MergeRecord.fromStored` first, so a stored record the domain refuses to
+ * load is never decided against. Never throws.
  */
 function decideAgainstStored(
   stored: MergeRecordRecord | undefined,
@@ -156,7 +159,7 @@ function decideAgainstStored(
   try {
     let storedRecord: MergeRecordRecord | null = null;
     if (stored !== undefined) {
-      const loaded = MergeRecord.create(stored);
+      const loaded = MergeRecord.fromStored(stored);
       if (!loaded.success) {
         return { kind: 'refused' };
       }

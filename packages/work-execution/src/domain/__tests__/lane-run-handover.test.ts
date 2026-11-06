@@ -184,6 +184,35 @@ describe('renderHandoverBrief', () => {
     );
   });
 
+  it('renders findings and gate predicates together, findings first, then the gate lines', () => {
+    const result = renderHandoverBrief(input({
+      source: 'gate',
+      findings: [finding({ severity: 'blocker', filePath: 'src/ex.ts', line: 4, summary: 'blocks the acceptance check' })],
+      gatePredicates: [{ name: 'command 1', verdict: 'fail', exitCode: 1 }],
+    }));
+    if (!result.ok) {
+      throw new Error('expected an ok render');
+    }
+    expect(result.numberedFixes).toEqual([
+      '[blocker] src/ex.ts:4 — blocks the acceptance check',
+      '[gate] command 1 — fail, exit 1',
+    ]);
+    expect(result.text).toContain('```\n1. [blocker] src/ex.ts:4 — blocks the acceptance check\n2. [gate] command 1 — fail, exit 1\n```');
+  });
+
+  it('renders findings and gate reason codes together, findings first, then the code line', () => {
+    const result = renderHandoverBrief(input({
+      source: 'gate',
+      findings: [finding({ severity: 'major', filePath: 'src/a.ts', line: 7, summary: 'major a7' })],
+      gateReasonCodes: ['gate-failed'],
+    }));
+    if (!result.ok) {
+      throw new Error('expected an ok render');
+    }
+    expect(result.numberedFixes).toEqual(['[major] src/a.ts:7 — major a7', '[gate] gate-failed']);
+    expect(result.text).toContain('2. [gate] gate-failed');
+  });
+
   it('refuses a gate predicate name that is invalid or contains a backtick', () => {
     expect(
       renderHandoverBrief(input({

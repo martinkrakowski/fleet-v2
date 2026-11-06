@@ -390,12 +390,13 @@ async function appendEntry(
 ): Promise<AppendOutcome> {
   try {
     const appended: unknown = await deps.journal.append(entry);
-    if (isRecord(appended) && appended['outcome'] === 'appended') {
+    const outcome = isRecord(appended) ? appended['outcome'] : null;
+    if (isRecord(appended) && outcome === 'appended') {
       // Only an answer that carries back the very entry we submitted proves it is durable.
       const stored = readLaneRunJournalEntry(appended['entry']);
       return stored.ok && isSameEntry(stored.entry, entry) ? { ok: true } : { ok: false, refusal: null };
     }
-    const reason = isRecord(appended) && appended['outcome'] === 'refused' ? appended['reason'] : null;
+    const reason = isRecord(appended) && outcome === 'refused' ? appended['reason'] : null;
     if (isJournalRefusal(reason)) {
       return { ok: false, refusal: reason };
     }
@@ -412,6 +413,23 @@ function appendFailure(key: string, appended: AppendOutcome): MergeLiveActionOut
   return appended.refusal === null
     ? { outcome: 'unavailable', journalKey: key, reasonCode: 'journal-unavailable' }
     : { outcome: 'journal-refused', journalKey: key, refusal: appended.refusal };
+}
+
+/**
+ * A key's entries as the journal's own rules allow them: exactly one intent first, then results, and
+ * nothing after a final result. Any other sequence (a result with no intent, a second intent) cannot
+ * say whether the key was acted on, so it is treated as an unreadable journal, never as an unused key.
+ */
+function isConsistentKeySequence(records: readonly LaneRunJournalEntryRecord[]): boolean {
+  let settled = false;
+  for (const [index, record] of records.entries()) {
+    const expectedKind = index === 0 ? 'intent' : 'result';
+    if (record.kind !== expectedKind || settled) {
+      return false;
+    }
+    settled = record.kind === 'result' && record.outcome !== 'ambiguous';
+  }
+  return true;
 }
 
 /** The key's journal entries; null when the journal throws or answers outside its contract. */
@@ -433,7 +451,7 @@ async function listKey(
       }
       records.push(read.entry);
     }
-    return records;
+    return isConsistentKeySequence(records) ? records : null;
   } catch {
     return null;
   }
@@ -456,8 +474,9 @@ async function readForge(
     });
     // Validated and copied inside the guard: a hostile getter on the answer is an unknown read, never a
     // throw, and the copy is what the verdict reads, so a getter cannot answer differently the second time.
-    if (isWellFormedRead(read)) {
-      return snapshotRead(read);
+    const copy = copyRead(read);
+    if (isWellFormedRead(copy)) {
+      return snapshotRead(copy);
     }
   } catch {
     return { outcome: 'unavailable', code: 'unknown', reason: 'port threw' };
@@ -472,6 +491,33 @@ function isUnresolvedThreads(value: unknown): boolean {
   return value === 'unknown' || (Number.isSafeInteger(value) && (value as number) >= 0);
 }
 const FORGE_READ_NON_OK_OUTCOMES: readonly unknown[] = ['not-found', 'budget-exhausted', 'unavailable'];
+
+/** Reads every field the verdict uses exactly once into a plain object; validation then judges the copy. */
+function copyRead(read: unknown): unknown {
+  if (!isRecord(read)) {
+    return read;
+  }
+  const contexts = read['contexts'];
+  return {
+    outcome: read['outcome'],
+    prState: read['prState'],
+    liveHeadSha: read['liveHeadSha'],
+    mergeState: read['mergeState'],
+    unresolvedThreads: read['unresolvedThreads'],
+    contexts: Array.isArray(contexts)
+      ? Array.from(contexts as readonly unknown[], (context) =>
+          isRecord(context)
+            ? {
+                name: context['name'],
+                state: context['state'],
+                isGreen: context['isGreen'],
+                creatorLogin: context['creatorLogin'],
+              }
+            : context,
+        )
+      : contexts,
+  };
+}
 
 function snapshotRead(read: ReadForgeMergeResult): ReadForgeMergeResult {
   if (read.outcome === 'ok') {
@@ -532,16 +578,21 @@ async function performForgeAction(
 ): Promise<MergeForgeActionResult> {
   try {
     const result: unknown = await deps.forgeAction.performMergeForgeAction(forgeRequest);
-    if (isRecord(result) && result['outcome'] === 'executed' && isMergeHex40(result['headSha'])) {
-      return { outcome: 'executed', headSha: result['headSha'] };
+    // Every field is read once and judged on that copy, so a getter cannot answer differently later.
+    const outcome = isRecord(result) ? result['outcome'] : null;
+    if (isRecord(result) && outcome === 'executed') {
+      const headSha = result['headSha'];
+      return isMergeHex40(headSha)
+        ? { outcome: 'executed', headSha }
+        : { outcome: 'ambiguous', reason: 'off-contract answer' };
     }
-    if (isRecord(result) && result['outcome'] === 'refused') {
+    if (isRecord(result) && outcome === 'refused') {
       const kind = result['refusalKind'];
+      const rawReason = result['reason'];
       const refusalKind: ForgeRefusalKind = (FORGE_REFUSAL_KINDS as readonly unknown[]).includes(kind)
         ? (kind as ForgeRefusalKind)
         : 'other';
-      const reason = typeof result['reason'] === 'string' ? result['reason'] : '';
-      return { outcome: 'refused', reason, refusalKind };
+      return { outcome: 'refused', reason: typeof rawReason === 'string' ? rawReason : '', refusalKind };
     }
     return { outcome: 'ambiguous', reason: 'off-contract answer' };
   } catch {

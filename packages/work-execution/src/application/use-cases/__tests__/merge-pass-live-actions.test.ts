@@ -761,4 +761,57 @@ describe('performMergeLiveAction never throws and never acts twice (DT9b fix rou
       expect(forgeAction.requests).toHaveLength(0);
     }
   });
+
+  it('treats a key with a result but no intent as an unreadable journal, never as an unused key', async () => {
+    const { journal, forgeAction, forgeRead, deps } = build();
+    journal.entries.push({
+      version: LANE_RUN_JOURNAL_ENTRY_VERSION,
+      entryId: '01JB00000000000000000000AC',
+      kind: 'result',
+      key: KEY_MERGE_PR,
+      runId: null,
+      recordedAtIso: NOW_ISO,
+      mode: null,
+      expectedRevision: null,
+      mintedId: null,
+      outcome: 'ambiguous',
+      reasonCode: 'forge-ambiguous',
+      detail: null,
+      grantId: GRANT_ID,
+      state: null,
+    });
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(result).toEqual({ outcome: 'unavailable', journalKey: KEY_MERGE_PR, reasonCode: 'journal-unavailable' });
+    expect(forgeAction.requests).toHaveLength(0);
+    expect(forgeRead.calls).toBe(0);
+    expect(journal.entries).toHaveLength(1);
+  });
+
+  it('judges a reconcile context on one read of each field, so a changing getter cannot settle the key', async () => {
+    const { journal, forgeAction, forgeRead, deps } = build();
+    seedIntent(journal, KEY_POST_STATUS);
+    let stateReads = 0;
+    const context = {
+      name: 'premerge',
+      get state(): string {
+        stateReads += 1;
+        return stateReads === 1 ? 'SUCCESS' : (undefined as unknown as string);
+      },
+      isGreen: true,
+      creatorLogin: 'fleet-bot',
+    };
+    forgeRead.result = {
+      outcome: 'ok',
+      prState: 'open',
+      liveHeadSha: HEAD,
+      mergeState: 'clean',
+      contexts: [context],
+      unresolvedThreads: 0,
+    };
+    const status = { context: 'premerge' as const, state: 'success' as const, description: 'premerge passed' };
+    const result = await performMergeLiveAction(deps, makeRequest({ action: 'post-status', status }));
+    expect(result).toEqual({ outcome: 'reconciled', journalKey: KEY_POST_STATUS, reconcile: 'status-present' });
+    expect(stateReads).toBe(1);
+    expect(forgeAction.requests).toHaveLength(0);
+  });
 });

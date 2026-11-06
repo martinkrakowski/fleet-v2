@@ -99,6 +99,24 @@ describe('SeatObservationRepositoryAdapter (memory mode)', () => {
     }
   });
 
+  it('validates the same values it stores when a subject getter changes between reads', async () => {
+    let reads = 0;
+    const subject = {
+      get attemptId(): string {
+        reads += 1;
+        return reads === 1 ? 'a1' : '';
+      },
+    };
+    const outcome = await adapter
+      .appendSeatObservation(observation('obs-g', { subject: subject as SeatObservationRecord['subject'] }))
+      .catch(() => 'refused');
+    const stored = await adapter.listSeatObservations();
+    for (const item of stored) {
+      expect((item.subject as { attemptId: string }).attemptId).not.toBe('');
+    }
+    expect(['appended', 'refused']).toContain(outcome);
+  });
+
   it('refuses an unknown outcome or via', async () => {
     await expect(
       adapter.appendSeatObservation({ ...observation('obs-1'), outcome: 'bogus' as SeatObservationRecord['outcome'] }),

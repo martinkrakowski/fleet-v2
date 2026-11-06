@@ -190,8 +190,11 @@ export class SeatObservationRepositoryAdapter implements SeatObservationReposito
     // the reader's own parser BEFORE storing, so a record the reader would
     // reject can never be written and make the store unreadable. The parsed
     // copy is what is stored: unknown extra top-level keys are dropped.
+    // Snapshot first (structuredClone reads every property, getters included,
+    // exactly once), so validation and storage see the same plain data.
+    const snapshot = structuredClone(record);
     const parsed = parseSeatObservationStateRecord({
-      ...record,
+      ...snapshot,
       schemaVersion: SEAT_OBSERVATION_STORE_VERSION_POLICY.writerVersion,
     });
     if (parsed === undefined) {

@@ -199,8 +199,9 @@ export class SeatTicketRepositoryAdapter implements SeatTicketRepositoryPort {
     }
     // Validate the whole record through the reader's own parser before either
     // save path, so nothing the reader would reject is ever stored or written.
+    const snapshot = structuredClone(record);
     const parsed = parseSeatTicketStateRecord({
-      ...record,
+      ...snapshot,
       schemaVersion: SEAT_TICKET_STORE_VERSION_POLICY.writerVersion,
     });
     if (parsed === undefined) {

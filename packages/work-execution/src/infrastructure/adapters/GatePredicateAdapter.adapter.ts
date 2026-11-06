@@ -241,19 +241,6 @@ function unknownResult(
   return { name, kind, verdict: 'unknown', exitCode: null, durationMs, detail };
 }
 
-/** Whether a stored coverage meets the command's declaration (none declared: any stored coverage is fine). */
-function coverageSatisfied(command: GateCommand, coverage: CheckCoverage | undefined): boolean {
-  if (command.coverage === undefined) {
-    return true;
-  }
-  return (
-    coverage !== undefined &&
-    coverage.ran &&
-    coverage.unitKind === command.coverage.unitKind &&
-    coverage.units >= command.coverage.minUnits
-  );
-}
-
 function isUsableRequest(request: EvaluateGatePredicatesRequest): boolean {
   if (request === null || typeof request !== 'object' || typeof request.worktreePath !== 'string') {
     return false;
@@ -515,7 +502,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
       const flight = (async (): Promise<GatePredicateResult> => {
         const result = await execute();
         if (result.verdict === 'pass') {
-          await this.recordReceipt(wiring, key, result);
+          await this.recordReceipt(wiring, key, command, result);
         }
         return result;
       })();
@@ -558,28 +545,31 @@ export class GatePredicateAdapter implements GatePredicatePort {
     }
   }
 
+  /**
+   * A recorded passing receipt for the key, as a result, or null (a miss: the command runs). The store keeps
+   * only a verdict and a reference, so a command that declares coverage is never reused (its coverage could
+   * not be shown), and a recorded fail is never reused (a flake is not replayed).
+   */
   private async findReceipt(
     wiring: GateReceiptReuseWiring,
     key: GateReceiptKey,
     command: GateCommand,
   ): Promise<GatePredicateResult | null> {
+    if (command.coverage !== undefined) {
+      return null;
+    }
     try {
       const found = await wiring.port.findGateReceipt(key);
-      if (found.outcome !== 'hit' || found.result.verdict !== 'pass' || found.result.exitCode !== 0) {
-        return null;
-      }
-      // A declared coverage must be shown by the receipt too, or the command just runs.
-      if (!coverageSatisfied(command, found.result.coverage)) {
+      if (found.outcome !== 'hit' || found.verdict !== 'pass') {
         return null;
       }
       return {
         name: '',
         kind: 'command',
         verdict: 'pass',
-        exitCode: found.result.exitCode,
+        exitCode: 0,
         durationMs: 0,
-        detail: 'reused receipt: ' + found.result.detail,
-        ...(found.result.coverage === undefined ? {} : { coverage: found.result.coverage }),
+        detail: 'reused receipt: ' + boundedDetail(found.receiptRef),
       };
     } catch {
       return null;
@@ -590,18 +580,17 @@ export class GatePredicateAdapter implements GatePredicatePort {
   private async recordReceipt(
     wiring: GateReceiptReuseWiring,
     key: GateReceiptKey,
+    command: GateCommand,
     result: GatePredicateResult,
   ): Promise<void> {
+    if (command.coverage !== undefined || result.verdict !== 'pass' || result.exitCode !== 0) {
+      return;
+    }
     try {
       await wiring.port.recordGateReceipt({
         key,
-        result: {
-          verdict: 'pass',
-          exitCode: result.exitCode,
-          durationMs: result.durationMs,
-          detail: boundedDetail(result.detail),
-          ...(result.coverage === undefined ? {} : { coverage: result.coverage }),
-        },
+        verdict: 'pass',
+        receiptRef: 'gate-pass:' + createHash('sha256').update(JSON.stringify(key)).digest('hex').slice(0, 32),
       });
     } catch {
       // Unrecorded is a miss next time, never a failure now.

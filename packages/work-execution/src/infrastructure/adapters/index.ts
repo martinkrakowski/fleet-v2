@@ -80,6 +80,8 @@ export * from "./ReviewAssessmentAdapter.adapter.js";
 export * from "./ReviewRequestAdapter.adapter.js";
 export * from "./RunnerForAttemptAdapter.adapter.js";
 export * from "./RunnerSelectorAdapter.adapter.js";
+export * from "./SeatObservationRepositoryAdapter.adapter.js";
+export * from "./SeatTicketRepositoryAdapter.adapter.js";
 export * from "./SingleRecordStore.helper.js";
 export * from "./spawn-run.js";
 export * from "./SshExecutor.adapter.js";

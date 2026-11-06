@@ -9,8 +9,8 @@ import { describe, expect, it } from 'vitest';
 
 import { GatePredicateAdapter, boundedCoverage } from '../GatePredicateAdapter.adapter.js';
 import type { GatePredicateAdapterOptions } from '../GatePredicateAdapter.adapter.js';
-import { GateReceiptReuseAdapter, InMemoryGateReceiptRecordStore } from '../GateReceiptReuseAdapter.adapter.js';
-import type { GateReceiptRecordStore } from '../GateReceiptReuseAdapter.adapter.js';
+import { GateReceiptReuseAdapter } from '../GateReceiptReuseAdapter.adapter.js';
+import type { GateReceiptReusePort } from '../../../application/ports/out/GateReceiptReusePort.out-port.js';
 import type {
   EvaluateGatePredicatesRequest,
   EvaluateGatePredicatesResult,
@@ -493,15 +493,31 @@ describe('GatePredicateAdapter concurrency (KS3)', () => {
   });
 });
 
+/** KS2b's receipt adapter with a count of the receipts it newly recorded. */
+class CountingReceiptPort implements GateReceiptReusePort {
+  size = 0;
+  private readonly inner = new GateReceiptReuseAdapter();
+  findGateReceipt(key: Parameters<GateReceiptReusePort['findGateReceipt']>[0]) {
+    return this.inner.findGateReceipt(key);
+  }
+  async recordGateReceipt(request: Parameters<GateReceiptReusePort['recordGateReceipt']>[0]) {
+    const result = await this.inner.recordGateReceipt(request);
+    if (result.outcome === 'recorded') {
+      this.size += 1;
+    }
+    return result;
+  }
+}
+
 describe('GatePredicateAdapter receipt reuse (KS2 key, KS3)', () => {
   const TOOLCHAIN = { node: '22.23.3', yarn: '4.12.0', hexagen: '1.2.3', turbo: '2.11.7' };
 
   function wiring(
-    store: GateReceiptRecordStore,
+    store: GateReceiptReusePort,
     overrides: Partial<NonNullable<GatePredicateAdapterOptions['receiptReuse']>> = {},
   ): NonNullable<GatePredicateAdapterOptions['receiptReuse']> {
     return {
-      port: new GateReceiptReuseAdapter(store),
+      port: store,
       toolchainVersions: async () => TOOLCHAIN,
       declaredEnvironmentDigest: async () => 'e'.repeat(64),
       ...overrides,
@@ -509,7 +525,7 @@ describe('GatePredicateAdapter receipt reuse (KS2 key, KS3)', () => {
   }
 
   it('runs a command once and reuses its receipt for an identical input', async () => {
-    const store = new InMemoryGateReceiptRecordStore();
+    const store = new CountingReceiptPort();
     const executor = new RecordingExecutor();
     const adapter = makeAdapter(executor, 2, { receiptReuse: wiring(store) });
     const first = evaluated(await adapter.evaluateGatePredicates(requestWith(['a', 'b'])));
@@ -526,7 +542,7 @@ describe('GatePredicateAdapter receipt reuse (KS2 key, KS3)', () => {
   });
 
   it('recovers after a crash: finished predicates are not run again, the rest are', async () => {
-    const store = new InMemoryGateReceiptRecordStore();
+    const store = new CountingReceiptPort();
     const crashing = new RecordingExecutor({ b: { throws: true } });
     const before = makeAdapter(crashing, 1, { receiptReuse: wiring(store) });
     const crashed = evaluated(await before.evaluateGatePredicates(requestWith(['a', 'b'])));
@@ -540,7 +556,7 @@ describe('GatePredicateAdapter receipt reuse (KS2 key, KS3)', () => {
   });
 
   it('does not reuse across a changed tree, definition, toolchain or declared environment', async () => {
-    const store = new InMemoryGateReceiptRecordStore();
+    const store = new CountingReceiptPort();
     const baseline = new RecordingExecutor();
     await makeAdapter(baseline, 2, { receiptReuse: wiring(store) }).evaluateGatePredicates(requestWith(['a']));
 
@@ -571,7 +587,7 @@ describe('GatePredicateAdapter receipt reuse (KS2 key, KS3)', () => {
   });
 
   it('treats an unreadable component or a throwing provider as a miss, never a reuse and never a throw', async () => {
-    const store = new InMemoryGateReceiptRecordStore();
+    const store = new CountingReceiptPort();
     await makeAdapter(new RecordingExecutor(), 2, { receiptReuse: wiring(store) }).evaluateGatePredicates(
       requestWith(['a']),
     );
@@ -606,31 +622,30 @@ describe('GatePredicateAdapter receipt reuse (KS2 key, KS3)', () => {
     expect(noTree.commandRuns).toBe(1);
   });
 
-  it('reuses a receipt for a coverage-declaring command only when the stored coverage meets the declaration', async () => {
-    const store = new InMemoryGateReceiptRecordStore();
-    const request = (minUnits: number): EvaluateGatePredicatesRequest => ({
+  it('never records or reuses a command that declares coverage (the store keeps no coverage)', async () => {
+    const store = new CountingReceiptPort();
+    const request: EvaluateGatePredicatesRequest = {
       ...requestWith(['a']),
       spec: {
         commitRequired: true,
         diffCheck: true,
-        commands: [{ argv: ['a'], coverage: { reader: 'vitest-summary', unitKind: 'tests', minUnits } }],
+        commands: [{ argv: ['a'], coverage: { reader: 'vitest-summary', unitKind: 'tests', minUnits: 5 } }],
       },
-    });
+    };
     const summary = { stdout: ' Tests  7 passed (7)\n' };
     const first = new RecordingExecutor({ a: { result: summary } });
     const ran = evaluated(
-      await makeAdapter(first, 2, { receiptReuse: wiring(store) }).evaluateGatePredicates(request(5)),
+      await makeAdapter(first, 2, { receiptReuse: wiring(store) }).evaluateGatePredicates(request),
     );
     expect(ran[2]).toMatchObject({ verdict: 'pass' });
-    expect(store.size).toBe(1);
-    // The same declaration reuses the receipt.
+    expect(store.size).toBe(0);
     const second = new RecordingExecutor({ a: { result: summary } });
-    await makeAdapter(second, 2, { receiptReuse: wiring(store) }).evaluateGatePredicates(request(5));
-    expect(second.commandRuns).toBe(0);
+    await makeAdapter(second, 2, { receiptReuse: wiring(store) }).evaluateGatePredicates(request);
+    expect(second.commandRuns).toBe(1);
   });
 
   it('never records or reuses a command that did not pass', async () => {
-    const store = new InMemoryGateReceiptRecordStore();
+    const store = new CountingReceiptPort();
     const failing = new RecordingExecutor({ a: { result: { exitCode: 1 } }, b: { result: { exitCode: null, error: 'timed out' } } });
     await makeAdapter(failing, 2, { receiptReuse: wiring(store) }).evaluateGatePredicates(requestWith(['a', 'b']));
     expect(store.size).toBe(0);
@@ -643,7 +658,7 @@ describe('GatePredicateAdapter receipt reuse (KS2 key, KS3)', () => {
   });
 
   it('runs an identical predicate once across concurrent lanes and records it once', async () => {
-    const store = new InMemoryGateReceiptRecordStore();
+    const store = new CountingReceiptPort();
     const executor = new RecordingExecutor({ a: { delayMs: 25 } });
     const adapter = makeAdapter(executor, 4, { receiptReuse: wiring(store) });
     const lanes = await Promise.all([
@@ -659,7 +674,7 @@ describe('GatePredicateAdapter receipt reuse (KS2 key, KS3)', () => {
   });
 
   it('lets a waiting lane run its own command when the shared run did not pass', async () => {
-    const store = new InMemoryGateReceiptRecordStore();
+    const store = new CountingReceiptPort();
     const executor = new RecordingExecutor({ a: { delayMs: 15, result: { exitCode: null, error: 'timed out' } } });
     const adapter = makeAdapter(executor, 4, { receiptReuse: wiring(store) });
     const lanes = await Promise.all([
@@ -674,11 +689,11 @@ describe('GatePredicateAdapter receipt reuse (KS2 key, KS3)', () => {
   });
 
   it('still returns the result when the receipt store fails', async () => {
-    const broken: GateReceiptRecordStore = {
-      get: async () => {
+    const broken: GateReceiptReusePort = {
+      findGateReceipt: async () => {
         throw new Error('disk gone');
       },
-      putIfAbsent: async () => {
+      recordGateReceipt: async () => {
         throw new Error('disk gone');
       },
     };
@@ -692,7 +707,7 @@ describe('GatePredicateAdapter receipt reuse (KS2 key, KS3)', () => {
 
   it('never exceeds the slot budget while reading receipt inputs and running commands together', async () => {
     const executor = new RecordingExecutor();
-    const adapter = makeAdapter(executor, 2, { receiptReuse: wiring(new InMemoryGateReceiptRecordStore()) });
+    const adapter = makeAdapter(executor, 2, { receiptReuse: wiring(new CountingReceiptPort()) });
     await Promise.all(
       ['x', 'y', 'z'].map((lane) =>
         adapter.evaluateGatePredicates(requestWith([lane + '1', lane + '2'], '/lanes/' + lane)),

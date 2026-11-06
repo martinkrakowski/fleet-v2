@@ -183,7 +183,7 @@ async function runCliCommand(
 
 /** Run git with an argv array (never a shell string) and return trimmed stdout. */
 function git(...args: string[]): string {
-  return execFileSync('git', args, { encoding: 'utf8' }).trim();
+  return gitWithEnv(isolatedGitEnv(), ...args);
 }
 
 /** Like `git`, but with an explicit environment (for isolated runs). */
@@ -261,13 +261,8 @@ function initUpstream(dir: string): void {
   );
 }
 
-/** Skip the whole suite only when git itself is unavailable. */
-let gitAvailable = true;
-try {
-  execFileSync('git', ['--version'], { stdio: 'ignore' });
-} catch {
-  gitAvailable = false;
-}
+// Git is a hard requirement: a missing git fails the suite loudly instead of
+// silently skipping the refused-dispatch scenario.
 
 const PROJECT_ID = 'proj-o12';
 const WORK_ORDER_ID = 'wo-1';
@@ -394,7 +389,7 @@ describe("fleet-v2 init --profile multi first run (O12')", () => {
 // Test 2: the refused-dispatch assertion (single profile, --isolation none)
 // ---------------------------------------------------------------------------
 
-describe.skipIf(!gitAvailable)("the refused dispatch on an isolation-none installation (O12')", () => {
+describe("the refused dispatch on an isolation-none installation (O12')", () => {
   it('init writes the false capabilities and dispatch refuses with exit 1', async () => {
     const dir = makeTempDir();
     const file = path.join(dir, 'installation', 'fleet.json');
@@ -597,5 +592,29 @@ describe.skipIf(!gitAvailable)("the refused dispatch on an isolation-none instal
       reason: 'Runner capabilities do not satisfy required isolation',
     });
     expect(dispatch.stderr).toBe('');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 3: the git helper ignores inherited GIT_* variables
+// ---------------------------------------------------------------------------
+
+describe("the smoke's git helper (O12')", () => {
+  it('reads the throwaway upstream even when GIT_DIR points elsewhere', () => {
+    const dir = makeTempDir();
+    const upstream = path.join(dir, 'upstream');
+    mkdirSync(upstream);
+    initUpstream(upstream);
+    const saved = process.env.GIT_DIR;
+    process.env.GIT_DIR = path.join(dir, 'does-not-exist');
+    try {
+      expect(git('-C', upstream, 'rev-parse', 'HEAD')).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      if (saved === undefined) {
+        delete process.env.GIT_DIR;
+      } else {
+        process.env.GIT_DIR = saved;
+      }
+    }
   });
 });

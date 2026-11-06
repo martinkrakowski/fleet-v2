@@ -389,6 +389,8 @@ describe('fleet-v2 state compact', () => {
     const result = await compact(dir);
     expect(result.code).toBe(1);
     expect(result.err).toContain('driver-live');
+    expect(await fs.readFile(path.join(dir, 'conductor-driver-lease.json'), 'utf8')).toBe('not valid json');
+    expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
   });
 
   it('compacts when the conductor driver lease has lapsed', async () => {

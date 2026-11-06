@@ -602,11 +602,31 @@ async function liveRunsMovedUnderPlan(stateDir: string, plan: CompactPlan): Prom
   }
 }
 
-/** True when a live (not lapsed) conductor driver lease is held; an unreadable lease fails closed. Read-only. */
+/** True when the lease file holds anything but an empty list: a read-only adapter answers null for an unreadable lease too. */
+async function leaseFileHoldsRecords(stateDir: string): Promise<boolean> {
+  try {
+    const text = (await fs.readFile(path.join(stateDir, 'conductor-driver-lease.json'), 'utf8')).trim();
+    if (text === '') {
+      return false;
+    }
+    const parsed: unknown = JSON.parse(text);
+    return !(Array.isArray(parsed) && parsed.length === 0);
+  } catch (error: unknown) {
+    return errorCodeOf(error) !== 'ENOENT';
+  }
+}
+
+/**
+ * True when a live (not lapsed) conductor driver lease is held; an unreadable lease fails closed. Strictly
+ * read-only: the adapter is opened read-only, so an unreadable lease file is never quarantined by this check.
+ */
 async function driverLeaseLive(stateDir: string): Promise<boolean> {
   try {
-    const lease = await new ConductorDriverLeaseAdapter({ stateDir }).read();
-    return lease !== null && !isLeaseLapsed(lease, new Date().toISOString());
+    const lease = await new ConductorDriverLeaseAdapter({ stateDir, readOnly: true }).read();
+    if (lease === null) {
+      return await leaseFileHoldsRecords(stateDir);
+    }
+    return !isLeaseLapsed(lease, new Date().toISOString());
   } catch {
     return true;
   }

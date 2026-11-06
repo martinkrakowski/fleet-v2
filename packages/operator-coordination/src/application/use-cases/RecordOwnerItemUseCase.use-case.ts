@@ -79,7 +79,7 @@ export class RecordOwnerItemUseCase implements RecordOwnerItemPort {
         reason: 'RecordOwnerItem the clock could not be read',
       };
     }
-    if (!Number.isFinite(Date.parse(nowIso))) {
+    if (typeof nowIso !== 'string' || !Number.isFinite(Date.parse(nowIso))) {
       return {
         outcome: 'refused',
         code: 'clock',

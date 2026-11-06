@@ -394,6 +394,21 @@ describe('RecordOwnerItemUseCase', () => {
     expect(await repo.list()).toEqual([]);
   });
 
+  it('RecordOwnerItem refuses a symbol clock value as clock', async () => {
+    const repo = new OwnerItemRepositoryAdapter();
+    const symbolClock: OwnerItemClock = {
+      nowIso(): string {
+        return Symbol('not-a-string') as unknown as string;
+      },
+    };
+    const uc = new RecordOwnerItemUseCase({ itemRepo: repo, clock: symbolClock, ids: ids() });
+
+    const refused = refusal(await uc.recordOwnerItem(MERGE_BODY, 'orch-example-1'));
+    expect(refused.code).toBe('clock');
+    expect(refused.reason).toBe('RecordOwnerItem the clock could not be read');
+    expect(await repo.list()).toEqual([]);
+  });
+
   it('RecordOwnerItem a repeat after a failed save records the item', async () => {
     const real = new OwnerItemRepositoryAdapter();
     let saveCalls = 0;
@@ -655,6 +670,18 @@ describe('ListOwnerItemsUseCase', () => {
       outcome: 'refused',
       code: 'request',
     });
+  });
+
+  it('ListOwnerItems refuses a revoked proxy filter as request', async () => {
+    const repo = await seededStore();
+    const uc = new ListOwnerItemsUseCase({ itemRepo: repo });
+    const { revoke, proxy } = Proxy.revocable({}, {});
+    revoke();
+    const result = await uc.listOwnerItems(proxy as unknown as ListOwnerItemsRequest);
+    expect(result).toMatchObject({ outcome: 'refused', code: 'request' });
+    if (result.outcome === 'refused') {
+      expect(result.reason).not.toContain('rejected');
+    }
   });
 
   it('ListOwnerItems reports an unreadable store as unknown, never an empty list', async () => {

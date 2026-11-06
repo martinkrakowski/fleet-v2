@@ -129,7 +129,7 @@ export class ResolveOwnerItemUseCase implements ResolveOwnerItemPort {
       } catch {
         return this.refuse('clock-read', 'ResolveOwnerItem the clock could not be read');
       }
-      if (!Number.isFinite(Date.parse(nowIso))) {
+      if (typeof nowIso !== 'string' || !Number.isFinite(Date.parse(nowIso))) {
         return this.refuse('clock-read', 'ResolveOwnerItem the clock could not be read');
       }
     }

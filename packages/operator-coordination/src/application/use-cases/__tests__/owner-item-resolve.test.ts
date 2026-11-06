@@ -715,6 +715,28 @@ describe('ResolveOwnerItemUseCase', () => {
     });
   });
 
+  it('ResolveOwnerItem refuses a symbol clock value as clock-read', async () => {
+    const repo = new OwnerItemRepositoryAdapter();
+    await seed(repo, { projectId: 'example-project', kind: 'other', subject: 'example follow-up', refs: [], blocks: [] }, 'oi-example-1');
+    const symbolClock: OwnerItemClock = {
+      nowIso(): string {
+        return Symbol('not-a-string') as unknown as string;
+      },
+    };
+    const useCase = new ResolveOwnerItemUseCase({
+      itemRepo: repo,
+      ownerQuestionRepo: emptyQuestions(),
+      clock: symbolClock,
+    });
+
+    const result = await useCase.resolveOwnerItem({ action: 'done', itemId: 'oi-example-1', via: 'cli' }, ACTOR);
+    expect(result).toMatchObject({
+      outcome: 'refused',
+      code: 'clock-read',
+      reason: 'ResolveOwnerItem the clock could not be read',
+    });
+  });
+
   it('ResolveOwnerItem refuses a throwing item store as store and names no path', async () => {
     const boom = new Error('/example/path/owner-items.json');
     const throwing: OwnerItemRepositoryPort = {

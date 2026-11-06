@@ -35,10 +35,21 @@ export class ListOwnerItemsUseCase implements ListOwnerItemsPort {
     if (!this.deps) {
       throw new Error('Not implemented: ListOwnerItemsUseCase');
     }
-    if (input === undefined) {
-      input = {};
-    }
-    if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    let request: ListOwnerItemsRequest;
+    try {
+      if (input === undefined) {
+        input = {};
+      }
+      if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+        return {
+          outcome: 'refused',
+          code: 'request',
+          reason: 'ListOwnerItems requires a filter object or no argument',
+        };
+      }
+      request = input as ListOwnerItemsRequest;
+    } catch {
+      // A revoked proxy throws even on the shape checks above.
       return {
         outcome: 'refused',
         code: 'request',
@@ -49,7 +60,6 @@ export class ListOwnerItemsUseCase implements ListOwnerItemsPort {
     let state: unknown;
     let kind: unknown;
     try {
-      const request = input as ListOwnerItemsRequest;
       projectId = request.projectId;
       state = request.state;
       kind = request.kind;

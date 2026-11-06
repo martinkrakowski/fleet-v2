@@ -65,4 +65,23 @@ describe("View nav P12 sample labels", () => {
     expect(viewNav).toContain('" (none open)"');
     expect(viewNav).toContain("openQuestions");
   });
+
+  it("places To-do directly above Questions and after Lanes", () => {
+    const todoIndex = viewNav.indexOf('href: "/todo"');
+    const questionsIndex = viewNav.indexOf('href: "/questions"');
+    const lanesIndex = viewNav.indexOf('href: "/lanes"');
+    expect(todoIndex).toBeGreaterThan(-1);
+    expect(questionsIndex).toBeGreaterThan(todoIndex);
+    expect(todoIndex).toBeGreaterThan(lanesIndex);
+  });
+
+  it("leaves To-do unmarked as sample", () => {
+    expect(entryText(viewNav, "/todo")).toContain("sample: false");
+  });
+
+  it("shows a to-do badge only when a count is supplied", () => {
+    expect(viewNav).toContain("openTodos");
+    expect(viewNav).toContain("sidebar-badge");
+    expect(viewNav).toContain("openTodos !== null");
+  });
 });

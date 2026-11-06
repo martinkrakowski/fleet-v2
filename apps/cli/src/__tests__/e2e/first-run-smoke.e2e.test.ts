@@ -186,24 +186,74 @@ function git(...args: string[]): string {
   return execFileSync('git', args, { encoding: 'utf8' }).trim();
 }
 
-/** Build the throwaway upstream repository with a committed package.json. */
+/** Like `git`, but with an explicit environment (for isolated runs). */
+function gitWithEnv(env: NodeJS.ProcessEnv, ...args: string[]): string {
+  return execFileSync('git', args, { encoding: 'utf8', env }).trim();
+}
+
+/**
+ * The git environment for the throwaway upstream repository. The smoke must
+ * not inherit the operator's git configuration: global and system config are
+ * ignored (so `core.hooksPath`, `init.templateDir` and `commit.gpgSign`
+ * cannot leak in), and any inherited `GIT_*` variable (for example `GIT_DIR`
+ * or `GIT_CONFIG_COUNT`) is stripped. The call sites pin identity, hooks and
+ * signing via `-c` flags.
+ */
+function isolatedGitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.startsWith('GIT_')) {
+      env[key] = value;
+    }
+  }
+  env.GIT_CONFIG_GLOBAL = '/dev/null';
+  env.GIT_CONFIG_SYSTEM = '/dev/null';
+  env.GIT_CONFIG_NOSYSTEM = '1';
+  return env;
+}
+
+/**
+ * Build the throwaway upstream repository with a committed package.json.
+ *
+ * Every repository-touching git command runs under `isolatedGitEnv()`: no
+ * operator global/system git config is read, a fresh empty template directory
+ * keeps customized template hooks out of `.git/hooks`, and the commit disables
+ * hooks (empty hooksPath) and signing. Nothing in this sequence can reach the
+ * network or SSH even if the operator has configured hooks or signing.
+ */
 function initUpstream(dir: string): void {
-  git('init', '--initial-branch=main', '-q', dir);
+  const env = isolatedGitEnv();
+  const emptyTemplate = path.join(path.dirname(dir), 'empty-git-template');
+  mkdirSync(emptyTemplate);
+
+  gitWithEnv(
+    env,
+    'init',
+    '--initial-branch=main',
+    '--template',
+    emptyTemplate,
+    '-q',
+    dir,
+  );
   writeFileSync(path.join(dir, 'AGENTS.md'), '# Demo project agent instructions\n');
   writeFileSync(path.join(dir, '.gitignore'), '.lane/\n');
   writeFileSync(
     path.join(dir, 'package.json'),
     `${JSON.stringify({ name: 'demo-upstream', scripts: { test: 'x', build: 'y' } }, null, 2)}\n`,
   );
-  git('-C', dir, 'add', '.');
-  // Identity is scoped to the commit command only; never global config.
-  git(
+  gitWithEnv(env, '-C', dir, 'add', '.');
+  gitWithEnv(
+    env,
     '-C',
     dir,
     '-c',
     'user.name=Fleet First Run Smoke',
     '-c',
     'user.email=fleet@example.invalid',
+    '-c',
+    `core.hooksPath=${emptyTemplate}`,
+    '-c',
+    'commit.gpgSign=false',
     'commit',
     '-q',
     '-m',

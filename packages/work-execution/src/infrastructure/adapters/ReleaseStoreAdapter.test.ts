@@ -145,6 +145,11 @@ describe('ReleaseStoreAdapter', () => {
     expect(await adapter.list({ root })).toEqual({ outcome: 'read', current: null, builds: [] });
   });
 
+  it('reports a dangling symlink root as unreadable, never as an empty store', async () => {
+    await fs.symlink(path.join(tempDir, 'gone'), root);
+    expect(await adapter.list({ root })).toEqual({ outcome: 'unreadable' });
+  });
+
   it('prunes to the keep count and never removes current or previous', async () => {
     for (const [digit, day] of [['a', 1], ['b', 2], ['c', 3], ['d', 4], ['e', 5]] as const) {
       await verified(digit, day);

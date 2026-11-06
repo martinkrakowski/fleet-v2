@@ -226,12 +226,14 @@ function shasToPrune(builds: readonly ReleaseBuildRecord[], current: string | nu
   return builds.filter((build) => !protectedShas.has(build.sha)).map((build) => build.sha);
 }
 
-/** The root's entries, null when the root does not exist; any other failure throws. */
+/** The root's entries, null when nothing at all exists at the root; any other failure throws. */
 async function readRoot(root: string): Promise<Dirent[] | null> {
   try {
     return await fs.readdir(root, { withFileTypes: true });
   } catch (error) {
-    if (isErrno(error, 'ENOENT')) {
+    // Only a root that is truly absent is a first-install store; a dangling
+    // symlink at the root also reads as ENOENT, and it is unreadable.
+    if (isErrno(error, 'ENOENT') && (await lstatOrNull(root)) === null) {
       return null;
     }
     throw error;

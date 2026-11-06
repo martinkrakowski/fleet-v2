@@ -193,15 +193,16 @@ export class SeatTicketRepositoryAdapter implements SeatTicketRepositoryPort {
     return list.filter((record) => record.projectId === projectId);
   }
 
-  async saveSeatTicket(record: SeatTicketRecord): Promise<SaveSeatTicketOutcome> {
+  async saveSeatTicket(input: SeatTicketRecord): Promise<SaveSeatTicketOutcome> {
+    // Snapshot first: every check below sees the same plain data that is stored.
+    const record = structuredClone(input);
     if (isUnsafeStoreId(record.projectId) || !SEAT_TICKET_ROLES.includes(record.role)) {
       throw new Error('SeatTicketRepositoryAdapter refuses an unsafe project id or role');
     }
     // Validate the whole record through the reader's own parser before either
     // save path, so nothing the reader would reject is ever stored or written.
-    const snapshot = structuredClone(record);
     const parsed = parseSeatTicketStateRecord({
-      ...snapshot,
+      ...record,
       schemaVersion: SEAT_TICKET_STORE_VERSION_POLICY.writerVersion,
     });
     if (parsed === undefined) {

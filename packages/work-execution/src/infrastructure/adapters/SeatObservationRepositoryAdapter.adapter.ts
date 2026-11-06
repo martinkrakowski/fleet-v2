@@ -176,7 +176,10 @@ export class SeatObservationRepositoryAdapter implements SeatObservationReposito
     this.options = options;
   }
 
-  async appendSeatObservation(record: SeatObservationRecord): Promise<AppendSeatObservationOutcome> {
+  async appendSeatObservation(input: SeatObservationRecord): Promise<AppendSeatObservationOutcome> {
+    // Snapshot first (structuredClone reads every property, getters included,
+    // exactly once), so validation and storage see the same plain data.
+    const record = structuredClone(input);
     if (isUnsafeStoreId(record.observationId) || isUnsafeStoreId(record.seatId)) {
       throw new Error('SeatObservationRepositoryAdapter refuses an unsafe observation id or seat id');
     }
@@ -190,11 +193,8 @@ export class SeatObservationRepositoryAdapter implements SeatObservationReposito
     // the reader's own parser BEFORE storing, so a record the reader would
     // reject can never be written and make the store unreadable. The parsed
     // copy is what is stored: unknown extra top-level keys are dropped.
-    // Snapshot first (structuredClone reads every property, getters included,
-    // exactly once), so validation and storage see the same plain data.
-    const snapshot = structuredClone(record);
     const parsed = parseSeatObservationStateRecord({
-      ...snapshot,
+      ...record,
       schemaVersion: SEAT_OBSERVATION_STORE_VERSION_POLICY.writerVersion,
     });
     if (parsed === undefined) {

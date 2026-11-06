@@ -117,6 +117,19 @@ describe('SeatObservationRepositoryAdapter (memory mode)', () => {
     expect(['appended', 'refused']).toContain(outcome);
   });
 
+  it('applies the unsafe-id guard to the snapshot, not to a getter that changes', async () => {
+    let reads = 0;
+    const tricky = {
+      ...observation('obs-t'),
+      get seatId(): string {
+        reads += 1;
+        return reads === 1 ? 'seat-1' : '..';
+      },
+    } as SeatObservationRecord;
+    await expect(adapter.appendSeatObservation(tricky)).rejects.toThrow(/unsafe/);
+    expect(await adapter.listSeatObservations()).toEqual([]);
+  });
+
   it('refuses an unknown outcome or via', async () => {
     await expect(
       adapter.appendSeatObservation({ ...observation('obs-1'), outcome: 'bogus' as SeatObservationRecord['outcome'] }),

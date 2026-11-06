@@ -1,13 +1,19 @@
 // KS2c: the two receipt-input readers (toolchain versions, declared environment digest) over a scripted executor.
 import { describe, expect, it } from 'vitest';
 
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { existsSync, realpathSync } from 'node:fs';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
   readGateDeclaredEnvironmentDigest,
   readGateToolchainVersions,
+  runReceiptProbe,
 } from '../GatePredicateAdapter.adapter.js';
+import { LocalExecutor } from '../LocalExecutor.adapter.js';
 import type {
   CommandExecutorPort,
   CommandRunOptions,
@@ -33,9 +39,9 @@ class ProbeExecutor implements CommandExecutorPort {
 
   async run(argv: readonly string[], options?: CommandRunOptions): Promise<CommandRunResult> {
     this.calls.push({ argv, options });
-    // Every probe runs inside the worktree through the `cd` wrapper; answers are
-    // keyed by the wrapped command after its `fleet-probe` marker.
-    const inner = argv[0] === '/usr/bin/env' && argv[1] === '-C' ? argv.slice(3) : argv;
+    // Every probe runs inside the worktree through the `env -C <worktree> --` wrapper;
+    // answers are keyed by the wrapped command after the `--`.
+    const inner = argv[0] === '/usr/bin/env' && argv[1] === '-C' ? argv.slice(4) : argv;
     const answer = this.answers[inner.join(' ')];
     if (answer === 'throw') {
       throw new Error('executor died');
@@ -87,10 +93,10 @@ describe('gate receipt input readers (KS2c)', () => {
       turbo: '2.5.4',
     });
     expect(executor.calls.map((call) => call.argv)).toEqual([
-      ['/usr/bin/env', '-C', WORKTREE, 'node', '--version'],
-      ['/usr/bin/env', '-C', WORKTREE, 'yarn', '--version'],
-      ['/usr/bin/env', '-C', WORKTREE, HEXAGEN_BIN, '--version'],
-      ['/usr/bin/env', '-C', WORKTREE, TURBO_BIN, '--version'],
+      ['/usr/bin/env', '-C', WORKTREE, '--', 'node', '--version'],
+      ['/usr/bin/env', '-C', WORKTREE, '--', 'yarn', '--version'],
+      ['/usr/bin/env', '-C', WORKTREE, '--', HEXAGEN_BIN, '--version'],
+      ['/usr/bin/env', '-C', WORKTREE, '--', TURBO_BIN, '--version'],
     ]);
   });
 
@@ -146,7 +152,7 @@ describe('gate receipt input readers (KS2c)', () => {
     await readGateDeclaredEnvironmentDigest(executor, hostile);
     expect(executor.calls.length).toBeGreaterThan(0);
     for (const call of executor.calls) {
-      expect(call.argv.slice(0, 3)).toEqual(['/usr/bin/env', '-C', hostile]);
+      expect(call.argv.slice(0, 4)).toEqual(['/usr/bin/env', '-C', hostile, '--']);
       expect(call.argv).not.toContain('sh');
       expect(call.argv).not.toContain('-c');
       expect(call.options?.cwd).toBe(hostile);
@@ -243,7 +249,7 @@ describe('gate receipt input readers (KS2c)', () => {
     });
     await readGateToolchainVersions(executor, WORKTREE);
     await readGateDeclaredEnvironmentDigest(executor, WORKTREE);
-    const innerCalls = executor.calls.map((call) => call.argv.slice(3));
+    const innerCalls = executor.calls.map((call) => call.argv.slice(4));
     expect(innerCalls.map((argv) => argv.join(' '))).toEqual([
       'node --version',
       'yarn --version',
@@ -254,7 +260,7 @@ describe('gate receipt input readers (KS2c)', () => {
       'printenv DECLARED_TWO',
     ]);
     for (const call of executor.calls) {
-      const inner = call.argv.slice(3);
+      const inner = call.argv.slice(4);
       expect(inner[0]).not.toBe('git');
       expect(inner[0]).not.toBe('sh');
       expect(inner.join(' ')).not.toMatch(/curl|wget|ssh|https?:/);
@@ -307,4 +313,49 @@ describe('gate receipt input readers (KS2c)', () => {
       ),
     ).resolves.toBeUndefined();
   });
+});
+
+/** The wrapper needs `env -C` (GNU coreutils 8.28+, BSD env); a host without it skips the real-process test. */
+const HOST_ENV_HAS_CHDIR =
+  spawnSync('/usr/bin/env', ['-C', '/', '--', 'true'], { stdio: 'ignore' }).status === 0;
+
+/** Runs the real `LocalExecutor` but drops `cwd`, as an ssh transport would: only the `env -C` wrapper can change directory. */
+class NoCwdLocalExecutor implements CommandExecutorPort {
+  private readonly local = new LocalExecutor();
+
+  run(argv: readonly string[], options?: CommandRunOptions): Promise<CommandRunResult> {
+    return this.local.run(argv, {
+      ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options?.maxBufferBytes !== undefined ? { maxBufferBytes: options.maxBufferBytes } : {}),
+    });
+  }
+}
+
+describe('gate receipt probe wrapper over a real process (HD1)', () => {
+  it.skipIf(!HOST_ENV_HAS_CHDIR)(
+    'runs the probe inside the worktree and passes a dash-leading word literally (skipped when the host env lacks -C)',
+    async () => {
+      const worktree = await mkdtemp(join(tmpdir(), 'fleet-probe-wrapper-'));
+      try {
+        await writeFile(join(worktree, 'only-here.txt'), 'present-only-in-the-worktree', 'utf8');
+        // A binary (not a script, whose interpreter would read the dash itself) at a dash-leading relative path.
+        await mkdir(join(worktree, '-d'));
+        await symlink(realpathSync(['/usr/bin/cat', '/bin/cat'].find((path) => existsSync(path)) ?? '/bin/cat'), join(worktree, '-d', 'mycat'));
+        const executor = new NoCwdLocalExecutor();
+
+        const read = await runReceiptProbe(executor, worktree, ['cat', 'only-here.txt'], 4096);
+        expect(read).toMatchObject({ exitCode: 0, stdout: 'present-only-in-the-worktree' });
+
+        // The first word after the worktree starts with `-`: without `--` env reads it as its own option.
+        const dashWord = await runReceiptProbe(executor, worktree, ['-d/mycat', 'only-here.txt'], 4096);
+        expect(dashWord).toMatchObject({ exitCode: 0, stdout: 'present-only-in-the-worktree' });
+
+        // Dash-leading arguments reach the program literally.
+        const literal = await runReceiptProbe(executor, worktree, ['printf', '%s|', '--help', '-x'], 4096);
+        expect(literal).toMatchObject({ exitCode: 0, stdout: '--help|-x|' });
+      } finally {
+        await rm(worktree, { recursive: true, force: true });
+      }
+    },
+  );
 });

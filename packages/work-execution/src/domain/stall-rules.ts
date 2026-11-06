@@ -333,9 +333,12 @@ const SNAPSHOT_SCHEMA = {
  * getter, a wrong-typed field) answers one `snapshot-invalid` finding naming
  * the field, never an exception. An unparseable ISO time is treated as
  * unknown: it fires no time-based rule and yields one `snapshot-invalid`
- * finding naming its field. The output is sorted (`page` first, then rule,
- * then key, bytewise), capped at `STALL_FINDINGS_MAX` plus one `truncated`
- * finding, and frozen.
+ * finding naming its field. A run that needs a timestamp for its time-based
+ * rule (a parked run its `parkedAtIso`, any other non-terminal run its
+ * `lastAdvancedAtIso`) must carry it; a missing one is one
+ * `snapshot-invalid` finding naming the field, never a silent skip.
+ * The output is sorted (`page` first, then rule, then key, bytewise),
+ * capped at `STALL_FINDINGS_MAX` plus one `truncated` finding, and frozen.
  */
 export function detectStalls(
   snapshot: StallSnapshot,
@@ -437,12 +440,25 @@ function detectStallsInner(
   }
 
   // The time-based run rules; each is skipped for a run whose time field is
-  // not a canonical ISO time, and one `snapshot-invalid` finding names it.
+  // missing or not a canonical ISO time, and one `snapshot-invalid` finding
+  // names it: a parked run must carry `parkedAtIso`, and any other
+  // non-terminal run must carry `lastAdvancedAtIso`, so a missing timestamp
+  // never silences a time-based rule.
   for (let i = 0; i < runs.length; i += 1) {
     const run = runs[i];
     const runId = String(run.id);
-    let parkedValid = true;
-    let advancedValid = true;
+    const nonTerminal = isNonTerminal(run.state);
+    const parked = run.state === 'parked';
+    const parkedMissing = parked && run.parkedAtIso === undefined;
+    const advancedMissing = nonTerminal && !parked && run.lastAdvancedAtIso === undefined;
+    if (parkedMissing) {
+      findings.push(invalidFinding(`runs[${i}].parkedAtIso`, 'missing-time'));
+    }
+    if (advancedMissing) {
+      findings.push(invalidFinding(`runs[${i}].lastAdvancedAtIso`, 'missing-time'));
+    }
+    let parkedValid = !parkedMissing;
+    let advancedValid = !advancedMissing;
     if (run.parkedAtIso !== undefined && !isCanonicalIso(run.parkedAtIso)) {
       parkedValid = false;
       findings.push(invalidFinding(`runs[${i}].parkedAtIso`, 'invalid-time'));
@@ -451,8 +467,6 @@ function detectStallsInner(
       advancedValid = false;
       findings.push(invalidFinding(`runs[${i}].lastAdvancedAtIso`, 'invalid-time'));
     }
-    const nonTerminal = isNonTerminal(run.state);
-    const parked = run.state === 'parked';
     if (parked && parkedValid && nowValid
       && run.prNumber === undefined && run.handOwned === false) {
       const parkedMs = msOf(run.parkedAtIso);

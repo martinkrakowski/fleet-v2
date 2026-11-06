@@ -292,6 +292,59 @@ describe('detectStalls', () => {
     });
   });
 
+  describe('missing times', () => {
+    it('names a parked run without parkedAtIso and fires no unowned-park', () => {
+      const findings = detectStalls(
+        snapshot({
+          runs: [{ id: 'run-p', state: 'parked', handOwned: false }],
+        }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(keysOf(findings)).toEqual(['snapshot-invalid:runs[0].parkedAtIso']);
+      expect(findings[0]?.evidence.field).toBe('runs[0].parkedAtIso');
+      expect(findings[0]?.evidence.reason).toBe('missing-time');
+      expect(rulesOf(findings)).not.toContain('unowned-park');
+    });
+
+    it('names a non-terminal non-parked run without lastAdvancedAtIso and fires no driver-not-adopting', () => {
+      const findings = detectStalls(
+        snapshot({
+          runs: [{ id: 'run-r', state: 'running', handOwned: false }],
+        }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(keysOf(findings)).toEqual(['snapshot-invalid:runs[0].lastAdvancedAtIso']);
+      expect(findings[0]?.evidence.field).toBe('runs[0].lastAdvancedAtIso');
+      expect(findings[0]?.evidence.reason).toBe('missing-time');
+      expect(rulesOf(findings)).not.toContain('driver-not-adopting');
+    });
+
+    it('does not demand a timestamp a run does not need', () => {
+      // A terminal run needs neither timestamp.
+      const terminal = detectStalls(
+        snapshot({
+          runs: [{ id: 'run-t', state: 'succeeded', handOwned: false }],
+        }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(terminal)).toEqual([]);
+
+      // A parked run does not need lastAdvancedAtIso; with its own timestamp
+      // present and fresh it stays silent.
+      const parkedOnly = detectStalls(
+        snapshot({
+          runs: [{ id: 'run-p', state: 'parked', handOwned: false, parkedAtIso: NOW }],
+        }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(rulesOf(parkedOnly)).toEqual([]);
+    });
+  });
+
   describe('runtime-malformed snapshots', () => {
     it('answers a typed snapshot-invalid finding for null and for a missing array', () => {
       for (const bad of [null, undefined, 42, { driverLease: { present: true } }]) {

@@ -881,8 +881,19 @@ const MAX_DECLARED_ENVIRONMENT_NAMES = 16;
 const TOOLCHAIN_VERSION_TOKEN = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/;
 /** A declared name is passed to `printenv` as an argument, so it can never look like an option or a pattern. */
 const DECLARED_ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+/** The marker before the worktree path in a probe's `cd` wrapper; the real command starts after it. */
+const PROBE_SH_MARKER = 'fleet-probe';
+/**
+ * Runs `argv` inside the worktree. The executor may ignore `cwd` (an ssh
+ * transport runs in the login directory), so every receipt-input probe goes
+ * through the same `cd` wrapper the gate commands themselves use: `$1` is the
+ * worktree, and the remaining words are exec'd there.
+ */
+function inWorktree(worktreePath: string, argv: readonly string[]): string[] {
+  return ['sh', '-c', 'cd -- "$1" && shift && exec "$@"', PROBE_SH_MARKER, worktreePath, ...argv];
+}
 
-/** One guarded receipt-input command: argv, timeout and output cap. A throw or a run with no completed exit is undefined. */
+/** One guarded receipt-input command, run inside the worktree, with a timeout and an output cap. A throw or a run with no completed exit is undefined. */
 async function runReceiptProbe(
   executor: CommandExecutorPort,
   worktreePath: string,
@@ -890,7 +901,11 @@ async function runReceiptProbe(
   maxBufferBytes: number,
 ): Promise<CommandRunResult | undefined> {
   try {
-    const run = await executor.run(argv, { cwd: worktreePath, timeoutMs: PROBE_TIMEOUT_MS, maxBufferBytes });
+    const run = await executor.run(inWorktree(worktreePath, argv), {
+      cwd: worktreePath,
+      timeoutMs: PROBE_TIMEOUT_MS,
+      maxBufferBytes,
+    });
     if (run === null || typeof run !== 'object' || run.error !== undefined || run.exitCode === null) {
       return undefined;
     }
@@ -920,7 +935,15 @@ export async function readGateToolchainVersions(
   try {
     const versions: Record<string, string> = {};
     for (const name of GATE_RECEIPT_TOOLCHAIN_NAMES) {
-      const run = await runReceiptProbe(executor, worktreePath, [name, '--version'], VERSION_PROBE_MAX_BYTES);
+      // `hexagen` and `turbo` are project dependencies, not global executables:
+      // their binaries live in the worktree's `node_modules/.bin`, so the probe
+      // names that file directly (the `cd` wrapper is independent of the
+      // executor's working directory).
+      const binary =
+        name === 'hexagen' || name === 'turbo'
+          ? join(worktreePath, 'node_modules', '.bin', name)
+          : name;
+      const run = await runReceiptProbe(executor, worktreePath, [binary, '--version'], VERSION_PROBE_MAX_BYTES);
       if (run === undefined || run.exitCode !== 0) {
         return undefined;
       }
@@ -987,9 +1010,10 @@ export async function readGateDeclaredEnvironmentDigest(
   worktreePath: string,
 ): Promise<string | undefined> {
   try {
-    // The path is absolute: the executor may ignore `cwd`, so a relative
-    // `turbo.json` could resolve to a different file in the SSH login
-    // directory and its variables would then be missing from the digest.
+    // The path is absolute and the probe runs inside the worktree (the `cd`
+    // wrapper): a relative `turbo.json` could resolve to a different file in
+    // the SSH login directory and its variables would then be missing from the
+    // digest.
     const turbo = await runReceiptProbe(
       executor,
       worktreePath,

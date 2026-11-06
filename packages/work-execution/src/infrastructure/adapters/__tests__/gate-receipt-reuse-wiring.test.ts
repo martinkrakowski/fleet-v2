@@ -1,5 +1,6 @@
 // KS2c: the gate reuses a recorded receipt when every key component is equal, with the real store and the real readers.
 import { describe, expect, it } from 'vitest';
+import { join } from 'node:path';
 
 import {
   GatePredicateAdapter,
@@ -32,6 +33,9 @@ const BASE = 'b'.repeat(40);
 const TREE = 'c'.repeat(40);
 const WORKTREE = '/lanes/reuse-wiring';
 const DECLARED_VALUE = 'declared-value-ZZZ-9137';
+/** `hexagen`/`turbo` are project dependencies: the probe names their binary in the worktree's `node_modules/.bin`. */
+const HEXAGEN_BIN = join(WORKTREE, 'node_modules/.bin/hexagen');
+const TURBO_BIN = join(WORKTREE, 'node_modules/.bin/turbo');
 
 interface Call {
   readonly argv: readonly string[];
@@ -46,8 +50,8 @@ class ScriptedExecutor implements CommandExecutorPort {
   versions: Record<string, string> = {
     node: 'v22.23.3',
     yarn: '4.12.0',
-    hexagen: 'hexagen 1.2.3',
-    turbo: 'turbo 2.5.4',
+    [HEXAGEN_BIN]: 'hexagen 1.2.3',
+    [TURBO_BIN]: 'turbo 2.5.4',
   };
   turboJson: string | null = JSON.stringify({ tasks: { build: { env: ['DECLARED_ONE'] } } });
   env: Record<string, string> = { DECLARED_ONE: DECLARED_VALUE };
@@ -61,6 +65,31 @@ class ScriptedExecutor implements CommandExecutorPort {
     }
     this.calls.push({ argv, options });
     const ok = (stdout: string): CommandRunResult => ({ exitCode: 0, signal: null, stdout, stderr: '' });
+    // A receipt-input probe runs inside the worktree through the `cd` wrapper:
+    // its real command starts after the `fleet-probe` marker.
+    const probeMarker = argv.indexOf('fleet-probe');
+    if (probeMarker >= 0) {
+      const inner = argv.slice(probeMarker + 2);
+      if (this.failingProbes.has(inner.join(' '))) {
+        return { exitCode: null, signal: 'SIGKILL', stdout: '', stderr: '', error: 'timed out' };
+      }
+      const head = inner[0] ?? '';
+      if (inner[1] === '--version' && this.versions[head] !== undefined) {
+        return ok((this.versions[head] ?? '') + '\n');
+      }
+      if (head === 'cat') {
+        return this.turboJson === null
+          ? { exitCode: 1, signal: null, stdout: '', stderr: 'no such file' }
+          : ok(this.turboJson);
+      }
+      if (head === 'printenv') {
+        const value = this.env[inner[1] ?? ''];
+        return value === undefined
+          ? { exitCode: 1, signal: null, stdout: '', stderr: '' }
+          : ok(value + '\n');
+      }
+      return { exitCode: 127, signal: null, stdout: '', stderr: 'not found' };
+    }
     const head = argv[0] ?? '';
     if (head === 'git') {
       if (argv.includes('--verify')) {
@@ -70,21 +99,6 @@ class ScriptedExecutor implements CommandExecutorPort {
         return ok(HEAD + '\n');
       }
       return ok(argv.includes('rev-list') ? '2\n' : '');
-    }
-    if (this.failingProbes.has(argv.join(' '))) {
-      return { exitCode: null, signal: 'SIGKILL', stdout: '', stderr: '', error: 'timed out' };
-    }
-    if (argv[1] === '--version' && this.versions[head] !== undefined) {
-      return ok((this.versions[head] ?? '') + '\n');
-    }
-    if (head === 'cat') {
-      return this.turboJson === null
-        ? { exitCode: 1, signal: null, stdout: '', stderr: 'no such file' }
-        : ok(this.turboJson);
-    }
-    if (head === 'printenv') {
-      const value = this.env[argv[1] ?? ''];
-      return value === undefined ? { exitCode: 1, signal: null, stdout: '', stderr: '' } : ok(value + '\n');
     }
     // After `fleet-gate <worktree>` comes the declared gate-slot prefix (env, two settings, the wrapper) or the command.
     const rest = argv.slice(argv.indexOf('fleet-gate') + 2);
@@ -326,7 +340,11 @@ describe('gate receipt reuse wiring (KS2c)', () => {
   it('guards every receipt-input call', async () => {
     const executor = new ScriptedExecutor();
     await adapterOver(executor, new SpyStore()).evaluateGatePredicates(requestWith([GATE]));
-    const probes = executor.calls.filter((call) => ['node', 'yarn', 'hexagen', 'turbo', 'cat', 'printenv'].includes(call.argv[0] ?? ''));
+    const probes = executor.calls.filter((call) => {
+      const marker = call.argv.indexOf('fleet-probe');
+      const inner = marker >= 0 ? call.argv.slice(marker + 2) : call.argv;
+      return inner[1] === '--version' || inner[0] === 'cat' || inner[0] === 'printenv';
+    });
     expect(probes).toHaveLength(6);
     for (const call of probes) {
       expect(typeof call.options?.timeoutMs).toBe('number');
@@ -366,7 +384,7 @@ describe('gate receipt reuse wiring (KS2c)', () => {
 
     const unreadable: Array<[string, (executor: ScriptedExecutor) => void]> = [
       ['toolchain', (executor) => executor.failingProbes.add('yarn --version')],
-      ['toolchain without a digit', (executor) => (executor.versions.turbo = 'turbo unknown')],
+      ['toolchain without a digit', (executor) => (executor.versions[TURBO_BIN] = 'turbo unknown')],
       ['environment file', (executor) => (executor.turboJson = null)],
       ['environment value', (executor) => executor.failingProbes.add('printenv DECLARED_ONE')],
     ];

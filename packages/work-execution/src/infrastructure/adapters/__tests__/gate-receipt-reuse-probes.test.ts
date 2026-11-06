@@ -14,6 +14,9 @@ import type {
 } from '../../../application/ports/out/CommandExecutorPort.out-port.js';
 
 const WORKTREE = '/lanes/probe-worktree';
+/** `hexagen`/`turbo` are project dependencies: the probe names their binary in the worktree's `node_modules/.bin`. */
+const HEXAGEN_BIN = join(WORKTREE, 'node_modules/.bin/hexagen');
+const TURBO_BIN = join(WORKTREE, 'node_modules/.bin/turbo');
 
 type Answer = Partial<CommandRunResult> | 'throw';
 
@@ -29,7 +32,11 @@ class ProbeExecutor implements CommandExecutorPort {
 
   async run(argv: readonly string[], options?: CommandRunOptions): Promise<CommandRunResult> {
     this.calls.push({ argv, options });
-    const answer = this.answers[argv.join(' ')];
+    // Every probe runs inside the worktree through the `cd` wrapper; answers are
+    // keyed by the wrapped command after its `fleet-probe` marker.
+    const marker = argv.indexOf('fleet-probe');
+    const inner = marker >= 0 ? argv.slice(marker + 2) : argv;
+    const answer = this.answers[inner.join(' ')];
     if (answer === 'throw') {
       throw new Error('executor died');
     }
@@ -43,8 +50,8 @@ class ProbeExecutor implements CommandExecutorPort {
 const VERSIONS: Record<string, Answer> = {
   'node --version': { stdout: 'v22.23.3\n' },
   'yarn --version': { stdout: '4.12.0\n' },
-  'hexagen --version': { stdout: 'hexagen 1.2.3\n' },
-  'turbo --version': { stdout: 'turbo 2.5.4\n' },
+  [HEXAGEN_BIN + ' --version']: { stdout: 'hexagen 1.2.3\n' },
+  [TURBO_BIN + ' --version']: { stdout: 'turbo 2.5.4\n' },
 };
 
 function turboJson(env: Record<string, readonly string[]>): string {
@@ -80,24 +87,24 @@ describe('gate receipt input readers (KS2c)', () => {
       turbo: '2.5.4',
     });
     expect(executor.calls.map((call) => call.argv)).toEqual([
-      ['node', '--version'],
-      ['yarn', '--version'],
-      ['hexagen', '--version'],
-      ['turbo', '--version'],
+      ['sh', '-c', 'cd -- "$1" && shift && exec "$@"', 'fleet-probe', WORKTREE, 'node', '--version'],
+      ['sh', '-c', 'cd -- "$1" && shift && exec "$@"', 'fleet-probe', WORKTREE, 'yarn', '--version'],
+      ['sh', '-c', 'cd -- "$1" && shift && exec "$@"', 'fleet-probe', WORKTREE, HEXAGEN_BIN, '--version'],
+      ['sh', '-c', 'cd -- "$1" && shift && exec "$@"', 'fleet-probe', WORKTREE, TURBO_BIN, '--version'],
     ]);
   });
 
   it('a failing version probe is a miss', async () => {
     const cases: Array<Record<string, Answer>> = [
       { ...VERSIONS, 'yarn --version': { exitCode: 1, stdout: '4.12.0\n' } },
-      { ...VERSIONS, 'turbo --version': { stdout: 'turbo unknown\n' } },
+      { ...VERSIONS, [TURBO_BIN + ' --version']: { stdout: 'turbo unknown\n' } },
       { ...VERSIONS, 'node --version': { stdout: '' } },
-      { ...VERSIONS, 'hexagen --version': { stdout: '1.2.3!\n' } },
-      { ...VERSIONS, 'hexagen --version': { stdout: '1'.repeat(65) + '\n' } },
+      { ...VERSIONS, [HEXAGEN_BIN + ' --version']: { stdout: '1.2.3!\n' } },
+      { ...VERSIONS, [HEXAGEN_BIN + ' --version']: { stdout: '1'.repeat(65) + '\n' } },
       { ...VERSIONS, 'node --version': { exitCode: null } },
       { ...VERSIONS, 'node --version': { error: 'spawn node ENOENT' } },
-      { ...VERSIONS, 'turbo --version': 'throw' },
-      Object.fromEntries(Object.entries(VERSIONS).filter(([name]) => name !== 'turbo --version')),
+      { ...VERSIONS, [TURBO_BIN + ' --version']: 'throw' },
+      Object.fromEntries(Object.entries(VERSIONS).filter(([name]) => name !== TURBO_BIN + ' --version')),
     ];
     for (const answers of cases) {
       await expect(readGateToolchainVersions(new ProbeExecutor(answers), WORKTREE)).resolves.toBeUndefined();
@@ -214,19 +221,21 @@ describe('gate receipt input readers (KS2c)', () => {
     });
     await readGateToolchainVersions(executor, WORKTREE);
     await readGateDeclaredEnvironmentDigest(executor, WORKTREE);
-    expect(executor.calls.map((call) => call.argv.join(' '))).toEqual([
+    const innerCalls = executor.calls.map((call) => call.argv.slice(call.argv.indexOf('fleet-probe') + 2));
+    expect(innerCalls.map((argv) => argv.join(' '))).toEqual([
       'node --version',
       'yarn --version',
-      'hexagen --version',
-      'turbo --version',
+      `${HEXAGEN_BIN} --version`,
+      `${TURBO_BIN} --version`,
       'cat ' + join(WORKTREE, 'turbo.json'),
       'printenv DECLARED_ONE',
       'printenv DECLARED_TWO',
     ]);
     for (const call of executor.calls) {
-      expect(call.argv[0]).not.toBe('git');
-      expect(call.argv[0]).not.toBe('sh');
-      expect(call.argv.join(' ')).not.toMatch(/curl|wget|ssh|https?:/);
+      const inner = call.argv.slice(call.argv.indexOf('fleet-probe') + 2);
+      expect(inner[0]).not.toBe('git');
+      expect(inner[0]).not.toBe('sh');
+      expect(inner.join(' ')).not.toMatch(/curl|wget|ssh|https?:/);
     }
   });
 

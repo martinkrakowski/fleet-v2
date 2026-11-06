@@ -271,7 +271,9 @@ describe('AdoptLaneUseCase happy paths', () => {
     const deps = { ...w.deps, computeDigest: (text: string): string => { seen.push(text); return sha(text); } };
     const result = await new AdoptLaneUseCase(deps).execute(request());
     expect(result.outcome).toBe('adopted');
-    expect(seen).toEqual([BRIEF_TEXT]);
+    // Only the brief text itself is digested as brief text; every other call hashes ids, never the text.
+    expect(seen[0]).toBe(BRIEF_TEXT);
+    expect(seen.filter((item) => item.includes('Implement the lane'))).toEqual([BRIEF_TEXT]);
   });
 });
 
@@ -627,6 +629,65 @@ describe('AdoptLaneUseCase robustness', () => {
     const result = JSON.stringify(await adopt(thrown));
     expect(result).not.toContain('/home/');
     expect(result).not.toContain('boom');
+  });
+
+  it('Luna round 2: a retry with a different id after a paused adoption is refused with nothing written', async () => {
+    const make = async (): Promise<{ w: World; req: Record<string, unknown> }> => {
+      const w = savedWorld();
+      const req = request({ deadlineIso: '2026-11-06T10:05:00.000Z' });
+      const deps: AdoptLaneDependencies = {
+        ...w.deps,
+        now: () => (w.trace.length >= 5 ? '2026-11-06T10:06:00.000Z' : '2026-11-06T10:00:00.000Z'),
+      };
+      const first = await new AdoptLaneUseCase(deps).execute(req);
+      expect(first).toEqual({ outcome: 'budget-exhausted', completedSteps: ['work-order', 'brief'], nextStep: 'attempt' });
+      return { w, req };
+    };
+    const variants: Record<string, (req: Record<string, unknown>) => Record<string, unknown>> = {
+      workOrderId: (req) => ({ ...req, workOrder: { ...(req.workOrder as Record<string, unknown>), workOrderId: 'wo-other' } }),
+      briefId: (req) => ({ ...req, brief: { ...(req.brief as Record<string, unknown>), briefId: 'brief-other' } }),
+      attemptId: (req) => ({ ...req, attempt: { ...(req.attempt as Record<string, unknown>), attemptId: 'attempt-other' } }),
+      runId: (req) => ({ ...req, run: { ...(req.run as Record<string, unknown>), runId: 'run-01JB0000000000000000000007' } }),
+    };
+    for (const [name, change] of Object.entries(variants)) {
+      const { w, req } = await make();
+      const trace = [...w.trace];
+      const retry = await adopt(w, { ...change(req), deadlineIso: undefined });
+      expect({ name, retry }).toEqual({ name, retry: { outcome: 'refused', reason: 'idempotency-conflict' } });
+      expect(w.trace).toEqual(trace);
+      expect(w.attempts.size).toBe(0);
+      expect(w.runs.size).toBe(0);
+      expect(w.runEntries).toHaveLength(0);
+    }
+    // The same ids still resume.
+    const { w, req } = await make();
+    expect(await adopt(w, { ...req, deadlineIso: undefined })).toMatchObject({ outcome: 'adopted', reused: false });
+  });
+
+  it('Luna round 2: the work-order, attempt and run results record the digest of the adoption ids', async () => {
+    const w = savedWorld();
+    await adopt(w);
+    const digests = ['work-order', 'attempt', 'run'].map((step) => w.cutover.find((e) => e.key === KEY(step) && e.kind === 'result')?.digest);
+    expect(new Set(digests).size).toBe(1);
+    expect(digests[0]).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('Luna round 2: AKIA-shaped lane, project and plan ids, and attempt ids, are refused before any write', async () => {
+    const akia = `AKIA${'A'.repeat(16)}`;
+    const cases: [string, Record<string, unknown>][] = [
+      ['laneId', request({ laneId: akia, planRef: { projectId: 'fleet-v2', planId: 'cutover-plan', laneId: akia } })],
+      ['projectId', request({ projectId: akia, planRef: { projectId: akia, planId: 'cutover-plan', laneId: LANE } })],
+      ['planId', request({ planRef: { projectId: 'fleet-v2', planId: akia, laneId: LANE } })],
+      ['attemptId', request({ attempt: { attemptId: `attempt-${akia}`, endedAtIso: '2026-11-06T09:30:00.000Z', sessionId: 'ses_1' } })],
+    ];
+    for (const [name, req] of cases) {
+      const w = world();
+      saveEntries(w);
+      const result = await adopt(w, req);
+      expect({ name, result }).toEqual({ name, result: { outcome: 'refused', reason: 'secret-detected' } });
+      expect(w.trace).toEqual([]);
+      expect(JSON.stringify(result)).not.toContain(akia);
+    }
   });
 
   it('performs adoption strictly through repositories and journals without git, network, or subprocess execution', async () => {

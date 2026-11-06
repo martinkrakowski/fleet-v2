@@ -282,6 +282,10 @@ function checkAdoptLaneText(request: AdoptLaneRequest): AdoptLaneRefusalReason |
     request.brief.briefId, request.workOrder.workOrderId, request.workOrder.policyRevision,
     request.run.runPolicyRevision, ...(request.workOrder.prerequisiteWorkOrderIds ?? []),
     ...request.workOrder.ownedPaths,
+    // Ids and refs that key the journal and every record: lane, project, plan, attempt, run, base branch.
+    // Hex-only fields (plan digest, commits, tree digest, seat plan ref, brief digest) cannot hold a secret shape.
+    request.laneId, request.projectId, request.planRef.planId, request.planRef.projectId, request.planRef.laneId,
+    request.attempt.attemptId, request.run.runId, request.baseBranch,
   ];
   // Every string `attemptRecord` persists: the session id and the runner's text fields.
   const { sessionId, runner } = request.attempt;
@@ -403,7 +407,8 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     const journal = await this.readJournal(request);
     const states = new Map<AdoptLaneStep, StepState>();
     for (const step of ADOPT_LANE_STEPS) states.set(step, stepState(journal, adoptLaneStepKey(request.planDigest, request.laneId, step)));
-    this.checkRecordedResults(request, states);
+    const identity = this.identityDigest(request);
+    this.checkRecordedResults(request, states, identity);
     const allDone = ADOPT_LANE_STEPS.every((step) => states.get(step)?.final?.outcome === 'completed');
     if (allDone) {
       await this.verifyReused(request);
@@ -419,7 +424,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
         continue;
       }
       if (this.context !== null) this.context.current = step;
-      await this.runStep(request, step, state);
+      await this.runStep(request, step, state, identity);
       completed.push(step);
     }
     return this.adopted(request, false);
@@ -471,7 +476,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
   }
 
   /** A recorded result for another brief digest or commit means this call is not a repeat of that adoption. */
-  private checkRecordedResults(request: AdoptLaneRequest, states: Map<AdoptLaneStep, StepState>): void {
+  private checkRecordedResults(request: AdoptLaneRequest, states: Map<AdoptLaneStep, StepState>, identity: string): void {
     const brief = states.get('brief')?.final;
     if (brief?.outcome === 'completed' && brief.digest !== request.brief.expectedBriefDigest) {
       throw refuse('idempotency-conflict');
@@ -480,9 +485,23 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     if (attempt?.outcome === 'completed' && attempt.commitId !== request.source.commitOid) {
       throw refuse('idempotency-conflict');
     }
+    // The work-order, attempt and run results carry the digest of the ids this adoption wrote (work order,
+    // brief, attempt, run, plan, lane, project); a repeat with other ids is not a repeat.
+    for (const step of ['work-order', 'attempt', 'run'] as const) {
+      const final = states.get(step)?.final;
+      if (final?.outcome === 'completed' && final.digest !== identity) throw refuse('idempotency-conflict');
+    }
     for (const state of states.values()) {
       if (state.final?.outcome === 'refused') throw refuse('idempotency-conflict');
     }
+  }
+
+  /** One digest over every id a step of this adoption writes; journals hold digests, never the ids. */
+  private identityDigest(request: AdoptLaneRequest): string {
+    return this.deps.computeDigest(JSON.stringify([
+      'adopt-lane-ids/1', request.projectId, request.planRef.planId, request.laneId, request.workOrder.workOrderId,
+      request.brief.briefId, request.attempt.attemptId, request.run.runId,
+    ]));
   }
 
   /** A full repeat: every recorded id must still be in its store; the collecting entry is re-ensured. */
@@ -547,15 +566,15 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     if (existing.some((run) => !own(run))) throw refuse('lane-already-has-run');
   }
 
-  private async runStep(request: AdoptLaneRequest, step: AdoptLaneStep, state: StepState): Promise<void> {
+  private async runStep(request: AdoptLaneRequest, step: AdoptLaneStep, state: StepState, identity: string): Promise<void> {
     const key = adoptLaneStepKey(request.planDigest, request.laneId, step);
-    if (step === 'work-order') await this.workOrderStep(request, key, state);
+    if (step === 'work-order') await this.workOrderStep(request, key, state, identity);
     else if (step === 'brief') await this.briefStep(request, key, state);
-    else if (step === 'attempt') await this.attemptStep(request, key, state);
-    else await this.runStepRun(request, key, state);
+    else if (step === 'attempt') await this.attemptStep(request, key, state, identity);
+    else await this.runStepRun(request, key, state, identity);
   }
 
-  private async workOrderStep(request: AdoptLaneRequest, key: string, state: StepState): Promise<void> {
+  private async workOrderStep(request: AdoptLaneRequest, key: string, state: StepState, identity: string): Promise<void> {
     const wo = request.workOrder;
     const existing = await this.guard('work-order-store-unavailable', () => this.deps.workOrderRepo.findWorkOrderById(wo.workOrderId));
     if (existing !== null) {
@@ -567,7 +586,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     if (existing === null) {
       await this.guard('work-order-store-unavailable', () => this.deps.workOrderRepo.saveWorkOrder(this.workOrderRecord(request)));
     }
-    await this.result(key, request.nowIso, { reasonCode: 'registered' });
+    await this.result(key, request.nowIso, { reasonCode: 'registered', digest: identity });
   }
 
   private async checkWorkOrderFree(request: AdoptLaneRequest): Promise<void> {
@@ -628,7 +647,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     await this.result(key, request.nowIso, { reasonCode: 'frozen', digest: request.brief.expectedBriefDigest });
   }
 
-  private async attemptStep(request: AdoptLaneRequest, key: string, state: StepState): Promise<void> {
+  private async attemptStep(request: AdoptLaneRequest, key: string, state: StepState, identity: string): Promise<void> {
     const { attempt, workOrder } = request;
     const existing = await this.guard('attempt-store-unavailable', () => this.deps.attemptRepo.findAttemptById(attempt.attemptId));
     const others = await this.guard('attempt-store-unavailable', () => this.deps.attemptRepo.listAttemptsByWorkOrder(workOrder.workOrderId));
@@ -638,7 +657,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     if (existing === null) {
       await this.guard('attempt-store-unavailable', () => this.deps.attemptRepo.saveAttempt(this.attemptRecord(request)));
     }
-    await this.result(key, request.nowIso, { reasonCode: 'recorded', commitId: request.source.commitOid });
+    await this.result(key, request.nowIso, { reasonCode: 'recorded', digest: identity, commitId: request.source.commitOid });
   }
 
   private attemptRecord(request: AdoptLaneRequest): AttemptRecord {
@@ -678,7 +697,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
     );
   }
 
-  private async runStepRun(request: AdoptLaneRequest, key: string, state: StepState): Promise<void> {
+  private async runStepRun(request: AdoptLaneRequest, key: string, state: StepState, identity: string): Promise<void> {
     const { run } = request;
     await this.intent(key, state, request.nowIso);
     const existing = await this.guard('lane-run-store-unavailable', () => this.deps.runRepo.get(run.runId));
@@ -692,7 +711,7 @@ export class AdoptLaneUseCase implements AdoptLanePort {
       throw refuse('lane-already-has-run');
     }
     await this.ensureCollecting(request);
-    await this.result(key, request.nowIso, { reasonCode: 'entered-collecting' });
+    await this.result(key, request.nowIso, { reasonCode: 'entered-collecting', digest: identity });
   }
 
   private runRecord(request: AdoptLaneRequest): LaneRunRecord {

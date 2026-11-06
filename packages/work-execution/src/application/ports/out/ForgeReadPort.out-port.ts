@@ -58,9 +58,35 @@ export type ReadPullRequestResult =
   | { readonly outcome: 'not-found' }
   | { readonly outcome: 'unavailable'; readonly reason: string };
 
+export interface ListOpenPullRequestsByBaseRequest {
+  /** `main` or `chain/<name>`; anything else is unavailable (`invalid-request`). */
+  readonly base: string;
+  readonly repository?: ForgeRepositoryRef;
+  /** Optional per-read timeout cap (ms), as for `ReadPullRequestRequest`. */
+  readonly timeoutMs?: number;
+}
+
+/** One open pull request: number, head and base only; no title, body, author, label or path. */
+export interface OpenPullRequestSummary {
+  readonly number: number;
+  readonly headSha: string;
+  readonly baseRef: string;
+}
+
+/** A partial or unreadable answer is `unavailable`, never an empty list. */
+export type ListOpenPullRequestsByBaseResult =
+  | { readonly outcome: 'listed'; readonly pullRequests: readonly OpenPullRequestSummary[] }
+  | { readonly outcome: 'unavailable'; readonly reason: string };
+
 export interface ForgeReadPort {
   /** Read one pull request's state; mutates nothing. */
   readPullRequest(request: ReadPullRequestRequest): Promise<ReadPullRequestResult>;
+  /**
+   * List every open pull request against one base branch (fully paginated);
+   * mutates nothing. Optional so a reader that cannot list (an older fake, a
+   * partial binding) type-checks; a caller treats its absence as unavailable.
+   */
+  listOpenPullRequestsByBase?(request: ListOpenPullRequestsByBaseRequest): Promise<ListOpenPullRequestsByBaseResult>;
   /** Whether a transport and a repository are configured. */
   isConfigured(): boolean;
 }

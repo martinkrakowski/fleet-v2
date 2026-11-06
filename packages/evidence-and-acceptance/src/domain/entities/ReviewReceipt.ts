@@ -8,6 +8,7 @@
  */
 
 import type {
+  ReceiptSubject,
   ReviewFindingRecord,
   ReviewReceiptRecord,
   ReviewKind,
@@ -15,6 +16,7 @@ import type {
 import {
   REVIEW_KINDS,
   REVIEW_REQUEST_ID_PATTERN,
+  receiptSubjectOf,
 } from '../evidence-records.js';
 import type { EvidenceResultValue } from '../value-objects/EvidenceResult.vo.js';
 import { EVIDENCE_RESULTS } from '../value-objects/EvidenceResult.vo.js';
@@ -38,6 +40,8 @@ export interface ReviewReceiptProps {
   readonly kind?: ReviewKind;
   /** The conductor's request id (§3.5); absent on manual reviews. */
   readonly requestId?: string;
+  /** What the receipt is about; absent reads as the attempt. */
+  readonly subject?: ReceiptSubject;
 }
 
 function isNonEmptyTrimmedString(value: unknown): value is string {
@@ -203,6 +207,12 @@ export class ReviewReceipt {
       return {
         success: false,
         error: new Error('ReviewReceipt with a requestId requires a kind'),
+      };
+    }
+    if (props.subject !== undefined && receiptSubjectOf(props) === null) {
+      return {
+        success: false,
+        error: new Error('ReviewReceipt has an invalid subject'),
       };
     }
     return {

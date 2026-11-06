@@ -7,9 +7,16 @@
 
 import type {
   EvidenceAssessmentRecord,
+  ReceiptSubject,
   ReviewReceiptRecord,
 } from '../../domain/evidence-records.js';
-import { REVIEW_KINDS, REVIEW_REQUEST_ID_PATTERN } from '../../domain/evidence-records.js';
+import {
+  REVIEW_KINDS,
+  REVIEW_REQUEST_ID_PATTERN,
+  assessmentIdForChain,
+  attemptIdForChain,
+  receiptSubjectOf,
+} from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
 import { AssessmentState } from '../../domain/value-objects/AssessmentState.vo.js';
 import { ReviewReceipt, isSameModelFamily, underlyingModelFamily } from '../../domain/entities/ReviewReceipt.js';
@@ -82,6 +89,112 @@ function manualReceiptIdOf(
     : base;
 }
 
+const HEAD_PATTERN = /^[0-9a-f]{40}$/;
+
+function ownValue(source: unknown, key: string): unknown {
+  try {
+    if (typeof source !== 'object' || source === null) {
+      return undefined;
+    }
+    return Object.getOwnPropertyDescriptor(source, key)?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+function nowIsoOf(request: RequestIndependentReviewRequest): string {
+  return isNonEmptyTrimmedString(request.nowIso) ? request.nowIso : new Date().toISOString();
+}
+
+/**
+ * The chain subject of a request: `undefined` when the request carries no
+ * subject or names its own attempt (the attempt path), `'invalid'` for a brief,
+ * an unknown kind, or a chain subject that does not match the request's own
+ * ids (project, pseudo attempt id, assessment id, head), is not a pre-merge
+ * review, or has no well-formed request id. Read through own properties only.
+ */
+function chainSubjectOf(request: RequestIndependentReviewRequest): ReceiptSubject | 'invalid' | undefined {
+  const raw = ownValue(request, 'subject');
+  if (raw === undefined) {
+    return undefined;
+  }
+  const subject = receiptSubjectOf({
+    subject: raw,
+    projectId: ownValue(request, 'projectId'),
+    attemptId: ownValue(request, 'attemptId'),
+  });
+  if (subject === null) {
+    return 'invalid';
+  }
+  if (subject.kind === 'attempt') {
+    return subject.projectId === request.projectId && subject.attemptId === request.attemptId ? undefined : 'invalid';
+  }
+  if (subject.kind !== 'chain' || subject.chainName === null || subject.integrationHeadSha === null) {
+    return 'invalid';
+  }
+  if (
+    subject.attemptId !== null || subject.briefPackageDigest !== null || subject.baseCommit !== null ||
+    !HEAD_PATTERN.test(subject.integrationHeadSha) ||
+    subject.projectId !== request.projectId ||
+    subject.integrationHeadSha !== request.candidateHeadSha ||
+    request.attemptId !== attemptIdForChain(subject.projectId, subject.chainName) ||
+    request.assessmentId !== assessmentIdForChain(subject.projectId, subject.chainName) ||
+    request.kind !== 'pre-merge' ||
+    typeof request.requestId !== 'string' ||
+    !REVIEW_REQUEST_ID_PATTERN.test(request.requestId)
+  ) {
+    return 'invalid';
+  }
+  return subject;
+}
+
+/** True when a stored receipt is the combined review of exactly this chain at this head. */
+function isChainReceiptOf(receipt: ReviewReceiptRecord, chain: ReceiptSubject): boolean {
+  const stored = receiptSubjectOf(receipt);
+  return (
+    stored !== null &&
+    stored.kind === 'chain' &&
+    stored.projectId === chain.projectId &&
+    stored.chainName === chain.chainName &&
+    stored.integrationHeadSha === chain.integrationHeadSha
+  );
+}
+
+/** Read or create the chain-scoped assessment: one pending record per (project, chain) at the integration head. */
+async function openChainAssessment(
+  deps: RequestIndependentReviewDependencies,
+  request: RequestIndependentReviewRequest,
+  nowIso: string,
+): Promise<EvidenceAssessmentRecord | null> {
+  const record: EvidenceAssessmentRecord = {
+    id: request.assessmentId,
+    projectId: request.projectId,
+    attemptId: request.attemptId,
+    candidateHeadSha: request.candidateHeadSha,
+    policyRevision: request.policyRevision,
+    implementerModel: request.implementerModel,
+    requiredChecks: [],
+    state: 'pending',
+    verificationReceipts: [],
+    reviewReceipts: [],
+    findingDispositions: [],
+    acceptanceReceiptId: null,
+    blockers: [],
+    revision: 1,
+    updatedAtIso: nowIso,
+  };
+  try {
+    await deps.repo.saveAssessment(record);
+  } catch (error) {
+    if (!(error instanceof EvidenceAssessmentRevisionConflictError)) {
+      throw error;
+    }
+    // A concurrent opener won: its record is the one to read.
+    return deps.repo.findAssessmentById(request.assessmentId);
+  }
+  return record;
+}
+
 export class RequestIndependentReviewUseCase implements RequestIndependentReviewPort {
   constructor(private readonly deps?: RequestIndependentReviewDependencies) {}
 
@@ -97,6 +210,23 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
   }
 
   private async run(request?: RequestIndependentReviewRequest): Promise<RequestIndependentReviewResult> {
+    try {
+      return await this.runChecked(request);
+    } catch (error) {
+      // Only a chain request turns an unexpected failure into the typed rejection; the attempt path
+      // and the unconfigured/missing-request refusals keep throwing exactly as before.
+      const isRefusal = error instanceof Error && error.message === NOT_IMPLEMENTED;
+      if (!isRefusal && this.deps !== undefined && typeof request === 'object' && request !== null) {
+        const chain = chainSubjectOf(request);
+        if (chain !== undefined && chain !== 'invalid') {
+          return rejectedFor(request, 'review-unavailable', 'The chain review could not be completed');
+        }
+      }
+      throw error;
+    }
+  }
+
+  private async runChecked(request?: RequestIndependentReviewRequest): Promise<RequestIndependentReviewResult> {
     // Unconfigured is 501 and is checked before any request validation.
     if (!this.deps) {
       throw new Error(NOT_IMPLEMENTED);
@@ -108,6 +238,14 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       throw new Error(NOT_IMPLEMENTED);
     }
     const deps = this.deps;
+
+    // A chain subject takes the combined pre-merge path; any other explicit
+    // subject (a brief, or an attempt that is not the request's own) is refused.
+    // An absent subject is the attempt path, unchanged.
+    const chain = chainSubjectOf(request);
+    if (chain === 'invalid') {
+      return rejectedFor(request, 'invalid-request', 'The review subject is not valid for this request');
+    }
 
     if (
       !isNonEmptyTrimmedString(request.assessmentId) ||
@@ -161,6 +299,9 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
     // its typed code. Any other reuse (a different head included) is request-id-reused.
     if (request.requestId !== undefined) {
       existing = await deps.repo.findAssessmentById(request.assessmentId);
+      if (existing === null && chain !== undefined) {
+        existing = await openChainAssessment(deps, request, nowIsoOf(request));
+      }
       if (existing === null) {
         return rejectedFor(
           request,
@@ -175,7 +316,8 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
         if (
           found.reviewerModel.trim() !== request.reviewerModel.trim() ||
           found.kind !== request.kind ||
-          found.candidateHeadSha !== request.candidateHeadSha
+          found.candidateHeadSha !== request.candidateHeadSha ||
+          (chain !== undefined && !isChainReceiptOf(found, chain))
         ) {
           return rejectedFor(
             request,
@@ -306,6 +448,7 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       request.kind !== undefined ? { kind: request.kind } : {};
     const requestIdFields: Partial<ReviewReceiptRecord> =
       request.requestId !== undefined ? { requestId: request.requestId } : {};
+    const subjectFields: Partial<ReviewReceiptRecord> = chain !== undefined ? { subject: chain } : {};
     const receiptId =
       request.requestId !== undefined
         ? 'rr-' + request.assessmentId + '-' + request.candidateHeadSha.slice(0, 8) + '-' + request.requestId
@@ -336,6 +479,7 @@ export class RequestIndependentReviewUseCase implements RequestIndependentReview
       completedAtIso: run.completedAtIso,
       ...kindFields,
       ...requestIdFields,
+      ...subjectFields,
     };
     // New writes only (plan §3.1, D1): stored receipts are not re-checked on load.
     const placeholderField = placeholderReviewReceiptField(candidate);

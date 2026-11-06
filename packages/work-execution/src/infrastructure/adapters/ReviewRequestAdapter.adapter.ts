@@ -7,10 +7,14 @@
  * reason code, and no transport or forge text reaches the caller.
  */
 
+import type { ReviewKind } from '@fleet/evidence-and-acceptance';
 import {
   REVIEW_KINDS,
   REVIEW_REQUEST_ID_PATTERN,
   assessmentIdForAttempt,
+  assessmentIdForChain,
+  attemptIdForChain,
+  receiptSubjectOf,
 } from '@fleet/evidence-and-acceptance';
 import type {
   EvidenceAssessmentRecord,
@@ -39,6 +43,7 @@ import type {
   ReviewReceiptSummary,
   ReviewVerdict,
 } from '../../application/ports/out/ReviewRequestPort.out-port.js';
+import { parseChainName } from '../../domain/chain-records.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../domain/lane-run-journal.js';
 import { REVIEW_UNAVAILABLE_CODES } from '@fleet/evidence-and-acceptance';
 
@@ -48,6 +53,102 @@ const REVIEW_DETAIL_CODES: ReadonlySet<string> = new Set([...REVIEW_UNAVAILABLE_
 const HEAD_PATTERN = /^[0-9a-f]{40}$/;
 const REVIEW_KIND_VALUES: readonly string[] = REVIEW_KINDS;
 const BRIEF_TEXT_MAX_BYTES = 64 * 1024;
+const DIFF_SUMMARY_MAX_BYTES = 2048;
+
+/** A chain subject, validated: the only subject kind besides the attempt that this adapter serves. */
+interface ChainSubject {
+  readonly projectId: string;
+  readonly chainName: string;
+  readonly integrationHeadSha: string;
+}
+
+type SubjectRead =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'chain'; readonly chain: ChainSubject }
+  | { readonly kind: 'brief' }
+  | { readonly kind: 'invalid' };
+
+/** A data property of `value`; a getter is never invoked. */
+function ownValue(value: unknown, key: string): unknown {
+  try {
+    if (typeof value !== 'object' || value === null) {
+      return undefined;
+    }
+    return Object.getOwnPropertyDescriptor(value, key)?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The request's subject, read through own properties. An explicit attempt
+ * subject must restate the request's own attempt, project and head; it then
+ * reads as `absent` (the attempt path). `invalid` is a malformed subject or one
+ * that disagrees with the request.
+ */
+function readSubject(request: { readonly projectId?: unknown; readonly attemptId?: unknown; readonly candidateHeadSha?: unknown }): SubjectRead {
+  const subject = ownValue(request, 'subject');
+  if (subject === undefined) {
+    return { kind: 'absent' };
+  }
+  const kind = ownValue(subject, 'kind');
+  const projectId = ownValue(subject, 'projectId');
+  if (typeof projectId !== 'string' || !isNonEmptyTrimmed(projectId)) {
+    return { kind: 'invalid' };
+  }
+  // A find request carries no project id; only a request that names one must agree with the subject.
+  const requestProjectId = ownValue(request, 'projectId');
+  const sameProject = requestProjectId === undefined || requestProjectId === projectId;
+  if (kind === 'attempt') {
+    return sameProject &&
+      ownValue(subject, 'attemptId') === ownValue(request, 'attemptId') &&
+      ownValue(subject, 'headSha') === ownValue(request, 'candidateHeadSha')
+      ? { kind: 'absent' }
+      : { kind: 'invalid' };
+  }
+  if (kind === 'brief') {
+    return { kind: 'brief' };
+  }
+  if (kind !== 'chain') {
+    return { kind: 'invalid' };
+  }
+  const chainName = parseChainName(ownValue(subject, 'chainName'));
+  const integrationHeadSha = ownValue(subject, 'integrationHeadSha');
+  if (chainName === undefined || typeof integrationHeadSha !== 'string' || !HEAD_PATTERN.test(integrationHeadSha)) {
+    return { kind: 'invalid' };
+  }
+  if (!sameProject || integrationHeadSha !== ownValue(request, 'candidateHeadSha')) {
+    return { kind: 'invalid' };
+  }
+  return { kind: 'chain', chain: { projectId, chainName, integrationHeadSha } };
+}
+
+/** The evidence context's stored subject of a chain receipt, as this adapter sends it. */
+function evidenceChainSubject(chain: ChainSubject) {
+  return {
+    kind: 'chain' as const,
+    projectId: chain.projectId,
+    attemptId: null,
+    chainName: chain.chainName,
+    integrationHeadSha: chain.integrationHeadSha,
+    briefPackageDigest: null,
+    baseCommit: null,
+  };
+}
+
+/** True when a stored receipt is the combined pre-merge review of exactly this chain at this head. */
+function isChainReceiptOf(receipt: ReviewReceiptRecord, chain: ChainSubject): boolean {
+  const stored = receiptSubjectOf(receipt);
+  return (
+    receipt.kind === 'pre-merge' &&
+    receipt.candidateHeadSha === chain.integrationHeadSha &&
+    stored !== null &&
+    stored.kind === 'chain' &&
+    stored.projectId === chain.projectId &&
+    stored.chainName === chain.chainName &&
+    stored.integrationHeadSha === chain.integrationHeadSha
+  );
+}
 
 /** The fixed out-of-scope reason (KF-33b2): never reviewer text. */
 const OUT_OF_SCOPE_REASON = 'not a file this lane changed (conductor scope rule)';
@@ -206,7 +307,67 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     return { outcome: 'assessment', assessment: inspected.assessment };
   }
 
+  /**
+   * The combined pre-merge review of a chain at its integration head: one
+   * evidence request on the chain subject, mapped exactly as the attempt path
+   * maps its outcome, with a receipt for any other subject treated as unknown.
+   */
+  private async requestChainReview(request: ReviewRequest, chain: ChainSubject): Promise<ReviewRequestResult> {
+    const diffSummary = request.diffSummary;
+    if (
+      request.kind !== 'pre-merge' ||
+      !REVIEW_REQUEST_ID_PATTERN.test(request.requestId) ||
+      !isNonEmptyTrimmed(request.policyRevision) ||
+      !isNonEmptyTrimmed(request.implementerModel) ||
+      !isNonEmptyTrimmed(request.reviewerModel) ||
+      (diffSummary !== undefined &&
+        (typeof diffSummary !== 'string' || Buffer.byteLength(diffSummary, 'utf8') > DIFF_SUMMARY_MAX_BYTES))
+    ) {
+      return { outcome: 'refused', reason: 'invalid-request', detail: null };
+    }
+    if (!this.delegates.requestIndependentReview) {
+      return { outcome: 'refused', reason: 'not-configured', detail: null };
+    }
+    let result: RequestIndependentReviewResult;
+    try {
+      result = await this.delegates.requestIndependentReview({
+        assessmentId: assessmentIdForChain(chain.projectId, chain.chainName),
+        projectId: chain.projectId,
+        attemptId: attemptIdForChain(chain.projectId, chain.chainName),
+        candidateHeadSha: chain.integrationHeadSha,
+        policyRevision: request.policyRevision,
+        implementerModel: request.implementerModel,
+        reviewerModel: request.reviewerModel,
+        kind: 'pre-merge',
+        requestId: request.requestId,
+        subject: evidenceChainSubject(chain),
+        ...(diffSummary !== undefined ? { diffSummary } : {}),
+        ...(request.nowIso !== undefined ? { nowIso: request.nowIso } : {}),
+      });
+    } catch {
+      return { outcome: 'unknown', reason: 'delegate-failed' };
+    }
+    if (result.outcome === 'reviewed') {
+      const receipt = result.receipt;
+      if (receipt.requestId !== request.requestId || !isChainReceiptOf(receipt, chain)) {
+        return { outcome: 'unknown', reason: 'receipt-mismatch' };
+      }
+      return { outcome: 'receipt', receipt: summaryOf(receipt, 'pre-merge', request.requestId) };
+    }
+    return mapRejection(result.rejection, result.code);
+  }
+
   async requestReview(request: ReviewRequest): Promise<ReviewRequestResult> {
+    const subject = readSubject(request);
+    if (ownValue(request, 'kind') === 'brief-verify' || subject.kind === 'brief') {
+      return { outcome: 'refused', reason: 'subject-not-implemented', detail: null };
+    }
+    if (subject.kind === 'invalid') {
+      return { outcome: 'refused', reason: 'invalid-request', detail: null };
+    }
+    if (subject.kind === 'chain') {
+      return this.requestChainReview(request, subject.chain);
+    }
     if (
       !isValidReviewRequest(request) ||
       (request.briefText !== undefined &&
@@ -218,6 +379,8 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (!this.delegates.requestIndependentReview) {
       return { outcome: 'refused', reason: 'not-configured', detail: null };
     }
+    // isValidReviewRequest accepted the kind, so it is one of the three stored review kinds here.
+    const kind = request.kind as ReviewKind;
     let result: RequestIndependentReviewResult;
     try {
       result = await this.delegates.requestIndependentReview({
@@ -228,11 +391,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         policyRevision: request.policyRevision,
         implementerModel: request.implementerModel,
         reviewerModel: request.reviewerModel,
-        kind: request.kind,
+        kind,
         requestId: request.requestId,
         // The frozen brief flows through only for a brief-check, so any other
         // kind's transport call carries exactly the fields it carried before.
-        ...(request.kind === 'brief-check' && request.briefText !== undefined
+        ...(kind === 'brief-check' && request.briefText !== undefined
           ? { briefText: request.briefText }
           : {}),
         ...(request.nowIso !== undefined ? { nowIso: request.nowIso } : {}),
@@ -244,18 +407,25 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       const receipt = result.receipt;
       if (
         receipt.requestId !== request.requestId ||
-        receipt.kind !== request.kind ||
+        receipt.kind !== kind ||
         receipt.attemptId !== request.attemptId ||
         receipt.candidateHeadSha !== request.candidateHeadSha
       ) {
         return { outcome: 'unknown', reason: 'receipt-mismatch' };
       }
-      return { outcome: 'receipt', receipt: summaryOf(receipt, request.kind, request.requestId) };
+      return { outcome: 'receipt', receipt: summaryOf(receipt, kind, request.requestId) };
     }
     return mapRejection(result.rejection, result.code);
   }
 
   async findReviewReceipt(request: FindReviewReceiptRequest): Promise<FindReviewReceiptResult> {
+    const subject = readSubject(request);
+    if (subject.kind === 'brief' || subject.kind === 'invalid') {
+      return { outcome: 'unavailable', reason: 'invalid-request' };
+    }
+    if (subject.kind === 'chain') {
+      return this.findChainReceipt(request, subject.chain);
+    }
     if (!isValidFindReceiptRequest(request)) {
       return { outcome: 'unavailable', reason: 'invalid-request' };
     }
@@ -281,9 +451,62 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     return { outcome: 'found', receipt: summaryOf(only, only.kind, request.requestId) };
   }
 
+  /** The chain's receipt for one request id, from the chain's own assessment; another kind, head or subject is a mismatch. */
+  private async findChainReceipt(request: FindReviewReceiptRequest, chain: ChainSubject): Promise<FindReviewReceiptResult> {
+    if (!REVIEW_REQUEST_ID_PATTERN.test(request.requestId)) {
+      return { outcome: 'unavailable', reason: 'invalid-request' };
+    }
+    const read = await this.readAssessmentOf(attemptIdForChain(chain.projectId, chain.chainName));
+    if (read.outcome !== 'assessment') {
+      return read;
+    }
+    const matches = read.assessment.reviewReceipts.filter((receipt) => receipt.requestId === request.requestId);
+    if (matches.length === 0) {
+      return { outcome: 'not-found' };
+    }
+    const [only] = matches;
+    if (matches.length > 1 || !isChainReceiptOf(only, chain)) {
+      return { outcome: 'unavailable', reason: 'receipt-mismatch' };
+    }
+    return { outcome: 'found', receipt: summaryOf(only, 'pre-merge', request.requestId) };
+  }
+
+  private async findLatestChainReceiptOfKind(
+    request: FindLatestReceiptOfKindRequest,
+    chain: ChainSubject,
+  ): Promise<FindLatestReceiptOfKindResult> {
+    const read = await this.readAssessmentOf(attemptIdForChain(chain.projectId, chain.chainName));
+    if (read.outcome !== 'assessment') {
+      return read;
+    }
+    const ofKind = read.assessment.reviewReceipts.filter((receipt) => receipt.kind === request.kind);
+    if (ofKind.length === 0) {
+      return { outcome: 'not-found' };
+    }
+    if (!ofKind.every((receipt) => isChainReceiptOf(receipt, chain))) {
+      return { outcome: 'unavailable', reason: 'receipt-mismatch' };
+    }
+    let latest = ofKind[0];
+    for (const candidate of ofKind.slice(1)) {
+      if (completedAtMs(candidate) >= completedAtMs(latest)) {
+        latest = candidate;
+      }
+    }
+    return { outcome: 'found', receipt: receiptOfKindSummaryOf(latest, 'pre-merge', latest.requestId ?? null) };
+  }
+
   async findLatestReceiptOfKind(
     request: FindLatestReceiptOfKindRequest,
   ): Promise<FindLatestReceiptOfKindResult> {
+    const subject = readSubject(request);
+    if (subject.kind === 'brief' || subject.kind === 'invalid') {
+      return { outcome: 'unavailable', reason: 'invalid-request' };
+    }
+    if (subject.kind === 'chain') {
+      return isReviewKind(request.kind)
+        ? this.findLatestChainReceiptOfKind(request, subject.chain)
+        : { outcome: 'unavailable', reason: 'invalid-request' };
+    }
     if (!isValidFindLatestReceiptOfKindRequest(request)) {
       return { outcome: 'unavailable', reason: 'invalid-request' };
     }

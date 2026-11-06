@@ -14,6 +14,7 @@
  */
 
 import { isPolicyGrantRecord } from '../../domain/policy-grants.js';
+import { GRANT_RECORD_VERSION } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import type {
@@ -22,6 +23,7 @@ import type {
   ResolveActionAuthorizationResult,
 } from '../ports/in/ResolveActionAuthorizationPort.in-port.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import { CoordinationRequestRevisionConflictError } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import type { DecisionTransportPort } from '../ports/out/DecisionTransportPort.out-port.js';
 
 export interface ResolveActionAuthorizationDependencies {
@@ -121,6 +123,10 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (candidate.getConsumptions().length > 0) {
       return blocked(`grant ${grantId} is already consumed by another action`);
     }
+    const attemptBlock = await this.bindAttempt(candidate, refreshed, request, grantId);
+    if (attemptBlock !== null) {
+      return attemptBlock;
+    }
     return {
       outcome: 'authorized',
       grantId,
@@ -157,6 +163,59 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
         ? approved
         : matching.filter((candidate) => candidate.state === 'awaiting-decision');
     return preferred.length > 0 ? preferred[preferred.length - 1] : null;
+  }
+
+  /**
+   * CO24e: a grant is bound to one attempt. A resolve that names an attempt must name the
+   * grant's recorded one; an owner grant that records none is bound to the first attempt
+   * that resolves it, durably, so a later consumption by another attempt at the same head
+   * is refused. A version-2 record without an attempt, and an unusable attempt id, block.
+   * A merge grant is attempt-less by design (DT6b) and is never bound.
+   */
+  private async bindAttempt(
+    candidate: CoordinationRequest,
+    record: CoordinationRequestRecord,
+    request: ResolveActionAuthorizationRequest,
+    grantId: string,
+  ): Promise<ResolveActionAuthorizationResult | null> {
+    if (candidate.isMissingRecordedAttempt()) {
+      return blocked('grant-attempt-unrecorded');
+    }
+    if (request.attemptId === undefined) {
+      return null;
+    }
+    if (!isFilled(request.attemptId)) {
+      return blocked('grant-attempt-invalid');
+    }
+    const supplied = request.attemptId.trim();
+    const bound = candidate.getBoundAttemptId();
+    if (bound !== null) {
+      return bound === supplied ? null : blocked('grant-attempt-mismatch');
+    }
+    if (candidate.getMergeGrant() !== null) {
+      return null;
+    }
+    let binding: CoordinationRequestRecord;
+    try {
+      binding = CoordinationRequest.fromRecord({
+        ...record,
+        grantRecordVersion: GRANT_RECORD_VERSION,
+        grantAttemptId: supplied,
+        revision: candidate.nextRevision(),
+        updatedAtIso: new Date().toISOString(),
+      }).toRecord();
+    } catch {
+      return blocked('grant-attempt-invalid');
+    }
+    try {
+      await (this.deps?.requestRepo.saveRequest(binding) ?? Promise.resolve());
+    } catch (error: unknown) {
+      if (error instanceof CoordinationRequestRevisionConflictError) {
+        return blocked(`grant ${grantId} moved while it was being bound to an attempt`);
+      }
+      throw error;
+    }
+    return null;
   }
 
   /** A pending request may have an answer recorded since it was last read. */

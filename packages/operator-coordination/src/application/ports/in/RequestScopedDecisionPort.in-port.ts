@@ -16,6 +16,8 @@ export interface RequestScopedDecisionRequest {
   readonly expectedHeadSha: string | null;
   readonly proposalDigest: string;
   readonly policyRevision: string;
+  /** The attempt the decision's grant is for (CO24e); recorded with the grant so consumption is bound to it. */
+  readonly attemptId?: string;
   readonly nowIso?: string;
 }
 

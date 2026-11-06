@@ -21,6 +21,7 @@ import {
   ACTION_JOURNAL_ENTRY_SCHEMA_VERSION,
   CAPACITY_RESERVATION_SCHEMA_VERSION,
   parseSeatTool,
+  readJournalPullRequestRef,
 } from '../../domain/execution-records.js';
 import type {
   CapacityReservationClaim,
@@ -70,7 +71,17 @@ export interface ExecutionJournalAdapterOptions {
 function isActionJournalEntryRecord(value: unknown): value is ActionJournalEntryRecord {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Record<string, unknown>;
-  return typeof candidate.id === 'string' && typeof candidate.attemptId === 'string';
+  if (typeof candidate.id !== 'string' || typeof candidate.attemptId !== 'string') return false;
+  // The typed pull-request reference (WB5b) must be a valid forge-only
+  // (repository, number) pair; any malformed value fails closed.
+  try {
+    if (readJournalPullRequestRef(candidate.action as ActionJournalEntryRecord['action'], candidate.pullRequest).kind === 'invalid') {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 function isCapacityReservationRecord(value: unknown): value is CapacityReservationRecord {

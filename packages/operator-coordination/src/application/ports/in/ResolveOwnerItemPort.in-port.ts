@@ -18,7 +18,7 @@ export type ResolveOwnerItemRequest =
   | { readonly action: 'done'; readonly itemId: string; readonly via: OwnerItemDoneVia }
   | { readonly action: 'withdraw'; readonly itemId: string; readonly reason: OwnerItemWithdrawReason };
 
-export type ResolveOwnerItemRefusalCode = 'request' | 'clock-read' | 'conflict' | OwnerItemRefusalCode;
+export type ResolveOwnerItemRefusalCode = 'request' | 'clock-read' | 'conflict' | 'store' | OwnerItemRefusalCode;
 
 export type ResolveOwnerItemResult =
   | { readonly outcome: 'resolved'; readonly item: OwnerItemRecord; readonly revision: number }

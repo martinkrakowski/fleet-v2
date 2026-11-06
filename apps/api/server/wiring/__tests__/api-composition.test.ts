@@ -598,6 +598,28 @@ describe("configured compositions execute real operations", () => {
     });
     expect(decided.outcome).toBe("requested");
 
+    // CO24f: the real API composition refuses a forge action decision with no
+    // attempt, and one whose attempt carries a bidi override, as typed rejections.
+    const forgeDecision = {
+      projectId: PROFILE_REQUEST.projectId,
+      kind: "action-decision",
+      actionScope: "forge:merge-pr",
+      proposalDigest: "digest-forge",
+      policyRevision: PROFILE_REQUEST.policyRevision,
+      expectedHeadSha: VERIFICATION_REQUEST.candidateHeadSha,
+    };
+    const forgeNoAttempt = await operator.requestScopedDecision.execute({
+      ...forgeDecision,
+      requestId: "req-forge-no-attempt",
+    });
+    expect(forgeNoAttempt.outcome).toBe("rejected");
+    const forgeBidiAttempt = await operator.requestScopedDecision.execute({
+      ...forgeDecision,
+      requestId: "req-forge-bidi-attempt",
+      attemptId: "att\u202eevil",
+    });
+    expect(forgeBidiAttempt.outcome).toBe("rejected");
+
     const resolved = await operator.resolveActionAuthorization.resolveActionAuthorization({
       projectId: PROFILE_REQUEST.projectId,
       actionScope: `${WORK_ORDER_REQUEST.workOrderId}/merge-pr`,

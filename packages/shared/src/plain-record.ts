@@ -158,20 +158,35 @@ function readValue(
       if (!Array.isArray(value)) {
         return { ok: false, reason: 'wrong-type', field: path };
       }
-      if (value.length > schema.maxLength) {
+      // Even `length` is read through its own data-property descriptor: no
+      // accessor on the input (an index, `length`, anything) is ever read.
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+      if (lengthDescriptor === undefined
+        || lengthDescriptor.get !== undefined
+        || lengthDescriptor.set !== undefined
+        || typeof lengthDescriptor.value !== 'number') {
+        return { ok: false, reason: 'hostile', field: path };
+      }
+      const length = lengthDescriptor.value;
+      if (length > schema.maxLength) {
         return { ok: false, reason: 'too-many-items', field: path };
       }
       if (!isValidFieldSchema(schema.items)) {
         return INVALID_SCHEMA;
       }
-      const items: unknown[] = new Array(value.length);
-      for (let i = 0; i < value.length; i += 1) {
+      const items: unknown[] = new Array(length);
+      for (let i = 0; i < length; i += 1) {
         const itemPath = `${path}[${i}]`;
         state.inFlight = itemPath;
-        if (!Object.hasOwn(value, i)) {
+        const itemDescriptor = Object.getOwnPropertyDescriptor(value, i);
+        if (itemDescriptor === undefined) {
           return { ok: false, reason: 'sparse-array', field: itemPath };
         }
-        const itemRead = readValue(value[i], schema.items, depth, itemPath, state);
+        if (itemDescriptor.get !== undefined || itemDescriptor.set !== undefined
+          || !itemDescriptor.enumerable) {
+          return { ok: false, reason: 'not-data-property', field: itemPath };
+        }
+        const itemRead = readValue(itemDescriptor.value, schema.items, depth, itemPath, state);
         if (!itemRead.ok) {
           return itemRead;
         }

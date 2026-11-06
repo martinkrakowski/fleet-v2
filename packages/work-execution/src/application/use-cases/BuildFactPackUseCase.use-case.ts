@@ -267,7 +267,7 @@ export class BuildFactPackUseCase implements BuildFactPackPort {
     for (const fact of typedFacts) {
       let read: Awaited<ReturnType<BuildFactPackUseCase['readFact']>>;
       try {
-        read = await this.readFact(request, fact);
+        read = await this.readFact(repositoryPath, commit, fact);
       } catch {
         // A rejecting port call is a read failure, not an exception path.
         read = { outcome: 'refused', reason: 'fact-unreadable' };
@@ -295,9 +295,9 @@ export class BuildFactPackUseCase implements BuildFactPackPort {
     }
 
     const prompt = renderFactPackPrompt({
-      laneId: request.laneId,
-      repositoryPath: request.repositoryPath,
-      commit: request.commit,
+      laneId,
+      repositoryPath,
+      commit,
       sections,
       nonce,
     });
@@ -311,13 +311,14 @@ export class BuildFactPackUseCase implements BuildFactPackPort {
 
   /** One port read, mapped to a section text or a typed refusal reason. */
   private async readFact(
-    request: BuildFactPackRequest,
+    repositoryPath: string,
+    commit: string,
     fact: BuildFactPackFact,
   ): Promise<{ outcome: 'read'; text: string } | { outcome: 'refused'; reason: 'fact-absent' | 'fact-unreadable' | 'fact-oversized' }> {
     if (fact.kind === 'file-list') {
       const listing = await this.facts.listFilesAtCommit({
-        repositoryPath: request.repositoryPath,
-        commit: request.commit,
+        repositoryPath,
+        commit,
         pathPrefix: fact.pathPrefix,
       });
       if (listing.status !== 'read') {
@@ -330,15 +331,15 @@ export class BuildFactPackUseCase implements BuildFactPackPort {
     }
     const read = fact.kind === 'file-range'
       ? await this.facts.readFileRangeAtCommit({
-        repositoryPath: request.repositoryPath,
-        commit: request.commit,
+        repositoryPath,
+        commit,
         path: fact.path,
         fromLine: fact.fromLine,
         toLine: fact.toLine,
       })
       : await this.facts.readMatchingLinesAtCommit({
-        repositoryPath: request.repositoryPath,
-        commit: request.commit,
+        repositoryPath,
+        commit,
         path: fact.path,
         token: fact.token,
       });

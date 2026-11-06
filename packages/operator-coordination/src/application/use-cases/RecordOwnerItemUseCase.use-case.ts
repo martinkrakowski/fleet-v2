@@ -69,7 +69,16 @@ export class RecordOwnerItemUseCase implements RecordOwnerItemPort {
     }
 
     // 3. The clock alone supplies the moment.
-    const nowIso = this.deps.clock.nowIso();
+    let nowIso: string;
+    try {
+      nowIso = this.deps.clock.nowIso();
+    } catch {
+      return {
+        outcome: 'refused',
+        code: 'clock',
+        reason: 'RecordOwnerItem the clock could not be read',
+      };
+    }
     if (!Number.isFinite(Date.parse(nowIso))) {
       return {
         outcome: 'refused',
@@ -78,10 +87,29 @@ export class RecordOwnerItemUseCase implements RecordOwnerItemPort {
       };
     }
 
-    // 4. The aggregate validates the full open record.
+    // 4. The aggregate validates the full open record. The id is minted
+    //    before opening so an unreadable id source is a refusal, not a throw.
+    let itemId: string;
+    try {
+      const minted = this.deps.ids.newItemId();
+      if (typeof minted !== 'string') {
+        return {
+          outcome: 'refused',
+          code: 'store',
+          reason: 'RecordOwnerItem the id source could not be read',
+        };
+      }
+      itemId = minted;
+    } catch {
+      return {
+        outcome: 'refused',
+        code: 'store',
+        reason: 'RecordOwnerItem the id source could not be read',
+      };
+    }
     const opened = OwnerItem.open(
       {
-        itemId: this.deps.ids.newItemId(),
+        itemId,
         projectId: parsed.projectId,
         kind: parsed.kind,
         subject: parsed.subject,
@@ -97,7 +125,16 @@ export class RecordOwnerItemUseCase implements RecordOwnerItemPort {
     const record = opened.value.toRecord();
 
     // 5. Find-or-create by natural key: the holder wins, whatever its state.
-    const existing = await this.holderOutcome(record);
+    let existing: RecordOwnerItemResult | null;
+    try {
+      existing = await this.holderOutcome(record);
+    } catch {
+      return {
+        outcome: 'refused',
+        code: 'store',
+        reason: 'RecordOwnerItem the item store could not be read',
+      };
+    }
     if (existing !== null) {
       return existing;
     }
@@ -110,7 +147,16 @@ export class RecordOwnerItemUseCase implements RecordOwnerItemPort {
       return { outcome: 'recorded', item: stored.item, revision: stored.revision };
     } catch (error) {
       if (error instanceof OwnerItemKeyConflictError) {
-        const holder = await this.holderOutcome(record);
+        let holder: RecordOwnerItemResult | null;
+        try {
+          holder = await this.holderOutcome(record);
+        } catch {
+          return {
+            outcome: 'refused',
+            code: 'store',
+            reason: 'RecordOwnerItem the item store could not be read',
+          };
+        }
         if (holder !== null) {
           return holder;
         }
@@ -127,7 +173,11 @@ export class RecordOwnerItemUseCase implements RecordOwnerItemPort {
           reason: 'RecordOwnerItem the minted item id is already taken',
         };
       }
-      throw error;
+      return {
+        outcome: 'refused',
+        code: 'store',
+        reason: 'RecordOwnerItem the item store could not be written',
+      };
     }
   }
 

@@ -16,6 +16,7 @@ import type {
   RecordOwnerItemResult,
 } from '../../ports/in/RecordOwnerItemPort.in-port.js';
 import type { ListOwnerItemsRequest } from '../../ports/in/ListOwnerItemsPort.in-port.js';
+import type { ListOwnerItemsResult } from '../../ports/in/ListOwnerItemsPort.in-port.js';
 import type {
   OwnerItemRepositoryPort,
   StoredOwnerItem,
@@ -346,6 +347,92 @@ describe('RecordOwnerItemUseCase', () => {
     expect(refusal(second).code).toBe('id-taken');
   });
 
+  it('RecordOwnerItem refuses a sparse refs array as invalid without throwing', async () => {
+    const repo = new OwnerItemRepositoryAdapter();
+    const uc = new RecordOwnerItemUseCase({ itemRepo: repo, clock: clock(), ids: ids() });
+
+    const sparse = new Array(1);
+    const bodies: unknown[] = [
+      { ...MERGE_BODY, refs: sparse },
+      { ...MERGE_BODY, refs: [null] },
+      { ...MERGE_BODY, refs: [undefined] },
+      { ...MERGE_BODY, refs: ['nope'] },
+    ];
+    const results = await Promise.all(
+      bodies.map((body) => uc.recordOwnerItem(body, 'orch-example-1')),
+    );
+    for (const result of results) {
+      expect(refusal(result).code).toBe('invalid');
+    }
+    expect(await repo.list()).toEqual([]);
+  });
+
+  it('RecordOwnerItem refuses an unknown kind without echoing it', async () => {
+    const repo = new OwnerItemRepositoryAdapter();
+    const uc = new RecordOwnerItemUseCase({ itemRepo: repo, clock: clock(), ids: ids() });
+
+    const refused = refusal(
+      await uc.recordOwnerItem({ ...MERGE_BODY, kind: 'not-a-kind' }, 'orch-example-1'),
+    );
+    expect(refused.code).toBe('invalid');
+    expect(refused.reason).not.toContain('not-a-kind');
+    expect(await repo.list()).toEqual([]);
+  });
+
+  it('RecordOwnerItem refuses a throwing clock as clock', async () => {
+    const repo = new OwnerItemRepositoryAdapter();
+    const throwing: OwnerItemClock = {
+      nowIso() {
+        throw new Error('rejected');
+      },
+    };
+    const uc = new RecordOwnerItemUseCase({ itemRepo: repo, clock: throwing, ids: ids() });
+
+    const refused = refusal(await uc.recordOwnerItem(MERGE_BODY, 'orch-example-1'));
+    expect(refused.code).toBe('clock');
+    expect(refused.reason).toBe('RecordOwnerItem the clock could not be read');
+    expect(await repo.list()).toEqual([]);
+  });
+
+  it('RecordOwnerItem a repeat after a failed save records the item', async () => {
+    const real = new OwnerItemRepositoryAdapter();
+    let saveCalls = 0;
+    const flaky: OwnerItemRepositoryPort = {
+      async save(item: OwnerItemRecord, expectedRevision: number) {
+        saveCalls += 1;
+        if (saveCalls === 1) {
+          throw new Error('rejected');
+        }
+        return real.save(item, expectedRevision);
+      },
+      async get(itemId: string) {
+        return real.get(itemId);
+      },
+      async findByKey(key: string) {
+        return real.findByKey(key);
+      },
+      async list() {
+        return real.list();
+      },
+    };
+    const uc = new RecordOwnerItemUseCase({
+      itemRepo: flaky,
+      clock: clock(),
+      ids: { newItemId: () => 'oi-example-1' },
+    });
+
+    const first = await uc.recordOwnerItem(MERGE_BODY, 'orch-example-1');
+    expect(refusal(first).code).toBe('store');
+
+    const second = await uc.recordOwnerItem(MERGE_BODY, 'orch-example-1');
+    expect(second).toEqual({
+      outcome: 'recorded',
+      item: expect.objectContaining({ itemId: 'oi-example-1' }),
+      revision: 1,
+    });
+    expect(saveCalls).toBe(2);
+  });
+
   it('throws Not implemented when unconfigured', async () => {
     await expect(new RecordOwnerItemUseCase().recordOwnerItem({}, 'x')).rejects.toThrow(
       'Not implemented: RecordOwnerItemUseCase',
@@ -419,11 +506,19 @@ describe('ListOwnerItemsUseCase', () => {
     return repo;
   }
 
+  /** Throws unless the result is a listed one, then returns it narrowed. */
+  function listed(result: ListOwnerItemsResult): ListOwnerItemsResult & { outcome: 'listed' } {
+    if (result.outcome !== 'listed') {
+      throw new Error(`expected outcome 'listed', got '${result.outcome}'`);
+    }
+    return result;
+  }
+
   it('lists items in store order with gating derived from the record', async () => {
     const repo = await seededStore();
     const uc = new ListOwnerItemsUseCase({ itemRepo: repo });
 
-    const all = await uc.listOwnerItems();
+    const all = listed(await uc.listOwnerItems());
     expect(all.items.map((entry) => entry.item.itemId)).toEqual([
       'oi-example-1',
       'oi-example-2',
@@ -445,33 +540,44 @@ describe('ListOwnerItemsUseCase', () => {
     const repo = await seededStore();
     const uc = new ListOwnerItemsUseCase({ itemRepo: repo });
 
-    const byProject = await uc.listOwnerItems({ projectId: 'example-project' });
+    const byProject = listed(await uc.listOwnerItems({ projectId: 'example-project' }));
     expect(byProject.items).toHaveLength(3);
 
-    const byState = await uc.listOwnerItems({ state: 'closed' });
+    const byState = listed(await uc.listOwnerItems({ state: 'closed' }));
     expect(byState.items.map((entry) => entry.item.itemId)).toEqual(['oi-example-3']);
 
-    const byKind = await uc.listOwnerItems({ kind: 'secret' });
+    const byKind = listed(await uc.listOwnerItems({ kind: 'secret' }));
     expect(byKind.items.map((entry) => entry.item.itemId)).toEqual(['oi-example-3']);
 
-    const combined = await uc.listOwnerItems({
-      projectId: 'example-project',
-      state: 'closed',
-      kind: 'secret',
-    });
+    const combined = listed(
+      await uc.listOwnerItems({
+        projectId: 'example-project',
+        state: 'closed',
+        kind: 'secret',
+      }),
+    );
     expect(combined.items.map((entry) => entry.item.itemId)).toEqual(['oi-example-3']);
 
-    expect((await uc.listOwnerItems({ state: 'XYZZY' } as unknown as ListOwnerItemsRequest)).items).toEqual([]);
-    expect((await uc.listOwnerItems({ kind: 'XYZZY' } as unknown as ListOwnerItemsRequest)).items).toEqual([]);
-    expect((await uc.listOwnerItems({ projectId: 42 } as unknown as ListOwnerItemsRequest)).items).toEqual([]);
+    expect(
+      await uc.listOwnerItems({ state: 'XYZZY' } as unknown as ListOwnerItemsRequest),
+    ).toMatchObject({ outcome: 'refused', code: 'request' });
+    expect(
+      await uc.listOwnerItems({ kind: 'XYZZY' } as unknown as ListOwnerItemsRequest),
+    ).toMatchObject({ outcome: 'refused', code: 'request' });
+    expect(
+      await uc.listOwnerItems({ projectId: 42 } as unknown as ListOwnerItemsRequest),
+    ).toMatchObject({ outcome: 'refused', code: 'request' });
   });
 
-  it('lists everything when no argument or a non-object argument is given', async () => {
+  it('lists everything when no argument is given and refuses a non-object argument', async () => {
     const repo = await seededStore();
     const uc = new ListOwnerItemsUseCase({ itemRepo: repo });
 
-    expect((await uc.listOwnerItems()).items).toHaveLength(3);
-    expect((await uc.listOwnerItems('x' as unknown as ListOwnerItemsRequest)).items).toHaveLength(3);
+    expect(listed(await uc.listOwnerItems()).items).toHaveLength(3);
+    expect(await uc.listOwnerItems('x' as unknown as ListOwnerItemsRequest)).toMatchObject({
+      outcome: 'refused',
+      code: 'request',
+    });
   });
 
   it('lists one entry per item id even when the store repeats an entry', async () => {
@@ -510,7 +616,7 @@ describe('ListOwnerItemsUseCase', () => {
     };
 
     const uc = new ListOwnerItemsUseCase({ itemRepo: duplicate });
-    const result = await uc.listOwnerItems();
+    const result = listed(await uc.listOwnerItems());
     expect(result.items.map((entry) => entry.item.itemId)).toEqual(['oi-example-1']);
   });
 
@@ -518,6 +624,108 @@ describe('ListOwnerItemsUseCase', () => {
     await expect(new ListOwnerItemsUseCase().listOwnerItems()).rejects.toThrow(
       'Not implemented: ListOwnerItemsUseCase',
     );
+  });
+
+  it('ListOwnerItems refuses a throwing getter on the filter as request', async () => {
+    const repo = await seededStore();
+    const uc = new ListOwnerItemsUseCase({ itemRepo: repo });
+    const filter = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('rejected');
+        },
+      },
+    );
+    expect(await uc.listOwnerItems(filter as unknown as ListOwnerItemsRequest)).toMatchObject({
+      outcome: 'refused',
+      code: 'request',
+      reason: 'ListOwnerItems the filter could not be read',
+    });
+  });
+
+  it('ListOwnerItems refuses an array or null filter as request', async () => {
+    const repo = await seededStore();
+    const uc = new ListOwnerItemsUseCase({ itemRepo: repo });
+    expect(await uc.listOwnerItems([1, 2] as unknown as ListOwnerItemsRequest)).toMatchObject({
+      outcome: 'refused',
+      code: 'request',
+    });
+    expect(await uc.listOwnerItems(null as unknown as ListOwnerItemsRequest)).toMatchObject({
+      outcome: 'refused',
+      code: 'request',
+    });
+  });
+
+  it('ListOwnerItems reports an unreadable store as unknown, never an empty list', async () => {
+    const repo = await seededStore();
+    const throwing: OwnerItemRepositoryPort = {
+      async save(item: OwnerItemRecord, expectedRevision: number) {
+        return repo.save(item, expectedRevision);
+      },
+      async get(itemId: string) {
+        return repo.get(itemId);
+      },
+      async findByKey(key: string) {
+        return repo.findByKey(key);
+      },
+      async list() {
+        throw new Error('rejected');
+      },
+    };
+    const uc = new ListOwnerItemsUseCase({ itemRepo: throwing });
+    expect(await uc.listOwnerItems()).toEqual({
+      outcome: 'unknown',
+      reason: 'ListOwnerItems the owner item store could not be read',
+    });
+  });
+
+  it('ListOwnerItems caps the output at 200 entries and reports truncation', async () => {
+    const real = new OwnerItemRepositoryAdapter();
+    const stored: StoredOwnerItem[] = [];
+    for (let i = 1; i <= 201; i += 1) {
+      const id = `oi-example-${String(i).padStart(3, '0')}`;
+      const opened = OwnerItem.open(
+        {
+          itemId: id,
+          projectId: 'example-project',
+          kind: 'secret',
+          subject: `example rotation ${i}`,
+          refs: [],
+          blocks: [],
+          createdBy: 'orch-example-1',
+        },
+        NOW_ISO,
+      );
+      expect(opened.success).toBe(true);
+      if (!opened.success) {
+        return;
+      }
+      stored.push(await real.save(opened.value.toRecord(), 0));
+    }
+    const fake: OwnerItemRepositoryPort = {
+      async save(item: OwnerItemRecord, expectedRevision: number) {
+        return real.save(item, expectedRevision);
+      },
+      async get(itemId: string) {
+        return real.get(itemId);
+      },
+      async findByKey(key: string) {
+        return real.findByKey(key);
+      },
+      async list() {
+        return stored;
+      },
+    };
+    const uc = new ListOwnerItemsUseCase({ itemRepo: fake });
+    const result = listed(await uc.listOwnerItems());
+    expect(result.items).toHaveLength(200);
+    expect(result.truncated).toBe(true);
+
+    const seeded = await seededStore();
+    const short = listed(await new ListOwnerItemsUseCase({ itemRepo: seeded }).listOwnerItems());
+    expect(short.items).toHaveLength(3);
+    expect(short.truncated).toBe(false);
   });
 });
 

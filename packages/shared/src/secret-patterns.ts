@@ -3,50 +3,46 @@
 // KeeperPublicationAdapter; the helpers built on it report only whether or
 // where a secret shape appears, never the matched text itself.
 
-/**
- * Stable rule names for the registry above, positional order preserved. The
- * diff check reports a finding's rule as `secret-pattern:<name>`; the matched
- * text itself is never reported.
- */
-export const SECRET_PATTERN_NAMES: readonly string[] = [
-  'private-key-block',
-  'github-token',
-  'openai-style-key',
-  'aws-access-key',
-  'slack-token',
-  'jwt',
-];
-
 /** One registry entry with its reporting rule name. */
 export interface NamedSecretPattern {
   readonly name: string;
   readonly regex: RegExp;
 }
 
-/** Zip the registry with its names; the lengths are checked, never guessed. */
-export function namedSecretPatterns(): readonly NamedSecretPattern[] {
-  if (SECRET_PATTERN_NAMES.length !== SECRET_PATTERNS.length) {
-    throw new Error('secret-pattern registry: names and patterns diverge');
-  }
-  return SECRET_PATTERNS.map((regex, index) => ({ name: SECRET_PATTERN_NAMES[index], regex }));
-}
-
-export const SECRET_PATTERNS: readonly RegExp[] = [
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
-  /\bsk-[A-Za-z0-9_-]{20,}\b/,
-  /\bAKIA[0-9A-Z]{16}\b/,
-  /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/,
-  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
+/**
+ * The legacy six secret shapes: one internal list from which both
+ * `SECRET_PATTERNS` and `SECRET_PATTERN_NAMES` are derived, so the two legacy
+ * exports cannot drift apart. Keep each regex and name character-for-character:
+ * `@fleet/brief-knowledge` pins the six entries, and widening this narrow scan
+ * to the canonical set is the SP-1 follow-up.
+ */
+const LEGACY_SECRET_SHAPES: readonly NamedSecretPattern[] = [
+  { name: 'private-key-block', regex: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
+  { name: 'github-token', regex: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/ },
+  { name: 'openai-style-key', regex: /\bsk-[A-Za-z0-9_-]{20,}\b/ },
+  { name: 'aws-access-key', regex: /\bAKIA[0-9A-Z]{16}\b/ },
+  { name: 'slack-token', regex: /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/ },
+  { name: 'jwt', regex: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/ },
 ];
 
+export const SECRET_PATTERNS: readonly RegExp[] = LEGACY_SECRET_SHAPES.map((s) => s.regex);
+
+export const SECRET_PATTERN_NAMES: readonly string[] = LEGACY_SECRET_SHAPES.map((s) => s.name);
+
+/** The legacy six shapes, in registry order. */
+export function namedSecretPatterns(): readonly NamedSecretPattern[] {
+  return LEGACY_SECRET_SHAPES;
+}
+
 /**
- * The complete registry mirrored from `scripts/lane-diff-check.sh` (S2): all
- * 17 named patterns, in the script's table order, with each POSIX ERE
- * translated to an equivalent JS RegExp. This is the registry the lane diff
- * check scans with; `SECRET_PATTERNS` above stays untouched for the contexts
- * that already rely on it. The matched text is never reported — only the
- * rule name.
+ * The one canonical secret-pattern registry. All 17 named rules live here, in
+ * the shell table's order, each POSIX ERE translated to an equivalent JS
+ * RegExp. The exported name is historical — this list began as the lane-diff
+ * check's rule set and the barrel keeps the old name. The shell twin's table
+ * is `scripts/lane-diff-check.sh:411-429`; the parity test that pins this
+ * registry to that table is
+ * `packages/shared/src/__tests__/lane-diff-pattern-parity.test.ts`. The
+ * matched text is never reported — only the rule name.
  */
 export const LANE_DIFF_SECRET_PATTERNS: readonly NamedSecretPattern[] = [
   { name: 'aws-access-key', regex: /AKIA[0-9A-Z]{16}/ },
@@ -68,7 +64,12 @@ export const LANE_DIFF_SECRET_PATTERNS: readonly NamedSecretPattern[] = [
   { name: 'basic-auth-url', regex: /https?:\/\/[^/:@ \t\v\f\r]+:[^/@ \t\v\f\r]{6,}@/ },
 ];
 
-/** True when any secret pattern matches anywhere in `text`. */
+/**
+ * True when any secret pattern matches anywhere in `text`. Scans only the
+ * legacy six, not the canonical seventeen: widening the shared scan is the
+ * SP-1 follow-up (`@fleet/operator-coordination` pins the narrow behaviour and
+ * is Track C's package).
+ */
 export function containsSecretShape(text: string): boolean {
   return SECRET_PATTERNS.some((pattern) => pattern.test(text));
 }

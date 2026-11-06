@@ -1,4 +1,13 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -7,6 +16,7 @@ import * as h3 from "h3";
 import { createApp, createRouter, eventHandler, toNodeListener, type EventHandler } from "h3";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import securityMiddleware from "../server/middleware/security.js";
+import { bootstrapFleetApiFromEnv } from "../server/plugins/runtime.js";
 import { configureFleetApiRuntime } from "../server/wiring/runtime.js";
 import { setActiveApiToken } from "../server/wiring/token.js";
 import {
@@ -25,12 +35,27 @@ import {
 import {
   consumeWebLoginCode,
   issueWebLoginCode,
+  removeWebLoginCodeFile,
   resetWebLogin,
   WEB_LOGIN_CODE_FILE,
   WEB_LOGIN_CODE_MAX_LENGTH,
   WEB_LOGIN_HEADER,
   WEB_LOGIN_PATH,
 } from "../server/wiring/web-login.js";
+
+// The module seam for the temp-file suffix: `randomBytes(16)` (the suffix) can be
+// pinned so a test can plant a file at the temp path; every other call is real.
+const randomSeam = vi.hoisted(() => ({ pinnedSuffix: null as Buffer | null, sizes: [] as number[] }));
+vi.mock("node:crypto", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:crypto")>();
+  const randomBytes = ((size: number) => {
+    randomSeam.sizes.push(size);
+    return size === 16 && randomSeam.pinnedSuffix !== null
+      ? randomSeam.pinnedSuffix
+      : actual.randomBytes(size);
+  }) as typeof actual.randomBytes;
+  return { ...actual, randomBytes };
+});
 
 // Nitro auto-imports h3 utilities into the global scope at build time;
 // vitest does not, so stub them globally before loading route modules.
@@ -138,6 +163,8 @@ describe("T6a web session login", () => {
     configurePresentedTokenResolver(null);
     configureSessionExchange();
     resetWebLogin();
+    randomSeam.pinnedSuffix = null;
+    randomSeam.sizes.length = 0;
     delete process.env.FLEET_API_ALLOWED_ORIGINS;
   });
 
@@ -509,5 +536,86 @@ describe("T6a web session login", () => {
     });
     expect(res.status).toBe(403);
     expect(getInteractiveSession("probe")).toBeNull();
+  });
+
+  describe("HD1 code file hardening", () => {
+    const PINNED = Buffer.alloc(16, 7);
+
+    function pinnedTempPath(): string {
+      return join(tempDir, `${WEB_LOGIN_CODE_FILE}.${PINNED.toString("hex")}.tmp`);
+    }
+
+    it("the temp file name carries a random 16-byte suffix, not the pid and the clock", () => {
+      const code = issueWebLoginCode(tempDir);
+      expect(code).toBeTruthy();
+      expect(randomSeam.sizes).toContain(16);
+      expect(readdirSync(tempDir)).toEqual([WEB_LOGIN_CODE_FILE]);
+    });
+
+    it("a symlink planted at the temp path is not followed: the issue fails closed", () => {
+      const victim = join(tempDir, "victim.txt");
+      writeFileSync(victim, "untouched");
+      symlinkSync(victim, pinnedTempPath());
+      randomSeam.pinnedSuffix = PINNED;
+
+      expect(issueWebLoginCode(tempDir)).toBeNull();
+      expect(readFileSync(victim, "utf8")).toBe("untouched");
+      expect(existsSync(join(tempDir, WEB_LOGIN_CODE_FILE))).toBe(false);
+      expect(consumeWebLoginCode("anything").ok).toBe(false);
+    });
+
+    it("an existing file at the temp path makes the issue fail closed without a throw", () => {
+      writeFileSync(pinnedTempPath(), "planted");
+      randomSeam.pinnedSuffix = PINNED;
+
+      let issued: string | null = "not-called";
+      expect(() => {
+        issued = issueWebLoginCode(tempDir);
+      }).not.toThrow();
+      expect(issued).toBeNull();
+      expect(existsSync(join(tempDir, WEB_LOGIN_CODE_FILE))).toBe(false);
+      expect(consumeWebLoginCode("anything").ok).toBe(false);
+    });
+
+    it("a failed issue removes a code file left by an earlier run", () => {
+      const filePath = join(tempDir, WEB_LOGIN_CODE_FILE);
+      writeFileSync(filePath, '{"code":"stale","issuedAtIso":"2026-01-01T00:00:00.000Z"}\n');
+      writeFileSync(pinnedTempPath(), "planted");
+      randomSeam.pinnedSuffix = PINNED;
+
+      expect(issueWebLoginCode(tempDir)).toBeNull();
+      expect(existsSync(filePath)).toBe(false);
+    });
+
+    it("a refused bootstrap removes a code file left by an earlier run", () => {
+      const filePath = join(tempDir, WEB_LOGIN_CODE_FILE);
+      for (const env of [
+        { FLEET_STATE_DIR: tempDir },
+        { FLEET_STATE_DIR: tempDir, FLEET_API_TOKEN_FILE: join(tempDir, "missing-token") },
+        { FLEET_STATE_DIR: `  ${tempDir}  `, FLEET_API_TOKEN_FILE: "   " },
+      ]) {
+        writeFileSync(filePath, '{"code":"stale","issuedAtIso":"2026-01-01T00:00:00.000Z"}\n');
+        expect(bootstrapFleetApiFromEnv(env)).toBe(false);
+        expect(existsSync(filePath)).toBe(false);
+      }
+    });
+
+    it("a bootstrap with no state directory touches no code file", () => {
+      const filePath = join(tempDir, WEB_LOGIN_CODE_FILE);
+      writeFileSync(filePath, "kept");
+      expect(bootstrapFleetApiFromEnv({ FLEET_STATE_DIR: "   " })).toBe(false);
+      expect(bootstrapFleetApiFromEnv({})).toBe(false);
+      expect(readFileSync(filePath, "utf8")).toBe("kept");
+    });
+
+    it("removeWebLoginCodeFile removes the file and never throws", () => {
+      const filePath = join(tempDir, WEB_LOGIN_CODE_FILE);
+      writeFileSync(filePath, "x");
+      removeWebLoginCodeFile(tempDir);
+      expect(existsSync(filePath)).toBe(false);
+      expect(() => removeWebLoginCodeFile(tempDir)).not.toThrow();
+      expect(() => removeWebLoginCodeFile(join(tempDir, "no", "such", "dir"))).not.toThrow();
+      expect(() => removeWebLoginCodeFile("\0bad")).not.toThrow();
+    });
   });
 });

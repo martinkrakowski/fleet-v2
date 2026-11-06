@@ -14,12 +14,15 @@
  * they reach a remote executor too), a 20 s deadline and an 8 MiB output cap;
  * a transport failure or timeout is `unknown`, a failed read is
  * `unreadable-tree`, never a guessed digest. Attribute lookups during `add`
- * are pinned to the empty tree (`GIT_ATTR_SOURCE`), so no repository-configured
- * clean filter ever runs on untrusted worktree content. The `update-ref`
- * carries the all-zeros expected old value, so a concurrent save's ref can
- * never be overwritten: a lost race re-reads the ref and reports
- * `already-saved` or `save-ref-conflict` instead. Nothing returned or thrown
- * carries a path, file content or a matched value.
+ * are pinned to the empty tree, written with `hash-object -w`
+ * (`GIT_ATTR_SOURCE`), so no repository-configured `.gitattributes` clean
+ * filter runs on untrusted worktree content; the one higher-precedence source
+ * left, `$GIT_DIR/info/attributes`, is scanned and the save is refused
+ * (`unreadable-tree`) if it assigns the `filter` attribute or cannot be read.
+ * The `update-ref` carries the all-zeros expected old value, so a concurrent
+ * save's ref can never be overwritten: a lost race re-reads the ref and
+ * reports `already-saved` or `save-ref-conflict` instead. Nothing returned or
+ * thrown carries a path, file content or a matched value.
  */
 
 import * as crypto from 'node:crypto';
@@ -46,7 +49,16 @@ const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MESSAGE_PATTERN = /^[A-Za-z0-9 ._:-]{1,200}$/;
 const SECRET_SHAPED_RUN = /[A-Za-z0-9_-]{32,}/;
 
-const NETWORK_GUARDS = ['GIT_ALLOW_PROTOCOL=none', 'GIT_NO_LAZY_FETCH=1', 'GIT_TERMINAL_PROMPT=0'] as const;
+/** A gitattributes token that selects a clean/smudge/process filter. */
+const ATTR_FILTER_PATTERN = '(^|[[:space:]])filter([[:space:]=]|$)';
+
+/** Environment hardening that travels inside every argv so it reaches a remote ssh executor too. */
+const ENV_GUARDS = [
+  'GIT_ALLOW_PROTOCOL=none',
+  'GIT_NO_LAZY_FETCH=1',
+  'GIT_TERMINAL_PROMPT=0',
+  'GIT_ATTR_NOSYSTEM=1',
+] as const;
 const IDENTITY_ENV = [
   'GIT_AUTHOR_NAME=fleet-v2',
   'GIT_AUTHOR_EMAIL=fleet-v2@localhost',
@@ -132,7 +144,7 @@ export class LaneEditSaveAdapter implements LaneEditSavePort {
       return { exitCode: result.exitCode, stdout: result.stdout.trim() };
     };
     const git = (dir: string, args: readonly string[], env: readonly string[] = []): readonly string[] => [
-      'env', ...NETWORK_GUARDS, ...env, 'git', ...GIT_CONFIG_ARGS, '-C', dir, ...args,
+      'env', ...ENV_GUARDS, ...env, 'git', ...GIT_CONFIG_ARGS, '-C', dir, ...args,
     ];
     const step = async (argv: readonly string[]): Promise<void> => {
       if ((await run(argv)).exitCode !== 0) throw refuse('unreadable-tree');
@@ -163,9 +175,23 @@ export class LaneEditSaveAdapter implements LaneEditSavePort {
     const worktreeCommon = await commonDir(worktree);
     if (cloneCommon !== worktreeCommon) throw refuse('worktree-not-in-clone');
 
+    // The only attribute source still able to select a clean filter is the
+    // higher-precedence `$GIT_DIR/info/attributes`: `GIT_ATTR_SOURCE` covers the
+    // worktree's `.gitattributes`, `core.attributesFile=/dev/null` the global file
+    // and `GIT_ATTR_NOSYSTEM=1` the system file. Refuse the save if it assigns the
+    // `filter` attribute — or if it cannot be inspected (fail closed, never a guess).
+    const gitDirRan = await run(git(worktree, ['rev-parse', '--absolute-git-dir']));
+    if (gitDirRan.exitCode !== 0 || !isAbsolute(gitDirRan.stdout)) throw refuse('unreadable-tree');
+    const infoAttributes = path.posix.join(gitDirRan.stdout, 'info', 'attributes');
+    const infoExists = await run(['test', '-f', infoAttributes]);
+    if (infoExists.exitCode === 0) {
+      const filterScan = await run(['grep', '-Eq', ATTR_FILTER_PATTERN, infoAttributes]);
+      if (filterScan.exitCode !== 1) throw refuse('unreadable-tree');
+    }
+
     // A per-save random name: concurrent saves for the same ref never share an index.
     const index = `${worktreeCommon}/fleet-save-index-${crypto.randomBytes(16).toString('hex')}`;
-    const emptyTree = await readId(worktree, ['hash-object', '-t', 'tree', '/dev/null']);
+    const emptyTree = await readId(worktree, ['hash-object', '-w', '-t', 'tree', '/dev/null']);
     const indexEnv = [`GIT_INDEX_FILE=${index}`, `GIT_ATTR_SOURCE=${emptyTree}`];
     let parent: string | null = null;
     let worktreeTree = '';

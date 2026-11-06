@@ -6,8 +6,8 @@
  * journal and the save ref. Order: validate, read the keyed journal (a final
  * result is returned as recorded), check the runner is idle (unknown is never
  * idle), run the lane diff check, journal the intent durably, save, verify the
- * tree digest, journal the result (a refused or unreadable final append is
- * reported as `journal-unavailable`). `execute` takes `unknown` and never throws.
+ * tree digest, journal the result (a failed final append preserves the outcome).
+ * `execute` takes `unknown` and never throws.
  * Results carry ids, codes, counts and digests only.
  */
 
@@ -139,8 +139,8 @@ export class SaveLaneEditsUseCase {
     const first = await this.readJournal(journalPrefix, journalKey, saveRef, planDigest, laneId);
     if (first.done) return first.result;
 
-    // The runner addresses the worktree by directory: a lane without a recorded attempt is
-    // addressed by its lane id. A recovered pass checks again; a lane may be live once more.
+    // The runner addresses the worktree by directory: a lane without a recorded attempt
+    // is addressed by its lane id; a recovered pass checks again.
     const busy = await this.worktreeBusy(request);
     if (busy !== null) return busy;
     const diff = await this.checkDiff(request);
@@ -164,30 +164,25 @@ export class SaveLaneEditsUseCase {
     } catch {
       saved = { outcome: 'unknown', reason: 'save-failed' } as const;
     }
-    // A final append that is refused or unreadable is reported, never ignored: the intent
-    // stays on record and the next pass reconciles it.
+    // A refused or unreadable final append never replaces the outcome that already
+    // happened (brief §6 step 8); the next pass reconciles the missing result.
     const finish = async (entry: Omit<CutoverJournalEntry, 'key' | 'kind' | 'entryId' | 'recordedAtIso'>) =>
       this.append({ key: journalKey, kind: 'result', entryId: '', recordedAtIso: nowIso, ...entry });
-    const record = async (
-      entry: Omit<CutoverJournalEntry, 'key' | 'kind' | 'entryId' | 'recordedAtIso'>,
-    ): Promise<boolean> => (await finish(entry)) === 'appended';
 
     if (saved.outcome === 'refused') {
-      if (!(await record({ outcome: 'refused', reasonCode: saved.reason }))) return refused('journal-unavailable');
+      await finish({ outcome: 'refused', reasonCode: saved.reason });
       return refused('save-refused', { reason: saved.reason });
     }
     if (saved.outcome === 'unknown') {
-      if (!(await record({ outcome: 'ambiguous', reasonCode: 'save-unknown' }))) return refused('journal-unavailable');
+      await finish({ outcome: 'ambiguous', reasonCode: 'save-unknown' });
       return { outcome: 'unknown', reason: 'save-unknown' };
     }
     if (saved.treeDigest !== saved.worktreeTreeDigest) {
-      if (!(await record({ outcome: 'refused', reasonCode: 'tree-digest-mismatch' }))) return refused('journal-unavailable');
+      await finish({ outcome: 'refused', reasonCode: 'tree-digest-mismatch' });
       return refused('tree-digest-mismatch');
     }
     const { outcome, commitId, treeDigest, saveRef: savedRef } = saved;
-    if (!(await record({ outcome: 'completed', reasonCode: outcome, digest: treeDigest, commitId, saveRef: savedRef }))) {
-      return refused('journal-unavailable');
-    }
+    await finish({ outcome: 'completed', reasonCode: outcome, digest: treeDigest, commitId, saveRef: savedRef });
     return { outcome, planDigest, laneId, journalKey, saveRef: savedRef, commitId, treeDigest };
   }
 

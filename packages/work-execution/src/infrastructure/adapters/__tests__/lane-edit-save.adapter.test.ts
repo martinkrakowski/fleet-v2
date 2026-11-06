@@ -31,6 +31,8 @@ interface World {
   headExists: boolean;
   refWritten: boolean;
   timeoutOn?: string;
+  /** `.git/info/attributes` state: absent, present without a filter, or selecting a clean filter. */
+  infoAttributes: 'absent' | 'harmless' | 'filter';
   /** When set, the first update-ref fails and the ref appears as this concurrent save (null: still absent). */
   updateRefFailsOnce?: { commit: string; tree: string } | null;
 }
@@ -45,6 +47,7 @@ class FakeExecutor implements CommandExecutorPort {
     headExists: true,
     refWritten: false,
     timeoutOn: undefined,
+    infoAttributes: 'absent',
     updateRefFailsOnce: undefined,
   };
 
@@ -56,13 +59,22 @@ class FakeExecutor implements CommandExecutorPort {
     if (this.world.timeoutOn !== undefined && sub.startsWith(this.world.timeoutOn)) {
       return { exitCode: null, signal: 'SIGTERM', stdout: '', stderr: '', error: 'timed out' };
     }
+    if (argv[0] === 'test' && argv[1] === '-f') {
+      return this.world.infoAttributes === 'absent' ? exit(1) : ok();
+    }
+    if (argv[0] === 'grep') {
+      if (this.world.infoAttributes === 'filter') return ok();
+      if (this.world.infoAttributes === 'harmless') return exit(1);
+      return exit(2);
+    }
     if (argv[0] === 'rm') return ok();
     const inClone = argv[argv.indexOf('-C') + 1] === CLONE;
     if (sub.startsWith('rev-parse --path-format=absolute --git-common-dir')) {
       return ok(inClone ? this.world.cloneCommon : this.world.worktreeCommon);
     }
+    if (sub === 'rev-parse --absolute-git-dir') return ok(this.world.worktreeCommon);
     if (sub === 'rev-parse --verify --quiet HEAD^{commit}') return this.world.headExists ? ok(HEAD) : exit(1);
-    if (sub === 'hash-object -t tree /dev/null') return ok(EMPTY_TREE);
+    if (sub === 'hash-object -w -t tree /dev/null') return ok(EMPTY_TREE);
     if (sub === 'read-tree HEAD' || sub === 'read-tree --empty' || sub.startsWith('add -A')) return ok();
     if (sub === 'write-tree') return this.world.worktreeTree === null ? exit(128) : ok(this.world.worktreeTree);
     if (sub === `rev-parse --verify --quiet ${SAVE_REF}^{commit}`) {
@@ -222,6 +234,7 @@ describe('LaneEditSaveAdapter', () => {
     for (const { argv } of gits) {
       const git = argv.indexOf('git');
       expect(argv.slice(1, 4)).toEqual(['GIT_ALLOW_PROTOCOL=none', 'GIT_NO_LAZY_FETCH=1', 'GIT_TERMINAL_PROMPT=0']);
+      expect(argv).toContain('GIT_ATTR_NOSYSTEM=1');
       const config = argv.slice(git + 1, argv.indexOf('-C'));
       for (const setting of [
         'color.ui=never', 'core.quotePath=false', 'diff.mnemonicPrefix=false', 'diff.noprefix=false',
@@ -308,5 +321,31 @@ describe('LaneEditSaveAdapter', () => {
       expect(await adapter.saveLaneEdits(request({ saveRef }))).toEqual({ outcome: 'refused', reason: 'save-ref-invalid' });
     }
     expect(executor.calls).toHaveLength(0);
+  });
+
+  it('the empty tree is written with hash-object -w before staging', async () => {
+    const executor = new FakeExecutor();
+    await new LaneEditSaveAdapter(executor).saveLaneEdits(request());
+    expect(executor.subcommands().filter((sub) => sub.startsWith('hash-object'))).toEqual([
+      'hash-object -w -t tree /dev/null',
+    ]);
+  });
+
+  it('an info/attributes file that selects a clean filter refuses the save', async () => {
+    const executor = new FakeExecutor();
+    executor.world.infoAttributes = 'filter';
+    expect(await new LaneEditSaveAdapter(executor).saveLaneEdits(request())).toEqual({
+      outcome: 'refused', reason: 'unreadable-tree',
+    });
+    const envSubs = executor.subcommands();
+    for (const verb of ['read-tree', 'add', 'write-tree', 'commit-tree', 'update-ref']) {
+      expect(envSubs.some((sub) => sub.startsWith(verb))).toBe(false);
+    }
+  });
+
+  it('an info/attributes file without a clean filter does not refuse the save', async () => {
+    const executor = new FakeExecutor();
+    executor.world.infoAttributes = 'harmless';
+    expect(await new LaneEditSaveAdapter(executor).saveLaneEdits(request())).toMatchObject({ outcome: 'saved' });
   });
 });

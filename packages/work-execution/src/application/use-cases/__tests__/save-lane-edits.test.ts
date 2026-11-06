@@ -305,7 +305,7 @@ describe('SaveLaneEditsUseCase', () => {
     expect(JSON.stringify(journaled)).not.toContain('/srv/');
   });
 
-  it('a refused or unreadable final append is reported as journal-unavailable, never ignored', async () => {
+  it('a refused or unreadable final append preserves the outcome that already happened', async () => {
     const real = new CutoverJournalAdapter();
     const refusing: CutoverJournalPort = {
       listByKeyPrefix: (prefix) => real.listByKeyPrefix(prefix),
@@ -320,30 +320,29 @@ describe('SaveLaneEditsUseCase', () => {
         return real.append(entry);
       },
     };
-    // A refused save whose refusal could not be recorded is reported as journal-unavailable.
+    // A refused save whose refusal could not be recorded still reports the refusal.
     const refusedSave = harness(refusing);
     refusedSave.state.save = { outcome: 'refused', reason: 'save-ref-conflict' };
     expect(await refusedSave.useCase.execute(validRequest())).toEqual({
-      outcome: 'refused', reason: 'journal-unavailable', detail: null,
+      outcome: 'refused', reason: 'save-refused', detail: { reason: 'save-ref-conflict' },
     });
     expect(refusedSave.saves).toHaveLength(1);
-    // A successful save whose result could not be recorded is reported too; the next pass reconciles.
+    // A successful save whose result could not be recorded still returns the save; the next pass reconciles.
     const savedOk = harness(throwing);
     expect(await savedOk.useCase.execute(validRequest())).toEqual({
-      outcome: 'refused', reason: 'journal-unavailable', detail: null,
+      outcome: 'saved', planDigest: PLAN, laneId: 'lane-1', journalKey: KEY, saveRef: SAVE_REF, commitId: COMMIT, treeDigest: TREE,
     });
     expect(savedOk.saves).toHaveLength(1);
-    // So is an ambiguous save result and a tree digest mismatch when the append fails.
+    // Only the intent stays on record, so the next pass re-runs the idempotent save and appends the result.
+    const listed = await savedOk.journal.listByKeyPrefix(KEY);
+    expect(listed.outcome === 'listed' && listed.entries.map((entry) => entry.kind)).toEqual(['intent']);
+    // An ambiguous save result and a tree digest mismatch also preserve their outcomes.
     const ambiguous = harness(throwing);
     ambiguous.state.save = { outcome: 'unknown', reason: 'command-failed' };
-    expect(await ambiguous.useCase.execute(validRequest())).toEqual({
-      outcome: 'refused', reason: 'journal-unavailable', detail: null,
-    });
+    expect(await ambiguous.useCase.execute(validRequest())).toEqual({ outcome: 'unknown', reason: 'save-unknown' });
     const mismatch = harness(throwing);
     mismatch.state.save = saved('saved', 'd'.repeat(40));
-    expect(await mismatch.useCase.execute(validRequest())).toEqual({
-      outcome: 'refused', reason: 'journal-unavailable', detail: null,
-    });
+    expect(await mismatch.useCase.execute(validRequest())).toEqual({ outcome: 'refused', reason: 'tree-digest-mismatch', detail: null });
   });
 
   it('an over-sized request is refused as invalid-request', async () => {

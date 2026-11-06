@@ -12,6 +12,7 @@ import { conductDispatching } from './prepare-dispatch.js';
 import { gatePreCheck, runCollectBody, runGateBody } from './collect-gate.js';
 import { reconcileReview } from './review-fix.js';
 import { reconcileAccept, reconcileMerge, reconcilePrPush } from './merge.js';
+import { reconcileMergeEnqueue } from './merge-enqueue.js';
 import { reconcilePremerge, recordCiFailure } from './premerge.js';
 
 /**
@@ -45,6 +46,9 @@ export async function performReconcile(ctx: AdvanceStepContext,
   }
   if (decision.step === 'merge') {
     return reconcileMerge(ctx, record, gathered, decision, request);
+  }
+  if (decision.step === 'merge-enqueue') {
+    return reconcileMergeEnqueue(ctx, record, gathered, decision, request);
   }
   if (decision.step === 'premerge') {
     return reconcilePremerge(ctx, record, gathered, decision, request);

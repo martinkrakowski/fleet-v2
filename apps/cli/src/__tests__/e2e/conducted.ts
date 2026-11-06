@@ -106,6 +106,12 @@ export interface ConductedFixtureOptions {
    * within one pass.
    */
   readonly ciChecksPending?: boolean;
+  /**
+   * KS7b: when true the installation turns `policy.autoMerge` on, so a run that
+   * reaches `merging` hands its PR to the merge queue instead of parking for the
+   * owner's merge.
+   */
+  readonly autoMerge?: boolean;
 }
 
 export interface CliRunResult {
@@ -187,6 +193,18 @@ export interface ConductedFixture extends E2eFixture {
    * `stop()` restores the mode.
    */
   readonly makeFixPlacementFail: () => Promise<void>;
+  /**
+   * KS7b: the fake forge now reads the run's PR as merged (the merge queue's pass
+   * merged it). Later `pr view` reads answer MERGED at the worktree head.
+   */
+  readonly markPullRequestMerged: () => Promise<void>;
+  /**
+   * KS7b: rewrite the merge queue's one entry for this run as the daemon's merge
+   * pass would leave it: `merged`, or `dropped` / `parked` with a reason.
+   */
+  readonly settleQueueEntry: (
+    settled: { readonly state: 'merged' } | { readonly state: 'dropped' | 'parked'; readonly reason: string },
+  ) => Promise<void>;
   /** A runtime rebuilt over the current installation FILE (scenario 3). */
   readonly rebuildRuntime: () => Promise<FleetCliRuntime>;
   /** Kill the fake lanes, tear the tunnel and sshd down, restore PATH. */
@@ -253,6 +271,7 @@ function buildConductedInstallation(
   seatAgent: string,
   laneAuthFile: string,
   maxLanes: number,
+  autoMerge = false,
 ): FleetInstallationV2 {
   return {
     schemaVersion: 2,
@@ -307,7 +326,10 @@ function buildConductedInstallation(
       implementer: [{ seatId: 'implementer' }],
       reviewer: [{ seatId: 'reviewer' }],
     },
-    policy: { conductor: { enabled: true } },
+    policy: {
+      conductor: { enabled: true },
+      ...(autoMerge ? { autoMerge: { enabled: true, allowHighRisk: false, onBlocked: 'hold' as const } } : {}),
+    },
     forge: { mode: 'github', owner: 'example-owner', repo: 'example-repo' },
     shelf: { provider: 'local' },
     verification: { procedures: { gate: { command: 'true', args: [] } } },
@@ -512,6 +534,8 @@ function makeForgeGhRunner(
     readonly prCreateMarkerFile?: string;
     /** R4a: when true, `pr checks` answers a pending bucket, so a run in watching-ci rests there. */
     readonly ciChecksPending?: boolean;
+    /** KS7b: once this file exists, `pr view` answers the PR as merged. */
+    readonly prMergedMarkerFile?: string;
   } = {},
 ) {
   const calls: string[][] = [];
@@ -537,17 +561,18 @@ function makeForgeGhRunner(
           };
         }
       }
+      const merged = options.prMergedMarkerFile !== undefined && existsSync(options.prMergedMarkerFile);
       return {
         exitCode: 0,
         stdout: JSON.stringify({
           number: 7,
-          state: 'OPEN',
+          state: merged ? 'MERGED' : 'OPEN',
           headRefOid: head(),
           headRefName: branchName,
           baseRefName: 'main',
-          mergedAt: null,
+          mergedAt: merged ? '2026-11-06T10:00:00Z' : null,
           closedAt: null,
-          mergeCommit: null,
+          mergeCommit: merged ? { oid: head() } : null,
           mergeStateStatus: 'CLEAN',
         }),
         stderr: '',
@@ -656,6 +681,7 @@ export async function startConductedFixture(
   // fake `pr view` flips to the open PR) and uses the count file to make the
   // ambiguous create happen exactly once.
   const ghPrCreateMarker = path.join(dir, 'pr-created.marker');
+  const prMergedMarker = path.join(dir, 'pr-merged.marker');
   const ghPrCreateCount = path.join(dir, 'pr-create.count');
   const laneScriptPath = path.join(dir, 'lane-commit.sh');
 
@@ -810,6 +836,7 @@ export async function startConductedFixture(
       seatAgent,
       laneAuthFile,
       options?.secondRun === true ? 2 : 1,
+      options?.autoMerge === true,
     );
     const written = writeInstallationV2(installation);
     const parsed = parseInstallation(JSON.parse(written));
@@ -834,6 +861,7 @@ export async function startConductedFixture(
         ? { prViewOpenAfterCreate: true, prCreateMarkerFile: ghPrCreateMarker }
         : {}),
       ...(options?.ciChecksPending === true ? { ciChecksPending: true } : {}),
+      prMergedMarkerFile: prMergedMarker,
     });
     const review = makeReviewSpawn(options?.reviewVerdicts ?? []);
     const buildRuntime = (installationForRuntime: FleetInstallationV2): FleetCliRuntime => {
@@ -1161,6 +1189,30 @@ export async function startConductedFixture(
       failedBriefPath = briefPath;
     };
 
+    const markPullRequestMerged = async (): Promise<void> => {
+      await fs.writeFile(prMergedMarker, 'merged\n', 'utf8');
+    };
+
+    const settleQueueEntry: ConductedFixture['settleQueueEntry'] = async (settled) => {
+      const queueFile = path.join(e2e.stateDir, 'merge-queue.json');
+      const records = JSON.parse(await fs.readFile(queueFile, 'utf8')) as Record<string, unknown>[];
+      const mine = records.filter((record) => record['runId'] === runId);
+      if (mine.length !== 1) {
+        throw new Error(`settleQueueEntry expects exactly one queue entry for the run, found ${mine.length}`);
+      }
+      const entry = mine[0]!;
+      entry['revision'] = (entry['revision'] as number) + 1;
+      entry['state'] = settled.state;
+      if (settled.state === 'merged') {
+        entry['reason'] = null;
+        entry['mergeCommitOid'] = String(entry['headOid']);
+        entry['mergedAtIso'] = '2026-11-06T10:00:00.000Z';
+      } else {
+        entry['reason'] = settled.reason;
+      }
+      await fs.writeFile(queueFile, JSON.stringify(records), 'utf8');
+    };
+
     return {
       ...e2e,
       get runtime() {
@@ -1196,6 +1248,8 @@ export async function startConductedFixture(
       runPass,
       recordAcceptanceReceipts,
       makeFixPlacementFail,
+      markPullRequestMerged,
+      settleQueueEntry,
       rebuildRuntime,
       stop,
     };

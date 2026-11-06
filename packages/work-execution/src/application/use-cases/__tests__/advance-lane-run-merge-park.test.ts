@@ -1,7 +1,8 @@
 /**
- * Unit tests for K6-7: the conductor's `act merge` through `AutoMergeAttemptPort`,
- * the merge facts (`oneWayDoor`, `branchBehind`, `trainFree`, `policyGrant`), the
- * merge reconcile by PR state, and the park notices raised through
+ * Unit tests for K6-7 and KS7b: the conductor's `act merge-enqueue` through
+ * `EnqueueMergePort` and its reconcile through `ListMergeQueuePort` (KS7b replaced the
+ * one-way `act merge`), the merge facts (`oneWayDoor`, `policyGrant`), the reconcile of
+ * a pre-KS7b `merge` intent by PR state, and the park notices raised through
  * `LaneRunParkNoticePort` (attention for every park; one keyed owner question for
  * the four owner reasons). The reason codes `notice-recorded` and `notice-refused`
  * stay unused by this lane: the notice is never journalled (the park key is not a
@@ -15,12 +16,11 @@ import type { AttemptRecord, CollectedAttemptArtifacts, WorkOrderRecord } from '
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
-import { buildLaneRunStepKey, laneRunPremergeKey } from '../../../domain/lane-run-keys.js';
+import { buildLaneRunStepKey, laneRunMergeEnqueueKey, laneRunPremergeKey } from '../../../domain/lane-run-keys.js';
 import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
-import type {
-  AutoMergeAttemptRequest,
-  AutoMergeAttemptResult,
-} from '../../ports/in/AutoMergeAttemptPort.in-port.js';
+import type { MergeQueueEnqueueCommand, MergeQueueListQuery } from '../../ports/out/MergeQueueRepositoryPort.out-port.js';
+import type { MergeEnqueueDecision } from '../../../domain/merge-queue-operations.js';
+import type { MergeQueueEntryRecord } from '../../../domain/merge-queue-records.js';
 import type {
   LaneRunParkNoticeResult,
   LaneRunParkRequest,
@@ -41,6 +41,8 @@ import { ExecutionJournalAdapter } from '../../../infrastructure/adapters/Execut
 import { RegisterWorkOrderUseCase } from '../RegisterWorkOrderUseCase.use-case.js';
 import type { WorkOrderRepositoryPort } from '../../ports/out/WorkOrderRepositoryPort.out-port.js';
 import { AdvanceLaneRunUseCase } from '../AdvanceLaneRunUseCase.use-case.js';
+import { EnqueueMergeUseCase } from '../EnqueueMergeUseCase.use-case.js';
+import { MergeQueueRepositoryAdapter } from '../../../infrastructure/adapters/MergeQueueRepositoryAdapter.adapter.js';
 import type { AdvanceLaneRunDependencies } from '../AdvanceLaneRunUseCase.use-case.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
@@ -57,10 +59,8 @@ const MOVED_HEAD12 = 'b'.repeat(12);
 const WORKTREE = '/tmp/opencode/wo-example-1/wt-example-1';
 const PROJECT_ID = 'project-example';
 const WORK_ORDER_ID = 'wo-example-1';
-const OTHER_WO_ID = 'wo-example-2';
-const AUTO_MERGE_DECISION = 'policy:autoMerge@0123456789ab';
+const REPOSITORY = { owner: 'owner-example', repo: 'repo-example' } as const;
 const QUESTION_ID = 'question-example-1';
-const FORGE_DETAIL = 'forge smoke detail example 1';
 
 const BASE_RECORD = {
   version: 1,
@@ -215,6 +215,49 @@ function mergeKey(): string {
   return stepKey({ round: 0, step: 'merge', seatIndex: 0, attemptOrdinal: null, head12: HEAD12 });
 }
 
+/** The merge-enqueue key at a round and head (no seat index, KS7b). */
+function enqueueKey(head12: string = HEAD12, round = 0): string {
+  const built = laneRunMergeEnqueueKey(RUN_ID, round, head12);
+  expect(built.ok).toBe(true);
+  if (!built.ok) {
+    throw new Error('fixture must build a merge-enqueue key');
+  }
+  return built.key;
+}
+
+/** A queue entry for the run's PR at the collected head; overrides set its state, ids and links. */
+function queueEntry(overrides: Partial<MergeQueueEntryRecord> = {}): MergeQueueEntryRecord {
+  const merged = overrides.state === 'merged';
+  return {
+    version: 1,
+    entryId: '01JB00000000000000000000EN',
+    repository: REPOSITORY,
+    repoDigest: '0'.repeat(12),
+    pullRequest: 7,
+    headOid: COMMIT,
+    state: 'queued',
+    reason: null,
+    attempt: 0,
+    notBeforeIso: null,
+    enqueuedAtIso: NOW,
+    enqueuedBy: 'conductor',
+    supersedes: null,
+    runId: RUN_ID,
+    attemptId: null,
+    workOrderId: null,
+    tier: 2,
+    verifiedHeadOid: null,
+    verifiedBy: null,
+    policyRevision: null,
+    premergeReceiptHeadOid: null,
+    veto: null,
+    mergeCommitOid: merged ? COMMIT : null,
+    mergedAtIso: merged ? LATER : null,
+    revision: 1,
+    ...overrides,
+  };
+}
+
 /** The premerge key at a head (no seat index, KS7a-2). */
 function premergeKey(head12: string = HEAD12): string {
   const built = laneRunPremergeKey(RUN_ID, 0, head12);
@@ -236,14 +279,22 @@ interface Harness {
   readonly runRepo: LaneRunRepositoryAdapter;
   readonly runJournal: LaneRunJournalAdapter;
   readonly attemptRepo: AttemptRepositoryAdapter;
-  readonly autoMergeRequests: readonly AutoMergeAttemptRequest[];
+  /** KS7b: every `enqueue` request the fake queue saw, in order. */
+  readonly enqueueRequests: readonly MergeQueueEnqueueCommand[];
+  /** KS7b: every `list` query the fake queue saw, in order. */
+  readonly queueQueries: readonly MergeQueueListQuery[];
+  /** KS7b: the fake queue's entries; tests change their state in place. */
+  readonly queue: MergeQueueEntryRecord[];
   readonly recordParkAttentionCalls: readonly LaneRunParkRequest[];
   readonly askParkQuestionCalls: readonly LaneRunParkRequest[];
   readonly forgeReadRequests: readonly ReadPullRequestRequest[];
   readonly ancestryRequests: readonly ContainsCommitRequest[];
   readonly portCalls: readonly string[];
   readonly deps: AdvanceLaneRunDependencies;
-  setAutoMergeAnswer(answer: AutoMergeAttemptResult | 'throw'): void;
+  /** Fix the enqueue answer (undefined restores the faithful fake). */
+  setEnqueueAnswer(answer: MergeEnqueueDecision | 'throw' | undefined): void;
+  /** Fix the list answer (undefined restores the faithful fake). */
+  setListAnswer(answer: readonly MergeQueueEntryRecord[] | 'throw' | undefined | { readonly notAList: true }): void;
   setAttentionAnswer(answer: LaneRunParkNoticeResult | 'throw'): void;
   setQuestionAnswer(answer: LaneRunParkNoticeResult | 'throw'): void;
   setForgeReadAnswer(answer: ReadPullRequestResult | 'throw'): void;
@@ -265,7 +316,8 @@ interface Harness {
 }
 
 interface HarnessOptions {
-  readonly wireAutoMerge?: boolean;
+  /** Wire the KS7b merge queue (enqueue, list and the forge repository). */
+  readonly wireQueue?: boolean;
   readonly wireParkNotice?: boolean;
   readonly wireForgeRead?: boolean;
   readonly wireForgeAncestry?: boolean;
@@ -336,19 +388,17 @@ async function makeHarness(
   const runJournal = new LaneRunJournalAdapter();
   const attemptRepo = new AttemptRepositoryAdapter();
   const executionJournal = new ExecutionJournalAdapter();
-  const autoMergeRequests: AutoMergeAttemptRequest[] = [];
+  const enqueueRequests: MergeQueueEnqueueCommand[] = [];
+  const queueQueries: MergeQueueListQuery[] = [];
+  const queue: MergeQueueEntryRecord[] = [];
+  let enqueueAnswer: MergeEnqueueDecision | 'throw' | undefined;
+  let listAnswer: readonly MergeQueueEntryRecord[] | 'throw' | undefined | { readonly notAList: true };
   const recordParkAttentionCalls: LaneRunParkRequest[] = [];
   const askParkQuestionCalls: LaneRunParkRequest[] = [];
   const forgeReadRequests: ReadPullRequestRequest[] = [];
   const ancestryRequests: ContainsCommitRequest[] = [];
   const portCalls: string[] = [];
   const workOrders = new Map<string, WorkOrderRecord>([[WORK_ORDER_ID, makeWorkOrder()]]);
-  let autoMergeAnswer: AutoMergeAttemptResult | 'throw' = {
-    outcome: 'merged',
-    attemptId: 'attempt-example-1',
-    headSha: COMMIT,
-    decisionRevision: AUTO_MERGE_DECISION,
-  };
   const autoMergeEnabled = options.autoMergeEnabled ?? true;
   let attentionAnswer: LaneRunParkNoticeResult | 'throw' | undefined;
   let questionAnswer: LaneRunParkNoticeResult | 'throw' | undefined;
@@ -481,17 +531,43 @@ async function makeHarness(
     },
     newUlid: makeUlidMinter(),
     autoMergeEnabled,
-    ...(options.wireAutoMerge === false
+    ...(options.wireQueue === false
       ? {}
       : {
-          autoMergeAttempt: {
-            autoMergeAttempt: async (request) => {
-              autoMergeRequests.push(request);
-              portCalls.push('auto-merge');
-              if (autoMergeAnswer === 'throw') {
-                throw new Error('merge unavailable');
+          forgeRepository: REPOSITORY,
+          enqueueMerge: {
+            enqueue: async (request: MergeQueueEnqueueCommand): Promise<MergeEnqueueDecision> => {
+              enqueueRequests.push(request);
+              portCalls.push('enqueue');
+              if (enqueueAnswer === 'throw') {
+                throw new Error('queue unavailable at /home/secret/path');
               }
-              return autoMergeAnswer;
+              if (enqueueAnswer !== undefined) {
+                return enqueueAnswer;
+              }
+              const duplicate = queue.find(
+                (entry) => entry.pullRequest === request.pullRequest && entry.headOid === request.headOid &&
+                  entry.state !== 'merged' && entry.state !== 'dropped' && entry.state !== 'superseded',
+              );
+              if (duplicate !== undefined) {
+                return { outcome: 'duplicate', entries: [...queue], record: duplicate };
+              }
+              const record = queueEntry({ entryId: request.entryId, headOid: request.headOid, runId: request.runId });
+              queue.push(record);
+              return { outcome: 'created', entries: [...queue], record };
+            },
+          },
+          mergeQueue: {
+            listMergeEntries: async (query: MergeQueueListQuery): Promise<readonly MergeQueueEntryRecord[]> => {
+              queueQueries.push(query);
+              portCalls.push('queue-list');
+              if (listAnswer === 'throw') {
+                throw new Error('queue unreadable at /home/secret/path');
+              }
+              if (listAnswer !== undefined) {
+                return listAnswer as readonly MergeQueueEntryRecord[];
+              }
+              return [...queue];
             },
           },
         }),
@@ -579,15 +655,20 @@ async function makeHarness(
     runRepo,
     runJournal,
     attemptRepo,
-    autoMergeRequests,
+    enqueueRequests,
+    queueQueries,
+    queue,
     recordParkAttentionCalls,
     askParkQuestionCalls,
     forgeReadRequests,
     ancestryRequests,
     portCalls,
     deps,
-    setAutoMergeAnswer: (answer) => {
-      autoMergeAnswer = answer;
+    setEnqueueAnswer: (answer) => {
+      enqueueAnswer = answer;
+    },
+    setListAnswer: (answer) => {
+      listAnswer = answer;
     },
     setAttentionAnswer: (answer) => {
       attentionAnswer = answer;
@@ -666,11 +747,11 @@ async function appendResult(
 }
 
 /** A collected attempt in `merging`, accepted at the collected head, PR open at the head. */
-async function mergingHarness(options: HarnessOptions = {}, record: LaneRunRecord = runRecord()): Promise<Harness> {
+async function mergingHarness(options: HarnessOptions = {}, record: LaneRunRecord = runRecord({ prNumber: 7 })): Promise<Harness> {
   const harness = await makeHarness(record, [collectedAttempt()], {
     wireForgeRead: true,
     wireWorkOrder: true,
-    wireAutoMerge: true,
+    wireQueue: true,
     ...options,
   });
   await conduct(harness, 'merging', NOW);
@@ -683,118 +764,10 @@ async function mergingHarness(options: HarnessOptions = {}, record: LaneRunRecor
 }
 
 describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
-  it('test 1: a merge at the head journals merged, the next advance enters merged and the one after is done', async () => {
-    const harness = await mergingHarness();
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'completed',
-      reasonCode: 'merged',
-    });
-    expect(harness.autoMergeRequests).toEqual([{ attemptId: 'attempt-example-1' }]);
-    const entries = await harness.runJournal.listForRun(RUN_ID);
-    expect(entries.some((entry) => entry.kind === 'result' && entry.key === mergeKey() && entry.outcome === 'completed' && entry.reasonCode === 'merged')).toBe(true);
-    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
-    expect(await advance(harness)).toEqual({ outcome: 'done' });
-  });
-
-  it('passes the recorded branch to the merge port (KF-5b)', async () => {
-    const harness = await mergingHarness({}, runRecord({ branchName: 'fleet/' + RUN_ID }));
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'completed',
-      reasonCode: 'merged',
-    });
-    expect(harness.autoMergeRequests).toEqual([
-      { attemptId: 'attempt-example-1', branchName: 'fleet/' + RUN_ID },
-    ]);
-  });
-
-  it('test 2: waiting refuses merge-waiting; after the head moves and acceptance re-establishes, the next merge acts at the new head', async () => {
-    const harness = await mergingHarness({}, runRecord({ branchName: 'fleet/' + RUN_ID }));
-    harness.setAutoMergeAnswer({ outcome: 'waiting', reason: 'ci-pending-first-look', headSha: COMMIT, firstLookAtIso: NOW });
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'refused',
-      reasonCode: 'merge-waiting',
-    });
-    expect(harness.autoMergeRequests).toHaveLength(1);
-    // `waiting` is refused: a one-way key cannot wait. The PR read still shows open,
-    // so the next merge needs a fresh head. The branch moves, acceptance is
-    // re-established at the new head, and the PR read still shows open there.
-    await harness.updateAttempt(collectedAttempt({
-      revision: 1,
-      artifacts: { ...COLLECTED_ARTIFACTS, headCommit: MOVED_COMMIT },
-    }));
-    await appendIntent(harness, stepKey({ round: 0, step: 'accept', seatIndex: 0, attemptOrdinal: null, head12: MOVED_HEAD12 }), null, LATER);
-    await appendResult(harness, stepKey({ round: 0, step: 'accept', seatIndex: 0, attemptOrdinal: null, head12: MOVED_HEAD12 }), 'completed', 'accepted', LATER);
-    harness.setForgeReadAnswer({
-      outcome: 'found',
-      pullRequest: {
-        number: 7,
-        state: 'open',
-        mergeState: 'clean',
-        headSha: MOVED_COMMIT,
-        headRef: 'wt-example-1',
-        baseRef: 'main',
-        mergedAtIso: null,
-        closedAtIso: null,
-        mergeCommitSha: null,
-      },
-    });
-    harness.setAutoMergeAnswer({
-      outcome: 'merged',
-      attemptId: 'attempt-example-1',
-      headSha: MOVED_COMMIT,
-      decisionRevision: AUTO_MERGE_DECISION,
-    });
-    // KS7a-2: a new head has no `premerge` status yet, so the merging hold posts
-    // it first; only then is the merge tail reached.
-    const movedPremergeKey = premergeKey(MOVED_HEAD12);
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'premerge',
-      key: movedPremergeKey,
-      result: 'completed',
-      reasonCode: 'premerge-success',
-    });
-    expect(harness.autoMergeRequests).toHaveLength(1);
-    const movedKey = stepKey({ round: 0, step: 'merge', seatIndex: 0, attemptOrdinal: null, head12: MOVED_HEAD12 });
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: movedKey,
-      result: 'completed',
-      reasonCode: 'merged',
-    });
-    expect(harness.autoMergeRequests).toHaveLength(2);
-    harness.setForgeReadAnswer({
-      outcome: 'found',
-      pullRequest: {
-        number: 7,
-        state: 'merged',
-        mergeState: 'clean',
-        headSha: MOVED_COMMIT,
-        headRef: 'wt-example-1',
-        baseRef: 'main',
-        mergedAtIso: LATER,
-        closedAtIso: null,
-        mergeCommitSha: MOVED_COMMIT,
-      },
-    });
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
-  });
-
-  it('test 3: a port off with autoMergeEnabled false parks owner-merge before any merge call and raises attention and a keyed question', async () => {
+  it('test 3: a port off with autoMergeEnabled false parks owner-merge before any enqueue and raises attention and a keyed question', async () => {
     const harness = await mergingHarness({ autoMergeEnabled: false, wireParkNotice: true });
     expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'owner-merge', qualifier: null });
-    expect(harness.autoMergeRequests).toEqual([]);
+    expect(harness.enqueueRequests).toEqual([]);
     expect(harness.recordParkAttentionCalls).toHaveLength(1);
     expect(harness.recordParkAttentionCalls[0]).toMatchObject({
       key: RUN_ID + '/park@1',
@@ -819,7 +792,7 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
     const harness = await makeHarness(parkedRecord, [collectedAttempt()], {
       wireForgeRead: true,
       wireWorkOrder: true,
-      wireAutoMerge: false,
+      wireQueue: false,
     });
     await conduct(harness, 'merging', NOW);
     await appendIntent(harness, acceptKey(), null, NOW);
@@ -842,7 +815,7 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
     const harness = await makeHarness(parkedRecord, [collectedAttempt()], {
       wireForgeRead: true,
       wireWorkOrder: true,
-      wireAutoMerge: false,
+      wireQueue: false,
     });
     await conduct(harness, 'merging', NOW);
     await appendIntent(harness, acceptKey(), null, NOW);
@@ -876,34 +849,7 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
     // decider acts merge instead (covered by test 1).
   });
 
-  it('test 5: a PR mergeState behind parks branch-behind with attention only and no question', async () => {
-    const harness = await mergingHarness({ wireParkNotice: true });
-    harness.setForgeReadAnswer(openPullRequestAtHead(7, 'behind'));
-    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'branch-behind', qualifier: null });
-    expect(harness.recordParkAttentionCalls).toHaveLength(1);
-    expect(harness.askParkQuestionCalls).toHaveLength(0);
-    const record = await harness.runRepo.get(RUN_ID);
-    expect(record?.parked?.questionId).toBeNull();
-  });
-
-  it('test 6: another run of the same repository in merging waits merge-train; a run of another repository does not', async () => {
-    const sameRepo = await mergingHarness({ wireParkNotice: true });
-    await sameRepo.addOtherRun({ runId: OTHER_RUN_ID, workOrderId: OTHER_WO_ID, repository: 'repo-example', state: 'merging' });
-    expect(await advance(sameRepo)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
-    expect(sameRepo.autoMergeRequests).toEqual([]);
-
-    const otherRepo = await mergingHarness();
-    await otherRepo.addOtherRun({ runId: OTHER_RUN_ID, workOrderId: OTHER_WO_ID, repository: 'other-repo', state: 'merging' });
-    expect(await advance(otherRepo)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'completed',
-      reasonCode: 'merged',
-    });
-  });
-
-  it('test 7: a crash after the merge intent reconciles by PR state; the merge port is never called twice', async () => {
+  it('test 7: a crash after a pre-KS7b merge intent reconciles by PR state; the queue is never asked', async () => {
     const merged = await mergingHarness();
     await appendIntent(merged, mergeKey(), null, NOW);
     merged.setForgeReadAnswer(mergedPullRequestAtHead(7));
@@ -914,7 +860,7 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
       result: 'completed',
       reasonCode: 'merged',
     });
-    expect(merged.autoMergeRequests).toHaveLength(0);
+    expect(merged.enqueueRequests).toHaveLength(0);
 
     const open = await mergingHarness();
     await appendIntent(open, mergeKey(), null, NOW);
@@ -926,55 +872,11 @@ describe('AdvanceLaneRunUseCase merge act and merge facts (K6-7)', () => {
       result: 'refused',
       reasonCode: 'merge-not-merged',
     });
-    expect(open.autoMergeRequests).toHaveLength(0);
+    expect(open.enqueueRequests).toHaveLength(0);
     // The refused merge is the state's step: the next advance parks step-refused merge.
     expect(await advance(open)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge' });
   });
 
-  it('test 8: not-merged journals merge-not-merged and off journals merge-off; detail text is never journalled', async () => {
-    const notMerged = await mergingHarness();
-    notMerged.setAutoMergeAnswer({
-      outcome: 'not-merged',
-      reason: 'forge-refused',
-      route: 'owner-question',
-      routeOutcome: 'refused',
-      detail: FORGE_DETAIL,
-    });
-    expect(await advance(notMerged)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'refused',
-      reasonCode: 'merge-not-merged',
-    });
-    const entries = await notMerged.runJournal.listForRun(RUN_ID);
-    expect(JSON.stringify(entries)).not.toContain(FORGE_DETAIL);
-
-    const off = await mergingHarness();
-    off.setAutoMergeAnswer({ outcome: 'off' });
-    expect(await advance(off)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'refused',
-      reasonCode: 'merge-off',
-    });
-  });
-
-  it('test 9: an absent autoMergeAttempt wiring is not-wired; a throw is forge-ambiguous', async () => {
-    const unwired = await mergingHarness({ wireAutoMerge: false });
-    expect(await advance(unwired)).toEqual({ outcome: 'not-wired', step: 'merge' });
-
-    const thrown = await mergingHarness();
-    thrown.setAutoMergeAnswer('throw');
-    expect(await advance(thrown)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'ambiguous',
-      reasonCode: 'forge-ambiguous',
-    });
-  });
 });
 
 describe('AdvanceLaneRunUseCase park notices (K6-7)', () => {
@@ -1004,41 +906,340 @@ describe('AdvanceLaneRunUseCase park notices (K6-7)', () => {
     expect(harness.askParkQuestionCalls).toEqual([]);
     expect((await harness.runRepo.get(RUN_ID))?.parked?.reason).toBe('owner-merge');
   });
+});
 
-  it('test 13: merge waiting refuses merge-waiting; the next advance parks step-refused merge without a second merge call', async () => {
-    const harness = await mergingHarness();
-    harness.setAutoMergeAnswer({ outcome: 'waiting', reason: 'ci-pending-first-look', headSha: COMMIT, firstLookAtIso: NOW });
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'refused',
-      reasonCode: 'merge-waiting',
+/** A `merging` run on PR 7 whose queue is wired (KS7b); the premerge hold is already released. */
+async function queueHarness(options: HarnessOptions = {}, record: LaneRunRecord = runRecord({ prNumber: 7 })): Promise<Harness> {
+  return mergingHarness(options, record);
+}
+
+async function journalOf(harness: Harness) {
+  return harness.runJournal.listForRun(RUN_ID);
+}
+
+async function resultsOf(harness: Harness, key: string) {
+  return (await journalOf(harness)).filter((entry) => entry.kind === 'result' && entry.key === key);
+}
+
+describe('AdvanceLaneRunUseCase merge-enqueue (KS7b)', () => {
+  it('enqueues the PR head once under a keyed intent whose minted id is the queue entry, then waits', async () => {
+    const harness = await queueHarness();
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    expect(harness.enqueueRequests).toHaveLength(1);
+    const request = harness.enqueueRequests[0]!;
+    expect(request).toMatchObject({
+      repository: REPOSITORY,
+      pullRequest: 7,
+      headOid: COMMIT,
+      tier: 2,
+      enqueuedBy: 'conductor',
+      runId: RUN_ID,
+      enqueuedAtIso: LATER,
     });
-    expect(harness.autoMergeRequests).toHaveLength(1);
-    // The merge key is spent: the next advance parks for the owner, never a second merge call.
-    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge' });
-    expect(harness.autoMergeRequests).toHaveLength(1);
+    const entries = await journalOf(harness);
+    const intents = entries.filter((entry) => entry.kind === 'intent' && entry.key === enqueueKey());
+    expect(intents).toHaveLength(1);
+    expect(intents[0]!.mintedId).toBe(request.entryId);
+    // A queued entry appends no result: the intent stays open and the queue holds the entry.
+    expect(await resultsOf(harness, enqueueKey())).toEqual([]);
+    expect(harness.queue).toHaveLength(1);
+    expect(harness.queue[0]!.entryId).toBe(request.entryId);
   });
 
-  it('test 14: a spent merge key parks step-refused merge without a new intent or a second merge call', async () => {
-    // A completed (non-refused) final result: the decider would re-act the same key; the guard parks.
-    const completed = await mergingHarness();
-    await appendIntent(completed, mergeKey(), null, NOW);
-    await appendResult(completed, mergeKey(), 'completed', 'merge-waiting', NOW);
-    expect(await advance(completed)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge' });
-    expect(completed.autoMergeRequests).toHaveLength(0);
-    const completedEntries = await completed.runJournal.listForRun(RUN_ID);
-    expect(completedEntries.filter((entry) => entry.kind === 'intent' && entry.key === mergeKey())).toHaveLength(1);
+  it('is idempotent: later advances read the queue and never enqueue or journal again while the entry is live', async () => {
+    const harness = await queueHarness();
+    await advance(harness);
+    const before = (await journalOf(harness)).length;
+    for (const state of ['queued', 'updating', 'awaiting-checks', 'ready', 'verifying', 'vetoing', 'merging'] as const) {
+      harness.queue[0] = { ...harness.queue[0]!, state };
+      expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    }
+    expect(harness.enqueueRequests).toHaveLength(1);
+    expect((await journalOf(harness)).length).toBe(before);
+  });
 
-    // A refused final result with the PR still open: same park, still no new intent or merge call.
-    const refused = await mergingHarness();
-    await appendIntent(refused, mergeKey(), null, NOW);
-    await appendResult(refused, mergeKey(), 'refused', 'merge-not-merged', NOW);
-    expect(await advance(refused)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge' });
-    expect(refused.autoMergeRequests).toHaveLength(0);
-    const refusedEntries = await refused.runJournal.listForRun(RUN_ID);
-    expect(refusedEntries.filter((entry) => entry.kind === 'intent' && entry.key === mergeKey())).toHaveLength(1);
+  it('a crash between the intent and the enqueue is recovered: the reconcile enqueues the same entry id', async () => {
+    const harness = await queueHarness();
+    await appendIntent(harness, enqueueKey(), 'MINTED00000000000000000001', NOW);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    expect(harness.enqueueRequests).toHaveLength(1);
+    expect(harness.enqueueRequests[0]!.entryId).toBe('MINTED00000000000000000001');
+    const intents = (await journalOf(harness)).filter((entry) => entry.kind === 'intent' && entry.key === enqueueKey());
+    expect(intents).toHaveLength(1);
+  });
+
+  it('a throwing enqueue leaves the intent open and the next advance asks again under the same entry id', async () => {
+    const harness = await queueHarness();
+    harness.setEnqueueAnswer('throw');
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    expect(await resultsOf(harness, enqueueKey())).toEqual([]);
+    harness.setEnqueueAnswer(undefined);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    expect(harness.enqueueRequests).toHaveLength(2);
+    expect(harness.enqueueRequests[1]!.entryId).toBe(harness.enqueueRequests[0]!.entryId);
+    // No secret or path from the thrown error reaches the journal.
+    expect(JSON.stringify(await journalOf(harness))).not.toContain('/home/secret');
+  });
+
+  it('a typed enqueue refusal journals a refused result with a closed token and parks step-refused merge-enqueue', async () => {
+    const harness = await queueHarness();
+    harness.setEnqueueAnswer({ outcome: 'refused', reason: 'invalid-head' });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted', step: 'merge-enqueue', key: enqueueKey(), result: 'refused', reasonCode: 'merge-enqueue-refused', detail: 'invalid-head',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge-enqueue' });
+    expect(harness.enqueueRequests).toHaveLength(1);
+  });
+
+  it('a refusal or answer of the wrong shape never throws and never echoes its text', async () => {
+    const wrongReason = await queueHarness();
+    wrongReason.setEnqueueAnswer({ outcome: 'refused', reason: '/home/secret/path' } as unknown as MergeEnqueueDecision);
+    const result = await advance(wrongReason);
+    expect(result).toMatchObject({ outcome: 'acted', reasonCode: 'merge-enqueue-refused', detail: 'unknown' });
+    expect(JSON.stringify(await journalOf(wrongReason))).not.toContain('/home/secret');
+
+    const junk = await queueHarness();
+    junk.setEnqueueAnswer(42 as unknown as MergeEnqueueDecision);
+    expect(await advance(junk)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    expect(await resultsOf(junk, enqueueKey())).toEqual([]);
+  });
+
+  it('a merged entry journals merged; the run enters merged only once the forge reads the PR merged', async () => {
+    const harness = await queueHarness();
+    await advance(harness);
+    harness.queue[0] = queueEntry({ entryId: harness.queue[0]!.entryId, state: 'merged' });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted', step: 'merge-enqueue', key: enqueueKey(), result: 'completed', reasonCode: 'merged', detail: null,
+    });
+    // The forge still reads the PR open: waiting, never merged on the queue's word alone.
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'facts-inconsistent' });
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(await advance(harness)).toEqual({ outcome: 'done' });
+  });
+
+  it('the forge reading the PR merged ends the run even while the enqueue intent is still open', async () => {
+    const harness = await queueHarness();
+    await advance(harness);
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+  });
+
+  it.each(['conflict', 'checks', 'macos'] as const)('a queue drop for %s with a round left maps to fixing', async (reason) => {
+    const harness = await queueHarness();
+    await advance(harness);
+    harness.queue[0] = queueEntry({ entryId: harness.queue[0]!.entryId, state: 'dropped', reason });
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted', step: 'merge-enqueue', key: enqueueKey(), result: 'completed', reasonCode: 'merge-dropped', detail: reason,
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'fixing' });
+  });
+
+  it('a queue drop with no round left parks blocker-after-round-2', async () => {
+    const harness = await queueHarness({}, runRecord({ prNumber: 7, round: 2, attemptIds: ['attempt-r0', 'attempt-r1', 'attempt-example-1'] }));
+    await advance(harness);
+    harness.queue[0] = queueEntry({ entryId: harness.queue[0]!.entryId, state: 'dropped', reason: 'checks' });
+    await advance(harness);
+    expect(await advance(harness)).toMatchObject({ outcome: 'parked', reason: 'blocker-after-round-2' });
+    expect(await resultsOf(harness, enqueueKey(HEAD12, 2))).toHaveLength(1);
+  });
+
+  it('a drop is deterministic: the same answer maps to the same state on every replay', async () => {
+    const outcomes: unknown[] = [];
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const harness = await queueHarness();
+      await advance(harness);
+      harness.queue[0] = queueEntry({ entryId: harness.queue[0]!.entryId, state: 'dropped', reason: 'conflict' });
+      outcomes.push([await advance(harness), await advance(harness)]);
+    }
+    expect(outcomes[0]).toEqual(outcomes[1]);
+  });
+
+  it.each(['forge-error-exhausted', 'operator-dropped', 'closed'] as const)('a queue drop for %s parks step-refused merge-enqueue', async (reason) => {
+    const harness = await queueHarness();
+    await advance(harness);
+    harness.queue[0] = queueEntry({ entryId: harness.queue[0]!.entryId, state: 'dropped', reason });
+    expect(await advance(harness)).toMatchObject({ reasonCode: 'merge-dropped', detail: reason });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge-enqueue' });
+  });
+
+  it('a drop with an unknown reason token journals the closed token unknown and parks, never merged', async () => {
+    const harness = await queueHarness();
+    await advance(harness);
+    harness.queue[0] = queueEntry({ entryId: harness.queue[0]!.entryId, state: 'dropped', reason: '/home/secret/key' });
+    expect(await advance(harness)).toMatchObject({ reasonCode: 'merge-dropped', detail: 'unknown' });
+    expect(JSON.stringify(await journalOf(harness))).not.toContain('/home/secret');
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge-enqueue' });
+  });
+
+  it('a queue entry parked for veto-hold maps to the owner-merge park', async () => {
+    const harness = await queueHarness({ wireParkNotice: true });
+    await advance(harness);
+    harness.queue[0] = queueEntry({ entryId: harness.queue[0]!.entryId, state: 'parked', reason: 'veto-hold' });
+    expect(await advance(harness)).toMatchObject({ reasonCode: 'merge-held', detail: 'veto-hold' });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'owner-merge', qualifier: null });
+  });
+
+  it('other queue parks wait for the queue; they never map to the run', async () => {
+    const harness = await queueHarness();
+    await advance(harness);
+    for (const reason of ['conflict', 'checks', 'threads', 'premerge', 'macos', 'forge-error', 'update-refused', 'owner-merge'] as const) {
+      harness.queue[0] = { ...harness.queue[0]!, state: 'parked', reason };
+      expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    }
+    expect(await resultsOf(harness, enqueueKey())).toEqual([]);
+  });
+
+  it('an unreadable, absent or wrongly shaped queue answer waits and never reaches merged', async () => {
+    const harness = await queueHarness();
+    await advance(harness);
+    harness.setListAnswer('throw');
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    harness.setListAnswer({ notAList: true });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    harness.setListAnswer([null, 7, { entryId: 5, state: 'merged' }, { repository: REPOSITORY, pullRequest: 7, entryId: harness.queue[0]!.entryId, state: 'nonsense', headOid: COMMIT, reason: null, supersedes: null }] as unknown as MergeQueueEntryRecord[]);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    expect(await resultsOf(harness, enqueueKey())).toEqual([]);
+    expect(harness.queue).toHaveLength(1);
+  });
+
+  it('an entry for another pull request or repository is ignored', async () => {
+    const harness = await queueHarness();
+    await advance(harness);
+    harness.setListAnswer([
+      queueEntry({ entryId: harness.queue[0]!.entryId, state: 'merged', pullRequest: 8 }),
+      queueEntry({ entryId: harness.queue[0]!.entryId, state: 'merged', repository: { owner: 'other-owner', repo: 'repo-example' } }),
+    ]);
+    // Neither is the run's: the reconcile asks the queue to enqueue again (the same id) and waits.
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    expect(await resultsOf(harness, enqueueKey())).toEqual([]);
+  });
+
+  it('a row that carries the minted id but another head or run is stale or foreign: it is never followed', async () => {
+    for (const foreign of [{ headOid: MOVED_COMMIT }, { runId: 'run-01JB0000000000000000000001' }, { runId: null }] as const) {
+      const harness = await queueHarness();
+      await advance(harness);
+      const own = harness.queue[0]!;
+      harness.queue[0] = queueEntry({ ...foreign, entryId: own.entryId, state: 'dropped', reason: 'checks' });
+      // Not the run's entry: the reconcile enqueues again under the same id and waits; no drop is journalled.
+      expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+      expect(await resultsOf(harness, enqueueKey())).toEqual([]);
+      expect(harness.enqueueRequests).toHaveLength(2);
+    }
+  });
+
+  it('follows a superseded entry to its successor and reads the successor state', async () => {
+    const harness = await queueHarness();
+    await advance(harness);
+    const first = harness.queue[0]!;
+    harness.queue[0] = queueEntry({ entryId: first.entryId, state: 'superseded' });
+    harness.queue.push(queueEntry({ entryId: '01JB00000000000000000000SU', supersedes: first.entryId, headOid: MOVED_COMMIT, state: 'dropped', reason: 'conflict' }));
+    expect(await advance(harness)).toMatchObject({ reasonCode: 'merge-dropped', detail: 'conflict' });
+    // A superseded entry whose successor is unknown is still the queue's: wait.
+    const waiting = await queueHarness();
+    await advance(waiting);
+    waiting.queue[0] = queueEntry({ entryId: waiting.queue[0]!.entryId, state: 'superseded' });
+    expect(await advance(waiting)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    expect(await resultsOf(waiting, enqueueKey())).toEqual([]);
+  });
+
+  it('a live duplicate that someone else enqueued at the head is followed; the run never creates a second entry', async () => {
+    const harness = await queueHarness();
+    harness.queue.push(queueEntry({ entryId: '01JB00000000000000000000DU' }));
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    expect(harness.queue).toHaveLength(1);
+    // The foreign duplicate is the queue's while it is live: no second enqueue and no result.
+    expect(harness.enqueueRequests).toHaveLength(1);
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    expect(harness.enqueueRequests).toHaveLength(1);
+    // Once the foreign entry is gone the hand-off is the run's again: one enqueue under its own id.
+    harness.queue[0] = { ...harness.queue[0]!, state: 'dropped', reason: 'checks' };
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    expect(harness.enqueueRequests).toHaveLength(2);
+    expect(harness.queue).toHaveLength(2);
+    expect(harness.queue[1]!.entryId).toBe(harness.enqueueRequests[1]!.entryId);
+  });
+
+  it('a moved head overtakes the open hand-off; the new head is a new key', async () => {
+    const harness = await queueHarness();
+    await advance(harness);
+    await harness.updateAttempt(collectedAttempt({
+      revision: 1,
+      artifacts: { ...COLLECTED_ARTIFACTS, headCommit: MOVED_COMMIT },
+    }));
+    await appendIntent(harness, stepKey({ round: 0, step: 'accept', seatIndex: 0, attemptOrdinal: null, head12: MOVED_HEAD12 }), null, LATER);
+    await appendResult(harness, stepKey({ round: 0, step: 'accept', seatIndex: 0, attemptOrdinal: null, head12: MOVED_HEAD12 }), 'completed', 'accepted', LATER);
+    harness.setForgeReadAnswer({
+      outcome: 'found',
+      pullRequest: { ...(openPullRequestAtHead(7) as { pullRequest: object }).pullRequest, headSha: MOVED_COMMIT } as never,
+    });
+    expect(await advance(harness)).toMatchObject({ step: 'merge-enqueue', result: 'overtaken', reasonCode: 'merge-overtaken' });
+  });
+
+  it('without the queue wiring the step is not-wired and nothing is journalled', async () => {
+    const harness = await queueHarness({ wireQueue: false });
+    expect(await advance(harness)).toEqual({ outcome: 'not-wired', step: 'merge-enqueue' });
+    expect((await journalOf(harness)).filter((entry) => entry.key === enqueueKey())).toEqual([]);
+  });
+
+  it('a run without a recorded PR number waits instead of enqueueing a guess', async () => {
+    const harness = await queueHarness({}, runRecord({ prNumber: null }));
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'facts-inconsistent' });
+    expect(harness.enqueueRequests).toEqual([]);
+  });
+
+  it('under a halt nothing is enqueued and a pending hand-off parks halted', async () => {
+    const harness = await queueHarness();
+    await advance(harness);
+    expect(await advance(harness, { halted: true })).toMatchObject({ outcome: 'parked', reason: 'halted' });
+    expect(harness.enqueueRequests).toHaveLength(1);
+  });
+
+  it('over the real queue adapter a terminal entry stays readable: an operator drop reaches the run, a live entry is never re-enqueued', async () => {
+    const harness = await queueHarness();
+    const queue = new MergeQueueRepositoryAdapter();
+    // The real adapter checks deadlines against the wall clock; the harness's clock is fixed in 2026-10, so
+    // the wrappers move only the deadline to the wall clock and pass everything else through.
+    const future = () => new Date(Date.now() + 60_000).toISOString();
+    const real = new EnqueueMergeUseCase({ queue });
+    const deps: AdvanceLaneRunDependencies = {
+      ...harness.deps,
+      enqueueMerge: { enqueue: (request) => real.enqueue({ ...request, deadlineIso: future() }) },
+      mergeQueue: { listMergeEntries: (query) => queue.listMergeEntries({ ...query, deadlineIso: future() }) },
+    };
+    const run = () => new AdvanceLaneRunUseCase(deps).advanceLaneRun({
+      runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, halted: false, nowIso: LATER,
+    });
+    expect(await run()).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    const live = await queue.listMergeEntries({ deadlineIso: new Date(Date.now() + 60_000).toISOString() });
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ state: 'queued', pullRequest: 7, runId: RUN_ID, enqueuedBy: 'conductor' });
+    // Still live: read, not enqueued again.
+    expect(await run()).toEqual({ outcome: 'waiting', reason: 'merge-train' });
+    expect(await queue.listMergeEntries({ deadlineIso: new Date(Date.now() + 60_000).toISOString() })).toHaveLength(1);
+    const dropped = await queue.dropMergeEntry({ entryId: live[0]!.entryId, deadlineIso: new Date(Date.now() + 60_000).toISOString() });
+    expect(dropped.outcome).toBe('dropped');
+    expect(await run()).toMatchObject({ outcome: 'acted', reasonCode: 'merge-dropped', detail: 'operator-dropped' });
+    expect(await run()).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge-enqueue' });
+    expect(await queue.listMergeEntries({ deadlineIso: new Date(Date.now() + 60_000).toISOString() })).toHaveLength(1);
+  });
+
+  it('a journal written before KS7b still replays: the old one-way merge key parses and its intent reconciles', async () => {
+    // A recorded pre-KS7b merging journal: accept, premerge and an open `merge` intent.
+    const harness = await queueHarness();
+    await appendIntent(harness, mergeKey(), null, NOW);
+    harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
+    expect(await advance(harness)).toEqual({
+      outcome: 'acted', step: 'merge', key: mergeKey(), result: 'completed', reasonCode: 'merged',
+    });
+    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
+    expect(harness.enqueueRequests).toEqual([]);
+    const open = await queueHarness();
+    await appendIntent(open, mergeKey(), null, NOW);
+    expect(await advance(open)).toEqual({
+      outcome: 'acted', step: 'merge', key: mergeKey(), result: 'refused', reasonCode: 'merge-not-merged',
+    });
+    expect(open.enqueueRequests).toEqual([]);
   });
 });
 
@@ -1058,7 +1259,7 @@ async function ownerMergeParkedHarness(options: HarnessOptions = {}): Promise<Ha
   const harness = await makeHarness(parkedRecord, [collectedAttempt({ baseCommit: 'd'.repeat(40) })], {
     wireForgeRead: true,
     wireWorkOrder: true,
-    wireAutoMerge: false,
+    wireQueue: false,
     ...options,
   });
   await conduct(harness, 'merging', NOW);
@@ -1228,9 +1429,10 @@ describe('AdvanceLaneRunUseCase park notice re-raise (KF-4)', () => {
   });
 
   it('test 16: an attention-only reason re-raises idempotently and never asks a question', async () => {
-    const harness = await mergingHarness({ wireParkNotice: true });
-    harness.setForgeReadAnswer(openPullRequestAtHead(7, 'behind'));
-    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'branch-behind', qualifier: null });
+    const harness = await mergingHarness({ wireParkNotice: true }, runRecord({ prNumber: 7 }));
+    harness.setEnqueueAnswer({ outcome: 'refused', reason: 'invalid-head' });
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', reasonCode: 'merge-enqueue-refused' });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'step-refused', qualifier: 'merge-enqueue' });
     expect(harness.recordParkAttentionCalls).toHaveLength(1);
     expect(harness.askParkQuestionCalls).toHaveLength(0);
     expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'parked' });
@@ -1238,10 +1440,6 @@ describe('AdvanceLaneRunUseCase park notice re-raise (KF-4)', () => {
     expect(harness.recordParkAttentionCalls).toHaveLength(2);
     expect(harness.recordParkAttentionCalls[1].key).toBe(RUN_ID + '/park@1');
     expect(harness.askParkQuestionCalls).toHaveLength(0);
-    // R4a: a parked `branch-behind` park now also reads its PR by branch while
-    // parked (the facts read for the decider); it still never asks a question.
-    expect(harness.forgeReadRequests).toHaveLength(2);
-    expect(harness.forgeReadRequests[1]?.ref.kind).toBe('branch');
   });
 
   it('test 17: no parkNotice wired means no raise and the parked wait is unchanged', async () => {
@@ -1300,13 +1498,7 @@ describe('AdvanceLaneRunUseCase work-order release at the run end (KF-36a)', () 
 
   it('entering merged saves the work order merged at revision + 1 and frees its paths for a new registration', async () => {
     const harness = await mergingHarness({ wireWorkOrderRelease: true });
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'completed',
-      reasonCode: 'merged',
-    });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
     harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
     expect(harness.savedWorkOrders).toHaveLength(1);
@@ -1331,13 +1523,7 @@ describe('AdvanceLaneRunUseCase work-order release at the run end (KF-36a)', () 
 
   it('with workOrderRelease absent the work order is left as it is', async () => {
     const harness = await mergingHarness();
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'completed',
-      reasonCode: 'merged',
-    });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
     harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
     expect(harness.savedWorkOrders).toHaveLength(0);
@@ -1347,13 +1533,7 @@ describe('AdvanceLaneRunUseCase work-order release at the run end (KF-36a)', () 
   it('a stale save whose re-read shows merged makes no second save and the run still enters merged', async () => {
     const harness = await mergingHarness({ wireWorkOrderRelease: true });
     harness.setWorkOrderReleaseRace('steal-merged');
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'completed',
-      reasonCode: 'merged',
-    });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
     harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
     // The other writer's merged save stands; the release never saved a second revision.
@@ -1364,13 +1544,7 @@ describe('AdvanceLaneRunUseCase work-order release at the run end (KF-36a)', () 
   it('a throwing work-order read never blocks the run and leaves the work order unchanged', async () => {
     const harness = await mergingHarness({ wireWorkOrderRelease: true });
     harness.setWorkOrderReleaseRace('throw-find');
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'completed',
-      reasonCode: 'merged',
-    });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
     harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
     expect(harness.savedWorkOrders).toHaveLength(0);
@@ -1383,13 +1557,7 @@ describe('AdvanceLaneRunUseCase work-order release at the run end (KF-36a)', () 
     expect(other.outcome).toBe('saved');
     const otherConduct = laneRunConductEntry(harness.deps.newUlid(), OTHER_RUN_ID, 'gating', NOW);
     expect((await harness.runJournal.append(otherConduct)).outcome).toBe('appended');
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'completed',
-      reasonCode: 'merged',
-    });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
     harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
     expect(harness.savedWorkOrders).toHaveLength(0);
@@ -1399,13 +1567,7 @@ describe('AdvanceLaneRunUseCase work-order release at the run end (KF-36a)', () 
   it('a terminal sibling run on the same work order never blocks the release (KF-36a-1 Fable minor 1)', async () => {
     const harness = await mergingHarness({ wireWorkOrderRelease: true });
     await harness.addOtherRun({ runId: OTHER_RUN_ID, workOrderId: WORK_ORDER_ID, repository: 'repo-example', state: 'stopped' });
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'completed',
-      reasonCode: 'merged',
-    });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
     harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
     expect(harness.savedWorkOrders).toHaveLength(1);
@@ -1420,13 +1582,7 @@ describe('AdvanceLaneRunUseCase work-order release at the run end (KF-36a)', () 
   it('a race that bumps the stored revision but keeps it approved retries into the merged save (KF-36a-1 Fable minor 3)', async () => {
     const harness = await mergingHarness({ wireWorkOrderRelease: true });
     harness.setWorkOrderReleaseRace('bump-approved');
-    expect(await advance(harness)).toEqual({
-      outcome: 'acted',
-      step: 'merge',
-      key: mergeKey(),
-      result: 'completed',
-      reasonCode: 'merged',
-    });
+    expect(await advance(harness)).toEqual({ outcome: 'waiting', reason: 'merge-train' });
     harness.setForgeReadAnswer(mergedPullRequestAtHead(7));
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'merged' });
     expect(harness.savedWorkOrders).toHaveLength(1);
@@ -1451,7 +1607,7 @@ describe('AdvanceLaneRunUseCase merged-PR leaves branch-behind and ambiguous ope
       const harness = await makeHarness(parkedRecord, [collectedAttempt()], {
         wireForgeRead: true,
         wireWorkOrder: true,
-        wireAutoMerge: false,
+        wireQueue: false,
         ...options,
       });
       await conduct(harness, 'merging', NOW);

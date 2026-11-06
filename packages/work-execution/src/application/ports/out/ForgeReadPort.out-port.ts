@@ -78,7 +78,56 @@ export type ListOpenPullRequestsByBaseResult =
   | { readonly outcome: 'listed'; readonly pullRequests: readonly OpenPullRequestSummary[] }
   | { readonly outcome: 'unavailable'; readonly reason: string };
 
+// --- CO20: read-only merged-PR CI cost --------------------------------------
+
+export interface ReadPullRequestCiCostRequest {
+  readonly pullRequestNumber: number;
+  readonly repository?: ForgeRepositoryRef;
+  /** Optional per-read timeout cap (ms), as for `ReadPullRequestRequest`. */
+  readonly timeoutMs?: number;
+}
+
+/** One workflow's share of a merged pull request's CI cost. */
+export interface WorkflowCiCost {
+  readonly workflowName: string;
+  readonly checkRuns: number;
+  readonly billedMinutes: number;
+}
+
+/** The whole CI cost of one merged pull request. */
+export interface PullRequestCiCost {
+  readonly pullRequestNumber: number;
+  readonly headSha: string;
+  readonly totalCheckRuns: number;
+  readonly totalBilledMinutes: number;
+  readonly workflows: readonly WorkflowCiCost[];
+}
+
+/** Fixed reason codes only: never a path, a stderr line or an error message. */
+export type PullRequestCiCostUnavailableReason =
+  | 'forge-not-configured'
+  | 'invalid-request'
+  | 'invalid-repository'
+  | 'pull-request-not-merged'
+  | 'different-pull-request'
+  | 'ci-cost-timed-out'
+  | 'ci-cost-failed'
+  | 'ci-cost-too-large'
+  | 'partial-ci-cost'
+  | 'unreadable-ci-cost';
+
+export type ReadPullRequestCiCostResult =
+  | { readonly outcome: 'found'; readonly cost: PullRequestCiCost }
+  | { readonly outcome: 'not-found' }
+  | { readonly outcome: 'unavailable'; readonly reason: PullRequestCiCostUnavailableReason };
+
 export interface ForgeReadPort {
+  /**
+   * Read one merged pull request's CI cost (check runs and billed minutes per
+   * workflow), fully paginated; mutates nothing. An unreadable or partial
+   * answer is unavailable, never an empty list or zero.
+   */
+  readPullRequestCiCost?(request: ReadPullRequestCiCostRequest): Promise<ReadPullRequestCiCostResult>;
   /** Read one pull request's state; mutates nothing. */
   readPullRequest(request: ReadPullRequestRequest): Promise<ReadPullRequestResult>;
   /**

@@ -34,14 +34,27 @@ import type {
   SeatRole,
 } from './types.js';
 import { hasUnknownKeys, isPlainRecord, readBoundedInteger, readOwnDataProperty } from './policy-read.js';
+import {
+  BOARD_KEYS,
+  CHAIN_KEYS,
+  CONDUCTOR_KEYS,
+  CONDUCTOR_REAPER_DISK_KEYS,
+  CONDUCTOR_REAPER_KEYS,
+  CONDUCTOR_REAPER_REPAIR_KINDS,
+  CONDUCTOR_REAPER_WORKTREE_KEYS,
+  MERGE_KEYS,
+  MERGE_REPO_KEYS,
+  MERGE_VETO_KEYS,
+  POLICY_DAEMON_KEYS,
+} from './keys.js';
+
+export { CONDUCTOR_REAPER_REPAIR_KINDS };
 
 /** Roles whose chain must not share a family with the implementer chain. */
 const REVIEWER_ROLES: readonly Exclude<SeatRole, 'implementer'>[] = [
   'reviewer',
   'high-risk-reviewer',
 ];
-
-const CHAIN_ROLES: readonly ChainRole[] = ['implementer', 'fix', 'reviewer', 'high-risk-reviewer'];
 
 /** The seat role a chain's seats must hold: the fix chain is an implementer chain. */
 function requiredSeatRole(chain: ChainRole): SeatRole {
@@ -156,7 +169,7 @@ export function validateSeatPolicy(
   }
 
   const chainSeatIds = new Map<ChainRole, string[]>();
-  for (const role of CHAIN_ROLES) {
+  for (const role of CHAIN_KEYS) {
     const ids: string[] = [];
     for (const step of seatSteps(chains, role)) {
       if (seatsById.has(step.seatId)) {
@@ -171,7 +184,7 @@ export function validateSeatPolicy(
   // the derived chains lost their free seats), the derived chains
   // otherwise. One iteration over one chain set keeps every reference
   // error singular.
-  for (const role of CHAIN_ROLES) {
+  for (const role of CHAIN_KEYS) {
     const steps = seatSteps(fileChains ?? chains, role);
     for (let index = 0; index < steps.length; index += 1) {
       const step = steps[index];
@@ -189,7 +202,7 @@ export function validateSeatPolicy(
   }
 
   // A free seat is never the only seat of a role.
-  for (const role of CHAIN_ROLES) {
+  for (const role of CHAIN_KEYS) {
     const ids = chainSeatIds.get(role) ?? [];
     if (ids.length === 1) {
       const seat = seatsById.get(ids[0]);
@@ -362,12 +375,6 @@ export function resolveAutoMergePolicy(policy: PolicySection | undefined): AutoM
   });
 }
 
-/** Repair kinds in canonical order; the first four are record-only (D14); `merged-worktree` and
- * `orphan-session` are destructive (D17). `orphan-session` stays last. */
-export const CONDUCTOR_REAPER_REPAIR_KINDS: readonly ConductorReaperRepairKind[] = Object.freeze([
-  'dead-attempt', 'leaked-slot', 'stale-stop', 'stale-attention', 'merged-worktree', 'orphan-session',
-]);
-
 /** The destructive repair kinds: an opt-in per installation, never a default (D14, D17). */
 export const CONDUCTOR_DESTRUCTIVE_REPAIR_KINDS: readonly ConductorReaperRepairKind[] = Object.freeze([
   'orphan-session', 'merged-worktree',
@@ -380,29 +387,6 @@ export const CONDUCTOR_MINUTE_BOUNDS = Object.freeze({
   graceMinutes: Object.freeze({ min: 4, max: 1440 }),
   staleStopMinutes: Object.freeze({ min: 5, max: 1440 }),
 });
-
-const CONDUCTOR_KEYS: readonly string[] = ['enabled', 'stopGraceMinutes', 'reaper'];
-
-const CONDUCTOR_REAPER_KEYS: readonly string[] = [
-  'enabled',
-  'intervalMinutes',
-  'graceMinutes',
-  'staleStopMinutes',
-  'repairs',
-  'worktrees',
-  'disk',
-];
-
-const CONDUCTOR_REAPER_WORKTREE_KEYS: readonly string[] = [
-  'retentionHours',
-  'maxRemovalsPerPass',
-  'passBudgetSeconds',
-];
-
-const CONDUCTOR_REAPER_DISK_KEYS: readonly string[] = [
-  'minFreePercent',
-  'clearFreePercent',
-];
 
 /** Inclusive integer bounds for `policy.conductor.reaper.worktrees` (KWp; the plan fixes none). */
 export const CONDUCTOR_REAPER_WORKTREE_BOUNDS: Readonly<
@@ -671,10 +655,6 @@ export const BOARD_BOUNDS: Readonly<
   forgeSyncMinutes: Object.freeze({ min: 1, max: 1440 }),
 });
 
-const BOARD_KEYS: readonly string[] = [
-  'forgeStaleMinutes', 'declarationTtlMinutes', 'doneWindowDays', 'forgeSyncMinutes',
-];
-
 /** The board policy for an installation without `policy.board` (WB6p):
  * the plan's defaults (D3, D6, §3.4; forgeSyncMinutes per WB7c). Deeply frozen. */
 export const DEFAULT_BOARD_POLICY: ResolvedBoardPolicy = Object.freeze({
@@ -767,21 +747,7 @@ export const DEFAULT_MERGE_REPOSITORY_SETTINGS = Object.freeze({
   veto: Object.freeze({ mode: 'off' as MergeVetoMode, holdConfidence: 0.8 as number }),
 });
 
-const MERGE_REPOSITORY_KEYS: readonly string[] = [
-  'projectId',
-  'shadow',
-  'unattended',
-  'requiredContexts',
-  'updateBranch',
-  'macosProcedure',
-  'maxAttempts',
-  'checksGraceMinutes',
-  'veto',
-];
-const MERGE_KEYS: readonly string[] = ['repos'];
-const MERGE_VETO_KEYS: readonly string[] = ['mode', 'holdConfidence'];
 const MERGE_VETO_MODES: ReadonlySet<string> = new Set(['off', 'shadow', 'live']);
-const MERGE_DAEMON_KEYS: readonly string[] = ['intervalSeconds', 'budgetSeconds', 'settleSeconds'];
 const MERGE_REPOSITORY_KEY_PATTERN = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/;
 
 /** The owner and repo of a `policy.merge.repos` key, or undefined when the key is not `<owner>/<repo>`. */
@@ -953,7 +919,7 @@ function readMergeRepository(
     return MERGE_SECRET;
   }
   const parts = parseMergeRepositoryKey(repositoryKey);
-  if (parts === undefined || !isPlainRecord(entry) || hasUnknownKeys(entry, MERGE_REPOSITORY_KEYS)) {
+  if (parts === undefined || !isPlainRecord(entry) || hasUnknownKeys(entry, MERGE_REPO_KEYS)) {
     return MERGE_INVALID;
   }
   const defaults = DEFAULT_MERGE_REPOSITORY_SETTINGS;
@@ -1069,7 +1035,7 @@ function readDaemonSection(
     return mergeOk(Object.freeze({ ...DEFAULT_MERGE_DAEMON_POLICY }));
   }
   const block = readOwnDataProperty(policy, 'daemon');
-  if (!isPlainRecord(block) || hasUnknownKeys(block, MERGE_DAEMON_KEYS)) {
+  if (!isPlainRecord(block) || hasUnknownKeys(block, POLICY_DAEMON_KEYS)) {
     return DAEMON_INVALID;
   }
   const defaults = DEFAULT_MERGE_DAEMON_POLICY;

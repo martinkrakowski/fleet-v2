@@ -458,61 +458,77 @@ async function readCompactStore<T>(
   if (inspection.status !== 'ok') {
     return { ok: false, message: `${basename} is unreadable: ${safeCompactReason(inspection.detail, stateDir)}` };
   }
+  const ids = (inspection.records as readonly { readonly id: string }[]).map((record) => record.id);
+  if (new Set(ids).size !== ids.length) {
+    return { ok: false, message: `${basename} has a duplicate record id` };
+  }
   return { ok: true, store: { basename, sha256: sha256Hex(bytes), records: inspection.records } };
 }
 
+async function lstatOrNull(target: string): Promise<Awaited<ReturnType<typeof fs.lstat>> | null> {
+  try {
+    return await fs.lstat(target);
+  } catch (error: unknown) {
+    if (errorCodeOf(error) === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/** Every segment of a store's path, parents included: a linked parent directory leads out of the state directory too. */
+async function linkedSegment(stateDir: string, relativePath: string): Promise<string | null> {
+  const segments = relativePath.split('/');
+  for (let depth = 1; depth <= segments.length; depth += 1) {
+    const prefix = segments.slice(0, depth).join('/');
+    const entry = await lstatOrNull(path.join(stateDir, prefix));
+    if (entry === null) {
+      return null;
+    }
+    if (entry.isSymbolicLink()) {
+      return prefix;
+    }
+  }
+  return null;
+}
+
+/** The three rewritten stores: a regular file within the size bound, and no directory squatting on the temp name. */
+async function compactStoreProblem(stateDir: string, basename: CompactBasename): Promise<string | null> {
+  const store = await lstatOrNull(path.join(stateDir, basename));
+  if (store !== null && !store.isFile()) {
+    return `${basename} is not a regular file`;
+  }
+  if (store !== null && store.size > MAX_COMPACT_STORE_BYTES) {
+    return `${basename} is too large to compact`;
+  }
+  const temp = await lstatOrNull(path.join(stateDir, `${basename}.compacted`));
+  return temp?.isDirectory() === true ? `${basename}.compacted is a directory` : null;
+}
+
 /**
- * Before any store is read: each of the three stores, its `.compacted` temp name and the quarantine
- * directory must be absent or a real file or directory of the right kind, and no store may exceed the
- * size bound. A link is never followed, so this runs before `state check` reads anything.
+ * Before any store is read: no store path (parents included) may be a link, the three rewritten stores,
+ * their `.compacted` temp names and the quarantine directory must be of the right kind, and no rewritten
+ * store may exceed the size bound. A link is never followed, so this runs before `state check` reads anything.
  */
 async function compactPreflight(stateDir: string): Promise<string | null> {
-  const lstatOrNull = async (target: string): Promise<Awaited<ReturnType<typeof fs.lstat>> | null> => {
-    try {
-      return await fs.lstat(target);
-    } catch (error: unknown) {
-      if (errorCodeOf(error) === 'ENOENT') {
-        return null;
-      }
-      throw error;
-    }
-  };
   try {
     for (const descriptor of STATE_FILE_DESCRIPTORS) {
-      // Every segment of the store's path, parents included: a linked parent directory leads out of the state directory too.
-      const segments = descriptor.basename.split('/');
-      for (let depth = 1; depth <= segments.length; depth += 1) {
-        const prefix = segments.slice(0, depth).join('/');
-        const other = await lstatOrNull(path.join(stateDir, prefix));
-        if (other?.isSymbolicLink() === true) {
-          return `${prefix} is a link`;
-        }
-        if (other === null) {
-          break;
-        }
+      const linked = await linkedSegment(stateDir, descriptor.basename);
+      if (linked !== null) {
+        return `${linked} is a link`;
       }
     }
     for (const basename of COMPACT_BASENAMES) {
-      const store = await lstatOrNull(path.join(stateDir, basename));
-      if (store !== null && !store.isFile()) {
-        return `${basename} is not a regular file`;
-      }
-      if (store !== null && store.size > MAX_COMPACT_STORE_BYTES) {
-        return `${basename} is too large to compact`;
-      }
-      const temp = await lstatOrNull(path.join(stateDir, `${basename}.compacted`));
-      if (temp !== null && temp.isDirectory()) {
-        return `${basename}.compacted is a directory`;
+      const problem = await compactStoreProblem(stateDir, basename);
+      if (problem !== null) {
+        return problem;
       }
     }
     const quarantine = await lstatOrNull(path.join(stateDir, 'quarantine'));
-    if (quarantine !== null && !quarantine.isDirectory()) {
-      return 'the quarantine directory is not a real directory';
-    }
+    return quarantine !== null && !quarantine.isDirectory() ? 'the quarantine directory is not a real directory' : null;
   } catch (error: unknown) {
     return `the state directory could not be inspected (${errorCodeOf(error)})`;
   }
-  return null;
 }
 
 interface CompactPlan {

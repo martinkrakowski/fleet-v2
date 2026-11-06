@@ -350,6 +350,21 @@ describe('fleet-v2 state compact', () => {
     expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
   });
 
+  it('refuses a store with a duplicate record id instead of dropping both records', async () => {
+    const dir = makeTempDir();
+    await seed(dir, 'attempts.json', [ATTEMPT('att-done', 'collected'), ATTEMPT('att-live', 'running')]);
+    const journal = await seed(dir, 'journal.json', [
+      JOURNAL_ENTRY('j-1', 'att-done', 'completed'),
+      JOURNAL_ENTRY('j-1', 'att-live', 'intent-recorded'),
+    ]);
+    const result = await compact(dir);
+    expect(result.code).toBe(1);
+    expect(result.err).toContain('state compact refused: journal.json has a duplicate record id');
+    expect(result.out).toContain('nothing changed');
+    expect(await fs.readFile(path.join(dir, 'journal.json'), 'utf8')).toBe(journal);
+    expect(await exists(path.join(dir, 'quarantine'))).toBe(false);
+  });
+
   it('compacts when a directory-backed store such as daemon/leases exists', async () => {
     const dir = makeTempDir();
     await fs.mkdir(path.join(dir, 'daemon', 'leases'), { recursive: true });

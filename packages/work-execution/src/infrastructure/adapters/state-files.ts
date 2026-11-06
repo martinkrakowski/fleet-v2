@@ -35,6 +35,7 @@ import { parseVersionedLaneRunStateRecord } from './LaneRunRepositoryAdapter.ada
 import { parseVersionedLaneRunJournalStateRecord } from './LaneRunJournalAdapter.adapter.js';
 import { parseVersionedLanePlanStateRecord } from './LanePlanRepositoryAdapter.adapter.js';
 import { parseVersionedSeatTicketStateRecord } from './SeatTicketRepositoryAdapter.adapter.js';
+import type { SeatTicketRecord } from '../../domain/execution-records.js';
 import { parseVersionedSeatObservationStateRecord } from './SeatObservationRepositoryAdapter.adapter.js';
 import { parseTelemetryDispositionStateRecord } from './TelemetryDispositionAdapter.adapter.js';
 import {
@@ -75,6 +76,19 @@ function inspectSingleDaemonLeaseRecord(raw: unknown): SingleRecordInspection<Da
     : { status: 'unreadable', detail: read.error };
 }
 
+/** The seat ticket reader refuses two records for one (project, role); `state check` must agree. */
+function duplicateSeatTicketKeyListError(records: readonly SeatTicketRecord[]): string | undefined {
+  const seen = new Set<string>();
+  for (const record of records) {
+    const key = `${record.projectId}\u0000${record.role}`;
+    if (seen.has(key)) {
+      return 'duplicate seat ticket key';
+    }
+    seen.add(key);
+  }
+  return undefined;
+}
+
 export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('work-orders.json', parseWorkOrderStateRecord),
   describeVersionedRecordListStore('attempts.json', parseVersionedAttemptStateRecord),
@@ -94,6 +108,10 @@ export const WORK_EXECUTION_STATE_FILES: readonly StateFileDescriptor[] = [
   describeRecordListStore('merge-queue.json', parseMergeQueueStateRecord, duplicateMergeQueueIdentityListError),
   describeRecordListStore('killall-halt.json', parseKillallHaltMarkerStateRecord),
   describeRecordListStore('killall-train-pause.json', parseKillallTrainPauseStateRecord),
-  describeVersionedRecordListStore('seat-tickets.json', parseVersionedSeatTicketStateRecord),
+  describeVersionedRecordListStore(
+    'seat-tickets.json',
+    parseVersionedSeatTicketStateRecord,
+    duplicateSeatTicketKeyListError,
+  ),
   describeVersionedRecordListStore('seat-observations.json', parseVersionedSeatObservationStateRecord),
 ];

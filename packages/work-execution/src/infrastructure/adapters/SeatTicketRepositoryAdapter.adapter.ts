@@ -134,7 +134,21 @@ async function readSeatStoreBytes(target: string): Promise<Buffer | null> {
     if (!opened.isFile() || opened.size > SEAT_STORE_MAX_BYTES) {
       throw new Error(`${path.basename(target)} is not a regular file within ${SEAT_STORE_MAX_BYTES} bytes`);
     }
-    return await handle.readFile();
+    // Bound the bytes actually read, not just the size seen at stat time: a
+    // file that grows in between is refused rather than read whole.
+    const buffer = Buffer.alloc(SEAT_STORE_MAX_BYTES + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, total, buffer.length - total, total);
+      if (bytesRead === 0) {
+        break;
+      }
+      total += bytesRead;
+    }
+    if (total > SEAT_STORE_MAX_BYTES) {
+      throw new Error(`${path.basename(target)} grew beyond ${SEAT_STORE_MAX_BYTES} bytes while being read`);
+    }
+    return buffer.subarray(0, total);
   } finally {
     await handle.close();
   }

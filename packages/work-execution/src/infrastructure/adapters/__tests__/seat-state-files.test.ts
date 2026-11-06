@@ -101,6 +101,27 @@ describe('work-execution seat state file descriptors match the store readers', (
     expect(basenames.indexOf('seat-observations.json')).toBe(pauseIndex + 2);
   });
 
+  it('reports duplicate seat ticket keys as unreadable in both state check and the reader', async () => {
+    const first = VALID_FIXTURES['seat-tickets.json']![0] as Record<string, unknown>;
+    const bytes = Buffer.from(
+      JSON.stringify([
+        { ...first, ticket: 10, revision: 1 },
+        { ...first, ticket: 5, revision: 2 },
+      ]),
+    );
+    await fs.writeFile(path.join(tempDir, 'seat-tickets.json'), bytes);
+    const descriptor = WORK_EXECUTION_STATE_FILES.find((d) => d.basename === 'seat-tickets.json')!;
+    const inspection = descriptor.inspect(bytes);
+    expect(inspection.status).toBe('unreadable');
+    const error = await new SeatTicketRepositoryAdapter({ stateDir: tempDir })
+      .listSeatTickets()
+      .then(() => null, (e: unknown) => e);
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    expect((error as StateFileUnreadableError).detail).toBe(
+      (inspection as { detail: string }).detail,
+    );
+  });
+
   it.each(CASES)('$basename / $kind', async ({ basename, bytes, inspect, read, expectedOk }) => {
     await fs.writeFile(path.join(tempDir, basename), bytes);
     const inspection = inspect(bytes);

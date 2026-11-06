@@ -10,13 +10,13 @@ import type {
   AttemptArtifactPort,
   AttemptRecord,
   AttemptRepositoryPort,
-  AutoMergeAttemptPort,
   CiStatePort,
   CollectedAttemptArtifacts,
   CollectAttemptArtifactsPort,
   CommandCompletionReceipt,
   CommitEditOnlyAttemptPort,
   ConductorForgeGrantPort,
+  EnqueueMergePort,
   DispatchAttemptPort,
   EvaluateAttemptGatePort,
   ExecuteAuthorizedForgeActionPort,
@@ -24,6 +24,8 @@ import type {
   ForgeReadPort,
   LaneRunAdmissionPort,
   LaneRunParkNoticePort,
+  MergeQueueRepositoryPort,
+  MergeQueueEntryRecord,
   PrepareBriefPackagePort,
   ReconcileAttemptPort,
   ReviewAssessmentPort,
@@ -65,7 +67,9 @@ export interface DryRunFakes {
   readonly forgeRead: ForgeReadPort;                              // 'not-found' until the push ran; then the PR at the pushed head: 'open' (clean, number 1) and, after the merge, 'merged'
   readonly conductorForgeGrant: ConductorForgeGrantPort;          // 'issued'; 'grant-dry-run-' + n under 'policy:conductor@dry-run'
   readonly executeForgeAction: ExecuteAuthorizedForgeActionPort;  // 'executed' at the expected head; PR number 1
-  readonly autoMergeAttempt: AutoMergeAttemptPort;                // 'merged' at the PR head; 'policy:autoMerge@dry-run'
+  readonly enqueueMerge: EnqueueMergePort;                        // KS7b: the queue merges the enqueued head at once (the forge then reads 'merged'); records the call
+  readonly mergeQueue: Pick<MergeQueueRepositoryPort, 'listMergeEntries'>; // KS7b: the one enqueued entry, state 'merged'; records the call
+  readonly forgeRepository: { readonly owner: string; readonly repo: string }; // the dry-run's queue repository
   readonly parkNotice: LaneRunParkNoticePort;                     // 'recorded'; the question id is 'question-dry-run-' + n
   readonly prepareBrief: PrepareBriefPackagePort;                  // 'prepared' with a fixed digest; prosePath '.lane/brief.md'; records the call
 }
@@ -498,17 +502,49 @@ export function createDryRunFakes(
     },
   };
 
-  const autoMergeAttempt: AutoMergeAttemptPort = {
-    autoMergeAttempt: async (request) => {
-      recordCall('autoMergeAttempt', request);
+  // KS7b: the dry-run's merge queue merges the enqueued head at once, like the
+  // old merge fake did; the forge then reads the PR as merged.
+  const forgeRepository = { owner: 'dry-run', repo: 'dry-run' } as const;
+  let queuedEntry: MergeQueueEntryRecord | null = null;
+  const enqueueMerge: EnqueueMergePort = {
+    enqueue: async (request) => {
+      recordCall('enqueueMerge', request);
       prMerged = true;
-      return {
-        outcome: 'merged',
-        attemptId: request.attemptId,
-        headSha: prHeadSha ?? DRY_RUN_HEAD_COMMIT,
-        pullRequestNumber: PR_NUMBER,
-        decisionRevision: 'policy:autoMerge@dry-run',
+      const record: MergeQueueEntryRecord = {
+        version: 1,
+        entryId: request.entryId,
+        repository: request.repository,
+        repoDigest: '0'.repeat(12),
+        pullRequest: request.pullRequest,
+        headOid: request.headOid,
+        state: 'merged',
+        reason: null,
+        attempt: 0,
+        notBeforeIso: null,
+        enqueuedAtIso: request.enqueuedAtIso,
+        enqueuedBy: request.enqueuedBy,
+        supersedes: null,
+        runId: request.runId,
+        attemptId: null,
+        workOrderId: null,
+        tier: request.tier as MergeQueueEntryRecord['tier'],
+        verifiedHeadOid: null,
+        verifiedBy: null,
+        policyRevision: null,
+        premergeReceiptHeadOid: null,
+        veto: null,
+        mergeCommitOid: 'e'.repeat(40),
+        mergedAtIso: request.enqueuedAtIso,
+        revision: 1,
       };
+      queuedEntry = record;
+      return { outcome: 'created', entries: [record], record };
+    },
+  };
+  const mergeQueue: Pick<MergeQueueRepositoryPort, 'listMergeEntries'> = {
+    listMergeEntries: async (query) => {
+      recordCall('listMergeQueue', query);
+      return queuedEntry === null ? [] : [queuedEntry];
     },
   };
 
@@ -574,7 +610,9 @@ export function createDryRunFakes(
     forgeRead,
     conductorForgeGrant,
     executeForgeAction,
-    autoMergeAttempt,
+    enqueueMerge,
+    mergeQueue,
+    forgeRepository,
     parkNotice,
     prepareBrief,
   };

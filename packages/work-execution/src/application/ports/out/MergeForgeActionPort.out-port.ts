@@ -33,8 +33,20 @@ export interface MergeForgeCreateBranchRequest {
   readonly deadlineIso: string;
 }
 
+/** Merge `main` into `chain/<name>` (lane CO8); carries no pull request and no status. */
+export interface MergeForgeMergeMainIntoBranchRequest {
+  readonly kind: 'merge-main-into-branch';
+  readonly actionId: string;
+  readonly repository: { readonly owner: string; readonly repo: string };
+  readonly branchName: string;
+  readonly sourceBranch: 'main';
+  readonly expectedHeadSha: string;
+  readonly deadlineIso: string;
+}
+
 export type MergeForgeActionRequest =
   | MergeForgeCreateBranchRequest
+  | MergeForgeMergeMainIntoBranchRequest
   | (MergeForgeActionBase & { readonly kind: 'merge-pr' })
   | (MergeForgeActionBase & { readonly kind: 'update-branch' })
   | (MergeForgeActionBase & {
@@ -48,6 +60,8 @@ export type MergeForgeActionRequest =
 
 export type MergeForgeActionResult =
   | { readonly outcome: 'executed'; readonly headSha: string }
+  | { readonly outcome: 'already-applied' }
+  | { readonly outcome: 'branch-gone' }
   | { readonly outcome: 'ambiguous'; readonly reason: string }
   | { readonly outcome: 'refused'; readonly reason: string; readonly refusalKind: ForgeRefusalKind };
 

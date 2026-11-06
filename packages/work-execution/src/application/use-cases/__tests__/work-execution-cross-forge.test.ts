@@ -1207,6 +1207,26 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
     ]);
     const useCase = new ExecuteAuthorizedForgeActionUseCase({
       mergeRecordRepo: new MergeRecordRepositoryAdapter(),
+      // WB5b2: a request-only pull-request number is verified before the grant;
+      // the read answers any number as open on the lane's branch at the head.
+      forgeRead: {
+        async readPullRequest(request) {
+          return {
+            outcome: "found",
+            pullRequest: {
+              number: request.ref.kind === "number" ? request.ref.number : 0,
+              state: "open",
+              mergeState: "clean",
+              headSha: HEAD_SHA,
+              headRef: `feat/${LANE_ID}`,
+              baseRef: "main",
+              mergedAtIso: null,
+              closedAtIso: null,
+              mergeCommitSha: null,
+            },
+          };
+        },
+      },
       attemptRepo,
       workOrderRepo,
       journal,

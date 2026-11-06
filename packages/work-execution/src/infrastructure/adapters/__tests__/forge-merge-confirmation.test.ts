@@ -43,11 +43,13 @@ interface SnapshotOverride {
 
 function makeRunGh(result: { exitCode: number; stdout: string; stderr: string }) {
   const calls: string[][] = [];
-  const runGh = async (args: readonly string[]) => {
+  const timeouts: (number | undefined)[] = [];
+  const runGh = async (args: readonly string[], _ghConfigDir?: string, timeoutMs?: number) => {
     calls.push([...args]);
+    timeouts.push(timeoutMs);
     return result;
   };
-  return { calls, runGh };
+  return { calls, timeouts, runGh };
 }
 
 function makeReadPort(result: ReadPullRequestResult | { throw: true }) {
@@ -203,6 +205,23 @@ describe('ForgeActionAdapter merge confirmation after a non-zero gh exit', () =>
     expect(JSON.stringify(result)).not.toContain('HTTP 403');
   });
 
+  it('merges the resolved pull request number, pinned to the expected head, in the bound repository (WB5b2)', async () => {
+    const { runGh, calls } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
+    const adapter = new ForgeActionAdapter({
+      runGh,
+      verifyCurrentHeadSha: async () => HEAD_SHA,
+      repository: { owner: 'acme', repo: 'app' },
+    });
+
+    const result = await adapter.performForgeAction({ ...forgeActionRequest(), pullRequestNumber: 42 });
+
+    expect(result).toEqual({ outcome: 'executed', headSha: HEAD_SHA });
+    expect(calls).toEqual([
+      ['pr', 'merge', '-R', 'acme/app', '42', '--match-head-commit', HEAD_SHA, '--merge'],
+    ]);
+    expect(calls[0]).not.toContain(BRANCH);
+  });
+
   it('reports executed on exit 0 without ever reading the pull request', async () => {
     const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
     const { readCalls, port } = makeReadPort(foundSnapshot());
@@ -291,6 +310,50 @@ describe('ForgeActionAdapter.findOpenPullRequestsByHead (legacy PR lookup)', () 
 
     expect(result).toEqual({ outcome: 'unreadable', reason: 'legacy-pr-lookup-repository-mismatch' });
     expect(calls).toHaveLength(0);
+  });
+
+  it('bounds the lookup to 15 seconds and treats a full page as an incomplete list (WB5b2)', async () => {
+    const one = makeRunGh({ exitCode: 0, stdout: JSON.stringify([OWN_PR(7, HEAD_SHA, 'acme')]), stderr: '' });
+    const adapter = new ForgeActionAdapter({ runGh: one.runGh, repository: BOUND });
+    await adapter.findOpenPullRequestsByHead({ repository: 'acme/app', branchName: BRANCH });
+    expect(one.timeouts).toEqual([15_000]);
+
+    const page = (count: number): string =>
+      JSON.stringify(Array.from({ length: count }, (_, index) => OWN_PR(index + 1, HEAD_SHA, 'acme')));
+    const full = makeRunGh({ exitCode: 0, stdout: page(20), stderr: '' });
+    const fullResult = await new ForgeActionAdapter({
+      runGh: full.runGh,
+      repository: BOUND,
+    }).findOpenPullRequestsByHead({ repository: 'acme/app', branchName: BRANCH });
+    expect(fullResult).toEqual({
+      outcome: 'unreadable',
+      reason: 'the pull request lookup answer was not a complete list',
+    });
+
+    const short = makeRunGh({ exitCode: 0, stdout: page(19), stderr: '' });
+    const shortResult = await new ForgeActionAdapter({
+      runGh: short.runGh,
+      repository: BOUND,
+    }).findOpenPullRequestsByHead({ repository: 'acme/app', branchName: BRANCH });
+    expect(shortResult.outcome).toBe('read');
+  });
+
+  it('screens the bound owner and repo with the repository pattern before they reach the endpoint, and never runs gh (WB5b2)', async () => {
+    // The Kelvin sign lower-cases to a plain k, so the case-insensitive bound
+    // comparison alone lets this owner through.
+    const { runGh, calls } = makeRunGh({ exitCode: 0, stdout: '[]', stderr: '' });
+    for (const bound of [
+      { owner: 'acme-\u212A', repo: 'app' },
+      { owner: 'acme', repo: 'ap\u212Ap' },
+    ]) {
+      const adapter = new ForgeActionAdapter({ runGh, repository: bound });
+      const result = await adapter.findOpenPullRequestsByHead({
+        repository: `${bound.owner.toLowerCase().replace('\u212a', 'k')}/${bound.repo.toLowerCase().replace('\u212a', 'k')}`,
+        branchName: BRANCH,
+      });
+      expect(result.outcome).toBe('unreadable');
+      expect(calls).toHaveLength(0);
+    }
   });
 
   it('measures the response in bytes: a multibyte answer over the cap is refused', async () => {

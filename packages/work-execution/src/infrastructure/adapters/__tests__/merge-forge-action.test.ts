@@ -840,7 +840,7 @@ describe('ForgeActionAdapter readMergeBranchHead (lane CO7)', () => {
 
   it('is unavailable for invalid input, no identity and an exhausted budget, without a gh call', async () => {
     const cases = [
-      { ...read, branchName: 'main' },
+      { ...read, branchName: '' },
       { ...read, repository: { owner: '', repo: REPO } },
       { ...read, deadlineIso: 'soon' },
       { ...read, deadlineIso: '2026-11-01T12:00:01.000Z' },

@@ -696,6 +696,9 @@ export function composeExecution(input: ComposeExecutionInput) {
       attemptOwnerDecisionPort: attemptOwnerDecision,
       lanePlanRepo: lanePlanRepository,
       mergeRecordRepo: mergeRecordRepository,
+      // WB5b2: the merge verifies a pull-request number no typed journal
+      // entry confirms through the installation's read-only forge read.
+      forgeRead,
       // Forge mode `none` (D6) refuses every forge action.
       ...(forgeMode === 'none' ? { forgeMode: 'none' as const } : {}),
     }),

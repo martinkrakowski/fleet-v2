@@ -186,6 +186,21 @@ describe('apps/cli composition', () => {
         forgeDeps.acceptedReceiptByHead[headH] = 'receipt-e2e-1';
       }
 
+      // WB5b2: the typed completed entry confirms number 7, so the request reaches
+      // the grant check this test is about.
+      await rt.execution.executionJournal.appendJournalEntry({
+        id: 'forge:action-open:completed:1',
+        attemptId,
+        workOrderId,
+        action: 'forge',
+        status: 'completed',
+        baseCommit: headH,
+        recordedAtIso: '2026-10-15T09:00:00Z',
+        sessionId: null,
+        detail: null,
+        pullRequest: { repository: 'org/repo', number: 7 },
+      });
+
       // Attempt to execute merge-pr at head H using the push grant
       const mergeResult = await rt.execution.executeAuthorizedForgeAction.executeAuthorizedForgeAction({
         actionId: 'action-merge-1',

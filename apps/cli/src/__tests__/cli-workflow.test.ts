@@ -726,6 +726,22 @@ describe('Fleet CLI workflow', () => {
       request: { id: 'dec-1', state: 'approved', grantId: 'grant-1', expectedHeadSha: laneHead },
     });
 
+    // WB5b2: a merge number no typed journal entry confirms must be verified on
+    // the forge, and this workflow has no forge read. The pull request was opened
+    // by an earlier fleet action, so its typed completed entry names number 7.
+    await runtime.execution.executionJournal.appendJournalEntry({
+      id: 'forge:forge-action-0:completed:1',
+      attemptId: ATTEMPT_ID,
+      workOrderId: WORK_ORDER_ID,
+      action: 'forge',
+      status: 'completed',
+      baseCommit: laneHead,
+      recordedAtIso: '2026-10-15T09:00:00Z',
+      sessionId: null,
+      detail: null,
+      pullRequest: { repository: 'org/repo', number: 7 },
+    });
+
     const forge = await cli([
       'forge',
       'execute',
@@ -1854,6 +1870,20 @@ describe('Fleet CLI workflow', () => {
     );
 
     // --- process: forge the merge against reloaded state ----------------------
+    // WB5b2: the typed completed entry of the earlier fleet action names the
+    // pull request, so the merge needs no forge read (this workflow has none).
+    await createFleetCliRuntime({ stateDir: multiProcStateDir }).execution.executionJournal.appendJournalEntry({
+      id: 'forge:forge-mp-action-0:completed:1',
+      attemptId: mpAttemptId,
+      workOrderId: mpWorkOrderId,
+      action: 'forge',
+      status: 'completed',
+      baseCommit: mpLaneHead,
+      recordedAtIso: '2026-10-15T09:00:00Z',
+      sessionId: null,
+      detail: null,
+      pullRequest: { repository: 'org/repo', number: 7 },
+    });
     const forge = await mpCli([
       'forge',
       'execute',

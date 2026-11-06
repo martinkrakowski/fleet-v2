@@ -23,6 +23,10 @@ import type { ActionAuthorizationPort } from "../ports/out/ActionAuthorizationPo
 import type { AttemptRepositoryPort } from "../ports/out/AttemptRepositoryPort.out-port.js";
 import type { ExecutionJournalPort } from "../ports/out/ExecutionJournalPort.out-port.js";
 import type { ForgeActionPort } from "../ports/out/ForgeActionPort.out-port.js";
+import type {
+  ForgeReadPort,
+  PullRequestSnapshot,
+} from "../ports/out/ForgeReadPort.out-port.js";
 import type { WorkOrderRepositoryPort } from "../ports/out/WorkOrderRepositoryPort.out-port.js";
 import type {
   ActionJournalEntryRecord,
@@ -31,7 +35,10 @@ import type {
   WorkOrderRecord,
 } from "../../domain/execution-records.js";
 import { WorkOrder } from "../../domain/entities/WorkOrder.js";
-import { MergeRecord } from "../../domain/entities/MergeRecord.js";
+import {
+  MERGE_RECORD_LIMITS,
+  MergeRecord,
+} from "../../domain/entities/MergeRecord.js";
 import { PullRequestLink } from "../../domain/entities/PullRequestLink.js";
 import type { PullRequestLinkConflictRecord } from "../../domain/lane-plan-records.js";
 import {
@@ -105,6 +112,13 @@ export interface ExecuteAuthorizedForgeActionDependencies {
    * exists. Optional so existing callers keep working.
    */
   readonly mergeRecordRepo?: MergeRecordRepositoryPort;
+  /**
+   * The read-only pull-request read (WB5b2): a merge's pull-request number
+   * that no typed journal entry confirms is verified here (open, the
+   * attempt's branch, the expected head) before the grant is consumed. Absent
+   * or unreadable means unverified, and an unverified number never merges.
+   */
+  readonly forgeRead?: Pick<ForgeReadPort, "readPullRequest">;
 }
 
 /** The forge action kinds that act on a pull request (WB5b pre-flight resolution). */
@@ -132,6 +146,27 @@ const OPTIONAL_TEXT_FIELDS: readonly string[] = [
 
 const MAX_REQUEST_TEXT_CHARS = 256;
 const MAX_PULL_REQUEST_NUMBER = 999_999_999;
+/** The bound on the verifying pull-request read (WB5b2). */
+const PULL_REQUEST_VERIFY_TIMEOUT_MS = 15_000;
+/** Digits reserved for the journal sequence in `forge:<actionId>:completed:<seq>`. */
+const ACTION_REF_SEQUENCE_DIGITS = 6;
+/** The only adapter reasons of the legacy lookup the use case passes through. */
+const LEGACY_LOOKUP_PASS_THROUGH_REASONS: ReadonlySet<string> = new Set([
+  "legacy-pr-lookup-unbound-repository",
+  "legacy-pr-lookup-repository-mismatch",
+]);
+
+/** The longest `actionId` whose completed journal id still fits the merge record's `actionRef`. */
+function actionIdFitsActionRef(actionId: string): boolean {
+  return (
+    `forge:${actionId}:completed:`.length + ACTION_REF_SEQUENCE_DIGITS <=
+    MERGE_RECORD_LIMITS.maxActionRefLength
+  );
+}
+
+type PullRequestNumberResolution =
+  | { readonly number: number | undefined }
+  | { readonly reason: string };
 const EXPECTED_HEAD_SHA_PATTERN = /^[0-9a-f]{40}$/;
 
 type ForgeActionRequestRead =
@@ -320,6 +355,14 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       };
     }
 
+    // The merge record's `actionRef` is the completed journal entry's id
+    // (`forge:<actionId>:completed:<seq>`, at most 128 characters): an
+    // operator action id that cannot fit refuses before the grant, never
+    // after the merge has happened (WB5b2).
+    if (request.kind === "merge-pr" && !actionIdFitsActionRef(request.actionId)) {
+      return { outcome: "refused", reason: "action-id-too-long" };
+    }
+
     // A policy-authorised action must name a policy setting revision (A8); an
     // owner grant leaves `authorizedBy` absent. Anything else refuses before a
     // grant is consumed or a journal entry is written (A11).
@@ -496,11 +539,16 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     // guessed. A thrown pre-flight read refuses before the grant is consumed.
     let preResolvedPrNumber: number | undefined;
     let legacyLookup = false;
+    // A merge with nowhere to record it refuses first, before any forge read.
+    if (request.kind === "merge-pr" && deps.mergeRecordRepo === undefined) {
+      return { outcome: "refused", reason: "merge-record-store-unavailable" };
+    }
     if (
       (PULL_REQUEST_ACTION_KINDS as readonly string[]).includes(request.kind)
     ) {
+      let resolution: PullRequestNumberResolution;
       try {
-        preResolvedPrNumber = await this.preResolvePullRequestNumber(
+        resolution = await this.preResolvePullRequestNumber(
           deps,
           request,
           attempt,
@@ -513,15 +561,16 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
           reason: "a pre-flight pull-request read failed",
         };
       }
+      if ("reason" in resolution) {
+        return { outcome: "refused", reason: resolution.reason };
+      }
+      preResolvedPrNumber = resolution.number;
     }
 
     // A merge with nowhere to record it, or one that cannot say which pull
     // request it merges, would mark the work order merged with no merge
     // record: refuse before the grant is consumed and before any forge call.
     if (request.kind === "merge-pr") {
-      if (deps.mergeRecordRepo === undefined) {
-        return { outcome: "refused", reason: "merge-record-store-unavailable" };
-      }
       // An attempt opened before WB5b has neither a typed journal reference
       // nor a stored link: one read-only lookup of the open pull request for
       // the attempt's branch may name it, never a guess.
@@ -707,10 +756,37 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
             merger: "fleet",
             actionRef: completedEntry.id,
           });
-          if (!created.success) {
-            throw new Error("the completed merge could not be recorded");
+          let saved: Awaited<
+            ReturnType<MergeRecordRepositoryPort["saveMergeRecord"]>
+          > | null = null;
+          if (created.success) {
+            saved = await deps.mergeRecordRepo.saveMergeRecord(
+              created.value.toRecord(),
+            );
           }
-          await deps.mergeRecordRepo.saveMergeRecord(created.value.toRecord());
+          // The record is the merge's durable fact (WB5b2): a refused or
+          // conflicting save never advances the work order. The completed
+          // entry above carries the typed pull-request reference, and the
+          // ambiguous entry below marks the merge for a pass to complete.
+          if (
+            saved === null ||
+            saved.outcome === "refused" ||
+            saved.outcome === "integrity-conflict"
+          ) {
+            await this.appendJournal(
+              deps,
+              request,
+              attempt,
+              "ambiguous",
+              `merge-record-not-saved:${saved === null ? "invalid" : saved.outcome}`,
+              pullRequestRef,
+            );
+            return {
+              outcome: "refused",
+              reason: "merge-record-not-saved",
+              forgeAmbiguous: true,
+            };
+          }
         }
         // FOURTH: a completed merge advances the work order.
         await this.markMerged(deps, workOrder);
@@ -851,12 +927,18 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
 
   /**
    * Resolve the pull-request number structurally before the forge runs
-   * (WB5b): the request's own number wins; then the attempt's latest
-   * completed `forge` journal entry carrying a typed reference (matching the
-   * normalized repository when it is known); then the lane's single stored
-   * link in that repository. Zero or several stored links are never guessed
-   * between. Any thrown read propagates: the caller refuses before a grant
-   * is consumed.
+   * (WB5b): the request's own number, the attempt's latest completed `forge`
+   * journal entry carrying a typed reference (matching the normalized
+   * repository when it is known), and the lane's single stored link in that
+   * repository. Zero or several stored links are never guessed between. Any
+   * thrown read propagates: the caller refuses before a grant is consumed.
+   *
+   * A merge (WB5b2) collects every source present and refuses when two name
+   * different numbers. A number no typed journal entry confirms is read from
+   * the forge before the grant: a request-only number must be the open pull
+   * request of the attempt's branch at the expected head, and a stored link
+   * must not be closed or merged at another head. The other kinds keep the
+   * first source in that order.
    */
   private async preResolvePullRequestNumber(
     deps: ExecuteAuthorizedForgeActionDependencies,
@@ -864,10 +946,12 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     attempt: AttemptRecord,
     workOrder: WorkOrderRecord,
     normalizedRepository: string | null,
-  ): Promise<number | undefined> {
-    if (request.pullRequestNumber !== undefined) {
-      return request.pullRequestNumber;
+  ): Promise<PullRequestNumberResolution> {
+    const isMerge = request.kind === "merge-pr";
+    if (!isMerge && request.pullRequestNumber !== undefined) {
+      return { number: request.pullRequestNumber };
     }
+    let journalNumber: number | undefined;
     const entries = await deps.journal.listJournalEntriesForAttempt(attempt.id);
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const entry = entries[index];
@@ -879,31 +963,118 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         (normalizedRepository === null ||
           entry.pullRequest.repository === normalizedRepository)
       ) {
-        return entry.pullRequest.number;
+        journalNumber = entry.pullRequest.number;
+        break;
       }
     }
-    const lanePlanRepo = deps.lanePlanRepo;
-    if (lanePlanRepo === undefined || normalizedRepository === null) {
-      return undefined;
+    if (!isMerge && journalNumber !== undefined) {
+      return { number: journalNumber };
     }
-    const lane = workOrderLane(workOrder);
-    // A stored link carries the plan's current lane id while the work order
-    // may carry an old alias: both sides are resolved before comparing.
-    const resolveLaneId = await laneAliasResolver(
-      lanePlanRepo,
-      lane.projectId,
-      lane.planId,
+    let linkNumber: number | undefined;
+    const lanePlanRepo = deps.lanePlanRepo;
+    if (lanePlanRepo !== undefined && normalizedRepository !== null) {
+      const lane = workOrderLane(workOrder);
+      // A stored link carries the plan's current lane id while the work order
+      // may carry an old alias: both sides are resolved before comparing.
+      const resolveLaneId = await laneAliasResolver(
+        lanePlanRepo,
+        lane.projectId,
+        lane.planId,
+      );
+      const wantedLaneId = resolveLaneId(lane.laneId);
+      const links = await lanePlanRepo.listPullRequestLinks(lane.projectId);
+      const matches = links.filter(
+        (link) =>
+          link.repository === normalizedRepository &&
+          link.projectId === lane.projectId &&
+          link.planId === lane.planId &&
+          resolveLaneId(link.laneId) === wantedLaneId,
+      );
+      linkNumber = matches.length === 1 ? matches[0]?.number : undefined;
+    }
+    if (!isMerge) {
+      return { number: linkNumber };
+    }
+    const requestNumber = request.pullRequestNumber;
+    const present = [requestNumber, journalNumber, linkNumber].filter(
+      (value): value is number => value !== undefined,
     );
-    const wantedLaneId = resolveLaneId(lane.laneId);
-    const links = await lanePlanRepo.listPullRequestLinks(lane.projectId);
-    const matches = links.filter(
-      (link) =>
-        link.repository === normalizedRepository &&
-        link.projectId === lane.projectId &&
-        link.planId === lane.planId &&
-        resolveLaneId(link.laneId) === wantedLaneId,
+    if (present.length === 0) {
+      return { number: undefined };
+    }
+    const resolved = present[0] as number;
+    if (present.some((value) => value !== resolved)) {
+      return { reason: "pull-request-sources-disagree" };
+    }
+    if (journalNumber !== undefined) {
+      // A typed completed journal entry is the fleet's own record of this
+      // attempt's pull request; the forge's head match guards the merge.
+      return { number: resolved };
+    }
+    const requestOnly = linkNumber === undefined;
+    const verified = await this.verifyPullRequest(
+      deps,
+      normalizedRepository,
+      resolved,
     );
-    return matches.length === 1 ? matches[0]?.number : undefined;
+    if (verified.outcome === "unreadable") {
+      return { reason: "pull-request-unverified" };
+    }
+    const snapshot = verified.snapshot;
+    if (requestOnly) {
+      return snapshot.state === "open" &&
+        snapshot.headRef === (request.branchName ?? `feat/${workOrder.laneId}`) &&
+        snapshot.headSha === request.expectedHeadSha
+        ? { number: resolved }
+        : { reason: "pull-request-unverified" };
+    }
+    const stale =
+      snapshot.state === "closed" ||
+      (snapshot.state === "merged" &&
+        snapshot.headSha !== request.expectedHeadSha);
+    return stale ? { reason: "pull-request-link-stale" } : { number: resolved };
+  }
+
+  /**
+   * One bounded read of the pull request (WB5b2). A missing reader, an
+   * unbound repository, a not-found, an unavailable answer, a malformed
+   * snapshot, a snapshot of another number or a throw is `unreadable`:
+   * unknown stays unknown.
+   */
+  private async verifyPullRequest(
+    deps: ExecuteAuthorizedForgeActionDependencies,
+    normalizedRepository: string | null,
+    number: number,
+  ): Promise<
+    | { readonly outcome: "read"; readonly snapshot: PullRequestSnapshot }
+    | { readonly outcome: "unreadable" }
+  > {
+    const reader = deps.forgeRead;
+    if (reader === undefined || normalizedRepository === null) {
+      return { outcome: "unreadable" };
+    }
+    const [owner, repo] = normalizedRepository.split("/");
+    if (owner === undefined || repo === undefined) {
+      return { outcome: "unreadable" };
+    }
+    try {
+      const read = await reader.readPullRequest({
+        ref: { kind: "number", number },
+        repository: { owner, repo },
+        timeoutMs: PULL_REQUEST_VERIFY_TIMEOUT_MS,
+      });
+      if (
+        read.outcome !== "found" ||
+        read.pullRequest.number !== number ||
+        typeof read.pullRequest.headSha !== "string" ||
+        typeof read.pullRequest.headRef !== "string"
+      ) {
+        return { outcome: "unreadable" };
+      }
+      return { outcome: "read", snapshot: read.pullRequest };
+    } catch {
+      return { outcome: "unreadable" };
+    }
   }
 
   /**
@@ -935,7 +1106,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       // The adapter's own typed reasons (unbound or mismatched repository)
       // pass through; any other unreadable answer is the generic reason.
       return {
-        reason: answer.reason.startsWith("legacy-pr-lookup-")
+        reason: LEGACY_LOOKUP_PASS_THROUGH_REASONS.has(answer.reason)
           ? answer.reason
           : "legacy-pr-lookup-unreadable",
       };

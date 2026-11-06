@@ -5,7 +5,7 @@
  * git action. Every call carries a deadline.
  */
 
-import type { ChainRecord, ChainRepositoryRef } from '../../../domain/chain-records.js';
+import type { ChainRecord, ChainRefreshTerminalOutcome, ChainRepositoryRef } from '../../../domain/chain-records.js';
 
 export interface ChainIntentCommand {
   /** State `intent-recorded`, revision 1. */
@@ -71,4 +71,56 @@ export interface ChainRepositoryPort {
    * with another.
    */
   recordChainReviewPin(command: ChainReviewPinCommand): Promise<ChainReviewPinDecision>;
+  /**
+   * List the chain records of one repository. A known absence is an empty list
+   * inside `ok`; an unreadable store or an over-long list is `unreadable`, never
+   * truncated.
+   */
+  listChains(command: ChainListCommand): Promise<ChainListResult>;
+  /**
+   * Record the keyed chain-refresh intent by compare-and-set on `revision`. The
+   * intent is written once per key (`already-recorded` on a repeat); a stale
+   * revision refuses as `stale-revision`.
+   */
+  recordChainRefreshIntent(command: ChainRefreshIntentCommand): Promise<ChainRecordDecision>;
+  /**
+   * Record the chain-refresh outcome by compare-and-set on `revision`: `conflict`
+   * sets the conflict mark, `merged` and `up-to-date` clear it, and `branch-gone`
+   * leaves it unchanged.
+   */
+  recordChainRefreshOutcome(command: ChainRefreshOutcomeCommand): Promise<ChainRecordDecision>;
+}
+
+export interface ChainListCommand {
+  readonly repository: ChainRepositoryRef;
+  readonly deadlineIso: string;
+}
+
+export type ChainListResult =
+  | { readonly status: 'ok'; readonly records: readonly ChainRecord[] }
+  | { readonly status: 'unreadable'; readonly reason: string };
+
+export interface ChainRefreshIntentCommand {
+  readonly repository: ChainRepositoryRef;
+  readonly chainName: string;
+  /** `chain-refresh/<name>@<main12>`. */
+  readonly key: string;
+  /** 40 lowercase hex: the `main` head the refresh merges. */
+  readonly mainSha: string;
+  /** Compare-and-set: applies only to the record at this revision. */
+  readonly expectedRevision: number;
+  readonly atIso: string;
+  readonly deadlineIso: string;
+}
+
+export interface ChainRefreshOutcomeCommand {
+  readonly repository: ChainRepositoryRef;
+  readonly chainName: string;
+  /** The intent the outcome belongs to; an outcome for another key is refused. */
+  readonly key: string;
+  /** Compare-and-set: applies only to the record at this revision. */
+  readonly expectedRevision: number;
+  readonly outcome: ChainRefreshTerminalOutcome;
+  readonly atIso: string;
+  readonly deadlineIso: string;
 }

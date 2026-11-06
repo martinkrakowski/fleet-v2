@@ -574,6 +574,11 @@ export function createConfiguredWorkComposition(
       attemptOwnerDecisionPort,
       lanePlanRepo,
       mergeRecordRepo,
+      // WB5b2: a merge's unconfirmed pull-request number is verified through
+      // the host's read-only pull-request read; absent, it stays unverified.
+      ...(crossContext?.forge?.pullRequestRead !== undefined
+        ? { forgeRead: crossContext.forge.pullRequestRead }
+        : {}),
       // Forge mode `none` (D6) refuses every forge action.
       ...(forgeMode === "none" ? { forgeMode: "none" as const } : {}),
     }),

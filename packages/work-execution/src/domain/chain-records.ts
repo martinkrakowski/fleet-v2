@@ -49,6 +49,20 @@ export interface ChainRecord {
    * and a record stored without it reads as no pin (`reviewPinOf`).
    */
   readonly reviewPin?: ChainReviewPin | null;
+  /**
+   * The last chain refresh (lane CO8): the keyed intent `chain-refresh/<name>@<main12>`
+   * and its outcome. `in-flight` means the intent is recorded and the merge has not
+   * completed; the terminal outcomes are `merged`, `up-to-date`, `conflict` and
+   * `branch-gone`. Absent or null: no refresh was attempted. Additive: the record
+   * stays version 1, and a record stored without it reads as no refresh
+   * (`chainRefreshOf`).
+   */
+  readonly refresh?: ChainRefreshEntry | null;
+  /**
+   * The landing-blocking mark a conflict sets (lane CO8): `chain-refresh-conflict`
+   * or null. A merge never clears it; an outcome of `merged` or `up-to-date` does.
+   */
+  readonly conflictMark?: typeof CHAIN_REFRESH_CONFLICT_MARK | null;
 }
 
 /** The pin the combined review is bound to: one per chain record, never overwritten by another. */
@@ -62,6 +76,25 @@ export interface ChainReviewPin {
   readonly pinnedAtIso: string;
 }
 
+/** The terminal refresh outcomes (lane CO8); `in-flight` is the recorded-intent state before one. */
+export const CHAIN_REFRESH_TERMINAL_OUTCOMES = ['merged', 'up-to-date', 'conflict', 'branch-gone'] as const;
+export type ChainRefreshTerminalOutcome = (typeof CHAIN_REFRESH_TERMINAL_OUTCOMES)[number];
+export const CHAIN_REFRESH_OUTCOMES = [...CHAIN_REFRESH_TERMINAL_OUTCOMES, 'in-flight'] as const;
+export type ChainRefreshOutcome = (typeof CHAIN_REFRESH_OUTCOMES)[number];
+
+/** The conflict mark a `conflict` refresh outcome sets (blocks landing; lane CO8). */
+export const CHAIN_REFRESH_CONFLICT_MARK = 'chain-refresh-conflict' as const;
+
+/** One chain-refresh intent and its outcome: the key, the main head it merged, and how it ended. */
+export interface ChainRefreshEntry {
+  /** `chain-refresh/<chainName>@<main12>`. */
+  readonly key: string;
+  /** 40 lowercase hex: the `main` head the refresh merged. */
+  readonly mainSha: string;
+  readonly outcome: ChainRefreshOutcome;
+  readonly updatedAtIso: string;
+}
+
 const REVIEW_PIN_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const REVIEW_PIN_KEYS: readonly string[] = ['headSha', 'requestId', 'key', 'pinnedAtIso'];
 
@@ -73,6 +106,34 @@ export function chainReviewKeyOf(chainName: string, headSha: string): string {
 /** The review request id of a chain at a head: `chain-review:<name>:<head12>`; the pin's requestId must equal it. */
 export function chainReviewRequestIdOf(chainName: string, headSha: string): string {
   return `chain-review:${chainName}:${headSha.slice(0, 12)}`;
+}
+
+const CHAIN_REFRESH_PREFIX = 'chain-refresh/';
+const HEX12_PATTERN = /^[0-9a-f]{12}$/;
+
+/** The refresh key of a chain at a main head: `chain-refresh/<name>@<main12>`; null for invalid inputs. */
+export function chainRefreshKey(chainName: string, mainSha: string): string | null {
+  if (parseChainName(chainName) === undefined || !isChainCommitSha(mainSha)) {
+    return null;
+  }
+  return `${CHAIN_REFRESH_PREFIX}${chainName}@${mainSha.slice(0, 12)}`;
+}
+
+/** True for a keyed chain-refresh intent id `chain-refresh/<name>@<main12>`. */
+export function isChainRefreshKey(value: unknown): value is string {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const at = value.lastIndexOf('@');
+  if (at <= CHAIN_REFRESH_PREFIX.length || !value.startsWith(CHAIN_REFRESH_PREFIX)) {
+    return false;
+  }
+  const name = value.slice(CHAIN_REFRESH_PREFIX.length, at);
+  const sha12 = value.slice(at + 1);
+  if (!HEX12_PATTERN.test(sha12)) {
+    return false;
+  }
+  return parseChainName(name) !== undefined;
 }
 
 const HEX40_PATTERN = /^[0-9a-f]{40}$/;
@@ -194,6 +255,8 @@ export function createChainRecord(input: CreateChainRecordInput): CreateChainRec
         reason: null,
         createdAtIso,
         revision: 1,
+        refresh: null,
+        conflictMark: null,
       }),
     };
   } catch {
@@ -205,7 +268,7 @@ const REQUIRED_KEYS: readonly string[] = [
   'repository', 'chainName', 'branchName', 'sourceBranch', 'expectedHeadSha', 'actionKey', 'state',
   'reason', 'createdAtIso', 'revision',
 ];
-const OPTIONAL_KEYS: readonly string[] = ['schemaVersion', 'reviewPin'];
+const OPTIONAL_KEYS: readonly string[] = ['schemaVersion', 'reviewPin', 'refresh', 'conflictMark'];
 
 export type ChainRecordReadResult =
   | { readonly ok: true; readonly record: ChainRecord }
@@ -250,6 +313,14 @@ export function readChainRecord(input: unknown): ChainRecordReadResult {
     if (reviewPin === undefined) {
       return MALFORMED;
     }
+    const refresh = readChainRefresh(snapshot.refresh, chainName);
+    if (refresh === undefined) {
+      return MALFORMED;
+    }
+    const conflictMark = readConflictMark(snapshot.conflictMark);
+    if (conflictMark === undefined) {
+      return MALFORMED;
+    }
     return {
       ok: true,
       record: Object.freeze({
@@ -266,6 +337,9 @@ export function readChainRecord(input: unknown): ChainRecordReadResult {
         revision,
         // Omitted when there is no pin, so a record stored without one reads exactly as before.
         ...(reviewPin === null ? {} : { reviewPin }),
+        // The refresh fields are always emitted: the writer always stores both (lane CO8).
+        refresh: refresh === null ? null : refresh,
+        conflictMark: conflictMark === null ? null : conflictMark,
       }),
     };
   } catch {
@@ -301,6 +375,48 @@ function readChainReviewPin(value: unknown, chainName: string): ChainReviewPin |
   return Object.freeze({ headSha, requestId, key, pinnedAtIso });
 }
 
+const REFRESH_KEYS: readonly string[] = ['key', 'mainSha', 'outcome', 'updatedAtIso'];
+
+/**
+ * A stored refresh entry: null when absent (or stored as null), the frozen entry
+ * when well formed for this chain, undefined when present but malformed. The key
+ * must be exactly the one the chain name and main head give.
+ */
+function readChainRefresh(value: unknown, chainName: string): ChainRefreshEntry | null | undefined {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const snapshot = readExactPlainRecord(value, REFRESH_KEYS);
+  if (snapshot === null) {
+    return undefined;
+  }
+  const { key, mainSha: storedSha, outcome, updatedAtIso } = snapshot;
+  if (typeof storedSha !== 'string' || !isChainCommitSha(storedSha)) {
+    return undefined;
+  }
+  if (
+    key !== chainRefreshKey(chainName, storedSha) ||
+    !CHAIN_REFRESH_OUTCOMES.includes(outcome as ChainRefreshOutcome) ||
+    !isZonedIsoDateTime(updatedAtIso)
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    key: key as string,
+    mainSha: storedSha,
+    outcome: outcome as ChainRefreshOutcome,
+    updatedAtIso: updatedAtIso as string,
+  });
+}
+
+/** A stored conflict mark: null when absent (or stored as null), the mark when exact, undefined when malformed. */
+function readConflictMark(value: unknown): typeof CHAIN_REFRESH_CONFLICT_MARK | null | undefined {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return value === CHAIN_REFRESH_CONFLICT_MARK ? CHAIN_REFRESH_CONFLICT_MARK : undefined;
+}
+
 /** The record's review pin; a record without one (every CO7 record) has none. */
 export function reviewPinOf(record: ChainRecord): ChainReviewPin | null {
   return record.reviewPin ?? null;
@@ -314,6 +430,68 @@ export function applyChainReviewPin(record: ChainRecord, pin: ChainReviewPin, at
   return Object.freeze({
     ...record,
     reviewPin: Object.freeze({ headSha: pin.headSha, requestId: pin.requestId, key: pin.key, pinnedAtIso: atIso }),
+    revision: record.revision + 1,
+  });
+}
+
+/** The record's refresh entry; a record without one (every CO7 record) has none. */
+export function chainRefreshOf(record: ChainRecord): ChainRefreshEntry | null {
+  return record.refresh ?? null;
+}
+
+/** The record's conflict mark; a record without one (every CO7 record) has none. */
+export function conflictMarkOf(record: ChainRecord): typeof CHAIN_REFRESH_CONFLICT_MARK | null {
+  return record.conflictMark ?? null;
+}
+
+/**
+ * The record with its refresh intent recorded (`in-flight` under the key at the
+ * main head) and revision advanced by one; the conflict mark is untouched.
+ * Never throws; never echoes an input value.
+ */
+export function applyChainRefreshIntent(
+  record: ChainRecord,
+  intent: { readonly key: string; readonly mainSha: string; readonly atIso: string },
+): ChainRecord {
+  return Object.freeze({
+    ...record,
+    refresh: Object.freeze({
+      key: intent.key,
+      mainSha: intent.mainSha,
+      outcome: 'in-flight' as const,
+      updatedAtIso: intent.atIso,
+    }),
+    conflictMark: record.conflictMark ?? null,
+    revision: record.revision + 1,
+  });
+}
+
+/**
+ * The record with its refresh outcome recorded and revision advanced by one:
+ * `conflict` sets the conflict mark, `merged` and `up-to-date` clear it, and
+ * `branch-gone` leaves it unchanged. Never throws; never echoes an input value.
+ */
+export function applyChainRefreshOutcome(
+  record: ChainRecord,
+  outcome: ChainRefreshTerminalOutcome,
+  atIso: string,
+): ChainRecord {
+  const prior = record.refresh ?? null;
+  const conflictMark =
+    outcome === 'conflict'
+      ? CHAIN_REFRESH_CONFLICT_MARK
+      : outcome === 'branch-gone'
+        ? (record.conflictMark ?? null)
+        : null;
+  return Object.freeze({
+    ...record,
+    refresh: Object.freeze({
+      key: prior?.key ?? '',
+      mainSha: prior?.mainSha ?? '',
+      outcome,
+      updatedAtIso: atIso,
+    }),
+    conflictMark,
     revision: record.revision + 1,
   });
 }

@@ -51,7 +51,37 @@ import type {
   SavePullRequestLinkResult,
 } from "../ports/out/LanePlanRepositoryPort.out-port.js";
 import type { MergeRecordRepositoryPort } from "../ports/out/MergeRecordRepositoryPort.out-port.js";
+import type {
+  PullRequestSnapshot,
+  ReadPullRequestRequest,
+  ReadPullRequestResult,
+} from "../ports/out/ForgeReadPort.out-port.js";
 import type { MergeRecordSaveOutcome } from "../ports/out/MergeRecordRepositoryPort.out-port.js";
+
+/**
+ * A pull-request read that answers any number as open on `feat/lane-auth` at
+ * the shared head (WB5b2): the verification of a request-only number passes.
+ */
+const OPEN_READER = {
+  async readPullRequest(
+    request: ReadPullRequestRequest,
+  ): Promise<ReadPullRequestResult> {
+    return {
+      outcome: "found",
+      pullRequest: {
+        number: request.ref.kind === "number" ? request.ref.number : 0,
+        state: "open",
+        mergeState: "clean",
+        headSha: "1111111111111111111111111111111111111111",
+        headRef: "feat/lane-auth",
+        baseRef: "main",
+        mergedAtIso: null,
+        closedAtIso: null,
+        mergeCommitSha: null,
+      },
+    };
+  },
+};
 
 class InMemoryAcceptanceEvidencePort implements AcceptanceEvidencePort {
   constructor(private readonly result: ReadAcceptanceResult) {}
@@ -236,6 +266,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         workOrderRepo,
         journal,
@@ -316,6 +347,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
       const instance1 = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -336,6 +368,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       // Instance 2 simulates a second process running with a fresh use case instance on the same journal
       const instance2 = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -386,6 +419,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -474,6 +508,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -506,6 +541,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -540,6 +576,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -569,6 +606,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -601,6 +639,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -635,6 +674,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -688,6 +728,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -728,6 +769,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
 
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -811,6 +853,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
         authorizationPort: authPort,
         forgePort,
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         acceptedReceiptByHead: { [HEAD]: "receipt-001" },
         acceptanceEvidencePort: acceptancePortFound(),
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
@@ -1024,6 +1067,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       };
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -1160,6 +1204,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
       };
       const useCase = new ExecuteAuthorizedForgeActionUseCase({
         mergeRecordRepo: new FakeMergeRecordRepo([]),
+        forgeRead: OPEN_READER,
         attemptRepo,
         attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
         workOrderRepo,
@@ -1288,6 +1333,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
         };
         const useCase = new ExecuteAuthorizedForgeActionUseCase({
           mergeRecordRepo: new FakeMergeRecordRepo([]),
+          forgeRead: OPEN_READER,
           attemptRepo,
           attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
           workOrderRepo,
@@ -1356,6 +1402,7 @@ describe("ExecuteAuthorizedForgeActionUseCase", () => {
         };
         const useCase = new ExecuteAuthorizedForgeActionUseCase({
           mergeRecordRepo: new FakeMergeRecordRepo([]),
+          forgeRead: OPEN_READER,
           attemptRepo,
           attemptOwnerDecisionPort: attemptDoorsFrom(attemptRepo),
           workOrderRepo,
@@ -1536,15 +1583,81 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
     };
   }
 
+  const WB_BRANCH = "feat/lane-auth";
+
+  function snapshot(
+    number: number,
+    overrides: Partial<PullRequestSnapshot> = {},
+  ): PullRequestSnapshot {
+    return {
+      number,
+      state: "open",
+      mergeState: "clean",
+      headSha: WB_HEAD,
+      headRef: WB_BRANCH,
+      baseRef: "main",
+      mergedAtIso: null,
+      closedAtIso: null,
+      mergeCommitSha: null,
+      ...overrides,
+    };
+  }
+
+  /** Any number the use case asks about is open on the attempt's branch at the expected head. */
+  async function openAtExpectedHead(
+    request: ReadPullRequestRequest,
+  ): Promise<ReadPullRequestResult> {
+    return {
+      outcome: "found",
+      pullRequest: snapshot(request.ref.kind === "number" ? request.ref.number : 0),
+    };
+  }
+
+  function typedCompletedEntry(number: number): ActionJournalEntryRecord {
+    return {
+      id: "forge:act-open:completed:2",
+      attemptId: "att-001",
+      workOrderId: "wo-001",
+      action: "forge",
+      status: "completed",
+      baseCommit: "b".repeat(40),
+      recordedAtIso: "2026-11-01T00:00:00.000Z",
+      sessionId: null,
+      detail: null,
+      pullRequest: { repository: "org/repo", number },
+    };
+  }
+
+  function storedLink(number: number): PullRequestLinkRecord {
+    return {
+      version: 1,
+      repository: "org/repo",
+      number,
+      projectId: "proj-001",
+      planId: null,
+      laneId: "lane-auth",
+      source: "fleet-forge-action",
+      linkedAtIso: "2026-11-05T10:00:00.000Z",
+    };
+  }
+
   function wb5bDeps(
     options: {
       workOrder?: WorkOrderRecord;
       forge?: (request: ForgeActionRequest) => ForgeActionResult;
       now?: () => string;
       lookup?: () => Promise<OpenPullRequestsByHeadResult>;
+      /** The pull-request read (WB5b2); `"none"` wires no reader. Default: any number is open at the expected head. */
+      read?:
+        | ((request: ReadPullRequestRequest) => Promise<ReadPullRequestResult>)
+        | "none";
+      /** Overrides the merge-record store's answer to `saveMergeRecord` (WB5b2). */
+      saveOutcome?: MergeRecordSaveOutcome;
     } = {},
   ) {
     const order: string[] = [];
+    const reads: ReadPullRequestRequest[] = [];
+    const consumed: string[] = [];
     const lookups: { repository: string; branchName: string }[] = [];
     const journalBase = new InMemoryJournal();
     const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
@@ -1553,6 +1666,24 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
     );
     const lanePlanRepo = new FakeLanePlanRepo(order);
     const mergeRecordRepo = new FakeMergeRecordRepo(order);
+    const mergeStore: MergeRecordRepositoryPort =
+      options.saveOutcome === undefined
+        ? mergeRecordRepo
+        : {
+            saveMergeRecord: async () =>
+              options.saveOutcome as MergeRecordSaveOutcome,
+            findMergeRecord: (repository, number) =>
+              mergeRecordRepo.findMergeRecord(repository, number),
+            listMergeRecords: () => mergeRecordRepo.listMergeRecords(),
+          };
+    const readOverride = options.read === "none" ? undefined : options.read;
+    const readPullRequest =
+      options.read === "none"
+        ? undefined
+        : async (request: ReadPullRequestRequest) => {
+            reads.push(request);
+            return (readOverride ?? openAtExpectedHead)(request);
+          };
     const seen: ForgeActionRequest[] = [];
     const forgePort: ForgeActionPort = {
       isConfigured: () => true,
@@ -1578,6 +1709,7 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
         return { outcome: "granted", authorizationGrantId: "grant-001" };
       },
       async consumeActionAuthorization(req) {
+        consumed.push(req.actionId);
         return { outcome: "consumed", actionId: req.actionId };
       },
     };
@@ -1591,10 +1723,15 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       acceptedReceiptByHead: { [WB_HEAD]: "receipt-001" },
       acceptanceEvidencePort: acceptedAssessment(),
       lanePlanRepo,
-      mergeRecordRepo,
+      mergeRecordRepo: mergeStore,
+      ...(readPullRequest !== undefined
+        ? { forgeRead: { readPullRequest } }
+        : {}),
       ...(options.now ? { now: options.now } : {}),
     });
     return {
+      consumed,
+      reads,
       lookups,
       useCase,
       journal: journalBase,
@@ -2253,6 +2390,312 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       ).toEqual({ outcome: "refused", reason: "legacy-pr-lookup-unreadable" });
       expect(unreadable.seen).toHaveLength(0);
       expect(thrown.seen).toHaveLength(0);
+    });
+  });
+
+  describe("WB5b2: the recorded pull request is the merged pull request", () => {
+    it("refuses a request number that disagrees with the typed journal reference: pull-request-sources-disagree, no grant, no forge call, no read", async () => {
+      const deps = wb5bDeps();
+      await deps.journal.appendJournalEntry(typedCompletedEntry(42));
+      const result = await deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        pullRequestNumber: 999,
+      });
+      expect(result).toEqual({
+        outcome: "refused",
+        reason: "pull-request-sources-disagree",
+      });
+      expect(deps.consumed).toEqual([]);
+      expect(deps.seen).toHaveLength(0);
+      expect(deps.reads).toHaveLength(0);
+      expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
+      expect(await deps.lanePlanRepo.listPullRequestLinks()).toEqual([]);
+    });
+
+    it("refuses a stored link that disagrees with the journal or the request, before the grant", async () => {
+      const journalVsLink = wb5bDeps();
+      await journalVsLink.journal.appendJournalEntry(typedCompletedEntry(42));
+      await journalVsLink.lanePlanRepo.savePullRequestLink(storedLink(43));
+      expect(
+        await journalVsLink.useCase.executeAuthorizedForgeAction(mergeReq),
+      ).toEqual({ outcome: "refused", reason: "pull-request-sources-disagree" });
+      expect(journalVsLink.consumed).toEqual([]);
+
+      const requestVsLink = wb5bDeps();
+      await requestVsLink.lanePlanRepo.savePullRequestLink(storedLink(43));
+      expect(
+        await requestVsLink.useCase.executeAuthorizedForgeAction({
+          ...mergeReq,
+          pullRequestNumber: 44,
+        }),
+      ).toEqual({ outcome: "refused", reason: "pull-request-sources-disagree" });
+      expect(requestVsLink.consumed).toEqual([]);
+      expect(requestVsLink.seen).toHaveLength(0);
+    });
+
+    it.each([
+      [
+        "another branch's pull request",
+        async () => ({
+          outcome: "found" as const,
+          pullRequest: snapshot(7, { headRef: "feat/other-lane" }),
+        }),
+      ],
+      [
+        "a head mismatch",
+        async () => ({
+          outcome: "found" as const,
+          pullRequest: snapshot(7, { headSha: WB_OTHER_HEAD }),
+        }),
+      ],
+      [
+        "a closed pull request",
+        async () => ({
+          outcome: "found" as const,
+          pullRequest: snapshot(7, {
+            state: "closed" as const,
+            closedAtIso: "2026-11-05T09:00:00.000Z",
+          }),
+        }),
+      ],
+      ["a not-found answer", async () => ({ outcome: "not-found" as const })],
+      [
+        "an unavailable answer",
+        async () => ({ outcome: "unavailable" as const, reason: "boom" }),
+      ],
+      [
+        "a snapshot of another number",
+        async () => ({
+          outcome: "found" as const,
+          pullRequest: snapshot(8),
+        }),
+      ],
+      [
+        "a throwing read",
+        async (): Promise<ReadPullRequestResult> => {
+          throw new Error("forge exploded");
+        },
+      ],
+    ])(
+      "refuses a request-only number that is unverified: %s",
+      async (_name, read) => {
+        const deps = wb5bDeps({ read });
+        const result = await deps.useCase.executeAuthorizedForgeAction({
+          ...mergeReq,
+          pullRequestNumber: 7,
+        });
+        expect(result).toEqual({
+          outcome: "refused",
+          reason: "pull-request-unverified",
+        });
+        expect(deps.consumed).toEqual([]);
+        expect(deps.seen).toHaveLength(0);
+        expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
+        expect(await deps.lanePlanRepo.listPullRequestLinks()).toEqual([]);
+      },
+    );
+
+    it("refuses a request-only number when no pull-request reader is wired: unknown stays unknown", async () => {
+      const deps = wb5bDeps({ read: "none" });
+      const result = await deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        pullRequestNumber: 7,
+      });
+      expect(result).toEqual({
+        outcome: "refused",
+        reason: "pull-request-unverified",
+      });
+      expect(deps.consumed).toEqual([]);
+      expect(deps.seen).toHaveLength(0);
+    });
+
+    it("verifies a request-only number that is right with one bounded read, and merges by that number", async () => {
+      const deps = wb5bDeps();
+      const result = await deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        pullRequestNumber: 7,
+      });
+      expect(result.outcome).toBe("executed");
+      expect(deps.reads).toEqual([
+        {
+          ref: { kind: "number", number: 7 },
+          repository: { owner: "org", repo: "repo" },
+          timeoutMs: 15_000,
+        },
+      ]);
+      expect(deps.seen[0]?.pullRequestNumber).toBe(7);
+      expect(
+        await deps.mergeRecordRepo.findMergeRecord("org/repo", 7),
+      ).toMatchObject({ number: 7, headSha: WB_HEAD });
+    });
+
+    it("needs no read when the request agrees with the typed journal reference", async () => {
+      const deps = wb5bDeps({ read: "none" });
+      await deps.journal.appendJournalEntry(typedCompletedEntry(42));
+      const result = await deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        pullRequestNumber: 42,
+      });
+      expect(result.outcome).toBe("executed");
+      expect(deps.seen[0]?.pullRequestNumber).toBe(42);
+    });
+
+    it.each([
+      [
+        "closed",
+        snapshot(9, {
+          state: "closed",
+          closedAtIso: "2026-11-05T09:00:00.000Z",
+        }),
+      ],
+      [
+        "merged at a different head",
+        snapshot(9, {
+          state: "merged",
+          headSha: WB_OTHER_HEAD,
+          mergedAtIso: "2026-11-05T09:00:00.000Z",
+          mergeCommitSha: WB_OTHER_HEAD,
+        }),
+      ],
+    ])(
+      "refuses a stored link whose pull request is %s: pull-request-link-stale",
+      async (_name, pullRequest) => {
+        const deps = wb5bDeps({
+          read: async () => ({ outcome: "found", pullRequest }),
+        });
+        await deps.lanePlanRepo.savePullRequestLink(storedLink(9));
+        const result = await deps.useCase.executeAuthorizedForgeAction(mergeReq);
+        expect(result).toEqual({
+          outcome: "refused",
+          reason: "pull-request-link-stale",
+        });
+        expect(deps.consumed).toEqual([]);
+        expect(deps.seen).toHaveLength(0);
+        expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
+      },
+    );
+
+    it("refuses a stored link it cannot read, and merges one that is open", async () => {
+      const unreadable = wb5bDeps({
+        read: async () => ({ outcome: "unavailable", reason: "boom" }),
+      });
+      await unreadable.lanePlanRepo.savePullRequestLink(storedLink(9));
+      expect(
+        await unreadable.useCase.executeAuthorizedForgeAction(mergeReq),
+      ).toEqual({ outcome: "refused", reason: "pull-request-unverified" });
+      expect(unreadable.consumed).toEqual([]);
+
+      const open = wb5bDeps();
+      await open.lanePlanRepo.savePullRequestLink(storedLink(9));
+      expect(
+        (await open.useCase.executeAuthorizedForgeAction(mergeReq)).outcome,
+      ).toBe("executed");
+      expect(open.seen[0]?.pullRequestNumber).toBe(9);
+    });
+
+    it.each([
+      [
+        "refused",
+        { outcome: "refused", code: "invalid" } as MergeRecordSaveOutcome,
+      ],
+      [
+        "integrity-conflict",
+        {
+          outcome: "integrity-conflict",
+          record: {
+            schemaVersion: 1,
+            repository: "org/repo",
+            number: 7,
+            headSha: WB_OTHER_HEAD,
+            mergedAtIso: "2026-11-05T09:00:00.000Z",
+            firstSeenAtIso: "2026-11-05T09:00:00.000Z",
+            source: "forge-observation",
+            merger: "unknown",
+          },
+        } as MergeRecordSaveOutcome,
+      ],
+    ])(
+      "does not mark the work order merged when saveMergeRecord answers %s: typed outcome and an ambiguous journal entry",
+      async (outcome, saveOutcome) => {
+        const deps = wb5bDeps({ saveOutcome });
+        const result = await deps.useCase.executeAuthorizedForgeAction({
+          ...mergeReq,
+          pullRequestNumber: 7,
+        });
+        expect(result).toEqual({
+          outcome: "refused",
+          reason: "merge-record-not-saved",
+          forgeAmbiguous: true,
+        });
+        expect(
+          (await deps.workOrderRepo.findWorkOrderById("wo-001"))?.state,
+        ).toBe("approved");
+        const ambiguous = deps.journal.entries.filter(
+          (entry) => entry.status === "ambiguous",
+        );
+        expect(ambiguous).toHaveLength(1);
+        expect(ambiguous[0]?.detail).toBe(
+          `merge-record-not-saved:${outcome}`,
+        );
+        // The completed entry still carries the typed reference a later pass reads.
+        expect(
+          deps.journal.entries.find((entry) => entry.status === "completed")
+            ?.pullRequest,
+        ).toEqual({ repository: "org/repo", number: 7 });
+      },
+    );
+
+    it("refuses an operator actionId too long for the merge record's actionRef before the grant, and accepts the longest that fits", async () => {
+      const tooLong = wb5bDeps();
+      const refused = await tooLong.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        actionId: "a".repeat(106),
+        pullRequestNumber: 7,
+      });
+      expect(refused).toEqual({
+        outcome: "refused",
+        reason: "action-id-too-long",
+      });
+      expect(tooLong.consumed).toEqual([]);
+      expect(tooLong.seen).toHaveLength(0);
+      expect(tooLong.reads).toHaveLength(0);
+      expect(tooLong.journal.entries).toHaveLength(0);
+
+      const fits = wb5bDeps();
+      const merged = await fits.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        actionId: "a".repeat(105),
+        pullRequestNumber: 7,
+      });
+      expect(merged.outcome).toBe("executed");
+      const stored = await fits.mergeRecordRepo.findMergeRecord("org/repo", 7);
+      expect(stored?.actionRef?.length).toBeLessThanOrEqual(128);
+    });
+
+    it("passes through only the two exact legacy-lookup reasons; every other unreadable reason is generic", async () => {
+      for (const reason of [
+        "legacy-pr-lookup-unbound-repository",
+        "legacy-pr-lookup-repository-mismatch",
+      ]) {
+        const deps = wb5bDeps({
+          lookup: async () => ({ outcome: "unreadable", reason }),
+        });
+        expect(
+          await deps.useCase.executeAuthorizedForgeAction(mergeReq),
+        ).toEqual({ outcome: "refused", reason });
+      }
+      for (const reason of [
+        "legacy-pr-lookup-token-ghp_exposed",
+        "legacy-pr-lookup-",
+        "gh failed",
+      ]) {
+        const deps = wb5bDeps({
+          lookup: async () => ({ outcome: "unreadable", reason }),
+        });
+        expect(
+          await deps.useCase.executeAuthorizedForgeAction(mergeReq),
+        ).toEqual({ outcome: "refused", reason: "legacy-pr-lookup-unreadable" });
+      }
     });
   });
 

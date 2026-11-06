@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -29,31 +29,49 @@ export function isWebLoginPath(path: string): boolean {
   return path === WEB_LOGIN_PATH;
 }
 
+/** Remove the login code file from a state directory. Never throws. */
+export function removeWebLoginCodeFile(stateDir: string): void {
+  try {
+    rmSync(join(stateDir, WEB_LOGIN_CODE_FILE), { force: true });
+  } catch {
+    // ignore removal failure
+  }
+}
+
 /**
  * Issue a fresh single-use web login code and persist it to
  * `<stateDir>/web-login-code.json` as `{"code":...,"issuedAtIso":...}`. The
- * file is written through a temp file in the same directory (created with mode
- * `0o600`), renamed into place, then chmod'ed to `0o600`. On any filesystem
- * error the login stays closed (no code is stored) and `null` is returned;
- * this function never throws.
+ * file is written through a temp file in the same directory (unpredictable
+ * name, created exclusively with `wx` and mode `0o600`) and renamed into
+ * place; no later operation touches the final path. On any filesystem error
+ * (an existing temp path included) the login stays closed: no code is stored, any earlier code file
+ * is removed and `null` is returned; this function never throws.
  */
 export function issueWebLoginCode(stateDir: string): string | null {
-  const code = randomBytes(32).toString("base64url");
   const filePath = join(stateDir, WEB_LOGIN_CODE_FILE);
   codeFilePath = filePath;
-  const tempPath = `${filePath}.${process.pid}-${Date.now()}.tmp`;
+  let tempPath: string | null = null;
+  let code: string;
   try {
+    code = randomBytes(32).toString("base64url");
+    tempPath = `${filePath}.${randomBytes(16).toString("hex")}.tmp`;
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(
       tempPath,
       `${JSON.stringify({ code, issuedAtIso: new Date().toISOString() })}\n`,
-      { mode: 0o600, encoding: "utf8" },
+      { flag: "wx", mode: 0o600, encoding: "utf8" },
     );
     renameSync(tempPath, filePath);
-    chmodSync(filePath, 0o600);
   } catch {
+    if (tempPath !== null) {
+      try {
+        rmSync(tempPath, { force: true });
+      } catch {
+        // ignore cleanup failure
+      }
+    }
     try {
-      rmSync(tempPath, { force: true });
+      rmSync(filePath, { force: true });
     } catch {
       // ignore cleanup failure
     }

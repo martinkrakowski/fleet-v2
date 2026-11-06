@@ -66,6 +66,10 @@ type TransitionInputResult =
   | { readonly kind: 'input'; readonly value: Record<string, unknown> }
   | ResolveOwnerItemResult;
 
+type ActorClockContext =
+  | { readonly kind: 'input'; readonly actorId?: string; readonly nowIso?: string }
+  | { readonly kind: 'refusal'; readonly result: ResolveOwnerItemResult };
+
 export class ResolveOwnerItemUseCase implements ResolveOwnerItemPort {
   constructor(private readonly deps?: ResolveOwnerItemDependencies) {}
 
@@ -115,24 +119,11 @@ export class ResolveOwnerItemUseCase implements ResolveOwnerItemPort {
 
     // 3. The actor is who marks done or withdraws; the clock supplies the
     //    moment for plan decisions and owner closure.
-    let actorId: string | undefined;
-    if (action === 'done' || action === 'withdraw') {
-      if (typeof actor !== 'string') {
-        return this.refuse('request', 'ResolveOwnerItem the actor could not be identified');
-      }
-      actorId = actor;
+    const context = this.actorAndClock(action, actor);
+    if (context.kind === 'refusal') {
+      return context.result;
     }
-    let nowIso: string | undefined;
-    if (action === 'plan-decision' || action === 'done' || action === 'withdraw') {
-      try {
-        nowIso = this.deps.clock.nowIso();
-      } catch {
-        return this.refuse('clock-read', 'ResolveOwnerItem the clock could not be read');
-      }
-      if (typeof nowIso !== 'string' || !Number.isFinite(Date.parse(nowIso))) {
-        return this.refuse('clock-read', 'ResolveOwnerItem the clock could not be read');
-      }
-    }
+    const { actorId, nowIso } = context;
 
     // 4. One attempt; a lost race is retried once.
     const first = await this.attemptSafely(action, parsed, actorId, nowIso);
@@ -148,6 +139,29 @@ export class ResolveOwnerItemUseCase implements ResolveOwnerItemPort {
 
   private refuse(code: ResolveOwnerItemRefusalCode, reason: string): ResolveOwnerItemResult {
     return { outcome: 'refused', code, reason };
+  }
+
+  /** The done/withdraw actor and the clock moment when the action needs them, or a refusal. */
+  private actorAndClock(action: ActionKind, actor: unknown): ActorClockContext {
+    let actorId: string | undefined;
+    if (action === 'done' || action === 'withdraw') {
+      if (typeof actor !== 'string') {
+        return { kind: 'refusal', result: this.refuse('request', 'ResolveOwnerItem the actor could not be identified') };
+      }
+      actorId = actor;
+    }
+    let nowIso: string | undefined;
+    if (action === 'plan-decision' || action === 'done' || action === 'withdraw') {
+      try {
+        nowIso = this.deps!.clock.nowIso();
+      } catch {
+        return { kind: 'refusal', result: this.refuse('clock-read', 'ResolveOwnerItem the clock could not be read') };
+      }
+      if (typeof nowIso !== 'string' || !Number.isFinite(Date.parse(nowIso))) {
+        return { kind: 'refusal', result: this.refuse('clock-read', 'ResolveOwnerItem the clock could not be read') };
+      }
+    }
+    return { kind: 'input', actorId, nowIso };
   }
 
   private async attemptOnce(

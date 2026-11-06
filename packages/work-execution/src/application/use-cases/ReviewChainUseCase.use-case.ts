@@ -21,12 +21,12 @@ import { attemptIdForChain, isSameModelFamily, underlyingModelFamily } from '@fl
 import { containsSecretShape } from '@fleet/shared';
 import { resolveLaneRunBaseBranch } from '../../domain/base-branch.js';
 import {
+  chainReviewRequestIdOf as chainReviewRequestIdOfDomain,
   isChainCommitSha,
   parseChainName,
   parseChainRepository,
   reviewPinOf,
 } from '../../domain/chain-records.js';
-import { chainReviewRequestIdOf as chainReviewRequestIdOfDomain } from '../../domain/chain-records.js';
 import type { ChainRecord } from '../../domain/chain-records.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import type { AttemptRecord } from '../../domain/execution-records.js';
@@ -537,6 +537,58 @@ const TERMINAL_STATES: readonly string[] = MERGE_QUEUE_TERMINAL_STATES;
 
 type Fail = { readonly outcome: 'refused' | 'unknown'; readonly reason: ReviewChainReason };
 
+type ProceedDecision = Extract<ReturnType<typeof decideChainReviewStart>, { readonly outcome: 'proceed' }>;
+
+/** Bytewise (UTF-16 code unit) order, the order of the default sort. */
+function compareBytewise(a: string, b: string): number {
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
+}
+
+/** One lane run as a chain link: its last attempt, head and merge-queue state. */
+function linkOf(run: LaneRunRecord, attempts: readonly AttemptRecord[], entries: readonly MergeQueueEntryRecord[]): ChainLink {
+  const last = attempts.at(-1);
+  const headSha = last?.artifacts?.headCommit ?? null;
+  const pullRequest = run.prNumber;
+  const linkEntries = pullRequest === null ? [] : entries.filter((entry) => entry.pullRequest === pullRequest);
+  const queueSettled =
+    linkEntries.length > 0 &&
+    linkEntries.every((entry) => TERMINAL_STATES.includes(entry.state)) &&
+    linkEntries.some((entry) => entry.state === 'merged');
+  const hasReceipt = (last?.completionReceipt ?? null) !== null;
+  return {
+    pullRequestNumber: pullRequest,
+    attemptId: last?.id ?? null,
+    headSha: headSha !== null && isChainCommitSha(headSha) ? headSha : null,
+    settled:
+      pullRequest !== null &&
+      last !== undefined &&
+      hasReceipt &&
+      headSha !== null &&
+      isChainCommitSha(headSha) &&
+      queueSettled,
+  };
+}
+
+/** The answer to a pin write that did not record: `null` means re-read and retry (a stale record on the first try). */
+function pinRefusalFor(reason: string, attempt: number): Fail | null {
+  if (reason === 'chain-unreadable') {
+    return unknownWith('chain-unreadable');
+  }
+  if (reason !== 'chain-record-stale') {
+    return unknownWith('store-unavailable');
+  }
+  if (attempt === 1) {
+    return refusedWith('chain-record-stale');
+  }
+  return null;
+}
+
 function refusedWith(reason: ReviewChainReason): Fail {
   return { outcome: 'refused', reason };
 }
@@ -764,42 +816,32 @@ export class ReviewChainUseCase implements ReviewChainPort {
     const links: ChainLink[] = [];
     const allAttempts: AttemptRecord[] = [];
     for (const run of runs) {
-      const attempts: AttemptRecord[] = [];
-      for (const attemptId of run.attemptIds) {
-        let attempt: AttemptRecord | null;
-        try {
-          attempt = await this.deps.attempts.findAttemptById(attemptId);
-        } catch {
-          return null;
-        }
-        if (attempt === null) {
-          return null;
-        }
-        attempts.push(attempt);
+      const attempts = await this.readRunAttempts(run);
+      if (attempts === null) {
+        return null;
       }
       allAttempts.push(...attempts);
-      const last = attempts.length === 0 ? undefined : attempts[attempts.length - 1];
-      const headSha = last?.artifacts?.headCommit ?? null;
-      const pullRequest = run.prNumber;
-      const linkEntries = pullRequest === null ? [] : entries.filter((entry) => entry.pullRequest === pullRequest);
-      const queueSettled =
-        linkEntries.length > 0 &&
-        linkEntries.every((entry) => TERMINAL_STATES.includes(entry.state)) &&
-        linkEntries.some((entry) => entry.state === 'merged');
-      links.push({
-        pullRequestNumber: pullRequest,
-        attemptId: last?.id ?? null,
-        headSha: headSha !== null && isChainCommitSha(headSha) ? headSha : null,
-        settled:
-          pullRequest !== null &&
-          last !== undefined &&
-          last.completionReceipt !== null &&
-          headSha !== null &&
-          isChainCommitSha(headSha) &&
-          queueSettled,
-      });
+      links.push(linkOf(run, attempts, entries));
     }
     return { links, attempts: allAttempts };
+  }
+
+  /** Every attempt of a run, in order; `null` when one cannot be read or is missing. */
+  private async readRunAttempts(run: LaneRunRecord): Promise<AttemptRecord[] | null> {
+    const attempts: AttemptRecord[] = [];
+    for (const attemptId of run.attemptIds) {
+      let attempt: AttemptRecord | null;
+      try {
+        attempt = await this.deps.attempts.findAttemptById(attemptId);
+      } catch {
+        return null;
+      }
+      if (attempt === null) {
+        return null;
+      }
+      attempts.push(attempt);
+    }
+    return attempts;
   }
 
   // ---------- start ----------
@@ -850,12 +892,21 @@ export class ReviewChainUseCase implements ReviewChainPort {
     if (decision.outcome !== 'proceed') {
       return decision;
     }
-    const implementerModels = models.ok ? [...models.models].sort() : [];
+    const implementerModels = models.ok ? [...models.models].sort(compareBytewise) : [];
+    return this.pinAndRequest(command, prepared.record, decision, implementerModels);
+  }
 
+  /** Pin the tip, then answer from an existing receipt or request the one review. */
+  private async pinAndRequest(
+    command: ChainReviewCommand,
+    record: ChainRecord,
+    decision: ProceedDecision,
+    implementerModels: readonly string[],
+  ): Promise<ReviewChainStartResult> {
     if (!this.budgetLeft(command.nowIso, command.deadlineIso)) {
       return refusedWith('budget-exhausted');
     }
-    const pinned = await this.pinTip(command, prepared.record, {
+    const pinned = await this.pinTip(command, record, {
       headSha: decision.headSha,
       requestId: decision.requestId,
       key: decision.key,
@@ -983,26 +1034,33 @@ export class ReviewChainUseCase implements ReviewChainPort {
       if (decision.outcome === 'already-recorded') {
         return { outcome: 'pinned', already: true };
       }
-      if (decision.reason === 'chain-unreadable') {
-        return unknownWith('chain-unreadable');
+      const stopped = pinRefusalFor(decision.reason, attempt);
+      if (stopped !== null) {
+        return stopped;
       }
-      if (decision.reason !== 'chain-record-stale') {
-        return unknownWith('store-unavailable');
+      const reread = await this.rereadRevision(command, pin);
+      if ('outcome' in reread) {
+        return reread;
       }
-      if (attempt === 1) {
-        return refusedWith('chain-record-stale');
-      }
-      const reread = await this.prepareRecord(command);
-      if (reread.outcome !== 'ok') {
-        return reread.fail;
-      }
-      const stored = reviewPinOf(reread.record);
-      if (stored !== null && (stored.key !== pin.key || stored.headSha !== pin.headSha)) {
-        return refusedWith('chain-record-stale');
-      }
-      revision = reread.record.revision;
+      revision = reread.revision;
     }
     return refusedWith('chain-record-stale');
+  }
+
+  /** The retry's re-read: the record's new revision, or a refusal when another pin took the record. */
+  private async rereadRevision(
+    command: ChainReviewCommand,
+    pin: { readonly headSha: string; readonly key: string },
+  ): Promise<{ readonly revision: ChainRecord['revision'] } | Fail> {
+    const reread = await this.prepareRecord(command);
+    if (reread.outcome !== 'ok') {
+      return reread.fail;
+    }
+    const stored = reviewPinOf(reread.record);
+    if (stored !== null && (stored.key !== pin.key || stored.headSha !== pin.headSha)) {
+      return refusedWith('chain-record-stale');
+    }
+    return { revision: reread.record.revision };
   }
 
   /** One more read of the record for the retry; the tip is not read again. */
@@ -1077,7 +1135,7 @@ export class ReviewChainUseCase implements ReviewChainPort {
       return prepared.fail;
     }
     const pin = reviewPinOf(prepared.record);
-    if (pin === null || pin.requestId !== command.requestId) {
+    if (pin?.requestId !== command.requestId) {
       return refusedWith('receipt-missing');
     }
     if (prepared.tipSha !== pin.headSha) {
@@ -1109,29 +1167,11 @@ export class ReviewChainUseCase implements ReviewChainPort {
       return refusedWith('link-unsettled');
     }
 
-    const inputs: ChainLinkReceiptInput[] = [];
-    for (const link of gathered.links) {
-      if (!this.budgetLeft(command.nowIso, command.deadlineIso)) {
-        return refusedWith('budget-exhausted');
-      }
-      // A settled link has a pull request, an attempt and a head by construction.
-      if (link.pullRequestNumber === null || link.attemptId === null || link.headSha === null) {
-        return refusedWith('link-unsettled');
-      }
-      let read: Awaited<ReturnType<AcceptanceReceiptReadPort['readReceiptsForHead']>>;
-      try {
-        read = await this.deps.receipts.readReceiptsForHead(link.attemptId, link.headSha);
-      } catch {
-        return unknownWith('store-unavailable');
-      }
-      if (read.outcome === 'none') {
-        return refusedWith('link-receipt-missing');
-      }
-      if (read.outcome !== 'found') {
-        return unknownWith('store-unavailable');
-      }
-      inputs.push({ pullRequestNumber: link.pullRequestNumber, attemptId: link.attemptId, receipts: read.review });
+    const collected = await this.collectLinkInputs(command, gathered.links);
+    if (!collected.ok) {
+      return collected.fail;
     }
+    const inputs = collected.inputs;
     const aggregate = aggregateLinkReceipts(inputs);
     if (!aggregate.ok) {
       return aggregate.reason === 'link-receipt-missing' ? refusedWith(aggregate.reason) : unknownWith(aggregate.reason);
@@ -1146,5 +1186,36 @@ export class ReviewChainUseCase implements ReviewChainPort {
       verdict: passed ? 'passed' : 'failed',
       links,
     };
+  }
+
+  /** Each settled link's receipts, in link order; the first refusal or unknown answer ends the read. */
+  private async collectLinkInputs(
+    command: ChainReviewCompleteInput,
+    links: readonly ChainLink[],
+  ): Promise<{ readonly ok: true; readonly inputs: ChainLinkReceiptInput[] } | { readonly ok: false; readonly fail: Fail }> {
+    const inputs: ChainLinkReceiptInput[] = [];
+    for (const link of links) {
+      if (!this.budgetLeft(command.nowIso, command.deadlineIso)) {
+        return { ok: false, fail: refusedWith('budget-exhausted') };
+      }
+      // A settled link has a pull request, an attempt and a head by construction.
+      if (link.pullRequestNumber === null || link.attemptId === null || link.headSha === null) {
+        return { ok: false, fail: refusedWith('link-unsettled') };
+      }
+      let read: Awaited<ReturnType<AcceptanceReceiptReadPort['readReceiptsForHead']>>;
+      try {
+        read = await this.deps.receipts.readReceiptsForHead(link.attemptId, link.headSha);
+      } catch {
+        return { ok: false, fail: unknownWith('store-unavailable') };
+      }
+      if (read.outcome === 'none') {
+        return { ok: false, fail: refusedWith('link-receipt-missing') };
+      }
+      if (read.outcome !== 'found') {
+        return { ok: false, fail: unknownWith('store-unavailable') };
+      }
+      inputs.push({ pullRequestNumber: link.pullRequestNumber, attemptId: link.attemptId, receipts: read.review });
+    }
+    return { ok: true, inputs };
   }
 }

@@ -209,6 +209,35 @@ const UNAVAILABLE_UNREADABLE_LIST: ListOpenPullRequestsByBaseResult = {
   reason: 'gh api pulls returned an unreadable answer',
 };
 
+/** One line of the open-pull-request listing; `null` when it is not exactly the requested shape. */
+function parseOpenPullRequestLine(line: string, base: string): OpenPullRequestSummary | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return null;
+  }
+  const record = parsed as Record<string, unknown>;
+  const head = record.head;
+  const baseRecord = record.base;
+  const number = parseSafeInteger(record.number);
+  const headSha =
+    head !== null && typeof head === 'object' && !Array.isArray(head)
+      ? parseHex40((head as Record<string, unknown>).sha)
+      : null;
+  const baseRef =
+    baseRecord !== null && typeof baseRecord === 'object' && !Array.isArray(baseRecord)
+      ? (baseRecord as Record<string, unknown>).ref
+      : undefined;
+  if (number === null || headSha === null || baseRef !== base) {
+    return null;
+  }
+  return { number, headSha, baseRef: base };
+}
+
 /**
  * Pure parse of the `gh api --paginate --jq OPEN_PULL_REQUESTS_JQ` stdout: one
  * JSON object per line, from every page. Every line must be an object with an
@@ -225,33 +254,13 @@ export function parseOpenPullRequests(stdout: string, base: string): ListOpenPul
     if (line.trim().length === 0) {
       continue;
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
+    const summary = parseOpenPullRequestLine(line, base);
+    if (summary === null) {
       return UNAVAILABLE_UNREADABLE_LIST;
     }
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return UNAVAILABLE_UNREADABLE_LIST;
-    }
-    const record = parsed as Record<string, unknown>;
-    const head = record.head;
-    const baseRecord = record.base;
-    const number = parseSafeInteger(record.number);
-    const headSha =
-      head !== null && typeof head === 'object' && !Array.isArray(head)
-        ? parseHex40((head as Record<string, unknown>).sha)
-        : null;
-    const baseRef =
-      baseRecord !== null && typeof baseRecord === 'object' && !Array.isArray(baseRecord)
-        ? (baseRecord as Record<string, unknown>).ref
-        : undefined;
-    if (number === null || headSha === null || baseRef !== base) {
-      return UNAVAILABLE_UNREADABLE_LIST;
-    }
-    if (!seen.has(number)) {
-      seen.add(number);
-      pullRequests.push({ number, headSha, baseRef: base });
+    if (!seen.has(summary.number)) {
+      seen.add(summary.number);
+      pullRequests.push(summary);
     }
   }
   return { outcome: 'listed', pullRequests };

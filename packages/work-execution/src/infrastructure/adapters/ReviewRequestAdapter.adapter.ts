@@ -7,27 +7,26 @@
  * reason code, and no transport or forge text reaches the caller.
  */
 
-import type { ReviewKind } from '@fleet/evidence-and-acceptance';
 import {
+  type EvidenceAssessmentRecord,
+  type EvidenceResultValue,
+  type FindingDispositionRecord,
+  type InspectAcceptanceEvidencePort,
+  type InspectAcceptanceEvidenceResult,
   REVIEW_KINDS,
   REVIEW_REQUEST_ID_PATTERN,
+  REVIEW_UNAVAILABLE_CODES,
+  type RecordFindingDispositionPort,
+  type RequestIndependentReviewPort,
+  type RequestIndependentReviewResult,
+  type ReviewKind,
+  type ReviewReceiptRecord,
+  type ReviewRejection,
+  type ReviewUnavailableCode,
   assessmentIdForAttempt,
   assessmentIdForChain,
   attemptIdForChain,
   receiptSubjectOf,
-} from '@fleet/evidence-and-acceptance';
-import type {
-  EvidenceAssessmentRecord,
-  EvidenceResultValue,
-  FindingDispositionRecord,
-  InspectAcceptanceEvidencePort,
-  InspectAcceptanceEvidenceResult,
-  RecordFindingDispositionPort,
-  RequestIndependentReviewPort,
-  RequestIndependentReviewResult,
-  ReviewReceiptRecord,
-  ReviewRejection,
-  ReviewUnavailableCode,
 } from '@fleet/evidence-and-acceptance';
 import type {
   FindLatestReceiptOfKindRequest,
@@ -45,7 +44,6 @@ import type {
 } from '../../application/ports/out/ReviewRequestPort.out-port.js';
 import { parseChainName } from '../../domain/chain-records.js';
 import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../domain/lane-run-journal.js';
-import { REVIEW_UNAVAILABLE_CODES } from '@fleet/evidence-and-acceptance';
 
 /** The only codes that may reach a run-journal `detail`: the evidence context's unavailable codes plus the two post-run rejections. */
 const REVIEW_DETAIL_CODES: ReadonlySet<string> = new Set([...REVIEW_UNAVAILABLE_CODES, 'not-read-only', 'invalid-receipt']);

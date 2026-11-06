@@ -738,7 +738,7 @@ describe('every refusal carries a fixed code and no path, diff or reviewer text'
       expect((result as { outcome: string }).outcome).not.toBe('started');
       expect((result as { outcome: string }).outcome).not.toBe('completed');
     }
-    expect(results.length).toBe(starts.length + completes.length);
+    expect(results).toHaveLength(starts.length + completes.length);
   });
 
   it('a started result and a completed result carry ids and codes only', async () => {

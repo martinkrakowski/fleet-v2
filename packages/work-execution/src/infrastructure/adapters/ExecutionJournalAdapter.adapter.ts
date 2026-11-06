@@ -212,6 +212,38 @@ export function parseReservationStateRecord(raw: unknown): CapacityReservationRe
 }
 
 /**
+ * The checks both fenced-release paths share: the attempt's held reservation
+ * must exist and be the requested one, and the attempt's revision must be
+ * readable and unchanged. Anything else answers the release result as is.
+ */
+async function checkFencedReleaseHeld(
+  reservations: Iterable<CapacityReservationRecord>,
+  request: ReleaseCapacityReservationIfUnchangedRequest,
+): Promise<
+  | { readonly outcome: 'held'; readonly held: CapacityReservationRecord }
+  | Exclude<ReleaseCapacityReservationIfUnchangedResult, { outcome: 'released' | 'refused' }>
+> {
+  const held = [...reservations].find(
+    (reservation) => reservation.attemptId === request.attemptId && reservation.held === true,
+  );
+  if (held === undefined) return { outcome: 'not-held' };
+  if (held.id !== request.reservationId) return { outcome: 'changed' };
+  let currentRevision: number | null;
+  try {
+    currentRevision = await request.readAttemptRevision();
+  } catch {
+    return { outcome: 'unknown', reason: 'attempt-unknown' };
+  }
+  if (currentRevision === null) {
+    return { outcome: 'unknown', reason: 'attempt-unknown' };
+  }
+  if (currentRevision !== request.attemptRevision) {
+    return { outcome: 'changed' };
+  }
+  return { outcome: 'held', held };
+}
+
+/**
  * One locked read-modify-write decision over the freshly read held
  * reservations: a claim by an attempt that already holds one is refused, a
  * claim over the host's budget is refused, and only a passing claim is
@@ -611,23 +643,11 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
             }
             throw error;
           }
-          const held = [...reservations.values()].find(
-            (reservation) => reservation.attemptId === request.attemptId && reservation.held === true,
-          );
-          if (held === undefined) return { outcome: 'not-held' };
-          if (held.id !== request.reservationId) return { outcome: 'changed' };
-          let currentRevision: number | null;
-          try {
-            currentRevision = await request.readAttemptRevision();
-          } catch {
-            return { outcome: 'unknown', reason: 'attempt-unknown' };
+          const check = await checkFencedReleaseHeld(reservations.values(), request);
+          if (check.outcome !== 'held') {
+            return check;
           }
-          if (currentRevision === null) {
-            return { outcome: 'unknown', reason: 'attempt-unknown' };
-          }
-          if (currentRevision !== request.attemptRevision) {
-            return { outcome: 'changed' };
-          }
+          const held = check.held;
           const priorList = [...reservations.values()];
           reservations.set(
             held.id,
@@ -714,23 +734,11 @@ export class ExecutionJournalAdapter implements ExecutionJournalPort {
   private async releaseInMemoryIfUnchangedLocked(
     request: ReleaseCapacityReservationIfUnchangedRequest,
   ): Promise<ReleaseCapacityReservationIfUnchangedResult> {
-    const held = [...this.inMemoryReservationsById.values()].find(
-      (reservation) => reservation.attemptId === request.attemptId && reservation.held === true,
-    );
-    if (held === undefined) return { outcome: 'not-held' };
-    if (held.id !== request.reservationId) return { outcome: 'changed' };
-    let currentRevision: number | null;
-    try {
-      currentRevision = await request.readAttemptRevision();
-    } catch {
-      return { outcome: 'unknown', reason: 'attempt-unknown' };
+    const check = await checkFencedReleaseHeld(this.inMemoryReservationsById.values(), request);
+    if (check.outcome !== 'held') {
+      return check;
     }
-    if (currentRevision === null) {
-      return { outcome: 'unknown', reason: 'attempt-unknown' };
-    }
-    if (currentRevision !== request.attemptRevision) {
-      return { outcome: 'changed' };
-    }
+    const held = check.held;
     this.inMemoryReservationsById.set(
       held.id,
       normalizeReservationRecord({ ...held, held: false, releasedAtIso: request.releasedAtIso }),

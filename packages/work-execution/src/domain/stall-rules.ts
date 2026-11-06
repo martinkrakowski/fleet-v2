@@ -69,7 +69,7 @@ export interface StallAdmissionRefusal {
 export interface StallProviderError {
   readonly provider: string;
   readonly class: 'payment-required' | 'rate-limited' | 'usage-limit' | string;
-  readonly atIso: string;
+  readonly atIso?: string;
 }
 
 /** The plain, readonly snapshot the rules read. */
@@ -306,7 +306,7 @@ const SNAPSHOT_SCHEMA = {
       schema: {
         provider: { kind: 'string', maxLength: 128 },
         class: { kind: 'string', maxLength: 64 },
-        atIso: { kind: 'string', maxLength: 40 },
+        atIso: { kind: 'string', maxLength: 40, optional: true },
       },
     },
     maxLength: 500,
@@ -339,6 +339,193 @@ export function detectStalls(
   }
 }
 
+type Row = Record<string, unknown>;
+
+/** The resolved thresholds and clock one detection uses. */
+interface StallContext {
+  readonly parkedMinutes: number;
+  readonly unadvancedMinutes: number;
+  readonly reviewFailures: number;
+  readonly admissionRefusalLimit: number;
+  readonly admissionHours: number;
+  /** The clock in epoch ms, or null when `nowIso` is not a canonical ISO time. */
+  readonly nowMs: number | null;
+}
+
+function contextOf(thresholds: StallThresholds, nowIso: unknown): StallContext {
+  return {
+    parkedMinutes: thresholdOf(thresholds?.parkedMinutes, DEFAULT_STALL_THRESHOLDS.parkedMinutes),
+    unadvancedMinutes: thresholdOf(thresholds?.unadvancedMinutes, DEFAULT_STALL_THRESHOLDS.unadvancedMinutes),
+    reviewFailures: thresholdOf(thresholds?.reviewFailures, DEFAULT_STALL_THRESHOLDS.reviewFailures),
+    admissionRefusalLimit: thresholdOf(thresholds?.admissionRefusals, DEFAULT_STALL_THRESHOLDS.admissionRefusals),
+    admissionHours: thresholdOf(thresholds?.admissionHours, DEFAULT_STALL_THRESHOLDS.admissionHours),
+    nowMs: isCanonicalIso(nowIso) ? msOf(nowIso) : null,
+  };
+}
+
+/** Whether more than `limitMs` has elapsed since `iso`; false when either time is unknown. */
+function elapsedOver(iso: unknown, nowMs: number | null, limitMs: number): { over: boolean; minutes: number } {
+  const thenMs = msOf(iso);
+  if (thenMs === null || nowMs === null) {
+    return { over: false, minutes: 0 };
+  }
+  const elapsedMs = nowMs - thenMs;
+  return { over: elapsedMs > limitMs, minutes: Math.floor(elapsedMs / MINUTE_MS) };
+}
+
+/** The driver-absent rule: no live lease while non-terminal runs exist. Not time-based. */
+function driverAbsentFindings(runs: readonly Row[], lease: Row, out: StallFinding[]): void {
+  if (lease.present && lease.lapsed !== true) {
+    return;
+  }
+  const nonTerminalRuns = runs.filter((run) => isNonTerminal(run.state)).length;
+  if (nonTerminalRuns > 0) {
+    out.push(finding('driver-absent', 'page', [], {
+      nonTerminalRuns,
+      lease: lease.present ? 'lapsed' : 'missing',
+    }));
+  }
+}
+
+/** The review-failing rule. Not time-based. */
+function reviewFailingFindings(runs: readonly Row[], ctx: StallContext, out: StallFinding[]): void {
+  for (const run of runs) {
+    const codes: readonly unknown[] = Array.isArray(run.recentReviewCodes) ? run.recentReviewCodes : [];
+    const failures = codes.filter(
+      (code) => typeof code === 'string' && FAILING_REVIEW_CODES.includes(code),
+    ).length;
+    if (failures >= ctx.reviewFailures) {
+      out.push(finding('review-failing', 'digest', [String(run.id)], {
+        runId: safeId(run.id),
+        failures,
+      }));
+    }
+  }
+}
+
+/**
+ * The provider-limit rule: one page per provider; not time-based, so a
+ * missing or invalid `atIso` never silences it. That field is named by one
+ * `snapshot-invalid` finding and the page's evidence carries null.
+ */
+function providerFindings(providerErrors: readonly Row[], out: StallFinding[]): void {
+  const limitedProviders = new Map<string, Row>();
+  for (let i = 0; i < providerErrors.length; i += 1) {
+    const error = providerErrors[i];
+    if (error.atIso === undefined) {
+      out.push(invalidFinding(`providerErrors[${i}].atIso`, 'missing-time'));
+    } else if (!isCanonicalIso(error.atIso)) {
+      out.push(invalidFinding(`providerErrors[${i}].atIso`, 'invalid-time'));
+    }
+    const provider = String(error.provider);
+    if (typeof error.class === 'string' && LIMITING_PROVIDER_CLASSES.includes(error.class)
+      && !limitedProviders.has(provider)) {
+      limitedProviders.set(provider, error);
+    }
+  }
+  for (const provider of Array.from(limitedProviders.keys()).sort()) {
+    const error = limitedProviders.get(provider) as Row;
+    out.push(finding('provider-limit', 'page', [provider], {
+      provider: safeId(provider),
+      errorClass: String(error.class),
+      atIso: isCanonicalIso(error.atIso) ? error.atIso : null,
+    }));
+  }
+}
+
+/**
+ * Whether a run's required time field is usable; names it with one
+ * `snapshot-invalid` finding when it is required and missing, or present
+ * and not a canonical ISO time.
+ */
+function timeFieldUsable(value: unknown, required: boolean, field: string, out: StallFinding[]): boolean {
+  if (value === undefined) {
+    if (required) {
+      out.push(invalidFinding(field, 'missing-time'));
+    }
+    return false;
+  }
+  if (!isCanonicalIso(value)) {
+    out.push(invalidFinding(field, 'invalid-time'));
+    return false;
+  }
+  return required;
+}
+
+/**
+ * The time-based run rules. A parked run must carry `parkedAtIso` and any
+ * other non-terminal run `lastAdvancedAtIso`; a missing or invalid one is
+ * named, never a silent skip.
+ */
+function runTimeFindings(runs: readonly Row[], ctx: StallContext, out: StallFinding[]): void {
+  for (let i = 0; i < runs.length; i += 1) {
+    const run = runs[i];
+    const runId = String(run.id);
+    const parked = run.state === 'parked';
+    const active = isNonTerminal(run.state) && !parked;
+    const parkedUsable = timeFieldUsable(run.parkedAtIso, parked, `runs[${i}].parkedAtIso`, out);
+    const advancedUsable = timeFieldUsable(
+      run.lastAdvancedAtIso, active, `runs[${i}].lastAdvancedAtIso`, out,
+    );
+    if (parkedUsable && run.prNumber === undefined && run.handOwned === false) {
+      const parkedFor = elapsedOver(run.parkedAtIso, ctx.nowMs, ctx.parkedMinutes * MINUTE_MS);
+      if (parkedFor.over) {
+        out.push(finding('unowned-park', 'digest', [runId], {
+          runId: safeId(runId),
+          parkedAtIso: String(run.parkedAtIso),
+          minutes: parkedFor.minutes,
+        }));
+      }
+    }
+    if (advancedUsable) {
+      const idleFor = elapsedOver(run.lastAdvancedAtIso, ctx.nowMs, ctx.unadvancedMinutes * MINUTE_MS);
+      if (idleFor.over) {
+        out.push(finding('driver-not-adopting', 'page', [runId], {
+          runId: safeId(runId),
+          lastAdvancedAtIso: String(run.lastAdvancedAtIso),
+          minutes: idleFor.minutes,
+        }));
+      }
+    }
+  }
+}
+
+/** The admission-loop rule: the count branch is not time-based; the age branch needs both times. */
+function admissionFindings(refusals: readonly Row[], ctx: StallContext, out: StallFinding[]): void {
+  for (let i = 0; i < refusals.length; i += 1) {
+    const refusal = refusals[i];
+    const count = refusal.count;
+    const laneId = String(refusal.laneId);
+    const firstValid = isCanonicalIso(refusal.firstAtIso);
+    if (!firstValid) {
+      out.push(invalidFinding(`admissionRefusals[${i}].firstAtIso`, 'invalid-time'));
+    }
+    const countBranch = typeof count === 'number' && count > ctx.admissionRefusalLimit;
+    const ageBranch = firstValid
+      && elapsedOver(refusal.firstAtIso, ctx.nowMs, ctx.admissionHours * HOUR_MS).over;
+    if (countBranch || ageBranch) {
+      out.push(finding('admission-loop', 'digest', [laneId], {
+        laneId: safeId(laneId),
+        refusals: typeof count === 'number' ? count : 0,
+        firstAtIso: firstValid ? String(refusal.firstAtIso) : null,
+      }));
+    }
+  }
+}
+
+/** Sorts, caps at `STALL_FINDINGS_MAX` plus one `truncated` finding, and freezes. */
+function finalise(findings: StallFinding[]): readonly StallFinding[] {
+  findings.sort(compareFindings);
+  if (findings.length <= STALL_FINDINGS_MAX) {
+    return Object.freeze(findings);
+  }
+  const dropped = findings.length - STALL_FINDINGS_MAX;
+  const capped = findings.slice(0, STALL_FINDINGS_MAX);
+  capped.push(finding('truncated', 'digest', [], { dropped }));
+  capped.sort(compareFindings);
+  return Object.freeze(capped);
+}
+
 function detectStallsInner(
   snapshot: unknown,
   thresholds: StallThresholds,
@@ -346,192 +533,21 @@ function detectStallsInner(
 ): readonly StallFinding[] {
   const read = readPlainRecord(snapshot, SNAPSHOT_SCHEMA);
   if (!read.ok) {
-    return [invalidFinding(read.field ?? 'snapshot', read.reason)];
+    return Object.freeze([invalidFinding(read.field ?? 'snapshot', read.reason)]);
   }
   const validated = read.value;
-
-  const parkedMinutes = thresholdOf(thresholds?.parkedMinutes, DEFAULT_STALL_THRESHOLDS.parkedMinutes);
-  const unadvancedMinutes = thresholdOf(
-    thresholds?.unadvancedMinutes,
-    DEFAULT_STALL_THRESHOLDS.unadvancedMinutes,
-  );
-  const reviewFailures = thresholdOf(thresholds?.reviewFailures, DEFAULT_STALL_THRESHOLDS.reviewFailures);
-  const admissionRefusalLimit = thresholdOf(
-    thresholds?.admissionRefusals,
-    DEFAULT_STALL_THRESHOLDS.admissionRefusals,
-  );
-  const admissionHours = thresholdOf(thresholds?.admissionHours, DEFAULT_STALL_THRESHOLDS.admissionHours);
-
-  const nowValid = isCanonicalIso(nowIso);
-  const nowMs = nowValid ? msOf(nowIso) : null;
-
+  const ctx = contextOf(thresholds, nowIso);
+  const runs = validated.runs as readonly Row[];
   const findings: StallFinding[] = [];
 
-  const runs = validated.runs as readonly Record<string, unknown>[];
-  const lease = validated.driverLease as Record<string, unknown>;
-  const refusals = (validated.admissionRefusals ?? []) as readonly Record<string, unknown>[];
-  const providerErrors = (validated.providerErrors ?? []) as readonly Record<string, unknown>[];
-
-  // The driver-absent rule: no live lease while non-terminal runs exist.
-  // Not time-based, so an invalid `nowIso` does not silence it.
-  if (!lease.present || lease.lapsed === true) {
-    let nonTerminalRuns = 0;
-    for (const run of runs) {
-      if (isNonTerminal(run.state)) {
-        nonTerminalRuns += 1;
-      }
-    }
-    if (nonTerminalRuns > 0) {
-      findings.push(finding('driver-absent', 'page', [], {
-        nonTerminalRuns,
-        lease: lease.present ? 'lapsed' : 'missing',
-      }));
-    }
-  }
-
-  // The review-failing rule: not time-based either.
-  for (const run of runs) {
-    const codes = Array.isArray(run.recentReviewCodes) ? run.recentReviewCodes : [];
-    let failures = 0;
-    for (const code of codes) {
-      if (typeof code === 'string' && FAILING_REVIEW_CODES.includes(code)) {
-        failures += 1;
-      }
-    }
-    if (failures >= reviewFailures) {
-      findings.push(finding('review-failing', 'digest', [String(run.id)], {
-        runId: safeId(run.id),
-        failures,
-      }));
-    }
-  }
-
-  // A provider error whose `atIso` is not a canonical ISO time is named by
-  // one `snapshot-invalid` finding; its provider-limit evidence carries null.
-  for (let i = 0; i < providerErrors.length; i += 1) {
-    if (!isCanonicalIso(providerErrors[i].atIso)) {
-      findings.push(invalidFinding(`providerErrors[${i}].atIso`, 'invalid-time'));
-    }
-  }
-
-  // The provider-limit rule: one finding per provider; not time-based.
-  const limitedProviders = new Map<string, Record<string, unknown>>();
-  for (const error of providerErrors) {
-    if (typeof error.class === 'string' && LIMITING_PROVIDER_CLASSES.includes(error.class)) {
-      const provider = String(error.provider);
-      if (!limitedProviders.has(provider)) {
-        limitedProviders.set(provider, error);
-      }
-    }
-  }
-  const providerKeys = Array.from(limitedProviders.keys()).sort();
-  for (const provider of providerKeys) {
-    const error = limitedProviders.get(provider) as Record<string, unknown>;
-    findings.push(finding('provider-limit', 'page', [provider], {
-      provider: safeId(provider),
-      errorClass: String(error.class),
-      atIso: isCanonicalIso(error.atIso) ? error.atIso : null,
-    }));
-  }
-
-  // The time-based run rules; each is skipped for a run whose time field is
-  // missing or not a canonical ISO time, and one `snapshot-invalid` finding
-  // names it: a parked run must carry `parkedAtIso`, and any other
-  // non-terminal run must carry `lastAdvancedAtIso`, so a missing timestamp
-  // never silences a time-based rule.
-  for (let i = 0; i < runs.length; i += 1) {
-    const run = runs[i];
-    const runId = String(run.id);
-    const nonTerminal = isNonTerminal(run.state);
-    const parked = run.state === 'parked';
-    const parkedMissing = parked && run.parkedAtIso === undefined;
-    const advancedMissing = nonTerminal && !parked && run.lastAdvancedAtIso === undefined;
-    if (parkedMissing) {
-      findings.push(invalidFinding(`runs[${i}].parkedAtIso`, 'missing-time'));
-    }
-    if (advancedMissing) {
-      findings.push(invalidFinding(`runs[${i}].lastAdvancedAtIso`, 'missing-time'));
-    }
-    let parkedValid = !parkedMissing;
-    let advancedValid = !advancedMissing;
-    if (run.parkedAtIso !== undefined && !isCanonicalIso(run.parkedAtIso)) {
-      parkedValid = false;
-      findings.push(invalidFinding(`runs[${i}].parkedAtIso`, 'invalid-time'));
-    }
-    if (run.lastAdvancedAtIso !== undefined && !isCanonicalIso(run.lastAdvancedAtIso)) {
-      advancedValid = false;
-      findings.push(invalidFinding(`runs[${i}].lastAdvancedAtIso`, 'invalid-time'));
-    }
-    if (parked && parkedValid && nowValid
-      && run.prNumber === undefined && run.handOwned === false) {
-      const parkedMs = msOf(run.parkedAtIso);
-      if (parkedMs !== null && nowMs !== null) {
-        const elapsedMs = nowMs - parkedMs;
-        const minutes = Math.floor(elapsedMs / MINUTE_MS);
-        if (elapsedMs > parkedMinutes * MINUTE_MS) {
-          findings.push(finding('unowned-park', 'digest', [runId], {
-            runId: safeId(runId),
-            parkedAtIso: String(run.parkedAtIso),
-            minutes,
-          }));
-        }
-      }
-    }
-    if (nonTerminal && !parked && advancedValid && nowValid) {
-      const advancedMs = msOf(run.lastAdvancedAtIso);
-      if (advancedMs !== null && nowMs !== null) {
-        const elapsedMs = nowMs - advancedMs;
-        const minutes = Math.floor(elapsedMs / MINUTE_MS);
-        if (elapsedMs > unadvancedMinutes * MINUTE_MS) {
-          findings.push(finding('driver-not-adopting', 'page', [runId], {
-            runId: safeId(runId),
-            lastAdvancedAtIso: String(run.lastAdvancedAtIso),
-            minutes,
-          }));
-        }
-      }
-    }
-  }
-
-  // The admission-loop rule: the count branch is not time-based; the age
-  // branch is, and needs a canonical `nowIso` and `firstAtIso`.
-  for (let i = 0; i < refusals.length; i += 1) {
-    const refusal = refusals[i];
-    const count = refusal.count;
-    const laneId = String(refusal.laneId);
-    let firstAtIso: string | null = null;
-    if (!isCanonicalIso(refusal.firstAtIso)) {
-      findings.push(invalidFinding(`admissionRefusals[${i}].firstAtIso`, 'invalid-time'));
-    } else {
-      firstAtIso = refusal.firstAtIso;
-    }
-    const countBranch = typeof count === 'number' && count > admissionRefusalLimit;
-    const ageBranch = firstAtIso !== null && nowValid && nowMs !== null
-      && msOf(firstAtIso) !== null
-      && nowMs - (msOf(firstAtIso) as number) > admissionHours * HOUR_MS;
-    if (countBranch || ageBranch) {
-      findings.push(finding('admission-loop', 'digest', [laneId], {
-        laneId: safeId(laneId),
-        refusals: typeof count === 'number' ? count : 0,
-        firstAtIso,
-      }));
-    }
-  }
-
-  // An invalid clock value names its field; the time-based rules above were
-  // already silenced.
-  if (!nowValid) {
+  driverAbsentFindings(runs, validated.driverLease as Row, findings);
+  reviewFailingFindings(runs, ctx, findings);
+  providerFindings((validated.providerErrors ?? []) as readonly Row[], findings);
+  runTimeFindings(runs, ctx, findings);
+  admissionFindings((validated.admissionRefusals ?? []) as readonly Row[], ctx, findings);
+  // An invalid clock names its field; every time-based rule above was silenced by `nowMs === null`.
+  if (ctx.nowMs === null) {
     findings.push(invalidFinding('nowIso', 'invalid-time'));
   }
-
-  findings.sort(compareFindings);
-
-  if (findings.length > STALL_FINDINGS_MAX) {
-    const dropped = findings.length - STALL_FINDINGS_MAX;
-    const capped = findings.slice(0, STALL_FINDINGS_MAX);
-    capped.push(finding('truncated', 'digest', [], { dropped }));
-    capped.sort(compareFindings);
-    return Object.freeze(capped);
-  }
-  return Object.freeze(findings);
+  return finalise(findings);
 }

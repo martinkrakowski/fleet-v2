@@ -475,6 +475,23 @@ describe('detectStalls', () => {
       expect(rulesOf(advanced)).toEqual(['driver-not-adopting']);
     });
 
+    it('keeps the provider-limit page when a provider error has no atIso, and names the field', () => {
+      const findings = detectStalls(
+        snapshot({ providerErrors: [{ provider: 'prov-1', class: 'rate-limited' }] }),
+        DEFAULT_STALL_THRESHOLDS,
+        NOW,
+      );
+      expect(keysOf(findings)).toEqual(['provider-limit:prov-1', 'snapshot-invalid:providerErrors[0].atIso']);
+      expect(findings[0]?.evidence.atIso).toBeNull();
+      expect(findings[1]?.evidence.reason).toBe('missing-time');
+    });
+
+    it('freezes the single finding answered for a malformed snapshot', () => {
+      const findings = detectStalls(null as unknown as StallSnapshot, DEFAULT_STALL_THRESHOLDS, NOW);
+      expect(rulesOf(findings)).toEqual(['snapshot-invalid']);
+      expect(Object.isFrozen(findings)).toBe(true);
+    });
+
     it('names a provider error with an invalid atIso and keeps its provider-limit page', () => {
       const findings = detectStalls(
         snapshot({ providerErrors: [{ provider: 'prov-1', class: 'rate-limited', atIso: 'not-a-time' }] }),

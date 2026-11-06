@@ -273,6 +273,7 @@ async function runTick(
       tickId,
       repositories: toDaemonRepositoryRefs(policyAnswer),
       budgetSeconds,
+      deadlineIso,
       intervalSeconds: policyAnswer.daemon.intervalSeconds,
       settleSeconds: policyAnswer.daemon.settleSeconds,
       ...(parsed.jobs.length > 0 ? { jobFilter: parsed.jobs } : {}),

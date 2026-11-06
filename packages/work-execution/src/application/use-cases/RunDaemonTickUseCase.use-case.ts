@@ -382,6 +382,7 @@ interface ValidTickRequest {
   readonly tickId: string;
   readonly repositories: readonly DaemonRepositoryRef[];
   readonly budgetSeconds: number;
+  readonly deadlineIso: string | undefined;
   readonly intervalSeconds: number | undefined;
   readonly settleSeconds: number | undefined;
   readonly jobFilter: readonly string[] | undefined;
@@ -464,6 +465,9 @@ function checkTickRequest(raw: unknown): TickRequestCheck {
   if (repositoryProblem !== null) {
     return refuse(repositoryProblem);
   }
+  if (raw.deadlineIso !== undefined && (typeof raw.deadlineIso !== 'string' || !isZonedIsoDateTime(raw.deadlineIso))) {
+    return refuse('invalid-deadline');
+  }
   if (raw.intervalSeconds !== undefined && !isValidInterval(raw.intervalSeconds)) {
     return refuse('invalid-interval');
   }
@@ -482,6 +486,7 @@ function checkTickRequest(raw: unknown): TickRequestCheck {
       tickId,
       repositories: raw.repositories as readonly DaemonRepositoryRef[],
       budgetSeconds,
+      deadlineIso: raw.deadlineIso as string | undefined,
       intervalSeconds: raw.intervalSeconds as number | undefined,
       settleSeconds: raw.settleSeconds as number | undefined,
       jobFilter: raw.jobFilter,
@@ -539,7 +544,8 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
     }
     const request = checked.request;
     const nowIso = this.readClock();
-    const deadlineIso = nowIso === null ? null : computeTickDeadlineIso(nowIso, request.budgetSeconds);
+    const deadlineIso =
+      nowIso === null ? null : (request.deadlineIso ?? computeTickDeadlineIso(nowIso, request.budgetSeconds));
     if (nowIso === null || deadlineIso === null) {
       return refused(request.tickId, 'invalid-clock');
     }
@@ -558,8 +564,10 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
 
     const jobs = new DaemonJobRegistry({ mergePass: this.deps.mergePass }).instances(request.repositories);
     const plan = await this.plan(ctx, jobs);
-    if (plan.settleDelayMs > 0) {
-      await (this.deps.sleep ?? defaultSleep)(plan.settleDelayMs);
+    // The settle never outlasts the tick: cap it to the time left before the deadline, skip it when none is left.
+    const settleMs = Math.min(plan.settleDelayMs, Math.max(0, Date.parse(deadlineIso) - Date.parse(nowIso)));
+    if (settleMs > 0) {
+      await (this.deps.sleep ?? defaultSleep)(settleMs);
     }
     if (plan.paused) {
       return this.finishPaused(ctx, plan);

@@ -348,6 +348,22 @@ describe('daemon tick (DT10b)', () => {
     expect(await tight.runtime.conductor.laneRunJournal.listForKey(journalKey(REPO_A))).toHaveLength(2);
   });
 
+  it('computes one deadline at command start: a probe that spends the budget leaves the tick no fresh budget', async () => {
+    let skewMs = 0;
+    const h = harness([REPO_A, REPO_B], { daemonNow: () => new Date(Date.now() + skewMs).toISOString() });
+    await enqueue(h.runtime, REPO_A);
+    h.gh.probe = async () => {
+      skewMs += 11_000; // the probe outlasts the whole 10 s budget
+      return { exitCode: 0, stdout: '{"resources":{}}', stderr: '' };
+    };
+    const result = await run(h.runtime, ['daemon', 'tick', '--budget-seconds', '10']);
+    expect(result.code).toBe(0);
+    expect(h.gh.calls.filter((call) => call.args[1] === 'rate_limit')).toHaveLength(1);
+    expect(h.gh.calls.filter((call) => call.args[1] === 'graphql')).toHaveLength(0);
+    const jobs = lastJson(result.out).jobs as Array<{ outcome: string }>;
+    expect(jobs.every((job) => job.outcome === 'budget-exhausted')).toBe(true);
+  });
+
   it('skips merge-pass jobs with forge-unreachable when the probe exits 1, times out, returns non-JSON or the forge mode is none', async () => {
     const variants: Array<[string, (stub: GhStub) => void, boolean]> = [
       ['exit 1', (stub) => { stub.probe = async () => ({ exitCode: 1, stdout: '', stderr: 'boom' }); }, true],

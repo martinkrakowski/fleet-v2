@@ -28,6 +28,14 @@ export interface RunDaemonTickRequest {
   readonly repositories: readonly DaemonRepositoryRef[];
   /** The tick's budget in seconds (default 45). */
   readonly budgetSeconds?: number;
+  /**
+   * The tick's deadline (a zoned ISO date-time), when the caller already fixed
+   * it before the tick started (the CLI computes one deadline at command start
+   * and shares it with the forge probe). Absent: the tick computes it from its
+   * own clock and `budgetSeconds`. A malformed value refuses the tick
+   * (`invalid-deadline`).
+   */
+  readonly deadlineIso?: string;
   /** The tick interval in seconds, `1..3600` (default 60); it governs when a status counts as stale and a wake settles. */
   readonly intervalSeconds?: number;
   /** The wake settle delay in seconds, `0..600` (default 20). */
@@ -63,7 +71,7 @@ export interface RunDaemonTickResult {
    * The refusal reason when `outcome` is `refused`: `invalid-request`,
    * `invalid-tick-id`, `invalid-budget`, `invalid-repositories`,
    * `invalid-repository`, `duplicate-repository`, `invalid-job-filter`,
-   * `invalid-interval`, `invalid-settle`, `forge-probe-missing`, `invalid-clock`, `status-unreadable`,
+   * `invalid-interval`, `invalid-settle`, `invalid-deadline`, `forge-probe-missing`, `invalid-clock`, `status-unreadable`,
    * `status-write-failed`, or `tick-failed` (the last-resort guard).
    */
   readonly reasonCode?: string;

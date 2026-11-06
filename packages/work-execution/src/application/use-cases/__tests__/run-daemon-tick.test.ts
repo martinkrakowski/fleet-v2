@@ -975,6 +975,35 @@ describe('RunDaemonTickUseCase (DT10b): interval, settle and input bounds', () =
     expect(zero.sleeps).toEqual([]);
   });
 
+  it('caps the settle delay to the time left before the tick deadline and skips it when none is left', async () => {
+    const previous = staleStatus('2026-11-01T11:50:00.000Z');
+    const capped = makeHarness({ previousStatus: previous });
+    await capped.run({ repositories: [repoRef(DIGEST_A)], settleSeconds: 600, budgetSeconds: 3 });
+    expect(capped.sleeps).toHaveLength(1);
+    expect(capped.sleeps[0]).toBeLessThanOrEqual(3_000);
+
+    // The clock has already passed the caller's deadline: nothing remains, so no settle sleep.
+    const spent = makeHarness({ previousStatus: previous });
+    const result = await spent.run({
+      repositories: [repoRef(DIGEST_A)],
+      settleSeconds: 600,
+      deadlineIso: '2026-11-01T11:59:59.000Z',
+    });
+    expect(result.outcome).toBe('completed');
+    expect(spent.sleeps).toEqual([]);
+  });
+
+  it('honours a caller deadline: an elapsed deadline starts no job, and a malformed one refuses the tick', async () => {
+    const h = makeHarness();
+    const result = await h.run({ repositories: [repoRef(DIGEST_A)], deadlineIso: '2026-11-01T11:59:59.000Z' });
+    expect(result.outcome).toBe('completed');
+    expect(result.jobs.every((job) => job.outcome === 'budget-exhausted')).toBe(true);
+    expect(h.mergePass.requests).toHaveLength(0);
+
+    const bad = await makeHarness().run({ deadlineIso: 'tomorrow' });
+    expect(bad).toMatchObject({ outcome: 'refused', reasonCode: 'invalid-deadline' });
+  });
+
   it('intervalSeconds governs staleness: 120 s keeps a 5-minute-old status fresh, the default does not', async () => {
     const previous = staleStatus('2026-11-01T11:55:00.000Z');
     const wide = makeHarness({ previousStatus: previous });

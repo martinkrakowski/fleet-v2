@@ -10,7 +10,13 @@
  * it was given: everything it returns is copied.
  */
 
-import { seatPlanFromCatalog, type SeatCatalog, type SeatPlanFromCatalogResult } from '../../domain/seat-selection.js';
+import {
+  isDeclaredCatalogTrigger,
+  isDeclaredSeatHealth,
+  seatPlanFromCatalog,
+  type SeatCatalog,
+  type SeatPlanFromCatalogResult,
+} from '../../domain/seat-selection.js';
 import type { SeatCatalogPort, SeatCatalogRead } from '../../application/ports/out/SeatCatalogPort.out-port.js';
 
 /** True for a plain object: not null, not an array. */
@@ -44,7 +50,7 @@ function copiedSeats(source: Record<string, unknown>): unknown[] | undefined | n
     if (seat['agent'] !== undefined && typeof seat['agent'] !== 'string') {
       return null;
     }
-    if (seat['health'] !== undefined && typeof seat['health'] !== 'string') {
+    if (seat['health'] !== undefined && !isDeclaredSeatHealth(seat['health'])) {
       return null;
     }
     seats.push({ ...seat });
@@ -83,7 +89,7 @@ function copiedChains(source: Record<string, unknown>): Record<string, unknown> 
           return null;
         }
         for (const trigger of step['triggers'] as unknown[]) {
-          if (typeof trigger !== 'string') {
+          if (!isDeclaredCatalogTrigger(trigger)) {
             return null;
           }
         }

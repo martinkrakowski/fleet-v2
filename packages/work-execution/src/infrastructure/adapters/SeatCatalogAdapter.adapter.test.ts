@@ -88,4 +88,19 @@ describe('SeatCatalogAdapter', () => {
     const plan = new SeatCatalogAdapter(malformed).readSeatPlan();
     expect('reason' in plan).toBe(true);
   });
+
+  it('reports unknown for a seat with an undeclared health value', () => {
+    const read = new SeatCatalogAdapter({
+      seats: [{ id: 'impl-a', tool: 'opencode', model: 'acme/mercury-3', health: 'sick' }],
+    }).readSeatCatalog();
+    expect(read.outcome).toBe('unknown');
+  });
+
+  it('reports unknown for a chain step with an undeclared trigger', () => {
+    const read = new SeatCatalogAdapter({
+      seats: CATALOG.seats,
+      chains: { implementer: [{ seatId: 'impl-a', triggers: ['banana'] }] },
+    }).readSeatCatalog();
+    expect(read.outcome).toBe('unknown');
+  });
 });

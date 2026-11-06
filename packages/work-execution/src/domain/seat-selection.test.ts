@@ -244,4 +244,23 @@ describe('unhealthySeatIdsFromCatalog refusals', () => {
       }),
     ).toEqual([]);
   });
+
+  it('yields [] for a catalogue whose chains are malformed', () => {
+    const seeds = [{ id: 'seat-two', tool: 'opencode', model: 'acme/argon-4', health: 'unhealthy' }];
+    expect(unhealthySeatIdsFromCatalog({ seats: seeds, chains: 'nope' })).toEqual([]);
+    expect(unhealthySeatIdsFromCatalog({ seats: seeds, chains: { implementer: 'nope' } })).toEqual([]);
+    expect(unhealthySeatIdsFromCatalog({ seats: seeds, chains: { implementer: [{ seatId: '' }] } })).toEqual([]);
+    expect(
+      unhealthySeatIdsFromCatalog({
+        seats: seeds,
+        chains: { implementer: Array.from({ length: 65 }, () => ({ seatId: 'seat-two' })) },
+      }),
+    ).toEqual([]);
+    expect(
+      unhealthySeatIdsFromCatalog({
+        seats: seeds,
+        chains: { implementer: [{ seatId: 'seat-two', triggers: ['banana'] }] },
+      }),
+    ).toEqual([]);
+  });
 });

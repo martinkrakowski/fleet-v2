@@ -757,6 +757,16 @@ const CATALOG_CHAIN_ROLES = ['implementer', 'fix', 'reviewer'] as const;
 
 type CatalogChainRole = (typeof CATALOG_CHAIN_ROLES)[number];
 
+/** True when the value is an operator-declared seat health (S1); absent means healthy. */
+export function isDeclaredSeatHealth(value: unknown): value is string {
+  return typeof value === 'string' && CATALOG_SEAT_HEALTH_VALUES.has(value);
+}
+
+/** True when the value is a declared catalogue trigger, i.e. it maps to a stop-reason class. */
+export function isDeclaredCatalogTrigger(value: unknown): value is string {
+  return typeof value === 'string' && CATALOG_TRIGGER_TO_STOP_REASON[value] !== undefined;
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -801,7 +811,7 @@ function catalogSeatsOf(
     if (agent !== undefined && typeof agent !== 'string') {
       return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries an agent that is not a string' };
     }
-    if (health !== undefined && (typeof health !== 'string' || !CATALOG_SEAT_HEALTH_VALUES.has(health))) {
+    if (health !== undefined && !isDeclaredSeatHealth(health)) {
       return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries a health that is not a declared seat health' };
     }
     seats.push({
@@ -862,6 +872,36 @@ function catalogStepsOf(
   return { ok: true, steps };
 }
 
+/**
+ * True when the catalogue's chains are well-formed: each declared role holds a
+ * list of steps within the step bound, every step names a non-empty seat id,
+ * and every trigger is declared. Used by `unhealthySeatIdsFromCatalog` so a
+ * malformed catalogue yields `[]` — not just one with malformed seats.
+ */
+function catalogChainsWellFormed(catalog: Record<string, unknown>): boolean {
+  const rawChains = catalog['chains'];
+  if (rawChains === undefined) {
+    return true;
+  }
+  if (!isPlainObject(rawChains)) {
+    return false;
+  }
+  for (const role of CATALOG_CHAIN_ROLES) {
+    const parsed = catalogStepsOf(role, rawChains[role]);
+    if (!parsed.ok) {
+      return false;
+    }
+    for (const step of parsed.steps) {
+      for (const trigger of step.triggers ?? []) {
+        if (!isDeclaredCatalogTrigger(trigger)) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
 function catalogPlanSeat(step: SeatCatalogChainStep, seat: SeatCatalogSeat): SeatPlanSeat {
   const on = [
     ...new Set(
@@ -917,7 +957,7 @@ export function seatPlanFromCatalog(catalog: unknown): SeatPlanFromCatalogResult
       const steps = chains[role] ?? [];
       for (const [index, step] of steps.entries()) {
         for (const trigger of step.triggers ?? []) {
-          if (CATALOG_TRIGGER_TO_STOP_REASON[trigger] === undefined) {
+          if (!isDeclaredCatalogTrigger(trigger)) {
             return {
               reason: 'The seat catalogue ' + role + ' chain step ' + index + ' names a trigger that is not a declared stop-reason class',
             };
@@ -977,7 +1017,7 @@ export function unhealthySeatIdsFromCatalog(catalog: unknown): string[] {
       return [];
     }
     // A malformed catalogue is refused as a whole: never a partial id list.
-    if (rawSeats.length > SEAT_CATALOG_SEAT_BOUND) {
+    if (rawSeats.length > SEAT_CATALOG_SEAT_BOUND || !catalogChainsWellFormed(catalog)) {
       return [];
     }
     const ids: string[] = [];
@@ -1004,7 +1044,7 @@ export function unhealthySeatIdsFromCatalog(catalog: unknown): string[] {
       if (agent !== undefined && typeof agent !== 'string') {
         return [];
       }
-      if (health !== undefined && (typeof health !== 'string' || !CATALOG_SEAT_HEALTH_VALUES.has(health))) {
+      if (health !== undefined && !isDeclaredSeatHealth(health)) {
         return [];
       }
       if (health === 'unhealthy') {

@@ -1,7 +1,7 @@
 // @generated inbound contract scaffold — refined for lane DT9a.
 import type { MergeRepoPolicy } from '../../../domain/merge-queue-decider.js';
 
-/** One bounded merge pass for one repository, in shadow mode (DT9a). */
+/** One bounded merge pass for one repository, in shadow mode (DT9a); entry records and notifications (DT9c). */
 export interface RunMergePassRequest {
   readonly repository: { readonly owner: string; readonly repo: string };
   readonly repoDigest: string;   // 12 lowercase hex
@@ -10,7 +10,7 @@ export interface RunMergePassRequest {
   readonly deadlineIso: string;  // the pass budget deadline (D-DT9)
 }
 
-export type MergePassEntryDecision = 'journalled' | 'no-action' | 'live-deferred';
+export type MergePassEntryDecision = 'journalled' | 'recorded' | 'no-action' | 'live-deferred';
 
 export interface MergePassEntryReport {
   readonly entryId: string;

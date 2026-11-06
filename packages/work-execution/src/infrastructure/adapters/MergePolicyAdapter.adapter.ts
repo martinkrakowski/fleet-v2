@@ -112,6 +112,26 @@ function isDenseArray(value: unknown, maxLength: number): value is readonly unkn
   return true;
 }
 
+/**
+ * Copies a dense array's element values through own data properties only, so an
+ * array's iterator is never touched: a custom iterator or an iterator getter can
+ * neither run nor substitute values for the actual slots.
+ */
+function readDenseArrayElements(value: unknown, maxLength: number): readonly unknown[] | undefined {
+  if (!isDenseArray(value, maxLength)) {
+    return undefined;
+  }
+  const elements: unknown[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor === undefined || !('value' in descriptor)) {
+      return undefined;
+    }
+    elements.push(descriptor.value);
+  }
+  return Object.freeze(elements);
+}
+
 function isBoundedText(value: unknown, maxLength: number): value is string {
   return typeof value === 'string' && value.length >= 1 && value.length <= maxLength;
 }
@@ -121,11 +141,12 @@ function isPositiveInteger(value: unknown): value is number {
 }
 
 function readRequiredContexts(value: unknown): readonly string[] | undefined {
-  if (!isDenseArray(value, MAX_REQUIRED_CONTEXTS)) {
+  const elements = readDenseArrayElements(value, MAX_REQUIRED_CONTEXTS);
+  if (elements === undefined) {
     return undefined;
   }
   const contexts: string[] = [];
-  for (const entry of value) {
+  for (const entry of elements) {
     if (!isBoundedText(entry, MAX_CONTEXT_LENGTH)) {
       return undefined;
     }
@@ -208,11 +229,12 @@ function readRepository(value: unknown): MergePolicyRepository | undefined {
 }
 
 function readRepositories(value: unknown): readonly MergePolicyRepository[] | undefined {
-  if (!isDenseArray(value, MAX_REPOSITORIES)) {
+  const elements = readDenseArrayElements(value, MAX_REPOSITORIES);
+  if (elements === undefined) {
     return undefined;
   }
   const repositories: MergePolicyRepository[] = [];
-  for (const entry of value) {
+  for (const entry of elements) {
     const repository = readRepository(entry);
     if (repository === undefined) {
       return undefined;

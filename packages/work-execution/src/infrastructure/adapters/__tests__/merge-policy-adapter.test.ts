@@ -216,6 +216,55 @@ describe('MergePolicyAdapter', () => {
     ).toEqual(installationInvalid);
   });
 
+  it('readMergePolicy answers unknown when a custom iterator on requiredContexts hides a malformed slot', async () => {
+    const contexts = new Array<string>(1);
+    contexts[0] = 42 as unknown as string;
+    Object.defineProperty(contexts, Symbol.iterator, {
+      value: function* () {
+        yield 'gate';
+      },
+    });
+    expect(
+      await adapterFor(() => resolved({ repositories: [repository({ requiredContexts: contexts })] })).readMergePolicy(),
+    ).toEqual(installationInvalid);
+  });
+
+  it('readMergePolicy answers unknown when a custom iterator on repositories hides a malformed slot', async () => {
+    const sources = new Array<MergePolicyRepository>(1);
+    sources[0] = { owner: 123 } as unknown as MergePolicyRepository;
+    Object.defineProperty(sources, Symbol.iterator, {
+      value: function* () {
+        yield repository();
+      },
+    });
+    expect(await adapterFor(() => resolved({ repositories: sources })).readMergePolicy()).toEqual(
+      installationInvalid,
+    );
+  });
+
+  it('readMergePolicy never runs the iterator of requiredContexts or repositories', async () => {
+    let contextIteratorRan = 0;
+    const contexts = ['gate', 'premerge'];
+    Object.defineProperty(contexts, Symbol.iterator, {
+      value: function* () {
+        contextIteratorRan += 1;
+        yield 'gate';
+      },
+    });
+    let repositoriesIteratorRan = 0;
+    const sources = [repository({ requiredContexts: contexts })];
+    Object.defineProperty(sources, Symbol.iterator, {
+      value: function* () {
+        repositoriesIteratorRan += 1;
+        yield repository();
+      },
+    });
+    const answer = await adapterFor(() => resolved({ repositories: sources })).readMergePolicy();
+    expect(answer).toMatchObject({ outcome: 'known' });
+    expect(contextIteratorRan).toBe(0);
+    expect(repositoriesIteratorRan).toBe(0);
+  });
+
   it('readMergePolicy answers unknown for an unknown veto mode', async () => {
     for (const veto of [
       { mode: 'sometimes', holdConfidence: 0.8 },

@@ -19,6 +19,12 @@ import type {
   ListOwnerItemsResult,
 } from '../ports/in/ListOwnerItemsPort.in-port.js';
 
+/** A plain object: prototype Object.prototype or null (e.g. Object.create(null)); arrays and class instances are not filters. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
 export interface ListOwnerItemsDependencies {
   readonly itemRepo: OwnerItemRepositoryPort;
 }
@@ -40,7 +46,7 @@ export class ListOwnerItemsUseCase implements ListOwnerItemsPort {
       if (input === undefined) {
         input = {};
       }
-      if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+      if (input === null || typeof input !== 'object' || Array.isArray(input) || !isPlainObject(input)) {
         return {
           outcome: 'refused',
           code: 'request',

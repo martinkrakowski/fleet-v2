@@ -672,6 +672,19 @@ describe('ListOwnerItemsUseCase', () => {
     });
   });
 
+  it('ListOwnerItems refuses a non-plain object filter as request', async () => {
+    const repo = await seededStore();
+    const uc = new ListOwnerItemsUseCase({ itemRepo: repo });
+    expect(await uc.listOwnerItems(new Date() as unknown as ListOwnerItemsRequest)).toMatchObject({
+      outcome: 'refused',
+      code: 'request',
+    });
+    expect(await uc.listOwnerItems(new Map() as unknown as ListOwnerItemsRequest)).toMatchObject({
+      outcome: 'refused',
+      code: 'request',
+    });
+  });
+
   it('ListOwnerItems refuses a revoked proxy filter as request', async () => {
     const repo = await seededStore();
     const uc = new ListOwnerItemsUseCase({ itemRepo: repo });

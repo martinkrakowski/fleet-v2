@@ -88,6 +88,37 @@ export type ReserveCapacityAtomicallyResult =
   | { readonly outcome: 'no-capacity' }
   | { readonly outcome: 'refused'; readonly reason: string };
 
+/**
+ * A fenced capacity release (plan §3.9.2, "Releases are fenced"): the reaper
+ * releases a leaked slot only while the attempt it read is still the attempt
+ * it holds and the reservation it read is still the reservation it holds.
+ */
+export interface ReleaseCapacityReservationIfUnchangedRequest {
+  /** The attempt whose reservation is released. */
+  readonly attemptId: string;
+  /** The reservation the caller read; another held reservation is `changed`. */
+  readonly reservationId: string;
+  /** The attempt revision the caller read (`record.revision ?? 0`). */
+  readonly attemptRevision: number;
+  /** The moment the release is recorded. */
+  readonly releasedAtIso: string;
+  /**
+   * Re-reads the attempt's current revision while the reservations lock is
+   * held — the same in-lock callback shape as `checkBusyWorktree` in
+   * `reserveCapacityAtomically`. It returns the attempt's current revision, or
+   * null when the attempt cannot be read. It is required: without it the
+   * attempt side of the fence cannot be checked.
+   */
+  readonly readAttemptRevision: () => Promise<number | null>;
+}
+
+export type ReleaseCapacityReservationIfUnchangedResult =
+  | { readonly outcome: 'released'; readonly reservationId: string }
+  | { readonly outcome: 'changed' }
+  | { readonly outcome: 'not-held' }
+  | { readonly outcome: 'unknown'; readonly reason: 'unreadable' | 'attempt-unknown' | 'lock-timeout' }
+  | { readonly outcome: 'refused'; readonly reason: 'invalid-request' };
+
 export interface ExecutionJournalPort {
   /** Append one journal entry; the journal is append-only evidence. */
   appendJournalEntry(entry: ActionJournalEntryRecord): Promise<void>;
@@ -120,4 +151,14 @@ export interface ExecutionJournalPort {
   reserveCapacityAtomically(
     request: ReserveCapacityAtomicallyRequest,
   ): Promise<ReserveCapacityAtomicallyResult>;
+
+  /**
+   * Fenced release (plan §3.9.2): releases the attempt's reservation only
+   * while the observed reservation is still the held one and the attempt still
+   * reads at the observed revision; otherwise the release is `changed` and
+   * nothing is written. An absent implementation is `unknown` for the caller.
+   */
+  releaseCapacityReservationIfUnchanged?(
+    request: ReleaseCapacityReservationIfUnchangedRequest,
+  ): Promise<ReleaseCapacityReservationIfUnchangedResult>;
 }

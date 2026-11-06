@@ -69,11 +69,31 @@ describe('review-selection (R1)', () => {
   });
 
   it('disagreement is true only when both pass and fail are present', () => {
-    expect(tallyReviews([receipt({ result: 'pass' }), receipt({ result: 'fail' })])).toEqual({
+    const blockingFinding = {
+      findingId: 'rr-1:f-1',
+      severity: 'major' as const,
+      summary: 's',
+      filePath: 'src/a.ts',
+      line: 1,
+      state: 'unresolved' as const,
+      dispositionReason: null,
+      dispositionEvidenceRef: null,
+    };
+    expect(
+      tallyReviews([receipt({ result: 'pass' }), receipt({ result: 'fail', findings: [blockingFinding] })]),
+    ).toEqual({
       pass: 1,
       fail: 1,
       unknown: 0,
       disagreement: true,
+    });
+    // RV3: a fail receipt with zero findings is an unparseable verdict and
+    // tallies as unknown, never as a fail.
+    expect(tallyReviews([receipt({ result: 'pass' }), receipt({ result: 'fail' })])).toEqual({
+      pass: 1,
+      fail: 0,
+      unknown: 1,
+      disagreement: false,
     });
     expect(tallyReviews([receipt({ result: 'pass' }), receipt({ result: 'pass' })])).toEqual({
       pass: 2,
@@ -243,7 +263,22 @@ describe('review kind selection', () => {
   it('different kinds from the same reviewer are kept separately, in recording order', () => {
     const latest = latestReceiptPerReviewer([
       receipt({ id: 'review-brief', kind: 'brief-check', result: 'pass' }),
-      receipt({ id: 'review-code', result: 'fail' }),
+      receipt({
+        id: 'review-code',
+        result: 'fail',
+        findings: [
+          {
+            findingId: 'rr-1:f-1',
+            severity: 'major',
+            summary: 's',
+            filePath: 'src/a.ts',
+            line: 1,
+            state: 'unresolved',
+            dispositionReason: null,
+            dispositionEvidenceRef: null,
+          },
+        ],
+      }),
     ]);
     expect(latest.map((record) => record.id)).toEqual(['review-brief', 'review-code']);
     expect(tallyReviews(latest)).toEqual({

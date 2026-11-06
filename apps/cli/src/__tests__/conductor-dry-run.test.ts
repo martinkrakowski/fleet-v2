@@ -559,6 +559,8 @@ describe('conductor run --dry-run (K7-8)', () => {
     expect(ports.slice(ports.lastIndexOf('reviewRequest') + 1)).toEqual([
       'acceptanceAssessment',
       'findLatestReceiptOfKind', 'ciState', 'forgeRead',
+      // RV3: open-pr reads the pre-merge receipt to carry its minors into Challenge this.
+      'findLatestReceiptOfKind',
       'acceptanceAssessment',
       'conductorForgeGrant', 'executeForgeAction',
       'findLatestReceiptOfKind', 'ciState', 'forgeRead',

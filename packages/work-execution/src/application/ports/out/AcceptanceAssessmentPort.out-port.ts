@@ -34,8 +34,16 @@ export interface AssessmentBlocker {
   readonly text: string;
 }
 
+export interface AcceptanceCarriedMinor {
+  readonly findingId: string;
+  readonly severity: 'minor' | 'nit';
+  readonly summary: string;
+  readonly filePath: string | null;
+  readonly line: number | null;
+}
+
 export type AcceptanceAssessmentResult =
-  | { readonly outcome: 'accepted'; readonly receiptId: string; readonly assessedHeadSha: string }
+  | { readonly outcome: 'accepted'; readonly receiptId: string; readonly assessedHeadSha: string; readonly carriedMinors?: readonly AcceptanceCarriedMinor[] }
   | {
       readonly outcome: 'rejected';
       readonly reason: string;
@@ -62,7 +70,7 @@ export type AcceptanceAssessmentResult =
  * `assessHeadAcceptance`.
  */
 export type AcceptanceReceiptsResult =
-  | { readonly outcome: 'passed'; readonly receiptsId: string; readonly assessedHeadSha: string }
+  | { readonly outcome: 'passed'; readonly receiptsId: string; readonly assessedHeadSha: string; readonly carriedMinors?: readonly AcceptanceCarriedMinor[] }
   | {
       readonly outcome: 'rejected';
       readonly reason: string;

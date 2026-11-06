@@ -274,14 +274,37 @@ describe('acceptance blocker kinds (AM3c-1, A11)', () => {
   });
 
   it('a failing review is other', async () => {
+    const receipt = independentReviewReceiptWithFindings(
+      [
+        finding('f-1'),
+      ],
+      { result: 'fail' },
+    );
+    const result = await assess(sampleRecord({ reviewReceipts: [receipt] }));
+    expectConsistent(result);
+    expect(result.outcome).toBe('blocked');
+    if (result.outcome === 'blocked') {
+      expect(result.blockerDetails).toEqual([
+        {
+          kind: 'other',
+          text: "review by 'seat-a/reviewer' failed for this head (receipt 'rr-1')",
+        },
+        { kind: 'other', text: "finding 'f-1' is unresolved" },
+      ]);
+    }
+  });
+
+  it('a zero-finding fail receipt is an unparseable verdict (review-missing)', async () => {
     const receipt = independentReviewReceiptWithFindings([], { result: 'fail' });
     const result = await assess(sampleRecord({ reviewReceipts: [receipt] }));
     expectConsistent(result);
     expect(result.outcome).toBe('blocked');
     if (result.outcome === 'blocked') {
       expect(result.blockerDetails).toHaveLength(1);
-      expect(result.blockerDetails[0].kind).toBe('other');
-      expect(result.blockerDetails[0].text.startsWith("review by 'seat-a/reviewer' failed")).toBe(true);
+      expect(result.blockerDetails[0].kind).toBe('review-missing');
+      expect(result.blockerDetails[0].text).toBe(
+        "review by 'seat-a/reviewer' failed for this head with no findings (unparseable-verdict, receipt 'rr-1')",
+      );
     }
   });
 
@@ -345,6 +368,10 @@ describe('acceptance blocker kinds (AM3c-1, A11)', () => {
     expect(result.outcome).toBe('blocked');
     if (result.outcome === 'blocked') {
       expect(result.blockerDetails).toEqual([
+        {
+          kind: 'other',
+          text: "review by 'seat-a/reviewer' failed for this head (receipt 'rr-1')",
+        },
         { kind: 'other', text: "finding 'f-1' is unresolved" },
       ]);
     }

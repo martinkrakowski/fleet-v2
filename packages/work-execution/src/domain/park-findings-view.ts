@@ -22,7 +22,7 @@ export const PARK_FINDINGS_MAX_COUNT = 5;
 /** A summary's code-point cap before it is truncated (characters, not bytes). */
 export const PARK_FINDING_SUMMARY_MAX = 160;
 
-const FINDING_ID_PATTERN = /^[0-9A-Za-z-]{1,128}$/;
+const FINDING_ID_PATTERN = /^[0-9A-Za-z][0-9A-Za-z._:-]{0,127}$/;
 const FILE_PATH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 
 /**
@@ -141,13 +141,14 @@ export function isParkFindingView(value: unknown): value is LaneRunParkFindingVi
 /**
  * The stored snapshot read: the exact snapshot is answered unchanged when it
  * is an array within the cap of valid bounded findings; anything else — a
- * non-array, more than the cap, or a malformed entry — answers null.
+ * non-array, an empty array (RV3: a finding-caused park record never carries
+ * `[]`), more than the cap, or a malformed entry — answers null.
  */
 export function parkFindingsSnapshotOf(snapshot: unknown): readonly LaneRunParkFindingView[] | null {
   if (!Array.isArray(snapshot)) {
     return null;
   }
-  if (snapshot.length > PARK_FINDINGS_MAX_COUNT) {
+  if (snapshot.length === 0 || snapshot.length > PARK_FINDINGS_MAX_COUNT) {
     return null;
   }
   for (const entry of snapshot) {
@@ -156,6 +157,72 @@ export function parkFindingsSnapshotOf(snapshot: unknown): readonly LaneRunParkF
     }
   }
   return snapshot;
+}
+
+/**
+ * The bounded view of the findings that CAUSED a park (RV3, req (d)): only
+ * the blocking (`blocker`/`major`) findings are selected, bounded through
+ * `boundedFindingsView`. A blocking finding whose id or summary cannot be
+ * bounded is never silently dropped to `[]`: up to `PARK_FINDINGS_MAX_COUNT`
+ * safe bounded entries are synthesized from the still-known fields (the
+ * summary redacted when it is empty or secret-shaped). The result is always
+ * `1..PARK_FINDINGS_MAX_COUNT` entries when at least one blocking finding
+ * was present, `[]` otherwise. Pure; never throws.
+ */
+export function causingParkFindingsView(findings: unknown): LaneRunParkFindingView[] {
+  try {
+    if (!Array.isArray(findings)) {
+      return [];
+    }
+    const blocking: Record<string, unknown>[] = [];
+    for (let index = 0; index < findings.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(findings, index)) {
+        continue;
+      }
+      const raw = findings[index];
+      if (!isPlainRecordObject(raw)) {
+        continue;
+      }
+      const severity = raw.severity;
+      if (severity !== 'blocker' && severity !== 'major') {
+        continue;
+      }
+      blocking.push(raw);
+    }
+    const bounded = boundedFindingsView(
+      blocking as unknown as Parameters<typeof boundedFindingsView>[0],
+    );
+    if (bounded.length > 0) {
+      return bounded;
+    }
+    if (blocking.length === 0) {
+      return [];
+    }
+    const synthesized: LaneRunParkFindingView[] = [];
+    for (let index = 0; index < blocking.length && synthesized.length < PARK_FINDINGS_MAX_COUNT; index += 1) {
+      const raw = blocking[index]!;
+      const rawId = typeof raw.findingId === 'string' ? raw.findingId : '';
+      const findingId =
+        rawId.length <= 128 && FINDING_ID_PATTERN.test(rawId)
+          ? rawId
+          : `finding-${index + 1}`;
+      const summary = summaryOf(raw.summary) ?? 'redacted blocking finding';
+      synthesized.push({
+        findingId,
+        severity: raw.severity as 'blocker' | 'major',
+        summary,
+        filePath: filePathOf(raw.filePath),
+        line: lineOf(raw.line),
+      });
+    }
+    if (synthesized.length === 0) {
+      // Unreachable in practice (blocking.length > 0), kept total.
+      return [];
+    }
+    return synthesized;
+  } catch {
+    return [];
+  }
 }
 
 /**

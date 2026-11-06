@@ -39,6 +39,45 @@ function refused(reason: string): RecordAuthorizationConsumptionResult {
   return { outcome: 'refused', reason };
 }
 
+/**
+ * Why a recorded grant cannot authorize this action, or `undefined` when it can.
+ * The checks run in a fixed order: already consumed, state, scope, commit, attempt.
+ */
+function refusalForRecordedGrant(
+  recorded: CoordinationRequestRecord,
+  request: RecordAuthorizationConsumptionRequest,
+  grantId: string,
+): string | undefined {
+  const existing = recorded.consumptions[0];
+  if (existing !== undefined) {
+    // One grant, one action: a second, unrelated action is never authorized,
+    // and the same action is never recorded twice.
+    return existing.actionId === request.actionId.trim()
+      ? `grant ${grantId} already authorized action ${existing.actionId}`
+      : `grant ${grantId} already authorized action ${existing.actionId} and never a second action`;
+  }
+  if (recorded.state !== 'approved') {
+    return `grant ${grantId} is ${recorded.state}, which authorizes no action`;
+  }
+  const suppliedScope = request.actionScope.trim();
+  if (recorded.actionScope !== suppliedScope) {
+    return `grant ${grantId} was recorded for scope ${recorded.actionScope}, not ${suppliedScope}`;
+  }
+  if (recorded.expectedHeadSha !== request.expectedHeadSha.trim()) {
+    return `grant ${grantId} was recorded for commit ${recorded.expectedHeadSha ?? 'none'}, not ${request.expectedHeadSha.trim()}`;
+  }
+  // A policy grant is issued for one attempt and authorizes no other. (An
+  // owner grant records no attempt; the composition that resolved it binds
+  // the attempt before it calls this port.)
+  if (
+    recorded.policyGrant !== undefined &&
+    recorded.policyGrant.attemptId !== request.attemptId.trim()
+  ) {
+    return 'grant-attempt-mismatch';
+  }
+  return undefined;
+}
+
 export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizationConsumptionPort {
   constructor(private readonly deps?: RecordAuthorizationConsumptionDependencies) {}
 
@@ -70,38 +109,9 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     if (recorded === null) {
       return refused(`no recorded request holds grant ${grantId}`);
     }
-    const existing = recorded.consumptions[0];
-    if (existing !== undefined) {
-      // One grant, one action: a second, unrelated action is never authorized,
-      // and the same action is never recorded twice.
-      return refused(
-        existing.actionId === request.actionId.trim()
-          ? `grant ${grantId} already authorized action ${existing.actionId}`
-          : `grant ${grantId} already authorized action ${existing.actionId} and never a second action`,
-      );
-    }
-    if (recorded.state !== 'approved') {
-      return refused(`grant ${grantId} is ${recorded.state}, which authorizes no action`);
-    }
-    const suppliedScope = request.actionScope.trim();
-    if (recorded.actionScope !== suppliedScope) {
-      return refused(
-        `grant ${grantId} was recorded for scope ${recorded.actionScope}, not ${suppliedScope}`,
-      );
-    }
-    if (recorded.expectedHeadSha !== request.expectedHeadSha.trim()) {
-      return refused(
-        `grant ${grantId} was recorded for commit ${recorded.expectedHeadSha ?? 'none'}, not ${request.expectedHeadSha.trim()}`,
-      );
-    }
-    // A policy grant is issued for one attempt and authorizes no other. (An
-    // owner grant records no attempt; the composition that resolved it binds
-    // the attempt before it calls this port.)
-    if (
-      recorded.policyGrant !== undefined &&
-      recorded.policyGrant.attemptId !== request.attemptId.trim()
-    ) {
-      return refused('grant-attempt-mismatch');
+    const refusal = refusalForRecordedGrant(recorded, request, grantId);
+    if (refusal !== undefined) {
+      return refused(refusal);
     }
     const aggregate = CoordinationRequest.fromRecord(recorded);
     // The composition root supplies the clock; no authority depends on it here.

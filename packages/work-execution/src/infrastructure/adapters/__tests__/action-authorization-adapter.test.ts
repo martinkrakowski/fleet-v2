@@ -1038,9 +1038,9 @@ describe('ActionAuthorizationAdapter control and bidi characters (CO24d)', () =>
     ['a newline', 'att\n1'],
     ['DEL', 'att\u007f1'],
     ['a C1 control', 'att\u00851'],
-    ['a bidi override', 'att‮1'],
-    ['a bidi isolate', 'att⁦1'],
-    ['a left-to-right mark', 'att‎1'],
+    ['a bidi override', 'att\u202e1'],
+    ['a bidi isolate', 'att\u20661'],
+    ['a left-to-right mark', 'att\u200e1'],
   ] as const;
 
   it.each(BAD)('refuses an attempt id (isSafeId) with %s', async (_label, attemptId) => {

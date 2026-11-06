@@ -8,7 +8,11 @@
  * 2. The refused-dispatch assertion: a single-profile installation written
  *    with `--isolation none` refuses `attempt dispatch` with exit 1 and the
  *    exact refusal reason, because the runner capabilities do not satisfy
- *    the required isolation.
+ *    the required isolation. On the way there, the brief-specified reserve
+ *    payload (hostId, worktreePath, maxSlots) is exercised: on a v2
+ *    installation each operator-supplied field is a usage error (exit 2),
+ *    the reserve allocates the worktree path itself, and the dispatch uses
+ *    the allocated path.
  *
  * This lane is TypeScript on purpose: the owner forbids new shell scripts in
  * fleet-v2, so the smoke runs as a vitest e2e test instead of a shell pair.
@@ -441,8 +445,55 @@ describe.skipIf(!gitAvailable)("the refused dispatch on an isolation-none instal
       workOrder: { id: WORK_ORDER_ID, state: 'approved', baseCommit: head },
     });
 
-    // A v2 installation's reserve allocates the worktree path itself; the
-    // operator passes no host, slot budget or path.
+    // The brief's reserve payload names hostId, worktreePath and maxSlots.
+    // On a v2 installation (the only shape init writes, schemaVersion 2) the
+    // CLI refuses each operator-supplied one of those with a usage error,
+    // because the host, the slot budget and the worktree path come from the
+    // installation and the reserve itself (H9a2). Exercise the specified
+    // payload explicitly: each supplied field is a usage error, exit 2.
+    const suppliedFieldCases: ReadonlyArray<{
+      field: string;
+      message: string;
+    }> = [
+      {
+        field: 'hostId',
+        message:
+          "'hostId' is not accepted for a v2 installation; the host is chosen from the installation's lane-runner hosts inside the reserve",
+      },
+      {
+        field: 'maxSlots',
+        message:
+          "'maxSlots' is not accepted for a v2 installation; each host's declared maxLanes feeds the slot budget",
+      },
+      {
+        field: 'worktreePath',
+        message:
+          "'worktreePath' is not accepted for a v2 installation; the worktree path is allocated from the attempt id inside the reserve",
+      },
+    ];
+    for (const { field, message } of suppliedFieldCases) {
+      const refused = await runCliCommand(
+        [
+          'capacity',
+          'reserve',
+          '--json',
+          JSON.stringify({
+            reservationId: 'res-supplied',
+            attemptId: 'att-supplied',
+            workOrderId: WORK_ORDER_ID,
+            seatTool: 'opencode',
+            [field]: field === 'maxSlots' ? 1 : path.join(dir, 'worktrees', 'supplied'),
+          }),
+        ],
+        runtime,
+      );
+      expect(refused.code).toBe(2);
+      expect(refused.stderr).toContain(message);
+    }
+
+    // The v2 reserve therefore takes no host, slot budget or path: it
+    // allocates the worktree path itself and the dispatch must use that
+    // allocated path.
     const reserve = await runCliCommand(
       [
         'capacity',

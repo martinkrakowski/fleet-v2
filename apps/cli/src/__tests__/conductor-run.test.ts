@@ -740,6 +740,65 @@ describe('conductor run change wake-up (K9)', () => {
       },
     );
   });
+
+  it('an interrupt during wake-reader startup stops the tunnel child', async () => {
+    const dir = tempStateDir();
+    const tokenFile = writeWakeTokenFile(dir);
+    const fake = makeFakeDriver({ enabled: true, passes: [completedPass()] });
+    let resolveExit: (value: { readonly code: number | null }) => void = () => undefined;
+    const exited = new Promise<{ readonly code: number | null }>((resolve) => {
+      resolveExit = resolve;
+    });
+    const killCalls: number[] = [];
+    const child: TunnelChild = {
+      exited,
+      stop: () => {
+        killCalls.push(1);
+        resolveExit({ code: null });
+      },
+      release: () => undefined,
+    };
+    let probes = 0;
+    const tunnel = new RunnerTunnelAdapter({
+      sshHost: 'lane-host',
+      remotePort: 46000,
+      isPortListening: async () => {
+        probes += 1;
+        return probes > 1;
+      },
+      spawner: () => child,
+      sleep: async () => undefined,
+      waitMs: 10_000,
+      pollMs: 1,
+    });
+    const controller = new AbortController();
+    let openedOpeners = 0;
+    await withWakeEnv(
+      {
+        FLEET_API_URL: WAKE_URL,
+        FLEET_CONDUCTOR_WAKE_TOKEN_FILE: tokenFile,
+      },
+      async () => {
+        const result = await runConductor(runtimeOf(dir), ['run', '--live'], {
+          stateDir: dir,
+          buildDriver: () => fake.driver,
+          stopSignal: controller.signal,
+          tunnel,
+          openWakeReader: async () => {
+            openedOpeners += 1;
+            // The interrupt arrives while the wake-reader opener is pending.
+            controller.abort();
+            return new Promise(() => undefined); // never settles
+          },
+        });
+        expect(result.code).toBe(0);
+        expect(openedOpeners).toBe(1);
+        expect(killCalls).toHaveLength(1);
+        expect(tunnel.owned).toBe(false);
+        expect(fake.passCalls).toHaveLength(0);
+      },
+    );
+  });
 });
 
 describe('conductor run --live tunnel wiring (KF-35 fix 1)', () => {

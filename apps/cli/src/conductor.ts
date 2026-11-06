@@ -908,8 +908,8 @@ const WAKE_OPENER_INTERRUPTED = 'wake-opener-interrupted';
  * wake-token file, and the opener must succeed — a reader that cannot open
  * prints one line and leaves the driver polling. The opener wait races the
  * stop signal: an API that never answers must not hold the run hostage, so an
- * interrupt ends the wait (and the production opener's fetch) and the caller's
- * `finally` still stops the tunnel, exporter and reader.
+ * interrupt ends the wait (and the production opener's fetch); the caller stops
+ * the tunnel and the `finally` stops the exporter and closes the reader.
  */
 async function resolveWakeReader(
   io: CliIo,
@@ -1055,8 +1055,10 @@ async function runCommand(
     // never answers cannot hold the run hostage).
     const opened = await resolveWakeReader(io, options, signal);
     if (opened === WAKE_OPENER_INTERRUPTED) {
-      // Same contract as the tunnel startup race: `finally` stops what the
-      // startup already opened and the run exits cleanly.
+      // Same contract as the tunnel startup race: an interrupt ends the opener
+      // wait, and the owned tunnel is stopped here too — the poll loop never
+      // starts, so its tunnel-release path would otherwise be skipped.
+      await tunnel.stop();
       return 0;
     }
     wake = opened;

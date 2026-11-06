@@ -263,13 +263,19 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       if (repointed.outcome !== 'ok') {
         return { refusal: repointRefusal(repointed.outcome) };
       }
-      return {
-        pruned: await this.deps.store.prune({
-          root: request.root,
-          keep: request.keep,
-          fence: () => this.stillHolds(held),
-        }),
-      };
+      // The repoint stands from here on: a prune that throws is an unfinished
+      // prune of an applied release, never a refusal a caller would retry.
+      try {
+        return {
+          pruned: await this.deps.store.prune({
+            root: request.root,
+            keep: request.keep,
+            fence: () => this.stillHolds(held),
+          }),
+        };
+      } catch {
+        return { pruned: { outcome: 'unreadable' } };
+      }
     } finally {
       await this.releaseLease(held);
     }

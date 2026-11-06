@@ -949,6 +949,25 @@ describe('ManageReleaseUseCase', () => {
     }
   });
 
+  it('a prune that throws after the repoint is still an applied release', async () => {
+    const store = new FakeStore([build('a', 1), build('b', 2)], B);
+    store.prune = async () => {
+      throw new Error('disk vanished');
+    };
+    const { useCase } = granted(SWAP, A, { store });
+    expect(await manage(useCase, applyRequest({ action: 'swap', sha: A, source: null }))).toEqual({
+      outcome: 'applied',
+      action: 'swap',
+      target: A,
+      current: A,
+      kept: [A, B],
+      pruned: [],
+      pruneOutcome: 'unreadable',
+      rebuilt: false,
+    });
+    expect(store.current).toBe(A);
+  });
+
   it('reports an unreadable prune instead of a false success', async () => {
     const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4), build('e', 5)], E);
     store.pruneUnreadable = true;

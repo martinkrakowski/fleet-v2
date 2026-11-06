@@ -68,6 +68,11 @@ class FakeForgeAction implements MergeForgeActionPort {
     return this.result;
   }
 
+  // The merge pass never reads a branch head; a call here is a test failure, not a fake answer.
+  async readMergeBranchHead(): Promise<never> {
+    throw new Error('readMergeBranchHead is not part of the merge pass');
+  }
+
   isConfigured(): boolean {
     return true;
   }

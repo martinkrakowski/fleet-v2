@@ -948,3 +948,54 @@ describe('WB2c deriveLaneWaits', () => {
     });
   });
 });
+
+describe('WB2c Luna review round 1 (majors)', () => {
+  const ghToken = 'gh' + 'p_' + 'x'.repeat(36);
+  const refuse = { ok: false, reason: 'invalid-board' };
+
+  it('refuses a board missing policy, columns, ownerItems, doneCutoffIso or complete', () => {
+    const base = board([card(REF_A, 'queued', { waitsOn: [seatRow()] })]);
+    for (const field of ['policy', 'columns', 'ownerItems', 'doneCutoffIso', 'complete'] as const) {
+      const partial: Record<string, unknown> = { ...base };
+      delete partial[field];
+      expect(deriveLaneWaits(partial, REF_A)).toEqual(refuse);
+    }
+    expect(deriveLaneWaits({ ...base, policy: { forgeStaleMinutes: 1 } }, REF_A)).toEqual(refuse);
+    expect(deriveLaneWaits({ ...base, columns: { done: {} } }, REF_A)).toEqual(refuse);
+    expect(deriveLaneWaits({ ...base, ownerItems: 'nope' }, REF_A)).toEqual(refuse);
+    expect(deriveLaneWaits({ ...base, ownerItems: [{ id: ghToken }] }, REF_A)).toEqual(refuse);
+  });
+
+  it('refuses a secret-shaped value in an unchecked card field (summary, scope) and never echoes it', () => {
+    const base = board([card(REF_A, 'queued', { waitsOn: [seatRow()] })]);
+    const withCard = (overrides: Record<string, unknown>) => ({ ...base, lanes: [{ ...base.lanes[0], ...overrides }] });
+    expect(deriveLaneWaits(withCard({ summary: ghToken }), REF_A)).toEqual(refuse);
+    expect(deriveLaneWaits(withCard({ scope: ghToken }), REF_A)).toEqual(refuse);
+    expect(deriveLaneWaits(withCard({ packages: [ghToken] }), REF_A)).toEqual(refuse);
+    expect(deriveLaneWaits(withCard({ pullRequests: [{ repository: 'o/r', number: 1, state: 'open', asOfIso: null, stale: false, title: ghToken }] }), REF_A)).toEqual(refuse);
+    expect(JSON.stringify(deriveLaneWaits(withCard({ scope: ghToken }), REF_A))).not.toContain(ghToken);
+  });
+
+  it('returns a rebuilt card: a distinct object carrying no unvalidated extra field', () => {
+    const input = board([card(REF_A, 'queued', { waitsOn: [seatRow()], summary: 'ok' })]);
+    const lane = { ...input.lanes[0], extraField: 'leak' } as unknown as BoardLaneCard;
+    const result = deriveOk({ ...input, lanes: [lane] }, REF_A);
+    expect(result.card).not.toBe(lane);
+    expect(result.card).toEqual(input.lanes[0]);
+    expect(Object.keys(result.card)).not.toContain('extraField');
+  });
+
+  it('refuses a secret-shaped SourceReading.repository', () => {
+    const base = board([card(REF_A, 'queued', { waitsOn: [seatRow()] })]);
+    const sources = [{ source: 'plans', repository: ghToken, readAtIso: NOW, status: 'read' }, ...base.sources.slice(1)];
+    expect(deriveLaneWaits({ ...base, sources }, REF_A)).toEqual(refuse);
+  });
+
+  it('refuses an owner-item sinceIso that is secret-shaped or not an ISO time', () => {
+    const base = board([card(REF_A, 'queued', { waitsOn: [ownerRow('item-1', NOW)] })]);
+    for (const sinceIso of [ghToken, 'yesterday-ish']) {
+      const guard = { ...ownerRow('item-1', NOW), subject: { ...(ownerRow('item-1', NOW).subject as object), sinceIso } };
+      expect(deriveLaneWaits({ ...base, lanes: [{ ...base.lanes[0], waitsOn: [guard] }] }, REF_A)).toEqual(refuse);
+    }
+  });
+});

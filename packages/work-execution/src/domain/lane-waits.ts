@@ -1,7 +1,8 @@
 /**
  * WB2c (`deriveLaneWaits`): the single-lane waits-for view over a derived
  * `WorkBoard` (waits-for-view plan §3.2, §3.7, §3.8). Pure domain: never
- * throws, never runs a getter or Proxy trap, never mutates inputs, never
+ * throws, never runs a getter (a Proxy's prototype/descriptor traps can still
+ * run, and a throwing trap is a refusal), never mutates inputs, never
  * touches filesystem/network/subprocess/clock. All inputs are validated
  * through own property descriptors; malformed input returns a typed refusal
  * (`'invalid-board' | 'invalid-ref' | 'invalid-options' | 'lane-not-on-board'`)
@@ -316,7 +317,7 @@ function validateSourceReading(value: unknown): SourceReading | null {
   const readAtIso = requiredProp(value, 'readAtIso');
   if (typeof source !== 'string' || !(BOARD_SOURCES as readonly string[]).includes(source)) return null;
   if (status !== 'read' && status !== 'not-read') return null;
-  if (repository !== null && typeof repository !== 'string') return null;
+  if (repository !== null && !acceptableText(repository)) return null;
   if (readAtIso !== null && (typeof readAtIso !== 'string' || parseTimeMs(readAtIso) === null)) return null;
   const reasonRead = optionalProp(value, 'reason');
   if (!reasonRead.ok) return null;
@@ -479,7 +480,7 @@ function validateWaitSubject(value: unknown): WaitSubject | null {
       if (!validId(itemId, false)) return null;
       if (itemKind !== 'merge' && itemKind !== 'decision' && itemKind !== 'secret') return null;
       if (!acceptableText(subject)) return null;
-      if (typeof sinceIso !== 'string') return null;
+      if (typeof sinceIso !== 'string' || !acceptableText(sinceIso) || parseTimeMs(sinceIso) === null) return null;
       return { kind: 'owner-item', itemId, itemKind, subject, sinceIso };
     }
     case 'plan-decision': {
@@ -642,7 +643,8 @@ interface ValidCard {
   readonly waitingOn: readonly { readonly id: string; readonly kind: 'merge' | 'decision' | 'secret'; readonly subject: string | null; readonly sinceIso: string }[];
   readonly waitsOn: readonly WaitGuard[];
   readonly notRead: readonly SourceReading[];
-  readonly original: BoardLaneCard;
+  /** The card rebuilt from validated fields; the caller's object is never echoed. */
+  readonly card: BoardLaneCard;
 }
 
 function validateCard(value: unknown): ValidCard | null {
@@ -694,7 +696,7 @@ function validateCard(value: unknown): ValidCard | null {
     if (typeof id !== 'string' || !acceptableText(id)) return null;
     if (kind !== 'merge' && kind !== 'decision' && kind !== 'secret') return null;
     if (subject !== null && !acceptableText(subject)) return null;
-    if (typeof sinceIso !== 'string') return null;
+    if (typeof sinceIso !== 'string' || !acceptableText(sinceIso) || parseTimeMs(sinceIso) === null) return null;
     waiting.push({ id, kind, subject: subject as string | null, sinceIso });
   }
 
@@ -716,6 +718,12 @@ function validateCard(value: unknown): ValidCard | null {
     readings.push(valid);
   }
 
+  const rebuiltCard = rebuildCard(value, {
+    key, ref, label, placement: placement as BoardPlacement, stepText: stepText as string | null,
+    waitsOn: guards, notRead: readings,
+  });
+  if (rebuiltCard === null) return null;
+
   return {
     key,
     ref,
@@ -727,14 +735,226 @@ function validateCard(value: unknown): ValidCard | null {
     waitingOn: waiting,
     waitsOn: guards,
     notRead: readings,
-    original: value as unknown as BoardLaneCard,
+    card: rebuiltCard,
   };
+}
+
+// --- Rebuilt card and board envelope ----------------------------------------
+
+const SAFE_COPY_MAX_DEPTH = 8;
+const SAFE_COPY_MAX_NODES = 5_000;
+const SAFE_COPY_ENVELOPE_MAX_NODES = 200_000;
+const PLAN_STATUS_VALUES: readonly string[] = ['planned', 'deferred', 'dropped', 'not-imported', 'no-plan'];
+
+/** A string with no secret shape (display text rules are stricter and apply to named fields). */
+function secretFreeString(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  if (containsSecretShape(value)) return false;
+  for (const pattern of LANE_DIFF_SECRET_PATTERNS) {
+    if (pattern.regex.test(value)) return false;
+  }
+  return true;
+}
+
+/**
+ * Deep-copies plain data through own data descriptors only: scalars, dense
+ * arrays and plain records, with every string free of secret shapes. Returns
+ * `undefined` for anything else (a getter, a symbol key, a function, a cycle
+ * past the depth bound, an oversized tree), so nothing unchecked is echoed.
+ */
+function safeCopy(value: unknown, depth: number, budget: { n: number; max: number }): unknown {
+  budget.n += 1;
+  if (budget.n > budget.max || depth > SAFE_COPY_MAX_DEPTH) return undefined;
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  if (typeof value === 'string') return secretFreeString(value) ? value : undefined;
+  if (Array.isArray(value)) {
+    if (!denseArray(value, budget.max)) return undefined;
+    const out: unknown[] = [];
+    for (const item of value) {
+      const copy = safeCopy(item, depth + 1, budget);
+      if (copy === undefined) return undefined;
+      out.push(copy);
+    }
+    return out;
+  }
+  if (!isPlainRecordObject(value)) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string' || key === '__proto__' || !secretFreeString(key)) return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || descriptor.get !== undefined || descriptor.set !== undefined) {
+      return undefined;
+    }
+    const copy = safeCopy(descriptor.value, depth + 1, budget);
+    if (copy === undefined) return undefined;
+    out[key] = copy;
+  }
+  return out;
+}
+
+function safeCopyField(value: unknown, max = SAFE_COPY_MAX_NODES): unknown {
+  return safeCopy(value, 0, { n: 0, max });
+}
+
+function stringList(value: unknown): string[] | null {
+  if (!denseArray(value, MAX_LANE_WAITS_BOARD_LANES)) return null;
+  const out: string[] = [];
+  for (const item of value) {
+    if (!secretFreeString(item)) return null;
+    out.push(item);
+  }
+  return out;
+}
+
+interface ValidatedCardParts {
+  readonly key: string;
+  readonly ref: LaneRef;
+  readonly label: string;
+  readonly placement: BoardPlacement;
+  readonly stepText: string | null;
+  readonly waitsOn: readonly WaitGuard[];
+  readonly notRead: readonly SourceReading[];
+}
+
+/**
+ * Rebuilds a `BoardLaneCard` from validated or deep-copied fields so the
+ * result never carries the caller's object (or an unchecked field of it).
+ */
+function rebuildCard(value: Record<string, unknown>, parts: ValidatedCardParts): BoardLaneCard | null {
+  const projectId = requiredProp(value, 'projectId');
+  if (!validId(projectId, true)) return null;
+  const planId = requiredProp(value, 'planId');
+  if (planId !== null && !validId(planId, true)) return null;
+  const planStatus = requiredProp(value, 'planStatus');
+  if (typeof planStatus !== 'string' || !PLAN_STATUS_VALUES.includes(planStatus)) return null;
+  const tier = requiredProp(value, 'tier');
+  if (tier !== null && tier !== 0 && tier !== 1 && tier !== 2) return null;
+  const scope = requiredProp(value, 'scope');
+  if (scope !== null && !secretFreeString(scope)) return null;
+  const packages = stringList(requiredProp(value, 'packages'));
+  const workOrderIds = stringList(requiredProp(value, 'workOrderIds'));
+  if (packages === null || workOrderIds === null) return null;
+  const started = requiredProp(value, 'started');
+  if (typeof started !== 'boolean') return null;
+  const round = requiredProp(value, 'round');
+  if (round !== null && (typeof round !== 'number' || !Number.isFinite(round))) return null;
+  const summary = requiredProp(value, 'summary');
+  if (!secretFreeString(summary)) return null;
+  const countsRaw = requiredProp(value, 'waitCounts');
+  if (!isPlainRecordObject(countsRaw)) return null;
+  const blocked = requiredProp(countsRaw, 'blocked');
+  const unknown = requiredProp(countsRaw, 'unknown');
+  const clear = requiredProp(countsRaw, 'clear');
+  for (const n of [blocked, unknown, clear]) {
+    if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0) return null;
+  }
+  const firstBlockerRaw = requiredProp(value, 'firstBlocker');
+  let firstBlocker: WaitGuard | null = null;
+  if (firstBlockerRaw !== null) {
+    firstBlocker = validateWaitGuard(firstBlockerRaw);
+    if (firstBlocker === null) return null;
+  }
+
+  const structured: Record<string, unknown> = {};
+  for (const name of ['done', 'step', 'seat', 'reviewCounts'] as const) {
+    const raw = requiredProp(value, name);
+    if (raw === null) {
+      structured[name] = null;
+      continue;
+    }
+    const copy = safeCopyField(raw);
+    if (copy === undefined || copy === null || typeof copy !== 'object' || Array.isArray(copy)) return null;
+    structured[name] = copy;
+  }
+  const lists: Record<string, unknown[]> = {};
+  for (const name of ['waitingOn', 'pullRequests', 'badges'] as const) {
+    const raw = requiredProp(value, name);
+    if (!denseArray(raw, MAX_LANE_WAITS_BOARD_LANES)) return null;
+    const copy = safeCopyField(raw);
+    if (!Array.isArray(copy)) return null;
+    lists[name] = copy;
+  }
+
+  return {
+    key: parts.key,
+    ref: parts.ref,
+    label: parts.label,
+    projectId,
+    planId: planId as string | null,
+    planStatus: planStatus as BoardLaneCard['planStatus'],
+    tier: tier as BoardLaneCard['tier'],
+    scope: scope as string | null,
+    packages,
+    workOrderIds,
+    started,
+    placement: parts.placement,
+    done: structured.done as BoardLaneCard['done'],
+    waitingOn: lists.waitingOn as unknown as BoardLaneCard['waitingOn'],
+    notRead: [...parts.notRead],
+    step: structured.step as BoardLaneCard['step'],
+    stepText: parts.stepText,
+    seat: structured.seat as BoardLaneCard['seat'],
+    round: round as number | null,
+    pullRequests: lists.pullRequests as unknown as BoardLaneCard['pullRequests'],
+    reviewCounts: structured.reviewCounts as BoardLaneCard['reviewCounts'],
+    badges: lists.badges as unknown as BoardLaneCard['badges'],
+    waitsOn: [...parts.waitsOn],
+    waitCounts: { blocked: blocked as number, unknown: unknown as number, clear: clear as number },
+    firstBlocker,
+    summary,
+  };
+}
+
+function validPolicy(value: unknown): boolean {
+  if (!isPlainRecordObject(value)) return false;
+  for (const name of ['forgeStaleMinutes', 'declarationTtlMinutes', 'doneWindowDays']) {
+    const n = requiredProp(value, name);
+    if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) return false;
+  }
+  return true;
+}
+
+function validReadingList(value: unknown): boolean {
+  if (!denseArray(value, MAX_LANE_WAITS_SOURCES)) return false;
+  return value.every((reading) => validateSourceReading(reading) !== null);
+}
+
+/** Every required `WorkBoard` field beyond the lanes and sources: policy, cutoff, complete, columns, owner items. */
+function validBoardEnvelope(value: Record<string, unknown>): boolean {
+  if (!validPolicy(requiredProp(value, 'policy'))) return false;
+  const cutoff = requiredProp(value, 'doneCutoffIso');
+  if (typeof cutoff !== 'string' || parseTimeMs(cutoff) === null) return false;
+  if (typeof requiredProp(value, 'complete') !== 'boolean') return false;
+  const columns = requiredProp(value, 'columns');
+  if (!isPlainRecordObject(columns)) return false;
+  const done = requiredProp(columns, 'done');
+  const waiting = requiredProp(columns, 'waiting');
+  const inFlight = requiredProp(columns, 'inFlight');
+  const queued = requiredProp(columns, 'queued');
+  if (!isPlainRecordObject(done) || !isPlainRecordObject(waiting) || !isPlainRecordObject(inFlight) || !isPlainRecordObject(queued)) {
+    return false;
+  }
+  const hidden = requiredProp(done, 'hiddenByWindow');
+  if (typeof hidden !== 'number' || !Number.isSafeInteger(hidden) || hidden < 0) return false;
+  for (const entries of [requiredProp(done, 'entries'), requiredProp(waiting, 'entries')]) {
+    if (!denseArray(entries, MAX_LANE_WAITS_BOARD_LANES) || !Array.isArray(safeCopyField(entries, SAFE_COPY_ENVELOPE_MAX_NODES))) return false;
+  }
+  for (const keys of [requiredProp(inFlight, 'keys'), requiredProp(queued, 'keys')]) {
+    if (stringList(keys) === null) return false;
+  }
+  for (const column of [done, waiting, inFlight, queued]) {
+    if (!validReadingList(requiredProp(column, 'notRead'))) return false;
+  }
+  const ownerItems = requiredProp(value, 'ownerItems');
+  return denseArray(ownerItems, MAX_LANE_WAITS_BOARD_LANES) && Array.isArray(safeCopyField(ownerItems, SAFE_COPY_ENVELOPE_MAX_NODES));
 }
 
 function validateBoard(value: unknown): ValidBoard | null {
   if (!isPlainRecordObject(value)) return null;
   const schemaVersion = requiredProp(value, 'schemaVersion');
   if (schemaVersion !== WORK_BOARD_SCHEMA_VERSION) return null;
+  if (!validBoardEnvelope(value)) return null;
   const readAtIso = requiredProp(value, 'readAtIso');
   if (typeof readAtIso !== 'string' || parseTimeMs(readAtIso) === null) return null;
   const sourcesRaw = requiredProp(value, 'sources');
@@ -1684,7 +1904,7 @@ function deriveFromValid(board: ValidBoard, ref: LaneRef, opts: ValidOptions): D
     const sources = unionClosureSources(board, target, [target], true);
     return {
       ok: true,
-      card: target.original,
+      card: target.card,
       lane: rootGlance,
       waits: null,
       noWaits,
@@ -1753,7 +1973,7 @@ function deriveFromValid(board: ValidBoard, ref: LaneRef, opts: ValidOptions): D
 
   return {
     ok: true,
-    card: target.original,
+    card: target.card,
     lane: rootGlance,
     waits,
     noWaits: null,

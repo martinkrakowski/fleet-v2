@@ -2,7 +2,14 @@
 // runtime from harmless parts, so this test file itself matches nothing; the
 // helpers report whether or where a shape appears, never the matched text.
 import { describe, expect, it } from 'vitest';
-import { LANE_DIFF_SECRET_PATTERNS, SECRET_PATTERNS, containsSecretShape, findSecretShapeLines } from '../secret-patterns.js';
+import {
+  LANE_DIFF_SECRET_PATTERNS,
+  SECRET_PATTERN_NAMES,
+  SECRET_PATTERNS,
+  containsSecretShape,
+  findSecretShapeLines,
+  namedSecretPatterns,
+} from '../secret-patterns.js';
 
 // Each fake value is built from fragments so no pattern literal ever appears
 // contiguously in this file.
@@ -28,6 +35,11 @@ describe('SECRET_PATTERNS registry', () => {
     for (const pattern of SECRET_PATTERNS) {
       expect(pattern.global, pattern.source).toBe(false);
     }
+  });
+
+  it('derives both legacy exports from the one internal list', () => {
+    expect(namedSecretPatterns().map((s) => s.name)).toEqual([...SECRET_PATTERN_NAMES]);
+    expect(namedSecretPatterns().map((s) => s.regex)).toEqual([...SECRET_PATTERNS]);
   });
 });
 

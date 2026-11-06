@@ -77,6 +77,9 @@ const ENV_GUARDS = [
   'GIT_CONFIG_NOSYSTEM=1',
   'GIT_CONFIG_GLOBAL=/dev/null',
   'GIT_CONFIG_SYSTEM=/dev/null',
+  // Neutralise inherited command-scope config (it would pass the `command` exemption of the filter guard).
+  'GIT_CONFIG_COUNT=0',
+  'GIT_CONFIG_PARAMETERS=',
 ] as const;
 const IDENTITY_ENV = [
   'GIT_AUTHOR_NAME=fleet-v2',

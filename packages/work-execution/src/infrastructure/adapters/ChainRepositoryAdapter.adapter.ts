@@ -48,16 +48,20 @@ import type {
   ChainRecordDecision,
   ChainRecordRead,
   ChainRepositoryPort,
+  ChainReviewPinCommand,
+  ChainReviewPinDecision,
 } from '../../application/ports/out/ChainRepositoryPort.out-port.js';
 import {
   applyChainOutcome,
+  applyChainReviewPin,
   isChainActionKey,
   isChainReasonCode,
   parseChainName,
   parseChainRepository,
   readChainRecord,
+  reviewPinOf,
 } from '../../domain/chain-records.js';
-import type { ChainRecord, ChainRepositoryRef } from '../../domain/chain-records.js';
+import type { ChainRecord, ChainRepositoryRef, ChainReviewPin } from '../../domain/chain-records.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 
 export interface ChainRepositoryAdapterOptions {
@@ -98,6 +102,8 @@ type Refusal =
   | 'record-unreadable'
   | 'chain-exists'
   | 'chain-not-found'
+  | 'chain-unreadable'
+  | 'chain-record-stale'
   | 'action-key-mismatch'
   | 'stale-revision'
   | 'record-limit'
@@ -271,6 +277,55 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
         const next = applyChainOutcome(current.record, { state, reason: state === 'started' ? null : (reason as string) });
         const check = readChainRecord(next);
         if (!check.ok) return refused('invalid-record');
+        await section.write(check.record, id);
+        return { outcome: 'recorded' } as const;
+      });
+    } catch (error) {
+      return this.refusalFor(error);
+    }
+  }
+
+  /**
+   * Pin the chain tip a combined review covers (lane CO9), by compare-and-set on
+   * the revision. A record already carrying the same pin (same key and head)
+   * answers `already-recorded`; a different pin, or a record past the expected
+   * revision, answers `chain-record-stale` and nothing is written: a stored pin
+   * is never overwritten with another.
+   */
+  async recordChainReviewPin(command: ChainReviewPinCommand): Promise<ChainReviewPinDecision> {
+    try {
+      const deadline = freshDeadline(own(command, 'deadlineIso'));
+      if (deadline !== 'ok') return refused(deadline);
+      const id = identityOf(own(command, 'repository'), own(command, 'chainName'));
+      const expectedRevision = own(command, 'expectedRevision');
+      const pinValue = own(command, 'pin');
+      const pin: ChainReviewPin = {
+        headSha: own(pinValue, 'headSha') as string,
+        requestId: own(pinValue, 'requestId') as string,
+        key: own(pinValue, 'key') as string,
+        pinnedAtIso: own(pinValue, 'pinnedAtIso') as string,
+      };
+      if (id === undefined) return refused('invalid-request');
+      if (typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+        return refused('invalid-request');
+      }
+      if (this.readOnly) return refused('read-only');
+      return await this.exclusive(own(command, 'deadlineIso') as string, async (section) => {
+        const current = await section.read(id);
+        if (current.status === 'unreadable') return refused('chain-unreadable');
+        if (current.status === 'not-found') return refused('chain-not-found');
+        const stored = reviewPinOf(current.record);
+        if (stored !== null) {
+          return stored.key === pin.key && stored.headSha === pin.headSha
+            ? ({ outcome: 'already-recorded' } as const)
+            : refused('chain-record-stale');
+        }
+        if (current.record.revision !== expectedRevision || current.record.state !== 'started') {
+          return refused('chain-record-stale');
+        }
+        const next = applyChainReviewPin(current.record, pin, pin.pinnedAtIso);
+        const check = readChainRecord(next);
+        if (!check.ok || reviewPinOf(check.record) === null) return refused('invalid-request');
         await section.write(check.record, id);
         return { outcome: 'recorded' } as const;
       });

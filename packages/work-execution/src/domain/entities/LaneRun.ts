@@ -31,12 +31,14 @@ import {
   LANE_RUN_SCHEMA_VERSION,
   LANE_RUN_TIERS,
   RUN_STOP_REFUSAL_KINDS,
+  parseLaneRunProvenance,
 } from '../lane-run-records.js';
 import type {
   LaneRunKeyStep,
   LaneRunLeaseRecord,
   LaneRunParkReason,
   LaneRunParkRecord,
+  LaneRunProvenance,
   LaneRunRecord,
   LaneRunTier,
   RunStopRefusalKind,
@@ -75,11 +77,11 @@ const REQUIRED_RECORD_KEYS: readonly string[] = [
 ];
 
 /**
- * The keys a record may omit: `branchName` (KF-5a), `baseBranch` (CB1) and
- * `schemaVersion` (Q5a, D6). One optional-key read keeps every stored record
+ * The keys a record may omit: `branchName` (KF-5a), `baseBranch` (CB1), `provenance`
+ * (CO28, D-R8) and `schemaVersion` (Q5a, D6). One optional-key read keeps every stored record
  * readable without a version bump; anything else is an unknown key.
  */
-const OPTIONAL_RECORD_KEYS: readonly string[] = ['branchName', 'baseBranch', 'schemaVersion'];
+const OPTIONAL_RECORD_KEYS: readonly string[] = ['branchName', 'baseBranch', 'provenance', 'schemaVersion'];
 
 const PARKED_REQUIRED_KEYS: readonly string[] = ['reason', 'qualifier', 'parkedFrom', 'questionId'];
 const PARKED_OPTIONAL_KEYS: readonly string[] = ['findings'];
@@ -164,6 +166,7 @@ export class LaneRun {
       runPolicyRevision: recordInput.runPolicyRevision as string,
       ...(branchFields.branchName === undefined ? {} : { branchName: branchFields.branchName }),
       ...(branchFields.baseBranch === undefined ? {} : { baseBranch: branchFields.baseBranch }),
+      ...(branchFields.provenance === undefined ? {} : { provenance: branchFields.provenance }),
       ...(versionRead.explicit ? { schemaVersion: versionRead.schemaVersion } : {}),
     };
     return { success: true, value: new LaneRun(Object.freeze(record)) };
@@ -214,6 +217,7 @@ export class LaneRun {
       runPolicyRevision: this.record.runPolicyRevision,
       ...(this.record.branchName === undefined ? {} : { branchName: this.record.branchName }),
       ...(this.record.baseBranch === undefined ? {} : { baseBranch: this.record.baseBranch }),
+      ...(this.record.provenance === undefined ? {} : { provenance: this.record.provenance }),
       ...(this.record.schemaVersion === undefined ? {} : { schemaVersion: this.record.schemaVersion }),
     };
   }
@@ -445,7 +449,26 @@ function readOptionalBaseBranch(recordInput: Record<string, unknown>): {
 }
 
 /**
- * runPolicyRevision, branchName (KF-5a) and baseBranch (CB1): the last field
+ * `provenance` is optional (CO28, D-R8): an absent key reads as `started` and stays absent on the record;
+ * when the key is present the value must be exactly `started` or `adopted` (an explicit `undefined`, a
+ * getter, null or any other value is refused, never defaulted).
+ */
+function readOptionalProvenance(recordInput: Record<string, unknown>): {
+  ok: true;
+  provenance: LaneRunProvenance | undefined;
+} | { ok: false; error: string } {
+  if (!Object.hasOwn(recordInput, 'provenance')) {
+    return { ok: true, provenance: undefined };
+  }
+  const parsed = parseLaneRunProvenance(recordInput.provenance);
+  if (parsed === undefined) {
+    return { ok: false, error: 'LaneRun provenance must be started or adopted' };
+  }
+  return { ok: true, provenance: parsed };
+}
+
+/**
+ * runPolicyRevision, branchName (KF-5a), baseBranch (CB1) and provenance (CO28): the last field
  * checks of the body, moved here (fix round 1) so createUnchecked stays under
  * the file's complexity cap of 12. Returns the first refusal, with the same
  * messages as the inline checks it replaced.
@@ -454,6 +477,7 @@ function readOptionalBranchFields(recordInput: Record<string, unknown>): {
   ok: true;
   branchName: string | undefined;
   baseBranch: BaseBranchValue | undefined;
+  provenance: LaneRunProvenance | undefined;
 } | { ok: false; error: string } {
   const runPolicyRevisionError = idError('runPolicyRevision', recordInput.runPolicyRevision);
   if (runPolicyRevisionError !== null) {
@@ -467,7 +491,16 @@ function readOptionalBranchFields(recordInput: Record<string, unknown>): {
   if (!baseBranch.ok) {
     return { ok: false, error: baseBranch.error };
   }
-  return { ok: true, branchName: branchName.branchName, baseBranch: baseBranch.baseBranch };
+  const provenance = readOptionalProvenance(recordInput);
+  if (!provenance.ok) {
+    return { ok: false, error: provenance.error };
+  }
+  return {
+    ok: true,
+    branchName: branchName.branchName,
+    baseBranch: baseBranch.baseBranch,
+    provenance: provenance.provenance,
+  };
 }
 
 function invalid(message: string): LaneRunResult {

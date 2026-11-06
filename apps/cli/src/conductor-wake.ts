@@ -292,9 +292,25 @@ export async function openChangeWakeReader(options: {
   readonly baseUrl: string;
   readonly token: string;
   readonly fetchImpl?: typeof fetch;
+  /**
+   * An external stop signal (the driver's); when it fires the fetch is
+   * aborted, so a hung connection cannot keep the opener (and the run) alive
+   * past an interrupt.
+   */
+  readonly signal?: AbortSignal;
 }): Promise<ChangeWakeReader | null> {
   const doFetch = options.fetchImpl ?? fetch;
   const fetchAbort = new AbortController();
+  let onStopFetch: (() => void) | null = null;
+  if (options.signal !== undefined) {
+    if (options.signal.aborted) {
+      return null;
+    }
+    onStopFetch = (): void => {
+      fetchAbort.abort();
+    };
+    options.signal.addEventListener('abort', onStopFetch, { once: true });
+  }
   let response: Response;
   try {
     response = await doFetch(`${options.baseUrl}/v1/changes`, {

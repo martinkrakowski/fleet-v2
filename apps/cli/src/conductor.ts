@@ -899,13 +899,23 @@ async function stopTelemetryExporter(runtime: FleetCliRuntime): Promise<void> {
   }
 }
 
+/** The interrupt marker `resolveWakeReader` returns when the stop signal ends the opener wait. */
+const WAKE_OPENER_INTERRUPTED = 'wake-opener-interrupted';
+
 /**
  * K9: build the change-feed wake reader for a live run. An injected reader
  * wins; otherwise the environment must configure both the API base URL and a
  * wake-token file, and the opener must succeed — a reader that cannot open
- * prints one line and leaves the driver polling.
+ * prints one line and leaves the driver polling. The opener wait races the
+ * stop signal: an API that never answers must not hold the run hostage, so an
+ * interrupt ends the wait (and the production opener's fetch) and the caller's
+ * `finally` still stops the tunnel, exporter and reader.
  */
-async function resolveWakeReader(io: CliIo, options: ConductorCliOptions): Promise<ChangeWakeReader | undefined> {
+async function resolveWakeReader(
+  io: CliIo,
+  options: ConductorCliOptions,
+  signal: AbortSignal,
+): Promise<ChangeWakeReader | undefined | typeof WAKE_OPENER_INTERRUPTED> {
   if (options.wakeReader !== undefined) {
     return options.wakeReader ?? undefined;
   }
@@ -913,13 +923,34 @@ async function resolveWakeReader(io: CliIo, options: ConductorCliOptions): Promi
   if (config === null) {
     return undefined;
   }
-  const opener = options.openWakeReader ?? openChangeWakeReader;
-  const reader = await opener(config);
-  if (reader === null) {
-    io.stderr('conductor run: the change feed is unavailable; polling\n');
-    return undefined;
+  const opener =
+    options.openWakeReader ?? ((open: { readonly baseUrl: string; readonly token: string }) => openChangeWakeReader({ ...open, signal }));
+  let onAbort: (() => void) | null = null;
+  const interrupted = new Promise<typeof WAKE_OPENER_INTERRUPTED>((resolve) => {
+    onAbort = () => resolve(WAKE_OPENER_INTERRUPTED);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    // The opener's promise is settled into a value before racing, so a later
+    // rejection can never surface as an unhandled rejection after the race.
+    const openerPromise = opener(config).then(
+      (reader): ChangeWakeReader | null => reader,
+      (): ChangeWakeReader | null => null,
+    );
+    const raced = await Promise.race([openerPromise.then((reader) => ({ reader })), interrupted]);
+    if (raced === WAKE_OPENER_INTERRUPTED) {
+      return WAKE_OPENER_INTERRUPTED;
+    }
+    if (raced.reader === null) {
+      io.stderr('conductor run: the change feed is unavailable; polling\n');
+      return undefined;
+    }
+    return raced.reader;
+  } finally {
+    if (onAbort !== null) {
+      signal.removeEventListener('abort', onAbort);
+    }
   }
-  return reader;
 }
 
 /**
@@ -1019,8 +1050,16 @@ async function runCommand(
       // a lost exporter delays only the next export
     }
     // K9: open the change-feed wake reader (when configured) so a signal ends
-    // the between-passes sleep; a reader that cannot open never prevents polling.
-    wake = await resolveWakeReader(io, options);
+    // the between-passes sleep; a reader that cannot open never prevents
+    // polling, and the stop signal ends the opener wait itself (an API that
+    // never answers cannot hold the run hostage).
+    const opened = await resolveWakeReader(io, options, signal);
+    if (opened === WAKE_OPENER_INTERRUPTED) {
+      // Same contract as the tunnel startup race: `finally` stops what the
+      // startup already opened and the run exits cleanly.
+      return 0;
+    }
+    wake = opened;
     const holderId = 'driver-' + runtime.conductor.newUlid();
     const seenAttention = new Set<string>();
     return await pollConductorPasses({

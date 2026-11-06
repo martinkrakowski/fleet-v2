@@ -674,6 +674,125 @@ describe('ResolveOwnerItemUseCase', () => {
     expect(racing.saves).toBe(2);
   });
 
+  it('ResolveOwnerItem refuses a throwing getter on the request as request', async () => {
+    const repo = new OwnerItemRepositoryAdapter();
+    const useCase = uc(repo);
+
+    const throwingGet = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('rejected');
+        },
+      },
+    );
+    const result = await useCase.resolveOwnerItem(throwingGet, ACTOR);
+    expect(result).toMatchObject({ outcome: 'refused', code: 'request' });
+    if (result.outcome === 'refused') {
+      expect(result.reason).not.toContain('rejected');
+    }
+  });
+
+  it('ResolveOwnerItem refuses a throwing clock as clock-read', async () => {
+    const repo = new OwnerItemRepositoryAdapter();
+    await seed(repo, { projectId: 'example-project', kind: 'other', subject: 'example follow-up', refs: [], blocks: [] }, 'oi-example-1');
+    const throwing: OwnerItemClock = {
+      nowIso() {
+        throw new Error('rejected');
+      },
+    };
+    const useCase = new ResolveOwnerItemUseCase({
+      itemRepo: repo,
+      ownerQuestionRepo: emptyQuestions(),
+      clock: throwing,
+    });
+
+    const result = await useCase.resolveOwnerItem({ action: 'done', itemId: 'oi-example-1', via: 'cli' }, ACTOR);
+    expect(result).toMatchObject({
+      outcome: 'refused',
+      code: 'clock-read',
+      reason: 'ResolveOwnerItem the clock could not be read',
+    });
+  });
+
+  it('ResolveOwnerItem refuses a symbol clock value as clock-read', async () => {
+    const repo = new OwnerItemRepositoryAdapter();
+    await seed(repo, { projectId: 'example-project', kind: 'other', subject: 'example follow-up', refs: [], blocks: [] }, 'oi-example-1');
+    const symbolClock: OwnerItemClock = {
+      nowIso(): string {
+        return Symbol('not-a-string') as unknown as string;
+      },
+    };
+    const useCase = new ResolveOwnerItemUseCase({
+      itemRepo: repo,
+      ownerQuestionRepo: emptyQuestions(),
+      clock: symbolClock,
+    });
+
+    const result = await useCase.resolveOwnerItem({ action: 'done', itemId: 'oi-example-1', via: 'cli' }, ACTOR);
+    expect(result).toMatchObject({
+      outcome: 'refused',
+      code: 'clock-read',
+      reason: 'ResolveOwnerItem the clock could not be read',
+    });
+  });
+
+  it('ResolveOwnerItem refuses a throwing item store as store and names no path', async () => {
+    const boom = new Error('/example/path/owner-items.json');
+    const throwing: OwnerItemRepositoryPort = {
+      async save() {
+        throw boom;
+      },
+      async get() {
+        throw boom;
+      },
+      async findByKey() {
+        throw boom;
+      },
+      async list() {
+        throw boom;
+      },
+    };
+    const useCase = uc(throwing);
+
+    const result = await useCase.resolveOwnerItem({ action: 'done', itemId: 'oi-example-1', via: 'cli' }, ACTOR);
+    expect(result).toMatchObject({
+      outcome: 'refused',
+      code: 'store',
+      reason: 'ResolveOwnerItem the owner item store could not be read or written',
+    });
+    if (result.outcome === 'refused') {
+      expect(result.reason).not.toContain('/example/path');
+    }
+  });
+
+  it('ResolveOwnerItem refuses a throwing question store as store', async () => {
+    const repo = new OwnerItemRepositoryAdapter();
+    await seed(repo, decisionQuestionBody(), 'oi-example-1');
+    const boom = new Error('/example/path/owner-questions.json');
+    const throwingQuestions: OwnerQuestionRepositoryPort = {
+      async save() {
+        throw boom;
+      },
+      async get() {
+        throw boom;
+      },
+      async list() {
+        throw boom;
+      },
+      async findByIdempotencyKey() {
+        throw boom;
+      },
+    };
+    const useCase = new ResolveOwnerItemUseCase({ itemRepo: repo, ownerQuestionRepo: throwingQuestions, clock: clock() });
+
+    const result = await useCase.resolveOwnerItem({ action: 'answer', questionId: 'q-example-1' }, ACTOR);
+    expect(result).toMatchObject({ outcome: 'refused', code: 'store' });
+    if (result.outcome === 'refused') {
+      expect(result.reason).not.toContain('/example/path');
+    }
+  });
+
   it('throws Not implemented when unconfigured', async () => {
     await expect(new ResolveOwnerItemUseCase().resolveOwnerItem({}, 'x')).rejects.toThrow(
       'Not implemented: ResolveOwnerItemUseCase',

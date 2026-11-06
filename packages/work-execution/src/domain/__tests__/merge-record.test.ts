@@ -1,0 +1,248 @@
+import { describe, expect, it } from 'vitest';
+
+import { decideMergeRecord, MergeRecord } from '../entities/MergeRecord.js';
+import type { MergeRecordRecord } from '../entities/MergeRecord.js';
+
+/**
+ * Secret-shaped fakes are assembled at runtime from inert pieces so this file
+ * never contains a credential-shaped literal.
+ */
+function fakeSecretShape(): string {
+  return `gh${'p_'}${'A'.repeat(30)}`;
+}
+
+const VALID: MergeRecordRecord = {
+  schemaVersion: 1,
+  repository: 'example-org/example-repo',
+  number: 251,
+  headSha: 'ab'.repeat(20),
+  mergedAtIso: '2026-10-27T12:00:00.000Z',
+  firstSeenAtIso: '2026-10-27T12:05:30.000Z',
+  source: 'forge-observation',
+  merger: 'unknown',
+};
+
+function createError(input: unknown): string {
+  const result = MergeRecord.create(input);
+  if (result.success) {
+    throw new Error('expected create failure');
+  }
+  return result.error.message;
+}
+
+function patched(patch: (record: Record<string, unknown>) => void): Record<string, unknown> {
+  const record = structuredClone(VALID) as unknown as Record<string, unknown>;
+  patch(record);
+  return record;
+}
+
+function decideError(stored: unknown, incoming: unknown): string {
+  const result = decideMergeRecord(stored, incoming);
+  if (result.success) {
+    throw new Error('expected decide failure');
+  }
+  return result.error.message;
+}
+
+describe('MergeRecord.create', () => {
+  it('round-trips a valid record and freezes it', () => {
+    const result = MergeRecord.create(structuredClone(VALID));
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.value.toRecord()).toEqual(VALID);
+
+    // The entity holds a frozen snapshot: later mutation of the input never
+    // leaks in, and mutating a returned record never leaks back.
+    const input = structuredClone(VALID) as unknown as Record<string, unknown>;
+    const created = MergeRecord.create(input);
+    if (!created.success) return;
+    input.headSha = 'ff'.repeat(20);
+    expect(created.value.getHeadSha()).toBe(VALID.headSha);
+    const out = created.value.toRecord() as { headSha: string };
+    out.headSha = 'ee'.repeat(20);
+    expect(created.value.getHeadSha()).toBe(VALID.headSha);
+  });
+
+  it('refuses a null or non-object record with a typed reason', () => {
+    expect(createError(null)).toBe('MergeRecord requires a record');
+    expect(createError('not a record')).toBe('MergeRecord requires a record');
+    expect(createError(42)).toBe('MergeRecord requires a record');
+    expect(createError(new Date())).toBe('MergeRecord requires a plain record');
+  });
+
+  it('refuses a sparse array record with a typed reason', () => {
+    const result = MergeRecord.create(new Array(2));
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.code).toBe('invalid');
+    expect(result.error.message).toBe('MergeRecord requires a record');
+  });
+
+  it('refuses a record with a missing or wrong-typed field', () => {
+    expect(createError(patched((record) => { delete record.number; })))
+      .toBe('MergeRecord is missing a required field');
+    expect(createError(patched((record) => { record.headSha = 123; })))
+      .toBe('MergeRecord field has the wrong type');
+  });
+
+  it('refuses an unknown enum value with a typed reason', () => {
+    expect(createError(patched((record) => { record.source = 'weird'; })))
+      .toBe('MergeRecord field must be one of its allowed values');
+    expect(createError(patched((record) => { record.merger = 'maybe'; })))
+      .toBe('MergeRecord field must be one of its allowed values');
+  });
+
+  it('refuses a throwing getter without throwing', () => {
+    const withGetter = Object.defineProperty(structuredClone(VALID), 'headSha', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        throw new Error('boom');
+      },
+    });
+    expect(() => MergeRecord.create(withGetter)).not.toThrow();
+    expect(createError(withGetter)).toBe('MergeRecord fields must be plain data properties');
+  });
+
+  it('refuses an unknown schema version', () => {
+    expect(createError(patched((record) => { record.schemaVersion = 2; })))
+      .toBe('MergeRecord field is out of range');
+  });
+
+  it('reads an absent schemaVersion as 1', () => {
+    const result = MergeRecord.create(patched((record) => { delete record.schemaVersion; }));
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.value.toRecord().schemaVersion).toBe(1);
+  });
+
+  it('refuses a secret-shaped repository without echoing the value', () => {
+    const secret = fakeSecretShape();
+    const message = createError(patched((record) => { record.repository = secret; }));
+    expect(message).toBe('MergeRecord merge.repository: contains a secret-shaped value and was refused');
+    expect(message).not.toContain(secret);
+
+    const actionSecretMessage = createError(patched((record) => { record.actionRef = secret; }));
+    expect(actionSecretMessage).toBe('MergeRecord actionRef: must be plain text of at most 128 characters');
+    expect(actionSecretMessage).not.toContain(secret);
+  });
+
+  it('refuses a field over the size bound', () => {
+    expect(createError(patched((record) => { record.repository = 'x'.repeat(201); })))
+      .toBe('MergeRecord field is too long');
+    expect(createError(patched((record) => { record.actionRef = 'y'.repeat(129); })))
+      .toBe('MergeRecord field is too long');
+  });
+
+  it('refuses a fleet-forge-action source with an unknown merger', () => {
+    expect(createError(patched((record) => { record.source = 'fleet-forge-action'; })))
+      .toBe('MergeRecord source and merger disagree');
+    expect(createError(patched((record) => { record.merger = 'fleet'; })))
+      .toBe('MergeRecord source and merger disagree');
+  });
+
+  it('getKey joins repository and number with #', () => {
+    const result = MergeRecord.create(VALID);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.value.getKey()).toBe('example-org/example-repo#251');
+  });
+});
+
+describe('decideMergeRecord', () => {
+  it('creates when nothing is stored', () => {
+    for (const stored of [undefined, null]) {
+      const result = decideMergeRecord(stored, VALID);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.outcome).toBe('create');
+      expect(result.record).toEqual(VALID);
+      expect(result.finding).toBeNull();
+    }
+  });
+
+  it('keeps the first sighting when a later read differs and reports one integrity finding', () => {
+    const different = {
+      ...VALID,
+      headSha: 'cd'.repeat(20),
+      mergedAtIso: '2026-10-28T12:00:00.000Z',
+    };
+    const result = decideMergeRecord(VALID, different);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.outcome).toBe('integrity-conflict');
+    expect(result.record.headSha).toBe(VALID.headSha);
+    expect(result.record.mergedAtIso).toBe(VALID.mergedAtIso);
+    expect(result.finding).not.toBeNull();
+    expect(result.finding?.differingFields).toEqual(['head-sha', 'merged-at']);
+    expect(result.finding?.expectedHeadSha).toBe(VALID.headSha);
+    expect(result.finding?.observedHeadSha).toBe(different.headSha);
+    expect(result.finding?.expectedMergedAtIso).toBe(VALID.mergedAtIso);
+    expect(result.finding?.observedMergedAtIso).toBe(different.mergedAtIso);
+  });
+
+  it('upgrades merger from unknown to fleet exactly once', () => {
+    const fleet = { ...VALID, source: 'fleet-forge-action', merger: 'fleet' };
+    const first = decideMergeRecord(VALID, fleet);
+    expect(first.success).toBe(true);
+    if (!first.success) return;
+    expect(first.outcome).toBe('upgrade-merger');
+    expect(first.record.merger).toBe('fleet');
+    expect(first.finding).toBeNull();
+
+    const second = decideMergeRecord(first.record, fleet);
+    expect(second.success).toBe(true);
+    if (!second.success) return;
+    expect(second.outcome).toBe('unchanged');
+    expect(second.record.merger).toBe('fleet');
+  });
+
+  it('changes only merger on the upgrade', () => {
+    const fleet = {
+      ...VALID,
+      source: 'fleet-forge-action',
+      merger: 'fleet',
+      firstSeenAtIso: '2026-10-29T12:00:00.000Z',
+      actionRef: 'action-1',
+    };
+    const result = decideMergeRecord(VALID, fleet);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.outcome).toBe('upgrade-merger');
+    expect(result.record).toEqual({ ...VALID, merger: 'fleet' });
+    expect(result.record.source).toBe('forge-observation');
+    expect(result.record.firstSeenAtIso).toBe(VALID.firstSeenAtIso);
+    expect(result.record.actionRef).toBeUndefined();
+  });
+
+  it('never downgrades merger from fleet to unknown', () => {
+    const fleetStored = { ...VALID, source: 'fleet-forge-action', merger: 'fleet' };
+    const result = decideMergeRecord(fleetStored, VALID);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.outcome).toBe('unchanged');
+    expect(result.record.merger).toBe('fleet');
+  });
+
+  it('is idempotent: deciding the same sighting twice changes nothing', () => {
+    const first = decideMergeRecord(VALID, VALID);
+    const second = decideMergeRecord(VALID, VALID);
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+    if (!first.success || !second.success) return;
+    expect(first.outcome).toBe('unchanged');
+    expect(second.outcome).toBe('unchanged');
+    expect(second.record).toEqual(first.record);
+    expect(first.record).toEqual(VALID);
+  });
+
+  it('refuses an unreadable stored record instead of treating it as empty', () => {
+    expect(decideError({ repository: 'example-org/example-repo' }, VALID))
+      .toBe('MergeRecord stored record could not be read');
+  });
+
+  it('refuses an unreadable incoming record with a typed reason', () => {
+    expect(decideError(VALID, null)).toBe('MergeRecord incoming record could not be read');
+    expect(decideError(VALID, {})).toBe('MergeRecord incoming record could not be read');
+  });
+});

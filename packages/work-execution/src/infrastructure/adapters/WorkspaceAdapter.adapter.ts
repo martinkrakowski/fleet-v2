@@ -52,6 +52,8 @@ import type {
   ReadFilesystemSpaceResult,
   RemoveLaneWorktreeRequest,
   RemoveLaneWorktreeResult,
+  RemoveWorktreeRequest,
+  RemoveWorktreeResult,
   ResetWorktreeToHeadRequest,
   ResetWorktreeToHeadResult,
   VerifySavedPatchRequest,
@@ -280,6 +282,49 @@ export function removeLaneWorktreeRequestIsValid(request: RemoveLaneWorktreeRequ
     return false;
   }
   return LANE_RUN_BRANCH_PATTERN.test(branch);
+}
+
+/**
+ * KW3' (conductor plan §3.10.3) path validation of one `removeWorktree`
+ * request, before any command runs: all three paths are absolute and
+ * normalised, the worktree path sits strictly under the worktree root, and it
+ * is neither equal to nor inside the clone. A path problem is refused as
+ * `path-refused`.
+ */
+function removeWorktreePathRefusal(request: RemoveWorktreeRequest): boolean {
+  const { repositoryRoot, worktreeRoot, worktreePath } = request;
+  if (
+    !isAbsoluteNormalisedPath(repositoryRoot) ||
+    !isAbsoluteNormalisedPath(worktreeRoot) ||
+    !isAbsoluteNormalisedPath(worktreePath)
+  ) {
+    return true;
+  }
+  if (!worktreePath.startsWith(`${worktreeRoot}/`)) {
+    return true;
+  }
+  return worktreePath === repositoryRoot || worktreePath.startsWith(`${repositoryRoot}/`);
+}
+
+/**
+ * KW3' (conductor plan §3.10.3) non-path validation of one `removeWorktree`
+ * request: the recorded host is named, `expectedHead` is a real commit sha
+ * (40 or 64 lowercase hex, not all zeros) and `expectedBranch` is a non-empty
+ * branch that is not `main`. Any other malformed request is refused as
+ * `invalid-request`.
+ */
+function removeWorktreeRequestIsValid(request: RemoveWorktreeRequest): boolean {
+  const { expectedHead, expectedBranch, recordedHost } = request;
+  if (!runnerHasHostName(recordedHost)) {
+    return false;
+  }
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(expectedHead) || /^0+$/.test(expectedHead)) {
+    return false;
+  }
+  if (typeof expectedBranch !== 'string' || expectedBranch === '' || expectedBranch === 'main') {
+    return false;
+  }
+  return true;
 }
 
 /** One entry of `git worktree list --porcelain`, as far as this adapter reads it. */
@@ -1756,6 +1801,152 @@ export class WorkspaceAdapter implements WorkspacePort {
       return lockRefusal;
     }
     return removeCleanListedWorktree(executor, clonePath, worktreePath, branchTip);
+  }
+
+  /**
+   * KW3' (conductor plan §3.10.3): remove one worktree after re-reading HEAD,
+   * the branch, the porcelain status, the lock and the in-progress operation
+   * files in this one executor call, and only then run
+   * `git worktree remove <path>`. Never `--force`, never a branch command,
+   * never `prune`, never `rm`, never a fetch or a push. The only write is
+   * `git worktree remove <path>` with no flags. Every command runs through the
+   * recorded host's executor — never the configured or legacy executor — and
+   * when the recorded host is not named or no host executor is configured,
+   * nothing runs. A refusal removes nothing; `partial` means the command ran
+   * but the directory or its administrative entry is still there; `unknown`
+   * means the executor did not answer.
+   */
+  async removeWorktree(request: RemoveWorktreeRequest): Promise<RemoveWorktreeResult> {
+    // 1. Validate before anything runs (no executor call on a bad request).
+    if (removeWorktreePathRefusal(request)) {
+      return { outcome: 'refused', reason: 'path-refused' };
+    }
+    if (!removeWorktreeRequestIsValid(request)) {
+      return { outcome: 'refused', reason: 'invalid-request' };
+    }
+
+    // 2. The removal runs on the recorded host's executor and nowhere else.
+    const executor = this.recordedHostExecutor(request.recordedHost);
+    if (executor === null) {
+      return { outcome: 'unknown', reason: 'no executor for the recorded host' };
+    }
+    try {
+      return await this.removeCheckedListedWorktree(request, executor);
+    } catch {
+      return { outcome: 'unknown', reason: 'the removal did not report' };
+    }
+  }
+
+  /**
+   * Steps 3–6 of `removeWorktree` on a resolved executor: find the worktree in
+   * the clone's list, re-read HEAD, branch, status, lock and in-progress
+   * operations through the same executor, then remove it only when every guard
+   * still holds. The outer try/catch stays in `removeWorktree` and answers
+   * `unknown` on any throw.
+   */
+  private async removeCheckedListedWorktree(
+    request: RemoveWorktreeRequest,
+    executor: CommandExecutorPort,
+  ): Promise<RemoveWorktreeResult> {
+    const { repositoryRoot, worktreePath, expectedHead, expectedBranch } = request;
+
+    // 3. Containment and the listed facts.
+    const listRun = await executor.run(
+      ['git', '-C', repositoryRoot, 'worktree', 'list', '--porcelain'],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (listRun.exitCode === null || listRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'git worktree list did not report an exit code' };
+    }
+    if (listRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'git worktree list failed' };
+    }
+    const listed = parseWorktreeList(listRun.stdout);
+    if (listed === null) {
+      return { outcome: 'unknown', reason: 'git worktree list output could not be parsed' };
+    }
+    const entry = await this.findLinkedWorktreeEntry(executor, repositoryRoot, worktreePath, listed);
+    if (entry === null) {
+      return { outcome: 'refused', reason: 'not-a-linked-worktree' };
+    }
+
+    // 4. Re-read the facts, in this order, through the same executor.
+    //    HEAD first: a moved HEAD refuses before anything else is read.
+    const headRun = await executor.run(['git', '-C', worktreePath, 'rev-parse', 'HEAD'], {
+      timeoutMs: GIT_TIMEOUT_MS,
+    });
+    if (headRun.exitCode === null || headRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'git rev-parse HEAD did not report an exit code' };
+    }
+    if (headRun.exitCode !== 0) {
+      return { outcome: 'unknown', reason: 'git rev-parse HEAD failed' };
+    }
+    const head = headRun.stdout.trim();
+    if (head !== expectedHead) {
+      return { outcome: 'refused', reason: 'head-moved' };
+    }
+
+    //    Branch, from the listed entry.
+    if (entry.branch === null) {
+      return { outcome: 'refused', reason: 'detached' };
+    }
+    if (entry.branch !== expectedBranch) {
+      return { outcome: 'refused', reason: 'branch-mismatch' };
+    }
+
+    //    Status: a read that did not answer is never a refusal.
+    const statusResult = await this.readWorktreeStatus(executor, worktreePath);
+    if (statusResult.outcome === 'unknown') {
+      return { outcome: 'unknown', reason: statusResult.reason };
+    }
+    if (statusResult.status.tracked + statusResult.status.untracked + statusResult.status.unmerged > 0) {
+      return { outcome: 'refused', reason: 'dirty' };
+    }
+
+    //    Lock.
+    if (entry.locked) {
+      return { outcome: 'refused', reason: 'locked' };
+    }
+
+    //    In-progress operations.
+    const inProgressResult = await this.readInProgressOperations(executor, worktreePath);
+    if (inProgressResult.outcome === 'unknown') {
+      return { outcome: 'unknown', reason: inProgressResult.reason };
+    }
+    if (inProgressResult.operations.length > 0) {
+      return { outcome: 'refused', reason: 'busy' };
+    }
+
+    // 5. Remove: exactly these five argv entries, no flags at all.
+    const removeRun = await executor.run(
+      ['git', '-C', repositoryRoot, 'worktree', 'remove', worktreePath],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (removeRun.exitCode === null || removeRun.error !== undefined) {
+      return { outcome: 'unknown', reason: 'the remove did not report an exit code' };
+    }
+    if (removeRun.exitCode !== 0) {
+      return { outcome: 'refused', reason: 'git-refused' };
+    }
+
+    // 6. Post-conditions, only after exit 0.
+    const existsRun = await executor.run(['test', '-e', worktreePath], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    if (existsRun.exitCode === 0) {
+      return { outcome: 'partial', detail: 'directory-present' };
+    }
+    const relistRun = await executor.run(
+      ['git', '-C', repositoryRoot, 'worktree', 'list', '--porcelain'],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (relistRun.exitCode === 0 && relistRun.error === undefined) {
+      const relisted = parseWorktreeList(relistRun.stdout);
+      if (relisted !== null && listedWorktreeAt(relisted, entry.path) !== null) {
+        return { outcome: 'partial', detail: 'admin-entry-present' };
+      }
+    }
+    return { outcome: 'removed', branchTip: head };
   }
 
   /**

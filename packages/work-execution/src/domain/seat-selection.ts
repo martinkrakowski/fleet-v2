@@ -742,6 +742,9 @@ export const SEAT_CATALOG_SEAT_BOUND = 256;
 /** Each chain may hold at most this many steps; a larger one is refused, never truncated. */
 export const SEAT_CATALOG_CHAIN_STEP_BOUND = 64;
 
+/** Each step may hold at most this many triggers; a larger list is refused, never truncated. */
+export const SEAT_CATALOG_TRIGGER_BOUND = 16;
+
 const CATALOG_TRIGGER_TO_STOP_REASON: Readonly<Record<string, StopReasonValue>> = {
   '429': 'rate-limited',
   '402': 'payment',
@@ -777,10 +780,58 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   }
 }
 
+type CatalogRefusal = { readonly ok: false; readonly reason: string };
+
+/** One raw seat as a typed record, or the rule-and-position refusal. The checks run in a fixed order. */
+function catalogSeatOf(
+  rawSeat: unknown,
+  index: number,
+): { readonly ok: true; readonly seat: SeatCatalogSeat } | CatalogRefusal {
+  const where = 'The seat catalogue seat at index ' + index;
+  if (!isPlainObject(rawSeat)) {
+    return { ok: false, reason: where + ' is not an object' };
+  }
+  const id = rawSeat['id'];
+  const tool = rawSeat['tool'];
+  const model = rawSeat['model'];
+  if (typeof id !== 'string' || id.trim() === '') {
+    return { ok: false, reason: where + ' carries no id' };
+  }
+  if (typeof tool !== 'string') {
+    return { ok: false, reason: where + ' carries no tool' };
+  }
+  if (typeof model !== 'string') {
+    return { ok: false, reason: where + ' carries no model' };
+  }
+  const variant = rawSeat['variant'];
+  const agent = rawSeat['agent'];
+  const health = rawSeat['health'];
+  if (variant !== undefined && typeof variant !== 'string') {
+    return { ok: false, reason: where + ' carries a variant that is not a string' };
+  }
+  if (agent !== undefined && typeof agent !== 'string') {
+    return { ok: false, reason: where + ' carries an agent that is not a string' };
+  }
+  if (health !== undefined && !isDeclaredSeatHealth(health)) {
+    return { ok: false, reason: where + ' carries a health that is not a declared seat health' };
+  }
+  return {
+    ok: true,
+    seat: {
+      id,
+      tool,
+      model,
+      ...(variant !== undefined ? { variant } : {}),
+      ...(agent !== undefined ? { agent } : {}),
+      ...(health !== undefined ? { health } : {}),
+    },
+  };
+}
+
 /** The catalogue's seats as typed records, or the rule-and-position refusal. */
 function catalogSeatsOf(
   catalog: Record<string, unknown>,
-): { readonly ok: true; readonly seats: readonly SeatCatalogSeat[] } | { readonly ok: false; readonly reason: string } {
+): { readonly ok: true; readonly seats: readonly SeatCatalogSeat[] } | CatalogRefusal {
   const rawSeats = catalog['seats'];
   if (rawSeats === undefined) {
     return { ok: true, seats: [] };
@@ -793,52 +844,25 @@ function catalogSeatsOf(
   }
   const seats: SeatCatalogSeat[] = [];
   for (const [index, rawSeat] of rawSeats.entries()) {
-    if (!isPlainObject(rawSeat)) {
-      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' is not an object' };
+    const parsed = catalogSeatOf(rawSeat, index);
+    if (!parsed.ok) {
+      return parsed;
     }
-    const id = rawSeat['id'];
-    const tool = rawSeat['tool'];
-    const model = rawSeat['model'];
-    if (typeof id !== 'string' || id.trim() === '') {
-      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries no id' };
-    }
-    if (typeof tool !== 'string') {
-      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries no tool' };
-    }
-    if (typeof model !== 'string') {
-      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries no model' };
-    }
-    const variant = rawSeat['variant'];
-    const agent = rawSeat['agent'];
-    const health = rawSeat['health'];
-    if (variant !== undefined && typeof variant !== 'string') {
-      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries a variant that is not a string' };
-    }
-    if (agent !== undefined && typeof agent !== 'string') {
-      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries an agent that is not a string' };
-    }
-    if (health !== undefined && !isDeclaredSeatHealth(health)) {
-      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries a health that is not a declared seat health' };
-    }
-    seats.push({
-      id,
-      tool,
-      model,
-      ...(variant !== undefined ? { variant } : {}),
-      ...(agent !== undefined ? { agent } : {}),
-      ...(health !== undefined ? { health } : {}),
-    });
+    seats.push(parsed.seat);
   }
   return { ok: true, seats };
 }
 
 /** A step's triggers as a copied string list, undefined when absent, or the name of the rule it breaks. */
-function catalogTriggersOf(raw: unknown): string[] | undefined | 'not-a-list' | 'not-a-string' {
+function catalogTriggersOf(raw: unknown): string[] | undefined | 'not-a-list' | 'too-many' | 'not-a-string' {
   if (raw === undefined) {
     return undefined;
   }
   if (!Array.isArray(raw)) {
     return 'not-a-list';
+  }
+  if (raw.length > SEAT_CATALOG_TRIGGER_BOUND) {
+    return 'too-many';
   }
   const triggers: string[] = [];
   for (const trigger of raw) {
@@ -850,11 +874,38 @@ function catalogTriggersOf(raw: unknown): string[] | undefined | 'not-a-list' | 
   return triggers;
 }
 
+/** One raw chain step as a typed record, or the rule-and-position refusal. The checks run in a fixed order. */
+function catalogStepOf(
+  role: CatalogChainRole,
+  rawStep: unknown,
+  index: number,
+): { readonly ok: true; readonly step: SeatCatalogChainStep } | CatalogRefusal {
+  const where = 'The seat catalogue ' + role + ' chain step ' + index;
+  if (!isPlainObject(rawStep)) {
+    return { ok: false, reason: where + ' is not an object' };
+  }
+  const seatId = rawStep['seatId'];
+  if (typeof seatId !== 'string' || seatId.trim() === '') {
+    return { ok: false, reason: where + ' carries no seatId' };
+  }
+  const triggers = catalogTriggersOf(rawStep['triggers']);
+  if (triggers === 'not-a-list') {
+    return { ok: false, reason: where + ' carries triggers that are not a list' };
+  }
+  if (triggers === 'too-many') {
+    return { ok: false, reason: where + ' carries more than ' + SEAT_CATALOG_TRIGGER_BOUND + ' triggers' };
+  }
+  if (triggers === 'not-a-string') {
+    return { ok: false, reason: where + ' carries a trigger that is not a string' };
+  }
+  return { ok: true, step: triggers === undefined ? { seatId } : { seatId, triggers } };
+}
+
 /** One chain's steps as typed records, or the rule-and-position refusal. */
 function catalogStepsOf(
   role: CatalogChainRole,
   rawSteps: unknown,
-): { readonly ok: true; readonly steps: readonly SeatCatalogChainStep[] } | { readonly ok: false; readonly reason: string } {
+): { readonly ok: true; readonly steps: readonly SeatCatalogChainStep[] } | CatalogRefusal {
   if (rawSteps === undefined) {
     return { ok: true, steps: [] };
   }
@@ -869,21 +920,11 @@ function catalogStepsOf(
   }
   const steps: SeatCatalogChainStep[] = [];
   for (const [index, rawStep] of rawSteps.entries()) {
-    if (!isPlainObject(rawStep)) {
-      return { ok: false, reason: 'The seat catalogue ' + role + ' chain step ' + index + ' is not an object' };
+    const parsed = catalogStepOf(role, rawStep, index);
+    if (!parsed.ok) {
+      return parsed;
     }
-    const seatId = rawStep['seatId'];
-    if (typeof seatId !== 'string' || seatId.trim() === '') {
-      return { ok: false, reason: 'The seat catalogue ' + role + ' chain step ' + index + ' carries no seatId' };
-    }
-    const triggers = catalogTriggersOf(rawStep['triggers']);
-    if (triggers === 'not-a-list') {
-      return { ok: false, reason: 'The seat catalogue ' + role + ' chain step ' + index + ' carries triggers that are not a list' };
-    }
-    if (triggers === 'not-a-string') {
-      return { ok: false, reason: 'The seat catalogue ' + role + ' chain step ' + index + ' carries a trigger that is not a string' };
-    }
-    steps.push(triggers === undefined ? { seatId } : { seatId, triggers });
+    steps.push(parsed.step);
   }
   return { ok: true, steps };
 }

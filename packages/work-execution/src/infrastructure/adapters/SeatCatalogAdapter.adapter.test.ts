@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import {
   SEAT_CATALOG_CHAIN_STEP_BOUND,
   SEAT_CATALOG_SEAT_BOUND,
+  SEAT_CATALOG_TRIGGER_BOUND,
   seatPlanFromCatalog,
   type SeatCatalog,
 } from '../../domain/seat-selection.js';
@@ -166,5 +167,34 @@ describe('SeatCatalogAdapter', () => {
       chains: { implementer: [{ seatId: 'impl-a', triggers: ['constructor'] }] },
     }).readSeatCatalog();
     expect(read.outcome).toBe('unknown');
+  });
+
+  it('never copies a value that differs from the one it validated (stateful health getter)', () => {
+    let reads = 0;
+    const seat = { id: 'impl-a', tool: 'opencode', model: 'acme/m' };
+    Object.defineProperty(seat, 'health', {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? 'healthy' : 'sick';
+      },
+    });
+    const read = new SeatCatalogAdapter({ seats: [seat] }).readSeatCatalog();
+    if (read.outcome === 'ok') {
+      expect(read.catalog.seats?.[0]?.health).toBe('healthy');
+    } else {
+      expect(read.outcome).toBe('unknown');
+    }
+    expect(reads).toBeLessThanOrEqual(1);
+  });
+
+  it('reports unknown for a step above the trigger bound and accepts one at the bound', () => {
+    const triggers = (n: number) => Array.from({ length: n }, () => '429');
+    const source = (list: string[]) => ({
+      seats: CATALOG.seats,
+      chains: { implementer: [{ seatId: 'impl-a', triggers: list }] },
+    });
+    expect(new SeatCatalogAdapter(source(triggers(SEAT_CATALOG_TRIGGER_BOUND))).readSeatCatalog().outcome).toBe('ok');
+    expect(new SeatCatalogAdapter(source(triggers(SEAT_CATALOG_TRIGGER_BOUND + 1))).readSeatCatalog().outcome).toBe('unknown');
   });
 });

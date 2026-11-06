@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  SEAT_CATALOG_TRIGGER_BOUND,
   seatPlanFromCatalog,
   unhealthySeatIdsFromCatalog,
   type SeatCatalog,
@@ -279,5 +280,19 @@ describe('unhealthySeatIdsFromCatalog refusals', () => {
     const built = seatPlanFromCatalog(catalog);
     expect(built).toHaveProperty('reason');
     expect(unhealthySeatIdsFromCatalog(catalog)).toEqual([]);
+  });
+});
+
+describe('seatPlanFromCatalog trigger bound', () => {
+  const catalog = (count: number) => ({
+    seats: [{ id: 'impl-a', tool: 'opencode', model: 'acme/m' }],
+    chains: { implementer: [{ seatId: 'impl-a', triggers: Array.from({ length: count }, () => '429') }] },
+  });
+
+  it('accepts a step at the trigger bound and refuses one above it', () => {
+    expect(seatPlanFromCatalog(catalog(SEAT_CATALOG_TRIGGER_BOUND))).toHaveProperty('plan');
+    const above = seatPlanFromCatalog(catalog(SEAT_CATALOG_TRIGGER_BOUND + 1));
+    expect(above).toHaveProperty('reason');
+    expect((above as { reason: string }).reason).toContain('triggers');
   });
 });

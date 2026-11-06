@@ -7,76 +7,99 @@
  * `absent`; a source that throws (a throwing getter) or is malformed is
  * `unknown`, never an empty catalogue. The adapter holds no store, no clock,
  * no file handle and no logger, writes nothing, and never mutates the source
- * it was given: everything it returns is copied.
+ * it was given: everything it returns is copied. The source is snapshotted
+ * exactly once through the shared `readPlainRecord` guard (own data properties
+ * only, no getter ever runs), and validation and the copy both use that
+ * snapshot, so a stateful property cannot pass validation and then change.
  */
+
+import { readPlainRecord, type PlainFieldSchema, type PlainRecordSchema } from '@fleet/shared';
 
 import {
   isDeclaredCatalogTrigger,
   isDeclaredSeatHealth,
   SEAT_CATALOG_CHAIN_STEP_BOUND,
   SEAT_CATALOG_SEAT_BOUND,
-  seatPlanFromCatalog,
+  SEAT_CATALOG_TRIGGER_BOUND,
   type SeatCatalog,
   type SeatPlanFromCatalogResult,
+  seatPlanFromCatalog,
 } from '../../domain/seat-selection.js';
 import type { SeatCatalogPort, SeatCatalogRead } from '../../application/ports/out/SeatCatalogPort.out-port.js';
 
-/** True for a plain object: not null, not an array. */
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+/** Longest accepted string field (id, tool, model, variant, agent, health, seatId, trigger). */
+const CATALOG_STRING_BOUND = 1024;
+
+const str: PlainFieldSchema = { kind: 'string', maxLength: CATALOG_STRING_BOUND };
+const optionalStr: PlainFieldSchema = { kind: 'string', maxLength: CATALOG_STRING_BOUND, optional: true };
+
+const SEAT_SCHEMA: PlainRecordSchema = {
+  id: str,
+  tool: str,
+  model: str,
+  variant: optionalStr,
+  agent: optionalStr,
+  health: optionalStr,
+};
+
+const STEP_SCHEMA: PlainRecordSchema = {
+  seatId: str,
+  triggers: { kind: 'array', items: str, maxLength: SEAT_CATALOG_TRIGGER_BOUND, optional: true },
+};
+
+const chainField: PlainFieldSchema = {
+  kind: 'array',
+  items: { kind: 'record', schema: STEP_SCHEMA },
+  maxLength: SEAT_CATALOG_CHAIN_STEP_BOUND,
+  optional: true,
+};
+
+const SOURCE_SCHEMA: PlainRecordSchema = {
+  seats: { kind: 'array', items: { kind: 'record', schema: SEAT_SCHEMA }, maxLength: SEAT_CATALOG_SEAT_BOUND, optional: true },
+  chains: {
+    kind: 'record',
+    optional: true,
+    schema: { implementer: chainField, fix: chainField, reviewer: chainField },
+  },
+};
+
+/** True when a snapshotted seat is one the domain accepts (non-empty id, declared health). */
+function seatAccepted(seat: Record<string, unknown>): boolean {
+  return (seat['id'] as string).trim() !== ''
+    && (seat['health'] === undefined || isDeclaredSeatHealth(seat['health']));
 }
 
-/** The seats copied as they are, or null when the shape is malformed. */
-function copiedSeats(source: Record<string, unknown>): unknown[] | undefined | null {
-  const raw = source['seats'];
+/** True when a snapshotted step names a seat id and only declared triggers. */
+function stepAccepted(step: Record<string, unknown>): boolean {
+  return (step['seatId'] as string).trim() !== ''
+    && ((step['triggers'] as readonly unknown[] | undefined) ?? []).every(isDeclaredCatalogTrigger);
+}
+
+/** The seats copied from the snapshot, or null when one is not accepted. */
+function copiedSeats(snapshot: Record<string, unknown>): SeatCatalog['seats'] | undefined | null {
+  const raw = snapshot['seats'] as readonly Record<string, unknown>[] | undefined;
   if (raw === undefined) {
     return undefined;
   }
-  if (!Array.isArray(raw) || raw.length > SEAT_CATALOG_SEAT_BOUND) {
-    // Above the bound is unknown, never a truncated or unbounded catalogue.
+  if (!raw.every(seatAccepted)) {
     return null;
   }
-  const seats: Record<string, unknown>[] = [];
-  for (const seat of raw) {
-    if (!isPlainObject(seat)) {
-      return null;
-    }
-    if (typeof seat['id'] !== 'string' || (seat['id'] as string).trim() === '') {
-      return null;
-    }
-    if (typeof seat['tool'] !== 'string' || typeof seat['model'] !== 'string') {
-      return null;
-    }
-    if (seat['variant'] !== undefined && typeof seat['variant'] !== 'string') {
-      return null;
-    }
-    if (seat['agent'] !== undefined && typeof seat['agent'] !== 'string') {
-      return null;
-    }
-    if (seat['health'] !== undefined && !isDeclaredSeatHealth(seat['health'])) {
-      return null;
-    }
-    // Only the declared fields are copied, so nothing nested aliases the source.
-    seats.push({
-      id: seat['id'],
-      tool: seat['tool'],
-      model: seat['model'],
-      ...(seat['variant'] !== undefined ? { variant: seat['variant'] } : {}),
-      ...(seat['agent'] !== undefined ? { agent: seat['agent'] } : {}),
-      ...(seat['health'] !== undefined ? { health: seat['health'] } : {}),
-    });
-  }
-  return seats;
+  // Only the declared fields are copied, so nothing nested aliases the source.
+  return raw.map((seat) => ({
+    id: seat['id'] as string,
+    tool: seat['tool'] as string,
+    model: seat['model'] as string,
+    ...(seat['variant'] !== undefined ? { variant: seat['variant'] as string } : {}),
+    ...(seat['agent'] !== undefined ? { agent: seat['agent'] as string } : {}),
+    ...(seat['health'] !== undefined ? { health: seat['health'] as 'healthy' | 'unhealthy' } : {}),
+  }));
 }
 
-/** The three chains copied as they are, or null when the shape is malformed. */
-function copiedChains(source: Record<string, unknown>): Record<string, unknown> | undefined | null {
-  const raw = source['chains'];
+/** The chains copied from the snapshot, or null when one step is not accepted. */
+function copiedChains(snapshot: Record<string, unknown>): SeatCatalog['chains'] | undefined | null {
+  const raw = snapshot['chains'] as Record<string, readonly Record<string, unknown>[] | undefined> | undefined;
   if (raw === undefined) {
     return undefined;
-  }
-  if (!isPlainObject(raw)) {
-    return null;
   }
   const chains: Record<string, unknown> = {};
   for (const role of ['implementer', 'fix', 'reviewer']) {
@@ -84,34 +107,14 @@ function copiedChains(source: Record<string, unknown>): Record<string, unknown> 
     if (rawSteps === undefined) {
       continue;
     }
-    if (!Array.isArray(rawSteps) || rawSteps.length > SEAT_CATALOG_CHAIN_STEP_BOUND) {
+    if (!rawSteps.every(stepAccepted)) {
       return null;
     }
-    const steps: Record<string, unknown>[] = [];
-    for (const step of rawSteps) {
-      if (!isPlainObject(step)) {
-        return null;
-      }
-      if (typeof step['seatId'] !== 'string' || (step['seatId'] as string).trim() === '') {
-        return null;
-      }
-      if (step['triggers'] !== undefined) {
-        if (!Array.isArray(step['triggers'])) {
-          return null;
-        }
-        for (const trigger of step['triggers'] as unknown[]) {
-          if (!isDeclaredCatalogTrigger(trigger)) {
-            return null;
-          }
-        }
-      }
-      // The triggers are copied too, so the returned step never aliases the source.
-      steps.push({
-        seatId: step['seatId'],
-        ...(Array.isArray(step['triggers']) ? { triggers: [...(step['triggers'] as unknown[])] } : {}),
-      });
-    }
-    chains[role] = steps;
+    // The triggers are copied too, so the returned step never aliases the source.
+    chains[role] = rawSteps.map((step) => ({
+      seatId: step['seatId'],
+      ...(step['triggers'] !== undefined ? { triggers: [...(step['triggers'] as readonly unknown[])] } : {}),
+    }));
   }
   return chains;
 }
@@ -124,20 +127,22 @@ export class SeatCatalogAdapter implements SeatCatalogPort {
       return { outcome: 'absent', reason: 'The installation has no seat catalogue' };
     }
     try {
-      if (!isPlainObject(this.source)) {
-        return { outcome: 'unknown', reason: 'The seat catalogue source is not an object' };
+      // One snapshot of the whole source; nothing below reads the source again.
+      const snapshot = readPlainRecord(this.source, SOURCE_SCHEMA);
+      if (!snapshot.ok) {
+        return { outcome: 'unknown', reason: 'The seat catalogue source is not a readable catalogue' };
       }
-      const seats = copiedSeats(this.source);
+      const seats = copiedSeats(snapshot.value);
       if (seats === null) {
         return { outcome: 'unknown', reason: 'The seat catalogue seats are malformed' };
       }
-      const chains = copiedChains(this.source);
+      const chains = copiedChains(snapshot.value);
       if (chains === null) {
         return { outcome: 'unknown', reason: 'The seat catalogue chains are malformed' };
       }
       const catalog: SeatCatalog = {
-        ...(seats !== undefined ? { seats: seats as SeatCatalog['seats'] } : {}),
-        ...(chains !== undefined ? { chains: chains as SeatCatalog['chains'] } : {}),
+        ...(seats !== undefined ? { seats: seats } : {}),
+        ...(chains !== undefined ? { chains: chains } : {}),
       };
       return { outcome: 'ok', catalog };
     } catch {

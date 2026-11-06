@@ -177,14 +177,19 @@ class ChangeWakeReaderImpl implements ChangeWakeReader {
 
   waitForSignal(abort: AbortSignal): Promise<boolean> {
     return new Promise((resolve) => {
-      if (abort.aborted || this.state !== 'open') {
+      if (abort.aborted || this.state === 'closed') {
         resolve(false);
         return;
       }
-      // One signal, one wake-up: a remembered signal is consumed here.
+      // One signal, one wake-up: a remembered signal is consumed here, even
+      // when the stream has ended since it arrived.
       if (this.signal !== null) {
         this.signal = null;
         resolve(true);
+        return;
+      }
+      if (this.state !== 'open') {
+        resolve(false);
         return;
       }
       const removeWaiter = (): void => {

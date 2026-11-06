@@ -275,6 +275,20 @@ describe('openChangeWakeReader (K9)', () => {
     reader!.close();
   });
 
+  it('a signal buffered before the stream ends still wakes the next wait once', async () => {
+    const stream = openStream((emit, close) => {
+      emit(signalLine(9, 'attempt'));
+      close();
+    });
+    const reader = await openChangeWakeReader({ baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchFromStream(stream) });
+    expect(reader).not.toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const abort = new AbortController().signal;
+    await expect(reader!.waitForSignal(abort)).resolves.toBe(true);
+    await expect(reader!.waitForSignal(abort)).resolves.toBe(false);
+    reader!.close();
+  });
+
   it('close resolves a pending wait with false and is idempotent', async () => {
     const stream = openStream(() => undefined);
     const reader = await openChangeWakeReader({ baseUrl: BASE_URL, token: TOKEN, fetchImpl: fetchFromStream(stream) });

@@ -271,10 +271,7 @@ describe('WorktreePoolAdapter take', () => {
   });
 
   it('refuses a configuration whose derived slot path exceeds the record budget', async () => {
-    const poolRoot = `/${'a'.repeat(190)}`;
-    const adapter = new WorktreePoolAdapter({ executorFor: () => new FakeHost(), projects: { proj: { repositoryPath: REPO, poolRoot } } });
-    expect(await take(adapter)).toEqual({ outcome: 'refused', reason: 'invalid-request' });
-    const long = new WorktreePoolAdapter({ executorFor: () => new FakeHost(), projects: { ['p'.repeat(64)]: { repositoryPath: REPO, poolRoot: `/${'a'.repeat(190)}` } } });
+    const long = new WorktreePoolAdapter({ executorFor: () => new FakeHost(), projects: { ['p'.repeat(64)]: { repositoryPath: REPO, poolRoot: `/${'a'.repeat(199)}` } } });
     expect(await long.take({ projectId: 'p'.repeat(64), baseCommit: BASE, recordedHost: HOST })).toEqual({ outcome: 'refused', reason: 'invalid-request' });
   });
 

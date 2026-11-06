@@ -6,6 +6,7 @@ import {
   InstallationReferenceAdapter,
   ObservationPublicationAdapter,
   OrchestratorSessionRepositoryAdapter,
+  OwnerItemRepositoryAdapter,
   OwnerQuestionRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
   RelayTransportAdapter,
@@ -36,6 +37,7 @@ import {
   RegisterProjectProfileUseCase,
   RequestScopedDecisionUseCase,
   ResolveActionAuthorizationUseCase,
+  ResolveOwnerItemUseCase,
   RetireOrchestratorSessionUseCase,
   RetireProjectProfileUseCase,
   SendFleetRelayUseCase,
@@ -52,6 +54,7 @@ export interface OperatorComposition {
   publishProjectObservation: PublishProjectObservationUseCase;
   requestScopedDecision: RequestScopedDecisionUseCase;
   resolveActionAuthorization: ResolveActionAuthorizationUseCase;
+  resolveOwnerItem: ResolveOwnerItemUseCase;
   checkOwnerDecision: CheckOwnerDecisionUseCase;
   recordAuthorizationConsumption: RecordAuthorizationConsumptionUseCase;
   readProjectAttention: ReadProjectAttentionUseCase;
@@ -95,6 +98,7 @@ function unconfiguredOperatorComposition(): OperatorComposition {
     publishProjectObservation: new PublishProjectObservationUseCase(),
     requestScopedDecision: new RequestScopedDecisionUseCase(),
     resolveActionAuthorization: new ResolveActionAuthorizationUseCase(),
+    resolveOwnerItem: new ResolveOwnerItemUseCase(),
     checkOwnerDecision: new CheckOwnerDecisionUseCase(),
     recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase(),
     readProjectAttention: new ReadProjectAttentionUseCase(),
@@ -160,6 +164,10 @@ export function createConfiguredOperatorComposition(
     stateDir,
     ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
   });
+  const ownerItemRepo = new OwnerItemRepositoryAdapter({
+    stateDir,
+    ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
+  });
 
   // Installation name references for project profiles (P5a): a v2
   // installation enables host and gate-procedure name checks behind profile
@@ -184,6 +192,11 @@ export function createConfiguredOperatorComposition(
     resolveActionAuthorization: new ResolveActionAuthorizationUseCase({
       requestRepo,
       decisionTransport,
+    }),
+    resolveOwnerItem: new ResolveOwnerItemUseCase({
+      itemRepo: ownerItemRepo,
+      ownerQuestionRepo,
+      clock: systemClock,
     }),
     checkOwnerDecision: new CheckOwnerDecisionUseCase({ requestRepo }),
     recordAuthorizationConsumption: new RecordAuthorizationConsumptionUseCase({ requestRepo }),

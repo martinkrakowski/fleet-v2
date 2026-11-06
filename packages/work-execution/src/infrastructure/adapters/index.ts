@@ -92,6 +92,7 @@ export * from "./ReviewAssessmentAdapter.adapter.js";
 export * from "./ReviewRequestAdapter.adapter.js";
 export * from "./RunnerForAttemptAdapter.adapter.js";
 export * from "./RunnerSelectorAdapter.adapter.js";
+export * from "./seat-store-bytes.js";
 export * from "./SeatObservationRepositoryAdapter.adapter.js";
 export * from "./SeatTicketRepositoryAdapter.adapter.js";
 export * from "./ShadowEvidenceAdapter.adapter.js";

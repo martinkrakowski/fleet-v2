@@ -28,8 +28,18 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto';
-import { constants as fsConstants, mkdirSync, promises as fs, realpathSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  promises as fs,
+  realpathSync,
+  statSync,
+} from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 
 import type {
   ChainIntentCommand,
@@ -171,13 +181,31 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
     this.root = typeof stateDir === 'string' ? ChainRepositoryAdapter.resolveRoot(stateDir, this.readOnly) : null;
   }
 
+  /** Create the state directory and make every new directory entry durable, up to the first one that existed. */
+  private static createDurably(stateDir: string): void {
+    const created: string[] = [];
+    for (let dir = resolve(stateDir); !existsSync(dir) && dirname(dir) !== dir; dir = dirname(dir)) {
+      created.push(dir);
+    }
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    for (const dir of created) {
+      // syncing a new directory's parent makes the new entry durable; the directory's own content is empty
+      const fd = openSync(dirname(dir), fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    }
+  }
+
   private static resolveRoot(
     stateDir: string,
     readOnly: boolean,
   ): { readonly path: string; readonly dev: number; readonly ino: number } | null {
     try {
       if (stateDir.trim().length === 0 || stateDir.includes('\0')) return null;
-      if (!readOnly) mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      if (!readOnly) ChainRepositoryAdapter.createDurably(stateDir);
       const physical = realpathSync(stateDir);
       const stat = statSync(physical);
       return stat.isDirectory() ? { path: physical, dev: stat.dev, ino: stat.ino } : null;

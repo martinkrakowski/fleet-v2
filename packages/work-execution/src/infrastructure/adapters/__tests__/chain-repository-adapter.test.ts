@@ -302,16 +302,30 @@ describe('ChainRepositoryAdapter (file store)', () => {
     expect(decision).toEqual({ outcome: 'refused', reason: 'internal-error' });
   });
 
-  it('leaves no temp file and the old record bytes when the write fails', async () => {
+  it('keeps the old record bytes and leaves no temp file when creating the temp file fails', async () => {
     const file = await seed();
     const before = await fs.readFile(file, 'utf8');
-    // a record of the allowed maximum plus one byte cannot be written; the old record must stay
-    const big = new ChainRepositoryAdapter({ stateDir });
-    const decision = await big.recordChainOutcome(outcomeCmd({ state: 'refused', reason: 'a'.repeat(CHAIN_RECORD_MAX_BYTES) }));
-    expect(decision.outcome).toBe('refused');
+    const realOpen = fs.open;
+    (fs as { open: unknown }).open = (async (target: unknown, flags?: unknown, ...rest: unknown[]) => {
+      if (flags === 'wx' && String(target).endsWith('.tmp')) throw Object.assign(new Error('boom'), { code: 'ENOSPC' });
+      return (realOpen as (...a: unknown[]) => unknown)(target, flags, ...rest);
+    }) as never;
+    let decision;
+    try {
+      decision = await adapter.recordChainOutcome(outcomeCmd());
+    } finally {
+      (fs as { open: unknown }).open = realOpen;
+    }
+    expect(decision).toEqual({ outcome: 'refused', reason: 'internal-error' });
     expect(await fs.readFile(file, 'utf8')).toBe(before);
-    const names = await fs.readdir(path.join(stateDir, 'chains'));
-    expect(names.filter((n) => n.endsWith('.tmp'))).toEqual([]);
+    expect((await fs.readdir(path.join(stateDir, 'chains'))).filter((n) => n.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('creates a nested state directory and records into it on the first write', async () => {
+    const nested = path.join(stateDir, 'a', 'b', 'c');
+    const fresh = new ChainRepositoryAdapter({ stateDir: nested });
+    expect(await fresh.recordChainIntent({ record: recordOf(), deadlineIso: deadline() })).toEqual({ outcome: 'recorded' });
+    expect((await new ChainRepositoryAdapter({ stateDir: nested }).readChain(readCmd())).status).toBe('ok');
   });
 
   it('leaves no temp file when the rename itself fails', async () => {

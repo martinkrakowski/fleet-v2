@@ -39,6 +39,7 @@ import {
   type HostDescriptor,
   type HostProbeExecutor,
   type HostRunnerDraft,
+  screenHostName,
   type InstallationFileRead,
 } from "@fleet/onboarding";
 import {
@@ -630,7 +631,11 @@ function hostsOf(value: unknown): Record<string, unknown> | undefined {
 export function moveLaneRunnerRole(
   current: unknown,
   name: string,
-): { readonly value: unknown; readonly movedFrom: readonly string[] } {
+): {
+  readonly value: unknown;
+  readonly movedFrom: readonly string[];
+  readonly refused?: "accessor";
+} {
   const hosts = hostsOf(current);
   if (hosts === undefined) {
     return { value: current, movedFrom: [] };
@@ -638,7 +643,7 @@ export function moveLaneRunnerRole(
   // A host map holding an accessor is refused outright: the value comes back
   // unchanged, and neither `Object.entries` nor a spread ever runs the getter.
   if (hasAccessor(hosts)) {
-    return { value: current, movedFrom: [] };
+    return { value: current, movedFrom: [], refused: "accessor" };
   }
   const movedFrom: string[] = [];
   let nextHosts: Record<string, unknown> | undefined;
@@ -909,14 +914,14 @@ async function writeHost(
     // The same rule the loader applies to v2 host-map keys, refused at the
     // boundary before anything is drafted.
     io.stderr(
-      `hosts ${mode}: '${name}' is not a valid host name (identifier-shaped, no '..')\n${HOSTS_HELP}\n`,
+      `hosts ${mode}: that name is not a valid host name (identifier-shaped, no '..')\n${HOSTS_HELP}\n`,
     );
     return 2;
   }
   if (args.sshAlias !== undefined && !isSafeSshHost(args.sshAlias)) {
     // The value never appears in the message: an alias is operator input.
     io.stderr(
-      `hosts.${name}.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option\n${HOSTS_HELP}\n`,
+      `hosts.${screenHostName(name)}.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option\n${HOSTS_HELP}\n`,
     );
     return 2;
   }
@@ -990,7 +995,7 @@ async function writeHost(
   if (mode === "edit" && existing === undefined) {
     // The engine reports the same fact for a v1 or absent file; name it here.
     io.stderr(
-      `hosts.${name}: not in the installation file; adding is a separate mode\n`,
+      `hosts.${screenHostName(name)}: not in the installation file; adding is a separate mode\n`,
     );
     return 1;
   }
@@ -1000,7 +1005,7 @@ async function writeHost(
     existing?.transport === "local"
   ) {
     io.stderr(
-      `hosts.${name}: the entry's transport is local; --ssh changes an ssh host's alias\n`,
+      `hosts.${screenHostName(name)}: the entry's transport is local; --ssh changes an ssh host's alias\n`,
     );
     return 2;
   }
@@ -1071,6 +1076,12 @@ async function writeHost(
   let movedFrom: readonly string[] = [];
   if (draft.host.roles.includes("lane-runner")) {
     const moved = moveLaneRunnerRole(current, name);
+    if (moved.refused !== undefined) {
+      io.stderr(
+        "hosts: the installation's host map carries an accessor property; nothing was written\n",
+      );
+      return 1;
+    }
     current = moved.value;
     movedFrom = moved.movedFrom;
   }
@@ -1100,14 +1111,17 @@ async function writeHost(
     laneRunnerName !== undefined
       ? validated.installation.hosts?.[laneRunnerName]
       : undefined;
+  // The probe lines are printed: they carry the screened host name, never a
+  // raw one (the name is used only as a label there).
   const spec = {
     ...hostProbeSpecFromDraft(draft),
+    name: screenHostName(draft.name),
     ...(draft.host.roles.includes("verifier") &&
     laneRunnerName !== undefined &&
     laneRunnerHost !== undefined
       ? {
           laneRunnerWorktreeRoot: {
-            hostName: laneRunnerName,
+            hostName: screenHostName(laneRunnerName),
             worktreeRoot: laneRunnerHost.worktreeRoot,
           },
         }
@@ -1149,7 +1163,7 @@ async function writeHost(
   }
   if (movedFrom.length > 0) {
     io.stdout(
-      `lanes now run on ${name} (the lane-runner role moved from ${movedFrom.join(", ")})\n`,
+      `lanes now run on ${screenHostName(name)} (the lane-runner role moved from ${movedFrom.map(screenHostName).join(", ")})\n`,
     );
   }
   // An edit that removes a role (or a host) can silently drop the role alias
@@ -1162,7 +1176,7 @@ async function writeHost(
   if (args.yes && dropped.length > 0) {
     io.stdout(
       `dropped role alias: ${dropped
-        .map((d) => `hosts.${d.hostName}.roleAliases.${d.role}`)
+        .map((d) => `hosts.${screenHostName(d.hostName)}.roleAliases.${d.role}`)
         .join(", ")}\n`,
     );
   }
@@ -1205,12 +1219,12 @@ async function removeHost(
   const hosts = state.installation.hosts ?? {};
   const host = Object.hasOwn(hosts, name) ? hosts[name] : undefined;
   if (host === undefined) {
-    io.stderr(`hosts.${name}: not in the installation file\n`);
+    io.stderr(`hosts.${screenHostName(name)}: not in the installation file\n`);
     return 1;
   }
   if (host.roles.includes("orchestrator")) {
     io.stderr(
-      `hosts.${name} holds the orchestrator role, and an installation needs exactly one orchestrator host; move the role to another host first (hosts edit)\n`,
+      `hosts.${screenHostName(name)} holds the orchestrator role, and an installation needs exactly one orchestrator host; move the role to another host first (hosts edit)\n`,
     );
     return 1;
   }
@@ -1220,7 +1234,7 @@ async function removeHost(
   );
   if (host.roles.includes("lane-runner") && otherLaneRunner === undefined) {
     io.stderr(
-      `hosts.${name} is the last lane-runner host; move the lane-runner role to another host before removing it\n`,
+      `hosts.${screenHostName(name)} is the last lane-runner host; move the lane-runner role to another host before removing it\n`,
     );
     return 1;
   }
@@ -1236,19 +1250,19 @@ async function removeHost(
   );
   if (liveAttempts.length > 0) {
     for (const attempt of liveAttempts) {
-      io.stderr(`attempt ${attempt.id} is ${attempt.state} on ${name}\n`);
+      io.stderr(`attempt ${attempt.id} is ${attempt.state} on ${screenHostName(name)}\n`);
     }
-    io.stderr(`hosts.${name} has live work; nothing was removed\n`);
+    io.stderr(`hosts.${screenHostName(name)} has live work; nothing was removed\n`);
     return 1;
   }
   const reservations = await journal.listActiveReservations(name);
   if (reservations.length > 0) {
     for (const reservation of reservations) {
       io.stderr(
-        `reservation ${reservation.id} holds a slot for attempt ${reservation.attemptId} on ${name}\n`,
+        `reservation ${reservation.id} holds a slot for attempt ${reservation.attemptId} on ${screenHostName(name)}\n`,
       );
     }
-    io.stderr(`hosts.${name} has live work; nothing was removed\n`);
+    io.stderr(`hosts.${screenHostName(name)} has live work; nothing was removed\n`);
     return 1;
   }
 
@@ -1334,7 +1348,7 @@ export function formatRoleAmbiguousRefusal(
 ): string {
   const suffix =
     hostNames !== undefined && hostNames.length > 0
-      ? ` (${hostNames.map((name) => sanitizeToken(name)).join(", ")})`
+      ? ` (${hostNames.map(screenHostName).join(", ")})`
       : "";
   return `hosts: role '${role}' is held by more than one host${suffix}; name the host explicitly (fleet-v2 hosts show <name>)`;
 }
@@ -1408,7 +1422,7 @@ async function showHosts(
     }
     if (!Object.hasOwn(hosts, args.name)) {
       io.stderr(
-        `hosts.${sanitizeToken(args.name)}: not in the installation file\n`,
+        `hosts.${screenHostName(args.name)}: not in the installation file\n`,
       );
       return 1;
     }

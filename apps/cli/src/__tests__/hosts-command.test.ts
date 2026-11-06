@@ -30,6 +30,7 @@ import {
 import { runCli, type CliIo } from "../index.js";
 import {
   hostsCommand,
+  formatRoleAmbiguousRefusal,
   moveLaneRunnerRole,
   sanitizeToken,
 } from "../hosts.js";
@@ -1474,6 +1475,64 @@ describe("fix round 1: redaction, usage echo and moveLaneRunnerRole guards", () 
     expect(out).not.toContain(path);
   });
 
+  it("host-name refusals and notices never echo a secret-shaped or invalid name (Fable round)", async () => {
+    const ghp = ["ghp", "_" + "a1".repeat(12)].join("");
+    const akia = ["AKIA", "C".repeat(16)].join("");
+    const colon = "user:" + "t".repeat(122) + "@h";
+    expect(colon.length).toBe(129);
+    const secrets = [ghp, akia, colon];
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot: path.join(dir, "wt"),
+          roles: ["orchestrator"],
+        },
+        [akia]: {
+          transport: "ssh",
+          sshAlias: "old",
+          worktreeRoot: path.join(dir, "old"),
+          roles: ["verifier", "lane-runner"],
+          roleAliases: { "lane-runner": "old-lr", verifier: "old-v" },
+          runner: { kind: "opencode", port: 4200 },
+        },
+      },
+    });
+    for (const secret of secrets) {
+      const results = [
+        await runHosts(["edit", secret, "--port", "1"], file, {}, async () => false),
+        // A valid name that is added lands in the file diff by design; only the
+        // refused (invalid) name must stay out of every line.
+        ...(secret === colon
+          ? [await runHosts(["add", secret, "--ssh", "h", "--worktree-root", "/w", "--role", "verifier", "--yes"], file)]
+          : []),
+        // `show` of a name the file holds prints that row by design.
+        ...(secret !== akia ? [await runHosts(["show", secret], file)] : []),
+        await runHosts(["remove", secret], file, {}, async () => false),
+      ];
+      for (const result of results) {
+        for (const s of secrets) {
+          expect(result.stdout + result.stderr).not.toContain(s);
+        }
+      }
+    }
+    // A secret-shaped host-map key goes through the movedFrom and dropped-alias notices.
+    const moved = await runHosts(
+      ["add", "newhost", "--worktree-root", path.join(dir, "n"), "--role", "lane-runner", "--port", "5000", "--yes"],
+      file,
+    );
+    expect(moved.code).toBe(0);
+    expect(moved.stdout).toContain("dropped role alias");
+    expect(moved.stdout + moved.stderr).not.toContain(akia);
+    expect(formatRoleAmbiguousRefusal("verifier", [ghp, akia, "ok-host"])).not.toContain(ghp);
+    expect(formatRoleAmbiguousRefusal("verifier", [ghp, akia, "ok-host"])).not.toContain(akia);
+    expect(formatRoleAmbiguousRefusal("verifier", [ghp, "ok-host"])).toContain("ok-host");
+  });
+
   it("moveLaneRunnerRole guards hostile runtime hosts without throwing", () => {
     // A null roleAliases map on the stripped host is omitted, not a throw.
     const withNullAliases = {
@@ -1597,5 +1656,6 @@ describe("moveLaneRunnerRole host-map accessors (Luna pre-merge round)", () => {
     expect(invoked).toBe(0);
     expect(result?.movedFrom).toEqual([]);
     expect(result?.value).toBe(current);
+    expect(result?.refused).toBe("accessor");
   });
 });

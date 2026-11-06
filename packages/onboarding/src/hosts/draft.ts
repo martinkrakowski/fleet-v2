@@ -346,11 +346,22 @@ export function draftHost(rawInput: unknown): HostDraftResult {
  * secret (short, no long alphanumeric run); anything else gets a fixed label.
  */
 function hostPath(name: string): string {
-  return isValidHostName(name) &&
+  return `hosts.${screenHostName(name)}`;
+}
+
+/**
+ * The one screening rule for a host name an operator-facing message would
+ * echo: the name itself only when it is a valid host name of at most 32
+ * characters with no run of 12 or more alphanumerics (so a pasted token never
+ * passes), otherwise the fixed label `<invalid-name>`.
+ */
+export function screenHostName(name: string): string {
+  return typeof name === 'string' &&
+    isValidHostName(name) &&
     name.length <= 32 &&
     !/[A-Za-z0-9]{12,}/.test(name)
-    ? `hosts.${name}`
-    : 'hosts.<invalid-name>';
+    ? name
+    : '<invalid-name>';
 }
 
 /**

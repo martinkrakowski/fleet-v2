@@ -28,16 +28,30 @@ export type StallRule =
 /** The run states the snapshot carries; the terminal ones end every rule. */
 export type StallRunState =
   | 'queued'
+  | 'ready'
+  | 'dispatching'
   | 'running'
   | 'parked'
   | 'review'
+  | 'fixing'
+  | 'watching-ci'
   | 'merging'
   | 'succeeded'
   | 'failed'
   | 'cancelled'
   | 'merged';
 
-const NON_TERMINAL_RUN_STATES: readonly string[] = ['queued', 'running', 'parked', 'review', 'merging'];
+const NON_TERMINAL_RUN_STATES: readonly string[] = [
+  'queued',
+  'ready',
+  'dispatching',
+  'running',
+  'parked',
+  'review',
+  'fixing',
+  'watching-ci',
+  'merging',
+];
 
 /** One run in the snapshot. Ids and codes only; no free text. */
 export interface StallRun {

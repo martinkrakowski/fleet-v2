@@ -12,8 +12,19 @@
  */
 
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
+import { parseBaseBranch } from './base-branch.js';
+import { LANE_RUN_PARK_REASONS } from './lane-run-records.js';
 import { isPlainRecordObject } from './record-schema-version.js';
+import { ATTEMPT_STATES } from './value-objects/AttemptState.vo.js';
+import { LANE_RUN_STATES } from './value-objects/LaneRunState.vo.js';
+import { STOP_REASONS } from './value-objects/StopReason.vo.js';
+import { BOARD_BADGE_KINDS } from './work-board-steps.js';
+import type { BoardBadge, BoardPrState, BoardPrStatus, BoardStep } from './work-board-steps.js';
 import {
+  BOARD_CI_STATES,
+  BOARD_DECLARATION_STEPS,
+  BOARD_OWNER_ITEM_KINDS,
+  BOARD_PR_STATES,
   BOARD_SOURCES,
   BOARD_TEXT_MAX_BYTES,
   SOURCE_READING_REASONS,
@@ -410,106 +421,135 @@ function validateLaneGlance(value: unknown): LaneGlance | null {
   };
 }
 
+type SubjectValidator = (value: Record<string, unknown>) => WaitSubject | null;
+
+function validateLaneSubject(value: Record<string, unknown>): WaitSubject | null {
+  const lane = validateLaneGlance(requiredProp(value, 'lane'));
+  return lane === null ? null : { kind: 'lane', lane };
+}
+
+function validatePackageSubject(value: Record<string, unknown>): WaitSubject | null {
+  const name = requiredProp(value, 'name');
+  if (!acceptableText(name)) return null;
+  const heldByValue = requiredProp(value, 'heldBy');
+  if (heldByValue === null) return { kind: 'package', name, heldBy: null };
+  const heldBy = validateLaneGlance(heldByValue);
+  return heldBy === null ? null : { kind: 'package', name, heldBy };
+}
+
+function validateSharedFileSubject(value: Record<string, unknown>): WaitSubject | null {
+  const path = requiredProp(value, 'path');
+  if (!relativeRepoPath(path)) return null;
+  const heldBy = validateLaneGlance(requiredProp(value, 'heldBy'));
+  return heldBy === null ? null : { kind: 'shared-file', path, heldBy };
+}
+
+function validateProjectSlotsSubject(value: Record<string, unknown>): WaitSubject | null {
+  const projectId = requiredProp(value, 'projectId');
+  const held = requiredProp(value, 'held');
+  const cap = requiredProp(value, 'cap');
+  if (!validId(projectId, true)) return null;
+  if (typeof held !== 'number' || typeof cap !== 'number') return null;
+  return { kind: 'project-slots', projectId, held, cap };
+}
+
+function validateCapacitySubject(value: Record<string, unknown>): WaitSubject | null {
+  const held = requiredProp(value, 'held');
+  const budget = requiredProp(value, 'budget');
+  if (typeof held !== 'number' || typeof budget !== 'number') return null;
+  return { kind: 'capacity', held, budget };
+}
+
+function validateSeatSubject(value: Record<string, unknown>): WaitSubject | null {
+  const role = requiredProp(value, 'role');
+  if (role !== null && !acceptableText(role)) return null;
+  return { kind: 'seat', role: role as string | null };
+}
+
+/** An optional string property: `ok: false` on a getter or a wrong type; `value` is absent when the key is. */
+function optionalStringProp(value: Record<string, unknown>, key: string, requireText: boolean): { ok: boolean; value?: string } {
+  const read = optionalProp(value, key);
+  if (!read.ok) return { ok: false };
+  if (!read.present) return { ok: true };
+  if (typeof read.value !== 'string') return { ok: false };
+  if (requireText && !acceptableText(read.value)) return { ok: false };
+  return { ok: true, value: read.value };
+}
+
+function validateBriefSubject(value: Record<string, unknown>): WaitSubject | null {
+  const path = requiredProp(value, 'path');
+  if (!relativeRepoPath(path)) return null;
+  const sha256 = optionalStringProp(value, 'sha256', true);
+  const readAt = optionalStringProp(value, 'readAtIso', false);
+  const lastFailed = optionalStringProp(value, 'lastFailedAtIso', false);
+  if (!sha256.ok || !readAt.ok || !lastFailed.ok) return null;
+  return {
+    kind: 'brief',
+    path,
+    ...(sha256.value !== undefined ? { sha256: sha256.value } : {}),
+    ...(readAt.value !== undefined ? { readAtIso: readAt.value } : {}),
+    ...(lastFailed.value !== undefined ? { lastFailedAtIso: lastFailed.value } : {}),
+  };
+}
+
+function validateOwnerItemSubject(value: Record<string, unknown>): WaitSubject | null {
+  const itemId = requiredProp(value, 'itemId');
+  const itemKind = requiredProp(value, 'itemKind');
+  const subject = requiredProp(value, 'subject');
+  const sinceIso = requiredProp(value, 'sinceIso');
+  if (!validId(itemId, false)) return null;
+  if (itemKind !== 'merge' && itemKind !== 'decision' && itemKind !== 'secret') return null;
+  if (!acceptableText(subject)) return null;
+  if (typeof sinceIso !== 'string' || !acceptableText(sinceIso) || parseTimeMs(sinceIso) === null) return null;
+  return { kind: 'owner-item', itemId, itemKind, subject, sinceIso };
+}
+
+function validatePlanDecisionSubject(value: Record<string, unknown>): WaitSubject | null {
+  const projectId = requiredProp(value, 'projectId');
+  const planId = requiredProp(value, 'planId');
+  const decisionId = requiredProp(value, 'decisionId');
+  if (!validId(projectId, true) || !validId(planId, true) || !validId(decisionId, false)) return null;
+  return { kind: 'plan-decision', projectId, planId, decisionId };
+}
+
+function validatePlanSubject(value: Record<string, unknown>): WaitSubject | null {
+  const projectId = requiredProp(value, 'projectId');
+  const planId = requiredProp(value, 'planId');
+  if (!validId(projectId, true) || !validId(planId, true)) return null;
+  return { kind: 'plan', projectId, planId };
+}
+
+function validateCycleSubject(value: Record<string, unknown>): WaitSubject | null {
+  const path = requiredProp(value, 'path');
+  if (!denseArray(path, MAX_LANE_WAITS_BOARD_LANES)) return null;
+  const refs: LaneRef[] = [];
+  for (const item of path) {
+    const ref = validateLaneRef(item);
+    if (ref === null) return null;
+    refs.push(ref);
+  }
+  return { kind: 'cycle', path: refs };
+}
+
+const SUBJECT_VALIDATORS: Readonly<Record<WaitSubject['kind'], SubjectValidator>> = {
+  lane: validateLaneSubject,
+  package: validatePackageSubject,
+  'shared-file': validateSharedFileSubject,
+  'project-slots': validateProjectSlotsSubject,
+  capacity: validateCapacitySubject,
+  seat: validateSeatSubject,
+  brief: validateBriefSubject,
+  'owner-item': validateOwnerItemSubject,
+  'plan-decision': validatePlanDecisionSubject,
+  plan: validatePlanSubject,
+  cycle: validateCycleSubject,
+};
+
 function validateWaitSubject(value: unknown): WaitSubject | null {
   if (!isPlainRecordObject(value)) return null;
   const kind = requiredProp(value, 'kind');
-  switch (kind) {
-    case 'lane': {
-      const lane = validateLaneGlance(requiredProp(value, 'lane'));
-      if (lane === null) return null;
-      return { kind: 'lane', lane };
-    }
-    case 'package': {
-      const name = requiredProp(value, 'name');
-      if (!acceptableText(name)) return null;
-      const heldByValue = requiredProp(value, 'heldBy');
-      if (heldByValue === null) return { kind: 'package', name, heldBy: null };
-      const heldBy = validateLaneGlance(heldByValue);
-      if (heldBy === null) return null;
-      return { kind: 'package', name, heldBy };
-    }
-    case 'shared-file': {
-      const path = requiredProp(value, 'path');
-      if (!relativeRepoPath(path)) return null;
-      const heldBy = validateLaneGlance(requiredProp(value, 'heldBy'));
-      if (heldBy === null) return null;
-      return { kind: 'shared-file', path, heldBy };
-    }
-    case 'project-slots': {
-      const projectId = requiredProp(value, 'projectId');
-      const held = requiredProp(value, 'held');
-      const cap = requiredProp(value, 'cap');
-      if (!validId(projectId, true)) return null;
-      if (typeof held !== 'number' || typeof cap !== 'number') return null;
-      return { kind: 'project-slots', projectId, held, cap };
-    }
-    case 'capacity': {
-      const held = requiredProp(value, 'held');
-      const budget = requiredProp(value, 'budget');
-      if (typeof held !== 'number' || typeof budget !== 'number') return null;
-      return { kind: 'capacity', held, budget };
-    }
-    case 'seat': {
-      const role = requiredProp(value, 'role');
-      if (role !== null && !acceptableText(role)) return null;
-      return { kind: 'seat', role: role as string | null };
-    }
-    case 'brief': {
-      const path = requiredProp(value, 'path');
-      if (!relativeRepoPath(path)) return null;
-      const sha256 = optionalProp(value, 'sha256');
-      const readAt = optionalProp(value, 'readAtIso');
-      const lastFailed = optionalProp(value, 'lastFailedAtIso');
-      if (!sha256.ok || !readAt.ok || !lastFailed.ok) return null;
-      if (sha256.present && (typeof sha256.value !== 'string' || !acceptableText(sha256.value))) return null;
-      if (readAt.present && typeof readAt.value !== 'string') return null;
-      if (lastFailed.present && typeof lastFailed.value !== 'string') return null;
-      return {
-        kind: 'brief',
-        path,
-        ...(sha256.present ? { sha256: sha256.value as string } : {}),
-        ...(readAt.present ? { readAtIso: readAt.value as string } : {}),
-        ...(lastFailed.present ? { lastFailedAtIso: lastFailed.value as string } : {}),
-      };
-    }
-    case 'owner-item': {
-      const itemId = requiredProp(value, 'itemId');
-      const itemKind = requiredProp(value, 'itemKind');
-      const subject = requiredProp(value, 'subject');
-      const sinceIso = requiredProp(value, 'sinceIso');
-      if (!validId(itemId, false)) return null;
-      if (itemKind !== 'merge' && itemKind !== 'decision' && itemKind !== 'secret') return null;
-      if (!acceptableText(subject)) return null;
-      if (typeof sinceIso !== 'string' || !acceptableText(sinceIso) || parseTimeMs(sinceIso) === null) return null;
-      return { kind: 'owner-item', itemId, itemKind, subject, sinceIso };
-    }
-    case 'plan-decision': {
-      const projectId = requiredProp(value, 'projectId');
-      const planId = requiredProp(value, 'planId');
-      const decisionId = requiredProp(value, 'decisionId');
-      if (!validId(projectId, true) || !validId(planId, true) || !validId(decisionId, false)) return null;
-      return { kind: 'plan-decision', projectId, planId, decisionId };
-    }
-    case 'plan': {
-      const projectId = requiredProp(value, 'projectId');
-      const planId = requiredProp(value, 'planId');
-      if (!validId(projectId, true) || !validId(planId, true)) return null;
-      return { kind: 'plan', projectId, planId };
-    }
-    case 'cycle': {
-      const path = requiredProp(value, 'path');
-      if (!denseArray(path, MAX_LANE_WAITS_BOARD_LANES)) return null;
-      const refs: LaneRef[] = [];
-      for (const item of path) {
-        const ref = validateLaneRef(item);
-        if (ref === null) return null;
-        refs.push(ref);
-      }
-      return { kind: 'cycle', path: refs };
-    }
-    default:
-      return null;
-  }
+  if (typeof kind !== 'string' || !Object.hasOwn(SUBJECT_VALIDATORS, kind)) return null;
+  return SUBJECT_VALIDATORS[kind as WaitSubject['kind']](value);
 }
 
 function validateClearedBy(value: unknown): ClearedBy | null {
@@ -807,6 +847,133 @@ function stringList(value: unknown): string[] | null {
   return out;
 }
 
+// --- Card structure (the tagged and enum fields of a BoardLaneCard) ---------
+//
+// These run on the output of `safeCopyField`, so they read plain data only.
+// The value lists are the work-board domain's own; a local list is checked
+// against its type with `satisfies`.
+
+type Plain = Record<string, unknown>;
+
+const PR_STATES = [...BOARD_PR_STATES, 'not-observed', 'not-read'] as const satisfies readonly BoardPrState[];
+const PR_SOURCES = ['merge-record', 'forge-observation', 'none'] as const satisfies readonly BoardPrStatus['source'][];
+const SEAT_SOURCES = ['run', 'attempt', 'declaration'] as const;
+const ATTEMPT_KINDS = ['initial', 'fix'] as const;
+const MERGERS = ['fleet', 'unknown'] as const;
+const OWNER_ORIGINS = ['owner-item', 'question'] as const;
+const OWNER_REASON_KINDS = ['merge', 'decision', 'secret'] as const;
+
+function isRec(value: unknown): value is Plain {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function oneOf(list: readonly string[], value: unknown): boolean {
+  return typeof value === 'string' && list.includes(value);
+}
+
+function isText(value: unknown): boolean {
+  return typeof value === 'string';
+}
+
+function isTextOrNull(value: unknown): boolean {
+  return value === null || typeof value === 'string';
+}
+
+function isCount(value: unknown): boolean {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function allText(v: Plain, keys: readonly string[]): boolean {
+  return keys.every((key) => isText(v[key]));
+}
+
+function validPrStatus(value: unknown): boolean {
+  if (!isRec(value)) return false;
+  if (!isText(value.repository) || !isCount(value.number) || !isTextOrNull(value.asOfIso) || !isTextOrNull(value.title)) return false;
+  if (!oneOf(PR_STATES, value.state) || !oneOf(PR_SOURCES, value.source)) return false;
+  if (value.ciState !== null && !oneOf(BOARD_CI_STATES, value.ciState)) return false;
+  return typeof value.stale === 'boolean';
+}
+
+function validRunFields(v: Plain): boolean {
+  if (!isText(v.runId) || !isCount(v.round) || parseBaseBranch(v.baseBranch) === undefined) return false;
+  return v.parkReason === null || oneOf(LANE_RUN_PARK_REASONS, v.parkReason);
+}
+
+type StepKind = Exclude<BoardStep['kind'], 'dropped-after-start'>;
+
+const RAW_STEP_CHECKS: Readonly<Record<StepKind, (v: Plain) => boolean>> = {
+  run: (v) => validRunFields(v) && oneOf(LANE_RUN_STATES, v.state),
+  'run-stopped': (v) => isText(v.runId) && isCount(v.round) && parseBaseBranch(v.baseBranch) !== undefined,
+  'attempt-live': (v) =>
+    isText(v.attemptId) && isCount(v.fixNumber) && oneOf(ATTEMPT_KINDS, v.attemptKind) && oneOf(ATTEMPT_STATES, v.state),
+  'pr-closed-without-merge': (v) => validPrStatus(v.pr),
+  'between-steps': (v) => isText(v.attemptId) && (v.stopReason === null || oneOf(STOP_REASONS, v.stopReason)),
+  'pr-open': (v) => validPrStatus(v.pr),
+  'pr-merged-unrecorded': (v) => validPrStatus(v.pr),
+  'pr-merge-not-observed': (v) => validPrStatus(v.pr),
+  declared: (v) => oneOf(BOARD_DECLARATION_STEPS, v.step) && allText(v, ['seatRole', 'model', 'declaredAtIso']),
+  'declaration-lapsed': (v) => isText(v.declaredAtIso),
+};
+
+function validRawStep(value: unknown): boolean {
+  if (!isRec(value) || typeof value.kind !== 'string' || !Object.hasOwn(RAW_STEP_CHECKS, value.kind)) return false;
+  return RAW_STEP_CHECKS[value.kind as StepKind](value);
+}
+
+function validStep(value: unknown): boolean {
+  if (isRec(value) && value.kind === 'dropped-after-start') return validRawStep(value.underlying);
+  return validRawStep(value);
+}
+
+function validDone(value: unknown): boolean {
+  if (!isRec(value)) return false;
+  if (value.via === 'work-order') return allText(value, ['workOrderId', 'recordedAtIso']);
+  if (value.via !== 'merge-record') return false;
+  return (
+    allText(value, ['repository', 'headSha', 'mergedAtIso', 'firstSeenAtIso']) &&
+    isCount(value.number) &&
+    oneOf(MERGERS, value.merger)
+  );
+}
+
+function validSeat(value: unknown): boolean {
+  return isRec(value) && isTextOrNull(value.role) && isTextOrNull(value.model) && oneOf(SEAT_SOURCES, value.source);
+}
+
+function validReviewCounts(value: unknown): boolean {
+  if (!isRec(value) || !allText(value, ['headSha', 'readAtIso'])) return false;
+  return ['blocker', 'major', 'minor', 'nit'].every((key) => isCount(value[key]));
+}
+
+function validOwnerReason(value: unknown): boolean {
+  if (!isRec(value) || !oneOf(OWNER_ORIGINS, value.origin) || !oneOf(OWNER_REASON_KINDS, value.kind)) return false;
+  return allText(value, ['id', 'sinceIso']) && isTextOrNull(value.subject);
+}
+
+const BADGE_CHECKS: Readonly<Record<BoardBadge['kind'], (v: Plain) => boolean>> = {
+  'attempt-running': (v) =>
+    isText(v.attemptId) && isTextOrNull(v.seatRole) && isTextOrNull(v.model) && oneOf(ATTEMPT_STATES, v.state),
+  run: (v) => validRunFields(v) && oneOf(LANE_RUN_STATES, v.state),
+  'owner-item-not-recorded': (v) => isText(v.runId),
+  pr: (v) => validPrStatus(v.pr),
+  'owner-item': (v) =>
+    oneOf(OWNER_ORIGINS, v.origin) && isText(v.id) && oneOf(BOARD_OWNER_ITEM_KINDS, v.itemKind) && typeof v.gating === 'boolean',
+  'link-conflict': (v) =>
+    allText(v, ['repository', 'linkedLane', 'refusedLane', 'recordedAtIso']) && isCount(v.number),
+  'merge-integrity': (v) => allText(v, ['repository', 'readAtIso']) && isCount(v.number),
+  declaration: (v) => oneOf(BOARD_DECLARATION_STEPS, v.step) && isText(v.declaredAtIso) && typeof v.lapsed === 'boolean',
+  'plan-lane-not-imported': () => true,
+};
+
+function validBadge(value: unknown): boolean {
+  if (!isRec(value) || !oneOf(BOARD_BADGE_KINDS, value.kind)) return false;
+  return BADGE_CHECKS[value.kind as BoardBadge['kind']](value);
+}
+
+const CARD_OBJECT_CHECKS = { done: validDone, step: validStep, seat: validSeat, reviewCounts: validReviewCounts } as const;
+const CARD_LIST_CHECKS = { waitingOn: validOwnerReason, pullRequests: validPrStatus, badges: validBadge } as const;
+
 interface ValidatedCardParts {
   readonly key: string;
   readonly ref: LaneRef;
@@ -864,7 +1031,7 @@ function rebuildCard(value: Record<string, unknown>, parts: ValidatedCardParts):
       continue;
     }
     const copy = safeCopyField(raw);
-    if (copy === undefined || copy === null || typeof copy !== 'object' || Array.isArray(copy)) return null;
+    if (copy === undefined || !CARD_OBJECT_CHECKS[name](copy)) return null;
     structured[name] = copy;
   }
   const lists: Record<string, unknown[]> = {};
@@ -872,7 +1039,7 @@ function rebuildCard(value: Record<string, unknown>, parts: ValidatedCardParts):
     const raw = requiredProp(value, name);
     if (!denseArray(raw, MAX_LANE_WAITS_BOARD_LANES)) return null;
     const copy = safeCopyField(raw);
-    if (!Array.isArray(copy)) return null;
+    if (!Array.isArray(copy) || !copy.every(CARD_LIST_CHECKS[name])) return null;
     lists[name] = copy;
   }
 

@@ -999,3 +999,91 @@ describe('WB2c Luna review round 1 (majors)', () => {
     }
   });
 });
+
+describe('WB2c Luna review round 1 (card field contracts)', () => {
+  const refuse = { ok: false, reason: 'invalid-board' };
+  const pr = { repository: 'o/r', number: 7, state: 'open', source: 'forge-observation', asOfIso: NOW, ciState: 'passed', title: 'T', stale: false };
+  const run = { kind: 'run', runId: 'run-1', state: 'running', round: 1, parkReason: null, baseBranch: 'main' };
+  const withCard = (overrides: Record<string, unknown>) => {
+    const base = board([card(REF_A, 'queued', { waitsOn: [seatRow()] })]);
+    return { ...base, lanes: [{ ...base.lanes[0], ...overrides }] };
+  };
+  const result = (overrides: Record<string, unknown>) => deriveLaneWaits(withCard(overrides), REF_A);
+
+  it('accepts well-formed step, done, seat, reviewCounts, badges and pullRequests', () => {
+    const good = {
+      step: { kind: 'dropped-after-start', underlying: { kind: 'pr-open', pr } },
+      done: { via: 'work-order', workOrderId: 'wo-1', recordedAtIso: NOW },
+      seat: { role: 'first-pass', model: null, source: 'run' },
+      reviewCounts: { headSha: 'abc', blocker: 0, major: 1, minor: 2, nit: 3, readAtIso: NOW },
+      badges: [run, { kind: 'pr', pr }, { kind: 'plan-lane-not-imported' }],
+      pullRequests: [pr, { ...pr, ciState: null, state: 'not-read', source: 'none' }],
+    };
+    expect(result(good).ok).toBe(true);
+    expect(result({ step: run }).ok).toBe(true);
+    expect(result({ done: { via: 'merge-record', repository: 'o/r', number: 1, headSha: 'a', mergedAtIso: NOW, firstSeenAtIso: NOW, merger: 'fleet' } }).ok).toBe(true);
+  });
+
+  it('refuses a malformed step', () => {
+    for (const step of [
+      { kind: 'bogus' },
+      { kind: 'run', runId: 'r', state: 'nope', round: 1, parkReason: null, baseBranch: 'main' },
+      { ...run, baseBranch: 'dev' },
+      { ...run, parkReason: 'nope' },
+      { kind: 'pr-open', pr: { ...pr, state: 'nope' } },
+      { kind: 'between-steps', attemptId: 'a', stopReason: 'nope' },
+      { kind: 'declared', step: 'nope', seatRole: 'x', model: 'y', declaredAtIso: NOW },
+      { kind: 'dropped-after-start', underlying: { kind: 'dropped-after-start', underlying: run } },
+      { kind: 'constructor' },
+      {},
+    ]) {
+      expect(result({ step })).toEqual(refuse);
+    }
+  });
+
+  it('refuses a malformed done', () => {
+    for (const done of [
+      { via: 'bogus' },
+      { via: 'work-order', workOrderId: 1, recordedAtIso: NOW },
+      { via: 'merge-record', repository: 'o/r', number: 1, headSha: 'a', mergedAtIso: NOW, firstSeenAtIso: NOW, merger: 'robot' },
+    ]) {
+      expect(result({ done })).toEqual(refuse);
+    }
+  });
+
+  it('refuses a malformed seat', () => {
+    for (const seat of [{ role: 'x', model: null, source: 'bogus' }, { role: 5, model: null, source: 'run' }, {}]) {
+      expect(result({ seat })).toEqual(refuse);
+    }
+  });
+
+  it('refuses malformed reviewCounts', () => {
+    const counts = { headSha: 'abc', blocker: 0, major: 0, minor: 0, nit: 0, readAtIso: NOW };
+    for (const reviewCounts of [{ ...counts, blocker: -1 }, { ...counts, major: 1.5 }, { ...counts, nit: 'x' }, { ...counts, headSha: null }]) {
+      expect(result({ reviewCounts })).toEqual(refuse);
+    }
+  });
+
+  it('refuses malformed badges', () => {
+    for (const badge of [
+      { kind: 'bogus' },
+      { kind: 'pr', pr: { ...pr, ciState: 'bogus' } },
+      { kind: 'owner-item', origin: 'owner-item', id: 'i', itemKind: 'bogus', gating: true },
+      { kind: 'declaration', step: 'nope', declaredAtIso: NOW, lapsed: false },
+      { kind: 'attempt-running', attemptId: 'a', seatRole: null, model: null, state: 'nope' },
+    ]) {
+      expect(result({ badges: [badge] })).toEqual(refuse);
+    }
+  });
+
+  it('refuses a pull request with a bad source, ciState or state', () => {
+    expect(result({ pullRequests: [{ ...pr, source: 'bogus' }] })).toEqual(refuse);
+    expect(result({ pullRequests: [{ ...pr, ciState: 'bogus' }] })).toEqual(refuse);
+    expect(result({ pullRequests: [{ ...pr, state: 'bogus' }] })).toEqual(refuse);
+    expect(result({ pullRequests: [{ ...pr, stale: 'no' }] })).toEqual(refuse);
+  });
+
+  it('refuses a malformed waitingOn reason', () => {
+    expect(result({ waitingOn: [{ origin: 'bogus', id: 'i', kind: 'merge', subject: null, sinceIso: NOW }] })).toEqual(refuse);
+  });
+});

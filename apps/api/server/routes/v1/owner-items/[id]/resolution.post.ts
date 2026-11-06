@@ -1,4 +1,4 @@
-import { defineEventHandler, setResponseStatus } from "h3";
+import { defineEventHandler, setResponseStatus, type H3Event } from "h3";
 import { getOperatorComposition } from "../../../../wiring/operator/composition.js";
 import {
   errorEnvelope,
@@ -20,6 +20,12 @@ import { presentedToken } from "../../../../wiring/presented-token";
 
 const WITHDRAW_REASONS: ReadonlySet<string> = new Set(["no-longer-needed", "duplicate", "superseded"]);
 
+/** Set the failure's HTTP status and answer with its body. */
+function respond<T extends { readonly statusCode: number; readonly body: unknown }>(event: H3Event, failure: T): T["body"] {
+  setResponseStatus(event, failure.statusCode);
+  return failure.body;
+}
+
 export default defineEventHandler(async (event) => {
   const itemId = routeParam(event, "id");
   const operationId = newOperationId();
@@ -30,51 +36,37 @@ export default defineEventHandler(async (event) => {
     if (action === "done") {
       const extraFields = Object.keys(body).filter((key) => key !== "action");
       if (extraFields.length > 0) {
-        const failure = refusedEnvelope(operationId, "owner item resolution accepts only the action field for done");
-        setResponseStatus(event, failure.statusCode);
-        return failure.body;
+        return respond(event, refusedEnvelope(operationId, "owner item resolution accepts only the action field for done"));
       }
       request = { action: "done", itemId, via: "web" };
     } else if (action === "withdraw") {
       const reason = body.reason;
       if (typeof reason !== "string" || !WITHDRAW_REASONS.has(reason)) {
-        const failure = refusedEnvelope(
+        return respond(event, refusedEnvelope(
           operationId,
           "owner item resolution withdraw reason is not one of no-longer-needed, duplicate, superseded",
-        );
-        setResponseStatus(event, failure.statusCode);
-        return failure.body;
+        ));
       }
       const extraFields = Object.keys(body).filter((key) => key !== "action" && key !== "reason");
       if (extraFields.length > 0) {
-        const failure = refusedEnvelope(operationId, "owner item resolution accepts only action and reason for withdraw");
-        setResponseStatus(event, failure.statusCode);
-        return failure.body;
+        return respond(event, refusedEnvelope(operationId, "owner item resolution accepts only action and reason for withdraw"));
       }
       request = { action: "withdraw", itemId, reason };
     } else {
-      const failure = refusedEnvelope(operationId, "owner item resolution action is not one of done, withdraw");
-      setResponseStatus(event, failure.statusCode);
-      return failure.body;
+      return respond(event, refusedEnvelope(operationId, "owner item resolution action is not one of done, withdraw"));
     }
     // The acting identity comes only from the presented token, never the body.
     const token = presentedToken(event);
     const actor = token.actor ?? token.tokenId;
     const result = await getOperatorComposition().resolveOwnerItem.resolveOwnerItem(request, actor);
     if (result.outcome === "not-found") {
-      const failure = notFoundEnvelope(operationId);
-      setResponseStatus(event, failure.statusCode);
-      return failure.body;
+      return respond(event, notFoundEnvelope(operationId));
     }
     if (result.outcome === "refused") {
-      const failure = refusedEnvelope(operationId, result.reason);
-      setResponseStatus(event, failure.statusCode);
-      return failure.body;
+      return respond(event, refusedEnvelope(operationId, result.reason));
     }
     return successEnvelope(operationId, result);
   } catch (error) {
-    const failure = errorEnvelope(operationId, error);
-    setResponseStatus(event, failure.statusCode);
-    return failure.body;
+    return respond(event, errorEnvelope(operationId, error));
   }
 });

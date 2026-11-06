@@ -9,6 +9,7 @@ import { ForgeActionAdapter } from '../ForgeActionAdapter.adapter.js';
 import type { ForgeActionRequest } from '../../../application/ports/out/ForgeActionPort.out-port.js';
 import type {
   ForgeReadPort,
+  ListOpenPullRequestsByBaseResult,
   ForgeRepositoryRef,
   PullRequestRef,
   PullRequestState,
@@ -77,6 +78,10 @@ class FakeReader implements ForgeReadPort {
 
   constructor(results: Array<ReadPullRequestResult | Error>) {
     this.queue = [...results];
+  }
+
+  async listOpenPullRequestsByBase(): Promise<ListOpenPullRequestsByBaseResult> {
+    return { outcome: "unavailable", reason: "not-used" };
   }
 
   isConfigured(): boolean {

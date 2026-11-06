@@ -61,6 +61,7 @@ import {
 } from '@fleet/work-execution';
 
 import type { FleetCliRuntime } from './composition.js';
+import { openChangeWakeReader, resolveWakeConfig, type ChangeWakeReader } from './conductor-wake.js';
 import { buildLiveConductorDriver, buildDryRunConductorDriver, type ConductorDriver, type DryRunStores } from './conductor-wiring.js';
 import { withFileLock } from './file-store.js';
 import type { CliIo } from './index.js';
@@ -88,6 +89,10 @@ export interface ConductorCliOptions {
    * runtime's `RunnerTunnelAdapter`.
    */
   readonly tunnel?: RunnerTunnelPort;
+  /** An injected change-feed reader (tests); null means "no reader". */
+  readonly wakeReader?: ChangeWakeReader | null;
+  /** The opener seam; production uses `openChangeWakeReader`. */
+  readonly openWakeReader?: (config: { readonly baseUrl: string; readonly token: string }) => Promise<ChangeWakeReader | null>;
 }
 
 export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
@@ -894,6 +899,60 @@ async function stopTelemetryExporter(runtime: FleetCliRuntime): Promise<void> {
   }
 }
 
+/** The interrupt marker `resolveWakeReader` returns when the stop signal ends the opener wait. */
+const WAKE_OPENER_INTERRUPTED = 'wake-opener-interrupted';
+
+/**
+ * K9: build the change-feed wake reader for a live run. An injected reader
+ * wins; otherwise the environment must configure both the API base URL and a
+ * wake-token file, and the opener must succeed — a reader that cannot open
+ * prints one line and leaves the driver polling. The opener wait races the
+ * stop signal: an API that never answers must not hold the run hostage, so an
+ * interrupt ends the wait (and the production opener's fetch); the caller stops
+ * the tunnel and the `finally` stops the exporter and closes the reader.
+ */
+async function resolveWakeReader(
+  io: CliIo,
+  options: ConductorCliOptions,
+  signal: AbortSignal,
+): Promise<ChangeWakeReader | undefined | typeof WAKE_OPENER_INTERRUPTED> {
+  if (options.wakeReader !== undefined) {
+    return options.wakeReader ?? undefined;
+  }
+  const config = resolveWakeConfig(process.env);
+  if (config === null) {
+    return undefined;
+  }
+  const opener =
+    options.openWakeReader ?? ((open: { readonly baseUrl: string; readonly token: string }) => openChangeWakeReader({ ...open, signal }));
+  let onAbort: (() => void) | null = null;
+  const interrupted = new Promise<typeof WAKE_OPENER_INTERRUPTED>((resolve) => {
+    onAbort = () => resolve(WAKE_OPENER_INTERRUPTED);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    // The opener's promise is settled into a value before racing, so a later
+    // rejection can never surface as an unhandled rejection after the race.
+    const openerPromise = opener(config).then(
+      (reader): ChangeWakeReader | null => reader,
+      (): ChangeWakeReader | null => null,
+    );
+    const raced = await Promise.race([openerPromise.then((reader) => ({ reader })), interrupted]);
+    if (raced === WAKE_OPENER_INTERRUPTED) {
+      return WAKE_OPENER_INTERRUPTED;
+    }
+    if (raced.reader === null) {
+      io.stderr('conductor run: the change feed is unavailable; polling\n');
+      return undefined;
+    }
+    return raced.reader;
+  } finally {
+    if (onAbort !== null) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
 /**
  * `conductor run --live`: the driver. One pass at a time under the state
  * directory's driver lease, polling with back-off from 30 seconds to 2 minutes,
@@ -946,6 +1005,7 @@ async function runCommand(
   // interrupt during the startup wait stops the tunnel child too.
   const tunnel = options.tunnel ?? runtime.runnerTunnel;
   const controller = new AbortController();
+  let wake: ChangeWakeReader | undefined;
   const signal = options.stopSignal ?? controller.signal;
   const onSignal = (): void => {
     controller.abort();
@@ -989,6 +1049,19 @@ async function runCommand(
     } catch {
       // a lost exporter delays only the next export
     }
+    // K9: open the change-feed wake reader (when configured) so a signal ends
+    // the between-passes sleep; a reader that cannot open never prevents
+    // polling, and the stop signal ends the opener wait itself (an API that
+    // never answers cannot hold the run hostage).
+    const opened = await resolveWakeReader(io, options, signal);
+    if (opened === WAKE_OPENER_INTERRUPTED) {
+      // Same contract as the tunnel startup race: an interrupt ends the opener
+      // wait, and the owned tunnel is stopped here too — the poll loop never
+      // starts, so its tunnel-release path would otherwise be skipped.
+      await tunnel.stop();
+      return 0;
+    }
+    wake = opened;
     const holderId = 'driver-' + runtime.conductor.newUlid();
     const seenAttention = new Set<string>();
     return await pollConductorPasses({
@@ -998,6 +1071,7 @@ async function runCommand(
       sleep: options.sleep ?? defaultSleep,
       stopSignal: signal,
       once: flags.once,
+      wake,
       releaseTunnel: () => tunnel.release(),
       eachPass: async (pass, result, nowIso) => {
         io.stdout(`${JSON.stringify({ pass, ...result })}\n`);
@@ -1042,6 +1116,8 @@ async function runCommand(
     }
     // OT5: stop the background exporter within the 2 s stop race (plan §3.5).
     await stopTelemetryExporter(runtime);
+    // K9: close the change-feed reader after the poll loop; idempotent.
+    wake?.close();
   }
 }
 
@@ -1075,6 +1151,47 @@ async function recordPassTrace(
 }
 
 /**
+ * The between-passes sleep of the poll loop. K9: a change signal ends the sleep
+ * early, so the next pass runs at once; a stream that closes without a signal
+ * keeps the back-off for the rest of this sleep.
+ */
+async function sleepBetweenPasses(options: {
+  readonly delayMs: number;
+  readonly signal: AbortSignal;
+  readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+  readonly wake: ChangeWakeReader | undefined;
+}): Promise<void> {
+  const { signal, wake } = options;
+  let sleepSettled = false;
+  const iteration = new AbortController();
+  const onStop = (): void => iteration.abort();
+  signal.addEventListener('abort', onStop, { once: true });
+  if (signal.aborted) {
+    iteration.abort();
+  }
+  try {
+    const slept = options.sleep(options.delayMs, iteration.signal).then(() => {
+      sleepSettled = true;
+    });
+    if (wake === undefined) {
+      await slept;
+      return;
+    }
+    const arrived = await Promise.race([
+      slept.then(() => false),
+      wake.waitForSignal(iteration.signal),
+    ]);
+    if (!arrived && !sleepSettled) {
+      // The stream closed without a signal: keep the back-off.
+      await slept;
+    }
+  } finally {
+    signal.removeEventListener('abort', onStop);
+    iteration.abort(); // ends a pending sleep timer and a pending waiter
+  }
+}
+
+/**
  * The shared poll loop of `conductor run`: one pass at a time under the
  * driver lease, printing one line per pass through `eachPass`, polling with
  * back-off from 30 seconds to 2 minutes, with a 10-second floor while a run
@@ -1088,6 +1205,11 @@ async function pollConductorPasses(options: {
   readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   readonly stopSignal?: AbortSignal;
   readonly once: boolean;
+  /**
+   * K9: the change-feed wake reader; when present its signal ends the
+   * between-passes sleep early.
+   */
+  readonly wake?: ChangeWakeReader;
   /**
    * KF-35: releases the driver's runner tunnel after `releaseLeases`, leaving
    * the forward running: detached lanes still talk to the server through it.
@@ -1128,7 +1250,13 @@ async function pollConductorPasses(options: {
       if (result.outcome !== 'refused') {
         previousDelay = nextPollDelayMs(previousDelay, result.progressed);
       }
-      await options.sleep(pollSleepMs(previousDelay ?? MIN_POLL_MS, result), signal);
+      const delayMs = pollSleepMs(previousDelay ?? MIN_POLL_MS, result);
+      await sleepBetweenPasses({
+        delayMs,
+        signal,
+        sleep: options.sleep,
+        wake: options.wake,
+      });
       if (signal.aborted) {
         break;
       }

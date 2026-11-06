@@ -424,6 +424,7 @@ async function makeHarness(
               return forgeReadAnswer;
             },
             isConfigured: () => true,
+            listOpenPullRequestsByBase: async () => ({ outcome: "unavailable" as const, reason: "not-used" }),
           },
         }),
   };

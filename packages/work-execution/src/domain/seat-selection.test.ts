@@ -270,4 +270,14 @@ describe('unhealthySeatIdsFromCatalog refusals', () => {
     expect(seatPlanFromCatalog(proxy)).toHaveProperty('reason');
     expect(unhealthySeatIdsFromCatalog(proxy)).toEqual([]);
   });
+
+  it('refuses an inherited object key as a trigger', () => {
+    const catalog = {
+      seats: [{ id: 'impl-a', tool: 'opencode', model: 'acme/m' }],
+      chains: { implementer: [{ seatId: 'impl-a', triggers: ['toString'] }] },
+    };
+    const built = seatPlanFromCatalog(catalog);
+    expect(built).toHaveProperty('reason');
+    expect(unhealthySeatIdsFromCatalog(catalog)).toEqual([]);
+  });
 });

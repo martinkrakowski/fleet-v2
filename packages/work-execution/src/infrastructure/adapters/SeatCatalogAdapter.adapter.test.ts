@@ -159,4 +159,12 @@ describe('SeatCatalogAdapter', () => {
     expect(roles).toEqual(['lane-runner']);
     expect(read.catalog.chains?.implementer?.[0]).toEqual({ seatId: 'impl-a' });
   });
+
+  it('reports unknown for an inherited object key used as a trigger', () => {
+    const read = new SeatCatalogAdapter({
+      seats: CATALOG.seats,
+      chains: { implementer: [{ seatId: 'impl-a', triggers: ['constructor'] }] },
+    }).readSeatCatalog();
+    expect(read.outcome).toBe('unknown');
+  });
 });

@@ -764,7 +764,8 @@ export function isDeclaredSeatHealth(value: unknown): value is string {
 
 /** True when the value is a declared catalogue trigger, i.e. it maps to a stop-reason class. */
 export function isDeclaredCatalogTrigger(value: unknown): value is string {
-  return typeof value === 'string' && CATALOG_TRIGGER_TO_STOP_REASON[value] !== undefined;
+  // An own key only: an inherited name such as `toString` is not a declared trigger.
+  return typeof value === 'string' && Object.hasOwn(CATALOG_TRIGGER_TO_STOP_REASON, value);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -831,6 +832,24 @@ function catalogSeatsOf(
   return { ok: true, seats };
 }
 
+/** A step's triggers as a copied string list, undefined when absent, or the name of the rule it breaks. */
+function catalogTriggersOf(raw: unknown): string[] | undefined | 'not-a-list' | 'not-a-string' {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(raw)) {
+    return 'not-a-list';
+  }
+  const triggers: string[] = [];
+  for (const trigger of raw) {
+    if (typeof trigger !== 'string') {
+      return 'not-a-string';
+    }
+    triggers.push(trigger);
+  }
+  return triggers;
+}
+
 /** One chain's steps as typed records, or the rule-and-position refusal. */
 function catalogStepsOf(
   role: CatalogChainRole,
@@ -857,22 +876,14 @@ function catalogStepsOf(
     if (typeof seatId !== 'string' || seatId.trim() === '') {
       return { ok: false, reason: 'The seat catalogue ' + role + ' chain step ' + index + ' carries no seatId' };
     }
-    const rawTriggers = rawStep['triggers'];
-    if (rawTriggers === undefined) {
-      steps.push({ seatId });
-      continue;
-    }
-    if (!Array.isArray(rawTriggers)) {
+    const triggers = catalogTriggersOf(rawStep['triggers']);
+    if (triggers === 'not-a-list') {
       return { ok: false, reason: 'The seat catalogue ' + role + ' chain step ' + index + ' carries triggers that are not a list' };
     }
-    const triggers: string[] = [];
-    for (const trigger of rawTriggers) {
-      if (typeof trigger !== 'string') {
-        return { ok: false, reason: 'The seat catalogue ' + role + ' chain step ' + index + ' carries a trigger that is not a string' };
-      }
-      triggers.push(trigger);
+    if (triggers === 'not-a-string') {
+      return { ok: false, reason: 'The seat catalogue ' + role + ' chain step ' + index + ' carries a trigger that is not a string' };
     }
-    steps.push({ seatId, triggers });
+    steps.push(triggers === undefined ? { seatId } : { seatId, triggers });
   }
   return { ok: true, steps };
 }

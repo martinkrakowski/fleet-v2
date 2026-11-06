@@ -50,7 +50,7 @@ import type {
 import { SshExecutor } from './SshExecutor.adapter.js';
 import { GateSlotBudget, readGateSlotCapacity } from './GateSlotBudget.helper.js';
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS, readPlainRecord } from '@fleet/shared';
 import type { PlainRecordSchema } from '@fleet/shared';
 import { GATE_RECEIPT_TOOLCHAIN_NAMES, buildGateReceiptKey } from '../../domain/gate-receipt-key.js';
@@ -247,7 +247,11 @@ function isUsableRequest(request: EvaluateGatePredicatesRequest): boolean {
   if (request === null || typeof request !== 'object' || typeof request.worktreePath !== 'string') {
     return false;
   }
-  if (request.worktreePath.length === 0 || !Array.isArray(request.allowedPathPrefixes)) {
+  if (
+    request.worktreePath.length === 0 ||
+    !isAbsolute(request.worktreePath) ||
+    !Array.isArray(request.allowedPathPrefixes)
+  ) {
     return false;
   }
   const spec = request.spec as { commands?: unknown } | null | undefined;
@@ -885,16 +889,17 @@ const DECLARED_ENVIRONMENT_NAME = /^[A-Za-z_]\w{0,127}$/;
 /**
  * Runs `argv` inside the worktree as a plain argv command: no shell, no `sh -c`.
  * The executor may ignore `cwd` (an ssh transport runs in the login directory),
- * so the probe is prefixed with `env -C <worktree>`, which changes directory and
- * execs the rest as separate words. Every word reaches the program literally.
+ * so the probe is prefixed with `env -C <worktree> --`, which changes directory and
+ * execs the rest as separate words; `--` ends env's options, so no word is read as
+ * one. Every word reaches the program literally.
  * A host whose `env` has no `-C` fails the probe, which is a receipt miss.
  */
 function inWorktree(worktreePath: string, argv: readonly string[]): string[] {
-  return ['/usr/bin/env', '-C', worktreePath, ...argv];
+  return ['/usr/bin/env', '-C', worktreePath, '--', ...argv];
 }
 
 /** One guarded receipt-input command, run inside the worktree, with a timeout and an output cap. A throw or a run with no completed exit is undefined. */
-async function runReceiptProbe(
+export async function runReceiptProbe(
   executor: CommandExecutorPort,
   worktreePath: string,
   argv: readonly string[],

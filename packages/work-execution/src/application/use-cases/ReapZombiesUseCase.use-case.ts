@@ -15,9 +15,9 @@
  * declared kinds need facts this lane has no port for (runs, worktrees, disk,
  * forge); they are never fabricated.
  *
- * Results are record-only and keyed: attempt reconciliation, the fenced
- * capacity release (`releaseCapacityReservationIfUnchanged`), and clearing
- * stale attention items. A finding the pass no longer sees is closed on
+ * Results are record-only and keyed: attempt reconciliation and clearing
+ * stale attention items. A leaked slot is report-only; the reaper never
+ * releases capacity. A finding the pass no longer sees is closed on
  * positive evidence the condition ended, and its attention item is cleared; a
  * repair intent without a result is reconciled read-only, never repeated. The
  * use case never throws; every failure is a typed refusal or an unknown entry,
@@ -31,7 +31,6 @@ import type { ActionJournalEntryRecord, AttemptRecord, CapacityReservationRecord
 import type { AttemptRepositoryPort } from '../ports/out/AttemptRepositoryPort.out-port.js';
 import type {
   ExecutionJournalPort,
-  ReleaseCapacityReservationIfUnchangedResult,
 } from '../ports/out/ExecutionJournalPort.out-port.js';
 import type {
   LaneRunJournalEntryRecord,
@@ -97,14 +96,8 @@ export interface ReaperAttentionPort {
 /** The reads, writes and id source the pass needs; narrowed so composition supplies only what it has. */
 export interface ReapZombiesDependencies {
   readonly attemptRepo: Pick<AttemptRepositoryPort, 'listAllAttempts' | 'findAttemptById'>;
-  /**
-   * Read-only facts plus the fenced capacity release. The release is optional
-   * on the port; when absent a `leaked-slot` repair is skipped.
-   */
-  readonly executionJournal: Pick<
-    ExecutionJournalPort,
-    'listActiveReservations' | 'listJournalEntriesForAttempt' | 'releaseCapacityReservationIfUnchanged'
-  >;
+  /** Read-only facts only; the reaper never releases capacity. */
+  readonly executionJournal: Pick<ExecutionJournalPort, 'listActiveReservations' | 'listJournalEntriesForAttempt'>;
   readonly runJournal: Pick<LaneRunJournalPort, 'append' | 'listForKey'>;
   readonly reconcile: Pick<ReconcileAttemptPort, 'reconcileAttempt'>;
   readonly runner: ExecutionRunnerPort;
@@ -232,7 +225,6 @@ function repairFlagSchema(): PlainRecordSchema {
 
 /** The policy fields the pass and the classifier read; anything else is dropped, a getter is refused. */
 const POLICY_SCHEMA: PlainRecordSchema = {
-  graceMinutes: { kind: 'integer', optional: true },
   staleStopMinutes: { kind: 'integer', optional: true },
   minFreePercent: { kind: 'integer', optional: true },
   repairs: { kind: 'record', schema: repairFlagSchema(), optional: true },
@@ -255,6 +247,33 @@ interface ParsedRequest {
   readonly policy: ReaperPolicy;
 }
 
+/**
+ * `graceMinutes` is any finite number >= 0 (fractions allowed), read from the
+ * own data property only: a getter, NaN, Infinity, a negative or a non-number
+ * is a refusal (null); absent is the default. Never throws.
+ */
+function readGraceMinutes(policy: unknown): number | null {
+  if (policy === undefined) {
+    return DEFAULT_GRACE_MINUTES;
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(policy as object, 'graceMinutes');
+    if (descriptor === undefined) {
+      return DEFAULT_GRACE_MINUTES;
+    }
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      return null;
+    }
+    const grace: unknown = descriptor.value;
+    if (grace === undefined) {
+      return DEFAULT_GRACE_MINUTES;
+    }
+    return typeof grace === 'number' && Number.isFinite(grace) && grace >= 0 ? grace : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Validate the request; null is the `request-invalid` refusal. Never throws. */
 function parseRequest(request: unknown): ParsedRequest | null {
   if (!isPlainObject(request)) {
@@ -269,8 +288,10 @@ function parseRequest(request: unknown): ParsedRequest | null {
   if (nowIso === null || policy === null) {
     return null;
   }
-  const grace = policy.graceMinutes;
-  const graceMinutes = typeof grace === 'number' && Number.isFinite(grace) && grace >= 0 ? grace : DEFAULT_GRACE_MINUTES;
+  const graceMinutes = readGraceMinutes(readField(request, 'policy'));
+  if (graceMinutes === null) {
+    return null;
+  }
   return { projectId, nowIso, nowMs: Date.parse(nowIso), graceMs: graceMinutes * MINUTE_MS, policy };
 }
 
@@ -703,8 +724,8 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     switch (finding.kind) {
       case 'dead-attempt':
         return await this.repairDeadAttempt(ctx.nowIso, finding, storedId, ctx.unknown);
-      case 'leaked-slot':
-        return await this.repairLeakedSlot(ctx.nowIso, finding, storedId, ctx.unknown, ctx.reservationById, ctx.attemptsById);
+      // A leaked slot is report-only whatever the policy says: the reaper
+      // never releases capacity, so it falls to `repair-not-available`.
       case 'stale-attention':
         return await this.repairStaleAttention(
           ctx.nowIso,
@@ -782,30 +803,8 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'already-repaired' };
     }
 
-    const intent = entries.find((entry) => entry.kind === 'intent');
-    if (intent !== undefined) {
-      // Recovery: the previous pass acted and crashed before its result.
-      let attempt: AttemptRecord | null;
-      try {
-        attempt = await this.deps.attemptRepo.findAttemptById(finding.subject);
-      } catch {
-        unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'attempts-unreadable' });
-        attempt = null;
-      }
-      if (attempt !== null && TERMINAL_ATTEMPT_STATES.has(attempt.state)) {
-        const journaled = await this.journalResult(key, nowIso, 'reconciled', null, unknown, finding.subject, finding.kind);
-        if (!journaled) {
-          return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
-        }
-        return { key, kind: finding.kind, subject: finding.subject, outcome: 'reconciled' };
-      }
-      return {
-        key,
-        kind: finding.kind,
-        subject: finding.subject,
-        outcome: 'skipped',
-        reasonCode: 'intent-without-result',
-      };
+    if (entries.some((entry) => entry.kind === 'intent')) {
+      return await this.recoverDeadAttempt(key, nowIso, finding, unknown);
     }
 
     const appended = await this.appendIntent(key, nowIso, findingId, unknown, finding.subject, finding.kind);
@@ -822,6 +821,47 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       };
     }
 
+    return await this.actDeadAttempt(key, nowIso, finding, unknown);
+  }
+
+  /** A dead-attempt repair intent without a result: reconcile read-only, never act twice. */
+  private async recoverDeadAttempt(
+    key: string,
+    nowIso: string,
+    finding: ReaperFinding,
+    unknown: ReaperUnknownView[],
+  ): Promise<ReaperRepairView> {
+    // Recovery: the previous pass acted and crashed before its result.
+    let attempt: AttemptRecord | null;
+    try {
+      attempt = await this.deps.attemptRepo.findAttemptById(finding.subject);
+    } catch {
+      unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'attempts-unreadable' });
+      attempt = null;
+    }
+    if (attempt !== null && TERMINAL_ATTEMPT_STATES.has(attempt.state)) {
+      const journaled = await this.journalResult(key, nowIso, 'reconciled', null, unknown, finding.subject, finding.kind);
+      if (!journaled) {
+        return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
+      }
+      return { key, kind: finding.kind, subject: finding.subject, outcome: 'reconciled' };
+    }
+    return {
+      key,
+      kind: finding.kind,
+      subject: finding.subject,
+      outcome: 'skipped',
+      reasonCode: 'intent-without-result',
+    };
+  }
+
+  /** The act step of a dead-attempt repair: the record-only reconcile and its journaled result. */
+  private async actDeadAttempt(
+    key: string,
+    nowIso: string,
+    finding: ReaperFinding,
+    unknown: ReaperUnknownView[],
+  ): Promise<ReaperRepairView> {
     // Act: record-only reconcile of the dead attempt.
     let outcome: ReconcileAttemptResult;
     try {
@@ -858,143 +898,6 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
     }
     return { key, kind: finding.kind, subject: finding.subject, outcome: 'ambiguous' };
-  }
-
-  /**
-   * The keyed record-only repair of one leaked slot: the fenced capacity
-   * release (`releaseCapacityReservationIfUnchanged`). The release observes
-   * the reservation and the attempt's revision; a changed postcondition ends
-   * the repair without a write. An absent release implementation means the
-   * repair is not available and the finding stays a report.
-   */
-  private async repairLeakedSlot(
-    nowIso: string,
-    finding: ReaperFinding,
-    findingId: string,
-    unknown: ReaperUnknownView[],
-    reservationById: ReadonlyMap<string, CapacityReservationRecord>,
-    attemptsById: ReadonlyMap<string, AttemptRecord>,
-  ): Promise<ReaperRepairView> {
-    const release = this.deps.executionJournal.releaseCapacityReservationIfUnchanged;
-    if (release === undefined) {
-      return {
-        key: keyOf(finding.subject, finding.kind, findingId),
-        kind: finding.kind,
-        subject: finding.subject,
-        outcome: 'skipped',
-        reasonCode: 'repair-not-available',
-      };
-    }
-
-    const keyResult = reaperRepairKey(finding.subject, finding.kind, findingId);
-    if (!keyResult.ok) {
-      return { key: '', kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'key-refused' };
-    }
-    const key = keyResult.key;
-
-    const entries = await this.safeListForKey(key, unknown, finding.subject, finding.kind);
-    if (entries === null) {
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'journal-unreadable' };
-    }
-
-    const finalResult = entries.find((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous');
-    if (finalResult !== undefined) {
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'already-repaired' };
-    }
-
-    const intent = entries.find((entry) => entry.kind === 'intent');
-    if (intent !== undefined) {
-      const stillHeld = reservationById.get(finding.subject)?.held === true;
-      if (!stillHeld) {
-        const journaled = await this.journalResult(key, nowIso, 'reconciled', null, unknown, finding.subject, finding.kind);
-        if (!journaled) {
-          return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
-        }
-        return { key, kind: finding.kind, subject: finding.subject, outcome: 'reconciled' };
-      }
-      return {
-        key,
-        kind: finding.kind,
-        subject: finding.subject,
-        outcome: 'skipped',
-        reasonCode: 'intent-without-result',
-      };
-    }
-
-    const appended = await this.appendIntent(key, nowIso, findingId, unknown, finding.subject, finding.kind);
-    if (appended === 'duplicate-key') {
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'already-intended' };
-    }
-    if (appended !== 'appended') {
-      return {
-        key,
-        kind: finding.kind,
-        subject: finding.subject,
-        outcome: 'skipped',
-        reasonCode: appended === 'refused' ? 'journal-refused' : 'journal-unwritable',
-      };
-    }
-
-    const reservation = reservationById.get(finding.subject);
-    if (reservation === undefined || reservation.held !== true) {
-      // The reservation is already gone: the postcondition holds. Journal the
-      // observed result as `reconciled` and perform no second action.
-      const journaled = await this.journalResult(key, nowIso, 'reconciled', null, unknown, finding.subject, finding.kind);
-      if (!journaled) {
-        return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
-      }
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'reconciled' };
-    }
-
-    const attempt = attemptsById.get(reservation.attemptId);
-    const attemptRevision = attempt === undefined ? 0 : (attempt.revision ?? 0);
-    let result: ReleaseCapacityReservationIfUnchangedResult;
-    try {
-      result = await release({
-        attemptId: reservation.attemptId,
-        reservationId: reservation.id,
-        attemptRevision,
-        releasedAtIso: nowIso,
-        readAttemptRevision: async () => {
-          const fresh = await this.deps.attemptRepo.findAttemptById(reservation.attemptId);
-          return fresh === null ? null : (fresh.revision ?? 0);
-        },
-      });
-    } catch {
-      unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'release-unknown' });
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'release-unknown' };
-    }
-
-    if (result.outcome === 'released') {
-      const journaled = await this.journalResult(key, nowIso, 'completed', null, unknown, finding.subject, finding.kind);
-      if (!journaled) {
-        return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
-      }
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'completed' };
-    }
-    if (result.outcome === 'changed') {
-      const journaled = await this.journalResult(key, nowIso, 'ambiguous', null, unknown, finding.subject, finding.kind);
-      if (!journaled) {
-        return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
-      }
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'ambiguous' };
-    }
-    if (result.outcome === 'not-held') {
-      const journaled = await this.journalResult(key, nowIso, 'reconciled', null, unknown, finding.subject, finding.kind);
-      if (!journaled) {
-        return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
-      }
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'reconciled' };
-    }
-    if (result.outcome === 'unknown') {
-      unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'release-unknown' });
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'release-unknown' };
-    }
-    const journaled = await this.journalResult(key, nowIso, 'refused', 'invalid-request', unknown, finding.subject, finding.kind);
-    if (!journaled) {
-      return { key, kind: finding.kind, subject: finding.subject, outcome: 'skipped', reasonCode: 'result-unwritten' };
-    }
-    return { key, kind: finding.kind, subject: finding.subject, outcome: 'refused', reasonCode: 'invalid-request' };
   }
 
   /**
@@ -1319,7 +1222,12 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
   private async closeAndClear(record: ReaperFindingStoreRecord, ctx: SettleContext): Promise<void> {
     try {
       const closed = await this.deps.reaperFindings.closeFinding(record.findingId, record.revision);
-      if (closed.outcome !== 'stored' && closed.outcome !== 'conflict') {
+      if (closed.outcome === 'conflict') {
+        // A concurrent pass updated the finding: leave it and its attention item as they are.
+        ctx.unknown.push({ subject: record.finding.subject, kind: record.finding.kind, reason: 'finding-close-conflict' });
+        return;
+      }
+      if (closed.outcome !== 'stored') {
         return;
       }
     } catch {

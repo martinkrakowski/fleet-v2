@@ -879,6 +879,36 @@ function parseReflogTimestamp(stdout: string): number | null {
   return Number.isNaN(ms) ? null : ms;
 }
 
+/**
+ * One `stat` answer as milliseconds. The first token is the whole-second epoch
+ * (`%Y` / `%m`); the sub-second part comes from the same line when the host
+ * prints it (GNU `%y`: `2026-01-01 00:00:00.123456789 +0000`, BSD `%Fm`:
+ * `1767225600.123456`). A host that prints only whole seconds yields whole
+ * seconds. Whole-second readings alone cannot tell a write made in the same
+ * second as the caller's inspection from the inspected state, so the removal
+ * re-check compares at millisecond precision.
+ */
+function parseStatMtimeMs(line: string): number | null {
+  const tokens = line.trim().split(/\s+/);
+  const first = tokens[0];
+  if (first === undefined || !/^\d+$/.test(first)) {
+    return null;
+  }
+  const seconds = Number.parseInt(first, 10);
+  if (!Number.isSafeInteger(seconds)) {
+    return null;
+  }
+  let millis = 0;
+  for (const token of tokens.slice(1)) {
+    const fraction = /^(?:\d{2}:\d{2}:\d{2}|\d+)\.(\d+)$/.exec(token);
+    if (fraction !== null) {
+      millis = Number.parseInt(fraction[1]!.padEnd(3, '0').slice(0, 3), 10);
+      break;
+    }
+  }
+  return seconds * 1000 + millis;
+}
+
 async function readReflogActivityMs(
   executor: CommandExecutorPort,
   worktreePath: string,
@@ -929,7 +959,7 @@ async function readIndexActivityMs(
     indexPath = path.join(worktreePath, indexPath);
   }
   const indexStatRun = await executor.run(
-    flavour === 'gnu' ? ['stat', '-c', '%Y', indexPath] : ['stat', '-f', '%m', indexPath],
+    flavour === 'gnu' ? ['stat', '-c', '%Y %y', indexPath] : ['stat', '-f', '%m %Fm', indexPath],
     { timeoutMs: GIT_TIMEOUT_MS },
   );
   if (
@@ -939,11 +969,7 @@ async function readIndexActivityMs(
   ) {
     return null;
   }
-  const seconds = Number.parseInt(indexStatRun.stdout.trim(), 10);
-  if (!Number.isSafeInteger(seconds)) {
-    return null;
-  }
-  return seconds * 1000;
+  return parseStatMtimeMs(indexStatRun.stdout.trim());
 }
 
 async function walkTreeActivity(
@@ -953,16 +979,16 @@ async function walkTreeActivity(
 ): Promise<{ newestMs: number | null; unknown: boolean }> {
   const walkArgv =
     flavour === 'gnu'
-      ? ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y', '{}', '+']
-      : ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-f', '%m', '{}', '+'];
+      ? ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y %y', '{}', '+']
+      : ['find', worktreePath, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-f', '%m %Fm', '{}', '+'];
   const walkRun = await executor.run(walkArgv, { timeoutMs: GIT_TIMEOUT_MS });
   let newestMs: number | null = null;
   for (const line of walkRun.stdout.split('\n')) {
     const trimmed = line.trim();
     if (trimmed === '') continue;
-    const seconds = Number.parseInt(trimmed, 10);
-    if (Number.isSafeInteger(seconds) && (newestMs === null || seconds * 1000 > newestMs)) {
-      newestMs = seconds * 1000;
+    const lineMs = parseStatMtimeMs(trimmed);
+    if (lineMs !== null && (newestMs === null || lineMs > newestMs)) {
+      newestMs = lineMs;
     }
   }
   const unknown = walkRun.exitCode === null || walkRun.error !== undefined || walkRun.exitCode !== 0;

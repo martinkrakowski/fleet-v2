@@ -140,6 +140,8 @@ const PWD_MARKER = 'pwd -P';
 const REFLOG_MARKER = 'reflog show';
 const FIND_MARKER = 'find';
 const STAT_MARKER = 'stat -c %Y';
+/** 2026-11-06T00:00:00Z, the epoch second of `ACTIVITY_ISO`. */
+const ACTIVITY_EPOCH = 1793923200;
 const INDEX_MARKER = 'rev-parse --git-path index';
 
 /**
@@ -198,8 +200,8 @@ describe('removeWorktree over a fake executor', () => {
       ['git', '-C', WORKTREE, 'reflog', 'show', '-1', '--date=iso-strict', '--format=%gD', 'HEAD'],
       ['stat', '-c', '%Y', WORKTREE],
       ['git', '-C', WORKTREE, 'rev-parse', '--git-path', 'index'],
-      ['stat', '-c', '%Y', `${WORKTREE}/.git/index`],
-      ['find', WORKTREE, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y', '{}', '+'],
+      ['stat', '-c', '%Y %y', `${WORKTREE}/.git/index`],
+      ['find', WORKTREE, '-name', '.git', '-prune', '-o', '-type', 'f', '-exec', 'stat', '-c', '%Y %y', '{}', '+'],
       ['git', '-C', CLONE, 'worktree', 'remove', WORKTREE],
       ['test', '-e', WORKTREE],
       ['git', '-C', CLONE, 'worktree', 'list', '--porcelain'],
@@ -458,6 +460,26 @@ describe('removeWorktree over a fake executor', () => {
     expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
   });
 
+  it('refuses busy for a write later in the same whole second as the caller-read baseline', async () => {
+    const canned = (fraction: string): Record<string, CannedSpec> => ({
+      [LIST_MARKER]: ({ callIndex }) =>
+        callIndex === 0 ? { stdout: worktreeList() } : { stdout: listWithoutWorktree() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      [REMOVE_MARKER]: { exitCode: 0 },
+      ...quietActivityCanned(),
+      [FIND_MARKER]: { stdout: `${ACTIVITY_EPOCH} 2026-11-06 00:00:00.${fraction} +0000\n` },
+    });
+    const baseline = makeRequest({ expectedLastActivityIso: '2026-11-06T00:00:00.200Z' });
+    const later = await removeWith(canned('600000000'), baseline);
+    expect(later.result).toEqual({ outcome: 'refused', reason: 'busy' });
+    expect(later.calls.some((call) => call.argv.includes('remove'))).toBe(false);
+    const same = await removeWith(canned('200000000'), baseline);
+    expect(same.result).toEqual({ outcome: 'removed', branchTip: HEAD });
+  });
+
   it('refuses busy when the newest activity moved past the caller-read baseline', async () => {
     const { result, calls } = await removeWith({
       [LIST_MARKER]: { stdout: worktreeList() },
@@ -684,6 +706,25 @@ describe('removeWorktree against real git', () => {
         expectedLastActivityIso: baseline,
       }),
     );
+    expect(result).toEqual({ outcome: 'refused', reason: 'busy' });
+    const listed = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: s.clonePath });
+    expect(listed.stdout).toContain(s.physicalWorktreePath);
+  });
+
+  it('refuses busy for an ignored-file write in the same whole second as the baseline and keeps the worktree listed', async () => {
+    const s = await setup();
+    await fs.appendFile(path.join(s.clonePath, '.git', 'info', 'exclude'), '\nignored-activity.txt\n', 'utf8');
+    const ignored = path.join(s.worktreePath, 'ignored-activity.txt');
+    await fs.writeFile(ignored, 'x\n', 'utf8');
+    // The ignored file is the newest activity at a controlled sub-second time.
+    const first = new Date('2030-01-01T00:00:00.125Z');
+    await fs.utimes(ignored, first, first);
+    const baseline = await lastActivityIso(s);
+    expect(baseline).toBe('2030-01-01T00:00:00.125Z');
+    // A later write inside the same whole second: whole-second mtimes cannot tell it apart.
+    const second = new Date('2030-01-01T00:00:00.750Z');
+    await fs.utimes(ignored, second, second);
+    const result = await removeWorktree(s, { expectedLastActivityIso: baseline });
     expect(result).toEqual({ outcome: 'refused', reason: 'busy' });
     const listed = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: s.clonePath });
     expect(listed.stdout).toContain(s.physicalWorktreePath);

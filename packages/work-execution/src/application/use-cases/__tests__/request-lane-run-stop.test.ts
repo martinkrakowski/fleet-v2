@@ -202,6 +202,25 @@ describe('RequestLaneRunStopUseCase', () => {
     }
   });
 
+  it('accepts a stop for a parked run (parked is not terminal), as `conductor stop` does', async () => {
+    const entries: LaneRunJournalEntryRecord[] = [
+      laneRunConductEntry(ulid(9), RUN_A, 'parked', NOW),
+    ];
+    const result = await useCase([runRecord()], entries).requestLaneRunStop(
+      validRequest({ mode: 'force', expectedRevision: 3 }) as never,
+    );
+    expect(result).toMatchObject({ outcome: 'stop-recorded', runId: RUN_A, mode: 'force' });
+    expect(entries).toHaveLength(2);
+  });
+
+  it('refuses only merged and stopped as run-terminal, never any other state', async () => {
+    for (const state of ['ready', 'running', 'fixing', 'awaiting-premerge', 'parked'] as const) {
+      const entries: LaneRunJournalEntryRecord[] = [laneRunConductEntry(ulid(9), RUN_A, state, NOW)];
+      const result = await useCase([runRecord()], entries).requestLaneRunStop(validRequest() as never);
+      expect(result.outcome, state).toBe('stop-recorded');
+    }
+  });
+
   it('refuses null, non-object, sparse array, missing or wrong-typed fields, unknown enum values, and throwing getters without throwing', async () => {
     const stop = useCase([runRecord()]);
     const refusing = [

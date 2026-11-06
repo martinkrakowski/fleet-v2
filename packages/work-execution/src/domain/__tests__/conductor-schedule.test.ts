@@ -13,7 +13,7 @@ import {
   deriveReservationSeries,
   deriveSessionStartMarks,
 } from '../conductor-schedule.js';
-import type { ConductorScheduleFacts } from '../conductor-schedule.js';
+import type { ConductorScheduleFacts, ConductorScheduleRow } from '../conductor-schedule.js';
 import { readConductorPassTrace } from '../conductor-pass-trace.js';
 
 const RUN_A = 'run-01JB0000000000000000000000';
@@ -232,6 +232,20 @@ describe('deriveConductorSchedule', () => {
       NOW,
     );
     expect(schedule.rows.find((row) => row.runId === RUN_B)?.admissionWait).toBe('package-overlap');
+  });
+
+  it('declares revision, stopMode and stopRequestedAtIso as required row fields', () => {
+    const row = deriveConductorSchedule(facts({ runs: [runRecord({ runId: RUN_A, attemptIds: ['a1'] })] }), NOW).rows[0]!;
+    // Required at the type level (fails typecheck on an optional field) and present at runtime.
+    const typed: { revision: number; stopMode: unknown; stopRequestedAtIso: unknown } = row;
+    expect(Object.keys(typed)).toEqual(expect.arrayContaining(['revision', 'stopMode', 'stopRequestedAtIso']));
+    expect(typeof row.revision).toBe('number');
+    const incomplete: ConductorScheduleRow = {
+      ...row,
+      // @ts-expect-error revision is required on a schedule row
+      revision: undefined,
+    };
+    expect(incomplete.runId).toBe(row.runId);
   });
 
   it('projects revision, stop facts and stop parks on each row', () => {

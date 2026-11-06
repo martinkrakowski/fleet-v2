@@ -105,7 +105,8 @@ describe("requiredScope", () => {
   });
 
   it("maps the operate family", () => {
-    expect(requiredScope("POST", "/v1/attempts/:id/stop")).toBe("operate");    expect(requiredScope("POST", "/v1/attempts/:id/reconcile")).toBe("operate");
+    expect(requiredScope("POST", "/v1/attempts/:id/stop")).toBe("operate");
+    expect(requiredScope("POST", "/v1/attempts/:id/reconcile")).toBe("operate");
     expect(requiredScope("POST", "/v1/attempts/:id/fix")).toBe("operate");
     expect(requiredScope("POST", "/v1/attempts/:id/acceptance")).toBe("operate");
     expect(requiredScope("POST", "/v1/attempts/:id/cancel-prepared")).toBe("operate");

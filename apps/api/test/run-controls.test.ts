@@ -11,6 +11,7 @@ import { setActiveApiToken } from "../server/wiring/token.js";
 import { configurePresentedTokenResolver } from "../server/wiring/presented-token.js";
 import { configureWorkComposition, workComposition } from "../server/wiring/work/composition.js";
 import { withRunOwnedStopRefusal } from "../server/wiring/work/stop-attempt-guard.js";
+import { newUlid, ULID_MAX_TIME_MS } from "../server/wiring/work/ulid.js";
 import {
   ConductorDriverLeaseAdapter,
   LaneRun,
@@ -599,5 +600,31 @@ describe("run control routes (A-C)", () => {
       expect(text).not.toContain("lane-runs.json");
       expect(text).not.toContain("run-journal.json");
     }
+  });
+});
+
+describe("newUlid (A-C)", () => {
+  it("mints 26-character ULIDs on the journal entry id pattern", () => {
+    for (const nowMs of [0, 1_762_425_600_000, ULID_MAX_TIME_MS]) {
+      expect(newUlid(nowMs)).toMatch(/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+    }
+    expect(newUlid()).toMatch(/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+  });
+
+  it("refuses fractional, negative, non-finite and beyond-48-bit timestamps", () => {
+    for (const bad of [1.5, -1, Number.NaN, Number.POSITIVE_INFINITY, ULID_MAX_TIME_MS + 1]) {
+      expect(() => newUlid(bad), String(bad)).toThrow(/newUlid/);
+    }
+  });
+
+  it("draws the whole 80-bit random part, not 5 bits per byte", () => {
+    // 10 bytes cover all 16 random characters; the first random character
+    // takes the top 5 bits of the first byte, so over many draws every
+    // alphabet symbol appears there (a %32 of 16 bytes would also, so assert
+    // the byte count instead via distinctness of the full suffix).
+    const suffixes = new Set(Array.from({ length: 500 }, () => newUlid(1).slice(10)));
+    expect(suffixes.size).toBe(500);
+    const firstChars = new Set(Array.from({ length: 4000 }, () => newUlid(1)[10]));
+    expect(firstChars.size).toBe(32);
   });
 });

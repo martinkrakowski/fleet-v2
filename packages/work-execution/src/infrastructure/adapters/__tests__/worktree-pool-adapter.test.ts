@@ -524,6 +524,18 @@ describe('WorktreePoolAdapter refillAfterMerge', () => {
     expect(host.worktrees.get(`${POOL}/w1`)!.head).toBe(BASE);
   });
 
+  it('refill does not report a clean slot warm when a run claimed it meanwhile', async () => {
+    const host = new FakeHost();
+    host.add(1, NEXT);
+    let statuses = 0;
+    host.override = (t) => {
+      if (t[0] === 'status' && (statuses += 1) === 1) host.claims.set(`${CLAIMS}/w1`, 'run-late');
+      return undefined;
+    };
+    const result = await make(host, { maxEntries: 1 }).refillAfterMerge({ projectId: 'proj', mergedBaseCommit: NEXT, recordedHost: HOST });
+    expect(result.outcome === 'refilled' ? result.entries : []).toEqual([]);
+  });
+
   it('leaves a fresh prepare claim alone even while its worktree is not yet listed', async () => {
     const host = new FakeHost();
     host.claims.set(`${CLAIMS}/w1`, 'prepare-fresh');

@@ -407,27 +407,8 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     const indexes = [...slots.keys()].sort((a, b) => a - b);
 
     if (runId !== null) {
-      for (const index of indexes) {
-        const slot = slots.get(index);
-        if (slot !== undefined && !slot.prunable && claims.get(index) === owner) {
-          // A slot being reset is not handed back. The retake holds the reset
-          // guard (exclusive) while it hands the entry out, so a reset cannot
-          // start between the check and the handout.
-          const guard = `${view.claimsDir}/w${index}.reset`;
-          const held = await this.call(view, ['ln', '-s', '--', 'retake', guard], deadline);
-          if (held.kind !== 'ok') continue;
-          // Re-prove ownership under the guard: a reset may have released the claim since the snapshot.
-          const still = await this.call(view, ['readlink', '--', this.linkPath(view, index)], deadline);
-          if (still.kind !== 'ok' || still.stdout.trim() !== owner) {
-            await this.call(view, ['rm', '-f', '--', guard], Math.max(deadline, this.now() + 5000));
-            continue;
-          }
-          const record = this.entry(projectId, index, slot.path, slot.head, 'taken', runId);
-          await this.call(view, ['rm', '-f', '--', guard], Math.max(deadline, this.now() + 5000));
-          if (record !== null && isWorktreePoolBaseCommit(slot.head)) return { outcome: 'taken', entry: record };
-          continue;
-        }
-      }
+      const again = await this.retake(view, projectId, runId, owner, slots, claims, deadline);
+      if (again !== null) return { outcome: 'taken', entry: again };
     }
 
     for (const index of indexes) {
@@ -443,6 +424,32 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
       if (clean === 'no') await this.release(view, index, deadline);
     }
     return { outcome: 'empty' };
+  }
+
+  /** The entry this run already holds, handed out again under the slot's guard; null when none. */
+  private async retake(
+    view: PoolView,
+    projectId: string,
+    runId: string,
+    owner: string,
+    slots: Map<number, ListedWorktree>,
+    claims: Map<number, string>,
+    deadline: number,
+  ): Promise<WorktreePoolEntryRecord | null> {
+    for (const index of [...slots.keys()].sort((a, b) => a - b)) {
+      const slot = slots.get(index);
+      if (slot === undefined || slot.prunable || claims.get(index) !== owner || !isWorktreePoolBaseCommit(slot.head)) continue;
+      // The retake holds the slot's guard while it re-proves ownership and
+      // hands the entry out, so a reset cannot start in between.
+      const guard = `${view.claimsDir}/w${index}.reset`;
+      const held = await this.call(view, ['ln', '-s', '--', 'retake', guard], deadline);
+      if (held.kind !== 'ok') continue;
+      const still = await this.claimOf(view, index, deadline);
+      const record = still === owner ? this.entry(projectId, index, slot.path, slot.head, 'taken', runId) : null;
+      await this.call(view, ['rm', '-f', '--', guard], Math.max(deadline, this.now() + 5000));
+      if (record !== null) return record;
+    }
+    return null;
   }
 
   // ---- reset -------------------------------------------------------------
@@ -651,6 +658,8 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
       if (slot === undefined || slot.prunable || state.claims.has(index)) continue;
       let record: WorktreePoolEntryRecord | null = null;
       if (slot.head === merged && (await this.isCleanAt(view, slot.path, merged, deadline)) === 'yes') {
+        // Reported warm only if no claim appeared while it was being proved clean.
+        if ((await this.claimOf(view, index, deadline)) !== 'absent') continue;
         record = this.entry(projectId, index, slot.path, merged, 'warm', null);
       } else {
         // At an older base, dirty or unreadable: rebuild it rather than leave it occupying the slot.

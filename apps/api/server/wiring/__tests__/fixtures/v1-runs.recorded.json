@@ -100,6 +100,113 @@
         "underStagger": null
       }
     ],
-    "truncated": false
+    "truncated": false,
+    "runs": [
+      {
+        "runId": "run-01JB0000000000000000000000",
+        "workOrderId": "wo-1",
+        "baseBranch": "main",
+        "tier": 2,
+        "state": "running",
+        "round": 0,
+        "revision": 1,
+        "seatPlanRef": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "cursors": {
+          "first-pass": 0,
+          "fix": null,
+          "review": null
+        },
+        "seatsByRole": {
+          "first-pass": null,
+          "fix": null,
+          "review": null
+        },
+        "prNumber": null,
+        "parked": null,
+        "parkDetail": null,
+        "parkCount": 0,
+        "stopMode": null,
+        "stopRequestedAtIso": null,
+        "pendingIntent": {
+          "step": "dispatch",
+          "reconciliation": "unread"
+        },
+        "latestAttemptId": "att-1",
+        "attemptCount": 1,
+        "lease": {
+          "holderId": "driver-secret-1",
+          "fence": 1,
+          "leaseUntilIso": "2099-01-01T00:00:00.000Z",
+          "lapsed": false
+        },
+        "wouldAct": [],
+        "wouldActTruncated": false
+      },
+      {
+        "runId": "run-01JB0000000000000000000001",
+        "workOrderId": "wo-2",
+        "baseBranch": "main",
+        "tier": 2,
+        "state": "ready",
+        "round": 0,
+        "revision": 1,
+        "seatPlanRef": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "cursors": {
+          "first-pass": 0,
+          "fix": null,
+          "review": null
+        },
+        "seatsByRole": {
+          "first-pass": null,
+          "fix": null,
+          "review": null
+        },
+        "prNumber": null,
+        "parked": null,
+        "parkDetail": null,
+        "parkCount": 0,
+        "stopMode": null,
+        "stopRequestedAtIso": null,
+        "pendingIntent": null,
+        "latestAttemptId": "att-2",
+        "attemptCount": 1,
+        "lease": null,
+        "wouldAct": [],
+        "wouldActTruncated": false
+      },
+      {
+        "runId": "run-01JB0000000000000000000002",
+        "workOrderId": "wo-1",
+        "baseBranch": "main",
+        "tier": 2,
+        "state": "stopped",
+        "round": 0,
+        "revision": 1,
+        "seatPlanRef": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "cursors": {
+          "first-pass": 0,
+          "fix": null,
+          "review": null
+        },
+        "seatsByRole": {
+          "first-pass": null,
+          "fix": null,
+          "review": null
+        },
+        "prNumber": null,
+        "parked": null,
+        "parkDetail": null,
+        "parkCount": 0,
+        "stopMode": null,
+        "stopRequestedAtIso": null,
+        "pendingIntent": null,
+        "latestAttemptId": null,
+        "attemptCount": 0,
+        "lease": null,
+        "wouldAct": [],
+        "wouldActTruncated": false
+      }
+    ],
+    "runsTruncated": false
   }
 }

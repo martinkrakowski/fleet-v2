@@ -782,7 +782,10 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
         fence,
         nowIso: ctx.clock(),
       });
-      return isRecord(released) && released.outcome === 'ok' && isRecord(released.lease);
+      const lease = isRecord(released) && released.outcome === 'ok' ? released.lease : null;
+      return (
+        isRecord(lease) && lease.scope === scope && lease.holderId === ctx.request.tickId && lease.fence === fence
+      );
     } catch {
       return false;
     }
@@ -851,6 +854,9 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       for (const entry of Array.isArray(entries) ? entries : []) {
         if (!appendedAfter(entry, run.startedAtIso)) {
           continue;
+        }
+        if (!this.hasBudget(ctx, ctx.clock())) {
+          return records;
         }
         const event = projectJournalEntryToDaemonEvent({
           eventId: this.deps.newUlid(),

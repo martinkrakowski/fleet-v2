@@ -788,17 +788,63 @@ describe('RunDaemonTickUseCase (DT10a)', () => {
     expect(h.lease.releases).toHaveLength(1);
   });
 
-  it('a release answered ok without a lease record is not a confirmed release', async () => {
-    const h = makeHarness();
-    h.lease.release = async (request) => {
-      h.lease.releases.push(request);
-      return { outcome: 'ok' } as unknown as DaemonLeaseResult;
-    };
+  it('a release answered ok without the released lease is not a confirmed release', async () => {
+    const answers: unknown[] = [
+      { outcome: 'ok' },
+      { outcome: 'ok', lease: {} },
+      { outcome: 'ok', lease: { version: 1, scope: `merge/${DIGEST_A}`, holderId: TICK_A, fence: 2, leaseUntilIso: NOW } },
+    ];
+    for (const answer of answers) {
+      const h = makeHarness();
+      h.lease.release = async (request) => {
+        h.lease.releases.push(request);
+        return answer as DaemonLeaseResult;
+      };
 
-    const result = await h.run({ repositories: [repoRef(DIGEST_A)] });
+      const result = await h.run({ repositories: [repoRef(DIGEST_A)] });
 
-    expect(result.exitCode).toBe(1);
-    expect(result.status?.jobs[0]).toMatchObject({ outcome: 'refused', reasonCode: 'lease-release-failed' });
+      expect(result.exitCode).toBe(1);
+      expect(result.status?.jobs[0]).toMatchObject({ outcome: 'refused', reasonCode: 'lease-release-failed' });
+    }
+  });
+
+  it('the journal projection stops at the deadline, also inside one key', async () => {
+    const key = `merge/${DIGEST_A}/42/0123456789ab/merge-pr`;
+    let nowCalls = 0;
+    const h = makeHarness({
+      // start, job start, the lease release, job end, queue read, finish, the key's budget check: all inside the budget; then past it
+      nowFn: () => {
+        nowCalls += 1;
+        return nowCalls <= 7 ? NOW : '2026-11-01T12:00:44.000Z';
+      },
+      mergePassResult: {
+        outcome: 'completed',
+        reasonCode: null,
+        entries: [{ entryId: 'entry-1', head12: '0123456789ab', decision: 'journalled', reasonCode: null, journalKey: key }],
+      },
+    });
+    const entry = {
+      version: 1,
+      entryId: `0${'8'.repeat(25)}`,
+      kind: 'intent',
+      key,
+      runId: null,
+      recordedAtIso: '2026-11-01T12:00:01.000Z',
+      mode: null,
+      expectedRevision: null,
+      mintedId: null,
+      outcome: null,
+      reasonCode: null,
+      detail: null,
+      grantId: null,
+      state: null,
+    } as LaneRunJournalEntryRecord;
+    h.journal.byKey.set(key, [entry, entry]);
+
+    await h.run({ repositories: [repoRef(DIGEST_A)] });
+
+    expect(h.journal.reads).toEqual([key]);
+    expect(h.events.events.map((event) => event.kind)).toEqual(['job']);
   });
 
   it('a malformed status write answer or previous record is a typed refusal', async () => {

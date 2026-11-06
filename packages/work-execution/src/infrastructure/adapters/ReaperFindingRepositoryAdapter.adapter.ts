@@ -24,6 +24,7 @@ import {
 import {
   REAPER_FINDING_SCHEMA_VERSION,
   type ReaperFinding,
+  type ReaperFindingAction,
 } from '../../domain/reaper-findings.js';
 import type {
   CloseReaperFindingResult,
@@ -61,6 +62,21 @@ function isValidFindingSubject(subject: unknown): subject is string {
     !containsSecretShape(subject);
 }
 
+function isValidFindingAction(action: unknown): action is ReaperFindingAction {
+  return action === 'report' || action === 'repair' || action === 'wait';
+}
+
+/** A sighting timestamp is present and parsable, or absent entirely. */
+function isValidSightingIso(value: unknown): boolean {
+  if (value === null || value === undefined) {
+    return true;
+  }
+  if (typeof value !== 'string') {
+    return false;
+  }
+  return !Number.isNaN(Date.parse(value));
+}
+
 /** Structural check of a stored finding; every failure is a code, never a value. */
 function isValidFinding(value: unknown): value is ReaperFinding {
   if (value === null || typeof value !== 'object') {
@@ -68,8 +84,12 @@ function isValidFinding(value: unknown): value is ReaperFinding {
   }
   const candidate = value as Record<string, unknown>;
   return (
+    candidate.schemaVersion === REAPER_FINDING_SCHEMA_VERSION &&
     isValidFindingKind(candidate.kind) &&
     isValidFindingSubject(candidate.subject) &&
+    isValidFindingAction(candidate.action) &&
+    isValidSightingIso(candidate.firstSightingIso) &&
+    isValidSightingIso(candidate.lastSightingIso) &&
     typeof candidate.sightings === 'number' &&
     Number.isFinite(candidate.sightings) &&
     candidate.sightings >= 0

@@ -107,11 +107,11 @@ function receiptFor(attemptId: string): { attemptId: string; sessionId: string; 
   };
 }
 
-/** The runner status that says the session is gone. */
+/** The runner status that says the session is gone: reachable, worker not running. */
 const SESSION_GONE: RunnerSessionStatus = {
-  runnerReachable: 'unreachable',
+  runnerReachable: 'reachable',
   workspacePreparation: 'prepared',
-  workerCommand: 'not-started',
+  workerCommand: 'ended',
   completionReceipt: null,
   artifactsCollected: false,
 };
@@ -417,6 +417,34 @@ describe('reap zombies', () => {
     expect(result.repairs).toEqual([]);
     expect(harness.reconcile.calls).toEqual([]);
     expect(harness.journal.state.appendCalls).toEqual([]);
+  });
+
+  it('an unreachable runner is an unknown and never proof the session ended', async () => {
+    const unreachableRunner: ReturnType<typeof makeRunner> & { inspectCalls: RunnerSessionRef[] } = {
+      ...makeRunner(),
+      inspectSession: () => {
+        return Promise.resolve({
+          runnerReachable: 'unreachable',
+          workspacePreparation: 'prepared',
+          workerCommand: 'not-started',
+          completionReceipt: null,
+          artifactsCollected: false,
+        } satisfies RunnerSessionStatus);
+      },
+    } as ReturnType<typeof makeRunner>;
+    const harness = baseHarness({
+      attempts: [attemptFixture('att-1', { updatedAtIso: BEFORE })],
+      runner: unreachableRunner,
+    });
+    const result = await runPass(harness);
+    expect(result.outcome).toBe('completed');
+    // Unreachability does not establish the session ended: no dead-attempt
+    // observation, no finding, no repair, only the unknown.
+    expect(result.findings).toEqual([]);
+    expect(result.repairs).toEqual([]);
+    expect(result.unknown).toEqual([{ subject: 'att-1', kind: 'dead-attempt', reason: 'runner-unreachable' }]);
+    expect(harness.journal.state.appendCalls).toEqual([]);
+    expect(harness.reconcile.calls).toEqual([]);
   });
 
   it('a leaked slot is reported and never released', async () => {

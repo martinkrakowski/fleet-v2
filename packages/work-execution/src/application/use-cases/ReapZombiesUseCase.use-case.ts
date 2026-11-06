@@ -193,26 +193,31 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     const graceMs = graceMinutes * MINUTE_MS;
     const nowMs = Date.parse(nowIso);
 
-    // 2. Read the facts. A read that throws is an unknown; an unreadable
-    // findings store writes nothing at all — never treated as empty.
+    // 2. Read the facts. A read that throws is an unknown; the affected part
+    // of the pass is skipped — never substituted with an empty read, and an
+    // unreadable findings store writes nothing at all.
     const unknown: ReaperUnknownView[] = [];
-    let attempts: readonly AttemptRecord[];
+    let attempts: readonly AttemptRecord[] = [];
+    let attemptsUnreadable = false;
     try {
       attempts = await this.deps.attemptRepo.listAllAttempts();
     } catch {
-      attempts = [];
+      attemptsUnreadable = true;
       unknown.push({ subject: '', reason: 'attempts-unreadable' });
     }
-    let reservations: Awaited<ReturnType<ExecutionJournalPort['listActiveReservations']>>;
+    let reservations: Awaited<ReturnType<ExecutionJournalPort['listActiveReservations']>> = [];
+    let reservationsUnreadable = false;
     try {
       reservations = await this.deps.executionJournal.listActiveReservations();
     } catch {
-      reservations = [];
+      reservationsUnreadable = true;
       unknown.push({ subject: '', reason: 'reservations-unreadable' });
     }
+    let attentionUnreadable = false;
     try {
       await this.deps.attention.listAttentionItems({ projectId });
     } catch {
+      attentionUnreadable = true;
       unknown.push({ subject: '', reason: 'attention-unreadable' });
     }
     let openRecords: Awaited<ReturnType<ReaperFindingRepositoryPort['listOpenFindings']>>;
@@ -230,84 +235,100 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
     }
 
     // 3. Build the observations, one per subject, this lane's two kinds only.
+    // When the attempts read failed, no observation is built at all: a
+    // reservation whose attempt could not be read is not classified as
+    // `absent`, and no finding, attention item or repair follows from a read
+    // this pass could not make.
     const observations: ReaperObservation[] = [];
-    let subjects = 0;
+    const findings: ReaperFinding[] = [];
     const attemptsById = new Map<string, AttemptRecord>();
-    for (const entry of attempts) {
-      if (isPlainObject(entry) && typeof (entry as { id?: unknown }).id === 'string') {
-        attemptsById.set((entry as { id: string }).id, entry as AttemptRecord);
+    if (!attemptsUnreadable) {
+      let subjects = 0;
+      for (const entry of attempts) {
+        if (isPlainObject(entry) && typeof (entry as { id?: unknown }).id === 'string') {
+          attemptsById.set((entry as { id: string }).id, entry as AttemptRecord);
+        }
       }
-    }
-    for (const attempt of attempts) {
-      if (!isPlainObject(attempt)) {
-        continue; // a sparse or malformed entry is skipped, never thrown on
-      }
-      if (attempt.state !== 'running' || typeof attempt.sessionId !== 'string') {
-        continue;
-      }
-      if (subjects >= MAX_SUBJECTS_PER_PASS) {
-        unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'pass-cap' });
-        continue;
-      }
-      subjects += 1;
-      const resolved = this.deps.runnerForAttempt.runnerForAttempt({ runner: attempt.runner ?? null });
-      if (!resolved.ok) {
-        unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'runner-unresolved' });
-        continue;
-      }
-      let status: RunnerSessionStatus;
-      try {
-        status = await resolved.runner.inspectSession({
-          attemptId: attempt.id,
-          sessionId: attempt.sessionId,
-          runner: attempt.runner ?? null,
+      for (const attempt of attempts) {
+        if (!isPlainObject(attempt)) {
+          continue; // a sparse or malformed entry is skipped, never thrown on
+        }
+        if (attempt.state !== 'running' || typeof attempt.sessionId !== 'string') {
+          continue;
+        }
+        if (subjects >= MAX_SUBJECTS_PER_PASS) {
+          unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'pass-cap' });
+          continue;
+        }
+        subjects += 1;
+        const resolved = this.deps.runnerForAttempt.runnerForAttempt({ runner: attempt.runner ?? null });
+        if (!resolved.ok) {
+          unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'runner-unresolved' });
+          continue;
+        }
+        let status: RunnerSessionStatus;
+        try {
+          status = await resolved.runner.inspectSession({
+            attemptId: attempt.id,
+            sessionId: attempt.sessionId,
+            runner: attempt.runner ?? null,
+          });
+        } catch {
+          unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'runner-unreadable' });
+          continue;
+        }
+        if (status.runnerReachable === 'unknown') {
+          unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'runner-unknown' });
+          continue;
+        }
+        if (status.runnerReachable === 'unreachable') {
+          // Unreachability does not establish that the session ended; the
+          // subject stays an unknown instead of a dead-attempt observation.
+          unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'runner-unreachable' });
+          continue;
+        }
+        const sessionEndedOrMissing =
+          status.workerCommand === 'not-started' ||
+          status.workerCommand === 'ended';
+        observations.push({
+          kind: 'dead-attempt',
+          subject: attempt.id,
+          youngActivity: attemptYoungActivity(attempt, nowMs, graceMs),
+          recordSaysRunning: true,
+          sessionEndedOrMissing,
         });
-      } catch {
-        unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'runner-unreadable' });
-        continue;
       }
-      if (status.runnerReachable === 'unknown') {
-        unknown.push({ subject: attempt.id, kind: 'dead-attempt', reason: 'runner-unknown' });
-        continue;
+      if (!reservationsUnreadable) {
+        for (const reservation of reservations) {
+          if (!isPlainObject(reservation) || (reservation as { held?: unknown }).held !== true) {
+            continue;
+          }
+          const record = reservation as { id: string; attemptId: string; reservedAtIso: string };
+          if (subjects >= MAX_SUBJECTS_PER_PASS) {
+            unknown.push({ subject: record.id, kind: 'leaked-slot', reason: 'pass-cap' });
+            continue;
+          }
+          subjects += 1;
+          const attempt = attemptsById.get(record.attemptId);
+          const state = attempt === undefined ? 'absent' : attemptStateOf(attempt.state);
+          observations.push({
+            kind: 'leaked-slot',
+            subject: record.id,
+            youngActivity: reservationsYoungActivity(record.reservedAtIso, nowMs, graceMs),
+            attemptState: state,
+          });
+        }
       }
-      const sessionEndedOrMissing =
-        status.runnerReachable === 'unreachable' ||
-        status.workerCommand === 'not-started' ||
-        status.workerCommand === 'ended';
-      observations.push({
-        kind: 'dead-attempt',
-        subject: attempt.id,
-        youngActivity: attemptYoungActivity(attempt, nowMs, graceMs),
-        recordSaysRunning: true,
-        sessionEndedOrMissing,
-      });
-    }
-    for (const reservation of reservations) {
-      if (!isPlainObject(reservation) || (reservation as { held?: unknown }).held !== true) {
-        continue;
-      }
-      const record = reservation as { id: string; attemptId: string; reservedAtIso: string };
-      if (subjects >= MAX_SUBJECTS_PER_PASS) {
-        unknown.push({ subject: record.id, kind: 'leaked-slot', reason: 'pass-cap' });
-        continue;
-      }
-      subjects += 1;
-      const attempt = attemptsById.get(record.attemptId);
-      const state = attempt === undefined ? 'absent' : attemptStateOf(attempt.state);
-      observations.push({
-        kind: 'leaked-slot',
-        subject: record.id,
-        youngActivity: reservationsYoungActivity(record.reservedAtIso, nowMs, graceMs),
-        attemptState: state,
-      });
-    }
 
-    // 4. Classify. The classifier never throws.
-    const findings = classifyZombies(
-      { observations, openFindings: openRecords.map((record) => record.finding) },
-      nowIso,
-      policy,
-    );
+      // 4. Classify. The classifier never throws.
+      findings.push(
+        ...classifyZombies(
+          { observations, openFindings: openRecords.map((record) => record.finding) },
+          nowIso,
+          policy,
+        ),
+      );
+    }
 
     // 5. Upsert. Reuse the stored finding id for (kind, subject); mint only
     // for a first sighting, and validate every minted id before any write.
@@ -328,21 +349,31 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       findingIds.set(index, minted);
     }
     const findingViews: ReaperFindingView[] = [];
+    /** The authoritative finding id per finding index; only a stored finding has one. */
+    const storedIds = new Map<number, string>();
     for (let index = 0; index < findings.length; index += 1) {
       const finding = findings[index];
-      const findingId = findingIds.get(index) as string;
-      let storedId = findingId;
+      const candidateId = findingIds.get(index) as string;
+      let storedId: string | null = null;
       try {
-        const upsert = await this.deps.reaperFindings.upsertFinding(finding, findingId);
+        const upsert = await this.deps.reaperFindings.upsertFinding(finding, candidateId);
         if (upsert.outcome === 'stored') {
+          // The stored record's id is authoritative, including when the store
+          // found an existing open record for this (subject, kind): concurrent
+          // passes share one finding id and therefore one repair key.
           storedId = upsert.record.findingId;
         } else {
           unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'finding-store-refused' });
         }
       } catch {
         unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'finding-store-unwritable' });
+      }
+      if (storedId === null) {
+        // A finding that was not stored is not exposed: no view, no attention
+        // item, and no repair may run on a locally minted candidate id.
         continue;
       }
+      storedIds.set(index, storedId);
       findingViews.push({
         findingId: storedId,
         kind: finding.kind,
@@ -352,36 +383,44 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
       });
     }
 
-    // 6. Raise or refresh attention for report and repair findings.
+    // 6. Raise or refresh attention for report and repair findings. When the
+    // attention read failed, this part of the pass is skipped entirely.
     const attention: ReaperAttentionView[] = [];
-    let raised = 0;
-    for (const finding of findings) {
-      if (finding.action === 'wait') {
-        continue;
-      }
-      if (raised >= MAX_ATTENTION_PER_PASS) {
-        unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'pass-cap' });
-        continue;
-      }
-      raised += 1;
-      const outcome = await this.recordAttention(projectId, finding, attemptsById);
-      attention.push({ kind: finding.kind, subject: finding.subject, outcome });
-      if (outcome === 'refused') {
-        // Recorded, never retried in the same pass.
+    if (!attentionUnreadable) {
+      let raised = 0;
+      for (let index = 0; index < findings.length; index += 1) {
+        const finding = findings[index];
+        if (!storedIds.has(index) || finding.action === 'wait') {
+          continue;
+        }
+        if (raised >= MAX_ATTENTION_PER_PASS) {
+          unknown.push({ subject: finding.subject, kind: finding.kind, reason: 'pass-cap' });
+          continue;
+        }
+        raised += 1;
+        const outcome = await this.recordAttention(projectId, finding, attemptsById);
+        attention.push({ kind: finding.kind, subject: finding.subject, outcome });
+        if (outcome === 'refused') {
+          // Recorded, never retried in the same pass.
+        }
       }
     }
 
-    // 7. Repair: record-only, keyed, dead-attempt only.
+    // 7. Repair: record-only, keyed, dead-attempt only. Only a successfully
+    // stored finding participates, and only under its authoritative id.
     const repairs: ReaperRepairView[] = [];
     for (let index = 0; index < findings.length; index += 1) {
       const finding = findings[index];
       if (finding.action !== 'repair') {
         continue;
       }
-      const findingId = findingIds.get(index) as string;
+      const storedId = storedIds.get(index);
+      if (storedId === undefined) {
+        continue; // never repaired and never surfaced under the candidate id
+      }
       if (finding.kind !== 'dead-attempt') {
         repairs.push({
-          key: keyOf(finding.subject, finding.kind, findingId),
+          key: keyOf(finding.subject, finding.kind, storedId),
           kind: finding.kind,
           subject: finding.subject,
           outcome: 'skipped',
@@ -390,7 +429,7 @@ export class ReapZombiesUseCase implements ReapZombiesPort {
         continue;
       }
       repairs.push(
-        await this.repairDeadAttempt(nowIso, finding, findingId, unknown),
+        await this.repairDeadAttempt(nowIso, finding, storedId, unknown),
       );
     }
 

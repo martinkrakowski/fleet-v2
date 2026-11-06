@@ -1,8 +1,10 @@
 import { hasUnknownKeys, isPlainRecord, readBoundedInteger, readOwnDataProperty } from './policy-read.js';
+import { SEATS_POLICY_KEYS } from './keys.js';
 import type { ResolvedSeatsPolicy, SeatRotationRole, SeatsPolicy } from './types.js';
 
+export { SEATS_POLICY_KEYS };
+
 export const SEAT_ROTATION_ROLES: readonly SeatRotationRole[] = Object.freeze(['first-pass', 'fix', 'review', 'pre-merge']);
-export const SEATS_POLICY_KEYS: readonly string[] = Object.freeze(['rotate', 'cooldownMinutes', 'observationCooldownMinutes']);
 export const SEATS_POLICY_MINUTE_BOUNDS = Object.freeze({ min: 0, max: 1440 });
 export const DEFAULT_SEAT_COOLDOWN_MINUTES = 60;
 export const DEFAULT_SEAT_OBSERVATION_COOLDOWN_MINUTES = 0;

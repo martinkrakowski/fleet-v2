@@ -279,17 +279,26 @@ describe('ChainRepositoryAdapter (file store)', () => {
     expect(names.filter((n) => n.endsWith('.tmp'))).toEqual([]);
   });
 
-  it('leaves no temp file and the old record when the rename fails', async () => {
+  it('keeps the old record bytes when an oversized outcome is refused', async () => {
     const file = await seed();
     const before = await fs.readFile(file, 'utf8');
-    // a directory squatting on the target path makes the rename fail
+    // an oversized reason is refused up front; the old record must stay byte for byte
+    const big = new ChainRepositoryAdapter({ stateDir });
+    const decision = await big.recordChainOutcome(outcomeCmd({ state: 'refused', reason: 'a'.repeat(CHAIN_RECORD_MAX_BYTES) }));
+    expect(decision.outcome).toBe('refused');
+    expect(await fs.readFile(file, 'utf8')).toBe(before);
+    const names = await fs.readdir(path.join(stateDir, 'chains'));
+    expect(names.filter((n) => n.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('leaves no temp file when the rename itself fails', async () => {
+    const file = await seed();
     await fs.rm(file);
     await fs.mkdir(file);
     const decision = await adapter.recordChainOutcome(outcomeCmd());
     expect(decision.outcome).toBe('refused');
     const names = await fs.readdir(path.join(stateDir, 'chains'));
     expect(names.filter((n) => n.endsWith('.tmp'))).toEqual([]);
-    expect(before.length).toBeGreaterThan(0);
   });
 
   it('refuses a record file that is a symlink, even to a valid record', async () => {
@@ -311,6 +320,37 @@ describe('ChainRepositoryAdapter (file store)', () => {
         outcome: 'refused', reason: 'store-unavailable',
       });
       expect(await linked.readChain(readCmd())).toMatchObject({ status: 'unreadable' });
+      expect(await fs.readdir(outside)).toEqual([]);
+    } finally {
+      await fs.rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps writing inside the real chains directory when it is swapped for a link mid-operation', async () => {
+    if (process.platform !== 'linux') return;
+    await seed();
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-chains-swap-'));
+    const chains = path.join(stateDir, 'chains');
+    const parked = path.join(stateDir, 'chains-parked');
+    try {
+      // the swap happens while the record is being written, after the directory check
+      const realRename = fs.rename;
+      let swapped = false;
+      const spy = (async (from: string, to: string) => {
+        if (!swapped) {
+          swapped = true;
+          await realRename(chains, parked);
+          await fs.symlink(outside, chains);
+        }
+        return realRename(from, to);
+      }) as typeof fs.rename;
+      (fs as { rename: typeof fs.rename }).rename = spy;
+      try {
+        await adapter.recordChainOutcome(outcomeCmd());
+      } finally {
+        (fs as { rename: typeof fs.rename }).rename = realRename;
+      }
+      expect(swapped).toBe(true);
       expect(await fs.readdir(outside)).toEqual([]);
     } finally {
       await fs.rm(outside, { recursive: true, force: true });

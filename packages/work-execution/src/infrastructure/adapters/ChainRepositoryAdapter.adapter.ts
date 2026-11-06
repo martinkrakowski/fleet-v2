@@ -237,9 +237,8 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
       const id = identityOf(own(command, 'repository'), own(command, 'chainName'));
       if (id === undefined) return unreadable('invalid-request');
       if (!this.persistent) return this.readMemory(id);
-      const dir = await this.chainsDir(false);
-      if (dir === 'absent') return { status: 'not-found' };
-      return await this.readFile(dir, id);
+      const read = await this.withChainsDir(false, (dir) => this.readFile(dir, id));
+      return read === 'absent' ? { status: 'not-found' } : read;
     } catch {
       return unreadable('store-unavailable');
     }
@@ -262,24 +261,26 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
       this.memoryTail = result.catch(() => undefined);
       return result;
     }
-    const dir = await this.chainsDir(true);
-    if (dir === 'absent') throw new StoreUnavailableError();
     const remaining = Math.max(1, Date.parse(deadlineIso) - Date.now());
     const timeoutMs = Math.min(this.lockTimeoutMs, remaining);
-    try {
-      return await withFileLock(
-        join(dir, LOCK_FILE),
-        async () => {
-          if (freshDeadline(deadlineIso) !== 'ok') return refused('deadline-expired');
-          await this.removeOrphanTemps(dir);
-          return run(this.fileSection(dir));
-        },
-        { timeoutMs },
-      );
-    } catch (error) {
-      if (error instanceof FileLockTimeoutError) throw new StoreBusyError();
-      throw error;
-    }
+    const decided = await this.withChainsDir(true, async (dir) => {
+      try {
+        return await withFileLock(
+          join(dir, LOCK_FILE),
+          async () => {
+            if (freshDeadline(deadlineIso) !== 'ok') return refused('deadline-expired');
+            await this.removeOrphanTemps(dir);
+            return run(this.fileSection(dir));
+          },
+          { timeoutMs },
+        );
+      } catch (error) {
+        if (error instanceof FileLockTimeoutError) throw new StoreBusyError();
+        throw error;
+      }
+    });
+    if (decided === 'absent') throw new StoreUnavailableError();
+    return decided;
   }
 
   // ---------- memory ----------
@@ -302,31 +303,50 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
   // ---------- files ----------
 
   /**
-   * The `chains` directory under the resolved root. 'absent' when it does not
-   * exist (read) or the store is unusable. A link in its place is refused.
+   * Open the `chains` directory under the resolved root without following a
+   * link, and run `use` against a path anchored to that open handle. On Linux
+   * the anchor is `/proc/self/fd/<n>`, so replacing `chains` with a link after
+   * this check cannot redirect any later operation; elsewhere the anchor is the
+   * path and the directory is re-verified after `use`. 'absent' when it does
+   * not exist and `create` is false. Unusable stores throw StoreUnavailableError.
    */
-  private async chainsDir(create: boolean): Promise<string | 'absent'> {
+  private async withChainsDir<T>(create: boolean, use: (dir: string) => Promise<T>): Promise<T | 'absent'> {
     if (this.root === null) throw new StoreUnavailableError();
-    const dir = join(this.root, CHAINS_DIR);
-    let stat;
+    const named = join(this.root, CHAINS_DIR);
+    const flags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
+    let handle: fs.FileHandle | undefined;
     try {
-      stat = await fs.lstat(dir);
+      handle = await fs.open(named, flags);
     } catch (error) {
-      if (errorCode(error) !== 'ENOENT') throw new StoreUnavailableError();
-      if (!create) return 'absent';
+      if (errorCode(error) !== 'ENOENT' || !create) {
+        if (errorCode(error) === 'ENOENT') return 'absent';
+        throw new StoreUnavailableError();
+      }
       try {
-        await fs.mkdir(dir, { mode: 0o700 });
+        await fs.mkdir(named, { mode: 0o700 });
       } catch (mkdirError) {
         if (errorCode(mkdirError) !== 'EEXIST') throw new StoreUnavailableError();
       }
       try {
-        stat = await fs.lstat(dir);
+        handle = await fs.open(named, flags);
       } catch {
         throw new StoreUnavailableError();
       }
     }
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new StoreUnavailableError();
-    return dir;
+    try {
+      if (!(await handle.stat()).isDirectory()) throw new StoreUnavailableError();
+      const anchored = process.platform === 'linux';
+      const result = await use(anchored ? `/proc/self/fd/${handle.fd}` : named);
+      if (!anchored) {
+        const [now, pinned] = await Promise.all([fs.lstat(named), handle.stat()]);
+        if (now.isSymbolicLink() || now.ino !== pinned.ino || now.dev !== pinned.dev) {
+          throw new StoreUnavailableError();
+        }
+      }
+      return result;
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
   }
 
   private fileSection(dir: string): Section {

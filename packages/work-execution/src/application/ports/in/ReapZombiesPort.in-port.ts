@@ -52,12 +52,21 @@ export interface ReaperUnknownView {
   readonly reason: string;
 }
 
+/** One worktree subject the pass gathered: ids and codes only, never a path or a branch name. */
+export interface ReaperWorktreeView {
+  readonly subject: string; // the 12-hex digest; never a path
+  readonly report: 'merged-worktree' | 'worktree-busy';
+  readonly evidence: 'merged-pr' | 'ancestor-only' | 'unknown';
+  readonly sizeBytes: number | null; // null when the measurement ran out of budget
+}
+
 export interface ReapZombiesResult {
   readonly outcome: 'completed' | 'refused';
   readonly reason?: string;
   readonly findings: readonly ReaperFindingView[];
   readonly attention: readonly ReaperAttentionView[];
   readonly repairs: readonly ReaperRepairView[];
+  readonly worktrees: readonly ReaperWorktreeView[];
   readonly unknown: readonly ReaperUnknownView[];
 }
 

@@ -57,11 +57,11 @@ export interface ConductorScheduleRow {
   readonly state: LaneRunStateValue;
   readonly round: number;
   /** The run record's revision: the token a stop request carries as `expectedRevision`. */
-  readonly revision: number;
-  /** Strongest stop intent over the run's journal: null when none was requested. */
-  readonly stopMode: LaneRunStopKeyMode | null;
+  readonly revision?: number;
+  /** Strongest stop intent over the run's journal; null when none was requested. */
+  readonly stopMode?: LaneRunStopKeyMode | null;
   /** `recordedAtIso` of the run's first stop intent; null when none was requested. */
-  readonly stopRequestedAtIso: string | null;
+  readonly stopRequestedAtIso?: string | null;
   readonly placement: ConductorSchedulePlacement;
   readonly pendingStep: { readonly step: LaneRunKeyStep; readonly reconciliation: 'unread' | 'ambiguous' } | null;
   readonly park: { readonly reason: LaneRunParkReason; readonly qualifier: string | null } | null;
@@ -121,9 +121,9 @@ interface ScheduleRow {
   tier: LaneRunTier;
   state: LaneRunStateValue;
   round: number;
-  revision: number;
-  stopMode: LaneRunStopKeyMode | null;
-  stopRequestedAtIso: string | null;
+  revision?: number;
+  stopMode?: LaneRunStopKeyMode | null;
+  stopRequestedAtIso?: string | null;
   placement: ConductorSchedulePlacement;
   pendingStep: ConductorScheduleRow['pendingStep'];
   park: ConductorScheduleRow['park'];

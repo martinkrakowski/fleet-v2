@@ -18,9 +18,23 @@ import { IssuePolicyForgeGrantUseCase } from '../IssuePolicyForgeGrantUseCase.us
 import { RecordAuthorizationConsumptionUseCase } from '../RecordAuthorizationConsumptionUseCase.use-case.js';
 import { RequestScopedDecisionUseCase } from '../RequestScopedDecisionUseCase.use-case.js';
 import { ResolveActionAuthorizationUseCase } from '../ResolveActionAuthorizationUseCase.use-case.js';
+import type { AttemptFactsRecord } from '../../ports/out/AttemptFactsReadPort.out-port.js';
 
 const HEAD = 'c'.repeat(40);
 const SCOPE = 'forge:push-and-open-pr';
+
+/** In-memory attempt-facts reader: whatever facts the test records, null for unknown attempts. */
+class FakeAttemptFactsRead {
+  private readonly facts: Map<string, AttemptFactsRecord>;
+  constructor(entries: readonly AttemptFactsRecord[]) {
+    this.facts = new Map(entries.map((entry) => [entry.attemptId, entry]));
+  }
+  findAttemptFactsById(attemptId: string): Promise<AttemptFactsRecord | null> {
+    return Promise.resolve(this.facts.get(attemptId) ?? null);
+  }
+}
+
+const attemptFacts = (...entries: readonly AttemptFactsRecord[]) => new FakeAttemptFactsRead(entries);
 
 function ownerGrant(overrides: Record<string, unknown> = {}): CoordinationRequestRecord {
   return {
@@ -70,7 +84,8 @@ describe('grant attempt binding (CO24e)', () => {
   });
 
   const consumer = () => new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
-  const resolver = () => new ResolveActionAuthorizationUseCase({ requestRepo: repo });
+  const resolver = (facts = attemptFacts({ attemptId: 'att-A', projectId: 'project-1', collectedHeadSha: HEAD }, { attemptId: 'att-B', projectId: 'project-1', collectedHeadSha: HEAD })) =>
+    new ResolveActionAuthorizationUseCase({ requestRepo: repo, attemptFactsRead: facts });
 
   describe('the stored record', () => {
     it('round-trips a version-2 owner grant with its attempt through the file', async () => {
@@ -141,8 +156,8 @@ describe('grant attempt binding (CO24e)', () => {
       expect(stored?.grantAttemptId).toBe('att-A');
     });
 
-    it('records no attempt on an owner decision requested without one (a legacy-style grant)', async () => {
-      await new RequestScopedDecisionUseCase({ requestRepo: repo }).requestScopedDecision({
+    it('refuses a forge action decision requested without an attempt (CO24f)', async () => {
+      const result = await new RequestScopedDecisionUseCase({ requestRepo: repo }).requestScopedDecision({
         requestId: 'req-new',
         projectId: 'project-1',
         kind: 'action-decision',
@@ -151,9 +166,25 @@ describe('grant attempt binding (CO24e)', () => {
         proposalDigest: 'prop',
         policyRevision: 'pol-1',
       });
-      const stored = await repo.findRequestById('req-new');
-      expect(stored).not.toHaveProperty('grantAttemptId');
-      expect(stored).not.toHaveProperty('grantRecordVersion');
+      expect(result).toEqual({
+        outcome: 'rejected',
+        reason: 'a forge action decision requires an attemptId',
+      });
+      expect(await repo.findRequestById('req-new')).toBeNull();
+    });
+
+    it('still records a non-forge decision without an attempt', async () => {
+      const result = await new RequestScopedDecisionUseCase({ requestRepo: repo }).requestScopedDecision({
+        requestId: 'req-new',
+        projectId: 'project-1',
+        kind: 'action-decision',
+        actionScope: 'deploy:staging',
+        expectedHeadSha: HEAD,
+        proposalDigest: 'prop',
+        policyRevision: 'pol-1',
+      });
+      expect(result.outcome).toBe('requested');
+      expect(await repo.findRequestById('req-new')).not.toHaveProperty('grantAttemptId');
     });
 
     it('rejects a blank or wrong-typed attempt on a decision request', async () => {
@@ -171,6 +202,45 @@ describe('grant attempt binding (CO24e)', () => {
         });
         expect(result.outcome).toBe('rejected');
       }
+      expect(await repo.findRequestById('req-bad')).toBeNull();
+    });
+
+    it('rejects an attempt carrying a control or bidi character, recording nothing (CO24f)', async () => {
+      const useCase = new RequestScopedDecisionUseCase({ requestRepo: repo });
+      for (const attemptId of ['att\u0001A', 'att\u202EA', 'att\u200FA', 'att\ufeffA']) {
+        const result = await useCase.requestScopedDecision({
+          requestId: 'req-bad',
+          projectId: 'project-1',
+          kind: 'action-decision',
+          actionScope: SCOPE,
+          expectedHeadSha: HEAD,
+          proposalDigest: 'prop',
+          policyRevision: 'pol-1',
+          attemptId,
+        });
+        expect(result).toEqual({
+          outcome: 'rejected',
+          reason: 'a decision request attemptId must not contain control or bidi characters',
+        });
+      }
+      expect(await repo.findRequestById('req-bad')).toBeNull();
+    });
+
+    it('rejects an attempt longer than the record builder allows, recording nothing (CO24f)', async () => {
+      const result = await new RequestScopedDecisionUseCase({ requestRepo: repo }).requestScopedDecision({
+        requestId: 'req-bad',
+        projectId: 'project-1',
+        kind: 'action-decision',
+        actionScope: SCOPE,
+        expectedHeadSha: HEAD,
+        proposalDigest: 'prop',
+        policyRevision: 'pol-1',
+        attemptId: 'a'.repeat(257),
+      });
+      expect(result).toEqual({
+        outcome: 'rejected',
+        reason: 'a decision request attemptId must be at most 256 characters',
+      });
       expect(await repo.findRequestById('req-bad')).toBeNull();
     });
 
@@ -265,6 +335,69 @@ describe('grant attempt binding (CO24e)', () => {
       });
       expect(result.outcome).toBe('authorized');
       expect(await repo.findRequestByGrantId('grant-owner')).not.toHaveProperty('grantAttemptId');
+    });
+
+    it('refuses an unknown attempt without binding, and the legitimate resolve then binds (CO24f)', async () => {
+      await repo.saveRequest(ownerGrant());
+      expect(await resolver().resolveActionAuthorization(resolveFor('nope'))).toEqual({
+        outcome: 'blocked',
+        reason: 'grant-attempt-unknown',
+      });
+      const unbound = await repo.findRequestByGrantId('grant-owner');
+      expect(unbound).not.toHaveProperty('grantAttemptId');
+      expect(unbound?.revision).toBe(1);
+      expect((await resolver().resolveActionAuthorization(resolveFor('att-A'))).outcome).toBe('authorized');
+      expect((await repo.findRequestByGrantId('grant-owner'))?.grantAttemptId).toBe('att-A');
+    });
+
+    it('refuses a foreign attempt and an attempt not collected at the expected head (CO24f)', async () => {
+      await repo.saveRequest(ownerGrant());
+      const foreignFacts = attemptFacts({ attemptId: 'att-A', projectId: 'project-2', collectedHeadSha: HEAD });
+      expect(await resolver(foreignFacts).resolveActionAuthorization(resolveFor('att-A'))).toEqual({
+        outcome: 'blocked',
+        reason: 'grant-attempt-foreign',
+      });
+      const uncollectedFacts = attemptFacts({ attemptId: 'att-A', projectId: 'project-1', collectedHeadSha: null });
+      expect(await resolver(uncollectedFacts).resolveActionAuthorization(resolveFor('att-A'))).toEqual({
+        outcome: 'blocked',
+        reason: 'grant-attempt-uncollected',
+      });
+      const otherHeadFacts = attemptFacts({
+        attemptId: 'att-A',
+        projectId: 'project-1',
+        collectedHeadSha: 'd'.repeat(40),
+      });
+      expect(await resolver(otherHeadFacts).resolveActionAuthorization(resolveFor('att-A'))).toEqual({
+        outcome: 'blocked',
+        reason: 'grant-attempt-head-mismatch',
+      });
+      expect(await repo.findRequestByGrantId('grant-owner')).not.toHaveProperty('grantAttemptId');
+    });
+
+    it('binds nothing when the attempt-facts port is not configured (CO24f fail-closed)', async () => {
+      await repo.saveRequest(ownerGrant());
+      const result = await new ResolveActionAuthorizationUseCase({ requestRepo: repo }).resolveActionAuthorization(
+        resolveFor('att-A'),
+      );
+      expect(result.outcome).toBe('blocked');
+      expect(await repo.findRequestByGrantId('grant-owner')).not.toHaveProperty('grantAttemptId');
+    });
+
+    it('binds exactly one of two concurrent first resolves; the other sees the grant moved (CO24f)', async () => {
+      await repo.saveRequest(ownerGrant());
+      // Two resolves racing to bind different attempts: both read the same
+      // unbound revision, so exactly one write lands and the other loses the
+      // same-revision race and is refused as moved-while-binding.
+      const results = await Promise.all([
+        resolver().resolveActionAuthorization(resolveFor('att-A')),
+        resolver().resolveActionAuthorization(resolveFor('att-B')),
+      ]);
+      expect(results.map((result) => result.outcome).sort()).toEqual(['authorized', 'blocked']);
+      const blocked = results.find((result) => result.outcome === 'blocked');
+      expect(blocked?.reason).toBe('grant grant-owner moved while it was being bound to an attempt');
+      const stored = await new CoordinationRequestRepositoryAdapter({ stateDir: dir }).findRequestByGrantId('grant-owner');
+      expect(stored?.revision).toBe(2);
+      expect(['att-A', 'att-B']).toContain(stored?.grantAttemptId);
     });
   });
 

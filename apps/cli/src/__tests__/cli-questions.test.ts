@@ -172,6 +172,7 @@ describe('fleet-v2 questions command group', () => {
         expectedHeadSha: null,
         proposalDigest: `merge attempt for ${requestId}`,
         policyRevision: POLICY_REVISION,
+        attemptId: `att-${requestId}`,
       }),
     ]);
     expect(decision.code).toBe(0);

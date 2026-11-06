@@ -14,7 +14,7 @@
 
 import { isAbsolute } from 'node:path';
 
-import { isSafeSshHost } from '@fleet/installation';
+import { isSafeSshHost, isValidHostName } from '@fleet/installation';
 import type {
   AgyAcknowledgement,
   GateSlotSection,
@@ -337,7 +337,32 @@ export function draftHost(rawInput: unknown): HostDraftResult {
       errors: ['hosts: the host name must be a non-empty string'],
     };
   }
-  const path = `hosts.${name}`;
+  return validateHostFields(fields, name);
+}
+
+/**
+ * The path prefix an error names a host by. The name is operator input, so it
+ * is echoed only when it is a valid host name that cannot be mistaken for a
+ * secret (short, no long alphanumeric run); anything else gets a fixed label.
+ */
+function hostPath(name: string): string {
+  return isValidHostName(name) &&
+    name.length <= 32 &&
+    !/[A-Za-z0-9]{12,}/.test(name)
+    ? `hosts.${name}`
+    : 'hosts.<invalid-name>';
+}
+
+/**
+ * The one field validator: `draftHost` runs it on the operator's input and
+ * `applyHostDraft` runs it again on the candidate host before `ok: true`, so
+ * a hand-built draft cannot carry a field the loader would refuse.
+ */
+function validateHostFields(
+  fields: Record<string, unknown>,
+  name: string,
+): HostDraftResult {
+  const path = hostPath(name);
   const errors: string[] = [];
 
   const transport = fields.transport;
@@ -541,7 +566,7 @@ export type ApplyHostDraftResult =
        * add, `missing` on an edit) or the current file is not a v2 file the
        * draft can apply to (`not-v2`).
        */
-      readonly reason: 'exists' | 'missing' | 'not-v2';
+      readonly reason: 'exists' | 'missing' | 'not-v2' | 'invalid';
       readonly errors: readonly string[];
     };
 
@@ -711,7 +736,7 @@ export function applyHostDraft(
       ok: false,
       reason: 'exists',
       errors: [
-        `hosts.${name}: already in the installation file; editing is a separate mode`,
+        `${hostPath(name)}: already in the installation file; editing is a separate mode`,
       ],
     };
   }
@@ -720,15 +745,22 @@ export function applyHostDraft(
       ok: false,
       reason: 'missing',
       errors: [
-        `hosts.${name}: not in the installation file; adding is a separate mode`,
+        `${hostPath(name)}: not in the installation file; adding is a separate mode`,
       ],
     };
   }
   const hostsRecord = { ...base.hosts };
-  hostsRecord[name] =
+  const merged =
     mode === 'edit'
       ? mergeDraftedHost(base.hosts[name], host as unknown as HostSection)
       : (host as unknown as HostSection);
+  // The same field validation `draftHost` runs, on the host as it will be
+  // filed: `roles: ["wizard"]` or `roleAliases: null` never reaches `ok: true`.
+  const checked = validateHostFields(copyOwnData(merged) ?? {}, name);
+  if (!checked.ok) {
+    return { ok: false, reason: 'invalid', errors: checked.errors };
+  }
+  hostsRecord[name] = merged;
   return {
     ok: true,
     candidate: {

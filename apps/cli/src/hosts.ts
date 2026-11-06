@@ -593,6 +593,24 @@ function copyOwnDataOf(record: unknown): Record<string, unknown> | undefined {
   }
 }
 
+/** True when any own property of `record` is an accessor; never runs one. */
+function hasAccessor(record: object): boolean {
+  try {
+    for (const key of Reflect.ownKeys(record)) {
+      const descriptor = Object.getOwnPropertyDescriptor(record, key);
+      if (
+        descriptor !== undefined &&
+        (descriptor.get !== undefined || descriptor.set !== undefined)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 function hostsOf(value: unknown): Record<string, unknown> | undefined {
   if (!isPlainObject(value)) {
     return undefined;
@@ -617,9 +635,15 @@ export function moveLaneRunnerRole(
   if (hosts === undefined) {
     return { value: current, movedFrom: [] };
   }
+  // A host map holding an accessor is refused outright: the value comes back
+  // unchanged, and neither `Object.entries` nor a spread ever runs the getter.
+  if (hasAccessor(hosts)) {
+    return { value: current, movedFrom: [] };
+  }
   const movedFrom: string[] = [];
   let nextHosts: Record<string, unknown> | undefined;
-  for (const [hostName, rawHost] of Object.entries(hosts)) {
+  for (const hostName of Object.keys(hosts)) {
+    const rawHost = ownData(hosts, hostName);
     if (hostName === name || !isPlainObject(rawHost)) {
       continue;
     }
@@ -647,7 +671,7 @@ export function moveLaneRunnerRole(
       continue;
     }
     movedFrom.push(hostName);
-    nextHosts ??= { ...hosts };
+    nextHosts ??= copyOwnDataOf(hosts) ?? {};
     const kept = roles.filter((role) => role !== "lane-runner");
     const rawAliases = ownData(rawHost, "roleAliases");
     const aliasData = copyOwnDataOf(rawAliases);

@@ -790,8 +790,77 @@ describe('mergeDraftedHost precedence (P2-cli)', () => {
     for (let index = 0; index < 17; index += 1) {
       manyAliases[`extra${index}`] = 'lanehost';
     }
-    expect(draftHost(sshInput({ roleAliases: manyAliases as never })).ok).toBe(
-      false,
+    const manyResult = draftHost(sshInput({ roleAliases: manyAliases as never }));
+    expect(manyResult.ok).toBe(false);
+    // The size bound itself must be what refuses: the message is asserted, so
+    // removing the MAX_ROLE_ALIASES check fails this test.
+    expect(manyResult.ok ? [] : manyResult.errors.join('\n')).toContain(
+      'roleAliases: must hold at most 16 role aliases',
     );
+  });
+});
+
+describe('applyHostDraft validates the host it files (Luna pre-merge round)', () => {
+  const base = { schemaVersion: 2, hosts: {} };
+  const goodHost = {
+    transport: 'ssh',
+    sshAlias: 'lanehost',
+    worktreeRoot: '/srv/fleet-v2/worktrees',
+    roles: ['lane-runner'],
+  };
+
+  it('refuses an unknown role, a null roleAliases and a bad transport instead of returning ok', () => {
+    for (const bad of [
+      { ...goodHost, roles: ['wizard'] },
+      { ...goodHost, roleAliases: null },
+      { ...goodHost, transport: 'carrier-pigeon' },
+      { ...goodHost, worktreeRoot: 'relative/path' },
+    ]) {
+      const result = applyHostDraft(
+        base,
+        { name: 'lanehost', host: bad as never },
+        'add',
+      );
+      expect(result.ok).toBe(false);
+    }
+    const edit = applyHostDraft(
+      { schemaVersion: 2, hosts: { lanehost: goodHost } },
+      { name: 'lanehost', host: { ...goodHost, roles: ['wizard'] } as never },
+      'edit',
+    );
+    expect(edit.ok).toBe(false);
+  });
+
+  it('never echoes a secret-shaped host name in a validation or mode error', () => {
+    const secretName = ['sk', '-' + 'b'.repeat(24)].join('');
+    const drafted = draftHost({
+      name: secretName,
+      transport: 'carrier-pigeon' as never,
+      worktreeRoot: '/srv/w',
+      roles: ['lane-runner'],
+    });
+    expect(drafted.ok).toBe(false);
+    expect(JSON.stringify(drafted)).not.toContain(secretName);
+    const added = applyHostDraft(
+      { schemaVersion: 2, hosts: { [secretName]: goodHost } },
+      { name: secretName, host: goodHost as never },
+      'add',
+    );
+    expect(added.ok).toBe(false);
+    expect(JSON.stringify(added)).not.toContain(secretName);
+    const missing = applyHostDraft(
+      base,
+      { name: secretName, host: goodHost as never },
+      'edit',
+    );
+    expect(missing.ok).toBe(false);
+    expect(JSON.stringify(missing)).not.toContain(secretName);
+    const invalid = applyHostDraft(
+      base,
+      { name: secretName, host: { ...goodHost, roles: ['wizard'] } as never },
+      'add',
+    );
+    expect(invalid.ok).toBe(false);
+    expect(JSON.stringify(invalid)).not.toContain(secretName);
   });
 });

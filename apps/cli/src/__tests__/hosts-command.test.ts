@@ -1571,3 +1571,31 @@ describe("fix round 1: redaction, usage echo and moveLaneRunnerRole guards", () 
     expect(hosts.sole).not.toHaveProperty("roleAliases");
   });
 });
+
+describe("moveLaneRunnerRole host-map accessors (Luna pre-merge round)", () => {
+  it("refuses a host-map entry that is a getter without invoking it", () => {
+    let invoked = 0;
+    const hosts: Record<string, unknown> = {
+      holder: {
+        transport: "local",
+        worktreeRoot: "/srv/w",
+        roles: ["orchestrator", "lane-runner"],
+      },
+    };
+    Object.defineProperty(hosts, "hostile", {
+      enumerable: true,
+      get() {
+        invoked += 1;
+        throw new Error("hostile getter ran");
+      },
+    });
+    const current = { schemaVersion: 2, hosts };
+    let result: ReturnType<typeof moveLaneRunnerRole> | undefined;
+    expect(() => {
+      result = moveLaneRunnerRole(current, "new");
+    }).not.toThrow();
+    expect(invoked).toBe(0);
+    expect(result?.movedFrom).toEqual([]);
+    expect(result?.value).toBe(current);
+  });
+});

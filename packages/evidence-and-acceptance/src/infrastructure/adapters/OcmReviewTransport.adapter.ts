@@ -464,6 +464,50 @@ function normalizeSeverity(word: string): FindingSeverity | null {
   return Object.prototype.hasOwnProperty.call(SEVERITY_SYNONYMS, key) ? (SEVERITY_SYNONYMS[key] as FindingSeverity) : null;
 }
 
+const BLOCKING_SEVERITY_WORD = /(?<![A-Za-z0-9])(?:blocker|critical|major|high|severe)(?![A-Za-z0-9])/i;
+const FILE_REFERENCE = /[\w./-]+\.\w+:\d+/;
+const LIST_OR_NUMBER_MARKER = /^(?:[-*+•>]\s|\d+[.)]\s)/;
+const SEVERITY_TOKEN_SKELETONS: ReadonlySet<string> = new Set([
+  'blocker', 'critical', 'major', 'high', 'severe', 'medium', 'minor', 'low', 'nit', 'info', 'trivial',
+]);
+/** Cyrillic and Greek letters that render like ASCII ones, folded before a severity-word check. */
+const LOOKALIKES: Readonly<Record<string, string>> = {
+  'а': 'a', 'с': 'c', 'е': 'e', 'о': 'o', 'р': 'p', 'х': 'x', 'у': 'y', 'і': 'i', 'ј': 'j', 'к': 'k', 'м': 'm', 'н': 'h', 'т': 't', 'ѕ': 's', 'ԁ': 'd', 'ɡ': 'g', 'ӏ': 'l', 'ᴎ': 'n',
+  'α': 'a', 'ε': 'e', 'ι': 'i', 'ο': 'o', 'ρ': 'p', 'ν': 'v', 'κ': 'k', 'τ': 't', 'η': 'n', 'μ': 'm', 'β': 'b', 'χ': 'x', 'υ': 'u',
+};
+
+/**
+ * RV3 (Luna round 2): true when a line that no finding pattern fully parsed
+ * still looks like a finding, so the whole reply must be refused rather than
+ * the line skipped. After dropping markdown emphasis and list markers: a
+ * `FINDING:` prefix; a blocking-severity ASCII word on a line that also has a
+ * `path:line` reference or a leading list/number marker; or a severity word
+ * written with look-alike non-ASCII letters on such a line. An ordinary
+ * sentence ("no major issues") carries none of those and is left alone.
+ */
+function looksLikeUnparsedFinding(trimmedLine: string): boolean {
+  const norm = trimmedLine.replace(/^[\s*_`>+•-]+/, '').replace(/^\d+[.)]\s+/, '').replace(/^[\s*_`>]+/, '');
+  if (/^FINDING\b\s*:/i.test(norm)) {
+    return true;
+  }
+  const findingShaped = FILE_REFERENCE.test(trimmedLine) || LIST_OR_NUMBER_MARKER.test(trimmedLine);
+  if (!findingShaped) {
+    return false;
+  }
+  if (BLOCKING_SEVERITY_WORD.test(trimmedLine)) {
+    return true;
+  }
+  for (const token of trimmedLine.split(/[^\p{L}\p{N}]+/u)) {
+    if (/\P{ASCII}/u.test(token)) {
+      const folded = [...token.toLowerCase()].map((ch) => LOOKALIKES[ch] ?? ch).join('');
+      if (SEVERITY_TOKEN_SKELETONS.has(folded)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /** The findings parsed from a reply, and whether any finding line carried an unrecognised severity. */
 interface ParsedFindingLines {
   readonly findings: ReviewFindingRecord[];
@@ -902,6 +946,10 @@ function parseFindingLines(text: string): ParsedFindingLines {
         dispositionReason: null,
         dispositionEvidenceRef: null,
       });
+      continue;
+    }
+    if (looksLikeUnparsedFinding(trimmedLine)) {
+      invalid = true;
     }
   }
   return { findings, invalid };

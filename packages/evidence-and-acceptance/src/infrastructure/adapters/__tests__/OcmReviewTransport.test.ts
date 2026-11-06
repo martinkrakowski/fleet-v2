@@ -2752,4 +2752,32 @@ describe('RV3 Luna round 1: unrecognised finding severities', () => {
       }
     }
   });
+  it('Luna round 2: finding-shaped lines that do not fully parse refuse the whole reply', () => {
+    for (const line of [
+      'FINDING:  Critical: src/a.ts:3 data loss',
+      'sev: critical src/a.ts:3 data loss',
+      '**Critical**: src/a.ts:3 data loss',
+      '- _major_ src/a.ts:3 wrong result',
+      '- \u0441ritical src/a.ts:3 data loss',
+      '1. `src/a.ts:3` - \u0441r\u0456t\u0456c\u0430l. data loss',
+    ]) {
+      for (const parse of [parseReviewReplyStrict, parseReviewReply]) {
+        const parsed = parse(`${line}\nVERDICT: PASS`);
+        expect(parsed.result, line).toBe('unknown');
+        expect(parsed.unknownReason, line).toBe('unparseable-verdict');
+      }
+    }
+  });
+
+  it('Luna round 2: a clean PASS reply and ordinary severity prose still pass', () => {
+    for (const text of [
+      'Looks good.\nVERDICT: PASS',
+      'There are no major issues and the risk is high only in theory.\nVERDICT: PASS',
+      'Résumé of the change: all fine, see src/a.ts for details.\nVERDICT: PASS',
+    ]) {
+      const parsed = parseReviewReplyStrict(text);
+      expect(parsed.result, text).toBe('pass');
+      expect(parsed.findings).toEqual([]);
+    }
+  });
 });

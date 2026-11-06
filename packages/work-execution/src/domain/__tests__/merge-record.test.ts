@@ -130,14 +130,21 @@ describe('MergeRecord.create', () => {
   it('handles a __proto__ key and a null-prototype record safely and refuses a class instance', () => {
     const withProto = JSON.parse(JSON.stringify(VALID).replace('{', '{"__proto__":{"x":1},')) as unknown;
     expect(() => MergeRecord.create(withProto)).not.toThrow();
-    // An own `__proto__` data key is either refused or dropped; it never reaches
-    // the record or the prototype chain.
+    // Brief: extra keys are ignored, so an own `__proto__` data key is dropped:
+    // the record is accepted and the key never reaches the record or the chain.
     const protoResult = MergeRecord.create(withProto);
-    if (protoResult.success) {
-      expect(Object.keys(protoResult.value.toRecord())).not.toContain('__proto__');
-      expect(Object.getPrototypeOf(protoResult.value.toRecord())).toBe(Object.prototype);
+    expect(protoResult.success).toBe(true);
+    if (!protoResult.success) {
+      throw new Error('expected create success');
     }
+    const protoRecord = protoResult.value.toRecord();
+    expect(Object.getPrototypeOf(protoRecord)).toBe(Object.prototype);
+    expect(Object.getOwnPropertyNames(protoRecord)).not.toContain('__proto__');
+    expect(Object.keys(protoRecord).sort()).toEqual(Object.keys(VALID).sort());
+    expect(protoRecord).toEqual(VALID);
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype);
     expect(({} as Record<string, unknown>).x).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(Object.prototype, 'x')).toBe(false);
 
     const nullProto = Object.assign(Object.create(null) as Record<string, unknown>, VALID);
     expect(() => MergeRecord.create(nullProto)).not.toThrow();
@@ -163,11 +170,16 @@ describe('MergeRecord.create', () => {
 
   it('does not copy extra fields into toRecord', () => {
     const result = MergeRecord.create({ ...VALID, extra: 'x', token: 'y' });
-    if (result.success) {
-      expect(Object.keys(result.value.toRecord()).sort()).toEqual(Object.keys(VALID).sort());
-    } else {
-      expect(result.code).toBe('invalid');
+    // Brief: extra keys on the input are ignored, never refused and never copied.
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      throw new Error('expected create success');
     }
+    const record = result.value.toRecord();
+    expect(Object.keys(record).sort()).toEqual(Object.keys(VALID).sort());
+    expect(record).toEqual(VALID);
+    expect(record).not.toHaveProperty('extra');
+    expect(record).not.toHaveProperty('token');
   });
 
   it('refuses an oversized headSha and timestamps', () => {

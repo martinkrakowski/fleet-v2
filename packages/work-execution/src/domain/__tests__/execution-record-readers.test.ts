@@ -5,6 +5,7 @@ import {
   readAttemptRecord,
   readCapacityReservationRecord,
 } from '../execution-record-readers.js';
+import { ActionJournalEntry } from '../entities/ActionJournalEntry.js';
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
@@ -933,5 +934,106 @@ describe('execution-record-readers: hostile input', () => {
       expect(Object.hasOwn(result.record, 'seatPlan')).toBe(false);
       expect(Object.hasOwn(result.record, 'usage')).toBe(false);
     }
+  });
+});
+
+describe('execution-record-readers: typed journal pullRequest (WB5b)', () => {
+  const forgeJournal = { ...clone(validJournal), action: 'forge' };
+
+  it('accepts a valid pullRequest on a forge entry and copies it into a fresh frozen object', () => {
+    const input = { ...clone(forgeJournal), pullRequest: { repository: 'acme/app', number: 42 } };
+    const read = readActionJournalEntryRecord(input);
+    expect(read.ok).toBe(true);
+    if (!read.ok) {
+      return;
+    }
+    expect(read.record.pullRequest).toEqual({ repository: 'acme/app', number: 42 });
+    expect(read.record.pullRequest).not.toBe(input.pullRequest);
+    expect(Object.isFrozen(read.record.pullRequest)).toBe(true);
+  });
+
+  it('refuses a pullRequest on a non-forge action and a forge entry without one stays fine', () => {
+    const dispatchWithRef = { ...clone(validJournal), pullRequest: { repository: 'acme/app', number: 42 } };
+    expect(readActionJournalEntryRecord(dispatchWithRef)).toEqual({ ok: false, reason: 'malformed' });
+    const plainForge = clone(forgeJournal);
+    const read = readActionJournalEntryRecord(plainForge);
+    expect(read.ok).toBe(true);
+    if (read.ok) {
+      expect(Object.hasOwn(read.record, 'pullRequest')).toBe(false);
+    }
+    const undefinedRef = { ...clone(forgeJournal), pullRequest: undefined };
+    const undefinedRead = readActionJournalEntryRecord(undefinedRef);
+    expect(undefinedRead.ok).toBe(true);
+    if (undefinedRead.ok) {
+      expect(Object.hasOwn(undefinedRead.record, 'pullRequest')).toBe(false);
+    }
+  });
+
+  it('refuses malformed repositories and numbers without throwing', () => {
+    for (const pullRequest of [
+      { repository: 'acme/app', number: 0 },
+      { repository: 'acme/app', number: 1_000_000_000 },
+      { repository: 'acme/app', number: 1.5 },
+      { repository: '', number: 42 },
+      { repository: 'acme/app' },
+      { repository: 'acme/app', number: 42, extra: true },
+      null,
+      'acme/app#42',
+      42,
+    ]) {
+      expect(readActionJournalEntryRecord({ ...clone(forgeJournal), pullRequest })).toEqual({
+        ok: false,
+        reason: 'malformed',
+      });
+    }
+    const secret = `gh${'p_'}${'A'.repeat(30)}`;
+    expect(
+      readActionJournalEntryRecord({ ...clone(forgeJournal), pullRequest: { repository: secret, number: 42 } }),
+    ).toEqual({ ok: false, reason: 'malformed' });
+  });
+
+  it('refuses sparse arrays and throwing getters on the pullRequest field without running them', () => {
+    const sparse = new Array(2) as unknown as Record<string, unknown>;
+    sparse.repository = 'acme/app';
+    sparse.number = 42;
+    expect(readActionJournalEntryRecord({ ...clone(forgeJournal), pullRequest: sparse })).toEqual({
+      ok: false,
+      reason: 'malformed',
+    });
+    let getterCalls = 0;
+    const hostile = {
+      repository: 'acme/app',
+      get number() {
+        getterCalls += 1;
+        return 42;
+      },
+    };
+    expect(readActionJournalEntryRecord({ ...clone(forgeJournal), pullRequest: hostile })).toEqual({
+      ok: false,
+      reason: 'malformed',
+    });
+    expect(getterCalls).toBe(0);
+  });
+
+  it('ActionJournalEntry.fromRecord accepts a valid forge reference and refuses the rest', () => {
+    const record = readActionJournalEntryRecord({
+      ...clone(forgeJournal),
+      pullRequest: { repository: 'acme/app', number: 42 },
+    });
+    expect(record.ok).toBe(true);
+    if (record.ok) {
+      expect(() => ActionJournalEntry.fromRecord(record.record)).not.toThrow();
+    }
+    const nonForge = readActionJournalEntryRecord({
+      ...clone(validJournal),
+      pullRequest: { repository: 'acme/app', number: 42 },
+    } as never);
+    expect(nonForge.ok).toBe(false);
+    expect(() =>
+      ActionJournalEntry.fromRecord({
+        ...clone(validJournal),
+        pullRequest: { repository: 'acme/app', number: 42 },
+      } as never),
+    ).toThrow(/pullRequest/);
   });
 });

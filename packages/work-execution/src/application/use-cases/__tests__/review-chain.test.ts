@@ -159,6 +159,15 @@ function harness(script: Script = {}) {
             state.pinRecordedCount += 1;
             return { outcome: 'recorded' } as const;
     },
+    async listChains() {
+      throw new Error('not used');
+    },
+    async recordChainRefreshIntent() {
+      throw new Error('not used');
+    },
+    async recordChainRefreshOutcome() {
+      throw new Error('not used');
+    },
   };
 
   const useCase = new ReviewChainUseCase({

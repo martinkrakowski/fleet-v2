@@ -11,6 +11,7 @@
 import type {
   LanePlanRecord,
   PlannedLaneRef,
+  PullRequestLinkConflictRecord,
   PullRequestLinkRecord,
 } from '../../../domain/lane-plan-records.js';
 
@@ -27,6 +28,11 @@ export type SavePullRequestLinkResult =
       readonly linkedLaneId: string | null;
     };
 
+export type SavePullRequestLinkConflictResult =
+  | { readonly outcome: 'saved'; readonly conflict: PullRequestLinkConflictRecord }
+  | { readonly outcome: 'unchanged'; readonly conflict: PullRequestLinkConflictRecord }
+  | { readonly outcome: 'refused'; readonly code: 'invalid' | 'store'; readonly message: string };
+
 export interface LanePlanRepositoryPort {
   /** Persist one plan revision; CAS on `revision`: a stored revision >= the incoming one is an error, never a silent overwrite. */
   saveLanePlan(record: LanePlanRecord): Promise<void>;
@@ -42,4 +48,13 @@ export interface LanePlanRepositoryPort {
   findPullRequestLink(repository: string, number: number): Promise<PullRequestLinkRecord | null>;
   /** Every stored link, optionally narrowed to one project. */
   listPullRequestLinks(projectId?: string): Promise<readonly PullRequestLinkRecord[]>;
+  /**
+   * Persist one pull-request link conflict (WB5b), keyed on the repository,
+   * the number and both lane tuples. Create-if-absent: the same conflict is
+   * never recorded twice. Optional so test doubles without conflict storage
+   * keep working; callers must tolerate its absence.
+   */
+  savePullRequestLinkConflict?(record: PullRequestLinkConflictRecord): Promise<SavePullRequestLinkConflictResult>;
+  /** Every stored conflict, optionally narrowed to one project. Optional for the same reason. */
+  listPullRequestLinkConflicts?(projectId?: string): Promise<readonly PullRequestLinkConflictRecord[]>;
 }

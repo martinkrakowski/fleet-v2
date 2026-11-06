@@ -194,6 +194,8 @@ function expectedMergeGrantRecord(): CoordinationRequestRecord {
       attemptId: 'attempt-example-a',
       acceptanceReceiptId: 'receipt-example-a',
     },
+    grantRecordVersion: 2,
+    grantAttemptId: 'attempt-example-a',
   };
 }
 

@@ -451,6 +451,8 @@ export interface MergeDaemonSection {
   readonly intervalSeconds?: number;
   readonly budgetSeconds?: number;
   readonly settleSeconds?: number;
+  /** Chain refresh mode of the daemon; only `shadow` (the default) is enabled, `live` is refused. */
+  readonly chainRefresh?: 'shadow' | 'live';
 }
 
 /** A merge repository policy with every default applied (`resolveMergePolicy`). */

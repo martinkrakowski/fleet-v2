@@ -97,6 +97,9 @@ class FakeFixAttempts implements PrepareFixAttemptPort {
 }
 
 class FakeForge implements ForgeActionPort {
+  boundRepository(): { owner: string; repo: string } | undefined {
+    return { owner: 'org', repo: 'repo' };
+  }
   readonly requests: ForgeActionRequest[] = [];
   configured = true;
 

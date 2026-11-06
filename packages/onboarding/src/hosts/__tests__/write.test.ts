@@ -99,7 +99,7 @@ describe("writeInstallation keeps policy through a hosts edit (IW1)", () => {
           },
         },
       },
-      daemon: { intervalSeconds: 90, budgetSeconds: 60, settleSeconds: 30 },
+      daemon: { intervalSeconds: 90, budgetSeconds: 60, settleSeconds: 30, chainRefresh: "shadow" },
     };
     try {
       await writeFile(file, `${JSON.stringify({ ...baseFile, policy }, null, 2)}\n`);

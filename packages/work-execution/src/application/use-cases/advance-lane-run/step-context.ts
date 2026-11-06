@@ -10,6 +10,7 @@ import type { LaneRunParkReason, LaneRunRecord } from '../../../domain/lane-run-
 import type { LaneRunParkRequest } from '../../ports/out/LaneRunParkNoticePort.out-port.js';
 import { boundedFindingsView } from '../../../domain/park-findings-view.js';
 import type { LaneRunParkFindingView } from '../../../domain/park-findings-view.js';
+import { resolveLaneRunProvenance } from '../../../domain/lane-run-records.js';
 import { canEnterLaneRunState, workOrderReleaseFor } from '../../../domain/lane-run-transitions.js';
 import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunState.vo.js';
 import { workOrderHoldFacts } from '../work-order-hold-facts.js';
@@ -69,7 +70,7 @@ export async function performEnter(ctx: AdvanceStepContext,
     record.parked.reason === 'ambiguous' &&
     record.parked.qualifier === 'open-pr' &&
     record.prNumber !== null;
-  if (!canEnterLaneRunState(from, to, record.parked?.parkedFrom ?? null, settledOpenPr)) {
+  if (!canEnterLaneRunState(from, to, record.parked?.parkedFrom ?? null, settledOpenPr, resolveLaneRunProvenance(record))) {
     return { outcome: 'refused', reason: 'illegal-transition' };
   }
   if (to === 'merged' || to === 'stopped') {

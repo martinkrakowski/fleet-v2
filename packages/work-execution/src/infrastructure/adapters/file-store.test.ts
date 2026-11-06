@@ -1525,6 +1525,30 @@ describe('readBoundedStoreBytes and readOrQuarantineVersionedRecordList', () => 
     expect(await fs.readFile(filePath)).toEqual(bytesB);
   });
 
+  it('says no quarantine was attempted when the store becomes a symlink while the reader waits for the lock', async () => {
+    await fs.writeFile(filePath, '{ not json');
+    const outside = path.join(tempDir, 'outside.txt');
+    await fs.writeFile(outside, '{ not json');
+    const release = createLatch();
+    const held = withFileLock(`${filePath}.lock`, () => release.promise);
+    await sleep(50);
+    const reading = readOrQuarantineVersionedRecordList({ filePath, parseRecord, lockTimeoutMs: 5_000 });
+    const settled = reading.catch((error: unknown) => error);
+    await sleep(100);
+    await fs.unlink(filePath);
+    await fs.symlink(outside, filePath);
+    release.resolve();
+    await held;
+    const error = await settled;
+    expect(error).toBeInstanceOf(StateFileUnreadableError);
+    const unreadable = error as StateFileUnreadableError;
+    expect(unreadable.quarantinePath).toBeNull();
+    expect(unreadable.message).toContain('no quarantine was attempted');
+    expect(unreadable.message).not.toContain('could not be copied');
+    expect(unreadable.message).not.toContain('repair it by hand');
+    await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+  });
+
   it('quarantines when lockHeld is true without deadlocking on the already-held store lock', async () => {
     await fs.writeFile(filePath, '{ not json');
     const error = await withFileLock(`${filePath}.lock`, () =>

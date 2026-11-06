@@ -837,7 +837,7 @@ export async function readOrQuarantineVersionedRecordList<T>(
       throw new StateFileUnreadableReadOnlyError(options.filePath, locked.detail);
     }
     if (locked.kind === 'unquarantinable') {
-      throw new StateFileUnreadableError(options.filePath, null, locked.detail);
+      throw new StateFileUnreadableError(options.filePath, null, locked.detail, undefined, undefined, false);
     }
     if (!(await isAbsentOrRealDirectory(path.join(path.dirname(options.filePath), 'quarantine')))) {
       throw new StateFileUnreadableError(

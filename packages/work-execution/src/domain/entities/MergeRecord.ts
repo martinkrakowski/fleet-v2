@@ -54,12 +54,14 @@ export type MergeRecordResult =
 const MERGE_HEAD_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
- * The source/merger pairing invariant: `fleet-forge-action` requires
- * `merger: 'fleet'` and `forge-observation` requires `merger: 'unknown'`.
+ * The source/merger pairing invariant, one way: a `fleet-forge-action` source
+ * claims the fleet path did the merge, so it always pairs with
+ * `merger: 'fleet'`. A `forge-observation` source may pair with either merger:
+ * it starts as `unknown` and may legitimately have been upgraded to `fleet` by
+ * the merger upgrade, so `forge-observation`/`fleet` is a valid stored record.
  */
 function mergeSourceMergerAgree(source: MergeRecordSource, merger: MergeRecordMerger): boolean {
-  return (source === 'fleet-forge-action' && merger === 'fleet') ||
-    (source === 'forge-observation' && merger === 'unknown');
+  return !(source === 'fleet-forge-action' && merger === 'unknown');
 }
 
 /**
@@ -110,9 +112,11 @@ export class MergeRecord {
       if (!read.ok) {
         return invalid(read.message);
       }
-      // A fresh record must come in with a source/merger pair that agrees; a
-      // stored record may legitimately have been upgraded (unknown → fleet), so
-      // this invariant is enforced here, not by the shared reader.
+      // Only an impossible pair is refused: a `fleet-forge-action` source claims
+      // the fleet path did the merge, so it must carry `merger: 'fleet'`. A
+      // `forge-observation` source may carry either merger — `unknown` on the
+      // first sighting and `fleet` after the merger upgrade, which is persisted
+      // and loaded back through this same path.
       if (!mergeSourceMergerAgree(read.record.source, read.record.merger)) {
         return invalid('MergeRecord source and merger disagree');
       }
@@ -298,11 +302,11 @@ export function decideMergeRecord(stored: unknown, incoming: unknown): MergeReco
     return invalidDecision('MergeRecord incoming record could not be read');
   }
   const incomingRecord = incomingRead.record;
-  // The incoming record must carry an agreeing source/merger pair, in
-  // particular when nothing is stored: a `forge-observation` sighting claiming
-  // `merger: 'fleet'` is refused, never recorded. A stored record is exempt —
-  // it may legitimately have been upgraded (`unknown` → `fleet`) — but an
-  // incoming record is a fresh sighting and must agree.
+  // The incoming record must carry a possible source/merger pair: a
+  // `fleet-forge-action` source claims the fleet path did the merge and must
+  // carry `merger: 'fleet'`. A `forge-observation` sighting may carry either
+  // merger — `unknown` on first sighting or `fleet` when the fleet path's
+  // typed journal entry has already moved it.
   if (!mergeSourceMergerAgree(incomingRecord.source, incomingRecord.merger)) {
     return invalidDecision('MergeRecord source and merger disagree');
   }

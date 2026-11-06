@@ -149,8 +149,18 @@ describe('MergeRecord.create', () => {
   it('refuses a fleet-forge-action source with an unknown merger', () => {
     expect(createError(patched((record) => { record.source = 'fleet-forge-action'; })))
       .toBe('MergeRecord source and merger disagree');
-    expect(createError(patched((record) => { record.merger = 'fleet'; })))
-      .toBe('MergeRecord source and merger disagree');
+  });
+
+  it('accepts an upgraded forge-observation record with a fleet merger', () => {
+    // The merger upgrade persists a stored `forge-observation` record whose
+    // merger moved `unknown` → `fleet`; loading it back through the entity
+    // must succeed and round-trip.
+    const result = MergeRecord.create(patched((record) => { record.merger = 'fleet'; }));
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.value.toRecord()).toEqual({ ...VALID, merger: 'fleet' });
+    expect(result.value.getSource()).toBe('forge-observation');
+    expect(result.value.getMerger()).toBe('fleet');
   });
 
   it('getKey joins repository and number with #', () => {
@@ -227,6 +237,23 @@ describe('decideMergeRecord', () => {
     expect(result.record.actionRef).toBeUndefined();
   });
 
+  it('reloads a persisted upgraded forge-observation record', () => {
+    // The upgrade persists the stored `forge-observation` record with only
+    // `merger` moved to `fleet`; that persisted record must reload through the
+    // entity and round-trip.
+    const fleetSighting = { ...VALID, merger: 'fleet' };
+    const decided = decideMergeRecord(VALID, fleetSighting);
+    expect(decided.success).toBe(true);
+    if (!decided.success) return;
+    expect(decided.outcome).toBe('upgrade-merger');
+    expect(decided.record).toEqual({ ...VALID, merger: 'fleet' });
+
+    const reloaded = MergeRecord.create(decided.record);
+    expect(reloaded.success).toBe(true);
+    if (!reloaded.success) return;
+    expect(reloaded.value.toRecord()).toEqual({ ...VALID, merger: 'fleet' });
+  });
+
   it('never downgrades merger from fleet to unknown', () => {
     const fleetStored = { ...VALID, source: 'fleet-forge-action', merger: 'fleet' };
     const result = decideMergeRecord(fleetStored, VALID);
@@ -249,15 +276,13 @@ describe('decideMergeRecord', () => {
   });
 
   it('refuses an incoming record whose source and merger disagree', () => {
-    // A forge observation claiming the fleet merger is refused, in particular
-    // when nothing is stored — it is never accepted as a new record.
-    const forged = { ...VALID, merger: 'fleet' } as MergeRecordRecord;
-    expect(decideError(null, forged)).toBe('MergeRecord source and merger disagree');
-    expect(decideError(undefined, forged)).toBe('MergeRecord source and merger disagree');
-
+    // A fleet-forge-action claim with an unknown merger is impossible and is
+    // refused both with nothing stored and against a stored record. A
+    // `forge-observation` sighting with a `fleet` merger is a legitimate
+    // upgraded record and is accepted.
     const journal = { ...VALID, source: 'fleet-forge-action', merger: 'unknown' } as MergeRecordRecord;
     expect(decideError(null, journal)).toBe('MergeRecord source and merger disagree');
-    // Even against a stored record the incoming sighting must agree.
+    expect(decideError(undefined, journal)).toBe('MergeRecord source and merger disagree');
     expect(decideError(VALID, journal)).toBe('MergeRecord source and merger disagree');
   });
 

@@ -520,6 +520,8 @@ interface TickContext {
   readonly previousStatus: DaemonStatusRecord | null;
   /** The tick clock after the start: a throwing or malformed reading falls back to the last good one. */
   readonly clock: () => string;
+  /** Set when a deadline-sensitive fresh read failed: the budget is then treated as exhausted. */
+  readonly state: { budgetSpent: boolean };
 }
 
 export class RunDaemonTickUseCase implements RunDaemonTickPort {
@@ -560,18 +562,12 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       deadlineIso,
       previousStatus: previous,
       clock: this.tickClock(nowIso),
+      state: { budgetSpent: false },
     };
 
     const jobs = new DaemonJobRegistry({ mergePass: this.deps.mergePass }).instances(request.repositories);
     const plan = await this.plan(ctx, jobs);
-    // The settle never outlasts the tick: cap it to the time left before the deadline, measured at the moment of
-    // the sleep (the status, pause and halt reads before it already spent part of the budget), skip it when none is left.
-    if (plan.settleDelayMs > 0) {
-      const settleMs = Math.min(plan.settleDelayMs, Math.max(0, Date.parse(deadlineIso) - Date.parse(ctx.clock())));
-      if (settleMs > 0) {
-        await (this.deps.sleep ?? defaultSleep)(settleMs);
-      }
-    }
+    await this.settle(ctx, plan.settleDelayMs);
     if (plan.paused) {
       return this.finishPaused(ctx, plan);
     }
@@ -621,6 +617,27 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       settleSeconds: ctx.request.settleSeconds,
       jobFilter: ctx.request.jobFilter,
     });
+  }
+
+  /**
+   * The settle never outlasts the tick: cap it to the time left before the deadline, measured at the moment of
+   * the sleep (the status, pause and halt reads before it already spent part of the budget), skip it when none is left.
+   * Fail closed: when the fresh clock read throws or is malformed the time left is unknown, so the settle is skipped
+   * and the budget counts as exhausted (every job then ends `budget-exhausted`), never measured from the start time.
+   */
+  private async settle(ctx: TickContext, settleDelayMs: number): Promise<void> {
+    if (settleDelayMs <= 0) {
+      return;
+    }
+    const freshNow = this.readClock();
+    if (freshNow === null) {
+      ctx.state.budgetSpent = true;
+      return;
+    }
+    const settleMs = Math.min(settleDelayMs, Math.max(0, Date.parse(ctx.deadlineIso) - Date.parse(freshNow)));
+    if (settleMs > 0) {
+      await (this.deps.sleep ?? defaultSleep)(settleMs);
+    }
   }
 
   /** A paused tick writes a paused status carrying the previous repositories and runs nothing. */
@@ -789,6 +806,9 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
 
   /** D-DT9: a call whose remaining time is under 2 s is not started. */
   private hasBudget(ctx: TickContext, nowIso: string): boolean {
+    if (ctx.state.budgetSpent) {
+      return false;
+    }
     return computeCallBudget({
       nowIso,
       deadlineIso: ctx.deadlineIso,

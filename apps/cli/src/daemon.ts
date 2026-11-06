@@ -144,6 +144,90 @@ function parseStatusArgs(args: readonly string[]): { readonly json: boolean } | 
   return args.length === 1 && args[0] === '--json' ? { json: true } : null;
 }
 
+type ParsedDaemonArgs =
+  | { readonly kind: 'tick'; readonly tick: ParsedTickArgs }
+  | { readonly kind: 'status'; readonly json: boolean }
+  | { readonly kind: 'pause' | 'resume' };
+
+/** Checks that need no parsing: an exit code for invalid, empty, help and unknown-subcommand argv, else null. */
+function preflight(argv: readonly string[], io: CliIo): number | null {
+  if (!isValidArgv(argv)) {
+    io.stderr(`Invalid daemon arguments\n${DAEMON_HELP}\n`);
+    return 2;
+  }
+  if (argv.length === 0) {
+    io.stderr(`${DAEMON_HELP}\n`);
+    return 2;
+  }
+  if (daemonHelpRequested(argv)) {
+    io.stdout(`${DAEMON_HELP}\n`);
+    return 0;
+  }
+  if (!SUBCOMMANDS.includes(argv[0])) {
+    io.stderr(`Unknown daemon subcommand\n${DAEMON_HELP}\n`);
+    return 2;
+  }
+  return null;
+}
+
+/** The subcommand's own strict flags; null for a usage error. */
+function parseSubcommandArgs(subcommand: string, args: readonly string[]): ParsedDaemonArgs | null {
+  if (subcommand === 'tick') {
+    const tick = parseTickArgs(args);
+    return tick === null ? null : { kind: 'tick', tick };
+  }
+  if (subcommand === 'status') {
+    const status = parseStatusArgs(args);
+    return status === null ? null : { kind: 'status', json: status.json };
+  }
+  return args.length > 0 ? null : { kind: subcommand === 'pause' ? 'pause' : 'resume' };
+}
+
+/** Commands that write need a durable state directory, given by option or by the runtime. */
+function hasDurableState(runtime: FleetCliRuntime, options?: DaemonCliOptions): boolean {
+  return (typeof options?.stateDir === 'string' && options.stateDir.trim().length > 0) || runtime.daemon.durable;
+}
+
+interface DaemonClock {
+  /** A fresh reading; the last good one when this reading fails; null before any good reading. */
+  readonly readNow: () => string | null;
+  /** A fresh reading only: null when the clock throws or answers an invalid time. Never a stale value. */
+  readonly readFresh: () => string | null;
+}
+
+function createClock(runtime: FleetCliRuntime, options?: DaemonCliOptions): DaemonClock {
+  let lastGoodNow: string | null = null;
+  const readFresh = (): string | null => {
+    try {
+      const value: unknown = options?.now !== undefined ? options.now() : runtime.daemon.now();
+      return typeof value === 'string' && isZonedIsoDateTime(value) ? value : null;
+    } catch {
+      return null;
+    }
+  };
+  const readNow = (): string | null => {
+    lastGoodNow = readFresh() ?? lastGoodNow;
+    return lastGoodNow;
+  };
+  return { readNow, readFresh };
+}
+
+async function dispatch(
+  parsed: ParsedDaemonArgs,
+  io: CliIo,
+  runtime: FleetCliRuntime,
+  nowIso: string,
+  clock: DaemonClock,
+): Promise<number> {
+  if (parsed.kind === 'tick') {
+    return await runTick(io, runtime, parsed.tick, nowIso, clock.readFresh);
+  }
+  if (parsed.kind === 'status') {
+    return await runStatus(io, runtime, parsed.json, nowIso);
+  }
+  return await runPause(io, runtime, parsed.kind === 'pause', nowIso);
+}
+
 export async function daemonCommand(
   argv: readonly string[],
   io: CliIo,
@@ -151,82 +235,30 @@ export async function daemonCommand(
   options?: DaemonCliOptions,
 ): Promise<number> {
   try {
-    if (!isValidArgv(argv)) {
-      io.stderr(`Invalid daemon arguments\n${DAEMON_HELP}\n`);
-      return 2;
-    }
-    if (argv.length === 0) {
-      io.stderr(`${DAEMON_HELP}\n`);
-      return 2;
-    }
-    if (daemonHelpRequested(argv)) {
-      io.stdout(`${DAEMON_HELP}\n`);
-      return 0;
+    const early = preflight(argv, io);
+    if (early !== null) {
+      return early;
     }
     const subcommand = argv[0];
-    if (!SUBCOMMANDS.includes(subcommand)) {
-      io.stderr(`Unknown daemon subcommand\n${DAEMON_HELP}\n`);
-      return 2;
-    }
-    const args = argv.slice(1);
-    const usage = (): number => {
+    // Parse before anything else runs, so a usage error never depends on the stores or the clock.
+    const parsed = parseSubcommandArgs(subcommand, argv.slice(1));
+    if (parsed === null) {
       io.stderr(`Invalid daemon ${subcommand} arguments\n${DAEMON_HELP}\n`);
       return 2;
-    };
-
-    // Parse before anything else runs, so a usage error never depends on the stores or the clock.
-    let tickArgs: ParsedTickArgs | null = null;
-    let statusArgs: { readonly json: boolean } | null = null;
-    if (subcommand === 'tick') {
-      tickArgs = parseTickArgs(args);
-      if (tickArgs === null) {
-        return usage();
-      }
-    } else if (subcommand === 'status') {
-      statusArgs = parseStatusArgs(args);
-      if (statusArgs === null) {
-        return usage();
-      }
-    } else if (args.length > 0) {
-      return usage();
     }
-
-    if (subcommand !== 'status') {
-      const durable =
-        (typeof options?.stateDir === 'string' && options.stateDir.trim().length > 0) || runtime.daemon.durable;
-      if (!durable) {
-        io.stderr(
-          `daemon ${subcommand} needs a durable state directory (--state-dir or FLEET_STATE_DIR)\n${DAEMON_HELP}\n`,
-        );
-        return 2;
-      }
+    if (parsed.kind !== 'status' && !hasDurableState(runtime, options)) {
+      io.stderr(
+        `daemon ${subcommand} needs a durable state directory (--state-dir or FLEET_STATE_DIR)\n${DAEMON_HELP}\n`,
+      );
+      return 2;
     }
-
-    let lastGoodNow: string | null = null;
-    const readNow = (): string | null => {
-      try {
-        const value: unknown = options?.now !== undefined ? options.now() : runtime.daemon.now();
-        if (typeof value === 'string' && isZonedIsoDateTime(value)) {
-          lastGoodNow = value;
-        }
-        return lastGoodNow;
-      } catch {
-        return lastGoodNow;
-      }
-    };
-    const nowIso = readNow();
+    const clock = createClock(runtime, options);
+    const nowIso = clock.readNow();
     if (nowIso === null) {
       io.stdout(`${JSON.stringify({ outcome: 'refused', exitCode: 1, reasonCode: 'invalid-clock' })}\n`);
       return 1;
     }
-
-    if (subcommand === 'tick' && tickArgs !== null) {
-      return await runTick(io, runtime, tickArgs, nowIso, readNow);
-    }
-    if (subcommand === 'status' && statusArgs !== null) {
-      return await runStatus(io, runtime, statusArgs.json, nowIso);
-    }
-    return await runPause(io, runtime, subcommand === 'pause', nowIso);
+    return await dispatch(parsed, io, runtime, nowIso, clock);
   } catch {
     io.stderr('daemon command failed\n');
     return 1;
@@ -238,7 +270,7 @@ async function runTick(
   runtime: FleetCliRuntime,
   parsed: ParsedTickArgs,
   nowIso: string,
-  readNow: () => string | null,
+  readFresh: () => string | null,
 ): Promise<number> {
   const tickId = `tick-${runtime.daemon.newUlid()}`;
   const refuse = (reasonCode: string): number => {
@@ -264,9 +296,7 @@ async function runTick(
   } catch {
     paused = true;
   }
-  const forgeReachable = paused
-    ? false
-    : await runtime.daemon.probeForge({ nowIso: readNow() ?? nowIso, deadlineIso });
+  const forgeReachable = paused ? false : await probeWithFreshClock(runtime, readFresh, deadlineIso);
 
   const result = await runtime.daemon.runDaemonTick
     .runTick({
@@ -312,6 +342,20 @@ async function runTick(
     })}\n`,
   );
   return result.exitCode;
+}
+
+/**
+ * The forge probe measured against a fresh clock reading. Fail closed: when the clock throws or answers an invalid
+ * time the budget left is unknown, so the probe is skipped (the forge counts as unreachable), never run from the
+ * command's start time.
+ */
+async function probeWithFreshClock(
+  runtime: FleetCliRuntime,
+  readFresh: () => string | null,
+  deadlineIso: string,
+): Promise<boolean> {
+  const probeNow = readFresh();
+  return probeNow === null ? false : await runtime.daemon.probeForge({ nowIso: probeNow, deadlineIso });
 }
 
 async function runStatus(io: CliIo, runtime: FleetCliRuntime, json: boolean, nowIso: string): Promise<number> {

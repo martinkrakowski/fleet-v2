@@ -364,6 +364,27 @@ describe('daemon tick (DT10b)', () => {
     expect(jobs.every((job) => job.outcome === 'budget-exhausted')).toBe(true);
   });
 
+  it('fails closed on a stale clock at the probe: a throwing or malformed fresh read skips the forge probe', async () => {
+    const failures: Array<[string, () => string]> = [
+      ['throws', () => { throw new Error('clock down'); }],
+      ['malformed', () => 'not-a-time'],
+    ];
+    for (const [label, failure] of failures) {
+      let calls = 0;
+      const h = harness([REPO_A, REPO_B], {
+        daemonNow: () => {
+          calls += 1;
+          return calls === 1 ? new Date().toISOString() : failure();
+        },
+      });
+      await enqueue(h.runtime, REPO_A);
+      const result = await run(h.runtime, ['daemon', 'tick']);
+      expect(h.gh.calls.some((call) => call.args[1] === 'rate_limit'), label).toBe(false);
+      expect(h.gh.calls.some((call) => call.args[1] === 'graphql'), label).toBe(false);
+      expect(result.code, label).toBeLessThanOrEqual(1);
+    }
+  });
+
   it('skips merge-pass jobs with forge-unreachable when the probe exits 1, times out, returns non-JSON or the forge mode is none', async () => {
     const variants: Array<[string, (stub: GhStub) => void, boolean]> = [
       ['exit 1', (stub) => { stub.probe = async () => ({ exitCode: 1, stdout: '', stderr: 'boom' }); }, true],

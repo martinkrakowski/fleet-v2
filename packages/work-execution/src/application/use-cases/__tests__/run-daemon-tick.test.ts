@@ -1015,6 +1015,29 @@ describe('RunDaemonTickUseCase (DT10b): interval, settle and input bounds', () =
     expect(whole.sleeps).toEqual([]);
   });
 
+  it('fails closed on a stale clock at the settle: a throwing or malformed fresh read skips the sleep and spends the budget', async () => {
+    const previous = staleStatus('2026-11-01T11:50:00.000Z');
+    const bad: Array<[string, () => string]> = [
+      ['throws', () => { throw new Error('clock down'); }],
+      ['malformed', () => 'not-a-time'],
+    ];
+    for (const [label, failure] of bad) {
+      let calls = 0;
+      const h = makeHarness({
+        previousStatus: previous,
+        nowFn: () => {
+          calls += 1;
+          return calls === 1 ? NOW : failure();
+        },
+      });
+      const result = await h.run({ repositories: [repoRef(DIGEST_A)], settleSeconds: 7 });
+      expect(result.outcome, label).toBe('completed');
+      expect(h.sleeps, label).toEqual([]);
+      expect(result.jobs.length, label).toBeGreaterThan(0);
+      expect(result.jobs.every((job) => job.outcome === 'budget-exhausted'), label).toBe(true);
+    }
+  });
+
   it('honours a caller deadline: an elapsed deadline starts no job, and a malformed one refuses the tick', async () => {
     const h = makeHarness();
     const result = await h.run({ repositories: [repoRef(DIGEST_A)], deadlineIso: '2026-11-01T11:59:59.000Z' });

@@ -230,6 +230,8 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     const executor = this.options.executorFor(host as unknown as AttemptRunnerRecord);
     if (executor === null || executor === undefined) return null;
     const poolDir = `${config.poolRoot}/${projectId}`;
+    // Every derived slot path must fit the entry record's field budget.
+    if (new TextEncoder().encode(`${poolDir}/w${HARD_MAX_ENTRIES}`).byteLength > 256) return null;
     return { poolDir, claimsDir: `${poolDir}/.claims`, config, executor };
   }
 

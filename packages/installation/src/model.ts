@@ -82,6 +82,8 @@ function deriveModelFromV2(installation: FleetInstallation): ModelOutcome {
     hosts[name] = {
       transport: host.transport,
       ...(host.sshAlias !== undefined ? { sshAlias: host.sshAlias } : {}),
+      ...(host.container !== undefined ? { container: host.container } : {}),
+      ...(host.roleAliases !== undefined ? { roleAliases: host.roleAliases } : {}),
       worktreeRoot: host.worktreeRoot,
       ...(host.tmpDir !== undefined ? { tmpDir: host.tmpDir } : {}),
       roles: host.roles,
@@ -155,6 +157,7 @@ function deriveHostRunner(runner: NonNullable<HostSection['runner']>): HostRunne
       : { source: 'declared', ...runner.capabilities };
   const common = {
     port: runner.port,
+    ...(runner.tunnelOffset !== undefined ? { tunnelOffset: runner.tunnelOffset } : {}),
     ...(runner.authFile !== undefined ? { authFile: runner.authFile } : {}),
     capabilities,
     ...(runner.maxLanes !== undefined ? { maxLanes: runner.maxLanes } : {}),

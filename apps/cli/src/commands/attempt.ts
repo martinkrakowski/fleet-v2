@@ -1,10 +1,9 @@
 /** The `attempt` command group of the CLI driver; its entries moved verbatim from the command table. */
 
-import { AttemptRevisionConflictError, historyEntryOf, laneRunJournalState, LANE_RUN_TERMINAL_STATES, nextAttemptRevision, SeatPlan, selectReviewSeat, selectSeat, type LaneRunStateValue } from '@fleet/work-execution';
+import { AttemptRevisionConflictError, historyEntryOf, laneRunJournalState, LANE_RUN_TERMINAL_STATES, nextAttemptRevision, SeatPlan, selectReviewSeat, selectSeat, unhealthySeatIdsFromCatalog, type LaneRunStateValue } from '@fleet/work-execution';
 import { isSameModelFamily, underlyingModelFamily as evidenceFamily } from '@fleet/evidence-and-acceptance';
 import { join } from 'node:path';
 import type { AttemptRecord, AttemptSeatOverrideRecord, CommandCompletionReceipt } from '@fleet/work-execution';
-import { unhealthySeatIdsOf } from '../seat-plan.js';
 import { str, optStr, num, optNum, strArr, nested, enumOf, jsonStrArr, derivedV2Model, CliUsageError } from './payload.js';
 import type { CommandHandler } from './payload.js';
 
@@ -162,7 +161,7 @@ export const attemptCommands: Readonly<Record<string, CommandHandler>> = {
     },
     fix: async (p, rt) => {
       const extra = p['unhealthySeatIds'] === undefined ? [] : jsonStrArr(p, 'unhealthySeatIds', 'attempt fix');
-      const unhealthySeatIds = [...new Set([...unhealthySeatIdsOf(derivedV2Model(rt)), ...extra])];
+      const unhealthySeatIds = [...new Set([...unhealthySeatIdsFromCatalog(derivedV2Model(rt)), ...extra])];
       return rt.execution.prepareFixAttempt.prepareFixAttempt({
         fixAttemptId: str(p, 'fixAttemptId'),
         workOrderId: str(p, 'workOrderId'),
@@ -191,7 +190,7 @@ export const attemptCommands: Readonly<Record<string, CommandHandler>> = {
       const lane = [...(await rt.execution.attemptRepository.listAttemptsByWorkOrder(attempt.workOrderId))].sort(
         (left, right) => left.createdAtIso.localeCompare(right.createdAtIso),
       );
-      const unhealthySeatIds = unhealthySeatIdsOf(derivedV2Model(rt));
+      const unhealthySeatIds = unhealthySeatIdsFromCatalog(derivedV2Model(rt));
       const selection =
         role === 'fix'
           ? selectSeat({

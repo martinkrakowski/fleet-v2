@@ -10,3 +10,10 @@ export * from './seats-policy.js';
 export * from './auto-merge-revision.js';
 export * from './runner-defaults.js';
 export * from './conductor-revision.js';
+export * from './keys.js';
+export {
+  CONDUCTOR_REAPER_REPAIR_KINDS,
+  POLICY_KEYS,
+  SEATS_POLICY_KEYS,
+  TELEMETRY_POLICY_KEYS,
+} from './keys.js';

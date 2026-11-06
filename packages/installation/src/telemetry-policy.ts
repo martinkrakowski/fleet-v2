@@ -1,7 +1,10 @@
 import { containsSecretShape } from '@fleet/shared';
 import { isPlainRecord, readOwnDataProperty } from './policy-read.js';
+import { TELEMETRY_POLICY_KEYS } from './keys.js';
 
 import type { ResolvedTelemetryPolicy, TelemetryPolicy, TelemetryRoute } from './types.js';
+
+export { TELEMETRY_POLICY_KEYS };
 
 /** Plan §3.2's project alias validator (also `projectName`). */
 export const TELEMETRY_PROJECT_ALIAS_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
@@ -10,9 +13,6 @@ export const TELEMETRY_SALT_MIN_DISTINCT = 8;
 export const TELEMETRY_MAX_PROJECT_ALIASES = 64;
 export const TELEMETRY_PROJECT_ID_MAX_LENGTH = 128;
 export const TELEMETRY_ROUTES: readonly TelemetryRoute[] = Object.freeze(['collector', 'phoenix']);
-export const TELEMETRY_POLICY_KEYS: readonly string[] = Object.freeze([
-  'enabled', 'projectName', 'route', 'sampleRatio', 'sendCost', 'includeDryRun', 'projectAliases', 'salt',
-]);
 const FORBIDDEN_PROJECT_IDS: readonly string[] = ['__proto__', 'constructor', 'prototype'];
 
 function isAlias(value: unknown): value is string {

@@ -16,6 +16,7 @@ import {
   REVIEW_KINDS,
   REVIEW_REQUEST_ID_PATTERN,
   REVIEW_UNAVAILABLE_CODES,
+  REVIEW_UNKNOWN_REASONS,
   type RecordFindingDispositionPort,
   type RequestIndependentReviewPort,
   type RequestIndependentReviewResult,
@@ -23,6 +24,7 @@ import {
   type ReviewReceiptRecord,
   type ReviewRejection,
   type ReviewUnavailableCode,
+  type ReviewUnknownReason,
   assessmentIdForAttempt,
   assessmentIdForChain,
   attemptIdForChain,
@@ -47,6 +49,8 @@ import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../../domain/lane-run-jour
 
 /** The only codes that may reach a run-journal `detail`: the evidence context's unavailable codes plus the two post-run rejections. */
 const REVIEW_DETAIL_CODES: ReadonlySet<string> = new Set([...REVIEW_UNAVAILABLE_CODES, 'not-read-only', 'invalid-receipt']);
+/** The fixed cause codes of an unknown review answer; only these travel onto a summary. */
+const REVIEW_UNKNOWN_REASON_CODES: ReadonlySet<string> = new Set(REVIEW_UNKNOWN_REASONS);
 
 const HEAD_PATTERN = /^[0-9a-f]{40}$/;
 const REVIEW_KIND_VALUES: readonly string[] = REVIEW_KINDS;
@@ -196,33 +200,71 @@ function briefTextByteLength(briefText: string): number {
   return Buffer.byteLength(briefText, 'utf8');
 }
 
+/**
+ * True when `request` is a plain object whose named fields are the expected
+ * strings: every check is guarded (a null, a non-object, a wrong-typed field,
+ * a sparse array, a throwing getter), so validation never throws. The
+ * patterns are tested only on verified strings — `.test` never coerces.
+ */
+function requestFieldsAreValid(
+  request: unknown,
+  fields: readonly { readonly key: string; readonly kind: 'requestId' | 'head' | 'nonEmpty' | 'reviewKind' }[],
+): boolean {
+  try {
+    if (typeof request !== 'object' || request === null || Array.isArray(request)) {
+      return false;
+    }
+    for (const field of fields) {
+      const value = Object.getOwnPropertyDescriptor(request, field.key)?.value;
+      if (field.kind === 'requestId') {
+        if (typeof value !== 'string' || !REVIEW_REQUEST_ID_PATTERN.test(value)) {
+          return false;
+        }
+      } else if (field.kind === 'head') {
+        if (typeof value !== 'string' || !HEAD_PATTERN.test(value)) {
+          return false;
+        }
+      } else if (field.kind === 'reviewKind') {
+        if (!isReviewKind(value)) {
+          return false;
+        }
+      } else if (!isNonEmptyTrimmed(value)) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isValidReviewRequest(request: ReviewRequest): boolean {
-  return (
-    REVIEW_REQUEST_ID_PATTERN.test(request.requestId) &&
-    isReviewKind(request.kind) &&
-    isNonEmptyTrimmed(request.attemptId) &&
-    isNonEmptyTrimmed(request.projectId) &&
-    isNonEmptyTrimmed(request.policyRevision) &&
-    isNonEmptyTrimmed(request.implementerModel) &&
-    isNonEmptyTrimmed(request.reviewerModel) &&
-    HEAD_PATTERN.test(request.candidateHeadSha)
-  );
+  return requestFieldsAreValid(request, [
+    { key: 'requestId', kind: 'requestId' },
+    { key: 'kind', kind: 'reviewKind' },
+    { key: 'attemptId', kind: 'nonEmpty' },
+    { key: 'projectId', kind: 'nonEmpty' },
+    { key: 'policyRevision', kind: 'nonEmpty' },
+    { key: 'implementerModel', kind: 'nonEmpty' },
+    { key: 'reviewerModel', kind: 'nonEmpty' },
+    { key: 'candidateHeadSha', kind: 'head' },
+  ]);
 }
 
 function isValidFindReceiptRequest(request: FindReviewReceiptRequest): boolean {
-  return (
-    REVIEW_REQUEST_ID_PATTERN.test(request.requestId) &&
-    isNonEmptyTrimmed(request.attemptId) &&
-    HEAD_PATTERN.test(request.candidateHeadSha)
-  );
+  return requestFieldsAreValid(request, [
+    { key: 'requestId', kind: 'requestId' },
+    { key: 'attemptId', kind: 'nonEmpty' },
+    { key: 'candidateHeadSha', kind: 'head' },
+  ]);
 }
 
 function isValidFindLatestReceiptOfKindRequest(request: FindLatestReceiptOfKindRequest): boolean {
-  return (
-    isNonEmptyTrimmed(request.attemptId) &&
-    HEAD_PATTERN.test(request.candidateHeadSha) &&
-    isReviewKind(request.kind)
-  );
+  return requestFieldsAreValid(request, [
+    { key: 'attemptId', kind: 'nonEmpty' },
+    { key: 'kind', kind: 'reviewKind' },
+    { key: 'candidateHeadSha', kind: 'head' },
+  ]);
 }
 
 function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
@@ -236,14 +278,42 @@ function mapVerdict(result: EvidenceResultValue): ReviewVerdict {
 }
 
 /**
+ * True when `findings` is a dense array of plain objects: a sparse array, a
+ * non-array or a hole is invalid transport output, never a summary.
+ */
+function findingsAreDense(findings: unknown): boolean {
+  try {
+    if (!Array.isArray(findings)) {
+      return false;
+    }
+    for (let index = 0; index < findings.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(findings, index)) {
+        return false;
+      }
+      const finding = findings[index];
+      if (typeof finding !== 'object' || finding === null || Array.isArray(finding)) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * One shared summary builder used by requestReview and findReviewReceipt. The kind and request id are the
- * values the caller has already matched on the receipt; nothing is defaulted here.
+ * values the caller has already matched on the receipt; nothing is defaulted here. Null when the
+ * receipt's findings are not a dense array of plain objects: the caller treats that as a mismatch.
  */
 function receiptOfKindSummaryOf(
   receipt: ReviewReceiptRecord,
   kind: ReviewReceiptSummary['kind'],
   requestId: string | null,
-): ReviewReceiptOfKind {
+): ReviewReceiptOfKind | null {
+  if (!findingsAreDense(receipt.findings)) {
+    return null;
+  }
   return {
     receiptId: receipt.id,
     requestId,
@@ -258,6 +328,15 @@ function receiptOfKindSummaryOf(
       filePath: finding.filePath,
       line: finding.line,
     })),
+    // The fixed cause code travels only on an unknown receipt whose code is
+    // one of the declared tokens and a journal-legal lowercase code; the key
+    // is omitted otherwise, so existing assertions without it stay identical.
+    ...(receipt.result === 'unknown' &&
+    typeof receipt.unknownReason === 'string' &&
+    REVIEW_UNKNOWN_REASON_CODES.has(receipt.unknownReason) &&
+    LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(receipt.unknownReason)
+      ? { unknownReason: receipt.unknownReason as ReviewUnknownReason }
+      : {}),
   };
 }
 
@@ -265,8 +344,9 @@ function summaryOf(
   receipt: ReviewReceiptRecord,
   kind: ReviewReceiptSummary['kind'],
   requestId: string,
-): ReviewReceiptSummary {
-  return { ...receiptOfKindSummaryOf(receipt, kind, requestId), requestId };
+): ReviewReceiptSummary | null {
+  const ofKind = receiptOfKindSummaryOf(receipt, kind, requestId);
+  return ofKind === null ? null : { ...ofKind, requestId };
 }
 
 function mapRejection(
@@ -375,7 +455,10 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       if (receipt.requestId !== request.requestId || !isChainReceiptOf(receipt, chain)) {
         return { outcome: 'unknown', reason: 'receipt-mismatch' };
       }
-      return { outcome: 'receipt', receipt: summaryOf(receipt, 'pre-merge', request.requestId) };
+      const summary = summaryOf(receipt, 'pre-merge', request.requestId);
+      return summary === null
+        ? { outcome: 'unknown', reason: 'receipt-mismatch' }
+        : { outcome: 'receipt', receipt: summary };
     }
     return mapRejection(result.rejection, result.code);
   }
@@ -436,7 +519,10 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
       ) {
         return { outcome: 'unknown', reason: 'receipt-mismatch' };
       }
-      return { outcome: 'receipt', receipt: summaryOf(receipt, kind, request.requestId) };
+      const summary = summaryOf(receipt, kind, request.requestId);
+      return summary === null
+        ? { outcome: 'unknown', reason: 'receipt-mismatch' }
+        : { outcome: 'receipt', receipt: summary };
     }
     return mapRejection(result.rejection, result.code);
   }
@@ -471,9 +557,11 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     ) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
-    return { outcome: 'found', receipt: summaryOf(only, only.kind, request.requestId) };
+    const summary = summaryOf(only, only.kind, request.requestId);
+    return summary === null
+      ? { outcome: 'unavailable', reason: 'receipt-mismatch' }
+      : { outcome: 'found', receipt: summary };
   }
-
   /** The chain's receipt for one request id, from the chain's own assessment; another kind, head or subject is a mismatch. */
   private async findChainReceipt(request: FindReviewReceiptRequest, chain: ChainSubject): Promise<FindReviewReceiptResult> {
     if (!REVIEW_REQUEST_ID_PATTERN.test(request.requestId)) {
@@ -491,7 +579,10 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
     if (matches.length > 1 || !isChainReceiptOf(only, chain)) {
       return { outcome: 'unavailable', reason: 'receipt-mismatch' };
     }
-    return { outcome: 'found', receipt: summaryOf(only, 'pre-merge', request.requestId) };
+    const summary = summaryOf(only, 'pre-merge', request.requestId);
+    return summary === null
+      ? { outcome: 'unavailable', reason: 'receipt-mismatch' }
+      : { outcome: 'found', receipt: summary };
   }
 
   private async findLatestChainReceiptOfKind(
@@ -515,7 +606,10 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         latest = candidate;
       }
     }
-    return { outcome: 'found', receipt: receiptOfKindSummaryOf(latest, 'pre-merge', latest.requestId ?? null) };
+    const latestSummary = receiptOfKindSummaryOf(latest, 'pre-merge', latest.requestId ?? null);
+    return latestSummary === null
+      ? { outcome: 'unavailable', reason: 'receipt-mismatch' }
+      : { outcome: 'found', receipt: latestSummary };
   }
 
   async findLatestReceiptOfKind(
@@ -554,9 +648,12 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         latest = candidate;
       }
     }
-    return {
+    const finalSummary = receiptOfKindSummaryOf(latest, latest.kind, latest.requestId ?? null);
+    return finalSummary === null
+      ? { outcome: 'unavailable', reason: 'receipt-mismatch' }
+      : {
       outcome: 'found',
-      receipt: receiptOfKindSummaryOf(latest, latest.kind, latest.requestId ?? null),
+      receipt: finalSummary,
     };
   }
 
@@ -568,12 +665,30 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
    */
   async recordOutOfScope(request: RecordOutOfScopeRequest): Promise<RecordOutOfScopeResult> {
     const delegate = this.delegates.recordFindingDisposition;
-    if (
-      delegate === undefined ||
-      !HEAD_PATTERN.test(request.candidateHeadSha) ||
-      request.findingIds.length === 0 ||
-      request.findingIds.some((findingId) => !isNonEmptyTrimmed(findingId))
-    ) {
+    // Runtime input never throws: a null, a non-object, a wrong-typed field,
+    // a sparse array or a throwing getter is a refusal, never a crash.
+    let valid = false;
+    try {
+      valid =
+        delegate !== undefined &&
+        typeof request === 'object' &&
+        request !== null &&
+        !Array.isArray(request) &&
+        typeof request.attemptId === 'string' &&
+        isNonEmptyTrimmed(request.attemptId) &&
+        typeof request.candidateHeadSha === 'string' &&
+        HEAD_PATTERN.test(request.candidateHeadSha) &&
+        Array.isArray(request.findingIds) &&
+        request.findingIds.length > 0 &&
+        request.findingIds.every(
+          (findingId, index) =>
+            Object.prototype.hasOwnProperty.call(request.findingIds, index) &&
+            isNonEmptyTrimmed(findingId),
+        );
+    } catch {
+      valid = false;
+    }
+    if (!valid) {
       return { outcome: 'refused' };
     }
     const evidenceRef = 'scope:' + request.candidateHeadSha.slice(0, 12);
@@ -591,7 +706,7 @@ export class ReviewRequestAdapter implements ReviewRequestPort {
         recordedAtIso,
       };
       try {
-        const answered = await delegate({ assessmentId: disposition.assessmentId, disposition });
+        const answered = await delegate!({ assessmentId: disposition.assessmentId, disposition });
         if (answered.outcome !== 'recorded') {
           return { outcome: 'refused' };
         }

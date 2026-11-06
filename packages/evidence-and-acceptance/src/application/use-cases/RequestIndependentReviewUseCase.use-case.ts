@@ -15,6 +15,7 @@ import {
   REVIEW_REQUEST_ID_PATTERN,
   assessmentIdForChain,
   attemptIdForChain,
+  isValidChainName,
   receiptSubjectOf,
 } from '../../domain/evidence-records.js';
 import { EvidenceAssessment } from '../../domain/entities/EvidenceAssessment.js';
@@ -129,7 +130,12 @@ function chainSubjectOf(request: RequestIndependentReviewRequest): ReceiptSubjec
   if (subject.kind === 'attempt') {
     return subject.projectId === request.projectId && subject.attemptId === request.attemptId ? undefined : 'invalid';
   }
-  if (subject.kind !== 'chain' || subject.chainName === null || subject.integrationHeadSha === null) {
+  if (
+    subject.kind !== 'chain' ||
+    subject.chainName === null ||
+    subject.integrationHeadSha === null ||
+    !isValidChainName(subject.chainName)
+  ) {
     return 'invalid';
   }
   if (
@@ -415,6 +421,12 @@ function receiptCandidateOf(
   const requestIdFields: Partial<ReviewReceiptRecord> =
     request.requestId !== undefined ? { requestId: request.requestId } : {};
   const subjectFields: Partial<ReviewReceiptRecord> = chain !== undefined ? { subject: chain } : {};
+  // RV2: the fixed cause code of an unknown answer travels onto the stored
+  // receipt; the key is omitted on pass/fail so stored receipts stay identical.
+  const unknownReasonFields: Partial<ReviewReceiptRecord> =
+    run.result === 'unknown' && run.unknownReason !== undefined
+      ? { unknownReason: run.unknownReason }
+      : {};
   const receiptId =
     request.requestId !== undefined
       ? 'rr-' + request.assessmentId + '-' + request.candidateHeadSha.slice(0, 8) + '-' + request.requestId
@@ -446,6 +458,7 @@ function receiptCandidateOf(
     ...kindFields,
     ...requestIdFields,
     ...subjectFields,
+    ...unknownReasonFields,
   };
 }
 

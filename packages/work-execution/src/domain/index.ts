@@ -11,6 +11,7 @@ export * from "./conductor-schedule.js";
 export * from "./coordination-keys.js";
 export * from "./daemon-events.js";
 export * from "./daemon-tick.js";
+export * from "./dispatch-stagger.js";
 export * from "./entities/index.js";
 export * from "./execution-record-readers.js";
 export * from "./execution-records.js";

@@ -5,6 +5,7 @@ export * from "./Attempt.js";
 export * from "./CapacityReservation.js";
 export * from "./LanePlan.js";
 export * from "./LaneRun.js";
+export * from "./MergeRecord.js";
 export * from "./PlannedLane.js";
 export * from "./PullRequestLink.js";
 export * from "./WorkOrder.js";

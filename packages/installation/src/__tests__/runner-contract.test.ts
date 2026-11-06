@@ -153,7 +153,7 @@ describe('the host contract fields (P2)', () => {
     });
     expect(result).toEqual({
       ok: false,
-      errors: ['hosts.verifier-host.roleAliases.manager: must be a known host role'],
+      errors: ['hosts.verifier-host.roleAliases: every key must be a known host role'],
     });
   });
 
@@ -512,5 +512,23 @@ describe('round-2 review fixes', () => {
     expect(resolveRunnerDefaults(model, 'second-verifier').ok).toBe(true);
     // A role one host holds still resolves.
     expect(resolveRoleRunnerDefaults(model, 'orchestrator').ok).toBe(true);
+  });
+
+  it('does not echo an unknown roleAliases key', () => {
+    const secretKey = `sk-${'a'.repeat(20)}`;
+    const result = parseInstallation({
+      ...contractV2,
+      hosts: {
+        ...contractV2.hosts,
+        'verifier-host': {
+          ...contractV2.hosts['verifier-host'],
+          roleAliases: { [secretKey]: 'verifier-alias' },
+        },
+      },
+    });
+    expect(result).toEqual({
+      ok: false,
+      errors: ['hosts.verifier-host.roleAliases: every key must be a known host role'],
+    });
   });
 });

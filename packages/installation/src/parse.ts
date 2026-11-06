@@ -1500,7 +1500,8 @@ function parseHostRoleAliases(
   const aliases: Partial<Record<HostRole, string>> = {};
   for (const key of Object.keys(value)) {
     if (!HOST_ROLES.includes(key as HostRole)) {
-      errors.push(`${fieldPath}.${key}: must be a known host role`);
+      // The key is operator input and never appears in the message.
+      errors.push(`${fieldPath}: every key must be a known host role`);
       continue;
     }
     if (!roles.includes(key as HostRole)) {

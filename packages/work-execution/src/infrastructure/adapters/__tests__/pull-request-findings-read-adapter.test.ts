@@ -24,7 +24,7 @@ function thread(id: string, overrides: Node = {}): Node {
 
 function page(
   nodes: readonly unknown[],
-  options: { head?: string; total?: number; hasNextPage?: boolean; endCursor?: string | null } = {},
+  options: { head?: string; state?: unknown; total?: number; hasNextPage?: boolean; endCursor?: string | null } = {},
 ): GhInvocationResult {
   return {
     exitCode: 0,
@@ -33,6 +33,7 @@ function page(
       data: {
         repository: {
           pullRequest: {
+            state: options.state === undefined ? 'OPEN' : options.state,
             headRefOid: options.head ?? HEAD,
             reviewThreads: {
               totalCount: options.total ?? nodes.length,
@@ -119,6 +120,7 @@ describe('PullRequestFindingsReadAdapter', () => {
     const query = args.find((arg) => arg.startsWith('query=')) ?? '';
     expect(query).toContain('reviewThreads(first: 100, after: $after)');
     expect(query).toContain('headRefOid');
+    expect(query).toMatch(/pullRequest\(number: \$number\) \{\s+state/);
     expect(query).toContain('totalCount');
     expect(calls[0].timeoutMs).toBe(30_000);
   });
@@ -181,6 +183,36 @@ describe('PullRequestFindingsReadAdapter', () => {
     });
   });
 
+  it('never accepts an abbreviated head: only the exact full head is the same head', async () => {
+    const { calls, runGh } = scripted(page([thread('PRRT_1')]));
+    const adapter = adapterFor(runGh);
+
+    for (const expectedHeadSha of [HEAD.slice(0, 7), HEAD.slice(0, 12), HEAD.slice(0, 39)]) {
+      expect(await adapter.readPullRequestFindings(request({ expectedHeadSha }))).toMatchObject({
+        outcome: 'unavailable',
+        code: 'unreadable',
+      });
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('reports a closed or merged pull request as unavailable with code not-open', async () => {
+    for (const state of ['CLOSED', 'MERGED']) {
+      const answer = page([thread('PRRT_1')], { state });
+      expect(await adapterFor(scripted(answer).runGh).readPullRequestFindings(request())).toEqual({
+        outcome: 'unavailable',
+        code: 'not-open',
+      });
+    }
+    for (const state of [null, 'open', 'DRAFT', 3]) {
+      const answer = page([thread('PRRT_1')], { state });
+      expect(await adapterFor(scripted(answer).runGh).readPullRequestFindings(request())).toMatchObject({
+        outcome: 'unavailable',
+        code: 'unreadable',
+      });
+    }
+  });
+
   it('reports an unreadable forge answer as unavailable and never as an empty list', async () => {
     const answers: GhInvocationResult[] = [
       { exitCode: 1, stdout: '', stderr: 'gh: token ghp_secret failed' },
@@ -219,6 +251,14 @@ describe('PullRequestFindingsReadAdapter', () => {
         code: 'unreadable',
       });
     }
+    const resolvedUnknown = page([
+      thread('PRRT_0'),
+      thread('PRRT_1', { isResolved: true, comments: { nodes: [{ body: 'text', author: null }] } }),
+    ]);
+    expect(await adapterFor(scripted(resolvedUnknown).runGh).readPullRequestFindings(request())).toMatchObject({
+      outcome: 'unavailable',
+      code: 'unreadable',
+    });
     const noComment = page([thread('PRRT_1', { comments: { nodes: [] } })]);
     expect(await adapterFor(scripted(noComment).runGh).readPullRequestFindings(request())).toMatchObject({
       outcome: 'unavailable',

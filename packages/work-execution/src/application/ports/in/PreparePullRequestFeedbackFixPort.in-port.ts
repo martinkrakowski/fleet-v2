@@ -6,9 +6,13 @@
  * as untrusted input, and a fresh fix attempt is prepared through
  * PrepareFixAttempt with the numbered findings, keyed
  * `pr-feedback/<pullRequest>@<head12>`. The fixed head is pushed only through
- * `push-to-pr` under the run's grant. A moved head, an unreadable forge or no
- * unresolved thread refuses with a reason code. It never resolves a thread.
- * Results carry ids, codes and counts only.
+ * `push-to-pr` under the run's grant: the push goes through
+ * ExecuteAuthorizedForgeAction, which durably consumes that grant for this
+ * one action before any forge call, so a missing, unknown, already-consumed or
+ * mismatched grant refuses and nothing is pushed. A moved head, an unreadable
+ * forge, a pull request that is not open or no unresolved thread refuses with
+ * a reason code. It never resolves a thread. Commits are full 40-character
+ * shas. Results carry ids, codes and counts only.
  */
 
 export type PreparePullRequestFeedbackFixCode =
@@ -21,12 +25,16 @@ export type PreparePullRequestFeedbackFixCode =
   | 'redaction-refused'
   | 'too-large'
   | 'fix-attempt-refused'
+  | 'pull-request-not-open'
+  | 'repository-mismatch'
+  | 'grant-missing'
+  | 'grant-refused'
   | 'push-refused';
 
 export interface PreparePullRequestFeedbackFixRequest {
   readonly repository: { readonly owner: string; readonly repo: string };
   readonly pullRequestNumber: number;
-  /** The exact current head of the pull request. */
+  /** The exact current head of the pull request (40 lowercase hex characters). */
   readonly headSha: string;
   readonly branchName: string;
   readonly workOrderId: string;
@@ -63,15 +71,27 @@ export interface PushPullRequestFeedbackFixRequest {
   readonly repository: { readonly owner: string; readonly repo: string };
   readonly pullRequestNumber: number;
   readonly branchName: string;
-  /** The head the round started from. */
+  /** The head the round started from (40 lowercase hex characters). */
   readonly expectedHeadSha: string;
-  /** The head the fix attempt produced. */
+  /**
+   * The head the fix attempt produced (40 lowercase hex characters): the head
+   * `push-to-pr` pushes, the fix attempt's collected head and the head the
+   * grant is scoped to.
+   */
   readonly fixedHeadSha: string;
   readonly workOrderId: string;
   /** The fix attempt. */
   readonly attemptId: string;
-  /** The run's grant id (ids only). */
+  /**
+   * The run's `push-to-pr` grant id (ids only). It is consumed for exactly
+   * this push; absent refuses `grant-missing` before any forge read or call.
+   */
   readonly grantId: string;
+  /**
+   * Who issued the grant when it is a policy grant
+   * (`policy:conductor@<rev>`); absent means an owner grant.
+   */
+  readonly authorizedBy?: string;
   readonly nowIso?: string;
 }
 

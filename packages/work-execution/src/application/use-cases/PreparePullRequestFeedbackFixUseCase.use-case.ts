@@ -7,8 +7,13 @@
  * with the numbered findings. The round's identity is the key
  * `pr-feedback/<pullRequest>@<head12>`; a repeat under the same key never
  * creates a second attempt. The fixed head is pushed only through
- * `ForgeActionPort` with `push-to-pr`, guarded by two head probes so a crash
- * between the push and its result recovers on the next call. The use case
+ * `ExecuteAuthorizedForgeActionPort` with `push-to-pr`: that path durably
+ * consumes the run's grant for exactly this action (kind, head and attempt
+ * scoped) before the forge runs, so a missing, unknown, already-consumed or
+ * mismatched grant refuses and nothing is pushed. Two head probes guard the
+ * push so a crash between the push and its result recovers on the next call.
+ * The request's repository must be the one repository this composition's
+ * forge path acts on. The use case
  * never resolves, replies to or comments on a thread, and returns ids, codes
  * and counts only — no path, no forge text, no token.
  *
@@ -29,7 +34,10 @@ import type {
   PushPullRequestFeedbackFixRequest,
   PushPullRequestFeedbackFixResult,
 } from '../ports/in/PreparePullRequestFeedbackFixPort.in-port.js';
-import type { ForgeActionPort } from '../ports/out/ForgeActionPort.out-port.js';
+import type {
+  ExecuteAuthorizedForgeActionPort,
+  ExecuteAuthorizedForgeActionResult,
+} from '../ports/in/ExecuteAuthorizedForgeActionPort.in-port.js';
 import type {
   PullRequestFinding,
   PullRequestFindingsReadPort,
@@ -39,7 +47,18 @@ import type {
 export interface PreparePullRequestFeedbackFixDependencies {
   readonly findings: PullRequestFindingsReadPort;
   readonly prepareFixAttempt: PrepareFixAttemptPort;
-  readonly forgeAction: ForgeActionPort;
+  /**
+   * The one authorised forge path: it consumes the run's grant for this
+   * action before the credential-bearing `push-to-pr` runs. There is no
+   * direct ForgeActionPort dependency, so no push can skip the grant.
+   */
+  readonly executeForgeAction: ExecuteAuthorizedForgeActionPort;
+  /**
+   * The repository the bound forge path acts on. A request naming another
+   * repository refuses `repository-mismatch`, so findings read from one
+   * repository never drive a push to another.
+   */
+  readonly repository: { readonly owner: string; readonly repo: string };
   readonly nowIso?: () => string;
   /** Mints one nonce per wrapped finding (16 to 64 lowercase hex characters). */
   readonly mintNonce: () => string;
@@ -51,7 +70,10 @@ export const PR_FEEDBACK_MAX_FIX_BYTES = 8 * 1024;
 export const PR_FEEDBACK_MAX_HANDOVER_BYTES = 32 * 1024;
 
 const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+$/;
-const COMMIT_PATTERN = /^[0-9a-f]{7,40}$/;
+const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
+const GRANT_ID_PATTERN = /^[A-Za-z0-9_.:@/-]{1,200}$/;
+/** The forge path's refusal when no forge transport is bound (ExecuteAuthorizedForgeActionUseCase). */
+const FORGE_UNCONFIGURED_REASON = 'unavailable';
 const NONCE_PATTERN = /^[0-9a-f]{16,64}$/;
 const THREAD_ID_PATTERN = /^[A-Za-z0-9_=-]{1,128}$/;
 const FINDING_LABEL = 'review finding';
@@ -213,7 +235,115 @@ function refusalKindWord(kind: unknown): string {
 }
 
 function headMatches(answered: unknown, expected: string): boolean {
-  return typeof answered === 'string' && COMMIT_PATTERN.test(answered) && answered.startsWith(expected);
+  return typeof answered === 'string' && answered === expected;
+}
+
+/** GitHub owner and repository names compare without case. */
+function sameRepository(
+  left: { readonly owner: string; readonly repo: string },
+  right: { readonly owner: unknown; readonly repo: unknown },
+): boolean {
+  return (
+    typeof right.owner === 'string' &&
+    typeof right.repo === 'string' &&
+    left.owner.toLowerCase() === right.owner.toLowerCase() &&
+    left.repo.toLowerCase() === right.repo.toLowerCase()
+  );
+}
+
+interface PushFields {
+  readonly repository: { owner: string; repo: string };
+  readonly pullRequestNumber: number;
+  readonly expectedHeadSha: string;
+  readonly fixedHeadSha: string;
+  readonly branchName: string;
+  readonly workOrderId: string;
+  readonly attemptId: string;
+  /** Undefined when the request carries no grant (refused `grant-missing`). */
+  readonly grantId: string | undefined;
+  readonly authorizedBy: string | undefined;
+}
+
+/**
+ * The push request's fields, or null for an invalid request. A grant id that
+ * is absent, empty or not a string reads as missing; one that is present but
+ * malformed (too long, unsafe characters) is an invalid request.
+ */
+function readPushFields(request: unknown): PushFields | null {
+  const repository = readRepository(request);
+  const pullRequestNumber = readPullRequestNumber(request);
+  const expectedHeadSha = readCommit(request, 'expectedHeadSha');
+  const fixedHeadSha = readCommit(request, 'fixedHeadSha');
+  const branchName = ownData(request, 'branchName');
+  const workOrderId = ownData(request, 'workOrderId');
+  const attemptId = ownData(request, 'attemptId');
+  const rawGrant = ownData(request, 'grantId');
+  const authorizedBy = readOptionalId(request, 'authorizedBy');
+  const nowIso = readOptionalIso(request);
+  if (
+    repository === null ||
+    pullRequestNumber === null ||
+    expectedHeadSha === null ||
+    fixedHeadSha === null ||
+    !isSafeBranchName(branchName) ||
+    !isNonEmptyString(workOrderId) ||
+    !isNonEmptyString(attemptId) ||
+    authorizedBy === null ||
+    nowIso === null ||
+    expectedHeadSha === fixedHeadSha
+  ) {
+    return null;
+  }
+  const grantId = isNonEmptyString(rawGrant) ? rawGrant : undefined;
+  if (grantId !== undefined && !GRANT_ID_PATTERN.test(grantId)) {
+    return null;
+  }
+  return {
+    repository,
+    pullRequestNumber,
+    expectedHeadSha,
+    fixedHeadSha,
+    branchName,
+    workOrderId,
+    attemptId,
+    grantId,
+    authorizedBy,
+  };
+}
+
+/**
+ * The authorised forge path's answer as a push result. A refusal the forge
+ * itself gave (after the grant was consumed) is `push-refused`; an ambiguous
+ * forge outcome is `ambiguous`; any other refusal happened before the forge
+ * ran (grant not consumed, attempt head or one-way door check) and is
+ * `grant-refused`, except an unbound forge transport (`not-configured`).
+ */
+function pushOutcome(
+  answer: ExecuteAuthorizedForgeActionResult,
+  key: string,
+  fixedHeadSha: string,
+  refusedPush: (code: PreparePullRequestFeedbackFixCode, detail?: string) => PushPullRequestFeedbackFixResult,
+): PushPullRequestFeedbackFixResult {
+  const outcome = ownData(answer, 'outcome');
+  if (outcome === 'executed') {
+    return headMatches(ownData(answer, 'headSha'), fixedHeadSha)
+      ? { outcome: 'pushed', key, headSha: fixedHeadSha }
+      : { outcome: 'ambiguous', key, headSha: fixedHeadSha, code: 'forge-ambiguous' };
+  }
+  if (outcome !== 'refused') {
+    return refusedPush('invalid-request');
+  }
+  if (ownData(answer, 'forgeAmbiguous') === true) {
+    return { outcome: 'ambiguous', key, headSha: fixedHeadSha, code: 'forge-ambiguous' };
+  }
+  const forgeRefusalKind = ownData(answer, 'forgeRefusalKind');
+  if (forgeRefusalKind !== undefined) {
+    return refusedPush('push-refused', refusalKindWord(forgeRefusalKind));
+  }
+  if (ownData(answer, 'reason') === FORGE_UNCONFIGURED_REASON) {
+    return refusedPush('not-configured');
+  }
+  return refusedPush('grant-refused');
 }
 
 type ReadOutcome =
@@ -291,6 +421,9 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
     if (fixAttemptId === priorAttemptId || fixAttemptId !== derivedId) {
       return refuse('invalid-request');
     }
+    if (!this.isBoundRepository(deps, repository)) {
+      return refuse('repository-mismatch');
+    }
 
     if (!this.isConfigured(deps)) {
       return refuse('not-configured');
@@ -349,29 +482,11 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
       headSha: null,
       code: 'invalid-request',
     };
-    const repository = readRepository(request);
-    const pullRequestNumber = readPullRequestNumber(request);
-    const expectedHeadSha = readCommit(request, 'expectedHeadSha');
-    const fixedHeadSha = readCommit(request, 'fixedHeadSha');
-    const branchName = ownData(request, 'branchName');
-    const workOrderId = ownData(request, 'workOrderId');
-    const attemptId = ownData(request, 'attemptId');
-    const grantId = ownData(request, 'grantId');
-    const nowIso = readOptionalIso(request);
-    if (
-      repository === null ||
-      pullRequestNumber === null ||
-      expectedHeadSha === null ||
-      fixedHeadSha === null ||
-      !isSafeBranchName(branchName) ||
-      !isNonEmptyString(workOrderId) ||
-      !isNonEmptyString(attemptId) ||
-      !isNonEmptyString(grantId) ||
-      nowIso === null ||
-      expectedHeadSha === fixedHeadSha
-    ) {
+    const fields = readPushFields(request);
+    if (fields === null) {
       return invalid;
     }
+    const { repository, pullRequestNumber, expectedHeadSha, fixedHeadSha } = fields;
 
     const key = keyOf(pullRequestNumber, expectedHeadSha);
     const refusedPush = (code: PreparePullRequestFeedbackFixCode, detail?: string): PushPullRequestFeedbackFixResult =>
@@ -379,6 +494,13 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
         ? { outcome: 'refused', key, headSha: fixedHeadSha, code }
         : { outcome: 'refused', key, headSha: fixedHeadSha, code, detail };
 
+    // No grant, no forge interaction of any kind: refused before a probe.
+    if (fields.grantId === undefined) {
+      return refusedPush('grant-missing');
+    }
+    if (!this.isBoundRepository(deps, repository)) {
+      return refusedPush('repository-mismatch');
+    }
     if (!this.isConfigured(deps)) {
       return refusedPush('not-configured');
     }
@@ -389,6 +511,9 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
     if (atFixed === 'at-head') {
       return { outcome: 'already-pushed', key, headSha: fixedHeadSha };
     }
+    if (atFixed === 'not-open') {
+      return refusedPush('pull-request-not-open');
+    }
     if (atFixed !== 'moved') {
       return refusedPush('forge-unreadable');
     }
@@ -398,43 +523,58 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
     if (atRound === 'moved') {
       return refusedPush('head-moved');
     }
+    if (atRound === 'not-open') {
+      return refusedPush('pull-request-not-open');
+    }
     if (atRound !== 'at-head') {
       return refusedPush('forge-unreadable');
     }
 
-    // `push-to-pr` carries the round's starting head as its expected-head
-    // precondition; the probes above already confirmed the PR still sits there.
-    let answer: Awaited<ReturnType<ForgeActionPort['performForgeAction']>>;
+    // The push runs only through the authorised forge path, which consumes
+    // the grant for this action id, kind, head and attempt before the forge
+    // runs. `expectedHeadSha` there is the head being pushed: the fix
+    // attempt's collected head, which the grant is scoped to.
+    let answer: ExecuteAuthorizedForgeActionResult;
     try {
-      answer = await deps.forgeAction.performForgeAction({
+      answer = await deps.executeForgeAction.executeAuthorizedForgeAction({
         actionId: key,
+        attemptId: fields.attemptId,
+        workOrderId: fields.workOrderId,
         kind: 'push-to-pr',
-        expectedHeadSha: expectedHeadSha,
-        branchName,
-        pullRequestNumber,
-        attemptId,
-        workOrderId,
+        expectedHeadSha: fixedHeadSha,
+        authorizationGrantId: fields.grantId,
+        branchName: fields.branchName,
+        ...(fields.authorizedBy === undefined ? {} : { authorizedBy: fields.authorizedBy }),
       });
     } catch {
       return { outcome: 'ambiguous', key, headSha: fixedHeadSha, code: 'forge-ambiguous' };
     }
-    if (answer.outcome === 'executed') {
-      return headMatches(answer.headSha, fixedHeadSha)
-        ? { outcome: 'pushed', key, headSha: fixedHeadSha }
-        : { outcome: 'ambiguous', key, headSha: fixedHeadSha, code: 'forge-ambiguous' };
+    return pushOutcome(answer, key, fixedHeadSha, refusedPush);
+  }
+
+  /** Whether the request names the repository the bound forge path acts on. */
+  private isBoundRepository(
+    deps: PreparePullRequestFeedbackFixDependencies,
+    repository: { readonly owner: string; readonly repo: string },
+  ): boolean {
+    try {
+      const bound = deps.repository;
+      return (
+        typeof bound === 'object' &&
+        bound !== null &&
+        sameRepository(repository, { owner: ownData(bound, 'owner'), repo: ownData(bound, 'repo') })
+      );
+    } catch {
+      return false;
     }
-    if (answer.outcome === 'ambiguous') {
-      return { outcome: 'ambiguous', key, headSha: fixedHeadSha, code: 'forge-ambiguous' };
-    }
-    if (answer.outcome === 'refused') {
-      return refusedPush('push-refused', refusalKindWord(answer.refusalKind));
-    }
-    return invalid;
   }
 
   private isConfigured(deps: PreparePullRequestFeedbackFixDependencies): boolean {
     try {
-      return deps.findings.isConfigured() === true && deps.forgeAction.isConfigured() === true;
+      return (
+        deps.findings.isConfigured() === true &&
+        typeof deps.executeForgeAction?.executeAuthorizedForgeAction === 'function'
+      );
     } catch {
       return false;
     }
@@ -475,7 +615,7 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
     repository: { owner: string; repo: string },
     pullRequestNumber: number,
     headSha: string,
-  ): Promise<'at-head' | 'moved' | 'unknown'> {
+  ): Promise<'at-head' | 'moved' | 'not-open' | 'unknown'> {
     const result = await this.callFindings(deps, repository, pullRequestNumber, headSha);
     if (result === null) {
       return 'unknown';
@@ -485,6 +625,9 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
     }
     if (result.outcome === 'unavailable' && result.code === 'head-moved') {
       return 'moved';
+    }
+    if (result.outcome === 'unavailable' && result.code === 'not-open') {
+      return 'not-open';
     }
     return 'unknown';
   }
@@ -503,6 +646,8 @@ export class PreparePullRequestFeedbackFixUseCase implements PreparePullRequestF
       switch (result.code) {
         case 'head-moved':
           return { kind: 'refused', refusal: refuse('head-moved') };
+        case 'not-open':
+          return { kind: 'refused', refusal: refuse('pull-request-not-open') };
         case 'forge-error':
         case 'unreadable':
           return { kind: 'refused', refusal: refuse('forge-unreadable') };

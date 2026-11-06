@@ -6,8 +6,8 @@
  * comment, no thread resolution. The delegate is injected; this adapter
  * never spawns a process and never reads a credential.
  *
- * The answer is complete or it is unavailable: the forge head must match the
- * expected head on every page, every page is followed by its cursor, the
+ * The answer is complete or it is unavailable: the pull request must be open
+ * and the forge head must equal the expected full head on every page, every page is followed by its cursor, the
  * nodes actually fetched are counted against `totalCount`, and any malformed
  * node makes the whole answer `unreadable` instead of a guess. Only
  * unresolved threads are returned. Every call is raced against the budget
@@ -51,13 +51,13 @@ const MAX_THREADS = 5_000;
 const MAX_STDOUT_BYTES = 1_048_576;
 const MAX_BODY_BYTES = 4_096;
 const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+$/;
-const COMMIT_PATTERN = /^[0-9a-f]{7,40}$/;
 const FULL_COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 
 const FINDINGS_QUERY = `
   query PullRequestFindings($owner: String!, $name: String!, $number: Int!, $after: String) {
     repository(owner: $owner, name: $name) {
       pullRequest(number: $number) {
+        state
         headRefOid
         reviewThreads(first: ${PAGE_SIZE}, after: $after) {
           totalCount
@@ -132,7 +132,7 @@ function validateRequest(
     return invalid;
   }
   const expectedHeadSha = ownData(request, 'expectedHeadSha');
-  if (typeof expectedHeadSha !== 'string' || !COMMIT_PATTERN.test(expectedHeadSha)) {
+  if (typeof expectedHeadSha !== 'string' || !FULL_COMMIT_PATTERN.test(expectedHeadSha)) {
     return invalid;
   }
   const deadline = ownData(request, 'deadlineIso');
@@ -147,6 +147,7 @@ function validateRequest(
 }
 
 interface Page {
+  readonly open: boolean;
   readonly headRefOid: string;
   readonly totalCount: number;
   readonly hasNextPage: boolean;
@@ -169,6 +170,10 @@ function parsePage(stdout: string): Page | Unavailable {
   const repository = isRecord(data) ? data.repository : undefined;
   const pullRequest = isRecord(repository) ? repository.pullRequest : undefined;
   if (!isRecord(pullRequest)) {
+    return unreadable;
+  }
+  const state = pullRequest.state;
+  if (state !== 'OPEN' && state !== 'CLOSED' && state !== 'MERGED') {
     return unreadable;
   }
   const headRefOid = pullRequest.headRefOid;
@@ -196,6 +201,7 @@ function parsePage(stdout: string): Page | Unavailable {
     return unreadable;
   }
   return {
+    open: state === 'OPEN',
     headRefOid,
     totalCount,
     hasNextPage: pageInfo.hasNextPage,
@@ -227,8 +233,12 @@ function identifyNode(node: unknown): { id: string; resolved: boolean; record: R
   return { id, resolved, record: node };
 }
 
-/** One unresolved thread as a finding, `too-large` for an oversized body, or null when malformed. */
-function toFinding(id: string, node: Record<string, unknown>): PullRequestFinding | 'too-large' | null {
+/**
+ * One thread as a finding, `too-large` for an oversized unresolved body, or
+ * null when malformed. A resolved thread's body is never returned, so its
+ * size is not bounded here.
+ */
+function toFinding(id: string, node: Record<string, unknown>, resolved: boolean): PullRequestFinding | 'too-large' | null {
   const path = node.path;
   const line = node.line;
   if (typeof path !== 'string') {
@@ -245,6 +255,9 @@ function toFinding(id: string, node: Record<string, unknown>): PullRequestFindin
   const authorKind = authorKindOf(first.author.__typename);
   if (authorKind === null) {
     return null;
+  }
+  if (resolved) {
+    return { threadId: id, path, line, authorKind, state: 'resolved', text: '' };
   }
   if (Buffer.byteLength(first.body, 'utf8') > MAX_BODY_BYTES) {
     return 'too-large';
@@ -325,10 +338,10 @@ export class PullRequestFindingsReadAdapter implements PullRequestFindingsReadPo
       if ('outcome' in page) {
         return page;
       }
-      const headMatches = valid.expectedHeadSha.length === 40
-        ? page.headRefOid === valid.expectedHeadSha
-        : page.headRefOid.startsWith(valid.expectedHeadSha);
-      if (!headMatches || (headSha !== null && page.headRefOid !== headSha)) {
+      if (!page.open) {
+        return unavailable('not-open');
+      }
+      if (page.headRefOid !== valid.expectedHeadSha || (headSha !== null && page.headRefOid !== headSha)) {
         return unavailable('head-moved');
       }
       headSha = page.headRefOid;
@@ -354,17 +367,18 @@ export class PullRequestFindingsReadAdapter implements PullRequestFindingsReadPo
         if (fetched > MAX_THREADS) {
           return unavailable('too-large', 'too many threads');
         }
-        if (node.resolved) {
-          continue;
-        }
-        const finding = toFinding(node.id, node.record);
+        // A resolved thread is validated like an unresolved one (an unknown
+        // or missing author makes the whole answer unreadable), then dropped.
+        const finding = toFinding(node.id, node.record, node.resolved);
         if (finding === null) {
           return unavailable('unreadable', 'a thread is malformed');
         }
         if (finding === 'too-large') {
           return unavailable('too-large', 'a thread body is too large');
         }
-        findings.push(finding);
+        if (!node.resolved) {
+          findings.push(finding);
+        }
       }
 
       if (!page.hasNextPage) {

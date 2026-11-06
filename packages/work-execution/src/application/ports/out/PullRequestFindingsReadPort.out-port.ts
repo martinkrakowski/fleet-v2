@@ -3,15 +3,15 @@
  * PullRequestFindingsReadPort: read, read-only, one pull request's unresolved
  * review threads at one exact head as typed fields. Any forge-sourced text is
  * returned for the caller to wrap as untrusted input; it is never an
- * instruction. An answer for another head, an unreadable forge or a partial
- * page is `unavailable`, never an empty list. The port never resolves or
+ * instruction. An answer for another head, a pull request that is not open,
+ * an unreadable forge or a partial page is `unavailable`, never an empty list. The port never resolves or
  * comments on anything, and no credential crosses it.
  */
 
 export interface PullRequestFindingsRequest {
   readonly repository: { readonly owner: string; readonly repo: string };
   readonly pullRequestNumber: number;
-  /** The exact head the caller believes is current. */
+  /** The exact head the caller believes is current (40 lowercase hex characters). */
   readonly expectedHeadSha: string;
   /** Optional deadline; the adapter never starts a call it cannot finish. */
   readonly deadlineIso?: string;
@@ -34,6 +34,7 @@ export type PullRequestFindingsUnavailableCode =
   | 'unconfigured'
   | 'forge-error'
   | 'head-moved'
+  | 'not-open'
   | 'unreadable'
   | 'partial-page'
   | 'too-large';

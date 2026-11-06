@@ -1,7 +1,11 @@
 // Lane CO24: PR-feedback fix round.
 import { describe, expect, it } from 'vitest';
 
-import type { AttemptRecord } from '../../../domain/execution-records.js';
+import type {
+  ActionJournalEntryRecord,
+  AttemptRecord,
+  WorkOrderRecord,
+} from '../../../domain/execution-records.js';
 import type {
   PrepareFixAttemptPort,
   PrepareFixAttemptRequest,
@@ -11,6 +15,13 @@ import type {
   PreparePullRequestFeedbackFixRequest,
   PushPullRequestFeedbackFixRequest,
 } from '../../ports/in/PreparePullRequestFeedbackFixPort.in-port.js';
+import type {
+  ActionAuthorizationPort,
+  ConsumeActionAuthorizationRequest,
+  ConsumeActionAuthorizationResult,
+  ResolveActionAuthorizationResult,
+} from '../../ports/out/ActionAuthorizationPort.out-port.js';
+import type { ExecutionJournalPort } from '../../ports/out/ExecutionJournalPort.out-port.js';
 import type {
   ForgeActionPort,
   ForgeActionRequest,
@@ -22,6 +33,7 @@ import type {
   PullRequestFindingsRequest,
   PullRequestFindingsResult,
 } from '../../ports/out/PullRequestFindingsReadPort.out-port.js';
+import { ExecuteAuthorizedForgeActionUseCase } from '../ExecuteAuthorizedForgeActionUseCase.use-case.js';
 import { PreparePullRequestFeedbackFixUseCase } from '../PreparePullRequestFeedbackFixUseCase.use-case.js';
 
 const REPOSITORY = { owner: 'fleet', repo: 'v2' };
@@ -31,6 +43,7 @@ const OTHER_HEAD = 'c'.repeat(40);
 const KEY = `pr-feedback/42@${'a'.repeat(12)}`;
 const FIX_ATTEMPT_ID = `pr-feedback-42-${'a'.repeat(12)}`;
 const NONCE = 'a'.repeat(32);
+const GRANT_ID = 'grant-1';
 
 function finding(overrides: Partial<PullRequestFinding> = {}): PullRequestFinding {
   return {
@@ -98,6 +111,163 @@ class FakeForge implements ForgeActionPort {
   }
 }
 
+interface GrantEntry {
+  readonly kind: string;
+  readonly expectedHeadSha: string;
+  readonly attemptId: string;
+  consumedByActionId: string | null;
+}
+
+/**
+ * The operator-coordination grant rules as an in-file store: an unknown grant,
+ * another kind, another head or another attempt refuses; a grant consumed by
+ * another action refuses; the same action id observes its own consumption.
+ */
+class FakeGrants implements ActionAuthorizationPort {
+  readonly grants = new Map<string, GrantEntry>();
+  readonly consumeCalls: ConsumeActionAuthorizationRequest[] = [];
+
+  issue(id: string, overrides: Partial<GrantEntry> = {}): void {
+    this.grants.set(id, {
+      kind: 'push-to-pr',
+      expectedHeadSha: FIXED_HEAD,
+      attemptId: FIX_ATTEMPT_ID,
+      consumedByActionId: null,
+      ...overrides,
+    });
+  }
+
+  async resolveActionAuthorization(): Promise<ResolveActionAuthorizationResult> {
+    return { outcome: 'blocked', reason: 'not used by this use case' };
+  }
+
+  async consumeActionAuthorization(
+    request: ConsumeActionAuthorizationRequest,
+  ): Promise<ConsumeActionAuthorizationResult> {
+    this.consumeCalls.push(request);
+    const grant = this.grants.get(request.authorizationGrantId);
+    if (grant === undefined) {
+      return { outcome: 'refused', reason: 'Authorization grant not found' };
+    }
+    if (
+      grant.kind !== request.actionKind ||
+      grant.expectedHeadSha !== request.expectedHeadSha ||
+      grant.attemptId !== request.attemptId
+    ) {
+      return { outcome: 'refused', reason: 'Authorization grant scope does not match' };
+    }
+    if (grant.consumedByActionId !== null && grant.consumedByActionId !== request.actionId) {
+      return { outcome: 'refused', reason: 'Authorization grant already consumed' };
+    }
+    grant.consumedByActionId = request.actionId;
+    return { outcome: 'consumed', actionId: request.actionId };
+  }
+}
+
+class MemoryJournal implements ExecutionJournalPort {
+  readonly entries: ActionJournalEntryRecord[] = [];
+
+  async appendJournalEntry(entry: ActionJournalEntryRecord): Promise<void> {
+    this.entries.push(entry);
+  }
+  async listJournalEntriesForAttempt(attemptId: string): Promise<readonly ActionJournalEntryRecord[]> {
+    return this.entries.filter((entry) => entry.attemptId === attemptId);
+  }
+  async saveCapacityReservation(): Promise<void> {}
+  async listActiveReservations(): Promise<readonly []> {
+    return [];
+  }
+  async releaseCapacityReservation(): Promise<boolean> {
+    return false;
+  }
+  async reserveCapacityAtomically(): Promise<never> {
+    throw new Error('not used');
+  }
+}
+
+function fixAttemptRecord(headCommit: string = FIXED_HEAD): AttemptRecord {
+  return {
+    id: FIX_ATTEMPT_ID,
+    ownerDecisionReferences: [],
+    workOrderId: 'wo-1',
+    kind: 'fix',
+    fixNumber: 1,
+    priorAttemptId: 'attempt-1',
+    state: 'collected',
+    outcome: 'done',
+    baseCommit: HEAD,
+    worktreePath: '/tmp/worktree',
+    briefDigest: 'sha256-brief',
+    briefPackagePath: null,
+    sessionId: null,
+    completionReceipt: null,
+    artifacts: {
+      headCommit,
+      commitsSinceBase: [headCommit],
+      collectedArtifactPaths: [],
+      notes: 'present',
+    },
+    createdAtIso: '2026-11-06T00:00:00Z',
+    updatedAtIso: '2026-11-06T00:10:00Z',
+  } as AttemptRecord;
+}
+
+function workOrderRecord(): WorkOrderRecord {
+  return {
+    id: 'wo-1',
+    projectId: 'fleet-v2',
+    taskId: 'task-1',
+    laneId: 'lane-co24',
+    repository: 'github.com/fleet/v2',
+    state: 'approved',
+    revision: 1,
+    baseCommit: HEAD,
+    ownedPaths: ['src/'],
+    policyRevision: 'pol-1',
+    prerequisiteWorkOrderIds: [],
+    createdAtIso: '2026-11-06T00:00:00Z',
+    updatedAtIso: '2026-11-06T00:00:00Z',
+  } as WorkOrderRecord;
+}
+
+/** The real authorised forge path over in-file stores, with `forge` as its credential-bearing port. */
+function authorizedForge(forge: ForgeActionPort, grants: FakeGrants, attempt: AttemptRecord | null = fixAttemptRecord()) {
+  const journal = new MemoryJournal();
+  const execute = new ExecuteAuthorizedForgeActionUseCase({
+    attemptRepo: {
+      async findAttemptById(id: string) {
+        return attempt !== null && attempt.id === id ? attempt : null;
+      },
+      async saveAttempt() {},
+      async listAttemptsByWorkOrder() {
+        return attempt === null ? [] : [attempt];
+      },
+      async listAllAttempts() {
+        return attempt === null ? [] : [attempt];
+      },
+    },
+    workOrderRepo: {
+      async findWorkOrderById(id: string) {
+        return id === 'wo-1' ? workOrderRecord() : null;
+      },
+      async saveWorkOrder() {},
+      async listWorkOrdersByProject() {
+        return [workOrderRecord()];
+      },
+    },
+    journal,
+    authorizationPort: grants,
+    forgePort: forge,
+    attemptOwnerDecisionPort: {
+      async readAttemptOwnerDecisionReferences() {
+        return { outcome: 'recorded', ownerDecisionReferences: [] };
+      },
+    },
+    now: () => '2026-11-06T00:20:00Z',
+  });
+  return { execute, journal };
+}
+
 function atHead(head: string, findings: readonly PullRequestFinding[] = [finding()]) {
   return (request: PullRequestFindingsRequest): PullRequestFindingsResult =>
     request.expectedHeadSha === head
@@ -109,13 +279,17 @@ function setup(options: { findings?: readonly PullRequestFinding[] } = {}) {
   const findings = new FakeFindings(atHead(HEAD, options.findings));
   const fixAttempts = new FakeFixAttempts();
   const forge = new FakeForge((request) => ({ outcome: 'executed', headSha: request.expectedHeadSha }));
+  const grants = new FakeGrants();
+  grants.issue(GRANT_ID);
+  const { execute, journal } = authorizedForge(forge, grants);
   const useCase = new PreparePullRequestFeedbackFixUseCase({
     findings,
     prepareFixAttempt: fixAttempts,
-    forgeAction: forge,
+    executeForgeAction: execute,
+    repository: REPOSITORY,
     mintNonce: () => NONCE,
   });
-  return { findings, fixAttempts, forge, useCase };
+  return { findings, fixAttempts, forge, grants, journal, useCase };
 }
 
 function prepareRequest(
@@ -141,7 +315,7 @@ function pushRequest(overrides: Partial<PushPullRequestFeedbackFixRequest> = {})
     fixedHeadSha: FIXED_HEAD,
     workOrderId: 'wo-1',
     attemptId: FIX_ATTEMPT_ID,
-    grantId: 'grant-1',
+    grantId: GRANT_ID,
     ...overrides,
   };
 }
@@ -339,9 +513,8 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
       {
         actionId: KEY,
         kind: 'push-to-pr',
-        expectedHeadSha: HEAD,
+        expectedHeadSha: FIXED_HEAD,
         branchName: 'fleet/lane-co24',
-        pullRequestNumber: 42,
         attemptId: FIX_ATTEMPT_ID,
         workOrderId: 'wo-1',
       },
@@ -451,7 +624,7 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
         await useCase.preparePullRequestFeedbackFix(request as unknown as PreparePullRequestFeedbackFixRequest),
       ).toEqual({ outcome: 'refused', code: 'invalid-request' });
     }
-    for (const field of ['grantId', 'attemptId', 'workOrderId', 'fixedHeadSha', 'expectedHeadSha'] as const) {
+    for (const field of ['attemptId', 'workOrderId', 'fixedHeadSha', 'expectedHeadSha'] as const) {
       const request: Record<string, unknown> = { ...pushRequest() };
       delete request[field];
       expect(await useCase.pushPullRequestFeedbackFix(request as unknown as PushPullRequestFeedbackFixRequest)).toMatchObject({
@@ -471,6 +644,8 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
       { headSha: 'XYZ' },
       { headSha: 'abc' },
       { headSha: 'A'.repeat(40) },
+      { headSha: 'a'.repeat(12) },
+      { headSha: 'a'.repeat(39) },
       { branchName: '../escape' },
       { branchName: 'feature.lock' },
       { branchName: 7 },
@@ -496,7 +671,13 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
       await useCase.pushPullRequestFeedbackFix(pushRequest({ fixedHeadSha: HEAD })),
     ).toMatchObject({ outcome: 'refused', code: 'invalid-request' });
     expect(
-      await useCase.pushPullRequestFeedbackFix(pushRequest({ grantId: 4 as unknown as string })),
+      await useCase.pushPullRequestFeedbackFix(pushRequest({ grantId: 'grant with spaces' })),
+    ).toMatchObject({ outcome: 'refused', code: 'invalid-request' });
+    expect(
+      await useCase.pushPullRequestFeedbackFix(pushRequest({ fixedHeadSha: 'b'.repeat(12) })),
+    ).toMatchObject({ outcome: 'refused', code: 'invalid-request' });
+    expect(
+      await useCase.pushPullRequestFeedbackFix(pushRequest({ authorizedBy: 7 as unknown as string })),
     ).toMatchObject({ outcome: 'refused', code: 'invalid-request' });
     expect(findings.calls).toHaveLength(0);
   });
@@ -557,7 +738,7 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
       },
     });
     const push = { ...pushRequest() } as Record<string, unknown>;
-    Object.defineProperty(push, 'grantId', {
+    Object.defineProperty(push, 'attemptId', {
       enumerable: true,
       get() {
         throw new Error('getter exploded');
@@ -572,5 +753,160 @@ describe('PreparePullRequestFeedbackFixUseCase', () => {
       code: 'invalid-request',
     });
     expect(findings.calls).toHaveLength(0);
+  });
+});
+
+/** A pull request at the round head that moves to the fixed head when the forge pushes. */
+function pushableSetup() {
+  const context = setup();
+  let prHead = HEAD;
+  context.findings.handler = (request) =>
+    request.expectedHeadSha === prHead
+      ? { outcome: 'available', headSha: prHead, findings: [finding()] }
+      : { outcome: 'unavailable', code: 'head-moved' };
+  context.forge.script = (request) => {
+    prHead = request.expectedHeadSha;
+    return { outcome: 'executed', pullRequestNumber: 42, headSha: request.expectedHeadSha };
+  };
+  return context;
+}
+
+describe('PreparePullRequestFeedbackFixUseCase push grant', () => {
+  it('consumes the run grant exactly once for the push-to-pr action before the forge pushes', async () => {
+    const { forge, grants, journal, useCase } = pushableSetup();
+
+    const first = await useCase.pushPullRequestFeedbackFix(pushRequest());
+    const again = await useCase.pushPullRequestFeedbackFix(pushRequest());
+
+    expect(first).toEqual({ outcome: 'pushed', key: KEY, headSha: FIXED_HEAD });
+    expect(again).toEqual({ outcome: 'already-pushed', key: KEY, headSha: FIXED_HEAD });
+    expect(grants.consumeCalls).toEqual([
+      {
+        authorizationGrantId: GRANT_ID,
+        actionId: KEY,
+        actionKind: 'push-to-pr',
+        expectedHeadSha: FIXED_HEAD,
+        attemptId: FIX_ATTEMPT_ID,
+      },
+    ]);
+    expect(grants.grants.get(GRANT_ID)?.consumedByActionId).toBe(KEY);
+    expect(forge.requests).toHaveLength(1);
+    const statuses = journal.entries.map((entry) => entry.status);
+    expect(statuses).toEqual(['intent-recorded', 'completed']);
+  });
+
+  it('refuses with code grant-missing and makes no forge read or call when the request carries no grant', async () => {
+    for (const grantId of [undefined, '', '   ', 4]) {
+      const { findings, forge, grants, useCase } = pushableSetup();
+      const request: Record<string, unknown> = { ...pushRequest() };
+      if (grantId === undefined) {
+        delete request.grantId;
+      } else {
+        request.grantId = grantId;
+      }
+
+      const result = await useCase.pushPullRequestFeedbackFix(request as unknown as PushPullRequestFeedbackFixRequest);
+
+      expect(result).toEqual({ outcome: 'refused', key: KEY, headSha: FIXED_HEAD, code: 'grant-missing' });
+      expect(findings.calls).toHaveLength(0);
+      expect(grants.consumeCalls).toHaveLength(0);
+      expect(forge.requests).toHaveLength(0);
+    }
+  });
+
+  it('refuses with code grant-refused and makes no forge call for an unknown grant', async () => {
+    const { forge, grants, useCase } = pushableSetup();
+
+    const result = await useCase.pushPullRequestFeedbackFix(pushRequest({ grantId: 'grant-unknown' }));
+
+    expect(result).toEqual({ outcome: 'refused', key: KEY, headSha: FIXED_HEAD, code: 'grant-refused' });
+    expect(grants.consumeCalls).toHaveLength(1);
+    expect(forge.requests).toHaveLength(0);
+  });
+
+  it('refuses with code grant-refused and makes no forge call for a grant already consumed by another action', async () => {
+    const { forge, grants, useCase } = pushableSetup();
+    grants.issue(GRANT_ID, { consumedByActionId: 'forge-another-action' });
+
+    const result = await useCase.pushPullRequestFeedbackFix(pushRequest());
+
+    expect(result).toEqual({ outcome: 'refused', key: KEY, headSha: FIXED_HEAD, code: 'grant-refused' });
+    expect(grants.grants.get(GRANT_ID)?.consumedByActionId).toBe('forge-another-action');
+    expect(forge.requests).toHaveLength(0);
+  });
+
+  it('refuses with code grant-refused and makes no forge call for a grant scoped to another kind, head or attempt', async () => {
+    const mismatches: Partial<GrantEntry>[] = [
+      { kind: 'push-and-open-pr' },
+      { kind: 'merge-pr' },
+      { expectedHeadSha: OTHER_HEAD },
+      { expectedHeadSha: HEAD },
+      { attemptId: 'attempt-other' },
+    ];
+    for (const mismatch of mismatches) {
+      const { forge, grants, useCase } = pushableSetup();
+      grants.issue(GRANT_ID, mismatch);
+
+      const result = await useCase.pushPullRequestFeedbackFix(pushRequest());
+
+      expect(result).toEqual({ outcome: 'refused', key: KEY, headSha: FIXED_HEAD, code: 'grant-refused' });
+      expect(grants.grants.get(GRANT_ID)?.consumedByActionId).toBeNull();
+      expect(forge.requests).toHaveLength(0);
+    }
+  });
+
+  it('refuses with code grant-refused and consumes nothing when the fix attempt did not produce the pushed head', async () => {
+    const context = pushableSetup();
+    const { execute } = authorizedForge(context.forge, context.grants, fixAttemptRecord(OTHER_HEAD));
+    const useCase = new PreparePullRequestFeedbackFixUseCase({
+      findings: context.findings,
+      prepareFixAttempt: context.fixAttempts,
+      executeForgeAction: execute,
+      repository: REPOSITORY,
+      mintNonce: () => NONCE,
+    });
+
+    const result = await useCase.pushPullRequestFeedbackFix(pushRequest());
+
+    expect(result).toEqual({ outcome: 'refused', key: KEY, headSha: FIXED_HEAD, code: 'grant-refused' });
+    expect(context.grants.consumeCalls).toHaveLength(0);
+    expect(context.forge.requests).toHaveLength(0);
+  });
+
+  it('refuses with code repository-mismatch when the request names another repository than the forge path', async () => {
+    const { findings, forge, grants, fixAttempts, useCase } = pushableSetup();
+    const other = { owner: 'fleet', repo: 'elsewhere' };
+
+    const push = await useCase.pushPullRequestFeedbackFix(pushRequest({ repository: other }));
+    const prepare = await useCase.preparePullRequestFeedbackFix(prepareRequest({ repository: other }));
+
+    expect(push).toEqual({ outcome: 'refused', key: KEY, headSha: FIXED_HEAD, code: 'repository-mismatch' });
+    expect(prepare).toEqual({ outcome: 'refused', code: 'repository-mismatch' });
+    expect(findings.calls).toHaveLength(0);
+    expect(grants.consumeCalls).toHaveLength(0);
+    expect(forge.requests).toHaveLength(0);
+    expect(fixAttempts.calls).toHaveLength(0);
+    expect(
+      await useCase.pushPullRequestFeedbackFix(pushRequest({ repository: { owner: 'Fleet', repo: 'V2' } })),
+    ).toEqual({ outcome: 'pushed', key: KEY, headSha: FIXED_HEAD });
+  });
+
+  it('refuses with code pull-request-not-open when the pull request is closed or merged', async () => {
+    const { findings, forge, grants, fixAttempts, useCase } = pushableSetup();
+    findings.handler = () => ({ outcome: 'unavailable', code: 'not-open' });
+
+    expect(await useCase.pushPullRequestFeedbackFix(pushRequest())).toEqual({
+      outcome: 'refused',
+      key: KEY,
+      headSha: FIXED_HEAD,
+      code: 'pull-request-not-open',
+    });
+    expect(await useCase.preparePullRequestFeedbackFix(prepareRequest())).toEqual({
+      outcome: 'refused',
+      code: 'pull-request-not-open',
+    });
+    expect(grants.consumeCalls).toHaveLength(0);
+    expect(forge.requests).toHaveLength(0);
+    expect(fixAttempts.calls).toHaveLength(0);
   });
 });

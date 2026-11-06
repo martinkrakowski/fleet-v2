@@ -9,6 +9,7 @@ import type { AttemptRecord, AttemptSeatSelectionRecord, SeatObservationRecord }
 import {
   type ImplementerSeatRole,
   type SeatPlan,
+  type SeatPlanProps,
   type SeatPlanRole,
   type SeatPlanSeat,
 } from './value-objects/SeatPlan.vo.js';
@@ -693,4 +694,288 @@ export function classifyRunnerRefusal(reason: string): StopReasonValue {
     return 'no-route';
   }
   return 'runner-refused';
+}
+
+// ---------------------------------------------------------------------------
+// The seat catalogue: the installation's seats and chains as a structural
+// subset (plan §3.5.7). Pure: the caller supplies the catalogue object and
+// nothing here reads a clock, a file, a port or another package.
+// ---------------------------------------------------------------------------
+
+/** One seat of the installation, as a structural subset (the installation package is never imported). */
+export interface SeatCatalogSeat {
+  readonly id: string;
+  readonly tool: string;
+  readonly model: string;
+  readonly variant?: string;
+  readonly agent?: string;
+  readonly health?: string;
+}
+
+/** One step of a chain: the seat it names and the installation triggers that open it. */
+export interface SeatCatalogChainStep {
+  readonly seatId: string;
+  readonly triggers?: readonly string[];
+}
+
+/** The chains the seat plan is built from. The pre-merge chain is not carried: SeatPlan v1 has three roles. */
+export interface SeatCatalogChains {
+  readonly implementer?: readonly SeatCatalogChainStep[];
+  readonly fix?: readonly SeatCatalogChainStep[];
+  readonly reviewer?: readonly SeatCatalogChainStep[];
+}
+
+/** The installation's seat catalogue: a structural subset, exactly as AllowedSeatPort does it. */
+export interface SeatCatalog {
+  readonly seats?: readonly SeatCatalogSeat[];
+  readonly chains?: SeatCatalogChains;
+}
+
+/** The built plan, or a typed refusal. Never a throw. */
+export type SeatPlanFromCatalogResult =
+  | { readonly plan: SeatPlanProps }
+  | { readonly reason: string };
+
+/** The catalogue may hold at most this many seats; a larger one is refused, never truncated. */
+const SEAT_CATALOG_SEAT_BOUND = 256;
+
+/** Each chain may hold at most this many steps; a larger one is refused, never truncated. */
+const SEAT_CATALOG_CHAIN_STEP_BOUND = 64;
+
+const CATALOG_TRIGGER_TO_STOP_REASON: Readonly<Record<string, StopReasonValue>> = {
+  '429': 'rate-limited',
+  '402': 'payment',
+  timeout: 'timeout',
+  quota: 'rate-limited',
+  'no-commit': 'no-commit',
+};
+
+const CATALOG_CHAIN_ROLES = ['implementer', 'fix', 'reviewer'] as const;
+
+type CatalogChainRole = (typeof CATALOG_CHAIN_ROLES)[number];
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** The catalogue's seats as typed records, or the rule-and-position refusal. */
+function catalogSeatsOf(
+  catalog: Record<string, unknown>,
+): { readonly ok: true; readonly seats: readonly SeatCatalogSeat[] } | { readonly ok: false; readonly reason: string } {
+  const rawSeats = catalog['seats'];
+  if (rawSeats === undefined) {
+    return { ok: true, seats: [] };
+  }
+  if (!Array.isArray(rawSeats)) {
+    return { ok: false, reason: 'The seat catalogue carries seats that are not a list' };
+  }
+  if (rawSeats.length > SEAT_CATALOG_SEAT_BOUND) {
+    return { ok: false, reason: 'The seat catalogue carries more than ' + SEAT_CATALOG_SEAT_BOUND + ' seats' };
+  }
+  const seats: SeatCatalogSeat[] = [];
+  for (const [index, rawSeat] of rawSeats.entries()) {
+    if (!isPlainObject(rawSeat)) {
+      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' is not an object' };
+    }
+    const id = rawSeat['id'];
+    const tool = rawSeat['tool'];
+    const model = rawSeat['model'];
+    if (typeof id !== 'string' || id.trim() === '') {
+      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries no id' };
+    }
+    if (typeof tool !== 'string') {
+      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries no tool' };
+    }
+    if (typeof model !== 'string') {
+      return { ok: false, reason: 'The seat catalogue seat at index ' + index + ' carries no model' };
+    }
+    const variant = rawSeat['variant'];
+    const agent = rawSeat['agent'];
+    const health = rawSeat['health'];
+    seats.push({
+      id,
+      tool,
+      model,
+      ...(typeof variant === 'string' ? { variant } : {}),
+      ...(typeof agent === 'string' ? { agent } : {}),
+      ...(typeof health === 'string' ? { health } : {}),
+    });
+  }
+  return { ok: true, seats };
+}
+
+/** One chain's steps as typed records, or the rule-and-position refusal. */
+function catalogStepsOf(
+  role: CatalogChainRole,
+  rawSteps: unknown,
+): { readonly ok: true; readonly steps: readonly SeatCatalogChainStep[] } | { readonly ok: false; readonly reason: string } {
+  if (rawSteps === undefined) {
+    return { ok: true, steps: [] };
+  }
+  if (!Array.isArray(rawSteps)) {
+    return { ok: false, reason: 'The seat catalogue ' + role + ' chain is not a list' };
+  }
+  if (rawSteps.length > SEAT_CATALOG_CHAIN_STEP_BOUND) {
+    return {
+      ok: false,
+      reason: 'The seat catalogue ' + role + ' chain carries more than ' + SEAT_CATALOG_CHAIN_STEP_BOUND + ' steps',
+    };
+  }
+  const steps: SeatCatalogChainStep[] = [];
+  for (const [index, rawStep] of rawSteps.entries()) {
+    if (!isPlainObject(rawStep)) {
+      return { ok: false, reason: 'The seat catalogue ' + role + ' chain step ' + index + ' is not an object' };
+    }
+    const seatId = rawStep['seatId'];
+    if (typeof seatId !== 'string' || seatId.trim() === '') {
+      return { ok: false, reason: 'The seat catalogue ' + role + ' chain step ' + index + ' carries no seatId' };
+    }
+    const rawTriggers = rawStep['triggers'];
+    if (rawTriggers === undefined) {
+      steps.push({ seatId });
+      continue;
+    }
+    if (!Array.isArray(rawTriggers)) {
+      return { ok: false, reason: 'The seat catalogue ' + role + ' chain step ' + index + ' carries triggers that are not a list' };
+    }
+    const triggers: string[] = [];
+    for (const trigger of rawTriggers) {
+      if (typeof trigger !== 'string') {
+        return { ok: false, reason: 'The seat catalogue ' + role + ' chain step ' + index + ' carries a trigger that is not a string' };
+      }
+      triggers.push(trigger);
+    }
+    steps.push({ seatId, triggers });
+  }
+  return { ok: true, steps };
+}
+
+function catalogPlanSeat(step: SeatCatalogChainStep, seat: SeatCatalogSeat): SeatPlanSeat {
+  const on = [
+    ...new Set(
+      (step.triggers ?? []).map((trigger) => CATALOG_TRIGGER_TO_STOP_REASON[trigger]),
+    ),
+  ];
+  return {
+    id: seat.id,
+    model: seat.model,
+    tool: seat.tool,
+    ...(seat.variant !== undefined ? { variant: seat.variant } : {}),
+    ...(seat.agent !== undefined ? { agent: seat.agent } : {}),
+    ...(on.length > 0 ? { on } : {}),
+  };
+}
+
+/**
+ * Build the S1 seat plan from the installation's seat catalogue (the code
+ * moved out of the CLI, plan §3.5.7). The parameter is `unknown` on purpose:
+ * every runtime input is validated inside, and every failure is the typed
+ * refusal `{ reason }` — never a throw. Triggers map onto stop-reason classes;
+ * a trigger outside the table is a refusal, never an `on` holding `undefined`.
+ * A chain step naming an undeclared seat is skipped. The refusal for a missing
+ * implementer chain is frozen: the CLI prints it as its exit-2 usage message.
+ */
+export function seatPlanFromCatalog(catalog: unknown): SeatPlanFromCatalogResult {
+  if (!isPlainObject(catalog)) {
+    return { reason: 'The seat catalogue is not an object' };
+  }
+  let seats: readonly SeatCatalogSeat[];
+  try {
+    const parsed = catalogSeatsOf(catalog);
+    if (!parsed.ok) {
+      return parsed;
+    }
+    seats = parsed.seats;
+    const rawChains = catalog['chains'];
+    if (rawChains !== undefined && !isPlainObject(rawChains)) {
+      return { reason: 'The seat catalogue chains are not an object' };
+    }
+    const chainsSource: Record<string, unknown> = rawChains ?? {};
+    const chains: Partial<Record<CatalogChainRole, readonly SeatCatalogChainStep[]>> = {};
+    for (const role of CATALOG_CHAIN_ROLES) {
+      const parsedSteps = catalogStepsOf(role, chainsSource[role]);
+      if (!parsedSteps.ok) {
+        return parsedSteps;
+      }
+      chains[role] = parsedSteps.steps;
+    }
+    const seatsById = new Map(seats.map((seat) => [seat.id, seat] as const));
+    const planSeatsOf = (role: CatalogChainRole): SeatPlanSeat[] | SeatPlanFromCatalogResult => {
+      const out: SeatPlanSeat[] = [];
+      const steps = chains[role] ?? [];
+      for (const [index, step] of steps.entries()) {
+        for (const trigger of step.triggers ?? []) {
+          if (CATALOG_TRIGGER_TO_STOP_REASON[trigger] === undefined) {
+            return {
+              reason: 'The seat catalogue ' + role + ' chain step ' + index + ' names a trigger that is not a declared stop-reason class',
+            };
+          }
+        }
+        const seat = seatsById.get(step.seatId);
+        if (seat !== undefined) {
+          out.push(catalogPlanSeat(step, seat));
+        }
+      }
+      return out;
+    };
+    const firstPass = planSeatsOf('implementer');
+    if (!Array.isArray(firstPass)) {
+      return firstPass;
+    }
+    if (firstPass.length === 0) {
+      return { reason: 'The installation has no implementer chain to build a seat plan from' };
+    }
+    const fixSteps = chains['fix'] ?? [];
+    const fixSource: CatalogChainRole = fixSteps.length > 0 ? 'fix' : 'implementer';
+    const fix = fixSource === 'fix' ? planSeatsOf('fix') : firstPass;
+    if (!Array.isArray(fix)) {
+      return fix;
+    }
+    const review = planSeatsOf('reviewer');
+    if (!Array.isArray(review)) {
+      return review;
+    }
+    return {
+      plan: {
+        version: 1,
+        'first-pass': firstPass,
+        fix,
+        review,
+      },
+    };
+  } catch {
+    // A throwing getter on the catalogue object is a refusal, never a crash.
+    return { reason: 'The seat catalogue could not be read' };
+  }
+}
+
+/**
+ * Seat ids the catalogue marks unhealthy, in file order (the code moved out of
+ * the CLI). An absent or malformed catalogue, or a throwing getter, yields
+ * `[]` — never a throw; the plan builder owns the typed refusal for a bad
+ * catalogue, so the CLI's exit-2 path is unaffected.
+ */
+export function unhealthySeatIdsFromCatalog(catalog: unknown): string[] {
+  try {
+    if (!isPlainObject(catalog)) {
+      return [];
+    }
+    const rawSeats = catalog['seats'];
+    if (!Array.isArray(rawSeats)) {
+      return [];
+    }
+    const ids: string[] = [];
+    for (const rawSeat of rawSeats) {
+      if (!isPlainObject(rawSeat)) {
+        continue;
+      }
+      const id = rawSeat['id'];
+      if (typeof id === 'string' && rawSeat['health'] === 'unhealthy') {
+        ids.push(id);
+      }
+    }
+    return ids;
+  } catch {
+    return [];
+  }
 }

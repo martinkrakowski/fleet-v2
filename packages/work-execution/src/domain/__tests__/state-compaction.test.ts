@@ -9,7 +9,10 @@ import type {
   AttemptRecord,
   CapacityReservationRecord,
 } from '../execution-records.js';
+import type { LaneRunJournalEntryRecord } from '../lane-run-journal.js';
+import type { LaneRunRecord } from '../lane-run-records.js';
 import {
+  liveRunAttemptIds,
   planAttemptScopedCompaction,
   type AttemptScopedCompactionInput,
   type AttemptScopedCompactionPlan,
@@ -124,5 +127,35 @@ describe('planAttemptScopedCompaction', () => {
     expect(result.removableAttemptIds).toEqual([]);
     expect(result.removableReservationIds).toEqual([]);
     expect(result.removableJournalEntryIds).toEqual([]);
+  });
+});
+
+describe('liveRunAttemptIds', () => {
+  const RUN_A = 'run-01J' + '0'.repeat(23);
+  const RUN_B = 'run-01J' + '1'.repeat(23);
+  const run = (runId: string, attemptIds: string[]): LaneRunRecord =>
+    ({ runId, attemptIds }) as unknown as LaneRunRecord;
+  const conduct = (runId: string, state: string): LaneRunJournalEntryRecord =>
+    ({ kind: 'conduct', runId, state }) as unknown as LaneRunJournalEntryRecord;
+
+  it('lists the attempts of a live run', () => {
+    const journals = new Map([[RUN_A, [conduct(RUN_A, 'running')]]]);
+    expect(liveRunAttemptIds([run(RUN_A, ['att-1', 'att-2'])], journals)).toEqual(['att-1', 'att-2']);
+  });
+
+  it('a terminal run contributes nothing', () => {
+    const journals = new Map([
+      [RUN_A, [conduct(RUN_A, 'running'), conduct(RUN_A, 'merged')]],
+      [RUN_B, [conduct(RUN_B, 'stopped')]],
+    ]);
+    expect(liveRunAttemptIds([run(RUN_A, ['att-1']), run(RUN_B, ['att-2'])], journals)).toEqual([]);
+  });
+
+  it('a run with no journal entry is live', () => {
+    expect(liveRunAttemptIds([run(RUN_A, ['att-1'])], new Map())).toEqual(['att-1']);
+  });
+
+  it('a run with an unreadable id reads as live and duplicates collapse', () => {
+    expect(liveRunAttemptIds([run('bogus', ['att-1', 'att-1'])], new Map())).toEqual(['att-1']);
   });
 });

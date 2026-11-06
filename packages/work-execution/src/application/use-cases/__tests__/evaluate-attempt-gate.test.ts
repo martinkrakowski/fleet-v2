@@ -940,4 +940,63 @@ describe('evaluateAttemptGate (EvaluateAttemptGatePort)', () => {
     expect(gate.requests).toHaveLength(0);
     expect(journal.entries).toHaveLength(0);
   });
+
+  it('decides by the first non-pass in declared order, not by a later result (KS3)', async () => {
+    const gate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        {
+          name: 'diff-check',
+          kind: 'diff-check',
+          verdict: 'unknown',
+          exitCode: null,
+          durationMs: 1,
+          detail: 'diff check error: unsupported-path-characters',
+        },
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'fail',
+          exitCode: 1,
+          durationMs: 1,
+          detail: 'exit 1',
+        },
+      ],
+    });
+    const { deps } = makeDeps({ gate });
+    const result = await new RequestAttemptAcceptanceUseCase(deps).evaluateAttemptGate(gateRequest());
+    expect(result).toEqual({
+      verdict: 'unknown',
+      reason: 'Gate predicate diff-check unknown: diff check error: unsupported-path-characters',
+    });
+  });
+
+  it('a skipped result never hides the real non-pass beside it (KS3)', async () => {
+    const gate = new FakeGatePredicatePort({
+      outcome: 'evaluated',
+      results: [
+        PASS_RESULTS[0],
+        {
+          name: 'diff-check',
+          kind: 'diff-check',
+          verdict: 'skipped',
+          exitCode: null,
+          durationMs: 0,
+          detail: 'not run: an earlier predicate did not pass',
+        },
+        {
+          name: 'command 1: corepack yarn build',
+          kind: 'command',
+          verdict: 'fail',
+          exitCode: 2,
+          durationMs: 1,
+          detail: 'exit 2',
+        },
+      ],
+    });
+    const { deps } = makeDeps({ gate });
+    const result = await new RequestAttemptAcceptanceUseCase(deps).evaluateAttemptGate(gateRequest());
+    expect(result.verdict).toBe('failed');
+  });
 });

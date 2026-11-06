@@ -495,6 +495,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     // lane's single stored link — never by parsing journal text, never
     // guessed. A thrown pre-flight read refuses before the grant is consumed.
     let preResolvedPrNumber: number | undefined;
+    let legacyLookup = false;
     if (
       (PULL_REQUEST_ACTION_KINDS as readonly string[]).includes(request.kind)
     ) {
@@ -520,6 +521,26 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     if (request.kind === "merge-pr") {
       if (deps.mergeRecordRepo === undefined) {
         return { outcome: "refused", reason: "merge-record-store-unavailable" };
+      }
+      // An attempt opened before WB5b has neither a typed journal reference
+      // nor a stored link: one read-only lookup of the open pull request for
+      // the attempt's branch may name it, never a guess.
+      if (
+        preResolvedPrNumber === undefined &&
+        normalizedRepository !== null &&
+        deps.forgePort.findOpenPullRequestsByHead !== undefined
+      ) {
+        const legacy = await this.legacyHeadLookup(
+          deps,
+          request,
+          workOrder,
+          normalizedRepository,
+        );
+        if ("reason" in legacy) {
+          return { outcome: "refused", reason: legacy.reason };
+        }
+        preResolvedPrNumber = legacy.number;
+        legacyLookup = true;
       }
       if (normalizedRepository === null || preResolvedPrNumber === undefined) {
         return {
@@ -635,7 +656,9 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         request.kind !== "merge-pr" &&
           forgeResult.pullRequestNumber !== undefined
           ? `pull request #${forgeResult.pullRequestNumber}`
-          : null,
+          : legacyLookup
+            ? "prSource=legacy-head-lookup"
+            : null,
         pullRequestRef,
       );
 
@@ -881,6 +904,47 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
         resolveLaneId(link.laneId) === wantedLaneId,
     );
     return matches.length === 1 ? matches[0]?.number : undefined;
+  }
+
+  /**
+   * The legacy pull-request lookup (WB5b): exactly one open pull request of
+   * the bound repository's own branch whose head is the expected head names
+   * the merge. Zero, several, a head mismatch or an unreadable answer each
+   * refuse with their own reason; a thrown read is unreadable.
+   */
+  private async legacyHeadLookup(
+    deps: ExecuteAuthorizedForgeActionDependencies,
+    request: ExecuteAuthorizedForgeActionRequest,
+    workOrder: WorkOrderRecord,
+    repository: string,
+  ): Promise<{ readonly number: number } | { readonly reason: string }> {
+    const lookup = deps.forgePort.findOpenPullRequestsByHead;
+    if (lookup === undefined) {
+      return { reason: "legacy-pr-lookup-unreadable" };
+    }
+    let answer: Awaited<ReturnType<typeof lookup>>;
+    try {
+      answer = await lookup.call(deps.forgePort, {
+        repository,
+        branchName: request.branchName ?? `feat/${workOrder.laneId}`,
+      });
+    } catch {
+      return { reason: "legacy-pr-lookup-unreadable" };
+    }
+    if (answer.outcome !== "read") {
+      return { reason: "legacy-pr-lookup-unreadable" };
+    }
+    if (answer.pullRequests.length === 0) {
+      return { reason: "legacy-pr-lookup-none-found" };
+    }
+    if (answer.pullRequests.length > 1) {
+      return { reason: "legacy-pr-lookup-ambiguous" };
+    }
+    const only = answer.pullRequests[0];
+    if (only === undefined || only.headSha !== request.expectedHeadSha) {
+      return { reason: "legacy-pr-lookup-head-mismatch" };
+    }
+    return { number: only.number };
   }
 
   /**

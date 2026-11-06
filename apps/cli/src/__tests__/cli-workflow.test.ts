@@ -1173,6 +1173,23 @@ describe('Fleet CLI workflow', () => {
     expect(badKind.code).toBe(2);
     expect(badKind.stderr).toContain("forge kind must be 'push-and-open-pr' or 'merge-pr'");
 
+    // A malformed pullRequestNumber is a usage error, never dropped.
+    for (const bad of ['8junk', 0, -1, 7.5]) {
+      const badNumber = await cli([
+        'forge',
+        'execute',
+        '--json',
+        jsonArg({
+          attemptId: ATTEMPT_ID,
+          kind: 'merge-pr',
+          pullRequestNumber: bad,
+          authorizationGrantId: 'g',
+        }),
+      ]);
+      expect(badNumber.code).toBe(2);
+      expect(badNumber.stderr).toContain('forge pullRequestNumber must be a positive integer');
+    }
+
     // H8: the seat tool is required and never defaulted; missing or
     // undeclared is a usage error (exit 2) on both request commands.
     const missingReserveSeat = await cli([

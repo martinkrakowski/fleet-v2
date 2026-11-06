@@ -218,3 +218,51 @@ describe('ForgeActionAdapter merge confirmation after a non-zero gh exit', () =>
     expect(readCalls).toHaveLength(0);
   });
 });
+
+describe('ForgeActionAdapter.findOpenPullRequestsByHead (legacy PR lookup)', () => {
+  const OWN_PR = (number: number, sha: string, owner: string, ref = BRANCH): unknown => ({
+    number,
+    head: { sha, ref, repo: { owner: { login: owner } } },
+  });
+
+  it('qualifies the head with the repository owner and ignores a fork PR of the same branch name', async () => {
+    const { runGh, calls } = makeRunGh({
+      exitCode: 0,
+      stdout: JSON.stringify([
+        OWN_PR(7, HEAD_SHA, 'acme'),
+        OWN_PR(8, HEAD_SHA, 'a-fork-owner'),
+        OWN_PR(9, HEAD_SHA, 'acme', 'feat/other'),
+      ]),
+      stderr: '',
+    });
+    const adapter = new ForgeActionAdapter({ runGh });
+
+    const result = await adapter.findOpenPullRequestsByHead({
+      repository: 'acme/app',
+      branchName: BRANCH,
+    });
+
+    expect(result).toEqual({ outcome: 'read', pullRequests: [{ number: 7, headSha: HEAD_SHA }] });
+    expect(calls).toHaveLength(1);
+    const args = JSON.stringify(calls[0]);
+    expect(args).toContain('head=acme%3Afeat%2Fexample-lane');
+    expect(args).toContain('state=open');
+  });
+
+  it('reports unreadable on a gh failure, a non-JSON answer and a throwing runGh, never an empty list', async () => {
+    for (const runGh of [
+      makeRunGh({ exitCode: 1, stdout: '', stderr: 'boom' }).runGh,
+      makeRunGh({ exitCode: 0, stdout: 'not json', stderr: '' }).runGh,
+      async () => {
+        throw new Error('spawn failed');
+      },
+    ]) {
+      const adapter = new ForgeActionAdapter({ runGh });
+      const result = await adapter.findOpenPullRequestsByHead({
+        repository: 'acme/app',
+        branchName: BRANCH,
+      });
+      expect(result.outcome).toBe('unreadable');
+    }
+  });
+});

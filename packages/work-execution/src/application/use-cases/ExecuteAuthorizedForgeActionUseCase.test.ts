@@ -19,6 +19,7 @@ import type {
   ForgeActionPort,
   ForgeActionRequest,
   ForgeActionResult,
+  OpenPullRequestsByHeadResult,
 } from "../ports/out/ForgeActionPort.out-port.js";
 import type { WorkOrderRepositoryPort } from "../ports/out/WorkOrderRepositoryPort.out-port.js";
 import type {
@@ -1540,9 +1541,11 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       workOrder?: WorkOrderRecord;
       forge?: (request: ForgeActionRequest) => ForgeActionResult;
       now?: () => string;
+      lookup?: () => Promise<OpenPullRequestsByHeadResult>;
     } = {},
   ) {
     const order: string[] = [];
+    const lookups: { repository: string; branchName: string }[] = [];
     const journalBase = new InMemoryJournal();
     const attemptRepo = new InMemoryAttemptRepo(makeAttemptRecord());
     const workOrderRepo = new InMemoryWorkOrderRepo(
@@ -1553,6 +1556,16 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
     const seen: ForgeActionRequest[] = [];
     const forgePort: ForgeActionPort = {
       isConfigured: () => true,
+      ...(options.lookup !== undefined
+        ? {
+            async findOpenPullRequestsByHead(query) {
+              lookups.push({ ...query });
+              return (
+                options.lookup as () => Promise<OpenPullRequestsByHeadResult>
+              )();
+            },
+          }
+        : {}),
       async performForgeAction(request) {
         seen.push(request);
         return options.forge
@@ -1582,6 +1595,7 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       ...(options.now ? { now: options.now } : {}),
     });
     return {
+      lookups,
       useCase,
       journal: journalBase,
       order,
@@ -2151,6 +2165,95 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
     expect(unresolved.outcome).toBe("refused");
     expect(seen).toHaveLength(0);
     expect(journal.entries).toHaveLength(0);
+  });
+
+  describe("legacy attempt: the pull request is looked up by its branch head", () => {
+    const legacyEntry = {
+      id: "forge:act-open:completed:2",
+      attemptId: "att-001",
+      workOrderId: "wo-001",
+      action: "forge" as const,
+      status: "completed" as const,
+      baseCommit: "b".repeat(40),
+      recordedAtIso: "2026-11-01T00:00:00.000Z",
+      sessionId: null,
+      detail: "pull request #42",
+    };
+
+    it("resolves a free-text legacy entry to the single open PR at the expected head and records the source", async () => {
+      const deps = wb5bDeps({
+        lookup: async () => ({
+          outcome: "read",
+          pullRequests: [{ number: 42, headSha: WB_HEAD }],
+        }),
+      });
+      await deps.journal.appendJournalEntry(legacyEntry);
+      const result = await deps.useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result.outcome).toBe("executed");
+      expect(deps.lookups).toEqual([
+        { repository: "org/repo", branchName: "feat/lane-auth" },
+      ]);
+      expect(deps.seen[0]?.pullRequestNumber).toBe(42);
+      const merged = deps.journal.entries.find(
+        (entry) =>
+          entry.status === "completed" && entry.id.startsWith("forge:act-1"),
+      )!;
+      expect(merged.detail).toBe("prSource=legacy-head-lookup");
+      expect(merged.pullRequest).toEqual({
+        repository: "org/repo",
+        number: 42,
+      });
+      const stored = await deps.mergeRecordRepo.findMergeRecord("org/repo", 42);
+      expect(stored?.actionRef).toBe(merged.id);
+    });
+
+    it.each([
+      ["no open pull request", [], "legacy-pr-lookup-none-found"],
+      [
+        "two matching pull requests",
+        [
+          { number: 42, headSha: WB_HEAD },
+          { number: 43, headSha: WB_HEAD },
+        ],
+        "legacy-pr-lookup-ambiguous",
+      ],
+      [
+        "a head sha mismatch",
+        [{ number: 42, headSha: WB_OTHER_HEAD }],
+        "legacy-pr-lookup-head-mismatch",
+      ],
+    ])(
+      "refuses %s before the grant and the forge call",
+      async (_name, pullRequests, reason) => {
+        const deps = wb5bDeps({
+          lookup: async () => ({ outcome: "read", pullRequests }),
+        });
+        const result =
+          await deps.useCase.executeAuthorizedForgeAction(mergeReq);
+        expect(result).toEqual({ outcome: "refused", reason });
+        expect(deps.seen).toHaveLength(0);
+        expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
+      },
+    );
+
+    it("refuses on an unreadable answer and on a thrown lookup, never guessing", async () => {
+      const unreadable = wb5bDeps({
+        lookup: async () => ({ outcome: "unreadable", reason: "gh failed" }),
+      });
+      expect(
+        await unreadable.useCase.executeAuthorizedForgeAction(mergeReq),
+      ).toEqual({ outcome: "refused", reason: "legacy-pr-lookup-unreadable" });
+      const thrown = wb5bDeps({
+        lookup: async () => {
+          throw new Error("forge exploded");
+        },
+      });
+      expect(
+        await thrown.useCase.executeAuthorizedForgeAction(mergeReq),
+      ).toEqual({ outcome: "refused", reason: "legacy-pr-lookup-unreadable" });
+      expect(unreadable.seen).toHaveLength(0);
+      expect(thrown.seen).toHaveLength(0);
+    });
   });
 
   it("refuses cleanly when the composition clock is unreadable, before consuming the grant", async () => {

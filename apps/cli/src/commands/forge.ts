@@ -1,7 +1,29 @@
 /** The `forge` command group of the CLI driver; its entries moved verbatim from the command table. */
 
-import { str, optNum, CliUsageError } from './payload.js';
-import type { CommandHandler } from './payload.js';
+import { str, CliUsageError } from './payload.js';
+import type { CommandHandler, Payload } from './payload.js';
+
+/**
+ * The optional `pullRequestNumber`: absent stays absent; a present value must
+ * be a positive safe integer (a number, or its plain decimal string from a
+ * flag). Anything else is a usage error and no request is made.
+ */
+function strictPullRequestNumber(p: Payload): number | undefined {
+  const value = p['pullRequestNumber'];
+  if (value === undefined) {
+    return undefined;
+  }
+  const parsed =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && /^[1-9][0-9]*$/.test(value)
+        ? Number(value)
+        : Number.NaN;
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new CliUsageError('forge pullRequestNumber must be a positive integer');
+  }
+  return parsed;
+}
 
 export const forgeCommands: Readonly<Record<string, CommandHandler>> = {
     execute: async (p, rt) => {
@@ -11,6 +33,7 @@ export const forgeCommands: Readonly<Record<string, CommandHandler>> = {
           "forge kind must be 'push-and-open-pr' or 'merge-pr', or 'push-to-pr' for an existing pull request",
         );
       }
+      const pullRequestNumber = strictPullRequestNumber(p);
       const attemptId = str(p, 'attemptId');
       const attempt = await rt.execution.attemptRepository.findAttemptById(attemptId);
       return rt.execution.executeAuthorizedForgeAction.executeAuthorizedForgeAction({
@@ -22,9 +45,7 @@ export const forgeCommands: Readonly<Record<string, CommandHandler>> = {
         authorizationGrantId: str(p, 'authorizationGrantId'),
         // A merge names its pull request unless the attempt's journal already
         // holds the typed reference from the action that opened it (WB5b).
-        ...(optNum(p, 'pullRequestNumber') !== undefined
-          ? { pullRequestNumber: optNum(p, 'pullRequestNumber') as number }
-          : {}),
+        ...(pullRequestNumber !== undefined ? { pullRequestNumber } : {}),
       });
     },
 };

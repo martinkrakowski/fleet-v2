@@ -23,7 +23,7 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto';
-import { constants as fsConstants, mkdirSync, promises as fs, realpathSync } from 'node:fs';
+import { constants as fsConstants, mkdirSync, promises as fs, realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type {
@@ -51,6 +51,12 @@ export interface ChainRepositoryAdapterOptions {
   readonly stateDir?: string;
   /** Every write refuses with `read-only`; reads still work. */
   readonly readOnly?: boolean;
+  /**
+   * Off Linux there is no `/proc/self/fd` to pin the directory, so a persistent
+   * store refuses to run unless this is set; the path is then re-verified before
+   * and after each operation, which narrows but cannot close a swap race.
+   */
+  readonly allowUnanchoredPaths?: boolean;
   /** Test seam: the exclusive-lock wait cap in milliseconds (default 5000). */
   readonly lockTimeoutMs?: number;
 }
@@ -141,7 +147,8 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
   private readonly memory = new Map<string, ChainRecord>();
   private memoryTail: Promise<unknown> = Promise.resolve();
   /** The physical state directory, resolved once; null when unusable. */
-  private readonly root: string | null;
+  private readonly root: { readonly path: string; readonly dev: number; readonly ino: number } | null;
+  private readonly allowUnanchored: boolean;
   private readonly persistent: boolean;
   private readonly readOnly: boolean;
   private readonly lockTimeoutMs: number;
@@ -152,15 +159,21 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
     const lockMs = own(options, 'lockTimeoutMs');
     this.lockTimeoutMs =
       typeof lockMs === 'number' && Number.isFinite(lockMs) && lockMs > 0 ? lockMs : DEFAULT_LOCK_TIMEOUT_MS;
+    this.allowUnanchored = own(options, 'allowUnanchoredPaths') === true;
     this.persistent = stateDir !== undefined;
     this.root = typeof stateDir === 'string' ? ChainRepositoryAdapter.resolveRoot(stateDir, this.readOnly) : null;
   }
 
-  private static resolveRoot(stateDir: string, readOnly: boolean): string | null {
+  private static resolveRoot(
+    stateDir: string,
+    readOnly: boolean,
+  ): { readonly path: string; readonly dev: number; readonly ino: number } | null {
     try {
       if (stateDir.trim().length === 0 || stateDir.includes('\0')) return null;
       if (!readOnly) mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-      return realpathSync(stateDir);
+      const physical = realpathSync(stateDir);
+      const stat = statSync(physical);
+      return stat.isDirectory() ? { path: physical, dev: stat.dev, ino: stat.ino } : null;
     } catch {
       return null;
     }
@@ -265,6 +278,9 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
     const timeoutMs = Math.min(this.lockTimeoutMs, remaining);
     const decided = await this.withChainsDir(true, async (dir) => {
       try {
+        // a lock path that is not a plain file (a link, a FIFO) is never read or waited on
+        const lockStat = await fs.lstat(join(dir, LOCK_FILE)).catch(() => null);
+        if (lockStat !== null && !lockStat.isFile()) throw new StoreBusyError();
         return await withFileLock(
           join(dir, LOCK_FILE),
           async () => {
@@ -303,49 +319,62 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
   // ---------- files ----------
 
   /**
-   * Open the `chains` directory under the resolved root without following a
-   * link, and run `use` against a path anchored to that open handle. On Linux
-   * the anchor is `/proc/self/fd/<n>`, so replacing `chains` with a link after
-   * this check cannot redirect any later operation; elsewhere the anchor is the
-   * path and the directory is re-verified after `use`. 'absent' when it does
-   * not exist and `create` is false. Unusable stores throw StoreUnavailableError.
+   * Open the state root (checked against the device and inode pinned at
+   * construction) and the `chains` directory under it, neither through a link,
+   * and run `use` against a path anchored to the open handle. On Linux the
+   * anchor is `/proc/self/fd/<n>`, so swapping either directory for a link or
+   * another directory after the check cannot redirect any later operation. Off
+   * Linux the store refuses to run unless `allowUnanchoredPaths` is set.
+   * 'absent' when `chains` does not exist and `create` is false. Unusable
+   * stores throw StoreUnavailableError.
    */
   private async withChainsDir<T>(create: boolean, use: (dir: string) => Promise<T>): Promise<T | 'absent'> {
     if (this.root === null) throw new StoreUnavailableError();
-    const named = join(this.root, CHAINS_DIR);
+    const anchored = process.platform === 'linux';
+    if (!anchored && !this.allowUnanchored) throw new StoreUnavailableError();
     const flags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
-    let handle: fs.FileHandle | undefined;
+    let rootHandle: fs.FileHandle;
     try {
-      handle = await fs.open(named, flags);
-    } catch (error) {
-      if (errorCode(error) !== 'ENOENT' || !create) {
-        if (errorCode(error) === 'ENOENT') return 'absent';
-        throw new StoreUnavailableError();
-      }
-      try {
-        await fs.mkdir(named, { mode: 0o700 });
-      } catch (mkdirError) {
-        if (errorCode(mkdirError) !== 'EEXIST') throw new StoreUnavailableError();
-      }
-      try {
-        handle = await fs.open(named, flags);
-      } catch {
-        throw new StoreUnavailableError();
-      }
+      rootHandle = await fs.open(this.root.path, flags);
+    } catch {
+      throw new StoreUnavailableError();
     }
+    let chainsHandle: fs.FileHandle | undefined;
     try {
-      if (!(await handle.stat()).isDirectory()) throw new StoreUnavailableError();
-      const anchored = process.platform === 'linux';
-      const result = await use(anchored ? `/proc/self/fd/${handle.fd}` : named);
-      if (!anchored) {
-        const [now, pinned] = await Promise.all([fs.lstat(named), handle.stat()]);
-        if (now.isSymbolicLink() || now.ino !== pinned.ino || now.dev !== pinned.dev) {
+      const rootStat = await rootHandle.stat();
+      if (!rootStat.isDirectory() || rootStat.dev !== this.root.dev || rootStat.ino !== this.root.ino) {
+        throw new StoreUnavailableError();
+      }
+      const named = join(anchored ? `/proc/self/fd/${rootHandle.fd}` : this.root.path, CHAINS_DIR);
+      try {
+        chainsHandle = await fs.open(named, flags);
+      } catch (error) {
+        if (errorCode(error) === 'ENOENT' && !create) return 'absent';
+        if (errorCode(error) !== 'ENOENT') throw new StoreUnavailableError();
+        try {
+          await fs.mkdir(named, { mode: 0o700 });
+        } catch (mkdirError) {
+          if (errorCode(mkdirError) !== 'EEXIST') throw new StoreUnavailableError();
+        }
+        try {
+          chainsHandle = await fs.open(named, flags);
+        } catch {
           throw new StoreUnavailableError();
         }
       }
+      if (!(await chainsHandle.stat()).isDirectory()) throw new StoreUnavailableError();
+      if (anchored) return await use(`/proc/self/fd/${chainsHandle.fd}`);
+      const verify = async (): Promise<void> => {
+        const [now, pinned] = await Promise.all([fs.lstat(named), (chainsHandle as fs.FileHandle).stat()]);
+        if (now.isSymbolicLink() || now.ino !== pinned.ino || now.dev !== pinned.dev) throw new StoreUnavailableError();
+      };
+      await verify();
+      const result = await use(named);
+      await verify();
       return result;
     } finally {
-      await handle.close().catch(() => undefined);
+      await chainsHandle?.close().catch(() => undefined);
+      await rootHandle.close().catch(() => undefined);
     }
   }
 
@@ -377,7 +406,7 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
       if (bytesRead > CHAIN_RECORD_MAX_BYTES) return unreadable('record-too-large');
       let parsed: unknown;
       try {
-        parsed = JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'));
+        parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead)));
       } catch {
         return unreadable('not-valid-json');
       }

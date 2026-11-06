@@ -279,10 +279,10 @@ describe('ChainRepositoryAdapter (file store)', () => {
     expect(names.filter((n) => n.endsWith('.tmp'))).toEqual([]);
   });
 
-  it('keeps the old record bytes when an oversized outcome is refused', async () => {
+  it('leaves no temp file and the old record bytes when the write fails', async () => {
     const file = await seed();
     const before = await fs.readFile(file, 'utf8');
-    // an oversized reason is refused up front; the old record must stay byte for byte
+    // a record of the allowed maximum plus one byte cannot be written; the old record must stay
     const big = new ChainRepositoryAdapter({ stateDir });
     const decision = await big.recordChainOutcome(outcomeCmd({ state: 'refused', reason: 'a'.repeat(CHAIN_RECORD_MAX_BYTES) }));
     expect(decision.outcome).toBe('refused');
@@ -355,6 +355,48 @@ describe('ChainRepositoryAdapter (file store)', () => {
     } finally {
       await fs.rm(outside, { recursive: true, force: true });
     }
+  });
+
+  it('refuses a state directory swapped for another directory or a link after construction', async () => {
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-chains-root-'));
+    const dir = path.join(stateDir, 'root');
+    try {
+      await fs.mkdir(path.join(outside, 'chains'));
+      const pinned = new ChainRepositoryAdapter({ stateDir: dir });
+      await pinned.recordChainIntent({ record: recordOf(), deadlineIso: deadline() });
+      await fs.rename(dir, path.join(stateDir, 'root-moved'));
+      await fs.symlink(outside, dir);
+      expect(await pinned.recordChainOutcome(outcomeCmd())).toEqual({ outcome: 'refused', reason: 'store-unavailable' });
+      expect(await fs.readdir(path.join(outside, 'chains'))).toEqual([]);
+      await fs.rm(dir);
+      await fs.mkdir(path.join(dir, 'chains'), { recursive: true });
+      expect(await pinned.readChain(readCmd())).toMatchObject({ status: 'unreadable' });
+    } finally {
+      await fs.rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('never reads or waits on a store lock that is a link to a device', async () => {
+    await seed();
+    const lock = path.join(stateDir, 'chains', '.store.lock');
+    await fs.symlink('/dev/zero', lock);
+    expect(await adapter.recordChainOutcome(outcomeCmd())).toEqual({ outcome: 'refused', reason: 'store-busy' });
+  });
+
+  it('reads a record with a corrupted UTF-8 byte as unreadable', async () => {
+    const file = await seed();
+    const bytes = await fs.readFile(file);
+    const at = bytes.indexOf('chain-start-1');
+    bytes[at + 5] = 0xff;
+    await fs.writeFile(file, bytes);
+    expect((await adapter.readChain(readCmd())).status).toBe('unreadable');
+  });
+
+  it('refuses a persistent store off Linux unless unanchored paths are allowed', async () => {
+    if (process.platform === 'linux') return;
+    expect(await adapter.recordChainIntent({ record: recordOf(), deadlineIso: deadline() })).toEqual({
+      outcome: 'refused', reason: 'store-unavailable',
+    });
   });
 
   it('resolves a symlinked state directory once, at construction', async () => {

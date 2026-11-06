@@ -204,3 +204,54 @@ describe('RecordAuthorizationConsumptionUseCase (H7)', () => {
     }
   });
 });
+
+const POLICY_HEAD = 'a'.repeat(40);
+
+describe('RecordAuthorizationConsumptionUseCase attempt binding (CO24d)', () => {
+  function policyGrant(attemptId: string): CoordinationRequestRecord {
+    return makeApprovedGrantRecord({
+      grantId: 'grant-policy',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: POLICY_HEAD,
+      decisionRevision: 'policy:autoMerge@309ab8c40bf2',
+      policyGrant: { workOrderId: 'wo-1', attemptId, acceptanceReceiptId: 'receipt-1' },
+    });
+  }
+
+  it('refuses a consumption whose attempt differs from the policy grant attempt and records nothing', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await repo.saveRequest(policyGrant('att-A'));
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+
+    const result = await useCase.recordAuthorizationConsumption({
+      consumptionId: 'c-1',
+      grantId: 'grant-policy',
+      actionId: 'action-push',
+      actionScope: 'forge:merge-pr',
+      attemptId: 'att-B',
+      expectedHeadSha: POLICY_HEAD,
+    });
+
+    expect(result).toEqual({ outcome: 'refused', reason: 'grant-attempt-mismatch' });
+    const stored = await repo.findRequestByGrantId('grant-policy');
+    expect(stored?.consumptions).toHaveLength(0);
+    expect(stored?.state).toBe('approved');
+  });
+
+  it('consumes a policy grant for its own attempt', async () => {
+    const repo = new InMemoryCoordinationRequestRepo();
+    await repo.saveRequest(policyGrant('att-A'));
+    const useCase = new RecordAuthorizationConsumptionUseCase({ requestRepo: repo });
+
+    const result = await useCase.recordAuthorizationConsumption({
+      consumptionId: 'c-1',
+      grantId: 'grant-policy',
+      actionId: 'action-push',
+      actionScope: 'forge:merge-pr',
+      attemptId: 'att-A',
+      expectedHeadSha: POLICY_HEAD,
+    });
+
+    expect(result.outcome).toBe('consumed');
+  });
+});

@@ -163,6 +163,13 @@ export interface MergeGrantRecord {
   readonly pullRequestNumber: number;
 }
 
+/**
+ * The stored grant record version that records the attempt a grant is bound to (CO24e).
+ * A record without `grantRecordVersion` is a legacy grant: it carries no attempt and
+ * is bound by scope and exact head only, until it expires.
+ */
+export const GRANT_RECORD_VERSION = 2 as const;
+
 /** Serializable snapshot of the CoordinationRequest aggregate. */
 export interface CoordinationRequestRecord {
   readonly id: string;
@@ -186,6 +193,14 @@ export interface CoordinationRequestRecord {
   readonly policyGrant?: PolicyGrantRecord;
   /** Present only on an attempt-less merge grant (DT6b); absent everywhere else. */
   readonly mergeGrant?: MergeGrantRecord;
+  /** `2` once the record can name the attempt its grant is bound to; absent on a legacy grant. */
+  readonly grantRecordVersion?: typeof GRANT_RECORD_VERSION;
+  /**
+   * The attempt the grant is bound to (CO24e). Written with `grantRecordVersion: 2`: at issue
+   * for a policy grant, at request time or first resolve for an owner grant. A version-2 record
+   * without it authorizes nothing at consumption.
+   */
+  readonly grantAttemptId?: string;
 }
 
 /** Bounded attention and staleness summary; reading it rewrites nothing. */

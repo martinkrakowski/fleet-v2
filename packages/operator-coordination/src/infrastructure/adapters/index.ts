@@ -13,6 +13,7 @@ export * from "./ObservationPublicationAdapter.adapter.js";
 export * from "./OrchestratorSessionRepositoryAdapter.adapter.js";
 export * from "./OwnerItemRepositoryAdapter.adapter.js";
 export * from "./OwnerQuestionRepositoryAdapter.adapter.js";
+export * from "./PermissionRequestRepositoryAdapter.adapter.js";
 export * from "./ProjectProfileRepositoryAdapter.adapter.js";
 export * from "./record-list-store.js";
 export * from "./RelayTransportAdapter.adapter.js";

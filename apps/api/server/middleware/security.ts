@@ -20,6 +20,7 @@ import {
   isSessionExchangePath,
   resolveSessionToken,
 } from "../wiring/session-exchange.js";
+import { isWebLoginPath } from "../wiring/web-login.js";
 
 const ALLOWED_UNAUTHENTICATED_PATHS = new Set(["/", "/health"]);
 
@@ -146,6 +147,31 @@ export default defineEventHandler((event) => {
       return exchangeFailure;
     }
     if (method !== "GET" && !hasJsonContentType(event)) {
+      setResponseStatus(event, 415);
+      setResponseHeader(event, "content-type", "application/json");
+      setResponseHeader(event, "cache-control", "no-store");
+      return { error: "Unsupported Media Type: Content-Type must be application/json" };
+    }
+    return;
+  }
+
+  // T6a: /sessions/login is a server-side call only. The login code is the
+  // credential; no bearer is required and the /v1 scope map is not consulted.
+  if (isWebLoginPath(requestPath)) {
+    const loginOrigin = getRequestHeader(event, "origin");
+    if (loginOrigin !== undefined && loginOrigin !== null && loginOrigin.trim().length > 0) {
+      setResponseStatus(event, 403);
+      setResponseHeader(event, "content-type", "application/json");
+      setResponseHeader(event, "cache-control", "no-store");
+      return { error: "Forbidden: the web login is a server-side call" };
+    }
+    if (method !== "POST") {
+      setResponseStatus(event, 403);
+      setResponseHeader(event, "content-type", "application/json");
+      setResponseHeader(event, "cache-control", "no-store");
+      return { error: "Forbidden: the web login is a POST" };
+    }
+    if (!hasJsonContentType(event)) {
       setResponseStatus(event, 415);
       setResponseHeader(event, "content-type", "application/json");
       setResponseHeader(event, "cache-control", "no-store");

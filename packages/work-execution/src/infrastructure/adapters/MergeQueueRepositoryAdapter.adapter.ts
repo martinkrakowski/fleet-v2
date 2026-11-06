@@ -18,6 +18,7 @@ import type {
   MergeQueueListQuery,
   MergeQueueRepositoryPort,
   MergeQueueRetryCommand,
+  MergeQueueTransitionCommand,
 } from '../../application/ports/out/MergeQueueRepositoryPort.out-port.js';
 import type {
   MergeEnqueueDecision,
@@ -30,6 +31,8 @@ import {
   decideMergeDrop,
   decideMergeRetry,
 } from '../../domain/merge-queue-operations.js';
+import { decideMergeTransition } from '../../domain/merge-pass-transitions.js';
+import type { MergeTransitionDecision } from '../../domain/merge-pass-transitions.js';
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import type { MergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
 import { isMergeQueueEntryLive, readMergeQueueEntryRecord } from '../../domain/merge-queue-records.js';
@@ -117,7 +120,11 @@ export function duplicateMergeQueueIdentityListError(records: readonly MergeQueu
   return undefined;
 }
 
-type MergeMutationDecision = MergeEnqueueDecision | MergeDropDecision | MergeRetryDecision;
+type MergeMutationDecision =
+  | MergeEnqueueDecision
+  | MergeDropDecision
+  | MergeRetryDecision
+  | MergeTransitionDecision;
 
 export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
   private inMemoryEntries: readonly MergeQueueEntryRecord[] = [];
@@ -167,6 +174,21 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
     );
   }
 
+  async applyMergeTransition(command: MergeQueueTransitionCommand): Promise<MergeTransitionDecision> {
+    const deadlineRefusal = this.deadlineRefusal(command.deadlineIso);
+    if (deadlineRefusal !== null) {
+      return deadlineRefusal;
+    }
+    return this.mutate((current) =>
+      decideMergeTransition(current, {
+        entryId: command.entryId,
+        expectedRevision: command.expectedRevision,
+        next: command.next,
+        successor: command.successor,
+      }),
+    );
+  }
+
   async listMergeEntries(query: MergeQueueListQuery): Promise<readonly MergeQueueEntryRecord[]> {
     if (!this.isFreshDeadline(query.deadlineIso)) {
       throw new MergeQueueDeadlineError();
@@ -193,7 +215,8 @@ export class MergeQueueRepositoryAdapter implements MergeQueueRepositoryPort {
         case 'created':
         case 'supersedes':
         case 'dropped':
-        case 'retried': {
+        case 'retried':
+        case 'applied': {
           if (target === null) {
             this.inMemoryEntries = result.entries;
           } else {

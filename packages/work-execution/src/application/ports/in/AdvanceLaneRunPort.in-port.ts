@@ -23,6 +23,25 @@ import type { LaneRunStateValue } from '../../../domain/value-objects/LaneRunSta
  */
 export interface SessionStartGate {
   tryStart(runId: string, nowIso: string): { readonly ok: true } | { readonly ok: false; readonly retryAfterMs: number };
+  /**
+   * CO13: the per-runner-endpoint dispatch stagger. Optional: a gate without
+   * it spaces no endpoint, so the existing fakes and the review path are
+   * unchanged.
+   */
+  tryStartForEndpoint?(
+    runId: string,
+    nowIso: string,
+    endpointKey: string,
+    lastStartIso: string | null,
+  ): { readonly ok: true } | { readonly ok: false; readonly retryAfterMs: number };
+  /**
+   * CO13: drop the run's endpoint start that `tryStartForEndpoint` granted
+   * and held, when no runner was contacted after all (another gate waited,
+   * the intent or the round raise was refused, or the runner refused), so a
+   * start that never happened delays no later start. Optional: a gate without
+   * it holds nothing, so the existing fakes and the review path are unchanged.
+   */
+  releaseStartForEndpoint?(runId: string): void;
 }
 
 export interface AdvanceLaneRunRequest {

@@ -369,7 +369,7 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
     let chainsHandle: fs.FileHandle | 'absent' | undefined;
     try {
       const named = join(anchored ? `/proc/self/fd/${rootHandle.fd}` : this.root.path, CHAINS_DIR);
-      chainsHandle = await ChainRepositoryAdapter.openChains(named, create);
+      chainsHandle = await ChainRepositoryAdapter.openChains(named, create, rootHandle);
       if (chainsHandle === 'absent') return 'absent';
       if (anchored) return await use(`/proc/self/fd/${chainsHandle.fd}`);
       const pinned = chainsHandle;
@@ -404,7 +404,7 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
   }
 
   /** Open (creating when asked) the `chains` directory without following a link. */
-  private static async openChains(named: string, create: boolean): Promise<fs.FileHandle | 'absent'> {
+  private static async openChains(named: string, create: boolean, rootHandle: fs.FileHandle): Promise<fs.FileHandle | 'absent'> {
     let handle: fs.FileHandle;
     try {
       handle = await fs.open(named, DIR_FLAGS);
@@ -416,6 +416,10 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
       } catch (mkdirError) {
         if (errorCode(mkdirError) !== 'EEXIST') throw new StoreUnavailableError();
       }
+      // the new `chains` entry must itself be durable before any record lands in it
+      await rootHandle.sync().catch(() => {
+        throw new StoreUnavailableError();
+      });
       try {
         handle = await fs.open(named, DIR_FLAGS);
       } catch {

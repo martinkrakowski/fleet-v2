@@ -8,12 +8,12 @@
  * Lane CO17 adds `authorBriefSession`: one read-only seat session per brief, an
  * argv array through the executor (never a shell) in a checkout pinned at the
  * base commit. Only `<stem>.intent.json`, `.prompt.md` and `.answer.md` are
- * written, inside the briefs directory. A repeat returns the recorded answer;
+ * written (plus a short-lived `.intent.json.lock`), inside the briefs directory. A repeat returns the recorded answer;
  * a cut-short session leaves its intent and no answer, so the next call re-runs.
  * Results carry codes only: never a path, the answer or a secret.
  */
 
-import { promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs } from 'node:fs';
 import path from 'node:path';
 
 import type {
@@ -146,6 +146,31 @@ async function isSymbolicLink(filePath: string): Promise<boolean> {
 }
 
 /**
+ * Read a regular file without following a symlink at the final component. The
+ * open itself refuses a link (O_NOFOLLOW), so a link planted between an earlier
+ * lstat and this read cannot redirect the read outside the briefs directory.
+ */
+async function readFileNoFollow(filePath: string): Promise<string> {
+  const handle = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    return await handle.readFile('utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Create or truncate a file for writing; the open refuses a symlink at the final component (O_NOFOLLOW). */
+async function writeFileNoFollow(filePath: string, data: string): Promise<void> {
+  const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
+  const handle = await fs.open(filePath, flags, 0o600);
+  try {
+    await handle.writeFile(data, 'utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
  * True when any existing component of the absolute path is a symlink, or the
  * path cannot be inspected safely. Each component is inspected with lstat from
  * the root down and never followed; the first missing component ends the walk
@@ -190,7 +215,7 @@ async function readRecordedAnswer(
   }
   let text: string;
   try {
-    text = await fs.readFile(answerPath, 'utf8');
+    text = await readFileNoFollow(answerPath);
   } catch {
     throw new Error('recorded brief answer is unreadable');
   }
@@ -205,8 +230,8 @@ async function recordAnswer(answerPath: string, answer: string): Promise<boolean
   if (await isSymbolicLink(answerPath)) {
     return false;
   }
-  const recorded = await fs.writeFile(answerPath, answer, 'utf8')
-    .then(() => fs.readFile(answerPath, 'utf8'))
+  const recorded = await writeFileNoFollow(answerPath, answer)
+    .then(() => readFileNoFollow(answerPath))
     .then((text) => text === answer, () => false);
   if (!recorded) {
     await fs.rm(answerPath, { force: true }).catch(() => undefined);
@@ -224,7 +249,7 @@ async function intentIsLive(intentPath: string, sessionKey: string, windowMs: nu
   if (stat === null || !stat.isFile()) {
     return false;
   }
-  const text = await fs.readFile(intentPath, 'utf8').catch(() => null);
+  const text = await readFileNoFollow(intentPath).catch(() => null);
   if (text === null) {
     return false;
   }
@@ -369,7 +394,7 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
     const pinned = await this.checkPinnedCheckout(executor, request);
     if (pinned !== null) return unavailable(pinned);
     if (await isSymbolicLink(promptPath)
-      || !(await fs.writeFile(promptPath, request.prompt, 'utf8').then(() => true, () => false))) {
+      || !(await writeFileNoFollow(promptPath, request.prompt).then(() => true, () => false))) {
       return unavailable('session-failed');
     }
     const run = await executor.run(argv, {

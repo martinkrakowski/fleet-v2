@@ -154,6 +154,37 @@ jobs:
         env:
           CI: 'true'
 
+  # Q8b: dependency audit, report-only (production-quality plan §4.8: report first, gate later). It is not in
+  # `gate`'s needs, so a finding never blocks a PR; the findings are written to the job summary.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: corepack enable (cache lookup)
+        run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: yarn
+      - name: corepack enable
+        run: corepack enable
+      - name: yarn npm audit (high and above, report-only)
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          yarn npm audit --all --recursive --severity high 2>&1 | tee audit.txt
+      - name: audit summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo '### Dependency audit (high and above, report-only)'
+            echo
+            echo '```'
+            tail -n 60 audit.txt 2>/dev/null || echo 'no audit output'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   gate:
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -136,11 +136,22 @@ export class SeatObservationRepositoryAdapter implements SeatObservationReposito
     if (record.via !== 'cli' && record.via !== 'mcp') {
       throw new Error('SeatObservationRepositoryAdapter refuses an unknown via');
     }
+    // Validate the whole record (subject shape, timestamp, identity) through
+    // the reader's own parser BEFORE storing, so a record the reader would
+    // reject can never be written and make the store unreadable. The parsed
+    // copy is what is stored: unknown extra top-level keys are dropped.
+    const parsed = parseSeatObservationStateRecord({
+      ...record,
+      schemaVersion: SEAT_OBSERVATION_STORE_VERSION_POLICY.writerVersion,
+    });
+    if (parsed === undefined) {
+      throw new Error('SeatObservationRepositoryAdapter refuses an invalid observation record');
+    }
     const stateDir = this.options?.stateDir;
     if (stateDir === undefined) {
-      return this.appendInMemory(record);
+      return this.appendInMemory(parsed);
     }
-    return this.appendOnDisk(record, stateDir);
+    return this.appendOnDisk(parsed, stateDir);
   }
 
   async listSeatObservations(seatId?: string): Promise<readonly SeatObservationRecord[]> {

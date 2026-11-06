@@ -78,6 +78,17 @@ describe('SeatObservationRepositoryAdapter (memory mode)', () => {
     }
   });
 
+  it('refuses a record the reader would reject (extra subject property, bad date) without storing it', async () => {
+    const extra = observation('obs-x', {
+      subject: { attemptId: 'a1', extra: true } as unknown as SeatObservationRecord['subject'],
+    });
+    await expect(adapter.appendSeatObservation(extra)).rejects.toThrow();
+    await expect(
+      adapter.appendSeatObservation(observation('obs-y', { observedAtIso: 'not-a-date' })),
+    ).rejects.toThrow();
+    expect(await adapter.listSeatObservations()).toEqual([]);
+  });
+
   it('refuses an unknown outcome or via', async () => {
     await expect(
       adapter.appendSeatObservation({ ...observation('obs-1'), outcome: 'bogus' as SeatObservationRecord['outcome'] }),
@@ -122,6 +133,20 @@ describe('SeatObservationRepositoryAdapter (file mode)', () => {
 
     const second = new SeatObservationRepositoryAdapter({ stateDir });
     expect(await second.listSeatObservations()).toEqual([record]);
+  });
+
+  it('does not write an invalid record to disk, so the store stays readable', async () => {
+    const adapter = new SeatObservationRepositoryAdapter({ stateDir });
+    await adapter.appendSeatObservation(observation('obs-1'));
+    await expect(
+      adapter.appendSeatObservation(
+        observation('obs-2', {
+          subject: { attemptId: 'a1', extra: true } as unknown as SeatObservationRecord['subject'],
+        }),
+      ),
+    ).rejects.toThrow();
+    const list = await new SeatObservationRepositoryAdapter({ stateDir }).listSeatObservations();
+    expect(list.map((r) => r.observationId)).toEqual(['obs-1']);
   });
 
   it('throws StateFileUnknownVersionError on schemaVersion 2 with no quarantine copy', async () => {

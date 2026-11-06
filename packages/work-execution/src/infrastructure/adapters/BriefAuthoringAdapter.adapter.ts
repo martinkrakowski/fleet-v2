@@ -44,6 +44,8 @@ const MAX_TIMEOUT_MS = 3_600_000;
 const DEFAULT_MAX_ANSWER_BYTES = 262_144;
 /** Room for the seat's stderr inside the executor's stdout+stderr cap. */
 const STDERR_HEADROOM_BYTES = 65_536;
+/** Slack added to the session timeout when judging an intent claim stale. */
+const INTENT_CLAIM_SLACK_MS = 60_000;
 const GIT_TIMEOUT_MS = 30_000;
 /** Mirrors the fact pack's prompt cap. */
 const MAX_PROMPT_BYTES = 300_000;
@@ -137,25 +139,45 @@ function sessionStem(request: BriefAuthorSessionRequest): string | null {
   return stem.length > MAX_STEM_LENGTH ? null : stem;
 }
 
-/** The recorded answer, or null when none exists; rejects when it exists but cannot be read. */
-async function readRecordedAnswer(answerPath: string): Promise<string | null> {
+/** True when the path is a symlink; a link may point outside the briefs directory. */
+async function isSymbolicLink(filePath: string): Promise<boolean> {
+  return fs.lstat(filePath).then((stat) => stat.isSymbolicLink(), () => false);
+}
+
+/**
+ * The recorded answer, or null when none exists, or 'too-large' when the
+ * recorded answer itself exceeds the answer limit. A symlinked answer file is
+ * refused like any other unreadable answer: it may point outside the briefs
+ * directory.
+ */
+async function readRecordedAnswer(
+  answerPath: string,
+  maxAnswerBytes: number,
+): Promise<string | null | 'too-large'> {
+  const stat = await fs.lstat(answerPath).catch(() => null);
+  if (stat === null) {
+    return null;
+  }
+  if (stat.isSymbolicLink()) {
+    throw new Error('recorded brief answer is unreadable');
+  }
   let text: string;
   try {
     text = await fs.readFile(answerPath, 'utf8');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') {
-      return null;
-    }
+  } catch {
     throw new Error('recorded brief answer is unreadable');
   }
   if (text.trim().length === 0) {
     throw new Error('recorded brief answer is unreadable');
   }
-  return text;
+  return Buffer.byteLength(text, 'utf8') > maxAnswerBytes ? 'too-large' : text;
 }
 
 /** Write the answer and read it back; a failed record is removed so it is never reused. */
 async function recordAnswer(answerPath: string, answer: string): Promise<boolean> {
+  if (await isSymbolicLink(answerPath)) {
+    return false;
+  }
   const recorded = await fs.writeFile(answerPath, answer, 'utf8')
     .then(() => fs.readFile(answerPath, 'utf8'))
     .then((text) => text === answer, () => false);
@@ -165,15 +187,57 @@ async function recordAnswer(answerPath: string, answer: string): Promise<boolean
   return recorded;
 }
 
-/** Write the intent file once; an existing one is the record of an earlier, unfinished session. */
-async function recordIntent(briefsDir: string, intentPath: string, sessionKey: string): Promise<boolean> {
+/** True when the intent file records this key and a start time inside the claim window. */
+async function intentIsLive(intentPath: string, sessionKey: string, windowMs: number): Promise<boolean> {
+  const text = await fs.readFile(intentPath, 'utf8').catch(() => null);
+  if (text === null) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(text) as { sessionKey?: unknown; startedAt?: unknown };
+    if (parsed.sessionKey !== sessionKey || typeof parsed.startedAt !== 'string') {
+      return false;
+    }
+    const startedAt = Date.parse(parsed.startedAt);
+    return Number.isFinite(startedAt) && Date.now() - startedAt < windowMs;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Claim the session by creating the intent file exclusively. When one already
+ * exists without an answer, it is another call's session while it is fresh for
+ * this key; a stale or foreign intent is replaced atomically so an interrupted
+ * session stays recoverable on the next call.
+ */
+async function claimIntent(
+  briefsDir: string,
+  intentPath: string,
+  sessionKey: string,
+  windowMs: number,
+): Promise<boolean> {
+  const intent = `${JSON.stringify({ sessionKey, startedAt: new Date().toISOString() })}\n`;
   try {
     await fs.mkdir(briefsDir, { recursive: true });
-    const intent = JSON.stringify({ sessionKey, startedAt: new Date().toISOString() });
-    await fs.writeFile(intentPath, `${intent}\n`, { encoding: 'utf8', flag: 'wx' });
+    await fs.writeFile(intentPath, intent, { encoding: 'utf8', flag: 'wx' });
     return true;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EEXIST';
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+      return false;
+    }
+  }
+  if (await intentIsLive(intentPath, sessionKey, windowMs)) {
+    return false;
+  }
+  const tempPath = `${intentPath}.takeover`;
+  try {
+    await fs.writeFile(tempPath, intent, 'utf8');
+    await fs.rename(tempPath, intentPath);
+    return true;
+  } catch {
+    await fs.rm(tempPath, { force: true }).catch(() => undefined);
+    return false;
   }
 }
 
@@ -222,19 +286,25 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
    * that as an unknown outcome, never as an empty brief.
    */
   async authorBriefSession(request: BriefAuthorSessionRequest): Promise<BriefAuthorSessionResult> {
-    const { seatCommand, executor } = this.options ?? {};
-    if (seatCommand === undefined || executor === undefined) {
-      return unavailable('seat-command-not-configured');
-    }
     const stem = sessionStem(request);
     if (stem === null) {
       return unavailable('session-command-invalid');
     }
     const base = path.join(request.briefsDir, stem);
     const answerPath = `${base}.answer.md`;
-    const recorded = await readRecordedAnswer(answerPath);
+    const maxAnswerBytes = this.options?.maxAnswerBytes ?? DEFAULT_MAX_ANSWER_BYTES;
+    // Recorded outcome first: a completed session replays without any seat
+    // configuration, executor or checkout check.
+    const recorded = await readRecordedAnswer(answerPath, maxAnswerBytes);
+    if (recorded === 'too-large') {
+      return unavailable('session-output-too-large');
+    }
     if (recorded !== null) {
       return { outcome: 'answered', answer: recorded };
+    }
+    const { seatCommand, executor } = this.options ?? {};
+    if (seatCommand === undefined || executor === undefined) {
+      return unavailable('seat-command-not-configured');
     }
     const promptPath = `${base}.prompt.md`;
     const argv = renderSeatArgv(seatCommand, {
@@ -242,18 +312,23 @@ export class BriefAuthoringAdapter implements BriefAuthoringPort {
       workOrderId: request.workOrderId, laneId: request.laneId, baseCommit: request.baseCommit,
     });
     if (argv === null) return unavailable('session-command-invalid');
-    if (!(await recordIntent(request.briefsDir, `${base}.intent.json`, request.sessionKey))) {
+    const timeoutMs = resolveTimeout(request.timeoutMs ?? this.options?.timeoutMs);
+    // The exclusive intent claim is what grants the seat run: a concurrent
+    // call sees a fresh claim for the same key and refuses instead of also
+    // running the seat.
+    const claimWindowMs = timeoutMs + INTENT_CLAIM_SLACK_MS;
+    if (!(await claimIntent(request.briefsDir, `${base}.intent.json`, request.sessionKey, claimWindowMs))) {
       return unavailable('session-failed');
     }
     const pinned = await this.checkPinnedCheckout(executor, request);
     if (pinned !== null) return unavailable(pinned);
-    if (!(await fs.writeFile(promptPath, request.prompt, 'utf8').then(() => true, () => false))) {
+    if (await isSymbolicLink(promptPath)
+      || !(await fs.writeFile(promptPath, request.prompt, 'utf8').then(() => true, () => false))) {
       return unavailable('session-failed');
     }
-    const maxAnswerBytes = this.options?.maxAnswerBytes ?? DEFAULT_MAX_ANSWER_BYTES;
     const run = await executor.run(argv, {
       cwd: request.checkoutPath,
-      timeoutMs: resolveTimeout(request.timeoutMs ?? this.options?.timeoutMs),
+      timeoutMs,
       maxBufferBytes: maxAnswerBytes + STDERR_HEADROOM_BYTES,
     }).catch(() => null);
     if (run === null || (run.error === undefined && run.exitCode !== 0)) {

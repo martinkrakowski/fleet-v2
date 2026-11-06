@@ -208,6 +208,30 @@ describe('WorktreePoolAdapter take', () => {
     expect(await take(make(host3))).toEqual({ outcome: 'empty' });
   });
 
+  it('keeps the claim when cleanliness cannot be read after claiming', async () => {
+    const host = new FakeHost();
+    host.add(1);
+    host.override = (t) => (t[0] === 'status' ? { exitCode: null, signal: null, stdout: '', stderr: '', error: 'x' } : undefined);
+    const adapter = make(host);
+    expect(await take(adapter)).toEqual({ outcome: 'empty' });
+    expect(host.claims.size).toBe(1);
+    host.override = undefined;
+    expect(await take(adapter, 'run-2')).toEqual({ outcome: 'empty' });
+  });
+
+  it('does not return a retaken slot whose claim moved after the snapshot', async () => {
+    const host = new FakeHost();
+    host.add(1);
+    const adapter = make(host);
+    await take(adapter, 'run-1');
+    let reads = 0;
+    host.override = (t) => {
+      if (t[0] === 'readlink' && (reads += 1) === 2) host.claims.delete(`${CLAIMS}/w1`);
+      return undefined;
+    };
+    expect(await take(adapter, 'run-1')).toEqual({ outcome: 'empty' });
+  });
+
   it('skips a prunable worktree', async () => {
     const host = new FakeHost();
     host.worktrees.set(`${POOL}/w1`, { head: BASE, dirty: false, prunable: true });
@@ -424,6 +448,14 @@ describe('WorktreePoolAdapter resetToBase', () => {
     expect(host.claims.get(`${CLAIMS}/w1`)).toBe('run-late');
   });
 
+  it('clears ignored files too, keeping only node_modules', async () => {
+    const host = new FakeHost();
+    host.add(1);
+    await make(host).resetToBase({ worktreePath: `${POOL}/w1`, baseCommit: NEXT, recordedHost: HOST });
+    const clean = host.calls.find((c) => c.argv.includes('clean'));
+    expect(clean?.argv.slice(clean.argv.indexOf('clean'))).toEqual(['clean', '-fdx', '-e', 'node_modules']);
+  });
+
   it('reports unknown when the executor does not answer', async () => {
     const host = new FakeHost();
     host.add(1);
@@ -470,6 +502,14 @@ describe('WorktreePoolAdapter refillAfterMerge', () => {
     expect(result.outcome).toBe('refilled');
     expect(host.claims.size).toBe(0);
     expect(host.worktrees.has(`${POOL}/w2`)).toBe(true); // recreated clean after the reap
+  });
+
+  it('never reaps a claim whose owner cannot be read, even with no worktree behind it', async () => {
+    const host = new FakeHost();
+    host.claims.set(`${CLAIMS}/w1`, 'run-x');
+    host.override = (t) => (t[0] === 'readlink' ? FAIL() : undefined);
+    await make(host).refillAfterMerge({ projectId: 'proj', mergedBaseCommit: BASE, recordedHost: HOST });
+    expect(host.claims.has(`${CLAIMS}/w1`)).toBe(true);
   });
 
   it('leaves a fresh prepare claim alone even while its worktree is not yet listed', async () => {

@@ -402,6 +402,12 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
           const guard = `${view.claimsDir}/w${index}.reset`;
           const held = await this.call(view, ['ln', '-s', '--', 'retake', guard], deadline);
           if (held.kind !== 'ok') continue;
+          // Re-prove ownership under the guard: a reset may have released the claim since the snapshot.
+          const still = await this.call(view, ['readlink', '--', this.linkPath(view, index)], deadline);
+          if (still.kind !== 'ok' || still.stdout.trim() !== owner) {
+            await this.call(view, ['rm', '-f', '--', guard], Math.max(deadline, this.now() + 5000));
+            continue;
+          }
           const record = this.entry(projectId, index, slot.path, slot.head, 'taken', runId);
           await this.call(view, ['rm', '-f', '--', guard], Math.max(deadline, this.now() + 5000));
           if (record !== null && isWorktreePoolBaseCommit(slot.head)) return { outcome: 'taken', entry: record };
@@ -419,8 +425,8 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
         const record = this.entry(projectId, index, slot.path, base, 'taken', runId);
         if (record !== null) return { outcome: 'taken', entry: record };
       }
-      // Not provably warm: back out the claim; if that cannot be shown, keep it.
-      await this.release(view, index, deadline);
+      // Provably not warm: back out the claim. Unknown keeps it: never offered again.
+      if (clean === 'no') await this.release(view, index, deadline);
     }
     return { outcome: 'empty' };
   }
@@ -500,7 +506,7 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
     if (!(await this.hasNoFilterDriver(view, deadline))) return 'unknown';
     const steps: (readonly string[])[] = [
       [...GIT_PREFIX, '-C', path, 'checkout', '--detach', '--force', base],
-      [...GIT_PREFIX, '-C', path, 'clean', '-fd', '-e', 'node_modules'],
+      [...GIT_PREFIX, '-C', path, 'clean', '-fdx', '-e', 'node_modules'],
       ['rm', '-rf', '--', `${path}/.lane`],
     ];
     for (const argv of steps) {
@@ -577,7 +583,7 @@ export class WorktreePoolAdapter implements WorktreePoolPort {
       const slot = slots.get(index);
       const isPrepare = owner.startsWith('prepare-');
       const gone = slot === undefined || slot.prunable;
-      if (isPrepare ? !stale.has(index) : !gone) continue;
+      if (owner === '?' || (isPrepare ? !stale.has(index) : !gone)) continue; // an unreadable owner is never reaped
       if (slot !== undefined && !slot.prunable) {
         const removed = await this.git(view, view.config.repositoryPath, ['worktree', 'remove', '--force', slot.path], deadline);
         if (removed.kind !== 'ok') continue;

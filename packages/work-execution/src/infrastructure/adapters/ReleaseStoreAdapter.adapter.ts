@@ -240,8 +240,8 @@ async function readRoot(root: string): Promise<Dirent[] | null> {
 
 /**
  * Take each doomed build out of the store by one quick rename to a trash name,
- * each only after the caller's fence passes and `current` is still what the
- * snapshot saw; the slow recursive delete then runs on a name `list`, `repoint`
+ * each only after `current` is still what the snapshot saw and then the
+ * caller's fence passes (the last await before the rename); the slow recursive delete then runs on a name `list`, `repoint`
  * and `current` can never reach. Stops at the first failed check.
  */
 async function removeDoomed(
@@ -252,10 +252,14 @@ async function removeDoomed(
 ): Promise<{ readonly complete: boolean; readonly removed: string[] }> {
   const removed: string[] = [];
   for (const sha of doomed) {
-    if ((fence !== undefined && !(await passesFence(fence))) || !(await currentStill(root, current))) {
+    const trash = path.join(root, `${TRASH_PREFIX}${sha}-${randomBytes(8).toString('hex')}`);
+    if (!(await currentStill(root, current))) {
       return { complete: false, removed };
     }
-    const trash = path.join(root, `${TRASH_PREFIX}${sha}-${randomBytes(8).toString('hex')}`);
+    // The fence is the last thing awaited before the rename, as in repoint.
+    if (fence !== undefined && !(await passesFence(fence))) {
+      return { complete: false, removed };
+    }
     try {
       await fs.rename(path.join(root, sha), trash);
     } catch {

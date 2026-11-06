@@ -192,6 +192,34 @@ describe('ReleaseStoreAdapter', () => {
     expect((await fs.readdir(root)).sort()).toEqual([D, E, 'current'].sort());
   });
 
+  it('awaits the prune fence after the current re-read, as the last step before each rename', async () => {
+    for (const [digit, day] of [['a', 1], ['b', 2], ['c', 3], ['d', 4]] as const) {
+      await verified(digit, day);
+    }
+    await adapter.repoint({ root, sha: D });
+    const seen: string[] = [];
+    const realReadlink = fs.readlink;
+    fs.readlink = (async (...args: Parameters<typeof fs.readlink>) => {
+      seen.push('read current');
+      return realReadlink(...args);
+    }) as typeof fs.readlink;
+    try {
+      const result = await adapter.prune({
+        root,
+        keep: 2,
+        fence: async () => {
+          seen.push('fence');
+          return true;
+        },
+      });
+      expect(result).toEqual({ outcome: 'pruned', removed: [A, B] });
+    } finally {
+      fs.readlink = realReadlink;
+    }
+    const removals = seen.slice(seen.indexOf('fence') - 1);
+    expect(removals).toEqual(['read current', 'fence', 'read current', 'fence']);
+  });
+
   it('removes only an orphan archive file and an orphan home', async () => {
     await verified('a', 1);
     const orphan = `.staging-${B}-${'0'.repeat(16)}`;

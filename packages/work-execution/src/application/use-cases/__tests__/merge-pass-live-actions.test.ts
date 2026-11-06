@@ -160,14 +160,17 @@ function build(overrides: Partial<MergeLiveActionDependencies> = {}) {
   return { journal, forgeAction, forgeRead, deps };
 }
 
-function seedIntent(journal: FakeJournal, key: string): void {
+/** A crashed intent from the previous pass, one minute before this call's nowIso. */
+const EARLIER_PASS_ISO = '2026-11-05T08:59:00.000Z';
+
+function seedIntent(journal: FakeJournal, key: string, recordedAtIso: string = EARLIER_PASS_ISO): void {
   journal.entries.push({
     version: LANE_RUN_JOURNAL_ENTRY_VERSION,
     entryId: '01JB00000000000000000000AA',
     kind: 'intent',
     key,
     runId: null,
-    recordedAtIso: NOW_ISO,
+    recordedAtIso,
     mode: null,
     expectedRevision: null,
     mintedId: '01JB00000000000000000000AB',
@@ -503,10 +506,12 @@ describe('performMergeLiveAction never throws and never acts twice (DT9b fix rou
     expect(first).toEqual({ outcome: 'unavailable', journalKey: KEY_MERGE_PR, reasonCode: 'journal-unavailable' });
     expect(forgeAction.requests).toHaveLength(1);
     forgeRead.result = { outcome: 'ok', prState: 'merged', liveHeadSha: HEAD, mergeState: 'clean', contexts: [], unresolvedThreads: 0 };
-    const second = await performMergeLiveAction(deps, makeRequest());
+    // The next pass, after the crash.
+    const nextPass = { nowIso: '2026-11-05T09:02:00.000Z', deadlineIso: '2026-11-05T09:03:00.000Z' };
+    const second = await performMergeLiveAction(deps, makeRequest(nextPass));
     expect(second).toEqual({ outcome: 'reconciled', journalKey: KEY_MERGE_PR, reconcile: 'merged' });
     expect(forgeAction.requests).toHaveLength(1);
-    const third = await performMergeLiveAction(deps, makeRequest());
+    const third = await performMergeLiveAction(deps, makeRequest(nextPass));
     expect(third).toEqual({ outcome: 'skipped', journalKey: KEY_MERGE_PR, reasonCode: 'already-settled' });
     expect(journal.entries.filter((entry) => entry.kind === 'result')).toHaveLength(1);
   });
@@ -845,5 +850,43 @@ describe('performMergeLiveAction never throws and never acts twice (DT9b fix rou
     expect(result).toEqual({ outcome: 'unavailable', journalKey: KEY_MERGE_PR, reasonCode: 'id-unavailable' });
     expect(journal.entries).toHaveLength(0);
     expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('never reconciles an intent written in the current pass, so a concurrent call cannot settle an action still running', async () => {
+    const { journal, forgeAction, forgeRead, deps } = build();
+    seedIntent(journal, KEY_MERGE_PR, NOW_ISO);
+    const result = await performMergeLiveAction(deps, makeRequest());
+    expect(result).toEqual({ outcome: 'skipped', journalKey: KEY_MERGE_PR, reasonCode: 'intent-in-flight' });
+    expect(journal.entries).toHaveLength(1);
+    expect(forgeRead.calls).toBe(0);
+    expect(forgeAction.requests).toHaveLength(0);
+  });
+
+  it('settles the in-flight call on its own result, and the next pass skips the settled key', async () => {
+    const { journal, forgeAction, forgeRead, deps } = build();
+    // Call A: intent and act in this pass; a concurrent call B in the same pass sees only the intent.
+    let resolveAct: (value: MergeForgeActionResult) => void = () => undefined;
+    forgeAction.performMergeForgeAction = (request) => {
+      forgeAction.requests.push(request);
+      return new Promise((resolve) => {
+        resolveAct = resolve;
+      });
+    };
+    const callA = performMergeLiveAction(deps, makeRequest());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const callB = await performMergeLiveAction(deps, makeRequest());
+    expect(callB).toEqual({ outcome: 'skipped', journalKey: KEY_MERGE_PR, reasonCode: 'intent-in-flight' });
+    expect(forgeRead.calls).toBe(0);
+    resolveAct({ outcome: 'executed', headSha: HEAD });
+    expect((await callA).outcome).toBe('acted');
+    expect(journal.entries.filter((entry) => entry.kind === 'result')).toEqual([
+      expect.objectContaining({ outcome: 'completed' }),
+    ]);
+    const nextPass = await performMergeLiveAction(
+      deps,
+      makeRequest({ nowIso: '2026-11-05T09:02:00.000Z', deadlineIso: '2026-11-05T09:03:00.000Z' }),
+    );
+    expect(nextPass).toEqual({ outcome: 'skipped', journalKey: KEY_MERGE_PR, reasonCode: 'already-settled' });
+    expect(forgeAction.requests).toHaveLength(1);
   });
 });

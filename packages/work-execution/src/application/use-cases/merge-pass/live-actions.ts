@@ -111,7 +111,11 @@ export type MergeLiveActionOutcome =
   | { readonly outcome: 'refused'; readonly journalKey: string; readonly refusalKind: ForgeRefusalKind; readonly reasonCode: string }
   | { readonly outcome: 'ambiguous'; readonly journalKey: string; readonly reasonCode: string }
   | { readonly outcome: 'reconciled'; readonly journalKey: string; readonly reconcile: 'merged' | 'absent' | 'head-moved' | 'closed' | 'status-present' }
-  | { readonly outcome: 'skipped'; readonly journalKey: string; readonly reasonCode: 'already-settled' | 'budget-exhausted' }
+  | {
+      readonly outcome: 'skipped';
+      readonly journalKey: string;
+      readonly reasonCode: 'already-settled' | 'budget-exhausted' | 'intent-in-flight';
+    }
   | { readonly outcome: 'invalid-request'; readonly reasonCode: string }
   | { readonly outcome: 'journal-refused'; readonly journalKey: string; readonly refusal: LaneRunJournalRefusal }
   /**
@@ -762,6 +766,12 @@ async function actLive(
 /**
  * Performs one keyed merge-pass action for one decided entry. Never throws:
  * malformed input is `invalid-request`, a failing port is a typed outcome.
+ *
+ * Concurrency precondition: the caller holds the repository's merge-pass lease
+ * (scope `merge/<repoDigest>`, daemon-tick plan §3.2), so no two calls on one
+ * key overlap across passes, and every forge call is bounded by `deadlineIso`.
+ * The journal has no in-flight marker, so within a pass an intent recorded at
+ * or after `nowIso` is treated as in flight and never reconciled.
  */
 export async function performMergeLiveAction(
   deps: MergeLiveActionDependencies,
@@ -793,7 +803,15 @@ export async function performMergeLiveAction(
   if (settled) {
     return { outcome: 'skipped', journalKey: valid.key, reasonCode: 'already-settled' };
   }
-  if (entries.some((record) => record.kind === 'intent')) {
+  const intent = entries.find((record) => record.kind === 'intent');
+  if (intent !== undefined) {
+    // Only an intent from an earlier pass can be a crash. One written at or after this call's
+    // nowIso belongs to the current pass and may still be acting: reconciling it as absent could
+    // settle the key while its action runs. Nothing is written and no port is called.
+    const intentMs = Date.parse(intent.recordedAtIso);
+    if (!Number.isFinite(intentMs) || intentMs >= valid.nowMs) {
+      return { outcome: 'skipped', journalKey: valid.key, reasonCode: 'intent-in-flight' };
+    }
     return reconcile(deps, valid);
   }
   return valid.shadowReason !== null ? actShadow(deps, valid, valid.shadowReason) : actLive(deps, valid);

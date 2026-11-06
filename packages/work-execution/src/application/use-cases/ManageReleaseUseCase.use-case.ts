@@ -7,8 +7,11 @@
  * when the sha is not yet a verified build, repoint `current` atomically, prune.
  * A live driver lease refuses before any write. The build is four reviewed argv
  * steps through the command executor (no shell); the git step is a local read
- * with no hooks and no network. Nothing is echoed from a command, and no result
- * carries a path or the authority.
+ * with no hooks and no network, and it runs on a filtered environment that
+ * never hands the operator's full `process.env` (tokens, credentials) to the
+ * child. A failed build discards the archive and the partial build directory so
+ * a retry starts clean. Nothing is echoed from a command, and no result carries
+ * a path or the authority; an unfinished prune is reported, never smoothed over.
  */
 
 import { containsSecretShape } from '@fleet/shared';
@@ -33,7 +36,8 @@ export interface ManageReleaseDependencies {
   readonly lease: ConductorDriverLeasePort;
   readonly executor: CommandExecutorPort;
   readonly nowIso: () => string;
-  /** Complete environment for the git step; the CLI passes () => process.env. */
+  /** Complete environment source for the git step; the use case passes only a
+   *  filtered allowlist of it to the child, never the operator's full set. */
   readonly env?: () => Record<string, string | undefined>;
 }
 
@@ -48,6 +52,8 @@ const GIT_STEP_TIMEOUT_MS = 300_000;
 const GIT_STEP_MAX_BUFFER_BYTES = 1_048_576;
 const YARN_STEP_TIMEOUT_MS = 900_000;
 const YARN_STEP_MAX_BUFFER_BYTES = 4_194_304;
+/** The only operator variables the git child may see; everything else (tokens, credentials) stays out. */
+const GIT_ENV_ALLOWLIST: readonly string[] = ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ'];
 
 type ValidRequest = ManageReleaseRequest;
 
@@ -140,6 +146,7 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       current: target,
       kept: afterShas.filter((sha) => !removed.includes(sha)),
       pruned: [...removed],
+      pruneOutcome: pruned.outcome === 'pruned' ? 'pruned' : 'unreadable',
       rebuilt,
     };
     return applied;
@@ -167,15 +174,19 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     if (prepared.outcome !== 'ok') {
       return 'store-unreadable';
     }
-    const gitEnv: Record<string, string> = { GIT_ALLOW_PROTOCOL: 'none', GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
     const baseEnv = this.deps.env?.() ?? process.env;
-    const env: Record<string, string> = {};
-    for (const [key, value] of Object.entries(baseEnv)) {
-      if (typeof value === 'string') {
+    const env: Record<string, string> = {
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_ALLOW_PROTOCOL: 'none',
+      GIT_NO_LAZY_FETCH: '1',
+      GIT_TERMINAL_PROMPT: '0',
+    };
+    for (const key of GIT_ENV_ALLOWLIST) {
+      const value = baseEnv[key];
+      if (typeof value === 'string' && value !== '') {
         env[key] = value;
       }
     }
-    Object.assign(env, gitEnv);
     const gitBudget = { timeoutMs: GIT_STEP_TIMEOUT_MS, maxBufferBytes: GIT_STEP_MAX_BUFFER_BYTES, killProcessTree: true };
     const yarnBudget = { timeoutMs: YARN_STEP_TIMEOUT_MS, maxBufferBytes: YARN_STEP_MAX_BUFFER_BYTES, killProcessTree: true };
     const steps: ReadonlyArray<{ argv: readonly string[]; options: CommandRunOptions }> = [
@@ -202,6 +213,7 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     ];
     for (const step of steps) {
       if (!(await this.stepSucceeds(step.argv, step.options))) {
+        await this.discardBuild(request.root, sha);
         return 'build-failed';
       }
     }
@@ -209,10 +221,20 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     if (marked.outcome === 'ok') {
       return null;
     }
+    await this.discardBuild(request.root, sha);
     if (marked.outcome === 'not-verified') {
       return 'verify-failed';
     }
     return marked.outcome === 'not-found' ? 'build-failed' : 'store-unreadable';
+  }
+
+  /** Best-effort cleanup of an incomplete build so a retry never reuses stale files. */
+  private async discardBuild(root: string, sha: string): Promise<void> {
+    try {
+      await this.deps.store.discard({ root, sha });
+    } catch {
+      // The refusal is reported regardless; the next pass can still complete the install.
+    }
   }
 
   private async stepSucceeds(argv: readonly string[], options: CommandRunOptions): Promise<boolean> {

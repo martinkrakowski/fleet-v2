@@ -47,6 +47,7 @@ class FakeStore implements ReleaseStorePort {
   current: string | null;
   unreadable = false;
   entryMissing = false;
+  pruneUnreadable = false;
   readonly calls: string[] = [];
   readonly removed: string[] = [];
 
@@ -89,6 +90,9 @@ class FakeStore implements ReleaseStorePort {
 
   async prune(input: { root: string; keep: number }): Promise<ReleaseStorePruneResult> {
     this.calls.push(`prune ${input.keep}`);
+    if (this.pruneUnreadable) {
+      return { outcome: 'unreadable' };
+    }
     const keepSet = new Set(this.builds.slice(Math.max(0, this.builds.length - input.keep)).map((entry) => entry.sha));
     const index = this.builds.findIndex((entry) => entry.sha === this.current);
     if (index >= 0) {
@@ -101,6 +105,11 @@ class FakeStore implements ReleaseStorePort {
     this.builds = this.builds.filter((entry) => keepSet.has(entry.sha));
     this.removed.push(...removed);
     return { outcome: 'pruned', removed };
+  }
+
+  async discard(input: { root: string; sha: string }): Promise<ReleaseStoreWriteResult> {
+    this.calls.push(`discard ${input.sha}`);
+    return { outcome: 'ok' };
   }
 
   get writes(): string[] {
@@ -321,7 +330,7 @@ describe('ManageReleaseUseCase', () => {
       executor.failAt = failAt;
       const { useCase, store } = make({ executor });
       expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'build-failed' });
-      expect(store.calls).toEqual([`prepare ${A}`]);
+      expect(store.calls).toEqual([`prepare ${A}`, `discard ${A}`]);
       expect(store.current).toBeNull();
       expect(executor.runs).toHaveLength(failAt + 1);
     }
@@ -332,7 +341,7 @@ describe('ManageReleaseUseCase', () => {
     store.entryMissing = true;
     const { useCase } = make({ store });
     expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'verify-failed' });
-    expect(store.calls).toEqual([`prepare ${A}`, `markVerified ${A}`]);
+    expect(store.calls).toEqual([`prepare ${A}`, `markVerified ${A}`, `discard ${A}`]);
     expect(store.current).toBeNull();
   });
 
@@ -376,6 +385,7 @@ describe('ManageReleaseUseCase', () => {
       current: A,
       kept: [A],
       pruned: [],
+      pruneOutcome: 'pruned',
       rebuilt: true,
     });
     expect(store.calls).toEqual([`prepare ${A}`, `markVerified ${A}`, `repoint ${A}`, 'prune 5']);
@@ -484,11 +494,43 @@ describe('ManageReleaseUseCase', () => {
     expect(git.options?.env).toEqual({
       PATH: '/usr/bin',
       HOME: '/home/example',
+      GIT_CONFIG_NOSYSTEM: '1',
       GIT_ALLOW_PROTOCOL: 'none',
       GIT_NO_LAZY_FETCH: '1',
       GIT_TERMINAL_PROMPT: '0',
     });
     expect(git.options?.cwd).toBe(SOURCE);
     expect(git.options?.killProcessTree).toBe(true);
+  });
+
+  it('the git child never sees the operator environment beyond the allowlist', async () => {
+    const { useCase, executor } = make();
+    await manage(useCase, applyRequest());
+    const env = executor.runs[0].options?.env ?? {};
+    for (const key of Object.keys(env)) {
+      expect(['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ', 'GIT_CONFIG_NOSYSTEM', 'GIT_ALLOW_PROTOCOL', 'GIT_NO_LAZY_FETCH', 'GIT_TERMINAL_PROMPT']).toContain(key);
+    }
+  });
+
+  it('reports an unreadable prune instead of a false success', async () => {
+    const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4), build('e', 5)], E);
+    store.pruneUnreadable = true;
+    const { useCase } = make({ store });
+    const result = await manage(useCase, applyRequest({ action: 'swap', sha: B, source: null }));
+    expect(result).toMatchObject({ outcome: 'applied', action: 'swap', target: B, current: B, pruned: [], pruneOutcome: 'unreadable' });
+  });
+
+  it('a failed build step discards the archive and the partial build dir so a retry starts clean', async () => {
+    const executor = new FakeExecutor();
+    executor.failAt = 3;
+    const { useCase, store } = make({ executor });
+    expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'build-failed' });
+    expect(store.calls).toEqual([`prepare ${A}`, `discard ${A}`]);
+
+    const verifiedStore = new FakeStore();
+    verifiedStore.entryMissing = true;
+    const verifyCase = make({ store: verifiedStore });
+    expect(await manage(verifyCase.useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'verify-failed' });
+    expect(verifiedStore.calls).toEqual([`prepare ${A}`, `markVerified ${A}`, `discard ${A}`]);
   });
 });

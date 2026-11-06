@@ -7,7 +7,8 @@
  * <root>/<sha>.tar is a transient archive that prune removes. A missing root is
  * an empty store (a first install starts there); any other read failure, an
  * unparseable marker or a `current` that is not a link into the root is
- * `unreadable`, never an empty or shorter store. Results carry shas and codes,
+ * `unreadable`, never an empty or shorter store. A partial prune is
+ * `unreadable`, never a clean success. Results carry shas and codes,
  * never a path.
  */
 
@@ -153,6 +154,19 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       failed = true;
     }
     return failed ? { outcome: 'unreadable' } : { outcome: 'pruned', removed };
+  }
+
+  async discard(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStoreWriteResult> {
+    if (!SHA_PATTERN.test(input.sha)) {
+      return { outcome: 'unreadable' };
+    }
+    try {
+      await fs.rm(path.join(input.root, input.sha), { recursive: true, force: true });
+      await fs.rm(path.join(input.root, `${input.sha}.tar`), { force: true });
+      return { outcome: 'ok' };
+    } catch {
+      return { outcome: 'unreadable' };
+    }
   }
 }
 

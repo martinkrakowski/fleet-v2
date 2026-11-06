@@ -45,7 +45,7 @@ function releaseHandler(action: ReleaseAction): CommandHandler {
         lease: rt.conductor.driverLease,
         executor: new LocalExecutor(),
         nowIso: () => new Date().toISOString(),
-        env: () => process.env,
+        env: () => process.env, // the use case passes only a filtered allowlist to the git child
       },
     );
   };

@@ -132,4 +132,16 @@ describe('ReleaseStoreAdapter', () => {
     expect(await adapter.markVerified({ root, sha: B, builtAtIso: at(1) })).toEqual({ outcome: 'not-found' });
     expect(await adapter.list({ root })).toEqual({ outcome: 'read', current: null, builds: [] });
   });
+
+  it('discards an incomplete build dir and its leftover archive', async () => {
+    await adapter.prepare({ root, sha: A });
+    await fs.writeFile(path.join(root, A, 'partial.txt'), 'stale');
+    await fs.writeFile(path.join(root, `${A}.tar`), 'tar');
+    expect(await adapter.discard({ root, sha: A })).toEqual({ outcome: 'ok' });
+    expect(await fs.readdir(root)).toEqual([]);
+    expect(await adapter.discard({ root, sha: A })).toEqual({ outcome: 'ok' });
+    expect(await adapter.discard({ root, sha: 'nothex' })).toEqual({ outcome: 'unreadable' });
+    await adapter.prepare({ root, sha: B });
+    expect(await adapter.discard({ root, sha: B })).toEqual({ outcome: 'ok' });
+  });
 });

@@ -44,4 +44,6 @@ export interface ReleaseStorePort {
   repoint(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStoreWriteResult>;
   /** Keep the newest `keep` verified builds; never remove current or previous. */
   prune(input: { readonly root: string; readonly keep: number }): Promise<ReleaseStorePruneResult>;
+  /** Remove an incomplete build: the `<sha>` directory and its leftover `<sha>.tar`. */
+  discard(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStoreWriteResult>;
 }

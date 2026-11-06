@@ -53,6 +53,8 @@ export interface ManageReleaseApplied {
   readonly current: string;
   readonly kept: readonly string[];
   readonly pruned: readonly string[];
+  /** `unreadable` means the retention cleanup did not complete; never a silent success. */
+  readonly pruneOutcome: 'pruned' | 'unreadable';
   readonly rebuilt: boolean;
 }
 

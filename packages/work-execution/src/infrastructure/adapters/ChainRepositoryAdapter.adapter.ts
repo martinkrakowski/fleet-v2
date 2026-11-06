@@ -73,6 +73,8 @@ export const CHAIN_RECORD_MAX_COUNT = 1000;
 const CHAINS_DIR = 'chains';
 const LOCK_FILE = '.store.lock';
 const DEFAULT_LOCK_TIMEOUT_MS = 5000;
+/** The names this adapter gives its temp files; nothing else in the directory is touched. */
+const ORPHAN_TEMP_PATTERN = /^[0-9a-f]{64}\.\d+-[0-9a-f]{12}\.tmp$/;
 const DIR_FLAGS = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
 
 type Refusal =
@@ -495,15 +497,12 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
       await fs.rm(temp, { force: true }).catch(() => undefined);
       throw error;
     }
+    // The rename is durable only once the directory entry is synced; a failure here is a failed write.
+    const dirHandle = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
     try {
-      const dirHandle = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
-      try {
-        await dirHandle.sync();
-      } finally {
-        await dirHandle.close();
-      }
-    } catch {
-      // directory fsync is best effort; the rename already happened
+      await dirHandle.sync();
+    } finally {
+      await dirHandle.close();
     }
   }
 
@@ -511,7 +510,7 @@ export class ChainRepositoryAdapter implements ChainRepositoryPort {
   private async removeOrphanTemps(dir: string): Promise<void> {
     try {
       for (const name of await fs.readdir(dir)) {
-        if (name.endsWith('.tmp')) await fs.rm(join(dir, name), { force: true });
+        if (ORPHAN_TEMP_PATTERN.test(name)) await fs.rm(join(dir, name), { force: true });
       }
     } catch {
       // best effort; an orphan never reads as a record

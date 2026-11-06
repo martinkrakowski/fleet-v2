@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -270,13 +270,36 @@ describe('ChainRepositoryAdapter (file store)', () => {
 
   it('writes atomically: a crash that left a temp file keeps the old record readable and the next write cleans it', async () => {
     const file = await seed();
-    const orphan = `${file.replace(/\.json$/, '')}.99999-deadbeef.tmp`;
+    const orphan = `${file.replace(/\.json$/, '')}.99999-deadbeef0123.tmp`;
+    const foreign = path.join(path.dirname(file), 'notes.tmp');
+    await fs.writeFile(foreign, 'keep me');
     await fs.writeFile(orphan, '{"half":');
     expect((await adapter.readChain(readCmd())).status).toBe('ok');
     expect(await adapter.recordChainOutcome(outcomeCmd())).toEqual({ outcome: 'recorded' });
     await expect(fs.stat(orphan)).rejects.toThrow();
-    const names = await fs.readdir(path.join(stateDir, 'chains'));
-    expect(names.filter((n) => n.endsWith('.tmp'))).toEqual([]);
+    expect(await fs.readFile(foreign, 'utf8')).toBe('keep me');
+  });
+
+  it('does not report success when the directory sync fails after the rename', async () => {
+    if (process.platform !== 'linux') return;
+    await seed();
+    const realOpen = fs.open;
+    let failed = false;
+    (fs as { open: unknown }).open = (async (target: unknown, flags?: unknown, ...rest: unknown[]) => {
+      if (!failed && typeof flags === 'number' && (flags & fsConstants.O_DIRECTORY) !== 0 && (flags & fsConstants.O_NOFOLLOW) === 0) {
+        failed = true;
+        throw Object.assign(new Error('boom'), { code: 'EIO' });
+      }
+      return (realOpen as (...a: unknown[]) => unknown)(target, flags, ...rest);
+    }) as never;
+    let decision;
+    try {
+      decision = await adapter.recordChainOutcome(outcomeCmd());
+    } finally {
+      (fs as { open: unknown }).open = realOpen;
+    }
+    expect(failed).toBe(true);
+    expect(decision).toEqual({ outcome: 'refused', reason: 'internal-error' });
   });
 
   it('leaves no temp file and the old record bytes when the write fails', async () => {

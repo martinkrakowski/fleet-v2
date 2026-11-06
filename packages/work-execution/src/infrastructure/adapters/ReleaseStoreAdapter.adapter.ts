@@ -36,6 +36,8 @@ const STAGING_PREFIX = '.staging-';
 const BUILD_ID_PATTERN = /^[0-9a-f]{40}-[0-9a-f]{16}$/;
 const TAR_PATTERN = /^\.staging-[0-9a-f]{40}-[0-9a-f]{16}\.tar$/;
 const HOME_PATTERN = /^\.staging-[0-9a-f]{40}-[0-9a-f]{16}\.home$/;
+const TRASH_PREFIX = '.trash-';
+const TRASH_PATTERN = /^\.trash-[0-9a-f]{40}-[0-9a-f]{16}$/;
 const ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const MARKER_NAME = '.fleet-release-verified';
 const CLI_ENTRY = ['apps', 'cli', 'dist', 'bin.js'];
@@ -157,7 +159,11 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     }
   }
 
-  async prune(input: { readonly root: string; readonly keep: number }): Promise<ReleaseStorePruneResult> {
+  async prune(input: {
+    readonly root: string;
+    readonly keep: number;
+    readonly fence?: () => Promise<boolean>;
+  }): Promise<ReleaseStorePruneResult> {
     if (!Number.isInteger(input.keep) || input.keep < 2) {
       return { outcome: 'unreadable' };
     }
@@ -165,43 +171,12 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     if (listing.outcome !== 'read') {
       return { outcome: 'unreadable' };
     }
-    const doomed = new Set(shasToPrune(listing.builds, listing.current, input.keep));
-    const removed: string[] = [];
-    let failed = false;
-    for (const build of listing.builds) {
-      if (!doomed.has(build.sha)) {
-        continue;
-      }
-      // Defense in depth behind the caller's lease: when `current` moved since
-      // the snapshot, the doomed set is stale, so stop before removing anything more.
-      if (!(await currentStill(input.root, listing.current))) {
-        failed = true;
-        break;
-      }
-      try {
-        await fs.rm(path.join(input.root, build.sha), { recursive: true, force: true });
-        removed.push(build.sha);
-      } catch {
-        failed = true;
-      }
-    }
-    try {
-      const entries = await fs.readdir(input.root, { withFileTypes: true });
-      const stagingDirs = new Set(entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name));
-      for (const entry of entries) {
-        // Only an orphan archive: one whose staging directory is gone (an
-        // install still extracting keeps its directory, so its archive stays).
-        if (entry.isFile() && TAR_PATTERN.test(entry.name) && !stagingDirs.has(entry.name.slice(0, -'.tar'.length))) {
-          await fs.rm(path.join(input.root, entry.name), { force: true });
-        }
-        if (entry.isDirectory() && HOME_PATTERN.test(entry.name) && !stagingDirs.has(entry.name.slice(0, -'.home'.length))) {
-          await fs.rm(path.join(input.root, entry.name), { recursive: true, force: true });
-        }
-      }
-    } catch {
-      failed = true;
-    }
-    return failed ? { outcome: 'unreadable' } : { outcome: 'pruned', removed };
+    const doomed = shasToPrune(listing.builds, listing.current, input.keep);
+    const removal = await removeDoomed(input.root, doomed, listing.current, input.fence);
+    const orphansClean = await removeOrphans(input.root);
+    return removal.complete && orphansClean
+      ? { outcome: 'pruned', removed: removal.removed }
+      : { outcome: 'unreadable' };
   }
 
   async discard(input: { readonly root: string; readonly buildId: string }): Promise<ReleaseStoreWriteResult> {
@@ -261,6 +236,61 @@ async function readRoot(root: string): Promise<Dirent[] | null> {
     }
     throw error;
   }
+}
+
+/**
+ * Take each doomed build out of the store by one quick rename to a trash name,
+ * each only after the caller's fence passes and `current` is still what the
+ * snapshot saw; the slow recursive delete then runs on a name `list`, `repoint`
+ * and `current` can never reach. Stops at the first failed check.
+ */
+async function removeDoomed(
+  root: string,
+  doomed: readonly string[],
+  current: string | null,
+  fence: (() => Promise<boolean>) | undefined,
+): Promise<{ readonly complete: boolean; readonly removed: string[] }> {
+  const removed: string[] = [];
+  for (const sha of doomed) {
+    if ((fence !== undefined && !(await passesFence(fence))) || !(await currentStill(root, current))) {
+      return { complete: false, removed };
+    }
+    const trash = path.join(root, `${TRASH_PREFIX}${sha}-${randomBytes(8).toString('hex')}`);
+    try {
+      await fs.rename(path.join(root, sha), trash);
+    } catch {
+      return { complete: false, removed };
+    }
+    removed.push(sha);
+    await fs.rm(trash, { recursive: true, force: true }).catch(() => undefined);
+  }
+  return { complete: true, removed };
+}
+
+/** Orphan archives, homes and trash: never a staging directory an install still uses. */
+async function removeOrphans(root: string): Promise<boolean> {
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    const dirs = new Set(entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name));
+    for (const entry of entries) {
+      if (isOrphan(entry, dirs)) {
+        await fs.rm(path.join(root, entry.name), { recursive: true, force: true });
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isOrphan(entry: Dirent, dirs: ReadonlySet<string>): boolean {
+  if (entry.isFile() && TAR_PATTERN.test(entry.name)) {
+    return !dirs.has(entry.name.slice(0, -'.tar'.length));
+  }
+  if (entry.isDirectory() && HOME_PATTERN.test(entry.name)) {
+    return !dirs.has(entry.name.slice(0, -'.home'.length));
+  }
+  return entry.isDirectory() && TRASH_PATTERN.test(entry.name);
 }
 
 async function currentStill(root: string, expected: string | null): Promise<boolean> {

@@ -175,11 +175,29 @@ describe('ReleaseStoreAdapter', () => {
     expect(await fs.readFile(path.join(root, 'current', 'apps', 'cli', 'dist', 'bin.js'), 'utf8')).toBe('// cli\n');
   });
 
+  it('prunes nothing more once the fence fails, and leaves no build half-removed', async () => {
+    for (const [digit, day] of [['a', 1], ['b', 2], ['c', 3], ['d', 4], ['e', 5]] as const) {
+      await verified(digit, day);
+    }
+    await adapter.repoint({ root, sha: E });
+    let calls = 0;
+    const fence = async (): Promise<boolean> => {
+      calls += 1;
+      return calls === 1;
+    };
+    expect(await adapter.prune({ root, keep: 2, fence })).toEqual({ outcome: 'unreadable' });
+    expect(calls).toBe(2);
+    expect((await fs.readdir(root)).sort()).toEqual([B, C, D, E, 'current'].sort());
+    expect(await adapter.prune({ root, keep: 2, fence: async () => true })).toEqual({ outcome: 'pruned', removed: [B, C] });
+    expect((await fs.readdir(root)).sort()).toEqual([D, E, 'current'].sort());
+  });
+
   it('removes only an orphan archive file and an orphan home', async () => {
     await verified('a', 1);
     const orphan = `.staging-${B}-${'0'.repeat(16)}`;
     await fs.writeFile(path.join(root, `${orphan}.tar`), 'tar');
     await fs.mkdir(path.join(root, `${orphan}.home`, '.yarn'), { recursive: true });
+    await fs.mkdir(path.join(root, `.trash-${B}-${'1'.repeat(16)}`, 'apps'), { recursive: true });
     const live = await staged(C);
     await fs.writeFile(live.archivePath, 'tar');
     await fs.writeFile(path.join(root, 'notes.tar'), 'keep');

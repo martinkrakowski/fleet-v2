@@ -78,7 +78,17 @@ export interface ReleaseStorePort {
     readonly fence?: () => Promise<boolean>;
   }): Promise<ReleaseStoreWriteResult | { readonly outcome: 'fenced' }>;
   /** Keep the newest `keep` verified builds; never remove current or previous. */
-  prune(input: { readonly root: string; readonly keep: number }): Promise<ReleaseStorePruneResult>;
+  prune(input: {
+    readonly root: string;
+    readonly keep: number;
+    /**
+     * Awaited before each build is taken out (one quick rename; the slow
+     * delete runs afterwards on a name nothing can point at). A false or
+     * throwing fence, or a `current` that moved since the snapshot, stops the
+     * prune as `unreadable`.
+     */
+    readonly fence?: () => Promise<boolean>;
+  }): Promise<ReleaseStorePruneResult>;
   /** Remove an incomplete build: this run's staging directory, its archive and its home. */
   discard(input: { readonly root: string; readonly buildId: string }): Promise<ReleaseStoreWriteResult>;
 }

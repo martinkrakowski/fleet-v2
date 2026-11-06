@@ -14,8 +14,9 @@
  * - The driver: a live lease refuses before any write; the build then runs
  *   outside any lock, and the repoint runs only while this process holds the
  *   conductor driver lease itself (acquired by CAS just before the repoint,
- *   re-checked by the store's fence immediately before its one rename, with a
- *   margin of lease time left, and released after it). A driver that took
+ *   renewed and re-checked by the store's fence immediately before its one
+ *   rename and before each build the prune takes out, with a margin of lease
+ *   time left, and released after the prune). A driver that took
  *   the lease meanwhile makes the acquire fail, and nothing is repointed.
  * - Stale trees: the build runs in a staging directory the store creates
  *   exclusively for this run; only that directory is verified and moved to
@@ -98,7 +99,8 @@ type ValidRequest = ManageReleaseRequest;
 interface HeldLease {
   readonly holderId: string;
   readonly fence: number;
-  readonly leaseUntilIso: string;
+  /** Moves forward each time the fence renews the lease. */
+  leaseUntilIso: string;
 }
 
 export class ManageReleaseUseCase implements ManageReleasePort {
@@ -261,27 +263,40 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       if (repointed.outcome !== 'ok') {
         return { refusal: repointRefusal(repointed.outcome) };
       }
-      return { pruned: await this.deps.store.prune({ root: request.root, keep: request.keep }) };
+      return {
+        pruned: await this.deps.store.prune({
+          root: request.root,
+          keep: request.keep,
+          fence: () => this.stillHolds(held),
+        }),
+      };
     } finally {
       await this.releaseLease(held);
     }
   }
 
   /**
-   * The repoint fence, awaited by the store right before its one rename: this
-   * process still holds the lease, and, on the clock after that check, the
-   * lease has at least REPOINT_MARGIN_MS left, far more than one rename takes.
+   * The fence the store awaits right before its rename (repoint) and before
+   * each build it takes out (prune): renew this process's lease for another
+   * fence window, then require, on a clock read after the renew returned, at
+   * least REPOINT_MARGIN_MS left. A lease this process no longer holds cannot
+   * be renewed, so a driver that took it over fails the fence.
    */
   private async stillHolds(held: HeldLease): Promise<boolean> {
-    const refusal = await this.deps.lease.check({
+    const nowIso = this.deps.nowIso();
+    const renewed = await this.deps.lease.renew({
       holderId: held.holderId,
       fence: held.fence,
-      nowIso: this.deps.nowIso(),
+      leaseUntilIso: new Date(Date.parse(nowIso) + REPOINT_FENCE_MS).toISOString(),
+      nowIso,
     });
-    // The margin is measured on a clock read after the check returned, so a
-    // slow check can never leave a stale "time left" behind it.
-    const afterCheck = Date.parse(this.deps.nowIso());
-    return refusal === null && Date.parse(held.leaseUntilIso) - afterCheck >= REPOINT_MARGIN_MS;
+    if (renewed.outcome !== 'ok' || renewed.lease.fence !== held.fence) {
+      return false;
+    }
+    held.leaseUntilIso = renewed.lease.leaseUntilIso;
+    // The margin is measured on a clock read after the renew returned, so a
+    // slow lease store can never leave a stale "time left" behind it.
+    return Date.parse(held.leaseUntilIso) - Date.parse(this.deps.nowIso()) >= REPOINT_MARGIN_MS;
   }
 
   private async acquireLease(request: ValidRequest, target: string): Promise<HeldLease | ManageReleaseRefusal> {

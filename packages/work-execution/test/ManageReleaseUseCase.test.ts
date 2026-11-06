@@ -40,6 +40,7 @@ import type {
   LeaseAcquireRequest,
   LeaseHoldRequest,
   LeaseRefusal,
+  LeaseRenewRequest,
 } from '../src/domain/lane-run-lease.js';
 
 const ROOT = '/srv/fleet-releases';
@@ -129,7 +130,7 @@ class FakeStore implements ReleaseStorePort {
     return { outcome: 'ok' };
   }
 
-  async prune(input: { root: string; keep: number }): Promise<ReleaseStorePruneResult> {
+  async prune(input: { root: string; keep: number; fence?: () => Promise<boolean> }): Promise<ReleaseStorePruneResult> {
     this.calls.push(`prune ${input.keep}`);
     if (this.pruneUnreadable) {
       return { outcome: 'unreadable' };
@@ -182,7 +183,7 @@ class FakeLease implements ConductorDriverLeasePort {
   /** The store grants less time than asked (as a clamped or slow store would). */
   grantedMs: number | null = null;
   checkRefusal: LeaseRefusal | null = null;
-  /** Called after each check returns, before the caller reads its clock again. */
+  /** Called inside each renew, before the caller reads its clock again. */
   onCheck: (() => void) | null = null;
   private readCount = 0;
 
@@ -210,8 +211,17 @@ class FakeLease implements ConductorDriverLeasePort {
     return { outcome: 'ok', lease: this.held };
   }
 
-  async renew(): Promise<ConductorDriverLeaseResult> {
-    throw new Error('renew is never called');
+  async renew(request: LeaseRenewRequest): Promise<ConductorDriverLeaseResult> {
+    this.events.push(`renew ${request.fence}`);
+    this.onCheck?.();
+    const held = this.held;
+    if (this.checkRefusal !== null || held === null || held.fence !== request.fence || held.holderId !== request.holderId) {
+      return { outcome: 'refused', reason: this.checkRefusal ?? 'lease-not-held' };
+    }
+    const leaseUntilIso =
+      this.grantedMs === null ? request.leaseUntilIso : new Date(Date.parse(request.nowIso) + this.grantedMs).toISOString();
+    this.held = { ...held, leaseUntilIso };
+    return { outcome: 'ok', lease: this.held };
   }
 
   async release(request: LeaseHoldRequest): Promise<ConductorDriverLeaseResult> {
@@ -555,7 +565,7 @@ describe('ManageReleaseUseCase', () => {
     expect(executor.runs).toEqual([]);
     const lapsed = granted(INSTALL, A, { lease: LAPSED_LEASE });
     expect((await manage(lapsed.useCase, applyRequest())).outcome).toBe('applied');
-    expect(lapsed.lease.events).toEqual([`acquire ${LAPSED_LEASE.fence}`, `check ${LAPSED_LEASE.fence + 1}`, `release ${LAPSED_LEASE.fence + 1}`]);
+    expect(lapsed.lease.events).toEqual([`acquire ${LAPSED_LEASE.fence}`, `renew ${LAPSED_LEASE.fence + 1}`, `release ${LAPSED_LEASE.fence + 1}`]);
   });
 
   it('refuses driver-lease-live when a driver starts during the build and repoints nothing', async () => {
@@ -590,7 +600,7 @@ describe('ManageReleaseUseCase', () => {
       reason: 'driver-lease-live',
     });
     expect(made.store.current).toBe(B);
-    expect(lease.events).toEqual(['acquire 0', 'check 1', 'release 1']);
+    expect(lease.events).toEqual(['acquire 0', 'renew 1', 'release 1']);
   });
 
   it('refuses driver-lease-live when too little lease time is left at the rename and repoints nothing', async () => {
@@ -605,10 +615,10 @@ describe('ManageReleaseUseCase', () => {
     expect(lease.held).toBeNull();
   });
 
-  it('refuses driver-lease-live when the lease check itself runs past the margin', async () => {
+  it('refuses driver-lease-live when the lease renew itself runs past the margin', async () => {
     let now = NOW;
     const lease = new FakeLease(null);
-    // The check answers "held", but by the time it returns 90 s of the 120 s lease are gone.
+    // The renew answers "held" until 120 s past its start, but by the time it returns 90 s are gone.
     lease.onCheck = () => {
       now = new Date(Date.parse(NOW) + 90_000).toISOString();
     };
@@ -627,10 +637,17 @@ describe('ManageReleaseUseCase', () => {
     const prune = made.store.prune.bind(made.store);
     made.store.prune = async (input) => {
       order.push(`prune while held=${lease.held !== null}`);
+      const fence = input.fence as () => Promise<boolean>;
+      order.push(`fence=${await fence()}`);
+      // A driver takes the lease over mid-prune: the next removal's fence fails.
+      const mine = lease.held;
+      lease.held = { ...(mine as ConductorDriverLeaseRecord), holderId: 'driver-2', fence: 99 };
+      order.push(`fence after takeover=${await fence()}`);
+      lease.held = mine;
       return prune(input);
     };
     expect((await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).outcome).toBe('applied');
-    expect(order).toEqual(['prune while held=true']);
+    expect(order).toEqual(['prune while held=true', 'fence=true', 'fence after takeover=false']);
     expect(lease.held).toBeNull();
   });
 
@@ -645,7 +662,7 @@ describe('ManageReleaseUseCase', () => {
     };
     expect((await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).outcome).toBe('applied');
     expect(order).toEqual(['repoint while held=true fenced=true']);
-    expect(lease.events).toEqual(['acquire 0', 'check 1', 'release 1']);
+    expect(lease.events).toEqual(['acquire 0', 'renew 1', 'release 1']);
     expect(lease.held).toBeNull();
   });
 

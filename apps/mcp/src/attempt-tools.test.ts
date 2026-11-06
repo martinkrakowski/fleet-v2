@@ -628,6 +628,7 @@ describe("new read tool names", () => {
       "fleet_lane_run_list",
       "fleet_conductor_status",
       "fleet_brief_preview",
+      "fleet_telemetry_status",
     ]);
   });
 });

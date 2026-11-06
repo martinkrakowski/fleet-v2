@@ -406,8 +406,7 @@ export function composeExecution(input: ComposeExecutionInput) {
         };
       }
       // Coordinates recorded at resolve time bind the grant to its attempt;
-      // a fresh process reloads them from disk. A grant with no recorded
-      // coordinates is refused: no attempt is ever picked by head alone.
+      // a fresh process reloads them from disk.
       if (
         !resolveCoordinates.has(request.authorizationGrantId) &&
         authorizationCoordinatesPath !== undefined
@@ -427,13 +426,24 @@ export function composeExecution(input: ComposeExecutionInput) {
         }
       }
       const coordinates = resolveCoordinates.get(request.authorizationGrantId);
-      if (coordinates === undefined) {
+      // A grant resolved in this or an earlier process carries its attempt.
+      // One never resolved (an owner decision granted straight through
+      // `coordination request-decision`, or a policy grant) carries none: the
+      // request's own attempt is then the only candidate, and the consumption
+      // use case checks it against a policy grant's attempt. No attempt is
+      // ever picked by head alone.
+      if (coordinates !== undefined) {
+        if (request.attemptId !== undefined && request.attemptId !== coordinates.attemptId) {
+          return { outcome: 'refused', reason: 'grant-attempt-mismatch' };
+        }
+      } else if (typeof request.attemptId !== 'string') {
         return { outcome: 'refused', reason: 'grant-attempt-unresolved' };
       }
-      if (request.attemptId !== undefined && request.attemptId !== coordinates.attemptId) {
-        return { outcome: 'refused', reason: 'grant-attempt-mismatch' };
-      }
-      const attempt = await attemptRepository.findAttemptById(coordinates.attemptId);
+      const boundAttemptId = coordinates?.attemptId ?? request.attemptId;
+      const attempt =
+        typeof boundAttemptId === 'string'
+          ? await attemptRepository.findAttemptById(boundAttemptId)
+          : null;
       if (attempt === null || attempt.artifacts?.headCommit !== request.expectedHeadSha) {
         return {
           outcome: 'refused',

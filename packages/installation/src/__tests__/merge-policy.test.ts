@@ -460,7 +460,7 @@ describe('mergePolicyRevision', () => {
       daemon: daemonDefaults,
     });
     expect(json).toBe(
-      '{"daemon":{"budgetSeconds":45,"chainRefresh":"shadow","intervalSeconds":60,"settleSeconds":20},' +
+      '{"daemon":{"budgetSeconds":45,"intervalSeconds":60,"settleSeconds":20},' +
         '"merge":{"repos":{' +
         '"alpha/first":{"checksGraceMinutes":30,"macosProcedure":"mac","maxAttempts":9,"projectId":"p",' +
         '"requiredContexts":["gate","premerge"],"shadow":true,"unattended":false,"updateBranch":false,' +

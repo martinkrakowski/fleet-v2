@@ -1137,9 +1137,12 @@ export function resolveMergePolicy(policy: PolicySection | undefined): MergePoli
 
 /**
  * The canonical JSON the merge-policy revision hashes: `daemon` (`budgetSeconds`,
- * `intervalSeconds`, `settleSeconds`, `chainRefresh`) then `merge.repos` keyed by `repositoryKey`
- * in ascending order, each entry with its keys in alphabetical order and `requiredContexts` sorted
- * ascending, no whitespace. Pass the resolved sections so an absent block hashes as its default.
+ * `intervalSeconds`, `settleSeconds`) then `merge.repos` keyed by `repositoryKey` in ascending
+ * order, each entry with its keys in alphabetical order and `requiredContexts` sorted ascending,
+ * no whitespace. Pass the resolved sections so an absent block hashes as its default.
+ * `daemon.chainRefresh` is deliberately excluded: it only gates the chain-refresh job, not the
+ * merge policy, so adding it here would change the revision for every existing installation even
+ * when the key is absent and defaults to `shadow`.
  */
 export function canonicalMergePolicyJson(input: {
   readonly repositories: readonly ResolvedMergeRepositoryPolicy[];
@@ -1165,7 +1168,6 @@ export function canonicalMergePolicyJson(input: {
   return JSON.stringify({
     daemon: {
       budgetSeconds: input.daemon.budgetSeconds,
-      chainRefresh: input.daemon.chainRefresh,
       intervalSeconds: input.daemon.intervalSeconds,
       settleSeconds: input.daemon.settleSeconds,
     },

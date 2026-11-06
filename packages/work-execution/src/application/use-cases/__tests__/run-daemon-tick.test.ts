@@ -993,6 +993,28 @@ describe('RunDaemonTickUseCase (DT10b): interval, settle and input bounds', () =
     expect(spent.sleeps).toEqual([]);
   });
 
+  it('measures the settle cap at the sleep, not at the tick start: planning time already spent is subtracted', async () => {
+    const previous = staleStatus('2026-11-01T11:50:00.000Z');
+    const at = (seconds: number) => new Date(Date.parse(NOW) + seconds * 1_000).toISOString();
+    const clockAfterFirst = (seconds: number) => {
+      let calls = 0;
+      return () => {
+        calls += 1;
+        return calls === 1 ? NOW : at(seconds);
+      };
+    };
+    // Two seconds of a three second budget went on the reads before the settle: at most one second remains.
+    const partly = makeHarness({ previousStatus: previous, nowFn: clockAfterFirst(2) });
+    await partly.run({ repositories: [repoRef(DIGEST_A)], settleSeconds: 3, budgetSeconds: 3 });
+    expect(partly.sleeps).toHaveLength(1);
+    expect(partly.sleeps[0]).toBeLessThanOrEqual(1_000);
+
+    // The reads used the whole budget: no settle sleep at all.
+    const whole = makeHarness({ previousStatus: previous, nowFn: clockAfterFirst(3) });
+    await whole.run({ repositories: [repoRef(DIGEST_A)], settleSeconds: 3, budgetSeconds: 3 });
+    expect(whole.sleeps).toEqual([]);
+  });
+
   it('honours a caller deadline: an elapsed deadline starts no job, and a malformed one refuses the tick', async () => {
     const h = makeHarness();
     const result = await h.run({ repositories: [repoRef(DIGEST_A)], deadlineIso: '2026-11-01T11:59:59.000Z' });

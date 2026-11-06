@@ -564,10 +564,13 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
 
     const jobs = new DaemonJobRegistry({ mergePass: this.deps.mergePass }).instances(request.repositories);
     const plan = await this.plan(ctx, jobs);
-    // The settle never outlasts the tick: cap it to the time left before the deadline, skip it when none is left.
-    const settleMs = Math.min(plan.settleDelayMs, Math.max(0, Date.parse(deadlineIso) - Date.parse(nowIso)));
-    if (settleMs > 0) {
-      await (this.deps.sleep ?? defaultSleep)(settleMs);
+    // The settle never outlasts the tick: cap it to the time left before the deadline, measured at the moment of
+    // the sleep (the status, pause and halt reads before it already spent part of the budget), skip it when none is left.
+    if (plan.settleDelayMs > 0) {
+      const settleMs = Math.min(plan.settleDelayMs, Math.max(0, Date.parse(deadlineIso) - Date.parse(ctx.clock())));
+      if (settleMs > 0) {
+        await (this.deps.sleep ?? defaultSleep)(settleMs);
+      }
     }
     if (plan.paused) {
       return this.finishPaused(ctx, plan);

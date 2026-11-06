@@ -10,13 +10,20 @@
  */
 
 import { isValidHostName } from '@fleet/shared';
-import type { ProjectProfileInput, ProjectProfileRecord } from '../coordination-records.js';
+import type {
+  ProjectGeneratorStateRecord,
+  ProjectGeneratorStateValue,
+  ProjectProfileInput,
+  ProjectProfileRecord,
+} from '../coordination-records.js';
 
 export type {
   AuthorizationConsumptionRecord,
   CoordinationRequestRecord,
   ProjectAttentionSummaryRecord,
   ProjectCloneRecord,
+  ProjectGeneratorStateRecord,
+  ProjectGeneratorStateValue,
   ProjectProfileInput,
   ProjectProfileRecord,
   ProjectProbeCheckRecord,
@@ -33,8 +40,17 @@ const FORBIDDEN_FIELD_PATTERN =
   /(token|secret|credential|password|passphrase|api[-_]?key|private[-_]?key|access[-_]?key|authorization|cookie)/i;
 
 const ALLOWED_CLONE_KEYS = new Set(['path', 'worktreeRoot']);
-const ALLOWED_PROBE_KEYS = new Set(['probedAtIso', 'probedFrom', 'checks']);
+const ALLOWED_PROBE_KEYS = new Set(['probedAtIso', 'probedFrom', 'checks', 'generatorState']);
 const ALLOWED_PROBE_CHECK_KEYS = new Set(['name', 'host', 'result', 'detail']);
+const ALLOWED_GENERATOR_STATE_KEYS = new Set(['state', 'generatorVersion', 'pinnedVersion']);
+const GENERATOR_STATES: readonly ProjectGeneratorStateValue[] = [
+  'provisioned',
+  'provisioned-legacy',
+  'adopting',
+  'none',
+];
+/** A version is an exact version: digits first, never a free-form token. */
+const VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta|rc|next|canary)(?:\.[0-9]+)*)?$/;
 
 /** One configured capability: supported, explicitly unsupported, or not known. */
 export type CapabilityStatus = 'supported' | 'missing' | 'unknown';
@@ -216,10 +232,40 @@ export class ProjectProfile {
         detail: check.detail,
       };
     });
+    const generatorState = ProjectProfile.readGeneratorState(probe.generatorState);
     return {
       probedAtIso: probe.probedAtIso,
       probedFrom: probe.probedFrom,
       checks,
+      ...(generatorState === undefined ? {} : { generatorState }),
+    };
+  }
+
+  /**
+   * The generator state of a probe receipt, when the probe recorded one.
+   * Absent is a receipt written before this field existed and stays valid.
+   */
+  private static readGeneratorState(value: unknown): ProjectGeneratorStateRecord | undefined {
+    if (value === undefined) {
+      return undefined;
+    }
+    const record = value as Record<string, unknown>;
+    const valid =
+      typeof value === 'object' &&
+      value !== null &&
+      !Array.isArray(value) &&
+      Object.keys(record).every((key) => ALLOWED_GENERATOR_STATE_KEYS.has(key)) &&
+      typeof record.state === 'string' &&
+      GENERATOR_STATES.includes(record.state as ProjectGeneratorStateValue) &&
+      isVersionOrNull(record.generatorVersion) &&
+      isVersionOrNull(record.pinnedVersion);
+    if (!valid) {
+      throw new Error('ProjectProfile requires lastProbe to be null or a probe receipt');
+    }
+    return {
+      state: record.state as ProjectGeneratorStateValue,
+      generatorVersion: record.generatorVersion as string | null,
+      pinnedVersion: record.pinnedVersion as string | null,
     };
   }
 
@@ -273,6 +319,9 @@ export class ProjectProfile {
                 result: check.result,
                 detail: check.detail,
               })),
+              ...(this.record.lastProbe.generatorState === undefined
+                ? {}
+                : { generatorState: { ...this.record.lastProbe.generatorState } }),
             },
     };
   }
@@ -349,6 +398,11 @@ function isNormalisedAbsolutePath(value: unknown): value is string {
     segments.length > 0 &&
     segments.every((segment) => segment.length > 0 && segment !== '.' && segment !== '..')
   );
+}
+
+/** A version is a short token; null is the only other accepted value. */
+function isVersionOrNull(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string' && VERSION_PATTERN.test(value));
 }
 
 /** True when a path contains a `..` path segment. */

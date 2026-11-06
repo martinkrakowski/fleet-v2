@@ -11,6 +11,7 @@
 
 import {
   buildLaneRunStepKey,
+  laneRunMergeEnqueueKey,
   laneRunPremergeKey,
   LANE_RUN_MAX_RETRY,
 } from './lane-run-keys.js';
@@ -33,6 +34,7 @@ import {
   LANE_RUN_STEP_OF_STATE,
 } from './lane-run-transitions.js';
 import type { LaneRunFailureCause, RunStopMode } from './lane-run-transitions.js';
+import type { LaneRunMergeEnqueueFact } from './lane-run-step-facts.js';
 import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 import { SEAT_TRIGGER_CLASSES } from './value-objects/StopReason.vo.js';
 import type { StopReasonValue } from './value-objects/StopReason.vo.js';
@@ -136,6 +138,8 @@ export interface LaneRunFacts {
   readonly preMerge: 'none' | 'passed' | 'failed' | 'unknown';
   /** KS7a-2: the latest final `premerge` journal result at `head12` (the merging hold's post). */
   readonly premergePost: 'none' | 'success' | 'failure' | 'refused';
+  /** KS7b: what the merge queue made of the run's enqueued head at (round, `head12`), from the journal. */
+  readonly mergeEnqueue: LaneRunMergeEnqueueFact;
   /** `AssessHeadAcceptance` at `head12` (K6). */
   readonly acceptance: 'none' | 'accepted' | 'rejected' | 'unknown';
   /**
@@ -160,8 +164,8 @@ export interface LaneRunFacts {
   readonly pr: { readonly state: 'open' | 'merged' | 'closed'; readonly head12: string; readonly containsLaneHead: boolean } | null;
   /** The step whose latest result in this round at this head was a refusal (K1b). */
   readonly refusedStep: LaneRunKeyStep | null;
-  /** Unreadable door or behind-ness reads true; `trainFree` and `policyGrant` per §3.6/AM4a (K6). */
-  readonly merge: { readonly oneWayDoor: boolean; readonly branchBehind: boolean; readonly trainFree: boolean; readonly policyGrant: boolean };
+  /** An unreadable door reads true; `policyGrant` per AM4a (K6). KS7b: the branch and the train belong to the merge queue. */
+  readonly merge: { readonly oneWayDoor: boolean; readonly policyGrant: boolean };
 }
 
 const PHASE_OF_ATTEMPT_STATE: Record<AttemptStateValue, LaneRunAttemptPhase> = {
@@ -252,7 +256,7 @@ function laneRunSettledOpenPrDecision(record: LaneRunRecord, facts: LaneRunFacts
  * eligible waiting state — a park (for every reason, without an open owner
  * question or a live attempt), `awaiting-premerge`, `watching-ci` or
  * `merging` — by itself. An unread intent shadows the rule unless its step is
- * `premerge` (so an unread `merge` intent reconciles first, as before). An
+ * `premerge` or `merge-enqueue` (a pending queue hand-off must not hide the merge the queue made); any other unread intent reconciles first. An
  * ambiguous intent cannot shadow it. Under a halt nothing changes (the halt
  * rules decide, as today), and a merged PR that does not carry the lane head
  * is left to the existing rules. Total; never throws.
@@ -266,7 +270,8 @@ function laneRunMergedPrDecision(record: LaneRunRecord, facts: LaneRunFacts): La
   if (
     facts.pendingIntent !== null &&
     facts.pendingIntent.reconciliation === 'unread' &&
-    facts.pendingIntent.step !== 'premerge'
+    facts.pendingIntent.step !== 'premerge' &&
+    facts.pendingIntent.step !== 'merge-enqueue'
   ) {
     return null;
   }
@@ -869,9 +874,6 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (facts.merge.oneWayDoor) {
         return park('one-way-door', null);
       }
-      if (facts.merge.branchBehind) {
-        return park('branch-behind', null);
-      }
       // KS7a-2 (D20): the `premerge` post is the merge hold, read before the
       // policy-grant park and the merge tail; null falls through to them.
       const premerge = laneRunPremergeDecision(record, facts);
@@ -881,21 +883,39 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
       if (!facts.merge.policyGrant) {
         return park('owner-merge', null);
       }
-      if (!facts.merge.trainFree) {
-        return wait('merge-train');
+      // KS7b: the merge is the daemon queue's. A drop maps back to the run
+      // here; an unknown queue state is read as a wait by the reconcile and
+      // never as a merge (only a merged PR enters `merged`).
+      switch (facts.mergeEnqueue) {
+        case 'merged':
+          // The queue merged the head but the forge read does not say so yet.
+          return WAIT_FACTS_INCONSISTENT;
+        case 'dropped-fixable':
+          return afterFailure(record.round, 'merge-queue');
+        case 'held':
+          return park('owner-merge', null);
+        case 'stuck':
+          return park('step-refused', 'merge-enqueue');
+        default:
+          break;
       }
       const attempt = facts.attempt;
-      if (attempt === null) {
+      if (attempt === null || facts.head12 === null) {
         return WAIT_FACTS_INCONSISTENT;
       }
-      return act({
-        step: 'merge',
-        round: attempt.round,
+      const enqueueKey = laneRunMergeEnqueueKey(record.runId, record.round, facts.head12);
+      if (!enqueueKey.ok) {
+        return WAIT_FACTS_INCONSISTENT;
+      }
+      return {
+        kind: 'act',
+        step: 'merge-enqueue',
+        key: enqueueKey.key,
+        round: record.round,
         seatIndex: attempt.seatIndex,
         head12: facts.head12,
         retry: null,
-        attemptOrdinal: null,
-      });
+      };
     };
 
     // G1: terminal states.
@@ -923,7 +943,7 @@ export function nextLaneRunAction(record: LaneRunRecord, facts: LaneRunFacts, no
     // halt rules' decision (G4b/G6) applies instead. Prepare, dispatch, stop and
     // cancel reconciles stay as they are under halt (read-only or record-only).
     if (facts.pendingIntent !== null && facts.pendingIntent.reconciliation === 'unread') {
-      if (facts.halted && (facts.pendingIntent.step === 'collect' || facts.pendingIntent.step === 'gate' || facts.pendingIntent.step === 'premerge')) {
+      if (facts.halted && (facts.pendingIntent.step === 'collect' || facts.pendingIntent.step === 'gate' || facts.pendingIntent.step === 'premerge' || facts.pendingIntent.step === 'merge-enqueue')) {
         if (facts.state === 'parked') {
           return wait('parked');
         }

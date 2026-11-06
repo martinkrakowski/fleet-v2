@@ -92,6 +92,7 @@ describe("buildRegistry", () => {
       "fleet_lane_run_list",
       "fleet_conductor_status",
       "fleet_brief_preview",
+      "fleet_telemetry_status",
     ]);
     expect([...registry.resources.map((resource) => resource.name)]).toEqual([
       ...FLEET_RESOURCE_NAMES,

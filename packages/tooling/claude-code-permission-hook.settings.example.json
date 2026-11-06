@@ -1,0 +1,50 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh release:*)",
+      "Bash(gh workflow run:*)",
+      "Bash(kubectl apply:*)",
+      "Bash(kubectl delete:*)",
+      "Bash(terraform apply:*)",
+      "Bash(docker push:*)",
+      "Bash(npm publish:*)",
+      "Bash(cargo publish:*)",
+      "Bash(fleet-v2 forge execute:*)",
+      "Bash(fleet-v2 merge enqueue:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<the fleet-v2 outward-tool guard command>",
+            "timeout": 10,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:<api-port>/v1/threads/<thread-id>/permissions",
+            "timeout": 600,
+            "onFailure": "block",
+            "headers": {
+              "Authorization": "Bearer $FLEET_HOOK_TOKEN"
+            },
+            "allowedEnvVars": ["FLEET_HOOK_TOKEN"]
+          }
+        ]
+      }
+    ]
+  }
+}

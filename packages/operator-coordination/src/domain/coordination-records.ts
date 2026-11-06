@@ -34,11 +34,30 @@ export interface ProjectProbeCheckRecord {
   readonly detail: string;
 }
 
+/**
+ * One project's generator state, read from files only. `state` is fleet-v2's
+ * own vocabulary; a version the project does not state is null. Never a
+ * credential, a path or a URL.
+ */
+export type ProjectGeneratorStateValue =
+  | 'provisioned'
+  | 'provisioned-legacy'
+  | 'adopting'
+  | 'none';
+
+export interface ProjectGeneratorStateRecord {
+  readonly state: ProjectGeneratorStateValue;
+  readonly generatorVersion: string | null;
+  readonly pinnedVersion: string | null;
+}
+
 /** Durable receipt proving a project was probed at a point in time. */
 export interface ProjectProbeReceiptRecord {
   readonly probedAtIso: string;
   readonly probedFrom: string;
   readonly checks: readonly ProjectProbeCheckRecord[];
+  /** The project's generator state; absent when the probe did not read it. */
+  readonly generatorState?: ProjectGeneratorStateRecord;
 }
 
 /**

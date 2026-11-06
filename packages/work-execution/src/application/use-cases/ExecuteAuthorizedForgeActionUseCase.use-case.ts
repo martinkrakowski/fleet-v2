@@ -541,6 +541,14 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     // from the request, from the attempt's typed journal entries, or from the
     // lane's single stored link — never by parsing journal text, never
     // guessed. A thrown pre-flight read refuses before the grant is consumed.
+    // The verifying read, the merge and the record must name one repository
+    // (WB5b2): the work order's must be the one the forge port is bound to.
+    if (request.kind === "merge-pr" && normalizedRepository !== null) {
+      const mismatch = this.boundRepositoryRefusal(deps, normalizedRepository);
+      if (mismatch !== null) {
+        return { outcome: "refused", reason: mismatch };
+      }
+    }
     let preResolvedPrNumber: number | undefined;
     let alreadyMerged = false;
     let legacyLookup = false;
@@ -1005,6 +1013,30 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
       confirmedBySource: journalNumber !== undefined || linkNumber !== undefined,
       linkInvolved: linkNumber !== undefined,
     });
+  }
+
+  /** `repository-unbound` or `repository-mismatch` when the port's bound repository is not the work order's; null when it matches or the port does not say. */
+  private boundRepositoryRefusal(
+    deps: ExecuteAuthorizedForgeActionDependencies,
+    normalizedRepository: string,
+  ): string | null {
+    const port = deps.forgePort;
+    if (typeof port.boundRepository !== "function") {
+      return null;
+    }
+    let bound: ReturnType<NonNullable<typeof port.boundRepository>>;
+    try {
+      bound = port.boundRepository();
+    } catch {
+      return "repository-unbound";
+    }
+    if (bound === undefined) {
+      return "repository-unbound";
+    }
+    return `${bound.owner}/${bound.repo}`.toLowerCase() ===
+      normalizedRepository.toLowerCase()
+      ? null
+      : "repository-mismatch";
   }
 
   /** Whether the attempt's latest completed typed `forge` reference is for a repository other than this one. */

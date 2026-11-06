@@ -1655,6 +1655,8 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       saveOutcome?: MergeRecordSaveOutcome;
       /** The first N `saveMergeRecord` calls throw (a disk or lock failure). */
       failSaves?: number;
+      /** The repository the forge port is bound to (WB5b2); `"unbound"` binds none. Default org/repo. */
+      bound?: { owner: string; repo: string } | "unbound";
     } = {},
   ) {
     const order: string[] = [];
@@ -1697,6 +1699,10 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
     const seen: ForgeActionRequest[] = [];
     const forgePort: ForgeActionPort = {
       isConfigured: () => true,
+      boundRepository: () =>
+        options.bound === "unbound"
+          ? undefined
+          : (options.bound ?? { owner: "org", repo: "repo" }),
       ...(options.lookup !== undefined
         ? {
             async findOpenPullRequestsByHead(query) {
@@ -2628,6 +2634,43 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       expect(deps.consumed).toEqual([]);
       expect(deps.seen).toHaveLength(0);
       expect(deps.reads).toHaveLength(0);
+    });
+
+    it("refuses a merge when the work order's repository is not the forge port's bound repository: no read, no grant, no merge", async () => {
+      const deps = wb5bDeps({ bound: { owner: "other", repo: "repo" } });
+      expect(
+        await deps.useCase.executeAuthorizedForgeAction({
+          ...mergeReq,
+          pullRequestNumber: 7,
+        }),
+      ).toEqual({ outcome: "refused", reason: "repository-mismatch" });
+      expect(deps.reads).toHaveLength(0);
+      expect(deps.consumed).toEqual([]);
+      expect(deps.seen).toHaveLength(0);
+      expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
+    });
+
+    it("refuses a merge through an unbound forge port, and compares the bound repository case-insensitively", async () => {
+      const unbound = wb5bDeps({ bound: "unbound" });
+      expect(
+        await unbound.useCase.executeAuthorizedForgeAction({
+          ...mergeReq,
+          pullRequestNumber: 7,
+        }),
+      ).toEqual({ outcome: "refused", reason: "repository-unbound" });
+      expect(unbound.reads).toHaveLength(0);
+      expect(unbound.consumed).toEqual([]);
+      expect(unbound.seen).toHaveLength(0);
+
+      const sameRepo = wb5bDeps({ bound: { owner: "ORG", repo: "Repo" } });
+      expect(
+        (
+          await sameRepo.useCase.executeAuthorizedForgeAction({
+            ...mergeReq,
+            pullRequestNumber: 7,
+          })
+        ).outcome,
+      ).toBe("executed");
     });
 
     it("a throwing merge-record store is merge-record-not-saved, and the next pass completes the record without merging again", async () => {

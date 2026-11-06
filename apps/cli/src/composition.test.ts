@@ -200,6 +200,9 @@ describe('apps/cli composition', () => {
         detail: null,
         pullRequest: { repository: 'org/repo', number: 7 },
       });
+      (rt.execution.executeAuthorizedForgeAction as unknown as {
+        deps: { forgePort: { boundRepository?: unknown } };
+      }).deps.forgePort.boundRepository = () => ({ owner: 'org', repo: 'repo' });
       (rt.execution.executeAuthorizedForgeAction as unknown as { deps: { forgeRead?: unknown } }).deps.forgeRead = {
         readPullRequest: async () => ({
           outcome: 'found',

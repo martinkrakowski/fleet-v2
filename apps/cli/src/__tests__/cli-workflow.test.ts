@@ -77,11 +77,13 @@ function wireOpenPullRequestRead(
   headSha: string,
 ): void {
   const deps = (rt.execution.executeAuthorizedForgeAction as unknown as {
-    deps?: { forgeRead?: unknown };
+    deps?: { forgeRead?: unknown; forgePort: { boundRepository?: unknown } };
   }).deps;
   if (deps === undefined) {
     throw new Error('the forge use case carries no deps');
   }
+  // No installation binds a repository here; the work order's is org/repo.
+  deps.forgePort.boundRepository = () => ({ owner: 'org', repo: 'repo' });
   deps.forgeRead = {
     readPullRequest: async (request: { ref: { kind: string; number?: number } }) => ({
       outcome: 'found',

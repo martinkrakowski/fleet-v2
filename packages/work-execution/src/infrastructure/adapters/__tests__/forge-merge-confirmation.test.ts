@@ -222,6 +222,16 @@ describe('ForgeActionAdapter merge confirmation after a non-zero gh exit', () =>
     expect(calls[0]).not.toContain(BRANCH);
   });
 
+  it('exposes the bound repository, and none when the adapter is unbound (WB5b2)', () => {
+    const { runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
+    expect(new ForgeActionAdapter({ runGh, repository: { owner: 'acme', repo: 'app' } }).boundRepository()).toEqual({
+      owner: 'acme',
+      repo: 'app',
+    });
+    expect(new ForgeActionAdapter({ runGh }).boundRepository()).toBeUndefined();
+    expect(new ForgeActionAdapter().boundRepository()).toBeUndefined();
+  });
+
   it('reports executed on exit 0 without ever reading the pull request', async () => {
     const { calls, runGh } = makeRunGh({ exitCode: 0, stdout: '', stderr: '' });
     const { readCalls, port } = makeReadPort(foundSnapshot());

@@ -251,6 +251,11 @@ export class ForgeActionAdapter implements ForgeActionPort, MergeForgeActionPort
     return this.delegate !== undefined && this.delegate.runGh !== undefined;
   }
 
+  /** The bound repository `gh` runs in, when the installation configured one (WB5b2). */
+  boundRepository(): ForgeRepositoryRef | undefined {
+    return this.delegate?.repository;
+  }
+
   /**
    * Read-only lookup of the open pull requests for `<owner>:<branch>` in the
    * bound repository (WB5b legacy PR-number lookup). The head is always

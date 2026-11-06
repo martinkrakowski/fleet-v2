@@ -685,6 +685,19 @@ describe('ListOwnerItemsUseCase', () => {
     });
   });
 
+  it('ListOwnerItems refuses a filter with an unknown key as request', async () => {
+    const repo = await seededStore();
+    const uc = new ListOwnerItemsUseCase({ itemRepo: repo });
+    expect(await uc.listOwnerItems({ projctId: 'example-project' } as unknown as ListOwnerItemsRequest)).toMatchObject({
+      outcome: 'refused',
+      code: 'request',
+      reason: 'ListOwnerItems the filter has an unknown key',
+    });
+    expect(
+      await uc.listOwnerItems({ kind: 'merge', extra: 1 } as unknown as ListOwnerItemsRequest),
+    ).toMatchObject({ outcome: 'refused', code: 'request' });
+  });
+
   it('ListOwnerItems refuses a revoked proxy filter as request', async () => {
     const repo = await seededStore();
     const uc = new ListOwnerItemsUseCase({ itemRepo: repo });

@@ -25,6 +25,9 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
+/** The only keys a filter may carry; any other key is a malformed filter, never an unfiltered read. */
+const FILTER_KEYS: readonly (string | symbol)[] = ['projectId', 'state', 'kind'];
+
 export interface ListOwnerItemsDependencies {
   readonly itemRepo: OwnerItemRepositoryPort;
 }
@@ -65,7 +68,9 @@ export class ListOwnerItemsUseCase implements ListOwnerItemsPort {
     let projectId: unknown;
     let state: unknown;
     let kind: unknown;
+    let unknownKey = false;
     try {
+      unknownKey = Reflect.ownKeys(request).some((key) => !FILTER_KEYS.includes(key));
       projectId = request.projectId;
       state = request.state;
       kind = request.kind;
@@ -74,6 +79,13 @@ export class ListOwnerItemsUseCase implements ListOwnerItemsPort {
         outcome: 'refused',
         code: 'request',
         reason: 'ListOwnerItems the filter could not be read',
+      };
+    }
+    if (unknownKey) {
+      return {
+        outcome: 'refused',
+        code: 'request',
+        reason: 'ListOwnerItems the filter has an unknown key',
       };
     }
     if (

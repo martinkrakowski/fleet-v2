@@ -705,7 +705,7 @@ function readGeneratorPin(text: string | null): { version: string } | null {
 }
 
 /** An exact version only: a range is not a pin the plan accepts. */
-const EXACT_VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/;
+const EXACT_VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta|rc|next|canary)(?:\.[0-9]+)*)?$/;
 
 /**
  * The state the plan's §3 table gives for the files that were read. The

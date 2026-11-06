@@ -50,7 +50,7 @@ const GENERATOR_STATES: readonly ProjectGeneratorStateValue[] = [
   'none',
 ];
 /** A version is an exact version: digits first, never a free-form token. */
-const VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]{1,48})?$/;
+const VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta|rc|next|canary)(?:\.[0-9]+)*)?$/;
 
 /** One configured capability: supported, explicitly unsupported, or not known. */
 export type CapabilityStatus = 'supported' | 'missing' | 'unknown';

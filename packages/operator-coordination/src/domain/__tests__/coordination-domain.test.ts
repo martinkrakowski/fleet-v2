@@ -611,7 +611,7 @@ describe('ProjectProfile', () => {
 });
 
 describe('ProjectProfile generator versions', () => {
-  it.each(['password', 'api-key', 'abc.def.ghi'])(
+  it.each(['password', 'api-key', 'abc.def.ghi', '1.2.3-password', '1.2.3-api-key', '1.2.3+secret'])(
     'refuses the credential-shaped generator version %s',
     (version) => {
       expect(() =>

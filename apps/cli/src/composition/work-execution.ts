@@ -357,6 +357,8 @@ export function composeExecution(input: ComposeExecutionInput) {
         projectId: request.projectId,
         actionScope: forgeActionScope(request.actionKind),
         expectedHeadSha: request.expectedHeadSha,
+        // CO24e: the grant records the attempt it is resolved for, durably.
+        attemptId: request.attemptId,
       });
       if (result.outcome === 'authorized') {
         resolveCoordinates.set(result.grantId, {
@@ -407,8 +409,7 @@ export function composeExecution(input: ComposeExecutionInput) {
         };
       }
       // Coordinates recorded at resolve time bind the grant to its attempt;
-      // a fresh process reloads them from disk before falling back to the
-      // head-matching scan over all recorded attempts.
+      // a fresh process reloads them from disk.
       if (
         !resolveCoordinates.has(request.authorizationGrantId) &&
         authorizationCoordinatesPath !== undefined
@@ -428,17 +429,25 @@ export function composeExecution(input: ComposeExecutionInput) {
         }
       }
       const coordinates = resolveCoordinates.get(request.authorizationGrantId);
-      const boundAttempt =
-        coordinates === undefined
-          ? null
-          : await attemptRepository.findAttemptById(coordinates.attemptId);
+      // The grant record names its attempt (CO24e: written at issue, at request
+      // time or at the first resolve); the resolve-time coordinates are the
+      // fallback. A legacy grant carries neither: the request's own attempt is
+      // then the only candidate (CO24d), validated at the head below. No
+      // attempt is ever picked by head alone.
+      const resolvedAttemptId = grant.grantAttemptId ?? grant.policyGrant?.attemptId ?? coordinates?.attemptId;
+      if (resolvedAttemptId !== undefined) {
+        if (request.attemptId !== undefined && request.attemptId !== resolvedAttemptId) {
+          return { outcome: 'refused', reason: 'grant-attempt-mismatch' };
+        }
+      } else if (typeof request.attemptId !== 'string') {
+        return { outcome: 'refused', reason: 'grant-attempt-unresolved' };
+      }
+      const boundAttemptId = resolvedAttemptId ?? request.attemptId;
       const attempt =
-        boundAttempt !== null && boundAttempt.artifacts?.headCommit === request.expectedHeadSha
-          ? boundAttempt
-          : (await attemptRepository.listAllAttempts()).find(
-              (candidate) => candidate.artifacts?.headCommit === request.expectedHeadSha,
-            );
-      if (attempt === undefined) {
+        typeof boundAttemptId === 'string'
+          ? await attemptRepository.findAttemptById(boundAttemptId)
+          : null;
+      if (attempt === null || attempt.artifacts?.headCommit !== request.expectedHeadSha) {
         return {
           outcome: 'refused',
           reason:

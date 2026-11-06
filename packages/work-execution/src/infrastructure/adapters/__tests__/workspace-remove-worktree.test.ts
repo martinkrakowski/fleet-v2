@@ -570,6 +570,21 @@ describe('removeWorktree over a fake executor', () => {
     expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
   });
 
+  it('refuses busy when the reflog activity cannot be read', async () => {
+    const { result, calls } = await removeWith({
+      [LIST_MARKER]: { stdout: worktreeList() },
+      [HEAD_MARKER]: { stdout: `${HEAD}\n` },
+      [STATUS_MARKER]: { stdout: '' },
+      [GIT_DIR_MARKER]: { stdout: `${WORKTREE}/.git\n` },
+      [TEST_E_MARKER]: { exitCode: 1 },
+      ...quietActivityCanned(),
+      [REFLOG_MARKER]: { exitCode: 128 },
+      [REMOVE_MARKER]: { exitCode: 0 },
+    });
+    expect(result).toEqual({ outcome: 'refused', reason: 'busy' });
+    expect(calls.some((call) => call.argv.includes('remove'))).toBe(false);
+  });
+
   it('refuses busy when the index activity cannot be read', async () => {
     const { result, calls } = await removeWith({
       [LIST_MARKER]: { stdout: worktreeList() },

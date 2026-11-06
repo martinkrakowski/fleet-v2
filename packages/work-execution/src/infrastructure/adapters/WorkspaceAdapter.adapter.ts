@@ -2411,12 +2411,13 @@ export class WorkspaceAdapter implements WorkspacePort {
     if (reflogMs !== null) {
       newestMs = reflogMs;
     }
+    // An unreadable reflog is an unreadable activity source: too coarse to prove quiet.
+    let coarse = reflogMs === null;
 
     // Detect the `stat` flavour once: GNU (`-c %Y`) or BSD (`-f %m`).
     const flavour = await detectStatFlavour(executor, worktreePath);
 
     let unknown = false;
-    let coarse = false;
     if (flavour === null) {
       // Neither stat answered: the index mtime and the walk are unknown.
       unknown = true;

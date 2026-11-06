@@ -73,6 +73,8 @@ describe("View nav P12 sample labels", () => {
     expect(todoIndex).toBeGreaterThan(-1);
     expect(questionsIndex).toBeGreaterThan(todoIndex);
     expect(todoIndex).toBeGreaterThan(lanesIndex);
+    // Directly above: no other rail entry sits between To-do and Questions (TD5a review minor).
+    expect(viewNav.slice(todoIndex + 1, questionsIndex)).not.toContain('href: "');
   });
 
   it("leaves To-do unmarked as sample", () => {

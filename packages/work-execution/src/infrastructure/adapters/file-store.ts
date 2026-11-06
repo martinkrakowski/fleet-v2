@@ -219,7 +219,7 @@ export interface QuarantineFs {
 /**
  * Error thrown when a JSON state file cannot be parsed or validated. The
  * quarantine path names the byte-exact copy kept for recovery; it is null
- * only when the copy itself failed.
+ * only when the copy itself failed or quarantine was never attempted.
  */
 export class StateFileUnreadableError extends Error {
   readonly filePath: string;
@@ -232,6 +232,7 @@ export class StateFileUnreadableError extends Error {
     detail: string,
     copyError?: unknown,
     postWriteNotes?: QuarantinePostWriteNotes,
+    quarantineAttempted?: boolean,
   ) {
     const notes: string[] = [];
     if (postWriteNotes?.chmodFailed === true) {
@@ -244,16 +245,30 @@ export class StateFileUnreadableError extends Error {
       notes.push(`pruning old copies failed (${postWriteNotes.pruneFailures})`);
     }
     let disposition: string;
+    let advice: string;
     if (quarantinePath !== null) {
       const notesSuffix = notes.length > 0 ? `; ${notes.join('; ')}` : '';
       disposition = `its bytes were kept at ${quarantinePath}${notesSuffix}`;
+      advice = 'restore it from that copy or repair it by hand; no command reads or writes this store until then';
+    } else if (quarantineAttempted === false) {
+      // Quarantine was never reached (for example a lock-side refusal), so
+      // claiming the bytes could not be copied and advising a manual repair
+      // would mislead the operator: nothing was read to quarantine and the
+      // store bytes were not modified.
+      disposition =
+        copyError instanceof Error && copyError.message !== ''
+          ? `no quarantine was attempted (${copyError.message})`
+          : 'no quarantine was attempted';
+      advice = 'the store bytes were not modified; resolve the reported condition and retry';
     } else if (copyError instanceof Error && copyError.message !== '') {
       disposition = `its bytes could not be copied (${copyError.message})`;
+      advice = 'restore it from that copy or repair it by hand; no command reads or writes this store until then';
     } else {
       disposition = 'its bytes could not be copied';
+      advice = 'restore it from that copy or repair it by hand; no command reads or writes this store until then';
     }
     super(
-      `State file ${filePath} is unreadable (${detail}); ${disposition}; restore it from that copy or repair it by hand; no command reads or writes this store until then`,
+      `State file ${filePath} is unreadable (${detail}); ${disposition}; ${advice}`,
     );
     this.name = 'StateFileUnreadableError';
     this.filePath = filePath;
@@ -872,6 +887,8 @@ export async function readOrQuarantineVersionedRecordList<T>(
         null,
         `timed out waiting for the store lock after ${lockTimeoutMs}ms`,
         error,
+        undefined,
+        false,
       );
     }
     const code = errorCodeOf(error);
@@ -884,6 +901,8 @@ export async function readOrQuarantineVersionedRecordList<T>(
           null,
           `the state directory is not writable (${code})`,
           error,
+          undefined,
+          false,
         );
       }
     }

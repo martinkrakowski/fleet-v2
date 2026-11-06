@@ -1552,6 +1552,11 @@ describe('readBoundedStoreBytes and readOrQuarantineVersionedRecordList', () => 
     const unreadable = error as StateFileUnreadableError;
     expect(unreadable.quarantinePath).toBeNull();
     expect(unreadable.cause).toBeInstanceOf(FileLockTimeoutError);
+    // Quarantine was never attempted on a lock-side refusal, so the message
+    // must not claim the bytes could not be copied nor advise a manual repair.
+    expect(unreadable.message).not.toContain('could not be copied');
+    expect(unreadable.message).not.toContain('repair it by hand');
+    expect(unreadable.message).toContain('no quarantine was attempted');
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(await fs.readFile(filePath)).toEqual(bytes);
     await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
@@ -1579,6 +1584,9 @@ describe('readBoundedStoreBytes and readOrQuarantineVersionedRecordList', () => 
     const unreadable = error as StateFileUnreadableError;
     expect(unreadable.quarantinePath).toBeNull();
     expect((unreadable.cause as NodeJS.ErrnoException).code).toBe('EACCES');
+    expect(unreadable.message).not.toContain('could not be copied');
+    expect(unreadable.message).not.toContain('repair it by hand');
+    expect(unreadable.message).toContain('no quarantine was attempted');
     await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
     expect(await fs.readFile(filePath)).toEqual(Buffer.from('{ not json'));
   });

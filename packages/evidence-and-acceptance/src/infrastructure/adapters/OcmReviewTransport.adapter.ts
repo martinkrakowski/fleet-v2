@@ -867,7 +867,12 @@ function parseFindingLines(text: string): ReviewFindingRecord[] {
   return findings;
 }
 
-/** The verdict on the last non-empty line of `verdictText`, or null when that line carries none. */
+/**
+ * The verdict on the last non-empty line of the whole joined answer, or null
+ * when that line carries none. The argument is always the whole answer (every
+ * text part joined in order), never a single part or a pre-extracted verdict
+ * snippet.
+ */
 function lastLineVerdict(verdictText: string): 'PASS' | 'FAIL' | null {
   // Echoed untrusted blocks and fenced diffs are data, never the reviewer's
   // verdict; an unclosed one swallows to EOF, so no verdict line remains.
@@ -898,7 +903,8 @@ function lastLineVerdict(verdictText: string): 'PASS' | 'FAIL' | null {
  * part joined in order): one path for every answer shape. The verdict is the
  * last non-empty line of the text left after untrusted blocks are stripped;
  * an unclosed block or fence anywhere makes the answer unparseable. The
- * second parameter is ignored and kept only so existing callers compile.
+ * second parameter (`_ignoredVerdictText`) has no effect on the parse; it is
+ * kept only so existing callers compile.
  */
 export function parseReviewReply(text: string, _ignoredVerdictText?: string): ParsedReviewReply {
   if (typeof text !== 'string') {
@@ -925,7 +931,9 @@ export function parseReviewReply(text: string, _ignoredVerdictText?: string): Pa
  * PASS with any blocker or major finding is a fail, a FAIL with zero findings
  * is unknown (the run parks ambiguous rather than starting a fix round
  * without findings), and a missing verdict is unknown. Manual reviews keep
- * `parseReviewReply` unchanged.
+ * `parseReviewReply` unchanged. The second parameter
+ * (`_ignoredVerdictText`) has no effect; it is kept only so existing callers
+ * compile.
  */
 export function parseReviewReplyStrict(text: string, _ignoredVerdictText?: string): ParsedReviewReply {
   if (typeof text !== 'string') {

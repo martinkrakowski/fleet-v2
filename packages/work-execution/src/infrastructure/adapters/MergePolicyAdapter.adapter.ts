@@ -62,7 +62,8 @@ const REPOSITORY_KEYS: readonly string[] = [
   'veto',
 ];
 const VETO_KEYS: readonly string[] = ['mode', 'holdConfidence'];
-const DAEMON_KEYS: readonly string[] = ['intervalSeconds', 'budgetSeconds', 'settleSeconds'];
+const DAEMON_KEYS: readonly string[] = ['intervalSeconds', 'budgetSeconds', 'settleSeconds', 'chainRefresh'];
+const CHAIN_REFRESH_MODES: ReadonlySet<string> = new Set(['shadow', 'invalid']);
 
 const UNREADABLE: MergePolicyAnswer = Object.freeze({
   outcome: 'unknown',
@@ -272,16 +273,24 @@ function readDaemon(value: unknown): MergePolicyDaemonSettings | undefined {
   const intervalSeconds = ownValue(value, 'intervalSeconds');
   const budgetSeconds = ownValue(value, 'budgetSeconds');
   const settleSeconds = ownValue(value, 'settleSeconds');
+  const chainRefresh = ownValue(value, 'chainRefresh');
   if (
     !isIntegerInRange(intervalSeconds, INTERVAL_RANGE) ||
     !isIntegerInRange(budgetSeconds, BUDGET_RANGE) ||
     !isIntegerInRange(settleSeconds, SETTLE_RANGE) ||
     budgetSeconds >= intervalSeconds ||
+    typeof chainRefresh !== 'string' ||
+    !CHAIN_REFRESH_MODES.has(chainRefresh) ||
     !hasExactlyKeys(value, DAEMON_KEYS)
   ) {
     return undefined;
   }
-  return Object.freeze({ intervalSeconds, budgetSeconds, settleSeconds });
+  return Object.freeze({
+    intervalSeconds,
+    budgetSeconds,
+    settleSeconds,
+    chainRefresh: chainRefresh as 'shadow' | 'invalid',
+  });
 }
 
 function answerFor(source: unknown): MergePolicyAnswer {

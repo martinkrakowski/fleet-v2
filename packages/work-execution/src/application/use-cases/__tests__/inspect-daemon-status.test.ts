@@ -52,7 +52,7 @@ function known(intervalSeconds: number): MergePolicyAnswer {
     outcome: 'known',
     policyRevision: 'abcdef012345',
     repositories: [],
-    daemon: { intervalSeconds, budgetSeconds: 45, settleSeconds: 20 },
+    daemon: { intervalSeconds, budgetSeconds: 45, settleSeconds: 20, chainRefresh: 'shadow' },
   };
 }
 

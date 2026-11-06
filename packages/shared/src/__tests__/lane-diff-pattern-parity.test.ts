@@ -35,7 +35,7 @@ function scriptPatternTable(): Array<{ name: string; ere: string }> {
   const rows: Array<{ name: string; ere: string }> = [];
   for (let index = start + 1; index < lines.length; index += 1) {
     const line = lines[index];
-    if (line.trimEnd() === 'PAT') {
+    if (line === 'PAT') {
       break;
     }
     const bar = line.indexOf('|');

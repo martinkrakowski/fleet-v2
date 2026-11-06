@@ -21,8 +21,10 @@
  * higher-precedence source left, `info/attributes` in the COMMON git dir (found
  * with `rev-parse --git-path`, which is right for a linked worktree), is read with
  * `cat` and scanned in TypeScript, immediately before `add`: the save is refused
- * (`unreadable-tree`) if it assigns the `filter` attribute or cannot be read;
- * only an ENOENT answer counts as confirmed absence. Argv commands only, no shell.
+ * (`unreadable-tree`) if any non-comment line contains the text `filter` or the
+ * file cannot be read; only an ENOENT answer counts as confirmed absence. A second
+ * guard runs `git config --get-regexp '^filter\.'` just before `add`: any filter
+ * driver defined in the repository config refuses the save. Argv commands only, no shell.
  * Git config is pinned too (no system or global config).
  * The `update-ref` carries the all-zeros expected old value, so a concurrent
  * save's ref can never be overwritten: a lost race re-reads the ref and
@@ -54,16 +56,17 @@ const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MESSAGE_PATTERN = /^[A-Za-z0-9 ._:-]{1,200}$/;
 const SECRET_SHAPED_RUN = /[A-Za-z0-9_-]{32,}/;
 
-/** A gitattributes line token that selects (or unsets) the filter attribute. */
-const ATTR_FILTER = /(^|\s)[-!]?filter(\s|=|$)/;
+/** Git's own wording for a missing file, anchored to the end of the message. */
+const NO_SUCH_FILE = /: No such file or directory\s*$/;
 const MIN_GIT: readonly [number, number] = [2, 40];
 
-/** True when the attributes text assigns, unsets or resets `filter` on any non-comment line. */
-const assignsFilter = (text: string): boolean =>
-  text.split(/\r?\n/).some((line) => {
-    const trimmed = line.trim();
-    return trimmed !== '' && !trimmed.startsWith('#') && ATTR_FILTER.test(trimmed);
-  });
+/**
+ * Fail closed: true when ANY non-comment line contains the substring `filter`
+ * (case-sensitive, as git is). No attribute-syntax parsing: git accepts forms
+ * such as a C-quoted pattern glued to the attribute (`"*"filter=x`).
+ */
+const mentionsFilter = (text: string): boolean =>
+  text.split(/\r?\n/).some((line) => !line.trimStart().startsWith('#') && line.includes('filter'));
 
 /** Environment hardening that travels inside every argv so it reaches a remote ssh executor too. */
 const ENV_GUARDS = [
@@ -212,11 +215,22 @@ export class LaneEditSaveAdapter implements LaneEditSavePort {
       if (where.exitCode !== 0 || !isAbsolute(where.stdout)) throw refuse('unreadable-tree');
       const read = await run(['env', 'LC_ALL=C', 'cat', '--', where.stdout]);
       if (read.exitCode === 0) {
-        if (assignsFilter(read.stdout)) throw refuse('unreadable-tree');
+        if (mentionsFilter(read.stdout)) throw refuse('unreadable-tree');
         return;
       }
       // Only a plain "no such file" is confirmed absence; any other failure is unknown.
-      if (!/No such file or directory/.test(read.stderr)) throw refuse('unreadable-tree');
+      if (!NO_SUCH_FILE.test(read.stderr)) throw refuse('unreadable-tree');
+    };
+
+    // Second guard, immediately before `add`: no filter driver may be defined in the
+    // repository's config at all. Exit 1 with no output is "none defined"; anything
+    // else refuses. The hardening list itself sets `filter.lfs.*` on the command
+    // line (scope `command`), which `--show-scope` lets us tell apart from config files.
+    const checkNoFilterDriver = async (): Promise<void> => {
+      const ran = await run(git(worktree, ['config', '--show-scope', '--get-regexp', '^filter\\.'], indexEnv));
+      const defined = ran.stdout.split('\n').some((line) => line.trim() !== '' && !line.startsWith('command\t'));
+      if (defined) throw refuse('unreadable-tree');
+      if (ran.exitCode !== 0 && ran.exitCode !== 1) throw refuse('unreadable-tree');
     };
 
     // A per-save random name: concurrent saves for the same ref never share an index.
@@ -236,6 +250,7 @@ export class LaneEditSaveAdapter implements LaneEditSavePort {
         await step(git(worktree, ['read-tree', '--empty'], indexEnv));
       }
       await checkInfoAttributes();
+      await checkNoFilterDriver();
       await step(git(worktree, ['add', '-A', '--', '.'], indexEnv));
       worktreeTree = await readId(worktree, ['write-tree'], indexEnv);
     } catch (error: unknown) {

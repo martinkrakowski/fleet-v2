@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, type TestContext } from 'vitest';
 
 import type {
   CommandExecutorPort,
@@ -42,7 +42,9 @@ interface World {
   timeoutOn?: string;
   /** `.git/info/attributes` state: absent, present without a filter, or selecting a clean filter. */
   gitVersion: string;
-  infoAttributes: 'absent' | 'harmless' | 'filter' | 'probe-error' | 'unsearchable';
+  infoAttributes: 'absent' | 'harmless' | 'filter' | 'quoted-filter' | 'probe-error' | 'unsearchable' | 'enoent-midline';
+  /** Result of `git config --get-regexp ^filter.`: none (exit 1), a driver defined, or a failure. */
+  filterConfig: 'none' | 'command-only' | 'defined' | 'exit-128' | 'exit-0-empty';
   /** When set, the first update-ref fails and the ref appears as this concurrent save (null: still absent). */
   updateRefFailsOnce?: { commit: string; tree: string } | null;
 }
@@ -59,6 +61,7 @@ class FakeExecutor implements CommandExecutorPort {
     timeoutOn: undefined,
     gitVersion: 'git version 2.43.0',
     infoAttributes: 'absent',
+    filterConfig: 'none',
     updateRefFailsOnce: undefined,
   };
 
@@ -80,6 +83,8 @@ class FakeExecutor implements CommandExecutorPort {
         filter: { exitCode: 0, signal: null, stdout: '*.c text\n* filter=x\n', stderr: '' },
         'probe-error': denied,
         unsearchable: { exitCode: 1, signal: null, stdout: '', stderr: 'cat: x: Is a directory\n' },
+        'quoted-filter': { exitCode: 0, signal: null, stdout: '"*"filter=x\n', stderr: '' },
+        'enoent-midline': { exitCode: 1, signal: null, stdout: '', stderr: 'cat: x: No such file or directory: Permission denied\n' },
       } as const;
       return states[this.world.infoAttributes];
     }
@@ -89,6 +94,16 @@ class FakeExecutor implements CommandExecutorPort {
       return ok(inClone ? this.world.cloneCommon : this.world.worktreeCommon);
     }
     if (sub === '--version') return ok(this.world.gitVersion);
+    if (sub.startsWith('config --show-scope --get-regexp ^filter\\.')) {
+      const states = {
+        none: exit(1),
+        'command-only': ok('command\tfilter.lfs.clean\t'),
+        defined: ok('local\tfilter.x.clean\ttouch m; cat'),
+        'exit-128': exit(128),
+        'exit-0-empty': { exitCode: 0, signal: null, stdout: '', stderr: '' },
+      } as const;
+      return states[this.world.filterConfig];
+    }
     if (sub === 'rev-parse --path-format=absolute --git-path info/attributes') return ok(`${this.world.worktreeCommon}/info/attributes`);
     if (sub === 'rev-parse --verify --quiet HEAD^{commit}') return this.world.headExists ? ok(HEAD) : exit(1);
     if (sub === 'hash-object -w -t tree /dev/null') return ok(EMPTY_TREE);
@@ -273,7 +288,7 @@ describe('LaneEditSaveAdapter', () => {
     for (const banned of ['push', 'fetch', 'pull', 'checkout', 'switch', 'reset', 'commit', 'remote', 'credential', 'clean', 'rm', 'gc']) {
       expect(verbs).not.toContain(banned);
     }
-    expect(new Set(verbs)).toEqual(new Set(['--version', 'rev-parse', 'read-tree', 'add', 'write-tree', 'commit-tree', 'update-ref', 'hash-object']));
+    expect(new Set(verbs)).toEqual(new Set(['--version', 'rev-parse', 'read-tree', 'add', 'write-tree', 'commit-tree', 'update-ref', 'hash-object', 'config']));
     expect(executor.calls.every((call) => call.argv.every((word) => !/--no-verify|credential|push/.test(word)))).toBe(true);
   });
 
@@ -363,6 +378,27 @@ describe('LaneEditSaveAdapter', () => {
     }
   });
 
+  it.each(['quoted-filter', 'enoent-midline'] as const)('a %s attributes file refuses the save before any staging', async (state) => {
+    const executor = new FakeExecutor();
+    executor.world.infoAttributes = state;
+    expect(await new LaneEditSaveAdapter(executor).saveLaneEdits(request())).toEqual({ outcome: 'refused', reason: 'unreadable-tree' });
+    expect(executor.subcommands().some((sub) => sub.startsWith('add'))).toBe(false);
+  });
+
+  it.each(['defined', 'exit-128'] as const)('a %s filter-config probe refuses the save before add', async (state) => {
+    const executor = new FakeExecutor();
+    executor.world.filterConfig = state;
+    expect(await new LaneEditSaveAdapter(executor).saveLaneEdits(request())).toEqual({ outcome: 'refused', reason: 'unreadable-tree' });
+    const subs = executor.subcommands();
+    for (const verb of ['add', 'write-tree', 'commit-tree', 'update-ref']) expect(subs.some((sub) => sub.startsWith(verb))).toBe(false);
+  });
+
+  it.each(['none', 'command-only', 'exit-0-empty'] as const)('a %s filter-config probe lets the save proceed', async (state) => {
+    const executor = new FakeExecutor();
+    executor.world.filterConfig = state;
+    expect(await new LaneEditSaveAdapter(executor).saveLaneEdits(request())).toMatchObject({ outcome: 'saved' });
+  });
+
   it.each(['probe-error', 'unsearchable'] as const)('a %s attributes probe refuses the save before any staging', async (state) => {
     const executor = new FakeExecutor();
     executor.world.infoAttributes = state;
@@ -383,7 +419,14 @@ describe('LaneEditSaveAdapter', () => {
     const cat = order.findIndex((line) => line.includes(' cat '));
     const add = order.findIndex((line) => line.includes(' add -A'));
     expect(cat).toBeGreaterThan(-1);
-    expect(order[add - 1]).toContain(' cat ');
+    const config = order.findIndex((line) => line.includes(' config --show-scope --get-regexp '));
+    expect(config).toBeGreaterThan(cat);
+    expect(order[add - 1]).toContain(' config --show-scope --get-regexp ');
+    expect(order[config]).toContain('GIT_CONFIG_NOSYSTEM=1');
+    expect(order[config]).toContain('GIT_CONFIG_GLOBAL=/dev/null');
+    expect(order[config]).toContain('GIT_ALLOW_PROTOCOL=none');
+    expect(order[config]).toContain(`-C ${WORKTREE}`);
+    expect(order[config]).toContain('core.hooksPath=/dev/null');
     expect(cat).toBeLessThan(add);
     expect(executor.subcommands()).toContain('rev-parse --path-format=absolute --git-path info/attributes');
   });
@@ -422,12 +465,19 @@ describe('LaneEditSaveAdapter', () => {
         cwd, encoding: 'utf8',
         env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' },
       }).trim();
-    let available = true;
+    let skipReason: string | null = null;
     try {
-      execFileSync('git', ['--version'], { stdio: 'ignore' });
+      const version = execFileSync('git', ['--version'], { encoding: 'utf8' });
+      const match = /^git version (\d+)\.(\d+)/.exec(version);
+      if (match === null || Number(match[1]) < 2 || (Number(match[1]) === 2 && Number(match[2]) < 40)) {
+        skipReason = `git >= 2.40 is required (GIT_ATTR_SOURCE); found ${version.trim()}`;
+      }
     } catch {
-      available = false;
+      skipReason = 'no git binary is available on the host running the tests';
     }
+    const needGit = (context: TestContext): void => {
+      if (skipReason !== null) context.skip(skipReason);
+    };
     const setup = (): { clone: string; worktree: string } => {
       const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lane-edit-save-')));
       const clone = path.join(root, 'clone');
@@ -443,17 +493,41 @@ describe('LaneEditSaveAdapter', () => {
     };
     const realRequest = (clone: string, worktree: string): LaneEditSaveRequest => request({ clonePath: clone, worktreePath: worktree });
 
-    // Skipped only when no git binary is available on the host running the tests.
-    it.skipIf(!available)('saves a linked worktree when no attributes file exists', async () => {
+    // Skipped, with the reason stated, when git is missing or older than 2.40.
+    it('saves a linked worktree when no attributes file and no filter config exist (control)', async (context) => {
+      needGit(context);
       const { clone, worktree } = setup();
       const result = await new LaneEditSaveAdapter(new LocalExecutor()).saveLaneEdits(realRequest(clone, worktree));
       expect(result).toMatchObject({ outcome: 'saved' });
     });
 
-    it.skipIf(!available)('refuses a linked worktree when the COMMON info/attributes assigns a filter', async () => {
+    it('refuses a linked worktree when the COMMON info/attributes assigns a filter', async (context) => {
+      needGit(context);
       const { clone, worktree } = setup();
       fs.mkdirSync(path.join(clone, '.git', 'info'), { recursive: true });
       fs.writeFileSync(path.join(clone, '.git', 'info', 'attributes'), '* filter=x\n');
+      const marker = path.join(path.dirname(clone), 'filter-ran');
+      git(clone, ['config', 'filter.x.clean', `touch ${marker}; cat`]);
+      const result = await new LaneEditSaveAdapter(new LocalExecutor()).saveLaneEdits(realRequest(clone, worktree));
+      expect(result).toEqual({ outcome: 'refused', reason: 'unreadable-tree' });
+      expect(fs.existsSync(marker)).toBe(false);
+    });
+
+    it('refuses a filter glued to a C-quoted pattern (git reads "*"filter=x as a filter)', async (context) => {
+      needGit(context);
+      const { clone, worktree } = setup();
+      fs.mkdirSync(path.join(clone, '.git', 'info'), { recursive: true });
+      fs.writeFileSync(path.join(clone, '.git', 'info', 'attributes'), '"*"filter=x\n');
+      const marker = path.join(path.dirname(clone), 'filter-ran');
+      git(clone, ['config', 'filter.x.clean', `touch ${marker}; cat`]);
+      const result = await new LaneEditSaveAdapter(new LocalExecutor()).saveLaneEdits(realRequest(clone, worktree));
+      expect(result).toEqual({ outcome: 'refused', reason: 'unreadable-tree' });
+      expect(fs.existsSync(marker)).toBe(false);
+    });
+
+    it('refuses when a filter driver is defined in the repository config, even with no attributes file', async (context) => {
+      needGit(context);
+      const { clone, worktree } = setup();
       const marker = path.join(path.dirname(clone), 'filter-ran');
       git(clone, ['config', 'filter.x.clean', `touch ${marker}; cat`]);
       const result = await new LaneEditSaveAdapter(new LocalExecutor()).saveLaneEdits(realRequest(clone, worktree));

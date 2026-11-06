@@ -18,6 +18,7 @@ import type { ReviewReceiptOfKind } from '../../ports/out/ReviewRequestPort.out-
 import type { WorkOrderRecord } from '../../../domain/execution-records.js';
 import { laneRunMergeHold } from '../../../domain/lane-run-transitions.js';
 import type { LaneRunMergeHold } from '../../../domain/lane-run-transitions.js';
+import { decideConductorReviewOutcome } from '../../../domain/lane-run-decider.js';
 import { buildLaneRunStepKey, parseLaneRunKey, LANE_RUN_MAX_RETRY } from '../../../domain/lane-run-keys.js';
 import type { LaneRunRecord } from '../../../domain/lane-run-records.js';
 import type { LaneRunDecision } from '../../../domain/lane-run-decider.js';
@@ -128,18 +129,12 @@ async function premergeReceiptIdOf(
   }
 }
 
-/** The verdict of one re-read receipt: passed/failed/unknown (anything else is unknown). */
-function verdictOfReceipt(verdict: Readonly<ReviewReceiptOfKind['verdict']>): 'passed' | 'failed' | 'unknown' {
-  if (verdict === 'passed') {
-    return 'passed';
-  }
-  if (verdict === 'failed') {
-    return 'failed';
-  }
-  return 'unknown';
+/** The blocking (`blocker`/`major`) finding count of a receipt (RV3). */
+function blockingFindingsCountOf(findings: readonly { readonly severity: string }[]): number {
+  return findings.filter((finding) => finding.severity === 'blocker' || finding.severity === 'major').length;
 }
 
-/** The re-read receipt's verdict at the exact head, like `preMergeFactOf`. */
+/** The re-read receipt's verdict at the exact head, like `preMergeFactOf` (RV3: severity-derived). */
 async function premergeVerdictOf(
   ctx: AdvanceStepContext,
   latest: { readonly id: string },
@@ -160,7 +155,9 @@ async function premergeVerdictOf(
       if (read.receipt.kind !== 'pre-merge' || read.receipt.candidateHeadSha !== headSha) {
         return { receipt: null, verdict: 'unknown' };
       }
-      return { receipt: read.receipt, verdict: verdictOfReceipt(read.receipt.verdict) };
+      // RV3: the severity outcome decides — a minor-only `failed` receipt
+      // releases the hold, a 0-finding `failed` receipt is unknown.
+      return { receipt: read.receipt, verdict: decideConductorReviewOutcome(read.receipt).outcome };
     }
     return { receipt: null, verdict: read.outcome === 'not-found' ? 'none' : 'unknown' };
   } catch {
@@ -318,7 +315,7 @@ export async function performPremerge(
     decision,
     request,
     true,
-    read.receipt?.findings.length ?? 0,
+    blockingFindingsCountOf(read.receipt?.findings ?? []),
     receiptId,
   );
 }
@@ -526,7 +523,7 @@ export async function reconcilePremerge(
     decision,
     request,
     false,
-    read.receipt?.findings.length ?? 0,
+    blockingFindingsCountOf(read.receipt?.findings ?? []),
     receiptId,
   );
 }

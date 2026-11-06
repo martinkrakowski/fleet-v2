@@ -438,7 +438,89 @@ export const REVIEWER_ENV_ALLOWLIST: readonly string[] = [
 ];
 
 const VERDICT_PATTERN = /^VERDICT: (PASS|FAIL|FIX FIRST)$/;
-const FINDING_PATTERN = /^FINDING: (blocker|major|minor|nit) (\S+?)(?::(\d+))? (.+)$/i;
+const FINDING_PATTERN = /^FINDING: ([A-Za-z][\w-]*) (\S+?)(?::(\d+))? (.+)$/i;
+
+/**
+ * RV3: reviewer severity words that are not the four declared ones but mean
+ * one of them. Anything else is not guessed at: a finding with an unrecognised
+ * severity makes the whole reply unparseable (never silently dropped).
+ */
+const SEVERITY_SYNONYMS: Readonly<Record<string, FindingSeverity>> = {
+  blocker: 'blocker',
+  major: 'major',
+  minor: 'minor',
+  nit: 'nit',
+  critical: 'blocker',
+  severe: 'blocker',
+  high: 'major',
+  medium: 'major',
+  low: 'minor',
+  info: 'nit',
+  trivial: 'nit',
+};
+
+function normalizeSeverity(word: string): FindingSeverity | null {
+  const key = word.toLowerCase();
+  return Object.prototype.hasOwnProperty.call(SEVERITY_SYNONYMS, key) ? (SEVERITY_SYNONYMS[key] as FindingSeverity) : null;
+}
+
+const FILE_REFERENCE = /[\w./-]+\.\w+:\d+/;
+const LIST_OR_NUMBER_MARKER = /^(?:[-*+•>]\s+|\d+[.)]\s+)/;
+const SEVERITY_TOKEN_SKELETONS: ReadonlySet<string> = new Set([
+  'blocker', 'critical', 'major', 'high', 'severe', 'medium', 'minor', 'low', 'nit', 'info', 'trivial',
+]);
+/** Cyrillic and Greek letters that render like ASCII ones, folded before a severity-word check. */
+const LOOKALIKES: Readonly<Record<string, string>> = {
+  'а': 'a', 'с': 'c', 'е': 'e', 'о': 'o', 'р': 'p', 'х': 'x', 'у': 'y', 'і': 'i', 'ј': 'j', 'к': 'k', 'м': 'm', 'н': 'h', 'т': 't', 'ѕ': 's', 'ԁ': 'd', 'ɡ': 'g', 'ӏ': 'l', 'ᴎ': 'n',
+  'α': 'a', 'ε': 'e', 'ι': 'i', 'ο': 'o', 'ρ': 'p', 'ν': 'v', 'κ': 'k', 'τ': 't', 'η': 'n', 'μ': 'm', 'β': 'b', 'χ': 'x', 'υ': 'u',
+};
+
+/** Every markdown emphasis or code character anywhere in the line is removed, whitespace collapsed, then trimmed. */
+function normaliseFindingLine(line: string): string {
+  return line.replace(/[*_`~]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/** True when `token` (punctuation trimmed) is a severity word, spelled with ASCII or look-alike letters. */
+function isSeverityToken(token: string): boolean {
+  const bare = token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+  const folded = [...bare.toLowerCase()].map((ch) => LOOKALIKES[ch] ?? ch).join('');
+  return SEVERITY_TOKEN_SKELETONS.has(folded) || folded === 'sev' || folded === 'severity';
+}
+
+/**
+ * RV3 (Luna rounds 2-3): true when a line that no finding pattern fully parsed
+ * still looks like a finding, so the whole reply is refused rather than the
+ * line skipped. The line is normalised first (markdown characters removed
+ * everywhere, so `maj**or**` is `major`). It is finding-shaped only when it
+ * starts with `FINDING`, or with a list or number marker followed by a
+ * severity word as the first word, or (no marker) carries a `path:line`
+ * reference after a leading severity word. A `path:line` reference alone never
+ * makes prose finding-shaped.
+ */
+function looksLikeUnparsedFinding(trimmedLine: string): boolean {
+  // Every shape check runs on the normalised line. A bare `*` bullet is the
+  // one marker normalisation would erase, so it is read first.
+  const normalised = normaliseFindingLine(trimmedLine);
+  const starBullet = /^\*\s+/.exec(trimmedLine);
+  const marker = starBullet ?? LIST_OR_NUMBER_MARKER.exec(normalised);
+  const body = marker === null ? normalised : normaliseFindingLine(starBullet !== null ? trimmedLine.slice(marker[0].length) : normalised.slice(marker[0].length));
+  if (/^FINDING\b/i.test(body) || /^FINDING\b/i.test(normalised)) {
+    return true;
+  }
+  const firstWord = body.split(' ')[0] ?? '';
+  if (isSeverityToken(firstWord)) {
+    return marker !== null || FILE_REFERENCE.test(trimmedLine);
+  }
+  // The numbered shape: `N. path:line - severity. summary`.
+  const afterTarget = /^\S+ [-–—] (\S+)/.exec(body);
+  return marker !== null && afterTarget !== null && isSeverityToken(afterTarget[1] ?? '');
+}
+
+/** The findings parsed from a reply, and whether any finding line carried an unrecognised severity. */
+interface ParsedFindingLines {
+  readonly findings: ReviewFindingRecord[];
+  readonly invalid: boolean;
+}
 export const MAX_RAW_OUTPUT_LENGTH = 20000;
 
 /** Default wall-clock budget for one review run when the caller gives no timeout. */
@@ -764,7 +846,7 @@ function scanUntrustedEchoBlocks(text: string): { readonly stripped: string; rea
 function parseNumberedFindingLine(trimmedLine: string): {
   readonly firstTarget: string;
   readonly extraTargets: string;
-  readonly severity: FindingSeverity;
+  readonly severity: FindingSeverity | null;
   readonly summaryText: string;
 } | null {
   const prefixMatch = /^(\d+)\.\s+(.*)$/.exec(trimmedLine);
@@ -791,14 +873,14 @@ function parseNumberedFindingLine(trimmedLine: string): {
     index += chainMatch[0].length;
   }
   const tail = remainder.slice(index);
-  const tailMatch = /^\s+(?:—|–|-)\s+(?:\*\*(blocker|major|minor|nit)\*\*|(blocker|major|minor|nit))(?:\.\s+|:\s+|\s+)(.+)$/i.exec(tail);
+  const tailMatch = /^\s+(?:—|–|-)\s+(?:\*\*([A-Za-z][\w-]*)\*\*|(blocker|major|minor|nit|critical|high))(?:\.\s+|:\s+|\s+)(.+)$/i.exec(tail);
   if (tailMatch === null) {
     return null;
   }
   return {
     firstTarget,
     extraTargets: extraTargets.trim(),
-    severity: (tailMatch[1] ?? tailMatch[2] ?? '').toLowerCase() as FindingSeverity,
+    severity: normalizeSeverity(tailMatch[1] ?? tailMatch[2] ?? ''),
     summaryText: tailMatch[3] ?? '',
   };
 }
@@ -816,8 +898,9 @@ function targetOf(firstTarget: string): { readonly filePath: string | null; read
 }
 
 /** Every finding line of `text`, numbered in order. */
-function parseFindingLines(text: string): ReviewFindingRecord[] {
+function parseFindingLines(text: string): ParsedFindingLines {
   const findings: ReviewFindingRecord[] = [];
+  let invalid = false;
   // Echoed untrusted blocks (a repeated diff or brief) and fenced diff blocks
   // are data the reviewer was handed, never its findings: they are stripped
   // before any line is parsed.
@@ -833,9 +916,14 @@ function parseFindingLines(text: string): ReviewFindingRecord[] {
     const trimmedLine = rawLine.trim();
     const findingMatch = FINDING_PATTERN.exec(trimmedLine);
     if (findingMatch !== null) {
+      const findingSeverity = normalizeSeverity(findingMatch[1]);
+      if (findingSeverity === null) {
+        invalid = true;
+        continue;
+      }
       findings.push({
         findingId: `review-${findings.length + 1}`,
-        severity: findingMatch[1].toLowerCase() as FindingSeverity,
+        severity: findingSeverity,
         summary: findingMatch[4].trim(),
         filePath: findingMatch[2] === '-' ? null : findingMatch[2],
         line: findingMatch[3] === undefined ? null : Number.parseInt(findingMatch[3], 10),
@@ -847,6 +935,10 @@ function parseFindingLines(text: string): ReviewFindingRecord[] {
     }
     const numbered = parseNumberedFindingLine(trimmedLine);
     if (numbered !== null) {
+      if (numbered.severity === null) {
+        invalid = true;
+        continue;
+      }
       const { filePath, line } = targetOf(numbered.firstTarget);
       const summary =
         numbered.extraTargets === ''
@@ -862,9 +954,13 @@ function parseFindingLines(text: string): ReviewFindingRecord[] {
         dispositionReason: null,
         dispositionEvidenceRef: null,
       });
+      continue;
+    }
+    if (looksLikeUnparsedFinding(trimmedLine)) {
+      invalid = true;
     }
   }
-  return findings;
+  return { findings, invalid };
 }
 
 /**
@@ -910,7 +1006,12 @@ export function parseReviewReply(text: string, _ignoredVerdictText?: string): Pa
   if (typeof text !== 'string') {
     return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
   }
-  const findings = parseFindingLines(text);
+  const parsedLines = parseFindingLines(text);
+  const findings = parsedLines.findings;
+  if (parsedLines.invalid) {
+    // RV3: a finding with an unrecognised severity refuses the whole reply.
+    return { result: 'unknown', findings, unknownReason: 'unparseable-verdict' };
+  }
   const verdict = lastLineVerdict(text);
   let result: EvidenceResultValue = 'unknown';
   if (verdict === 'PASS') {
@@ -939,7 +1040,12 @@ export function parseReviewReplyStrict(text: string, _ignoredVerdictText?: strin
   if (typeof text !== 'string') {
     return { result: 'unknown', findings: [], unknownReason: 'unparseable-verdict' };
   }
-  const findings = parseFindingLines(text);
+  const parsedLines = parseFindingLines(text);
+  const findings = parsedLines.findings;
+  if (parsedLines.invalid) {
+    // RV3: a finding with an unrecognised severity refuses the whole reply.
+    return { result: 'unknown', findings, unknownReason: 'unparseable-verdict' };
+  }
   const verdict = lastLineVerdict(text);
   let result: EvidenceResultValue = 'unknown';
   if (verdict === 'PASS') {

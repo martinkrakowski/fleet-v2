@@ -12,7 +12,7 @@
  */
 
 import type { AcceptanceBlocker } from '../../../domain/acceptance-blockers.js';
-import type { EvidenceAssessmentRecord } from '../../../domain/evidence-records.js';
+import type { EvidenceAssessmentRecord, ReviewFindingRecord } from '../../../domain/evidence-records.js';
 import type { ReviewTally } from '../../../domain/review-selection.js';
 
 export interface AssessHeadAcceptanceRequest {
@@ -23,7 +23,7 @@ export interface AssessHeadAcceptanceRequest {
 }
 
 export type AssessHeadAcceptanceResult =
-  | { readonly outcome: 'accepted'; readonly receiptId: string; readonly candidateHeadSha: string; readonly assessment: EvidenceAssessmentRecord; readonly reviewTally?: ReviewTally }
+  | { readonly outcome: 'accepted'; readonly receiptId: string; readonly candidateHeadSha: string; readonly assessment: EvidenceAssessmentRecord; readonly reviewTally?: ReviewTally; readonly carriedMinors?: readonly ReviewFindingRecord[] }
   | {
       readonly outcome: 'blocked';
       /** Display texts, unchanged; `blockers[i]` is `blockerDetails[i].text`. */
@@ -50,6 +50,9 @@ export type AssessHeadReceiptsResult =
       // No assessment record: a stored acceptance (state, acceptance receipt
       // id) never travels through the receipts-only result.
       readonly reviewTally?: ReviewTally;
+      // RV3: the non-blocking `minor`/`nit` findings carried from the passing
+      // receipts of the head. Optional so external test stubs stay compatible.
+      readonly carriedMinors?: readonly ReviewFindingRecord[];
     }
   | Extract<AssessHeadAcceptanceResult, { outcome: 'blocked' | 'stale' | 'rejected' }>;
 

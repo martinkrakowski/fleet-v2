@@ -14,6 +14,7 @@ import {
 } from '../ChainRepositoryAdapter.adapter.js';
 
 const SHA = '0123456789abcdef0123456789abcdef01234567';
+const TIP = 'fedcba9876543210fedcba9876543210fedcba98';
 const REPO = { owner: 'fleet', repo: 'fleet-v2' };
 const NOW = '2026-11-05T10:00:00.000Z';
 
@@ -121,6 +122,85 @@ describe.each([['memory'], ['file']] as const)('ChainRepositoryAdapter (%s)', (m
     );
     expect(results.filter((r) => r.outcome === 'recorded')).toHaveLength(1);
     expect(results.filter((r) => r.outcome === 'refused')).toHaveLength(7);
+  });
+
+  function pinCmd(overrides: Record<string, unknown> = {}, head = TIP) {
+    return {
+      repository: REPO, chainName: 'example', expectedRevision: 2,
+      pin: { headSha: head, requestId: `chain-review:example:${head.slice(0, 12)}`, key: `chain-review/example@${head.slice(0, 12)}`, pinnedAtIso: NOW },
+      deadlineIso: deadline(), ...overrides,
+    } as never;
+  }
+
+  async function startedChain(): Promise<void> {
+    await adapter.recordChainIntent({ record: recordOf(), deadlineIso: deadline() });
+    await adapter.recordChainOutcome(outcomeCmd());
+  }
+
+  it('pins the chain tip at the expected revision and advances the revision by one', async () => {
+    await startedChain();
+    expect(await adapter.recordChainReviewPin(pinCmd())).toEqual({ outcome: 'recorded' });
+    const read = await adapter.readChain(readCmd());
+    expect(read.status === 'ok' && read.record).toMatchObject({
+      state: 'started', revision: 3, reviewPin: { headSha: TIP, key: `chain-review/example@${TIP.slice(0, 12)}` },
+    });
+  });
+
+  it('answers already-recorded for the same pin, at any revision, and writes nothing', async () => {
+    await startedChain();
+    await adapter.recordChainReviewPin(pinCmd());
+    expect(await adapter.recordChainReviewPin(pinCmd())).toEqual({ outcome: 'already-recorded' });
+    expect(await adapter.recordChainReviewPin(pinCmd({ expectedRevision: 3 }))).toEqual({ outcome: 'already-recorded' });
+    const read = await adapter.readChain(readCmd());
+    expect(read.status === 'ok' && read.record.revision).toBe(3);
+  });
+
+  it('a second pin at the same revision is refused and the first pin stands', async () => {
+    await startedChain();
+    await adapter.recordChainReviewPin(pinCmd());
+    const second = await adapter.recordChainReviewPin(pinCmd({ expectedRevision: 3 }, SHA));
+    expect(second).toEqual({ outcome: 'refused', reason: 'chain-record-stale' });
+    const read = await adapter.readChain(readCmd());
+    expect(read.status === 'ok' && read.record.reviewPin?.headSha).toBe(TIP);
+  });
+
+  it('refuses a stale or future expected revision with chain-record-stale and writes nothing', async () => {
+    await startedChain();
+    expect(await adapter.recordChainReviewPin(pinCmd({ expectedRevision: 1 }))).toEqual({
+      outcome: 'refused', reason: 'chain-record-stale',
+    });
+    expect(await adapter.recordChainReviewPin(pinCmd({ expectedRevision: 9 }))).toEqual({
+      outcome: 'refused', reason: 'chain-record-stale',
+    });
+    const read = await adapter.readChain(readCmd());
+    expect(read.status === 'ok' && read.record.reviewPin).toBeUndefined();
+  });
+
+  it('refuses a pin on an unknown chain and a malformed command with fixed codes', async () => {
+    expect(await adapter.recordChainReviewPin(pinCmd())).toEqual({ outcome: 'refused', reason: 'chain-not-found' });
+    await startedChain();
+    for (const bad of [{ expectedRevision: 0 }, { expectedRevision: 'x' }, { chainName: 'Bad/Name' }, { pin: null }]) {
+      const decision = await adapter.recordChainReviewPin(pinCmd(bad));
+      expect(decision.outcome).toBe('refused');
+      expect(JSON.stringify(decision)).not.toContain(stateDir);
+    }
+    expect(await adapter.recordChainReviewPin(pinCmd({ pin: { headSha: TIP, requestId: 'r', key: 'chain-review/example@aaaaaaaaaaaa', pinnedAtIso: NOW } }))).toEqual({
+      outcome: 'refused', reason: 'invalid-request',
+    });
+    expect(await adapter.recordChainReviewPin(pinCmd({ deadlineIso: '2020-01-01T00:00:00.000Z' }))).toEqual({
+      outcome: 'refused', reason: 'deadline-expired',
+    });
+  });
+
+  it('lets exactly one of many concurrent different pins win', async () => {
+    await startedChain();
+    const other = mode === 'file' ? new ChainRepositoryAdapter({ stateDir }) : adapter;
+    const heads = [TIP, SHA, 'a'.repeat(40), 'b'.repeat(40)];
+    const results = await Promise.all(
+      heads.map((head, i) => (i % 2 === 0 ? adapter : other).recordChainReviewPin(pinCmd({}, head))),
+    );
+    expect(results.filter((r) => r.outcome === 'recorded')).toHaveLength(1);
+    expect(results.filter((r) => r.outcome === 'refused')).toHaveLength(3);
   });
 
   it('lets exactly one of many concurrent intents record', async () => {

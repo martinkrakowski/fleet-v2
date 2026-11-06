@@ -8,7 +8,12 @@ import type {
   AttemptRecord,
   CapacityReservationRecord,
 } from './execution-records.js';
+import { laneRunJournalState } from './lane-run-journal.js';
+import type { LaneRunJournalEntryRecord } from './lane-run-journal.js';
+import type { LaneRunRecord } from './lane-run-records.js';
 import type { AttemptStateValue } from './value-objects/AttemptState.vo.js';
+import { LANE_RUN_TERMINAL_STATES } from './value-objects/LaneRunState.vo.js';
+import type { LaneRunStateValue } from './value-objects/LaneRunState.vo.js';
 
 /** Attempt states that are terminal and collected: only these may be compacted. */
 export const COMPACTABLE_ATTEMPT_STATES: readonly AttemptStateValue[] = ['collected', 'cancelled'];
@@ -96,4 +101,26 @@ export function planAttemptScopedCompaction(
   }
 
   return { removableAttemptIds, removableReservationIds, removableJournalEntryIds };
+}
+
+/**
+ * EX-3c: the attempt ids every live (non-terminal) lane run still lists. A run
+ * is live unless its last conduct entry is terminal; a run with no journal
+ * entry reads as `ready`, so its attempts are protected. Pure.
+ */
+export function liveRunAttemptIds(
+  runs: readonly LaneRunRecord[],
+  journals: ReadonlyMap<string, readonly LaneRunJournalEntryRecord[]>,
+): readonly string[] {
+  const ids = new Set<string>();
+  for (const run of runs) {
+    const state = laneRunJournalState(journals.get(run.runId) ?? [], run.runId);
+    const terminal = (LANE_RUN_TERMINAL_STATES as readonly LaneRunStateValue[]).includes(state);
+    if (!terminal) {
+      for (const attemptId of run.attemptIds) {
+        ids.add(attemptId);
+      }
+    }
+  }
+  return [...ids];
 }

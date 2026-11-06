@@ -30,6 +30,7 @@ import type {
   HostRole,
   HostSection,
   HostRunnerSection,
+  HostTransport,
   LiveTailPolicy,
   MergeDaemonSection,
   MergePolicySection,
@@ -133,6 +134,8 @@ const SHELF_KEYS: readonly string[] = ['baseUrl', 'keyFile'];
 const HOST_KEYS: readonly string[] = [
   'transport',
   'sshAlias',
+  'container',
+  'roleAliases',
   'worktreeRoot',
   'tmpDir',
   'roles',
@@ -141,6 +144,7 @@ const HOST_KEYS: readonly string[] = [
 const HOST_RUNNER_KEYS: readonly string[] = [
   'kind',
   'port',
+  'tunnelOffset',
   'authFile',
   'capabilities',
   'maxLanes',
@@ -180,7 +184,7 @@ const CHAIN_KEYS: readonly (keyof ChainsSection)[] = [
   'fix',
 ];
 const CHAIN_STEP_KEYS: readonly string[] = ['seatId', 'triggers'];
-const POLICY_KEYS: readonly string[] = [
+export const POLICY_KEYS: readonly string[] = [
   'forbiddenRoutes',
   'perLaneCostCeiling',
   'useFreeSeats',
@@ -301,6 +305,11 @@ const CHAIN_TRIGGERS: readonly ChainTrigger[] = [
 ];
 
 const PROCEDURE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+/** Container names share the procedure-name shape; see parseHostContainer. */
+const CONTAINER_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const MAX_CONTAINER_NAME_LENGTH = 64;
+/** The tunnel offset is bounded so a dial port stays far below 65535. */
+const MAX_TUNNEL_OFFSET = 1024;
 const FORBIDDEN_PROCEDURE_NAMES: ReadonlySet<string> = new Set([
   'constructor',
   'prototype',
@@ -1169,6 +1178,70 @@ function parseGateSlot(
   return { path, slots };
 }
 
+/**
+ * Read one optional own property without ever running a getter. An accessor
+ * property is reported as `accessor`, never treated as an absent field, so
+ * the caller refuses it with a typed message instead of accepting the file.
+ */
+function readOptionalDataField(
+  record: JsonObject,
+  key: string,
+):
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'accessor' }
+  | { readonly kind: 'value'; readonly value: unknown } {
+  if (!Object.hasOwn(record, key)) {
+    return { kind: 'absent' };
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(record, key);
+  if (descriptor === undefined || 'get' in descriptor || 'set' in descriptor) {
+    return { kind: 'accessor' };
+  }
+  return descriptor.value === undefined
+    ? { kind: 'absent' }
+    : { kind: 'value', value: descriptor.value };
+}
+
+/**
+ * The optional `hosts.<name>.runner.tunnelOffset` field: how far above
+ * `runner.port` the bundled runner program dials the server. The frozen
+ * `bin/ocm-run` dials `port + 1` and refuses a different `OCM_PORT`, so the
+ * file may only declare the offset that program implements; absent means 1.
+ */
+function parseRunnerTunnelOffset(
+  runner: JsonObject,
+  runnerPath: string,
+  errors: string[],
+): number | undefined {
+  const fieldPath = `${runnerPath}.tunnelOffset`;
+  // Read without running a getter; an accessor is refused, not absent.
+  const field = readOptionalDataField(runner, 'tunnelOffset');
+  if (field.kind === 'absent') {
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${fieldPath}: must be a plain data property`);
+    return undefined;
+  }
+  const value = field.value;
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < 0 ||
+    value > MAX_TUNNEL_OFFSET
+  ) {
+    errors.push(`${fieldPath}: must be an integer from 0 to ${MAX_TUNNEL_OFFSET}`);
+    return undefined;
+  }
+  if (value !== 1) {
+    errors.push(
+      `${fieldPath}: must be 1 while the bundled runner program dials the server at port + 1`,
+    );
+    return undefined;
+  }
+  return value;
+}
+
 function parseHostRunner(
   runner: JsonObject,
   runnerPath: string,
@@ -1192,6 +1265,11 @@ function parseHostRunner(
     }
   }
   const port = readRequiredPort(runner, 'port', `${runnerPath}.port`, errors);
+  const tunnelOffset = parseRunnerTunnelOffset(
+    runner,
+    runnerPath,
+    errors,
+  );
   const authFile = readOptionalAbsolutePath(
     runner,
     'authFile',
@@ -1246,6 +1324,7 @@ function parseHostRunner(
   }
   const common = {
     port,
+    ...(tunnelOffset !== undefined ? { tunnelOffset } : {}),
     ...(authFile !== undefined ? { authFile } : {}),
     ...(capabilities !== undefined ? { capabilities } : {}),
     ...(maxLanes !== undefined ? { maxLanes } : {}),
@@ -1331,6 +1410,124 @@ export function isSafeSshHost(host: string): boolean {
   return SAFE_SSH_HOST_PATTERN.test(host);
 }
 
+/**
+ * The optional `hosts.<name>.container` field: a lowercase container name the
+ * host's runner runs in. A refused value never appears in the message.
+ */
+function parseHostContainer(
+  entry: JsonObject,
+  hostPath: string,
+  errors: string[],
+): string | undefined {
+  const fieldPath = `${hostPath}.container`;
+  // An accessor property is refused, never treated as an absent field.
+  const field = readOptionalDataField(entry, 'container');
+  if (field.kind === 'absent') {
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${fieldPath}: must be a plain data property`);
+    return undefined;
+  }
+  const value = field.value;
+  if (typeof value !== 'string' || !isNonEmptyString(value)) {
+    errors.push(`${fieldPath}: must be a non-empty string`);
+    return undefined;
+  }
+  if (value !== value.trim()) {
+    errors.push(`${fieldPath}: must not have leading or trailing whitespace`);
+    return undefined;
+  }
+  const name = value;
+  if (name.length > MAX_CONTAINER_NAME_LENGTH) {
+    errors.push(`${fieldPath}: must be at most 64 characters`);
+    return undefined;
+  }
+  // The credential check comes first, so a value carrying both a secret
+  // shape and a bad identifier shape reports the credential refusal and
+  // never the shape refusal.
+  if (containsSecretShape(name)) {
+    errors.push(`${fieldPath}: must not contain secret-shaped text`);
+    return undefined;
+  }
+  if (!CONTAINER_NAME_PATTERN.test(name)) {
+    errors.push(
+      `${fieldPath}: must be a lowercase container name matching ^[a-z0-9][a-z0-9-]*$`,
+    );
+    return undefined;
+  }
+  return name;
+}
+
+/**
+ * The optional `hosts.<name>.roleAliases` map: one ssh alias per held role
+ * that overrides the host's own alias for that role. Only an ssh host may
+ * declare it, only held roles may appear as keys, and every value must pass
+ * the loader's own safe-host rule. A refused value never appears in the
+ * message.
+ */
+function parseHostRoleAliases(
+  entry: JsonObject,
+  hostPath: string,
+  transport: HostTransport | undefined,
+  roles: readonly HostRole[] | undefined,
+  errors: string[],
+): Partial<Record<HostRole, string>> | undefined {
+  const fieldPath = `${hostPath}.roleAliases`;
+  // An accessor property is refused, never treated as an absent field.
+  const field = readOptionalDataField(entry, 'roleAliases');
+  if (field.kind === 'absent') {
+    return undefined;
+  }
+  if (field.kind === 'accessor') {
+    errors.push(`${fieldPath}: must be a plain data property`);
+    return undefined;
+  }
+  const value = field.value;
+  if (!isJsonObject(value)) {
+    errors.push(`${fieldPath}: must be an object`);
+    return undefined;
+  }
+  if (transport === 'local') {
+    // A local host has no alias to override.
+    errors.push(`${fieldPath}: must be absent when transport is "local"`);
+    return undefined;
+  }
+  if (roles === undefined) {
+    // The roles field already carried its own refusal; do not add more.
+    return undefined;
+  }
+  const aliases: Partial<Record<HostRole, string>> = {};
+  for (const key of Object.keys(value)) {
+    if (!HOST_ROLES.includes(key as HostRole)) {
+      // The key is operator input and never appears in the message.
+      errors.push(`${fieldPath}: every key must be a known host role`);
+      continue;
+    }
+    if (!roles.includes(key as HostRole)) {
+      errors.push(`${fieldPath}.${key}: the host does not hold that role`);
+      continue;
+    }
+    // Read through the record's own data property so a getter never runs.
+    const rawAlias = readOwnDataProperty(value, key);
+    if (!isNonEmptyString(rawAlias)) {
+      errors.push(`${fieldPath}.${key}: must be a non-empty string`);
+      continue;
+    }
+    // Validated as supplied: a padded alias is refused, never trimmed.
+    const alias = rawAlias;
+    if (!isSafeSshHost(alias)) {
+      // The value never appears in the message: an alias is operator input.
+      errors.push(
+        `${fieldPath}.${key}: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option`,
+      );
+      continue;
+    }
+    aliases[key as HostRole] = alias;
+  }
+  return Object.keys(aliases).length > 0 ? aliases : undefined;
+}
+
 function parseHost(
   entry: JsonObject,
   hostPath: string,
@@ -1375,6 +1572,7 @@ function parseHost(
     `${hostPath}.worktreeRoot`,
     errors,
   );
+  const container = parseHostContainer(entry, hostPath, errors);
   const tmpDir = readOptionalAbsolutePath(
     entry,
     'tmpDir',
@@ -1386,6 +1584,13 @@ function parseHost(
     hostPath,
     HOST_ROLES,
     'must be a known host role',
+    errors,
+  );
+  const roleAliases = parseHostRoleAliases(
+    entry,
+    hostPath,
+    transport,
+    roles,
     errors,
   );
   let runner: HostRunnerSection | undefined;
@@ -1414,6 +1619,8 @@ function parseHost(
   return {
     transport,
     ...(sshAlias !== undefined ? { sshAlias } : {}),
+    ...(container !== undefined ? { container } : {}),
+    ...(roleAliases !== undefined ? { roleAliases } : {}),
     worktreeRoot,
     ...(tmpDir !== undefined ? { tmpDir } : {}),
     roles,
@@ -1469,10 +1676,13 @@ function parseV2Hosts(
     }
     // Every host with a runner takes part in the dial-port rule, whatever the
     // runner kind: a local host dials its own `port`, an ssh host the
-    // `port + 1` forward. Two equal dial ports would race for one server.
+    // `port + tunnelOffset` forward (the offset the bundled runner program
+    // implements; absent means 1). Two equal dial ports would race for one
+    // server.
     if (host.runner !== undefined) {
+      const offset = host.runner.tunnelOffset ?? 1;
       const dialPort =
-        host.transport === 'local' ? host.runner.port : host.runner.port + 1;
+        host.transport === 'local' ? host.runner.port : host.runner.port + offset;
       if (dialPort > 65535) {
         // An ssh host on 65535 would need forward port 65536, which cannot be bound.
         errors.push(
@@ -3102,7 +3312,9 @@ export function parseInstallation(value: unknown): ParseResult {
   if (!isJsonObject(value)) {
     return { ok: false, errors: ['installation: must be an object'] };
   }
-  const version = value.schemaVersion;
+  // Read the discriminator through the record's own data property so a
+  // getter never runs.
+  const version = readOwnDataProperty(value, 'schemaVersion');
   if (version === 2) {
     return parseInstallationV2(value);
   }
@@ -3116,7 +3328,7 @@ function parseInstallationV1(value: JsonObject): ParseResult {
   if (!Object.hasOwn(value, 'schemaVersion')) {
     errors.push('schemaVersion: required');
   } else {
-    const version = value.schemaVersion;
+    const version = readOwnDataProperty(value, 'schemaVersion');
     if (
       typeof version !== 'number' ||
       !Number.isInteger(version) ||

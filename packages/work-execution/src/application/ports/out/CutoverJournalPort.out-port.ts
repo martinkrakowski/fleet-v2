@@ -23,7 +23,10 @@ export interface CutoverJournalEntry {
   readonly outcome?: CutoverJournalOutcome;
   /** A fixed token such as `saved` or `already-saved` (results only). */
   readonly reasonCode?: string | null;
-  /** The tree digest of the save (results only). */
+  /**
+   * An optional 40-64 lowercase hex digest. On an intent: the request digest a replay pass verifies before
+   * it mutates state. On a result: the result digest (such as the tree digest of a save).
+   */
   readonly digest?: string | null;
   /** The saved commit id (results only). */
   readonly commitId?: string | null;

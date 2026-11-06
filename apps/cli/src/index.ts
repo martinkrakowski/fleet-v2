@@ -45,6 +45,7 @@ import { initCommand, type InitCliOptions } from './init.js';
 import { projectsCommand, type ProjectsCliOptions } from './projects.js';
 import { stateCommand, stateDoctorLine, type StateCliOptions } from './state.js';
 import { conductorCommand, type ConductorCliOptions } from './conductor.js';
+import { daemonCommand, daemonHelpRequested, DAEMON_HELP, type DaemonCliOptions } from './daemon.js';
 import { telemetryCommand, type TelemetryCliOptions } from './telemetry.js';
 import { killallCommand, type KillallCliOptions } from './commands/killall.js';
 import { reportCommand, type ReportCliOptions } from './report.js';
@@ -705,6 +706,7 @@ Commands:
   init [--profile single|multi] [--tools <a,b>] ... [--yes]
   state check|restore|compact
   conductor status|halt|stop|resume|start|run
+  daemon tick|status|pause|resume
   telemetry export|status
   killall [--lift]
   report weekly
@@ -754,6 +756,7 @@ export async function runCli(
   telemetryOptions?: TelemetryCliOptions,
   reportOptions?: ReportCliOptions,
   killallOptions?: KillallCliOptions,
+  daemonOptions?: DaemonCliOptions,
 ): Promise<number> {
   try {
     const { stateDir, restArgv } = extractStateDirOption(argv, process.env.FLEET_STATE_DIR);
@@ -810,6 +813,35 @@ export async function runCli(
       return await killallCommand(restArgv.slice(1), io, {
         ...killallOptions,
         stateDir: killallOptions?.stateDir ?? stateDir,
+      });
+    }
+    // The daemon group answers help before anything is loaded, and resolves its
+    // own runtime so an invalid installation file never reaches the generic
+    // "installation invalid (<file>)" refusal (which echoes a path) and never
+    // blocks `daemon pause` / `daemon resume`: the merge policy is simply unknown.
+    if (group === 'daemon') {
+      if (daemonHelpRequested(restArgv.slice(1))) {
+        io.stdout(`${DAEMON_HELP}\n`);
+        return 0;
+      }
+      let daemonRuntime: FleetCliRuntime;
+      if (runtime !== undefined) {
+        daemonRuntime = runtime;
+      } else {
+        const loadResult = loadInstallation();
+        daemonRuntime = createFleetCliRuntime(
+          loadResult.status === 'invalid'
+            ? { stateDir, loadInstallationForMergePolicy: () => loadResult }
+            : {
+                stateDir,
+                installation: loadResult.installation,
+                loadInstallationForMergePolicy: () => loadInstallation(),
+              },
+        );
+      }
+      return await daemonCommand(restArgv.slice(1), io, daemonRuntime, {
+        ...daemonOptions,
+        stateDir: daemonOptions?.stateDir ?? stateDir,
       });
     }
     // An explicitly injected runtime stays authoritative; only a call without

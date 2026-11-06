@@ -77,6 +77,13 @@ import type { RunMergePassPort, RunMergePassResult } from '../ports/in/RunMergeP
 
 const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9_.-]{1,100}$/;
 
+/** Input bounds: a larger or sparse input is refused before any port is called. */
+const MAX_REPOSITORIES = 64;
+const MAX_JOB_FILTER_ITEMS = 64;
+const MAX_JOB_ID_LENGTH = 64;
+const MAX_INTERVAL_SECONDS = 3_600;
+const MAX_SETTLE_SECONDS = 600;
+
 /** The production sleep: a `setTimeout` promise. Tests inject a fake instead. */
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -375,6 +382,9 @@ interface ValidTickRequest {
   readonly tickId: string;
   readonly repositories: readonly DaemonRepositoryRef[];
   readonly budgetSeconds: number;
+  readonly deadlineIso: string | undefined;
+  readonly intervalSeconds: number | undefined;
+  readonly settleSeconds: number | undefined;
   readonly jobFilter: readonly string[] | undefined;
   readonly forgeReachable: boolean;
 }
@@ -384,12 +394,16 @@ type TickRequestCheck =
   | { readonly ok: false; readonly tickId: string; readonly reasonCode: string };
 
 function checkRepositories(value: unknown): string | null {
-  if (!Array.isArray(value)) {
+  if (!Array.isArray(value) || value.length > MAX_REPOSITORIES) {
     return 'invalid-repositories';
   }
   const digests = new Set<string>();
   const names = new Set<string>();
-  for (const repository of value as readonly unknown[]) {
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.hasOwn(value, index)) {
+      return 'invalid-repository';
+    }
+    const repository: unknown = value[index];
     if (!isUsableRepository(repository)) {
       return 'invalid-repository';
     }
@@ -409,8 +423,28 @@ function isValidBudgetSeconds(value: unknown): value is number {
   );
 }
 
+function isValidInterval(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= MAX_INTERVAL_SECONDS;
+}
+
+function isValidSettle(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= MAX_SETTLE_SECONDS;
+}
+
 function isValidJobFilter(value: unknown): value is readonly string[] | undefined {
-  return value === undefined || (Array.isArray(value) && value.every((item) => typeof item === 'string'));
+  if (value === undefined) {
+    return true;
+  }
+  if (!Array.isArray(value) || value.length > MAX_JOB_FILTER_ITEMS) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const item: unknown = Object.hasOwn(value, index) ? value[index] : undefined;
+    if (typeof item !== 'string' || item.length === 0 || item.length > MAX_JOB_ID_LENGTH) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Validates the whole runtime request; the first failing field names the refusal. */
@@ -431,6 +465,15 @@ function checkTickRequest(raw: unknown): TickRequestCheck {
   if (repositoryProblem !== null) {
     return refuse(repositoryProblem);
   }
+  if (raw.deadlineIso !== undefined && (typeof raw.deadlineIso !== 'string' || !isZonedIsoDateTime(raw.deadlineIso))) {
+    return refuse('invalid-deadline');
+  }
+  if (raw.intervalSeconds !== undefined && !isValidInterval(raw.intervalSeconds)) {
+    return refuse('invalid-interval');
+  }
+  if (raw.settleSeconds !== undefined && !isValidSettle(raw.settleSeconds)) {
+    return refuse('invalid-settle');
+  }
   if (!isValidJobFilter(raw.jobFilter)) {
     return refuse('invalid-job-filter');
   }
@@ -443,6 +486,9 @@ function checkTickRequest(raw: unknown): TickRequestCheck {
       tickId,
       repositories: raw.repositories as readonly DaemonRepositoryRef[],
       budgetSeconds,
+      deadlineIso: raw.deadlineIso as string | undefined,
+      intervalSeconds: raw.intervalSeconds as number | undefined,
+      settleSeconds: raw.settleSeconds as number | undefined,
       jobFilter: raw.jobFilter,
       forgeReachable: raw.forgeReachable,
     },
@@ -474,6 +520,8 @@ interface TickContext {
   readonly previousStatus: DaemonStatusRecord | null;
   /** The tick clock after the start: a throwing or malformed reading falls back to the last good one. */
   readonly clock: () => string;
+  /** Set when a deadline-sensitive fresh read failed: the budget is then treated as exhausted. */
+  readonly state: { budgetSpent: boolean };
 }
 
 export class RunDaemonTickUseCase implements RunDaemonTickPort {
@@ -498,7 +546,8 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
     }
     const request = checked.request;
     const nowIso = this.readClock();
-    const deadlineIso = nowIso === null ? null : computeTickDeadlineIso(nowIso, request.budgetSeconds);
+    const deadlineIso =
+      nowIso === null ? null : (request.deadlineIso ?? computeTickDeadlineIso(nowIso, request.budgetSeconds));
     if (nowIso === null || deadlineIso === null) {
       return refused(request.tickId, 'invalid-clock');
     }
@@ -513,13 +562,12 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       deadlineIso,
       previousStatus: previous,
       clock: this.tickClock(nowIso),
+      state: { budgetSpent: false },
     };
 
     const jobs = new DaemonJobRegistry({ mergePass: this.deps.mergePass }).instances(request.repositories);
     const plan = await this.plan(ctx, jobs);
-    if (plan.settleDelayMs > 0) {
-      await (this.deps.sleep ?? defaultSleep)(plan.settleDelayMs);
-    }
+    await this.settle(ctx, plan.settleDelayMs);
     if (plan.paused) {
       return this.finishPaused(ctx, plan);
     }
@@ -565,8 +613,31 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
       halt,
       forgeReachable,
       nowIso: ctx.nowIso,
+      intervalSeconds: ctx.request.intervalSeconds,
+      settleSeconds: ctx.request.settleSeconds,
       jobFilter: ctx.request.jobFilter,
     });
+  }
+
+  /**
+   * The settle never outlasts the tick: cap it to the time left before the deadline, measured at the moment of
+   * the sleep (the status, pause and halt reads before it already spent part of the budget), skip it when none is left.
+   * Fail closed: when the fresh clock read throws or is malformed the time left is unknown, so the settle is skipped
+   * and the budget counts as exhausted (every job then ends `budget-exhausted`), never measured from the start time.
+   */
+  private async settle(ctx: TickContext, settleDelayMs: number): Promise<void> {
+    if (settleDelayMs <= 0) {
+      return;
+    }
+    const freshNow = this.readClock();
+    if (freshNow === null) {
+      ctx.state.budgetSpent = true;
+      return;
+    }
+    const settleMs = Math.min(settleDelayMs, Math.max(0, Date.parse(ctx.deadlineIso) - Date.parse(freshNow)));
+    if (settleMs > 0) {
+      await (this.deps.sleep ?? defaultSleep)(settleMs);
+    }
   }
 
   /** A paused tick writes a paused status carrying the previous repositories and runs nothing. */
@@ -735,6 +806,9 @@ export class RunDaemonTickUseCase implements RunDaemonTickPort {
 
   /** D-DT9: a call whose remaining time is under 2 s is not started. */
   private hasBudget(ctx: TickContext, nowIso: string): boolean {
+    if (ctx.state.budgetSpent) {
+      return false;
+    }
     return computeCallBudget({
       nowIso,
       deadlineIso: ctx.deadlineIso,

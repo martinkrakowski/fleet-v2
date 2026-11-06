@@ -6,14 +6,14 @@
  * unrelated action.
  */
 
-import type { ForgeActionKind } from '../../../domain/coordination-keys.js';
+import type { AuthorizedActionKind } from '../../../domain/coordination-keys.js';
 
 export interface ResolveActionAuthorizationRequest {
   readonly actionId: string;
   readonly projectId: string;
   readonly workOrderId: string;
   readonly attemptId: string;
-  readonly actionKind: ForgeActionKind;
+  readonly actionKind: AuthorizedActionKind;
   readonly expectedHeadSha: string;
   readonly policyRevision: string;
 }
@@ -26,7 +26,7 @@ export type ResolveActionAuthorizationResult =
 export interface ConsumeActionAuthorizationRequest {
   readonly authorizationGrantId: string;
   readonly actionId: string;
-  readonly actionKind: ForgeActionKind;
+  readonly actionKind: AuthorizedActionKind;
   /**
    * Head the grant was scoped to at resolve time. Optional because the
    * resolving runtime retains the coordinates and scopes the consumption

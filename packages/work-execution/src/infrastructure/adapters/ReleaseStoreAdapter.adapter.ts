@@ -2,9 +2,13 @@
  * ReleaseStoreAdapter implements ReleaseStorePort on the local filesystem
  * (`node:fs/promises`, `node:path`; no command, no network).
  *
- * Layout: <root>/<sha>/ holds one built tree, <root>/<sha>/.fleet-release-verified
- * marks it verified, <root>/current is a relative symlink to <sha>, and
- * <root>/<sha>.tar is a transient archive that prune removes. A missing root is
+ * Layout: <root>/<sha>/ holds one verified built tree, <root>/<sha>/.fleet-release-verified
+ * marks it verified, <root>/current is a relative symlink to <sha>. A build is
+ * made in <root>/.staging-<sha>-<16 hex>/ (created exclusively by `prepare` for
+ * one run, with its transient <root>/.staging-<sha>-<16 hex>.tar archive) and
+ * reaches <root>/<sha> only by one rename after its marker is written, so a
+ * staging directory a failed cleanup left is never reused, and prune removes
+ * only orphan archives. A missing root is
  * an empty store (a first install starts there); any other read failure, an
  * unparseable marker or a `current` that is not a link into the root is
  * `unreadable`, never an empty or shorter store. A partial prune is
@@ -20,13 +24,16 @@ import type {
   ReleaseBuildRecord,
   ReleaseStoreListing,
   ReleaseStorePort,
+  ReleaseStagingResult,
   ReleaseStorePruneResult,
   ReleaseStoreWriteResult,
 } from '../../application/ports/out/ReleaseStorePort.out-port.js';
 import { isCalendarDateTime } from '../../domain/plain-record-reads.js';
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
-const TAR_PATTERN = /^[0-9a-f]{40}\.tar$/;
+const STAGING_PREFIX = '.staging-';
+const BUILD_ID_PATTERN = /^[0-9a-f]{40}-[0-9a-f]{16}$/;
+const TAR_PATTERN = /^\.staging-[0-9a-f]{40}-[0-9a-f]{16}\.tar$/;
 const ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const MARKER_NAME = '.fleet-release-verified';
 const CLI_ENTRY = ['apps', 'cli', 'dist', 'bin.js'];
@@ -37,14 +44,22 @@ type CurrentRead = { readonly ok: true; readonly sha: string | null } | { readon
 type BuildsRead = { readonly ok: true; readonly builds: readonly ReleaseBuildRecord[] } | { readonly ok: false };
 
 export class ReleaseStoreAdapter implements ReleaseStorePort {
-  async prepare(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStoreWriteResult> {
+  async prepare(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStagingResult> {
     if (!SHA_PATTERN.test(input.sha)) {
       return { outcome: 'unreadable' };
     }
     try {
-      await fs.mkdir(path.join(input.root, input.sha), { recursive: true });
-      const stat = await fs.lstat(path.join(input.root, input.sha));
-      return stat.isDirectory() ? { outcome: 'ok' } : { outcome: 'unreadable' };
+      await fs.mkdir(input.root, { recursive: true });
+      // A tree already at <root>/<sha> that is not a verified build is stale:
+      // it is never built over or reused, so the install refuses.
+      if ((await lstatOrNull(path.join(input.root, input.sha))) !== null) {
+        return { outcome: 'unreadable' };
+      }
+      const buildId = `${input.sha}-${randomBytes(8).toString('hex')}`;
+      const buildDir = stagingDir(input.root, buildId);
+      // Not recursive: the mkdir fails when the name exists, so this run alone created it.
+      await fs.mkdir(buildDir);
+      return { outcome: 'prepared', buildId, buildDir, archivePath: `${buildDir}.tar` };
     } catch {
       return { outcome: 'unreadable' };
     }
@@ -70,12 +85,14 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
   async markVerified(input: {
     readonly root: string;
     readonly sha: string;
+    readonly buildId: string;
     readonly builtAtIso: string;
   }): Promise<ReleaseStoreWriteResult> {
-    if (!SHA_PATTERN.test(input.sha) || !isZonedIso(input.builtAtIso)) {
+    if (!SHA_PATTERN.test(input.sha) || !isBuildIdOf(input.buildId, input.sha) || !isZonedIso(input.builtAtIso)) {
       return { outcome: 'unreadable' };
     }
-    const buildDir = path.join(input.root, input.sha);
+    const buildDir = stagingDir(input.root, input.buildId);
+    const target = path.join(input.root, input.sha);
     try {
       const dir = await lstatOrNull(buildDir);
       if (dir === null) {
@@ -88,8 +105,13 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       if (entry === null || !entry.isFile()) {
         return { outcome: 'not-verified' };
       }
+      if ((await lstatOrNull(target)) !== null) {
+        return { outcome: 'unreadable' };
+      }
       const marker = JSON.stringify({ version: 1, sha: input.sha, builtAtIso: input.builtAtIso });
       await writeAtomically(buildDir, MARKER_NAME, marker);
+      await fs.rename(buildDir, target);
+      await fs.rm(`${buildDir}.tar`, { force: true }).catch(() => undefined);
       return { outcome: 'ok' };
     } catch {
       return { outcome: 'unreadable' };
@@ -145,8 +167,12 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       }
     }
     try {
-      for (const entry of await fs.readdir(input.root, { withFileTypes: true })) {
-        if (entry.isFile() && TAR_PATTERN.test(entry.name)) {
+      const entries = await fs.readdir(input.root, { withFileTypes: true });
+      const stagingDirs = new Set(entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name));
+      for (const entry of entries) {
+        // Only an orphan archive: one whose staging directory is gone (an
+        // install still extracting keeps its directory, so its archive stays).
+        if (entry.isFile() && TAR_PATTERN.test(entry.name) && !stagingDirs.has(entry.name.slice(0, -'.tar'.length))) {
           await fs.rm(path.join(input.root, entry.name), { force: true });
         }
       }
@@ -156,18 +182,29 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
     return failed ? { outcome: 'unreadable' } : { outcome: 'pruned', removed };
   }
 
-  async discard(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStoreWriteResult> {
-    if (!SHA_PATTERN.test(input.sha)) {
+  async discard(input: { readonly root: string; readonly buildId: string }): Promise<ReleaseStoreWriteResult> {
+    const sha = input.buildId.slice(0, 40);
+    if (!isBuildIdOf(input.buildId, sha)) {
       return { outcome: 'unreadable' };
     }
+    const buildDir = stagingDir(input.root, input.buildId);
     try {
-      await fs.rm(path.join(input.root, input.sha), { recursive: true, force: true });
-      await fs.rm(path.join(input.root, `${input.sha}.tar`), { force: true });
+      await fs.rm(buildDir, { recursive: true, force: true });
+      await fs.rm(`${buildDir}.tar`, { force: true });
       return { outcome: 'ok' };
     } catch {
       return { outcome: 'unreadable' };
     }
   }
+}
+
+/** The staging directory of one build id; the name starts with a dot, so `list` never reads it as a build. */
+function stagingDir(root: string, buildId: string): string {
+  return path.join(root, `${STAGING_PREFIX}${buildId}`);
+}
+
+function isBuildIdOf(buildId: unknown, sha: string): buildId is string {
+  return typeof buildId === 'string' && BUILD_ID_PATTERN.test(buildId) && buildId.startsWith(`${sha}-`);
 }
 
 /** The shas outside the newest `keep` builds, never `current` nor the build just older than it; oldest first. */

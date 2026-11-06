@@ -1,6 +1,7 @@
 /**
  * CO14 tests: `release install | swap | rollback` use case, with a fake store,
- * a fake driver lease and a fake command executor (no filesystem, no process).
+ * a fake driver lease, a fake grant store behind ActionAuthorizationPort and a
+ * fake command executor (no filesystem, no process).
  */
 
 import { describe, expect, it } from 'vitest';
@@ -15,20 +16,37 @@ import type {
   CommandRunOptions,
   CommandRunResult,
 } from '../src/application/ports/out/CommandExecutorPort.out-port.js';
-import type { ConductorDriverLeasePort } from '../src/application/ports/out/ConductorDriverLeasePort.out-port.js';
+import type {
+  ActionAuthorizationPort,
+  ConsumeActionAuthorizationRequest,
+  ConsumeActionAuthorizationResult,
+  ResolveActionAuthorizationRequest,
+  ResolveActionAuthorizationResult,
+} from '../src/application/ports/out/ActionAuthorizationPort.out-port.js';
+import type {
+  ConductorDriverLeasePort,
+  ConductorDriverLeaseResult,
+} from '../src/application/ports/out/ConductorDriverLeasePort.out-port.js';
 import type {
   ReleaseBuildRecord,
+  ReleaseStagingResult,
   ReleaseStoreListing,
   ReleaseStorePort,
   ReleaseStorePruneResult,
   ReleaseStoreWriteResult,
 } from '../src/application/ports/out/ReleaseStorePort.out-port.js';
-import type { ConductorDriverLeaseRecord } from '../src/domain/lane-run-lease.js';
+import type {
+  ConductorDriverLeaseRecord,
+  LeaseAcquireRequest,
+  LeaseHoldRequest,
+  LeaseRefusal,
+} from '../src/domain/lane-run-lease.js';
 
 const ROOT = '/srv/fleet-releases';
 const SOURCE = '/srv/fleet-v2';
 const NOW = '2026-11-06T10:00:00.000Z';
-const AUTHORITY = 'owner-deploy-2026-11-06';
+const PROJECT = 'fleet-v2';
+const GRANT = 'grant-release-0001';
 
 const sha = (digit: string): string => digit.repeat(40);
 const A = sha('a');
@@ -56,9 +74,17 @@ class FakeStore implements ReleaseStorePort {
     this.current = current;
   }
 
-  async prepare(input: { root: string; sha: string }): Promise<ReleaseStoreWriteResult> {
+  prepared = 0;
+  discardUnreadable = false;
+  readonly preparedIds: string[] = [];
+
+  async prepare(input: { root: string; sha: string }): Promise<ReleaseStagingResult> {
     this.calls.push(`prepare ${input.sha}`);
-    return { outcome: 'ok' };
+    this.prepared += 1;
+    const buildId = `${input.sha}-${String(this.prepared).padStart(16, '0')}`;
+    this.preparedIds.push(buildId);
+    const buildDir = `${input.root}/.staging-${buildId}`;
+    return { outcome: 'prepared', buildId, buildDir, archivePath: `${buildDir}.tar` };
   }
 
   async list(): Promise<ReleaseStoreListing> {
@@ -68,8 +94,16 @@ class FakeStore implements ReleaseStorePort {
     return { outcome: 'read', current: this.current, builds: [...this.builds] };
   }
 
-  async markVerified(input: { root: string; sha: string; builtAtIso: string }): Promise<ReleaseStoreWriteResult> {
+  readonly verifiedIds: string[] = [];
+
+  async markVerified(input: {
+    root: string;
+    sha: string;
+    buildId: string;
+    builtAtIso: string;
+  }): Promise<ReleaseStoreWriteResult> {
     this.calls.push(`markVerified ${input.sha}`);
+    this.verifiedIds.push(input.buildId);
     if (this.entryMissing) {
       return { outcome: 'not-verified' };
     }
@@ -107,9 +141,9 @@ class FakeStore implements ReleaseStorePort {
     return { outcome: 'pruned', removed };
   }
 
-  async discard(input: { root: string; sha: string }): Promise<ReleaseStoreWriteResult> {
-    this.calls.push(`discard ${input.sha}`);
-    return { outcome: 'ok' };
+  async discard(input: { root: string; buildId: string }): Promise<ReleaseStoreWriteResult> {
+    this.calls.push(`discard ${input.buildId.slice(0, 40)}`);
+    return this.discardUnreadable ? { outcome: 'unreadable' } : { outcome: 'ok' };
   }
 
   get writes(): string[] {
@@ -128,15 +162,113 @@ class FakeExecutor implements CommandExecutorPort {
   }
 }
 
-function fakeLease(lease: ConductorDriverLeaseRecord | null | Error): ConductorDriverLeasePort {
-  return {
-    read: async () => {
-      if (lease instanceof Error) {
-        throw lease;
-      }
-      return lease;
-    },
-  } as unknown as ConductorDriverLeasePort;
+/**
+ * A driver lease store with the real CAS rules in miniature. `reads` scripts
+ * what each read returns (the last entry repeats); `takeOverOnAcquire` makes a
+ * driver win the race between the read and the acquire.
+ */
+class FakeLease implements ConductorDriverLeasePort {
+  readonly events: string[] = [];
+  reads: Array<ConductorDriverLeaseRecord | null | Error>;
+  held: ConductorDriverLeaseRecord | null = null;
+  takeOverOnAcquire = false;
+  checkRefusal: LeaseRefusal | null = null;
+  private readCount = 0;
+
+  constructor(lease: ConductorDriverLeaseRecord | null | Error) {
+    this.reads = [lease];
+  }
+
+  async read(): Promise<ConductorDriverLeaseRecord | null> {
+    const next = this.reads[Math.min(this.readCount, this.reads.length - 1)];
+    this.readCount += 1;
+    if (next instanceof Error) {
+      throw next;
+    }
+    return next;
+  }
+
+  async acquire(request: LeaseAcquireRequest): Promise<ConductorDriverLeaseResult> {
+    this.events.push(`acquire ${request.observedFence}`);
+    if (this.takeOverOnAcquire) {
+      return { outcome: 'refused', reason: 'lease-held' };
+    }
+    this.held = { version: 1, holderId: request.holderId, fence: request.observedFence + 1, leaseUntilIso: request.leaseUntilIso };
+    return { outcome: 'ok', lease: this.held };
+  }
+
+  async renew(): Promise<ConductorDriverLeaseResult> {
+    throw new Error('renew is never called');
+  }
+
+  async release(request: LeaseHoldRequest): Promise<ConductorDriverLeaseResult> {
+    this.events.push(`release ${request.fence}`);
+    const released = this.held as ConductorDriverLeaseRecord;
+    this.held = null;
+    return { outcome: 'ok', lease: released };
+  }
+
+  async check(request: LeaseHoldRequest): Promise<LeaseRefusal | null> {
+    this.events.push(`check ${request.fence}`);
+    return this.checkRefusal;
+  }
+}
+
+/**
+ * A recorded grant store: one approved owner grant for one scope at one sha,
+ * consumed at most once. `answer` overrides the resolve outcome.
+ */
+class FakeAuthorization implements ActionAuthorizationPort {
+  readonly resolves: ResolveActionAuthorizationRequest[] = [];
+  readonly consumes: ConsumeActionAuthorizationRequest[] = [];
+  grant: { kind: string; sha: string; projectId: string } | null;
+  answer: ResolveActionAuthorizationResult | Error | null = null;
+  consumeAnswer: ConsumeActionAuthorizationResult | Error | null = null;
+  consumedBy: string | null = null;
+
+  constructor(grant: { kind: string; sha: string; projectId: string } | null) {
+    this.grant = grant;
+  }
+
+  async resolveActionAuthorization(
+    request: ResolveActionAuthorizationRequest,
+  ): Promise<ResolveActionAuthorizationResult> {
+    this.resolves.push(request);
+    if (this.answer instanceof Error) {
+      throw this.answer;
+    }
+    if (this.answer !== null) {
+      return this.answer;
+    }
+    const grant = this.grant;
+    if (
+      grant === null ||
+      this.consumedBy !== null ||
+      grant.kind !== request.actionKind ||
+      grant.sha !== request.expectedHeadSha ||
+      grant.projectId !== request.projectId
+    ) {
+      return { outcome: 'blocked', reason: 'no recorded decision authorizes this' };
+    }
+    return { outcome: 'granted', authorizationGrantId: GRANT };
+  }
+
+  async consumeActionAuthorization(
+    request: ConsumeActionAuthorizationRequest,
+  ): Promise<ConsumeActionAuthorizationResult> {
+    this.consumes.push(request);
+    if (this.consumeAnswer instanceof Error) {
+      throw this.consumeAnswer;
+    }
+    if (this.consumeAnswer !== null) {
+      return this.consumeAnswer;
+    }
+    if (this.consumedBy !== null || request.authorizationGrantId !== GRANT) {
+      return { outcome: 'refused', reason: 'already consumed' };
+    }
+    this.consumedBy = request.actionId;
+    return { outcome: 'consumed', actionId: request.actionId };
+  }
 }
 
 const LIVE_LEASE: ConductorDriverLeaseRecord = {
@@ -155,37 +287,59 @@ function request(overrides: Partial<ManageReleaseRequest> = {}): ManageReleaseRe
     source: SOURCE,
     keep: 5,
     apply: false,
-    authority: null,
+    projectId: null,
     ...overrides,
   };
 }
 
 function applyRequest(overrides: Partial<ManageReleaseRequest> = {}): ManageReleaseRequest {
-  return request({ apply: true, authority: AUTHORITY, ...overrides });
+  return request({ apply: true, projectId: PROJECT, ...overrides });
 }
 
+interface Made {
+  useCase: ManageReleaseUseCase;
+  store: FakeStore;
+  executor: FakeExecutor;
+  lease: FakeLease;
+  authorization: FakeAuthorization;
+}
+
+/** The default grant authorizes whatever the test applies: same kind, same target. */
 function make(
   options: {
     store?: FakeStore;
-    lease?: ConductorDriverLeaseRecord | null | Error;
+    lease?: ConductorDriverLeaseRecord | null | Error | FakeLease;
     executor?: FakeExecutor;
+    authorization?: FakeAuthorization;
   } = {},
-): { useCase: ManageReleaseUseCase; store: FakeStore; executor: FakeExecutor } {
+): Made {
   const store = options.store ?? new FakeStore();
   const executor = options.executor ?? new FakeExecutor();
+  const lease = options.lease instanceof FakeLease ? options.lease : new FakeLease(options.lease ?? null);
+  const authorization = options.authorization ?? new FakeAuthorization(null);
   const useCase = new ManageReleaseUseCase({
     store,
-    lease: fakeLease(options.lease === undefined ? null : options.lease),
+    lease,
+    authorization,
     executor,
     nowIso: () => NOW,
     env: () => ({ PATH: '/usr/bin', HOME: '/home/example', UNSET: undefined }),
   });
-  return { useCase, store, executor };
+  return { useCase, store, executor, lease, authorization };
+}
+
+/** A use case whose recorded grant matches `kind` at `target`. */
+function granted(kind: string, target: string, options: Parameters<typeof make>[0] = {}): Made {
+  return make({ ...options, authorization: new FakeAuthorization({ kind, sha: target, projectId: PROJECT }) });
 }
 
 async function manage(useCase: ManageReleaseUseCase, input: unknown): Promise<ManageReleaseResult> {
   return useCase.manageRelease(input as ManageReleaseRequest);
 }
+
+const INSTALL = 'release-install';
+const SWAP = 'release-swap';
+const ROLLBACK = 'release-rollback';
 
 describe('ManageReleaseUseCase', () => {
   it('refuses invalid-request for a null request', async () => {
@@ -196,7 +350,7 @@ describe('ManageReleaseUseCase', () => {
 
   it('refuses invalid-request for a request with a missing field', async () => {
     const { useCase } = make();
-    const { authority: _authority, ...partial } = request();
+    const { projectId: _projectId, ...partial } = request();
     expect(await manage(useCase, partial)).toEqual({ outcome: 'refused', reason: 'invalid-request' });
     expect(await manage(useCase, { ...request(), extra: 1 })).toEqual({ outcome: 'refused', reason: 'invalid-request' });
   });
@@ -214,8 +368,10 @@ describe('ManageReleaseUseCase', () => {
       { root: 'relative/root' },
       { root: 42 },
       { source: null },
-      { authority: '' },
-      { authority: 'x'.repeat(257) },
+      { projectId: '' },
+      { projectId: ' padded ' },
+      { projectId: 'x'.repeat(257) },
+      { projectId: 7 },
     ]) {
       expect(await manage(useCase, { ...request(), ...bad })).toEqual({ outcome: 'refused', reason: 'invalid-request' });
     }
@@ -227,6 +383,16 @@ describe('ManageReleaseUseCase', () => {
       outcome: 'refused',
       reason: 'invalid-request',
     });
+  });
+
+  it('refuses invalid-request for a free-text authority field', async () => {
+    const { useCase, store } = granted(INSTALL, A);
+    const { projectId: _projectId, ...rest } = applyRequest();
+    expect(await manage(useCase, { ...rest, authority: 'owner-said-yes' })).toEqual({
+      outcome: 'refused',
+      reason: 'invalid-request',
+    });
+    expect(store.calls).toEqual([]);
   });
 
   it('refuses invalid-request for a sparse array request', async () => {
@@ -267,32 +433,171 @@ describe('ManageReleaseUseCase', () => {
     });
   });
 
-  it('refuses authority-required when apply is true without authority', async () => {
-    const { useCase, store, executor } = make();
-    for (const authority of [null, '   ']) {
-      expect(await manage(useCase, request({ apply: true, authority }))).toEqual({
-        outcome: 'refused',
-        reason: 'authority-required',
-      });
-    }
+  it('refuses authority-required when apply is true without a project', async () => {
+    const { useCase, store, executor, authorization } = granted(INSTALL, A);
+    expect(await manage(useCase, request({ apply: true, projectId: null }))).toEqual({
+      outcome: 'refused',
+      reason: 'authority-required',
+    });
     expect(store.calls).toEqual([]);
     expect(executor.runs).toEqual([]);
+    expect(authorization.resolves).toEqual([]);
+  });
+
+  it('refuses authority-refused when no recorded grant exists and builds nothing', async () => {
+    const { useCase, store, executor, lease } = make();
+    expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'authority-refused' });
+    expect(store.calls).toEqual([]);
+    expect(executor.runs).toEqual([]);
+    expect(lease.events).toEqual([]);
+  });
+
+  it('refuses authority-refused for a grant that names another action, another sha or another project', async () => {
+    for (const grant of [
+      { kind: SWAP, sha: A, projectId: PROJECT },
+      { kind: 'push-and-open-pr', sha: A, projectId: PROJECT },
+      { kind: INSTALL, sha: B, projectId: PROJECT },
+      { kind: INSTALL, sha: A, projectId: 'other-project' },
+    ]) {
+      const { useCase, store, executor } = make({ authorization: new FakeAuthorization(grant) });
+      expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'authority-refused' });
+      expect(store.calls).toEqual([]);
+      expect(executor.runs).toEqual([]);
+    }
+  });
+
+  it('resolves the grant for the release action at the target sha, rollback included', async () => {
+    const install = granted(INSTALL, A);
+    await manage(install.useCase, applyRequest());
+    expect(install.authorization.resolves).toEqual([
+      expect.objectContaining({ actionKind: INSTALL, expectedHeadSha: A, projectId: PROJECT }),
+    ]);
+    const rollback = granted(ROLLBACK, B, { store: new FakeStore([build('a', 1), build('b', 2), build('c', 3)], C) });
+    expect(await manage(rollback.useCase, applyRequest({ action: 'rollback', sha: null, source: null }))).toMatchObject({
+      outcome: 'applied',
+      target: B,
+    });
+    expect(rollback.authorization.resolves[0]).toMatchObject({ actionKind: ROLLBACK, expectedHeadSha: B });
+    // A grant for the sha that is current now does not authorize rolling back from it.
+    const wrong = granted(ROLLBACK, C, { store: new FakeStore([build('a', 1), build('b', 2), build('c', 3)], C) });
+    expect(await manage(wrong.useCase, applyRequest({ action: 'rollback', sha: null, source: null }))).toEqual({
+      outcome: 'refused',
+      reason: 'authority-refused',
+    });
+    expect(wrong.store.current).toBe(C);
+  });
+
+  it('refuses authority-unknown when the grant read throws or answers unknown', async () => {
+    for (const answer of [new Error('coordination store unreadable'), { outcome: 'unknown', reason: 'x' } as const]) {
+      const made = granted(INSTALL, A);
+      made.authorization.answer = answer;
+      expect(await manage(made.useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'authority-unknown' });
+      expect(made.store.calls).toEqual([]);
+      expect(made.executor.runs).toEqual([]);
+    }
+  });
+
+  it('refuses when the grant cannot be consumed and repoints nothing', async () => {
+    for (const [answer, reason] of [
+      [{ outcome: 'refused', reason: 'grant expired' }, 'authority-refused'],
+      [{ outcome: 'consumed', actionId: 'some-other-action' }, 'authority-refused'],
+      [new Error('journal unreadable'), 'authority-unknown'],
+    ] as const) {
+      const made = granted(SWAP, A, { store: new FakeStore([build('a', 1), build('b', 2)], B) });
+      made.authorization.consumeAnswer = answer;
+      expect(await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).toEqual({
+        outcome: 'refused',
+        reason,
+      });
+      expect(made.store.current).toBe(B);
+      expect(made.store.calls).not.toContain(`repoint ${A}`);
+      expect(made.lease.events.at(-1)).toMatch(/^release /);
+    }
+  });
+
+  it('a consumed grant never authorizes a second release', async () => {
+    const made = granted(SWAP, A, { store: new FakeStore([build('a', 1), build('b', 2)], B) });
+    expect((await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).outcome).toBe('applied');
+    made.store.current = B;
+    expect(await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).toEqual({
+      outcome: 'refused',
+      reason: 'authority-refused',
+    });
+    expect(made.store.current).toBe(B);
   });
 
   it('refuses driver-lease-live while the conductor driver lease is live', async () => {
-    const { useCase, store, executor } = make({ lease: LIVE_LEASE });
+    const { useCase, store, executor } = granted(INSTALL, A, { lease: LIVE_LEASE });
     expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'driver-lease-live' });
     expect(store.calls).toEqual([]);
     expect(executor.runs).toEqual([]);
-    const lapsed = make({ lease: LAPSED_LEASE });
+    const lapsed = granted(INSTALL, A, { lease: LAPSED_LEASE });
     expect((await manage(lapsed.useCase, applyRequest())).outcome).toBe('applied');
+    expect(lapsed.lease.events).toEqual([`acquire ${LAPSED_LEASE.fence}`, `check ${LAPSED_LEASE.fence + 1}`, `release ${LAPSED_LEASE.fence + 1}`]);
+  });
+
+  it('refuses driver-lease-live when a driver starts during the build and repoints nothing', async () => {
+    const lease = new FakeLease(null);
+    lease.reads = [null, LIVE_LEASE];
+    const { useCase, store, executor } = granted(INSTALL, A, { lease });
+    expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'driver-lease-live' });
+    expect(executor.runs).toHaveLength(4);
+    expect(store.calls).not.toContain(`repoint ${A}`);
+    expect(store.current).toBeNull();
+    expect(lease.events).toEqual([]);
+  });
+
+  it('refuses driver-lease-live when a driver wins the acquire race and repoints nothing', async () => {
+    const lease = new FakeLease(null);
+    lease.takeOverOnAcquire = true;
+    const made = granted(SWAP, A, { lease, store: new FakeStore([build('a', 1), build('b', 2)], B) });
+    expect(await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).toEqual({
+      outcome: 'refused',
+      reason: 'driver-lease-live',
+    });
+    expect(made.store.current).toBe(B);
+    expect(made.authorization.consumes).toEqual([]);
+  });
+
+  it('refuses driver-lease-live when the held lease fails the check right before the repoint', async () => {
+    const lease = new FakeLease(null);
+    lease.checkRefusal = 'lease-expired';
+    const made = granted(SWAP, A, { lease, store: new FakeStore([build('a', 1), build('b', 2)], B) });
+    expect(await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).toEqual({
+      outcome: 'refused',
+      reason: 'driver-lease-live',
+    });
+    expect(made.store.current).toBe(B);
+    expect(lease.events).toEqual(['acquire 0', 'check 1', 'release 1']);
+  });
+
+  it('holds the driver lease around the repoint and releases it after', async () => {
+    const lease = new FakeLease(null);
+    const made = granted(SWAP, A, { lease, store: new FakeStore([build('a', 1), build('b', 2)], B) });
+    const order: string[] = [];
+    const repoint = made.store.repoint.bind(made.store);
+    made.store.repoint = async (input) => {
+      order.push(`repoint while held=${lease.held !== null}`);
+      return repoint(input);
+    };
+    expect((await manage(made.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).outcome).toBe('applied');
+    expect(order).toEqual(['repoint while held=true']);
+    expect(lease.held).toBeNull();
   });
 
   it('refuses lease-unknown when the lease read throws', async () => {
-    const { useCase, store } = make({ lease: new Error('unreadable lease file') });
+    const { useCase, store } = granted(INSTALL, A, { lease: new Error('unreadable lease file') });
     expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'lease-unknown' });
     expect(await manage(useCase, request())).toEqual({ outcome: 'refused', reason: 'lease-unknown' });
     expect(store.calls).toEqual([]);
+    const lease = new FakeLease(null);
+    lease.reads = [null, new Error('unreadable lease file')];
+    const late = granted(SWAP, A, { lease, store: new FakeStore([build('a', 1), build('b', 2)], B) });
+    expect(await manage(late.useCase, applyRequest({ action: 'swap', sha: A, source: null }))).toEqual({
+      outcome: 'refused',
+      reason: 'lease-unknown',
+    });
+    expect(late.store.current).toBe(B);
   });
 
   it('refuses store-unreadable when the store listing is unreadable', async () => {
@@ -303,7 +608,7 @@ describe('ManageReleaseUseCase', () => {
   });
 
   it('refuses not-found when swap names a sha that is not kept', async () => {
-    const { useCase, store } = make({ store: new FakeStore([build('a', 1)], A) });
+    const { useCase, store } = granted(SWAP, B, { store: new FakeStore([build('a', 1)], A) });
     expect(await manage(useCase, applyRequest({ action: 'swap', sha: B, source: null }))).toEqual({
       outcome: 'refused',
       reason: 'not-found',
@@ -328,26 +633,44 @@ describe('ManageReleaseUseCase', () => {
     for (let failAt = 0; failAt < 4; failAt += 1) {
       const executor = new FakeExecutor();
       executor.failAt = failAt;
-      const { useCase, store } = make({ executor });
+      const { useCase, store, authorization } = granted(INSTALL, A, { executor });
       expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'build-failed' });
       expect(store.calls).toEqual([`prepare ${A}`, `discard ${A}`]);
       expect(store.current).toBeNull();
       expect(executor.runs).toHaveLength(failAt + 1);
+      expect(authorization.consumes).toEqual([]);
     }
   });
 
   it('refuses verify-failed when the built tree has no CLI entry', async () => {
     const store = new FakeStore();
     store.entryMissing = true;
-    const { useCase } = make({ store });
+    const { useCase } = granted(INSTALL, A, { store });
     expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'verify-failed' });
     expect(store.calls).toEqual([`prepare ${A}`, `markVerified ${A}`, `discard ${A}`]);
     expect(store.current).toBeNull();
   });
 
+  it('a failed cleanup never lets a retry reuse the stale build directory', async () => {
+    const executor = new FakeExecutor();
+    executor.failAt = 3;
+    const store = new FakeStore();
+    store.discardUnreadable = true;
+    const first = granted(INSTALL, A, { executor, store });
+    expect(await manage(first.useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'build-failed' });
+    executor.failAt = null;
+    const retry = granted(INSTALL, A, { executor, store });
+    expect((await manage(retry.useCase, applyRequest())).outcome).toBe('applied');
+    expect(store.preparedIds).toHaveLength(2);
+    expect(store.preparedIds[0]).not.toBe(store.preparedIds[1]);
+    // Only the directory this run created is verified, and the build ran in it.
+    expect(store.verifiedIds).toEqual([store.preparedIds[1]]);
+    expect(executor.runs.at(-1)?.options?.cwd).toBe(`${ROOT}/.staging-${store.preparedIds[1]}`);
+  });
+
   it('prints the plan without applying and writes nothing', async () => {
     const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3)], C);
-    const { useCase, executor } = make({ store, lease: LIVE_LEASE });
+    const { useCase, executor, authorization, lease } = make({ store, lease: LIVE_LEASE });
     const result = await manage(useCase, request({ action: 'swap', sha: A, source: null }));
     expect(result).toEqual({
       outcome: 'planned',
@@ -361,6 +684,8 @@ describe('ManageReleaseUseCase', () => {
     });
     expect(store.calls).toEqual([]);
     expect(executor.runs).toEqual([]);
+    expect(authorization.resolves).toEqual([]);
+    expect(lease.events).toEqual([]);
 
     const install = make({ store: new FakeStore([build('a', 1)], A) });
     expect(await manage(install.useCase, request({ sha: B }))).toMatchObject({
@@ -376,7 +701,7 @@ describe('ManageReleaseUseCase', () => {
   });
 
   it('install builds, verifies and repoints current', async () => {
-    const { useCase, store, executor } = make();
+    const { useCase, store, executor } = granted(INSTALL, A);
     const result = await manage(useCase, applyRequest());
     expect(result).toEqual({
       outcome: 'applied',
@@ -389,6 +714,7 @@ describe('ManageReleaseUseCase', () => {
       rebuilt: true,
     });
     expect(store.calls).toEqual([`prepare ${A}`, `markVerified ${A}`, `repoint ${A}`, 'prune 5']);
+    const staging = `${ROOT}/.staging-${store.preparedIds[0]}`;
     expect(executor.runs.map((run) => run.argv)).toEqual([
       [
         'git',
@@ -401,10 +727,10 @@ describe('ManageReleaseUseCase', () => {
         'archive',
         '--format=tar',
         '--output',
-        `${ROOT}/${A}.tar`,
+        `${staging}.tar`,
         A,
       ],
-      ['tar', '-xf', `${ROOT}/${A}.tar`, '-C', `${ROOT}/${A}`],
+      ['tar', '-xf', `${staging}.tar`, '-C', staging],
       ['yarn', 'install', '--immutable'],
       ['yarn', 'build'],
     ]);
@@ -412,11 +738,11 @@ describe('ManageReleaseUseCase', () => {
       expect(run.options?.timeoutMs).toBeGreaterThan(0);
       expect(run.options?.maxBufferBytes).toBeGreaterThan(0);
     }
-    expect(executor.runs[2].options?.cwd).toBe(`${ROOT}/${A}`);
+    expect(executor.runs[2].options?.cwd).toBe(staging);
   });
 
   it('install of an already built sha does not build twice', async () => {
-    const { useCase, store, executor } = make({ store: new FakeStore([build('a', 1), build('b', 2)], B) });
+    const { useCase, store, executor } = granted(INSTALL, A, { store: new FakeStore([build('a', 1), build('b', 2)], B) });
     const result = await manage(useCase, applyRequest({ sha: A }));
     expect(result).toMatchObject({ outcome: 'applied', target: A, current: A, rebuilt: false });
     expect(executor.runs).toEqual([]);
@@ -426,7 +752,7 @@ describe('ManageReleaseUseCase', () => {
 
   it('completes a crash between the build and the repoint on the next install', async () => {
     const store = new FakeStore([build('a', 1)], null);
-    const { useCase, executor } = make({ store });
+    const { useCase, executor } = granted(INSTALL, A, { store });
     const result = await manage(useCase, applyRequest({ sha: A }));
     expect(result).toMatchObject({ outcome: 'applied', current: A, rebuilt: false });
     expect(store.current).toBe(A);
@@ -434,17 +760,30 @@ describe('ManageReleaseUseCase', () => {
   });
 
   it('swap repoints current to a kept build', async () => {
-    const { useCase, store } = make({ store: new FakeStore([build('a', 1), build('b', 2), build('c', 3)], C) });
+    const { useCase, store } = granted(SWAP, A, { store: new FakeStore([build('a', 1), build('b', 2), build('c', 3)], C) });
     const result = await manage(useCase, applyRequest({ action: 'swap', sha: A, source: null }));
     expect(result).toMatchObject({ outcome: 'applied', action: 'swap', target: A, current: A, rebuilt: false });
     expect(store.current).toBe(A);
   });
 
   it('rollback repoints current to the previous kept build', async () => {
-    const { useCase, store } = make({ store: new FakeStore([build('a', 1), build('b', 2), build('c', 3)], C) });
+    const { useCase, store } = granted(ROLLBACK, B, {
+      store: new FakeStore([build('a', 1), build('b', 2), build('c', 3)], C),
+    });
     const result = await manage(useCase, applyRequest({ action: 'rollback', sha: null, source: null }));
     expect(result).toMatchObject({ outcome: 'applied', action: 'rollback', target: B, current: B, rebuilt: false });
     expect(store.current).toBe(B);
+  });
+
+  it('the rollback plan prunes what the rollback would prune, with no phantom build', async () => {
+    const builds = [build('a', 1), build('b', 2), build('c', 3), build('d', 4), build('e', 5)];
+    const plan = make({ store: new FakeStore(builds, E) });
+    const planned = await manage(plan.useCase, request({ action: 'rollback', sha: null, source: null, keep: 2 }));
+    expect(planned).toMatchObject({ outcome: 'planned', target: D, previous: D, wouldPrune: [A, B] });
+    const applied = granted(ROLLBACK, D, { store: new FakeStore(builds, E) });
+    expect(
+      await manage(applied.useCase, applyRequest({ action: 'rollback', sha: null, source: null, keep: 2 })),
+    ).toMatchObject({ outcome: 'applied', current: D, pruned: [A, B], kept: [C, D, E] });
   });
 
   it('prunes to the keep count and never removes current or previous', async () => {
@@ -455,12 +794,12 @@ describe('ManageReleaseUseCase', () => {
       wouldPrune: [C],
     });
 
-    const { useCase, store } = make({ store: new FakeStore(builds, E) });
+    const { useCase, store } = granted(SWAP, B, { store: new FakeStore(builds, E) });
     const result = await manage(useCase, applyRequest({ action: 'swap', sha: B, source: null, keep: 2 }));
     expect(result).toMatchObject({ outcome: 'applied', current: B, pruned: [C], kept: [A, B, D, E] });
     expect(store.removed).toEqual([C]);
 
-    const fresh = make({ store: new FakeStore(builds, E) });
+    const fresh = granted(INSTALL, F, { store: new FakeStore(builds, E) });
     expect(await manage(fresh.useCase, applyRequest({ sha: F, keep: 2 }))).toMatchObject({
       outcome: 'applied',
       current: F,
@@ -469,24 +808,25 @@ describe('ManageReleaseUseCase', () => {
     });
   });
 
-  it('the result carries no path and no secret-shaped value', async () => {
+  it('the result carries no path, no grant id and no secret-shaped value', async () => {
     const plan = await manage(make().useCase, request());
-    const applied = await manage(make().useCase, applyRequest());
+    const applied = await manage(granted(INSTALL, A).useCase, applyRequest());
     const executor = new FakeExecutor();
     executor.failAt = 3;
-    const refused = await manage(make({ executor }).useCase, applyRequest());
+    const refused = await manage(granted(INSTALL, A, { executor }).useCase, applyRequest());
     for (const result of [plan, applied, refused]) {
       const text = JSON.stringify(result);
       expect(text).not.toContain(ROOT);
       expect(text).not.toContain(SOURCE);
-      expect(text).not.toContain(AUTHORITY);
+      expect(text).not.toContain(GRANT);
       expect(text).not.toContain('secret-ish');
       expect(text).not.toContain('/srv');
+      expect(text).not.toContain('staging');
     }
   });
 
   it('the git step runs with GIT_ALLOW_PROTOCOL none, GIT_NO_LAZY_FETCH 1 and no hooks path', async () => {
-    const { useCase, executor } = make();
+    const { useCase, executor } = granted(INSTALL, A);
     await manage(useCase, applyRequest());
     const git = executor.runs[0];
     expect(git.argv).toContain('core.hooksPath=/dev/null');
@@ -504,7 +844,7 @@ describe('ManageReleaseUseCase', () => {
   });
 
   it('the git child never sees the operator environment beyond the allowlist', async () => {
-    const { useCase, executor } = make();
+    const { useCase, executor } = granted(INSTALL, A);
     await manage(useCase, applyRequest());
     const env = executor.runs[0].options?.env ?? {};
     for (const key of Object.keys(env)) {
@@ -515,22 +855,8 @@ describe('ManageReleaseUseCase', () => {
   it('reports an unreadable prune instead of a false success', async () => {
     const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4), build('e', 5)], E);
     store.pruneUnreadable = true;
-    const { useCase } = make({ store });
+    const { useCase } = granted(SWAP, B, { store });
     const result = await manage(useCase, applyRequest({ action: 'swap', sha: B, source: null }));
     expect(result).toMatchObject({ outcome: 'applied', action: 'swap', target: B, current: B, pruned: [], pruneOutcome: 'unreadable' });
-  });
-
-  it('a failed build step discards the archive and the partial build dir so a retry starts clean', async () => {
-    const executor = new FakeExecutor();
-    executor.failAt = 3;
-    const { useCase, store } = make({ executor });
-    expect(await manage(useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'build-failed' });
-    expect(store.calls).toEqual([`prepare ${A}`, `discard ${A}`]);
-
-    const verifiedStore = new FakeStore();
-    verifiedStore.entryMissing = true;
-    const verifyCase = make({ store: verifiedStore });
-    expect(await manage(verifyCase.useCase, applyRequest())).toEqual({ outcome: 'refused', reason: 'verify-failed' });
-    expect(verifiedStore.calls).toEqual([`prepare ${A}`, `markVerified ${A}`, `discard ${A}`]);
   });
 });

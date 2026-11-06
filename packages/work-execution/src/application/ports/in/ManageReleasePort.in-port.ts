@@ -2,9 +2,12 @@
 /**
  * ManageReleasePort installs, swaps and rolls back the built fleet-v2 release
  * that a scheduler unit executes through the `current` pointer. Without
- * `apply` it only reports the plan; with `apply` it needs explicit deployment
- * authority and a conductor driver lease that is not live. It never installs
- * or edits a scheduler unit, and no result carries a path or the authority.
+ * `apply` it only reports the plan; with `apply` it needs a recorded owner
+ * grant for this release action at the target sha (resolved and consumed
+ * through ActionAuthorizationPort, never a free-text token) and it holds the
+ * conductor driver lease from just before the repoint through the repoint, so
+ * nothing is repointed while a driver is live. It never installs or edits a
+ * scheduler unit, and no result carries a path or a grant id.
  */
 
 export type ReleaseAction = 'install' | 'swap' | 'rollback';
@@ -20,13 +23,20 @@ export interface ManageReleaseRequest {
   /** How many verified builds to keep (>= 2). */
   readonly keep: number;
   readonly apply: boolean;
-  /** Explicit deployment authority; required when apply is true. */
-  readonly authority: string | null;
+  /**
+   * The coordination project whose recorded owner grants are consulted;
+   * required when apply is true. It names where the grant lives, it is not
+   * itself authority: the grant must be recorded, approved, unconsumed and
+   * scoped to `release:<action>` at the target sha.
+   */
+  readonly projectId: string | null;
 }
 
 export type ManageReleaseRefusal =
   | 'invalid-request'
   | 'authority-required'
+  | 'authority-refused'
+  | 'authority-unknown'
   | 'driver-lease-live'
   | 'lease-unknown'
   | 'not-found'

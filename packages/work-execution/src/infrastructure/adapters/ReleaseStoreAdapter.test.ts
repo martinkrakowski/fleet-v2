@@ -28,13 +28,21 @@ describe('ReleaseStoreAdapter', () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
+  async function staged(id: string): Promise<{ buildId: string; buildDir: string; archivePath: string }> {
+    const prepared = await adapter.prepare({ root, sha: id });
+    if (prepared.outcome !== 'prepared') {
+      throw new Error(`prepare refused for ${id}`);
+    }
+    return prepared;
+  }
+
   async function verified(digit: string, day: number): Promise<string> {
     const id = sha(digit);
-    expect(await adapter.prepare({ root, sha: id })).toEqual({ outcome: 'ok' });
-    const entry = path.join(root, id, 'apps', 'cli', 'dist');
+    const { buildId, buildDir } = await staged(id);
+    const entry = path.join(buildDir, 'apps', 'cli', 'dist');
     await fs.mkdir(entry, { recursive: true });
     await fs.writeFile(path.join(entry, 'bin.js'), '// cli\n');
-    expect(await adapter.markVerified({ root, sha: id, builtAtIso: at(day) })).toEqual({ outcome: 'ok' });
+    expect(await adapter.markVerified({ root, sha: id, buildId, builtAtIso: at(day) })).toEqual({ outcome: 'ok' });
     return id;
   }
 
@@ -116,32 +124,73 @@ describe('ReleaseStoreAdapter', () => {
     expect(await adapter.prune({ root, keep: 1 })).toEqual({ outcome: 'unreadable' });
   });
 
-  it('removes the leftover archive file', async () => {
+  it('removes only an orphan archive file', async () => {
     await verified('a', 1);
-    await fs.writeFile(path.join(root, `${B}.tar`), 'tar');
+    const orphan = `.staging-${B}-${'0'.repeat(16)}.tar`;
+    await fs.writeFile(path.join(root, orphan), 'tar');
+    const live = await staged(C);
+    await fs.writeFile(live.archivePath, 'tar');
     await fs.writeFile(path.join(root, 'notes.tar'), 'keep');
     expect(await adapter.prune({ root, keep: 2 })).toEqual({ outcome: 'pruned', removed: [] });
-    expect((await fs.readdir(root)).sort()).toEqual([A, 'notes.tar']);
+    expect((await fs.readdir(root)).sort()).toEqual(
+      [A, path.basename(live.buildDir), path.basename(live.archivePath), 'notes.tar'].sort(),
+    );
   });
 
   it('markVerified refuses a build without the CLI entry', async () => {
-    await adapter.prepare({ root, sha: A });
-    expect(await adapter.markVerified({ root, sha: A, builtAtIso: at(1) })).toEqual({ outcome: 'not-verified' });
-    await fs.mkdir(path.join(root, A, 'apps', 'cli', 'dist', 'bin.js'), { recursive: true });
-    expect(await adapter.markVerified({ root, sha: A, builtAtIso: at(1) })).toEqual({ outcome: 'not-verified' });
-    expect(await adapter.markVerified({ root, sha: B, builtAtIso: at(1) })).toEqual({ outcome: 'not-found' });
+    const { buildId, buildDir } = await staged(A);
+    expect(await adapter.markVerified({ root, sha: A, buildId, builtAtIso: at(1) })).toEqual({ outcome: 'not-verified' });
+    await fs.mkdir(path.join(buildDir, 'apps', 'cli', 'dist', 'bin.js'), { recursive: true });
+    expect(await adapter.markVerified({ root, sha: A, buildId, builtAtIso: at(1) })).toEqual({ outcome: 'not-verified' });
     expect(await adapter.list({ root })).toEqual({ outcome: 'read', current: null, builds: [] });
   });
 
-  it('discards an incomplete build dir and its leftover archive', async () => {
-    await adapter.prepare({ root, sha: A });
+  it('prepare creates a fresh, uniquely named staging directory each time', async () => {
+    const first = await staged(A);
+    const second = await staged(A);
+    expect(first.buildId).not.toBe(second.buildId);
+    expect(first.buildId.startsWith(`${A}-`)).toBe(true);
+    expect((await fs.lstat(first.buildDir)).isDirectory()).toBe(true);
+    expect((await fs.lstat(second.buildDir)).isDirectory()).toBe(true);
+    expect(await fs.readdir(second.buildDir)).toEqual([]);
+    expect(await adapter.list({ root })).toEqual({ outcome: 'read', current: null, builds: [] });
+  });
+
+  it('prepare refuses when a stale unverified tree already sits at the sha', async () => {
+    await fs.mkdir(path.join(root, A), { recursive: true });
     await fs.writeFile(path.join(root, A, 'partial.txt'), 'stale');
-    await fs.writeFile(path.join(root, `${A}.tar`), 'tar');
-    expect(await adapter.discard({ root, sha: A })).toEqual({ outcome: 'ok' });
+    expect(await adapter.prepare({ root, sha: A })).toEqual({ outcome: 'unreadable' });
+    expect(await fs.readdir(path.join(root, A))).toEqual(['partial.txt']);
+  });
+
+  it('markVerified verifies only a staging directory this store created for that sha', async () => {
+    const { buildId, buildDir } = await staged(A);
+    await fs.mkdir(path.join(buildDir, 'apps', 'cli', 'dist'), { recursive: true });
+    await fs.writeFile(path.join(buildDir, 'apps', 'cli', 'dist', 'bin.js'), '// cli\n');
+    expect(await adapter.markVerified({ root, sha: A, buildId: `${A}-${'f'.repeat(16)}`, builtAtIso: at(1) })).toEqual({
+      outcome: 'not-found',
+    });
+    expect(await adapter.markVerified({ root, sha: B, buildId, builtAtIso: at(1) })).toEqual({ outcome: 'unreadable' });
+    expect(await adapter.markVerified({ root, sha: A, buildId: '../x', builtAtIso: at(1) })).toEqual({ outcome: 'unreadable' });
+    // A tree that appeared at the sha meanwhile is never overwritten.
+    await fs.mkdir(path.join(root, A));
+    await fs.writeFile(path.join(root, A, 'other.txt'), 'other');
+    expect(await adapter.markVerified({ root, sha: A, buildId, builtAtIso: at(1) })).toEqual({ outcome: 'unreadable' });
+    expect(await fs.readdir(path.join(root, A))).toEqual(['other.txt']);
+    await fs.rm(path.join(root, A), { recursive: true });
+    expect(await adapter.markVerified({ root, sha: A, buildId, builtAtIso: at(1) })).toEqual({ outcome: 'ok' });
+    expect(await adapter.list({ root })).toEqual({ outcome: 'read', current: null, builds: [{ sha: A, builtAtIso: at(1) }] });
+    await expect(fs.lstat(buildDir)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('discards an incomplete staging dir and its archive', async () => {
+    const { buildId, buildDir, archivePath } = await staged(A);
+    await fs.writeFile(path.join(buildDir, 'partial.txt'), 'stale');
+    await fs.writeFile(archivePath, 'tar');
+    expect(await adapter.discard({ root, buildId })).toEqual({ outcome: 'ok' });
     expect(await fs.readdir(root)).toEqual([]);
-    expect(await adapter.discard({ root, sha: A })).toEqual({ outcome: 'ok' });
-    expect(await adapter.discard({ root, sha: 'nothex' })).toEqual({ outcome: 'unreadable' });
-    await adapter.prepare({ root, sha: B });
-    expect(await adapter.discard({ root, sha: B })).toEqual({ outcome: 'ok' });
+    expect(await adapter.discard({ root, buildId })).toEqual({ outcome: 'ok' });
+    expect(await adapter.discard({ root, buildId: 'nothex' })).toEqual({ outcome: 'unreadable' });
+    expect(await adapter.discard({ root, buildId: `${A}/../../x` })).toEqual({ outcome: 'unreadable' });
   });
 });

@@ -1,22 +1,37 @@
 /**
  * ManageReleaseUseCase implements ManageReleasePort (cutover row CO14).
  *
- * Flow: read the request defensively, check the authority, read the conductor
- * driver lease (an unreadable lease is `lease-unknown`, never "no lease"), read
- * the store, resolve the target, then either report the plan or apply it: build
- * when the sha is not yet a verified build, repoint `current` atomically, prune.
- * A live driver lease refuses before any write. The build is four reviewed argv
- * steps through the command executor (no shell); the git step is a local read
- * with no hooks and no network, and it runs on a filtered environment that
- * never hands the operator's full `process.env` (tokens, credentials) to the
- * child. A failed build discards the archive and the partial build directory so
- * a retry starts clean. Nothing is echoed from a command, and no result carries
- * a path or the authority; an unfinished prune is reported, never smoothed over.
+ * Flow: read the request defensively, read the conductor driver lease (an
+ * unreadable lease is `lease-unknown`, never "no lease"), read the store,
+ * resolve the target, then either report the plan or apply it.
+ *
+ * Apply is fenced three ways:
+ * - Authority: a recorded owner grant for `release:<action>` at the target sha
+ *   is resolved through ActionAuthorizationPort before any write, and consumed
+ *   (once, durably) just before the repoint. A missing, mismatched, expired or
+ *   consumed grant is `authority-refused`; a grant read that fails or answers
+ *   unknown is `authority-unknown`. No free-text value is ever authority.
+ * - The driver: a live lease refuses before any write; the build then runs
+ *   outside any lock, and the repoint runs only while this process holds the
+ *   conductor driver lease itself (acquired by CAS just before the repoint,
+ *   re-checked immediately before it, released after it). A driver that took
+ *   the lease meanwhile makes the acquire fail, and nothing is repointed.
+ * - Stale trees: the build runs in a staging directory the store creates
+ *   exclusively for this run; only that directory is verified and moved to
+ *   <root>/<sha>. A failed cleanup leaves a uniquely named directory nothing
+ *   will reuse.
+ *
+ * The build is four reviewed argv steps through the command executor (no
+ * shell); the git step is a local read with no hooks and no network, on a
+ * filtered environment that never hands the operator's full environment to the
+ * child. Nothing is echoed from a command, and no result carries a path or a
+ * grant id; an unfinished prune is reported, never smoothed over.
  */
 
 import { containsSecretShape } from '@fleet/shared';
 
-import { isLeaseLapsed } from '../../domain/lane-run-lease.js';
+import type { ReleaseActionKind } from '../../domain/coordination-keys.js';
+import { isLeaseLapsed, type ConductorDriverLeaseRecord } from '../../domain/lane-run-lease.js';
 import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 import type {
   ManageReleaseApplied,
@@ -27,6 +42,7 @@ import type {
   ManageReleaseResult,
   ReleaseAction,
 } from '../ports/in/ManageReleasePort.in-port.js';
+import type { ActionAuthorizationPort } from '../ports/out/ActionAuthorizationPort.out-port.js';
 import type { CommandExecutorPort, CommandRunOptions } from '../ports/out/CommandExecutorPort.out-port.js';
 import type { ConductorDriverLeasePort } from '../ports/out/ConductorDriverLeasePort.out-port.js';
 import type { ReleaseBuildRecord, ReleaseStorePort } from '../ports/out/ReleaseStorePort.out-port.js';
@@ -34,28 +50,37 @@ import type { ReleaseBuildRecord, ReleaseStorePort } from '../ports/out/ReleaseS
 export interface ManageReleaseDependencies {
   readonly store: ReleaseStorePort;
   readonly lease: ConductorDriverLeasePort;
+  /** Resolves and consumes the recorded owner grant for `release:<action>` at the target sha. */
+  readonly authorization: ActionAuthorizationPort;
   readonly executor: CommandExecutorPort;
   readonly nowIso: () => string;
-  /** Complete environment source for the git step; the use case passes only a
-   *  filtered allowlist of it to the child, never the operator's full set. */
-  readonly env?: () => Record<string, string | undefined>;
+  /** The operator environment the composition root supplies; only a filtered
+   *  allowlist of it reaches the git child, never the operator's full set. */
+  readonly env: () => Record<string, string | undefined>;
 }
 
-const REQUEST_KEYS = ['action', 'root', 'sha', 'source', 'keep', 'apply', 'authority'] as const;
+const REQUEST_KEYS = ['action', 'root', 'sha', 'source', 'keep', 'apply', 'projectId'] as const;
 const ACTIONS: readonly ReleaseAction[] = ['install', 'swap', 'rollback'];
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 const MAX_PATH_BYTES = 4096;
-const MAX_AUTHORITY_BYTES = 256;
+const MAX_PROJECT_ID_BYTES = 256;
 const MIN_KEEP = 2;
 const MAX_KEEP = 64;
 const GIT_STEP_TIMEOUT_MS = 300_000;
 const GIT_STEP_MAX_BUFFER_BYTES = 1_048_576;
 const YARN_STEP_TIMEOUT_MS = 900_000;
 const YARN_STEP_MAX_BUFFER_BYTES = 4_194_304;
+/** How long the release holds the driver lease around the repoint; well inside the lease maximum. */
+const REPOINT_FENCE_MS = 120_000;
 /** The only operator variables the git child may see; everything else (tokens, credentials) stays out. */
 const GIT_ENV_ALLOWLIST: readonly string[] = ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ'];
 
 type ValidRequest = ManageReleaseRequest;
+
+interface HeldLease {
+  readonly holderId: string;
+  readonly fence: number;
+}
 
 export class ManageReleaseUseCase implements ManageReleasePort {
   constructor(private readonly deps: ManageReleaseDependencies) {}
@@ -73,14 +98,11 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     if (request === null) {
       return refuse('invalid-request');
     }
-    if (request.apply && (request.authority === null || request.authority.trim() === '')) {
+    if (request.apply && request.projectId === null) {
       return refuse('authority-required');
     }
-    let live: boolean;
-    try {
-      const lease = await this.deps.lease.read();
-      live = lease !== null && !isLeaseLapsed(lease, this.deps.nowIso());
-    } catch {
+    const live = await this.leaseIsLive();
+    if (live === null) {
       return refuse('lease-unknown');
     }
     const listing = await this.deps.store.list({ root: request.root });
@@ -90,21 +112,11 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     const { builds, current } = listing;
     const kept = builds.map((build) => build.sha);
     const previous = previousBuild(builds, current);
-    const alreadyBuilt = request.sha !== null && kept.includes(request.sha);
-    let target: string;
-    if (request.action === 'install') {
-      target = request.sha as string;
-    } else if (request.action === 'swap') {
-      if (!alreadyBuilt) {
-        return refuse('not-found');
-      }
-      target = request.sha as string;
-    } else {
-      if (previous === null) {
-        return refuse('not-found');
-      }
-      target = previous;
+    const target = request.action === 'rollback' ? previous : request.sha;
+    if (target === null || (request.action === 'swap' && !kept.includes(target))) {
+      return refuse('not-found');
     }
+    const alreadyBuilt = kept.includes(target);
     if (!request.apply) {
       const plan: ManageReleasePlan = {
         outcome: 'planned',
@@ -121,6 +133,10 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     if (live) {
       return refuse('driver-lease-live');
     }
+    const grant = await this.resolveGrant(request, target);
+    if (typeof grant !== 'string') {
+      return refuse(grant.refusal);
+    }
     let rebuilt = false;
     if (request.action === 'install' && !alreadyBuilt) {
       const built = await this.build(request, target);
@@ -129,12 +145,9 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       }
       rebuilt = true;
     }
-    const repointed = await this.deps.store.repoint({ root: request.root, sha: target });
-    if (repointed.outcome === 'not-found') {
-      return refuse('not-found');
-    }
-    if (repointed.outcome !== 'ok') {
-      return refuse('store-unreadable');
+    const repointed = await this.fencedRepoint(request, target, grant);
+    if (repointed !== null) {
+      return refuse(repointed);
     }
     const afterShas = rebuilt ? [...kept, target] : kept;
     const pruned = await this.deps.store.prune({ root: request.root, keep: request.keep });
@@ -152,6 +165,130 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     return applied;
   }
 
+  /** true when a driver holds an unexpired lease; null when the lease cannot be read. */
+  private async leaseIsLive(): Promise<boolean | null> {
+    try {
+      const lease = await this.deps.lease.read();
+      return lease !== null && !isLeaseLapsed(lease, this.deps.nowIso());
+    } catch {
+      return null;
+    }
+  }
+
+  /** The grant id of an applicable recorded owner grant, or the refusal. Writes nothing. */
+  private async resolveGrant(
+    request: ValidRequest,
+    target: string,
+  ): Promise<string | { readonly refusal: ManageReleaseRefusal }> {
+    const coordinates = grantCoordinates(request, target);
+    try {
+      const resolved = await this.deps.authorization.resolveActionAuthorization({
+        actionId: coordinates.actionId,
+        projectId: request.projectId as string,
+        workOrderId: coordinates.actionId,
+        attemptId: coordinates.actionId,
+        actionKind: coordinates.actionKind,
+        expectedHeadSha: target,
+        policyRevision: coordinates.actionKind,
+      });
+      if (resolved.outcome === 'granted') {
+        return typeof resolved.authorizationGrantId === 'string' && resolved.authorizationGrantId.trim() !== ''
+          ? resolved.authorizationGrantId
+          : { refusal: 'authority-unknown' };
+      }
+      return { refusal: resolved.outcome === 'blocked' ? 'authority-refused' : 'authority-unknown' };
+    } catch {
+      return { refusal: 'authority-unknown' };
+    }
+  }
+
+  /**
+   * Repoint `current` only while this process holds the conductor driver
+   * lease: re-read it, acquire it by CAS, consume the grant, re-check the
+   * lease, repoint, release. null when repointed; the refusal otherwise.
+   */
+  private async fencedRepoint(
+    request: ValidRequest,
+    target: string,
+    grantId: string,
+  ): Promise<ManageReleaseRefusal | null> {
+    const held = await this.acquireLease(request, target);
+    if (typeof held === 'string') {
+      return held;
+    }
+    try {
+      const consumed = await this.consumeGrant(request, target, grantId);
+      if (consumed !== null) {
+        return consumed;
+      }
+      const stillHeld = await this.deps.lease.check({ ...held, nowIso: this.deps.nowIso() });
+      if (stillHeld !== null) {
+        return 'driver-lease-live';
+      }
+      const repointed = await this.deps.store.repoint({ root: request.root, sha: target });
+      if (repointed.outcome === 'ok') {
+        return null;
+      }
+      return repointed.outcome === 'not-found' ? 'not-found' : 'store-unreadable';
+    } finally {
+      await this.releaseLease(held);
+    }
+  }
+
+  private async acquireLease(request: ValidRequest, target: string): Promise<HeldLease | ManageReleaseRefusal> {
+    let lease: ConductorDriverLeaseRecord | null;
+    try {
+      lease = await this.deps.lease.read();
+    } catch {
+      return 'lease-unknown';
+    }
+    const nowIso = this.deps.nowIso();
+    if (lease !== null && !isLeaseLapsed(lease, nowIso)) {
+      return 'driver-lease-live';
+    }
+    const holderId = `release-${request.action}-${target}`;
+    try {
+      const acquired = await this.deps.lease.acquire({
+        holderId,
+        observedFence: lease?.fence ?? 0,
+        leaseUntilIso: new Date(Date.parse(nowIso) + REPOINT_FENCE_MS).toISOString(),
+        nowIso,
+      });
+      return acquired.outcome === 'ok' ? { holderId, fence: acquired.lease.fence } : 'driver-lease-live';
+    } catch {
+      return 'lease-unknown';
+    }
+  }
+
+  /** Best effort: a release that fails leaves a lease that lapses on its own within the fence window. */
+  private async releaseLease(held: HeldLease): Promise<void> {
+    try {
+      await this.deps.lease.release({ ...held, nowIso: this.deps.nowIso() });
+    } catch {
+      // The lease expires by itself; the repoint result stands.
+    }
+  }
+
+  private async consumeGrant(
+    request: ValidRequest,
+    target: string,
+    grantId: string,
+  ): Promise<ManageReleaseRefusal | null> {
+    const coordinates = grantCoordinates(request, target);
+    try {
+      const consumed = await this.deps.authorization.consumeActionAuthorization({
+        authorizationGrantId: grantId,
+        actionId: coordinates.actionId,
+        actionKind: coordinates.actionKind,
+        expectedHeadSha: target,
+        attemptId: coordinates.actionId,
+      });
+      return consumed.outcome === 'consumed' && consumed.actionId === coordinates.actionId ? null : 'authority-refused';
+    } catch {
+      return 'authority-unknown';
+    }
+  }
+
   /** The shas a prune would remove once `target` is current (and, for a new install, built). */
   private wouldPrune(
     builds: readonly ReleaseBuildRecord[],
@@ -165,16 +302,15 @@ export class ManageReleaseUseCase implements ManageReleasePort {
     return shasToPrune(after, target, keep);
   }
 
-  /** null when the build is verified; the refusal otherwise. Nothing is repointed here. */
+  /** null when the build is verified and in place; the refusal otherwise. Nothing is repointed here. */
   private async build(request: ValidRequest, sha: string): Promise<ManageReleaseRefusal | null> {
     const source = request.source as string;
-    const buildDir = `${request.root}/${sha}`;
-    const archive = `${buildDir}.tar`;
-    const prepared = await this.deps.store.prepare({ root: request.root, sha });
-    if (prepared.outcome !== 'ok') {
+    const staging = await this.deps.store.prepare({ root: request.root, sha });
+    if (staging.outcome !== 'prepared') {
       return 'store-unreadable';
     }
-    const baseEnv = this.deps.env?.() ?? process.env;
+    const { buildId, buildDir, archivePath } = staging;
+    const baseEnv = this.deps.env();
     const env: Record<string, string> = {
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_ALLOW_PROTOCOL: 'none',
@@ -202,38 +338,47 @@ export class ManageReleaseUseCase implements ManageReleasePort {
           'archive',
           '--format=tar',
           '--output',
-          archive,
+          archivePath,
           sha,
         ],
         options: { cwd: source, env, ...gitBudget },
       },
-      { argv: ['tar', '-xf', archive, '-C', buildDir], options: { cwd: request.root, ...gitBudget } },
+      { argv: ['tar', '-xf', archivePath, '-C', buildDir], options: { cwd: request.root, ...gitBudget } },
       { argv: ['yarn', 'install', '--immutable'], options: { cwd: buildDir, ...yarnBudget } },
       { argv: ['yarn', 'build'], options: { cwd: buildDir, ...yarnBudget } },
     ];
     for (const step of steps) {
       if (!(await this.stepSucceeds(step.argv, step.options))) {
-        await this.discardBuild(request.root, sha);
+        await this.discardBuild(request.root, buildId);
         return 'build-failed';
       }
     }
-    const marked = await this.deps.store.markVerified({ root: request.root, sha, builtAtIso: this.deps.nowIso() });
+    const marked = await this.deps.store.markVerified({
+      root: request.root,
+      sha,
+      buildId,
+      builtAtIso: this.deps.nowIso(),
+    });
     if (marked.outcome === 'ok') {
       return null;
     }
-    await this.discardBuild(request.root, sha);
+    await this.discardBuild(request.root, buildId);
     if (marked.outcome === 'not-verified') {
       return 'verify-failed';
     }
     return marked.outcome === 'not-found' ? 'build-failed' : 'store-unreadable';
   }
 
-  /** Best-effort cleanup of an incomplete build so a retry never reuses stale files. */
-  private async discardBuild(root: string, sha: string): Promise<void> {
+  /**
+   * Cleanup of this run's staging directory. A failed cleanup is safe: the
+   * directory's name is unique to this run, `prepare` never hands it out
+   * again, and only `markVerified` with its build id moves it into place.
+   */
+  private async discardBuild(root: string, buildId: string): Promise<void> {
     try {
-      await this.deps.store.discard({ root, sha });
+      await this.deps.store.discard({ root, buildId });
     } catch {
-      // The refusal is reported regardless; the next pass can still complete the install.
+      // The refusal stands; the staging directory is never reused.
     }
   }
 
@@ -245,6 +390,15 @@ export class ManageReleaseUseCase implements ManageReleasePort {
       return false;
     }
   }
+}
+
+/** The release action kind and the deterministic action id one grant is bound to. */
+function grantCoordinates(
+  request: ValidRequest,
+  target: string,
+): { readonly actionKind: ReleaseActionKind; readonly actionId: string } {
+  const actionKind: ReleaseActionKind = `release-${request.action}`;
+  return { actionKind, actionId: `${actionKind}-${target}` };
 }
 
 function refuse(reason: ManageReleaseRefusal): ManageReleaseResult {
@@ -285,7 +439,7 @@ function readRequest(raw: unknown): ValidRequest | null {
   if (keys.length !== REQUEST_KEYS.length || !REQUEST_KEYS.every((key) => keys.includes(key))) {
     return null;
   }
-  const { action, root, sha, source, keep, apply, authority } = snapshot;
+  const { action, root, sha, source, keep, apply, projectId } = snapshot;
   if (typeof action !== 'string' || !(ACTIONS as readonly string[]).includes(action)) {
     return null;
   }
@@ -301,7 +455,7 @@ function readRequest(raw: unknown): ValidRequest | null {
   if (source !== null && !isAbsolutePath(source)) {
     return null;
   }
-  if (authority !== null && !isBoundedString(authority, MAX_AUTHORITY_BYTES)) {
+  if (projectId !== null && !isProjectId(projectId)) {
     return null;
   }
   const needsSha = action !== 'rollback';
@@ -315,12 +469,16 @@ function readRequest(raw: unknown): ValidRequest | null {
     source: source as string | null,
     keep,
     apply,
-    authority: authority as string | null,
+    projectId: projectId as string | null,
   };
 }
 
 function isBoundedString(value: unknown, maxBytes: number): value is string {
   return typeof value === 'string' && value !== '' && new TextEncoder().encode(value).length <= maxBytes;
+}
+
+function isProjectId(value: unknown): value is string {
+  return isBoundedString(value, MAX_PROJECT_ID_BYTES) && value.trim() === value && !containsSecretShape(value);
 }
 
 function isAbsolutePath(value: unknown): value is string {

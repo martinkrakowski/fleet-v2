@@ -90,7 +90,7 @@ function makeWorkOrder(
     projectId: "project-example",
     taskId: "task-example-1",
     laneId: "lane-example",
-    repository: "org/repo-example",
+    repository: "https://github.com/martinkrakowski/fleet-v2.git",
     baseCommit: BASE,
     ownedPaths: ["src/example.ts"],
     policyRevision: POLICY_REVISION,
@@ -316,7 +316,7 @@ class FakeForge implements ExecuteAuthorizedForgeActionPort {
 
 class FakeForgeActionPort implements ForgeActionPort {
   boundRepository(): { owner: string; repo: string } | undefined {
-    return { owner: "org", repo: "repo-example" };
+    return { owner: "martinkrakowski", repo: "fleet-v2" };
   }
   readonly requests: ForgeActionRequest[] = [];
   result: ForgeActionResult;
@@ -525,7 +525,7 @@ async function seedOpenedPullRequest(built: Built): Promise<void> {
       attemptId: ATTEMPT_ID,
       status: "completed",
       detail: "pull request #7",
-      pullRequest: { repository: "org/repo-example", number: 7 },
+      pullRequest: { repository: "martinkrakowski/fleet-v2", number: 7 },
     }),
   );
 }

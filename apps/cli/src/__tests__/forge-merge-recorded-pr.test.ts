@@ -37,7 +37,7 @@ function installation(): FleetInstallation {
         },
       },
     },
-    forge: { mode: 'github', owner: 'org', repo: 'repo' },
+    forge: { mode: 'github', owner: 'martinkrakowski', repo: 'fleet-v2' },
   };
 }
 
@@ -78,7 +78,8 @@ async function seed(options: { readNumberBranch: string }) {
     projectId: 'proj-cli-test',
     taskId: 'task-cli-test',
     laneId: 'lane-cli-test',
-    repository: 'github.com/org/repo',
+    // The exact shape of a live .fleet/state work-orders.json record (WB5b2).
+    repository: 'https://github.com/martinkrakowski/fleet-v2.git',
     state: 'approved',
     revision: 1,
     baseCommit: '0'.repeat(40),
@@ -179,7 +180,7 @@ describe('forge execute merge-pr through the CLI composition (WB5b2)', () => {
       recordedAtIso: '2026-10-15T10:40:00Z',
       sessionId: null,
       detail: null,
-      pullRequest: { repository: 'org/repo', number: 42 },
+      pullRequest: { repository: 'martinkrakowski/fleet-v2', number: 42 },
     });
 
     const result = await rt.execution.executeAuthorizedForgeAction.executeAuthorizedForgeAction(
@@ -216,11 +217,11 @@ describe('forge execute merge-pr through the CLI composition (WB5b2)', () => {
 
     expect(result.outcome).toBe('executed');
     expect(reads).toHaveLength(1);
-    expect(reads[0]).toEqual(expect.arrayContaining(['pr', 'view', '7', '-R', 'org/repo']));
-    expect(merges).toEqual([['pr', 'merge', '-R', 'org/repo', '7', '--match-head-commit', HEAD, '--merge']]);
+    expect(reads[0]).toEqual(expect.arrayContaining(['pr', 'view', '7', '-R', 'martinkrakowski/fleet-v2']));
+    expect(merges).toEqual([['pr', 'merge', '-R', 'martinkrakowski/fleet-v2', '7', '--match-head-commit', HEAD, '--merge']]);
     const entries = await rt.execution.executionJournal.listJournalEntriesForAttempt('att-wb5b2');
     expect(entries.find((entry) => entry.status === 'completed')?.pullRequest).toEqual({
-      repository: 'org/repo',
+      repository: 'martinkrakowski/fleet-v2',
       number: 7,
     });
     expect((await rt.execution.workOrderRepository.findWorkOrderById('wo-wb5b2'))?.state).toBe('merged');

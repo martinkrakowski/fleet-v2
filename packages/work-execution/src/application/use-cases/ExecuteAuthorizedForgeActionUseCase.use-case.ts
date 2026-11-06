@@ -156,21 +156,89 @@ const LEGACY_LOOKUP_PASS_THROUGH_REASONS: ReadonlySet<string> = new Set([
   "legacy-pr-lookup-repository-mismatch",
 ]);
 
-/**
- * The comparison key of an `owner/repo` (WB5b2), one function for both sides:
- * trimmed, one trailing `.git` stripped, lower-cased by an explicit ASCII map
- * (never Unicode case folding, which maps the Kelvin sign to `k`), and null
- * unless owner and repo are non-empty and use only `[A-Za-z0-9_.-]`.
- */
-function canonicalRepositoryKey(raw: string): string | null {
-  let value = raw.trim();
-  if (value.endsWith(".git")) {
-    value = value.slice(0, -4);
-  }
-  const lowered = value.replace(/[A-Z]/g, (letter) =>
+const GITHUB_HOST = "github.com";
+const REPOSITORY_SEGMENT = /^[A-Za-z0-9_.-]+$/;
+
+/** Lower-cases ASCII letters only: no Unicode folding (the Kelvin sign stays itself). */
+function asciiLower(value: string): string {
+  return value.replace(/[A-Z]/g, (letter) =>
     String.fromCharCode(letter.charCodeAt(0) + 32),
   );
-  return /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(lowered) ? lowered : null;
+}
+
+/** The part of `rest` after `separator`, when the part before it is exactly the GitHub host. */
+function pathAfterGithubHost(rest: string, separator: "/" | ":"): string | null {
+  const cut = rest.indexOf(separator);
+  if (cut < 0 || asciiLower(rest.slice(0, cut)) !== GITHUB_HOST) {
+    return null;
+  }
+  return rest.slice(cut + 1);
+}
+
+/**
+ * The repository forms the work order store holds (WB5b2), reduced to
+ * `{owner, repo}` with the case kept: `https://github.com/<owner>/<repo>[.git]`,
+ * `ssh://git@github.com/...`, `git@github.com:<owner>/<repo>[.git]`,
+ * `github.com/<owner>/<repo>` and a plain `owner/repo`. Exactly one trailing
+ * slash and one trailing `.git` are accepted. The host must be github.com
+ * (ASCII case-insensitive); `http://`, credentials, a query, a fragment,
+ * whitespace, extra path segments and any character outside
+ * `[A-Za-z0-9_.-]` in owner or repo are null.
+ */
+function parseGithubRepository(
+  raw: string,
+): { readonly owner: string; readonly repo: string } | null {
+  let value = raw.trim();
+  if (value.endsWith("/")) {
+    value = value.slice(0, -1);
+  }
+  if (/[?#\s\\]/.test(value)) {
+    return null;
+  }
+  const lowered = asciiLower(value);
+  let path: string | null;
+  if (lowered.startsWith("https://")) {
+    path = pathAfterGithubHost(value.slice("https://".length), "/");
+  } else if (lowered.startsWith("ssh://git@")) {
+    path = pathAfterGithubHost(value.slice("ssh://git@".length), "/");
+  } else if (lowered.startsWith("git@")) {
+    path = pathAfterGithubHost(value.slice("git@".length), ":");
+  } else if (lowered.startsWith(`${GITHUB_HOST}/`)) {
+    path = value.slice(GITHUB_HOST.length + 1);
+  } else {
+    path = value.includes(":") ? null : value;
+  }
+  if (path === null) {
+    return null;
+  }
+  if (path.endsWith(".git")) {
+    path = path.slice(0, -4);
+  }
+  const segments = path.split("/");
+  const [owner, repo] = segments;
+  if (
+    segments.length !== 2 ||
+    owner === undefined ||
+    repo === undefined ||
+    !REPOSITORY_SEGMENT.test(owner) ||
+    !REPOSITORY_SEGMENT.test(repo) ||
+    owner === "." ||
+    owner === ".." ||
+    repo === "." ||
+    repo === ".."
+  ) {
+    return null;
+  }
+  return { owner, repo };
+}
+
+/** The comparison key of a repository (WB5b2): one function for both sides, ASCII-lower-cased `owner/repo`. */
+function canonicalRepositoryKey(raw: unknown): string | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const parsed = parseGithubRepository(raw);
+  return parsed === null ? null : asciiLower(`${parsed.owner}/${parsed.repo}`);
 }
 
 /** The longest `actionId` whose completed journal id still fits the merge record's `actionRef`. */
@@ -312,8 +380,11 @@ function normalizeWorkOrderRepository(raw: unknown): string | null {
   if (typeof raw !== "string") {
     return null;
   }
-  const prefix = "github.com/";
-  const candidate = raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+  const parsed = parseGithubRepository(raw);
+  if (parsed === null) {
+    return null;
+  }
+  const candidate = `${parsed.owner}/${parsed.repo}`;
   if (
     pullRequestRefError("pr", { repository: candidate, number: 1 }) !== null
   ) {
@@ -560,8 +631,8 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
     // guessed. A thrown pre-flight read refuses before the grant is consumed.
     // The verifying read, the merge and the record must name one repository
     // (WB5b2): the work order's must be the one the forge port is bound to.
-    if (request.kind === "merge-pr" && normalizedRepository !== null) {
-      const mismatch = this.boundRepositoryRefusal(deps, normalizedRepository);
+    if (request.kind === "merge-pr") {
+      const mismatch = this.boundRepositoryRefusal(deps, workOrder.repository);
       if (mismatch !== null) {
         return { outcome: "refused", reason: mismatch };
       }
@@ -1039,7 +1110,7 @@ export class ExecuteAuthorizedForgeActionUseCase implements ExecuteAuthorizedFor
    */
   private boundRepositoryRefusal(
     deps: ExecuteAuthorizedForgeActionDependencies,
-    workOrderRepository: string,
+    workOrderRepository: unknown,
   ): string | null {
     let bound: ReturnType<ExecuteAuthorizedForgeActionDependencies["forgePort"]["boundRepository"]>;
     try {

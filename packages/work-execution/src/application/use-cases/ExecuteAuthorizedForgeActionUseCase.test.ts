@@ -2723,6 +2723,83 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       }
     });
 
+    const LIVE_URL = "https://github.com/martinkrakowski/fleet-v2.git";
+    const LIVE_BOUND = { owner: "martinkrakowski", repo: "fleet-v2" };
+
+    it("merges a work order that stores the live URL form, and records the canonical owner/repo", async () => {
+      const deps = wb5bDeps({
+        bound: LIVE_BOUND,
+        workOrder: { ...makeWorkOrderRecord(), repository: LIVE_URL },
+      });
+      const result = await deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        pullRequestNumber: 7,
+      });
+      expect(result.outcome).toBe("executed");
+      expect(deps.reads[0]?.repository).toEqual(LIVE_BOUND);
+      expect(
+        await deps.mergeRecordRepo.findMergeRecord("martinkrakowski/fleet-v2", 7),
+      ).toMatchObject({ number: 7 });
+      expect(
+        deps.journal.entries.find((entry) => entry.status === "completed")
+          ?.pullRequest,
+      ).toEqual({ repository: "martinkrakowski/fleet-v2", number: 7 });
+    });
+
+    it.each([
+      ["the live URL with another owner", LIVE_URL, { owner: "someone", repo: "fleet-v2" }, "repository-mismatch"],
+      ["a non-GitHub host", "https://gitlab.com/martinkrakowski/fleet-v2.git", LIVE_BOUND, "repository-invalid"],
+      ["a look-alike host", "https://github.com.evil.example/martinkrakowski/fleet-v2", LIVE_BOUND, "repository-invalid"],
+      ["http (refused: the forge is https only)", "http://github.com/martinkrakowski/fleet-v2.git", LIVE_BOUND, "repository-invalid"],
+      ["credentials in the URL", "https://user:pass@github.com/martinkrakowski/fleet-v2.git", LIVE_BOUND, "repository-invalid"],
+      ["a query", "https://github.com/martinkrakowski/fleet-v2.git?x=1", LIVE_BOUND, "repository-invalid"],
+      ["a fragment", "https://github.com/martinkrakowski/fleet-v2#readme", LIVE_BOUND, "repository-invalid"],
+      ["an extra path segment", "https://github.com/martinkrakowski/fleet-v2/tree/main", LIVE_BOUND, "repository-invalid"],
+      ["two trailing slashes", "https://github.com/martinkrakowski/fleet-v2//", LIVE_BOUND, "repository-invalid"],
+      ["a non-ASCII owner", "https://github.com/\u212Aartinkrakowski/fleet-v2", LIVE_BOUND, "repository-invalid"],
+      ["an ssh user other than git", "ssh://root@github.com/martinkrakowski/fleet-v2.git", LIVE_BOUND, "repository-invalid"],
+    ])(
+      "refuses a work order repository with %s, before any read, grant or merge",
+      async (_name, repository, bound, reason) => {
+        const deps = wb5bDeps({
+          bound,
+          workOrder: { ...makeWorkOrderRecord(), repository },
+        });
+        expect(
+          await deps.useCase.executeAuthorizedForgeAction({
+            ...mergeReq,
+            pullRequestNumber: 7,
+          }),
+        ).toEqual({ outcome: "refused", reason });
+        expect(deps.reads).toHaveLength(0);
+        expect(deps.consumed).toEqual([]);
+        expect(deps.seen).toHaveLength(0);
+      },
+    );
+
+    it.each([
+      ["one trailing slash", "https://github.com/martinkrakowski/fleet-v2/"],
+      ["no .git", "https://github.com/martinkrakowski/fleet-v2"],
+      ["an upper-case host", "https://GitHub.COM/martinkrakowski/fleet-v2.git"],
+      ["the scp form", "git@github.com:martinkrakowski/fleet-v2.git"],
+      ["the ssh form", "ssh://git@github.com/martinkrakowski/fleet-v2.git"],
+      ["the host-prefixed form", "github.com/martinkrakowski/fleet-v2"],
+      ["the plain form", "martinkrakowski/fleet-v2"],
+    ])("accepts a work order repository in %s form", async (_name, repository) => {
+      const deps = wb5bDeps({
+        bound: LIVE_BOUND,
+        workOrder: { ...makeWorkOrderRecord(), repository },
+      });
+      expect(
+        (
+          await deps.useCase.executeAuthorizedForgeAction({
+            ...mergeReq,
+            pullRequestNumber: 7,
+          })
+        ).outcome,
+      ).toBe("executed");
+    });
+
     it("a throwing merge-record store is merge-record-not-saved, and the next pass completes the record without merging again", async () => {
       let state: "open" | "merged" = "open";
       const deps = wb5bDeps({

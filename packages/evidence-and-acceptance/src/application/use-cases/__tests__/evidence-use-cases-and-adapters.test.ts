@@ -1723,7 +1723,7 @@ describe('IndependentReviewAdapter', () => {
     expect(failing).toEqual({
       outcome: 'unavailable',
       reason: 'reviewer seat timed out',
-      code: 'transport-failed',
+      code: 'timeout',
     });
   });
 

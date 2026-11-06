@@ -134,7 +134,7 @@ describe('ForgeActionAdapter refusal kinds', () => {
         mergeCommitSha: null,
       },
     });
-    return { readPullRequest: read, isConfigured: () => true };
+    return { readPullRequest: read, isConfigured: () => true, listOpenPullRequestsByBase: async () => ({ outcome: "unavailable" as const, reason: "not-used" }) };
   }
 
   it('kinds a refused create as permission', async () => {

@@ -305,6 +305,36 @@ describe("T6a web session login", () => {
     expect(res.status).toBe(403);
   });
 
+  it("a disallowed origin gets the login route's own refusal and no-store, other routes keep the generic refusal", async () => {
+    process.env.FLEET_API_ALLOWED_ORIGINS = "http://allowed.example";
+    const login = await fetch(loginUrl(), {
+      method: "POST",
+      headers: { origin: "http://evil.example", "content-type": "application/json" },
+      body: "{}",
+    });
+    expect(login.status).toBe(403);
+    expect(login.headers.get("cache-control")).toBe("no-store");
+    expect(await login.json()).toEqual({ error: "Forbidden: the web login is a server-side call" });
+
+    const allowedOriginLogin = await fetch(loginUrl(), {
+      method: "POST",
+      headers: { origin: "http://allowed.example", "content-type": "application/json" },
+      body: "{}",
+    });
+    expect(allowedOriginLogin.status).toBe(403);
+    expect(await allowedOriginLogin.json()).toEqual({
+      error: "Forbidden: the web login is a server-side call",
+    });
+
+    const other = await fetch(`${baseUrl}/v1/questions`, {
+      method: "POST",
+      headers: { origin: "http://evil.example", "content-type": "application/json" },
+      body: "{}",
+    });
+    expect(other.status).toBe(403);
+    expect(await other.json()).toEqual({ error: "Forbidden origin" });
+  });
+
   it("a non-POST request and a request without the json content type are refused", async () => {
     const getRes = await fetch(loginUrl(), { method: "GET" });
     expect(getRes.status).toBe(403);

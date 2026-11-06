@@ -126,9 +126,15 @@ export default defineEventHandler((event) => {
     return;
   }
 
-  // Refuse any request carrying an Origin header unless it is in FLEET_API_ALLOWED_ORIGINS
+  // Refuse any request carrying an Origin header unless it is in FLEET_API_ALLOWED_ORIGINS.
+  // /sessions/login is skipped here: it refuses every Origin itself, with its own body and no-store.
   const originHeader = getRequestHeader(event, "origin");
-  if (originHeader !== undefined && originHeader !== null && originHeader.trim().length > 0) {
+  if (
+    !isWebLoginPath(requestPath) &&
+    originHeader !== undefined &&
+    originHeader !== null &&
+    originHeader.trim().length > 0
+  ) {
     if (!isAllowedOrigin(originHeader.trim())) {
       if (isSessionExchangePath(requestPath)) {
         setResponseHeader(event, "cache-control", "no-store");

@@ -510,10 +510,9 @@ export async function performReview(
 
 /**
  * KS6: one review starts beside the gate. The gate body calls this for the
- * brief-check and then the code-review, so each review is requested on the
- * sealed diff (the collected head) while the gate runs, and the matching
- * state later reads the recorded receipt instead of requesting a second
- * review. Failure-tolerant by design — an unwired port, missing facts, an
+ * brief-check only, so it is requested on the sealed diff (the collected
+ * head) while the gate runs, and the brief-check state later reads the
+ * recorded receipt instead of requesting a second review. Failure-tolerant by design — an unwired port, missing facts, an
  * existing intent of the kind, an unavailable seat or a built-key failure
  * starts nothing, and a throw from the journal read or `performReview` is
  * swallowed — because a review that cannot start must never block or change
@@ -578,11 +577,10 @@ async function startReviewInFlight(
 }
 
 /**
- * KS6: the brief-check and code-review start beside the gate, in that order.
- * Each runs on the sealed diff while the gate evaluates; the two reviews run
- * one after the other (the review transport owns the lane's worktree), and
- * the session-start gate may space them. A review that cannot start here
- * starts later from its own state, exactly as today.
+ * KS6: the brief-check starts beside the gate. It runs on the sealed diff
+ * while the gate evaluates. The code-review is NOT started here: it starts
+ * from its own state, exactly as today. A brief-check that cannot start here
+ * starts later from its own state too.
  */
 export async function startReviewsInFlight(
   ctx: AdvanceStepContext,
@@ -591,7 +589,6 @@ export async function startReviewsInFlight(
   request: AdvanceLaneRunRequest,
 ): Promise<void> {
   await startReviewInFlight(ctx, record, gathered, request, 'brief-check');
-  await startReviewInFlight(ctx, record, gathered, request, 'code-review');
 }
 
 /**

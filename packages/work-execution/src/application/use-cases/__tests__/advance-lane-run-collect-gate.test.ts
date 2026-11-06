@@ -2245,7 +2245,7 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
     });
   });
 
-  it('test 20 (KS6): the gate act starts the brief-check and code-review reviews beside the gate', async () => {
+  it('test 20 (KS6): the gate act starts only the brief-check review beside the gate; code-review is not started', async () => {
     const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, seatPlan: SEAT_PLAN_WITH_REVIEW });
     const harness = await makeHarness(runRecord(), [collected], { wireReviewRequest: true, wireReviewAssessment: true });
     await harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['command 1'] }));
@@ -2260,13 +2260,12 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
       result: 'completed',
       reasonCode: 'gate-passed',
     });
-    // Both reviews went out beside the gate, on the sealed diff (the collected head).
+    // Only the brief-check went out beside the gate, on the sealed diff (the collected head).
     expect(harness.reviewRequests).toEqual([
       expect.objectContaining({ kind: 'brief-check', candidateHeadSha: COMMIT }),
-      expect.objectContaining({ kind: 'code-review', candidateHeadSha: COMMIT }),
     ]);
     // The journal holds the gate intent, then the brief-check intent and
-    // result, then the code-review intent and result, then the gate's result.
+    // result, then the gate's result; no code-review entry exists.
     const entries = await harness.runJournal.listForRun(RUN_ID);
     const gateIntentIndex = entries.findIndex((entry) => entry.kind === 'intent' && entry.key === gateKey());
     const briefIntentIndex = entries.findIndex((entry) => entry.kind === 'intent' && entry.key === briefCheckKey());
@@ -2277,17 +2276,15 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
     expect(gateIntentIndex).toBeGreaterThanOrEqual(0);
     expect(briefIntentIndex).toBeGreaterThan(gateIntentIndex);
     expect(briefResultIndex).toBeGreaterThan(briefIntentIndex);
-    expect(codeIntentIndex).toBeGreaterThan(briefResultIndex);
-    expect(codeResultIndex).toBeGreaterThan(codeIntentIndex);
-    expect(gateResultIndex).toBeGreaterThan(codeResultIndex);
+    expect(codeIntentIndex).toBe(-1);
+    expect(codeResultIndex).toBe(-1);
+    expect(gateResultIndex).toBeGreaterThan(briefResultIndex);
     expect(entries[briefIntentIndex]).toMatchObject({ kind: 'intent', mintedId: expect.stringMatching(/^review-/) });
     expect(entries[briefResultIndex]).toMatchObject({ kind: 'result', outcome: 'completed', reasonCode: 'review-passed' });
-    expect(entries[codeIntentIndex]).toMatchObject({ kind: 'intent', mintedId: expect.stringMatching(/^review-/) });
-    expect(entries[codeResultIndex]).toMatchObject({ kind: 'result', outcome: 'completed', reasonCode: 'review-passed' });
     expect(entries[gateResultIndex]).toMatchObject({ kind: 'result', outcome: 'completed', reasonCode: 'gate-passed' });
   });
 
-  it('test 21 (KS6): the brief-check and code-review states read the recorded receipts instead of requesting second reviews', async () => {
+  it('test 21 (KS6): the brief-check state reads the recorded receipt; the code-review state still requests its own review', async () => {
     const collected = attemptFixture({ state: 'collected', artifacts: COLLECTED_ARTIFACTS, seatPlan: SEAT_PLAN_WITH_REVIEW });
     const harness = await makeHarness(runRecord(), [collected], { wireReviewRequest: true, wireReviewAssessment: true });
     await harness.setManifest(JSON.stringify({ stepLimit: 100, timeLimitSeconds: 2700, expectedArtifacts: [], acceptanceChecks: ['command 1'] }));
@@ -2295,12 +2292,15 @@ describe('AdvanceLaneRunUseCase force stops release the work order (KF-36a-2)', 
     await conduct(harness, 'gating', NOW);
 
     expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'gate', reasonCode: 'gate-passed' });
-    // The gate's verdict is consumed only after the reviews' receipts are recorded: the next advance enters brief-check.
+    // The gate's verdict is consumed only after the review's receipt is recorded: the next advance enters brief-check.
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
-    // The recorded receipts are read: neither state requests a second review.
+    // The recorded receipt is read: the brief-check state requests no second review.
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'code-review' });
-    expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'accepting' });
+    expect(harness.reviewRequests).toHaveLength(1);
+    // The code-review was not in flight: its own state requests it.
+    expect(await advance(harness)).toMatchObject({ outcome: 'acted', step: 'code-review' });
     expect(harness.reviewRequests).toHaveLength(2);
+    expect(harness.reviewRequests[1]).toMatchObject({ kind: 'code-review' });
   });
 
   it('test 22 (KS6): without the review wiring the gate act behaves exactly as before', async () => {

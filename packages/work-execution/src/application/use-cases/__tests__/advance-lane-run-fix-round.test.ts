@@ -3249,12 +3249,12 @@ describe('KF-20: the gate and the review open the evidence assessment with the m
     expect(await advance(harness)).toMatchObject({
       outcome: 'acted', step: 'gate', result: 'completed', reasonCode: 'gate-passed',
     });
-    // The gate act starts the brief-check and code-review reviews beside the
-    // gate (KS6): the in-flight reviews open their assessments with the same
-    // implementer model, head and policy as the gate's own receipt-recording
-    // open — never a `head-mismatch` refusal — and their receipts are
-    // recorded before the gate's result entry.
-    expect(harness.reviewOpenRequests).toHaveLength(3);
+    // The gate act starts the brief-check review beside the gate (KS6): the
+    // in-flight review opens its assessment with the same implementer model,
+    // head and policy as the gate's own receipt-recording open — never a
+    // `head-mismatch` refusal — and its receipt is recorded before the
+    // gate's result entry.
+    expect(harness.reviewOpenRequests).toHaveLength(2);
     for (const open of harness.reviewOpenRequests) {
       expect(open).toMatchObject({
         attemptId: 'attempt-fix-1',
@@ -3265,16 +3265,15 @@ describe('KF-20: the gate and the review open the evidence assessment with the m
       });
     }
     expect(harness.gateReceiptRequests).toHaveLength(1);
-    // The reviews are requested beside the gate, not refused `assessment-unavailable`.
-    expect(harness.reviewRequests).toHaveLength(2);
+    // The review is requested beside the gate, not refused `assessment-unavailable`.
+    expect(harness.reviewRequests).toHaveLength(1);
     expect(harness.reviewRequests[0]).toMatchObject({ kind: 'brief-check', implementerModel: 'fix-model-1' });
-    expect(harness.reviewRequests[1]).toMatchObject({ kind: 'code-review', implementerModel: 'fix-model-1' });
 
-    // The recorded receipts are read: neither review state opens a second
-    // assessment or requests a second review.
+    // The recorded receipt is read: the brief-check state opens no second
+    // assessment and requests no second review.
     expect(await advance(harness)).toEqual({ outcome: 'entered', state: 'brief-check' });
-    expect(harness.reviewOpenRequests).toHaveLength(3);
-    expect(harness.reviewRequests).toHaveLength(2);
+    expect(harness.reviewOpenRequests).toHaveLength(2);
+    expect(harness.reviewRequests).toHaveLength(1);
   });
 });
 

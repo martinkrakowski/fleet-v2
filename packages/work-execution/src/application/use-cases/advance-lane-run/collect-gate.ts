@@ -340,8 +340,8 @@ export async function runGateBody(ctx: AdvanceStepContext,
   const parsedKey = parseLaneRunKey(key);
   const gateRun = parsedKey !== null && parsedKey.kind === 'step' ? (parsedKey.retry ?? undefined) : undefined;
   // KS6: the evaluation is launched without being awaited, so the brief-check
-  // and code-review start beside it (the reviews run while the gate runs,
-  // one after the other). The settled outcome keeps a throwing port behaving
+  // starts beside it (the review runs while the gate runs; code-review is not
+  // part of this lane). The settled outcome keeps a throwing port behaving
   // exactly as today — the throw leaves the advance — and leaves no rejection
   // unhandled.
   const gateOutcome = gate.evaluateAttemptGate({

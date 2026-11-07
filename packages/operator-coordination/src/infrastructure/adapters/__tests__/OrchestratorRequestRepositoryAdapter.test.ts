@@ -775,6 +775,47 @@ describe('OrchestratorRequestRepositoryAdapter', () => {
     ).toEqual({ outcome: 'refused', code: 'terminal-state', requestId: R1 });
   });
 
+  it('refuses save transitioning stalled to dispatched or refused with terminal-state', async () => {
+    const adapter = new OrchestratorRequestRepositoryAdapter({ stateDir: tempDir });
+    await adapter.save(initialRequest(R1), 0);
+    const stalledRecord: OrchestratorRequestRecord = {
+      ...initialRequest(R1),
+      revision: 2,
+      state: 'stalled',
+      claimCount: 2,
+      fence: 2,
+      claim: null,
+    };
+    const saveStalled = await adapter.save(stalledRecord, 1);
+    expect(saveStalled).toMatchObject({ outcome: 'saved' });
+
+    // save of stalled -> dispatched refuses terminal-state
+    const toDispatched: OrchestratorRequestRecord = {
+      ...stalledRecord,
+      revision: 3,
+      state: 'dispatched',
+      linked: { attemptId: 'attempt-example-1', journalKey: `request/${R1}` },
+    };
+    expect(await adapter.save(toDispatched, 2)).toEqual({
+      outcome: 'refused',
+      code: 'terminal-state',
+      requestId: R1,
+    });
+
+    // save of stalled -> refused refuses terminal-state
+    const toRefused: OrchestratorRequestRecord = {
+      ...stalledRecord,
+      revision: 3,
+      state: 'refused',
+      reason: { reasonKind: 'seat-unavailable', detail: null },
+    };
+    expect(await adapter.save(toRefused, 2)).toEqual({
+      outcome: 'refused',
+      code: 'terminal-state',
+      requestId: R1,
+    });
+  });
+
   it('honors readOnly mode by refusing saves without locking and reporting unreadable files as unknown without quarantining', async () => {
     const storePath = path.join(tempDir, 'orchestrator-requests.json');
     await fs.writeFile(storePath, '{ nope');

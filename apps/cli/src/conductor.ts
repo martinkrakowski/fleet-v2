@@ -103,6 +103,7 @@ export interface ConductorCliOptions {
 }
 
 export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
+       fleet-v2 conductor status --stalled
        fleet-v2 conductor schedule [--json] [--passes]
        fleet-v2 conductor halt [--lift]
        fleet-v2 conductor stop <runId> [--force] [--revision <n>]
@@ -111,6 +112,11 @@ export const CONDUCTOR_HELP = `Usage: fleet-v2 conductor status [<runId>]
        fleet-v2 conductor start --abandon --run-id <id> --attempt-id <id>
        fleet-v2 conductor run --live|--dry-run [--once] [--max-active-runs <n>] [--pass-concurrency <n>]
        fleet-v2 conductor reap --worktrees|--sessions [--dry-run] [--yes] [--force-unsealed]
+
+conductor status --stalled lists the runs parked longer than
+policy.daemon.stallAfterMinutes (default 30) as run id, park class, age in
+minutes and work order, oldest first; it is the view of the same stall rule
+that raises the conductor's stall:<runId> attention items.
 
 Read-only status of one lane run (or every run) with its projected state,
 the halt marker and the driver lease; a kill-switch halt the driver checks
@@ -182,6 +188,7 @@ function revisionOf(value: string | undefined): number | 'invalid' | 'absent' {
 interface ControlOptions {
   readonly force: boolean;
   readonly lift: boolean;
+  readonly stalled: boolean;
   readonly revision: number | undefined;
   readonly positionals: readonly string[];
 }
@@ -195,6 +202,7 @@ function readControlOptions(argv: readonly string[], io: CliIo): ControlOptions 
   const positionals: string[] = [];
   let force = false;
   let lift = false;
+  let stalled = false;
   let revision: number | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index]!;
@@ -212,6 +220,14 @@ function readControlOptions(argv: readonly string[], io: CliIo): ControlOptions 
         return null;
       }
       lift = true;
+      continue;
+    }
+    if (token === '--stalled') {
+      if (stalled) {
+        io.stderr(`Repeated flag: ${token}\n${CONDUCTOR_HELP}\n`);
+        return null;
+      }
+      stalled = true;
       continue;
     }
     if (token === '--revision' || token.startsWith('--revision=')) {
@@ -241,17 +257,17 @@ function readControlOptions(argv: readonly string[], io: CliIo): ControlOptions 
     io.stderr(`conductor takes at most one run id\n${CONDUCTOR_HELP}\n`);
     return null;
   }
-  return { force, lift, revision, positionals };
+  return { force, lift, stalled, revision, positionals };
 }
 
 /** What each subcommand accepts; anything else is a usage error, never silently ignored. */
 const SUBCOMMAND_SHAPE: Readonly<
-  Record<string, { readonly force: boolean; readonly lift: boolean; readonly revision: boolean; readonly runId: 'none' | 'optional' | 'required'; readonly writes: boolean }>
+  Record<string, { readonly force: boolean; readonly lift: boolean; readonly stalled: boolean; readonly revision: boolean; readonly runId: 'none' | 'optional' | 'required'; readonly writes: boolean }>
 > = {
-  status: { force: false, lift: false, revision: false, runId: 'optional', writes: false },
-  halt: { force: false, lift: true, revision: false, runId: 'none', writes: true },
-  stop: { force: true, lift: false, revision: true, runId: 'required', writes: true },
-  resume: { force: false, lift: false, revision: true, runId: 'required', writes: true },
+  status: { force: false, lift: false, stalled: true, revision: false, runId: 'optional', writes: false },
+  halt: { force: false, lift: true, stalled: false, revision: false, runId: 'none', writes: true },
+  stop: { force: true, lift: false, stalled: false, revision: true, runId: 'required', writes: true },
+  resume: { force: false, lift: false, stalled: false, revision: true, runId: 'required', writes: true },
 };
 
 /** The exit code of a control result, read from its outcome; text is never parsed. */
@@ -1997,9 +2013,14 @@ function controlUsageExit(
   const misplaced =
     (parsed.force && !shape.force ? '--force' : null) ??
     (parsed.lift && !shape.lift ? '--lift' : null) ??
+    (parsed.stalled && !shape.stalled ? '--stalled' : null) ??
     (parsed.revision !== undefined && !shape.revision ? '--revision' : null);
   if (misplaced !== null) {
     io.stderr(`conductor ${subcommand} does not take ${misplaced}\n${CONDUCTOR_HELP}\n`);
+    return 2;
+  }
+  if (parsed.stalled && parsed.positionals.length > 0) {
+    io.stderr(`conductor ${subcommand} --stalled takes no run id\n${CONDUCTOR_HELP}\n`);
     return 2;
   }
   if (shape.runId === 'none' && parsed.positionals.length > 0) {
@@ -2013,6 +2034,17 @@ function controlUsageExit(
     return 2;
   }
   return null;
+}
+
+/** `conductor status --stalled`: the runs parked past the stall threshold, oldest first, as one JSON document. */
+async function conductorStalledExit(
+  conductor: FleetCliRuntime['conductor'],
+  io: CliIo,
+  nowIso: string,
+): Promise<number> {
+  const result = await conductor.listStalledRuns.listStalledRuns({ nowIso });
+  io.stdout(`${JSON.stringify(result)}\n`);
+  return exitFor(result);
 }
 
 /** `conductor status`: one JSON document describing lane runs. */
@@ -2172,6 +2204,9 @@ export async function conductorCommand(
   const conductor = runtime.conductor;
   switch (subcommand) {
     case 'status':
+      if (parsed.stalled) {
+        return await conductorStalledExit(conductor, io, nowIso);
+      }
       return await conductorStatusExit(conductor, io, nowIso, parsed.positionals[0]);
     case 'halt':
       return await conductorHaltExit(conductor, io, nowIso, parsed.lift);

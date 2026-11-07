@@ -14,7 +14,7 @@
  */
 
 import { isPolicyGrantRecord } from '../../domain/policy-grants.js';
-import { GRANT_RECORD_VERSION } from '../../domain/coordination-records.js';
+import { GRANT_RECORD_VERSION, isReleaseActionScope } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import type {
@@ -24,11 +24,14 @@ import type {
 } from '../ports/in/ResolveActionAuthorizationPort.in-port.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import { CoordinationRequestRevisionConflictError } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import type { AttemptFactsReadPort } from '../ports/out/AttemptFactsReadPort.out-port.js';
 import type { DecisionTransportPort } from '../ports/out/DecisionTransportPort.out-port.js';
 
 export interface ResolveActionAuthorizationDependencies {
   readonly requestRepo: CoordinationRequestRepositoryPort;
   readonly decisionTransport?: DecisionTransportPort;
+  /** CO24f: reads the attempt facts a first bind validates against; binding fails closed without it. */
+  readonly attemptFactsRead?: AttemptFactsReadPort;
 }
 
 function isFilled(value: unknown): value is string {
@@ -171,6 +174,15 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
    * that resolves it, durably, so a later consumption by another attempt at the same head
    * is refused. A version-2 record without an attempt, and an unusable attempt id, block.
    * A merge grant is attempt-less by design (DT6b) and is never bound.
+   *
+   * CO24g: a resolve that names no attempt cannot authorize an owner grant. An unbound one
+   * refuses (`attempt-required`) without binding or consuming, and an already-bound one also
+   * refuses, because every caller that resolves a bound owner grant passes its attempt and no
+   * anonymous path is needed. Policy grants keep their own recorded attempt and are resolved
+   * only by their id, so they stay unaffected. Two grant kinds are attempt-less by design and
+   * are exempt by kind, never by a missing attemptId: a merge grant (DT6b), anchored by
+   * repository, pull request and head, and a release grant (CO14), anchored by its
+   * `release:<action>` scope, exact head and one deterministic consumption.
    */
   private async bindAttempt(
     candidate: CoordinationRequest,
@@ -181,8 +193,30 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (candidate.isMissingRecordedAttempt()) {
       return blocked('grant-attempt-unrecorded');
     }
-    if (request.attemptId === undefined) {
+    // DT6b: a merge grant is anchored by repository, pull request and head, never by an
+    // attempt; it resolves unbound and is never bound.
+    if (candidate.getMergeGrant() !== null) {
       return null;
+    }
+    // CO24g: an unbound release grant is attempt-less by design (cutover row CO14). It is
+    // anchored by its exact `release:<action>` scope (only `release:install`,
+    // `release:swap` or `release:rollback`) and exact head, and consumed once
+    // by its deterministic action id, so it resolves with or without an attempt
+    // coordinate and is never bound to a work attempt. A bound release grant is held
+    // to its attempt and falls through to the normal checks. The gate is the grant's
+    // recorded scope — the grant kind — never the absence of an attemptId, and
+    // never an arbitrary `release:*` prefix.
+    if (isReleaseActionScope(candidate.getActionScope()) && candidate.getBoundAttemptId() === null) {
+      return null;
+    }
+    if (request.attemptId === undefined) {
+      // A policy grant carries its own recorded attempt and resolves only by its id, so it
+      // is unaffected by the attempt-required default. Every other grant — an owner grant,
+      // bound or not — refuses without the attempt coordinate.
+      if (candidate.getPolicyGrant() !== null) {
+        return null;
+      }
+      return blocked('attempt-required');
     }
     if (!isFilled(request.attemptId)) {
       return blocked('grant-attempt-invalid');
@@ -192,8 +226,22 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (bound !== null) {
       return bound === supplied ? null : blocked('grant-attempt-mismatch');
     }
-    if (candidate.getMergeGrant() !== null) {
-      return null;
+    // CO24f: an unbound owner grant binds only an attempt that exists, belongs
+    // to the grant's project and was collected at the requested head, read
+    // through the attempt-facts port. Anything else refuses without binding,
+    // so a wrong attempt can never attach to — or kill — the grant.
+    const facts = await (this.deps?.attemptFactsRead?.findAttemptFactsById(supplied) ?? null);
+    if (facts === null) {
+      return blocked('grant-attempt-unknown');
+    }
+    if (facts.projectId === null || facts.projectId !== record.projectId) {
+      return blocked('grant-attempt-foreign');
+    }
+    if (facts.collectedHeadSha === null) {
+      return blocked('grant-attempt-uncollected');
+    }
+    if (facts.collectedHeadSha !== request.expectedHeadSha.trim()) {
+      return blocked('grant-attempt-head-mismatch');
     }
     let binding: CoordinationRequestRecord;
     try {

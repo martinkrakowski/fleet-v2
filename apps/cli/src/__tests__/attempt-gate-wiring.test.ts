@@ -245,6 +245,8 @@ function passingGhRunner(): (args: readonly string[]) => Promise<GhResult> {
           closedAt: null,
           mergeCommit: null,
           mergeStateStatus: "CLEAN",
+          isCrossRepository: false,
+          headRepositoryOwner: { login: "example-org" },
         }),
         stderr: "",
       };

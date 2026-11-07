@@ -26,6 +26,7 @@ import {
   LANE_RUN_KEY_ATTEMPT_RULE,
   LANE_RUN_KEY_HEAD_RULE,
   LANE_RUN_KEY_STEPS,
+  LANE_RUN_ONE_WAY_STEPS,
 } from '../lane-run-records.js';
 
 /**
@@ -1024,6 +1025,35 @@ describe('merge-enqueue key (KS7b)', () => {
       if (parsed !== null && parsed.kind === 'step') {
         expect(buildLaneRunStepKey(parsed)).toEqual({ ok: true, key });
       }
+    }
+  });
+});
+
+describe('review resume keys (RV4)', () => {
+  it('resumed review key is two-way and has no request digest', () => {
+    for (const step of ['brief-check', 'code-review'] as const) {
+      expect((LANE_RUN_ONE_WAY_STEPS as readonly string[]).includes(step)).toBe(false);
+      const keys: string[] = [];
+      for (const retry of [null, 1, 2, 3, 4, 5, 6, 7, 8, 9]) {
+        const built = buildLaneRunStepKey({
+          runId: RUN_ID, round: 1, step, seatIndex: 0, attemptOrdinal: null, head12: HEAD12, retry,
+        });
+        expect(built.ok).toBe(true);
+        if (!built.ok) throw new Error('unreachable');
+        // Only run, round, step, seat, head and retry: no digest segment.
+        expect(built.key).toBe(
+          `${RUN_ID}/r1/${step}/0@${HEAD12}` + (retry === null ? '' : `/retry${retry}`),
+        );
+        expect(parseLaneRunKey(built.key)).toMatchObject({ kind: 'step', step, retry });
+        keys.push(built.key);
+      }
+      expect(new Set(keys).size).toBe(10);
+      // A tenth retry is refused.
+      expect(
+        buildLaneRunStepKey({
+          runId: RUN_ID, round: 1, step, seatIndex: 0, attemptOrdinal: null, head12: HEAD12, retry: 10,
+        }).ok,
+      ).toBe(false);
     }
   });
 });

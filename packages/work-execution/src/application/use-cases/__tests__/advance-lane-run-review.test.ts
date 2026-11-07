@@ -606,16 +606,11 @@ describe('AdvanceLaneRunUseCase review acts (K5-4a)', () => {
       result: 'completed',
       reasonCode: 'review-no-receipt',
     });
+    // RV4: retries count every remaining review intent of the generation
+    // (`remaining.length - 1`), so after the one budget retry on the first
+    // seat the switched seat's no-receipt parks — no second budget retry.
     const fourth = await advance(harness);
-    expect(fourth).toEqual({
-      outcome: 'acted',
-      step: 'brief-check',
-      key: reviewKey('brief-check', 1, HEAD12_A, 1),
-      result: 'completed',
-      reasonCode: 'review-no-receipt',
-    });
-    const fifth = await advance(harness);
-    expect(fifth).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
+    expect(fourth).toEqual({ outcome: 'parked', reason: 'review-seat-unavailable', qualifier: null });
   });
 
   it('journals the fixed detail of a no-receipt result end to end', async () => {
@@ -1879,5 +1874,151 @@ describe('review cause codes reach the run journal (RV2)', () => {
       policyRevision: 'pol', implementerModel: 'i', reviewerModel: 'r',
     } as never);
     expect(result).toEqual({ outcome: 'unknown', reason: 'receipt-mismatch' });
+  });
+
+  it('RV4: seat-busy is idempotent under the same key and opens the next free retry key', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+    // The seat is busy for the first review, then frees: the retry succeeds.
+    let reviewCalls = 0;
+    harness.setReviewAnswer(async (request) => {
+      reviewCalls += 1;
+      if (reviewCalls === 1) {
+        return { outcome: 'no-receipt', reason: 'review-unavailable', detail: 'seat-busy' };
+      }
+      return { outcome: 'receipt', receipt: receiptFor(request, 'passed') };
+    });
+
+    const first = await advance(harness);
+    expect(first).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A),
+      result: 'completed',
+      reasonCode: 'seat-busy',
+      detail: 'seat-busy',
+    });
+
+    // The base key has exactly one intent, never appended twice.
+    let entries = await harness.runJournal.listForRun(RUN_ID);
+    const baseIntents = entries.filter(
+      (entry) => entry.kind === 'intent' && entry.key === reviewKey('brief-check', 0, HEAD12_A),
+    );
+    expect(baseIntents).toHaveLength(1);
+
+    // The seat-busy result is not a second verdict: the next pass opens the
+    // next free retry key instead of parking or reusing the same key.
+    const second = await advance(harness);
+    expect(second).toEqual({
+      outcome: 'acted',
+      step: 'brief-check',
+      key: reviewKey('brief-check', 0, HEAD12_A, 1),
+      result: 'completed',
+      reasonCode: 'review-passed',
+    });
+    entries = await harness.runJournal.listForRun(RUN_ID);
+    const retryIntents = entries.filter(
+      (entry) => entry.kind === 'intent' && entry.key === reviewKey('brief-check', 0, HEAD12_A, 1),
+    );
+    expect(retryIntents).toHaveLength(1);
+  });
+
+  it('RV4: unknown worktree status does not dispatch and does not abort', async () => {
+    const harness = await makeHarness(runRecord(), [collectedAttempt()]);
+    await conduct(harness, 'brief-check', NOW);
+
+    let inspectCalls = 0;
+    let abortCalls = 0;
+    const deps: AdvanceLaneRunDependencies = {
+      ...harness.deps,
+      runnerForAttempt: {
+        runnerForAttempt: () => ({
+          ok: true,
+          runner: {
+            inspectWorktreeRun: async () => {
+              inspectCalls += 1;
+              return { state: 'unknown', reason: 'status unreadable' };
+            },
+            abortWorktreeRun: async () => {
+              abortCalls += 1;
+              return { outcome: 'aborted', endedAtIso: LATER };
+            },
+          } as never,
+        }),
+      },
+    };
+    harness.setJournalBaseline((await harness.runJournal.listForRun(RUN_ID)).length);
+    const useCase = new AdvanceLaneRunUseCase(deps);
+    const result = await useCase.advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+
+    expect(result).toEqual({ outcome: 'waiting', reason: 'facts-inconsistent' });
+    expect(inspectCalls).toBe(1);
+    expect(abortCalls).toBe(0);
+    expect(harness.reviewRequests).toHaveLength(0);
+    // Nothing was written: the journal holds only the conduct entry.
+    const entries = await harness.runJournal.listForRun(RUN_ID);
+    expect(entries).toHaveLength(1);
+  });
+
+  it('RV4: a running session matching the collected attempt is aborted; a non-aborted abort waits review-pending', async () => {
+    const collected = { ...collectedAttempt(), sessionId: 'session-match' };
+
+    // Matching session, abort succeeds: the review proceeds on the free base key.
+    const abortedHarness = await makeHarness(runRecord(), [collected]);
+    await conduct(abortedHarness, 'brief-check', NOW);
+    const abortedDeps: AdvanceLaneRunDependencies = {
+      ...abortedHarness.deps,
+      runnerForAttempt: {
+        runnerForAttempt: () => ({
+          ok: true,
+          runner: {
+            inspectWorktreeRun: async () => ({ state: 'running', sessionId: 'session-match' }),
+            abortWorktreeRun: async () => ({ outcome: 'aborted', endedAtIso: LATER }),
+          } as never,
+        }),
+      },
+    };
+    abortedHarness.setJournalBaseline((await abortedHarness.runJournal.listForRun(RUN_ID)).length);
+    const abortedUseCase = new AdvanceLaneRunUseCase(abortedDeps);
+    const aborted = await abortedUseCase.advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+    expect(aborted).toMatchObject({ outcome: 'acted', step: 'brief-check', reasonCode: 'review-passed' });
+    expect(abortedHarness.reviewRequests).toHaveLength(1);
+
+    // Matching session but the abort stays running: review-pending, nothing written.
+    const runningHarness = await makeHarness(runRecord(), [collected]);
+    await conduct(runningHarness, 'brief-check', NOW);
+    const runningDeps: AdvanceLaneRunDependencies = {
+      ...runningHarness.deps,
+      runnerForAttempt: {
+        runnerForAttempt: () => ({
+          ok: true,
+          runner: {
+            inspectWorktreeRun: async () => ({ state: 'running', sessionId: 'session-match' }),
+            abortWorktreeRun: async () => ({ outcome: 'still-running', reason: 'still there' }),
+          } as never,
+        }),
+      },
+    };
+    runningHarness.setJournalBaseline((await runningHarness.runJournal.listForRun(RUN_ID)).length);
+    const runningUseCase = new AdvanceLaneRunUseCase(runningDeps);
+    const running = await runningUseCase.advanceLaneRun({
+      runId: RUN_ID,
+      lease: { holderId: HOLDER, fence: 1 },
+      halted: false,
+      nowIso: LATER,
+    });
+    expect(running).toEqual({ outcome: 'waiting', reason: 'review-pending' });
+    expect(runningHarness.reviewRequests).toHaveLength(0);
+    expect(await runningHarness.runJournal.listForRun(RUN_ID)).toHaveLength(1);
   });
 });

@@ -45,6 +45,8 @@ const CHECKS_GRACE_RANGE = { min: 1, max: 1440 } as const;
 const INTERVAL_RANGE = { min: 10, max: 3600 } as const;
 const BUDGET_RANGE = { min: 5, max: 600 } as const;
 const SETTLE_RANGE = { min: 0, max: 600 } as const;
+const STALL_AFTER_RANGE = { min: 1, max: 1440 } as const;
+const DEFAULT_STALL_AFTER_MINUTES = 30;
 const REVISION_PATTERN = /^[0-9a-f]{12}$/;
 const VETO_MODES: ReadonlySet<string> = new Set(['off', 'shadow', 'live']);
 const REPOSITORY_KEYS: readonly string[] = [
@@ -63,6 +65,8 @@ const REPOSITORY_KEYS: readonly string[] = [
 ];
 const VETO_KEYS: readonly string[] = ['mode', 'holdConfidence'];
 const DAEMON_KEYS: readonly string[] = ['intervalSeconds', 'budgetSeconds', 'settleSeconds', 'chainRefresh'];
+/** PT1a: `stallAfterMinutes` is optional on the source (a record resolved before PT1a lacks it); an unusable value reads as 30. */
+const STALL_AFTER_KEY = 'stallAfterMinutes';
 const CHAIN_REFRESH_MODES: ReadonlySet<string> = new Set(['shadow', 'invalid']);
 
 const UNREADABLE: MergePolicyAnswer = Object.freeze({
@@ -274,6 +278,8 @@ function readDaemon(value: unknown): MergePolicyDaemonSettings | undefined {
   const budgetSeconds = ownValue(value, 'budgetSeconds');
   const settleSeconds = ownValue(value, 'settleSeconds');
   const chainRefresh = ownValue(value, 'chainRefresh');
+  const hasStallAfter = Object.hasOwn(value, STALL_AFTER_KEY);
+  const stallAfterMinutes = ownValue(value, STALL_AFTER_KEY);
   if (
     !isIntegerInRange(intervalSeconds, INTERVAL_RANGE) ||
     !isIntegerInRange(budgetSeconds, BUDGET_RANGE) ||
@@ -281,7 +287,7 @@ function readDaemon(value: unknown): MergePolicyDaemonSettings | undefined {
     budgetSeconds >= intervalSeconds ||
     typeof chainRefresh !== 'string' ||
     !CHAIN_REFRESH_MODES.has(chainRefresh) ||
-    !hasExactlyKeys(value, DAEMON_KEYS)
+    !hasExactlyKeys(value, hasStallAfter ? [...DAEMON_KEYS, STALL_AFTER_KEY] : DAEMON_KEYS)
   ) {
     return undefined;
   }
@@ -290,6 +296,10 @@ function readDaemon(value: unknown): MergePolicyDaemonSettings | undefined {
     budgetSeconds,
     settleSeconds,
     chainRefresh: chainRefresh as 'shadow' | 'invalid',
+    // PT1a: never a refusal because of this key; an unusable value reads as the default.
+    ...(hasStallAfter
+      ? { stallAfterMinutes: isIntegerInRange(stallAfterMinutes, STALL_AFTER_RANGE) ? stallAfterMinutes : DEFAULT_STALL_AFTER_MINUTES }
+      : {}),
   });
 }
 

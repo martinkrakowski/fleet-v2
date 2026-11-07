@@ -23,6 +23,9 @@ const GET_ROUTE_PATTERNS: readonly string[] = [
   "/v1/attempts/:id/journal",
   "/v1/runs",
   "/v1/runs/passes",
+  "/v1/runs/journal",
+  "/v1/runs/:id",
+  "/v1/runs/:id/journal",
   "/v1/changes",
   "/v1/work-orders/:id",
   "/v1/coordination",
@@ -56,6 +59,9 @@ const MUTATION_ROUTE_RULES: ReadonlyArray<readonly [string, string, string]> = [
   ["POST", "/v1/authorizations/resolve", "hook"],
   ["POST", "/v1/authorizations/:id/consume", "hook"],
   ["POST", "/v1/forge", "hook"],
+  ["POST", "/v1/threads/:id/permissions", "hook"],
+  ["GET", "/v1/threads/:id/permissions", "verdict"],
+  ["POST", "/v1/threads/:id/permissions/:requestId/verdict", "verdict"],
   ["POST", "/v1/attempts/:id/stop", "operate"],
   // A-C: direct conductor run-control writes (operate scope)
   ["POST", "/v1/runs/halt", "operate"],
@@ -145,6 +151,11 @@ export function requiredScope(method: string, requestPath: string): string | nul
     for (const pattern of GET_ROUTE_PATTERNS) {
       if (matchesSegmentPattern(normalized, pattern)) {
         return "read";
+      }
+    }
+    for (const [m, pattern, scope] of MUTATION_ROUTE_RULES) {
+      if (m === upperMethod && matchesSegmentPattern(normalized, pattern)) {
+        return scope;
       }
     }
     return null;

@@ -46,11 +46,31 @@ export interface RenderHandoverBriefInput {
 
 export type RenderHandoverBriefResult =
   | { readonly ok: true; readonly text: string; readonly numberedFixes: readonly string[] }
-  | { readonly ok: false; readonly reason: string };
+  | { readonly ok: false; readonly reason: HandoverBriefRefusalReason };
+
+/** Every reason `renderHandoverBrief` can refuse with — a closed union, so a caller can build a refusal detail from it without echoing free text (PF1). */
+export const HANDOVER_BRIEF_REFUSAL_REASONS = [
+  'invalid-header-value',
+  'secret-shaped-finding',
+  'secret-shaped-input',
+  'invalid-finding-path',
+  'invalid-finding-line',
+  'invalid-gate-predicate',
+  'invalid-gate-code',
+  'invalid-proof-command',
+  'nothing-to-fix',
+  'handover-too-large',
+] as const;
+export type HandoverBriefRefusalReason = (typeof HANDOVER_BRIEF_REFUSAL_REASONS)[number];
 
 const MAX_NUMBERED_FIXES = 20;
-/** A repository-relative path: plain path characters only, so it can never break the fenced block. */
-const FINDING_PATH_PATTERN = /^[A-Za-z0-9._@+/-]{1,300}$/;
+/**
+ * A repository-relative path: plain path characters only, so it can never
+ * break the fenced block. `[` and `]` are allowed so Nitro dynamic-route
+ * paths (`threads/[id]/index.post.ts`) render (PF1); path shape is checked
+ * separately so `../x` and `/etc/x` still refuse.
+ */
+const FINDING_PATH_PATTERN = /^[A-Za-z0-9._@+/[\]-]{1,300}$/;
 /** A gate reason code: lowercase and hyphens, like every journal reason code. */
 const GATE_REASON_CODE_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 /** A gate predicate name: printable ASCII, never a backtick, at most 120 characters. */
@@ -101,14 +121,37 @@ function compareFindings(a: HandoverFinding, b: HandoverFinding): number {
   return (a.line ?? -1) - (b.line ?? -1);
 }
 
+function findingPathRejectOf(filePath: unknown): HandoverBriefRefusalReason | undefined {
+  if (typeof filePath !== 'string') {
+    return 'invalid-finding-path';
+  }
+  if (!FINDING_PATH_PATTERN.test(filePath)) {
+    return 'invalid-finding-path';
+  }
+  if (filePath.startsWith('/')) {
+    return 'invalid-finding-path';
+  }
+  const segments = filePath.split('/');
+  if (segments.some((segment) => segment === '..' || segment === '.' || segment === '')) {
+    return 'invalid-finding-path';
+  }
+  return undefined;
+}
+
 function renderFindingLine(
   finding: HandoverFinding,
-): { readonly ok: true; readonly text: string } | { readonly ok: false; readonly reason: string } {
+): { readonly ok: true; readonly text: string } | { readonly ok: false; readonly reason: HandoverBriefRefusalReason } {
   if (containsSecretShape(finding.summary)) {
     return { ok: false, reason: 'secret-shaped-finding' };
   }
-  if (finding.filePath !== null && !FINDING_PATH_PATTERN.test(finding.filePath)) {
-    return { ok: false, reason: 'invalid-finding-path' };
+  if (finding.filePath !== null) {
+    const pathReject = findingPathRejectOf(finding.filePath);
+    if (pathReject !== undefined) {
+      return { ok: false, reason: pathReject };
+    }
+    if (containsSecretShape(finding.filePath)) {
+      return { ok: false, reason: 'secret-shaped-finding' };
+    }
   }
   if (finding.line !== null && (!Number.isInteger(finding.line) || finding.line < 0)) {
     return { ok: false, reason: 'invalid-finding-line' };

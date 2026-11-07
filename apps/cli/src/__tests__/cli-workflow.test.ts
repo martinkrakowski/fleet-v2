@@ -94,6 +94,8 @@ function wireOpenPullRequestRead(
         headSha,
         headRef,
         baseRef: 'main',
+        isCrossRepository: false,
+        headRepositoryOwner: 'org',
         mergedAtIso: null,
         closedAtIso: null,
         mergeCommitSha: null,
@@ -753,6 +755,7 @@ describe('Fleet CLI workflow', () => {
         expectedHeadSha: laneHead,
         proposalDigest: `merge ${ATTEMPT_ID} at ${laneHead}`,
         policyRevision: POLICY_REVISION,
+        attemptId: ATTEMPT_ID,
       }),
     ]);
     expect(decision.code).toBe(0);
@@ -911,6 +914,7 @@ describe('Fleet CLI workflow', () => {
         expectedHeadSha: laneHead,
         proposalDigest: `open a pull request for ${ATTEMPT_ID}`,
         policyRevision: POLICY_REVISION,
+        attemptId: ATTEMPT_ID,
       }),
     ]);
     expect(decision.code).toBe(0);
@@ -927,6 +931,7 @@ describe('Fleet CLI workflow', () => {
         projectId: PROJECT_ID,
         actionScope: 'forge:push-and-open-pr',
         expectedHeadSha: laneHead,
+        attemptId: ATTEMPT_ID,
       }),
     ]);
     expect(resolved.code).toBe(0);
@@ -964,6 +969,7 @@ describe('Fleet CLI workflow', () => {
         projectId: PROJECT_ID,
         actionScope: 'forge:push-and-open-pr',
         expectedHeadSha: laneHead,
+        attemptId: ATTEMPT_ID,
       }),
     ]);
     expect(blocked.code).toBe(1);
@@ -1870,6 +1876,7 @@ describe('Fleet CLI workflow', () => {
         expectedHeadSha: mpLaneHead,
         proposalDigest: `merge ${mpAttemptId} at ${mpLaneHead}`,
         policyRevision: POLICY_REVISION,
+        attemptId: mpAttemptId,
       }),
     ]);
     expect(decision.code).toBe(0);
@@ -1886,6 +1893,7 @@ describe('Fleet CLI workflow', () => {
         projectId: PROJECT_ID,
         actionScope: 'forge:merge-pr',
         expectedHeadSha: mpLaneHead,
+        attemptId: mpAttemptId,
       }),
     ]);
     expect(resolved.code).toBe(0);

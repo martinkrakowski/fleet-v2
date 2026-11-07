@@ -15,14 +15,23 @@ import type {
   OpenPullRequestSummary,
   PullRequestCiCost,
   PullRequestCiCostUnavailableReason,
+  PullRequestChangedFilesUnknownReason,
   PullRequestRef,
   PullRequestSnapshot,
+  ReadPullRequestChangedFilesRequest,
+  ReadPullRequestChangedFilesResult,
   ReadPullRequestCiCostRequest,
   ReadPullRequestCiCostResult,
   ReadPullRequestRequest,
   ReadPullRequestResult,
   WorkflowCiCost,
 } from '../../application/ports/out/ForgeReadPort.out-port.js';
+import {
+  MAX_PULL_REQUEST_CHANGED_FILES,
+  MAX_PULL_REQUEST_NUMBER,
+  screenRepoRelativePath,
+} from '../../domain/held-work-order.js';
+import { snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
 import type { ContainsCommitRequest, ContainsCommitResult } from '../../application/ports/out/ForgeAncestryPort.out-port.js';
 import type { ForgeAncestryPort } from '../../application/ports/out/ForgeAncestryPort.out-port.js';
 import { parseBaseBranch } from '../../domain/base-branch.js';
@@ -40,7 +49,7 @@ export interface ForgeReadAdapterOptions {
 
 /** Always ask for state and head: `--json number` alone is answered without the forge. */
 export const PULL_REQUEST_VIEW_FIELDS =
-  'number,state,headRefOid,headRefName,baseRefName,mergedAt,closedAt,mergeCommit,mergeStateStatus';
+  'number,state,headRefOid,headRefName,baseRefName,mergedAt,closedAt,mergeCommit,mergeStateStatus,isCrossRepository,headRepositoryOwner';
 
 const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const HEX_40 = /^[0-9a-f]{40}$/;
@@ -121,6 +130,22 @@ function parseMergeCommit(value: unknown): string | null | undefined {
   return typeof oid === 'string' && HEX_40.test(oid) ? oid : undefined;
 }
 
+/**
+ * The head repository's owner login from one `gh pr view` record: GitHub
+ * answers an owner object carrying `login`; a plain string is also accepted.
+ * `null` when absent or unreadable — never assumed same-repository.
+ */
+function parseHeadRepositoryOwner(value: unknown): string | null {
+  if (typeof value === 'string') {
+    return value.length > 0 ? value : null;
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const login = (value as Record<string, unknown>).login;
+  return typeof login === 'string' && login.length > 0 ? login : null;
+}
+
 /** Pure parse of one `gh pr view --json PULL_REQUEST_VIEW_FIELDS` stdout, checked against the ref. */
 export function parsePullRequestView(stdout: string, ref: PullRequestRef): ReadPullRequestResult {
   let parsed: unknown;
@@ -142,6 +167,8 @@ export function parsePullRequestView(stdout: string, ref: PullRequestRef): ReadP
   const closedAtIso = parseTimestamp(record.closedAt);
   const mergeCommitSha = parseMergeCommit(record.mergeCommit);
   const mergeState = parseMergeStateStatus(record.mergeStateStatus);
+  const isCrossRepository = typeof record.isCrossRepository === 'boolean' ? record.isCrossRepository : null;
+  const headRepositoryOwner = parseHeadRepositoryOwner(record.headRepositoryOwner);
   if (
     number === null ||
     state === null ||
@@ -150,7 +177,11 @@ export function parsePullRequestView(stdout: string, ref: PullRequestRef): ReadP
     baseRef === null ||
     mergedAtIso === undefined ||
     closedAtIso === undefined ||
-    mergeCommitSha === undefined
+    mergeCommitSha === undefined ||
+    // A missing or unreadable fork field refuses the whole read: unknown stays
+    // unknown, and a consumer never assumes same-repository.
+    isCrossRepository === null ||
+    headRepositoryOwner === null
   ) {
     return UNAVAILABLE_UNREADABLE;
   }
@@ -170,6 +201,8 @@ export function parsePullRequestView(stdout: string, ref: PullRequestRef): ReadP
     headSha,
     headRef,
     baseRef,
+    isCrossRepository,
+    headRepositoryOwner,
     mergedAtIso,
     closedAtIso,
     mergeCommitSha,
@@ -507,6 +540,65 @@ export function parsePullRequestCiCostPage(
   return { kind: 'page', headSha, suites, hasMore, endCursor };
 }
 
+// --- PT1ca: read-only open-PR changed files ---------------------------------
+
+/** Stdout above four mebibytes is not parsed; the changed-file read is unknown. */
+export const MAX_PULL_REQUEST_FILES_STDOUT_BYTES = 4_194_304;
+
+const CHANGED_FILES_REQUEST_KEYS: readonly string[] = ['pullRequestNumber', 'repository', 'timeoutMs'];
+
+function unknownChangedFiles(reason: PullRequestChangedFilesUnknownReason): ReadPullRequestChangedFilesResult {
+  return { outcome: 'unknown', reason };
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/**
+ * Pure parse of one `gh pr view --json files,changedFiles` stdout: a plain
+ * object whose `files` is a dense array of fewer than 100 `{ path }` entries,
+ * every path already screened and exactly as the forge named it, and
+ * `changedFiles` is a non-negative integer equal to `files.length`.
+ * When `changedFiles` is missing or not a non-negative integer, or
+ * `changedFiles !== files.length` (an inconsistent forge count is unknown,
+ * in either direction), or `files.length >= 100`, the read is `unknown`;
+ * the result is deduplicated and sorted in code-unit order.
+ */
+export function parsePullRequestChangedFiles(stdout: string): ReadPullRequestChangedFilesResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return unknownChangedFiles('unreadable-files');
+  }
+  const root = snapshotPlainDataRecord(parsed);
+  const files: unknown = root === null ? undefined : root.files;
+  if (!Array.isArray(files)) {
+    return unknownChangedFiles('unreadable-files');
+  }
+  const changedFiles: unknown = root === null ? undefined : root.changedFiles;
+  if (typeof changedFiles !== 'number' || !Number.isSafeInteger(changedFiles) || changedFiles < 0) {
+    return unknownChangedFiles('unreadable-files');
+  }
+  if (changedFiles !== files.length || files.length >= MAX_PULL_REQUEST_CHANGED_FILES) {
+    return unknownChangedFiles('too-many-files');
+  }
+  const paths = new Set<string>();
+  for (let index = 0; index < files.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(files, index)) {
+      return unknownChangedFiles('unreadable-files');
+    }
+    const entry = snapshotPlainDataRecord(files[index]);
+    const path: unknown = entry === null ? undefined : entry.path;
+    if (typeof path !== 'string' || path !== path.trim() || screenRepoRelativePath(path) !== path) {
+      return unknownChangedFiles('unreadable-files');
+    }
+    paths.add(path);
+  }
+  return { outcome: 'found', files: [...paths].sort(compareCodeUnits) };
+}
+
 export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
   private readonly owner?: string;
   private readonly repo?: string;
@@ -747,6 +839,83 @@ export class ForgeReadAdapter implements ForgeReadPort, ForgeAncestryPort {
       return { outcome: 'unavailable', reason: 'partial-ci-cost' };
     } catch {
       return { outcome: 'unavailable', reason: 'invalid-request' };
+    }
+  }
+
+  /**
+   * The read-only open-PR changed-file read (PT1ca): one `gh pr view <n> --json
+   * files` per call through the injected runner, never a git subprocess. The
+   * whole answer is bounded (4 MiB of stdout, at most 3000 files) and every
+   * path is screened; one unreadable or unscreened entry makes the whole read
+   * unknown, never a shorter list, and no path or stderr is ever echoed.
+   */
+  async readPullRequestChangedFiles(
+    request: ReadPullRequestChangedFilesRequest,
+  ): Promise<ReadPullRequestChangedFilesResult> {
+    try {
+      const raw = snapshotPlainDataRecord(request);
+      if (raw === null || Object.keys(raw).some((key) => !CHANGED_FILES_REQUEST_KEYS.includes(key))) {
+        return unknownChangedFiles('invalid-request');
+      }
+      const pullRequestNumber = raw.pullRequestNumber;
+      if (
+        typeof pullRequestNumber !== 'number' ||
+        !Number.isSafeInteger(pullRequestNumber) ||
+        pullRequestNumber < 1 ||
+        pullRequestNumber > MAX_PULL_REQUEST_NUMBER
+      ) {
+        return unknownChangedFiles('invalid-request');
+      }
+      const requestedTimeoutMs: unknown = raw.timeoutMs;
+      let timeoutMs = this.timeoutMs;
+      if (requestedTimeoutMs !== undefined) {
+        if (typeof requestedTimeoutMs !== 'number' || !Number.isFinite(requestedTimeoutMs)) {
+          return unknownChangedFiles('invalid-request');
+        }
+        if (requestedTimeoutMs <= 0) {
+          return unknownChangedFiles('files-timed-out');
+        }
+        timeoutMs = requestedTimeoutMs;
+      }
+      let repository: { readonly owner?: unknown; readonly repo?: unknown };
+      if (raw.repository !== undefined) {
+        const snapshot = snapshotPlainDataRecord(raw.repository);
+        if (snapshot === null) {
+          return unknownChangedFiles('invalid-repository');
+        }
+        repository = snapshot;
+      } else {
+        repository = { owner: this.owner, repo: this.repo };
+        if (repository.owner === undefined || repository.repo === undefined) {
+          return unknownChangedFiles('forge-not-configured');
+        }
+      }
+      if (this.runGh === undefined) {
+        return unknownChangedFiles('forge-not-configured');
+      }
+      if (!isValidRepository(repository)) {
+        return unknownChangedFiles('invalid-repository');
+      }
+      const raced = await this.runGhWithinDeadline(
+        ['pr', 'view', String(pullRequestNumber), '-R', `${String(repository.owner)}/${String(repository.repo)}`, '--json', 'files,changedFiles'],
+        timeoutMs,
+      );
+      if (raced.kind === 'timed-out') {
+        return unknownChangedFiles('files-timed-out');
+      }
+      if (raced.kind === 'failed' || raced.gh.exitCode !== 0) {
+        return unknownChangedFiles('files-failed');
+      }
+      const stdout: unknown = raced.gh.stdout;
+      if (typeof stdout !== 'string') {
+        return unknownChangedFiles('unreadable-files');
+      }
+      if (Buffer.byteLength(stdout, 'utf8') > MAX_PULL_REQUEST_FILES_STDOUT_BYTES) {
+        return unknownChangedFiles('files-too-large');
+      }
+      return parsePullRequestChangedFiles(stdout);
+    } catch {
+      return unknownChangedFiles('invalid-request');
     }
   }
 

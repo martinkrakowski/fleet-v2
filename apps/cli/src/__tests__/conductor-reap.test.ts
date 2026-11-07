@@ -528,6 +528,7 @@ describe('conductor reap --worktrees against real git (C2\')', () => {
       expectedHeadSha: s.head,
       proposalDigest: 'd'.repeat(64),
       policyRevision: 'pol-1',
+      attemptId: 'attempt-example-1',
     });
     expect(requested.outcome).toBe('requested');
     const asked = await s.runtime.coordination.askOwnerQuestion.askOwnerQuestion({
@@ -627,6 +628,7 @@ describe('conductor reap --worktrees against real git (C2\')', () => {
       projectId: 'example-project',
       actionScope,
       expectedHeadSha: s.head,
+      attemptId: 'attempt-example-1',
     });
     expect(resolved.outcome).toBe('authorized');
     const consumed = await s.runtime.coordination.recordAuthorizationConsumption.recordAuthorizationConsumption({

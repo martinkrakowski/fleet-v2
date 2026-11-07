@@ -27,12 +27,14 @@ export default defineEventHandler(async (event) => {
       return failure.body;
     }
 
+    const threadId = routeParam(event, "id");
     const requestId = routeParam(event, "requestId");
     const body = await readObjectBody(event);
     const result = await getOperatorComposition().giveToolPermissionVerdict.giveToolPermissionVerdict(
       body,
       requestId,
       token.tokenId,
+      threadId,
     );
 
     if (result.outcome === "recorded" || result.outcome === "unchanged") {

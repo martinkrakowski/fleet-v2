@@ -19,8 +19,18 @@ import type { PermissionRequestRepositoryPort } from '../../application/ports/ou
 const MAX_PENDING_RECORDS = 128;
 const MAX_TOTAL_RECORDS = 512;
 
+export interface PermissionRequestRepositoryAdapterOptions {
+  readonly now?: () => number;
+}
+
 export class PermissionRequestRepositoryAdapter implements PermissionRequestRepositoryPort {
   private readonly records = new Map<string, PermissionRequest>();
+
+  constructor(private readonly options?: PermissionRequestRepositoryAdapterOptions) {}
+
+  private now(): number {
+    return this.options?.now ? this.options.now() : Date.now();
+  }
 
   record(
     request: PermissionRequestRecord,
@@ -31,28 +41,42 @@ export class PermissionRequestRepositoryAdapter implements PermissionRequestRepo
       return { stored: false };
     }
 
-    // Drop the oldest decided records while the total cap is reached; pending
-    // records are never dropped.
-    while (this.records.size >= MAX_TOTAL_RECORDS) {
-      const oldestDecided = this.firstDecided();
-      if (oldestDecided === undefined) {
-        break;
+    const now = this.now();
+
+    // Prune records that are not pending and whose deadlineAt has passed.
+    for (const [id, entity] of this.records.entries()) {
+      if (entity.getState() !== 'pending' && Date.parse(entity.getDeadlineAtIso()) <= now) {
+        this.records.delete(id);
       }
-      this.records.delete(oldestDecided.getId());
     }
 
-    if (this.pendingCount() >= MAX_PENDING_RECORDS || this.records.size >= MAX_TOTAL_RECORDS) {
+    // Drop the oldest decided/expired records while the total cap is reached; pending
+    // records are never dropped.
+    while (this.records.size >= MAX_TOTAL_RECORDS) {
+      const oldestNonPending = this.firstNonPending();
+      if (oldestNonPending === undefined) {
+        break;
+      }
+      this.records.delete(oldestNonPending.getId());
+    }
+
+    if (this.livePendingCount(now) >= MAX_PENDING_RECORDS || this.records.size >= MAX_TOTAL_RECORDS) {
       return { stored: false, reason: 'too-many-pending-requests' };
     }
 
-    const entity = new PermissionRequest({
-      requestId: request.requestId,
-      threadId: request.threadId,
-      toolName: request.toolName,
-      toolInput: request.toolInput,
-      requestedAtIso: request.requestedAtIso,
-      deadlineAtIso: request.deadlineAtIso,
-    });
+    const entity = new PermissionRequest(
+      {
+        requestId: request.requestId,
+        threadId: request.threadId,
+        toolName: request.toolName,
+        toolInput: request.toolInput,
+        requestedAtIso: request.requestedAtIso,
+        deadlineAtIso: request.deadlineAtIso,
+      },
+      request.verdict !== undefined || request.state !== undefined
+        ? { state: request.state, verdict: request.verdict }
+        : undefined,
+    );
     this.records.set(request.requestId, entity);
     return { stored: true };
   }
@@ -64,8 +88,9 @@ export class PermissionRequestRepositoryAdapter implements PermissionRequestRepo
 
   listPending(): readonly PermissionRequestRecord[] {
     const pending: PermissionRequestRecord[] = [];
+    const now = this.now();
     for (const entity of this.records.values()) {
-      if (entity.getVerdict() === undefined) {
+      if (entity.getState() === 'pending' && Date.parse(entity.getDeadlineAtIso()) > now) {
         pending.push(entity.toRecord());
       }
     }
@@ -75,7 +100,7 @@ export class PermissionRequestRepositoryAdapter implements PermissionRequestRepo
   recordVerdict(
     requestId: string,
     verdict: PermissionVerdictRecord,
-  ): { readonly outcome: 'recorded' | 'unchanged' | 'conflict' | 'unknown' } {
+  ): { readonly outcome: 'recorded' | 'unchanged' | 'conflict' | 'unknown' | 'expired' } {
     const entity = this.records.get(requestId);
     if (entity === undefined) {
       return { outcome: 'unknown' };
@@ -84,19 +109,35 @@ export class PermissionRequestRepositoryAdapter implements PermissionRequestRepo
     return { outcome };
   }
 
-  private firstDecided(): PermissionRequest | undefined {
+  expire(
+    requestId: string,
+    reasonCode: 'timed-out' | 'interrupted',
+    expiredAtIso?: string,
+  ): { readonly outcome: 'expired' | 'noop' | 'unknown' } {
+    const entity = this.records.get(requestId);
+    if (entity === undefined) {
+      return { outcome: 'unknown' };
+    }
+    const outcome = entity.expire(
+      reasonCode,
+      expiredAtIso ?? new Date(this.now()).toISOString(),
+    );
+    return { outcome };
+  }
+
+  private firstNonPending(): PermissionRequest | undefined {
     for (const entity of this.records.values()) {
-      if (entity.getVerdict() !== undefined) {
+      if (entity.getState() !== 'pending') {
         return entity;
       }
     }
     return undefined;
   }
 
-  private pendingCount(): number {
+  private livePendingCount(now: number): number {
     let count = 0;
     for (const entity of this.records.values()) {
-      if (entity.getVerdict() === undefined) {
+      if (entity.getState() === 'pending' && Date.parse(entity.getDeadlineAtIso()) > now) {
         count += 1;
       }
     }

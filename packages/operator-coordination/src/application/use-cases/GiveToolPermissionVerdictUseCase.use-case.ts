@@ -42,9 +42,10 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
     body: unknown,
     requestId: string,
     actorId: string,
+    threadId?: string,
   ): Promise<GiveToolPermissionVerdictOutcome> {
     try {
-      return this.execute(body, requestId, actorId);
+      return this.execute(body, requestId, actorId, threadId);
     } catch {
       return { outcome: 'refused', reason: 'internal-error' };
     }
@@ -64,6 +65,7 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
     body: unknown,
     requestId: string,
     actorId: string,
+    threadId?: string,
   ): GiveToolPermissionVerdictOutcome {
     if (!isPlainObject(body)) {
       return { outcome: 'refused', reason: 'body-not-an-object' };
@@ -90,6 +92,14 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
       return { outcome: 'unknown' };
     }
 
+    if (threadId !== undefined && record.threadId !== threadId) {
+      return { outcome: 'unknown' };
+    }
+
+    if (record.state === 'expired') {
+      return { outcome: 'expired' };
+    }
+
     const verdict: PermissionVerdictRecord = {
       decision,
       actorId,
@@ -100,6 +110,9 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
       const result = this.repository.recordVerdict(requestId, verdict);
       if (result.outcome === 'unknown') {
         return { outcome: 'unknown' };
+      }
+      if (result.outcome === 'expired') {
+        return { outcome: 'expired' };
       }
       const first = this.read(requestId)?.verdict;
       if (first === undefined) {
@@ -113,12 +126,16 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
     }
 
     if (this.now() > Date.parse(record.deadlineAtIso)) {
+      this.repository.expire(requestId, 'timed-out', this.clock.nowIso());
       return { outcome: 'expired' };
     }
 
     const result = this.repository.recordVerdict(requestId, verdict);
     if (result.outcome === 'recorded') {
       return { outcome: 'recorded', verdict };
+    }
+    if (result.outcome === 'expired') {
+      return { outcome: 'expired' };
     }
     if (result.outcome === 'unchanged' || result.outcome === 'conflict') {
       const first = this.read(requestId)?.verdict;

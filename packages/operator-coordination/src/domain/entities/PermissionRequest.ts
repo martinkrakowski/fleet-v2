@@ -12,6 +12,8 @@
  */
 
 export type ToolPermissionDecision = 'allow' | 'deny';
+export type PermissionRequestState = 'pending' | 'decided' | 'expired';
+export type ToolPermissionReasonCode = 'timed-out' | 'interrupted';
 
 export interface PermissionRequestProps {
   readonly requestId: string;
@@ -27,20 +29,44 @@ export interface PermissionVerdictRecord {
   readonly decision: ToolPermissionDecision;
   readonly actorId: string;
   readonly decidedAtIso: string;
+  readonly reasonCode?: string;
 }
 
 export interface PermissionRequestRecord extends PermissionRequestProps {
-  readonly state: 'pending' | 'decided';
+  readonly state: PermissionRequestState;
   readonly verdict?: PermissionVerdictRecord;
 }
 
 export class PermissionRequest {
   private verdictRecord?: PermissionVerdictRecord;
+  private state: PermissionRequestState = 'pending';
 
-  constructor(private readonly props: PermissionRequestProps) {}
+  constructor(
+    private readonly props: PermissionRequestProps,
+    initial?: { readonly state?: PermissionRequestState; readonly verdict?: PermissionVerdictRecord },
+  ) {
+    if (initial?.state !== undefined) {
+      this.state = initial.state;
+    }
+    if (initial?.verdict !== undefined) {
+      this.verdictRecord = { ...initial.verdict };
+    }
+  }
 
   getId(): string {
     return this.props.requestId;
+  }
+
+  getThreadId(): string {
+    return this.props.threadId;
+  }
+
+  getDeadlineAtIso(): string {
+    return this.props.deadlineAtIso;
+  }
+
+  getState(): PermissionRequestState {
+    return this.state;
   }
 
   getVerdict(): PermissionVerdictRecord | undefined {
@@ -49,7 +75,7 @@ export class PermissionRequest {
 
   /** Still awaiting: no verdict yet and `nowIso` has not passed the deadline. */
   isAwaitingVerdict(nowIso: string): boolean {
-    if (this.verdictRecord !== undefined) {
+    if (this.state !== 'pending' || this.verdictRecord !== undefined) {
       return false;
     }
     return nowIso <= this.props.deadlineAtIso;
@@ -58,18 +84,46 @@ export class PermissionRequest {
   /**
    * Record the first verdict. No verdict yet -> `recorded`; the same
    * decision again -> `unchanged` (the stored verdict is untouched); a
-   * different decision -> `conflict` (the stored verdict is untouched).
+   * different decision -> `conflict` (the stored verdict is untouched);
+   * a verdict on an expired request -> `expired`.
    */
   decide(
     decision: ToolPermissionDecision,
     actorId: string,
     decidedAtIso: string,
-  ): 'recorded' | 'unchanged' | 'conflict' {
+  ): 'recorded' | 'unchanged' | 'conflict' | 'expired' {
+    if (this.state === 'expired') {
+      return 'expired';
+    }
     if (this.verdictRecord !== undefined) {
       return this.verdictRecord.decision === decision ? 'unchanged' : 'conflict';
     }
+    this.state = 'decided';
     this.verdictRecord = { decision, actorId, decidedAtIso };
     return 'recorded';
+  }
+
+  /**
+   * Expire a pending request. If already decided or expired, this is a no-op.
+   */
+  expire(
+    reasonCode: ToolPermissionReasonCode,
+    expiredAtIso: string,
+  ): 'expired' | 'noop' {
+    if (this.state === 'decided' || (this.verdictRecord !== undefined && this.state !== 'expired')) {
+      return 'noop';
+    }
+    if (this.state === 'expired') {
+      return 'noop';
+    }
+    this.state = 'expired';
+    this.verdictRecord = {
+      decision: 'deny',
+      actorId: 'system',
+      decidedAtIso: expiredAtIso,
+      reasonCode,
+    };
+    return 'expired';
   }
 
   toRecord(): PermissionRequestRecord {
@@ -81,9 +135,12 @@ export class PermissionRequest {
       requestedAtIso: this.props.requestedAtIso,
       deadlineAtIso: this.props.deadlineAtIso,
     };
-    if (this.verdictRecord === undefined) {
+    if (this.state === 'pending') {
       return { ...base, state: 'pending' as const };
     }
-    return { ...base, state: 'decided' as const, verdict: { ...this.verdictRecord } };
+    if (this.state === 'expired') {
+      return { ...base, state: 'expired' as const, verdict: { ...this.verdictRecord! } };
+    }
+    return { ...base, state: 'decided' as const, verdict: { ...this.verdictRecord! } };
   }
 }

@@ -102,14 +102,23 @@ describe("requiredScope", () => {
     expect(requiredScope("POST", "/v1/authorizations/resolve")).toBe("hook");
     expect(requiredScope("POST", "/v1/authorizations/:id/consume")).toBe("hook");
     expect(requiredScope("POST", "/v1/forge")).toBe("hook");
+  });
+
+  it("maps the permission-request route to hook", () => {
     expect(requiredScope("POST", "/v1/threads/:id/permissions")).toBe("hook");
   });
 
-  it("maps the permission verdict route to verdict and fails closed on GET", () => {
+  it("maps the permission verdict route to verdict", () => {
     expect(requiredScope("POST", "/v1/threads/:id/permissions/:requestId/verdict")).toBe(
       "verdict",
     );
-    expect(requiredScope("GET", "/v1/threads/:id/permissions")).toBeNull();
+  });
+
+  it("maps the permission list route to verdict", () => {
+    expect(requiredScope("GET", "/v1/threads/:id/permissions")).toBe("verdict");
+  });
+
+  it("fails closed on unsupported GET permission paths", () => {
     expect(requiredScope("GET", "/v1/threads/:id/permissions/:requestId/verdict")).toBeNull();
   });
 

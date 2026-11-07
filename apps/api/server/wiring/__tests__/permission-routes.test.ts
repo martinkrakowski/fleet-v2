@@ -45,6 +45,7 @@ describe("tool-permission routes", () => {
 
   let hookPostHandler: EventHandler;
   let verdictPostHandler: EventHandler;
+  let listGetHandler: EventHandler;
 
   beforeAll(async () => {
     hookPostHandler = (
@@ -52,6 +53,9 @@ describe("tool-permission routes", () => {
     ).default;
     verdictPostHandler = (
       await import("../../routes/v1/threads/[id]/permissions/[requestId]/verdict.post.js")
+    ).default;
+    listGetHandler = (
+      await import("../../routes/v1/threads/[id]/permissions/index.get.js")
     ).default;
   });
 
@@ -69,6 +73,7 @@ describe("tool-permission routes", () => {
     const router = createRouter();
     router.post("/v1/threads/:id/permissions", hookPostHandler);
     router.post("/v1/threads/:id/permissions/:requestId/verdict", verdictPostHandler);
+    router.get("/v1/threads/:id/permissions", listGetHandler);
     app.use(router.handler);
 
     server = createServer(toNodeListener(app));
@@ -305,5 +310,206 @@ describe("tool-permission routes", () => {
     expect(verdictText).not.toContain("updatedInput");
     expect(verdictText).not.toContain("bash");
     expect(verdictText).not.toContain(marker);
+  });
+
+  it("F2a: GET pending lists only this thread's pending ids; another thread's request is absent, and an expired one is absent", async () => {
+    const repo = getOperatorComposition().permissionRequestRepository;
+    repo.record({
+      requestId: "req-threadA",
+      threadId: "threadA",
+      toolName: "bash",
+      toolInput: { secret: "arg" },
+      requestedAtIso: new Date().toISOString(),
+      deadlineAtIso: FUTURE_ISO,
+      state: "pending",
+    });
+    repo.record({
+      requestId: "req-threadB",
+      threadId: "threadB",
+      toolName: "read_file",
+      toolInput: { secret: "arg" },
+      requestedAtIso: new Date().toISOString(),
+      deadlineAtIso: FUTURE_ISO,
+      state: "pending",
+    });
+    repo.record({
+      requestId: "req-threadA-expired",
+      threadId: "threadA",
+      toolName: "bash",
+      toolInput: { secret: "arg" },
+      requestedAtIso: "2020-01-01T00:00:00.000Z",
+      deadlineAtIso: "2020-01-01T00:00:01.000Z",
+      state: "expired",
+    });
+
+    const res = await fetch(`${baseUrl}/v1/threads/threadA/permissions?state=pending`, {
+      headers: authHeaders(),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.code).toBe("OK");
+    expect(body.result).toEqual({
+      requests: [
+        {
+          requestId: "req-threadA",
+          toolCode: "bash",
+          deadlineAt: FUTURE_ISO,
+        },
+      ],
+    });
+  });
+
+  it("F2b: GET permissions: state=all gives 400, and no state gives 400", async () => {
+    const resAll = await fetch(`${baseUrl}/v1/threads/t1/permissions?state=all`, {
+      headers: authHeaders(),
+    });
+    expect(resAll.status).toBe(400);
+    const bodyAll = await resAll.json();
+    expect(bodyAll.code).toBe("REFUSED");
+    expect(bodyAll.result.reason).toBe("invalid-state");
+
+    const resNone = await fetch(`${baseUrl}/v1/threads/t1/permissions`, {
+      headers: authHeaders(),
+    });
+    expect(resNone.status).toBe(400);
+    const bodyNone = await resNone.json();
+    expect(bodyNone.code).toBe("REFUSED");
+    expect(bodyNone.result.reason).toBe("invalid-state");
+  });
+
+  it("F2c: GET permissions: without the scope gives 403, and the response body carries no tool arguments", async () => {
+    configurePresentedTokenResolver(() => ({
+      tokenId: "read-only-token",
+      scopes: ["read"],
+    }));
+    const res = await fetch(`${baseUrl}/v1/threads/t1/permissions?state=pending`, {
+      headers: authHeaders(),
+    });
+    expect(res.status).toBe(403);
+    const text = await res.text();
+    expect(text).not.toContain("toolInput");
+    expect(text).not.toContain("tool_input");
+  });
+
+  it("F3: a verdict posted under thread B for thread A's request gives 404 request-not-found, and A's request stays pending", async () => {
+    const repo = getOperatorComposition().permissionRequestRepository;
+    repo.record({
+      requestId: "req-threadA-pending",
+      threadId: "threadA",
+      toolName: "bash",
+      toolInput: {},
+      requestedAtIso: new Date().toISOString(),
+      deadlineAtIso: FUTURE_ISO,
+      state: "pending",
+    });
+
+    const verdictRes = await fetch(
+      `${baseUrl}/v1/threads/threadB/permissions/req-threadA-pending/verdict`,
+      {
+        method: "POST",
+        headers: { ...authHeaders(), "content-type": "application/json" },
+        body: JSON.stringify({ decision: "allow" }),
+      },
+    );
+    expect(verdictRes.status).toBe(404);
+    const verdictBody = await verdictRes.json();
+    expect(verdictBody.code).toBe("NOT_FOUND");
+
+    const stored = repo.find("req-threadA-pending");
+    expect(stored?.state).toBe("pending");
+    expect(stored?.verdict).toBeUndefined();
+  });
+
+  it("runtime input: non-string state, array state, missing id and throwing request getter give typed 400", async () => {
+    const resArr = await fetch(`${baseUrl}/v1/threads/t1/permissions?state=pending&state=other`, {
+      headers: authHeaders(),
+    });
+    expect(resArr.status).toBe(400);
+    const bodyArr = await resArr.json();
+    expect(bodyArr.code).toBe("REFUSED");
+    expect(bodyArr.result.reason).toBe("invalid-state");
+
+    const resBadId = await fetch(`${baseUrl}/v1/threads/%00/permissions?state=pending`, {
+      headers: authHeaders(),
+    });
+    expect(resBadId.status).toBe(400);
+    const bodyBadId = await resBadId.json();
+    expect(bodyBadId.code).toBe("REFUSED");
+  });
+
+  it("unknown stays unknown: a store read failure in GET gives 503, never an empty list", async () => {
+    const repo = getOperatorComposition().permissionRequestRepository;
+    const originalListPending = repo.listPending.bind(repo);
+    repo.listPending = () => {
+      throw new Error("store failure");
+    };
+    try {
+      const res = await fetch(`${baseUrl}/v1/threads/t1/permissions?state=pending`, {
+        headers: authHeaders(),
+      });
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body.code).toBe("STORE_UNAVAILABLE");
+    } finally {
+      repo.listPending = originalListPending;
+    }
+  });
+
+  it("nothing echoed: GET returns ids and codes only", async () => {
+    const secretMarker = "TOP_SECRET_ARGUMENT_VAL";
+    const repo = getOperatorComposition().permissionRequestRepository;
+    repo.record({
+      requestId: "req-clean-1",
+      threadId: "t-clean",
+      toolName: "bash",
+      toolInput: { secret: secretMarker, summary: "run bad script" },
+      requestedAtIso: new Date().toISOString(),
+      deadlineAtIso: FUTURE_ISO,
+      state: "pending",
+    });
+
+    const res = await fetch(`${baseUrl}/v1/threads/t-clean/permissions?state=pending`, {
+      headers: authHeaders(),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain(secretMarker);
+    expect(text).not.toContain("run bad script");
+    expect(text).not.toContain("summary");
+    expect(text).not.toContain("toolInput");
+    const json = JSON.parse(text);
+    const item = json.result.requests[0];
+    expect(Object.keys(item).sort()).toEqual(["deadlineAt", "requestId", "toolCode"]);
+  });
+
+  it("size-bounded: at most 128 entries", async () => {
+    const repo = getOperatorComposition().permissionRequestRepository as unknown as {
+      records: Map<string, unknown>;
+    };
+    for (let i = 0; i < 150; i += 1) {
+      repo.records.set(`req-many-${i}`, {
+        getId: () => `req-many-${i}`,
+        getThreadId: () => "t-many",
+        getDeadlineAtIso: () => FUTURE_ISO,
+        getState: () => "pending",
+        getVerdict: () => undefined,
+        toRecord: () => ({
+          requestId: `req-many-${i}`,
+          threadId: "t-many",
+          toolName: "tool",
+          toolInput: {},
+          requestedAtIso: new Date().toISOString(),
+          deadlineAtIso: FUTURE_ISO,
+          state: "pending",
+        }),
+      });
+    }
+
+    const res = await fetch(`${baseUrl}/v1/threads/t-many/permissions?state=pending`, {
+      headers: authHeaders(),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.result.requests.length).toBe(128);
   });
 });

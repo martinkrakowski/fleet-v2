@@ -22,6 +22,7 @@ export interface RequestToolPermissionDependencies {
   readonly now?: () => number;
   readonly idSource?: () => string;
   readonly clock?: { nowIso: () => string };
+  readonly sleep?: (ms: number) => Promise<void>;
 }
 
 const DEFAULT_DEADLINE_MS = 540_000;
@@ -62,6 +63,7 @@ export class RequestToolPermissionUseCase implements RequestToolPermissionPort {
   private readonly now: () => number;
   private readonly idSource: () => string;
   private readonly clock: { nowIso: () => string };
+  private readonly sleepFn: (ms: number) => Promise<void>;
 
   constructor(options: RequestToolPermissionDependencies) {
     this.repository = options.repository;
@@ -70,17 +72,32 @@ export class RequestToolPermissionUseCase implements RequestToolPermissionPort {
     this.now = options.now ?? Date.now;
     this.idSource = options.idSource ?? defaultIdSource;
     this.clock = options.clock ?? { nowIso: () => new Date().toISOString() };
+    this.sleepFn = options.sleep ?? sleep;
   }
 
   async requestToolPermission(body: unknown, threadId: string): Promise<RequestToolPermissionOutcome> {
+    let recordedRequestId: string | undefined;
     try {
-      return await this.execute(body, threadId);
+      return await this.execute(body, threadId, (id) => {
+        recordedRequestId = id;
+      });
     } catch {
+      if (recordedRequestId !== undefined) {
+        try {
+          this.repository.expire(recordedRequestId, 'interrupted', this.clock.nowIso());
+        } catch {
+          // Ignore secondary failure on expire
+        }
+      }
       return { outcome: 'refused', reason: 'internal-error' };
     }
   }
 
-  private async execute(body: unknown, threadId: string): Promise<RequestToolPermissionOutcome> {
+  private async execute(
+    body: unknown,
+    threadId: string,
+    onRecorded?: (id: string) => void,
+  ): Promise<RequestToolPermissionOutcome> {
     if (!isPlainObject(body)) {
       return { outcome: 'refused', reason: 'body-not-an-object' };
     }
@@ -144,6 +161,7 @@ export class RequestToolPermissionUseCase implements RequestToolPermissionPort {
     if (!stored.stored) {
       return { outcome: 'refused', reason: 'too-many-pending-requests' };
     }
+    onRecorded?.(requestId);
 
     return this.waitForVerdict(requestId, deadlineAt);
   }
@@ -165,14 +183,18 @@ export class RequestToolPermissionUseCase implements RequestToolPermissionPort {
           message: 'the owner denied this tool call',
         };
       }
-      if (this.now() >= deadlineAt) {
+      const now = this.now();
+      if (now >= deadlineAt) {
+        this.repository.expire(requestId, 'timed-out', this.clock.nowIso());
         const message =
           this.deadlineMs % 1000 === 0
             ? `no verdict in ${this.deadlineMs / 1000} s`
             : `no verdict in ${this.deadlineMs} ms`;
         return { outcome: 'denied', requestId, reason: 'no-verdict', message };
       }
-      await sleep(this.pollIntervalMs);
+      const remainingMs = deadlineAt - now;
+      const sleepMs = Math.max(0, Math.min(this.pollIntervalMs, remainingMs));
+      await this.sleepFn(sleepMs);
     }
   }
 }

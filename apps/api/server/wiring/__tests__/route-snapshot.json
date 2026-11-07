@@ -563,6 +563,15 @@
     ]
   },
   {
+    "method": "GET",
+    "path": "/v1/threads/[id]/permissions",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
     "method": "POST",
     "path": "/v1/threads/[id]/permissions",
     "envelope": [

@@ -25,5 +25,12 @@ export interface PermissionRequestRepositoryPort {
   recordVerdict(
     requestId: string,
     verdict: PermissionVerdictRecord,
-  ): { readonly outcome: 'recorded' | 'unchanged' | 'conflict' | 'unknown' };
+  ): { readonly outcome: 'recorded' | 'unchanged' | 'conflict' | 'unknown' | 'expired' };
+
+  /** Expire a pending request. If already decided or expired, this is a no-op. */
+  expire(
+    requestId: string,
+    reasonCode: 'timed-out' | 'interrupted',
+    expiredAtIso?: string,
+  ): { readonly outcome: 'expired' | 'noop' | 'unknown' };
 }

@@ -97,4 +97,62 @@ describe('PermissionRequestRepositoryAdapter', () => {
     expect(adapter.listPending().map((record) => record.requestId)).toEqual(['pending-a', 'pending-b']);
     expect(adapter.listPending().every((record) => record.verdict === undefined)).toBe(true);
   });
+
+  it('F1b: 128 timed-out requests do not block request 129', () => {
+    const adapter = new PermissionRequestRepositoryAdapter();
+    for (let i = 0; i < 128; i += 1) {
+      const id = `req-${i}`;
+      expect(adapter.record(pendingRecord({ requestId: id })).stored).toBe(true);
+      expect(adapter.expire(id, 'timed-out', NOW_ISO)).toEqual({ outcome: 'expired' });
+    }
+    expect(adapter.listPending()).toHaveLength(0);
+    expect(adapter.record(pendingRecord({ requestId: 'req-129' }))).toEqual({ stored: true });
+    expect(adapter.listPending()).toHaveLength(1);
+    expect(adapter.find('req-129')).toBeDefined();
+  });
+
+  it('expiring an already-decided request is a no-op', () => {
+    const adapter = new PermissionRequestRepositoryAdapter();
+    adapter.record(pendingRecord({ requestId: 'req-decided' }));
+    adapter.recordVerdict('req-decided', {
+      decision: 'allow',
+      actorId: 'owner',
+      decidedAtIso: NOW_ISO,
+    });
+    expect(adapter.expire('req-decided', 'timed-out', NOW_ISO)).toEqual({ outcome: 'noop' });
+    const stored = adapter.find('req-decided');
+    expect(stored?.state).toBe('decided');
+    expect(stored?.verdict?.decision).toBe('allow');
+  });
+
+  it('a verdict on an expired request gives expired', () => {
+    const adapter = new PermissionRequestRepositoryAdapter();
+    adapter.record(pendingRecord({ requestId: 'req-expired' }));
+    adapter.expire('req-expired', 'timed-out', NOW_ISO);
+    expect(
+      adapter.recordVerdict('req-expired', {
+        decision: 'allow',
+        actorId: 'owner',
+        decidedAtIso: NOW_ISO,
+      }),
+    ).toEqual({ outcome: 'expired' });
+  });
+
+  it('does not list expired or deadline-passed requests in listPending', () => {
+    const nowMs = 1_000_000;
+    const adapter = new PermissionRequestRepositoryAdapter({ now: () => nowMs });
+    adapter.record(
+      pendingRecord({
+        requestId: 'req-past',
+        deadlineAtIso: new Date(nowMs - 1000).toISOString(),
+      }),
+    );
+    adapter.record(
+      pendingRecord({
+        requestId: 'req-future',
+        deadlineAtIso: new Date(nowMs + 10000).toISOString(),
+      }),
+    );
+    expect(adapter.listPending().map((r) => r.requestId)).toEqual(['req-future']);
+  });
 });

@@ -2733,6 +2733,25 @@ function parseMergeDaemonPolicy(
   ) {
     warnings.push('policy.daemon.stallAfterMinutes: stall-after-minutes-invalid');
   }
+  // PT1b1: like `stallAfterMinutes`, a bad `autoResumeMax` is a warning, never an error: it gates
+  // only the auto-resume budget. The raw value is kept so a write round-trips the operator's own
+  // text; the resolver reads `0` (fail-closed, never auto-resume). The warning names the key and
+  // a code, never the value.
+  const autoResumeMax: unknown = Object.hasOwn(value, 'autoResumeMax')
+    ? value.autoResumeMax
+    : undefined;
+  const autoResumeBounds = MERGE_POLICY_BOUNDS.autoResumeMax;
+  if (
+    Object.hasOwn(value, 'autoResumeMax') &&
+    !(
+      typeof autoResumeMax === 'number' &&
+      Number.isInteger(autoResumeMax) &&
+      autoResumeMax >= autoResumeBounds.min &&
+      autoResumeMax <= autoResumeBounds.max
+    )
+  ) {
+    warnings.push('policy.daemon.autoResumeMax: auto-resume-max-invalid');
+  }
   // CO8a: an unknown or `live` `chainRefresh` is a warning, never an error:
   // the file still parses and the raw value round-trips so the operator sees
   // and fixes their own text. The warning names the key and the reason code
@@ -2756,6 +2775,9 @@ function parseMergeDaemonPolicy(
     ...(settleSeconds !== undefined ? { settleSeconds } : {}),
     ...(Object.hasOwn(value, 'stallAfterMinutes')
       ? { stallAfterMinutes: stallAfterMinutes as MergeDaemonSection['stallAfterMinutes'] }
+      : {}),
+    ...(Object.hasOwn(value, 'autoResumeMax')
+      ? { autoResumeMax: autoResumeMax as MergeDaemonSection['autoResumeMax'] }
       : {}),
     ...(Object.hasOwn(value, 'chainRefresh')
       ? { chainRefresh: value.chainRefresh as MergeDaemonSection['chainRefresh'] }

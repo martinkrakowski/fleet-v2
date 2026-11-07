@@ -4,9 +4,13 @@
  * fake command executor (no filesystem, no process).
  */
 
+import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { ManageReleaseUseCase } from '../src/application/use-cases/ManageReleaseUseCase.use-case.js';
+import { ReleaseStoreAdapter } from '../src/infrastructure/adapters/ReleaseStoreAdapter.adapter.js';
 import type {
   ManageReleaseRequest,
   ManageReleaseResult,
@@ -1011,5 +1015,23 @@ describe('ManageReleaseUseCase', () => {
     const { useCase } = granted(SWAP, B, { store });
     const result = await manage(useCase, applyRequest({ action: 'swap', sha: B, source: null }));
     expect(result).toMatchObject({ outcome: 'applied', action: 'swap', target: B, current: B, pruned: [], pruneOutcome: 'unreadable' });
+  });
+
+  // CO14c fix round 2: the store never creates the release root, so even an
+  // applied, approved install of a missing root creates nothing at all.
+  it('an applied install against a missing root refuses and creates neither the root nor any ancestor', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-release-missing-root-test-'));
+    try {
+      const parent = path.join(tempDir, 'srv');
+      const root = path.join(parent, 'fleet-releases');
+      const { useCase } = granted(INSTALL, A, { store: new ReleaseStoreAdapter() as unknown as FakeStore });
+      const result = await manage(useCase, applyRequest({ root }));
+      expect(result).toMatchObject({ outcome: 'refused', reason: 'store-unreadable' });
+      expect(await fs.lstat(tempDir).then(() => true, () => null)).not.toBeNull();
+      expect(await fs.lstat(parent).then(() => true, () => null)).toBeNull();
+      expect(await fs.lstat(root).then(() => true, () => null)).toBeNull();
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
   });
 });

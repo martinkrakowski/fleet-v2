@@ -13,6 +13,18 @@ const D = sha('d');
 const E = sha('e');
 const at = (day: number): string => `2026-11-0${day}T09:00:00.000Z`;
 
+/** lstat that returns null when nothing exists; mirrors the adapter's own read of a path. */
+async function lstatOrNullForTest(target: string): Promise<boolean | null> {
+  try {
+    return (await fs.lstat(target)).isDirectory();
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+}
+
 describe('ReleaseStoreAdapter', () => {
   let tempDir: string;
   let root: string;
@@ -21,6 +33,7 @@ describe('ReleaseStoreAdapter', () => {
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-release-store-test-'));
     root = path.join(tempDir, 'releases');
+    // The store never creates the release root; tests that stage inside it create it via `staged`.
     adapter = new ReleaseStoreAdapter();
   });
 
@@ -31,6 +44,8 @@ describe('ReleaseStoreAdapter', () => {
   async function staged(
     id: string,
   ): Promise<{ buildId: string; buildDir: string; archivePath: string; homeDir: string }> {
+    // The adapter never creates the release root, so the test fixture does.
+    await fs.mkdir(root, { recursive: true });
     const prepared = await adapter.prepare({ root, sha: id });
     if (prepared.outcome !== 'prepared') {
       throw new Error(`prepare refused for ${id}`);
@@ -259,6 +274,28 @@ describe('ReleaseStoreAdapter', () => {
     expect((await fs.lstat(second.buildDir)).isDirectory()).toBe(true);
     expect(await fs.readdir(second.buildDir)).toEqual([]);
     expect(await adapter.list({ root })).toEqual({ outcome: 'read', current: null, builds: [] });
+  });
+
+  it('prepare refuses and creates nothing when the root is missing', async () => {
+    expect(await adapter.prepare({ root, sha: A })).toEqual({ outcome: 'unreadable' });
+    // Neither the root nor any ancestor of it exists afterwards.
+    expect(await lstatOrNullForTest(root)).toBeNull();
+    expect(await lstatOrNullForTest(tempDir)).not.toBeNull();
+  });
+
+  it('prepare refuses when the root is a symlink to a real directory', async () => {
+    const real = path.join(tempDir, 'real-releases');
+    await fs.mkdir(real);
+    await fs.symlink(real, root);
+    expect(await adapter.prepare({ root, sha: A })).toEqual({ outcome: 'unreadable' });
+    expect((await fs.lstat(root)).isSymbolicLink()).toBe(true);
+    expect(await fs.readdir(real)).toEqual([]);
+  });
+
+  it('prepare refuses when the root is a file rather than a directory', async () => {
+    await fs.writeFile(root, 'not a directory');
+    expect(await adapter.prepare({ root, sha: A })).toEqual({ outcome: 'unreadable' });
+    expect((await fs.lstat(root)).isFile()).toBe(true);
   });
 
   it('prepare refuses when a stale unverified tree already sits at the sha', async () => {

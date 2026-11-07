@@ -53,7 +53,12 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       return { outcome: 'unreadable' };
     }
     try {
-      await fs.mkdir(input.root, { recursive: true });
+      // The release root is never created here: it must already exist as a real
+      // directory. Only directories inside an existing real root are created.
+      const rootStat = await lstatOrNull(input.root);
+      if (rootStat === null || !rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+        return { outcome: 'unreadable' };
+      }
       // A tree already at <root>/<sha> that is not a verified build is stale:
       // it is never built over or reused, so the install refuses.
       if ((await lstatOrNull(path.join(input.root, input.sha))) !== null) {

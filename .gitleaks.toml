@@ -13,3 +13,13 @@ targetRules = ["jwt"]
 regexTarget = "line"
 regexes = ['''JWT: \x27Expired eyJ''']
 paths = ['''^packages/brief-knowledge/src/infrastructure/adapters/__tests__/git-shelf-provider\.test\.ts$''']
+
+# Synthetic test fixture, not a real value: the hosts leak tests need a token-shaped 36-character host key to prove it is
+# never echoed. Allowlisted with the owner's approval (2026-11-07, option (a) on #833).
+[[allowlists]]
+description = "hosts-command leak tests: a synthetic 36-character token-shaped host key fixture"
+condition = "AND"
+targetRules = ["generic-api-key"]
+regexTarget = "line"
+regexes = ['''const flatTokenKey = "abcdefghij0123456789"\.repeat\(2\)\.slice\(0, 36\);''']
+paths = ['''^apps/cli/src/__tests__/hosts-command\.test\.ts$''']

@@ -19,8 +19,9 @@ const FORBIDDEN_HOST_NAMES: ReadonlySet<string> = new Set([
 /**
  * Whether `name` is a valid installation host-map key: at most 128
  * characters, identifier-shaped, without a `..` traversal, and never one of
- * the forbidden prototype-chain names. This is the exact rule the
- * installation loader applies to v2 `hosts` keys.
+ * the forbidden prototype-chain names. This is the identifier rule; the
+ * loader also refuses a key when `containsSecretShape` is true, and that
+ * check is not in this function.
  */
 export function isValidHostName(name: string): boolean {
   return (

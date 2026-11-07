@@ -74,6 +74,8 @@ const OPEN_READER = {
         mergeState: "clean",
         headSha: "1111111111111111111111111111111111111111",
         headRef: "feat/lane-auth",
+        isCrossRepository: false,
+        headRepositoryOwner: 'org',
         baseRef: "main",
         mergedAtIso: null,
         closedAtIso: null,
@@ -1608,6 +1610,8 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
       mergeState: "clean",
       headSha: WB_HEAD,
       headRef: WB_BRANCH,
+      isCrossRepository: false,
+      headRepositoryOwner: 'org',
       baseRef: "main",
       mergedAtIso: null,
       closedAtIso: null,
@@ -1622,7 +1626,9 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
   ): Promise<ReadPullRequestResult> {
     return {
       outcome: "found",
-      pullRequest: snapshot(request.ref.kind === "number" ? request.ref.number : 0),
+      pullRequest: snapshot(request.ref.kind === "number" ? request.ref.number : 0, {
+        headRepositoryOwner: request.repository?.owner ?? "org",
+      }),
     };
   }
 
@@ -2614,7 +2620,9 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
             {
               state: "merged",
               headRef: "feat/other-lane",
-              mergedAtIso: "2026-11-05T09:00:00.000Z",
+              isCrossRepository: false,
+              headRepositoryOwner: 'org',
+mergedAtIso: "2026-11-05T09:00:00.000Z",
               mergeCommitSha: WB_HEAD,
             },
           ),
@@ -3007,6 +3015,151 @@ describe("ExecuteAuthorizedForgeActionUseCase WB5b: merge-record and PR-link pro
           await deps.useCase.executeAuthorizedForgeAction(mergeReq),
         ).toEqual({ outcome: "refused", reason: "legacy-pr-lookup-unreadable" });
       }
+    });
+  });
+
+  describe("WB5b3: fork pull requests are refused and repositories are canonical", () => {
+    it("refuses a fork PR carrying the attempt's branch name and exact head commit: pull-request-cross-repository, no grant, no merge, no record", async () => {
+      const deps = wb5bDeps({
+        read: async (request) => ({
+          outcome: "found",
+          pullRequest: snapshot(request.ref.kind === "number" ? request.ref.number : 0, {
+            isCrossRepository: true,
+            headRepositoryOwner: "some-fork-owner",
+          }),
+        }),
+      });
+      const result = await deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        pullRequestNumber: 7,
+      });
+      expect(result).toEqual({
+        outcome: "refused",
+        reason: "pull-request-cross-repository",
+      });
+      expect(deps.consumed).toEqual([]);
+      expect(deps.seen).toHaveLength(0);
+      expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
+      expect(await deps.lanePlanRepo.listPullRequestLinks()).toEqual([]);
+      expect(
+        deps.journal.entries.filter((entry) => entry.status === "completed"),
+      ).toHaveLength(0);
+    });
+
+    it("refuses when the head repository owner differs from the read repository's owner, even with isCrossRepository false", async () => {
+      const deps = wb5bDeps({
+        read: async (request) => ({
+          outcome: "found",
+          pullRequest: snapshot(request.ref.kind === "number" ? request.ref.number : 0, {
+            headRepositoryOwner: "Other-Org",
+          }),
+        }),
+      });
+      expect(
+        await deps.useCase.executeAuthorizedForgeAction({
+          ...mergeReq,
+          pullRequestNumber: 7,
+        }),
+      ).toEqual({ outcome: "refused", reason: "pull-request-cross-repository" });
+      expect(deps.consumed).toEqual([]);
+      expect(deps.seen).toHaveLength(0);
+    });
+
+    it("refuses pull-request-unverified when isCrossRepository is missing from the read", async () => {
+      const deps = wb5bDeps({
+        read: async () => ({
+          outcome: "unavailable",
+          reason: "gh pr view returned an unreadable pull request",
+        }),
+      });
+      expect(
+        await deps.useCase.executeAuthorizedForgeAction({
+          ...mergeReq,
+          pullRequestNumber: 7,
+        }),
+      ).toEqual({ outcome: "refused", reason: "pull-request-unverified" });
+      expect(deps.consumed).toEqual([]);
+      expect(deps.seen).toHaveLength(0);
+    });
+
+    it("refuses pull-request-unverified when the found snapshot carries a non-boolean isCrossRepository, before the grant is consumed", async () => {
+      const deps = wb5bDeps({
+        read: async (request) => ({
+          outcome: "found",
+          pullRequest: {
+            ...snapshot(
+              request.ref.kind === "number" ? request.ref.number : 0,
+            ),
+            // Simulate a snapshot that came back malformed (WB5b3): the
+            // flag is not a boolean, so verification must fail closed
+            // rather than treating a truthy non-boolean as false.
+            isCrossRepository: "no" as unknown as boolean,
+          },
+        }),
+      });
+      expect(
+        await deps.useCase.executeAuthorizedForgeAction({
+          ...mergeReq,
+          pullRequestNumber: 7,
+        }),
+      ).toEqual({ outcome: "refused", reason: "pull-request-unverified" });
+      expect(deps.consumed).toEqual([]);
+      expect(deps.seen).toHaveLength(0);
+      expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
+    });
+
+    it("refuses a fork pull request found through the legacy head lookup, before the grant is consumed", async () => {
+      const deps = wb5bDeps({
+        lookup: async () => ({
+          outcome: "read",
+          pullRequests: [{ number: 42, headSha: WB_HEAD }],
+        }),
+        read: async (request) => ({
+          outcome: "found",
+          pullRequest: snapshot(
+            request.ref.kind === "number" ? request.ref.number : 0,
+            {
+              isCrossRepository: true,
+              headRepositoryOwner: "some-fork-owner",
+            },
+          ),
+        }),
+      });
+      await deps.journal.appendJournalEntry({
+        id: "forge:act-open:completed:2",
+        attemptId: "att-001",
+        workOrderId: "wo-001",
+        action: "forge",
+        status: "completed",
+        baseCommit: "b".repeat(40),
+        recordedAtIso: "2026-11-01T00:00:00.000Z",
+        sessionId: null,
+        detail: "pull request #42",
+      });
+      const result = await deps.useCase.executeAuthorizedForgeAction(mergeReq);
+      expect(result).toEqual({
+        outcome: "refused",
+        reason: "pull-request-cross-repository",
+      });
+      expect(deps.consumed).toEqual([]);
+      expect(deps.seen).toHaveLength(0);
+      expect(await deps.mergeRecordRepo.listMergeRecords()).toEqual([]);
+      expect(await deps.lanePlanRepo.listPullRequestLinks()).toEqual([]);
+      expect(
+        deps.journal.entries.filter(
+          (entry) => entry.status === "completed" && entry.id.startsWith("forge:act-1"),
+        ),
+      ).toHaveLength(0);
+    });
+
+    it("still merges a same-repository PR at the expected head", async () => {
+      const deps = wb5bDeps();
+      const result = await deps.useCase.executeAuthorizedForgeAction({
+        ...mergeReq,
+        pullRequestNumber: 7,
+      });
+      expect(result.outcome).toBe("executed");
+      expect(deps.consumed).toEqual(["act-1"]);
     });
   });
 

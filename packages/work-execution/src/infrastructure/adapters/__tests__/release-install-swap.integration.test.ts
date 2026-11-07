@@ -344,11 +344,12 @@ describe('release install and swap integration', () => {
     const uc = useCase();
     await uc.manageRelease(installRequest(A, '/src'));
     const gitStep = executor.runs[0];
-    const env = gitStep.options?.env ?? {};
-    expect(env.GIT_ALLOW_PROTOCOL).toBe('none');
-    expect(env.GIT_NO_LAZY_FETCH).toBe('1');
-    expect(env.GIT_TERMINAL_PROMPT).toBe('0');
-    expect(env.GIT_CONFIG_NOSYSTEM).toBe('1');
+    expect(gitStep.options?.env ?? {}).toMatchObject({
+      GIT_ALLOW_PROTOCOL: 'none',
+      GIT_NO_LAZY_FETCH: '1',
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_CONFIG_NOSYSTEM: '1',
+    });
     // The git argv itself disables hooks and fsmonitor and never writes.
     const argv = gitStep.argv.join(' ');
     expect(argv).toContain('core.hooksPath=/dev/null');

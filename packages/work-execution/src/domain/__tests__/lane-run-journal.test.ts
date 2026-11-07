@@ -681,3 +681,49 @@ describe('readLaneRunJournalEntryRecord and schemaVersion (Q5a)', () => {
     expect(Object.hasOwn(read.entry, 'schemaVersion')).toBe(false);
   });
 });
+
+describe('digest (O2c)', () => {
+  const DIGEST_64 = 'a'.repeat(64);
+
+  it('reads a request-key intent without a digest field as absent', () => {
+    const read = readLaneRunJournalEntry(intent(REQUEST_KEY));
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(Object.hasOwn(read.entry, 'digest')).toBe(false);
+  });
+
+  it('round-trips a 64-hex digest on an intent', () => {
+    const entry = intent(REQUEST_KEY, { digest: DIGEST_64 });
+    const read = readLaneRunJournalEntry(entry);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.entry).toEqual(entry);
+    expect(read.entry.digest).toBe(DIGEST_64);
+  });
+
+  it('refuses a 12-hex digest on an intent', () => {
+    const read = readLaneRunJournalEntry(intent(REQUEST_KEY, { digest: '0123456789abcdef' }));
+    expect(read.ok).toBe(false);
+    if (read.ok) return;
+    expect(read.error).toBe('LaneRunJournal digest must be null or a 64-hex string on an intent and null elsewhere');
+  });
+
+  it('refuses a digest on a result or conduct entry', () => {
+    const resultRead = readLaneRunJournalEntry({ ...result(REQUEST_KEY, 'completed'), digest: DIGEST_64 });
+    expect(resultRead.ok).toBe(false);
+    if (resultRead.ok) return;
+    expect(resultRead.error).toBe('LaneRunJournal digest must be null or a 64-hex string on an intent and null elsewhere');
+
+    const conductRead = readLaneRunJournalEntry({ ...conduct('running'), digest: DIGEST_64 });
+    expect(conductRead.ok).toBe(false);
+    if (conductRead.ok) return;
+    expect(conductRead.error).toBe('LaneRunJournal digest must be null or a 64-hex string on an intent and null elsewhere');
+  });
+
+  it('keeps a digest through prepareLaneRunJournalAppend', () => {
+    const decision = prepareLaneRunJournalAppend([], intent(REQUEST_KEY, { digest: DIGEST_64 }));
+    expect(decision.ok).toBe(true);
+    if (!decision.ok) return;
+    expect(decision.entry.digest).toBe(DIGEST_64);
+  });
+});

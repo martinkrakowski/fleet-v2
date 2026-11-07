@@ -318,8 +318,11 @@ async function realpathOrNull(target: string): Promise<string | null> {
 
 /**
  * The lstat observation of a path, with error types kept: `'absent'` only for
- * ENOENT (and ENOTDIR, whose parent walk also proves no entry exists there);
- * every other failure is `'unknown'` and never treated as absence.
+ * ENOENT — the path does not exist and its parent chain is all real
+ * directories, so it could be created. `ENOTDIR` is NOT absence: it means a
+ * component is not a directory, so the configured root is invalid and stays
+ * `'unknown'` — it never enters the first-install creation path. Every other
+ * failure is `'unknown'` too and never treated as absence.
  */
 async function lstatEntry(
   target: string,
@@ -328,7 +331,7 @@ async function lstatEntry(
     return await lstat(target);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | null)?.code;
-    return code === 'ENOENT' || code === 'ENOTDIR' ? 'absent' : 'unknown';
+    return code === 'ENOENT' ? 'absent' : 'unknown';
   }
 }
 

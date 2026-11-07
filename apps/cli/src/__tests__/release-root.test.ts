@@ -180,6 +180,21 @@ describe('resolveVerifiedRoot (CO14c rules 2–5)', () => {
     ).toEqual({ outcome: 'refused' });
   });
 
+  it('an invalid configured root whose parent is a regular file (ENOTDIR) stays unknown and never enters creation', async () => {
+    const base = freshDir('srv');
+    writeFileSync(path.join(base, 'notadir'), 'a file, not a directory', 'utf8');
+    const root = path.join(base, 'notadir', 'fleet');
+    const facts = factsFor(root, freshDir('state'));
+    const lease = new ScriptedLease(true);
+    expect(
+      await resolveVerifiedRoot(root, facts!, { createIfAbsent: true, lease, nowIso: () => NOW }),
+    ).toEqual({ outcome: 'refused' });
+    // The invalid root is refused outright: the creation path (and its lock)
+    // was never entered, and nothing was created.
+    expect(lease.acquireCalls).toEqual([]);
+    expect(existsSync(root)).toBe(false);
+  });
+
   it('accepts a symlink to the configured root, with the entry point absent', async () => {
     const root = freshDir('configured');
     mkdirSync(root, { recursive: true });

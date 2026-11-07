@@ -2614,13 +2614,16 @@ function parseMergeDaemonPolicy(
   }
   const before = errors.length;
   collectUnknownKeys(value, POLICY_DAEMON_KEYS, 'policy.daemon', errors);
-  const read = (field: 'intervalSeconds' | 'budgetSeconds' | 'settleSeconds'): number | undefined =>
+  const read = (
+    field: 'intervalSeconds' | 'budgetSeconds' | 'settleSeconds' | 'stallAfterMinutes',
+  ): number | undefined =>
     Object.hasOwn(value, field)
       ? readMergeInteger(value, field, 'policy.daemon', MERGE_POLICY_BOUNDS[field], errors)
       : undefined;
   const intervalSeconds = read('intervalSeconds');
   const budgetSeconds = read('budgetSeconds');
   const settleSeconds = read('settleSeconds');
+  const stallAfterMinutes = read('stallAfterMinutes');
   // CO8a: an unknown or `live` `chainRefresh` is a warning, never an error:
   // the file still parses and the raw value round-trips so the operator sees
   // and fixes their own text. The warning names the key and the reason code
@@ -2642,6 +2645,7 @@ function parseMergeDaemonPolicy(
     ...(intervalSeconds !== undefined ? { intervalSeconds } : {}),
     ...(budgetSeconds !== undefined ? { budgetSeconds } : {}),
     ...(settleSeconds !== undefined ? { settleSeconds } : {}),
+    ...(stallAfterMinutes !== undefined ? { stallAfterMinutes } : {}),
     ...(Object.hasOwn(value, 'chainRefresh')
       ? { chainRefresh: value.chainRefresh as MergeDaemonSection['chainRefresh'] }
       : {}),

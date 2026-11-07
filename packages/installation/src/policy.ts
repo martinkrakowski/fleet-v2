@@ -722,6 +722,7 @@ export const MERGE_POLICY_BOUNDS = Object.freeze({
   intervalSeconds: Object.freeze({ min: 10, max: 3600 }),
   budgetSeconds: Object.freeze({ min: 5, max: 600 }),
   settleSeconds: Object.freeze({ min: 0, max: 600 }),
+  stallAfterMinutes: Object.freeze({ min: 1, max: 1440 }),
 });
 
 /** The defaults of an absent `policy.daemon` (D-DT9). */
@@ -730,6 +731,7 @@ export const DEFAULT_MERGE_DAEMON_POLICY: ResolvedMergeDaemonPolicy = Object.fre
   budgetSeconds: 45,
   settleSeconds: 20,
   chainRefresh: 'shadow',
+  stallAfterMinutes: 30,
 });
 
 /**
@@ -1058,7 +1060,13 @@ function readDaemonSection(
     MERGE_POLICY_BOUNDS.settleSeconds,
     defaults.settleSeconds,
   );
-  if (!intervalSeconds.ok || !budgetSeconds.ok || !settleSeconds.ok) {
+  const stallAfterMinutes = readMergeInteger(
+    block,
+    'stallAfterMinutes',
+    MERGE_POLICY_BOUNDS.stallAfterMinutes,
+    defaults.stallAfterMinutes,
+  );
+  if (!intervalSeconds.ok || !budgetSeconds.ok || !settleSeconds.ok || !stallAfterMinutes.ok) {
     return DAEMON_INVALID;
   }
   // The chain-refresh mode resolves, never refuses: `shadow` (written or
@@ -1077,6 +1085,7 @@ function readDaemonSection(
       budgetSeconds: budgetSeconds.value,
       settleSeconds: settleSeconds.value,
       chainRefresh,
+      stallAfterMinutes: stallAfterMinutes.value,
     }),
   );
 }
@@ -1140,6 +1149,7 @@ export function resolveMergePolicy(policy: PolicySection | undefined): MergePoli
  * `intervalSeconds`, `settleSeconds`) then `merge.repos` keyed by `repositoryKey` in ascending
  * order, each entry with its keys in alphabetical order and `requiredContexts` sorted ascending,
  * no whitespace. Pass the resolved sections so an absent block hashes as its default.
+ * `daemon.stallAfterMinutes` is excluded for the same reason (it gates only the stall attention).
  * `daemon.chainRefresh` is deliberately excluded: it only gates the chain-refresh job, not the
  * merge policy, so adding it here would change the revision for every existing installation even
  * when the key is absent and defaults to `shadow`.

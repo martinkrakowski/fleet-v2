@@ -49,6 +49,7 @@ import type {
 } from '../../application/ports/out/LaneDiffCheckPort.out-port.js';
 import { SshExecutor } from './SshExecutor.adapter.js';
 import { GateSlotBudget, readGateSlotCapacity } from './GateSlotBudget.helper.js';
+import { extractFailingFile } from './GateFailingFile.helper.js';
 import { createHash } from 'node:crypto';
 import { isAbsolute, join } from 'node:path';
 import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS, readPlainRecord } from '@fleet/shared';
@@ -845,6 +846,12 @@ export class GatePredicateAdapter implements GatePredicatePort {
     }
 
     const raw = rawVerdict(run, this.isRemote(executor));
+    // PT1a: a failing command's output may name the file that failed; only the
+    // screened, repo-relative path is carried, never the output.
+    const failing =
+      mapVerdict(raw) === 'fail'
+        ? { failingFile: extractFailingFile(run.stdout, run.stderr, worktreePath, command.argv) }
+        : {};
     if (command.coverage === undefined) {
       return {
         name,
@@ -853,6 +860,7 @@ export class GatePredicateAdapter implements GatePredicatePort {
         exitCode: run.exitCode,
         durationMs: this.nowMs() - started,
         detail: detailForCommand(run, command, undefined),
+        ...failing,
       };
     }
 
@@ -873,6 +881,9 @@ export class GatePredicateAdapter implements GatePredicatePort {
       durationMs: this.nowMs() - started,
       detail: detailForCommand(run, command, coverage),
       coverage,
+      ...(mapVerdict(verdict) === 'fail'
+        ? { failingFile: extractFailingFile(run.stdout, run.stderr, worktreePath, command.argv) }
+        : {}),
     };
   }
 }

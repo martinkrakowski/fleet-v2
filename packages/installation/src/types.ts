@@ -457,6 +457,8 @@ export interface MergeDaemonSection {
    * kept verbatim so a write round-trips the operator's own text.
    */
   readonly chainRefresh?: 'shadow' | 'live' | (string & {});
+  /** PT1a: minutes a run may sit parked before the conductor raises its stall attention; 1..1440, default 30. */
+  readonly stallAfterMinutes?: number;
 }
 
 /** A merge repository policy with every default applied (`resolveMergePolicy`). */
@@ -487,6 +489,8 @@ export interface ResolvedMergeDaemonPolicy {
    * `invalid` when written `live` or anything unknown. Never `live`.
    */
   readonly chainRefresh: 'shadow' | 'invalid';
+  /** PT1a: the stall threshold in minutes with the default (30) applied. */
+  readonly stallAfterMinutes: number;
 }
 
 /** The result of `resolveMergePolicy`: the normalized sections at their revision, or a refusal code. */

@@ -109,6 +109,7 @@ const daemonDefaults: ResolvedMergeDaemonPolicy = {
   budgetSeconds: 45,
   settleSeconds: 20,
   chainRefresh: 'shadow',
+  stallAfterMinutes: 30,
 };
 
 describe('resolveMergePolicy', () => {
@@ -153,7 +154,7 @@ describe('resolveMergePolicy', () => {
       },
       repository({ owner: 'zeta', repo: 'last', repositoryKey: 'zeta/last', projectId: 'p-z' }),
     ]);
-    expect(read.daemon).toEqual({ intervalSeconds: 120, budgetSeconds: 100, settleSeconds: 0, chainRefresh: 'shadow' });
+    expect(read.daemon).toEqual({ intervalSeconds: 120, budgetSeconds: 100, settleSeconds: 0, chainRefresh: 'shadow', stallAfterMinutes: 30 });
 
     const boundary = expectResolved(
       resolveMergePolicy(
@@ -175,7 +176,7 @@ describe('resolveMergePolicy', () => {
       ),
     );
     expect(boundary.repositories[0].veto).toEqual({ mode: 'off', holdConfidence: 0 });
-    expect(boundary.daemon).toEqual({ intervalSeconds: 10, budgetSeconds: 5, settleSeconds: 20, chainRefresh: 'shadow' });
+    expect(boundary.daemon).toEqual({ intervalSeconds: 10, budgetSeconds: 5, settleSeconds: 20, chainRefresh: 'shadow', stallAfterMinutes: 30 });
   });
 
   const malformedMerge: readonly (readonly [string, unknown, string?])[] = [
@@ -514,7 +515,7 @@ describe('the parsed installation', () => {
     expect(model.policy?.daemon).toEqual(daemon);
 
     const read = expectResolved(resolveMergePolicy(model.policy));
-    expect(read.daemon).toEqual({ ...daemon, chainRefresh: 'shadow' });
+    expect(read.daemon).toEqual({ ...daemon, chainRefresh: 'shadow', stallAfterMinutes: 30 });
     expect(read.repositories.map((entry) => entry.repositoryKey)).toEqual([
       'example-owner/example-repo',
       'example-owner/other-repo',
@@ -640,6 +641,26 @@ describe('the parsed installation', () => {
         expectResolved(resolveMergePolicy(policyWith(undefined, { chainRefresh: value }))).daemon.chainRefresh,
       ).toBe('invalid');
     }
+  });
+
+  it('PT1a: policy.daemon.stallAfterMinutes defaults to 30, takes 1..1440, refuses anything else and leaves the policy revision alone', () => {
+    expect(expectResolved(resolveMergePolicy(policyWith(undefined, {}))).daemon.stallAfterMinutes).toBe(30);
+    for (const value of [1, 45, 1440]) {
+      const parsed = parsePolicy({ daemon: { stallAfterMinutes: value } });
+      expect(parsed.ok).toBe(true);
+      expect(
+        expectResolved(resolveMergePolicy(policyWith(undefined, { stallAfterMinutes: value }))).daemon
+          .stallAfterMinutes,
+      ).toBe(value);
+    }
+    for (const value of [0, 1441, -3, 2.5, '30', null, true]) {
+      const parsed = parsePolicy({ daemon: { stallAfterMinutes: value } });
+      expect(parsed.ok).toBe(false);
+      expect(resolveMergePolicy(policyWith(undefined, { stallAfterMinutes: value })).outcome).toBe('invalid');
+    }
+    const base = expectResolved(resolveMergePolicy(policyWith(undefined, {})));
+    const changed = expectResolved(resolveMergePolicy(policyWith(undefined, { stallAfterMinutes: 90 })));
+    expect(changed.policyRevision).toBe(base.policyRevision);
   });
 
   it('the parser never echoes a secret-shaped repository key or value', () => {

@@ -16,12 +16,15 @@ import {
   ConductorHaltAdapter,
   ConductorPassTraceAdapter,
   ExecutionJournalAdapter,
+  GateFailingFileAdapter,
   GateReceiptAdapter,
   InspectLaneRunsUseCase,
   LaneRunJournalAdapter,
   LaneRunRepositoryAdapter,
   ListConductorPassesUseCase,
   ListLaneRunsUseCase,
+  ListStalledRunsUseCase,
+  StallAttentionAdapter,
   ReapLaneWorktreesUseCase,
   ReapOrphanSessionsUseCase,
   RequestLaneRunStopUseCase,
@@ -42,7 +45,12 @@ import {
 } from '@fleet/work-execution';
 import type { CoordinationRequestRepositoryAdapter } from '@fleet/operator-coordination';
 
-import { conductorRevision, resolveConductorPolicy } from '@fleet/installation';
+import {
+  DEFAULT_MERGE_DAEMON_POLICY,
+  conductorRevision,
+  resolveConductorPolicy,
+  resolveMergePolicy,
+} from '@fleet/installation';
 import { assessmentIdForAttempt } from '@fleet/evidence-and-acceptance';
 
 import type { FleetCliRuntime } from '../composition.js';
@@ -60,6 +68,8 @@ export interface ComposeConductorInput {
   readonly coordination: Pick<
     FleetCliRuntime['coordination'],
     | 'recordAttentionItem'
+    | 'clearAttentionItem'
+    | 'listAttentionItems'
     | 'askOwnerQuestion'
     | 'syncOneWayOwnerQuestions'
     | 'listOwnerQuestions'
@@ -148,7 +158,16 @@ export function composeConductor(input: ComposeConductorInput) {
     }),
   });
 
+  // PT1a: `policy.daemon.stallAfterMinutes`, read once at composition like the
+  // auto-merge setting; an unreadable merge policy falls back to the default.
+  const mergePolicy = resolveMergePolicy(installation?.policy);
+  const stallAfterMinutes =
+    mergePolicy.outcome === 'resolved'
+      ? mergePolicy.daemon.stallAfterMinutes
+      : DEFAULT_MERGE_DAEMON_POLICY.stallAfterMinutes;
+
   const conductor = {
+    stallAfterMinutes,
     laneRunRepository,
     laneRunJournal,
     driverLease: conductorDriverLease,
@@ -165,6 +184,30 @@ export function composeConductor(input: ComposeConductorInput) {
       attemptRepo: attemptRepository,
       reviewReceipts: reviewRequest,
       executionJournal,
+    }),
+    // PT1a (SN3): `conductor status --stalled`, over the same stores and threshold as the pass.
+    listStalledRuns: new ListStalledRunsUseCase({
+      runRepo: laneRunRepository,
+      runJournal: laneRunJournal,
+      stallAfterMinutes,
+    }),
+    // PT1a (SN2): the pass raises, refreshes and clears one `stall:<runId>` item per stalled run.
+    stallAttention: new StallAttentionAdapter({
+      recordAttentionItem: (body, actor) => coordination.recordAttentionItem.recordAttentionItem(body, actor),
+      clearAttentionItem: (request, via, actor) =>
+        coordination.clearAttentionItem.clearAttentionItem(
+          request as Parameters<typeof coordination.clearAttentionItem.clearAttentionItem>[0],
+          via as 'cli' | 'web' | 'machine',
+          actor,
+        ),
+      listAttentionItems: (request) => coordination.listAttentionItems.listAttentionItems(request),
+    }),
+    // PT1a: the failing gate file a verification receipt recorded, read to class a gate park.
+    gateFailingFile: new GateFailingFileAdapter({
+      inspector: {
+        inspectAcceptanceEvidence: (request) =>
+          evidence.inspectAcceptanceEvidence.inspectAcceptanceEvidence(request),
+      },
     }),
     listLaneRuns: new ListLaneRunsUseCase({
       runRepo: laneRunRepository,

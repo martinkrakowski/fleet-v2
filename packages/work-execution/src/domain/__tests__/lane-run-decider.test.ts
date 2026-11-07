@@ -7,6 +7,7 @@ import { LANE_RUN_MAX_RETRY } from '../lane-run-keys.js';
 import {
   GATE_CONGESTION_BACKOFF_MS,
   GATE_CONGESTION_MAX_RETRIES,
+  REVIEW_SEAT_UNAVAILABLE_MAX_PASSES,
   laneRunAttemptPhaseOf,
   nextLaneRunAction,
 } from '../lane-run-decider.js';
@@ -898,11 +899,58 @@ describe('gating state', () => {
 });
 
 describe('review rules per kind', () => {
-  it.each(['brief-check', 'code-review'] as const)('V1: %s with no seat parks review-seat-unavailable', (kind) => {
+  it.each(['brief-check', 'code-review'] as const)('V1: %s with no seat and no pass count parks review-seat-unavailable', (kind) => {
     const facts = reviewFacts(kind, { verdict: 'none' }, { reviewSeat: { ok: false } });
     assertDecision(facts, record({}), decide(record({}), facts), {
       kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
     });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V1b: %s with no seat below the pass bound waits review-seat-unavailable', (kind) => {
+    for (const reviewSeatUnavailablePasses of [0, REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1]) {
+      const facts = reviewFacts(kind, { verdict: 'none' }, { reviewSeat: { ok: false }, reviewSeatUnavailablePasses });
+      expect(decide(record({}), facts)).toEqual({ kind: 'wait', reason: 'review-seat-unavailable' });
+    }
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V1c: %s with no seat at the pass bound parks review-seat-unavailable', (kind) => {
+    const facts = reviewFacts(
+      kind,
+      { verdict: 'none' },
+      { reviewSeat: { ok: false }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V1d: %s none with a free seat acts even at the pass bound', (kind) => {
+    const facts = reviewFacts(
+      kind,
+      { verdict: 'none' },
+      { reviewSeat: { ok: true, seatIndex: 0 }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/0@${HEAD}`, round: 0, seatIndex: 0, head12: HEAD, retry: null,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V1e: %s malformed reviewSeatUnavailablePasses waits facts-inconsistent at both sites', (kind) => {
+    for (const reviewSeatUnavailablePasses of [-1, 1.5, Number.POSITIVE_INFINITY]) {
+      const site1 = reviewFacts(
+        kind,
+        { verdict: 'none' },
+        { reviewSeat: { ok: false }, reviewSeatUnavailablePasses },
+      );
+      expect(decide(record({}), site1)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+
+      const site2 = reviewFacts(
+        kind,
+        { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+        { reviewSeatUnavailablePasses },
+      );
+      expect(decide(record({}), site2)).toEqual({ kind: 'wait', reason: 'facts-inconsistent' });
+    }
   });
 
   it.each(['brief-check', 'code-review'] as const)('V2: %s none acts the kind', (kind) => {
@@ -924,6 +972,17 @@ describe('review rules per kind', () => {
     });
   });
 
+  it.each(['brief-check', 'code-review'] as const)('V4b: %s no-receipt with retries: 0 retries the same seat even with no free seat and at the pass bound', (kind) => {
+    const facts = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 0 },
+      { reviewSeat: { ok: false }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/0@${HEAD}/retry1`, round: 0, seatIndex: 0, head12: HEAD, retry: 1,
+    });
+  });
+
   it.each(['brief-check', 'code-review'] as const)('V5: %s no-receipt switches to a new seat without retry', (kind) => {
     const facts = reviewFacts(kind, { verdict: 'no-receipt', seatIndex: 0, retries: 1 }, { reviewSeat: { ok: true, seatIndex: 2 } });
     expect(decide(record({}), facts)).toEqual({
@@ -931,9 +990,67 @@ describe('review rules per kind', () => {
     });
   });
 
-  it.each(['brief-check', 'code-review'] as const)('V6: %s no-receipt otherwise parks review-seat-unavailable', (kind) => {
+  it.each(['brief-check', 'code-review'] as const)('V5b: %s no-receipt switches to a new seat even at the pass bound', (kind) => {
+    const facts = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeat: { ok: true, seatIndex: 2 }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    expect(decide(record({}), facts)).toEqual({
+      kind: 'act', step: kind, key: `${RUN_ID}/r0/${kind}/2@${HEAD}`, round: 0, seatIndex: 2, head12: HEAD, retry: null,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V6: %s no-receipt with no other seat and no pass count parks review-seat-unavailable', (kind) => {
     const facts = reviewFacts(kind, { verdict: 'no-receipt', seatIndex: 0, retries: 1 });
     assertDecision(facts, record({}), decide(record({}), facts), {
+      kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V6b: %s no-receipt with no other seat waits below the pass bound and parks at the bound', (kind) => {
+    for (const reviewSeatUnavailablePasses of [0, REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1]) {
+      const below = reviewFacts(
+        kind,
+        { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+        { reviewSeatUnavailablePasses },
+      );
+      expect(decide(record({}), below)).toEqual({ kind: 'wait', reason: 'review-seat-unavailable' });
+    }
+
+    const atBound = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    assertDecision(atBound, record({}), decide(record({}), atBound), {
+      kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
+    });
+  });
+
+  it.each(['brief-check', 'code-review'] as const)('V6c: %s no-receipt with reviewSeat not ok parks when pass count omitted, waits below the bound, and parks at the bound', (kind) => {
+    const omitted = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeat: { ok: false } },
+    );
+    assertDecision(omitted, record({}), decide(record({}), omitted), {
+      kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
+    });
+
+    const below = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeat: { ok: false }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES - 1 },
+    );
+    expect(decide(record({}), below)).toEqual({ kind: 'wait', reason: 'review-seat-unavailable' });
+
+    const atBound = reviewFacts(
+      kind,
+      { verdict: 'no-receipt', seatIndex: 0, retries: 1 },
+      { reviewSeat: { ok: false }, reviewSeatUnavailablePasses: REVIEW_SEAT_UNAVAILABLE_MAX_PASSES },
+    );
+    assertDecision(atBound, record({}), decide(record({}), atBound), {
       kind: 'park', reason: 'review-seat-unavailable', qualifier: null, parkedFrom: kind,
     });
   });

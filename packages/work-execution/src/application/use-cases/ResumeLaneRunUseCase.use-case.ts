@@ -15,12 +15,21 @@
  * never cleared here and `open-pr` is never re-issued.
  */
 
+import { containsSecretShape, LANE_DIFF_SECRET_PATTERNS } from '@fleet/shared';
+
 import { isZonedIsoDateTime } from '../../domain/conductor-halt.js';
 import { laneRunJournalPendingIntent, laneRunJournalState, laneRunJournalStopFacts } from '../../domain/lane-run-journal.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome, LaneRunJournalPendingIntent } from '../../domain/lane-run-journal.js';
 import { LANE_RUN_KEY_VIAS, head12Of, laneRunResumeKey, parseLaneRunKey } from '../../domain/lane-run-keys.js';
+import { LANE_RUN_ID_PATTERN } from '../../domain/lane-run-records.js';
 import type { LaneRunRecord } from '../../domain/lane-run-records.js';
-import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../domain/lane-run-step-facts.js';
+import { isCalendarDateTime, snapshotPlainDataRecord } from '../../domain/plain-record-reads.js';
+import {
+  LANE_RUN_INTENT_ABANDONED_REASON_CODE,
+  laneRunConductEntry,
+  laneRunIntentEntry,
+  laneRunResultEntry,
+} from '../../domain/lane-run-step-facts.js';
 import type { LaneRunResultReasonCode } from '../../domain/lane-run-step-facts.js';
 import { checkLaneRunResume } from '../../domain/lane-run-transitions.js';
 import type { RunStopMode } from '../../domain/lane-run-transitions.js';
@@ -61,14 +70,70 @@ function isPositiveSafeInteger(value: number | undefined): boolean {
   return value !== undefined && Number.isSafeInteger(value) && value >= 1;
 }
 
-function requestResumeError(request: RequestResumeRequest): 'invalid-request' | null {
-  if (!LANE_RUN_KEY_VIAS.includes(request.via)) {
+const ULID_PATTERN = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+const NOW_ISO_MAX_LENGTH = 64;
+const HOLDER_ID_MAX_BYTES = 256;
+
+function isBoundedNowIso(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= NOW_ISO_MAX_LENGTH && isZonedIsoDateTime(value) && isCalendarDateTime(value);
+}
+
+function isSecretShaped(text: string): boolean {
+  return containsSecretShape(text) || LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(text));
+}
+
+/** Never throws and never echoes: a non-plain or throwing-getter request, or any invalid field, is 'invalid-request'. */
+function requestResumeError(request: unknown): 'invalid-request' | null {
+  const snap = snapshotPlainDataRecord(request);
+  if (snap === null) {
     return 'invalid-request';
   }
-  if (request.expectedRevision !== undefined && !isPositiveSafeInteger(request.expectedRevision)) {
+  const { runId, via, expectedRevision, entryId, nowIso } = snap;
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
     return 'invalid-request';
   }
-  if (!isZonedIsoDateTime(request.nowIso)) {
+  if (typeof via !== 'string' || !(LANE_RUN_KEY_VIAS as readonly string[]).includes(via)) {
+    return 'invalid-request';
+  }
+  if (expectedRevision !== undefined && !(typeof expectedRevision === 'number' && isPositiveSafeInteger(expectedRevision))) {
+    return 'invalid-request';
+  }
+  if (typeof entryId !== 'string' || !ULID_PATTERN.test(entryId)) {
+    return 'invalid-request';
+  }
+  if (!isBoundedNowIso(nowIso)) {
+    return 'invalid-request';
+  }
+  return null;
+}
+
+/** Never throws and never echoes: the lease holder, fence, run id and time of an apply request, or 'invalid-request'. */
+function applyPendingResumeError(request: unknown): 'invalid-request' | null {
+  const snap = snapshotPlainDataRecord(request);
+  if (snap === null) {
+    return 'invalid-request';
+  }
+  const lease = snapshotPlainDataRecord(snap.lease);
+  if (lease === null) {
+    return 'invalid-request';
+  }
+  const { runId, nowIso } = snap;
+  const { holderId, fence } = lease;
+  if (typeof runId !== 'string' || !LANE_RUN_ID_PATTERN.test(runId)) {
+    return 'invalid-request';
+  }
+  if (
+    typeof holderId !== 'string' ||
+    holderId === '' ||
+    Buffer.byteLength(holderId, 'utf8') > HOLDER_ID_MAX_BYTES ||
+    isSecretShaped(holderId)
+  ) {
+    return 'invalid-request';
+  }
+  if (typeof fence !== 'number' || !isPositiveSafeInteger(fence)) {
+    return 'invalid-request';
+  }
+  if (!isBoundedNowIso(nowIso)) {
     return 'invalid-request';
   }
   return null;
@@ -171,6 +236,28 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
   }
 
   /**
+   * F171: close an ambiguous pending step intent as `overtaken`
+   * `intent-abandoned-by-operator` before the resume applies, so the resumed run
+   * never carries it. A reconcile intent is left to its own rule; a key that
+   * already has a final result is never written twice. False only when the
+   * journal refuses the closing result.
+   */
+  private async abandonAmbiguousPendingIntent(
+    runId: string,
+    pendingIntent: LaneRunJournalPendingIntent | null,
+    nowIso: string,
+  ): Promise<boolean> {
+    if (pendingIntent === null || pendingIntent.reconciliation !== 'ambiguous' || pendingIntent.step === 'reconcile') {
+      return true;
+    }
+    const keyEntries = await this.deps.runJournal.listForKey(pendingIntent.key);
+    if (keyEntries.some((entry) => entry.kind === 'result' && entry.outcome !== 'ambiguous')) {
+      return true;
+    }
+    return this.appendResult(runId, pendingIntent.key, 'overtaken', LANE_RUN_INTENT_ABANDONED_REASON_CODE, nowIso);
+  }
+
+  /**
    * RV4: settle every `brief-check`/`code-review` intent of this run that has
    * no final result as `reconciled` / `review-superseded`, so the next advance
    * sees verdict `none` and performReview opens the next free key. Never
@@ -243,6 +330,9 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
   }
 
   async applyPendingResume(request: ApplyPendingResumeRequest): Promise<ApplyPendingResumeResult> {
+    if (applyPendingResumeError(request) !== null) {
+      return { outcome: 'refused', key: null, reason: 'invalid-request' };
+    }
     const record = await this.deps.runRepo.get(request.runId);
     if (record === null) {
       return { outcome: 'refused', key: null, reason: 'run-not-found' };
@@ -307,6 +397,9 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
         await this.appendResult(request.runId, firstPendingKey, 'refused', 'stop-pending', request.nowIso);
         return { outcome: 'refused', key: firstPendingKey, reason: 'stop-pending' };
       }
+      if (!(await this.abandonAmbiguousPendingIntent(request.runId, facts.pendingIntent, request.nowIso))) {
+        return { outcome: 'refused', key: firstPendingKey, reason: 'journal-refused' };
+      }
       const finished = await this.deps.runRepo.save(
         { ...record, parked: null, revision: record.revision + 1 },
         { holderId: request.lease.holderId, fence: request.lease.fence, nowIso: request.nowIso },
@@ -334,6 +427,10 @@ export class ResumeLaneRunUseCase implements ResumeLaneRunPort {
       return { outcome: 'refused', key: first.key, reason: check.reason };
     }
     const firstKey = first.key as string;
+
+    if (!(await this.abandonAmbiguousPendingIntent(request.runId, facts.pendingIntent, request.nowIso))) {
+      return { outcome: 'refused', key: firstKey, reason: 'journal-refused' };
+    }
 
     const conduct = await this.deps.runJournal.append(
       laneRunConductEntry(this.deps.newUlid(), request.runId, check.to, request.nowIso),

@@ -11,8 +11,9 @@
 import { describe, expect, it } from 'vitest';
 
 import { LaneRun } from '../../../domain/entities/LaneRun.js';
-import { laneRunConductEntry, laneRunIntentEntry } from '../../../domain/lane-run-step-facts.js';
-import { laneRunJournalState } from '../../../domain/lane-run-journal.js';
+import { laneRunConductEntry, laneRunIntentEntry, laneRunResultEntry } from '../../../domain/lane-run-step-facts.js';
+import { laneRunJournalPendingIntent, laneRunJournalState } from '../../../domain/lane-run-journal.js';
+import type { LaneRunJournalPort } from '../../ports/out/LaneRunJournalPort.out-port.js';
 import type { LaneRunJournalEntryRecord } from '../../../domain/lane-run-journal.js';
 import { buildLaneRunStepKey } from '../../../domain/lane-run-keys.js';
 import { LANE_RUN_ONE_WAY_STEPS } from '../../../domain/lane-run-records.js';
@@ -521,5 +522,248 @@ describe('ResumeLaneRunUseCase applyPendingResume', () => {
     for (const entry of entries) {
       expect(Object.hasOwn(entry, 'requestDigest')).toBe(false);
     }
+  });
+});
+
+const GATE_KEY = `${RUN_ID}/r0/gate/0@0123456789ab`;
+const AMBIGUOUS_GATE_PARK: LaneRunParkRecord = {
+  reason: 'ambiguous',
+  qualifier: 'gate',
+  parkedFrom: 'gating',
+  questionId: null,
+};
+
+/** HN1's shape: parked `ambiguous` at gate with an open ambiguous gate intent. */
+async function seededAmbiguousGate(): Promise<Fixture> {
+  const fx = await seededParked(AMBIGUOUS_GATE_PARK);
+  expect(await fx.journal.append(laneRunIntentEntry('01JB00000000000000000000A1', RUN_ID, GATE_KEY, null, NOW))).toMatchObject({
+    outcome: 'appended',
+  });
+  expect(
+    await fx.journal.append(laneRunResultEntry('01JB00000000000000000000A2', RUN_ID, GATE_KEY, 'ambiguous', 'gate-unknown', NOW)),
+  ).toMatchObject({ outcome: 'appended' });
+  return fx;
+}
+
+/** A journal that refuses the first conduct entry appended after `armed` is switched on, as a crash would. */
+function crashingOnConduct(journal: LaneRunJournalAdapter): { readonly port: LaneRunJournalPort; arm(): void } {
+  let armed = false;
+  return {
+    arm: () => {
+      armed = true;
+    },
+    port: {
+      append: async (entry) => {
+        if (armed && entry.kind === 'conduct') {
+          armed = false;
+          return { outcome: 'refused', reason: 'invalid-entry', detail: null };
+        }
+        return journal.append(entry);
+      },
+      listForRun: (runId) => journal.listForRun(runId),
+      listForKey: (key) => journal.listForKey(key),
+    },
+  };
+}
+
+function finalResultsOf(entries: readonly LaneRunJournalEntryRecord[], key: string): readonly LaneRunJournalEntryRecord[] {
+  return entries.filter((entry) => entry.kind === 'result' && entry.key === key && entry.outcome !== 'ambiguous');
+}
+
+describe('ResumeLaneRunUseCase PT1b3a ambiguous intent', () => {
+  it('PT1b3a: applyPendingResume on parked ambiguous gate run abandons pending gate intent before conducting to gating', async () => {
+    const oneWayBefore = [...LANE_RUN_ONE_WAY_STEPS];
+    const fx = await seededAmbiguousGate();
+    expect(laneRunJournalPendingIntent(await fx.journal.listForRun(RUN_ID), RUN_ID)).toEqual({
+      key: GATE_KEY,
+      step: 'gate',
+      reconciliation: 'ambiguous',
+    });
+    await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'resumed', to: 'gating', key: RESUME_CLI_KEY });
+
+    const entries = await fx.journal.listForRun(RUN_ID);
+    const finals = finalResultsOf(entries, GATE_KEY);
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ outcome: 'overtaken', reasonCode: 'intent-abandoned-by-operator' });
+    expect(laneRunJournalPendingIntent(entries, RUN_ID)).toBeNull();
+    const abandonedAt = entries.indexOf(finals[0]!);
+    const gatingAt = entries.findIndex((entry) => entry.kind === 'conduct' && entry.state === 'gating');
+    expect(gatingAt).toBeGreaterThan(abandonedAt);
+    expect(laneRunJournalState(entries, RUN_ID)).toBe('gating');
+    expect(entries.find((entry) => entry.kind === 'result' && entry.key === RESUME_CLI_KEY)).toMatchObject({
+      outcome: 'completed',
+      reasonCode: 'resumed',
+    });
+    expect((await fx.repo.get(RUN_ID))?.parked).toBeNull();
+
+    expect([...LANE_RUN_ONE_WAY_STEPS]).toEqual(oneWayBefore);
+    for (const entry of entries) {
+      expect(Object.hasOwn(entry, 'requestDigest')).toBe(false);
+    }
+  });
+
+  it('PT1b3a: replay after crash between intent-abandoned-by-operator result and conduct or save never double-writes', async () => {
+    const conductCrash = await seededAmbiguousGate();
+    await conductCrash.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    const crashing = crashingOnConduct(conductCrash.journal);
+    crashing.arm();
+    let crashedId = 0;
+    const first = new ResumeLaneRunUseCase({
+      runRepo: conductCrash.repo,
+      runJournal: crashing.port,
+      newUlid: () => '01JB00000000000000000000Q' + String((crashedId += 1)),
+    });
+    expect(await first.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: NOW })).toEqual({
+      outcome: 'refused',
+      key: RESUME_CLI_KEY,
+      reason: 'journal-refused',
+    });
+    expect(finalResultsOf(await conductCrash.journal.listForRun(RUN_ID), GATE_KEY)).toHaveLength(1);
+    expect(
+      await conductCrash.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: LATER }),
+    ).toEqual({ outcome: 'resumed', to: 'gating', key: RESUME_CLI_KEY });
+    const afterConduct = await conductCrash.journal.listForRun(RUN_ID);
+    expect(finalResultsOf(afterConduct, GATE_KEY)).toHaveLength(1);
+    expect(laneRunJournalPendingIntent(afterConduct, RUN_ID)).toBeNull();
+    expect((await conductCrash.repo.get(RUN_ID))?.parked).toBeNull();
+
+    const saveCrash = await seededAmbiguousGate();
+    await saveCrash.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await saveCrash.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: 'driver-example-2', fence: 99 }, nowIso: NOW }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'save-refused' });
+    expect(finalResultsOf(await saveCrash.journal.listForRun(RUN_ID), GATE_KEY)).toHaveLength(1);
+    expect(
+      await saveCrash.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: LATER }),
+    ).toEqual({ outcome: 'resumed', to: 'gating', key: RESUME_CLI_KEY });
+    const afterSave = await saveCrash.journal.listForRun(RUN_ID);
+    const finals = finalResultsOf(afterSave, GATE_KEY);
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ outcome: 'overtaken', reasonCode: 'intent-abandoned-by-operator' });
+    expect((await saveCrash.repo.get(RUN_ID))?.parked).toBeNull();
+  });
+
+  it('PT1b3a: stop recorded after resume on ambiguous gate park refuses resume as stop-pending without abandoning until advance stops', async () => {
+    const fx = await seededAmbiguousGate();
+    await fx.resume.requestResume({ runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW });
+    expect(
+      await fx.journal.append({
+        ...laneRunIntentEntry(ENTRY_2, RUN_ID, `${RUN_ID}/stop@cli`, null, LATER),
+        mode: 'graceful',
+        expectedRevision: 2,
+      }),
+    ).toMatchObject({ outcome: 'appended' });
+    expect(
+      await fx.resume.applyPendingResume({ runId: RUN_ID, lease: { holderId: HOLDER, fence: 1 }, nowIso: LATER }),
+    ).toEqual({ outcome: 'refused', key: RESUME_CLI_KEY, reason: 'stop-pending' });
+
+    const entries = await fx.journal.listForRun(RUN_ID);
+    expect(finalResultsOf(entries, GATE_KEY)).toHaveLength(0);
+    expect(laneRunJournalPendingIntent(entries, RUN_ID)).toEqual({ key: GATE_KEY, step: 'gate', reconciliation: 'ambiguous' });
+    expect((await fx.repo.get(RUN_ID))?.parked).toEqual(AMBIGUOUS_GATE_PARK);
+  });
+
+  it('PT1b3a robustness (1)(5)(7): requestResume and applyPendingResume refuse malformed, throwing-getter, oversized, and secret-shaped inputs without throwing or echoing values', async () => {
+    const fx = await seededAmbiguousGate();
+    const throwing: Record<string, unknown> = { via: 'cli', entryId: ENTRY_1, nowIso: NOW };
+    Object.defineProperty(throwing, 'runId', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter must never run');
+      },
+    });
+    class Boxed {
+      runId = RUN_ID;
+      via = 'cli';
+      entryId = ENTRY_1;
+      nowIso = NOW;
+    }
+    const secretToken = 'gh' + 'p_' + 'A1b2C3d4'.repeat(4);
+    const credentialPath = '/home/' + 'someone' + '/.ssh/' + 'id_ed25519';
+    const good = { runId: RUN_ID, via: 'cli', entryId: ENTRY_1, nowIso: NOW };
+    const badRequests: unknown[] = [
+      null,
+      undefined,
+      'run',
+      42,
+      [],
+      [RUN_ID],
+      new Boxed(),
+      throwing,
+      { ...good, runId: secretToken },
+      { ...good, runId: credentialPath },
+      { ...good, runId: RUN_ID + 'x' },
+      { ...good, via: 'smoke' },
+      { ...good, via: 7 },
+      { ...good, expectedRevision: 0 },
+      { ...good, expectedRevision: -1 },
+      { ...good, expectedRevision: Number.NaN },
+      { ...good, expectedRevision: 1.5 },
+      { ...good, expectedRevision: '2' },
+      { ...good, entryId: 'short' },
+      { ...good, entryId: secretToken + 'X' },
+      { ...good, entryId: ENTRY_1.toLowerCase() },
+      { ...good, nowIso: '2026-02-31T10:00:00.000Z' },
+      { ...good, nowIso: NOW + ' '.repeat(80) },
+      { ...good, nowIso: 'not a date' },
+      { ...good, nowIso: undefined },
+    ];
+    const before = await fx.journal.listForRun(RUN_ID);
+    for (const bad of badRequests) {
+      const refused = await fx.resume.requestResume(bad as Parameters<ResumeLaneRunUseCase['requestResume']>[0]);
+      expect(refused).toEqual({ outcome: 'refused', reason: 'invalid-request' });
+      expect(JSON.stringify(refused)).not.toContain(secretToken);
+      expect(JSON.stringify(refused)).not.toContain(credentialPath);
+    }
+
+    const lease = { holderId: HOLDER, fence: 1 };
+    const goodApply = { runId: RUN_ID, lease, nowIso: NOW };
+    const throwingLease = { runId: RUN_ID, nowIso: NOW, lease: {} as Record<string, unknown> };
+    Object.defineProperty(throwingLease.lease, 'holderId', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter must never run');
+      },
+    });
+    const badApplies: unknown[] = [
+      null,
+      7,
+      [],
+      new Boxed(),
+      { runId: RUN_ID, nowIso: NOW },
+      { ...goodApply, lease: null },
+      { ...goodApply, lease: [] },
+      throwingLease,
+      { ...goodApply, runId: secretToken },
+      { ...goodApply, runId: credentialPath },
+      { ...goodApply, lease: { holderId: '', fence: 1 } },
+      { ...goodApply, lease: { holderId: 5, fence: 1 } },
+      { ...goodApply, lease: { holderId: 'h'.repeat(257), fence: 1 } },
+      { ...goodApply, lease: { holderId: 'é'.repeat(129), fence: 1 } },
+      { ...goodApply, lease: { holderId: secretToken, fence: 1 } },
+      { ...goodApply, lease: { holderId: credentialPath, fence: 1 } },
+      { ...goodApply, lease: { holderId: HOLDER, fence: 0 } },
+      { ...goodApply, lease: { holderId: HOLDER, fence: -3 } },
+      { ...goodApply, lease: { holderId: HOLDER, fence: Number.NaN } },
+      { ...goodApply, lease: { holderId: HOLDER, fence: Number.MAX_SAFE_INTEGER + 2 } },
+      { ...goodApply, lease: { holderId: HOLDER, fence: '1' } },
+      { ...goodApply, nowIso: 'yesterday' },
+      { ...goodApply, nowIso: '2026-13-01T00:00:00.000Z' },
+      { ...goodApply, nowIso: NOW + ' '.repeat(80) },
+    ];
+    for (const bad of badApplies) {
+      const refused = await fx.resume.applyPendingResume(bad as Parameters<ResumeLaneRunUseCase['applyPendingResume']>[0]);
+      expect(refused).toEqual({ outcome: 'refused', key: null, reason: 'invalid-request' });
+      expect(JSON.stringify(refused)).not.toContain(secretToken);
+      expect(JSON.stringify(refused)).not.toContain(credentialPath);
+    }
+    expect(await fx.journal.listForRun(RUN_ID)).toEqual(before);
+    expect((await fx.repo.get(RUN_ID))?.parked).toEqual(AMBIGUOUS_GATE_PARK);
+    expect(await fx.resume.requestResume(good as Parameters<ResumeLaneRunUseCase['requestResume']>[0])).toMatchObject({
+      outcome: 'resume-recorded',
+    });
   });
 });

@@ -34,6 +34,7 @@ export * from "./ListConductorPassesPort.in-port.js";
 export * from "./ListLaneRunsPort.in-port.js";
 export * from "./ListMergeQueuePort.in-port.js";
 export * from "./ListStaleWorkOrdersPort.in-port.js";
+export * from "./ListStalledRunsPort.in-port.js";
 export * from "./ListUnregisteredProjectsPort.in-port.js";
 export * from "./ManageCutoverPort.in-port.js";
 export * from "./ManageDaemonSchedulerPort.in-port.js";

@@ -77,6 +77,7 @@ import type {
   RecordGateReceiptsRequest,
   RecordGateReceiptsResult,
 } from '../../ports/out/GateReceiptPort.out-port.js';
+import type { ReadGateFailingFileResult } from '../../ports/out/GateFailingFilePort.out-port.js';
 
 const RUN_ID = 'run-01JB0000000000000000000000';
 const NOW = '2026-10-27T10:00:00.000Z';
@@ -422,6 +423,10 @@ interface HarnessOptions {
   readonly wireReviewAssessment?: boolean;
   readonly wireGateReceipts?: boolean;
   readonly wireParkNotice?: boolean;
+  /** PT1a: the answer of the wired gate failing-file read; absent leaves the port unwired. */
+  readonly gateFailingFile?: ReadGateFailingFileResult;
+  /** PT1a: the work order's owned paths; absent keeps the fixture's. */
+  readonly ownedPaths?: readonly string[];
 }
 
 async function makeHarness(
@@ -586,7 +591,8 @@ async function makeHarness(
     newUlid: makeUlidMinter(),
     sameModelFamily: (left, right) => sameFamilyImpl(left, right),
     workOrderRepo: {
-      findWorkOrderById: async () => WORK_ORDER,
+      findWorkOrderById: async () =>
+        options.ownedPaths === undefined ? WORK_ORDER : { ...WORK_ORDER, ownedPaths: [...options.ownedPaths] },
     },
     ...(options.wireReviewRequest === false
       ? {}
@@ -684,6 +690,13 @@ async function makeHarness(
               gateReceiptRequests.push(request);
               return { outcome: 'recorded', count: request.receipts.length } as RecordGateReceiptsResult;
             },
+          },
+        }
+      : {}),
+    ...(options.gateFailingFile !== undefined
+      ? {
+          gateFailingFile: {
+            readGateFailingFile: async () => options.gateFailingFile as ReadGateFailingFileResult,
           },
         }
       : {}),
@@ -1345,6 +1358,52 @@ describe('AdvanceLaneRunUseCase fix-round prepare (K5-5)', () => {
     expect(record?.parked?.reason).toBe('blocker-after-round-2');
     expect(record?.round).toBe(2);
     expect(harness.fixRequests).toHaveLength(0);
+  });
+
+  it('f1) PT1a: the round-2 review failure parks with class blocker on the record', async () => {
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, { ...collectedAttempt(), id: 'attempt-example-3' }],
+    );
+    await seedReviewFailure(harness, [blockerFinding()]);
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked?.class).toBe('blocker');
+  });
+
+  async function gateFailureInRound2(gateFailingFile?: ReadGateFailingFileResult): Promise<Harness> {
+    const harness = await makeHarness(
+      runRecord({ round: 2, attemptIds: ['attempt-example-1', 'attempt-example-2', 'attempt-example-3'] }),
+      [collectedAttempt(), { ...collectedAttempt(), id: 'attempt-example-2' }, { ...collectedAttempt(), id: 'attempt-example-3' }],
+      gateFailingFile === undefined ? {} : { gateFailingFile, ownedPaths: ['packages/example/src'] },
+    );
+    const key = gateKey();
+    await appendIntent(harness, key, null, NOW);
+    await appendResult(harness, key, 'completed', 'gate-failed', NOW);
+    await conduct(harness, 'gating', NOW);
+    return harness;
+  }
+
+  it('f1b) PT1a: a round-2 gate failure whose failing file is outside the owned paths parks gate-outside-owned', async () => {
+    const harness = await gateFailureInRound2({ outcome: 'found', failingFile: 'packages/other/src/outside.test.ts' });
+    expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+    const record = await harness.runRepo.get(RUN_ID);
+    expect(record?.parked?.parkedFrom).toBe('gating');
+    expect(record?.parked?.class).toBe('gate-outside-owned');
+  });
+
+  it('f1c) PT1a: a gate failure inside the owned paths, with no file, or with an unreadable receipt parks other, never a guess', async () => {
+    for (const answer of [
+      { outcome: 'found', failingFile: 'packages/example/src/inside.test.ts' },
+      { outcome: 'found', failingFile: null },
+      { outcome: 'unavailable' },
+      undefined,
+    ] as const) {
+      const harness = await gateFailureInRound2(answer);
+      expect(await advance(harness)).toEqual({ outcome: 'parked', reason: 'blocker-after-round-2', qualifier: null });
+      const record = await harness.runRepo.get(RUN_ID);
+      expect(record?.parked?.class).toBe('other');
+    }
   });
 
   it('f2) a blocker-after-round-2 park carries the bounded findings in the notice request', async () => {

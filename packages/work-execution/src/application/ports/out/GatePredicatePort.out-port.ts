@@ -41,6 +41,11 @@ export interface GatePredicateResult {
   readonly cause?: 'gate-slot-wait-limit';
   /** Commands with a coverage declaration that ran. */
   readonly coverage?: CheckCoverage;
+  /**
+   * PT1a: on a failing command, the screened repo-relative file its output names, or null when
+   * none could be determined. Absent on every other result. Never command output.
+   */
+  readonly failingFile?: string | null;
 }
 
 export interface EvaluateGatePredicatesRequest {

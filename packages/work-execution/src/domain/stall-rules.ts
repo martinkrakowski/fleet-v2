@@ -22,6 +22,7 @@ export type StallSeverity = 'page' | 'digest';
 /** The fixed rule codes. */
 export type StallRule =
   | 'unowned-park'
+  | 'owned-park'
   | 'driver-absent'
   | 'driver-not-adopting'
   | 'review-failing'
@@ -487,6 +488,19 @@ function runTimeFindings(runs: readonly Row[], ctx: StallContext, out: StallFind
           runId: safeId(runId),
           parkedAtIso: String(run.parkedAtIso),
           minutes: parkedFor.minutes,
+        }));
+      }
+    }
+    // PT1a: the sibling of `unowned-park` for a parked run that has an open PR: the same
+    // threshold, the same key style, carrying the PR number. A hand-owned run stays silent.
+    if (parkedUsable && typeof run.prNumber === 'number' && run.handOwned === false) {
+      const parkedFor = elapsedOver(run.parkedAtIso, ctx.nowMs, ctx.parkedMinutes * MINUTE_MS);
+      if (parkedFor.over) {
+        out.push(finding('owned-park', 'digest', [runId], {
+          runId: safeId(runId),
+          parkedAtIso: String(run.parkedAtIso),
+          minutes: parkedFor.minutes,
+          prNumber: run.prNumber,
         }));
       }
     }

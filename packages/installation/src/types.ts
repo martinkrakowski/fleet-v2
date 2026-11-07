@@ -451,8 +451,12 @@ export interface MergeDaemonSection {
   readonly intervalSeconds?: number;
   readonly budgetSeconds?: number;
   readonly settleSeconds?: number;
-  /** Chain refresh mode of the daemon; only `shadow` (the default) is enabled, `live` is refused. */
-  readonly chainRefresh?: 'shadow' | 'live';
+  /**
+   * Chain refresh mode as written. Only `shadow` is valid; `live` and any
+   * unknown value load with a `chain-refresh-mode-invalid` warning and are
+   * kept verbatim so a write round-trips the operator's own text.
+   */
+  readonly chainRefresh?: 'shadow' | 'live' | (string & {});
 }
 
 /** A merge repository policy with every default applied (`resolveMergePolicy`). */
@@ -478,6 +482,11 @@ export interface ResolvedMergeDaemonPolicy {
   readonly intervalSeconds: number;
   readonly budgetSeconds: number;
   readonly settleSeconds: number;
+  /**
+   * The effective chain-refresh mode: `shadow` when written `shadow` or absent,
+   * `invalid` when written `live` or anything unknown. Never `live`.
+   */
+  readonly chainRefresh: 'shadow' | 'invalid';
 }
 
 /** The result of `resolveMergePolicy`: the normalized sections at their revision, or a refusal code. */

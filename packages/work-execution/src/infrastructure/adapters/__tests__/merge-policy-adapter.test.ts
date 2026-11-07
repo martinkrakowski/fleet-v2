@@ -30,7 +30,7 @@ function resolved(overrides: Record<string, unknown> = {}): MergePolicySource {
     outcome: 'resolved',
     policyRevision: 'abcdef012345',
     repositories: [repository()],
-    daemon: { intervalSeconds: 60, budgetSeconds: 45, settleSeconds: 20 },
+    daemon: { intervalSeconds: 60, budgetSeconds: 45, settleSeconds: 20, chainRefresh: 'shadow' },
     ...overrides,
   } as MergePolicySource;
 }
@@ -66,7 +66,7 @@ describe('MergePolicyAdapter', () => {
           veto: { mode: 'live', holdConfidence: 0 },
         }),
       ],
-      daemon: { intervalSeconds: 120, budgetSeconds: 90, settleSeconds: 0 },
+      daemon: { intervalSeconds: 120, budgetSeconds: 90, settleSeconds: 0, chainRefresh: 'shadow' },
     });
     const answer = await adapterFor(() => source).readMergePolicy();
     expect(answer).toEqual({
@@ -85,7 +85,7 @@ describe('MergePolicyAdapter', () => {
           veto: { mode: 'live', holdConfidence: 0 },
         }),
       ],
-      daemon: { intervalSeconds: 120, budgetSeconds: 90, settleSeconds: 0 },
+      daemon: { intervalSeconds: 120, budgetSeconds: 90, settleSeconds: 0, chainRefresh: 'shadow' },
     });
   });
 
@@ -184,7 +184,7 @@ describe('MergePolicyAdapter', () => {
       await adapterFor(() => resolved({ repositories: [repository({ requiredContexts: contexts })] })).readMergePolicy(),
     ).toEqual(installationInvalid);
 
-    const daemon = { intervalSeconds: 60, budgetSeconds: 45 };
+    const daemon = { intervalSeconds: 60, budgetSeconds: 45, chainRefresh: 'shadow' };
     throwingGetter(daemon, 'settleSeconds');
     expect(await adapterFor(() => resolved({ daemon })).readMergePolicy()).toEqual(installationInvalid);
 
@@ -367,17 +367,32 @@ describe('MergePolicyAdapter', () => {
     const answer = await adapterFor(() =>
       resolved({
         repositories: [repository({ maxAttempts: 32, checksGraceMinutes: 1440 })],
-        daemon: { intervalSeconds: 10, budgetSeconds: 5, settleSeconds: 600 },
+        daemon: { intervalSeconds: 10, budgetSeconds: 5, settleSeconds: 600, chainRefresh: 'shadow' },
       }),
     ).readMergePolicy();
     expect(answer.outcome).toBe('known');
     const lower = await adapterFor(() =>
       resolved({
         repositories: [repository({ maxAttempts: 1, checksGraceMinutes: 1 })],
-        daemon: { intervalSeconds: 3600, budgetSeconds: 600, settleSeconds: 0 },
+        daemon: { intervalSeconds: 3600, budgetSeconds: 600, settleSeconds: 0, chainRefresh: 'shadow' },
       }),
     ).readMergePolicy();
     expect(lower.outcome).toBe('known');
+  });
+
+  it('readMergePolicy accepts the resolved shadow/invalid chain-refresh modes and refuses any other value', async () => {
+    for (const mode of ['shadow', 'invalid']) {
+      const answer = await adapterFor(() =>
+        resolved({ daemon: { intervalSeconds: 60, budgetSeconds: 45, settleSeconds: 20, chainRefresh: mode } }),
+      ).readMergePolicy();
+      expect([mode, answer.outcome]).toEqual([mode, 'known']);
+    }
+    for (const mode of ['live', 'SHADOW', 1, null]) {
+      const answer = await adapterFor(() =>
+        resolved({ daemon: { intervalSeconds: 60, budgetSeconds: 45, settleSeconds: 20, chainRefresh: mode } }),
+      ).readMergePolicy();
+      expect([mode, answer]).toEqual([mode, installationInvalid]);
+    }
   });
 
   it('readMergePolicy answers unknown for daemon settings outside the contract bounds', async () => {

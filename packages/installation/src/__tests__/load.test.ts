@@ -277,6 +277,34 @@ describe('loadInstallation', () => {
     });
   });
 
+  it('loads a file with an invalid policy.daemon.chainRefresh mode and reports a warning naming the key and code, never the value', () => {
+    const directory = makeTempDirectory();
+    const installation = {
+      schemaVersion: 2,
+      hosts: {
+        local: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['orchestrator', 'lane-runner'],
+          runner: { kind: 'opencode', port: 46000 },
+        },
+      },
+      forge: { mode: 'none' },
+      policy: { daemon: { chainRefresh: 'livee' } },
+    };
+    const file = writeInstallationFile(directory, `${JSON.stringify(installation, null, 2)}\n`);
+    const result = loadInstallation({ file, env: {} });
+    expect(result.status).toBe('loaded');
+    if (result.status !== 'loaded') {
+      return;
+    }
+    expect(result.warnings).toEqual(['policy.daemon.chainRefresh: chain-refresh-mode-invalid']);
+    expect(result.warnings.join(' ')).not.toContain('livee');
+    // The raw value round-trips untouched so the operator sees and fixes it.
+    expect(result.installation.policy?.daemon).toMatchObject({ chainRefresh: 'livee' });
+    expect(result.model.policy?.daemon).toMatchObject({ chainRefresh: 'livee' });
+  });
+
   it('reports invalid JSON without echoing the file content', () => {
     const directory = makeTempDirectory();
     const file = writeInstallationFile(directory, '{ "schemaVersion": 1, "runner": SENTINEL');

@@ -1525,6 +1525,28 @@ interface FixRenderInput {
 }
 
 /**
+ * PF1: the brief now refuses absolute finding paths, but a reviewer may spell
+ * a changed file with the absolute worktree prefix (the scope rule already
+ * normalises that spelling). Strip the prior attempt's worktree prefix before
+ * rendering so such a finding still hands over — as the repository-relative
+ * path — while every other absolute path refuses at the render.
+ */
+function relativeWorktreeFindingsOf(
+  findings: readonly HandoverFinding[],
+  worktreePath: string,
+): readonly HandoverFinding[] {
+  if (worktreePath === '' || !findings.some((finding) => finding.filePath?.startsWith(worktreePath + '/') === true)) {
+    return findings;
+  }
+  return findings.map((finding) => {
+    if (finding.filePath === null || !finding.filePath.startsWith(worktreePath + '/')) {
+      return finding;
+    }
+    return { ...finding, filePath: finding.filePath.slice(worktreePath.length + 1) };
+  });
+}
+
+/**
  * Steps 16–17: the handover note flag (GB3a) and the rendered brief
  * (KF-5b). A brief that does not render, or renders no numbered fix,
  * refuses.
@@ -1553,14 +1575,25 @@ async function fixRenderHandoverStep(
     branchName,
     head12: input.head,
     source: input.failure.source === 'review' ? 'review' : 'gate',
-    findings: input.findings,
+    findings: relativeWorktreeFindingsOf(input.findings, input.prior.worktreePath),
     gateReasonCodes: input.failure.source === 'review' ? [] : [input.failure.reasonCode],
     gatePredicates: input.gatePredicates,
     proofCommands: input.proofCommands,
     originalBrief: input.originalBrief,
     ...(handover ? { uncommittedHandover: true } : {}),
   } satisfies RenderHandoverBriefInput);
-  if (!brief.ok || brief.numberedFixes.length === 0) {
+  if (!brief.ok) {
+    // PF1: `nothing-to-fix` keeps its own token; any other render refusal
+    // reports the real reason as `prepare-handover-<reason>` — built only
+    // from the closed reason union, never from free text, so the path is
+    // never echoed into the detail.
+    const detail =
+      brief.reason === 'nothing-to-fix'
+        ? 'prepare-nothing-to-fix'
+        : `prepare-handover-${brief.reason}`;
+    return { status: 'refused', result: await shared.refuse('prepare-refused', detail) };
+  }
+  if (brief.numberedFixes.length === 0) {
     return { status: 'refused', result: await shared.refuse('prepare-refused', 'prepare-nothing-to-fix') };
   }
   return { status: 'ok', value: { briefText: brief.text, numberedFixes: brief.numberedFixes } };

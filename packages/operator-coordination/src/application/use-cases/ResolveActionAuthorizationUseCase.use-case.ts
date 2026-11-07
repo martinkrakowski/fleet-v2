@@ -198,14 +198,15 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (candidate.getMergeGrant() !== null) {
       return null;
     }
-    // CO24g: a release grant is attempt-less by design (cutover row CO14). It is
+    // CO24g: an unbound release grant is attempt-less by design (cutover row CO14). It is
     // anchored by its exact `release:<action>` scope (only `release:install`,
     // `release:swap` or `release:rollback`) and exact head, and consumed once
     // by its deterministic action id, so it resolves with or without an attempt
-    // coordinate and is never bound to a work attempt. The gate is the grant's
+    // coordinate and is never bound to a work attempt. A bound release grant is held
+    // to its attempt and falls through to the normal checks. The gate is the grant's
     // recorded scope — the grant kind — never the absence of an attemptId, and
     // never an arbitrary `release:*` prefix.
-    if (isReleaseActionScope(candidate.getActionScope())) {
+    if (isReleaseActionScope(candidate.getActionScope()) && candidate.getBoundAttemptId() === null) {
       return null;
     }
     if (request.attemptId === undefined) {

@@ -536,6 +536,56 @@ describe('grant attempt binding (CO24e)', () => {
       ).toEqual({ outcome: 'refused', reason: 'grant-attempt-unrecorded' });
       expect((await repo.findRequestByGrantId('grant-owner'))?.consumptions).toHaveLength(0);
     });
+
+    it('refuses a release:swap grant bound to attempt A when resolved with attempt B', async () => {
+      await repo.saveRequest(ownerGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      expect(await resolver().resolveActionAuthorization({
+        projectId: 'project-1',
+        actionScope: 'release:swap',
+        expectedHeadSha: HEAD,
+        attemptId: 'att-B',
+      })).toEqual({ outcome: 'blocked', reason: 'grant-attempt-mismatch' });
+    });
+
+    it('refuses a release:swap grant bound to attempt A when resolved with no attempt', async () => {
+      await repo.saveRequest(ownerGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      expect(await resolver().resolveActionAuthorization({
+        projectId: 'project-1',
+        actionScope: 'release:swap',
+        expectedHeadSha: HEAD,
+      })).toEqual({ outcome: 'blocked', reason: 'attempt-required' });
+    });
+
+    it('authorizes a release:swap grant bound to attempt A when resolved with attempt A', async () => {
+      await repo.saveRequest(ownerGrant({ actionScope: 'release:swap', grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      expect(await resolver().resolveActionAuthorization({
+        projectId: 'project-1',
+        actionScope: 'release:swap',
+        expectedHeadSha: HEAD,
+        attemptId: 'att-A',
+      })).toEqual({
+        outcome: 'authorized',
+        grantId: 'grant-owner',
+        requestId: 'req-owner',
+        expectedHeadSha: HEAD,
+        policyRevision: 'pol-1',
+      });
+    });
+
+    it('resolves an unbound release:swap grant without an attempt', async () => {
+      await repo.saveRequest(ownerGrant({ actionScope: 'release:swap' }));
+      expect(await resolver().resolveActionAuthorization({
+        projectId: 'project-1',
+        actionScope: 'release:swap',
+        expectedHeadSha: HEAD,
+      })).toEqual({
+        outcome: 'authorized',
+        grantId: 'grant-owner',
+        requestId: 'req-owner',
+        expectedHeadSha: HEAD,
+        policyRevision: 'pol-1',
+      });
+    });
   });
 
   describe('consumption', () => {

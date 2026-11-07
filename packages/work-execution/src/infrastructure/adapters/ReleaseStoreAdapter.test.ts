@@ -313,7 +313,10 @@ describe('ReleaseStoreAdapter', () => {
    * the adapter's identity recording right after it) still happens on the
    * real root, so the recorded dev/ino belongs to the moved-away directory.
    */
-  async function swappingAdapter(plant?: (target: string, stagingName: string) => Promise<void>): Promise<{
+  async function swappingAdapter(
+    plant?: (target: string, stagingName: string) => Promise<void>,
+    onLstat?: (targetPath: string, swapped: boolean) => Promise<void> | void,
+  ): Promise<{
     adapter: ReleaseStoreAdapter;
     fixture: SwapFixture;
   }> {
@@ -346,6 +349,12 @@ describe('ReleaseStoreAdapter', () => {
       rmdir: async (pathOrDir) => {
         fixture.rmdirCalls.push(pathOrDir.toString());
         return fs.rmdir(pathOrDir as never);
+      },
+      lstat: async (pathOrTarget, options) => {
+        if (onLstat !== undefined) {
+          await onLstat(pathOrTarget.toString(), swapped);
+        }
+        return fs.lstat(pathOrTarget as never, options as never);
       },
     } as typeof fs;
     return { adapter: new ReleaseStoreAdapter(swapping), fixture };
@@ -434,6 +443,32 @@ describe('ReleaseStoreAdapter', () => {
     // Our own empty `.home` (created through the target symlink) is still ours and removed.
     expect(await lstatOrNullForTest(path.join(root, `${stagingNames[0]}.home`))).toBeNull();
     expect((await fs.readdir(fixture.target)).sort()).toEqual([stagingNames[0]]);
+  });
+
+  it('prepare reports an unverifiable staging path in leftovers and never calls rmdir when lstat rejects with EACCES', async () => {
+    let swapDetected = false;
+    const { adapter: swapped, fixture } = await swappingAdapter(undefined, async (targetPath, isSwapped) => {
+      if (isSwapped && path.resolve(targetPath) === path.resolve(root)) {
+        swapDetected = true;
+      } else if (swapDetected && path.basename(targetPath).startsWith(`.staging-${A}-`) && !targetPath.endsWith('.home')) {
+        const error = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+        throw error;
+      }
+    });
+    await fs.mkdir(fixture.target, { recursive: true });
+    await fs.mkdir(root, { recursive: true });
+    const result = await swapped.prepare({ root, sha: A });
+    expect(result.outcome).toBe('root-changed');
+    if (result.outcome !== 'root-changed') {
+      throw new Error(`expected root-changed, got ${result.outcome}`);
+    }
+    expect(swapDetected).toBe(true);
+    const stagingNames = await movedStagingNames(fixture.moved);
+    expect(stagingNames.length).toBeGreaterThanOrEqual(1);
+    const stagingPath = path.join(root, stagingNames[0]);
+    expect(result.leftovers).toContain(stagingPath);
+    expect(result.leftovers).toEqual([stagingPath]);
+    expect(fixture.rmdirCalls).not.toContain(stagingPath);
   });
 
   it('prepare refuses when the root is a file rather than a directory', async () => {

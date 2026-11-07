@@ -306,7 +306,13 @@ async function discardStaging(
   const leftovers: string[] = [];
   for (const dir of stagingPaths) {
     const identity = created.get(dir) ?? null;
-    const stat = await lstatOrNullBigInt(fsApi, dir);
+    let stat: BigIntStats | null;
+    try {
+      stat = await lstatOrNullBigInt(fsApi, dir);
+    } catch {
+      leftovers.push(dir);
+      continue;
+    }
     if (identity === null) {
       // Never recorded (the mkdir or the recording lstat failed for it): the
       // name at this path is not proven ours, so it is left alone and, when
@@ -348,8 +354,11 @@ async function discardStaging(
 async function lstatOrNullBigInt(fsApi: typeof fs, target: string): Promise<BigIntStats | null> {
   try {
     return await fsApi.lstat(target, { bigint: true });
-  } catch {
-    return null;
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) {
+      return null;
+    }
+    throw error;
   }
 }
 

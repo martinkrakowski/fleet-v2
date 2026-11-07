@@ -203,20 +203,15 @@ export class ReapLaneWorktreesUseCase implements ReapLaneWorktreesPort {
     if (!this.deps) {
       throw new Error('Not implemented: ReapLaneWorktreesUseCase');
     }
-    const refusal = reapRequestRefusal(request);
-    if (refusal !== null) {
-      return { outcome: 'refused', reason: refusal };
+    const validation = validateReapRequest(request);
+    if (validation === 'invalid-request') {
+      return { outcome: 'refused', reason: 'invalid-request' };
     }
-    // The validated snapshot is what `reap` reads: a proxy can pass
-    // descriptor-based validation and still throw when its fields are read a
-    // second time, so the snapshot is authoritative and the original request
-    // is never read again.
+    // The validated snapshot is what `reap` reads: the original request is
+    // never read again after validation, so a stateful proxy cannot change a
+    // field (for example, `dryRun`) between the validation and the reap.
     try {
-      const snap = snapshotPlainDataRecord(request);
-      if (snap === null) {
-        return { outcome: 'refused', reason: 'invalid-request' };
-      }
-      return await this.reap(this.deps, snap as unknown as ReapLaneWorktreesRequest);
+      return await this.reap(this.deps, validation.snap as unknown as ReapLaneWorktreesRequest);
     } catch {
       return { outcome: 'refused', reason: 'invalid-request' };
     }
@@ -358,13 +353,18 @@ function isRecordObject(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
+/** The result of validating a reap request: the validated snapshot or a refusal. */
+type ReapRequestValidation = { readonly snap: Record<string, unknown> } | 'invalid-request';
+
 /**
  * C2': the strict runtime-input guard. A null, a non-object, an unreadable
  * (throwing-getter) request, a missing or non-boolean `dryRun`, a non-boolean
  * `forceUnsealed` or a malformed `nowIso` is refused; a missing `nowIso` is
- * fine (the clock answers).
+ * fine (the clock answers). The single validated snapshot is returned so the
+ * caller never re-reads the original request (a stateful proxy could return
+ * different field values, such as `dryRun`, across reads).
  */
-function reapRequestRefusal(input: unknown): 'invalid-request' | null {
+function validateReapRequest(input: unknown): ReapRequestValidation {
   let snap: Record<string, unknown> | null;
   try {
     snap = snapshotPlainDataRecord(input);
@@ -388,7 +388,7 @@ function reapRequestRefusal(input: unknown): 'invalid-request' | null {
   ) {
     return 'invalid-request';
   }
-  return null;
+  return { snap };
 }
 
 /** A project-profile clone: the clone root and the worktree root it manages. */

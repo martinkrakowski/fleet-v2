@@ -885,7 +885,9 @@ describe('mergeDraftedHost precedence (P2-cli)', () => {
       expect(jsonDraftResult.errors.join(' ')).toContain('roleAliases');
     }
 
-    // Preserving an own __proto__ key on a null-prototype copy is covered by planHostRename.
+    // Survival of an own __proto__ key through copyOwnData is proven by the
+    // host-entry test below; planHostRename proves the same property for a
+    // ROOT key, on its own code path.
 
     // 2. An own __proto__ value is an object with a throwing orchestrator getter
     let getterCalled = false;
@@ -989,6 +991,112 @@ describe('mergeDraftedHost precedence (P2-cli)', () => {
         }
       }).not.toThrow();
       expect(validGetterCalled).toBe(false);
+    }
+  });
+
+  /**
+   * The round-2 review left this guarantee unproven: an own `__proto__` must
+   * SURVIVE the copy, so the loader refuses the candidate instead of the write
+   * silently losing the key. Three places, and they differ:
+   *   - the hosts RECORD, copied by `copyOwnData`: survives;
+   *   - the DRAFTED host, whose own keys `copyOwnData` keeps and the candidate
+   *     stores: survives;
+   *   - an own key on the EXISTING entry, or inside `roleAliases`: NOT kept,
+   *     because `mergeDraftedHost` rebuilds the entry from the draft and prunes
+   *     aliases to known roles. `planHostRename` proves the same property for a
+   *     root key, on its own code path.
+   * Each case runs a control WITHOUT the key, which must parse, so a refusal
+   * can only be the surviving key and not something else in the fixture: the
+   * loader also requires an orchestrator host to be local and some host to hold
+   * the lane-runner role, which is why the draft below is not `hereDraft`.
+   */
+  const protoDraft: HostDraft = {
+    name: 'here',
+    host: {
+      transport: 'local',
+      worktreeRoot: '/srv/worktrees',
+      roles: ['orchestrator', 'lane-runner'],
+      runner: { kind: 'opencode', port: 46000 },
+    },
+  };
+  const validFile = (extra: string) => `{
+      "schemaVersion": 2,
+      "forge": { "mode": "none" },
+      "hosts": {
+        "here": {
+          "transport": "local",
+          "worktreeRoot": "/srv/worktrees",
+          "roles": ["orchestrator", "lane-runner"],
+          "runner": { "kind": "opencode", "port": 46000 }
+        }${extra}
+      }
+    }`;
+
+  it('applyHostDraft keeps an own __proto__ key in the hosts record, and only that key refuses the candidate', () => {
+    // JSON.parse creates an own `__proto__` data property; an object literal
+    // cannot, because the literal triggers the inherited setter instead.
+    const control: unknown = JSON.parse(validFile(''));
+    const polluted: unknown = JSON.parse(validFile(',\n        "__proto__": { "injected": true }'));
+    expect(Object.hasOwn((polluted as { hosts: object }).hosts, '__proto__')).toBe(true);
+
+    const clean = applyHostDraft(control, protoDraft, 'edit');
+    expect(clean.ok).toBe(true);
+    if (clean.ok) {
+      expect(parseInstallation(clean.candidate).ok).toBe(true);
+    }
+
+    const result = applyHostDraft(polluted, protoDraft, 'edit');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // If `copyOwnData` assigned onto `{}` instead of defining each key on a
+      // null-prototype target, the key would be dropped here and the loader
+      // would accept a candidate that had silently lost it.
+      expect(Object.hasOwn(result.candidate.hosts, '__proto__')).toBe(true);
+      // Object spread defines rather than assigns, so the record stays an
+      // ordinary object and its prototype is untouched.
+      expect(Object.getPrototypeOf(result.candidate.hosts)).toBe(Object.prototype);
+      const parsed = parseInstallation(result.candidate);
+      expect(parsed.ok).toBe(false);
+      if (!parsed.ok) {
+        // The loader refuses it as a host name and deliberately never echoes
+        // the name itself, so the message is matched, not the key.
+        expect(parsed.errors.join(' ')).toContain('invalid host name');
+      }
+    }
+  });
+
+  it('applyHostDraft keeps an own __proto__ key supplied on the drafted host, and only that key refuses the candidate', () => {
+    // A hostile draft must not slip an unknown key past the loader by hiding it
+    // behind the prototype setter.
+    const hostJson = (extra: string) => `{
+      "transport": "local",
+      "worktreeRoot": "/srv/worktrees",
+      "roles": ["orchestrator", "lane-runner"],
+      "runner": { "kind": "opencode", "port": 46000 }${extra}
+    }`;
+    const cleanHost = JSON.parse(hostJson('')) as HostDraft['host'];
+    const pollutedHost = JSON.parse(
+      hostJson(',\n      "__proto__": { "injected": true }'),
+    ) as HostDraft['host'];
+    expect(Object.hasOwn(pollutedHost as object, '__proto__')).toBe(true);
+
+    const base: unknown = JSON.parse(validFile(''));
+    const clean = applyHostDraft(base, { name: 'here', host: cleanHost }, 'edit');
+    expect(clean.ok).toBe(true);
+    if (clean.ok) {
+      expect(parseInstallation(clean.candidate).ok).toBe(true);
+    }
+
+    const result = applyHostDraft(base, { name: 'here', host: pollutedHost }, 'edit');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(Object.hasOwn(result.candidate.hosts.here as object, '__proto__')).toBe(true);
+      const parsed = parseInstallation(result.candidate);
+      expect(parsed.ok).toBe(false);
+      if (!parsed.ok) {
+        // The refusal names the host whose entry carries the surviving key.
+        expect(parsed.errors.join(' ')).toContain('hosts.here');
+      }
     }
   });
 

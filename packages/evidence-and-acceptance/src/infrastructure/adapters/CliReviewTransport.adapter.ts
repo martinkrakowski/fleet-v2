@@ -230,7 +230,7 @@ export function buildEmbeddedReviewPrompt(request: RunIndependentReviewRequest, 
       const wrappedBrief = wrapUntrusted({ label: 'brief', text: request.briefText, nonce });
       sections.push(
         `${BRIEF_INPUT_RULE}\n\nBrief:\n${wrappedBrief}\n\n` +
-          'Does the change satisfy every work-order item of the brief? Report a FINDING for each item the change does not satisfy.',
+          'Does the change satisfy every work-order item of the brief? Report each item the change does not satisfy as a finding.',
       );
     } else {
       throw new Error('a brief-check review requires the brief text');
@@ -419,10 +419,11 @@ export function createCliReviewTransport(
       if (nonBlankLines.length === 0) {
         throw new Error('reviewer CLI returned an empty response');
       }
-      // A clean review with no findings is exactly one line, the verdict
-      // (KF-14d: grok answers a bare `VERDICT: PASS`); only a one-line answer
-      // that is not a verdict is the failed review the guard exists for.
-      if (nonBlankLines.length < 2 && !/^VERDICT: (PASS|FAIL|FIX FIRST)$/.test(nonBlankLines[0].trim())) {
+      // A manual review (no kind) keeps the one-line guard: single-line
+      // prose is the failed review the guard exists for. A conductor reply
+      // (a kind) always reaches the structured parser (RV5), so one-line
+      // free text resolves to `unknown` / `unparseable-verdict` there.
+      if (request.kind === undefined && nonBlankLines.length < 2) {
         throw new Error('reviewer CLI returned a one-line response');
       }
 

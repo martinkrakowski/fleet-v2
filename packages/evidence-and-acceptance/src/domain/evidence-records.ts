@@ -43,13 +43,16 @@ export type ReviewKind = (typeof REVIEW_KINDS)[number];
 
 /**
  * The fixed cause codes of an `unknown` review answer (RV2): an empty reply, a
- * reply without a parseable verdict, and a FAIL / FIX FIRST verdict with zero
- * findings. The code is a fixed token, never reviewer text.
+ * reply without a parseable verdict, a FAIL / FIX FIRST verdict with zero
+ * findings, and (RV5b) an opencode JSON event stream that breaks the stream
+ * grammar (malformed, truncated or out-of-step events). The code is a fixed
+ * token, never reviewer text.
  */
 export const REVIEW_UNKNOWN_REASONS = [
   'empty',
   'unparseable-verdict',
   'no-findings-on-fail',
+  'stream-grammar',
 ] as const;
 export type ReviewUnknownReason = (typeof REVIEW_UNKNOWN_REASONS)[number];
 

@@ -89,6 +89,18 @@ describe('MergePolicyAdapter', () => {
     });
   });
 
+  it('PT1a: stallAfterMinutes is accepted when valid and never a refusal when unusable: it reads as 30', async () => {
+    const daemon = { intervalSeconds: 60, budgetSeconds: 45, settleSeconds: 20, chainRefresh: 'shadow' };
+    const valid = await adapterFor(() => resolved({ daemon: { ...daemon, stallAfterMinutes: 45 } })).readMergePolicy();
+    expect(valid).toMatchObject({ outcome: 'known', daemon: { stallAfterMinutes: 45 } });
+    for (const bad of [0, 1441, 2.5, '30', null, true]) {
+      const answer = await adapterFor(() => resolved({ daemon: { ...daemon, stallAfterMinutes: bad } })).readMergePolicy();
+      expect(answer).toMatchObject({ outcome: 'known', daemon: { stallAfterMinutes: 30 } });
+    }
+    const absent = await adapterFor(() => resolved()).readMergePolicy();
+    expect(absent.outcome === 'known' && 'stallAfterMinutes' in absent.daemon).toBe(false);
+  });
+
   it('readMergePolicy answers known with zero repositories when none is configured', async () => {
     const answer = await adapterFor(() => resolved({ repositories: [] })).readMergePolicy();
     expect(answer).toMatchObject({ outcome: 'known', repositories: [] });

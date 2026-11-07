@@ -1060,13 +1060,13 @@ function readDaemonSection(
     MERGE_POLICY_BOUNDS.settleSeconds,
     defaults.settleSeconds,
   );
-  const stallAfterMinutes = readMergeInteger(
-    block,
-    'stallAfterMinutes',
-    MERGE_POLICY_BOUNDS.stallAfterMinutes,
-    defaults.stallAfterMinutes,
-  );
-  if (!intervalSeconds.ok || !budgetSeconds.ok || !settleSeconds.ok || !stallAfterMinutes.ok) {
+  // PT1a: resolves, never refuses (like `chainRefresh`): a missing, out-of-range or non-integer
+  // value reads as the default, so a typo in this optional key can never stop the merge policy.
+  const stallAfterMinutes =
+    (Object.hasOwn(block, 'stallAfterMinutes')
+      ? readBoundedInteger(readOwnDataProperty(block, 'stallAfterMinutes'), MERGE_POLICY_BOUNDS.stallAfterMinutes)
+      : undefined) ?? defaults.stallAfterMinutes;
+  if (!intervalSeconds.ok || !budgetSeconds.ok || !settleSeconds.ok) {
     return DAEMON_INVALID;
   }
   // The chain-refresh mode resolves, never refuses: `shadow` (written or
@@ -1085,7 +1085,7 @@ function readDaemonSection(
       budgetSeconds: budgetSeconds.value,
       settleSeconds: settleSeconds.value,
       chainRefresh,
-      stallAfterMinutes: stallAfterMinutes.value,
+      stallAfterMinutes,
     }),
   );
 }

@@ -524,6 +524,36 @@ describe('writeInstallationV2 round trip (shared key lists)', () => {
     }
   });
 
+  it('PT1a: round-trips a bad stallAfterMinutes value unchanged, with the same warning on the way back', () => {
+    const base = {
+      schemaVersion: 2,
+      hosts: {
+        local: {
+          transport: 'local',
+          worktreeRoot: '/srv/fleet/worktrees',
+          roles: ['orchestrator', 'lane-runner'],
+          runner: { kind: 'opencode', port: 46000 },
+        },
+      },
+      forge: { mode: 'none' },
+      policy: { daemon: { stallAfterMinutes: 0 } },
+    };
+    const parsed = parseInstallation(base);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect(parsed.warnings).toEqual(['policy.daemon.stallAfterMinutes: stall-after-minutes-invalid']);
+    const written = writeInstallationV2(parsed.installation as FleetInstallationV2);
+    expect(written).toContain('"stallAfterMinutes": 0');
+    const reparsed = parseInstallation(JSON.parse(written));
+    expect(reparsed.ok).toBe(true);
+    if (reparsed.ok) {
+      expect(reparsed.installation).toEqual(parsed.installation);
+      expect(reparsed.warnings).toEqual(parsed.warnings);
+    }
+  });
+
   it('round-trips an invalid chainRefresh value unchanged so the operator sees their own text', () => {
     const base = {
       schemaVersion: 2,

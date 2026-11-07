@@ -457,8 +457,12 @@ export interface MergeDaemonSection {
    * kept verbatim so a write round-trips the operator's own text.
    */
   readonly chainRefresh?: 'shadow' | 'live' | (string & {});
-  /** PT1a: minutes a run may sit parked before the conductor raises its stall attention; 1..1440, default 30. */
-  readonly stallAfterMinutes?: number;
+  /**
+   * PT1a: minutes a run may sit parked before the conductor raises its stall attention; 1..1440,
+   * default 30. As written: a value outside that range or not an integer loads with a
+   * `stall-after-minutes-invalid` warning, is kept verbatim for a round trip and resolves to 30.
+   */
+  readonly stallAfterMinutes?: number | (string & {}) | boolean | null;
 }
 
 /** A merge repository policy with every default applied (`resolveMergePolicy`). */

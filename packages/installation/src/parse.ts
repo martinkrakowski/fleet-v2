@@ -2614,16 +2614,32 @@ function parseMergeDaemonPolicy(
   }
   const before = errors.length;
   collectUnknownKeys(value, POLICY_DAEMON_KEYS, 'policy.daemon', errors);
-  const read = (
-    field: 'intervalSeconds' | 'budgetSeconds' | 'settleSeconds' | 'stallAfterMinutes',
-  ): number | undefined =>
+  const read = (field: 'intervalSeconds' | 'budgetSeconds' | 'settleSeconds'): number | undefined =>
     Object.hasOwn(value, field)
       ? readMergeInteger(value, field, 'policy.daemon', MERGE_POLICY_BOUNDS[field], errors)
       : undefined;
   const intervalSeconds = read('intervalSeconds');
   const budgetSeconds = read('budgetSeconds');
   const settleSeconds = read('settleSeconds');
-  const stallAfterMinutes = read('stallAfterMinutes');
+  // PT1a: like `chainRefresh`, a bad `stallAfterMinutes` is a warning, never an error: it gates
+  // only the stall attention, so it must not stop the installation from loading or the merge
+  // pass from running. The raw value is kept so a write round-trips the operator's own text;
+  // the resolver reads the default (30). The warning names the key and a code, never the value.
+  const stallAfterMinutes: unknown = Object.hasOwn(value, 'stallAfterMinutes')
+    ? value.stallAfterMinutes
+    : undefined;
+  const stallBounds = MERGE_POLICY_BOUNDS.stallAfterMinutes;
+  if (
+    Object.hasOwn(value, 'stallAfterMinutes') &&
+    !(
+      typeof stallAfterMinutes === 'number' &&
+      Number.isInteger(stallAfterMinutes) &&
+      stallAfterMinutes >= stallBounds.min &&
+      stallAfterMinutes <= stallBounds.max
+    )
+  ) {
+    warnings.push('policy.daemon.stallAfterMinutes: stall-after-minutes-invalid');
+  }
   // CO8a: an unknown or `live` `chainRefresh` is a warning, never an error:
   // the file still parses and the raw value round-trips so the operator sees
   // and fixes their own text. The warning names the key and the reason code
@@ -2645,7 +2661,9 @@ function parseMergeDaemonPolicy(
     ...(intervalSeconds !== undefined ? { intervalSeconds } : {}),
     ...(budgetSeconds !== undefined ? { budgetSeconds } : {}),
     ...(settleSeconds !== undefined ? { settleSeconds } : {}),
-    ...(stallAfterMinutes !== undefined ? { stallAfterMinutes } : {}),
+    ...(Object.hasOwn(value, 'stallAfterMinutes')
+      ? { stallAfterMinutes: stallAfterMinutes as MergeDaemonSection['stallAfterMinutes'] }
+      : {}),
     ...(Object.hasOwn(value, 'chainRefresh')
       ? { chainRefresh: value.chainRefresh as MergeDaemonSection['chainRefresh'] }
       : {}),

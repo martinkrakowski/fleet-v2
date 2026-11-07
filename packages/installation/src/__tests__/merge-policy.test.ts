@@ -643,7 +643,7 @@ describe('the parsed installation', () => {
     }
   });
 
-  it('PT1a: policy.daemon.stallAfterMinutes defaults to 30, takes 1..1440, refuses anything else and leaves the policy revision alone', () => {
+  it('PT1a: policy.daemon.stallAfterMinutes defaults to 30, takes 1..1440, reads anything else as 30 with a warning, and leaves the policy revision alone', () => {
     expect(expectResolved(resolveMergePolicy(policyWith(undefined, {}))).daemon.stallAfterMinutes).toBe(30);
     for (const value of [1, 45, 1440]) {
       const parsed = parsePolicy({ daemon: { stallAfterMinutes: value } });
@@ -653,11 +653,21 @@ describe('the parsed installation', () => {
           .stallAfterMinutes,
       ).toBe(value);
     }
-    for (const value of [0, 1441, -3, 2.5, '30', null, true]) {
+    // Like chainRefresh: a bad value is a warning naming the key and a code (never the value); the
+    // installation loads, the raw value is kept, and the policy resolves with the default, never refused.
+    for (const value of [0, 1441, -3, 2.5, '30', null, true, 'sometimes']) {
       const parsed = parsePolicy({ daemon: { stallAfterMinutes: value } });
-      expect(parsed.ok).toBe(false);
-      expect(resolveMergePolicy(policyWith(undefined, { stallAfterMinutes: value })).outcome).toBe('invalid');
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) {
+        expect(parsed.warnings ?? []).toEqual(['policy.daemon.stallAfterMinutes: stall-after-minutes-invalid']);
+        expect((parsed.warnings ?? []).join(' ')).not.toContain('sometimes');
+        expect(parsed.installation.policy?.daemon).toMatchObject({ stallAfterMinutes: value });
+      }
+      const read = expectResolved(resolveMergePolicy(policyWith(undefined, { stallAfterMinutes: value })));
+      expect(read.daemon.stallAfterMinutes).toBe(30);
     }
+    const valid = parsePolicy({ daemon: { stallAfterMinutes: 45 } });
+    expect(valid.ok && (valid.warnings ?? [])).toEqual([]);
     const base = expectResolved(resolveMergePolicy(policyWith(undefined, {})));
     const changed = expectResolved(resolveMergePolicy(policyWith(undefined, { stallAfterMinutes: 90 })));
     expect(changed.policyRevision).toBe(base.policyRevision);

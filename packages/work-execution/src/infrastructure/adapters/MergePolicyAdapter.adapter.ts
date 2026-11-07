@@ -46,6 +46,7 @@ const INTERVAL_RANGE = { min: 10, max: 3600 } as const;
 const BUDGET_RANGE = { min: 5, max: 600 } as const;
 const SETTLE_RANGE = { min: 0, max: 600 } as const;
 const STALL_AFTER_RANGE = { min: 1, max: 1440 } as const;
+const DEFAULT_STALL_AFTER_MINUTES = 30;
 const REVISION_PATTERN = /^[0-9a-f]{12}$/;
 const VETO_MODES: ReadonlySet<string> = new Set(['off', 'shadow', 'live']);
 const REPOSITORY_KEYS: readonly string[] = [
@@ -64,7 +65,7 @@ const REPOSITORY_KEYS: readonly string[] = [
 ];
 const VETO_KEYS: readonly string[] = ['mode', 'holdConfidence'];
 const DAEMON_KEYS: readonly string[] = ['intervalSeconds', 'budgetSeconds', 'settleSeconds', 'chainRefresh'];
-/** PT1a: `stallAfterMinutes` is optional on the source (a record resolved before PT1a lacks it) and validated when present. */
+/** PT1a: `stallAfterMinutes` is optional on the source (a record resolved before PT1a lacks it); an unusable value reads as 30. */
 const STALL_AFTER_KEY = 'stallAfterMinutes';
 const CHAIN_REFRESH_MODES: ReadonlySet<string> = new Set(['shadow', 'invalid']);
 
@@ -280,7 +281,6 @@ function readDaemon(value: unknown): MergePolicyDaemonSettings | undefined {
   const hasStallAfter = Object.hasOwn(value, STALL_AFTER_KEY);
   const stallAfterMinutes = ownValue(value, STALL_AFTER_KEY);
   if (
-    (hasStallAfter && !isIntegerInRange(stallAfterMinutes, STALL_AFTER_RANGE)) ||
     !isIntegerInRange(intervalSeconds, INTERVAL_RANGE) ||
     !isIntegerInRange(budgetSeconds, BUDGET_RANGE) ||
     !isIntegerInRange(settleSeconds, SETTLE_RANGE) ||
@@ -296,7 +296,10 @@ function readDaemon(value: unknown): MergePolicyDaemonSettings | undefined {
     budgetSeconds,
     settleSeconds,
     chainRefresh: chainRefresh as 'shadow' | 'invalid',
-    ...(hasStallAfter ? { stallAfterMinutes: stallAfterMinutes as number } : {}),
+    // PT1a: never a refusal because of this key; an unusable value reads as the default.
+    ...(hasStallAfter
+      ? { stallAfterMinutes: isIntegerInRange(stallAfterMinutes, STALL_AFTER_RANGE) ? stallAfterMinutes : DEFAULT_STALL_AFTER_MINUTES }
+      : {}),
   });
 }
 

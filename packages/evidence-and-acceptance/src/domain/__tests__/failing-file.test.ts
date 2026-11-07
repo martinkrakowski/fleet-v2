@@ -48,6 +48,15 @@ describe('screenFailingFile (PT1a)', () => {
     expect(screenFailingFile('x'.repeat(FAILING_FILE_MAX_LENGTH))).not.toBeNull();
   });
 
+  it('keeps a leading-dot directory or file name, but never a whole . or .. segment', () => {
+    expect(screenFailingFile('.github/workflows/ci.yml')).toBe('.github/workflows/ci.yml');
+    expect(screenFailingFile('apps/web/.next-config.mjs')).toBe('apps/web/.next-config.mjs');
+    expect(screenFailingFile('.eslintrc.json')).toBe('.eslintrc.json');
+    for (const value of ['.', './a.ts', 'a/./b.ts', '..', '.hidden/../x.ts', '../.github/ci.yml']) {
+      expect(screenFailingFile(value)).toBeNull();
+    }
+  });
+
   it('reads a non-string as null without throwing', () => {
     for (const value of [undefined, null, 7, {}, [], true, Symbol('x')]) {
       expect(screenFailingFile(value)).toBeNull();

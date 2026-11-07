@@ -18,6 +18,7 @@ import { OrchestratorSessionRevisionConflictError } from '../../ports/out/Orches
 import type {
   OrchestratorSessionListQuery,
   OrchestratorSessionRepositoryPort,
+  RegisterOrAdoptSessionResult,
   StoredOrchestratorSession,
 } from '../../ports/out/OrchestratorSessionRepositoryPort.out-port.js';
 import type { ChangeSignal, ChangeSignalPort } from '../../ports/out/ChangeSignalPort.out-port.js';
@@ -300,6 +301,24 @@ describe('register', () => {
       outcome: 'refused',
       reason: 'an orchestrator session with this id already exists',
     });
+  });
+
+  it('refuses a second active conductor session for one identity through the register use case', async () => {
+    const env = fresh();
+    const conductorBody = { ...BODY, cliKind: 'conductor' as const };
+    const first = await env.register.registerOrchestratorSession(conductorBody, ['message'], TOKEN);
+    expect(first.outcome).toBe('registered');
+    const second = await env.register.registerOrchestratorSession(
+      { ...conductorBody, orchestratorId: 'orch-example-2' },
+      ['message'],
+      TOKEN,
+    );
+    expect(second).toEqual({
+      outcome: 'refused',
+      reason: 'an active orchestrator session already exists for this conductor identity',
+    });
+    const sessions = await env.list.listOrchestratorSessions({ status: 'active' });
+    expect(sessions.sessions.map((entry) => entry.session.orchestratorId)).toEqual(['orch-example-1']);
   });
 });
 
@@ -729,6 +748,10 @@ class ConflictSessionRepo implements OrchestratorSessionRepositoryPort {
   saveCalls = 0;
   conflictsRemaining = 0;
 
+  async registerOrAdoptSession(): Promise<RegisterOrAdoptSessionResult> {
+    return { outcome: 'refused', reason: 'registerOrAdoptSession is not part of this double' };
+  }
+
   async save(
     session: OrchestratorSessionRecord,
     expectedRevision: number,
@@ -779,6 +802,10 @@ class HookedRepo implements OrchestratorSessionRepositoryPort {
     private readonly inner: ConflictSessionRepo,
     private readonly onConflict: () => Promise<void>,
   ) {}
+
+  async registerOrAdoptSession(): Promise<RegisterOrAdoptSessionResult> {
+    return this.inner.registerOrAdoptSession();
+  }
 
   async save(
     session: OrchestratorSessionRecord,

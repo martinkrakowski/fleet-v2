@@ -1,10 +1,12 @@
-// O9 first slice: live conductor orchestrator session registration (L9).
+// O9b: the thin caller over the store's one locked register-or-adopt operation.
 /**
- * Helper tests drive `registerConductorOrchestrator` over a fake session
- * repository and a fake `listProfiles`; the composition tests run the real
- * `conductor run --live --once` through `createFleetCliRuntime` and read the
- * stored session through a fresh adapter. No test dispatches a subprocess,
- * touches a runner or reaches the network.
+ * Helper tests drive `registerConductorOrchestrator` over a real in-memory
+ * store (failure-injected) and a fake `listProfiles`; the interleaving tests
+ * run the three raced orderings against the REAL adapter in a temp directory;
+ * the composition tests run the real `conductor run --live --once` through
+ * `createFleetCliRuntime` and read the stored session through a fresh
+ * adapter. No test dispatches a subprocess, touches a runner or reaches the
+ * network.
  */
 
 import { mkdtempSync } from 'node:fs';
@@ -19,10 +21,12 @@ import {
   OrchestratorSession,
   OrchestratorSessionRepositoryAdapter,
   OrchestratorSessionRevisionConflictError,
+  type OrchestratorSessionIdentity,
   type OrchestratorSessionListQuery,
   type OrchestratorSessionRecord,
   type OrchestratorSessionRepositoryPort,
   type ProjectProfileRecord,
+  type RegisterOrAdoptSessionResult,
   type StoredOrchestratorSession,
 } from '@fleet/operator-coordination';
 
@@ -59,11 +63,28 @@ function copy(stored: StoredOrchestratorSession): StoredOrchestratorSession {
   };
 }
 
+/**
+ * A failure-injecting wrapper over a REAL in-memory store, so the helper is
+ * always exercised through the store's own contract, never a hand-written
+ * decision.
+ */
 class FakeSessionRepository implements OrchestratorSessionRepositoryPort {
-  private readonly store = new Map<string, StoredOrchestratorSession>();
+  private readonly inner = new OrchestratorSessionRepositoryAdapter();
   failNextSave = false;
+  failNextAdoption = false;
   listShouldThrow = false;
   getShouldThrow = false;
+
+  async registerOrAdoptSession(
+    identity: OrchestratorSessionIdentity,
+    nowIso: string,
+  ): Promise<RegisterOrAdoptSessionResult> {
+    if (this.failNextAdoption) {
+      this.failNextAdoption = false;
+      throw new Error('adoption-failed');
+    }
+    return this.inner.registerOrAdoptSession(identity, nowIso);
+  }
 
   async save(
     session: OrchestratorSessionRecord,
@@ -73,26 +94,14 @@ class FakeSessionRepository implements OrchestratorSessionRepositoryPort {
       this.failNextSave = false;
       throw new Error('save-failed');
     }
-    const existing = this.store.get(session.orchestratorId);
-    const storedRevision = existing === undefined ? 0 : existing.revision;
-    if (storedRevision !== expectedRevision) {
-      throw new OrchestratorSessionRevisionConflictError(
-        session.orchestratorId,
-        expectedRevision + 1,
-        'conflict',
-      );
-    }
-    const stored: StoredOrchestratorSession = { revision: expectedRevision + 1, session };
-    this.store.set(session.orchestratorId, stored);
-    return copy(stored);
+    return this.inner.save(session, expectedRevision);
   }
 
   async get(orchestratorId: string): Promise<StoredOrchestratorSession | null> {
     if (this.getShouldThrow) {
       throw new Error('get-failed');
     }
-    const found = this.store.get(orchestratorId);
-    return found === undefined ? null : copy(found);
+    return this.inner.get(orchestratorId);
   }
 
   async list(
@@ -101,16 +110,11 @@ class FakeSessionRepository implements OrchestratorSessionRepositoryPort {
     if (this.listShouldThrow) {
       throw new Error('list-failed');
     }
-    const entries = [...this.store.values()];
-    const filtered =
-      query?.status === undefined
-        ? entries
-        : entries.filter((entry) => entry.session.status === query.status);
-    return filtered.map(copy);
+    return this.inner.list(query);
   }
 
-  snapshot(): StoredOrchestratorSession[] {
-    return [...this.store.values()].map(copy);
+  async snapshot(): Promise<StoredOrchestratorSession[]> {
+    return (await this.inner.list()).map(copy);
   }
 }
 
@@ -327,29 +331,30 @@ describe('o9-runtime-input-refused: registerConductorOrchestrator input refusal'
     const repo = new FakeSessionRepository();
     const result = await registerConductorOrchestrator(makeRegisterInput(repo, overrides));
     expect(result).toEqual({ code, orchestratorId: null });
-    expect(repo.snapshot()).toEqual([]);
+    expect(await repo.snapshot()).toEqual([]);
   });
 });
 
-describe('o9 registerConductorOrchestrator store and retire behaviour', () => {
-  it('o9-store-failure-leaves-a-retry: a failing save is register-unknown, then a retry registers', async () => {
+describe('o9 registerConductorOrchestrator through the store operation', () => {
+  it('o9-store-failure-leaves-a-retry: a failing store operation is register-unknown, then a retry registers', async () => {
     const repo = new FakeSessionRepository();
-    repo.failNextSave = true;
+    repo.failNextAdoption = true;
     const first = await registerConductorOrchestrator(makeRegisterInput(repo));
     expect(first).toEqual({ code: 'register-unknown', orchestratorId: null });
+    expect(await repo.snapshot()).toEqual([]);
     const second = await registerConductorOrchestrator(makeRegisterInput(repo));
     expect(second.code).toBe('registered');
     expect(second.orchestratorId).toMatch(/^orch-/);
     expect(pollDelayWhileRegistered(120_000)).toBe(60_000);
   });
 
-  it('o9-lapsed-session-retired-once: retires only lapsed conductor-driver sessions, never attached ones', async () => {
+  it('o9b-lapsed-replaced-then-live-adopted: a lapsed session is replaced once, and a second register adopts the live one', async () => {
     const repo = new FakeSessionRepository();
     await seedSession(repo, { orchestratorId: 'orch-lapsed-1' });
     const first = await registerConductorOrchestrator(makeRegisterInput(repo));
     expect(first.code).toBe('registered');
 
-    const afterFirst = repo.snapshot();
+    const afterFirst = await repo.snapshot();
     expect(afterFirst.filter((entry) => entry.session.status === 'retired')).toHaveLength(1);
     expect(afterFirst.filter((entry) => entry.session.status === 'retired')[0]!.session.orchestratorId).toBe(
       'orch-lapsed-1',
@@ -358,71 +363,30 @@ describe('o9 registerConductorOrchestrator store and retire behaviour', () => {
     expect(activeAfterFirst).toHaveLength(1);
     expect(activeAfterFirst[0]!.session.orchestratorId).toBe(first.orchestratorId);
 
-    // The CLI registers once, so this second register only proves the helper is
-    // stateless: the new row is still attached at NOW, so it is not retired,
-    // and a second active row is created. The first new row's id is unchanged.
+    // The store holds one live session for the identity now: a second register
+    // adopts it, refreshes its heartbeat and registers nothing new.
     const second = await registerConductorOrchestrator(makeRegisterInput(repo));
-    expect(second.code).toBe('registered');
-    const afterSecond = repo.snapshot();
+    expect(second).toEqual({ code: 'registered', orchestratorId: first.orchestratorId });
+    const afterSecond = await repo.snapshot();
     expect(afterSecond.filter((entry) => entry.session.status === 'retired')).toHaveLength(1);
-    expect(afterSecond.filter((entry) => entry.session.status === 'active')).toHaveLength(2);
-    const originalNew = afterSecond.find((entry) => entry.session.orchestratorId === first.orchestratorId);
-    expect(originalNew).toBeDefined();
-    expect(originalNew!.session.status).toBe('active');
+    expect(afterSecond.filter((entry) => entry.session.status === 'active')).toHaveLength(1);
+    expect(afterSecond.find((entry) => entry.session.orchestratorId === first.orchestratorId)).toBeDefined();
   });
 
-  it('o9-heartbeat-between-list-and-retire-stays-live: a session heartbeated after the list snapshot is not retired', async () => {
-    class HeartbeatAfterListRepository extends FakeSessionRepository {
-      override async list(query?: OrchestratorSessionListQuery): Promise<readonly StoredOrchestratorSession[]> {
-        const snapshot = await super.list(query);
-        // Another process heartbeats the lapsed session right after the snapshot.
-        for (const entry of snapshot) {
-          const current = await this.get(entry.session.orchestratorId);
-          if (current !== null) {
-            await this.save(
-              {
-                ...current.session,
-                lastHeartbeatIso: ATTACHED_HEARTBEAT,
-                leaseUntilIso: ATTACHED_LEASE,
-              },
-              current.revision,
-            );
-          }
-        }
-        return snapshot;
-      }
-    }
-    const repo = new HeartbeatAfterListRepository();
-    await seedSession(repo, { orchestratorId: 'orch-raced-1' });
+  it('o9b-adopt-live-seeded-session: a live session another process registered is adopted, never duplicated', async () => {
+    const repo = new FakeSessionRepository();
+    await seedSession(repo, {
+      orchestratorId: 'orch-adopt-1',
+      lastHeartbeatIso: ATTACHED_HEARTBEAT,
+      leaseUntilIso: ATTACHED_LEASE,
+    });
     const result = await registerConductorOrchestrator(makeRegisterInput(repo));
-    expect(result.code).toBe('registered');
-    const raced = repo.snapshot().find((entry) => entry.session.orchestratorId === 'orch-raced-1');
-    expect(raced).toBeDefined();
-    expect(raced!.session.status).toBe('active');
-  });
-
-  it('o9-heartbeat-between-reread-and-retire-stays-live: a heartbeat landing after the re-read makes the retire conflict and the session stays active', async () => {
-    class HeartbeatAfterGetRepository extends FakeSessionRepository {
-      private beaten = false;
-      override async get(orchestratorId: string): Promise<StoredOrchestratorSession | null> {
-        const stale = await super.get(orchestratorId);
-        if (stale !== null && !this.beaten && stale.session.status === 'active') {
-          this.beaten = true;
-          // Another process heartbeats right after this read, before any retire.
-          await this.save(
-            { ...stale.session, lastHeartbeatIso: ATTACHED_HEARTBEAT, leaseUntilIso: ATTACHED_LEASE },
-            stale.revision,
-          );
-        }
-        return stale;
-      }
-    }
-    const repo = new HeartbeatAfterGetRepository();
-    await seedSession(repo, { orchestratorId: 'orch-raced-2' });
-    const result = await registerConductorOrchestrator(makeRegisterInput(repo));
-    expect(result.code).toBe('registered');
-    const raced = repo.snapshot().find((entry) => entry.session.orchestratorId === 'orch-raced-2');
-    expect(raced!.session.status).toBe('active');
+    expect(result).toEqual({ code: 'registered', orchestratorId: 'orch-adopt-1' });
+    const rows = await repo.snapshot();
+    expect(rows.map((entry) => entry.session.orchestratorId)).toEqual(['orch-adopt-1']);
+    expect(rows[0]!.session.status).toBe('active');
+    // The adoption refreshed the heartbeat to the caller's now.
+    expect(rows[0]!.session.lastHeartbeatIso).toBe(NOW);
   });
 
   it('o9-refused-heartbeat-re-registers-once: a retired session is replaced by a new one, one time only', async () => {
@@ -437,37 +401,13 @@ describe('o9 registerConductorOrchestrator store and retire behaviour', () => {
     expect(healed.code).toBe('heartbeat-refused');
     expect(healed.reRegistration).toBe('registered');
     expect(healed.orchestratorId).not.toBe(firstId);
-    const active = repo.snapshot().filter((entry) => entry.session.status === 'active');
+    const active = (await repo.snapshot()).filter((entry) => entry.session.status === 'active');
     expect(active.map((entry) => entry.session.orchestratorId)).toEqual([healed.orchestratorId]);
 
     // Once used, a later refusal re-registers nothing.
     const again = await heartbeatOrReRegisterConductorOrchestrator(input, firstId, false);
     expect(again).toEqual({ code: 'heartbeat-refused', orchestratorId: firstId, reRegistration: null });
-    expect(repo.snapshot().filter((entry) => entry.session.status === 'active')).toHaveLength(1);
-  });
-
-  it('o9-retire-conflict-adopts-live-session: a conflicting retire adopts the live session and registers nothing', async () => {
-    class HeartbeatOnceAfterGetRepository extends FakeSessionRepository {
-      private beaten = false;
-      override async get(orchestratorId: string): Promise<StoredOrchestratorSession | null> {
-        const stale = await super.get(orchestratorId);
-        if (stale !== null && !this.beaten && stale.session.status === 'active') {
-          this.beaten = true;
-          await this.save(
-            { ...stale.session, lastHeartbeatIso: ATTACHED_HEARTBEAT, leaseUntilIso: ATTACHED_LEASE },
-            stale.revision,
-          );
-        }
-        return stale;
-      }
-    }
-    const repo = new HeartbeatOnceAfterGetRepository();
-    await seedSession(repo, { orchestratorId: 'orch-adopt-1' });
-    const result = await registerConductorOrchestrator(makeRegisterInput(repo));
-    expect(result).toEqual({ code: 'registered', orchestratorId: 'orch-adopt-1' });
-    const rows = repo.snapshot();
-    expect(rows.map((entry) => entry.session.orchestratorId)).toEqual(['orch-adopt-1']);
-    expect(rows[0]!.session.status).toBe('active');
+    expect((await repo.snapshot()).filter((entry) => entry.session.status === 'active')).toHaveLength(1);
   });
 
   it('o9-exhausted-heartbeat-retry-does-not-re-register: only a retired or missing session is replaced', async () => {
@@ -491,10 +431,10 @@ describe('o9 registerConductorOrchestrator store and retire behaviour', () => {
     const beat = await heartbeatOrReRegisterConductorOrchestrator(input, first.orchestratorId!, true);
     expect(beat).toEqual({ code: 'heartbeat-refused', orchestratorId: first.orchestratorId, reRegistration: null });
     repo.conflictSaves = false;
-    expect(repo.snapshot().filter((entry) => entry.session.status === 'active')).toHaveLength(1);
+    expect((await repo.snapshot()).filter((entry) => entry.session.status === 'active')).toHaveLength(1);
   });
 
-  it('o9-unreadable-store-is-unknown: an unreadable profile store and session store are both register-unknown', async () => {
+  it('o9-unreadable-store-is-unknown: an unreadable profile store and a failing store operation are both register-unknown', async () => {
     const repo = new FakeSessionRepository();
     const viaProfiles = await registerConductorOrchestrator(
       makeRegisterInput(repo, {
@@ -504,13 +444,19 @@ describe('o9 registerConductorOrchestrator store and retire behaviour', () => {
       }),
     );
     expect(viaProfiles).toEqual({ code: 'register-unknown', orchestratorId: null });
-    expect(repo.snapshot()).toEqual([]);
+    expect(await repo.snapshot()).toEqual([]);
 
-    const listThrowsRepo = new FakeSessionRepository();
-    listThrowsRepo.listShouldThrow = true;
-    const viaList = await registerConductorOrchestrator(makeRegisterInput(listThrowsRepo));
-    expect(viaList).toEqual({ code: 'register-unknown', orchestratorId: null });
-    expect(listThrowsRepo.snapshot()).toEqual([]);
+    const viaStore = await registerConductorOrchestrator(
+      makeRegisterInput(repo, {
+        sessionRepo: {
+          registerOrAdoptSession: async () => {
+            throw new Error('store-unreadable');
+          },
+        } as unknown as OrchestratorSessionRepositoryPort,
+      }),
+    );
+    expect(viaStore).toEqual({ code: 'register-unknown', orchestratorId: null });
+    expect(await repo.snapshot()).toEqual([]);
   });
 
   it('o9-project-list-is-bounded: 65 active profiles are projects-over-cap and register no session', async () => {
@@ -519,27 +465,12 @@ describe('o9 registerConductorOrchestrator store and retire behaviour', () => {
       makeRegisterInput(repo, { listProfiles: async () => profilesFixture(65) }),
     );
     expect(result).toEqual({ code: 'projects-over-cap', orchestratorId: null });
-    expect(repo.snapshot()).toEqual([]);
-  });
-
-  it('o9-project-list-is-bounded: 65 lapsed conductor-driver sessions retire at most 64', async () => {
-    const repo = new FakeSessionRepository();
-    await Promise.all(
-      Array.from({ length: 65 }, (_, index) =>
-        seedSession(repo, { orchestratorId: `orch-lapsed-${String(index).padStart(2, '0')}` }),
-      ),
-    );
-    const result = await registerConductorOrchestrator(makeRegisterInput(repo));
-    expect(result.code).toBe('registered');
-    const snapshot = repo.snapshot();
-    expect(snapshot.filter((entry) => entry.session.status === 'retired')).toHaveLength(64);
-    // One lapsed row stays active (the scan cap) plus the newly registered row.
-    expect(snapshot.filter((entry) => entry.session.status === 'active')).toHaveLength(2);
+    expect(await repo.snapshot()).toEqual([]);
   });
 });
 
 describe('o9 heartbeat and retire helpers', () => {
-  it('heartbeat renews an attached conductor session and reports refusal/unknown', async () => {
+  it('heartbeat renews an attached conductor session and reports refusals with their kind', async () => {
     const repo = new FakeSessionRepository();
     const attached = await seedSession(repo, {
       orchestratorId: 'orch-attached-1',
@@ -547,18 +478,25 @@ describe('o9 heartbeat and retire helpers', () => {
       leaseUntilIso: ATTACHED_LEASE,
     });
     const renewed = await heartbeatConductorOrchestrator(repo, { nowIso: () => NOW }, attached.session.orchestratorId);
-    expect(renewed).toEqual({ code: 'renewed' });
-    expect(repo.snapshot()[0]!.revision).toBe(attached.revision + 1);
+    expect(renewed).toEqual({ code: 'renewed', refusalKind: null });
+    expect((await repo.snapshot())[0]!.revision).toBe(attached.revision + 1);
 
     expect(
       await heartbeatConductorOrchestrator(repo, { nowIso: () => NOW }, 'orch-missing-1'),
-    ).toEqual({ code: 'heartbeat-refused' });
+    ).toEqual({ code: 'heartbeat-refused', refusalKind: 'not-found' });
+
+    const retiredRepo = new FakeSessionRepository();
+    const retiredSession = await seedSession(retiredRepo, { orchestratorId: 'orch-retired-1' });
+    await retireConductorOrchestrator(retiredRepo, { nowIso: () => NOW }, retiredSession.session.orchestratorId);
+    expect(
+      await heartbeatConductorOrchestrator(retiredRepo, { nowIso: () => NOW }, retiredSession.session.orchestratorId),
+    ).toEqual({ code: 'heartbeat-refused', refusalKind: 'retired' });
 
     const throwingRepo = new FakeSessionRepository();
     throwingRepo.getShouldThrow = true;
     expect(
       await heartbeatConductorOrchestrator(throwingRepo, { nowIso: () => NOW }, 'orch-any-1'),
-    ).toEqual({ code: 'heartbeat-unknown' });
+    ).toEqual({ code: 'heartbeat-unknown', refusalKind: null });
   });
 
   it('retire retires idempotently and reports refusal/unknown', async () => {
@@ -585,6 +523,236 @@ describe('o9 heartbeat and retire helpers', () => {
     ).toEqual({ code: 'retire-unknown' });
   });
 });
+
+describe('o9b interleavings against the real adapter in a temp directory', () => {
+  function fileAdapter(dir: string): OrchestratorSessionRepositoryAdapter {
+    return new OrchestratorSessionRepositoryAdapter({ stateDir: dir });
+  }
+
+  function identityFor(
+    dir: string,
+    orchestratorId: string,
+    overrides: Partial<OrchestratorSessionIdentity['registration']> = {},
+  ): OrchestratorSessionIdentity {
+    return {
+      host: 'local',
+      stateDir: dir,
+      registration: {
+        orchestratorId,
+        model: null,
+        projects: [],
+        claims: ['start-lane-run'],
+        scopes: ['orchestrate'],
+        registeredByTokenId: 'conductor-driver',
+        ...overrides,
+      },
+    };
+  }
+
+  async function activeIds(
+    adapter: OrchestratorSessionRepositoryAdapter,
+  ): Promise<readonly string[]> {
+    return (await adapter.list({ status: 'active' })).map((entry) => entry.session.orchestratorId);
+  }
+
+  it('o9b-concurrent-register: two conductors registering the same identity at once end with one active session', async () => {
+    const dir = tempStateDir();
+    const [first, second] = await Promise.all([
+      fileAdapter(dir).registerOrAdoptSession(identityFor(dir, 'orch-race-a'), NOW),
+      fileAdapter(dir).registerOrAdoptSession(identityFor(dir, 'orch-race-b'), NOW),
+    ]);
+    // One registers over known absence; the other adopts the single live session.
+    expect(new Set([first.outcome, second.outcome])).toEqual(new Set(['registered', 'adopted']));
+    expect(await activeIds(fileAdapter(dir))).toHaveLength(1);
+  });
+
+  it('o9b-replace-before-save: a heartbeat of a replaced session reads the revision conflict, then adopts the replacement', async () => {
+    const dir = tempStateDir();
+    const mine = fileAdapter(dir);
+    // This process's session is lapsed: another process retires it and registers a replacement.
+    const seeded = await seedAdapterSession(mine, 'orch-mine-1');
+    const replacement = await fileAdapter(dir).registerOrAdoptSession(
+      identityFor(dir, 'orch-replacement-1'),
+      NOW,
+    );
+    expect(replacement.outcome).toBe('registered');
+    // The lapsed id is retired; the replacement is the single live session.
+    expect(await activeIds(fileAdapter(dir))).toEqual(['orch-replacement-1']);
+
+    // This process's save of the old record reads the revision conflict, never "still live".
+    await expect(
+      mine.save({ ...seeded.session, lastHeartbeatIso: NOW, leaseUntilIso: ATTACHED_LEASE }, seeded.revision),
+    ).rejects.toThrow(OrchestratorSessionRevisionConflictError);
+    expect(await activeIds(fileAdapter(dir))).toEqual(['orch-replacement-1']);
+
+    // The next heartbeat is refused (retired) and the one locked operation adopts the replacement.
+    const adoption = await mine.registerOrAdoptSession(identityFor(dir, 'orch-mine-2'), NOW);
+    expect(adoption).toMatchObject({ outcome: 'adopted' });
+    if (adoption.outcome !== 'refused') {
+      expect(adoption.session.orchestratorId).toBe('orch-replacement-1');
+    }
+    expect(await activeIds(fileAdapter(dir))).toEqual(['orch-replacement-1']);
+  });
+
+  it('o9b-adopt-retired-id: a process holding a retired id re-registers into the single active session next to no duplicate', async () => {
+    const dir = tempStateDir();
+    const adapter = fileAdapter(dir);
+    // A retired id is never reused; the replacement is active.
+    const retiredRecord = OrchestratorSession.create({
+      orchestratorId: 'orch-old-1',
+      cliKind: 'conductor',
+      model: null,
+      host: 'local',
+      projects: [],
+      claims: ['start-lane-run'],
+      scopes: ['orchestrate'],
+      registeredByTokenId: 'conductor-driver',
+      startedAtIso: PAST,
+      lastHeartbeatIso: PAST,
+      leaseUntilIso: '2026-10-27T09:00:01.000Z',
+      lastPolledRequestsAtIso: null,
+      status: 'retired',
+    });
+    if (!retiredRecord.success) {
+      throw retiredRecord.error;
+    }
+    await adapter.save(retiredRecord.value.toRecord(), 0);
+    await adapter.registerOrAdoptSession(identityFor(dir, 'orch-current-1'), NOW);
+    expect(await activeIds(adapter)).toEqual(['orch-current-1']);
+
+    // The lapsed process re-registers on its next heartbeat: it adopts the
+    // replacement and the retired id stays retired.
+    const next = await adapter.registerOrAdoptSession(identityFor(dir, 'orch-old-2'), NOW);
+    expect(next).toMatchObject({ outcome: 'adopted' });
+    if (next.outcome !== 'refused') {
+      expect(next.session.orchestratorId).toBe('orch-current-1');
+    }
+    expect(await activeIds(adapter)).toEqual(['orch-current-1']);
+  });
+
+  it('o9b-second-active-refused: saving a second active session for the identity is refused with the typed error, on every save path', async () => {
+    const dir = tempStateDir();
+    const adapter = fileAdapter(dir);
+    const first = await adapter.registerOrAdoptSession(identityFor(dir, 'orch-first-1'), NOW);
+    expect(first.outcome).toBe('registered');
+    const duplicateRecord = OrchestratorSession.create({
+      orchestratorId: 'orch-second-1',
+      cliKind: 'conductor',
+      model: null,
+      host: 'local',
+      projects: [],
+      claims: ['start-lane-run'],
+      scopes: ['orchestrate'],
+      registeredByTokenId: 'conductor-driver',
+      startedAtIso: NOW,
+      lastHeartbeatIso: NOW,
+      leaseUntilIso: ATTACHED_LEASE,
+      lastPolledRequestsAtIso: null,
+      status: 'active',
+    });
+    if (!duplicateRecord.success) {
+      throw duplicateRecord.error;
+    }
+    await expect(adapter.save(duplicateRecord.value.toRecord(), 0)).rejects.toMatchObject({
+      name: 'OrchestratorSessionIdentityAlreadyActiveError',
+      code: 'identity-already-active',
+    });
+    expect(await activeIds(adapter)).toEqual(['orch-first-1']);
+
+    // A retired writer and a heartbeating writer never trip the invariant.
+    const retiredOfSameRecord = OrchestratorSession.create({
+      orchestratorId: 'orch-second-1',
+      cliKind: 'conductor',
+      model: null,
+      host: 'local',
+      projects: [],
+      claims: ['start-lane-run'],
+      scopes: ['orchestrate'],
+      registeredByTokenId: 'conductor-driver',
+      startedAtIso: PAST,
+      lastHeartbeatIso: PAST,
+      leaseUntilIso: '2026-10-27T09:00:01.000Z',
+      lastPolledRequestsAtIso: null,
+      status: 'retired',
+    });
+    if (!retiredOfSameRecord.success) {
+      throw retiredOfSameRecord.error;
+    }
+    await expect(adapter.save(retiredOfSameRecord.value.toRecord(), 0)).resolves.toMatchObject({
+      revision: 1,
+    });
+  });
+
+  it('o9b-malformed-input-refused: a secret-shaped or unreadable identity is refused and writes nothing', async () => {
+    const dir = tempStateDir();
+    const adapter = fileAdapter(dir);
+    const fakeSecret = ['sk', '-', 'x9y8z7'.repeat(4)].join('');
+    await expect(
+      adapter.registerOrAdoptSession(
+        { ...identityFor(dir, 'orch-any-1'), host: fakeSecret },
+        NOW,
+      ),
+    ).resolves.toEqual({ outcome: 'refused', reason: 'the conductor identity host was refused' });
+    await expect(
+      adapter.registerOrAdoptSession({ ...identityFor(dir, 'orch-any-2'), host: 7 as never }, NOW),
+    ).resolves.toMatchObject({ outcome: 'refused' });
+    await expect(
+      adapter.registerOrAdoptSession(identityFor(dir, 'orch-any-3'), 'not-a-time'),
+    ).resolves.toEqual({ outcome: 'refused', reason: 'the adoption time is not a valid timestamp' });
+    expect(await adapter.list()).toEqual([]);
+  });
+
+  it('o9b-unreadable-store-refuses: an unreadable store refuses and never registers', async () => {
+    const dir = tempStateDir();
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(join(dir, 'orchestrators.json'), 'not json at all', 'utf8');
+    const adapter = fileAdapter(dir);
+    await expect(adapter.registerOrAdoptSession(identityFor(dir, 'orch-any-4'), NOW)).resolves.toEqual({
+      outcome: 'refused',
+      reason: 'the orchestrator session store could not be read',
+    });
+    const raw = await (await import('node:fs/promises')).readFile(join(dir, 'orchestrators.json'), 'utf8');
+    expect(raw).toBe('not json at all');
+  });
+
+  it('o9b-identity-state-dir-screened: a supplied state directory must name this store', async () => {
+    const dir = tempStateDir();
+    const adapter = fileAdapter(dir);
+    await expect(
+      adapter.registerOrAdoptSession(identityFor(join(dir, 'elsewhere'), 'orch-any-5'), NOW),
+    ).resolves.toEqual({ outcome: 'refused', reason: 'the identity does not belong to this store' });
+    expect(await adapter.list()).toEqual([]);
+    await expect(adapter.registerOrAdoptSession(identityFor(dir, 'orch-mine-9'), NOW)).resolves.toMatchObject({
+      outcome: 'registered',
+    });
+  });
+});
+
+/** Seed one session through the aggregate and a real file-backed adapter. */
+async function seedAdapterSession(
+  adapter: OrchestratorSessionRepositoryAdapter,
+  orchestratorId: string,
+): Promise<StoredOrchestratorSession> {
+  const result = OrchestratorSession.create({
+    orchestratorId,
+    cliKind: 'conductor',
+    model: null,
+    host: 'local',
+    projects: [],
+    claims: ['start-lane-run'],
+    scopes: ['orchestrate'],
+    registeredByTokenId: 'conductor-driver',
+    startedAtIso: PAST,
+    lastHeartbeatIso: LAPSED_HEARTBEAT,
+    leaseUntilIso: LAPSED_LEASE,
+    lastPolledRequestsAtIso: null,
+    status: 'active',
+  });
+  if (!result.success) {
+    throw result.error;
+  }
+  return adapter.save(result.value.toRecord(), 0);
+}
 
 describe('o9 live composition', () => {
   async function registerProfile(runtime: FleetCliRuntime): Promise<void> {
@@ -644,6 +812,21 @@ describe('o9 live composition', () => {
     expect(session.status).toBe('retired');
     expect(session.model).toBeNull();
     expect(session.projects).toEqual(['project-example-1']);
+  });
+
+  it('o9b-real-composition-one-active: the production path leaves exactly one session row and never a duplicate identity', async () => {
+    const dir = tempStateDir();
+    const runtime = runtimeOf(dir, makeInstallation(true));
+    await registerProfile(runtime);
+    const result = await runLiveOnce(runtime, dir);
+    expect(result.code).toBe(0);
+    // The whole production path went through the store's one locked operation:
+    // one session for the conductor identity, retired on exit.
+    const adapter = new OrchestratorSessionRepositoryAdapter({ stateDir: dir });
+    const sessions = await adapter.list();
+    expect(sessions.filter((entry) => entry.session.cliKind === 'conductor')).toHaveLength(1);
+    expect(sessions.filter((entry) => entry.session.host === 'local' && entry.session.status === 'active'))
+      .toHaveLength(0);
   });
 
   it('dry-run writes no session; a disabled conductor writes no session', async () => {

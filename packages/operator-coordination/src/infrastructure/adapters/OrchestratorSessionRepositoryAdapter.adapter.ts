@@ -13,17 +13,31 @@
  * OrchestratorSessionRevisionConflictError rather than a silent overwrite.
  * A save that only renews the lease or the mailbox poll of an active session
  * emits a `heartbeat` change signal; every other save emits `orchestrator`.
+ *
+ * One active session per conductor identity is the store's own invariant: a
+ * save of a second ACTIVE conductor session for the same host in this store
+ * is refused with the typed OrchestratorSessionIdentityAlreadyActiveError,
+ * and `registerOrAdoptSession` is the one locked operation that adopts,
+ * replaces or registers the identity's single session under the store's
+ * lock.
  */
 
 import { promises as fs } from "node:fs";
 import { join, resolve } from "node:path";
 
 import type { OrchestratorSessionRecord } from "../../domain/orchestrator-session-records.js";
-import { OrchestratorSession } from "../../domain/entities/OrchestratorSession.js";
-import { OrchestratorSessionRevisionConflictError } from "../../application/ports/out/OrchestratorSessionRepositoryPort.out-port.js";
+import { OrchestratorSession, isOrchestratorAttached, isOrchestratorTokenId } from "../../domain/entities/OrchestratorSession.js";
+import { ORCHESTRATOR_SESSION_LEASE_SECONDS } from "../../domain/entities/OrchestratorSession.js";
+import { containsSecretShape } from "@fleet/shared";
+import {
+  OrchestratorSessionIdentityAlreadyActiveError,
+  OrchestratorSessionRevisionConflictError,
+} from "../../application/ports/out/OrchestratorSessionRepositoryPort.out-port.js";
 import type {
+  OrchestratorSessionIdentity,
   OrchestratorSessionListQuery,
   OrchestratorSessionRepositoryPort,
+  RegisterOrAdoptSessionResult,
   StoredOrchestratorSession,
 } from "../../application/ports/out/OrchestratorSessionRepositoryPort.out-port.js";
 import type {
@@ -114,6 +128,189 @@ function signalKindFor(
   return "heartbeat";
 }
 
+/** Sessions of the conductor identity this store keeps single. */
+const CONDUCTOR_CLI_KIND = 'conductor';
+
+type Refusal = { readonly ok: false; readonly reason: string };
+
+/** Screen one identity text without ever echoing it. */
+function screenIdentityText(
+  field: 'host' | 'stateDir',
+  value: string,
+  maxBytes: number,
+): string | null {
+  if (value.trim().length === 0) {
+    return `the conductor identity ${field} must be a non-empty string`;
+  }
+  if (new TextEncoder().encode(value).byteLength > maxBytes) {
+    return `the conductor identity ${field} is too long`;
+  }
+  if (containsSecretShape(value)) {
+    return `the conductor identity ${field} was refused`;
+  }
+  return null;
+}
+
+/** Screen the identity's own fields before any store read; the registration facts are validated by the aggregate. */
+function screenAdoptionIdentity(
+  identity: OrchestratorSessionIdentity,
+): { readonly ok: true } | Refusal {
+  if (typeof identity !== 'object' || identity === null) {
+    return { ok: false, reason: 'the conductor identity must be a record' };
+  }
+  if (typeof identity.host !== 'string') {
+    return { ok: false, reason: 'the conductor identity host must be a string' };
+  }
+  const hostError = screenIdentityText('host', identity.host, 256);
+  if (hostError !== null) {
+    return { ok: false, reason: hostError };
+  }
+  return { ok: true };
+}
+
+type AdoptionDecision =
+  | {
+      readonly ok: true;
+      readonly outcome: 'adopted' | 'registered';
+      readonly session: OrchestratorSessionRecord;
+      readonly revision: number;
+      readonly updates: readonly { readonly stored: StoredOrchestratorSession }[];
+      readonly signals: readonly {
+        readonly before: OrchestratorSessionRecord | undefined;
+        readonly after: OrchestratorSessionRecord;
+      }[];
+    }
+  | Refusal;
+
+/**
+ * The one decision of `registerOrAdoptSession` over an already-read set of
+ * records: adopt the single live conductor session for the identity, or
+ * retire the lapsed ones and register the new record, or register over known
+ * absence. Pure with respect to the map: writes are returned, never applied.
+ */
+function decideAdoption(
+  records: ReadonlyMap<string, StoredOrchestratorSession>,
+  identity: OrchestratorSessionIdentity,
+  fresh: OrchestratorSessionRecord,
+  nowIso: string,
+): AdoptionDecision {
+  if (records.has(fresh.orchestratorId)) {
+    return { ok: false, reason: 'an orchestrator session with this id already exists' };
+  }
+  const candidates = [...records.values()].filter(
+    (stored) =>
+      stored.session.cliKind === CONDUCTOR_CLI_KIND &&
+      stored.session.status === 'active' &&
+      stored.session.host === identity.host,
+  );
+  const live = candidates.filter((stored) =>
+    isOrchestratorAttached(stored.session, nowIso),
+  );
+  if (live.length > 1) {
+    return {
+      ok: false,
+      reason: 'more than one live session exists for this conductor identity',
+    };
+  }
+  const retireOne = (
+    stored: StoredOrchestratorSession,
+  ):
+    | {
+        readonly ok: true;
+        readonly stored: StoredOrchestratorSession;
+        readonly after: OrchestratorSessionRecord;
+      }
+    | Refusal => {
+    const loaded = OrchestratorSession.create(stored.session);
+    if (!loaded.success) {
+      return { ok: false, reason: 'the stored session could not be read' };
+    }
+    const retired = loaded.value.retire(nowIso);
+    if (!retired.success) {
+      return { ok: false, reason: 'the lapsed session could not be retired' };
+    }
+    const record = retired.value.toRecord();
+    return {
+      ok: true,
+      stored: { revision: stored.revision + 1, session: record },
+      after: record,
+    };
+  };
+  const updates: { readonly stored: StoredOrchestratorSession }[] = [];
+  const signals: { before: OrchestratorSessionRecord | undefined; after: OrchestratorSessionRecord }[] = [];
+  if (live.length === 1) {
+    const liveStored = live[0]!;
+    const loaded = OrchestratorSession.create(liveStored.session);
+    if (!loaded.success) {
+      return { ok: false, reason: 'the stored session could not be read' };
+    }
+    const renewed = loaded.value.renewLease(nowIso);
+    if (!renewed.success) {
+      return { ok: false, reason: 'the live session could not be renewed' };
+    }
+    const record = renewed.value.toRecord();
+    const revision = liveStored.revision + 1;
+    updates.push({ stored: { revision, session: record } });
+    signals.push({ before: liveStored.session, after: record });
+    for (const lapsed of candidates) {
+      if (lapsed.session.orchestratorId === liveStored.session.orchestratorId) {
+        continue;
+      }
+      const retired = retireOne(lapsed);
+      if (!retired.ok) {
+        return retired;
+      }
+      updates.push({ stored: retired.stored });
+      signals.push({ before: lapsed.session, after: retired.after });
+    }
+    return { ok: true, outcome: 'adopted', session: record, revision, updates, signals };
+  }
+  for (const lapsed of candidates) {
+    const retired = retireOne(lapsed);
+    if (!retired.ok) {
+      return retired;
+    }
+    updates.push({ stored: retired.stored });
+    signals.push({ before: lapsed.session, after: retired.after });
+  }
+  updates.push({ stored: { revision: 1, session: fresh } });
+  signals.push({ before: undefined, after: fresh });
+  return { ok: true, outcome: 'registered', session: fresh, revision: 1, updates, signals };
+}
+
+function applyAdoption(
+  records: Map<string, StoredOrchestratorSession>,
+  decision: Extract<AdoptionDecision, { ok: true }>,
+): void {
+  for (const update of decision.updates) {
+    records.set(update.stored.session.orchestratorId, update.stored);
+  }
+}
+
+/**
+ * The store-side invariant: no second ACTIVE session for one conductor
+ * identity (same host, in this same store) is ever written. The session
+ * being written never conflicts with itself.
+ */
+function assertNoActiveIdentityConflict(
+  records: ReadonlyMap<string, StoredOrchestratorSession>,
+  record: OrchestratorSessionRecord,
+): void {
+  if (record.status !== 'active' || record.cliKind !== CONDUCTOR_CLI_KIND) {
+    return;
+  }
+  for (const other of records.values()) {
+    if (
+      other.session.orchestratorId !== record.orchestratorId &&
+      other.session.cliKind === CONDUCTOR_CLI_KIND &&
+      other.session.status === 'active' &&
+      other.session.host === record.host
+    ) {
+      throw new OrchestratorSessionIdentityAlreadyActiveError();
+    }
+  }
+}
+
 /**
  * The reader's record parser, shared with `fleet-v2 state check`. Never throws:
  * any malformed entry is `undefined`, which makes the file unreadable so the
@@ -193,6 +390,7 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
           "OrchestratorSessionRepositoryAdapter refuses a stale expected revision",
         );
       }
+      assertNoActiveIdentityConflict(this.inMemorySessions, validated);
       const stored: StoredOrchestratorSession = {
         revision: expectedRevision + 1,
         session: validated,
@@ -229,6 +427,7 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
           "OrchestratorSessionRepositoryAdapter refuses a stale expected revision",
         );
       }
+      assertNoActiveIdentityConflict(records, validated);
       existing = stored;
       const next: StoredOrchestratorSession = {
         revision: expectedRevision + 1,
@@ -263,6 +462,166 @@ export class OrchestratorSessionRepositoryAdapter implements OrchestratorSession
       written,
     });
     return copy(stored);
+  }
+
+  /**
+   * ONE locked operation, keyed by the conductor identity (host plus state
+   * directory, both screened). Under the store's lock it does exactly one of
+   * three things: adopts the single live session for the identity and
+   * refreshes its heartbeat, retires a lapsed one and registers a new one, or
+   * registers when there is none. An unreadable store is refused and never
+   * registers; every refusal names a fixed reason and never the identity.
+   */
+  async registerOrAdoptSession(
+    identity: OrchestratorSessionIdentity,
+    nowIso: string,
+  ): Promise<RegisterOrAdoptSessionResult> {
+    const screened = screenAdoptionIdentity(identity);
+    if (!screened.ok) {
+      return { outcome: 'refused', reason: screened.reason };
+    }
+    if (typeof nowIso !== 'string' || Number.isNaN(Date.parse(nowIso))) {
+      return { outcome: 'refused', reason: 'the adoption time is not a valid timestamp' };
+    }
+    if (!isOrchestratorTokenId(identity.registration.registeredByTokenId)) {
+      return { outcome: 'refused', reason: 'the presenting token could not be identified' };
+    }
+    const nowMs = Date.parse(nowIso);
+    let fresh: OrchestratorSessionRecord;
+    try {
+      const created = OrchestratorSession.create({
+        orchestratorId: identity.registration.orchestratorId,
+        cliKind: CONDUCTOR_CLI_KIND,
+        model: identity.registration.model,
+        host: identity.host,
+        projects: identity.registration.projects,
+        claims: identity.registration.claims,
+        scopes: identity.registration.scopes,
+        registeredByTokenId: identity.registration.registeredByTokenId,
+        startedAtIso: nowIso,
+        lastHeartbeatIso: nowIso,
+        leaseUntilIso: new Date(
+          nowMs + ORCHESTRATOR_SESSION_LEASE_SECONDS * 1000,
+        ).toISOString(),
+        lastPolledRequestsAtIso: null,
+        status: 'active',
+      });
+      if (!created.success) {
+        return { outcome: 'refused', reason: 'the conductor session record was refused' };
+      }
+      fresh = created.value.toRecord();
+    } catch {
+      return { outcome: 'refused', reason: 'the conductor registration could not be read' };
+    }
+    const stateDirCheck = this.stateDirMatches(identity.stateDir);
+    if (!stateDirCheck.ok) {
+      return { outcome: 'refused', reason: stateDirCheck.reason };
+    }
+    const target = this.statePath;
+
+    if (target === null) {
+      // The in-memory store's decision is one synchronous step on its map.
+      const decision = decideAdoption(this.inMemorySessions, identity, fresh, nowIso);
+      if (!decision.ok) {
+        return { outcome: 'refused', reason: decision.reason };
+      }
+      applyAdoption(this.inMemorySessions, decision);
+      for (const signalOf of decision.signals) {
+        this.signal({
+          kind: signalKindFor(signalOf.before, signalOf.after),
+          id: signalOf.after.orchestratorId,
+          stateFile: null,
+          before: null,
+          written: null,
+        });
+      }
+      return {
+        outcome: decision.outcome,
+        session: copy({ revision: decision.revision, session: decision.session }).session,
+        revision: decision.revision,
+      };
+    }
+
+    let written: ChangeSignal["written"] = null;
+    let locked: AdoptionDecision;
+    try {
+      locked = await withFileLock(`${target}.lock`, async (): Promise<AdoptionDecision> => {
+        const records = await this.readRecordsFromDisk(target);
+        const decision = decideAdoption(records, identity, fresh, nowIso);
+        if (!decision.ok) {
+          return decision;
+        }
+        applyAdoption(records, decision);
+        const list = [...records.values()]
+          .sort((left, right) =>
+            left.session.orchestratorId.localeCompare(right.session.orchestratorId),
+          )
+          .map(copy);
+        await writeJsonAtomically(target, list);
+        try {
+          const stat = await fs.stat(target);
+          written = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
+        } catch {
+          written = null;
+        }
+        return decision;
+      });
+    } catch {
+      // An unreadable store, a lost lock or any other store failure refuses;
+      // it never registers and the thrown detail is never echoed.
+      return {
+        outcome: 'refused',
+        reason: 'the orchestrator session store could not be read',
+      };
+    }
+    if (!locked.ok) {
+      return { outcome: 'refused', reason: locked.reason };
+    }
+    for (const signalOf of locked.signals) {
+      this.signal({
+        kind: signalKindFor(signalOf.before, signalOf.after),
+        id: signalOf.after.orchestratorId,
+        stateFile: resolve(target),
+        before: null,
+        written,
+      });
+    }
+    return {
+      outcome: locked.outcome,
+      session: copy({ revision: locked.revision, session: locked.session }).session,
+      revision: locked.revision,
+    };
+  }
+
+  /**
+   * Screen a supplied state directory against this store's own: null matches
+   * any store's own directory, and a supplied value must name this store's
+   * directory exactly (a store never acts on another store's identity).
+   */
+  private stateDirMatches(
+    identityStateDir: string | null,
+  ): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
+    if (identityStateDir === null) {
+      return { ok: true };
+    }
+    if (typeof identityStateDir !== 'string') {
+      return {
+        ok: false,
+        reason: 'the conductor identity state directory must be null or a string',
+      };
+    }
+    const screened = screenIdentityText('stateDir', identityStateDir, 1024);
+    if (screened !== null) {
+      return { ok: false, reason: screened };
+    }
+    const own = this.options.stateDir;
+    if (own === undefined || own.trim().length === 0) {
+      return { ok: false, reason: 'the identity does not belong to this store' };
+    }
+    if (resolve(identityStateDir) !== resolve(own)) {
+      return { ok: false, reason: 'the identity does not belong to this store' };
+    }
+    return { ok: true };
   }
 
   async get(orchestratorId: string): Promise<StoredOrchestratorSession | null> {

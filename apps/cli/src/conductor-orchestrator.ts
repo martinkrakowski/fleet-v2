@@ -1,22 +1,17 @@
 /**
- * O9 first slice: the live conductor registers one orchestrator session with
- * `cliKind` conductor and the `start-lane-run` claim after a pass holds the
- * driver lease, heartbeats so the 90 s lease does not lapse across the poll
- * sleep, and retires that session on exit. This module holds the decisions;
- * the CLI's `conductor.ts` does all stderr I/O. Every public function never
- * throws and maps a thrown use case or input to the `-unknown` codes.
+ * O9b: the live conductor's thin caller over the store's one locked
+ * register-or-adopt operation. This module holds the conductor's own facts
+ * (its host, projects, claims, scopes and token id) and maps outcomes to
+ * codes; every invariant — one active session per conductor identity, lapsed
+ * retire-and-replace, adopting a retired id — lives in the store. The CLI's
+ * `conductor.ts` does all stderr I/O. Every public function never throws and
+ * maps a thrown use case or input to the `-unknown` codes.
  */
 
 import {
   HeartbeatOrchestratorSessionUseCase,
-  ListOrchestratorSessionsUseCase,
   ORCHESTRATOR_SESSION_MAX_PROJECTS,
-  RegisterOrchestratorSessionUseCase,
-  OrchestratorSession,
-  OrchestratorSessionRevisionConflictError,
   RetireOrchestratorSessionUseCase,
-  isOrchestratorAttached,
-  type ListOrchestratorSessionsResult,
   type OrchestratorSessionClock,
   type OrchestratorSessionRepositoryPort,
   type ProjectProfileRecord,
@@ -24,18 +19,13 @@ import {
 
 /** The presenting token id: matches the session token-id pattern; never a secret. */
 const CONDUCTOR_TOKEN_ID = 'conductor-driver';
-/** Presented scopes exactly; never placed on the registration body. */
+/** Presented scopes exactly; never placed on a registration body. */
 const CONDUCTOR_REGISTERED_SCOPES = ['orchestrate'] as const;
 /** Claims exactly; never `dispatch-attempt`. */
 const CONDUCTOR_CLAIMS = ['start-lane-run'] as const;
-const CONDUCTOR_CLI_KIND = 'conductor';
 const CONDUCTOR_MODEL: string | null = null;
 /** Heartbeat gap cap, under the 90 s lease; also the during-pass beat interval. */
 export const CONDUCTOR_HEARTBEAT_GAP_CAP_MS = 60_000;
-/** At most this many lapsed conductor-driver sessions are retired before registering. */
-const CONDUCTOR_LAPSED_SCAN_CAP = 64;
-/** A longer stored-session list is unknown and writes nothing. */
-const CONDUCTOR_LIST_CAP = 1000;
 
 export type RegisterConductorOrchestratorCode =
   | 'registered'
@@ -56,6 +46,11 @@ export interface RegisterConductorOrchestratorInput {
   readonly installation: unknown;
   readonly clock: OrchestratorSessionClock;
   readonly newOrchestratorId: () => string;
+  /**
+   * The state directory of this conductor's own store, when it is known;
+   * null (the default) lets the store key the identity on its own directory.
+   */
+  readonly stateDir?: string | null;
 }
 
 type LocalHostRead =
@@ -110,9 +105,10 @@ function localHostOf(installation: unknown): LocalHostRead {
 }
 
 /**
- * Register one conductor orchestrator session. Never throws; every code maps
- * a throw or an unreadable input to `register-unknown`, and `register-unknown`
- * writes nothing.
+ * Register one conductor orchestrator session through the store's one locked
+ * register-or-adopt operation. Never throws; every code maps a throw or an
+ * unreadable input to `register-unknown`, and `register-unknown` writes
+ * nothing.
  */
 export async function registerConductorOrchestrator(
   input: RegisterConductorOrchestratorInput,
@@ -140,7 +136,6 @@ async function registerConductorOrchestratorUnchecked(
   } catch {
     return { code: 'register-unknown', orchestratorId: null };
   }
-  const clock: OrchestratorSessionClock = { nowIso: () => nowIso };
 
   let profiles: readonly ProjectProfileRecord[];
   try {
@@ -161,132 +156,71 @@ async function registerConductorOrchestratorUnchecked(
     return { code: 'projects-over-cap', orchestratorId: null };
   }
 
-  // Before creating a session list the stored sessions; a throw or a list
-  // longer than the cap writes nothing.
-  const listUseCase = new ListOrchestratorSessionsUseCase({ sessionRepo: input.sessionRepo, clock });
-  let listed: ListOrchestratorSessionsResult;
-  try {
-    listed = await listUseCase.listOrchestratorSessions();
-  } catch {
-    return { code: 'register-unknown', orchestratorId: null };
-  }
-  if (listed.sessions.length > CONDUCTOR_LIST_CAP) {
-    return { code: 'register-unknown', orchestratorId: null };
-  }
-
-  // Retire up to the scan cap of lapsed conductor-driver active sessions; a
-  // throw or refusal writes no new session. Attached sessions are never retired.
-  let retired = 0;
-  for (const entry of listed.sessions) {
-    if (retired >= CONDUCTOR_LAPSED_SCAN_CAP) {
-      break;
-    }
-    if (entry.session.cliKind !== CONDUCTOR_CLI_KIND) {
-      continue;
-    }
-    if (entry.session.registeredByTokenId !== CONDUCTOR_TOKEN_ID) {
-      continue;
-    }
-    if (entry.session.status !== 'active') {
-      continue;
-    }
-    if (isOrchestratorAttached(entry.session, nowIso)) {
-      continue;
-    }
-    try {
-      // The list is a snapshot: another process may have heartbeated this
-      // session since. Re-read the CURRENT record and skip the retire when it
-      // is no longer an active, lapsed conductor-driver session.
-      const current = await input.sessionRepo.get(entry.session.orchestratorId);
-      if (
-        current === null ||
-        current.session.status !== 'active' ||
-        current.session.registeredByTokenId !== CONDUCTOR_TOKEN_ID ||
-        isOrchestratorAttached(current.session, nowIso)
-      ) {
-        // Heartbeated since the snapshot: it is live. Adopt it and register
-        // nothing, so two active conductor sessions never coexist.
-        if (
-          current !== null &&
-          current.session.status === 'active' &&
-          current.session.registeredByTokenId === CONDUCTOR_TOKEN_ID &&
-          isOrchestratorAttached(current.session, nowIso)
-        ) {
-          return { code: 'registered', orchestratorId: current.session.orchestratorId };
-        }
-        continue;
-      }
-      // Compare-and-set on the revision just read: a heartbeat bumps the
-      // revision, so a session heartbeated after this read makes the save
-      // conflict and stays live. The read and the save are one revision-checked
-      // step in the repository, not two independent ones.
-      const loaded = OrchestratorSession.create(current.session);
-      if (!loaded.success) {
-        return { code: 'register-unknown', orchestratorId: null };
-      }
-      const retiredSession = loaded.value.retire(nowIso);
-      if (!retiredSession.success) {
-        return { code: 'register-unknown', orchestratorId: null };
-      }
-      try {
-        await input.sessionRepo.save(retiredSession.value.toRecord(), current.revision);
-      } catch (saveError) {
-        if (saveError instanceof OrchestratorSessionRevisionConflictError) {
-          // Heartbeat moved: the session is live. Adopt it, register nothing.
-          return { code: 'registered', orchestratorId: current.session.orchestratorId };
-        }
-        throw saveError;
-      }
-      retired += 1;
-    } catch {
-      return { code: 'register-unknown', orchestratorId: null };
-    }
-  }
-
   let orchestratorId: string;
   try {
     orchestratorId = 'orch-' + input.newOrchestratorId();
   } catch {
     return { code: 'register-unknown', orchestratorId: null };
   }
-  const body = {
-    orchestratorId,
-    cliKind: CONDUCTOR_CLI_KIND,
-    model: CONDUCTOR_MODEL,
-    host: hostRead.host,
-    projects,
-    claims: [...CONDUCTOR_CLAIMS],
-  };
-  const registerUseCase = new RegisterOrchestratorSessionUseCase({ sessionRepo: input.sessionRepo, clock });
-  try {
-    const result = await registerUseCase.registerOrchestratorSession(
-      body,
-      [...CONDUCTOR_REGISTERED_SCOPES],
-      CONDUCTOR_TOKEN_ID,
-    );
-    if (result.outcome === 'registered') {
-      return { code: 'registered', orchestratorId: result.session.orchestratorId };
-    }
+
+  // One locked store operation decides: adopt the identity's live session,
+  // replace a lapsed one, or register. The caller makes no list-then-retire
+  // decision of its own.
+  const result = await input.sessionRepo.registerOrAdoptSession(
+    {
+      host: hostRead.host,
+      stateDir: input.stateDir ?? null,
+      registration: {
+        orchestratorId,
+        model: CONDUCTOR_MODEL,
+        projects,
+        claims: [...CONDUCTOR_CLAIMS],
+        scopes: [...CONDUCTOR_REGISTERED_SCOPES],
+        registeredByTokenId: CONDUCTOR_TOKEN_ID,
+      },
+    },
+    nowIso,
+  );
+  if (result.outcome === 'refused') {
     return { code: 'register-refused', orchestratorId: null };
-  } catch {
-    return { code: 'register-unknown', orchestratorId: null };
   }
+  return { code: 'registered', orchestratorId: result.session.orchestratorId };
 }
 
 export type ConductorHeartbeatCode = 'renewed' | 'heartbeat-refused' | 'heartbeat-unknown';
 
-/** Heartbeat the registered session with the same token. Never throws. */
+/** Why a heartbeat was not renewed, when it was not. Null on `renewed` and `heartbeat-unknown`. */
+export type ConductorHeartbeatRefusalKind = 'retired' | 'not-found' | 'other' | null;
+
+const RETIRED_HEARTBEAT_REASON = 'OrchestratorSession is retired and cannot renew its lease';
+
+/**
+ * Heartbeat the registered session with the same token, and report why a
+ * refused heartbeat was refused. Never throws.
+ */
 export async function heartbeatConductorOrchestrator(
   repo: OrchestratorSessionRepositoryPort,
   clock: OrchestratorSessionClock,
   orchestratorId: string,
-): Promise<{ readonly code: ConductorHeartbeatCode }> {
+): Promise<{ readonly code: ConductorHeartbeatCode; readonly refusalKind: ConductorHeartbeatRefusalKind }> {
   try {
     const useCase = new HeartbeatOrchestratorSessionUseCase({ sessionRepo: repo, clock });
     const result = await useCase.heartbeatOrchestratorSession({ orchestratorId }, CONDUCTOR_TOKEN_ID);
-    return { code: result.outcome === 'renewed' ? 'renewed' : 'heartbeat-refused' };
+    if (result.outcome === 'renewed') {
+      return { code: 'renewed', refusalKind: null };
+    }
+    if (result.outcome === 'not-found') {
+      return { code: 'heartbeat-refused', refusalKind: 'not-found' };
+    }
+    if (
+      result.outcome === 'refused' &&
+      result.reason === RETIRED_HEARTBEAT_REASON
+    ) {
+      return { code: 'heartbeat-refused', refusalKind: 'retired' };
+    }
+    return { code: 'heartbeat-refused', refusalKind: 'other' };
   } catch {
-    return { code: 'heartbeat-unknown' };
+    return { code: 'heartbeat-unknown', refusalKind: null };
   }
 }
 
@@ -299,8 +233,11 @@ export interface HeartbeatOrReRegisterResult {
 }
 
 /**
- * Heartbeat; when the session is refused (retired or missing) and a
- * re-registration is still allowed, register once as a new session. Never throws.
+ * Heartbeat; when the store refused it because the session is retired or
+ * gone, call the store's register-or-adopt operation once: it adopts the
+ * live replacement or registers the single new session, never a duplicate.
+ * Any other refusal (a retry that ran out, a store hiccup) stays an error.
+ * Never throws.
  */
 export async function heartbeatOrReRegisterConductorOrchestrator(
   input: RegisterConductorOrchestratorInput,
@@ -311,15 +248,10 @@ export async function heartbeatOrReRegisterConductorOrchestrator(
   if (beat.code !== 'heartbeat-refused' || !canReRegister) {
     return { code: beat.code, orchestratorId, reRegistration: null };
   }
-  // Re-register only when the session is explicitly gone (missing or retired).
-  // Any other refusal (a retry that ran out, a store hiccup) stays a refusal:
-  // the session may still be live and a new one would duplicate it.
-  try {
-    const stored = await input.sessionRepo.get(orchestratorId);
-    if (stored !== null && stored.session.status !== 'retired') {
-      return { code: beat.code, orchestratorId, reRegistration: null };
-    }
-  } catch {
+  // Re-register only when the store refused the session as retired or
+  // missing; the one locked operation then ends with exactly one active
+  // session for the identity.
+  if (beat.refusalKind !== 'retired' && beat.refusalKind !== 'not-found') {
     return { code: beat.code, orchestratorId, reRegistration: null };
   }
   const registration = await registerConductorOrchestrator(input);

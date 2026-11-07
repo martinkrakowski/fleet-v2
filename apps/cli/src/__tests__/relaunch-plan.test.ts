@@ -7,6 +7,7 @@
  */
 
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -227,6 +228,27 @@ async function snapshotStateWithSizes(dir: string): Promise<string[]> {
   return rows.sort((a, b) => a.localeCompare(b));
 }
 
+/**
+ * Every entry under `dir` (recursive, directories included) with its kind, size in bytes and the sha256 of its
+ * content (a symlink's target for a link), sorted: nothing may be added, removed, resized or rewritten.
+ */
+async function snapshotStateWithHashes(dir: string): Promise<string[]> {
+  const names = await fs.readdir(dir, { recursive: true });
+  const rows: string[] = [];
+  for (const name of names) {
+    const target = path.join(dir, name);
+    const stat = await fs.lstat(target);
+    if (stat.isDirectory()) {
+      rows.push(`${name}\tdir`);
+    } else if (stat.isSymbolicLink()) {
+      rows.push(`${name}\tlink\t${createHash('sha256').update(await fs.readlink(target)).digest('hex')}`);
+    } else {
+      rows.push(`${name}\t${stat.size}\t${createHash('sha256').update(await fs.readFile(target)).digest('hex')}`);
+    }
+  }
+  return rows.sort((a, b) => a.localeCompare(b));
+}
+
 async function plan(
   runtime: FleetCliRuntime,
   ...flags: string[]
@@ -436,6 +458,69 @@ describe('relaunch plan (production composition)', () => {
     await expect(fs.stat(path.join(fx.stateDir, 'relaunch-plans.json'))).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await snapshotStateWithSizes(fx.stateDir)).toEqual(before);
   });
+
+  // Per corrupted state file: what the commands answer, and whether the plan may store its one record.
+  // - lane-runs.json, attempts.json: the inventory refuses (exit 1) and the plan is unknown, nothing stored.
+  // - work-orders.json: only the plan reads it; the plan is unknown, nothing stored.
+  // - conductor-halt.json: an unreadable marker reads as a halt; the plan is still made (halted: true recorded),
+  //   which is its one allowed write (relaunch-plans.json), so only that file may differ.
+  // - conductor-driver-lease.json: the read-only lease adapter reads unreadable bytes as an absent lease (package
+  //   behaviour, outside this lane), so the plan is made too. The answer is not pinned here, only the absence of a write.
+  interface InventoryAnswer {
+    readonly outcome?: string;
+    readonly conductor?: { readonly halted?: boolean; readonly driverLease?: string };
+  }
+  const unreadableCases: ReadonlyArray<{
+    readonly file: string;
+    readonly inventory: (answer: InventoryAnswer, code: number) => boolean;
+    readonly planOutcome: 'unknown' | 'planned';
+  }> = [
+    { file: 'lane-runs.json', inventory: (a, code) => code !== 0 && a.outcome !== 'inventoried', planOutcome: 'unknown' },
+    { file: 'attempts.json', inventory: (a, code) => code !== 0 && a.outcome !== 'inventoried', planOutcome: 'unknown' },
+    { file: 'work-orders.json', inventory: (a, code) => a.outcome === 'inventoried' && code === 0, planOutcome: 'unknown' },
+    {
+      file: 'conductor-halt.json',
+      inventory: (a) => a.outcome === 'inventoried' && a.conductor?.halted === true,
+      planOutcome: 'planned',
+    },
+    { file: 'conductor-driver-lease.json', inventory: (a) => a.outcome === 'inventoried', planOutcome: 'planned' },
+  ];
+
+  it.each(unreadableCases)(
+    'relaunch inventory and relaunch plan change no byte of the state or the worktrees on an unreadable $file',
+    async ({ file, inventory, planOutcome }) => {
+      const fx = await seededFixture();
+      await fs.writeFile(path.join(fx.stateDir, file), '{broken CANARY-bytes', 'utf8');
+      const stateBefore = await snapshotStateWithHashes(fx.stateDir);
+      const worktreesBefore = await snapshotStateWithHashes(fx.worktreeRoot);
+
+      const inventoryIo = capture();
+      const inventoryCode = await runCli(['relaunch', 'inventory'], inventoryIo, fx.runtime);
+      const inventoryOut = inventoryIo.out.join('');
+      const inventoryAnswer = JSON.parse(inventoryOut) as InventoryAnswer;
+      expect(inventory(inventoryAnswer, inventoryCode), `inventory answered ${inventoryOut} with exit ${inventoryCode}`).toBe(true);
+      expect(await snapshotStateWithHashes(fx.stateDir)).toEqual(stateBefore);
+      expect(await snapshotStateWithHashes(fx.worktreeRoot)).toEqual(worktreesBefore);
+
+      const planned = await plan(fx.runtime);
+      expect(planned.result.outcome, planned.stdout).toBe(planOutcome);
+      const withoutPlanStore = (rows: readonly string[]): string[] =>
+        rows.filter((row) => !row.startsWith('relaunch-plans.json'));
+      if (planOutcome === 'unknown') {
+        expect(planned.code).toBe(1);
+        expect(await snapshotStateWithHashes(fx.stateDir)).toEqual(stateBefore);
+      } else {
+        expect(withoutPlanStore(await snapshotStateWithHashes(fx.stateDir))).toEqual(withoutPlanStore(stateBefore));
+      }
+      expect(await snapshotStateWithHashes(fx.worktreeRoot)).toEqual(worktreesBefore);
+
+      // Output is ids and codes only: no path, no canary bytes.
+      for (const text of [inventoryOut, planned.stdout, planned.stderr, inventoryIo.err.join('')]) {
+        expect(text).not.toContain('CANARY');
+        expect(text).not.toContain(fx.stateDir);
+      }
+    },
+  );
 
   it('exits 1 with unknown when the profile records cannot be read', async () => {
     const fx = await fixture([]);

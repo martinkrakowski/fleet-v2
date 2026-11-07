@@ -27,6 +27,7 @@ import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
 import { composeExecution } from './composition/work-execution.js';
 import { composeConductor } from './composition/conductor.js';
+import { composeReadOnlyRelaunch } from './composition/relaunch.js';
 import { composeDaemon, type ComposedDaemon } from './composition/daemon.js';
 import { composeTelemetry, type TelemetryConfiguredState, type TelemetryPolicyView } from './composition/telemetry.js';
 
@@ -1129,36 +1130,13 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   });
 
   // CO26 + CO29a: `relaunch inventory` and `relaunch plan` are strictly
-  // read-only over the record stores, so both compose read-only instances: an
-  // unreadable state file is a read error (mapped to `unknown`), never a
-  // quarantine write. One inventory instance serves both commands.
-  const relaunchRunRepo = new LaneRunRepositoryAdapter({ stateDir, readOnly: true });
-  const relaunchAttemptRepo = new AttemptRepositoryAdapter({ stateDir, readOnly: true });
-  const inventoryRelaunch = new InventoryRelaunchUseCase({
-    runRepo: relaunchRunRepo,
-    attemptRepo: relaunchAttemptRepo,
+  // read-only; composeReadOnlyRelaunch builds every state adapter they reach
+  // read-only and takes no store from the conductor (CO29a-ro).
+  const { inventoryRelaunch, planRelaunch, relaunchPlanRepository } = composeReadOnlyRelaunch({
+    stateDir,
     workspace,
-    halt: conductor.halt,
-    driverLease: conductor.driverLease,
     runnerForAttempt,
     computeDigest: sha256HexDigest,
-  });
-
-  // CO29a: the ordered relaunch plan reads the (read-only) inventory and the
-  // same record stores read-only, and stores one immutable plan by digest
-  // (relaunch-plans.json): planRepo is the one allowed write.
-  const relaunchWorkOrderRepo = new WorkOrderRepositoryAdapter({ stateDir, readOnly: true });
-  const relaunchLanePlanRepo = new LanePlanRepositoryAdapter({ stateDir, readOnly: true });
-  const relaunchPlanRepository = new RelaunchPlanRepositoryAdapter({ stateDir });
-  const planRelaunch = new PlanRelaunchUseCase({
-    inventory: inventoryRelaunch,
-    runRepo: relaunchRunRepo,
-    attemptRepo: relaunchAttemptRepo,
-    workOrderRepo: relaunchWorkOrderRepo,
-    lanePlanRepo: relaunchLanePlanRepo,
-    planRepo: relaunchPlanRepository,
-    computeDigest: sha256HexDigest,
-    clock: () => new Date().toISOString(),
   });
 
   const { telemetry } = composeTelemetry({

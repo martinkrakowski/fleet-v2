@@ -102,6 +102,15 @@ describe("requiredScope", () => {
     expect(requiredScope("POST", "/v1/authorizations/resolve")).toBe("hook");
     expect(requiredScope("POST", "/v1/authorizations/:id/consume")).toBe("hook");
     expect(requiredScope("POST", "/v1/forge")).toBe("hook");
+    expect(requiredScope("POST", "/v1/threads/:id/permissions")).toBe("hook");
+  });
+
+  it("maps the permission verdict route to verdict and fails closed on GET", () => {
+    expect(requiredScope("POST", "/v1/threads/:id/permissions/:requestId/verdict")).toBe(
+      "verdict",
+    );
+    expect(requiredScope("GET", "/v1/threads/:id/permissions")).toBeNull();
+    expect(requiredScope("GET", "/v1/threads/:id/permissions/:requestId/verdict")).toBeNull();
   });
 
   it("maps the operate family", () => {

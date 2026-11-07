@@ -1,53 +1,89 @@
-// @generated entity stub — edit freely
+// @generated entity stub — refined for lane T2c.
 /**
- * PermissionRequest is a domain entity with identity and lifecycle.
+ * PermissionRequest is the domain entity for one pending tool-permission
+ * request. It carries the tool call's name and verbatim input under an
+ * API-issued id and enforces the "first verdict wins" invariant: the first
+ * decision is recorded once, the same decision again changes nothing, and a
+ * different decision is a conflict that leaves the stored verdict untouched.
  *
- * Domain entities:
- * - Have unique identity (ID)
- * - Contain business logic and invariants
- * - Are mutable (unlike value objects)
- * - Enforce domain rules in their methods
- *
- * @example
- * const entity = new PermissionRequest(id, props);
- * entity.performAction();
+ * The entity is pure: the clock and the id arrive as arguments, it never
+ * reads the clock, never throws on malformed input, and holds no I/O. A
+ * verdict grants nothing beyond the one tool call it names.
  */
+
+export type ToolPermissionDecision = 'allow' | 'deny';
+
+export interface PermissionRequestProps {
+  readonly requestId: string;
+  readonly threadId: string;
+  readonly toolName: string;
+  /** Stored verbatim; never returned by any use case or route. */
+  readonly toolInput: unknown;
+  readonly requestedAtIso: string;
+  readonly deadlineAtIso: string;
+}
+
+export interface PermissionVerdictRecord {
+  readonly decision: ToolPermissionDecision;
+  readonly actorId: string;
+  readonly decidedAtIso: string;
+}
+
+export interface PermissionRequestRecord extends PermissionRequestProps {
+  readonly state: 'pending' | 'decided';
+  readonly verdict?: PermissionVerdictRecord;
+}
+
 export class PermissionRequest {
-  /**
-   * Constructor for PermissionRequest entity.
-   *
-   * @param id - Unique identifier
-   * @param props - Entity properties
-   *
-   * TODO: Define your entity properties
-   * Example:
-   * constructor(
-   *   private readonly id: string,
-   *   private name: string,
-   *   private status: Status,
-   * ) {
-   *   // Validate invariants
-   * }
-   */
-  constructor(private readonly id: string) {
-    // TODO: Initialize entity state
-    // TODO: Validate invariants
-  }
+  private verdictRecord?: PermissionVerdictRecord;
 
-  /**
-   * Get entity ID.
-   */
+  constructor(private readonly props: PermissionRequestProps) {}
+
   getId(): string {
-    return this.id;
+    return this.props.requestId;
+  }
+
+  getVerdict(): PermissionVerdictRecord | undefined {
+    return this.verdictRecord === undefined ? undefined : { ...this.verdictRecord };
+  }
+
+  /** Still awaiting: no verdict yet and `nowIso` has not passed the deadline. */
+  isAwaitingVerdict(nowIso: string): boolean {
+    if (this.verdictRecord !== undefined) {
+      return false;
+    }
+    return nowIso <= this.props.deadlineAtIso;
   }
 
   /**
-   * TODO: Add domain methods here
-   * Example:
-   * performAction(): Result<void, Error> {
-   *   // Validate business rules
-   *   // Update state
-   *   // Return result
-   * }
+   * Record the first verdict. No verdict yet -> `recorded`; the same
+   * decision again -> `unchanged` (the stored verdict is untouched); a
+   * different decision -> `conflict` (the stored verdict is untouched).
    */
+  decide(
+    decision: ToolPermissionDecision,
+    actorId: string,
+    decidedAtIso: string,
+  ): 'recorded' | 'unchanged' | 'conflict' {
+    if (this.verdictRecord !== undefined) {
+      return this.verdictRecord.decision === decision ? 'unchanged' : 'conflict';
+    }
+    this.verdictRecord = { decision, actorId, decidedAtIso };
+    return 'recorded';
+  }
+
+  toRecord(): PermissionRequestRecord {
+    const base = {
+      requestId: this.props.requestId,
+      threadId: this.props.threadId,
+      toolName: this.props.toolName,
+      toolInput: this.props.toolInput,
+      requestedAtIso: this.props.requestedAtIso,
+      deadlineAtIso: this.props.deadlineAtIso,
+    };
+    if (this.verdictRecord === undefined) {
+      return { ...base, state: 'pending' as const };
+    }
+    return { ...base, state: 'decided' as const, verdict: { ...this.verdictRecord } };
+  }
 }

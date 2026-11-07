@@ -564,6 +564,24 @@
   },
   {
     "method": "POST",
+    "path": "/v1/threads/[id]/permissions",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/threads/[id]/permissions/[requestId]/verdict",
+    "envelope": [
+      "operationId",
+      "code",
+      "result"
+    ]
+  },
+  {
+    "method": "POST",
     "path": "/v1/verifications",
     "envelope": [
       "operationId",

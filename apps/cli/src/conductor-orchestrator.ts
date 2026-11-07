@@ -58,11 +58,14 @@ type LocalHostRead =
   | { readonly ok: false; readonly reason: 'unreadable' | 'not-local' };
 
 /**
- * The single local host key of a readable v2 installation. `null` and
- * non-object installations are unreadable (register-unknown); a readable
- * installation that is not v2, or whose `hosts` is not a plain object with
- * exactly one `local` entry, is not local (host-unknown). A sparse array is
- * not that object; an unknown transport is not local.
+ * The key of the single `local`-transport host of a readable v2 installation,
+ * chosen among ALL host entries: a real installation also lists ssh
+ * lane-runner hosts, which are never the conductor's own host. `null` and
+ * non-object installations, and a host entry that is not an object or cannot
+ * be read, are unreadable (register-unknown); a readable installation that is
+ * not v2, whose `hosts` is not a plain object, or that has zero or several
+ * `local` hosts, is not local (host-unknown). A sparse array is not that
+ * object; an unknown transport is not local.
  */
 function localHostOf(installation: unknown): LocalHostRead {
   if (typeof installation !== 'object' || installation === null) {
@@ -88,17 +91,24 @@ function localHostOf(installation: unknown): LocalHostRead {
   }
   try {
     const entries = Object.entries(hosts as Record<string, unknown>);
-    if (entries.length !== 1) {
+    const localHosts: string[] = [];
+    let unreadable = false;
+    for (const [hostName, hostValue] of entries) {
+      if (typeof hostValue !== 'object' || hostValue === null) {
+        unreadable = true;
+        continue;
+      }
+      if ((hostValue as { transport?: unknown }).transport === 'local') {
+        localHosts.push(hostName);
+      }
+    }
+    if (unreadable) {
+      return { ok: false, reason: 'unreadable' };
+    }
+    if (localHosts.length !== 1) {
       return { ok: false, reason: 'not-local' };
     }
-    const [hostName, hostValue] = entries[0]!;
-    if (typeof hostValue !== 'object' || hostValue === null) {
-      return { ok: false, reason: 'not-local' };
-    }
-    if ((hostValue as { transport?: unknown }).transport !== 'local') {
-      return { ok: false, reason: 'not-local' };
-    }
-    return { ok: true, host: hostName };
+    return { ok: true, host: localHosts[0]! };
   } catch {
     return { ok: false, reason: 'unreadable' };
   }

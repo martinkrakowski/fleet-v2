@@ -403,7 +403,7 @@ describe('RelaunchPlanRepositoryAdapter', () => {
       memory as unknown as { inMemoryPlans: Map<string, RelaunchPlanRecord> }
     ).inMemoryPlans.get(plan.planDigest) as RelaunchPlanRecord;
     (held.lanes[1] as { admissionWave: number }).admissionWave = 2;
-    expect(await memory.findByDigest(plan.planDigest)).toEqual({ outcome: 'absent' });
+    expect(await memory.findByDigest(plan.planDigest)).toEqual({ outcome: 'unreadable', reason: 'unreadable' });
   });
 
   it('hands out copies, so mutating a returned plan never changes the stored one', async () => {

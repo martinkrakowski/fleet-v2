@@ -426,7 +426,9 @@ export class RelaunchPlanRepositoryAdapter implements RelaunchPlanRepositoryPort
       if (this.target === null) {
         const held = this.inMemoryPlans.get(planDigest);
         // A record whose body no longer hashes to its digest is corrupt: never handed out as found.
-        return held === undefined || !digestMatches(held) ? { outcome: 'absent' } : { outcome: 'found', plan: deepCopy(held) };
+        if (held === undefined) return { outcome: 'absent' };
+        if (!digestMatches(held)) return { outcome: 'unreadable', reason: 'unreadable' };
+        return { outcome: 'found', plan: deepCopy(held) };
       }
       const current = await this.readFromDisk(this.target);
       if (current.status === 'unknown-version') return { outcome: 'unreadable', reason: 'unknown-version' };

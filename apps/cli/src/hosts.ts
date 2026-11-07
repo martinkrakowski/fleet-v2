@@ -1516,7 +1516,32 @@ async function daemonCommand(
   return result.units.some((unit) => unit.code === "unreadable") ? 1 : 0;
 }
 
-/** `fleet-v2 hosts <subcommand>`; exit codes: 0 written/listed, 1 refused, 2 usage. */
+/**
+ * The one tag an escaped error is named by: `error.code` when it is an
+ * upper-case identifier, else `error.name` when it is an `*Error` name, else
+ * `unknown`. A non-Error has no tag at all.
+ */
+function errorTag(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return "unknown";
+  }
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === "string" && /^[A-Z][A-Z0-9_]{0,40}$/.test(code)) {
+    return code;
+  }
+  if (/^[A-Za-z]{1,60}Error$/.test(error.name)) {
+    return error.name;
+  }
+  return "unknown";
+}
+
+/**
+ * `fleet-v2 hosts <subcommand>`; exit codes: 0 written/listed, 1 refused, 2
+ * usage. No thrown error escapes the screened io (HN1b fix a): the file read
+ * is guarded before the installation keys are known — it reports a tag-only
+ * line — and every later throw is caught and reported as exactly one screened
+ * line, never a stack and never a raw non-Error value.
+ */
 export async function hostsCommand(
   argv: readonly string[],
   rawIo: CliIo,
@@ -1525,48 +1550,63 @@ export async function hostsCommand(
   const file =
     hostsOptions.installationFile ??
     resolveInstallationFile(undefined, process.env, process.cwd());
-  const read = await readInstallationFile(file);
-  const out = screenedHostsIo(rawIo, [
-    ...(read.status === "read" ? installationKeys(read.value) : []),
-    ...argv,
-  ]);
-  // The confirmation question reaches an injected gate without passing the
-  // wrapped stdout, so it is screened here with the same screen.
-  const injectedConfirm = hostsOptions.confirm;
-  const options: HostsCliOptions =
-    injectedConfirm === undefined
-      ? hostsOptions
-      : {
-          ...hostsOptions,
-          confirm: (question) => injectedConfirm(out.screen(question)),
-        };
-  if (argv[0] === "daemon") {
-    return daemonCommand(argv.slice(1), file, out, options);
+  const out = screenedHostsIo(rawIo, [...argv]);
+  let read: Awaited<ReturnType<typeof readInstallationFile>>;
+  try {
+    read = await readInstallationFile(file);
+  } catch (error: unknown) {
+    out.stderr(`error: ${errorTag(error)}\n`);
+    return 1;
   }
-  const parsed = parseHostsArgs(argv);
-  if (!parsed.ok) {
-    out.stderr(`${parsed.error}\n`);
-    return 2;
+  if (read.status === "read") {
+    out.addKeys(installationKeys(read.value));
   }
-  if (parsed.help) {
-    out.stdout(`${HOSTS_HELP}\n`);
-    return 0;
+  try {
+    // The confirmation question reaches an injected gate without passing the
+    // wrapped stdout, so it is screened here with the same screen.
+    const injectedConfirm = hostsOptions.confirm;
+    const options: HostsCliOptions =
+      injectedConfirm === undefined
+        ? hostsOptions
+        : {
+            ...hostsOptions,
+            confirm: (question) => injectedConfirm(out.screen(question)),
+          };
+    if (argv[0] === "daemon") {
+      return await daemonCommand(argv.slice(1), file, out, options);
+    }
+    const parsed = parseHostsArgs(argv);
+    if (!parsed.ok) {
+      out.stderr(`${parsed.error}\n`);
+      return 2;
+    }
+    if (parsed.help) {
+      out.stdout(`${HOSTS_HELP}\n`);
+      return 0;
+    }
+    const args = parsed.args;
+    if (args.subcommand === "list") {
+      return await listHosts(file, out);
+    }
+    if (args.subcommand === "remove") {
+      return await removeHost(args, file, out, options);
+    }
+    if (args.subcommand === "rename") {
+      return await renameHost(args, file, out, options);
+    }
+    return await writeHost(
+      args.subcommand === "edit" ? "edit" : "add",
+      args,
+      file,
+      out,
+      options,
+    );
+  } catch (error: unknown) {
+    if (error instanceof Error) {
+      out.stderr(`error: ${errorTag(error)}: ${error.message.split("\n")[0]}\n`);
+    } else {
+      out.stderr("error: unknown\n");
+    }
+    return 1;
   }
-  const args = parsed.args;
-  if (args.subcommand === "list") {
-    return listHosts(file, out);
-  }
-  if (args.subcommand === "remove") {
-    return removeHost(args, file, out, options);
-  }
-  if (args.subcommand === "rename") {
-    return renameHost(args, file, out, options);
-  }
-  return writeHost(
-    args.subcommand === "edit" ? "edit" : "add",
-    args,
-    file,
-    out,
-    options,
-  );
 }

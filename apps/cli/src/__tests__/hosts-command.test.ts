@@ -13,7 +13,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import type {
   DoctorCommandRunResult,
@@ -1462,5 +1462,61 @@ describe("hosts output never echoes a withheld host key", () => {
     expect(code).toBe(1);
     expect(readFileSync(file, "utf8")).toBe(before);
     expect(stderr).not.toContain("renamed host");
+  });
+
+  // HN1b fix a: no thrown error escapes the screened io. A dependency's
+  // failure is reported as exactly one screened line — the tag, the message's
+  // first line, no stack — and the screen still withholds every secret.
+  it("a thrown Error from a state reader prints one screened error line and no stack", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, installationWithTokenKeys(path.join(dir, "worktrees")));
+    // Built at runtime so the fixture is not a literal secret-scanner match.
+    const token = `s3cret${"xY9".repeat(11)}`.slice(0, 36);
+    const spy = vi
+      .spyOn(AttemptRepositoryAdapter.prototype, "listAllAttempts")
+      .mockRejectedValue(
+        new Error(
+          `hosts.${flatTokenKey}: live-work read failed near token ${token}`,
+        ),
+      );
+    try {
+      const { code, stdout, stderr } = await runHosts(
+        ["remove", flatTokenKey, "--yes"],
+        file,
+      );
+      expect(code).toBe(1);
+      const errorLines = stderr
+        .split("\n")
+        .filter((line) => line.startsWith("error: "));
+      expect(errorLines).toHaveLength(1);
+      expect(stderr).not.toContain("    at ");
+      expect(echoedWindows(stdout + stderr, flatTokenKey)).toEqual([]);
+      expect(echoedWindows(stdout + stderr, token)).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("a thrown non-Error prints error: unknown and nothing of the value", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, installationWithTokenKeys(path.join(dir, "worktrees")));
+    const token = `s3cret${"xY9".repeat(11)}`.slice(0, 36);
+    const spy = vi
+      .spyOn(AttemptRepositoryAdapter.prototype, "listAllAttempts")
+      .mockRejectedValue(`thrown string carrying token ${token}`);
+    try {
+      const { code, stdout, stderr } = await runHosts(
+        ["remove", flatTokenKey, "--yes"],
+        file,
+      );
+      expect(code).toBe(1);
+      expect(stderr).toContain("error: unknown");
+      expect(stderr).not.toContain("thrown string");
+      expect(echoedWindows(stdout + stderr, token)).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

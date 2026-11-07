@@ -234,6 +234,39 @@ describe('daemon tick with a bad policy.daemon.stallAfterMinutes (PT1a)', () => 
   });
 });
 
+describe('daemon tick with a bad policy.daemon.autoResumeMax (PT1b1)', () => {
+  for (const bad of [-1, 33, 2.5, 'soon']) {
+    it(`with autoResumeMax ${JSON.stringify(bad)} the tick runs, the merge policy resolves fail-closed to 0 and nothing is refused`, async () => {
+      const h = harness([REPO_A], {}, { daemon: { autoResumeMax: bad } });
+      await enqueue(h.runtime, REPO_A);
+
+      const answer = await h.runtime.daemon.mergePolicy.readMergePolicy();
+      expect(answer).toMatchObject({ outcome: 'known', daemon: { autoResumeMax: 0 } });
+
+      const result = await run(h.runtime, ['daemon', 'tick']);
+      expect(result.code).toBe(0);
+      const json = lastJson(result.out);
+      expect(json).toMatchObject({ outcome: 'completed', exitCode: 0, forgeReachable: true });
+      expect((json.jobs as Array<{ jobId: string; outcome: string }>).find((job) => job.jobId === `merge-pass:${digestOf(REPO_A)}`)).toMatchObject({ outcome: 'completed' });
+      if (typeof bad === 'string') {
+        expect(JSON.stringify(json)).not.toContain(bad);
+      }
+    });
+  }
+
+  it('the installation loader reports the warning for the same file and still loads it', () => {
+    const dir = tempDir();
+    const file = path.join(dir, 'fleet.json');
+    writeFileSync(file, JSON.stringify({ ...(installation([REPO_A], { daemon: { autoResumeMax: 33 } }) as object) }), 'utf8');
+    const loaded = loadInstallation({ file, env: {} });
+    expect(loaded.status).toBe('loaded');
+    if (loaded.status === 'loaded') {
+      expect(loaded.warnings).toEqual(['policy.daemon.autoResumeMax: auto-resume-max-invalid']);
+      expect(mergePolicySourceFromLoad(loaded)).toMatchObject({ outcome: 'resolved', daemon: { autoResumeMax: 0 } });
+    }
+  });
+});
+
 describe('daemon tick (DT10b)', () => {
   it('serves two repositories: two merge-pass jobs, two leases, two status summaries, a shadow would-merge', async () => {
     const h = harness();

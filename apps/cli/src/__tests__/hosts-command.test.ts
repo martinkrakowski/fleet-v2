@@ -719,6 +719,28 @@ describe("fleet-v2 hosts edit", () => {
     expect(written.policy.daemon.stallAfterMinutes).toBe(0);
   });
 
+  it("PT1b1: edits a host in a file whose policy.daemon.autoResumeMax is bad, keeping the operator's value", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      ...(v2Installation(path.join(dir, "worktrees")) as Record<string, unknown>),
+      policy: { daemon: { autoResumeMax: "plenty" } },
+    });
+    const { code, stdout, stderr } = await runHosts(
+      ["edit", "lanehost", "--port", "4266", "--yes"],
+      file,
+    );
+    expect(stderr).not.toContain("autoResumeMax");
+    expect(code).toBe(0);
+    expect(stdout).toContain("written");
+    const written = JSON.parse(readFileSync(file, "utf8")) as {
+      hosts: Record<string, { runner?: { port: number } }>;
+      policy: { daemon: { autoResumeMax: string | number } };
+    };
+    expect(written.hosts.lanehost?.runner?.port).toBe(4266);
+    expect(written.policy.daemon.autoResumeMax).toBe("plenty");
+  });
+
   it("edits the roles of an existing host", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");

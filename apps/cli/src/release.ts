@@ -65,9 +65,9 @@ export function releaseAuthorization(rt: FleetCliRuntime): ActionAuthorizationPo
         projectId: request.projectId,
         actionScope,
         expectedHeadSha: request.expectedHeadSha,
-        // CO24g: the release grant is bound to its deterministic action id (the
-        // attempt coordinate the ManageReleaseUseCase passes); a resolve without
-        // it can no longer authorize an unbound owner grant.
+        // CO24g: the release grant is attempt-less by design — it is anchored by
+        // its `release:<action>` scope and exact head and consumed once — so the
+        // attempt coordinate is passed through only when the caller carries one.
         attemptId: request.attemptId,
       });
       return result.outcome === 'authorized'

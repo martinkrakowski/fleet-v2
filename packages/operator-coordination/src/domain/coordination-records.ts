@@ -170,6 +170,19 @@ export interface MergeGrantRecord {
  */
 export const GRANT_RECORD_VERSION = 2 as const;
 
+/**
+ * The scope prefix of a release grant (cutover row CO14): `release:install`,
+ * `release:swap` or `release:rollback`. A release grant is attempt-less by
+ * design (CO24g): it is anchored by its scope and exact head and consumed once
+ * by its deterministic action id, so it never binds a work attempt.
+ */
+export const RELEASE_SCOPE_PREFIX = 'release:';
+
+/** True only for a `release:<action>` scope; such a grant never binds an attempt. */
+export function isReleaseActionScope(actionScope: string): boolean {
+  return actionScope.startsWith(RELEASE_SCOPE_PREFIX);
+}
+
 /** Serializable snapshot of the CoordinationRequest aggregate. */
 export interface CoordinationRequestRecord {
   readonly id: string;

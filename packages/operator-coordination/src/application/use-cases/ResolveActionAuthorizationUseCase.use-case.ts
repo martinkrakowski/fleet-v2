@@ -14,7 +14,7 @@
  */
 
 import { isPolicyGrantRecord } from '../../domain/policy-grants.js';
-import { GRANT_RECORD_VERSION } from '../../domain/coordination-records.js';
+import { GRANT_RECORD_VERSION, isReleaseActionScope } from '../../domain/coordination-records.js';
 import type { CoordinationRequestRecord } from '../../domain/coordination-records.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
 import type {
@@ -179,7 +179,10 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
    * refuses (`attempt-required`) without binding or consuming, and an already-bound one also
    * refuses, because every caller that resolves a bound owner grant passes its attempt and no
    * anonymous path is needed. Policy grants keep their own recorded attempt and are resolved
-   * only by their id, so they stay unaffected.
+   * only by their id, so they stay unaffected. Two grant kinds are attempt-less by design and
+   * are exempt by kind, never by a missing attemptId: a merge grant (DT6b), anchored by
+   * repository, pull request and head, and a release grant (CO14), anchored by its
+   * `release:<action>` scope, exact head and one deterministic consumption.
    */
   private async bindAttempt(
     candidate: CoordinationRequest,
@@ -193,6 +196,14 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     // DT6b: a merge grant is anchored by repository, pull request and head, never by an
     // attempt; it resolves unbound and is never bound.
     if (candidate.getMergeGrant() !== null) {
+      return null;
+    }
+    // CO24g: a release grant is attempt-less by design (cutover row CO14). It is
+    // anchored by its `release:<action>` scope and exact head, and consumed once
+    // by its deterministic action id, so it resolves with or without an attempt
+    // coordinate and is never bound to a work attempt. The gate is the grant's
+    // recorded scope — the grant kind — never the absence of an attemptId.
+    if (isReleaseActionScope(candidate.getActionScope())) {
       return null;
     }
     if (request.attemptId === undefined) {

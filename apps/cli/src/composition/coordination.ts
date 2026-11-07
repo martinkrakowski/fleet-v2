@@ -28,11 +28,15 @@ import {
   ListOwnerQuestionsUseCase,
   ListProjectProfilesUseCase,
   ObservationPublicationAdapter,
+  OrchestratorRequestJournalAdapter,
+  OrchestratorRequestRepositoryAdapter,
+  OrchestratorSessionRepositoryAdapter,
   OwnerQuestionRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
   PublishProjectObservationUseCase,
   ReadOwnerQuestionUseCase,
   ReadProjectAttentionUseCase,
+  ReconcileOrchestratorRequestUseCase,
   RecordAttentionItemUseCase,
   RecordAuthorizationConsumptionUseCase,
   RecordProjectProbeUseCase,
@@ -45,17 +49,20 @@ import {
   SendFleetRelayUseCase,
   SyncOneWayOwnerQuestionsUseCase,
   UpdateProjectProfileUseCase,
+  hashOrchestratorRequestDigest,
   type AttentionClock,
   type AttemptFactsReadPort,
   type AttemptFactsRecord,
   type OwnerQuestionClock,
 } from '@fleet/operator-coordination';
 import {
+  LaneRunJournalAdapter,
   type ExecutorForRecordedHostResult,
   executorForInstallationHost,
   ProjectProfileReadAdapter,
   ProjectProbeRecordAdapter,
 } from '@fleet/work-execution';
+import type { LaneRunJournalEntryRecord } from '@fleet/work-execution';
 
 import type { FleetCliRuntimeOptions } from '../composition.js';
 
@@ -125,6 +132,27 @@ export function composeCoordination(input: ComposeCoordinationInput) {
   const ownerQuestionClock: OwnerQuestionClock = { nowIso: () => new Date().toISOString() };
   const attentionItemRepository = new AttentionItemRepositoryAdapter({ stateDir });
   const attentionClock: AttentionClock = { nowIso: () => new Date().toISOString() };
+
+  // O2c: the orchestrator-request store and the shared run-journal delegate.
+  // The journal is a second file-backed LaneRunJournalAdapter on the same
+  // stateDir, sharing `run-journal.json` with the conductor's own adapter
+  // under the existing lock; without a stateDir both stay in memory.
+  const orchestratorSessionRepository = new OrchestratorSessionRepositoryAdapter({ stateDir });
+  const orchestratorRequestRepository = new OrchestratorRequestRepositoryAdapter({ stateDir });
+  const runJournal = new LaneRunJournalAdapter({ stateDir });
+  const orchestratorRequestJournal = new OrchestratorRequestJournalAdapter({
+    append: (entry) => runJournal.append(entry as unknown as LaneRunJournalEntryRecord),
+    listForKey: (key) => runJournal.listForKey(key),
+  });
+  const reconcileOrchestratorRequest = new ReconcileOrchestratorRequestUseCase({
+    requestRepo: orchestratorRequestRepository,
+    sessionRepo: orchestratorSessionRepository,
+    profileRepo: projectProfileRepository,
+    journal: orchestratorRequestJournal,
+    clock: { nowIso: () => new Date().toISOString() },
+    hashDigest: hashOrchestratorRequestDigest,
+    mintEntryId: newUlid,
+  });
 
   // Installation name references for project profiles (P6a): a v2
   // installation enables host and gate-procedure name checks behind profile
@@ -241,6 +269,8 @@ export function composeCoordination(input: ComposeCoordinationInput) {
     listAttentionItems: new ListAttentionItemsUseCase({
       itemRepo: attentionItemRepository,
     }),
+    orchestratorRequestRepository,
+    reconcileOrchestratorRequest,
   };
 
   // AM5-3: the auto-merge policy-grant use case over the shared coordination

@@ -574,6 +574,8 @@ function makeForgeGhRunner(
           closedAt: null,
           mergeCommit: merged ? { oid: head() } : null,
           mergeStateStatus: 'CLEAN',
+          isCrossRepository: false,
+          headRepositoryOwner: { id: 'MDQ6VXNlcjE=', login: 'example-owner', name: 'Example Owner' },
         }),
         stderr: '',
       };

@@ -40,7 +40,7 @@ export interface ForgeReadAdapterOptions {
 
 /** Always ask for state and head: `--json number` alone is answered without the forge. */
 export const PULL_REQUEST_VIEW_FIELDS =
-  'number,state,headRefOid,headRefName,baseRefName,mergedAt,closedAt,mergeCommit,mergeStateStatus';
+  'number,state,headRefOid,headRefName,baseRefName,mergedAt,closedAt,mergeCommit,mergeStateStatus,isCrossRepository,headRepositoryOwner';
 
 const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const HEX_40 = /^[0-9a-f]{40}$/;
@@ -121,6 +121,22 @@ function parseMergeCommit(value: unknown): string | null | undefined {
   return typeof oid === 'string' && HEX_40.test(oid) ? oid : undefined;
 }
 
+/**
+ * The head repository's owner login from one `gh pr view` record: GitHub
+ * answers an owner object carrying `login`; a plain string is also accepted.
+ * `null` when absent or unreadable — never assumed same-repository.
+ */
+function parseHeadRepositoryOwner(value: unknown): string | null {
+  if (typeof value === 'string') {
+    return value.length > 0 ? value : null;
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const login = (value as Record<string, unknown>).login;
+  return typeof login === 'string' && login.length > 0 ? login : null;
+}
+
 /** Pure parse of one `gh pr view --json PULL_REQUEST_VIEW_FIELDS` stdout, checked against the ref. */
 export function parsePullRequestView(stdout: string, ref: PullRequestRef): ReadPullRequestResult {
   let parsed: unknown;
@@ -142,6 +158,8 @@ export function parsePullRequestView(stdout: string, ref: PullRequestRef): ReadP
   const closedAtIso = parseTimestamp(record.closedAt);
   const mergeCommitSha = parseMergeCommit(record.mergeCommit);
   const mergeState = parseMergeStateStatus(record.mergeStateStatus);
+  const isCrossRepository = typeof record.isCrossRepository === 'boolean' ? record.isCrossRepository : null;
+  const headRepositoryOwner = parseHeadRepositoryOwner(record.headRepositoryOwner);
   if (
     number === null ||
     state === null ||
@@ -150,7 +168,11 @@ export function parsePullRequestView(stdout: string, ref: PullRequestRef): ReadP
     baseRef === null ||
     mergedAtIso === undefined ||
     closedAtIso === undefined ||
-    mergeCommitSha === undefined
+    mergeCommitSha === undefined ||
+    // A missing or unreadable fork field refuses the whole read: unknown stays
+    // unknown, and a consumer never assumes same-repository.
+    isCrossRepository === null ||
+    headRepositoryOwner === null
   ) {
     return UNAVAILABLE_UNREADABLE;
   }
@@ -170,6 +192,8 @@ export function parsePullRequestView(stdout: string, ref: PullRequestRef): ReadP
     headSha,
     headRef,
     baseRef,
+    isCrossRepository,
+    headRepositoryOwner,
     mergedAtIso,
     closedAtIso,
     mergeCommitSha,

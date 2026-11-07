@@ -297,10 +297,47 @@ describe('grant attempt binding (CO24e)', () => {
       expect((await resolver().resolveActionAuthorization(resolveFor('att-A'))).outcome).toBe('authorized');
     });
 
-    it('resolves without an attempt and binds nothing', async () => {
+    it('refuses an unbound owner grant resolved without an attempt: no bind, no consume, grant survives (CO24g)', async () => {
       await repo.saveRequest(ownerGrant());
-      expect((await resolver().resolveActionAuthorization(resolveFor())).outcome).toBe('authorized');
-      expect(await repo.findRequestByGrantId('grant-owner')).not.toHaveProperty('grantAttemptId');
+      expect(await resolver().resolveActionAuthorization(resolveFor())).toEqual({
+        outcome: 'blocked',
+        reason: 'attempt-required',
+      });
+      const stored = await repo.findRequestByGrantId('grant-owner');
+      expect(stored).not.toHaveProperty('grantAttemptId');
+      expect(stored?.consumptions).toHaveLength(0);
+      expect(stored?.revision).toBe(1);
+      // The same grant still binds when resolved with the right attempt.
+      expect((await resolver().resolveActionAuthorization(resolveFor('att-A'))).outcome).toBe('authorized');
+      expect((await repo.findRequestByGrantId('grant-owner'))?.grantAttemptId).toBe('att-A');
+    });
+
+    it('refuses an already-bound owner grant resolved without an attempt too (CO24g)', async () => {
+      await repo.saveRequest(ownerGrant({ grantRecordVersion: 2, grantAttemptId: 'att-A' }));
+      expect(await resolver().resolveActionAuthorization(resolveFor())).toEqual({
+        outcome: 'blocked',
+        reason: 'attempt-required',
+      });
+      const stored = await repo.findRequestByGrantId('grant-owner');
+      expect(stored?.grantAttemptId).toBe('att-A');
+      expect(stored?.consumptions).toHaveLength(0);
+    });
+
+    it('resolves a policy grant by its id without an attempt, unaffected (CO24g)', async () => {
+      await repo.saveRequest(
+        ownerGrant({
+          actionScope: 'forge:merge-pr',
+          decisionRevision: 'policy:autoMerge@309ab8c40bf2',
+          policyGrant: { workOrderId: 'wo-1', attemptId: 'att-A', acceptanceReceiptId: 'r-1' },
+        }),
+      );
+      const result = await resolver().resolveActionAuthorization({
+        projectId: 'project-1',
+        actionScope: 'forge:merge-pr',
+        expectedHeadSha: HEAD,
+        authorizationGrantId: 'grant-owner',
+      });
+      expect(result.outcome).toBe('authorized');
     });
 
     it('blocks a blank attempt and a version-2 grant that records none', async () => {

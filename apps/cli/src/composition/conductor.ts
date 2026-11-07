@@ -326,6 +326,9 @@ export function unsealedWorktreeRemovalAuthorizer(
           projectId,
           actionScope,
           expectedHeadSha,
+          // CO24g: the approval is bound to the one attempt it names; a resolve
+          // without the attempt can no longer authorize an unbound owner grant.
+          attemptId,
         });
         if (resolved.outcome !== 'authorized' || resolved.requestId !== coordReq.id) {
           continue;

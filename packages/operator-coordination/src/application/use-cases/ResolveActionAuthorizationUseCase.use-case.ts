@@ -174,6 +174,12 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
    * that resolves it, durably, so a later consumption by another attempt at the same head
    * is refused. A version-2 record without an attempt, and an unusable attempt id, block.
    * A merge grant is attempt-less by design (DT6b) and is never bound.
+   *
+   * CO24g: a resolve that names no attempt cannot authorize an owner grant. An unbound one
+   * refuses (`attempt-required`) without binding or consuming, and an already-bound one also
+   * refuses, because every caller that resolves a bound owner grant passes its attempt and no
+   * anonymous path is needed. Policy grants keep their own recorded attempt and are resolved
+   * only by their id, so they stay unaffected.
    */
   private async bindAttempt(
     candidate: CoordinationRequest,
@@ -184,8 +190,19 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     if (candidate.isMissingRecordedAttempt()) {
       return blocked('grant-attempt-unrecorded');
     }
-    if (request.attemptId === undefined) {
+    // DT6b: a merge grant is anchored by repository, pull request and head, never by an
+    // attempt; it resolves unbound and is never bound.
+    if (candidate.getMergeGrant() !== null) {
       return null;
+    }
+    if (request.attemptId === undefined) {
+      // A policy grant carries its own recorded attempt and resolves only by its id, so it
+      // is unaffected by the attempt-required default. Every other grant — an owner grant,
+      // bound or not — refuses without the attempt coordinate.
+      if (candidate.getPolicyGrant() !== null) {
+        return null;
+      }
+      return blocked('attempt-required');
     }
     if (!isFilled(request.attemptId)) {
       return blocked('grant-attempt-invalid');
@@ -194,9 +211,6 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     const bound = candidate.getBoundAttemptId();
     if (bound !== null) {
       return bound === supplied ? null : blocked('grant-attempt-mismatch');
-    }
-    if (candidate.getMergeGrant() !== null) {
-      return null;
     }
     // CO24f: an unbound owner grant binds only an attempt that exists, belongs
     // to the grant's project and was collected at the requested head, read

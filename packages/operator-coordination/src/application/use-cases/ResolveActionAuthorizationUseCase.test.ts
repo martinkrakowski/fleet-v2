@@ -145,10 +145,29 @@ describe('ResolveActionAuthorizationUseCase', () => {
     expect(result.outcome).toBe('blocked');
   });
 
-  it('keeps today behaviour for grants without merge coordinates', async () => {
+  it('authorizes a bound owner grant resolved by its id with its attempt', async () => {
     const requestRepo = new InMemoryCoordinationRequestRepository();
-    const grant = createStandardGrantRecord();
+    const grant = createStandardGrantRecord({ grantRecordVersion: 2, grantAttemptId: 'att-2' });
     await requestRepo.saveRequest(grant);
+
+    const useCase = new ResolveActionAuthorizationUseCase({ requestRepo });
+    const result = await useCase.resolveActionAuthorization({
+      projectId: 'proj-1',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: headSha,
+      authorizationGrantId: 'grant-2',
+      attemptId: 'att-2',
+    });
+
+    expect(result.outcome).toBe('authorized');
+    if (result.outcome === 'authorized') {
+      expect(result.grantId).toBe('grant-2');
+    }
+  });
+
+  it('refuses an unbound owner grant resolved by its id without an attempt (CO24g)', async () => {
+    const requestRepo = new InMemoryCoordinationRequestRepository();
+    await requestRepo.saveRequest(createStandardGrantRecord());
 
     const useCase = new ResolveActionAuthorizationUseCase({ requestRepo });
     const result = await useCase.resolveActionAuthorization({
@@ -158,10 +177,7 @@ describe('ResolveActionAuthorizationUseCase', () => {
       authorizationGrantId: 'grant-2',
     });
 
-    expect(result.outcome).toBe('authorized');
-    if (result.outcome === 'authorized') {
-      expect(result.grantId).toBe('grant-2');
-    }
+    expect(result).toEqual({ outcome: 'blocked', reason: 'attempt-required' });
   });
 
   it('matches merge coordinates when resolving recorded request by grant id', async () => {

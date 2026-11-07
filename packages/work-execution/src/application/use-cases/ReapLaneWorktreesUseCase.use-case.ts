@@ -73,11 +73,10 @@ export interface ReapLaneWorktreesDependencies {
   /** C2': the scoped owner approval for `--force-unsealed`. */
   readonly actionAuthorization?: Pick<ActionAuthorizationPort, 'authorizeUnsealedWorktreeRemoval'>;
   /**
-   * C2': resolves the runner of the attempt's recorded host. When present,
-   * the worktree must be proved `idle` before any approval is consumed or any
-   * removal runs; `running` is `busy`, anything unprovable is `unknown`.
+   * C2': Required. Absent at runtime (an untyped caller): every removal
+   * candidate is refused `not-configured`; nothing is removed.
    */
-  readonly runnerForAttempt?: RunnerForAttemptPort;
+  readonly runnerForAttempt: RunnerForAttemptPort;
   /** F129: infrastructure digest of the one-way intent; the pure fallback is used when absent. */
   readonly computeDigest?: (content: string) => string;
   /** Clock override; production uses the system clock. */
@@ -673,12 +672,21 @@ async function reapCandidateWorktree(params: ReapCandidateWorktreeParams): Promi
 
   // C2': the runner must prove the worktree idle before any approval is
   // consumed or any removal runs; unprovable liveness is never idle.
-  if (deps.runnerForAttempt !== undefined) {
-    const liveness = await worktreeRunnerLiveness(deps.runnerForAttempt, latestAttempt, recordedHost, budget);
-    if (liveness !== 'idle') {
-      refused.push({ runId: run.runId, reason: liveness });
-      return;
-    }
+  const runnerForAttempt: unknown = deps.runnerForAttempt;
+  const resolveRunner =
+    typeof runnerForAttempt === 'object' &&
+    runnerForAttempt !== null &&
+    typeof (runnerForAttempt as RunnerForAttemptPort).runnerForAttempt === 'function'
+      ? (runnerForAttempt as RunnerForAttemptPort)
+      : undefined;
+  if (resolveRunner === undefined) {
+    refused.push({ runId: run.runId, reason: 'not-configured' });
+    return;
+  }
+  const liveness = await worktreeRunnerLiveness(resolveRunner, latestAttempt, recordedHost, budget);
+  if (liveness !== 'idle') {
+    refused.push({ runId: run.runId, reason: liveness });
+    return;
   }
 
   // C2': where the sealed manifest lives, read from the attempt's record.

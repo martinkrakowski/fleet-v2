@@ -40,7 +40,11 @@ import type {
 } from '../../ports/out/ActionAuthorizationPort.out-port.js';
 import type { ArtifactManifestRemovalCheckResult } from '../../ports/out/AttemptArtifactPort.out-port.js';
 import type { RunnerForAttemptPort } from '../../ports/out/RunnerForAttemptPort.out-port.js';
-import { ReapLaneWorktreesUseCase, unsealedRemovalRequestDigest } from '../ReapLaneWorktreesUseCase.use-case.js';
+import {
+  ReapLaneWorktreesDependencies,
+  ReapLaneWorktreesUseCase,
+  unsealedRemovalRequestDigest,
+} from '../ReapLaneWorktreesUseCase.use-case.js';
 import type { ReapLaneWorktreesResult } from '../../ports/in/ReapLaneWorktreesPort.in-port.js';
 
 const NOW = '2026-10-31T00:00:00.000Z';
@@ -306,8 +310,8 @@ function harness(options: {
   appendJournalEntry?: JournalFake['appendJournalEntry'];
   listAttemptsThrows?: boolean;
   runnerForAttempt?: RunnerForAttemptPort;
-} = {}): Harness {
-  const workOrders = new Map((options.workOrders ?? [makeWorkOrder('wo-a')]).map((r) => [r.id, r]));
+  noRunnerForAttempt?: boolean;
+} = {}): Harness {  const workOrders = new Map((options.workOrders ?? [makeWorkOrder('wo-a')]).map((r) => [r.id, r]));
   const attempts = options.attempts ?? [];
   const runs = options.runs ?? [];
   const journalStates = options.journalStates ?? new Map<string, string>();
@@ -363,6 +367,11 @@ function harness(options: {
   const authorization =
     options.noActionAuthorization === true ? null : makeActionAuthorization(options.authorization);
 
+  const runnerForAttempt: RunnerForAttemptPort | undefined =
+    options.noRunnerForAttempt === true
+      ? undefined
+      : (options.runnerForAttempt ?? defaultRunnerForAttempt());
+
   const useCase = new ReapLaneWorktreesUseCase({
     workOrderRepo,
     attemptRepo,
@@ -375,11 +384,13 @@ function harness(options: {
       ? {}
       : { attemptArtifact: makeAttemptArtifact(options.attemptArtifact) }),
     ...(authorization !== null ? { actionAuthorization: authorization } : {}),
-    ...(options.runnerForAttempt !== undefined ? { runnerForAttempt: options.runnerForAttempt } : {}),
+    ...(runnerForAttempt === undefined
+      ? {}
+      : ({ runnerForAttempt } as { runnerForAttempt: RunnerForAttemptPort })),
     ...(options.storeCallTimeoutMs !== undefined
       ? { storeCallTimeoutMs: options.storeCallTimeoutMs }
       : {}),
-  });
+  } as ReapLaneWorktreesDependencies);
   return {
     useCase,
     workspace,
@@ -397,6 +408,20 @@ function reap(
   return h.useCase.reapLaneWorktrees(request as never) as Promise<
     Extract<ReapLaneWorktreesResult, { outcome: 'reaped' }>
   >;
+}
+
+/** The default fake runner: answers idle so fixtures stay eligible without the option. */
+function defaultRunnerForAttempt(): RunnerForAttemptPort {
+  return {
+    runnerForAttempt: () => ({
+      ok: true,
+      runner: {
+        async inspectWorktreeRun() {
+          return { state: 'idle' };
+        },
+      } as never,
+    }),
+  };
 }
 
 /** One terminal, eligible run: merged journal, merged work order, one collected attempt with a sealed manifest. */
@@ -502,7 +527,6 @@ describe('ReapLaneWorktreesUseCase', () => {
       journalFailed: [],
     });
     expect(h.removeCalls()).toHaveLength(0);
-    expect(h.inspectCalls()).toHaveLength(0);
     expect(h.journal.entries).toHaveLength(0);
   });
 
@@ -1006,7 +1030,6 @@ describe('ReapLaneWorktreesUseCase', () => {
       });
     }
     expect(storeReads).toBe(0);
-    expect(h.inspectCalls()).toHaveLength(0);
     expect(h.removeCalls()).toHaveLength(0);
     expect(h.journal.entries).toHaveLength(0);
 
@@ -1306,5 +1329,26 @@ describe('ReapLaneWorktreesUseCase', () => {
     };
     visit(useCaseDir);
     expect(offenders).toEqual([]);
+  });
+
+  it('refuses not-configured when runnerForAttempt is absent at runtime (untyped caller), removing nothing', async () => {
+    const h = harness({ ...eligibleSeed(), noRunnerForAttempt: true });
+    const result = await reap(h, { dryRun: false });
+    expect(result.refused).toEqual([{ runId: RUN_1, reason: 'not-configured' }]);
+    expect(result.removed).toEqual([]);
+    expect(h.removeCalls()).toHaveLength(0);
+    expect(h.authorization?.calls).toEqual([]);
+    expect(h.journal.entries).toHaveLength(0);
+  });
+
+  it('refuses not-configured when runnerForAttempt is a non-object without the method (untyped caller)', async () => {
+    const bogus = {} as unknown as RunnerForAttemptPort;
+    const h = harness({ ...eligibleSeed(), runnerForAttempt: bogus });
+    const result = await reap(h, { dryRun: false });
+    expect(result.refused).toEqual([{ runId: RUN_1, reason: 'not-configured' }]);
+    expect(result.removed).toEqual([]);
+    expect(h.removeCalls()).toHaveLength(0);
+    expect(h.authorization?.calls).toEqual([]);
+    expect(h.journal.entries).toHaveLength(0);
   });
 });

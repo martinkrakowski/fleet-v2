@@ -572,6 +572,18 @@ describe('conductor reap --worktrees against real git (C2\')', () => {
       workspace,
       attemptArtifact,
       actionAuthorization,
+      // The reap gate requires a runner resolver; this fixture's recorded host
+      // has no real runner seat, so the resolver answers idle for any host.
+      runnerForAttempt: {
+        runnerForAttempt: () => ({
+          ok: true,
+          runner: {
+            async inspectWorktreeRun() {
+              return { state: 'idle' };
+            },
+          } as never,
+        }),
+      },
     });
     return { runtime, root, clonePath, worktreeRoot, worktreePath, head, privateKey };  }
 

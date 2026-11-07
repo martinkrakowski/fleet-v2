@@ -48,7 +48,11 @@ type CurrentRead = { readonly ok: true; readonly sha: string | null } | { readon
 type BuildsRead = { readonly ok: true; readonly builds: readonly ReleaseBuildRecord[] } | { readonly ok: false };
 
 export class ReleaseStoreAdapter implements ReleaseStorePort {
+  /** The filesystem seam, injectable for tests that simulate a swapped root. */
+  constructor(private readonly fsApi: typeof fs = fs) {}
+
   async prepare(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStagingResult> {
+    const fs = this.fsApi;
     if (!SHA_PATTERN.test(input.sha)) {
       return { outcome: 'unreadable' };
     }
@@ -64,11 +68,33 @@ export class ReleaseStoreAdapter implements ReleaseStorePort {
       if ((await lstatOrNull(path.join(input.root, input.sha))) !== null) {
         return { outcome: 'unreadable' };
       }
+      // Pinned before the mkdirs so the re-check below can tell a moved or
+      // swapped root from the one this call verified.
+      const realRoot = await fs.realpath(input.root);
       const buildId = `${input.sha}-${randomBytes(8).toString('hex')}`;
       const buildDir = stagingDir(input.root, buildId);
       // Not recursive: the mkdir fails when the name exists, so this run alone created it.
       await fs.mkdir(buildDir);
       await fs.mkdir(`${buildDir}.home`);
+      // Re-verify after the mkdirs: someone with write access to the root's
+      // parent can swap it for a symlink between the check and the mkdir.
+      // This narrows the check-then-use window; it cannot close it.
+      try {
+        const afterStat = await fs.lstat(input.root);
+        const afterReal = await fs.realpath(input.root);
+        const buildReal = await fs.realpath(buildDir);
+        if (
+          afterStat.isDirectory() === false ||
+          afterStat.isSymbolicLink() ||
+          afterReal !== realRoot ||
+          !buildReal.startsWith(realRoot + path.sep) ||
+          path.dirname(buildReal) !== realRoot
+        ) {
+          return await discardStaging(buildDir, { outcome: 'root-changed' });
+        }
+      } catch {
+        return await discardStaging(buildDir, { outcome: 'root-changed' });
+      }
       return { outcome: 'prepared', buildId, buildDir, archivePath: `${buildDir}.tar`, homeDir: `${buildDir}.home` };
     } catch {
       return { outcome: 'unreadable' };
@@ -212,6 +238,20 @@ async function passesFence(fence: () => Promise<boolean>): Promise<boolean> {
 /** The staging directory of one build id; the name starts with a dot, so `list` never reads it as a build. */
 function stagingDir(root: string, buildId: string): string {
   return path.join(root, `${STAGING_PREFIX}${buildId}`);
+}
+
+/**
+ * Remove exactly the two directories this `prepare` created, non-recursively
+ * and with errors ignored: the caller sees `root-changed`, never a thrown
+ * cleanup failure, and nothing beyond these two names is ever touched.
+ */
+async function discardStaging(
+  buildDir: string,
+  result: { readonly outcome: 'root-changed' },
+): Promise<{ readonly outcome: 'root-changed' }> {
+  await fs.rmdir(buildDir).catch(() => undefined);
+  await fs.rmdir(`${buildDir}.home`).catch(() => undefined);
+  return result;
 }
 
 function isBuildIdOf(buildId: unknown, sha: string): buildId is string {

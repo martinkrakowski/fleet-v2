@@ -45,6 +45,7 @@ export type ManageReleaseRefusal =
   | 'build-failed'
   | 'verify-failed'
   | 'store-unreadable'
+  | 'release-root-changed'
   | 'failed';
 
 export interface ManageReleasePlan {

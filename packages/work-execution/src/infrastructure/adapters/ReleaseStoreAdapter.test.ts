@@ -292,6 +292,43 @@ describe('ReleaseStoreAdapter', () => {
     expect(await fs.readdir(real)).toEqual([]);
   });
 
+  // CO14c fix round 3: with write access to the root's parent, the root can be
+  // renamed away and replaced by a symlink between the check and the mkdirs.
+  // The re-check must report root-changed and remove only what this call made.
+  it('prepare re-verifies the root after the mkdirs and removes only its own staging dirs on a swap', async () => {
+    const other = path.join(tempDir, 'other');
+    let swapped = false;
+    // The real filesystem, except the mkdir that creates the staging directory
+    // is followed by the swap: the root is renamed to `other` and a symlink
+    // replaces it at `root`, so both later mkdirs run through the link.
+    const swapping: typeof fs = {
+      ...fs,
+      mkdir: async (pathOrDir, options) => {
+        await fs.mkdir(pathOrDir as never, options);
+        const dir = pathOrDir.toString();
+        if (!swapped && path.dirname(dir) === root && path.basename(dir).startsWith(`.staging-${A}-`)) {
+          swapped = true;
+          await fs.rename(root, other);
+          await fs.writeFile(path.join(other, 'sentinel.txt'), 'untouched');
+          await fs.symlink(other, root);
+        }
+        return undefined;
+      },
+    } as typeof fs;
+    const swappingAdapter = new ReleaseStoreAdapter(swapping);
+    await fs.mkdir(root, { recursive: true });
+    const result = await swappingAdapter.prepare({ root, sha: A });
+    expect(result).toEqual({ outcome: 'root-changed' });
+    // Neither staging directory remains, reached either way.
+    for (const name of (await fs.readdir(other)).filter((n) => n.startsWith('.staging-'))) {
+      expect(await lstatOrNullForTest(path.join(other, name))).toBeNull();
+      expect(await lstatOrNullForTest(path.join(root, name))).toBeNull();
+    }
+    // The swap is in place and nothing else in `other` was removed.
+    expect((await fs.lstat(root)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(other, 'sentinel.txt'), 'utf8')).toBe('untouched');
+  });
+
   it('prepare refuses when the root is a file rather than a directory', async () => {
     await fs.writeFile(root, 'not a directory');
     expect(await adapter.prepare({ root, sha: A })).toEqual({ outcome: 'unreadable' });

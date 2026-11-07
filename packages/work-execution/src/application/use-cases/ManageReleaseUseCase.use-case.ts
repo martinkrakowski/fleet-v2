@@ -394,6 +394,9 @@ export class ManageReleaseUseCase implements ManageReleasePort {
   private async build(request: ValidRequest, sha: string): Promise<ManageReleaseRefusal | null> {
     const source = request.source as string;
     const staging = await this.deps.store.prepare({ root: request.root, sha });
+    if (staging.outcome === 'root-changed') {
+      return 'release-root-changed';
+    }
     if (staging.outcome !== 'prepared') {
       return 'store-unreadable';
     }

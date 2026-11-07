@@ -81,10 +81,14 @@ class FakeStore implements ReleaseStorePort {
 
   prepared = 0;
   discardUnreadable = false;
+  rootChanged = false;
   readonly preparedIds: string[] = [];
 
   async prepare(input: { root: string; sha: string }): Promise<ReleaseStagingResult> {
     this.calls.push(`prepare ${input.sha}`);
+    if (this.rootChanged) {
+      return { outcome: 'root-changed' };
+    }
     this.prepared += 1;
     const buildId = `${input.sha}-${String(this.prepared).padStart(16, '0')}`;
     this.preparedIds.push(buildId);
@@ -1015,6 +1019,16 @@ describe('ManageReleaseUseCase', () => {
     const { useCase } = granted(SWAP, B, { store });
     const result = await manage(useCase, applyRequest({ action: 'swap', sha: B, source: null }));
     expect(result).toMatchObject({ outcome: 'applied', action: 'swap', target: B, current: B, pruned: [], pruneOutcome: 'unreadable' });
+  });
+
+  // CO14c fix round 3: a re-check that caught a swapped root is its own
+  // refusal, distinct from an unreadable store, and creates nothing.
+  it('refuses release-root-changed when the store reports the root swapped under it', async () => {
+    const store = new FakeStore([build('a', 1), build('b', 2), build('c', 3), build('d', 4), build('e', 5)], E);
+    store.rootChanged = true;
+    const { useCase } = granted(INSTALL, F, { store });
+    const result = await manage(useCase, applyRequest({ root: ROOT, source: SOURCE, sha: F }));
+    expect(result).toEqual({ outcome: 'refused', reason: 'release-root-changed' });
   });
 
   // CO14c fix round 2: the store never creates the release root, so even an

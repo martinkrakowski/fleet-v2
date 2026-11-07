@@ -45,13 +45,18 @@ export type ReleaseStagingResult =
       /** An empty home directory for this run's build children, never the operator's. */
       readonly homeDir: string;
     }
-  | { readonly outcome: 'unreadable' };
+  | { readonly outcome: 'unreadable' }
+  /** The root was swapped for a symlink or moved between the check and the mkdirs; nothing this call created remains. */
+  | { readonly outcome: 'root-changed' };
 
 export interface ReleaseStorePort {
   /**
-   * Create <root> and a new, uniquely named staging directory for <sha>; it
-   * refuses (`unreadable`) when <root>/<sha> already exists, so a stale or
-   * unverified tree is never built over. Never writes a build.
+   * Stage a new, uniquely named staging directory for <sha>; it refuses
+   * (`unreadable`) when the root is missing or not a real directory, or when
+   * <root>/<sha> already exists, so a stale or unverified tree is never built
+   * over. After the staging directories are created it re-verifies the root
+   * and returns `root-changed` (removing only what this call created) when it
+   * was swapped or moved in between. Never writes a build.
    */
   prepare(input: { readonly root: string; readonly sha: string }): Promise<ReleaseStagingResult>;
   list(input: { readonly root: string }): Promise<ReleaseStoreListing>;

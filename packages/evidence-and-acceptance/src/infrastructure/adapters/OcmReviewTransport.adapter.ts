@@ -12,6 +12,7 @@ import {
   isSafeRelativeFilePath,
   validateReviewAnswerObject,
 } from '../../domain/review-answer-schema.js';
+import { validateReviewStream } from '../../domain/review-stream-grammar.js';
 import type { EvidenceResultValue } from '../../domain/value-objects/EvidenceResult.vo.js';
 import type { ReviewTransportDiagnostic, ReviewUnavailableCode, RunIndependentReviewRequest } from '../../application/ports/out/IndependentReviewPort.out-port.js';
 import type { IndependentReviewTransportResult } from './IndependentReviewAdapter.adapter.js';
@@ -636,28 +637,6 @@ export function extractTextPart(record: Record<string, unknown>): string | null 
   return null;
 }
 
-function isStepStart(record: Record<string, unknown>): boolean {
-  if (record.type === 'step_start' || record.type === 'step-start') {
-    return true;
-  }
-  const part = isPlainRecord(record.part) ? record.part : null;
-  if (part !== null && (part.type === 'step_start' || part.type === 'step-start')) {
-    return true;
-  }
-  return false;
-}
-
-function isStepFinish(record: Record<string, unknown>): boolean {
-  if (record.type === 'step_finish' || record.type === 'step-finish') {
-    return true;
-  }
-  const part = isPlainRecord(record.part) ? record.part : null;
-  if (part !== null && (part.type === 'step_finish' || part.type === 'step-finish')) {
-    return true;
-  }
-  return false;
-}
-
 function isToolEvent(record: Record<string, unknown>): boolean {
   if (record.type === 'tool' || record.type === 'tool_use' || record.type === 'tool_call') {
     return true;
@@ -1262,17 +1241,65 @@ export async function defaultSpawn(
   };
 }
 
+/** True when one parsed event has an unrecognised type or part, or a tool event that is not a known read-only tool. */
+function eventVoidsReadOnly(parsed: Record<string, unknown>): boolean {
+  if (typeof parsed.type !== 'string' || !RECOGNISED_EVENT_TYPES.has(parsed.type)) {
+    return true;
+  }
+  if (parsed.part !== undefined) {
+    if (!isPlainRecord(parsed.part)) {
+      return true;
+    }
+    if (
+      parsed.part.type !== undefined &&
+      (typeof parsed.part.type !== 'string' || !ALLOWED_PART_TYPES.has(parsed.part.type))
+    ) {
+      return true;
+    }
+  }
+  if (isToolEvent(parsed)) {
+    // F68: the prompt voids any shell call whatever the command, so no
+    // command is read: the four read-only tools keep the proof and every
+    // other tool (bash and shell included, `git status` included, an
+    // unreadable command included) voids it.
+    const toolName = extractToolName(parsed);
+    return toolName === null || !READ_ONLY_REVIEW_TOOLS.has(toolName);
+  }
+  return false;
+}
+
 /**
- * RV5 (Fable, F157 hand fix): a stream-format answer is accepted only after the
- * stream finished. Without a `step_finish` event the run was cut short, and no
- * verdict is read from it, PASS or otherwise: the answer is `unknown`
- * (`stream-incomplete`). Plain-text answers from other transports never come
- * through here; they are parsed directly by parseReviewReplyStrict. Every
- * step emits its own finish, so the test is that the LAST step started also
- * finished: an earlier step's finish does not cover a step cut short.
+ * The read-only verification scan over the raw stream: every line must be a
+ * JSON record of a recognised event type with an allowed part type, and every
+ * tool event must name one of the read-only tools. `hasStepStart` is true only
+ * on an event-level step start, matching the stream grammar. It never throws
+ * and reads no verdict (RV5b: the verdict comes from `validateReviewStream`).
  */
-function isStreamCutBeforeFinish(hasStepFinish: boolean, lastStepOpen: boolean): boolean {
-  return !hasStepFinish || lastStepOpen;
+function scanStreamReadOnly(rawStdout: string): { readonly readOnlyVoided: boolean; readonly hasStepStart: boolean } {
+  let readOnlyVoided = false;
+  let hasStepStart = false;
+  for (const rawLine of rawStdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line === '') continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      readOnlyVoided = true;
+      continue;
+    }
+    if (!isPlainRecord(parsed)) {
+      readOnlyVoided = true;
+      continue;
+    }
+    if (parsed.type === 'step_start' || parsed.type === 'step-start') {
+      hasStepStart = true;
+    }
+    if (eventVoidsReadOnly(parsed)) {
+      readOnlyVoided = true;
+    }
+  }
+  return { readOnlyVoided, hasStepStart };
 }
 
 export function createOcmReviewTransport(
@@ -1455,76 +1482,10 @@ export function createOcmReviewTransport(
       );
     }
 
-    // 7. Parse stdout JSON lines for text and tool parts
-    // A missing or non-string stdout reads as empty; the parse loop never throws.
+    // 7. Scan stdout for the read-only proof; a missing or non-string stdout reads as empty.
     const spawnStdout = safeRead(() => spawnResult.stdout);
-    let readOnlyVoided = false;
-    let hasStepStart = false;
-    let hasStepFinish = false;
-    let lastStepOpen = false;
-    const textParts: string[] = [];
-    const toolNames: string[] = [];
-    for (const rawLine of (typeof spawnStdout === 'string' ? spawnStdout : '').split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (line === '') continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        readOnlyVoided = true;
-        continue;
-      }
-      if (!isPlainRecord(parsed)) {
-        readOnlyVoided = true;
-        continue;
-      }
-
-      if (typeof parsed.type !== 'string' || !RECOGNISED_EVENT_TYPES.has(parsed.type)) {
-        readOnlyVoided = true;
-      }
-
-      if (parsed.part !== undefined) {
-        if (!isPlainRecord(parsed.part)) {
-          readOnlyVoided = true;
-        } else if (
-          parsed.part.type !== undefined &&
-          (typeof parsed.part.type !== 'string' || !ALLOWED_PART_TYPES.has(parsed.part.type))
-        ) {
-          readOnlyVoided = true;
-        }
-      }
-
-      if (isStepStart(parsed)) {
-        hasStepStart = true;
-        lastStepOpen = true;
-      }
-
-      if (isStepFinish(parsed)) {
-        hasStepFinish = true;
-        lastStepOpen = false;
-      }
-
-      if (isToolEvent(parsed)) {
-        const toolName = extractToolName(parsed);
-        if (toolName === null) {
-          readOnlyVoided = true;
-        } else {
-          toolNames.push(toolName);
-          // F68: the prompt voids any shell call whatever the command, so no
-          // command is read: the four read-only tools keep the proof and every
-          // other tool (bash and shell included, `git status` included, an
-          // unreadable command included) voids it.
-          if (!READ_ONLY_REVIEW_TOOLS.has(toolName)) {
-            readOnlyVoided = true;
-          }
-        }
-      }
-
-      const textPart = extractTextPart(parsed);
-      if (textPart !== null) {
-        textParts.push(textPart);
-      }
-    }
+    const rawStdout = typeof spawnStdout === 'string' ? spawnStdout : '';
+    const { readOnlyVoided, hasStepStart } = scanStreamReadOnly(rawStdout);
 
     // 8. Verify head after review and compute readOnlyVerified
     const after = await options.readHead(dir);
@@ -1534,18 +1495,20 @@ export function createOcmReviewTransport(
       before === request.candidateHeadSha &&
       after === request.candidateHeadSha;
 
-    // 9. Parse verdict, findings, and rawOutput
-    if (isStreamCutBeforeFinish(hasStepFinish, lastStepOpen)) {
+    // 9. RV5b: the verdict is read only from a stream that satisfies the step
+    // grammar; every violation is unknown (`stream-grammar`) with no verdict read.
+    const stream = validateReviewStream(rawStdout);
+    if (!stream.ok) {
       return {
-        rawOutput: 'stream-incomplete',
+        rawOutput: 'stream-grammar',
         readOnlyVerified,
         result: 'unknown',
         findings: [],
+        unknownReason: 'stream-grammar',
         completedAtIso: new Date().toISOString(),
       };
     }
-    // Each text part is a whole message part; a part that does not end in a newline must not glue its last line onto the next part's first.
-    const finalText = textParts.join('\n');
+    const finalText = stream.verdictText;
     // A conductor request (a kind) is validated strictly; a manual request keeps today's parse.
     const { result, findings, unknownReason } =
       request.kind !== undefined

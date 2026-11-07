@@ -8,5 +8,6 @@ export * from "./evidence-records.js";
 export * from "./placeholder-evidence.js";
 export * from "./review-answer-schema.js";
 export * from "./review-selection.js";
+export * from "./review-stream-grammar.js";
 export * from "./untrusted-input.js";
 export * from "./value-objects/index.js";

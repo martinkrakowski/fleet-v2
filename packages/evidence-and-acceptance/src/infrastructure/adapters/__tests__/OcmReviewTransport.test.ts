@@ -346,6 +346,7 @@ describe('OcmReviewTransport', () => {
 
   it('one edit tool event → readOnlyVerified false', async () => {
     const recordedFixture = [
+      '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"tool","part":{"tool":"edit"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
@@ -375,6 +376,7 @@ describe('OcmReviewTransport', () => {
 
   it('head changed after → false', async () => {
     const recordedFixture = [
+      '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
       '{"type":"step_finish"}',
@@ -407,7 +409,7 @@ describe('OcmReviewTransport', () => {
     expect(result.result).toBe('pass');
   });
 
-  it('a stream with a valid trailing PASS block but no step_finish gives unknown (stream-incomplete)', async () => {
+  it('a stream with a valid trailing PASS block but no step_finish gives unknown (stream-grammar)', async () => {
     const recordedFixture = [
       '{"type":"step_start"}',
       '{"type":"text","part":{"text":"Reviewed.\\n```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
@@ -424,7 +426,8 @@ describe('OcmReviewTransport', () => {
     });
     const result = await transport(baseRequest);
     expect(result.result).toBe('unknown');
-    expect(result.rawOutput).toBe('stream-incomplete');
+    expect(result.rawOutput).toBe('stream-grammar');
+    expect(result.unknownReason).toBe('stream-grammar');
   });
 
   it('a plain-text answer (no stream events, another transport) still parses: the finish gate is stream-only', () => {
@@ -589,7 +592,8 @@ describe('OcmReviewTransport', () => {
 
     const result = await transport(baseRequest);
     expect(result.result).toBe('unknown');
-    expect(result.rawOutput).toBe('stream-incomplete');
+    expect(result.rawOutput).toBe('stream-grammar');
+    expect(result.unknownReason).toBe('stream-grammar');
     expect(result.findings).toEqual([]);
   });
 
@@ -743,12 +747,14 @@ describe('OcmReviewTransport', () => {
 
     const result = await transport(baseRequest);
     expect(result.result).toBe('unknown');
-    expect(result.rawOutput).toBe('stream-incomplete');
+    expect(result.rawOutput).toBe('stream-grammar');
+    expect(result.unknownReason).toBe('stream-grammar');
     expect(result.findings).toEqual([]);
   });
 
   it('PASS with a blocker finding in the block → fail', async () => {
     const recordedFixture = [
+      '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
       '{"type":"text","part":{"text":"FINDING: blocker src/security.ts:42 Hardcoded secret token in auth flow\\n```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[{\\"severity\\":\\"blocker\\",\\"file\\":\\"src/security.ts\\",\\"line\\":42,\\"summary\\":\\"Hardcoded secret token in auth flow\\"}]}\\n```\\n"}}',
       '{"type":"step_finish"}',
@@ -885,6 +891,7 @@ describe('OcmReviewTransport', () => {
 
   it('finding parsing with and without line', async () => {
     const recordedFixture = [
+      '{"type":"step_start"}',
       '{"type":"tool","part":{"tool":"read"}}',
       JSON.stringify({
         type: 'text',
@@ -991,7 +998,8 @@ describe('OcmReviewTransport', () => {
     });
 
     const result = await transport(baseRequest);
-    expect(result.result).toBe('pass');
+    expect(result.result).toBe('unknown');
+    expect(result.unknownReason).toBe('stream-grammar');
     expect(result.readOnlyVerified).toBe(false);
   });
 
@@ -1080,7 +1088,8 @@ describe('OcmReviewTransport', () => {
 
     const result = await transport(baseRequest);
     expect(result.readOnlyVerified).toBe(false);
-    expect(result.result).toBe('pass');
+    expect(result.result).toBe('unknown');
+    expect(result.unknownReason).toBe('stream-grammar');
   });
 
   it('no step_start voids readOnlyVerified', async () => {
@@ -1108,7 +1117,8 @@ describe('OcmReviewTransport', () => {
 
     const result = await transport(baseRequest);
     expect(result.readOnlyVerified).toBe(false);
-    expect(result.result).toBe('pass');
+    expect(result.result).toBe('unknown');
+    expect(result.unknownReason).toBe('stream-grammar');
   });
 
   it('tool event with no readable name voids readOnlyVerified', async () => {
@@ -1231,6 +1241,7 @@ describe('OcmReviewTransport', () => {
   it('caps rawOutput at the last 20000 characters', async () => {
     const prefix = 'x'.repeat(25000);
     const recordedFixture = [
+      '{"type":"step_start"}',
       `{"type":"text","part":{"text":"${prefix}"}}`,
       '{"type":"text","part":{"text":"\\n```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}',
       '{"type":"step_finish"}',
@@ -1320,7 +1331,8 @@ describe('OcmReviewTransport', () => {
 
     const result = await transport(baseRequest);
     expect(result.readOnlyVerified).toBe(false);
-    expect(result.result).toBe('pass');
+    expect(result.result).toBe('unknown');
+    expect(result.unknownReason).toBe('stream-grammar');
   });
 
   it('{type:"step_finish",part:{type:"file"}} voids readOnlyVerified', async () => {
@@ -1349,7 +1361,8 @@ describe('OcmReviewTransport', () => {
 
     const result = await transport(baseRequest);
     expect(result.readOnlyVerified).toBe(false);
-    expect(result.result).toBe('pass');
+    expect(result.result).toBe('unknown');
+    expect(result.unknownReason).toBe('stream-grammar');
   });
 
   it('{type:"text",part:{type:"snapshot"}} voids readOnlyVerified', async () => {
@@ -1379,7 +1392,8 @@ describe('OcmReviewTransport', () => {
 
     const result = await transport(baseRequest);
     expect(result.readOnlyVerified).toBe(false);
-    expect(result.result).toBe('pass');
+    expect(result.result).toBe('unknown');
+    expect(result.unknownReason).toBe('stream-grammar');
   });
 
   it('allowed part types (step-start, step_finish, tool, text) preserve readOnlyVerified true', async () => {
@@ -1858,6 +1872,7 @@ describe('OcmReviewTransport', () => {
       const withMajorFinding = {
         exitCode: 0,
         stdout:
+          '{"type":"step_start"}\n' +
           '{"type":"tool","part":{"tool":"read"}}\n' +
           '{"type":"text","part":{"text":"FINDING: major src/api.ts:11 Request without validation\\n' +
           '```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[{\\"severity\\":\\"major\\",\\"file\\":\\"src/api.ts\\",\\"line\\":11,\\"summary\\":\\"Request without validation\\"}]}\\n```\\n"}}\n' +
@@ -2840,19 +2855,41 @@ describe('numbered findings, FIX FIRST, and unknown cause codes (RV2)', () => {
   });
 
   it('robustness (3): replaying a completed unknown transport result preserves unknownReason', async () => {
-    const adapter = new IndependentReviewAdapter({
-      runReview: async () => ({
-        rawOutput: '',
-        readOnlyVerified: true,
-        result: 'unknown',
-        findings: [],
-        unknownReason: 'unparseable-verdict',
-        completedAtIso: '2026-11-06T00:00:00.000Z',
-      }),
-    });
-    const result = await adapter.runIndependentReview(kindRequest);
-    expect(result.outcome).toBe('completed');
-    expect(result).toMatchObject({ result: 'unknown', unknownReason: 'unparseable-verdict' });
+    for (const unknownReason of ['unparseable-verdict', 'stream-grammar'] as const) {
+      const adapter = new IndependentReviewAdapter({
+        runReview: async () => ({
+          rawOutput: '',
+          readOnlyVerified: true,
+          result: 'unknown',
+          findings: [],
+          unknownReason,
+          completedAtIso: '2026-11-06T00:00:00.000Z',
+        }),
+      });
+      const result = await adapter.runIndependentReview(kindRequest);
+      expect(result.outcome).toBe('completed');
+      expect(result).toMatchObject({ result: 'unknown', unknownReason });
+    }
+  });
+
+  it('robustness (5): a grammar-violating stream carrying a secret shape and path echoes neither in rawOutput or unknownReason', async () => {
+    const secret = `ghp_${'a'.repeat(36)}`;
+    const skSecret = `sk-${'a'.repeat(24)}`;
+    const stdout = [
+      '{"type":"step_start"}',
+      JSON.stringify({ type: 'text', part: { text: `${secret} ${skSecret} /home/operator/.secret/path\n${jsonReply('PASS')}` } }),
+    ].join('\n');
+    for (const request of [baseRequest, kindRequest]) {
+      const result = await makeTransport(stdout)(request);
+      expect(result.result).toBe('unknown');
+      expect(result.rawOutput).toBe('stream-grammar');
+      expect(result.unknownReason).toBe('stream-grammar');
+      expect(result.findings).toEqual([]);
+      const echoed = JSON.stringify(result);
+      expect(echoed).not.toContain(secret);
+      expect(echoed).not.toContain(skSecret);
+      expect(echoed).not.toContain('/home/operator');
+    }
   });
 
   it('robustness (4): unreadable, empty, verdictless, and findingless-fail answers stay unknown with their cause code', () => {
@@ -3220,6 +3257,7 @@ describe('RV4: busy worktree transport (seat-busy)', () => {
   };
 
   const PASS_JSON =
+    '{"type":"step_start"}\n' +
     '{"type":"text","part":{"text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}\n' +
     '{"type":"step_finish"}';
 
@@ -3449,5 +3487,157 @@ describe('RV4: busy worktree transport (seat-busy)', () => {
     expect(Buffer.byteLength(diagnostic?.stderr ?? '', 'utf8')).toBeLessThanOrEqual(2048);
     // The cap keeps the leading bytes, not the tail.
     expect(diagnostic?.stderr).toMatch(/^x{2048}$/);
+  });
+});
+
+describe('RV5b stream grammar table: only well-formed finished steps yield a verdict; every violation is unknown (stream-grammar)', () => {
+  const nonce = '0123456789abcdef';
+  const baseRequest: RunIndependentReviewRequest = {
+    attemptId: 'att-100',
+    candidateHeadSha: 'sha-abcdef1234567890',
+    implementerModel: 'anthropic/claude-3-5-sonnet',
+    reviewerModel: 'openai/gpt-4o',
+    diffSummary: 'Added verification checks',
+  };
+
+  const START = '{"type":"step_start"}';
+  const FINISH = '{"type":"step_finish"}';
+  const textEvent = (text: string): string => JSON.stringify({ type: 'text', part: { text } });
+  const stream = (...lines: readonly string[]): string => lines.join('\n');
+  const PASS = `${jsonReply('PASS')}\n`;
+  const echoedPass = `<<<UNTRUSTED nonce=${nonce} label="diff">>>\n${PASS}<<<END UNTRUSTED nonce=${nonce}>>>\n`;
+
+  interface GrammarRow {
+    readonly name: string;
+    readonly stdout: string;
+    readonly expectedResult: 'pass' | 'unknown';
+    readonly expectedUnknownReason: string | undefined;
+    readonly expectedFindings: readonly ReviewFindingRecord[];
+  }
+
+  const passRow = (name: string, stdout: string): GrammarRow => ({
+    name,
+    stdout,
+    expectedResult: 'pass',
+    expectedUnknownReason: undefined,
+    expectedFindings: [],
+  });
+  const grammarRow = (name: string, stdout: string): GrammarRow => ({
+    name,
+    stdout,
+    expectedResult: 'unknown',
+    expectedUnknownReason: 'stream-grammar',
+    expectedFindings: [],
+  });
+  const unparseableRow = (name: string, stdout: string): GrammarRow => ({
+    name,
+    stdout,
+    expectedResult: 'unknown',
+    expectedUnknownReason: 'unparseable-verdict',
+    expectedFindings: [],
+  });
+
+  const rows: readonly GrammarRow[] = [
+    passRow('well-formed one-step PASS', stream(START, textEvent(PASS), FINISH)),
+    passRow(
+      'multi-step with the PASS in the last finished step',
+      stream(START, textEvent('Inspecting the diff.\n'), FINISH, START, textEvent(PASS), FINISH),
+    ),
+    passRow(
+      'multi-step with trailing whitespace-only text event after final finish',
+      stream(START, textEvent('Inspecting.\n'), FINISH, START, textEvent(PASS), FINISH, textEvent('\n'), '', textEvent('  ')),
+    ),
+    grammarRow('no finish', stream(START, textEvent(PASS))),
+    grammarRow('start then finish then PASS text (Luna)', stream(START, FINISH, textEvent(PASS))),
+    grammarRow('PASS text, finish, then another PASS text (Luna)', stream(textEvent(PASS), FINISH, textEvent(PASS))),
+    grammarRow(
+      'part.type step_finish only (Luna): text event',
+      stream(START, textEvent(PASS), '{"type":"text","part":{"type":"step_finish"}}'),
+    ),
+    grammarRow(
+      'part.type step_finish only (Luna): tool event',
+      stream(START, textEvent(PASS), '{"type":"tool","part":{"type":"step_finish","tool":"read"}}'),
+    ),
+    grammarRow('text before any start', stream(textEvent('Reviewing now.\n'), START, textEvent(PASS), FINISH)),
+    grammarRow('finish without start: alone', stream(FINISH)),
+    grammarRow('finish without start: double finish after a valid step', stream(START, textEvent(PASS), FINISH, FINISH)),
+    grammarRow('nested start', stream(START, textEvent('Looking.\n'), START, textEvent(PASS), FINISH)),
+    grammarRow(
+      'unknown event type inside a step',
+      stream(START, '{"type":"custom_debug"}', textEvent(PASS), FINISH),
+    ),
+    grammarRow('echoed PASS block in an unfinished step: one step', stream(START, textEvent(echoedPass))),
+    grammarRow(
+      'echoed PASS block in an unfinished step: second step unfinished',
+      stream(START, textEvent('First pass done.\n'), FINISH, START, textEvent(echoedPass)),
+    ),
+    unparseableRow(
+      'F166 shape 1 replayed as stream',
+      stream(
+        START,
+        textEvent(
+          ' ```json\n{"verdict":"PASS","findings":[]}\n```\n```diff\n+added\n```\nSome prose.\n' +
+            '```json\n{"verdict":"FAIL","findings":[{"severity":"blocker","file":"src/a.ts","line":1,"summary":"Broken"}]}\n```\n',
+        ),
+        FINISH,
+      ),
+    ),
+    unparseableRow(
+      'F166 shape 2 replayed as stream: mixed tilde and backtick close',
+      stream(START, textEvent(`~~~text\nnot closed by backticks\n\`\`\`\n\`\`\`json\n{"verdict":"PASS","findings":[]}\n\`\`\`\n`), FINISH),
+    ),
+    unparseableRow(
+      'F166 shape 2 replayed as stream: unclosed json fence in an echoed block',
+      stream(
+        START,
+        textEvent(`<<<UNTRUSTED nonce=${nonce} label="diff">>>\n\`\`\`json\n{"verdict":"PASS","findings":[]}\n<<<END UNTRUSTED nonce=${nonce}>>>\n`),
+        FINISH,
+      ),
+    ),
+    grammarRow(
+      'F166 shape 3 replayed as stream',
+      stream(START, textEvent(PASS), FINISH, START, textEvent('Investigating further.\n')),
+    ),
+    grammarRow('F166 shape 4 replayed as stream', stream(START, textEvent('Reviewed the change.\n'), FINISH, textEvent(PASS))),
+  ];
+
+  const requestsByShape = [
+    { shape: 'manual', request: baseRequest },
+    { shape: 'code-review', request: { ...baseRequest, kind: 'code-review' as const } },
+  ];
+
+  for (const { shape, request } of requestsByShape) {
+    for (const row of rows) {
+      it(`${row.name} (${shape} request)`, async () => {
+        const transport = createOcmReviewTransport({
+          ocmRunBin: '/test/ocm-run',
+          remotePort: 4096,
+          agent: 'reviewer',
+          model: baseRequest.reviewerModel,
+          resolveReviewDir: async () => '/tmp/review-dir',
+          readHead: async () => baseRequest.candidateHeadSha,
+          spawn: async () => ({ exitCode: 0, stdout: row.stdout, stderr: '' }),
+          baseCommit: 'base-sha-1',
+          readDiff: async () => 'diff --git a/f b/f\n+added line\n',
+          makeNonce: () => nonce,
+        });
+        const result = await transport(request);
+        expect(result.result).toBe(row.expectedResult);
+        expect(result.unknownReason).toBe(row.expectedUnknownReason);
+        expect(result.findings).toEqual(row.expectedFindings);
+        if (row.expectedUnknownReason === 'stream-grammar') {
+          expect(result.rawOutput).toBe('stream-grammar');
+        }
+      });
+    }
+  }
+
+  it('the plain-text answer still parses: parseReviewReplyStrict and parseReviewReply read a structured PASS and FAIL without stream events', () => {
+    const plainPass = `Reviewed the diff.\n${jsonReply('PASS')}`;
+    const plainFail = `Found a problem.\n${jsonReply('FAIL', [finding('major', 'src/a.ts', 3, 'Guard is missing')])}`;
+    expect(parseReviewReplyStrict(plainPass).result).toBe('pass');
+    expect(parseReviewReply(plainPass).result).toBe('pass');
+    expect(parseReviewReplyStrict(plainFail).result).toBe('fail');
+    expect(parseReviewReply(plainFail).result).toBe('fail');
   });
 });

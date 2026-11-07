@@ -626,6 +626,28 @@ describe("fleet-v2 hosts edit", () => {
     expect(parsed.hosts.lanehost?.roles).toEqual(["lane-runner"]);
   });
 
+  it("PT1a: edits a host in a file whose policy.daemon.stallAfterMinutes is bad, keeping the operator's value", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, {
+      ...(v2Installation(path.join(dir, "worktrees")) as Record<string, unknown>),
+      policy: { daemon: { stallAfterMinutes: 0 } },
+    });
+    const { code, stdout, stderr } = await runHosts(
+      ["edit", "lanehost", "--port", "4266", "--yes"],
+      file,
+    );
+    expect(stderr).not.toContain("stallAfterMinutes");
+    expect(code).toBe(0);
+    expect(stdout).toContain("written");
+    const written = JSON.parse(readFileSync(file, "utf8")) as {
+      hosts: Record<string, { runner?: { port: number } }>;
+      policy: { daemon: { stallAfterMinutes: number } };
+    };
+    expect(written.hosts.lanehost?.runner?.port).toBe(4266);
+    expect(written.policy.daemon.stallAfterMinutes).toBe(0);
+  });
+
   it("edits the roles of an existing host", async () => {
     const dir = makeTempDir();
     const file = path.join(dir, "fleet.json");

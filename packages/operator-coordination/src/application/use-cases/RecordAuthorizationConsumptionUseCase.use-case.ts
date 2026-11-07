@@ -15,6 +15,7 @@ import type {
 } from '../../domain/coordination-records.js';
 import { AuthorizationConsumption } from '../../domain/entities/AuthorizationConsumption.js';
 import { CoordinationRequest } from '../../domain/entities/CoordinationRequest.js';
+import { isReleaseActionScope } from '../../domain/coordination-records.js';
 import type {
   RecordAuthorizationConsumptionPort,
   RecordAuthorizationConsumptionRequest,
@@ -107,9 +108,15 @@ export class RecordAuthorizationConsumptionUseCase implements RecordAuthorizatio
     // A grant that records an attempt, owner or policy, authorizes no other
     // (CO24e). A version-2 record without one authorizes nothing. A legacy grant
     // records no attempt and keeps the composition's own binding (CO24d) until
-    // it expires. Both checks run before anything is recorded.
+    // it expires. Both checks run before anything is recorded. A release grant
+    // (CO14, CO24g) is attempt-less by design: only the three exact release
+    // scopes (`release:install`, `release:swap`, `release:rollback`) are
+    // exempt, each anchored by its scope and exact head and consumed once, so
+    // the consumption records the deterministic action id as its attempt
+    // coordinate; an unknown `release:*` scope is an owner grant and stays
+    // under the recorded-attempt check.
     const aggregate = CoordinationRequest.fromRecord(recorded);
-    if (aggregate.isMissingRecordedAttempt()) {
+    if (!isReleaseActionScope(recorded.actionScope) && aggregate.isMissingRecordedAttempt()) {
       return refused('grant-attempt-unrecorded');
     }
     const boundAttemptId = aggregate.getBoundAttemptId();

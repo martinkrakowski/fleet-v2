@@ -35,6 +35,7 @@ export * from "./ListConductorPassesUseCase.use-case.js";
 export * from "./ListLaneRunsUseCase.use-case.js";
 export * from "./ListMergeQueueUseCase.use-case.js";
 export * from "./ListStaleWorkOrdersUseCase.use-case.js";
+export * from "./ListStalledRunsUseCase.use-case.js";
 export * from "./ListUnregisteredProjectsUseCase.use-case.js";
 export * from "./ManageCutoverUseCase.use-case.js";
 export * from "./ManageDaemonSchedulerUseCase.use-case.js";

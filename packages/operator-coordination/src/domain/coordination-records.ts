@@ -170,6 +170,21 @@ export interface MergeGrantRecord {
  */
 export const GRANT_RECORD_VERSION = 2 as const;
 
+/**
+ * The exact scope of a release grant (cutover row CO14): `release:install`,
+ * `release:swap` or `release:rollback`. A release grant is attempt-less by
+ * design (CO24g): it is anchored by its scope and exact head and consumed once
+ * by its deterministic action id, so it never binds a work attempt. No other
+ * `release:*` scope is exempt: an unknown release scope is an owner grant and
+ * must bind an attempt like any other.
+ */
+export const RELEASE_ACTION_SCOPES = ['release:install', 'release:swap', 'release:rollback'] as const;
+
+/** True only for one of the three exact release action scopes; such a grant never binds an attempt. */
+export function isReleaseActionScope(actionScope: string): boolean {
+  return (RELEASE_ACTION_SCOPES as readonly string[]).includes(actionScope);
+}
+
 /** Serializable snapshot of the CoordinationRequest aggregate. */
 export interface CoordinationRequestRecord {
   readonly id: string;

@@ -65,6 +65,21 @@ function resolve(
 }
 
 describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', () => {
+  // CO24g: owner grants resolve with their recorded attempt; the fallback picks
+  // among approved record, and the attempt binds or matches after the pick.
+  const ATTEMPT = 'attempt-example-a';
+
+  it('refuses an unbound owner grant resolved without an attempt (CO24g)', async () => {
+    const repository = new CoordinationRequestRepositoryAdapter();
+    await saveAll(repository, [requestRecord()]);
+    const result = await resolve(repository, {
+      projectId: 'project-example',
+      actionScope: 'forge:merge-pr',
+      expectedHeadSha: HEAD,
+    });
+    expect(result).toEqual({ outcome: 'blocked', reason: 'attempt-required' });
+  });
+
   it('does not shadow an owner grant with a newer policy grant', async () => {
     const repository = new CoordinationRequestRepositoryAdapter();
     await saveAll(repository, [
@@ -73,6 +88,8 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
         grantId: 'grant-owner-b',
         expectedHeadSha: HEAD_B,
         decisionRevision: 'decision-example-b',
+        grantRecordVersion: 2,
+        grantAttemptId: ATTEMPT,
         createdAtIso: NOW_OLDER,
         updatedAtIso: NOW_OLDER,
       }),
@@ -89,6 +106,7 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
       projectId: 'project-example',
       actionScope: 'forge:merge-pr',
       expectedHeadSha: HEAD_B,
+      attemptId: ATTEMPT,
     });
     expect(atB).toMatchObject({ outcome: 'authorized', grantId: 'grant-owner-b' });
 
@@ -96,6 +114,7 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
       projectId: 'project-example',
       actionScope: 'forge:merge-pr',
       expectedHeadSha: HEAD_HA,
+      attemptId: ATTEMPT,
     });
     expect(atHa).toEqual({
       outcome: 'blocked',
@@ -109,6 +128,8 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
       requestRecord({
         id: 'request-owner',
         grantId: 'grant-owner',
+        grantRecordVersion: 2,
+        grantAttemptId: ATTEMPT,
         createdAtIso: NOW_OLDER,
         updatedAtIso: NOW_OLDER,
       }),
@@ -125,6 +146,7 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
       projectId: 'project-example',
       actionScope: 'forge:merge-pr',
       expectedHeadSha: HEAD,
+      attemptId: ATTEMPT,
     });
     expect(result).toMatchObject({ outcome: 'authorized', grantId: 'grant-owner' });
   });
@@ -205,12 +227,16 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
       requestRecord({
         id: 'request-owner-old',
         grantId: 'grant-owner-old',
+        grantRecordVersion: 2,
+        grantAttemptId: ATTEMPT,
         createdAtIso: NOW_OLDER,
         updatedAtIso: NOW_OLDER,
       }),
       requestRecord({
         id: 'request-owner-new',
         grantId: 'grant-owner-new',
+        grantRecordVersion: 2,
+        grantAttemptId: ATTEMPT,
         createdAtIso: NOW_NEWER,
         updatedAtIso: NOW_NEWER,
       }),
@@ -220,6 +246,7 @@ describe('ResolveActionAuthorizationUseCase no-id fallback and policy grants', (
       projectId: 'project-example',
       actionScope: 'forge:merge-pr',
       expectedHeadSha: HEAD,
+      attemptId: ATTEMPT,
     });
     expect(result).toMatchObject({ outcome: 'authorized', grantId: 'grant-owner-new' });
   });

@@ -104,10 +104,22 @@ export function containsReviewSecretShape(text: unknown): boolean {
 }
 
 /**
+ * C0 controls (U+0000–U+001F), DEL (U+007F), C1 controls (U+0080–U+009F), and
+ * Unicode bidirectional controls (U+200E, U+200F, U+202A–U+202E, U+2066–U+2069).
+ */
+// eslint-disable-next-line no-control-regex
+const DISALLOWED_CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
+
+export function containsDisallowedControlCharacters(text: string): boolean {
+  return DISALLOWED_CONTROL_CHARS.test(text);
+}
+
+/**
  * True only for a safe repo-relative path: a trimmed, non-empty string of at
  * most `MAX_FINDING_FILE_LENGTH` characters with no control character or
  * backslash, no leading `/`, `-`, or `~`, no Windows drive prefix, no URL
- * scheme, and no `.` or `..` path segment, that carries no secret shape.
+ * scheme, and no `.` or `..` path segment, that carries no secret shape and
+ * no disallowed control characters.
  */
 export function isSafeRelativeFilePath(value: unknown): value is string {
   if (typeof value !== 'string') {
@@ -119,11 +131,8 @@ export function isSafeRelativeFilePath(value: unknown): value is string {
   if (value.trim() !== value) {
     return false;
   }
-  for (const ch of value) {
-    const code = ch.codePointAt(0) ?? 0;
-    if (code <= 0x1f || code === 0x7f) {
-      return false;
-    }
+  if (containsDisallowedControlCharacters(value)) {
+    return false;
   }
   if (value.includes('\\')) {
     return false;
@@ -176,8 +185,8 @@ function isValidFindingSummary(summary: unknown): summary is string {
   if (
     typeof summary !== 'string' ||
     summary.length > MAX_FINDING_SUMMARY_LENGTH ||
-    summary.includes('\0') ||
     summary.trim().length === 0 ||
+    containsDisallowedControlCharacters(summary) ||
     isWholeValuePlaceholder(summary) ||
     containsReviewSecretShape(summary)
   ) {
@@ -272,10 +281,10 @@ interface ScannedFence {
   readonly body: string;
 }
 
-const FENCE_OPEN = /^[ \t]{0,3}(`{3,}|~{3,})[ \t]*([^\r\n]*)$/;
-const FENCE_CLOSE = /^[ \t]{0,3}(`{3,}|~{3,})[ \t]*$/;
+export const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})[ \t]*([^\r\n]*)$/;
+export const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 /** A trimmed info string that names the json answer block, case-insensitively. */
-const INFO_JSON = /^json(?:$|[^a-z0-9])/i;
+export const INFO_JSON = /^json(?:$|[^a-z0-9])/i;
 
 interface OpenFenceSpec {
   readonly fence: string;
@@ -288,7 +297,7 @@ function parseFenceOpen(line: string): OpenFenceSpec | null {
     return null;
   }
   const fence = match[1] ?? '';
-  const info = match[2] ?? '';
+  const info = (match[2] ?? '').trim();
   if (fence.startsWith('`') && info.includes('`')) {
     // CommonMark §4.5: a backtick fence whose info string carries a
     // backtick cannot open a fence; the line is ordinary text.
@@ -362,7 +371,7 @@ function checkTrailingRegion(
   lines: readonly string[],
   fence: ScannedFence,
 ): { kind: 'invalid' } | { kind: 'single'; jsonText: string } {
-  if (fence.endLine === null || fence.info !== 'json') {
+  if (fence.endLine === null || fence.info.trim() !== 'json') {
     return { kind: 'invalid' };
   }
   if (hasTrailingNonBlankLines(lines, fence.endLine + 1)) {
@@ -376,9 +385,9 @@ function checkTrailingRegion(
  * (linear over the lines, no backtracking regex):
  *
  * - `{ kind: 'none' }` — no json-named fence at all;
- * - `{ kind: 'invalid' }` — an unclosed fence, more than one json fence, a
- *   json fence whose info string is not exactly `json`, or any text after
- *   the closing fence of the single json fence;
+ * - `{ kind: 'invalid' }` — an unclosed fence, any json fence before the
+ *   last fence, a last fence whose info string is not exactly `json`, or
+ *   any non-blank text after the closing fence of the single json fence;
  * - `{ kind: 'single', jsonText }` — exactly one ```json fence placed last.
  */
 export function extractSingleTrailingJsonFence(
@@ -389,12 +398,16 @@ export function extractSingleTrailingJsonFence(
   if (unclosed) {
     return { kind: 'invalid' };
   }
-  const jsonFences = fences.filter((fence) => INFO_JSON.test(fence.info.trim()));
-  if (jsonFences.length === 0) {
+  if (fences.length === 0) {
     return { kind: 'none' };
   }
-  if (jsonFences.length > 1) {
+  const jsonBeforeLast = fences.slice(0, -1).filter((fence) => INFO_JSON.test(fence.info.trim()));
+  if (jsonBeforeLast.length > 0) {
     return { kind: 'invalid' };
   }
-  return checkTrailingRegion(lines, jsonFences[0]!);
+  const lastFence = fences[fences.length - 1]!;
+  if (!INFO_JSON.test(lastFence.info.trim())) {
+    return { kind: 'none' };
+  }
+  return checkTrailingRegion(lines, lastFence);
 }

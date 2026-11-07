@@ -228,6 +228,60 @@ describe('validateReviewAnswerObject', () => {
     expect(validateReviewAnswerObject(fail([finding('minor', 'a.ts', 1, 'bad\u0000summary')])).ok).toBe(false);
   });
 
+  describe('disallowed control characters in summary and file (RV5 fix 2)', () => {
+    it('rejects finding summary containing C0 controls', () => {
+      for (const ctrl of ['\u0000', '\u0009', '\u001f']) {
+        const res = validateReviewAnswerObject(fail([finding('minor', 'a.ts', 1, `bad${ctrl}summary`)]));
+        expect(res).toEqual({ ok: false, reason: 'unparseable-verdict' });
+      }
+    });
+
+    it('rejects finding summary containing DEL (U+007F)', () => {
+      const res = validateReviewAnswerObject(fail([finding('minor', 'a.ts', 1, 'bad\u007Fsummary')]));
+      expect(res).toEqual({ ok: false, reason: 'unparseable-verdict' });
+    });
+
+    it('rejects finding summary containing C1 controls (U+0080-U+009F)', () => {
+      for (const ctrl of ['\u0080', '\u0085', '\u009F']) {
+        const res = validateReviewAnswerObject(fail([finding('minor', 'a.ts', 1, `bad${ctrl}summary`)]));
+        expect(res).toEqual({ ok: false, reason: 'unparseable-verdict' });
+      }
+    });
+
+    it('rejects finding summary containing bidi controls (U+202A-U+202E, U+2066-U+2069, U+200E, U+200F)', () => {
+      for (const ctrl of ['\u200E', '\u200F', '\u202A', '\u202E', '\u2066', '\u2069']) {
+        const res = validateReviewAnswerObject(fail([finding('minor', 'a.ts', 1, `bad${ctrl}summary`)]));
+        expect(res).toEqual({ ok: false, reason: 'unparseable-verdict' });
+      }
+    });
+
+    it('rejects file path containing C0 controls', () => {
+      for (const ctrl of ['\u0000', '\u0009', '\u001f']) {
+        const res = validateReviewAnswerObject(fail([finding('minor', `src/${ctrl}a.ts`, 1, 'note')]));
+        expect(res).toEqual({ ok: false, reason: 'unparseable-verdict' });
+      }
+    });
+
+    it('rejects file path containing DEL (U+007F)', () => {
+      const res = validateReviewAnswerObject(fail([finding('minor', 'src/\u007Fa.ts', 1, 'note')]));
+      expect(res).toEqual({ ok: false, reason: 'unparseable-verdict' });
+    });
+
+    it('rejects file path containing C1 controls (U+0080-U+009F)', () => {
+      for (const ctrl of ['\u0080', '\u0085', '\u009F']) {
+        const res = validateReviewAnswerObject(fail([finding('minor', `src/${ctrl}a.ts`, 1, 'note')]));
+        expect(res).toEqual({ ok: false, reason: 'unparseable-verdict' });
+      }
+    });
+
+    it('rejects file path containing bidi controls (U+202A-U+202E, U+2066-U+2069, U+200E, U+200F)', () => {
+      for (const ctrl of ['\u200E', '\u200F', '\u202A', '\u202E', '\u2066', '\u2069']) {
+        const res = validateReviewAnswerObject(fail([finding('minor', `src/${ctrl}a.ts`, 1, 'note')]));
+        expect(res).toEqual({ ok: false, reason: 'unparseable-verdict' });
+      }
+    });
+  });
+
   it('rejects secret-shaped summaries or file paths built at runtime (robustness 5)', () => {
     for (const shape of ['sk-' + 'a'.repeat(24), 'ghp_' + 'b'.repeat(24), 'AKIA' + '0'.repeat(16), 'github_pat_' + 'c'.repeat(24)]) {
       expect(validateReviewAnswerObject(fail([finding('minor', 'a.ts', 1, `leak ${shape}`)])).ok, 'summary').toBe(false);
@@ -315,6 +369,45 @@ describe('extractSingleTrailingJsonFence', () => {
   it('a tilde-fenced text block closed with ~~~, followed by a valid trailing json block, still passes', () => {
     const stripped = '~~~text\nsome notes\n~~~\n```json\n{"verdict":"PASS","findings":[]}\n```\n';
     expect(extractSingleTrailingJsonFence(stripped)).toEqual({
+      kind: 'single',
+      jsonText: '{"verdict":"PASS","findings":[]}',
+    });
+  });
+
+  it("Fable's exact input (space + ```json PASS block, then ```diff, prose, ```json with a FAIL/blocker block, then ```) gives invalid", () => {
+    const fableInput = [
+      ' ```json',
+      '{"verdict":"PASS","findings":[]}',
+      '```',
+      '```diff',
+      'some diff prose',
+      '```json',
+      '{"verdict":"FAIL","findings":[{"severity":"blocker","file":"src/a.ts","line":1,"summary":"s"}]}',
+      '```',
+      '```',
+    ].join('\n');
+    expect(extractSingleTrailingJsonFence(fableInput)).toEqual({ kind: 'invalid' });
+  });
+
+  it('a json block followed by trailing prose gives invalid', () => {
+    const trailingProse = '```json\n{"verdict":"PASS","findings":[]}\n```\nsome trailing notes';
+    expect(extractSingleTrailingJsonFence(trailingProse)).toEqual({ kind: 'invalid' });
+  });
+
+  it('two json blocks give invalid, whatever lies between them', () => {
+    const betweenProse = '```json\n{"verdict":"PASS","findings":[]}\n```\nprose between\n```json\n{"verdict":"FAIL","findings":[]}\n```';
+    expect(extractSingleTrailingJsonFence(betweenProse)).toEqual({ kind: 'invalid' });
+    const betweenFence = '```json\n{"verdict":"PASS","findings":[]}\n```\n```diff\n+foo\n```\n```json\n{"verdict":"PASS","findings":[]}\n```';
+    expect(extractSingleTrailingJsonFence(betweenFence)).toEqual({ kind: 'invalid' });
+  });
+
+  it('tabs or four or more spaces mean the line is not a fence (CommonMark ^ {0,3})', () => {
+    const tabFence = '\t```json\n{"verdict":"PASS","findings":[]}\n\t```\n';
+    expect(extractSingleTrailingJsonFence(tabFence)).toEqual({ kind: 'none' });
+    const fourSpaceFence = '    ```json\n{"verdict":"PASS","findings":[]}\n    ```\n';
+    expect(extractSingleTrailingJsonFence(fourSpaceFence)).toEqual({ kind: 'none' });
+    const threeSpaceFence = '   ```json\n{"verdict":"PASS","findings":[]}\n   ```\n';
+    expect(extractSingleTrailingJsonFence(threeSpaceFence)).toEqual({
       kind: 'single',
       jsonText: '{"verdict":"PASS","findings":[]}',
     });

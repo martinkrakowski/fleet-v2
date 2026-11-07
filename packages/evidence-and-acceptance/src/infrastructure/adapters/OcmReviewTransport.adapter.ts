@@ -647,6 +647,17 @@ function isStepStart(record: Record<string, unknown>): boolean {
   return false;
 }
 
+function isStepFinish(record: Record<string, unknown>): boolean {
+  if (record.type === 'step_finish' || record.type === 'step-finish') {
+    return true;
+  }
+  const part = isPlainRecord(record.part) ? record.part : null;
+  if (part !== null && (part.type === 'step_finish' || part.type === 'step-finish')) {
+    return true;
+  }
+  return false;
+}
+
 function isToolEvent(record: Record<string, unknown>): boolean {
   if (record.type === 'tool' || record.type === 'tool_use' || record.type === 'tool_call') {
     return true;
@@ -891,24 +902,20 @@ export function stripUntrustedEchoBlocks(text: string): string {
 }
 
 /**
- * The stripped text plus whether an untrusted block or diff fence was opened
- * and never closed. An unclosed block is a malformed answer: callers refuse it
+ * The stripped text plus whether an untrusted block was opened and never
+ * closed. An unclosed block is a malformed answer: callers refuse it
  * (no verdict is read) rather than trusting whatever the strip left.
  */
-function scanUntrustedEchoBlocks(text: string): { readonly stripped: string; readonly unclosed: boolean } {
+function scanUntrustedEchoBlocks(text: string): {
+  readonly stripped: string;
+  readonly unclosed: boolean;
+} {
   const kept: string[] = [];
   let openNonce: string | null = null;
-  let fenceToken: string | null = null;
   for (const line of text.split(/\r?\n/)) {
     if (openNonce !== null) {
       if (line.trim() === `<<<END UNTRUSTED nonce=${openNonce}>>>`) {
         openNonce = null;
-      }
-      continue;
-    }
-    if (fenceToken !== null) {
-      if (line.trim() === fenceToken) {
-        fenceToken = null;
       }
       continue;
     }
@@ -917,14 +924,9 @@ function scanUntrustedEchoBlocks(text: string): { readonly stripped: string; rea
       openNonce = openMatch[1] ?? null;
       continue;
     }
-    const fenceMatch = /^(```|~~~)diff\s*$/.exec(line.trim());
-    if (fenceMatch !== null) {
-      fenceToken = fenceMatch[1] ?? null;
-      continue;
-    }
     kept.push(line);
   }
-  return { stripped: kept.join('\n'), unclosed: openNonce !== null || fenceToken !== null };
+  return { stripped: kept.join('\n'), unclosed: openNonce !== null };
 }
 
 /**
@@ -1114,9 +1116,8 @@ function parseStructuredReviewReply(text: string, _ignoredVerdictText?: string):
     return { result: 'unknown', findings: [], unknownReason: 'empty' };
   }
   // RV2: an echoed untrusted block (the reviewer repeating the diff or brief)
-  // or a fenced diff block is data, so any ```json block inside it is
-  // stripped before fence extraction and therefore ignored. An unclosed
-  // block anywhere is a malformed answer.
+  // is data, so any ```json block inside it is stripped before fence extraction
+  // and therefore ignored. An unclosed block anywhere is a malformed answer.
   const scanned = scanUntrustedEchoBlocks(text);
   if (scanned.unclosed) {
     return UNPARSEABLE;
@@ -1259,6 +1260,47 @@ export async function defaultSpawn(
     stderr: outcome.stderr !== '' ? outcome.stderr : outcome.error ?? '',
     ...(timedOut ? { timedOut: true } : {}),
   };
+}
+
+function hasEchoedPassBlock(text: string): boolean {
+  let insideUntrusted = false;
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (UNTRUSTED_OPEN_PATTERN.test(trimmed)) {
+      insideUntrusted = true;
+      continue;
+    }
+    if (insideUntrusted) {
+      if (trimmed.startsWith('<<<END UNTRUSTED')) {
+        insideUntrusted = false;
+      } else if (trimmed.includes('"PASS"') || trimmed.includes('VERDICT: PASS')) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isStreamCutBeforeFinish(
+  hasStepFinish: boolean,
+  textParts: readonly string[],
+): boolean {
+  if (hasStepFinish) {
+    return false;
+  }
+  for (const part of textParts) {
+    if (hasEchoedPassBlock(part)) {
+      return true;
+    }
+  }
+  if (textParts.length > 1) {
+    for (let i = 0; i < textParts.length - 1; i += 1) {
+      if (textParts[i]?.includes('"PASS"') || textParts[i]?.includes('VERDICT: PASS')) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 export function createOcmReviewTransport(
@@ -1446,6 +1488,7 @@ export function createOcmReviewTransport(
     const spawnStdout = safeRead(() => spawnResult.stdout);
     let readOnlyVoided = false;
     let hasStepStart = false;
+    let hasStepFinish = false;
     const textParts: string[] = [];
     const toolNames: string[] = [];
     for (const rawLine of (typeof spawnStdout === 'string' ? spawnStdout : '').split(/\r?\n/)) {
@@ -1482,6 +1525,10 @@ export function createOcmReviewTransport(
         hasStepStart = true;
       }
 
+      if (isStepFinish(parsed)) {
+        hasStepFinish = true;
+      }
+
       if (isToolEvent(parsed)) {
         const toolName = extractToolName(parsed);
         if (toolName === null) {
@@ -1513,6 +1560,15 @@ export function createOcmReviewTransport(
       after === request.candidateHeadSha;
 
     // 9. Parse verdict, findings, and rawOutput
+    if (isStreamCutBeforeFinish(hasStepFinish, textParts)) {
+      return {
+        rawOutput: 'stream-incomplete',
+        readOnlyVerified,
+        result: 'unknown',
+        findings: [],
+        completedAtIso: new Date().toISOString(),
+      };
+    }
     // Each text part is a whole message part; a part that does not end in a newline must not glue its last line onto the next part's first.
     const finalText = textParts.join('\n');
     // A conductor request (a kind) is validated strictly; a manual request keeps today's parse.

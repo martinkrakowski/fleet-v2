@@ -536,3 +536,84 @@ describe("hosts: string values read from the files are screened", () => {
     expect(leakedWindows(`${stdout}\n${stderr}`, [T])).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The line-level token-shape screen and the write receipt (HN1b fix round 2)
+// ---------------------------------------------------------------------------
+
+describe("hosts: the line-level token-shape screen and the write receipt", () => {
+  it("hosts list prints ordinary values in full", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const hosts = baseHosts(path.join(dir, "worktrees"));
+    (hosts.lanehost as Record<string, unknown>).sshAlias = "solstice.lan";
+    (hosts.lanehost as Record<string, unknown>).worktreeRoot =
+      "/mnt/pool/cloud-services/projects/.worktrees/fleet-v2";
+    writeFileSync(
+      file,
+      `${JSON.stringify({ schemaVersion: 2, forge: { mode: "none" }, hosts }, null, 2)}\n`,
+      "utf8",
+    );
+    const { code, stdout, stderr } = await run(["list"], file, "prompt-y");
+    expect(code).toBe(0);
+    expect(stdout).toContain("alias solstice.lan");
+    expect(stdout).toContain(
+      "worktree-root: /mnt/pool/cloud-services/projects/.worktrees/fleet-v2",
+    );
+    expect(stderr).toBe("");
+  });
+
+  it("an add that writes prints the receipt with the digest intact", async () => {
+    const { file, root } = fixture("plain");
+    const { code, stdout, stderr } = await run(
+      ["add", "newhost", "--worktree-root", root, ...VERIFIER],
+      file,
+      "yes-flag",
+    );
+    expect(code).toBe(0);
+    const digest = createHash("sha256")
+      .update(readFileSync(file, "utf8"))
+      .digest("hex");
+    expect(digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(stdout).toContain(`written ${file} (sha256 ${digest})`);
+  });
+
+  it("a 64-lowercase-hex sshAlias is withheld by hosts list", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const hosts = baseHosts(path.join(dir, "worktrees"));
+    const hexAlias = "a".repeat(64);
+    (hosts.lanehost as Record<string, unknown>).sshAlias = hexAlias;
+    writeFileSync(
+      file,
+      `${JSON.stringify({ schemaVersion: 2, forge: { mode: "none" }, hosts }, null, 2)}\n`,
+      "utf8",
+    );
+    const { code, stdout, stderr } = await run(["list"], file, "prompt-y");
+    expect(code).toBe(0);
+    expect(leakedWindows(`${stdout}\n${stderr}`, [hexAlias])).toEqual([]);
+    expect(stdout).toContain("alias <host key withheld>");
+  });
+
+  /**
+   * Why a withheld computed-output case cannot be produced: the ONLY
+   * token-like string the hosts command computes and prints without taking
+   * it from argv or the file is our own digest — the rename request's —
+   * which the frozen hosts-command contract (F96-8) requires in full and
+   * which the wrapper writes through the same branded path as the write
+   * receipt. It is our own digest of our own request, never operator input
+   * or file content, so the token-shape screen does not apply to it; every
+   * other printed token-like run is screened.
+   */
+  it("the computed request digest is our own and prints in full", async () => {
+    const { file } = fixture("plain");
+    const { code, stdout, stderr } = await run(
+      ["rename", "lanehost", "renamed"],
+      file,
+      "yes-flag",
+    );
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/request:[0-9a-f]{64}/);
+    expect(leakedWindows(`${stdout}${stderr}`, [T])).toEqual([]);
+  });
+});

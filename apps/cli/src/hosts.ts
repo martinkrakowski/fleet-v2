@@ -553,15 +553,29 @@ function screenHostKeysIn(
 /**
  * The ONE screen every line the hosts command prints passes, on stdout and
  * stderr alike: every known host key is replaced by its screened code — which
- * withholds a secret-shaped key and a long opaque token run alike — and any
- * residual secret-shaped text withholds the whole line (HN1 fix round 2,
- * finding 1). A line carrying no known key is still screened for secrets.
+ * withholds a secret-shaped key and a long opaque token run alike — then
+ * every residual TOKEN-SHAPE run is put through the same test, and a line
+ * still carrying secret-shaped text withholds the whole line (HN1 fix round
+ * 2, finding 1). A line carrying no known key is still screened for secrets.
  */
 function screenHostsLine(line: string, keys: readonly string[]): string {
-  return screenErrorLine(screenHostKeysIn(line, keys));
+  return screenErrorLine(screenTokenRunsIn(screenHostKeysIn(line, keys)));
 }
 
 const LONG_TOKEN_RUN = /[A-Za-z0-9]{20,}/g;
+
+/**
+ * The line-level TOKEN-SHAPE rule (HN1b fix round 2, finding 1): every
+ * alphanumeric run of every printed line — wherever the text came from:
+ * file, argv, descriptor, computed — is handed to `screenHostKey` itself, so
+ * the replacement decision is the same long-token (or secret-shape) test the
+ * host-key screen makes and the two cannot drift. Ordinary values — hostnames
+ * like `solstice.lan`, paths, ports, role names, subcommand words — carry no
+ * run long enough to be token-shaped and pass through untouched.
+ */
+function screenTokenRunsIn(line: string): string {
+  return line.replace(LONG_TOKEN_RUN, (run) => screenHostKey(run));
+}
 
 /**
  * Every text a line must never carry: each key, the value of a `--flag=value`
@@ -609,7 +623,32 @@ export interface ScreenedHostsIo extends CliIo {
    * against them too (HN1b fix round 1).
    */
   readonly addKeys: (keys: readonly string[]) => void;
+  /**
+   * Write one line that carries our own write digest: the text before and
+   * after the digest passes the one line screen; the branded digest — and
+   * only it — is written through unscreened (HN1b fix round 2, finding 2).
+   */
+  readonly stdoutDigest: (
+    before: string,
+    digest: WriteDigest,
+    after: string,
+  ) => void;
 }
+
+declare const writeDigestBrand: unique symbol;
+
+/**
+ * A sha256 digest our own code computed for an installation write — the
+ * write receipt's digest, or the rename request's digest. It is the ONE kind
+ * of value the hosts screen writes through unscreened: it is not operator
+ * input, not file content and not a secret, and the frozen hosts-command
+ * contract prints both digests in full. Every other 64-hex value — from a
+ * config field, argv or the file — is still withheld by the token-shape
+ * screen (HN1b fix round 2, finding 2: no general "64-hex is fine" rule).
+ */
+export type WriteDigest = string & {
+  readonly [writeDigestBrand]: "sha256";
+};
 
 /**
  * The ONE output wrapper of the hosts command. Every line written through it,
@@ -638,6 +677,11 @@ export function screenedHostsIo(
   return {
     screen,
     addKeys,
+    stdoutDigest: (before, digest, after) => {
+      io.stdout(screenHostsText(before, texts));
+      io.stdout(digest);
+      io.stdout(screenHostsText(after, texts));
+    },
     stdout: (text) => {
       for (const piece of text.split(/(?<=\n)/)) {
         io.stdout(screenHostsText(piece, texts));
@@ -754,8 +798,27 @@ export async function confirmAndWrite(
     out.stderr("nothing was written\n");
     return 1;
   }
-  out.stdout(`written ${file} (sha256 ${result.hash})\n`);
+  printWriteReceipt(out, file, result.hash as WriteDigest);
   return 0;
+}
+
+/**
+ * The write receipt. Through the hosts wrapper the branded digest — and only
+ * it — travels unscreened, while the path and the fixed words around it pass
+ * the one line screen. A caller whose io has no wrapper (seats, policy) has
+ * no screen to bypass and prints the line as before.
+ */
+function printWriteReceipt(
+  out: CliIo,
+  file: string,
+  digest: WriteDigest,
+): void {
+  const wrapped = out as Partial<ScreenedHostsIo>;
+  if (typeof wrapped.stdoutDigest === "function") {
+    wrapped.stdoutDigest(`written ${file} (sha256 `, digest, ")\n");
+    return;
+  }
+  out.stdout(`written ${file} (sha256 ${digest})\n`);
 }
 
 async function writeHost(
@@ -1234,9 +1297,21 @@ async function renameHost(
     out.stderr(`installation: ${result.reason}\n`);
     return 1;
   }
-  out.stdout(
-    `renamed host ${screened} to ${screenHostKey(newName)} request:${digest}\n`,
-  );
+  // Our own digest of our own rename request — not operator input, not file
+  // content — written through the same branded path as the write receipt,
+  // which the frozen hosts-command contract prints in full (F96-8).
+  const wrapped = out as Partial<ScreenedHostsIo>;
+  if (typeof wrapped.stdoutDigest === "function") {
+    wrapped.stdoutDigest(
+      `renamed host ${screened} to ${screenHostKey(newName)} request:`,
+      digest as WriteDigest,
+      "\n",
+    );
+  } else {
+    out.stdout(
+      `renamed host ${screened} to ${screenHostKey(newName)} request:${digest}\n`,
+    );
+  }
   return 0;
 }
 

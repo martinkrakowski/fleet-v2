@@ -1128,11 +1128,15 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     runJournal: conductor.laneRunJournal,
   });
 
-  // CO26: the read-only relaunch inventory reads the same lane-run stores the
-  // conductor composes, beside closeWorkOrder / listStaleWorkOrders.
+  // CO26 + CO29a: `relaunch inventory` and `relaunch plan` are strictly
+  // read-only over the record stores, so both compose read-only instances: an
+  // unreadable state file is a read error (mapped to `unknown`), never a
+  // quarantine write. One inventory instance serves both commands.
+  const relaunchRunRepo = new LaneRunRepositoryAdapter({ stateDir, readOnly: true });
+  const relaunchAttemptRepo = new AttemptRepositoryAdapter({ stateDir, readOnly: true });
   const inventoryRelaunch = new InventoryRelaunchUseCase({
-    runRepo: conductor.laneRunRepository,
-    attemptRepo: attemptRepository,
+    runRepo: relaunchRunRepo,
+    attemptRepo: relaunchAttemptRepo,
     workspace,
     halt: conductor.halt,
     driverLease: conductor.driverLease,
@@ -1140,14 +1144,9 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     computeDigest: sha256HexDigest,
   });
 
-  // CO29a: the ordered relaunch plan reads the inventory and the same record
-  // stores, and stores one immutable plan by digest (relaunch-plans.json).
-  // The plan is strictly read-only over the record stores, so it composes
-  // read-only instances: an unreadable state file is a read error (mapped to
-  // `unknown`) and never a quarantine write. planRepo stays the one allowed
-  // write. inventoryRelaunch (CO26) still shares the writable composition.
-  const relaunchRunRepo = new LaneRunRepositoryAdapter({ stateDir, readOnly: true });
-  const relaunchAttemptRepo = new AttemptRepositoryAdapter({ stateDir, readOnly: true });
+  // CO29a: the ordered relaunch plan reads the (read-only) inventory and the
+  // same record stores read-only, and stores one immutable plan by digest
+  // (relaunch-plans.json): planRepo is the one allowed write.
   const relaunchWorkOrderRepo = new WorkOrderRepositoryAdapter({ stateDir, readOnly: true });
   const relaunchLanePlanRepo = new LanePlanRepositoryAdapter({ stateDir, readOnly: true });
   const relaunchPlanRepository = new RelaunchPlanRepositoryAdapter({ stateDir });

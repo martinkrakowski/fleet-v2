@@ -216,6 +216,17 @@ async function snapshotState(dir: string): Promise<string[]> {
   return names.sort((a, b) => a.localeCompare(b));
 }
 
+/** Every file under the state dir (recursive) with its size in bytes, sorted: names and bytes must not change. */
+async function snapshotStateWithSizes(dir: string): Promise<string[]> {
+  const names = await fs.readdir(dir, { recursive: true });
+  const rows: string[] = [];
+  for (const name of names) {
+    const stat = await fs.lstat(path.join(dir, name));
+    rows.push(`${name}\t${stat.isDirectory() ? 'dir' : String(stat.size)}`);
+  }
+  return rows.sort((a, b) => a.localeCompare(b));
+}
+
 async function plan(
   runtime: FleetCliRuntime,
   ...flags: string[]
@@ -409,18 +420,21 @@ describe('relaunch plan (production composition)', () => {
     expect(after).toEqual(before);
   });
 
-  it('exits 1 with unknown on an unreadable lane-runs.json before any plan read (CO26 inventory shares the writable composition)', async () => {
+  it('relaunch inventory and relaunch plan write nothing on an unreadable lane-runs.json (both compose read-only stores)', async () => {
     const fx = await seededFixture();
-    // With an unreadable lane-run store the embedded CO26 inventory refuses
-    // first (it still reads the writable composition and may quarantine), and
-    // the plan maps that refusal to unknown without planning anything.
     await fs.writeFile(path.join(fx.stateDir, 'lane-runs.json'), '{broken CANARY-bytes', 'utf8');
+    const before = await snapshotStateWithSizes(fx.stateDir);
+
+    const io = capture();
+    const inventoryCode = await runCli(['relaunch', 'inventory'], io, fx.runtime);
+    expect(inventoryCode).not.toBe(0);
+    expect(await snapshotStateWithSizes(fx.stateDir)).toEqual(before);
 
     const result = await plan(fx.runtime);
-
     expect(result.code).toBe(1);
     expect(result.result).toEqual({ outcome: 'unknown', reasons: ['inventory-records-unreadable'] });
     await expect(fs.stat(path.join(fx.stateDir, 'relaunch-plans.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await snapshotStateWithSizes(fx.stateDir)).toEqual(before);
   });
 
   it('exits 1 with unknown when the profile records cannot be read', async () => {

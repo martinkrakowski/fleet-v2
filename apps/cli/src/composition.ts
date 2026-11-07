@@ -44,6 +44,7 @@ import {
   GateReceiptAdapter,
   CollectAttemptArtifactsUseCase,
   CommitEditOnlyAttemptUseCase,
+  ListHeldWorkOrdersUseCase,
   ListStaleWorkOrdersUseCase,
   ConductorForgeGrantAdapter,
   DispatchAttemptUseCase,
@@ -113,6 +114,9 @@ import {
   type SubprocessRunner,
   type CommandExecutorPort,
   type AcceptanceReceiptReadAdapter,
+  type GateFailingFileAdapter,
+  type ListStalledRunsUseCase,
+  type StallAttentionAdapter,
   type ExportRunTelemetryUseCase,
   type TelemetryDispositionAdapter,
   type TelemetryResourceInput,
@@ -174,6 +178,7 @@ import {
   ListOwnerQuestionsUseCase,
   ListProjectProfilesUseCase,
   ObservationPublicationAdapter,
+  OrchestratorSessionRepositoryAdapter,
   OwnerQuestionRepositoryAdapter,
   ProjectProfileRepositoryAdapter,
   PublishProjectObservationUseCase,
@@ -638,6 +643,7 @@ export interface FleetCliRuntime {
   readonly coordination: {
     readonly projectProfileRepository: ProjectProfileRepositoryAdapter;
     readonly coordinationRequestRepository: CoordinationRequestRepositoryAdapter;
+    readonly orchestratorSessionRepository: OrchestratorSessionRepositoryAdapter;
     readonly decisionTransport: DecisionTransportAdapter;
     readonly observationPublication: ObservationPublicationAdapter;
     readonly relayTransport: RelayTransportAdapter;
@@ -747,6 +753,8 @@ export interface FleetCliRuntime {
     readonly closeWorkOrder: CloseWorkOrderUseCase;
     /** KF-36b-2: the read-only stale work-order listing; built beside closeWorkOrder from the same stores. */
     readonly listStaleWorkOrders: ListStaleWorkOrdersUseCase;
+    /** PT1ca: the read-only listing of registrations held by overlap admission. */
+    readonly listHeldWorkOrders: ListHeldWorkOrdersUseCase;
     readonly inspectAttempt: InspectAttemptUseCase;
     readonly explainAttempt: ExplainAttemptUseCase;
     readonly prepareBriefPackage: PrepareBriefPackageUseCase;
@@ -784,6 +792,14 @@ export interface FleetCliRuntime {
     readonly halt: ConductorHaltAdapter;
     readonly requestLaneRunStop: RequestLaneRunStopUseCase;
     readonly inspectLaneRuns: InspectLaneRunsUseCase;
+    /** PT1a (SN3): the runs parked past `policy.daemon.stallAfterMinutes`, for `conductor status --stalled`. */
+    readonly listStalledRuns: ListStalledRunsUseCase;
+    /** PT1a (SN2): raises, refreshes and clears one `stall:<runId>` attention item per stalled run. */
+    readonly stallAttention: StallAttentionAdapter;
+    /** PT1a: the failing gate file a verification receipt recorded, read to class a gate park. */
+    readonly gateFailingFile: GateFailingFileAdapter;
+    /** PT1a: `policy.daemon.stallAfterMinutes` as resolved at composition. */
+    readonly stallAfterMinutes: number;
     readonly listLaneRuns: ListLaneRunsUseCase;
     /** VZ5b: the recorded conductor passes newest first (conductor schedule --passes). */
     readonly listConductorPasses: ListConductorPassesUseCase;
@@ -1088,6 +1104,29 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     runnerForAttempt,
   });
 
+  // PT1ca: registration checks the open pull requests of the base branch, so it
+  // is built here, after the conductor composes its lane-run stores (a pull
+  // request bound to the work order by a run is never its own blocker). The
+  // forge read is bound in forge mode `github` only, as for AssessHeadAcceptance
+  // in the evidence composition: a workspace without a GitHub installation keeps
+  // registering, while every GitHub installation enforces the open-PR check and
+  // fails closed with `overlap-unknown` when the forge cannot be read.
+  const registerWorkOrder = new RegisterWorkOrderUseCase({
+    workOrderRepo: workOrderRepository,
+    profileRead,
+    lanePlanRepo: execution.lanePlanRepository,
+    heldWorkOrderRepo: execution.heldWorkOrderRepository,
+    runRepo: conductor.laneRunRepository,
+    attemptRepo: attemptRepository,
+    executionJournal,
+    computeDigest: sha256HexDigest,
+    // PT1ca fix 3: a hold skipped for an invalid blocker id is recorded as a
+    // work-execution attention item, through the same recorder the conductor
+    // and the daemon use.
+    recordAttentionItem: (body, actor) => coordination.recordAttentionItem.recordAttentionItem(body, actor),
+    ...(forgeMode === 'github' ? { forgeRead } : {}),
+  });
+
   // KF-36b-1b: the operator's close command is built here, after the
   // conductor composes its lane-run stores, because composeExecution holds no
   // lane-run stores of its own.
@@ -1184,7 +1223,14 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     coordination,
     knowledge,
     evidence,
-    execution: { ...execution, closeWorkOrder, listStaleWorkOrders, inspectMergeReadiness, inventoryRelaunch },
+    execution: {
+      ...execution,
+      registerWorkOrder,
+      closeWorkOrder,
+      listStaleWorkOrders,
+      inspectMergeReadiness,
+      inventoryRelaunch,
+    },
     conductor,
     runnerTunnel,
     telemetry,

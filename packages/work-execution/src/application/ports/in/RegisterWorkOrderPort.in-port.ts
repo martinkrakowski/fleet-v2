@@ -40,10 +40,55 @@ export interface RegisterWorkOrderRequest {
   readonly planLaneId?: string;
   readonly planProjectId?: string;
   readonly nowIso?: string;
+  /**
+   * Optional reference to the brief request this registration came from: an id
+   * or digest token only (never a path). Kept with a held registration.
+   */
+  readonly briefRequestRef?: string;
+  /**
+   * Optional id of the hold intent, for replaying one registration; absent
+   * derives it from the request digest. Replaying it with a changed request is
+   * refused `intent-digest-mismatch`.
+   */
+  readonly intentId?: string;
 }
 
+/**
+ * A registration that overlaps an active work order or an open pull request is
+ * refused with the blocker's id (a work order id or a pull request number) and
+ * the code of the first overlapping owned path (`path-<12 hex>`), never a path.
+ * `held` says whether the refused registration was kept (`work-order held`).
+ */
 export type RegisterWorkOrderResult =
   | { readonly outcome: 'registered'; readonly workOrder: WorkOrderRecord }
+  | {
+      readonly outcome: 'refused';
+      readonly reason: 'active-work-order-overlap';
+      readonly blockerKind: 'active-work-order';
+      readonly blockerId: string;
+      readonly pathCode: string;
+      readonly held: boolean;
+      readonly requestDigest: string;
+    }
+  | {
+      readonly outcome: 'refused';
+      readonly reason: 'open-pr-overlap';
+      readonly pullRequestNumber: number;
+      readonly blockerKind: 'open-pr';
+      readonly blockerId: string;
+      readonly pathCode: string;
+      readonly held: boolean;
+      readonly requestDigest: string;
+    }
+  | {
+      readonly outcome: 'refused';
+      readonly reason:
+        | 'overlap-unknown'
+        | 'invalid-request'
+        | 'held-request-mismatch'
+        | 'intent-digest-mismatch'
+        | 'store-unavailable';
+    }
   | { readonly outcome: 'rejected'; readonly reason: string };
 
 export interface RegisterWorkOrderPort {

@@ -178,7 +178,8 @@ describe('conductor run telemetry marks (OT5)', () => {
     });
 
     expect(result.code).toBe(0);
-    expect(result.stderr).toEqual([]);
+    // O9: with no installation, the live run reports register-unknown once.
+    expect(result.stderr).toEqual([`${JSON.stringify({ orchestrator: 'register-unknown' })}\n`]);
     expect(result.stdout).toHaveLength(1);
     expect(JSON.parse(result.stdout[0]!)).toMatchObject({ pass: 1, outcome: 'completed' });
   });

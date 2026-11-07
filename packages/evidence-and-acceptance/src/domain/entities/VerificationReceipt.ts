@@ -8,6 +8,7 @@
 
 import type { VerificationReceiptRecord } from '../evidence-records.js';
 import { isCheckCoverage, type CheckCoverage } from '../check-coverage.js';
+import { screenFailingFile } from '../failing-file.js';
 import type { EvidenceResultValue } from '../value-objects/EvidenceResult.vo.js';
 import { EVIDENCE_RESULTS } from '../value-objects/EvidenceResult.vo.js';
 
@@ -22,6 +23,7 @@ export interface VerificationReceiptProps {
   readonly result: EvidenceResultValue;
   readonly exitCode: number | null;
   readonly coverage?: CheckCoverage;
+  readonly failingFile?: string | null;
   readonly evidenceRef: string;
   readonly policyRevision: string;
   readonly completedAtIso: string;
@@ -78,6 +80,16 @@ export class VerificationReceipt {
         error: new Error('VerificationReceipt coverage is malformed'),
       };
     }
+    if (
+      props.failingFile !== undefined &&
+      props.failingFile !== null &&
+      screenFailingFile(props.failingFile) === null
+    ) {
+      return {
+        success: false,
+        error: new Error('VerificationReceipt failingFile is not a bounded repo-relative path'),
+      };
+    }
     return {
       success: true,
       value: new VerificationReceipt({ ...props }),
@@ -118,6 +130,11 @@ export class VerificationReceipt {
 
   getCoverage(): CheckCoverage | undefined {
     return this.props.coverage;
+  }
+
+  /** The screened failing file, or null when none was determined or the record has none. */
+  getFailingFile(): string | null {
+    return this.props.failingFile ?? null;
   }
 
   /** A receipt only proves the head it was produced for. */

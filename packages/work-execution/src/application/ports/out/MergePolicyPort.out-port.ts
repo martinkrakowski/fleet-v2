@@ -43,6 +43,8 @@ export interface MergePolicyDaemonSettings {
   readonly settleSeconds: number;
   /** The effective chain-refresh mode: `shadow` or `invalid` (CO8a); never `live`. */
   readonly chainRefresh: 'shadow' | 'invalid';
+  /** PT1a: `policy.daemon.stallAfterMinutes` (1..1440); absent on a source resolved before PT1a. */
+  readonly stallAfterMinutes?: number;
 }
 
 /** What the installation seam hands the adapter; the adapter re-validates it before trusting it. */

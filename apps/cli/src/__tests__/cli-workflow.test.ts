@@ -931,6 +931,7 @@ describe('Fleet CLI workflow', () => {
         projectId: PROJECT_ID,
         actionScope: 'forge:push-and-open-pr',
         expectedHeadSha: laneHead,
+        attemptId: ATTEMPT_ID,
       }),
     ]);
     expect(resolved.code).toBe(0);
@@ -968,6 +969,7 @@ describe('Fleet CLI workflow', () => {
         projectId: PROJECT_ID,
         actionScope: 'forge:push-and-open-pr',
         expectedHeadSha: laneHead,
+        attemptId: ATTEMPT_ID,
       }),
     ]);
     expect(blocked.code).toBe(1);
@@ -1891,6 +1893,7 @@ describe('Fleet CLI workflow', () => {
         projectId: PROJECT_ID,
         actionScope: 'forge:merge-pr',
         expectedHeadSha: mpLaneHead,
+        attemptId: mpAttemptId,
       }),
     ]);
     expect(resolved.code).toBe(0);

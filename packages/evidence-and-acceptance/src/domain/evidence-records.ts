@@ -23,6 +23,12 @@ export interface VerificationReceiptRecord {
   readonly exitCode: number | null;
   // Optional; records written before V1 have none.
   readonly coverage?: CheckCoverage;
+  /**
+   * PT1a: the repo-relative file a failing check names, screened (`screenFailingFile`); null when
+   * the check failed and no file could be determined. Absent on passing checks and on records
+   * written before PT1a.
+   */
+  readonly failingFile?: string | null;
   readonly evidenceRef: string;
   readonly policyRevision: string;
   readonly completedAtIso: string;

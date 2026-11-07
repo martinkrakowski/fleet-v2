@@ -393,6 +393,36 @@ describe('prepareLaneRunJournalAppend', () => {
     });
   });
 
+  it('allows not-started results on a request key and then a final result', () => {
+    const intentEntry = intent(REQUEST_KEY);
+    const notStarted1 = result(REQUEST_KEY, 'not-started');
+    const notStarted2 = result(REQUEST_KEY, 'not-started');
+    const final = result(REQUEST_KEY, 'completed');
+    const after = result(REQUEST_KEY, 'refused');
+
+    expect(prepareLaneRunJournalAppend([intentEntry], notStarted1).ok).toBe(true);
+    expect(prepareLaneRunJournalAppend([intentEntry, notStarted1], notStarted2).ok).toBe(true);
+    expect(prepareLaneRunJournalAppend([intentEntry, notStarted1, notStarted2], final).ok).toBe(true);
+    expect(prepareLaneRunJournalAppend([intentEntry, notStarted1, notStarted2, final], after)).toEqual({
+      ok: false,
+      reason: 'result-after-final',
+      detail: null,
+    });
+  });
+
+  it('still treats not-started as final on a step key', () => {
+    const intentEntry = intent(STEP_KEY);
+    const notStarted = result(STEP_KEY, 'not-started');
+    const after = result(STEP_KEY, 'completed');
+
+    expect(prepareLaneRunJournalAppend([intentEntry], notStarted).ok).toBe(true);
+    expect(prepareLaneRunJournalAppend([intentEntry, notStarted], after)).toEqual({
+      ok: false,
+      reason: 'result-after-final',
+      detail: null,
+    });
+  });
+
   it('refuses a result whose runId differs from its intent', () => {
     const decision = prepareLaneRunJournalAppend([intent(REQUEST_KEY)], result(REQUEST_KEY, 'completed', { runId: RUN_ID }));
     expect(decision).toEqual({
@@ -679,5 +709,93 @@ describe('readLaneRunJournalEntryRecord and schemaVersion (Q5a)', () => {
     if (!read.ok) return;
     expect(read.entry.detail).toBeNull();
     expect(Object.hasOwn(read.entry, 'schemaVersion')).toBe(false);
+  });
+});
+
+describe('digest (O2c)', () => {
+  const DIGEST_64 = 'a'.repeat(64);
+
+  it('reads a request-key intent without a digest field as absent', () => {
+    const read = readLaneRunJournalEntry(intent(REQUEST_KEY));
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(Object.hasOwn(read.entry, 'digest')).toBe(false);
+  });
+
+  it('round-trips a 64-hex digest on an intent', () => {
+    const entry = intent(REQUEST_KEY, { digest: DIGEST_64 });
+    const read = readLaneRunJournalEntry(entry);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.entry).toEqual(entry);
+    expect(read.entry.digest).toBe(DIGEST_64);
+  });
+
+  it('refuses a 12-hex digest on an intent', () => {
+    const read = readLaneRunJournalEntry(intent(REQUEST_KEY, { digest: '0123456789abcdef' }));
+    expect(read.ok).toBe(false);
+    if (read.ok) return;
+    expect(read.error).toBe('LaneRunJournal digest must be null or a 64-hex string on an intent and null elsewhere');
+  });
+
+  it('refuses a digest on a result or conduct entry', () => {
+    const resultRead = readLaneRunJournalEntry({ ...result(REQUEST_KEY, 'completed'), digest: DIGEST_64 });
+    expect(resultRead.ok).toBe(false);
+    if (resultRead.ok) return;
+    expect(resultRead.error).toBe('LaneRunJournal digest must be null or a 64-hex string on an intent and null elsewhere');
+
+    const conductRead = readLaneRunJournalEntry({ ...conduct('running'), digest: DIGEST_64 });
+    expect(conductRead.ok).toBe(false);
+    if (conductRead.ok) return;
+    expect(conductRead.error).toBe('LaneRunJournal digest must be null or a 64-hex string on an intent and null elsewhere');
+  });
+
+  it('keeps a digest through prepareLaneRunJournalAppend', () => {
+    const decision = prepareLaneRunJournalAppend([], intent(REQUEST_KEY, { digest: DIGEST_64 }));
+    expect(decision.ok).toBe(true);
+    if (!decision.ok) return;
+    expect(decision.entry.digest).toBe(DIGEST_64);
+  });
+});
+
+describe('result recovery fields (O2c fix round 1)', () => {
+  it('round-trips a reasonKind and a linkedId on a result', () => {
+    const entry = result(REQUEST_KEY, 'completed', { reasonKind: null, linkedId: 'run-example-1' });
+    const read = readLaneRunJournalEntry(entry);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.entry).toEqual(entry);
+    expect(read.entry.linkedId).toBe('run-example-1');
+  });
+
+  it('round-trips a refused result that carries its reason kind', () => {
+    const entry = result(REQUEST_KEY, 'refused', { reasonKind: 'seat-unavailable', linkedId: null });
+    const read = readLaneRunJournalEntry(entry);
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.entry).toEqual(entry);
+    expect(read.entry.reasonKind).toBe('seat-unavailable');
+  });
+
+  it('refuses a reasonKind or a linkedId on an intent or conduct entry', () => {
+    const intentReason = readLaneRunJournalEntry(intent(REQUEST_KEY, { reasonKind: 'policy' }));
+    expect(intentReason.ok).toBe(false);
+    if (intentReason.ok) return;
+    expect(intentReason.error).toBe('LaneRunJournal reasonKind must be null or a lowercase token on a result and null elsewhere');
+
+    const intentLinked = readLaneRunJournalEntry(intent(REQUEST_KEY, { linkedId: 'run-example-1' }));
+    expect(intentLinked.ok).toBe(false);
+    if (intentLinked.ok) return;
+    expect(intentLinked.error).toBe('LaneRunJournal linkedId must be null except on a result');
+
+    const conductReason = readLaneRunJournalEntry(conduct('running', { reasonKind: 'policy' }));
+    expect(conductReason.ok).toBe(false);
+  });
+
+  it('refuses a result reasonKind that is not a lowercase token', () => {
+    const read = readLaneRunJournalEntry(result(REQUEST_KEY, 'refused', { reasonKind: 'Seat Unavailable!' }));
+    expect(read.ok).toBe(false);
+    if (read.ok) return;
+    expect(read.error).toBe('LaneRunJournal reasonKind must be null or a lowercase token on a result and null elsewhere');
   });
 });

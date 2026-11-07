@@ -24,6 +24,7 @@ export * from "./OwnerNotificationPort.in-port.js";
 export * from "./PublishProjectObservationPort.in-port.js";
 export * from "./ReadOwnerQuestionPort.in-port.js";
 export * from "./ReadProjectAttentionPort.in-port.js";
+export * from "./ReconcileOrchestratorRequestPort.in-port.js";
 export * from "./RecordAttentionItemPort.in-port.js";
 export * from "./RecordAuthorizationConsumptionPort.in-port.js";
 export * from "./RecordOwnerItemPort.in-port.js";

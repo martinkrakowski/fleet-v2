@@ -25,6 +25,8 @@ export interface RecordGateReceiptsRequest {
     readonly result: GatePredicateVerdict;
     readonly exitCode: number | null;
     readonly coverage?: CheckCoverage;
+    /** PT1a: the screened failing file of a failing check (null when none was found); absent otherwise. */
+    readonly failingFile?: string | null;
   }[];
 }
 

@@ -824,6 +824,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       qualifier: null,
       parkedFrom: 'running',
       questionId: null,
+      class: 'other',
     });
     expect(afterRunning?.parkCount).toBe(1);
 
@@ -849,6 +850,7 @@ describe('AdvanceLaneRunUseCase stop, collect and gate acts (K4-6)', () => {
       qualifier: 'attempt-terminal',
       parkedFrom: 'running',
       questionId: null,
+      class: 'other',
     });
   });
 

@@ -31,6 +31,7 @@ import { runCli, type CliIo } from '../index.js';
 import type { ConductorCliOptions } from '../conductor.js';
 import {
   heartbeatConductorOrchestrator,
+  heartbeatOrReRegisterConductorOrchestrator,
   pollDelayWhileRegistered,
   registerConductorOrchestrator,
   retireConductorOrchestrator,
@@ -398,6 +399,51 @@ describe('o9 registerConductorOrchestrator store and retire behaviour', () => {
     const raced = repo.snapshot().find((entry) => entry.session.orchestratorId === 'orch-raced-1');
     expect(raced).toBeDefined();
     expect(raced!.session.status).toBe('active');
+  });
+
+  it('o9-heartbeat-between-reread-and-retire-stays-live: a heartbeat landing after the re-read makes the retire conflict and the session stays active', async () => {
+    class HeartbeatAfterGetRepository extends FakeSessionRepository {
+      private beaten = false;
+      override async get(orchestratorId: string): Promise<StoredOrchestratorSession | null> {
+        const stale = await super.get(orchestratorId);
+        if (stale !== null && !this.beaten && stale.session.status === 'active') {
+          this.beaten = true;
+          // Another process heartbeats right after this read, before any retire.
+          await this.save(
+            { ...stale.session, lastHeartbeatIso: ATTACHED_HEARTBEAT, leaseUntilIso: ATTACHED_LEASE },
+            stale.revision,
+          );
+        }
+        return stale;
+      }
+    }
+    const repo = new HeartbeatAfterGetRepository();
+    await seedSession(repo, { orchestratorId: 'orch-raced-2' });
+    const result = await registerConductorOrchestrator(makeRegisterInput(repo));
+    expect(result.code).toBe('registered');
+    const raced = repo.snapshot().find((entry) => entry.session.orchestratorId === 'orch-raced-2');
+    expect(raced!.session.status).toBe('active');
+  });
+
+  it('o9-refused-heartbeat-re-registers-once: a retired session is replaced by a new one, one time only', async () => {
+    const repo = new FakeSessionRepository();
+    const input = makeRegisterInput(repo);
+    const first = await registerConductorOrchestrator(input);
+    expect(first.code).toBe('registered');
+    const firstId = first.orchestratorId!;
+    expect((await retireConductorOrchestrator(repo, input.clock, firstId)).code).toBe('retired');
+
+    const healed = await heartbeatOrReRegisterConductorOrchestrator(input, firstId, true);
+    expect(healed.code).toBe('heartbeat-refused');
+    expect(healed.reRegistration).toBe('registered');
+    expect(healed.orchestratorId).not.toBe(firstId);
+    const active = repo.snapshot().filter((entry) => entry.session.status === 'active');
+    expect(active.map((entry) => entry.session.orchestratorId)).toEqual([healed.orchestratorId]);
+
+    // Once used, a later refusal re-registers nothing.
+    const again = await heartbeatOrReRegisterConductorOrchestrator(input, firstId, false);
+    expect(again).toEqual({ code: 'heartbeat-refused', orchestratorId: firstId, reRegistration: null });
+    expect(repo.snapshot().filter((entry) => entry.session.status === 'active')).toHaveLength(1);
   });
 
   it('o9-unreadable-store-is-unknown: an unreadable profile store and session store are both register-unknown', async () => {

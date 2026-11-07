@@ -63,7 +63,7 @@ import {
 import type { FleetCliRuntime } from './composition.js';
 import {
   CONDUCTOR_HEARTBEAT_GAP_CAP_MS,
-  heartbeatConductorOrchestrator,
+  heartbeatOrReRegisterConductorOrchestrator,
   pollDelayWhileRegistered,
   registerConductorOrchestrator,
   retireConductorOrchestrator,
@@ -1042,6 +1042,8 @@ async function runCommand(
   let registeredOrchestratorId: string | null = null;
   // Registration is attempted exactly once per process, whether it succeeds or not.
   let registrationAttempted = false;
+  // The heartbeat re-registers a refused (retired or missing) session once per process.
+  let reRegistrationUsed = false;
   // One stderr line per distinct non-renewed heartbeat code per process.
   const seenHeartbeatCodes = new Set<string>();
   // O9 fix: the heartbeat gap is anchored to the last beat, never to the pass
@@ -1063,12 +1065,33 @@ async function runCommand(
     if (registeredOrchestratorId === null) {
       return;
     }
-    const heartbeat = await heartbeatConductorOrchestrator(
-      runtime.coordination.orchestratorSessionRepository,
-      { nowIso: () => nowIsoOf(options) },
+    const heartbeat = await heartbeatOrReRegisterConductorOrchestrator(
+      {
+        sessionRepo: runtime.coordination.orchestratorSessionRepository,
+        listProfiles: () => runtime.coordination.projectProfileRepository.listProfiles(),
+        installation: runtime.installation,
+        clock: { nowIso: () => nowIsoOf(options) },
+        newOrchestratorId: () => runtime.conductor.newUlid(),
+      },
       registeredOrchestratorId,
+      !reRegistrationUsed,
     );
     lastHeartbeatAtMs = Date.now();
+    if (heartbeat.reRegistration !== null) {
+      // Self-heal is one-shot per process.
+      reRegistrationUsed = true;
+      registeredOrchestratorId = heartbeat.orchestratorId;
+      io.stderr(
+        `${JSON.stringify(
+          heartbeat.reRegistration === 'registered'
+            ? { orchestrator: 're-registered', orchestratorId: heartbeat.orchestratorId }
+            : { orchestrator: heartbeat.reRegistration },
+        )}\n`,
+      );
+      if (heartbeat.reRegistration === 'registered') {
+        return;
+      }
+    }
     if (heartbeat.code !== 'renewed' && !seenHeartbeatCodes.has(heartbeat.code)) {
       seenHeartbeatCodes.add(heartbeat.code);
       io.stderr(`${JSON.stringify({ orchestrator: heartbeat.code })}\n`);

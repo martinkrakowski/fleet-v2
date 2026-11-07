@@ -12,6 +12,8 @@ import {
   ListOrchestratorSessionsUseCase,
   ORCHESTRATOR_SESSION_MAX_PROJECTS,
   RegisterOrchestratorSessionUseCase,
+  OrchestratorSession,
+  OrchestratorSessionRevisionConflictError,
   RetireOrchestratorSessionUseCase,
   isOrchestratorAttached,
   type ListOrchestratorSessionsResult,
@@ -174,7 +176,6 @@ async function registerConductorOrchestratorUnchecked(
 
   // Retire up to the scan cap of lapsed conductor-driver active sessions; a
   // throw or refusal writes no new session. Attached sessions are never retired.
-  const retireUseCase = new RetireOrchestratorSessionUseCase({ sessionRepo: input.sessionRepo, clock });
   let retired = 0;
   for (const entry of listed.sessions) {
     if (retired >= CONDUCTOR_LAPSED_SCAN_CAP) {
@@ -205,12 +206,25 @@ async function registerConductorOrchestratorUnchecked(
       ) {
         continue;
       }
-      const result = await retireUseCase.retireOrchestratorSession(
-        { orchestratorId: entry.session.orchestratorId },
-        CONDUCTOR_TOKEN_ID,
-      );
-      if (result.outcome !== 'retired') {
+      // Compare-and-set on the revision just read: a heartbeat bumps the
+      // revision, so a session heartbeated after this read makes the save
+      // conflict and stays live. The read and the save are one revision-checked
+      // step in the repository, not two independent ones.
+      const loaded = OrchestratorSession.create(current.session);
+      if (!loaded.success) {
         return { code: 'register-unknown', orchestratorId: null };
+      }
+      const retiredSession = loaded.value.retire(nowIso);
+      if (!retiredSession.success) {
+        return { code: 'register-unknown', orchestratorId: null };
+      }
+      try {
+        await input.sessionRepo.save(retiredSession.value.toRecord(), current.revision);
+      } catch (saveError) {
+        if (saveError instanceof OrchestratorSessionRevisionConflictError) {
+          continue; // heartbeat moved: the session is live, leave it
+        }
+        throw saveError;
       }
       retired += 1;
     } catch {
@@ -263,6 +277,38 @@ export async function heartbeatConductorOrchestrator(
   } catch {
     return { code: 'heartbeat-unknown' };
   }
+}
+
+export interface HeartbeatOrReRegisterResult {
+  readonly code: ConductorHeartbeatCode;
+  /** The session id to keep beating: the new one after a successful re-registration. */
+  readonly orchestratorId: string;
+  /** Null unless a re-registration was attempted; then its register code. */
+  readonly reRegistration: RegisterConductorOrchestratorResult['code'] | null;
+}
+
+/**
+ * Heartbeat; when the session is refused (retired or missing) and a
+ * re-registration is still allowed, register once as a new session. Never throws.
+ */
+export async function heartbeatOrReRegisterConductorOrchestrator(
+  input: RegisterConductorOrchestratorInput,
+  orchestratorId: string,
+  canReRegister: boolean,
+): Promise<HeartbeatOrReRegisterResult> {
+  const beat = await heartbeatConductorOrchestrator(input.sessionRepo, input.clock, orchestratorId);
+  if (beat.code !== 'heartbeat-refused' || !canReRegister) {
+    return { code: beat.code, orchestratorId, reRegistration: null };
+  }
+  const registration = await registerConductorOrchestrator(input);
+  return {
+    code: beat.code,
+    orchestratorId:
+      registration.code === 'registered' && registration.orchestratorId !== null
+        ? registration.orchestratorId
+        : orchestratorId,
+    reRegistration: registration.code,
+  };
 }
 
 export type ConductorRetireCode = 'retired' | 'retire-refused' | 'retire-unknown';

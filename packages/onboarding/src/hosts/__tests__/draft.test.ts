@@ -7,12 +7,19 @@
 
 import { describe, expect, it } from 'vitest';
 
+import {
+  HOST_NAME_SECRET_REFUSAL,
+  hostNameHasSecretShape,
+  isValidHostName,
+  parseInstallation,
+} from '@fleet/installation';
 import type { RunnerCapabilityDeclaration } from '@fleet/installation';
 
 import {
   applyHostDraft,
   draftHost,
   isSafeSshHost,
+  planHostRename,
   type HostDraft,
   type HostDraftInput,
   type HostRunnerDraft,
@@ -308,6 +315,80 @@ describe('draftHost', () => {
       ]);
     }
   });
+
+  it('refuses a secret-shaped name and does not echo it', () => {
+    const githubToken = `ghp_${'a'.repeat(20)}`;
+    expect(isValidHostName(githubToken)).toBe(true);
+    expect(hostNameHasSecretShape(githubToken)).toBe(true);
+    const result = draftHost(sshInput({ name: githubToken }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors).toEqual([HOST_NAME_SECRET_REFUSAL]);
+      expect(result.errors.join(' ')).not.toContain(githubToken);
+    }
+  });
+
+  it('F96-1 draftHost and planHostRename refuse null, wrong types, a sparse hosts array, an unknown schema version and a throwing getter', () => {
+    const notObject = ['hosts: host draft is not an object'];
+    expect(draftHost(null)).toEqual({ ok: false, errors: notObject });
+    expect(draftHost([] as never)).toEqual({ ok: false, errors: notObject });
+    expect(draftHost({})).toEqual({ ok: false, errors: notObject });
+
+    let nameGetterRan = false;
+    const throwingName = draftHost({
+      get name() {
+        nameGetterRan = true;
+        throw new Error('boom');
+      },
+      transport: 'local',
+      worktreeRoot: '/srv',
+      roles: ['orchestrator'],
+    } as never);
+    expect(throwingName).toEqual({
+      ok: false,
+      errors: ['hosts: host name is unreadable'],
+    });
+    expect(nameGetterRan).toBe(false);
+
+    expect(planHostRename(null, 'a', 'b')).toEqual({
+      ok: false,
+      reason: 'not-object',
+    });
+    expect(
+      planHostRename({ schemaVersion: 2, hosts: new Array(2) }, 'a', 'b'),
+    ).toEqual({ ok: false, reason: 'hosts-not-object' });
+    expect(planHostRename({ schemaVersion: 3, hosts: {} }, 'a', 'b')).toEqual({
+      ok: false,
+      reason: 'not-v2',
+    });
+
+    let hostsGetterRan = false;
+    const throwingHosts = planHostRename(
+      {
+        schemaVersion: 2,
+        get hosts() {
+          hostsGetterRan = true;
+          throw new Error('boom');
+        },
+      },
+      'a',
+      'b',
+    );
+    expect(throwingHosts).toEqual({ ok: false, reason: 'unreadable' });
+    expect(hostsGetterRan).toBe(false);
+  });
+
+  it('F96-7 planHostRename refuses an over-long name', () => {
+    const value = { schemaVersion: 2, hosts: {} };
+    expect(planHostRename(value, 'a', 'b'.repeat(4097))).toEqual({
+      ok: false,
+      reason: 'name-too-long',
+    });
+    expect(planHostRename(value, 'a', 'x'.repeat(129))).toEqual({
+      ok: false,
+      reason: 'invalid-new-name',
+    });
+  });
 });
 
 describe('applyHostDraft', () => {
@@ -412,5 +493,122 @@ describe('applyHostDraft', () => {
         ]);
       }
     }
+  });
+});
+
+describe('planHostRename', () => {
+  it('renames a key, moves the entry unchanged and never mutates the input', () => {
+    const input = {
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        mac: {
+          transport: 'local',
+          worktreeRoot: '/srv/mac',
+          roles: ['orchestrator'],
+        },
+        old: {
+          transport: 'ssh',
+          sshAlias: 'm',
+          worktreeRoot: '/srv/lane',
+          roles: ['lane-runner'],
+          runner: { kind: 'opencode', port: 4166 },
+        },
+      },
+    };
+    const before = JSON.stringify(input);
+    const result = planHostRename(input, 'old', 'new-host');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(JSON.stringify(input)).toBe(before);
+      expect(Object.keys(result.candidate.hosts)).toEqual(['mac', 'new-host']);
+      expect(result.candidate.hosts['new-host']).toBe(input.hosts.old);
+      expect(result.candidate.hosts['new-host']).toEqual(input.hosts.old);
+      expect(result.candidate.forge).toEqual({ mode: 'none' });
+      expect(result.candidate.schemaVersion).toBe(2);
+    }
+  });
+
+  /**
+   * HN1 fix round 1, finding 3: an own `"__proto__"` data property survives
+   * the copy, so the loader's unknown-root-key check refuses the candidate
+   * instead of the rename rewriting the file silently without it.
+   */
+  it('planHostRename keeps an own __proto__ key so the loader refuses the candidate', () => {
+    // The JSON text exactly as the file on disk would carry it: JSON.parse
+    // creates an own `__proto__` data property, which an object literal
+    // would not.
+    const value: unknown = JSON.parse(`{
+      "schemaVersion": 2,
+      "forge": { "mode": "none" },
+      "__proto__": { "injected": true },
+      "hosts": {
+        "old": {
+          "transport": "local",
+          "worktreeRoot": "/srv/fleet/old",
+          "roles": ["orchestrator", "lane-runner"],
+          "runner": { "kind": "opencode", "port": 4166 }
+        }
+      }
+    }`);
+    expect(Object.hasOwn(value as object, '__proto__')).toBe(true);
+
+    const result = planHostRename(value, 'old', 'new-host');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // The copy kept the key as an own data property on a null-prototype
+      // target, so the loader sees it and refuses the candidate.
+      expect(Object.hasOwn(result.candidate, '__proto__')).toBe(true);
+      const parsed = parseInstallation(result.candidate);
+      expect(parsed.ok).toBe(false);
+      if (!parsed.ok) {
+        expect(parsed.errors).toContain('installation: unknown key');
+      }
+      expect(Object.getPrototypeOf(result.candidate)).toBe(null);
+    }
+  });
+
+  /** HN1 fix round 1, finding 4: a class instance is not a plain object. */
+  it('draftHost and planHostRename refuse a class instance with not-object', () => {
+    class Draft {
+      name = 'lanehost';
+      transport = 'local' as const;
+      worktreeRoot = '/srv/fleet-v2/worktrees';
+      roles = ['lane-runner'];
+    }
+    class RenameRoot {
+      schemaVersion = 2;
+      hosts: Record<string, unknown> = {};
+    }
+    const instance = new Draft();
+    expect(draftHost(instance)).toEqual({
+      ok: false,
+      errors: ['hosts: host draft is not an object'],
+    });
+    expect(planHostRename(new RenameRoot(), 'a', 'b')).toEqual({
+      ok: false,
+      reason: 'not-object',
+    });
+  });
+
+  /** HN1 fix round 2, finding 2: a class instance as `hosts` is refused too. */
+  it('planHostRename refuses a class instance hosts map with hosts-not-object and writes nothing', () => {
+    class HostsMap {
+      old = {
+        transport: 'local' as const,
+        worktreeRoot: '/srv/fleet/worktrees',
+        roles: ['lane-runner'],
+      };
+    }
+    const value: Record<string, unknown> = {
+      schemaVersion: 2,
+      hosts: new HostsMap(),
+    };
+    const result = planHostRename(value, 'old', 'new-host');
+    expect(result).toEqual({ ok: false, reason: 'hosts-not-object' });
+    // Nothing is written: the root and its hosts map are exactly as they were.
+    expect(Object.keys(value)).toEqual(['schemaVersion', 'hosts']);
+    expect(Object.getPrototypeOf(value.hosts as object)).toBe(HostsMap.prototype);
+    expect(Object.hasOwn(value.hosts as object, 'old')).toBe(true);
   });
 });

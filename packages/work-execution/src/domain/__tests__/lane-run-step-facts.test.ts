@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildLaneRunStepKey } from '../lane-run-keys.js';
+import { buildLaneRunStepKey, laneRunPremergeKey } from '../lane-run-keys.js';
 import type { LaneRunKeyResult } from '../lane-run-keys.js';
-import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN } from '../lane-run-journal.js';
+import { LANE_RUN_JOURNAL_REASON_CODE_PATTERN, laneRunJournalPendingIntent } from '../lane-run-journal.js';
 import type { LaneRunJournalEntryRecord, LaneRunJournalOutcome } from '../lane-run-journal.js';
 import {
+  LANE_RUN_INTENT_ABANDONED_REASON_CODE,
   LANE_RUN_RESULT_REASON_CODES,
   laneRunAttemptDispatchResult,
   laneRunAttemptPlacement,
@@ -14,6 +15,7 @@ import {
   laneRunGateFact,
   laneRunIntentEntry,
   laneRunParkedConductCount,
+  laneRunPremergePost,
   laneRunRecordedSeatAdvance,
   laneRunRefusedStep,
   laneRunResultEntry,
@@ -397,6 +399,34 @@ describe('laneRunRefusedStep', () => {
       result(gateKey, 'completed', 'gate-passed'),
     ];
     expect(laneRunRefusedStep(entries, RUN_ID, 0)).toBeNull();
+  });
+});
+
+describe('intent-abandoned-by-operator', () => {
+  it('LANE_RUN_RESULT_REASON_CODES includes intent-abandoned-by-operator and keeps gate unknown, refusedStep null, and premergePost none', () => {
+    expect(LANE_RUN_INTENT_ABANDONED_REASON_CODE).toBe('intent-abandoned-by-operator');
+    expect(LANE_RUN_RESULT_REASON_CODES).toContain(LANE_RUN_INTENT_ABANDONED_REASON_CODE);
+    expect(LANE_RUN_JOURNAL_REASON_CODE_PATTERN.test(LANE_RUN_INTENT_ABANDONED_REASON_CODE)).toBe(true);
+
+    const gateKey = keyOf({ round: 0, step: 'gate', seatIndex: 0, head12: HEAD });
+    const ambiguous = [intent(gateKey), result(gateKey, 'ambiguous', 'gate-unknown')];
+    expect(laneRunJournalPendingIntent(ambiguous, RUN_ID)).toEqual({ key: gateKey, step: 'gate', reconciliation: 'ambiguous' });
+
+    const abandoned = [
+      ...ambiguous,
+      laneRunResultEntry(nextEntryId(), RUN_ID, gateKey, 'overtaken', LANE_RUN_INTENT_ABANDONED_REASON_CODE, NOW),
+    ];
+    expect(laneRunJournalPendingIntent(abandoned, RUN_ID)).toBeNull();
+    expect(laneRunGateFact(abandoned, RUN_ID, HEAD)).toBe('unknown');
+    expect(laneRunRefusedStep(abandoned, RUN_ID, 0)).toBeNull();
+
+    const premergeKey = mustBuild(laneRunPremergeKey(RUN_ID, 0, HEAD));
+    const premerge = [
+      intent(premergeKey),
+      result(premergeKey, 'ambiguous', 'forge-ambiguous'),
+      laneRunResultEntry(nextEntryId(), RUN_ID, premergeKey, 'overtaken', LANE_RUN_INTENT_ABANDONED_REASON_CODE, NOW),
+    ];
+    expect(laneRunPremergePost(premerge, RUN_ID, HEAD)).toBe('none');
   });
 });
 

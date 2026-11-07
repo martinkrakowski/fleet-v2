@@ -63,7 +63,7 @@ const BASE_REQUEST: RunIndependentReviewRequest = {
 
 const PASS_FIXTURE =
   '{"type":"step_start","part":{"type":"step-start"}}\n' +
-  '{"type":"text","part":{"type":"text","text":"VERDICT: PASS\\n"}}';
+  '{"type":"text","part":{"type":"text","text":"```json\\n{\\"verdict\\":\\"PASS\\",\\"findings\\":[]}\\n```\\n"}}';
 
 describe('ReviewTransportRouter', () => {
   describe('reviewerChainSeatIds and hasReviewerSeat', () => {
@@ -592,7 +592,10 @@ describe('ReviewTransportRouter', () => {
       };
     }
 
-    const CLI_STDOUT = 'FINDING: minor a.txt:1 wording\nVERDICT: PASS\n';
+    const CLI_STDOUT =
+      '```json\n' +
+      JSON.stringify({ verdict: 'PASS', findings: [{ severity: 'minor', file: 'a.txt', line: 1, summary: 'wording' }] }) +
+      '\n```';
 
     it('routes a grok seat to the CLI transport and a none route does not block it', async () => {
       const recorded: Array<{ file: string; args: readonly string[] }> = [];

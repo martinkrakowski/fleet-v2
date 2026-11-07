@@ -615,9 +615,13 @@ function makeForgeGhRunner(
 
 /** The fake review transport: exit 0, one step_start event, then the verdict text part. */
 const REVIEW_STEP_START_LINE = '{"type":"step_start","part":{"type":"step-start"}}';
-const REVIEW_PASS_TEXT = 'VERDICT: PASS\n';
-/** A FAIL carries one finding line before its verdict, so the verdict is never `unknown`. */
-const REVIEW_FAIL_TEXT = 'FINDING: blocker packages/example/README.md:1 example\nVERDICT: FAIL\n';
+/** A PASS carries the single trailing ```json answer block (RV5). */
+const REVIEW_PASS_TEXT = '```json\n{"verdict":"PASS","findings":[]}\n```';
+/** A FAIL carries one finding in the block, so the verdict is never `no-findings-on-fail`. */
+const REVIEW_FAIL_TEXT =
+  '```json\n' +
+  '{"verdict":"FAIL","findings":[{"severity":"blocker","file":"packages/example/README.md","line":1,"summary":"example"}]}' +
+  '\n```';
 
 function makeReviewSpawn(verdicts: readonly ('PASS' | 'FAIL')[]) {
   const calls: Array<{ file: string; args: readonly string[] }> = [];

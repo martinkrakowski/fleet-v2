@@ -1395,4 +1395,47 @@ describe('parseInstallation v2 secret-shaped host keys', () => {
       expect(containsSecretShape(value)).toBe(true);
     },
   );
+
+  /**
+   * HN1 fix round 1, finding 1: a host key the loader accepts but the
+   * withholding screen flags never reaches an error line.
+   */
+  it('withholds a long opaque token-run key from a malformed entry error', () => {
+    const key = 'x.abcdefghijklmnopqrstuvwxyz0123456789';
+    expect(isValidHostName(key)).toBe(true);
+    const result = parseInstallation({
+      schemaVersion: 2,
+      forge: { mode: 'none' },
+      hosts: {
+        [key]: 'not-an-object',
+      },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors).toContain(
+        'hosts.<host key withheld>: must be an object',
+      );
+      // No window of twenty characters or more of the key appears anywhere.
+      for (let start = 0; start < key.length; start += 1) {
+        for (let end = start + 20; end <= key.length; end += 1) {
+          expect(JSON.stringify(result.errors)).not.toContain(
+            key.slice(start, end),
+          );
+        }
+      }
+    }
+  });
+
+  it('echoes an ordinary host key unchanged in a malformed entry error', () => {
+    const result = parseInstallation({
+      ...validV2,
+      hosts: { ...validV2.hosts, 'lane-host-2': 'not-an-object' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors).toContain(
+        'hosts.lane-host-2: must be an object',
+      );
+    }
+  });
 });

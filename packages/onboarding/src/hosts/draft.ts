@@ -182,6 +182,38 @@ function buildHostRunner(
 }
 
 /**
+ * A plain object: its prototype is `Object.prototype` or `null`. A class
+ * instance carries behaviour a draft or a rename root must not inherit, so it
+ * is refused like any other non-object.
+ */
+function isPlainObject(value: unknown): boolean {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * Copy one own data property by descriptor, never by assignment: an own
+ * `"__proto__"` data property assigned onto a fresh `{}` triggers the
+ * inherited setter and is dropped, so a key the unknown-root-key check must
+ * see disappears. A null-prototype target plus `defineProperty` keeps it.
+ */
+function copyOwnDataProperty(
+  target: Record<string, unknown>,
+  key: string,
+  value: unknown,
+): void {
+  Object.defineProperty(target, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+/**
  * Draft one host entry from collected answers.
  *
  * Refused here, before any probe runs: an alias that is not a safe ssh host
@@ -192,7 +224,7 @@ function buildHostRunner(
  * agy isolation floor — is the loader's answer, not this function's.
  */
 export function draftHost(input: unknown): HostDraftResult {
-  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+  if (!isPlainObject(input)) {
     return { ok: false, errors: ['hosts: host draft is not an object'] };
   }
   const record = input as Record<string, unknown>;
@@ -467,7 +499,7 @@ export function planHostRename(
   if (!isValidHostName(newName)) {
     return { ok: false, reason: 'invalid-new-name' };
   }
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+  if (!isPlainObject(value)) {
     return { ok: false, reason: 'not-object' };
   }
   const record = value as Record<string, unknown>;
@@ -502,7 +534,9 @@ export function planHostRename(
   ) {
     return { ok: false, reason: 'unreadable' };
   }
-  const newHosts: Record<string, unknown> = {};
+  const newHosts: Record<string, unknown> = Object.create(
+    null,
+  ) as Record<string, unknown>;
   for (const key of Object.keys(hostsRecord)) {
     const descriptor = Object.getOwnPropertyDescriptor(hostsRecord, key);
     if (
@@ -513,11 +547,13 @@ export function planHostRename(
       return { ok: false, reason: 'unreadable' };
     }
     if (key !== oldName) {
-      newHosts[key] = descriptor.value;
+      copyOwnDataProperty(newHosts, key, descriptor.value);
     }
   }
-  newHosts[newName] = oldEntryDescriptor.value;
-  const newRoot: Record<string, unknown> = {};
+  copyOwnDataProperty(newHosts, newName, oldEntryDescriptor.value);
+  const newRoot: Record<string, unknown> = Object.create(
+    null,
+  ) as Record<string, unknown>;
   for (const key of Object.keys(record)) {
     if (key === 'hosts') {
       continue;
@@ -530,7 +566,7 @@ export function planHostRename(
     ) {
       return { ok: false, reason: 'unreadable' };
     }
-    newRoot[key] = descriptor.value;
+    copyOwnDataProperty(newRoot, key, descriptor.value);
   }
   newRoot.hosts = newHosts;
   return { ok: true, candidate: newRoot as HostDraftCandidate };

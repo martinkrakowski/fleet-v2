@@ -872,6 +872,46 @@ export function hostNameHasSecretShape(name: string): boolean {
   return typeof name === 'string' && containsSecretShape(name);
 }
 
+/**
+ * A long run of alphanumeric characters is the shape of an opaque token even
+ * without a known prefix, so a host key carrying one is withheld from every
+ * error line too — the loader still accepts such a key, but the key text is
+ * never echoed back (HN1 fix round 1, finding 1).
+ */
+const HOST_KEY_TOKEN_RUN = /[A-Za-z0-9]{20,}/;
+
+/** The placeholder that stands in for a host key the screen withholds. */
+export const HOST_KEY_WITHHELD = '<host key withheld>';
+
+/**
+ * The key text an error line may carry: the key itself only when it passes
+ * the secret screen, otherwise the withheld placeholder. A key the loader
+ * refused for secret-shaped text and a key carrying a long opaque token run
+ * are both withheld; an ordinary host name is echoed unchanged.
+ */
+export function screenHostKey(key: string): string {
+  return typeof key === 'string' &&
+    (hostNameHasSecretShape(key) || HOST_KEY_TOKEN_RUN.test(key))
+    ? HOST_KEY_WITHHELD
+    : key;
+}
+
+/** The placeholder that stands in for an error line the screen withholds. */
+export const ERROR_LINE_WITHHELD =
+  '<error line withheld: it carried secret-shaped text>';
+
+/**
+ * The last screen before any CLI line reaches the operator: a line carrying
+ * secret-shaped text is withheld whole, because removing the matched text
+ * would mean quoting it. Host keys are screened at their source
+ * (`screenHostKey`); this is the defence in depth behind that.
+ */
+export function screenErrorLine(line: string): string {
+  return typeof line === 'string' && containsSecretShape(line)
+    ? ERROR_LINE_WITHHELD
+    : line;
+}
+
 function readRequiredEnum<T extends string>(
   record: JsonObject,
   key: string,
@@ -1500,6 +1540,11 @@ function parseV2Hosts(
   }
   const hosts: Record<string, HostSection> = Object.create(null);
   for (const name of Object.keys(section)) {
+    // Every error line carries the key only through the screen: a
+    // secret-shaped key, or one carrying a long opaque token run, is never
+    // echoed (HN1 fix round 1, finding 1).
+    const keyText = screenHostKey(name);
+    const hostPath = `hosts.${keyText}`;
     if (hostNameHasSecretShape(name)) {
       errors.push(HOST_NAME_SECRET_REFUSAL);
       continue;
@@ -1510,10 +1555,10 @@ function parseV2Hosts(
     }
     const entry = section[name];
     if (!isJsonObject(entry)) {
-      errors.push(`hosts.${name}: must be an object`);
+      errors.push(`${hostPath}: must be an object`);
       continue;
     }
-    const host = parseHost(entry, `hosts.${name}`, errors);
+    const host = parseHost(entry, hostPath, errors);
     if (host !== undefined) {
       hosts[name] = host;
     }
@@ -1522,13 +1567,16 @@ function parseV2Hosts(
   let laneRunners = 0;
   const dialPorts = new Map<number, string>();
   for (const [name, host] of Object.entries(hosts)) {
+    // These hosts parsed, but a key carrying a long opaque token run is
+    // still never echoed (HN1 fix round 1, finding 1).
+    const hostPath = `hosts.${screenHostKey(name)}`;
     if (host.roles.includes('orchestrator')) {
       orchestrators += 1;
       // The runtime always forces a local orchestrator executor, so an
       // orchestrator host reached over ssh could never run it (plan section 1).
       if (host.transport !== 'local') {
         errors.push(
-          `hosts.${name}.transport: must be "local" when the host holds the orchestrator role`,
+          `${hostPath}.transport: must be "local" when the host holds the orchestrator role`,
         );
       }
     }
@@ -1547,11 +1595,11 @@ function parseV2Hosts(
       if (dialPort > 65535) {
         // An ssh host on 65535 would need forward port 65536, which cannot be bound.
         errors.push(
-          `hosts.${name}.runner.port: must leave room for the ssh forward port`,
+          `${hostPath}.runner.port: must leave room for the ssh forward port`,
         );
       } else if (dialPorts.has(dialPort)) {
         errors.push(
-          `hosts.${name}.runner.port: derived dial port must be unique across hosts`,
+          `${hostPath}.runner.port: derived dial port must be unique across hosts`,
         );
       } else {
         dialPorts.set(dialPort, name);

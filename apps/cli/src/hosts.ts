@@ -53,6 +53,8 @@ import {
   isValidHostName,
   parseInstallation,
   resolveInstallationFile,
+  screenErrorLine,
+  screenHostKey,
   type FleetInstallation,
   type HostRole,
   type HostSection,
@@ -345,7 +347,10 @@ export async function readInstallationState(file: string): Promise<InstallationS
 
 export function printErrors(io: CliIo, errors: readonly string[]): void {
   for (const error of errors) {
-    io.stderr(`${error}\n`);
+    // Every line is screened again here, however its producer built it: a
+    // line carrying secret-shaped text is withheld whole (HN1 fix round 1,
+    // finding 1).
+    io.stderr(`${screenErrorLine(error)}\n`);
   }
 }
 
@@ -510,6 +515,36 @@ function runnerDraftFor(
   return { kind: "opencode", ...common };
 }
 
+/**
+ * Every host key the diff could carry, from both sides: the candidate's hosts
+ * and the current file's. The current text is parsed defensively — an invalid
+ * or absent file contributes no keys, and its loader errors are screened by
+ * `printErrors` instead.
+ */
+function currentHostKeys(currentText: string): readonly string[] {
+  try {
+    const parsed: unknown = JSON.parse(currentText);
+    return Object.keys(hostsOf(parsed) ?? {});
+  } catch {
+    return [];
+  }
+}
+
+/** Replace every occurrence of a withheld key with its screened code. */
+function screenHostKeysIn(
+  text: string,
+  keys: readonly string[],
+): string {
+  let screened = text;
+  for (const key of keys) {
+    const code = screenHostKey(key);
+    if (code !== key) {
+      screened = screened.split(key).join(code);
+    }
+  }
+  return screened;
+}
+
 /** Diff the file as it sits against the candidate as the write would put it. */
 export function printDiff(
   io: CliIo,
@@ -522,7 +557,21 @@ export function printDiff(
       serialiseInstallationCandidate(candidate),
     ),
   );
-  io.stdout(diff === "" ? "no changes\n" : `${diff}\n`);
+  if (diff === "") {
+    io.stdout("no changes\n");
+    return;
+  }
+  // Every host key on either side is screened the same way, for edit and for
+  // remove alike, and each line passes the error-line screen (HN1 fix round
+  // 1, finding 2).
+  const keys = [
+    ...new Set([...Object.keys(candidate.hosts), ...currentHostKeys(currentText)]),
+  ];
+  const screened = screenHostKeysIn(diff, keys)
+    .split("\n")
+    .map(screenErrorLine)
+    .join("\n");
+  io.stdout(`${screened}\n`);
 }
 
 /** Probe, diff, confirm, then the compare-and-swap write. */
@@ -581,14 +630,14 @@ async function writeHost(
     // The same rule the loader applies to v2 host-map keys, refused at the
     // boundary before anything is drafted.
     io.stderr(
-      `hosts ${mode}: '${name}' is not a valid host name (identifier-shaped, no '..')\n${HOSTS_HELP}\n`,
+      `hosts ${mode}: '${screenHostKey(name)}' is not a valid host name (identifier-shaped, no '..')\n${HOSTS_HELP}\n`,
     );
     return 2;
   }
   if (args.sshAlias !== undefined && !isSafeSshHost(args.sshAlias)) {
     // The value never appears in the message: an alias is operator input.
     io.stderr(
-      `hosts.${name}.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option\n${HOSTS_HELP}\n`,
+      `hosts.${screenHostKey(name)}.sshAlias: must match ^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+$ and must not start with "-", so it can never be read as an ssh option\n${HOSTS_HELP}\n`,
     );
     return 2;
   }
@@ -662,7 +711,7 @@ async function writeHost(
   if (mode === "edit" && existing === undefined) {
     // The engine reports the same fact for a v1 or absent file; name it here.
     io.stderr(
-      `hosts.${name}: not in the installation file; adding is a separate mode\n`,
+      `hosts.${screenHostKey(name)}: not in the installation file; adding is a separate mode\n`,
     );
     return 1;
   }
@@ -672,7 +721,7 @@ async function writeHost(
     existing?.transport === "local"
   ) {
     io.stderr(
-      `hosts.${name}: the entry's transport is local; --ssh changes an ssh host's alias\n`,
+      `hosts.${screenHostKey(name)}: the entry's transport is local; --ssh changes an ssh host's alias\n`,
     );
     return 2;
   }
@@ -766,7 +815,9 @@ async function writeHost(
   const executor = options.probeExecutor ?? createNodeDoctorExecutor();
   const lines = await probeHost(spec, executor);
   for (const line of lines) {
-    io.stdout(`${formatDoctorLine(line)}\n`);
+    // The probe lines name the host; a key the screen withholds is never
+    // echoed (HN1 fix round 1, finding 1).
+    io.stdout(`${screenHostKeysIn(formatDoctorLine(line), [name])}\n`);
   }
   if (hostProbesHaveFailure(lines)) {
     io.stderr("refused: a probe reported FAIL; nothing was written\n");
@@ -799,7 +850,9 @@ async function writeHost(
   }
   if (movedFrom.length > 0) {
     io.stdout(
-      `lanes now run on ${name} (the lane-runner role moved from ${movedFrom.join(", ")})\n`,
+      `lanes now run on ${screenHostKey(name)} (the lane-runner role moved from ${movedFrom
+        .map(screenHostKey)
+        .join(", ")})\n`,
     );
   }
   return confirmAndWrite(file, state.read, candidate, args, io, options);
@@ -841,12 +894,12 @@ async function removeHost(
   const hosts = state.installation.hosts ?? {};
   const host = Object.hasOwn(hosts, name) ? hosts[name] : undefined;
   if (host === undefined) {
-    io.stderr(`hosts.${name}: not in the installation file\n`);
+    io.stderr(`hosts.${screenHostKey(name)}: not in the installation file\n`);
     return 1;
   }
   if (host.roles.includes("orchestrator")) {
     io.stderr(
-      `hosts.${name} holds the orchestrator role, and an installation needs exactly one orchestrator host; move the role to another host first (hosts edit)\n`,
+      `hosts.${screenHostKey(name)} holds the orchestrator role, and an installation needs exactly one orchestrator host; move the role to another host first (hosts edit)\n`,
     );
     return 1;
   }
@@ -856,7 +909,7 @@ async function removeHost(
   );
   if (host.roles.includes("lane-runner") && otherLaneRunner === undefined) {
     io.stderr(
-      `hosts.${name} is the last lane-runner host; move the lane-runner role to another host before removing it\n`,
+      `hosts.${screenHostKey(name)} is the last lane-runner host; move the lane-runner role to another host before removing it\n`,
     );
     return 1;
   }
@@ -872,19 +925,19 @@ async function removeHost(
   );
   if (liveAttempts.length > 0) {
     for (const attempt of liveAttempts) {
-      io.stderr(`attempt ${attempt.id} is ${attempt.state} on ${name}\n`);
+      io.stderr(`attempt ${attempt.id} is ${attempt.state} on ${screenHostKey(name)}\n`);
     }
-    io.stderr(`hosts.${name} has live work; nothing was removed\n`);
+    io.stderr(`hosts.${screenHostKey(name)} has live work; nothing was removed\n`);
     return 1;
   }
   const reservations = await journal.listActiveReservations(name);
   if (reservations.length > 0) {
     for (const reservation of reservations) {
       io.stderr(
-        `reservation ${reservation.id} holds a slot for attempt ${reservation.attemptId} on ${name}\n`,
+        `reservation ${reservation.id} holds a slot for attempt ${reservation.attemptId} on ${screenHostKey(name)}\n`,
       );
     }
-    io.stderr(`hosts.${name} has live work; nothing was removed\n`);
+    io.stderr(`hosts.${screenHostKey(name)} has live work; nothing was removed\n`);
     return 1;
   }
 
@@ -1030,7 +1083,9 @@ async function listHosts(file: string, io: CliIo): Promise<number> {
   for (const name of names) {
     const host = hosts[name];
     const parts = [
-      name,
+      // A key the screen withholds is never echoed, even from a file that
+      // parsed (HN1 fix round 1, finding 1).
+      screenHostKey(name),
       host.transport,
       ...(host.sshAlias !== undefined ? [`alias ${host.sshAlias}`] : []),
       `roles: ${host.roles.join(", ")}`,

@@ -11,6 +11,7 @@ import {
   HOST_NAME_SECRET_REFUSAL,
   hostNameHasSecretShape,
   isValidHostName,
+  parseInstallation,
 } from '@fleet/installation';
 import type { RunnerCapabilityDeclaration } from '@fleet/installation';
 
@@ -526,5 +527,67 @@ describe('planHostRename', () => {
       expect(result.candidate.forge).toEqual({ mode: 'none' });
       expect(result.candidate.schemaVersion).toBe(2);
     }
+  });
+
+  /**
+   * HN1 fix round 1, finding 3: an own `"__proto__"` data property survives
+   * the copy, so the loader's unknown-root-key check refuses the candidate
+   * instead of the rename rewriting the file silently without it.
+   */
+  it('planHostRename keeps an own __proto__ key so the loader refuses the candidate', () => {
+    // The JSON text exactly as the file on disk would carry it: JSON.parse
+    // creates an own `__proto__` data property, which an object literal
+    // would not.
+    const value: unknown = JSON.parse(`{
+      "schemaVersion": 2,
+      "forge": { "mode": "none" },
+      "__proto__": { "injected": true },
+      "hosts": {
+        "old": {
+          "transport": "local",
+          "worktreeRoot": "/srv/fleet/old",
+          "roles": ["orchestrator", "lane-runner"],
+          "runner": { "kind": "opencode", "port": 4166 }
+        }
+      }
+    }`);
+    expect(Object.hasOwn(value as object, '__proto__')).toBe(true);
+
+    const result = planHostRename(value, 'old', 'new-host');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // The copy kept the key as an own data property on a null-prototype
+      // target, so the loader sees it and refuses the candidate.
+      expect(Object.hasOwn(result.candidate, '__proto__')).toBe(true);
+      const parsed = parseInstallation(result.candidate);
+      expect(parsed.ok).toBe(false);
+      if (!parsed.ok) {
+        expect(parsed.errors).toContain('installation: unknown key');
+      }
+      expect(Object.getPrototypeOf(result.candidate)).toBe(null);
+    }
+  });
+
+  /** HN1 fix round 1, finding 4: a class instance is not a plain object. */
+  it('draftHost and planHostRename refuse a class instance with not-object', () => {
+    class Draft {
+      name = 'lanehost';
+      transport = 'local' as const;
+      worktreeRoot = '/srv/fleet-v2/worktrees';
+      roles = ['lane-runner'];
+    }
+    class RenameRoot {
+      schemaVersion = 2;
+      hosts: Record<string, unknown> = {};
+    }
+    const instance = new Draft();
+    expect(draftHost(instance)).toEqual({
+      ok: false,
+      errors: ['hosts: host draft is not an object'],
+    });
+    expect(planHostRename(new RenameRoot(), 'a', 'b')).toEqual({
+      ok: false,
+      reason: 'not-object',
+    });
   });
 });

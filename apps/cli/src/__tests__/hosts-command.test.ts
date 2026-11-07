@@ -1277,3 +1277,130 @@ describe("fleet-v2 hosts rename", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// HN1 fix round 1: host keys are never echoed
+// ---------------------------------------------------------------------------
+
+/** Every window of twenty characters or more of `key` that `text` contains. */
+function echoedWindows(text: string, key: string): string[] {
+  const echoed: string[] = [];
+  for (let start = 0; start < key.length; start += 1) {
+    for (let end = start + 20; end <= key.length; end += 1) {
+      const window = key.slice(start, end);
+      if (text.includes(window) && !echoed.includes(window)) {
+        echoed.push(window);
+      }
+    }
+  }
+  return echoed;
+}
+
+describe("hosts output never echoes a withheld host key", () => {
+  // A valid dotted key the loader accepts, carrying a long opaque token run.
+  const tokenRunKey = "x.abcdefghijklmnopqrstuvwxyz0123456789";
+  // A flat 36-character alphanumeric key, the shape of an opaque token.
+  const flatTokenKey = "abcdefghij0123456789abcdefghij012345";
+
+  function installationWithTokenKeys(worktreeRoot: string): unknown {
+    return {
+      schemaVersion: 2,
+      forge: { mode: "none" },
+      hosts: {
+        mac: {
+          transport: "local",
+          worktreeRoot,
+          roles: ["orchestrator", "lane-runner"],
+          runner: { kind: "opencode", port: 46000 },
+        },
+        [flatTokenKey]: {
+          transport: "ssh",
+          sshAlias: "lane-alias",
+          worktreeRoot: `${worktreeRoot}/lane`,
+          roles: ["lane-runner"],
+          runner: { kind: "opencode", port: 4166 },
+        },
+      },
+    };
+  }
+
+  it("hosts list discloses nothing of a malformed host under a token-run key", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    const installation = installationWithTokenKeys(
+      path.join(dir, "worktrees"),
+    ) as { hosts: Record<string, unknown> };
+    // The malformed entry: the loader refuses it and names the host key.
+    installation.hosts[tokenRunKey] = "not-an-object";
+    writeJsonFile(file, installation);
+    const { code, stdout, stderr } = await runHosts(["list"], file);
+    expect(code).toBe(1);
+    expect(stderr).toContain("the installation file is invalid");
+    expect(stderr).toContain("must be an object");
+    expect(echoedWindows(stdout + stderr, tokenRunKey)).toEqual([]);
+  });
+
+  it("hosts list never prints a withheld key even when the file parses", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, installationWithTokenKeys(path.join(dir, "worktrees")));
+    const { code, stdout } = await runHosts(["list"], file);
+    expect(code).toBe(0);
+    expect(echoedWindows(stdout, flatTokenKey)).toEqual([]);
+    expect(stdout).toContain("<host key withheld>");
+  });
+
+  it("removing a host with a 36-character alphanumeric key prints no key", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, installationWithTokenKeys(path.join(dir, "worktrees")));
+    const { code, stdout, stderr } = await runHosts(
+      ["remove", flatTokenKey, "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("written");
+    expect(stdout).toContain("-");
+    expect(echoedWindows(stdout + stderr, flatTokenKey)).toEqual([]);
+  });
+
+  it("editing a host with a 36-character alphanumeric key prints no key", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    writeJsonFile(file, installationWithTokenKeys(path.join(dir, "worktrees")));
+    const { code, stdout, stderr } = await runHosts(
+      ["edit", flatTokenKey, "--port", "4167", "--yes"],
+      file,
+    );
+    expect(code).toBe(0);
+    expect(stdout).toContain("written");
+    expect(echoedWindows(stdout + stderr, flatTokenKey)).toEqual([]);
+  });
+
+  it("renaming a host whose root carries an own __proto__ key refuses and leaves the file unchanged", async () => {
+    const dir = makeTempDir();
+    const file = path.join(dir, "fleet.json");
+    // Written as JSON text so the root gains an own "__proto__" data property.
+    writeFileSync(
+      file,
+      `${JSON.stringify(
+        installationWithTokenKeys(path.join(dir, "worktrees")),
+        null,
+        2,
+      ).slice(0, -1)},"__proto__": {"injected": true}}\n`,
+      "utf8",
+    );
+    const before = readFileSync(file, "utf8");
+    expect(JSON.parse(before)).toEqual(
+      expect.objectContaining({ schemaVersion: 2 }),
+    );
+    expect(Object.hasOwn(JSON.parse(before), "__proto__")).toBe(true);
+    const { code, stderr } = await runHosts(
+      ["rename", flatTokenKey, "renamed-host", "--yes"],
+      file,
+    );
+    expect(code).toBe(1);
+    expect(readFileSync(file, "utf8")).toBe(before);
+    expect(stderr).not.toContain("renamed host");
+  });
+});

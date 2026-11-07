@@ -17,7 +17,6 @@ import type { HostRole, RunnerCapabilityDeclaration } from '@fleet/installation'
 
 import {
   applyHostDraft,
-  copyOwnData,
   draftHost,
   isSafeSshHost,
   planHostRename,
@@ -886,15 +885,7 @@ describe('mergeDraftedHost precedence (P2-cli)', () => {
       expect(jsonDraftResult.errors.join(' ')).toContain('roleAliases');
     }
 
-    // copyOwnData keeps __proto__ as an own key and prototype is unchanged
-    const jsonCopy = copyOwnData(jsonAliases);
-    expect(jsonCopy).toBeDefined();
-    if (jsonCopy !== undefined) {
-      expect(Object.hasOwn(jsonCopy, '__proto__')).toBe(true);
-      expect(Object.getPrototypeOf(jsonCopy)).toBe(null);
-      expect(jsonCopy['orchestrator']).toBeUndefined();
-      expect(jsonCopy['__proto__']).toEqual({ orchestrator: 'x' });
-    }
+    // Preserving an own __proto__ key on a null-prototype copy is covered by planHostRename.
 
     // 2. An own __proto__ value is an object with a throwing orchestrator getter
     let getterCalled = false;
@@ -953,14 +944,51 @@ describe('mergeDraftedHost precedence (P2-cli)', () => {
       expect(throwingDraftResult.errors.join(' ')).toContain('roleAliases');
     }
 
-    // copyOwnData keeps __proto__ as an own key and prototype is unchanged
-    const throwingCopy = copyOwnData(throwingAliases);
-    expect(throwingCopy).toBeDefined();
-    if (throwingCopy !== undefined) {
-      expect(Object.hasOwn(throwingCopy, '__proto__')).toBe(true);
-      expect(Object.getPrototypeOf(throwingCopy)).toBe(null);
-      expect(throwingCopy['orchestrator']).toBeUndefined();
-      expect(getterCalled).toBe(false);
+    // 3. A host file whose roleAliases is a valid map carrying both an ordinary
+    // role key and an own __proto__ data property with a throwing orchestrator getter.
+    let validGetterCalled = false;
+    const validWithProtoAliases: Record<string, unknown> = {
+      orchestrator: 'here-alias',
+    };
+    Object.defineProperty(validWithProtoAliases, '__proto__', {
+      value: {
+        get orchestrator() {
+          validGetterCalled = true;
+          throw new Error('hostile __proto__ getter');
+        },
+      },
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+    expect(Object.hasOwn(validWithProtoAliases, '__proto__')).toBe(true);
+
+    const validWithProtoFile = hereFile({
+      transport: 'ssh',
+      sshAlias: 'here',
+      worktreeRoot: '/srv/worktrees',
+      roles: ['orchestrator'],
+      roleAliases: validWithProtoAliases,
+    });
+    expect(() =>
+      applyHostDraft(validWithProtoFile, hereDraft, 'edit'),
+    ).not.toThrow();
+    expect(validGetterCalled).toBe(false);
+    const validResult = applyHostDraft(validWithProtoFile, hereDraft, 'edit');
+    expect(validGetterCalled).toBe(false);
+    expect(validResult.ok).toBe(true);
+    if (validResult.ok) {
+      const aliases = validResult.candidate.hosts.here.roleAliases;
+      expect(aliases).toBeDefined();
+      expect(() => {
+        if (aliases !== undefined) {
+          expect(Object.hasOwn(aliases, 'orchestrator')).toBe(true);
+          expect(aliases.orchestrator).toBe('here-alias');
+          const proto = Object.getPrototypeOf(aliases);
+          expect(proto === null || proto === Object.prototype).toBe(true);
+        }
+      }).not.toThrow();
+      expect(validGetterCalled).toBe(false);
     }
   });
 

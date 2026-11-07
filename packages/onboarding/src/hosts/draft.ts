@@ -125,7 +125,7 @@ function copyOwnDataProperty(
  * `copyOwnDataProperty` keeps an own `__proto__` from setting the copy's
  * prototype.
  */
-export function copyOwnData(record: unknown): Record<string, unknown> | undefined {
+function copyOwnData(record: unknown): Record<string, unknown> | undefined {
   if (!isPlainRecord(record)) {
     return undefined;
   }

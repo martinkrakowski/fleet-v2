@@ -57,6 +57,7 @@ import {
   ExecuteAuthorizedForgeActionUseCase,
   InspectAttemptUseCase,
   InspectWorkOrderUseCase,
+  LaneRunBoardReads,
   ListLaneRunsUseCase,
   ListAttemptsUseCase,
   ListAttemptJournalUseCase,
@@ -102,6 +103,8 @@ export interface WorkComposition {
   listAttempts: ListAttemptsUseCase;
   // GET /v1/runs: the read-only conductor schedule (A-R-1)
   listLaneRuns: ListLaneRunsUseCase;
+  // GET /v1/runs*: the read-only board, detail and keyed journal reads (A-R)
+  laneRunReads: LaneRunBoardReads;
   // GET /v1/runs/passes: the recorded conductor pass traces (VZ6)
   listConductorPasses: ListConductorPassesUseCase;
   listAttemptJournal: ListAttemptJournalUseCase;
@@ -279,6 +282,7 @@ function unconfiguredWorkComposition(): WorkComposition {
     inspectAttempt: new InspectAttemptUseCase(),
     listAttempts: new ListAttemptsUseCase(),
     listLaneRuns: new ListLaneRunsUseCase(),
+    laneRunReads: new LaneRunBoardReads(),
     listConductorPasses: new ListConductorPassesUseCase(),
     listAttemptJournal: new ListAttemptJournalUseCase(),
     probeProject: new ProbeProjectUseCase(),
@@ -390,6 +394,12 @@ export function createConfiguredWorkComposition(
     stateDir,
     ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
   });
+  // A-R: the run reads are read-only GETs, so the stores they touch are opened
+  // read-only: a malformed file reads as unreadable and is never quarantined
+  // or written by a GET. Mutating use cases keep the writable instances.
+  const readOnlyWorkOrderRepo = new WorkOrderRepositoryAdapter({ stateDir, readOnly: true });
+  const readOnlyAttemptRepo = new AttemptRepositoryAdapter({ stateDir, readOnly: true });
+  const readOnlyExecutionJournal = new ExecutionJournalAdapter({ stateDir, readOnly: true });
   // WB5b: the stores a completed merge writes to (merge-records.json and the
   // pull-request link files), opened on the same state dir as the others.
   const lanePlanRepo = new LanePlanRepositoryAdapter({ stateDir });
@@ -536,9 +546,20 @@ export function createConfiguredWorkComposition(
       runJournal: laneRunJournal,
       halt: conductorHalt,
       driverLease: conductorDriverLease,
-      attemptRepo,
-      executionJournal: journal,
-      workOrderRepo,
+      attemptRepo: readOnlyAttemptRepo,
+      executionJournal: readOnlyExecutionJournal,
+      workOrderRepo: readOnlyWorkOrderRepo,
+      passTrace: conductorPassTrace,
+    }),
+    laneRunReads: new LaneRunBoardReads({
+      runRepo: laneRunRepo,
+      runJournal: laneRunJournal,
+      halt: conductorHalt,
+      driverLease: conductorDriverLease,
+      attemptRepo: readOnlyAttemptRepo,
+      executionJournal: readOnlyExecutionJournal,
+      workOrderRepo: readOnlyWorkOrderRepo,
+      passTrace: conductorPassTrace,
     }),
     listConductorPasses: new ListConductorPassesUseCase({ passTrace: conductorPassTrace }),
     listAttemptJournal: new ListAttemptJournalUseCase({ attemptRepo, journal }),

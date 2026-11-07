@@ -85,8 +85,7 @@ describe('MergeRecordRepositoryAdapter', () => {
       expect(onDisk).toEqual([{ ...mergeRecord(), schemaVersion: 1 }]);
     });
 
-    it('keeps one record per (repository, number) key and a second key beside it', async () => {
-      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+    it('keeps one record per (repository, number) key and a second key beside it', async () => {      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
       await store.saveMergeRecord(mergeRecord());
       await store.saveMergeRecord(mergeRecord({ number: 8 }));
       await store.saveMergeRecord(mergeRecord({ repository: 'acme/other' }));
@@ -233,6 +232,51 @@ describe('MergeRecordRepositoryAdapter', () => {
       const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir, readOnly: true });
       await expect(store.listMergeRecords()).rejects.toBeInstanceOf(StateFileUnreadableReadOnlyError);
       await expect(fs.stat(path.join(tempDir, 'quarantine'))).rejects.toThrow();
+    });
+  });
+
+  describe('canonical repository case (WB5b3)', () => {
+    it('finds a stored mixed-case record by a lower-case lookup, and never rewrites the stored record', async () => {
+      // The stored record is written through the store's own serialiser in the
+      // pre-WB5b3 mixed-case shape, never hand-typed JSON.
+      const writer = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+      const mixed = mergeRecord({ repository: 'Acme/App' });
+      expect(await writer.saveMergeRecord(asRuntimeInput(mixed))).toEqual({
+        outcome: 'created',
+        record: mixed,
+      });
+
+      const reader = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+      expect(await reader.findMergeRecord('acme/app', 7)).toEqual(mixed);
+      expect(await reader.findMergeRecord('ACME/APP', 7)).toEqual(mixed);
+      // The stored file keeps the case it was written with.
+      const onDisk = JSON.parse(await readBytes()) as Array<Record<string, unknown>>;
+      expect(onDisk).toEqual([{ ...mixed, schemaVersion: 1 }]);
+    });
+
+    it('decides a second sighting in another case as the same record, not a new record or an integrity conflict', async () => {
+      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+      const first = mergeRecord({ repository: 'Acme/App' });
+      expect(await store.saveMergeRecord(asRuntimeInput(first))).toEqual({
+        outcome: 'created',
+        record: first,
+      });
+      const second = mergeRecord({ repository: 'ACME/APP', headSha: HEAD_A });
+      expect(await store.saveMergeRecord(asRuntimeInput(second))).toEqual({
+        outcome: 'unchanged',
+        record: first,
+      });
+      expect(await store.listMergeRecords()).toEqual([first]);
+    });
+
+    it('still conflicts correctly for the same PR in another case when the head differs', async () => {
+      const store = new MergeRecordRepositoryAdapter({ stateDir: tempDir });
+      const first = mergeRecord({ repository: 'Acme/App' });
+      await store.saveMergeRecord(asRuntimeInput(first));
+      const conflicting = mergeRecord({ repository: 'acme/app', headSha: HEAD_B });
+      const result = await store.saveMergeRecord(asRuntimeInput(conflicting));
+      expect(result.outcome).toBe('integrity-conflict');
+      expect(await store.listMergeRecords()).toEqual([first]);
     });
   });
 

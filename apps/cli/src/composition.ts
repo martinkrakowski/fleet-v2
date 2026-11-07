@@ -21,7 +21,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 
 import { GH_BINARY_CANDIDATES, resolveGhBinary } from './gh-binary.js';
 import { RunnerTunnelAdapter } from './runner-tunnel.js';
-import { composeCoordination } from './composition/coordination.js';
+import { composeCoordination, DeferredAttemptFactsRead } from './composition/coordination.js';
 import { composeKnowledge } from './composition/knowledge.js';
 import { composeEvidence } from './composition/evidence.js';
 import { composeExecutionHosts } from './composition/work-execution-hosts.js';
@@ -54,6 +54,7 @@ import {
   ExecutionRunnerAdapter,
   ForgeActionAdapter,
   MergeGrantAdapter,
+  MergeRecordRepositoryAdapter,
   ForgeReadAdapter,
   GhForgeMergeReadAdapter,
   InspectAttemptUseCase,
@@ -715,6 +716,7 @@ export interface FleetCliRuntime {
     readonly workOrderRepository: WorkOrderRepositoryAdapter;
     readonly attemptRepository: AttemptRepositoryAdapter;
     readonly executionJournal: ExecutionJournalAdapter;
+    readonly mergeRecordRepository: MergeRecordRepositoryAdapter;
     readonly workspace: WorkspaceAdapter;
     readonly runner: ExecutionRunnerAdapter;
     /** H9b1: resolves the runner for an attempt's recorded host. */
@@ -931,6 +933,13 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
   const ownerPublicKey =
     options?.ownerPublicKey ?? (process.env.FLEET_OWNER_PUBLIC_KEY?.trim() || undefined);
 
+  // CO24f: the authorization resolve binds owner grants to the attempt that
+  // resolves them, and validates that attempt through the execution stack's
+  // attempt store. The execution stack composes after the coordination stack,
+  // so the root fills the deferred reader in once the repositories exist;
+  // until then every read reports absence, which fails closed.
+  const attemptFactsRead = new DeferredAttemptFactsRead();
+
   const {
     coordination,
     coordinationRequestRepository,
@@ -939,7 +948,7 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     profileRead,
     probeRecord,
     executorForHostName,
-  } = composeCoordination({ stateDir, ownerPublicKey, options });
+  } = composeCoordination({ stateDir, ownerPublicKey, options, attemptFactsRead });
 
   const { knowledge } = composeKnowledge({ stateDir, options });
 
@@ -1004,6 +1013,23 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
     runGitCommand,
     issuePolicyForgeGrantUseCase,
     issueMergeGrantUseCase,
+  });
+
+  // CO24f: the attempt facts live behind the execution stack's repositories,
+  // composed above; the deferred reader now resolves them through both.
+  attemptFactsRead.setDelegate({
+    findAttemptFactsById: async (attemptId) => {
+      const attempt = await attemptRepository.findAttemptById(attemptId);
+      if (attempt === null) {
+        return null;
+      }
+      const workOrder = await workOrderRepository.findWorkOrderById(attempt.workOrderId);
+      return {
+        attemptId,
+        projectId: workOrder?.projectId ?? null,
+        collectedHeadSha: attempt.artifacts?.headCommit ?? null,
+      };
+    },
   });
 
   const { execution } = composeExecution({
@@ -1146,6 +1172,10 @@ export function createFleetCliRuntime(options?: FleetCliRuntimeOptions): FleetCl
         ((ghArgs: readonly string[], ghTimeoutMs?: number) =>
           runGhSubprocess(ghArgs, ghBinaryCandidates, undefined, ghTimeoutMs))
       )(args, timeoutMs),
+    chainAttention: {
+      recordAttentionItem: (body, actor) => coordination.recordAttentionItem.recordAttentionItem(body, actor),
+      clearAttentionItem: (request, via, actor) => coordination.clearAttentionItem.clearAttentionItem(request, via, actor),
+    },
   });
 
   return {

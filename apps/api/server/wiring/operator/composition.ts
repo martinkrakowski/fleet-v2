@@ -14,6 +14,7 @@ import {
 } from "@fleet/operator-coordination";
 
 import type { FleetInstallation } from "@fleet/installation";
+import { AttemptRepositoryAdapter, WorkOrderRepositoryAdapter } from "@fleet/work-execution";
 import { join } from "node:path";
 import {
   AcknowledgeOwnerAnswerUseCase,
@@ -169,6 +170,25 @@ export function createConfiguredOperatorComposition(
     ...(options?.changeSignal ? { changeSignal: options.changeSignal } : {}),
   });
 
+  // CO24f: the attempt facts the authorization resolve binds owner grants
+  // against, read through the execution stack's own repositories.
+  const attemptRepo = new AttemptRepositoryAdapter({ stateDir });
+  const attemptWorkOrderRepo = new WorkOrderRepositoryAdapter({ stateDir });
+  const attemptFactsRead = {
+    findAttemptFactsById: async (attemptId: string) => {
+      const attempt = await attemptRepo.findAttemptById(attemptId);
+      if (attempt === null) {
+        return null;
+      }
+      const workOrder = await attemptWorkOrderRepo.findWorkOrderById(attempt.workOrderId);
+      return {
+        attemptId,
+        projectId: workOrder?.projectId ?? null,
+        collectedHeadSha: attempt.artifacts?.headCommit ?? null,
+      };
+    },
+  };
+
   // Installation name references for project profiles (P5a): a v2
   // installation enables host and gate-procedure name checks behind profile
   // registration and update; a v1 or absent installation passes no reference
@@ -192,6 +212,7 @@ export function createConfiguredOperatorComposition(
     resolveActionAuthorization: new ResolveActionAuthorizationUseCase({
       requestRepo,
       decisionTransport,
+      attemptFactsRead,
     }),
     resolveOwnerItem: new ResolveOwnerItemUseCase({
       itemRepo: ownerItemRepo,

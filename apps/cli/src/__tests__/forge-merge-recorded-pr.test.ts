@@ -52,6 +52,8 @@ function prView(number: number, headRefName: string): string {
     closedAt: null,
     mergeCommit: null,
     mergeStateStatus: 'CLEAN',
+    isCrossRepository: false,
+    headRepositoryOwner: { login: 'martinkrakowski' },
   });
 }
 
@@ -225,5 +227,18 @@ describe('forge execute merge-pr through the CLI composition (WB5b2)', () => {
       number: 7,
     });
     expect((await rt.execution.workOrderRepository.findWorkOrderById('wo-wb5b2'))?.state).toBe('merged');
+    // WB5b3: the merge record itself is stored under the canonical
+    // lower-case `owner/repo`, and a mixed-case lookup still finds it.
+    const stored = await rt.execution.mergeRecordRepository.findMergeRecord(
+      'martinkrakowski/fleet-v2',
+      7,
+    );
+    expect(stored).toMatchObject({
+      repository: 'martinkrakowski/fleet-v2',
+      number: 7,
+      headSha: HEAD,
+      source: 'fleet-forge-action',
+      merger: 'fleet',
+    });
   });
 });

@@ -1,18 +1,24 @@
-// @generated outbound contract scaffold — refined for lane CO8.
+// @generated outbound contract scaffold — refined for lane CO8 / CO8a.
 /**
  * ChainAttentionPort: raise or clear one chain attention item (chain-refresh-conflict,
- * link-not-landed or branch-moved), keyed by project, chain name, kind and link pull
- * request, through operator coordination's attention store. A repeat refreshes the open
- * item. The item grants and blocks nothing (the chain record's own mark is what blocks
- * landing), and a failed raise is reported, never retried blindly. Ids and codes only.
+ * link-not-landed, branch-moved or chain-refresh-mode-invalid), keyed by project, subject,
+ * kind and link pull request, through operator coordination's attention store. A repeat
+ * refreshes the open item. The item grants and blocks nothing (the chain record's own mark is
+ * what blocks landing), and a failed raise is reported, never retried blindly. Ids and codes
+ * only.
  */
 
-export type ChainAttentionKind = 'chain-refresh-conflict' | 'link-not-landed' | 'branch-moved';
+export type ChainAttentionKind =
+  | 'chain-refresh-conflict'
+  | 'link-not-landed'
+  | 'branch-moved'
+  | 'chain-refresh-mode-invalid';
 
 export interface ChainAttentionCommand {
   readonly projectId: string;
   readonly repository: { readonly owner: string; readonly repo: string };
-  readonly chainName: string;
+  /** Chain-scoped kinds name the chain; the policy-level `chain-refresh-mode-invalid` kind omits it. */
+  readonly chainName?: string;
   readonly kind: ChainAttentionKind;
   readonly linkPullRequest?: { readonly owner: string; readonly repo: string; readonly number: number };
 }

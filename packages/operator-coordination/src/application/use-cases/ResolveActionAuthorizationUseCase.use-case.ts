@@ -24,11 +24,14 @@ import type {
 } from '../ports/in/ResolveActionAuthorizationPort.in-port.js';
 import type { CoordinationRequestRepositoryPort } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
 import { CoordinationRequestRevisionConflictError } from '../ports/out/CoordinationRequestRepositoryPort.out-port.js';
+import type { AttemptFactsReadPort } from '../ports/out/AttemptFactsReadPort.out-port.js';
 import type { DecisionTransportPort } from '../ports/out/DecisionTransportPort.out-port.js';
 
 export interface ResolveActionAuthorizationDependencies {
   readonly requestRepo: CoordinationRequestRepositoryPort;
   readonly decisionTransport?: DecisionTransportPort;
+  /** CO24f: reads the attempt facts a first bind validates against; binding fails closed without it. */
+  readonly attemptFactsRead?: AttemptFactsReadPort;
 }
 
 function isFilled(value: unknown): value is string {
@@ -194,6 +197,23 @@ export class ResolveActionAuthorizationUseCase implements ResolveActionAuthoriza
     }
     if (candidate.getMergeGrant() !== null) {
       return null;
+    }
+    // CO24f: an unbound owner grant binds only an attempt that exists, belongs
+    // to the grant's project and was collected at the requested head, read
+    // through the attempt-facts port. Anything else refuses without binding,
+    // so a wrong attempt can never attach to — or kill — the grant.
+    const facts = await (this.deps?.attemptFactsRead?.findAttemptFactsById(supplied) ?? null);
+    if (facts === null) {
+      return blocked('grant-attempt-unknown');
+    }
+    if (facts.projectId === null || facts.projectId !== record.projectId) {
+      return blocked('grant-attempt-foreign');
+    }
+    if (facts.collectedHeadSha === null) {
+      return blocked('grant-attempt-uncollected');
+    }
+    if (facts.collectedHeadSha !== request.expectedHeadSha.trim()) {
+      return blocked('grant-attempt-head-mismatch');
     }
     let binding: CoordinationRequestRecord;
     try {

@@ -44,6 +44,7 @@ import {
   type InstallationFileRead,
   type PlanHostRenameReason,
 } from "@fleet/onboarding";
+
 import {
   HOST_NAME_SECRET_REFUSAL,
   HOST_NAME_TOO_LONG,
@@ -102,13 +103,20 @@ probe plan, a diff, an explicit confirmation and a compare-and-swap write.
 A schema version 1 file is converted to v2 on the first write.
 
   list                         print one line per configured host
+  show [<name>] [--role <role>] print the host table for all hosts, one
+                               named host, or the host holding a role; a
+                               role held by several hosts is refused
   add <name> [--ssh <alias>] [--port <n>] [--worktree-root <path>]
+                               [--container <name>] [--tunnel-offset <n>]
+                               [--role-alias <role>=<alias>]...
                                [--from-descriptor <file>] [--role <role>]... [--yes]
                                draft a new host; the default role is
                                lane-runner, and without --ssh the host is
                                local. With --from-descriptor the file carries
                                the port, worktree root, tool and capabilities.
   edit <name> [--ssh <alias>] [--port <n>] [--worktree-root <path>]
+                               [--container <name>] [--tunnel-offset <n>]
+                               [--role-alias <role>=<alias>]...
                                [--role <role>]... [--yes]
                                change an existing host; flags left out keep
                                the entry's current values
@@ -153,8 +161,28 @@ const CONVERSION_ISOLATION_FLOOR: RunnerCapabilityDeclaration = {
 /** Which flags each subcommand accepts; anything else is a usage error. */
 const SUBCOMMAND_FLAGS: Readonly<Record<string, ReadonlySet<string>>> = {
   list: new Set([]),
-  add: new Set(["ssh", "port", "worktree-root", "from-descriptor", "role", "yes"]),
-  edit: new Set(["ssh", "port", "worktree-root", "role", "yes"]),
+  show: new Set(["role"]),
+  add: new Set([
+    "ssh",
+    "port",
+    "worktree-root",
+    "container",
+    "tunnel-offset",
+    "role-alias",
+    "from-descriptor",
+    "role",
+    "yes",
+  ]),
+  edit: new Set([
+    "ssh",
+    "port",
+    "worktree-root",
+    "container",
+    "tunnel-offset",
+    "role-alias",
+    "role",
+    "yes",
+  ]),
   remove: new Set(["yes"]),
   rename: new Set(["yes"]),
 };
@@ -166,8 +194,13 @@ interface HostsArgs {
   readonly sshAlias?: string;
   readonly port?: number;
   readonly worktreeRoot?: string;
+  readonly container?: string;
+  readonly tunnelOffset?: number;
+  /** The `--role-alias role=alias` pairs as parsed, in flag order. */
+  readonly roleAliasFlags: readonly (readonly [string, string])[];
   readonly fromDescriptor?: string;
   readonly roles: readonly HostRole[];
+  readonly showRole?: HostRole;
   readonly yes: boolean;
 }
 
@@ -181,7 +214,12 @@ function isHelpToken(token: string): boolean {
 
 /** Parse one hosts invocation; every problem is a usage message, never a guess. */
 function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
-  const emptyArgs: HostsArgs = { subcommand: "", roles: [], yes: false };
+  const emptyArgs: HostsArgs = {
+    subcommand: "",
+    roles: [],
+    roleAliasFlags: [],
+    yes: false,
+  };
   const subcommand = tokens[0] ?? "";
   if (isHelpToken(subcommand)) {
     return { ok: true, help: true, args: emptyArgs };
@@ -200,10 +238,14 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
     sshAlias?: string;
     port?: number;
     worktreeRoot?: string;
+    container?: string;
+    tunnelOffset?: number;
+    roleAliasFlags: [string, string][];
     fromDescriptor?: string;
     roles: HostRole[];
+    showRole?: HostRole;
     yes: boolean;
-  } = { subcommand, roles: [], yes: false };
+  } = { subcommand, roles: [], roleAliasFlags: [], yes: false };
   for (let index = 1; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (isHelpToken(token)) {
@@ -262,16 +304,76 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
       args.sshAlias = value;
     } else if (flag === "worktree-root") {
       args.worktreeRoot = value;
+    } else if (flag === "container") {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(value) || value.length > 128) {
+        return {
+          ok: false,
+          error: `--container must be 1..128 characters of letters, digits, '.', '_' or '-', starting with a letter or digit\n${HOSTS_HELP}`,
+        };
+      }
+      args.container = value;
+    } else if (flag === "tunnel-offset") {
+      if (!/^-?\d{1,6}$/.test(value)) {
+        return {
+          ok: false,
+          error: `--tunnel-offset must be an integer\n${HOSTS_HELP}`,
+        };
+      }
+      args.tunnelOffset = Number(value);
+    } else if (flag === "role-alias") {
+      const separator = value.indexOf("=");
+      if (separator === -1) {
+        return {
+          ok: false,
+          error: `--role-alias must be <role>=<alias> with a role from: ${HOST_ROLES.join(", ")}\n${HOSTS_HELP}`,
+        };
+      }
+      const role = value.slice(0, separator).trim();
+      const alias = value.slice(separator + 1).trim();
+      if (!HOST_ROLES.includes(role as HostRole)) {
+        return {
+          ok: false,
+          error: `--role-alias must name one of: ${HOST_ROLES.join(", ")}\n${HOSTS_HELP}`,
+        };
+      }
+      if (alias === "" || !isSafeSshHost(alias)) {
+        return {
+          ok: false,
+          error: `--role-alias alias must be a safe ssh host: an alias, user@alias or dotted host that cannot start a shell option\n${HOSTS_HELP}`,
+        };
+      }
+      args.roleAliasFlags.push([role as HostRole, alias]);
     } else if (flag === "port") {
       if (!/^\d+$/.test(value)) {
         return {
           ok: false,
-          error: `--port must be an integer, not '${value}'\n${HOSTS_HELP}`,
+          error: `--port must be an integer\n${HOSTS_HELP}`,
         };
       }
       args.port = Number(value);
     } else if (flag === "from-descriptor") {
       args.fromDescriptor = value;
+    } else if (subcommand === "show") {
+      if (value.split(",").length > 1) {
+        return {
+          ok: false,
+          error: `hosts show takes one role\n${HOSTS_HELP}`,
+        };
+      }
+      const role = value.trim();
+      if (!HOST_ROLES.includes(role as HostRole)) {
+        return {
+          ok: false,
+          error: `hosts show --role must be one of: ${HOST_ROLES.join(", ")}\n${HOSTS_HELP}`,
+        };
+      }
+      if (args.showRole !== undefined) {
+        return {
+          ok: false,
+          error: `hosts show takes one --role\n${HOSTS_HELP}`,
+        };
+      }
+      args.showRole = role as HostRole;
     } else {
       const segments = value.split(",");
       const roles: HostRole[] = [];
@@ -280,7 +382,7 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
         if (role === "") {
           return {
             ok: false,
-            error: `--role requires role names, not '${value}'\n${HOSTS_HELP}`,
+            error: `--role requires role names\n${HOSTS_HELP}`,
           };
         }
         if (!HOST_ROLES.includes(role as HostRole)) {
@@ -293,6 +395,12 @@ function parseHostsArgs(tokens: readonly string[]): ParsedHostsArgs {
       }
       args.roles.push(...roles);
     }
+  }
+  if (subcommand === "show" && args.name !== undefined && args.showRole !== undefined) {
+    return {
+      ok: false,
+      error: `hosts show takes a host name or --role, not both\n${HOSTS_HELP}`,
+    };
   }
   return { ok: true, help: false, args };
 }
@@ -384,49 +492,224 @@ function convertV1File(installation: FleetInstallation): HostDraftCandidate {
   };
 }
 
-function hostsOf(value: unknown): Record<string, HostSection> | undefined {
-  if (typeof value !== "object" || value === null) {
+/**
+ * A plain data record: an object whose prototype is `Object.prototype` or
+ * `null`. Everything a hosts command reads off a runtime value is read
+ * through this check first, so a class instance or a falsy value is refused,
+ * never run.
+ */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  try {
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read one own data property of a plain record without running a getter: an
+ * accessor property reads as absent. Wrapped in `try/catch` so a hostile
+ * value can never throw through the command.
+ */
+function ownData(record: object, key: string): unknown {
+  try {
+    if (!Object.hasOwn(record, key)) {
+      return undefined;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    if (descriptor === undefined || descriptor.get !== undefined) {
+      return undefined;
+    }
+    return descriptor.value;
+  } catch {
     return undefined;
   }
-  const hosts = (value as { readonly hosts?: unknown }).hosts;
-  return typeof hosts === "object" && hosts !== null && !Array.isArray(hosts)
-    ? (hosts as Record<string, HostSection>)
-    : undefined;
+}
+
+/**
+ * Copy a plain record's own data properties, skipping accessors; `undefined`
+ * for anything that is not a plain record. A hostile value never throws and
+ * never runs a getter.
+ */
+function copyOwnDataOf(record: unknown): Record<string, unknown> | undefined {
+  if (!isPlainObject(record)) {
+    return undefined;
+  }
+  try {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(record)) {
+      const value = ownData(record, key);
+      if (value !== undefined) {
+        out[key] = value;
+      }
+    }
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when any own property of `record` is an accessor; never runs one. */
+function hasAccessor(record: object): boolean {
+  try {
+    for (const key of Reflect.ownKeys(record)) {
+      const descriptor = Object.getOwnPropertyDescriptor(record, key);
+      if (
+        descriptor !== undefined &&
+        (descriptor.get !== undefined || descriptor.set !== undefined)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function hostsOf(value: unknown): Record<string, unknown> | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+  const hosts = ownData(value, "hosts");
+  return isPlainObject(hosts) ? hosts : undefined;
 }
 
 /**
  * Move the lane-runner role off every other host (plan section 1: until the
  * loader allows several, adding one moves the role). The current value is
  * never mutated; a host that keeps no role is left for the loader to refuse.
+ * A host stripped of the lane-runner role also drops its lane-runner role
+ * alias: the loader refuses an alias for a role the host does not hold, so
+ * leaving it would turn every role move into a refused write.
  */
-function moveLaneRunnerRole(
+export function moveLaneRunnerRole(
   current: unknown,
   name: string,
-): { readonly value: unknown; readonly movedFrom: readonly string[] } {
-  const hosts = hostsOf(current) ?? {};
+): {
+  readonly value: unknown;
+  readonly movedFrom: readonly string[];
+  readonly refused?: "accessor";
+} {
+  const hosts = hostsOf(current);
+  if (hosts === undefined) {
+    return { value: current, movedFrom: [] };
+  }
+  // A host map holding an accessor is refused outright: the value comes back
+  // unchanged, and neither `Object.entries` nor a spread ever runs the getter.
+  if (hasAccessor(hosts)) {
+    return { value: current, movedFrom: [], refused: "accessor" };
+  }
   const movedFrom: string[] = [];
-  let nextHosts: Record<string, HostSection> | undefined;
-  for (const [hostName, host] of Object.entries(hosts)) {
-    if (hostName === name || !host.roles.includes("lane-runner")) {
+  let nextHosts: Record<string, unknown> | undefined;
+  for (const hostName of Object.keys(hosts)) {
+    const rawHost = ownData(hosts, hostName);
+    if (hostName === name || !isPlainObject(rawHost)) {
+      continue;
+    }
+    // Roles are read through own-data guards: a sparse array or an
+    // element-carrying getter is skipped, never invoked and never a throw.
+    const rawRoles = ownData(rawHost, "roles");
+    if (!Array.isArray(rawRoles)) {
+      continue;
+    }
+    const roles: string[] = [];
+    let holdsLaneRunner = false;
+    let dense = true;
+    for (let index = 0; index < rawRoles.length; index += 1) {
+      const role = ownData(rawRoles, String(index));
+      if (typeof role !== "string") {
+        dense = false;
+        break;
+      }
+      roles.push(role);
+      if (role === "lane-runner") {
+        holdsLaneRunner = true;
+      }
+    }
+    if (!dense || !holdsLaneRunner) {
       continue;
     }
     movedFrom.push(hostName);
-    nextHosts ??= { ...hosts };
-    nextHosts[hostName] = {
-      ...host,
-      roles: host.roles.filter((role) => role !== "lane-runner"),
+    nextHosts ??= copyOwnDataOf(hosts) ?? {};
+    const kept = roles.filter((role) => role !== "lane-runner");
+    const rawAliases = ownData(rawHost, "roleAliases");
+    const aliasData = copyOwnDataOf(rawAliases);
+    const keptAliases =
+      aliasData === undefined
+        ? undefined
+        : Object.fromEntries(
+            Object.entries(aliasData).filter(
+              ([role]) => role !== "lane-runner",
+            ),
+          );
+    // Drop the host's original alias map and re-add only what survives the
+    // role move; when nothing survives, the key is omitted entirely rather
+    // than left naming a role the host no longer holds. The host's other
+    // fields are carried through the own-data copy, so a getter never runs.
+    const hostData = copyOwnDataOf(rawHost);
+    if (hostData === undefined) {
+      continue;
+    }
+    const { roleAliases: _rawAliases, ...hostWithoutAliases } = hostData;
+    void _rawAliases;
+    const nextHost: Record<string, unknown> = {
+      ...hostWithoutAliases,
+      roles: kept,
+      ...(keptAliases !== undefined && Object.keys(keptAliases).length > 0
+        ? { roleAliases: keptAliases }
+        : {}),
     };
+    nextHosts[hostName] = nextHost;
   }
   if (nextHosts === undefined) {
     return { value: current, movedFrom: [] };
   }
   return {
     value: {
-      ...(current as Readonly<Record<string, unknown>>),
+      ...(copyOwnDataOf(current) ?? {}),
       hosts: nextHosts,
     },
     movedFrom,
   };
+}
+
+/**
+ * Role-alias keys the pre-write file held that the candidate no longer holds:
+ * `(hostName, role)` pairs present before and absent after, sorted by host
+ * name then role. An edit that removes a role (or a host) drops the alias
+ * that named it, and the operator must see that without asking.
+ */
+function droppedRoleAliasesBetween(
+  before: Readonly<Record<string, HostSection>> | undefined,
+  after: Readonly<Record<string, HostSection>> | undefined,
+): { readonly hostName: string; readonly role: HostRole }[] {
+  const dropped: { readonly hostName: string; readonly role: HostRole }[] = [];
+  if (before === undefined || after === undefined) {
+    return dropped;
+  }
+  for (const [hostName, host] of Object.entries(before)) {
+    const aliases = host.roleAliases;
+    if (aliases === undefined) {
+      continue;
+    }
+    const afterHost = Object.hasOwn(after, hostName) ? after[hostName] : undefined;
+    for (const role of Object.keys(aliases)) {
+      if (afterHost?.roleAliases === undefined) {
+        dropped.push({ hostName, role: role as HostRole });
+      } else if (!Object.hasOwn(afterHost.roleAliases, role)) {
+        dropped.push({ hostName, role: role as HostRole });
+      }
+    }
+  }
+  return dropped.sort(
+    (a, b) =>
+      a.hostName.localeCompare(b.hostName) || a.role.localeCompare(b.role),
+  );
 }
 
 /** The default confirmation: one stdin line, only an explicit y/yes writes. */
@@ -485,9 +768,14 @@ export function confirmFromStdin(out: CliIo): (question: string) => Promise<bool
 function runnerDraftFor(
   existing: HostSection | undefined,
   port: number | undefined,
+  tunnelOffset: number | undefined,
   converting: boolean,
 ): HostRunnerDraft | undefined {
   const runner = existing?.runner;
+  const offset =
+    tunnelOffset !== undefined
+      ? tunnelOffset
+      : existing?.runner?.tunnelOffset;
   if (runner === undefined) {
     if (port === undefined) {
       return undefined;
@@ -495,11 +783,13 @@ function runnerDraftFor(
     return {
       kind: "opencode",
       port,
+      ...(offset !== undefined ? { tunnelOffset: offset } : {}),
       ...(converting ? { capabilities: CONVERSION_ISOLATION_FLOOR } : {}),
     };
   }
   const common = {
     port: port ?? runner.port,
+    ...(offset !== undefined ? { tunnelOffset: offset } : {}),
     ...(runner.authFile !== undefined ? { authFile: runner.authFile } : {}),
     ...(runner.capabilities !== undefined
       ? { capabilities: runner.capabilities }
@@ -956,7 +1246,27 @@ async function writeHost(
               ? { capabilities: CONVERSION_ISOLATION_FLOOR }
               : {}),
         }
-      : runnerDraftFor(existing, args.port, converting && mode === "add");
+      : runnerDraftFor(existing, args.port, args.tunnelOffset, converting && mode === "add");
+  // With --role-alias flags the supplied aliases merge over the entry's
+  // existing aliases filtered to the target roles: a named role updates while
+  // untouched aliases on kept roles are preserved. Without the flag the field
+  // is left undefined so the engine inherits and prunes the entry's aliases.
+  let roleAliases: Record<string, string> | undefined;
+  if (args.roleAliasFlags.length > 0) {
+    const targetRoles = roles ?? [...(existing?.roles ?? ["lane-runner"])];
+    const merged: Record<string, string> = {};
+    if (mode === "edit" && existing?.roleAliases !== undefined) {
+      for (const [role, alias] of Object.entries(existing.roleAliases)) {
+        if (targetRoles.includes(role as HostRole)) {
+          merged[role] = alias;
+        }
+      }
+    }
+    for (const [role, alias] of args.roleAliasFlags) {
+      merged[role] = alias;
+    }
+    roleAliases = merged;
+  }
   const input: HostDraftInput = {
     name,
     transport:
@@ -966,10 +1276,12 @@ async function writeHost(
       : existing?.transport === "ssh" && existing.sshAlias !== undefined
         ? { sshAlias: existing.sshAlias }
         : {}),
+    ...(args.container !== undefined ? { container: args.container } : {}),
     worktreeRoot:
       descriptor?.worktreeRoot ?? args.worktreeRoot ?? existing?.worktreeRoot ?? "",
     ...(existing?.tmpDir !== undefined ? { tmpDir: existing.tmpDir } : {}),
     roles: roles ?? [...(existing?.roles ?? ["lane-runner"])],
+    ...(roleAliases !== undefined ? { roleAliases } : {}),
     ...(runner !== undefined ? { runner } : {}),
   };
   const drafted = draftHost(input);
@@ -994,6 +1306,12 @@ async function writeHost(
   let movedFrom: readonly string[] = [];
   if (draft.host.roles.includes("lane-runner")) {
     const moved = moveLaneRunnerRole(current, name);
+    if (moved.refused !== undefined) {
+      out.stderr(
+        "hosts: the installation's host map carries an accessor property; nothing was written\n",
+      );
+      return 1;
+    }
     current = moved.value;
     movedFrom = moved.movedFrom;
   }
@@ -1093,6 +1411,20 @@ async function writeHost(
         .join(", ")})\n`,
     );
   }
+  // An edit that removes a role (or a host) can silently drop the role alias
+  // that named it; under --yes there is no diff-confirm step, so the dropped
+  // aliases are named here, on stdout, one line, ids only.
+  const dropped = droppedRoleAliasesBetween(
+    state.status === "v2" ? state.installation.hosts : undefined,
+    validated.installation.hosts,
+  );
+  if (args.yes && dropped.length > 0) {
+    out.stdout(
+      `dropped role alias: ${dropped
+        .map((d) => `hosts.${screenHostKey(d.hostName)}.roleAliases.${d.role}`)
+        .join(", ")}\n`,
+    );
+  }
   return confirmAndWrite(file, state.read, candidate, args, out, options);
 }
 
@@ -1186,8 +1518,10 @@ async function removeHost(
   }
 
   if (host.runner !== undefined && host.transport === "ssh") {
+    const forwardPort =
+      host.runner.port + (host.runner.tunnelOffset ?? 1);
     out.stdout(
-      `note: a leftover ssh -f -N forward for this host may still listen on 127.0.0.1:${host.runner.port + 1}; find it with pgrep -f 'ssh .*-L 127.0.0.1:${host.runner.port + 1}' and kill the pid\n`,
+      `note: a leftover ssh -f -N forward for this host may still listen on 127.0.0.1:${forwardPort}; find it with pgrep -f 'ssh .*-L 127.0.0.1:${forwardPort}' and kill the pid\n`,
     );
   }
 
@@ -1351,15 +1685,201 @@ async function listHosts(file: string, out: CliIo): Promise<number> {
       // round 1, finding 1; round 2, finding 1).
       name,
       host.transport,
-      ...(host.sshAlias !== undefined ? [`alias ${host.sshAlias}`] : []),
+      ...(host.sshAlias !== undefined
+        ? [`alias ${host.sshAlias}`]
+        : []),
       `roles: ${host.roles.join(", ")}`,
       `worktree-root: ${host.worktreeRoot}`,
-      ...(host.tmpDir !== undefined ? [`tmp-dir: ${host.tmpDir}`] : []),
+      ...(host.tmpDir !== undefined
+        ? [`tmp-dir: ${host.tmpDir}`]
+        : []),
       ...(host.runner !== undefined
         ? [`runner: ${host.runner.kind}, port ${host.runner.port}`]
         : []),
     ];
     out.stdout(`${screenHostsLine(parts.join("  "), names)}\n`);
+  }
+  return 0;
+}
+
+/**
+ * The refusal when a role resolves to more than one host: plain operator text
+ * naming the role and telling the operator how to proceed. Host names pass
+ * through the one host-key screen; the role name is a fixed enum value.
+ */
+export function formatRoleAmbiguousRefusal(
+  role: HostRole,
+  hostNames?: readonly string[],
+): string {
+  const suffix =
+    hostNames !== undefined && hostNames.length > 0
+      ? ` (${hostNames.map((key) => screenHostKey(key)).join(", ")})`
+      : "";
+  return `hosts: role '${role}' is held by more than one host${suffix}; name the host explicitly (fleet-v2 hosts show <name>)`;
+}
+
+/**
+ * `hosts show [<name>] [--role <role>]`: the host table for every host, one
+ * named host, or the host holding a role. Like `list` this reads the file and
+ * mutates nothing; a role held by several hosts is refused until the
+ * operator names the host explicitly.
+ */
+async function showHosts(
+  args: HostsArgs,
+  file: string,
+  out: ScreenedHostsIo,
+): Promise<number> {
+  let state: InstallationState;
+  try {
+    state = await readInstallationState(file);
+  } catch {
+    out.stderr("installation: unknown (unreadable)\n");
+    return 1;
+  }
+  if (state.status === "unreadable") {
+    out.stderr("installation: unknown (unreadable)\n");
+    return 1;
+  }
+  if (state.status === "absent") {
+    out.stderr("installation: absent\n");
+    return 1;
+  }
+  if (state.status === "v1") {
+    out.stderr("installation.hosts: schema version 1 has no hosts section\n");
+    return 1;
+  }
+  if (state.status === "invalid") {
+    out.stderr("the installation file is invalid; fix it by hand:\n");
+    printErrors(out, state.errors);
+    return 1;
+  }
+  const hosts = state.installation.hosts ?? {};
+  const names = [...Object.keys(hosts)].sort((a, b) => a.localeCompare(b));
+  if (names.length > 256) {
+    out.stderr("hosts show: host count exceeds maximum (256)\n");
+    return 1;
+  }
+  if (args.showRole !== undefined) {
+    const role = args.showRole;
+    const holding = names.filter((name) => {
+      const host = hosts[name];
+      return Array.isArray(host?.roles) && host.roles.includes(role);
+    });
+    if (holding.length === 0) {
+      out.stderr(`hosts: no host holds the ${role} role\n`);
+      return 1;
+    }
+    if (holding.length > 1) {
+      out.stderr(`${formatRoleAmbiguousRefusal(role, holding)}\n`);
+      return 1;
+    }
+    return printHostTable(out, [holding[0] as string], hosts);
+  }
+  if (args.name !== undefined) {
+    if (!isValidHostName(args.name)) {
+      // The operator-supplied name never appears in the message.
+      out.stderr(
+        `hosts show: that name is not a valid host name (identifier-shaped, no '..')\n${HOSTS_HELP}\n`,
+      );
+      return 2;
+    }
+    if (!Object.hasOwn(hosts, args.name)) {
+      out.stderr(
+        `hosts.${screenHostKey(args.name)}: not in the installation file\n`,
+      );
+      return 1;
+    }
+    return printHostTable(out, [args.name], hosts);
+  }
+  if (names.length === 0) {
+    out.stdout("no hosts are configured\n");
+    return 0;
+  }
+  return printHostTable(out, names, hosts);
+}
+
+/** The hosts show table: one aligned row per named host, in that order. */
+function printHostTable(
+  out: ScreenedHostsIo,
+  names: readonly string[],
+  hosts: Readonly<Record<string, HostSection>>,
+): number {
+  const rows = names.map((name) => {
+    const host = hosts[name];
+    const runner = host.runner;
+    const tunnelOffset = runner?.tunnelOffset ?? 1;
+    const dialPort =
+      runner === undefined
+        ? "-"
+        : host.transport === "ssh"
+          ? String(runner.port + tunnelOffset)
+          : String(runner.port);
+    const alias = host.sshAlias ?? "-";
+    const container = host.container ?? "-";
+    const roleAliases =
+      host.roleAliases === undefined ||
+      Object.keys(host.roleAliases).length === 0
+        ? "-"
+        : Object.entries(host.roleAliases)
+            .map(([role, alias]) => `${role}=${alias}`)
+            .join(", ");
+    return {
+      name,
+      transport: host.transport,
+      alias,
+      container,
+      roles: host.roles.join(", "),
+      roleAliases,
+      runner:
+        runner === undefined
+          ? "-"
+          : `${runner.kind}, port ${runner.port}`,
+      tunnelOffset:
+        runner === undefined ? "-" : String(runner.tunnelOffset ?? 1),
+      dialPort,
+      auth: runner?.authFile !== undefined ? "configured" : "-",
+    };
+  });
+  const widths = {
+    name: Math.max("HOST".length, ...rows.map((r) => r.name.length)),
+    transport: Math.max("TRANSPORT".length, ...rows.map((r) => r.transport.length)),
+    alias: Math.max("SSH".length, ...rows.map((r) => r.alias.length)),
+    container: Math.max("CONTAINER".length, ...rows.map((r) => r.container.length)),
+    roles: Math.max("ROLES".length, ...rows.map((r) => r.roles.length)),
+    roleAliases: Math.max("ROLE_ALIASES".length, ...rows.map((r) => r.roleAliases.length)),
+    runner: Math.max("RUNNER".length, ...rows.map((r) => r.runner.length)),
+    tunnelOffset: Math.max("TUNNEL_OFFSET".length, ...rows.map((r) => r.tunnelOffset.length)),
+    dialPort: Math.max("DIAL_PORT".length, ...rows.map((r) => r.dialPort.length)),
+    auth: Math.max("AUTH".length, ...rows.map((r) => r.auth.length)),
+  };
+  const header = [
+    "HOST".padEnd(widths.name),
+    "TRANSPORT".padEnd(widths.transport),
+    "SSH".padEnd(widths.alias),
+    "CONTAINER".padEnd(widths.container),
+    "ROLES".padEnd(widths.roles),
+    "ROLE_ALIASES".padEnd(widths.roleAliases),
+    "RUNNER".padEnd(widths.runner),
+    "TUNNEL_OFFSET".padEnd(widths.tunnelOffset),
+    "DIAL_PORT".padEnd(widths.dialPort),
+    "AUTH".padEnd(widths.auth),
+  ].join("  ");
+  out.stdout(`${header}\n`);
+  for (const row of rows) {
+    out.stdout(
+      [
+        row.name.padEnd(widths.name),
+        row.transport.padEnd(widths.transport),
+        row.alias.padEnd(widths.alias),
+        row.container.padEnd(widths.container),
+        row.roles.padEnd(widths.roles),
+        row.roleAliases.padEnd(widths.roleAliases),
+        row.runner.padEnd(widths.runner),
+        row.tunnelOffset.padEnd(widths.tunnelOffset),
+        row.dialPort.padEnd(widths.dialPort),
+        row.auth.padEnd(widths.auth),
+      ].join("  ") + "\n",
+    );
   }
   return 0;
 }
@@ -1547,6 +2067,33 @@ export async function hostsCommand(
   rawIo: CliIo,
   hostsOptions: HostsCliOptions = {},
 ): Promise<number> {
+  // Runtime guard: a malformed argv or hostile options object is a typed
+  // refusal, never a throw. Tokens and token count are bounded; every token
+  // must be a dense string element the array itself owns.
+  try {
+    if (!Array.isArray(argv) || argv.length > 128) {
+      return 2;
+    }
+    for (let index = 0; index < argv.length; index += 1) {
+      if (
+        !(index in argv) ||
+        typeof argv[index] !== "string" ||
+        (argv[index] as string).length > 1024
+      ) {
+        return 2;
+      }
+    }
+    if (
+      hostsOptions !== null &&
+      typeof hostsOptions === "object" &&
+      Object.getPrototypeOf(hostsOptions) !== Object.prototype &&
+      Object.getPrototypeOf(hostsOptions) !== null
+    ) {
+      return 1;
+    }
+  } catch {
+    return 1;
+  }
   const out = screenedHostsIo(rawIo, [...argv]);
   let file: string;
   let read: Awaited<ReturnType<typeof readInstallationFile>>;
@@ -1588,6 +2135,9 @@ export async function hostsCommand(
     const args = parsed.args;
     if (args.subcommand === "list") {
       return await listHosts(file, out);
+    }
+    if (args.subcommand === "show") {
+      return await showHosts(args, file, out);
     }
     if (args.subcommand === "remove") {
       return await removeHost(args, file, out, options);

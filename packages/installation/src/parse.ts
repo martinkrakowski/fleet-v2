@@ -1,6 +1,11 @@
 import { isAbsolute } from 'node:path';
 
-import { containsSecretShape, isValidHostName } from '@fleet/shared';
+import {
+  LANE_DIFF_SECRET_PATTERNS,
+  SECRET_PATTERNS,
+  containsSecretShape,
+  isValidHostName,
+} from '@fleet/shared';
 
 import { AGY_SECURITY_TEXT_VERSION } from './agy-security.js';
 
@@ -868,8 +873,32 @@ export const HOST_NAME_TOO_LONG = 'hosts: a host name is too long';
 
 export const MAX_HOST_NAME_ARGUMENT_LENGTH = 4096;
 
+/**
+ * The ONE host-name secret screen: the shared legacy six plus the canonical
+ * lane-diff seventeen. `containsSecretShape` alone scans only the legacy six,
+ * so the union lives here and every hosts surface (loader, draft, CLI) uses it.
+ */
 export function hostNameHasSecretShape(name: string): boolean {
-  return typeof name === 'string' && containsSecretShape(name);
+  return (
+    typeof name === 'string' &&
+    (containsSecretShape(name) ||
+      LANE_DIFF_SECRET_PATTERNS.some((pattern) => pattern.regex.test(name)))
+  );
+}
+
+/**
+ * Replace every span of `text` that matches a screened secret shape (the same
+ * union `hostNameHasSecretShape` tests) with `replacement`.
+ */
+export function redactSecretShapes(text: string, replacement: string): string {
+  let out = text;
+  for (const regex of [
+    ...SECRET_PATTERNS,
+    ...LANE_DIFF_SECRET_PATTERNS.map((pattern) => pattern.regex),
+  ]) {
+    out = out.replace(new RegExp(regex.source, 'g'), replacement);
+  }
+  return out;
 }
 
 /**

@@ -31,5 +31,9 @@ export type RequestToolPermissionOutcome =
   | { readonly outcome: 'refused'; readonly reason: ToolPermissionRefusal };
 
 export interface RequestToolPermissionPort {
-  requestToolPermission(body: unknown, threadId: string): Promise<RequestToolPermissionOutcome>;
+  requestToolPermission(
+    body: unknown,
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<RequestToolPermissionOutcome>;
 }

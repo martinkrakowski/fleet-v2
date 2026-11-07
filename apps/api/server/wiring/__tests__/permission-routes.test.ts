@@ -5,13 +5,15 @@
 // input, and the actor is always the presenting token's id.
 import "./nitro-globals.js";
 
-import { createServer, type Server } from "node:http";
+import { EventEmitter } from "node:events";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createApp,
+  createEvent,
   createRouter,
   toNodeListener,
   type EventHandler,
@@ -180,6 +182,86 @@ describe("tool-permission routes", () => {
         hookEventName: "PermissionRequest",
         decision: { behavior: "deny", message: "the owner denied this tool call" },
       },
+    });
+  });
+
+  it("route composition (abort signal): client abort cancels the wait and marks the stored request expired/interrupted", async () => {
+    const controller = new AbortController();
+    const hookPromise = fetch(`${baseUrl}/v1/threads/t1/permissions`, {
+      method: "POST",
+      headers: { ...authHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ tool_name: "bash", tool_input: { cmd: "sleep" } }),
+      signal: controller.signal,
+    }).catch(() => null);
+
+    const { requestId } = await waitForPending();
+    const repo = getOperatorComposition().permissionRequestRepository;
+    const pending = repo.find(requestId);
+    expect(pending?.state).toBe("pending");
+
+    const startTime = Date.now();
+    controller.abort();
+    await hookPromise;
+
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const stored = repo.find(requestId);
+      if (stored?.state === "expired") {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const elapsed = Date.now() - startTime;
+    expect(elapsed).toBeLessThan(5000);
+
+    const stored = repo.find(requestId);
+    expect(stored?.state).toBe("expired");
+    expect(stored?.verdict).toMatchObject({
+      decision: "deny",
+      reasonCode: "interrupted",
+    });
+  });
+
+  it("route composition (emit close): emitting close on the request cancels the wait before the deadline", async () => {
+    const json = JSON.stringify({ tool_name: "bash", tool_input: {} });
+    const buf = Buffer.from(json);
+
+    const req = Object.assign(new EventEmitter(), {
+      method: "POST",
+      url: "/v1/threads/t1/permissions",
+      headers: {
+        authorization: `Bearer ${VALID_TOKEN}`,
+        "content-type": "application/json",
+        "content-length": String(buf.length),
+      },
+      aborted: false,
+      [Symbol.for("h3RawBody")]: Promise.resolve(buf),
+    });
+    const res = {
+      statusCode: 200,
+      setHeader: () => {},
+      getHeader: () => {},
+    };
+    const event = createEvent(
+      req as unknown as IncomingMessage,
+      res as unknown as ServerResponse,
+    );
+    event.context.params = { id: "t1" };
+
+    const start = Date.now();
+    const handlePromise = (hookPostHandler as (e: unknown) => Promise<unknown>)(event);
+    const { requestId } = await waitForPending();
+
+    req.emit("close");
+    await handlePromise;
+    const elapsed = Date.now() - start;
+
+    expect(elapsed).toBeLessThan(5000);
+    const stored = getOperatorComposition().permissionRequestRepository.find(requestId);
+    expect(stored?.state).toBe("expired");
+    expect(stored?.verdict).toMatchObject({
+      decision: "deny",
+      reasonCode: "interrupted",
     });
   });
 
@@ -435,6 +517,105 @@ describe("tool-permission routes", () => {
     expect(resBadId.status).toBe(400);
     const bodyBadId = await resBadId.json();
     expect(bodyBadId.code).toBe("REFUSED");
+  });
+
+  it("throwing getter: throwing query or body getter gives a typed 400 and not 500", async () => {
+    // Query getter throws
+    const query = {};
+    Object.defineProperty(query, "state", {
+      get() {
+        throw new Error("throwing state getter");
+      },
+      enumerable: true,
+    });
+    const getReq = Object.assign(new EventEmitter(), {
+      method: "GET",
+      url: "/v1/threads/t1/permissions",
+      headers: { authorization: `Bearer ${VALID_TOKEN}` },
+    });
+    const getRes = {
+      statusCode: 200,
+      setHeader: () => {},
+      getHeader: () => {},
+    };
+    const getEvent = createEvent(
+      getReq as unknown as IncomingMessage,
+      getRes as unknown as ServerResponse,
+    );
+    getEvent.context.params = { id: "t1" };
+    getEvent.context.query = query;
+
+    const getOutcome = await (listGetHandler as (e: unknown) => Promise<unknown>)(getEvent);
+    expect(getRes.statusCode).toBe(400);
+    expect(getOutcome).toMatchObject({
+      code: "REFUSED",
+      result: { reason: "invalid-state" },
+    });
+
+    // Request body getter throws on req itself
+    const hostileReq = Object.assign(new EventEmitter(), {
+      method: "POST",
+      url: "/v1/threads/t1/permissions",
+      headers: {
+        authorization: `Bearer ${VALID_TOKEN}`,
+        "content-type": "application/json",
+      },
+      aborted: false,
+    });
+    Object.defineProperty(hostileReq, "body", {
+      get() {
+        throw new Error("throwing req.body getter");
+      },
+      enumerable: true,
+    });
+    const hostileRes = {
+      statusCode: 200,
+      setHeader: () => {},
+      getHeader: () => {},
+    };
+    const hostileEvent = createEvent(
+      hostileReq as unknown as IncomingMessage,
+      hostileRes as unknown as ServerResponse,
+    );
+    hostileEvent.context.params = { id: "t1" };
+
+    const hostileOutcome = (await (hookPostHandler as (e: unknown) => Promise<unknown>)(
+      hostileEvent,
+    )) as Record<string, unknown>;
+    expect(hostileRes.statusCode).toBe(400);
+    expect(hostileOutcome).toMatchObject({
+      code: "REFUSED",
+    });
+    expect(hostileOutcome.code).not.toBe("INTERNAL_ERROR");
+
+    // Request URL getter throws
+    const badUrlReq = Object.assign(new EventEmitter(), {
+      method: "GET",
+      headers: { authorization: `Bearer ${VALID_TOKEN}` },
+    });
+    Object.defineProperty(badUrlReq, "url", {
+      get() {
+        throw new Error("throwing req.url getter");
+      },
+      enumerable: true,
+    });
+    const badUrlRes = {
+      statusCode: 200,
+      setHeader: () => {},
+      getHeader: () => {},
+    };
+    const badUrlEvent = createEvent(
+      badUrlReq as unknown as IncomingMessage,
+      badUrlRes as unknown as ServerResponse,
+    );
+    badUrlEvent.context.params = { id: "t1" };
+
+    const badUrlOutcome = await (listGetHandler as (e: unknown) => Promise<unknown>)(badUrlEvent);
+    expect(badUrlRes.statusCode).toBe(400);
+    expect(badUrlOutcome).toMatchObject({
+      code: "REFUSED",
+      result: { reason: "invalid-state" },
+    });
   });
 
   it("unknown stays unknown: a store read failure in GET gives 503, never an empty list", async () => {

@@ -42,7 +42,7 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
     body: unknown,
     requestId: string,
     actorId: string,
-    threadId?: string,
+    threadId: string,
   ): Promise<GiveToolPermissionVerdictOutcome> {
     try {
       return this.execute(body, requestId, actorId, threadId);
@@ -65,7 +65,7 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
     body: unknown,
     requestId: string,
     actorId: string,
-    threadId?: string,
+    threadId: string,
   ): GiveToolPermissionVerdictOutcome {
     if (!isPlainObject(body)) {
       return { outcome: 'refused', reason: 'body-not-an-object' };
@@ -87,16 +87,27 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
       return { outcome: 'refused', reason: 'request-id-invalid' };
     }
 
+    if (typeof threadId !== 'string' || threadId.length === 0) {
+      return { outcome: 'unknown' };
+    }
+
     const record = this.read(requestId);
     if (record === undefined) {
       return { outcome: 'unknown' };
     }
 
-    if (threadId !== undefined && record.threadId !== threadId) {
+    if (record.threadId !== threadId) {
       return { outcome: 'unknown' };
     }
 
     if (record.state === 'expired') {
+      return { outcome: 'expired' };
+    }
+
+    if (this.now() >= Date.parse(record.deadlineAtIso)) {
+      if (record.verdict === undefined) {
+        this.repository.expire(requestId, 'timed-out', this.clock.nowIso());
+      }
       return { outcome: 'expired' };
     }
 
@@ -123,11 +134,6 @@ export class GiveToolPermissionVerdictUseCase implements GiveToolPermissionVerdi
         outcome: result.outcome === 'recorded' ? 'unchanged' : result.outcome,
         verdict: first,
       };
-    }
-
-    if (this.now() >= Date.parse(record.deadlineAtIso)) {
-      this.repository.expire(requestId, 'timed-out', this.clock.nowIso());
-      return { outcome: 'expired' };
     }
 
     const result = this.repository.recordVerdict(requestId, verdict);

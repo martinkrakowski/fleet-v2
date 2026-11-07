@@ -23,6 +23,6 @@ export interface GiveToolPermissionVerdictPort {
     body: unknown,
     requestId: string,
     actorId: string,
-    threadId?: string,
+    threadId: string,
   ): Promise<GiveToolPermissionVerdictOutcome>;
 }

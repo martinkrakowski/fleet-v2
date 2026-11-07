@@ -366,6 +366,79 @@ describe('RequestToolPermissionUseCase', () => {
     });
     expect(repo.listPending()).toHaveLength(0);
   });
+
+  it('a signal that is already aborted records interrupted without polling', async () => {
+    let polled = false;
+    const repo = new PermissionRequestRepositoryAdapter();
+    const originalFind = repo.find.bind(repo);
+    repo.find = (id: string) => {
+      polled = true;
+      return originalFind(id);
+    };
+    const uc = requestUseCase(repo, { clock: fixedClock() });
+    const controller = new AbortController();
+    controller.abort();
+    const result = await uc.requestToolPermission(
+      { tool_name: 'bash', tool_input: {} },
+      'thread-1',
+      controller.signal,
+    );
+    expect(result).toMatchObject({
+      outcome: 'denied',
+      reason: 'no-verdict',
+    });
+    expect(polled).toBe(false);
+    if ('requestId' in result) {
+      const stored = originalFind(result.requestId);
+      expect(stored?.state).toBe('expired');
+      expect(stored?.verdict).toEqual({
+        decision: 'deny',
+        actorId: 'system',
+        decidedAtIso: NOW_ISO,
+        reasonCode: 'interrupted',
+      });
+    }
+  });
+
+  it('wakes from sleep when signal aborts during wait and records interrupted', async () => {
+    const repo = new PermissionRequestRepositoryAdapter();
+    const controller = new AbortController();
+    const uc = new RequestToolPermissionUseCase({
+      repository: repo,
+      deadlineMs: 60_000,
+      pollIntervalMs: 10_000,
+      clock: fixedClock(),
+      sleep: async () => {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 10_000);
+          controller.signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+      },
+    });
+
+    setTimeout(() => {
+      controller.abort();
+    }, 50);
+
+    const start = Date.now();
+    const result = await uc.requestToolPermission(
+      { tool_name: 'bash', tool_input: {} },
+      'thread-1',
+      controller.signal,
+    );
+    const duration = Date.now() - start;
+
+    expect(duration).toBeLessThan(5000);
+    expect(result).toMatchObject({
+      outcome: 'denied',
+      reason: 'no-verdict',
+    });
+    if ('requestId' in result) {
+      const stored = repo.find(result.requestId);
+      expect(stored?.state).toBe('expired');
+      expect(stored?.verdict?.reasonCode).toBe('interrupted');
+    }
+  });
 });
 
 describe('GiveToolPermissionVerdictUseCase', () => {
@@ -377,12 +450,12 @@ describe('GiveToolPermissionVerdictUseCase', () => {
     const repo = new PermissionRequestRepositoryAdapter();
     repo.record(pendingRecord());
     const uc = verdictUseCase(repo);
-    const first = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-1', 'actor-one');
+    const first = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-1', 'actor-one', 'thread-1');
     expect(first).toEqual({
       outcome: 'recorded',
       verdict: { decision: 'allow', actorId: 'actor-one', decidedAtIso: NOW_ISO },
     });
-    const second = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-1', 'actor-two');
+    const second = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-1', 'actor-two', 'thread-1');
     expect(second).toEqual({
       outcome: 'unchanged',
       verdict: { decision: 'allow', actorId: 'actor-one', decidedAtIso: NOW_ISO },
@@ -398,8 +471,8 @@ describe('GiveToolPermissionVerdictUseCase', () => {
     const repo = new PermissionRequestRepositoryAdapter();
     repo.record(pendingRecord());
     const uc = verdictUseCase(repo);
-    await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-1', 'actor-one');
-    const conflict = await uc.giveToolPermissionVerdict({ decision: 'deny' }, 'req-1', 'actor-two');
+    await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-1', 'actor-one', 'thread-1');
+    const conflict = await uc.giveToolPermissionVerdict({ decision: 'deny' }, 'req-1', 'actor-two', 'thread-1');
     expect(conflict).toEqual({
       outcome: 'conflict',
       verdict: { decision: 'allow', actorId: 'actor-one', decidedAtIso: NOW_ISO },
@@ -413,7 +486,7 @@ describe('GiveToolPermissionVerdictUseCase', () => {
 
   it('a verdict for an unknown request id is unknown, never allowed', async () => {
     const uc = verdictUseCase(new PermissionRequestRepositoryAdapter());
-    const result = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'no-such', 'actor');
+    const result = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'no-such', 'actor', 'thread-1');
     expect(result).toEqual({ outcome: 'unknown' });
   });
 
@@ -428,7 +501,7 @@ describe('GiveToolPermissionVerdictUseCase', () => {
       expire: () => ({ outcome: 'unknown' }),
     };
     const uc = verdictUseCase(unreadable);
-    const result = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-1', 'actor');
+    const result = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-1', 'actor', 'thread-1');
     expect(result).toEqual({ outcome: 'unknown' });
   });
 
@@ -442,7 +515,7 @@ describe('GiveToolPermissionVerdictUseCase', () => {
       clock: fixedClock(),
       now: () => Date.now(),
     });
-    const result = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-expired', 'actor');
+    const result = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-expired', 'actor', 'thread-1');
     expect(result).toEqual({ outcome: 'expired' });
     expect(repo.find('req-expired')?.state).toBe('expired');
   });
@@ -456,9 +529,49 @@ describe('GiveToolPermissionVerdictUseCase', () => {
       clock: fixedClock(),
       now: () => Date.parse(deadlineIso),
     });
-    const result = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-at-deadline', 'actor');
+    const result = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-at-deadline', 'actor', 'thread-1');
     expect(result).toEqual({ outcome: 'expired' });
     expect(repo.find('req-at-deadline')?.state).toBe('expired');
+  });
+
+  it('a decided request plus a second verdict after the deadline gives expired, and the stored verdict is unchanged', async () => {
+    const deadlineIso = '2030-01-01T00:00:00.000Z';
+    const deadlineMs = Date.parse(deadlineIso);
+    const repo = new PermissionRequestRepositoryAdapter();
+    repo.record(pendingRecord({ requestId: 'req-decided-then-deadline', deadlineAtIso: deadlineIso }));
+    let currentNow = deadlineMs - 1000;
+    const uc = new GiveToolPermissionVerdictUseCase({
+      repository: repo,
+      clock: fixedClock(),
+      now: () => currentNow,
+    });
+    const first = await uc.giveToolPermissionVerdict(
+      { decision: 'allow' },
+      'req-decided-then-deadline',
+      'actor-one',
+      'thread-1',
+    );
+    expect(first).toEqual({
+      outcome: 'recorded',
+      verdict: { decision: 'allow', actorId: 'actor-one', decidedAtIso: NOW_ISO },
+    });
+
+    currentNow = deadlineMs + 1000;
+    const second = await uc.giveToolPermissionVerdict(
+      { decision: 'deny' },
+      'req-decided-then-deadline',
+      'actor-two',
+      'thread-1',
+    );
+    expect(second).toEqual({ outcome: 'expired' });
+
+    const stored = repo.find('req-decided-then-deadline');
+    expect(stored?.state).toBe('decided');
+    expect(stored?.verdict).toEqual({
+      decision: 'allow',
+      actorId: 'actor-one',
+      decidedAtIso: NOW_ISO,
+    });
   });
 
   it('F3: a verdict for a different threadId is unknown, never allowed', async () => {
@@ -475,12 +588,27 @@ describe('GiveToolPermissionVerdictUseCase', () => {
     expect(repo.find('req-t1')?.state).toBe('pending');
   });
 
+  it('an empty threadId gives unknown, and the request stays pending', async () => {
+    const repo = new PermissionRequestRepositoryAdapter();
+    repo.record(pendingRecord({ requestId: 'req-empty-thread', threadId: 'thread-1' }));
+    const uc = verdictUseCase(repo);
+    const result = await uc.giveToolPermissionVerdict(
+      { decision: 'allow' },
+      'req-empty-thread',
+      'actor',
+      '',
+    );
+    expect(result).toEqual({ outcome: 'unknown' });
+    expect(repo.find('req-empty-thread')?.state).toBe('pending');
+    expect(repo.find('req-empty-thread')?.verdict).toBeUndefined();
+  });
+
   it('a verdict on an expired request gives expired', async () => {
     const repo = new PermissionRequestRepositoryAdapter();
     repo.record(pendingRecord({ requestId: 'req-exp' }));
     repo.expire('req-exp', 'timed-out', NOW_ISO);
     const uc = verdictUseCase(repo);
-    const result = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-exp', 'actor');
+    const result = await uc.giveToolPermissionVerdict({ decision: 'allow' }, 'req-exp', 'actor', 'thread-1');
     expect(result).toEqual({ outcome: 'expired' });
   });
 });

@@ -75,10 +75,14 @@ export class RequestToolPermissionUseCase implements RequestToolPermissionPort {
     this.sleepFn = options.sleep ?? sleep;
   }
 
-  async requestToolPermission(body: unknown, threadId: string): Promise<RequestToolPermissionOutcome> {
+  async requestToolPermission(
+    body: unknown,
+    threadId: string,
+    signal?: AbortSignal,
+  ): Promise<RequestToolPermissionOutcome> {
     let recordedRequestId: string | undefined;
     try {
-      return await this.execute(body, threadId, (id) => {
+      return await this.execute(body, threadId, signal, (id) => {
         recordedRequestId = id;
       });
     } catch {
@@ -96,6 +100,7 @@ export class RequestToolPermissionUseCase implements RequestToolPermissionPort {
   private async execute(
     body: unknown,
     threadId: string,
+    signal?: AbortSignal,
     onRecorded?: (id: string) => void,
   ): Promise<RequestToolPermissionOutcome> {
     if (!isPlainObject(body)) {
@@ -163,38 +168,97 @@ export class RequestToolPermissionUseCase implements RequestToolPermissionPort {
     }
     onRecorded?.(requestId);
 
-    return this.waitForVerdict(requestId, deadlineAt);
+    return this.waitForVerdict(requestId, deadlineAt, signal);
   }
 
   private async waitForVerdict(
     requestId: string,
     deadlineAt: number,
+    signal?: AbortSignal,
   ): Promise<RequestToolPermissionOutcome> {
-    while (true) {
-      const record = this.repository.find(requestId);
-      if (record !== undefined && record.verdict !== undefined) {
-        if (record.verdict.decision === 'allow') {
-          return { outcome: 'allowed', requestId };
+    if (signal?.aborted) {
+      try {
+        this.repository.expire(requestId, 'interrupted', this.clock.nowIso());
+      } catch {
+        // Ignore secondary failure on expire
+      }
+      return {
+        outcome: 'denied',
+        requestId,
+        reason: 'no-verdict',
+        message: 'the request was interrupted',
+      };
+    }
+
+    let wakeSleep: (() => void) | undefined;
+    const onAbort = () => {
+      wakeSleep?.();
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          try {
+            this.repository.expire(requestId, 'interrupted', this.clock.nowIso());
+          } catch {
+            // Ignore secondary failure on expire
+          }
+          return {
+            outcome: 'denied',
+            requestId,
+            reason: 'no-verdict',
+            message: 'the request was interrupted',
+          };
         }
-        return {
-          outcome: 'denied',
-          requestId,
-          reason: 'owner-denied',
-          message: 'the owner denied this tool call',
-        };
+
+        const record = this.repository.find(requestId);
+        if (record !== undefined && record.verdict !== undefined) {
+          if (record.verdict.decision === 'allow') {
+            return { outcome: 'allowed', requestId };
+          }
+          return {
+            outcome: 'denied',
+            requestId,
+            reason: 'owner-denied',
+            message: 'the owner denied this tool call',
+          };
+        }
+        const now = this.now();
+        if (now >= deadlineAt) {
+          this.repository.expire(requestId, 'timed-out', this.clock.nowIso());
+          const message =
+            this.deadlineMs % 1000 === 0
+              ? `no verdict in ${this.deadlineMs / 1000} s`
+              : `no verdict in ${this.deadlineMs} ms`;
+          return { outcome: 'denied', requestId, reason: 'no-verdict', message };
+        }
+        const remainingMs = deadlineAt - now;
+        const sleepMs = Math.max(0, Math.min(this.pollIntervalMs, remainingMs));
+        if (signal) {
+          await new Promise<void>((resolve) => {
+            let done = false;
+            const finish = () => {
+              if (!done) {
+                done = true;
+                wakeSleep = undefined;
+                resolve();
+              }
+            };
+            wakeSleep = finish;
+            this.sleepFn(sleepMs).then(finish, finish);
+          });
+        } else {
+          await this.sleepFn(sleepMs);
+        }
       }
-      const now = this.now();
-      if (now >= deadlineAt) {
-        this.repository.expire(requestId, 'timed-out', this.clock.nowIso());
-        const message =
-          this.deadlineMs % 1000 === 0
-            ? `no verdict in ${this.deadlineMs / 1000} s`
-            : `no verdict in ${this.deadlineMs} ms`;
-        return { outcome: 'denied', requestId, reason: 'no-verdict', message };
+    } finally {
+      if (signal) {
+        signal.removeEventListener('abort', onAbort);
       }
-      const remainingMs = deadlineAt - now;
-      const sleepMs = Math.max(0, Math.min(this.pollIntervalMs, remainingMs));
-      await this.sleepFn(sleepMs);
     }
   }
 }

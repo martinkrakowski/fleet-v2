@@ -28,11 +28,67 @@ export default defineEventHandler(async (event) => {
     }
 
     const threadId = routeParam(event, "id");
-    const body = await readObjectBody(event);
-    const result = await getOperatorComposition().requestToolPermission.requestToolPermission(
-      body,
-      threadId,
-    );
+    let body: unknown;
+    try {
+      body = await readObjectBody(event);
+    } catch (error) {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "statusCode" in error &&
+        typeof error.statusCode === "number"
+      ) {
+        throw error;
+      }
+      const failure = refusedEnvelope(operationId, "body-not-an-object");
+      setResponseStatus(event, 400);
+      return failure.body;
+    }
+
+    const controller = new AbortController();
+    const req = event.node?.req;
+    const res = event.node?.res;
+    let responseWritten = false;
+    const onClose = () => {
+      if (!responseWritten) {
+        controller.abort();
+      }
+    };
+    if (req?.aborted) {
+      controller.abort();
+    } else {
+      if (typeof req?.on === "function") {
+        req.on("close", onClose);
+      }
+      if (typeof res?.on === "function") {
+        res.on("close", onClose);
+      }
+    }
+
+    let result;
+    try {
+      result = await getOperatorComposition().requestToolPermission.requestToolPermission(
+        body,
+        threadId,
+        controller.signal,
+      );
+    } finally {
+      responseWritten = true;
+      if (req) {
+        if (typeof req.off === "function") {
+          req.off("close", onClose);
+        } else if (typeof req.removeListener === "function") {
+          req.removeListener("close", onClose);
+        }
+      }
+      if (res) {
+        if (typeof res.off === "function") {
+          res.off("close", onClose);
+        } else if (typeof res.removeListener === "function") {
+          res.removeListener("close", onClose);
+        }
+      }
+    }
 
     if (result.outcome === "refused") {
       // A refusal is a client error (400); only an unexpected internal error
